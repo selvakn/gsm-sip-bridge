@@ -66,6 +66,8 @@ add_executable(gsm-sip-bridge
     src/bridge/bridge_config.cpp
     src/bridge/bridge_account.cpp
     src/bridge/bridge_call.cpp
+    src/bridge/card_instance.cpp
+    src/bridge/card_pool.cpp
     src/bridge/alsa_media_port.cpp
     src/bridge/beep_generator.cpp
     src/sip/sip_config.cpp
@@ -176,12 +178,18 @@ if(GTest_FOUND)
         tests/integration/test_ring_buffer.cpp
         tests/integration/test_beep_generator.cpp
         tests/integration/test_bridge_call.cpp
+        tests/integration/test_card_pool.cpp
         src/bridge/bridge_config.cpp
         src/bridge/bridge_account.cpp
         src/bridge/bridge_call.cpp
+        src/bridge/card_instance.cpp
+        src/bridge/card_pool.cpp
         src/bridge/alsa_media_port.cpp
         src/bridge/beep_generator.cpp
         src/sip/sip_config.cpp
+        src/device_discovery.cpp
+        src/serial_port.cpp
+        src/at_commander.cpp
     )
 
     target_include_directories(bridge-tests PRIVATE
@@ -189,11 +197,13 @@ if(GTest_FOUND)
         vendor
         tests/integration
         ${PJSIP_INCLUDE_DIRS}
+        ${ALSA_INCLUDE_DIRS}
     )
 
     target_link_libraries(bridge-tests PRIVATE
         GTest::gtest GTest::gtest_main
         ${PJSIP_LIBRARIES}
+        ${ALSA_LIBRARIES}
         pthread
     )
 

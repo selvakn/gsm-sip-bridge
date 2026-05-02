@@ -7,8 +7,8 @@
 class BeepGenerator {
 public:
     static constexpr unsigned int DEFAULT_FREQUENCY_HZ = 400;
-    static constexpr unsigned int DEFAULT_ON_MS = 200;
-    static constexpr unsigned int DEFAULT_OFF_MS = 200;
+    static constexpr unsigned int DEFAULT_ON_MS = 1000;
+    static constexpr unsigned int DEFAULT_OFF_MS = 4000;
     static constexpr unsigned int DEFAULT_SAMPLE_RATE = 8000;
     static constexpr int16_t DEFAULT_AMPLITUDE = 16000;
 

@@ -1,8 +1,8 @@
 # GSM-SIP Bridge
 
-Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the GSM number on the Quectel EC20 module, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties.
+Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the GSM number on a Quectel EC20 module, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously.
 
-**Version**: 1.1.0 | **Language**: C++17 | **Platform**: Linux
+**Version**: 2.0.0 | **Language**: C++17 | **Platform**: Linux
 
 ## Prerequisites
 
@@ -11,7 +11,7 @@ Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the G
 - CMake 3.14+
 - ALSA development headers (`libasound2-dev`)
 - PJSIP development libraries (`libpjproject-dev` or built from source)
-- Quectel EC20 module connected via USB with an active SIM card
+- One or more Quectel EC20 modules connected via USB, each with an active SIM card
 - SIP server account (Asterisk, FreePBX, MikoPBX, etc.)
 
 Install build dependencies:
@@ -30,9 +30,52 @@ make test
 make run
 ```
 
+## Multi-Card Support
+
+The system automatically detects all connected EC20 modules at startup by scanning the USB bus for devices matching vendor/product ID `2c7c:0125`. Each detected module:
+
+- Receives a **stable card identifier** derived from its USB hardware serial number (e.g., `ec20-A1B2C3`). The same physical module always gets the same ID regardless of USB enumeration order.
+- Runs its own independent call-handling thread with isolated serial port and ALSA audio.
+- Can handle one GSM call at a time, bridged to SIP concurrently with calls on other modules.
+
+All modules share a single SIP server registration and configuration. No per-module config is needed.
+
+### Startup Behavior
+
+- If **no modules** are found, the system exits with an error.
+- If **some modules** fail initialization (e.g., SIM not registered), the system logs warnings and operates with the remaining functional modules.
+- **Failed modules are retried** every 30 seconds in the background. When a previously failed module becomes functional, it joins the active pool automatically.
+- At least **one functional module** is required to start.
+
+### Example Startup Output
+
+```text
+2026-05-02T10:00:00.100 INFO detected 3 EC20 module(s)
+2026-05-02T10:00:00.200 INFO [ec20-A1B2C3] initializing (serial=/dev/ttyUSB2, audio=hw:1,0)
+2026-05-02T10:00:00.500 INFO [ec20-A1B2C3] GSM network registration confirmed
+2026-05-02T10:00:00.600 INFO [ec20-D4E5F6] initializing (serial=/dev/ttyUSB6, audio=hw:2,0)
+2026-05-02T10:00:01.000 INFO [ec20-D4E5F6] GSM network registration confirmed
+2026-05-02T10:00:01.100 INFO [ec20-G7H8I9] initializing (serial=/dev/ttyUSB10, audio=hw:3,0)
+2026-05-02T10:00:01.500 ERROR [ec20-G7H8I9] SIM not registered on network
+2026-05-02T10:00:02.000 INFO === Module Summary ===
+2026-05-02T10:00:02.001 INFO   [ec20-A1B2C3] serial=/dev/ttyUSB2 audio=hw:1,0 — ACTIVE
+2026-05-02T10:00:02.002 INFO   [ec20-D4E5F6] serial=/dev/ttyUSB6 audio=hw:2,0 — ACTIVE
+2026-05-02T10:00:02.003 INFO   [ec20-G7H8I9] serial=/dev/ttyUSB10 audio=hw:3,0 — FAILED (SIM not registered on network)
+2026-05-02T10:00:02.004 INFO ready, 2 module(s) active, 1 failed
+2026-05-02T10:00:02.005 INFO retry thread started (30s interval)
+```
+
+### Single-Card Override
+
+When both `--serial` and `--audio` flags are provided, the system operates in single-card mode with the specified devices, bypassing auto-detection:
+
+```bash
+gsm-sip-bridge -s /dev/ttyUSB3 -a hw:2,0 --config config.ini
+```
+
 ## One-Time EC20 Setup
 
-Enable USB Audio Class (UAC) on the EC20 module:
+Enable USB Audio Class (UAC) on each EC20 module:
 
 ```bash
 # Connect to AT command port
@@ -51,6 +94,8 @@ Verify audio device appears:
 arecord -l    # Should show a card named "Android"
 aplay -l      # Same card for playback
 ```
+
+Repeat for each EC20 module.
 
 ## Configuration
 
@@ -82,14 +127,14 @@ sip_dial_timeout_sec = 30
 | `[bridge]` | `sip_destination` | *(empty)* | SIP extension to dial. When empty, the GSM caller's number is used as the DID, letting the PBX inbound route decide the destination. |
 | `[bridge]` | `sip_dial_timeout_sec` | `30` | Seconds to wait for SIP answer (5-120) |
 
-The `[bridge]` section is optional; defaults apply if absent.
+The `[bridge]` section is optional; defaults apply if absent. All modules share the same configuration.
 
 ## Usage
 
 ```bash
-gsm-sip-bridge --config config.ini              # auto-detect EC20, bridge to configured extension
+gsm-sip-bridge --config config.ini              # auto-detect all EC20 modules
 gsm-sip-bridge --config config.ini --verbose    # verbose SIP + AT logging
-gsm-sip-bridge -s /dev/ttyUSB3 -a hw:2,0       # override GSM devices
+gsm-sip-bridge -s /dev/ttyUSB3 -a hw:2,0       # single-card override
 ```
 
 ### System Overview
@@ -98,7 +143,7 @@ gsm-sip-bridge -s /dev/ttyUSB3 -a hw:2,0       # override GSM devices
 flowchart LR
     Phone["GSM Phone<br/>(Caller)"]
     Tower["Cell Tower"]
-    EC20["Quectel EC20<br/>GSM Module"]
+    EC20["Quectel EC20<br/>GSM Modules (1..N)"]
     Server["Bridge Server<br/>(gsm-sip-bridge)"]
     PBX["SIP PBX<br/>(Asterisk / FreePBX)"]
     IPPhone["IP Phone /<br/>Softphone"]
@@ -185,6 +230,8 @@ flowchart LR
     F <-->|RTP| I
 ```
 
+Each EC20 module has its own isolated audio pipeline. Multiple pipelines run concurrently when multiple modules are active.
+
 If the SIP call fails (busy, timeout, unreachable), the GSM caller hears an error tone and the call is terminated.
 
 ## Makefile Targets
@@ -213,7 +260,7 @@ Two standalone echo tools are included for isolating GSM or SIP issues independe
 src/
 ├── logger.h              # Shared timestamped stdout logging
 ├── ring_buffer.h         # Lock-free SPSC ring buffer (header-only)
-├── device_discovery.*    # USB sysfs auto-detection (VID:PID 2c7c:0125)
+├── device_discovery.*    # USB sysfs auto-detection (VID:PID 2c7c:0125), multi-device
 ├── serial_port.*         # POSIX termios RAII wrapper
 ├── at_commander.*        # AT command send/receive, URC parsing
 ├── audio_loop.*          # ALSA capture->playback loopback (used by GSM echo)
@@ -224,9 +271,11 @@ src/
 │   ├── echo_account.*    # pj::Account for SIP echo
 │   └── echo_call.*       # pj::Call for SIP echo loopback
 └── bridge/
-    ├── main.cpp          # Bridge: GSM+SIP orchestration, state machine
+    ├── main.cpp          # Entry point: config, PJSIP init, CardPool orchestration
+    ├── card_instance.*   # Per-module encapsulation (serial, AT, thread, call handling)
+    ├── card_pool.*       # Multi-card lifecycle (discover, init, retry, shutdown)
     ├── bridge_config.*   # [bridge] section INI parser
-    ├── bridge_account.*  # pj::Account for outbound SIP calls
+    ├── bridge_account.*  # pj::Account for concurrent outbound SIP calls
     ├── bridge_call.*     # pj::Call for outbound SIP leg
     ├── alsa_media_port.* # AudioMediaPort adapter (ALSA <-> PJSIP)
     └── beep_generator.*  # 400Hz tone pattern generator
@@ -234,7 +283,7 @@ src/
 vendor/
 └── mini/ini.h            # mINI header-only INI parser (MIT)
 
-tests/integration/        # 70 integration tests
+tests/integration/        # 82 integration tests
 ```
 
 ## ModemManager Interference
@@ -257,13 +306,17 @@ sudo systemctl disable ModemManager
 
 **No `/dev/ttyUSB*` devices**: Check `dmesg | grep ttyUSB`. Ensure `option` and `qcserial` kernel modules are loaded.
 
-**No audio device in `arecord -l`**: UAC not enabled. Follow the one-time setup above.
+**No audio device in `arecord -l`**: UAC not enabled. Follow the one-time setup above for each module.
 
 **SIP registration failed**: Verify credentials in `config.ini`. Check PBX logs. Ensure the SIP port is correct.
 
 **SIP call fails / busy**: Verify `sip_destination` is a valid, reachable extension on the PBX.
 
 **No audio after SIP answers**: Check that `AT+QPCMV=1,2` succeeded in the logs. This routes voice audio to USB.
+
+**Module shows FAILED at startup**: Check the failure reason in the startup summary. Common causes: SIM not inserted, SIM not registered on network, serial port claimed by another process.
+
+**Retry thread not recovering module**: Verify the underlying issue is resolved (SIM registered, USB audio available). The retry thread attempts reinitialization every 30 seconds.
 
 **Permission denied**: Add user to `dialout` and `audio` groups:
 

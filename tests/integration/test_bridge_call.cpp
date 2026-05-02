@@ -118,9 +118,9 @@ TEST_F(BridgeCallTest, make_outbound_call_with_caller_id_does_not_crash) {
 
     // Assert
     if (call) {
-        account.hangup_call();
+        account.hangup_call(call->getId());
+        account.remove_call(call->getId());
     }
-    account.clear_call();
     account.shutdown();
 }
 
@@ -136,9 +136,9 @@ TEST_F(BridgeCallTest, make_outbound_call_without_caller_id_does_not_crash) {
 
     // Assert
     if (call) {
-        account.hangup_call();
+        account.hangup_call(call->getId());
+        account.remove_call(call->getId());
     }
-    account.clear_call();
     account.shutdown();
 }
 
