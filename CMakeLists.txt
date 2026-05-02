@@ -30,6 +30,36 @@ target_compile_options(audio-echo PRIVATE
     -Wall -Wextra -Wpedantic -Werror
 )
 
+# --- SIP Echo binary ---
+pkg_check_modules(PJSIP REQUIRED libpjproject)
+
+add_executable(sip-echo
+    src/sip/main.cpp
+    src/sip/sip_config.cpp
+    src/sip/echo_account.cpp
+    src/sip/echo_call.cpp
+)
+
+target_include_directories(sip-echo PRIVATE
+    src
+    vendor
+    ${PJSIP_INCLUDE_DIRS}
+)
+
+target_link_libraries(sip-echo PRIVATE
+    ${PJSIP_LIBRARIES}
+    pthread
+)
+
+target_link_directories(sip-echo PRIVATE
+    ${PJSIP_LIBRARY_DIRS}
+)
+
+target_compile_options(sip-echo PRIVATE
+    -Wall -Wextra -Wpedantic -Werror
+    ${PJSIP_CFLAGS_OTHER}
+)
+
 enable_testing()
 
 find_package(GTest QUIET)
@@ -75,8 +105,39 @@ if(GTest_FOUND)
         -Wall -Wextra -Wpedantic
     )
 
+    add_executable(sip-echo-tests
+        tests/integration/test_sip_config.cpp
+        tests/integration/test_sip_echo.cpp
+        src/sip/sip_config.cpp
+        src/sip/echo_account.cpp
+        src/sip/echo_call.cpp
+    )
+
+    target_include_directories(sip-echo-tests PRIVATE
+        src
+        vendor
+        tests/integration
+        ${PJSIP_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(sip-echo-tests PRIVATE
+        GTest::gtest GTest::gtest_main
+        ${PJSIP_LIBRARIES}
+        pthread
+    )
+
+    target_link_directories(sip-echo-tests PRIVATE
+        ${PJSIP_LIBRARY_DIRS}
+    )
+
+    target_compile_options(sip-echo-tests PRIVATE
+        -Wall -Wextra -Wpedantic
+        ${PJSIP_CFLAGS_OTHER}
+    )
+
     include(GoogleTest)
     gtest_discover_tests(audio-echo-tests)
+    gtest_discover_tests(sip-echo-tests)
 else()
     message(WARNING "GTest not found, tests will not be built")
 endif()

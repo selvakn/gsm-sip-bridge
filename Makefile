@@ -1,9 +1,10 @@
 BUILD_DIR := build
-BINARY := $(BUILD_DIR)/audio-echo
+GSM_BINARY := $(BUILD_DIR)/audio-echo
+SIP_BINARY := $(BUILD_DIR)/sip-echo
 
-.PHONY: build test run clean lint help
+.PHONY: build test run run-sip clean lint help
 
-build: ## Compile the audio-echo binary
+build: ## Compile both audio-echo and sip-echo binaries
 	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -S .
 	@cmake --build $(BUILD_DIR) --parallel
 
@@ -12,8 +13,11 @@ test: ## Run the full integration test suite
 	@cmake --build $(BUILD_DIR) --parallel
 	@cd $(BUILD_DIR) && ctest --output-on-failure
 
-run: build ## Build and run audio-echo with auto-detection
-	@$(BINARY)
+run: build ## Build and run GSM audio-echo with auto-detection
+	@$(GSM_BINARY)
+
+run-sip: build ## Build and run SIP echo server with config.ini
+	@$(SIP_BINARY) --config config.ini --verbose
 
 clean: ## Remove all build artifacts
 	@rm -rf $(BUILD_DIR)

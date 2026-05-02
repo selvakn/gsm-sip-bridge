@@ -1,22 +1,22 @@
 # Audio Echo
 
-Auto-answer incoming GSM voice calls on a Quectel EC20 module and echo the caller's audio back in real time.
+Echo incoming voice call audio back to the caller. Supports two modes: GSM (Quectel EC20 hardware) and SIP (VoIP via PJSIP).
 
 **Version**: 0.1.0 | **Language**: C++17 | **Platform**: Linux
 
 ## Prerequisites
 
-- Linux with ALSA support (kernel 3.11+, Debian/Ubuntu recommended)
+- Linux (Debian/Ubuntu recommended)
 - GCC 9+ with C++17 support
 - CMake 3.14+
-- ALSA development headers (`libasound2-dev`)
-- Quectel EC20 module connected via USB with an active SIM card
-- EC20 firmware EC20CEFAGR06A15M4G or later (USB Audio Class support)
+- ALSA development headers (`libasound2-dev`) -- for GSM echo
+- PJSIP development libraries (`libpjproject-dev` or built from source) -- for SIP echo
+- Quectel EC20 module connected via USB with an active SIM card -- for GSM echo only
 
 Install build dependencies:
 
 ```bash
-sudo apt install build-essential cmake g++ libasound2-dev
+sudo apt install build-essential cmake g++ libasound2-dev libpjproject-dev
 ```
 
 ## Quick Start
@@ -25,7 +25,13 @@ sudo apt install build-essential cmake g++ libasound2-dev
 git clone <repo-url> audio-echo && cd audio-echo
 make build
 make test
+
+# GSM echo (requires EC20 hardware)
 make run
+
+# SIP echo (requires SIP server)
+cp config.ini.example config.ini   # edit with your SIP credentials
+make run-sip
 ```
 
 ## One-Time EC20 Setup
@@ -52,41 +58,65 @@ aplay -l      # Same card for playback
 
 ## Usage
 
+### GSM Echo (audio-echo)
+
 ```bash
-# Auto-detect EC20 module
-audio-echo
+audio-echo                              # auto-detect EC20 module
+audio-echo --serial /dev/ttyUSB3        # override serial port
+audio-echo -s /dev/ttyUSB2 -a hw:2,0 -v  # override both, verbose
+```
 
-# Override serial port
-audio-echo --serial /dev/ttyUSB3
+### SIP Echo (sip-echo)
 
-# Override both with verbose AT logging
-audio-echo -s /dev/ttyUSB2 -a hw:2,0 -v
+```bash
+sip-echo --config config.ini            # use specific config file
+sip-echo --config config.ini --verbose  # verbose SIP logging
+sip-echo --help                         # show all options
+```
 
-# Show help
-audio-echo --help
+## SIP Configuration
+
+Create a `config.ini` file (see `config.ini.example`):
+
+```ini
+[sip]
+server = pbx.example.com
+port = 5060
+username = echo-test
+password = your-password
+transport = udp
 ```
 
 ## Makefile Targets
 
-| Target       | Description                          |
-|-------------|--------------------------------------|
-| `make build` | Compile the audio-echo binary        |
-| `make test`  | Run the full integration test suite  |
-| `make run`   | Build and run with auto-detection    |
-| `make clean` | Remove all build artifacts           |
-| `make lint`  | Run static analysis                  |
-| `make help`  | Show all available targets           |
+| Target         | Description                          |
+|---------------|--------------------------------------|
+| `make build`   | Compile both binaries                |
+| `make test`    | Run the full integration test suite  |
+| `make run`     | Build and run GSM echo               |
+| `make run-sip` | Build and run SIP echo               |
+| `make clean`   | Remove all build artifacts           |
+| `make lint`    | Run static analysis                  |
+| `make help`    | Show all available targets           |
 
 ## Architecture
 
 ```text
 src/
-├── main.cpp              # CLI, signal handling, event loop
-├── device_discovery.*    # USB sysfs auto-detection (VID:PID 2c7c:0125)
-├── serial_port.*         # POSIX termios RAII wrapper
-├── at_commander.*        # AT command send/receive, URC parsing
-├── audio_loop.*          # ALSA capture->playback loopback
-└── logger.h              # Timestamped stdout logging
+├── logger.h              # Shared timestamped stdout logging
+├── main.cpp              # GSM: CLI, signal handling, event loop
+├── device_discovery.*    # GSM: USB sysfs auto-detection (VID:PID 2c7c:0125)
+├── serial_port.*         # GSM: POSIX termios RAII wrapper
+├── at_commander.*        # GSM: AT command send/receive, URC parsing
+├── audio_loop.*          # GSM: ALSA capture->playback loopback
+└── sip/
+    ├── main.cpp          # SIP: CLI, PJSIP endpoint lifecycle
+    ├── sip_config.*      # SIP: INI config parser and validation
+    ├── echo_account.*    # SIP: pj::Account subclass (registration, incoming calls)
+    └── echo_call.*       # SIP: pj::Call subclass (call state, audio loopback)
+
+vendor/
+└── mini/ini.h            # mINI header-only INI parser (MIT)
 
 tests/integration/
 ├── pty_pair.h            # PTY pair helper for serial tests
@@ -94,7 +124,9 @@ tests/integration/
 ├── test_serial_port.cpp
 ├── test_at_commander.cpp
 ├── test_audio_loop.cpp
-└── test_end_to_end.cpp
+├── test_end_to_end.cpp
+├── test_sip_config.cpp   # SIP config parsing tests
+└── test_sip_echo.cpp     # SIP echo lifecycle tests
 ```
 
 ## ModemManager Interference

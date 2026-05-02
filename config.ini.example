@@ -1,0 +1,18 @@
+[sip]
+; SIP server hostname or IP address (required)
+server = pbx.example.com
+
+; SIP server port (optional, default: 5060)
+port = 5060
+
+; SIP account username (required)
+username = echo-test
+
+; SIP account password (required)
+password = changeme
+
+; Display name shown to callers (optional, default: username)
+display_name = Echo Server
+
+; Transport protocol: udp, tcp, or tls (optional, default: udp)
+transport = udp

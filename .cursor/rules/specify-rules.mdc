@@ -9,6 +9,8 @@ alwaysApply: true
 Auto-generated from all feature plans. Last updated: 2026-05-02
 
 ## Active Technologies
+- C++17 (GCC 9+) + PJSIP/PJSUA2 (SIP + media), mINI (INI parsing, header-only, MIT) (002-sip-audio-echo)
+- N/A (configuration file only, no persistent state) (002-sip-audio-echo)
 
 - C++17 (GCC 9+) + libasound2 (ALSA), libudev (USB discovery) (001-gsm-audio-echo)
 
@@ -28,6 +30,7 @@ tests/
 C++17 (GCC 9+): Follow standard conventions
 
 ## Recent Changes
+- 002-sip-audio-echo: Added C++17 (GCC 9+) + PJSIP/PJSUA2 (SIP + media), mINI (INI parsing, header-only, MIT)
 
 - 001-gsm-audio-echo: Added C++17 (GCC 9+) + libasound2 (ALSA), libudev (USB discovery)
 
