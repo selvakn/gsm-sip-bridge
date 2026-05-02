@@ -1,11 +1,11 @@
 BUILD_DIR := build
-GSM_BINARY := $(BUILD_DIR)/audio-echo
-SIP_BINARY := $(BUILD_DIR)/sip-echo
 BRIDGE_BINARY := $(BUILD_DIR)/gsm-sip-bridge
+GSM_ECHO_BINARY := $(BUILD_DIR)/audio-echo
+SIP_ECHO_BINARY := $(BUILD_DIR)/sip-echo
 
-.PHONY: build test run run-sip run-bridge clean lint help
+.PHONY: build test run run-gsm-echo run-sip-echo docker clean lint help
 
-build: ## Compile both audio-echo and sip-echo binaries
+build: ## Compile all binaries
 	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -S .
 	@cmake --build $(BUILD_DIR) --parallel
 
@@ -14,14 +14,18 @@ test: ## Run the full integration test suite
 	@cmake --build $(BUILD_DIR) --parallel
 	@cd $(BUILD_DIR) && ctest --output-on-failure
 
-run: build ## Build and run GSM audio-echo with auto-detection
-	@$(GSM_BINARY)
-
-run-sip: build ## Build and run SIP echo server with config.ini
-	@$(SIP_BINARY) --config config.ini --verbose
-
-run-bridge: build ## Build and run GSM-SIP bridge with config.ini
+run: build ## Build and run the GSM-SIP bridge
 	@$(BRIDGE_BINARY) --config config.ini
+
+run-gsm-echo: build ## [Debug] Echo GSM audio back to caller (no SIP)
+	@$(GSM_ECHO_BINARY)
+
+run-sip-echo: build ## [Debug] Echo SIP audio back to caller (no GSM)
+	@$(SIP_ECHO_BINARY) --config config.ini --verbose
+
+docker: ## Build and run via Docker Compose
+	@docker compose up --build -d
+	@docker compose logs -f
 
 clean: ## Remove all build artifacts
 	@rm -rf $(BUILD_DIR)
@@ -33,4 +37,4 @@ lint: ## Run static analysis on all source files
 
 help: ## Show all available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'

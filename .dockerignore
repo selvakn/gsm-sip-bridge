@@ -1,0 +1,10 @@
+build/
+build-test/
+.git/
+.cursor/
+.specify/
+specs/
+*.md
+config.ini
+.gitignore
+.dockerignore

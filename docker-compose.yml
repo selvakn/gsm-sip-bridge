@@ -1,0 +1,19 @@
+services:
+  gsm-sip-bridge:
+    build: .
+    container_name: gsm-sip-bridge
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./config.ini:/etc/gsm-sip-bridge/config.ini:ro
+      - /dev/snd:/dev/snd
+      - /dev/bus/usb:/dev/bus/usb
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+      - /dev/ttyUSB1:/dev/ttyUSB1
+      - /dev/ttyUSB2:/dev/ttyUSB2
+      - /dev/ttyUSB3:/dev/ttyUSB3
+    group_add:
+      - audio
+      - dialout
