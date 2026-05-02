@@ -104,21 +104,35 @@ bool AudioLoop::open(const std::string& device_name) {
 
     config_ = cap_config;
 
-    LOG_INFO("audio opened: %s, rate=%u, period=%u, buffer=%u",
-             device_name.c_str(), config_.sample_rate,
-             config_.period_frames, config_.buffer_frames);
+    LOG_INFO("audio opened: %s", device_name.c_str());
+    LOG_INFO("  capture:  rate=%u, period=%u, buffer=%u",
+             cap_config.sample_rate, cap_config.period_frames,
+             cap_config.buffer_frames);
+    LOG_INFO("  playback: rate=%u, period=%u, buffer=%u",
+             play_config.sample_rate, play_config.period_frames,
+             play_config.buffer_frames);
     return true;
 }
 
 void AudioLoop::run(std::atomic<bool>& running) {
     if (!impl_ || !impl_->capture || !impl_->playback) return;
 
-    std::vector<int16_t> buffer(config_.period_frames * config_.channels);
+    const snd_pcm_uframes_t period = config_.period_frames;
+    std::vector<int16_t> buffer(period * config_.channels);
+
+    // Pre-fill the playback buffer with silence to prevent initial underrun.
+    // Write enough silent periods to fill most of the buffer, giving the
+    // capture side time to start delivering real audio.
+    std::vector<int16_t> silence(period * config_.channels, 0);
+    unsigned int prefill_periods = (config_.buffer_frames / period);
+    if (prefill_periods > 1) prefill_periods -= 1;
+    for (unsigned int i = 0; i < prefill_periods; ++i) {
+        snd_pcm_writei(impl_->playback, silence.data(), period);
+    }
 
     while (running.load(std::memory_order_relaxed)) {
         snd_pcm_sframes_t frames = snd_pcm_readi(
-            impl_->capture, buffer.data(),
-            static_cast<snd_pcm_uframes_t>(config_.period_frames));
+            impl_->capture, buffer.data(), period);
 
         if (frames < 0) {
             if (frames == -EPIPE) {
@@ -139,6 +153,12 @@ void AudioLoop::run(std::atomic<bool>& running) {
             if (written == -EPIPE) {
                 LOG_WARN("playback underrun, recovering");
                 snd_pcm_prepare(impl_->playback);
+                // Re-prefill with silence then retry the current audio data
+                for (unsigned int i = 0; i + 1 < prefill_periods; ++i) {
+                    snd_pcm_writei(impl_->playback, silence.data(), period);
+                }
+                snd_pcm_writei(impl_->playback, buffer.data(),
+                               static_cast<snd_pcm_uframes_t>(frames));
                 continue;
             }
             if (written == -EINTR) continue;

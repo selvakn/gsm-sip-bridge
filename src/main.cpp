@@ -195,10 +195,25 @@ int main(int argc, char* argv[]) {
     AtCommander at(serial);
     at.set_verbose(args.verbose);
 
-    if (!at.send_and_expect_ok("ATE0", 2000)) {
-        LOG_WARN("echo disable command failed, continuing");
+    // Drain any stale data in the serial buffer from prior sessions
+    for (int i = 0; i < 20; ++i) {
+        if (!serial.read_line()) break;
     }
+
+    // Disable modem echo; retry once since the first attempt may be
+    // garbled by the modem's own echo of the command
+    if (!at.send_and_expect_ok("ATE0", 2000)) {
+        at.send_and_expect_ok("ATE0", 2000);
+    }
+
     at.send_and_expect_ok("AT+CLIP=1", 2000);
+
+    // Route voice call audio through USB Audio Class (UAC) interface.
+    // Without this, audio goes to the analog PCM pins, not USB.
+    if (!at.send_and_expect_ok("AT+QPCMV=1,2", 2000)) {
+        LOG_WARN("AT+QPCMV=1,2 failed, trying AT+QPCMV=1,0");
+        at.send_and_expect_ok("AT+QPCMV=1,0", 2000);
+    }
 
     if (!at.query_network_registration()) {
         LOG_ERROR("SIM not registered on network");

@@ -54,6 +54,11 @@ bool AtCommander::send_and_expect_ok(const std::string& command, int timeout_ms)
         auto line = read_response(static_cast<int>(remaining));
         if (!line) continue;
 
+        // Skip echo of the command itself (modem echo may still be on)
+        if (line->find(command) != std::string::npos) continue;
+        // Skip empty or whitespace-only lines
+        if (line->find_first_not_of(" \t") == std::string::npos) continue;
+
         if (*line == "OK") return true;
         if (line->find("ERROR") != std::string::npos) {
             LOG_ERROR("AT command '%s' returned: %s", command.c_str(), line->c_str());
