@@ -8,6 +8,18 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALSA REQUIRED alsa)
 
+include(FetchContent)
+FetchContent_Declare(
+    prometheus-cpp
+    GIT_REPOSITORY https://github.com/jupp0r/prometheus-cpp.git
+    GIT_TAG v1.3.0
+)
+set(ENABLE_PUSH OFF CACHE BOOL "" FORCE)
+set(ENABLE_COMPRESSION OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "Disable prometheus-cpp tests" FORCE)
+set(GENERATE_PKGCONFIG OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(prometheus-cpp)
+
 add_executable(audio-echo
     src/main.cpp
     src/device_discovery.cpp
@@ -70,6 +82,7 @@ add_executable(gsm-sip-bridge
     src/bridge/card_pool.cpp
     src/bridge/alsa_media_port.cpp
     src/bridge/beep_generator.cpp
+    src/bridge/metrics.cpp
     src/sip/sip_config.cpp
     src/device_discovery.cpp
     src/serial_port.cpp
@@ -86,6 +99,8 @@ target_include_directories(gsm-sip-bridge PRIVATE
 target_link_libraries(gsm-sip-bridge PRIVATE
     ${ALSA_LIBRARIES}
     ${PJSIP_LIBRARIES}
+    prometheus-cpp::pull
+    prometheus-cpp::core
     pthread
 )
 
@@ -179,6 +194,7 @@ if(GTest_FOUND)
         tests/integration/test_beep_generator.cpp
         tests/integration/test_bridge_call.cpp
         tests/integration/test_card_pool.cpp
+        tests/integration/test_metrics.cpp
         src/bridge/bridge_config.cpp
         src/bridge/bridge_account.cpp
         src/bridge/bridge_call.cpp
@@ -186,6 +202,7 @@ if(GTest_FOUND)
         src/bridge/card_pool.cpp
         src/bridge/alsa_media_port.cpp
         src/bridge/beep_generator.cpp
+        src/bridge/metrics.cpp
         src/sip/sip_config.cpp
         src/device_discovery.cpp
         src/serial_port.cpp
@@ -204,6 +221,8 @@ if(GTest_FOUND)
         GTest::gtest GTest::gtest_main
         ${PJSIP_LIBRARIES}
         ${ALSA_LIBRARIES}
+        prometheus-cpp::pull
+        prometheus-cpp::core
         pthread
     )
 

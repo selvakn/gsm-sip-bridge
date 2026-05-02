@@ -55,5 +55,7 @@ COPY --from=builder /src/build/audio-echo /usr/local/bin/audio-echo
 COPY --from=builder /src/build/sip-echo /usr/local/bin/sip-echo
 COPY config.ini.example /etc/gsm-sip-bridge/config.ini.example
 
+EXPOSE 9091
+
 ENTRYPOINT ["gsm-sip-bridge"]
 CMD ["--config", "/etc/gsm-sip-bridge/config.ini"]

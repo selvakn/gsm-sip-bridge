@@ -15,6 +15,8 @@ Auto-generated from all feature plans. Last updated: 2026-05-02
 - N/A (stateless runtime) (003-gsm-sip-bridge)
 - C++17 (GCC 9+) + PJSIP/PJSUA2 (SIP + media), libasound2 (ALSA), mINI (INI parsing, header-only, MIT), Google Test (004-multi-card-support)
 - N/A (stateless runtime, config.ini read-only at startup) (004-multi-card-support)
+- C++17 (GCC 9+) + prometheus-cpp (MIT, Prometheus client for C++), PJSIP/PJSUA2, libasound2, mINI (005-observability-metrics)
+- N/A (Prometheus handles metric storage) (005-observability-metrics)
 
 - C++17 (GCC 9+) + libasound2 (ALSA), libudev (USB discovery) (001-gsm-audio-echo)
 
@@ -34,9 +36,9 @@ tests/
 C++17 (GCC 9+): Follow standard conventions
 
 ## Recent Changes
+- 005-observability-metrics: Added C++17 (GCC 9+) + prometheus-cpp (MIT, Prometheus client for C++), PJSIP/PJSUA2, libasound2, mINI
 - 004-multi-card-support: Added C++17 (GCC 9+) + PJSIP/PJSUA2 (SIP + media), libasound2 (ALSA), mINI (INI parsing, header-only, MIT), Google Test
 - 003-gsm-sip-bridge: Added C++17 + ALSA (`libasound2`), PJSIP (`libpjproject`), mINI (MIT, header-only INI parser), Google Test
-- 002-sip-audio-echo: Added C++17 (GCC 9+) + PJSIP/PJSUA2 (SIP + media), mINI (INI parsing, header-only, MIT)
 
 
 <!-- MANUAL ADDITIONS START -->

@@ -2,6 +2,7 @@
 #include "bridge/bridge_account.h"
 #include "bridge/card_instance.h"
 #include "bridge/card_pool.h"
+#include "bridge/metrics.h"
 #include "sip/sip_config.h"
 #include "device_discovery.h"
 #include "logger.h"
@@ -17,7 +18,7 @@
 #include <string>
 #include <thread>
 
-static constexpr const char* VERSION = "2.0.0";
+static constexpr const char* VERSION = "3.0.0";
 static constexpr const char* DEFAULT_CONFIG_PATH = "config.ini";
 
 static std::atomic<bool> g_running{true};
@@ -106,6 +107,13 @@ int main(int argc, char* argv[]) {
              sip_config.username.c_str(), sip_config.server.c_str(),
              bridge_config.sip_destination.empty() ? "(PBX routing)" : bridge_config.sip_destination.c_str(),
              bridge_config.sip_dial_timeout_sec);
+
+    uint16_t metrics_port = metrics::DEFAULT_METRICS_PORT;
+    const char* metrics_port_env = std::getenv("METRICS_PORT");
+    if (metrics_port_env) {
+        metrics_port = static_cast<uint16_t>(std::atoi(metrics_port_env));
+    }
+    metrics::init(metrics_port);
 
     if (std::system("systemctl is-active --quiet ModemManager 2>/dev/null") == 0) {
         LOG_WARN("ModemManager is running and may interfere with serial access");
@@ -196,8 +204,9 @@ int main(int argc, char* argv[]) {
         return 5;
     }
 
+    auto start_time = std::chrono::steady_clock::now();
+
     if (single_card_override) {
-        // Single-card manual override mode — create card and run directly
         DeviceInfo manual_device{args.serial_override, args.audio_override, "manual", "manual"};
         auto card = std::make_unique<CardInstance>(std::move(manual_device));
         if (!card->initialize(args.verbose)) {
@@ -208,6 +217,9 @@ int main(int argc, char* argv[]) {
         card->start(account, bridge_config, sip_config, g_running);
 
         while (g_running.load(std::memory_order_relaxed)) {
+            auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time).count();
+            metrics::uptime_update(elapsed);
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
@@ -218,6 +230,9 @@ int main(int argc, char* argv[]) {
         pool.start_retry_thread(account, bridge_config, sip_config, g_running);
 
         while (g_running.load(std::memory_order_relaxed)) {
+            auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time).count();
+            metrics::uptime_update(elapsed);
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
@@ -234,6 +249,7 @@ int main(int argc, char* argv[]) {
         LOG_ERROR("shutdown: %s", err.info().c_str());
     }
 
+    metrics::shutdown();
     LOG_INFO("gsm-sip-bridge stopped");
     return 0;
 }

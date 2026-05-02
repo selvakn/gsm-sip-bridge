@@ -2,7 +2,7 @@
 
 Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the GSM number on a Quectel EC20 module, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously.
 
-**Version**: 2.0.0 | **Language**: C++17 | **Platform**: Linux
+**Version**: 3.0.0 | **Language**: C++17 | **Platform**: Linux
 
 ## Prerequisites
 
@@ -128,6 +128,69 @@ sip_dial_timeout_sec = 30
 | `[bridge]` | `sip_dial_timeout_sec` | `30` | Seconds to wait for SIP answer (5-120) |
 
 The `[bridge]` section is optional; defaults apply if absent. All modules share the same configuration.
+
+## Observability
+
+The bridge exposes Prometheus-compatible metrics on an HTTP endpoint for monitoring call activity, SIP registration, module health, and errors in real time.
+
+### Metrics Endpoint
+
+The bridge serves metrics at `http://<host>:9091/metrics` (Prometheus exposition format). Configure the port via the `METRICS_PORT` environment variable.
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `METRICS_PORT` | `9091` | Port for the metrics HTTP server |
+
+### Available Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `gsm_bridge_calls_total` | Counter | GSM calls by module, status (incoming/answered/missed), and caller ID |
+| `gsm_bridge_sip_calls_total` | Counter | Outbound SIP calls by module and status (initiated/connected/timeout/error) |
+| `gsm_bridge_sip_registrations_total` | Counter | SIP registration attempts by status |
+| `gsm_bridge_module_init_total` | Counter | Module initialization attempts by status |
+| `gsm_bridge_module_retries_total` | Counter | Module retry attempts |
+| `gsm_bridge_audio_errors_total` | Counter | Audio errors by module and type |
+| `gsm_bridge_sip_registered` | Gauge | SIP registration state (1=registered, 0=unregistered) |
+| `gsm_bridge_modules_active` | Gauge | Number of active modules |
+| `gsm_bridge_modules_failed` | Gauge | Number of failed modules pending retry |
+| `gsm_bridge_active_calls` | Gauge | Currently active bridged calls per module |
+| `gsm_bridge_uptime_seconds` | Gauge | Process uptime |
+| `gsm_bridge_call_duration_seconds` | Histogram | Call duration distribution (buckets: 1s to 30min) |
+
+### Monitoring Stack (Docker Compose)
+
+The Docker Compose setup includes Prometheus and Grafana with a pre-configured dashboard:
+
+```bash
+docker compose up -d --build
+```
+
+| Service | URL | Purpose |
+|---|---|---|
+| gsm-sip-bridge | `http://localhost:9091/metrics` | Metrics endpoint |
+| Prometheus | `http://localhost:9090` | Metrics collection and querying |
+| Grafana | `http://localhost:3000` | Dashboards and visualization |
+
+Grafana credentials: `admin` / `admin`. The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot.
+
+![GSM-SIP Bridge Grafana Dashboard](screenshots/grafana-dashboard.png)
+
+Dashboard panels include:
+
+- System overview (SIP registration, active modules, uptime, call counts)
+- GSM and SIP call rates over time
+- Active calls per module
+- Call duration percentiles (p50/p95/p99)
+- SIP registration state timeline
+- Module health and retry counts
+- Audio and SIP error rates
+
+### Verify Metrics
+
+```bash
+curl http://localhost:9091/metrics
+```
 
 ## Usage
 
@@ -278,12 +341,19 @@ src/
     ├── bridge_account.*  # pj::Account for concurrent outbound SIP calls
     ├── bridge_call.*     # pj::Call for outbound SIP leg
     ├── alsa_media_port.* # AudioMediaPort adapter (ALSA <-> PJSIP)
-    └── beep_generator.*  # 400Hz tone pattern generator
+    ├── beep_generator.*  # 400Hz tone pattern generator
+    └── metrics.*         # Prometheus metrics exposition (prometheus-cpp)
 
 vendor/
 └── mini/ini.h            # mINI header-only INI parser (MIT)
 
-tests/integration/        # 82 integration tests
+docker/
+├── prometheus.yml        # Prometheus scrape configuration
+└── grafana/
+    ├── provisioning/     # Auto-configured datasource and dashboard provider
+    └── dashboards/       # Pre-built Grafana dashboard JSON
+
+tests/integration/        # 95 integration tests
 ```
 
 ## ModemManager Interference

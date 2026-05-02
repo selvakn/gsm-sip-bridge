@@ -1,5 +1,6 @@
 #include "bridge/card_pool.h"
 #include "bridge/bridge_account.h"
+#include "bridge/metrics.h"
 #include "sip/sip_config.h"
 #include "device_discovery.h"
 #include "logger.h"
@@ -23,14 +24,20 @@ CardPool::DiscoverResult CardPool::discover_and_initialize(bool verbose) {
 
     for (auto& dev : devices) {
         auto card = std::make_unique<CardInstance>(std::move(dev));
+        std::string cid = card->card_id();
         if (card->initialize(verbose)) {
+            metrics::module_init_success(cid);
             std::lock_guard<std::mutex> lock(mutex_);
             active_cards_.push_back(std::move(card));
         } else {
+            metrics::module_init_failure(cid);
             std::lock_guard<std::mutex> lock(mutex_);
             failed_cards_.push_back(std::move(card));
         }
     }
+
+    metrics::modules_active(static_cast<int>(active_cards_.size()));
+    metrics::modules_failed(static_cast<int>(failed_cards_.size()));
 
     if (active_cards_.empty()) {
         return {false, "all " + std::to_string(failed_cards_.size()) +
@@ -130,17 +137,23 @@ void CardPool::retry_loop(BridgeAccount& account,
 
         auto it = failed_cards_.begin();
         while (it != failed_cards_.end()) {
-            LOG_INFO("[%s] retrying initialization...", (*it)->card_id().c_str());
+            std::string cid = (*it)->card_id();
+            metrics::module_retry(cid);
+            LOG_INFO("[%s] retrying initialization...", cid.c_str());
             if ((*it)->initialize(verbose_)) {
-                LOG_INFO("[%s] retry succeeded, adding to active pool", (*it)->card_id().c_str());
+                LOG_INFO("[%s] retry succeeded, adding to active pool", cid.c_str());
+                metrics::module_init_success(cid);
                 (*it)->start(account, bridge_config, sip_config, running);
                 active_cards_.push_back(std::move(*it));
                 it = failed_cards_.erase(it);
             } else {
-                LOG_WARN("[%s] retry failed: %s", (*it)->card_id().c_str(),
+                metrics::module_init_failure(cid);
+                LOG_WARN("[%s] retry failed: %s", cid.c_str(),
                          (*it)->fail_reason().c_str());
                 ++it;
             }
         }
+        metrics::modules_active(static_cast<int>(active_cards_.size()));
+        metrics::modules_failed(static_cast<int>(failed_cards_.size()));
     }
 }

@@ -1,5 +1,6 @@
 #include "bridge/bridge_account.h"
 #include "bridge/bridge_call.h"
+#include "bridge/metrics.h"
 #include "logger.h"
 
 BridgeAccount::BridgeAccount() = default;
@@ -11,10 +12,14 @@ void BridgeAccount::onRegState(pj::OnRegStateParam& prm) {
     if (ai.regIsActive) {
         LOG_INFO("SIP registration successful (code=%d)", prm.code);
         registered_.store(true, std::memory_order_release);
+        metrics::sip_registration(true);
+        metrics::sip_registered(true);
     } else {
         LOG_WARN("SIP registration lost (code=%d, reason=%s)",
                  prm.code, prm.reason.c_str());
         registered_.store(false, std::memory_order_release);
+        metrics::sip_registration(false);
+        metrics::sip_registered(false);
     }
 }
 
