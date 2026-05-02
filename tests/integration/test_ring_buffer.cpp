@@ -22,18 +22,56 @@ TEST(RingBuffer, write_then_read_returns_same_data) {
     }
 }
 
-TEST(RingBuffer, write_to_full_returns_false) {
+TEST(RingBuffer, write_to_full_overwrites_oldest) {
     // Arrange
     RingBuffer<int16_t> rb(4);
-    int16_t data[] = {1, 2, 3, 4};
+    int16_t data1[] = {1, 2, 3, 4};
+    int16_t data2[] = {99};
 
     // Act
-    bool first = rb.try_write(data, 4);
-    bool second = rb.try_write(data, 1);
+    bool first = rb.try_write(data1, 4);
+    bool second = rb.try_write(data2, 1);
+
+    int16_t out[4] = {};
+    size_t count = rb.read(out, 4);
 
     // Assert
     EXPECT_TRUE(first);
-    EXPECT_FALSE(second);
+    EXPECT_TRUE(second);
+    EXPECT_EQ(count, 4u);
+    EXPECT_EQ(out[0], 2);
+    EXPECT_EQ(out[1], 3);
+    EXPECT_EQ(out[2], 4);
+    EXPECT_EQ(out[3], 99);
+}
+
+TEST(RingBuffer, write_exceeding_capacity_returns_false) {
+    // Arrange
+    RingBuffer<int16_t> rb(4);
+    int16_t data[5] = {1, 2, 3, 4, 5};
+
+    // Act
+    bool result = rb.try_write(data, 5);
+
+    // Assert
+    EXPECT_FALSE(result);
+}
+
+TEST(RingBuffer, reset_clears_all_data) {
+    // Arrange
+    RingBuffer<int16_t> rb(16);
+    int16_t data[] = {1, 2, 3, 4};
+    rb.try_write(data, 4);
+
+    // Act
+    rb.reset();
+
+    // Assert
+    EXPECT_EQ(rb.available_read(), 0u);
+    EXPECT_EQ(rb.available_write(), 16u);
+
+    int16_t out[4] = {};
+    EXPECT_EQ(rb.read(out, 4), 0u);
 }
 
 TEST(RingBuffer, read_from_empty_returns_zero) {
@@ -88,33 +126,37 @@ TEST(RingBuffer, concurrent_producer_consumer) {
     // Arrange
     static constexpr size_t TOTAL_ITEMS = 100000;
     static constexpr size_t BATCH = 160;
-    RingBuffer<int16_t> rb(4096);
+    static constexpr size_t BUF_CAP = 4096;
+    RingBuffer<int16_t> rb(BUF_CAP);
     std::vector<int16_t> produced(TOTAL_ITEMS);
-    std::vector<int16_t> consumed(TOTAL_ITEMS);
+    std::atomic<bool> producer_done{false};
 
     for (size_t i = 0; i < TOTAL_ITEMS; ++i) {
         produced[i] = static_cast<int16_t>(i % 32768);
     }
 
     // Act
+    std::vector<int16_t> consumed;
+    consumed.reserve(TOTAL_ITEMS);
+
     std::thread producer([&]() {
         size_t offset = 0;
         while (offset < TOTAL_ITEMS) {
             size_t chunk = std::min(BATCH, TOTAL_ITEMS - offset);
-            if (rb.try_write(&produced[offset], chunk)) {
-                offset += chunk;
-            } else {
-                std::this_thread::yield();
-            }
+            rb.try_write(&produced[offset], chunk);
+            offset += chunk;
         }
+        producer_done.store(true, std::memory_order_release);
     });
 
     std::thread consumer([&]() {
-        size_t offset = 0;
-        while (offset < TOTAL_ITEMS) {
-            size_t chunk = std::min(BATCH, TOTAL_ITEMS - offset);
-            size_t got = rb.read(&consumed[offset], chunk);
-            offset += got;
+        int16_t buf[BATCH];
+        while (!producer_done.load(std::memory_order_acquire) ||
+               rb.available_read() > 0) {
+            size_t got = rb.read(buf, BATCH);
+            for (size_t i = 0; i < got; ++i) {
+                consumed.push_back(buf[i]);
+            }
             if (got == 0) std::this_thread::yield();
         }
     });
@@ -122,8 +164,13 @@ TEST(RingBuffer, concurrent_producer_consumer) {
     producer.join();
     consumer.join();
 
-    // Assert
-    for (size_t i = 0; i < TOTAL_ITEMS; ++i) {
-        EXPECT_EQ(consumed[i], produced[i]) << "Mismatch at index " << i;
+    // Assert: consumer reads a contiguous tail of the produced sequence
+    ASSERT_GT(consumed.size(), 0u);
+    ASSERT_LE(consumed.size(), TOTAL_ITEMS);
+
+    size_t start = TOTAL_ITEMS - consumed.size();
+    for (size_t i = 0; i < consumed.size(); ++i) {
+        EXPECT_EQ(consumed[i], produced[start + i])
+            << "Mismatch at consumed[" << i << "] (produced[" << start + i << "])";
     }
 }

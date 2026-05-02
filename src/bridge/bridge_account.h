@@ -14,7 +14,8 @@ public:
     void onRegState(pj::OnRegStateParam& prm) override;
     void onIncomingCall(pj::OnIncomingCallParam& iprm) override;
 
-    BridgeCall* make_outbound_call(const std::string& dest_uri);
+    BridgeCall* make_outbound_call(const std::string& dest_uri,
+                                   const std::string& gsm_caller_id = "");
     void hangup_call();
     void clear_call();
 

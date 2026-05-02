@@ -105,6 +105,43 @@ TEST_F(BridgeCallTest, media_port_provides_silence_when_buffer_empty) {
     EXPECT_EQ(frame.type, PJMEDIA_FRAME_TYPE_AUDIO);
 }
 
+TEST_F(BridgeCallTest, make_outbound_call_with_caller_id_does_not_crash) {
+    // Arrange
+    BridgeAccount account;
+    pj::AccountConfig cfg;
+    cfg.idUri = "sip:test@localhost";
+    account.create(cfg);
+
+    // Act — call will fail (no remote server) but header setup must not crash
+    BridgeCall* call = account.make_outbound_call(
+        "sip:999@127.0.0.1:19999", "+919876543210");
+
+    // Assert
+    if (call) {
+        account.hangup_call();
+    }
+    account.clear_call();
+    account.shutdown();
+}
+
+TEST_F(BridgeCallTest, make_outbound_call_without_caller_id_does_not_crash) {
+    // Arrange
+    BridgeAccount account;
+    pj::AccountConfig cfg;
+    cfg.idUri = "sip:test@localhost";
+    account.create(cfg);
+
+    // Act
+    BridgeCall* call = account.make_outbound_call("sip:999@127.0.0.1:19999");
+
+    // Assert
+    if (call) {
+        account.hangup_call();
+    }
+    account.clear_call();
+    account.shutdown();
+}
+
 TEST_F(BridgeCallTest, media_port_returns_data_from_capture_buffer) {
     // Arrange
     RingBuffer<int16_t> cap_buf(1600);

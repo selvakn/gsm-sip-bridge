@@ -169,6 +169,10 @@ static bool configure_pcm(snd_pcm_t* pcm, const char* label) {
         LOG_ERROR("%s: apply params: %s", label, snd_strerror(err));
         return false;
     }
+    if ((err = snd_pcm_prepare(pcm)) < 0) {
+        LOG_ERROR("%s: prepare: %s", label, snd_strerror(err));
+        return false;
+    }
     return true;
 }
 
@@ -203,8 +207,10 @@ static void close_alsa(AlsaPcm& pcm) {
 
 static void alsa_capture_thread(snd_pcm_t* capture,
                                 RingBuffer<int16_t>& ring,
-                                std::atomic<bool>& running) {
+                                std::atomic<bool>& running,
+                                std::atomic<bool>& bridged) {
     std::vector<int16_t> buf(PERIOD_FRAMES);
+    bool was_bridged = false;
     while (running.load(std::memory_order_relaxed)) {
         snd_pcm_sframes_t frames = snd_pcm_readi(capture, buf.data(), PERIOD_FRAMES);
         if (frames < 0) {
@@ -216,7 +222,16 @@ static void alsa_capture_thread(snd_pcm_t* capture,
             LOG_ERROR("ALSA capture: %s", snd_strerror(static_cast<int>(frames)));
             break;
         }
-        ring.try_write(buf.data(), static_cast<size_t>(frames));
+
+        bool now_bridged = bridged.load(std::memory_order_acquire);
+        if (now_bridged && !was_bridged) {
+            ring.reset();
+            was_bridged = true;
+        }
+
+        if (was_bridged) {
+            ring.try_write(buf.data(), static_cast<size_t>(frames));
+        }
     }
 }
 
@@ -224,7 +239,8 @@ static void alsa_playback_thread(snd_pcm_t* playback,
                                  RingBuffer<int16_t>& ring,
                                  BeepGenerator& beep,
                                  std::atomic<bool>& running,
-                                 std::atomic<bool>& beep_active) {
+                                 std::atomic<bool>& beep_active,
+                                 std::atomic<bool>& bridged) {
     std::vector<int16_t> buf(PERIOD_FRAMES);
     std::vector<int16_t> silence(PERIOD_FRAMES, 0);
 
@@ -234,7 +250,15 @@ static void alsa_playback_thread(snd_pcm_t* playback,
         snd_pcm_writei(playback, silence.data(), PERIOD_FRAMES);
     }
 
+    bool was_bridged = false;
+
     while (running.load(std::memory_order_relaxed)) {
+        bool now_bridged = bridged.load(std::memory_order_acquire);
+        if (now_bridged && !was_bridged) {
+            ring.reset();
+            was_bridged = true;
+        }
+
         if (beep_active.load(std::memory_order_acquire)) {
             beep.fill_frame(buf.data(), PERIOD_FRAMES);
         } else {
@@ -286,7 +310,8 @@ static void handle_bridged_call(AtCommander& at,
                                 const std::string& alsa_device,
                                 BridgeAccount& account,
                                 const std::string& sip_dest_uri,
-                                uint16_t dial_timeout_sec) {
+                                uint16_t dial_timeout_sec,
+                                const std::string& gsm_caller_id) {
     AlsaPcm alsa{};
     if (!open_alsa(alsa_device, alsa)) {
         LOG_ERROR("ALSA open failed, hanging up GSM");
@@ -299,22 +324,27 @@ static void handle_bridged_call(AtCommander& at,
     BeepGenerator beep;
     std::atomic<bool> audio_running{true};
     std::atomic<bool> beep_active{true};
+    std::atomic<bool> audio_bridged{false};
 
     std::thread cap_thread(alsa_capture_thread, alsa.capture,
-                           std::ref(capture_ring), std::ref(audio_running));
+                           std::ref(capture_ring), std::ref(audio_running),
+                           std::ref(audio_bridged));
     std::thread play_thread(alsa_playback_thread, alsa.playback,
                             std::ref(playback_ring), std::ref(beep),
-                            std::ref(audio_running), std::ref(beep_active));
+                            std::ref(audio_running), std::ref(beep_active),
+                            std::ref(audio_bridged));
 
     LOG_INFO("beep pattern started for GSM caller");
 
-    BridgeCall* sip_call = account.make_outbound_call(sip_dest_uri);
+    BridgeCall* sip_call = account.make_outbound_call(sip_dest_uri, gsm_caller_id);
     if (!sip_call) {
         LOG_ERROR("SIP call initiation failed");
         beep_active.store(false, std::memory_order_release);
         audio_running.store(false, std::memory_order_relaxed);
         cap_thread.join();
         play_thread.join();
+        snd_pcm_drop(alsa.playback);
+        snd_pcm_prepare(alsa.playback);
         play_error_tone(alsa.playback);
         close_alsa(alsa);
         at.hangup();
@@ -375,6 +405,7 @@ static void handle_bridged_call(AtCommander& at,
 
             if (sip_state == SipCallState::CONFIRMED && sip_call->media_connected()) {
                 beep_active.store(false, std::memory_order_release);
+                audio_bridged.store(true, std::memory_order_release);
 
                 try {
                     pj::CallInfo ci = sip_call->getInfo();
@@ -434,6 +465,8 @@ static void handle_bridged_call(AtCommander& at,
 
     if (state == BridgeState::SIP_FAILED) {
         LOG_INFO("playing error tone to GSM caller");
+        snd_pcm_drop(alsa.playback);
+        snd_pcm_prepare(alsa.playback);
         play_error_tone(alsa.playback);
     }
 
@@ -579,19 +612,40 @@ int main(int argc, char* argv[]) {
     LOG_INFO("ready, GSM calls will bridge to SIP %s (timeout=%us)",
              sip_dest_uri.c_str(), bridge_config.sip_dial_timeout_sec);
 
+    static constexpr int CLIP_WAIT_MS = 300;
+
     while (g_running.load(std::memory_order_relaxed)) {
         auto urc = at.poll_urc();
         if (!urc) continue;
 
+        std::string caller;
+
+        if (urc->find("+CLIP:") != std::string::npos) {
+            auto start = urc->find('"');
+            auto end = urc->find('"', start + 1);
+            if (start != std::string::npos && end != std::string::npos) {
+                caller = urc->substr(start + 1, end - start - 1);
+            }
+        }
+
         if (urc->find("RING") != std::string::npos) {
-            std::string caller;
-            if (urc->find("+CLIP:") != std::string::npos) {
-                auto start = urc->find('"');
-                auto end = urc->find('"', start + 1);
-                if (start != std::string::npos && end != std::string::npos) {
-                    caller = urc->substr(start + 1, end - start - 1);
+            if (caller.empty()) {
+                auto clip_deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(CLIP_WAIT_MS);
+                while (std::chrono::steady_clock::now() < clip_deadline) {
+                    auto clip_urc = at.poll_urc();
+                    if (!clip_urc) continue;
+                    if (clip_urc->find("+CLIP:") != std::string::npos) {
+                        auto start = clip_urc->find('"');
+                        auto end = clip_urc->find('"', start + 1);
+                        if (start != std::string::npos && end != std::string::npos) {
+                            caller = clip_urc->substr(start + 1, end - start - 1);
+                        }
+                        break;
+                    }
                 }
             }
+
             LOG_INFO("GSM RING%s%s", caller.empty() ? "" : " from ",
                      caller.empty() ? "" : caller.c_str());
 
@@ -602,9 +656,12 @@ int main(int argc, char* argv[]) {
             }
 
             if (at.answer_call()) {
-                LOG_INFO("GSM call answered, bridging to %s", sip_dest_uri.c_str());
+                LOG_INFO("GSM call answered, bridging to %s (caller: %s)",
+                         sip_dest_uri.c_str(),
+                         caller.empty() ? "unknown" : caller.c_str());
                 handle_bridged_call(at, device.alsa_device, account,
-                                    sip_dest_uri, bridge_config.sip_dial_timeout_sec);
+                                    sip_dest_uri, bridge_config.sip_dial_timeout_sec,
+                                    caller);
                 LOG_INFO("idle, waiting for next GSM call");
             } else {
                 LOG_ERROR("failed to answer GSM call");

@@ -12,11 +12,16 @@ public:
         : capacity_(capacity), buffer_(capacity) {}
 
     bool try_write(const T* data, size_t count) {
+        if (count > capacity_) return false;
+
         size_t w = write_pos_.load(std::memory_order_relaxed);
         size_t r = read_pos_.load(std::memory_order_acquire);
 
         size_t available = capacity_ - (w - r);
-        if (count > available) return false;
+        if (count > available) {
+            size_t overflow = count - available;
+            read_pos_.store(r + overflow, std::memory_order_release);
+        }
 
         size_t offset = w % capacity_;
         size_t first_chunk = capacity_ - offset;
@@ -64,6 +69,11 @@ public:
         size_t w = write_pos_.load(std::memory_order_relaxed);
         size_t r = read_pos_.load(std::memory_order_acquire);
         return capacity_ - (w - r);
+    }
+
+    void reset() {
+        write_pos_.store(0, std::memory_order_relaxed);
+        read_pos_.store(0, std::memory_order_relaxed);
     }
 
 private:

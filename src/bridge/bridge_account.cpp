@@ -28,11 +28,28 @@ void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
     call.hangup(op);
 }
 
-BridgeCall* BridgeAccount::make_outbound_call(const std::string& dest_uri) {
+BridgeCall* BridgeAccount::make_outbound_call(const std::string& dest_uri,
+                                              const std::string& gsm_caller_id) {
     auto call = std::make_unique<BridgeCall>(*this);
 
     try {
         pj::CallOpParam op(true);
+
+        if (!gsm_caller_id.empty()) {
+            pj::SipHeader pai_header;
+            pai_header.hName = "P-Asserted-Identity";
+            pai_header.hValue = "\"" + gsm_caller_id + "\" <tel:" + gsm_caller_id + ">";
+
+            pj::SipHeader gsm_header;
+            gsm_header.hName = "X-GSM-Caller-ID";
+            gsm_header.hValue = gsm_caller_id;
+
+            op.txOption.headers.push_back(pai_header);
+            op.txOption.headers.push_back(gsm_header);
+
+            LOG_INFO("forwarding GSM caller ID: %s", gsm_caller_id.c_str());
+        }
+
         call->makeCall(dest_uri, op);
         LOG_INFO("outbound SIP call to %s", dest_uri.c_str());
     } catch (pj::Error& err) {
