@@ -88,9 +88,12 @@ static std::string find_sound_card_under(const std::string& usb_device_path) {
     return {};
 }
 
-std::optional<DeviceInfo> discover_ec20() {
+std::vector<DeviceInfo> discover_all_ec20() {
+    std::vector<DeviceInfo> results;
     const std::string usb_devices_path = "/sys/bus/usb/devices";
     auto devices = list_dir(usb_devices_path);
+
+    std::sort(devices.begin(), devices.end());
 
     for (const auto& dev : devices) {
         std::string dev_path = usb_devices_path + "/" + dev;
@@ -101,17 +104,31 @@ std::optional<DeviceInfo> discover_ec20() {
 
         std::string serial = find_tty_under(dev_path);
         std::string alsa = find_sound_card_under(dev_path);
+        std::string serial_number = read_sysfs_attr(dev_path + "/serial");
 
-        if (!serial.empty() && !alsa.empty()) {
-            LOG_INFO("detected EC20 at %s, audio %s", serial.c_str(), alsa.c_str());
-            return DeviceInfo{serial, alsa};
+        if (serial.empty()) {
+            LOG_WARN("EC20 at USB %s: no serial port found, skipping", dev.c_str());
+            continue;
+        }
+        if (alsa.empty()) {
+            LOG_WARN("EC20 at USB %s (%s): no audio device (UAC may not be enabled)",
+                     dev.c_str(), serial.c_str());
+            continue;
         }
 
-        if (!serial.empty()) {
-            LOG_WARN("EC20 found at %s but no audio device (UAC may not be enabled)",
-                     serial.c_str());
-        }
+        DeviceInfo info{serial, alsa, serial_number, dev};
+        LOG_INFO("detected EC20 at %s, audio %s, serial_number=%s, usb=%s",
+                 serial.c_str(), alsa.c_str(),
+                 serial_number.empty() ? "(none)" : serial_number.c_str(),
+                 dev.c_str());
+        results.push_back(std::move(info));
     }
 
-    return std::nullopt;
+    return results;
+}
+
+std::optional<DeviceInfo> discover_ec20() {
+    auto all = discover_all_ec20();
+    if (all.empty()) return std::nullopt;
+    return std::move(all.front());
 }

@@ -2,7 +2,9 @@
 
 #include <pjsua2.hpp>
 #include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
 
 class BridgeCall;
 
@@ -16,16 +18,18 @@ public:
 
     BridgeCall* make_outbound_call(const std::string& dest_uri,
                                    const std::string& gsm_caller_id = "");
-    void hangup_call();
-    void clear_call();
+    void hangup_call(int call_id);
+    void hangup_all_calls();
+    void remove_call(int call_id);
 
     bool is_registered() const {
         return registered_.load(std::memory_order_acquire);
     }
 
-    BridgeCall* active_call() const { return active_call_.get(); }
+    void shutdown();
 
 private:
-    std::unique_ptr<BridgeCall> active_call_;
+    std::mutex calls_mutex_;
+    std::map<int, std::unique_ptr<BridgeCall>> active_calls_;
     std::atomic<bool> registered_{false};
 };

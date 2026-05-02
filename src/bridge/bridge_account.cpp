@@ -57,24 +57,58 @@ BridgeCall* BridgeAccount::make_outbound_call(const std::string& dest_uri,
         return nullptr;
     }
 
-    active_call_ = std::move(call);
-    return active_call_.get();
+    BridgeCall* raw = call.get();
+    int id = raw->getId();
+
+    std::lock_guard<std::mutex> lock(calls_mutex_);
+    active_calls_[id] = std::move(call);
+    return raw;
 }
 
-void BridgeAccount::hangup_call() {
-    if (!active_call_) return;
+void BridgeAccount::hangup_call(int call_id) {
+    std::lock_guard<std::mutex> lock(calls_mutex_);
+    auto it = active_calls_.find(call_id);
+    if (it == active_calls_.end()) return;
 
     try {
-        if (active_call_->isActive()) {
+        if (it->second && it->second->isActive()) {
             pj::CallOpParam op;
             op.statusCode = PJSIP_SC_OK;
-            active_call_->hangup(op);
+            it->second->hangup(op);
         }
     } catch (pj::Error& err) {
-        LOG_WARN("SIP hangup error: %s", err.info().c_str());
+        LOG_WARN("SIP hangup error (call %d): %s", call_id, err.info().c_str());
     }
 }
 
-void BridgeAccount::clear_call() {
-    active_call_.reset();
+void BridgeAccount::hangup_all_calls() {
+    std::lock_guard<std::mutex> lock(calls_mutex_);
+    for (auto& [id, call] : active_calls_) {
+        try {
+            if (call && call->isActive()) {
+                pj::CallOpParam op;
+                op.statusCode = PJSIP_SC_OK;
+                call->hangup(op);
+            }
+        } catch (pj::Error& err) {
+            LOG_WARN("SIP hangup error (call %d): %s", id, err.info().c_str());
+        }
+    }
+}
+
+void BridgeAccount::remove_call(int call_id) {
+    std::lock_guard<std::mutex> lock(calls_mutex_);
+    active_calls_.erase(call_id);
+}
+
+void BridgeAccount::shutdown() {
+    hangup_all_calls();
+    {
+        std::lock_guard<std::mutex> lock(calls_mutex_);
+        active_calls_.clear();
+    }
+    try {
+        pj::AccountConfig dummy;
+        this->pj::Account::shutdown();
+    } catch (...) {}
 }

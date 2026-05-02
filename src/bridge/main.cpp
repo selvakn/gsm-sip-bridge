@@ -1,18 +1,12 @@
 #include "bridge/bridge_config.h"
 #include "bridge/bridge_account.h"
-#include "bridge/bridge_call.h"
-#include "bridge/alsa_media_port.h"
-#include "bridge/beep_generator.h"
-#include "ring_buffer.h"
+#include "bridge/card_instance.h"
+#include "bridge/card_pool.h"
 #include "sip/sip_config.h"
-#include "at_commander.h"
-#include "audio_loop.h"
 #include "device_discovery.h"
 #include "logger.h"
-#include "serial_port.h"
 
 #include <pjsua2.hpp>
-#include <alsa/asoundlib.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,37 +16,15 @@
 #include <getopt.h>
 #include <string>
 #include <thread>
-#include <vector>
 
-static constexpr const char* VERSION = "1.1.0";
+static constexpr const char* VERSION = "2.0.0";
 static constexpr const char* DEFAULT_CONFIG_PATH = "config.ini";
-
-static constexpr unsigned int SAMPLE_RATE = 8000;
-static constexpr unsigned int CHANNELS = 1;
-static constexpr unsigned int PERIOD_FRAMES = 160;
-static constexpr unsigned int BUFFER_FRAMES = 640;
-static constexpr size_t RING_BUFFER_FRAMES = 4000;
-
-static constexpr unsigned int ERROR_TONE_HZ = 200;
-static constexpr unsigned int ERROR_TONE_ON_MS = 500;
-static constexpr unsigned int ERROR_TONE_OFF_MS = 100;
-static constexpr unsigned int ERROR_TONE_DURATION_MS = 2000;
 
 static std::atomic<bool> g_running{true};
 
 static void signal_handler(int) {
     g_running.store(false, std::memory_order_relaxed);
 }
-
-enum class BridgeState {
-    IDLE,
-    GSM_ANSWERED,
-    SIP_DIALING,
-    BRIDGED,
-    SIP_FAILED,
-    ENDING
-};
-
 
 struct CliArgs {
     std::string config_path = DEFAULT_CONFIG_PATH;
@@ -82,12 +54,12 @@ static int parse_args(int argc, char* argv[], CliArgs& args) {
             case 'h':
                 std::printf(
                     "Usage: %s [OPTIONS]\n\n"
-                    "GSM to SIP audio bridge. Answers incoming GSM calls and\n"
-                    "bridges audio to a SIP extension.\n\n"
+                    "GSM to SIP audio bridge. Answers incoming GSM calls on one\n"
+                    "or more EC20 modules and bridges audio to a SIP extension.\n\n"
                     "Options:\n"
                     "  -c, --config PATH   Configuration file (default: %s)\n"
-                    "  -s, --serial PATH   Override serial port (default: auto-detect)\n"
-                    "  -a, --audio DEVICE  Override ALSA device (default: auto-detect)\n"
+                    "  -s, --serial PATH   Override serial port (single-card mode only)\n"
+                    "  -a, --audio DEVICE  Override ALSA device (single-card mode only)\n"
                     "  -v, --verbose       Enable verbose logging\n"
                     "  -h, --help          Show this help\n"
                     "      --version       Show version\n",
@@ -101,425 +73,6 @@ static int parse_args(int argc, char* argv[], CliArgs& args) {
         }
     }
     return 0;
-}
-
-static DeviceInfo resolve_device(const CliArgs& args) {
-    DeviceInfo info;
-
-    if (!args.serial_override.empty() && !args.audio_override.empty()) {
-        info.serial_port = args.serial_override;
-        info.alsa_device = args.audio_override;
-        LOG_INFO("manual overrides: serial=%s, audio=%s",
-                 info.serial_port.c_str(), info.alsa_device.c_str());
-        return info;
-    }
-
-    auto detected = discover_ec20();
-    if (!detected) {
-        LOG_ERROR("no EC20 module found (USB %04X:%04X)", EC20_VENDOR_ID, EC20_PRODUCT_ID);
-        return {};
-    }
-
-    info = *detected;
-    if (!args.serial_override.empty()) info.serial_port = args.serial_override;
-    if (!args.audio_override.empty()) info.alsa_device = args.audio_override;
-    return info;
-}
-
-struct AlsaPcm {
-    snd_pcm_t* capture = nullptr;
-    snd_pcm_t* playback = nullptr;
-};
-
-static bool configure_pcm(snd_pcm_t* pcm, const char* label) {
-    snd_pcm_hw_params_t* hw;
-    snd_pcm_hw_params_alloca(&hw);
-    snd_pcm_hw_params_any(pcm, hw);
-
-    int err;
-    if ((err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
-        LOG_ERROR("%s: set access: %s", label, snd_strerror(err));
-        return false;
-    }
-    if ((err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0) {
-        LOG_ERROR("%s: set format: %s", label, snd_strerror(err));
-        return false;
-    }
-    unsigned int ch = CHANNELS;
-    if ((err = snd_pcm_hw_params_set_channels(pcm, hw, ch)) < 0) {
-        LOG_ERROR("%s: set channels: %s", label, snd_strerror(err));
-        return false;
-    }
-    unsigned int rate = SAMPLE_RATE;
-    if ((err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, nullptr)) < 0) {
-        LOG_ERROR("%s: set rate: %s", label, snd_strerror(err));
-        return false;
-    }
-    snd_pcm_uframes_t period = PERIOD_FRAMES;
-    if ((err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, nullptr)) < 0) {
-        LOG_ERROR("%s: set period: %s", label, snd_strerror(err));
-        return false;
-    }
-    snd_pcm_uframes_t buffer = BUFFER_FRAMES;
-    if ((err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer)) < 0) {
-        LOG_ERROR("%s: set buffer: %s", label, snd_strerror(err));
-        return false;
-    }
-    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
-        LOG_ERROR("%s: apply params: %s", label, snd_strerror(err));
-        return false;
-    }
-    if ((err = snd_pcm_prepare(pcm)) < 0) {
-        LOG_ERROR("%s: prepare: %s", label, snd_strerror(err));
-        return false;
-    }
-    return true;
-}
-
-static bool open_alsa(const std::string& device, AlsaPcm& pcm) {
-    int err;
-    if ((err = snd_pcm_open(&pcm.capture, device.c_str(), SND_PCM_STREAM_CAPTURE, 0)) < 0) {
-        LOG_ERROR("ALSA capture open: %s", snd_strerror(err));
-        return false;
-    }
-    if ((err = snd_pcm_open(&pcm.playback, device.c_str(), SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-        LOG_ERROR("ALSA playback open: %s", snd_strerror(err));
-        snd_pcm_close(pcm.capture);
-        pcm.capture = nullptr;
-        return false;
-    }
-    if (!configure_pcm(pcm.capture, "capture") || !configure_pcm(pcm.playback, "playback")) {
-        snd_pcm_close(pcm.capture);
-        snd_pcm_close(pcm.playback);
-        pcm = {};
-        return false;
-    }
-    LOG_INFO("ALSA opened: %s (rate=%u, period=%u, buffer=%u)",
-             device.c_str(), SAMPLE_RATE, PERIOD_FRAMES, BUFFER_FRAMES);
-    return true;
-}
-
-static void close_alsa(AlsaPcm& pcm) {
-    if (pcm.capture) { snd_pcm_drop(pcm.capture); snd_pcm_close(pcm.capture); }
-    if (pcm.playback) { snd_pcm_drop(pcm.playback); snd_pcm_close(pcm.playback); }
-    pcm = {};
-}
-
-static void alsa_capture_thread(snd_pcm_t* capture,
-                                RingBuffer<int16_t>& ring,
-                                std::atomic<bool>& running,
-                                std::atomic<bool>& bridged) {
-    std::vector<int16_t> buf(PERIOD_FRAMES);
-    bool was_bridged = false;
-    unsigned long total_frames = 0;
-    unsigned long bridged_frames = 0;
-    unsigned int xrun_count = 0;
-    auto last_stats = std::chrono::steady_clock::now();
-
-    while (running.load(std::memory_order_relaxed)) {
-        snd_pcm_sframes_t frames = snd_pcm_readi(capture, buf.data(), PERIOD_FRAMES);
-        if (frames < 0) {
-            if (frames == -EPIPE) {
-                ++xrun_count;
-                LOG_WARN("ALSA capture overrun #%u (bridged=%s, total_frames=%lu)",
-                         xrun_count, was_bridged ? "yes" : "no", total_frames);
-                snd_pcm_prepare(capture);
-                snd_pcm_start(capture);
-                continue;
-            }
-            if (frames == -EINTR) continue;
-            LOG_ERROR("ALSA capture: %s", snd_strerror(static_cast<int>(frames)));
-            break;
-        }
-
-        total_frames += static_cast<unsigned long>(frames);
-
-        bool now_bridged = bridged.load(std::memory_order_acquire);
-        if (now_bridged && !was_bridged) {
-            ring.reset();
-            was_bridged = true;
-            LOG_INFO("ALSA capture: bridge active, forwarding audio (pre-bridge frames=%lu, xruns=%u)",
-                     total_frames, xrun_count);
-        }
-
-        if (was_bridged) {
-            ring.try_write(buf.data(), static_cast<size_t>(frames));
-            bridged_frames += static_cast<unsigned long>(frames);
-
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_stats).count();
-            if (elapsed >= 5) {
-                LOG_INFO("ALSA capture stats: bridged_frames=%lu, ring_avail=%zu, xruns=%u",
-                         bridged_frames, ring.available_read(), xrun_count);
-                last_stats = now;
-            }
-        }
-    }
-}
-
-static void alsa_playback_thread(snd_pcm_t* playback,
-                                 RingBuffer<int16_t>& ring,
-                                 BeepGenerator& beep,
-                                 std::atomic<bool>& running,
-                                 std::atomic<bool>& beep_active,
-                                 std::atomic<bool>& bridged) {
-    std::vector<int16_t> buf(PERIOD_FRAMES);
-    std::vector<int16_t> silence(PERIOD_FRAMES, 0);
-
-    unsigned int prefill = (BUFFER_FRAMES / PERIOD_FRAMES);
-    if (prefill > 1) prefill -= 1;
-    for (unsigned int i = 0; i < prefill; ++i) {
-        snd_pcm_writei(playback, silence.data(), PERIOD_FRAMES);
-    }
-
-    bool was_bridged = false;
-
-    while (running.load(std::memory_order_relaxed)) {
-        bool now_bridged = bridged.load(std::memory_order_acquire);
-        if (now_bridged && !was_bridged) {
-            ring.reset();
-            was_bridged = true;
-        }
-
-        if (beep_active.load(std::memory_order_acquire)) {
-            beep.fill_frame(buf.data(), PERIOD_FRAMES);
-        } else {
-            size_t got = ring.read(buf.data(), PERIOD_FRAMES);
-            if (got < PERIOD_FRAMES) {
-                std::memset(buf.data() + got, 0,
-                            (PERIOD_FRAMES - got) * sizeof(int16_t));
-            }
-        }
-
-        snd_pcm_sframes_t written = snd_pcm_writei(playback, buf.data(), PERIOD_FRAMES);
-        if (written < 0) {
-            if (written == -EPIPE) {
-                snd_pcm_prepare(playback);
-                for (unsigned int i = 0; i + 1 < prefill; ++i) {
-                    snd_pcm_writei(playback, silence.data(), PERIOD_FRAMES);
-                }
-                snd_pcm_writei(playback, buf.data(), PERIOD_FRAMES);
-                continue;
-            }
-            if (written == -EINTR) continue;
-            LOG_ERROR("ALSA playback: %s", snd_strerror(static_cast<int>(written)));
-            break;
-        }
-    }
-}
-
-static void play_error_tone(snd_pcm_t* playback) {
-    BeepGenerator error_beep(ERROR_TONE_HZ, ERROR_TONE_ON_MS, ERROR_TONE_OFF_MS, SAMPLE_RATE);
-    unsigned int total_samples = SAMPLE_RATE * ERROR_TONE_DURATION_MS / 1000;
-    std::vector<int16_t> buf(PERIOD_FRAMES);
-
-    unsigned int played = 0;
-    while (played < total_samples) {
-        error_beep.fill_frame(buf.data(), PERIOD_FRAMES);
-        snd_pcm_sframes_t written = snd_pcm_writei(playback, buf.data(), PERIOD_FRAMES);
-        if (written < 0) {
-            if (written == -EPIPE) {
-                snd_pcm_prepare(playback);
-                snd_pcm_writei(playback, buf.data(), PERIOD_FRAMES);
-            }
-        }
-        played += PERIOD_FRAMES;
-    }
-    snd_pcm_drain(playback);
-}
-
-static void handle_bridged_call(AtCommander& at,
-                                const std::string& alsa_device,
-                                BridgeAccount& account,
-                                const std::string& sip_dest_uri,
-                                uint16_t dial_timeout_sec,
-                                const std::string& gsm_caller_id) {
-    AlsaPcm alsa{};
-    if (!open_alsa(alsa_device, alsa)) {
-        LOG_ERROR("ALSA open failed, hanging up GSM");
-        at.hangup();
-        return;
-    }
-
-    RingBuffer<int16_t> capture_ring(RING_BUFFER_FRAMES);
-    RingBuffer<int16_t> playback_ring(RING_BUFFER_FRAMES);
-    BeepGenerator beep;
-    std::atomic<bool> audio_running{true};
-    std::atomic<bool> beep_active{true};
-    std::atomic<bool> audio_bridged{false};
-
-    std::thread cap_thread(alsa_capture_thread, alsa.capture,
-                           std::ref(capture_ring), std::ref(audio_running),
-                           std::ref(audio_bridged));
-    std::thread play_thread(alsa_playback_thread, alsa.playback,
-                            std::ref(playback_ring), std::ref(beep),
-                            std::ref(audio_running), std::ref(beep_active),
-                            std::ref(audio_bridged));
-
-    LOG_INFO("beep pattern started for GSM caller");
-
-    BridgeCall* sip_call = account.make_outbound_call(sip_dest_uri, gsm_caller_id);
-    if (!sip_call) {
-        LOG_ERROR("SIP call initiation failed");
-        beep_active.store(false, std::memory_order_release);
-        audio_running.store(false, std::memory_order_relaxed);
-        cap_thread.join();
-        play_thread.join();
-        snd_pcm_drop(alsa.playback);
-        snd_pcm_prepare(alsa.playback);
-        play_error_tone(alsa.playback);
-        close_alsa(alsa);
-        at.hangup();
-        account.clear_call();
-        return;
-    }
-
-    AlsaMediaPort media_port(capture_ring, playback_ring);
-    try {
-        media_port.create();
-    } catch (pj::Error& err) {
-        LOG_ERROR("media port creation failed: %s", err.info().c_str());
-        account.hangup_call();
-        account.clear_call();
-        beep_active.store(false, std::memory_order_release);
-        audio_running.store(false, std::memory_order_relaxed);
-        cap_thread.join();
-        play_thread.join();
-        close_alsa(alsa);
-        at.hangup();
-        return;
-    }
-
-    BridgeState state = BridgeState::SIP_DIALING;
-
-    auto dial_start = std::chrono::steady_clock::now();
-    bool bridge_connected = false;
-    unsigned int last_media_version = 0;
-
-    auto connect_media = [&]() -> bool {
-        try {
-            pj::CallInfo ci = sip_call->getInfo();
-            for (unsigned i = 0; i < ci.media.size(); ++i) {
-                if (ci.media[i].type != PJMEDIA_TYPE_AUDIO) continue;
-                if (ci.media[i].status != PJSUA_CALL_MEDIA_ACTIVE) continue;
-
-                pj::AudioMedia aud = sip_call->getAudioMedia(i);
-                media_port.startTransmit(aud);
-                aud.startTransmit(media_port);
-                return true;
-            }
-        } catch (pj::Error& err) {
-            LOG_ERROR("media connect failed: %s", err.info().c_str());
-        }
-        return false;
-    };
-
-    while (g_running.load(std::memory_order_relaxed)) {
-        auto urc = at.poll_urc();
-        if (urc) {
-            if (urc->find("NO CARRIER") != std::string::npos ||
-                urc->find("BUSY") != std::string::npos ||
-                urc->find("NO ANSWER") != std::string::npos) {
-                LOG_INFO("GSM call ended (remote hangup)");
-                state = BridgeState::ENDING;
-                break;
-            }
-        }
-
-        SipCallState sip_state = sip_call->sip_state();
-
-        if (state == BridgeState::SIP_DIALING || state == BridgeState::GSM_ANSWERED) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - dial_start).count();
-
-            if (elapsed >= dial_timeout_sec) {
-                LOG_WARN("SIP dial timeout (%us)", dial_timeout_sec);
-                state = BridgeState::SIP_FAILED;
-                break;
-            }
-
-            if (sip_state == SipCallState::FAILED) {
-                LOG_WARN("SIP call failed");
-                state = BridgeState::SIP_FAILED;
-                break;
-            }
-
-            if (sip_state == SipCallState::CONFIRMED && sip_call->media_connected()) {
-                beep_active.store(false, std::memory_order_release);
-                audio_bridged.store(true, std::memory_order_release);
-
-                if (connect_media()) {
-                    bridge_connected = true;
-                    last_media_version = sip_call->media_version();
-                    LOG_INFO("audio bridge connected (GSM <-> SIP)");
-                } else {
-                    state = BridgeState::SIP_FAILED;
-                    break;
-                }
-
-                state = BridgeState::BRIDGED;
-            }
-        }
-
-        if (state == BridgeState::BRIDGED) {
-            if (sip_state == SipCallState::DISCONNECTED) {
-                LOG_INFO("SIP party hung up");
-                state = BridgeState::ENDING;
-                break;
-            }
-
-            unsigned int cur_version = sip_call->media_version();
-            if (cur_version != last_media_version) {
-                LOG_INFO("SIP media renegotiated (version %u -> %u), reconnecting bridge",
-                         last_media_version, cur_version);
-                if (connect_media()) {
-                    last_media_version = cur_version;
-                    LOG_INFO("audio bridge reconnected (GSM <-> SIP)");
-                } else {
-                    LOG_ERROR("failed to reconnect media after renegotiation");
-                    state = BridgeState::SIP_FAILED;
-                    break;
-                }
-            }
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-
-    beep_active.store(false, std::memory_order_release);
-    audio_running.store(false, std::memory_order_relaxed);
-
-    if (bridge_connected) {
-        try {
-            pj::CallInfo ci = sip_call->getInfo();
-            for (unsigned i = 0; i < ci.media.size(); ++i) {
-                if (ci.media[i].type != PJMEDIA_TYPE_AUDIO) continue;
-                if (ci.media[i].status != PJSUA_CALL_MEDIA_ACTIVE) continue;
-                pj::AudioMedia aud = sip_call->getAudioMedia(i);
-                media_port.stopTransmit(aud);
-                aud.stopTransmit(media_port);
-                break;
-            }
-        } catch (...) {}
-    }
-
-    account.hangup_call();
-
-    cap_thread.join();
-    play_thread.join();
-
-    if (state == BridgeState::SIP_FAILED) {
-        LOG_INFO("playing error tone to GSM caller");
-        snd_pcm_drop(alsa.playback);
-        snd_pcm_prepare(alsa.playback);
-        play_error_tone(alsa.playback);
-    }
-
-    close_alsa(alsa);
-    at.hangup();
-    account.clear_call();
-
-    LOG_INFO("call teardown complete, state: IDLE");
 }
 
 int main(int argc, char* argv[]) {
@@ -558,39 +111,31 @@ int main(int argc, char* argv[]) {
         LOG_WARN("ModemManager is running and may interfere with serial access");
     }
 
-    DeviceInfo device = resolve_device(args);
-    if (device.serial_port.empty() || device.alsa_device.empty()) {
-        return 1;
+    // Discover and initialize cards
+    CardPool pool;
+
+    bool single_card_override = !args.serial_override.empty() && !args.audio_override.empty();
+    if (single_card_override) {
+        LOG_INFO("manual overrides: serial=%s, audio=%s (single-card mode)",
+                 args.serial_override.c_str(), args.audio_override.c_str());
+
+        DeviceInfo manual_device{args.serial_override, args.audio_override, "manual", "manual"};
+        auto card = std::make_unique<CardInstance>(std::move(manual_device));
+        if (!card->initialize(args.verbose)) {
+            LOG_ERROR("manual card initialization failed: %s", card->fail_reason().c_str());
+            return 1;
+        }
+        // For manual single-card, we manage the card directly outside CardPool
+        // but we still need PJSIP running first — fall through to PJSIP init below
+    } else {
+        auto discover_result = pool.discover_and_initialize(args.verbose);
+        if (!discover_result.ok) {
+            LOG_ERROR("%s", discover_result.error.c_str());
+            return 1;
+        }
     }
 
-    SerialPort serial;
-    if (!serial.open(device.serial_port)) {
-        return 2;
-    }
-
-    AtCommander at(serial);
-    at.set_verbose(args.verbose);
-
-    for (int i = 0; i < 20; ++i) {
-        if (!serial.read_line()) break;
-    }
-
-    if (!at.send_and_expect_ok("ATE0", 2000)) {
-        at.send_and_expect_ok("ATE0", 2000);
-    }
-    at.send_and_expect_ok("AT+CLIP=1", 2000);
-
-    if (!at.send_and_expect_ok("AT+QPCMV=1,2", 2000)) {
-        LOG_WARN("AT+QPCMV=1,2 failed, trying AT+QPCMV=1,0");
-        at.send_and_expect_ok("AT+QPCMV=1,0", 2000);
-    }
-
-    if (!at.query_network_registration()) {
-        LOG_ERROR("SIM not registered on network");
-        return 6;
-    }
-    LOG_INFO("GSM network registration confirmed");
-
+    // Initialize PJSIP
     pj::Endpoint ep;
     try {
         ep.libCreate();
@@ -651,94 +196,37 @@ int main(int argc, char* argv[]) {
         return 5;
     }
 
-    std::string sip_server_suffix = "@" + sip_config.server
-                                    + ":" + std::to_string(sip_config.port)
-                                    + sip_config.transport_param();
+    if (single_card_override) {
+        // Single-card manual override mode — create card and run directly
+        DeviceInfo manual_device{args.serial_override, args.audio_override, "manual", "manual"};
+        auto card = std::make_unique<CardInstance>(std::move(manual_device));
+        if (!card->initialize(args.verbose)) {
+            LOG_ERROR("manual card initialization failed: %s", card->fail_reason().c_str());
+            return 1;
+        }
+        LOG_INFO("[%s] single-card mode, listening for GSM calls", card->card_id().c_str());
+        card->start(account, bridge_config, sip_config, g_running);
 
-    LOG_INFO("ready, GSM calls will bridge to SIP %s (timeout=%us)",
-             bridge_config.sip_destination.empty()
-                 ? "(PBX routing via caller DID)"
-                 : ("sip:" + bridge_config.sip_destination + sip_server_suffix).c_str(),
-             bridge_config.sip_dial_timeout_sec);
-
-    static constexpr int CLIP_WAIT_MS = 300;
-
-    while (g_running.load(std::memory_order_relaxed)) {
-        auto urc = at.poll_urc();
-        if (!urc) continue;
-
-        std::string caller;
-
-        if (urc->find("+CLIP:") != std::string::npos) {
-            auto start = urc->find('"');
-            auto end = urc->find('"', start + 1);
-            if (start != std::string::npos && end != std::string::npos) {
-                caller = urc->substr(start + 1, end - start - 1);
-            }
+        while (g_running.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
-        if (urc->find("RING") != std::string::npos) {
-            if (caller.empty()) {
-                auto clip_deadline = std::chrono::steady_clock::now()
-                    + std::chrono::milliseconds(CLIP_WAIT_MS);
-                while (std::chrono::steady_clock::now() < clip_deadline) {
-                    auto clip_urc = at.poll_urc();
-                    if (!clip_urc) continue;
-                    if (clip_urc->find("+CLIP:") != std::string::npos) {
-                        auto start = clip_urc->find('"');
-                        auto end = clip_urc->find('"', start + 1);
-                        if (start != std::string::npos && end != std::string::npos) {
-                            caller = clip_urc->substr(start + 1, end - start - 1);
-                        }
-                        break;
-                    }
-                }
-            }
+        card->stop();
+    } else {
+        pool.print_summary();
+        pool.start_all(account, bridge_config, sip_config, g_running);
+        pool.start_retry_thread(account, bridge_config, sip_config, g_running);
 
-            LOG_INFO("GSM RING%s%s", caller.empty() ? "" : " from ",
-                     caller.empty() ? "" : caller.c_str());
-
-            if (!account.is_registered()) {
-                LOG_WARN("SIP not registered, ignoring GSM call");
-                at.hangup();
-                continue;
-            }
-
-            if (at.answer_call()) {
-                std::string sip_user = bridge_config.sip_destination;
-                if (sip_user.empty()) {
-                    sip_user = caller;
-                    if (!sip_user.empty() && sip_user[0] == '+') {
-                        sip_user.erase(0, 1);
-                    }
-                }
-
-                if (sip_user.empty()) {
-                    LOG_WARN("no SIP destination and no caller ID, cannot route call");
-                    at.hangup();
-                    continue;
-                }
-
-                std::string sip_dest_uri = "sip:" + sip_user + sip_server_suffix;
-
-                LOG_INFO("GSM call answered, bridging to %s (caller: %s)",
-                         sip_dest_uri.c_str(),
-                         caller.empty() ? "unknown" : caller.c_str());
-                handle_bridged_call(at, device.alsa_device, account,
-                                    sip_dest_uri, bridge_config.sip_dial_timeout_sec,
-                                    caller);
-                LOG_INFO("idle, waiting for next GSM call");
-            } else {
-                LOG_ERROR("failed to answer GSM call");
-            }
+        while (g_running.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
+
+        LOG_INFO("shutting down");
+        pool.stop_all();
     }
 
-    LOG_INFO("shutting down");
-    at.hangup();
-
     try {
-        account.hangup_call();
+        account.hangup_all_calls();
         account.shutdown();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         ep.libDestroy();
@@ -746,7 +234,6 @@ int main(int argc, char* argv[]) {
         LOG_ERROR("shutdown: %s", err.info().c_str());
     }
 
-    serial.close();
     LOG_INFO("gsm-sip-bridge stopped");
     return 0;
 }
