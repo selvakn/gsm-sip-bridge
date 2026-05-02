@@ -7,6 +7,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  PJSIP_VERSION: "2.16"
 
 jobs:
   publish:
@@ -49,8 +50,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=pjsip-${{ env.PJSIP_VERSION }}
+            type=gha,scope=build-main
+            type=gha,scope=build-${{ github.ref_name }}
+          cache-to: |
+            type=gha,scope=pjsip-${{ env.PJSIP_VERSION }},mode=max
+            type=gha,scope=build-${{ github.ref_name }},mode=max
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

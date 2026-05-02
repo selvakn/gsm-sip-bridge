@@ -1,12 +1,10 @@
-FROM debian:bookworm-slim AS builder
+FROM debian:bookworm-slim AS pjsip
 
 ARG PJSIP_VERSION=2.16
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    cmake \
     pkg-config \
-    git \
     libasound2-dev \
     libssl-dev \
     wget \
@@ -26,6 +24,13 @@ RUN wget -q https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSION
     && make install \
     && ldconfig \
     && cd / && rm -rf pjproject-${PJSIP_VERSION} ${PJSIP_VERSION}.tar.gz
+
+FROM pjsip AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY CMakeLists.txt Makefile ./
