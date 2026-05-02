@@ -97,6 +97,22 @@ tests/integration/
 └── test_end_to_end.cpp
 ```
 
+## ModemManager Interference
+
+ModemManager probes `ttyUSB*` ports for modems, which corrupts AT sessions. The program warns at startup if ModemManager is active. To fix permanently, install the included udev rule:
+
+```bash
+sudo cp etc/99-ec20-audio-echo.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+This tells ModemManager to ignore the EC20 entirely. To stop it immediately:
+
+```bash
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager   # prevent restart on boot
+```
+
 ## Troubleshooting
 
 **No `/dev/ttyUSB*` devices**: Check `dmesg | grep ttyUSB`. Ensure `option` and `qcserial` kernel modules are loaded.
@@ -107,5 +123,7 @@ tests/integration/
 ```bash
 sudo usermod -aG dialout,audio $USER
 ```
+
+**AT commands timing out or garbled responses**: ModemManager is likely probing the port. See the ModemManager section above.
 
 **Audio clicks/dropouts**: Ensure no other process claims the ALSA device (`fuser /dev/snd/*`). Consider real-time scheduling.

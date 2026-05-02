@@ -79,25 +79,43 @@ bool AtCommander::hangup() {
 }
 
 bool AtCommander::query_network_registration() {
-    if (!send("AT+COPS?")) return false;
+    static constexpr int MAX_ATTEMPTS = 10;
+    static constexpr int RETRY_INTERVAL_MS = 3000;
 
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
-    bool registered = false;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        if (!send("AT+COPS?")) return false;
 
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0) break;
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(3000);
+        bool got_operator = false;
 
-        auto line = read_response(static_cast<int>(remaining));
-        if (!line) continue;
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) break;
 
-        if (line->find("+COPS:") != std::string::npos && line->size() > 7) {
-            registered = true;
+            auto line = read_response(static_cast<int>(remaining));
+            if (!line) continue;
+
+            // +COPS: 0,0,"Operator Name",7  -- registered (has quoted operator)
+            // +COPS: 0                       -- not registered (no operator)
+            if (line->find("+COPS:") != std::string::npos &&
+                line->find('"') != std::string::npos) {
+                got_operator = true;
+            }
+            if (*line == "OK") break;
         }
-        if (*line == "OK") break;
+
+        if (got_operator) return true;
+
+        if (attempt < MAX_ATTEMPTS) {
+            LOG_INFO("waiting for network registration (attempt %d/%d)",
+                     attempt, MAX_ATTEMPTS);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(RETRY_INTERVAL_MS));
+        }
     }
-    return registered;
+    return false;
 }
 
 std::optional<std::string> AtCommander::poll_urc() {

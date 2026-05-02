@@ -5,6 +5,7 @@
 #include "serial_port.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <csignal>
 #include <cstring>
 #include <getopt.h>
@@ -181,6 +182,12 @@ int main(int argc, char* argv[]) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+
+    if (std::system("systemctl is-active --quiet ModemManager 2>/dev/null") == 0) {
+        LOG_WARN("ModemManager is running and may interfere with serial access");
+        LOG_WARN("consider: sudo systemctl stop ModemManager");
+        LOG_WARN("permanent fix: install etc/99-ec20-audio-echo.rules to /etc/udev/rules.d/");
+    }
 
     DeviceInfo device = resolve_device(args);
     if (device.serial_port.empty() || device.alsa_device.empty()) {
