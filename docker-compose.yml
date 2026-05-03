@@ -7,6 +7,7 @@ services:
     privileged: true
     volumes:
       - ./config.ini:/etc/gsm-sip-bridge/config.ini:ro
+      - sms-data:/var/lib/gsm-sip-bridge
       - /dev/snd:/dev/snd
       - /dev/bus/usb:/dev/bus/usb
     devices:
@@ -48,5 +49,6 @@ services:
       - grafana-data:/var/lib/grafana
 
 volumes:
+  sms-data:
   prometheus-data:
   grafana-data:

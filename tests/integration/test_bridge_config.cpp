@@ -167,3 +167,95 @@ TEST(BridgeConfig, destination_with_special_chars) {
     EXPECT_EQ(config.sip_destination, "+1234*#");
     std::remove(path.c_str());
 }
+
+TEST(BridgeConfig, sms_section_defaults) {
+    // Arrange
+    auto path = create_temp_file("[sip]\nserver=pbx\nusername=u\npassword=p\n");
+
+    // Act
+    BridgeConfig config;
+    auto result = BridgeConfig::load(path, config);
+
+    // Assert
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(config.sms.enabled);
+    EXPECT_TRUE(config.sms.discord_webhook_url.empty());
+    EXPECT_EQ(config.sms.db_path, "/var/lib/gsm-sip-bridge/sms.db");
+    std::remove(path.c_str());
+}
+
+TEST(BridgeConfig, sms_section_full_config) {
+    // Arrange
+    auto path = create_temp_file(
+        "[sms]\n"
+        "enabled = true\n"
+        "discord_webhook_url = https://discord.com/api/webhooks/123/abc\n"
+        "db_path = /tmp/test.db\n");
+
+    // Act
+    BridgeConfig config;
+    auto result = BridgeConfig::load(path, config);
+
+    // Assert
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(config.sms.enabled);
+    EXPECT_EQ(config.sms.discord_webhook_url, "https://discord.com/api/webhooks/123/abc");
+    EXPECT_EQ(config.sms.db_path, "/tmp/test.db");
+    std::remove(path.c_str());
+}
+
+TEST(BridgeConfig, sms_section_disabled) {
+    // Arrange
+    auto path = create_temp_file("[sms]\nenabled = false\n");
+
+    // Act
+    BridgeConfig config;
+    auto result = BridgeConfig::load(path, config);
+
+    // Assert
+    EXPECT_TRUE(result.ok);
+    EXPECT_FALSE(config.sms.enabled);
+    std::remove(path.c_str());
+}
+
+TEST(BridgeConfig, sms_section_disabled_with_zero) {
+    // Arrange
+    auto path = create_temp_file("[sms]\nenabled = 0\n");
+
+    // Act
+    BridgeConfig config;
+    auto result = BridgeConfig::load(path, config);
+
+    // Assert
+    EXPECT_TRUE(result.ok);
+    EXPECT_FALSE(config.sms.enabled);
+    std::remove(path.c_str());
+}
+
+TEST(BridgeConfig, sms_phone_number_parsed) {
+    // Arrange
+    auto path = create_temp_file("[sms]\nphone_number = +9876543210\n");
+
+    // Act
+    BridgeConfig config;
+    auto result = BridgeConfig::load(path, config);
+
+    // Assert
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(config.sms.phone_number, "+9876543210");
+    std::remove(path.c_str());
+}
+
+TEST(BridgeConfig, sms_phone_number_default_empty) {
+    // Arrange
+    auto path = create_temp_file("[sms]\nenabled = true\n");
+
+    // Act
+    BridgeConfig config;
+    auto result = BridgeConfig::load(path, config);
+
+    // Assert
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(config.sms.phone_number.empty());
+    std::remove(path.c_str());
+}

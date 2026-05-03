@@ -21,34 +21,54 @@ BridgeConfig::LoadResult BridgeConfig::load(const std::string& path, BridgeConfi
         return {false, "cannot read config file: " + path};
     }
 
-    if (!ini.has("bridge")) {
-        out = BridgeConfig{};
-        return {true, ""};
+    if (ini.has("bridge")) {
+        auto& bridge = ini["bridge"];
+
+        if (bridge.has("sip_destination") && !bridge["sip_destination"].empty()) {
+            std::string dest = bridge["sip_destination"];
+            if (!is_valid_destination(dest)) {
+                return {false, "invalid sip_destination (alphanumeric/*/#+, max 32 chars): " + dest};
+            }
+            out.sip_destination = dest;
+        } else {
+            out.sip_destination.clear();
+        }
+
+        if (bridge.has("sip_dial_timeout_sec") && !bridge["sip_dial_timeout_sec"].empty()) {
+            int val = 0;
+            try {
+                val = std::stoi(bridge["sip_dial_timeout_sec"]);
+            } catch (...) {
+                return {false, "invalid sip_dial_timeout_sec: " + bridge["sip_dial_timeout_sec"]};
+            }
+            if (val < MIN_TIMEOUT_SEC || val > MAX_TIMEOUT_SEC) {
+                return {false, "sip_dial_timeout_sec out of range (5-120): " + std::to_string(val)};
+            }
+            out.sip_dial_timeout_sec = static_cast<uint16_t>(val);
+        }
     }
 
-    auto& bridge = ini["bridge"];
+    if (ini.has("sms")) {
+        auto& sms = ini["sms"];
 
-    if (bridge.has("sip_destination") && !bridge["sip_destination"].empty()) {
-        std::string dest = bridge["sip_destination"];
-        if (!is_valid_destination(dest)) {
-            return {false, "invalid sip_destination (alphanumeric/*/#+, max 32 chars): " + dest};
+        if (sms.has("enabled") && !sms["enabled"].empty()) {
+            std::string val = sms["enabled"];
+            if (val == "false" || val == "0" || val == "no") {
+                out.sms.enabled = false;
+            }
         }
-        out.sip_destination = dest;
-    } else {
-        out.sip_destination.clear();
-    }
 
-    if (bridge.has("sip_dial_timeout_sec") && !bridge["sip_dial_timeout_sec"].empty()) {
-        int val = 0;
-        try {
-            val = std::stoi(bridge["sip_dial_timeout_sec"]);
-        } catch (...) {
-            return {false, "invalid sip_dial_timeout_sec: " + bridge["sip_dial_timeout_sec"]};
+        if (sms.has("discord_webhook_url") && !sms["discord_webhook_url"].empty()) {
+            out.sms.discord_webhook_url = sms["discord_webhook_url"];
         }
-        if (val < MIN_TIMEOUT_SEC || val > MAX_TIMEOUT_SEC) {
-            return {false, "sip_dial_timeout_sec out of range (5-120): " + std::to_string(val)};
+
+        if (sms.has("db_path") && !sms["db_path"].empty()) {
+            out.sms.db_path = sms["db_path"];
         }
-        out.sip_dial_timeout_sec = static_cast<uint16_t>(val);
+
+        if (sms.has("phone_number") && !sms["phone_number"].empty()) {
+            out.sms.phone_number = sms["phone_number"];
+        }
     }
 
     return {true, ""};

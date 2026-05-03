@@ -11,6 +11,7 @@
 #include <thread>
 
 class BridgeAccount;
+class SmsHandler;
 struct SipConfig;
 
 enum class CardState {
@@ -41,11 +42,13 @@ public:
     void start(BridgeAccount& account,
                const BridgeConfig& bridge_config,
                const SipConfig& sip_config,
-               std::atomic<bool>& running);
+               std::atomic<bool>& running,
+               SmsHandler* sms_handler = nullptr);
 
     void stop();
 
     const std::string& card_id() const { return card_id_; }
+    const std::string& own_number() const { return own_number_; }
     const DeviceInfo& device() const { return device_; }
     CardState state() const { return state_.load(std::memory_order_acquire); }
     const std::string& fail_reason() const { return fail_reason_; }
@@ -54,7 +57,8 @@ private:
     void run_loop(BridgeAccount& account,
                   const BridgeConfig& bridge_config,
                   const SipConfig& sip_config,
-                  std::atomic<bool>& running);
+                  std::atomic<bool>& running,
+                  SmsHandler* sms_handler);
 
     void handle_bridged_call(AtCommander& at,
                              BridgeAccount& account,
@@ -65,6 +69,7 @@ private:
 
     DeviceInfo device_;
     std::string card_id_;
+    std::string own_number_;
     std::string fail_reason_;
     std::atomic<CardState> state_{CardState::DISCOVERED};
     SerialPort serial_;

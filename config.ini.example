@@ -28,3 +28,17 @@ sip_destination = 599
 
 ; Timeout in seconds for the outbound SIP call (optional, default: 30, range: 5-120)
 sip_dial_timeout_sec = 30
+
+[sms]
+; Enable SMS monitoring and forwarding (optional, default: true)
+enabled = true
+
+; Discord webhook URL for SMS notifications (optional, leave empty to disable forwarding)
+; discord_webhook_url = https://discord.com/api/webhooks/123456789/abcdef
+
+; Path to SQLite database for SMS persistence (optional)
+db_path = /var/lib/gsm-sip-bridge/sms.db
+
+; SIM phone number shown in Discord notifications (optional)
+; Used as fallback when AT+CNUM does not return the number from the SIM
+; phone_number = +1234567890

@@ -3,6 +3,7 @@
 #include "bridge/card_instance.h"
 #include "bridge/card_pool.h"
 #include "bridge/metrics.h"
+#include "bridge/sms_handler.h"
 #include "sip/sip_config.h"
 #include "device_discovery.h"
 #include "logger.h"
@@ -18,7 +19,7 @@
 #include <string>
 #include <thread>
 
-static constexpr const char* VERSION = "3.0.0";
+static constexpr const char* VERSION = "4.0.0";
 static constexpr const char* DEFAULT_CONFIG_PATH = "config.ini";
 
 static std::atomic<bool> g_running{true};
@@ -114,6 +115,14 @@ int main(int argc, char* argv[]) {
         metrics_port = static_cast<uint16_t>(std::atoi(metrics_port_env));
     }
     metrics::init(metrics_port);
+
+    SmsHandler sms_handler(bridge_config.sms);
+    if (!sms_handler.start()) {
+        LOG_ERROR("SMS handler initialization failed");
+        return 6;
+    }
+
+    SmsHandler* sms_ptr = bridge_config.sms.enabled ? &sms_handler : nullptr;
 
     if (std::system("systemctl is-active --quiet ModemManager 2>/dev/null") == 0) {
         LOG_WARN("ModemManager is running and may interfere with serial access");
@@ -214,7 +223,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         LOG_INFO("[%s] single-card mode, listening for GSM calls", card->card_id().c_str());
-        card->start(account, bridge_config, sip_config, g_running);
+        card->start(account, bridge_config, sip_config, g_running, sms_ptr);
 
         while (g_running.load(std::memory_order_relaxed)) {
             auto elapsed = std::chrono::duration<double>(
@@ -226,8 +235,8 @@ int main(int argc, char* argv[]) {
         card->stop();
     } else {
         pool.print_summary();
-        pool.start_all(account, bridge_config, sip_config, g_running);
-        pool.start_retry_thread(account, bridge_config, sip_config, g_running);
+        pool.start_all(account, bridge_config, sip_config, g_running, sms_ptr);
+        pool.start_retry_thread(account, bridge_config, sip_config, g_running, sms_ptr);
 
         while (g_running.load(std::memory_order_relaxed)) {
             auto elapsed = std::chrono::duration<double>(
@@ -249,6 +258,7 @@ int main(int argc, char* argv[]) {
         LOG_ERROR("shutdown: %s", err.info().c_str());
     }
 
+    sms_handler.stop();
     metrics::shutdown();
     LOG_INFO("gsm-sip-bridge stopped");
     return 0;

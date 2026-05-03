@@ -36,4 +36,8 @@ void audio_error(const std::string& module_id, const std::string& type);
 
 void uptime_update(double seconds);
 
+void sms_received(const std::string& module_id);
+void sms_forwarded(const std::string& module_id, const std::string& status);
+void sms_db_write(bool success);
+
 }  // namespace metrics

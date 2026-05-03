@@ -7,7 +7,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALSA REQUIRED alsa)
-
 include(FetchContent)
 
 FetchContent_Declare(
@@ -16,6 +15,22 @@ FetchContent_Declare(
     GIT_TAG 0.9.17
 )
 FetchContent_MakeAvailable(mini)
+
+FetchContent_Declare(
+    sqlite3
+    GIT_REPOSITORY https://github.com/sjinks/sqlite3-cmake.git
+    GIT_TAG v3.46.1
+)
+FetchContent_MakeAvailable(sqlite3)
+
+FetchContent_Declare(
+    cpp-httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.41.0
+)
+set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_REQUIRE_OPENSSL ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(cpp-httplib)
 
 FetchContent_Declare(
     prometheus-cpp
@@ -91,6 +106,8 @@ add_executable(gsm-sip-bridge
     src/bridge/alsa_media_port.cpp
     src/bridge/beep_generator.cpp
     src/bridge/metrics.cpp
+    src/bridge/sms_store.cpp
+    src/bridge/sms_handler.cpp
     src/sip/sip_config.cpp
     src/device_discovery.cpp
     src/serial_port.cpp
@@ -100,6 +117,7 @@ add_executable(gsm-sip-bridge
 target_include_directories(gsm-sip-bridge PRIVATE
     src
     ${mini_SOURCE_DIR}/src
+    ${cpp-httplib_SOURCE_DIR}
     ${ALSA_INCLUDE_DIRS}
     ${PJSIP_INCLUDE_DIRS}
 )
@@ -107,9 +125,12 @@ target_include_directories(gsm-sip-bridge PRIVATE
 target_link_libraries(gsm-sip-bridge PRIVATE
     ${ALSA_LIBRARIES}
     ${PJSIP_LIBRARIES}
+    SQLite::SQLite3
     prometheus-cpp::pull
     prometheus-cpp::core
     pthread
+    ssl
+    crypto
 )
 
 target_link_directories(gsm-sip-bridge PRIVATE
@@ -203,6 +224,8 @@ if(GTest_FOUND)
         tests/integration/test_bridge_call.cpp
         tests/integration/test_card_pool.cpp
         tests/integration/test_metrics.cpp
+        tests/integration/test_sms_store.cpp
+        tests/integration/test_sms_handler.cpp
         src/bridge/bridge_config.cpp
         src/bridge/bridge_account.cpp
         src/bridge/bridge_call.cpp
@@ -211,6 +234,8 @@ if(GTest_FOUND)
         src/bridge/alsa_media_port.cpp
         src/bridge/beep_generator.cpp
         src/bridge/metrics.cpp
+        src/bridge/sms_store.cpp
+        src/bridge/sms_handler.cpp
         src/sip/sip_config.cpp
         src/device_discovery.cpp
         src/serial_port.cpp
@@ -220,6 +245,7 @@ if(GTest_FOUND)
     target_include_directories(bridge-tests PRIVATE
         src
         ${mini_SOURCE_DIR}/src
+        ${cpp-httplib_SOURCE_DIR}
         tests/integration
         ${PJSIP_INCLUDE_DIRS}
         ${ALSA_INCLUDE_DIRS}
@@ -229,9 +255,12 @@ if(GTest_FOUND)
         GTest::gtest GTest::gtest_main
         ${PJSIP_LIBRARIES}
         ${ALSA_LIBRARIES}
+        SQLite::SQLite3
         prometheus-cpp::pull
         prometheus-cpp::core
         pthread
+        ssl
+        crypto
     )
 
     target_link_directories(bridge-tests PRIVATE

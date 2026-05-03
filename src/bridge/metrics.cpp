@@ -28,6 +28,10 @@ static prometheus::Family<prometheus::Gauge>* g_modules_failed = nullptr;
 static prometheus::Family<prometheus::Gauge>* g_active_calls = nullptr;
 static prometheus::Family<prometheus::Gauge>* g_uptime = nullptr;
 
+static prometheus::Family<prometheus::Counter>* g_sms_received = nullptr;
+static prometheus::Family<prometheus::Counter>* g_sms_forwarded = nullptr;
+static prometheus::Family<prometheus::Counter>* g_sms_db_writes = nullptr;
+
 static prometheus::Family<prometheus::Histogram>* g_call_duration = nullptr;
 
 void init(uint16_t port) {
@@ -92,6 +96,21 @@ void init(uint16_t port) {
         .Help("Process uptime in seconds")
         .Register(*g_registry);
 
+    g_sms_received = &prometheus::BuildCounter()
+        .Name("gsm_bridge_sms_received_total")
+        .Help("Total SMS messages received")
+        .Register(*g_registry);
+
+    g_sms_forwarded = &prometheus::BuildCounter()
+        .Name("gsm_bridge_sms_forwarded_total")
+        .Help("SMS Discord forwarding outcomes")
+        .Register(*g_registry);
+
+    g_sms_db_writes = &prometheus::BuildCounter()
+        .Name("gsm_bridge_sms_db_writes_total")
+        .Help("SMS database write outcomes")
+        .Register(*g_registry);
+
     g_call_duration = &prometheus::BuildHistogram()
         .Name("gsm_bridge_call_duration_seconds")
         .Help("Duration of completed bridged calls")
@@ -116,6 +135,9 @@ void shutdown() {
     g_modules_failed = nullptr;
     g_active_calls = nullptr;
     g_uptime = nullptr;
+    g_sms_received = nullptr;
+    g_sms_forwarded = nullptr;
+    g_sms_db_writes = nullptr;
     g_call_duration = nullptr;
 }
 
@@ -213,6 +235,21 @@ void audio_error(const std::string& module_id, const std::string& type) {
 void uptime_update(double seconds) {
     if (!g_uptime) return;
     g_uptime->Add({}).Set(seconds);
+}
+
+void sms_received(const std::string& module_id) {
+    if (!g_sms_received) return;
+    g_sms_received->Add({{"module_id", module_id}}).Increment();
+}
+
+void sms_forwarded(const std::string& module_id, const std::string& status) {
+    if (!g_sms_forwarded) return;
+    g_sms_forwarded->Add({{"module_id", module_id}, {"status", status}}).Increment();
+}
+
+void sms_db_write(bool success) {
+    if (!g_sms_db_writes) return;
+    g_sms_db_writes->Add({{"status", success ? "success" : "failure"}}).Increment();
 }
 
 }  // namespace metrics

@@ -1,8 +1,8 @@
 # GSM-SIP Bridge
 
-Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the GSM number on a Quectel EC20 module, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously.
+Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the GSM number on a Quectel EC20 module, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously. Incoming SMS messages are persisted to a local database and optionally forwarded to Discord.
 
-**Version**: 3.0.0 | **Language**: C++17 | **Platform**: Linux
+**Version**: 4.0.0 | **Language**: C++17 | **Platform**: Linux
 
 ## Prerequisites
 
@@ -11,13 +11,14 @@ Bridge incoming GSM calls to a SIP extension over VoIP. When someone dials the G
 - CMake 3.14+
 - ALSA development headers (`libasound2-dev`)
 - PJSIP development libraries (`libpjproject-dev` or built from source)
+- OpenSSL development headers (`libssl-dev`) for Discord HTTPS
 - One or more Quectel EC20 modules connected via USB, each with an active SIM card
 - SIP server account (Asterisk, FreePBX, MikoPBX, etc.)
 
 Install build dependencies:
 
 ```bash
-sudo apt install build-essential cmake g++ libasound2-dev libpjproject-dev
+sudo apt install build-essential cmake g++ libasound2-dev libpjproject-dev libssl-dev
 ```
 
 ## Quick Start
@@ -129,6 +130,32 @@ sip_dial_timeout_sec = 30
 
 The `[bridge]` section is optional; defaults apply if absent. All modules share the same configuration.
 
+### SMS Forwarding
+
+The `[sms]` section configures SMS monitoring and forwarding:
+
+```ini
+[sms]
+enabled = true
+discord_webhook_url = https://discord.com/api/webhooks/123456789/abcdef
+db_path = /var/lib/gsm-sip-bridge/sms.db
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Enable SMS monitoring on all modules |
+| `discord_webhook_url` | *(empty)* | Discord webhook URL. When empty, SMS is persisted to DB but not forwarded. |
+| `db_path` | `/var/lib/gsm-sip-bridge/sms.db` | Path to the SQLite database for SMS persistence |
+
+When an SMS arrives on any connected EC20 module:
+
+1. The message is read from the module via AT commands
+2. Persisted to the local SQLite database
+3. Deleted from the SIM card
+4. Forwarded to Discord as a rich embed notification (if webhook URL is configured)
+
+SMS monitoring runs independently of call handling and does not interfere with incoming call processing. If the Discord webhook is unreachable, the SMS is still safely stored in the database with a `failed` status.
+
 ## Observability
 
 The bridge exposes Prometheus-compatible metrics on an HTTP endpoint for monitoring call activity, SIP registration, module health, and errors in real time.
@@ -156,6 +183,9 @@ The bridge serves metrics at `http://<host>:9091/metrics` (Prometheus exposition
 | `gsm_bridge_modules_failed` | Gauge | Number of failed modules pending retry |
 | `gsm_bridge_active_calls` | Gauge | Currently active bridged calls per module |
 | `gsm_bridge_uptime_seconds` | Gauge | Process uptime |
+| `gsm_bridge_sms_received_total` | Counter | SMS messages received per module |
+| `gsm_bridge_sms_forwarded_total` | Counter | SMS Discord forwarding outcomes (sent/failed/skipped) per module |
+| `gsm_bridge_sms_db_writes_total` | Counter | SMS database write outcomes (success/failure) |
 | `gsm_bridge_call_duration_seconds` | Histogram | Call duration distribution (buckets: 1s to 30min) |
 
 ### Monitoring Stack (Docker Compose)

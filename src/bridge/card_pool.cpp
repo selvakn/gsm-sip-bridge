@@ -70,23 +70,26 @@ void CardPool::print_summary() const {
 void CardPool::start_all(BridgeAccount& account,
                          const BridgeConfig& bridge_config,
                          const SipConfig& sip_config,
-                         std::atomic<bool>& running) {
+                         std::atomic<bool>& running,
+                         SmsHandler* sms_handler) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& card : active_cards_) {
-        card->start(account, bridge_config, sip_config, running);
+        card->start(account, bridge_config, sip_config, running, sms_handler);
     }
 }
 
 void CardPool::start_retry_thread(BridgeAccount& account,
                                   const BridgeConfig& bridge_config,
                                   const SipConfig& sip_config,
-                                  std::atomic<bool>& running) {
+                                  std::atomic<bool>& running,
+                                  SmsHandler* sms_handler) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (failed_cards_.empty()) return;
 
     retry_thread_ = std::thread(&CardPool::retry_loop, this,
                                 std::ref(account), std::cref(bridge_config),
-                                std::cref(sip_config), std::ref(running));
+                                std::cref(sip_config), std::ref(running),
+                                sms_handler);
 }
 
 void CardPool::stop_all() {
@@ -120,7 +123,8 @@ size_t CardPool::total_count() const {
 void CardPool::retry_loop(BridgeAccount& account,
                           const BridgeConfig& bridge_config,
                           const SipConfig& sip_config,
-                          std::atomic<bool>& running) {
+                          std::atomic<bool>& running,
+                          SmsHandler* sms_handler) {
     LOG_INFO("retry thread started (%us interval)", DEFAULT_RETRY_INTERVAL_SEC);
 
     while (running.load(std::memory_order_relaxed)) {
@@ -143,7 +147,7 @@ void CardPool::retry_loop(BridgeAccount& account,
             if ((*it)->initialize(verbose_)) {
                 LOG_INFO("[%s] retry succeeded, adding to active pool", cid.c_str());
                 metrics::module_init_success(cid);
-                (*it)->start(account, bridge_config, sip_config, running);
+                (*it)->start(account, bridge_config, sip_config, running, sms_handler);
                 active_cards_.push_back(std::move(*it));
                 it = failed_cards_.erase(it);
             } else {

@@ -110,6 +110,26 @@ TEST_F(MetricsTest, call_duration_histogram) {
     SUCCEED();
 }
 
+TEST_F(MetricsTest, sms_received_counter) {
+    metrics::sms_received("ec20-abc123");
+    metrics::sms_received("ec20-abc123");
+    metrics::sms_received("ec20-def456");
+    SUCCEED();
+}
+
+TEST_F(MetricsTest, sms_forwarded_counter) {
+    metrics::sms_forwarded("ec20-abc123", "sent");
+    metrics::sms_forwarded("ec20-abc123", "failed");
+    metrics::sms_forwarded("ec20-abc123", "skipped");
+    SUCCEED();
+}
+
+TEST_F(MetricsTest, sms_db_write_counter) {
+    metrics::sms_db_write(true);
+    metrics::sms_db_write(false);
+    SUCCEED();
+}
+
 TEST_F(MetricsTest, operations_are_safe_after_shutdown) {
     metrics::shutdown();
     metrics::sip_registration(true);
@@ -117,5 +137,8 @@ TEST_F(MetricsTest, operations_are_safe_after_shutdown) {
     metrics::modules_active(1);
     metrics::call_ended("ec20-abc123", 10.0);
     metrics::uptime_update(100.0);
+    metrics::sms_received("ec20-abc123");
+    metrics::sms_forwarded("ec20-abc123", "sent");
+    metrics::sms_db_write(true);
     SUCCEED();
 }

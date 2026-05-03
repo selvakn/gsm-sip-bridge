@@ -4,6 +4,7 @@
 #include "bridge/alsa_media_port.h"
 #include "bridge/beep_generator.h"
 #include "bridge/metrics.h"
+#include "bridge/sms_handler.h"
 #include "ring_buffer.h"
 #include "sip/sip_config.h"
 #include "logger.h"
@@ -171,6 +172,33 @@ bool CardInstance::initialize(bool verbose) {
     }
 
     LOG_INFO("[%s] GSM network registration confirmed", card_id_.c_str());
+
+    if (at_->send("AT+CNUM")) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto line = at_->poll_urc();
+            if (!line) continue;
+            if (line->find("+CNUM:") != std::string::npos) {
+                auto q1 = line->find('"', line->find("+CNUM:"));
+                if (q1 != std::string::npos) {
+                    auto q2 = line->find('"', q1 + 1);
+                    auto q3 = line->find('"', q2 + 1);
+                    auto q4 = line->find('"', q3 + 1);
+                    if (q3 != std::string::npos && q4 != std::string::npos) {
+                        own_number_ = line->substr(q3 + 1, q4 - q3 - 1);
+                    }
+                }
+            }
+            if (*line == "OK" || line->find("ERROR") != std::string::npos) break;
+        }
+    }
+
+    if (!own_number_.empty()) {
+        LOG_INFO("[%s] SIM number: %s", card_id_.c_str(), own_number_.c_str());
+    } else {
+        LOG_WARN("[%s] SIM number not available (AT+CNUM empty)", card_id_.c_str());
+    }
+
     state_.store(CardState::ACTIVE, std::memory_order_release);
     return true;
 }
@@ -178,10 +206,12 @@ bool CardInstance::initialize(bool verbose) {
 void CardInstance::start(BridgeAccount& account,
                          const BridgeConfig& bridge_config,
                          const SipConfig& sip_config,
-                         std::atomic<bool>& running) {
+                         std::atomic<bool>& running,
+                         SmsHandler* sms_handler) {
     thread_ = std::thread(&CardInstance::run_loop, this,
                           std::ref(account), std::cref(bridge_config),
-                          std::cref(sip_config), std::ref(running));
+                          std::cref(sip_config), std::ref(running),
+                          sms_handler);
 }
 
 void CardInstance::stop() {
@@ -599,7 +629,8 @@ void CardInstance::handle_bridged_call(AtCommander& at,
 void CardInstance::run_loop(BridgeAccount& account,
                             const BridgeConfig& bridge_config,
                             const SipConfig& sip_config,
-                            std::atomic<bool>& running) {
+                            std::atomic<bool>& running,
+                            SmsHandler* sms_handler) {
     pj_thread_desc thread_desc = {};
     pj_thread_t* pj_thread = nullptr;
     pj_status_t status = pj_thread_register(card_id_.c_str(), thread_desc, &pj_thread);
@@ -613,12 +644,28 @@ void CardInstance::run_loop(BridgeAccount& account,
                                     + ":" + std::to_string(sip_config.port)
                                     + sip_config.transport_param();
 
-    LOG_INFO("[%s] listening for GSM calls", card_id_.c_str());
+    if (sms_handler) {
+        sms_handler->enable_sms_mode(*at_);
+        LOG_INFO("[%s] SMS text mode enabled", card_id_.c_str());
+    }
+
+    if (own_number_.empty() && !bridge_config.sms.phone_number.empty()) {
+        own_number_ = bridge_config.sms.phone_number;
+        LOG_INFO("[%s] using configured phone_number: %s", card_id_.c_str(), own_number_.c_str());
+    }
+
+    LOG_INFO("[%s] listening for GSM calls%s", card_id_.c_str(),
+             sms_handler ? " and SMS" : "");
 
     while (running.load(std::memory_order_relaxed) &&
            state_.load(std::memory_order_acquire) == CardState::ACTIVE) {
         auto urc = at_->poll_urc();
         if (!urc) continue;
+
+        if (sms_handler && urc->find("+CMTI:") != std::string::npos) {
+            sms_handler->handle_cmti(*at_, *urc, card_id_, own_number_);
+            continue;
+        }
 
         std::string caller;
 

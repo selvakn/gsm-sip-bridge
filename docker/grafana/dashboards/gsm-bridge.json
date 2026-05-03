@@ -643,6 +643,125 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
+      "id": 200,
+      "title": "SMS Forwarding",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 51 },
+      "id": 201,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "SMS Received (Total)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(gsm_bridge_sms_received_total{module_id=~\"$module_id\"}) or vector(0)",
+          "legendFormat": "Total",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 51 },
+      "id": 202,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "SMS Forwarded (Sent)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(gsm_bridge_sms_forwarded_total{module_id=~\"$module_id\", status=\"sent\"}) or vector(0)",
+          "legendFormat": "Sent",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 0 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 51 },
+      "id": 203,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "SMS Forward Failures",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(gsm_bridge_sms_forwarded_total{module_id=~\"$module_id\", status=\"failed\"}) or vector(0)",
+          "legendFormat": "Failed",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 51 },
+      "id": 204,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "title": "SMS DB Writes",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(gsm_bridge_sms_db_writes_total{status=\"success\"}) or vector(0)",
+          "legendFormat": "Success",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 1, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 55 },
+      "id": 205,
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list" } },
+      "title": "SMS Rate (per minute)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (module_id) (rate(gsm_bridge_sms_received_total{module_id=~\"$module_id\"}[5m]) * 60)",
+          "legendFormat": "{{module_id}} received",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (module_id, status) (rate(gsm_bridge_sms_forwarded_total{module_id=~\"$module_id\"}[5m]) * 60)",
+          "legendFormat": "{{module_id}} {{status}}",
+          "refId": "B"
+        }
+      ]
     }
   ],
   "refresh": "5s",
