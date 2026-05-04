@@ -593,6 +593,7 @@ dependencies = [
  "rusb",
  "rusqlite",
  "serde",
+ "serde_json",
  "serialport",
  "tempfile",
  "thiserror 2.0.18",
