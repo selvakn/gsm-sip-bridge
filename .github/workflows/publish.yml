@@ -63,7 +63,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           if [ -f RELEASE_NOTES.md ]; then
-            SECTION=$(awk "/^## v${TAG}\$/,/^## v/" RELEASE_NOTES.md | sed '$ { /^## v/d }' | sed '1d')
+            SECTION=$(awk "found && /^## v/{exit} /^## v${TAG}\$/{found=1; next} found{print}" RELEASE_NOTES.md)
             if [ -n "$SECTION" ]; then
               {
                 echo 'NOTES<<RELEASE_EOF'
