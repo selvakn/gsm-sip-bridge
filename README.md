@@ -2,7 +2,7 @@
 
 Bridge incoming GSM calls on Quectel EC20 modules to a SIP extension over VoIP. When someone dials the GSM number, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously. Incoming SMS messages are persisted to a local database and optionally forwarded to Discord.
 
-**Version**: 5.0.0 | **Language**: Rust | **Platform**: Linux (amd64, arm64)
+**Version**: 5.0.1 | **Language**: Rust | **Platform**: Linux (amd64, arm64)
 
 ## Features
 
@@ -20,7 +20,42 @@ Bridge incoming GSM calls on Quectel EC20 modules to a SIP extension over VoIP. 
 - **USB Device Auto-Discovery** -- Scans the USB bus by vendor/product ID, matches serial numbers for stable identification, and maps AT command ports to ALSA audio devices.
 - **Memory Safety** -- Zero `unsafe` in the application binary; all FFI confined to the `pjsua-sys` and `pjsua-safe` crates with documented safety invariants.
 
-## Prerequisites
+## Quick Start (Docker Compose)
+
+The recommended deployment method. Requires Docker with Compose plugin and one or more Quectel EC20 USB modems.
+
+```bash
+git clone <repo-url> && cd gsm-sip-bridge/docker
+cp ../config.toml.example config.toml   # edit with your SIP/PBX details
+cat > .env <<EOF
+SIP_PASSWORD=yourpassword
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+EOF
+docker compose up -d
+```
+
+This starts the full stack:
+
+| Service | URL | Purpose |
+|---|---|---|
+| gsm-sip-bridge | `http://localhost:9091/metrics` | Bridge + metrics endpoint |
+| Prometheus | `http://localhost:9090` | Metrics collection and querying |
+| Grafana | `http://localhost:3000` | Dashboards (admin/admin) |
+| sqlite-web | `http://localhost:8088` | Browse call and SMS database (read-only) |
+
+The container runs in `privileged` + `network_mode: host` to access USB devices and ALSA audio.
+
+### Update
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+## Building from Source
+
+For development or non-Docker deployments.
+
+### Prerequisites
 
 - Rust stable (pinned by `rust-toolchain.toml`)
 - System packages: `build-essential`, `pkg-config`, `clang`, `libclang-dev`
@@ -35,10 +70,9 @@ sudo apt install build-essential pkg-config clang libclang-dev \
   libasound2-dev libusb-1.0-0-dev libpjproject-dev uuid-dev libssl-dev
 ```
 
-## Quick Start
+### Build and Run
 
 ```bash
-git clone <repo-url> && cd gsm-sip-bridge
 cp config.toml.example config.toml   # edit with your SIP/PBX details
 export SIP_PASSWORD=yourpassword
 make build
@@ -311,23 +345,9 @@ Prometheus-compatible metrics at `http://<host>:9091/metrics`.
 | `gsm_sip_bridge_uptime_seconds` | Gauge | Process uptime in seconds |
 | `gsm_sip_bridge_build_info` | Gauge | Build metadata (version, git SHA) |
 
-### Monitoring Stack (Docker Compose)
+### Grafana Dashboard
 
-```bash
-cd docker
-cp ../config.toml.example config.toml  # edit
-echo "SIP_PASSWORD=secret" > .env
-docker compose up -d
-```
-
-| Service | URL | Purpose |
-|---|---|---|
-| gsm-sip-bridge | `http://localhost:9091/metrics` | Metrics endpoint |
-| Prometheus | `http://localhost:9090` | Metrics collection and querying |
-| Grafana | `http://localhost:3000` | Dashboards and visualization |
-| sqlite-web | `http://localhost:8088` | Browse call and SMS database (read-only) |
-
-Grafana credentials: `admin` / `admin`. The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot.
+The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot (credentials: `admin` / `admin`).
 
 ![GSM-SIP Bridge Grafana Dashboard](screenshots/grafana-dashboard.png)
 
