@@ -329,6 +329,8 @@ docker compose up -d
 
 Grafana credentials: `admin` / `admin`. The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot.
 
+![GSM-SIP Bridge Grafana Dashboard](screenshots/grafana-dashboard.png)
+
 Dashboard panels include:
 
 - System overview (SIP registration, active modules, uptime, call counts)
