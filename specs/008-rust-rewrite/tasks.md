@@ -127,6 +127,14 @@ All paths below are relative to the repo root.
 
 **Checkpoint**: With one or more EC20 modules attached (or PTY-backed in tests), the bridge auto-answers, dials SIP, bridges audio, handles multi-card. MVP delivered. Tests covering US1 scenarios 1–7 pass; scenario 8 (latency p95) is validated in Phase 8.
 
+**Hardware Smoke Test (Phase 3)**: Deploy to real hardware with at least one EC20 module. Verify manually:
+1. PJSIP enumerates the correct ALSA device (check logs for `sound device set` with matching card name)
+2. SIP registration succeeds (logs show `registered` state, not "not yet wired")
+3. Incoming GSM call is answered and a SIP INVITE is sent (verify with PBX logs or `tcpdump`)
+4. Audio flows bidirectionally (speak into GSM phone, hear on SIP side and vice versa)
+5. GSM hangup propagates to SIP; SIP hangup propagates to GSM (AT+CHUP issued)
+6. Ringback tone is audible to GSM caller while SIP is dialing
+
 ---
 
 ## Phase 4: User Story 2 — Capture Incoming SMS Reliably and Forward to Discord (Priority: P2)
@@ -152,6 +160,11 @@ All paths below are relative to the repo root.
 - [x] T064 [US2] Implement `gsm-sip-bridge/src/store/sms.rs::insert_sms` and `update_sms_forwarding` against the schema in `contracts/db.schema.sql`
 
 **Checkpoint**: SMS path works end-to-end. US1 (calls) is unaffected. Tests covering US2 scenarios 1–4 pass.
+
+**Hardware Smoke Test (Phase 4)**: With a real EC20 module and active call bridging:
+1. Send an SMS to the SIM — verify Discord embed appears with correct sender/body/timestamp
+2. Send an SMS during an active call — verify call audio is not disrupted
+3. Kill network to Discord — verify SMS is persisted locally with `failed` status and SIM is cleared
 
 ---
 

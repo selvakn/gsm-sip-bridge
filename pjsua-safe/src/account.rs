@@ -92,6 +92,11 @@ impl Account {
         self.registered
     }
 
+    #[cfg(feature = "pjsip-linked")]
+    pub fn account_id(&self) -> i32 {
+        self.account_id
+    }
+
     pub fn unregister(&mut self) {
         #[cfg(feature = "pjsip-linked")]
         {

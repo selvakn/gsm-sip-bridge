@@ -1,25 +1,23 @@
 /// Bridges PJSIP internal logging to the `tracing` framework.
 ///
-/// When PJSIP is compiled in, this installs a log callback that routes all
-/// PJSIP log lines to `tracing` under the `sip` target.
+/// When PJSIP is compiled in, the log callback is configured during
+/// Endpoint::create via pjsua_init's logging_config parameter.
+/// This function is provided for the stub-mode path.
 pub fn install_log_bridge() {
-    // SAFETY: pjsua_logging_config_default + setting the callback is safe
-    // as long as pjsua_create has been called first. The caller (Endpoint::create)
-    // guarantees this ordering.
     #[cfg(feature = "pjsip-linked")]
-    unsafe {
-        use pjsua_sys::*;
-        let mut log_cfg: pjsua_logging_config = std::mem::zeroed();
-        pjsua_logging_config_default(&mut log_cfg);
-        log_cfg.cb = Some(pjsip_log_callback);
-        log_cfg.level = 4;
-        log_cfg.console_level = 0;
+    {
+        tracing::debug!(target: "sip", "PJSIP log bridge active (configured via pjsua_init)");
     }
 
     #[cfg(not(feature = "pjsip-linked"))]
     {
         tracing::debug!(target: "sip", "PJSIP log bridge installed (stub mode)");
     }
+}
+
+#[cfg(feature = "pjsip-linked")]
+pub fn get_log_callback() -> pjsua_sys::pj_log_func {
+    Some(pjsip_log_callback)
 }
 
 #[cfg(feature = "pjsip-linked")]

@@ -7,6 +7,7 @@ const MAX_RETRIES: u32 = 3;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "gsm-sip-bridge/5.0.0";
 
+#[derive(Clone)]
 pub struct DiscordClient {
     client: reqwest::Client,
     webhook_url: Secret<String>,

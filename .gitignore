@@ -2,12 +2,12 @@
 target/
 *.rs.bk
 
-# Build artifacts (legacy C++)
+# Build artifacts
 build/
 
 # Configuration with secrets
-config.ini
 config.toml
+docker/config.toml
 .env
 
 # Logs

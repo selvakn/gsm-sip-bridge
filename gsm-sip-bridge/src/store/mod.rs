@@ -12,6 +12,7 @@ pub enum StoreCommand {
     InsertCall(calls::CallRecord),
     InsertSms(sms::SmsRecord),
     UpdateSmsForwarding(sms::SmsForwardingUpdate),
+    UpdateSmsForwardingByTime(sms::SmsForwardingByTimeUpdate),
     Shutdown,
 }
 
@@ -74,6 +75,11 @@ fn writer_loop(conn: Connection, rx: Receiver<StoreCommand>) {
             }
             StoreCommand::UpdateSmsForwarding(update) => {
                 if let Err(e) = sms::update_sms_forwarding(&conn, &update) {
+                    tracing::error!(error = %e, "failed to update SMS forwarding status");
+                }
+            }
+            StoreCommand::UpdateSmsForwardingByTime(update) => {
+                if let Err(e) = sms::update_sms_forwarding_by_time(&conn, &update) {
                     tracing::error!(error = %e, "failed to update SMS forwarding status");
                 }
             }

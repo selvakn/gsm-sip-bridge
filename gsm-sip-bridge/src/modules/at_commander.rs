@@ -96,6 +96,36 @@ impl AtCommander {
         Ok(AtResponse::Ok(lines))
     }
 
+    pub fn read_line_raw(&mut self) -> BridgeResult<String> {
+        let mut buf = [0u8; 1];
+        let mut line = Vec::new();
+
+        loop {
+            match self.port.as_mut().read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if buf[0] == b'\n' {
+                        break;
+                    }
+                    if buf[0] != b'\r' {
+                        line.push(buf[0]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    if line.is_empty() {
+                        return Err(BridgeError::Discovery("AT read timeout".into()));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    return Err(BridgeError::Discovery(format!("AT read error: {e}")));
+                }
+            }
+        }
+
+        Ok(String::from_utf8_lossy(&line).to_string())
+    }
+
     pub fn check_signal(&mut self) -> BridgeResult<(u8, u8)> {
         match self.send_command("AT+CSQ")? {
             AtResponse::Ok(lines) => {

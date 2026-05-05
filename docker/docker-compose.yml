@@ -5,13 +5,17 @@ services:
       dockerfile: docker/Dockerfile
     network_mode: host
     restart: unless-stopped
+    privileged: true
     volumes:
       - bridge-data:/data
       - ./config.toml:/etc/gsm-sip-bridge/config.toml:ro
+      - /dev:/dev
+      - /sys:/sys:ro
     env_file:
       - .env
-    devices:
-      - /dev/bus/usb:/dev/bus/usb
+    group_add:
+      - audio
+      - dialout
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9091/metrics"]
       interval: 30s

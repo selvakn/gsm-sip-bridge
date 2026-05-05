@@ -1,8 +1,11 @@
 use gsm_sip_bridge::cli::Cli;
 use gsm_sip_bridge::config::load_config;
 use gsm_sip_bridge::metrics;
+use gsm_sip_bridge::modules::CardPool;
 use gsm_sip_bridge::observability::{logging, modemmanager};
 use gsm_sip_bridge::runtime;
+use gsm_sip_bridge::sip::SipBridge;
+use gsm_sip_bridge::sms::SmsHandler;
 use gsm_sip_bridge::store::StoreHandle;
 use std::process::ExitCode;
 
@@ -43,7 +46,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let (shutdown_tx, _shutdown_rx) = runtime::shutdown_channel();
+    let (shutdown_tx, shutdown_rx) = runtime::shutdown_channel();
 
     rt.block_on(async {
         let metrics_port = config.metrics.port;
@@ -61,18 +64,29 @@ fn main() -> ExitCode {
             "configuration loaded"
         );
 
-        if let (Some(serial), Some(audio)) = (&cli.serial, &cli.audio) {
-            tracing::info!(
-                serial = %serial.display(),
-                audio = %audio,
-                "single-card override mode"
-            );
-        }
+        let single_card = match (&cli.serial, &cli.audio) {
+            (Some(serial), Some(audio)) => {
+                tracing::info!(
+                    serial = %serial.display(),
+                    audio = %audio,
+                    "single-card override mode"
+                );
+                Some((serial.clone(), audio.clone()))
+            }
+            _ => None,
+        };
 
-        tracing::info!("ready, waiting for modules (not yet implemented)");
+        let sip_bridge = SipBridge::new(&config);
+        let sms_handler = SmsHandler::new(&config.sms, store.sender());
+        let card_pool = CardPool::new(config, store.sender(), sip_bridge, sms_handler);
+
+        let pool_handle = tokio::spawn(async move {
+            card_pool.run(single_card, shutdown_rx).await;
+        });
 
         runtime::wait_for_shutdown(shutdown_tx).await;
 
+        pool_handle.abort();
         metrics_handle.abort();
     });
 
