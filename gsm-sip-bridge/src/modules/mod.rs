@@ -90,7 +90,11 @@ impl CardPool {
         let modules = match single_card {
             Some((serial, audio)) => {
                 let id = discovery::derive_module_id(
-                    serial.file_name().unwrap_or_default().to_string_lossy().as_ref(),
+                    serial
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .as_ref(),
                 );
                 vec![DiscoveredModule {
                     id,
@@ -367,7 +371,9 @@ fn run_module_loop(
     let mut call_ctx: Option<CallContext> = None;
 
     tracing::info!(module = %module.id, "module worker started, monitoring for events");
-    metrics::ACTIVE_CALLS.with_label_values(&[&module.id]).set(0.0);
+    metrics::ACTIVE_CALLS
+        .with_label_values(&[&module.id])
+        .set(0.0);
 
     loop {
         let line = match read_line_from_at(&mut at) {
@@ -388,7 +394,9 @@ fn run_module_loop(
             let _ = at.hangup();
             record_call_end(&module.id, &store_tx, &mut call_ctx, "answered");
             card.state = CardState::Idle;
-            metrics::ACTIVE_CALLS.with_label_values(&[&module.id]).set(0.0);
+            metrics::ACTIVE_CALLS
+                .with_label_values(&[&module.id])
+                .set(0.0);
         }
 
         let trimmed = line.trim();
@@ -463,7 +471,9 @@ fn handle_ring(
             });
 
             card.state = CardState::Bridged;
-            metrics::ACTIVE_CALLS.with_label_values(&[&module.id]).set(1.0);
+            metrics::ACTIVE_CALLS
+                .with_label_values(&[&module.id])
+                .set(1.0);
             metrics::CALLS_TOTAL
                 .with_label_values(&[&module.id, "answered"])
                 .inc();
@@ -508,7 +518,9 @@ fn handle_hangup(
 ) {
     if card.state == CardState::Bridged || card.state == CardState::Answering {
         tracing::info!(module = %module.id, "call ended (NO CARRIER)");
-        metrics::ACTIVE_CALLS.with_label_values(&[&module.id]).set(0.0);
+        metrics::ACTIVE_CALLS
+            .with_label_values(&[&module.id])
+            .set(0.0);
         let _ = event_tx.send(BridgeEvent::Hangup {
             module_id: module.id.clone(),
         });

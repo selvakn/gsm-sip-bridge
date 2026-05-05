@@ -1,7 +1,7 @@
 use crate::account::Account;
-use crate::error::PjsipError;
 #[cfg(feature = "pjsip-linked")]
 use crate::endpoint::ensure_pjsip_thread;
+use crate::error::PjsipError;
 
 pub type SlotId = i32;
 

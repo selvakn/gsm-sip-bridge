@@ -188,7 +188,12 @@ impl Endpoint {
 
             unsafe {
                 let count = pjsua_sys::pjmedia_aud_dev_count() as i32;
-                tracing::debug!(count, alsa_hint, ?alsa_card_name, "enumerating PJSIP audio devices");
+                tracing::debug!(
+                    count,
+                    alsa_hint,
+                    ?alsa_card_name,
+                    "enumerating PJSIP audio devices"
+                );
 
                 for i in 0..count {
                     let mut info: pjsua_sys::pjmedia_aud_dev_info = std::mem::zeroed();
@@ -278,7 +283,9 @@ pub fn ensure_pjsip_thread() {
 #[cfg(feature = "pjsip-linked")]
 fn read_alsa_card_name(card_num: u32) -> Option<String> {
     let path = format!("/proc/asound/card{card_num}/id");
-    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(feature = "pjsip-linked")]
@@ -293,7 +300,11 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
         let call_slot = info.conf_slot as i32;
         pjsua_sys::pjsua_conf_connect(call_slot, 0);
         pjsua_sys::pjsua_conf_connect(0, call_slot);
-        tracing::info!(call_id, call_slot, "call media active, audio connected to sound device");
+        tracing::info!(
+            call_id,
+            call_slot,
+            "call media active, audio connected to sound device"
+        );
     }
 }
 
@@ -344,11 +355,7 @@ unsafe fn start_ringback_tone() {
         return;
     }
 
-    let pool = pjsua_sys::pjsua_pool_create(
-        b"ringback\0".as_ptr() as *const i8,
-        512,
-        512,
-    );
+    let pool = pjsua_sys::pjsua_pool_create(b"ringback\0".as_ptr() as *const i8, 512, 512);
     if pool.is_null() {
         return;
     }
@@ -356,12 +363,11 @@ unsafe fn start_ringback_tone() {
     let name = CString::new("ringback").unwrap();
     let mut port: *mut pjsua_sys::pjmedia_port = std::ptr::null_mut();
     let status = pjsua_sys::pjmedia_tonegen_create(
-        pool,
-        8000,  // clock rate
-        1,     // channel count
-        160,   // samples per frame (20ms)
-        16,    // bits per sample
-        0,     // options
+        pool, 8000, // clock rate
+        1,    // channel count
+        160,  // samples per frame (20ms)
+        16,   // bits per sample
+        0,    // options
         &mut port,
     );
     if status != PJ_SUCCESS || port.is_null() {

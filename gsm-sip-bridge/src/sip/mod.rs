@@ -152,10 +152,7 @@ impl SipBridge {
         let mut headers: Vec<(&str, &str)> = Vec::new();
         let pai_value;
         if !gsm_caller_id.is_empty() {
-            pai_value = format!(
-                "\"{}\" <tel:{}>",
-                gsm_caller_id, gsm_caller_id
-            );
+            pai_value = format!("\"{}\" <tel:{}>", gsm_caller_id, gsm_caller_id);
             headers.push(("P-Asserted-Identity", &pai_value));
             headers.push(("X-GSM-Caller-ID", gsm_caller_id));
         }
@@ -192,4 +189,3 @@ impl SipBridge {
         tracing::info!("SIP unregistered");
     }
 }
-

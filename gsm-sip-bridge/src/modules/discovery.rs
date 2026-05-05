@@ -15,10 +15,7 @@ pub struct DiscoveredModule {
 }
 
 pub fn derive_module_id(identifier: &str) -> String {
-    let clean: String = identifier
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect();
+    let clean: String = identifier.chars().filter(|c| c.is_alphanumeric()).collect();
     let suffix = if clean.len() >= 6 {
         &clean[clean.len() - 6..]
     } else {
