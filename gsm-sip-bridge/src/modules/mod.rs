@@ -541,6 +541,11 @@ fn record_call_end(
         let duration = Utc::now()
             .signed_duration_since(ctx.started_at)
             .num_seconds() as f64;
+
+        metrics::CALL_DURATION_SECONDS
+            .with_label_values(&[module_id])
+            .observe(duration);
+
         let record = CallRecord {
             module_id: module_id.to_string(),
             caller_id: ctx.caller_id,
