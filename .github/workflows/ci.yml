@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config clang libclang-dev \
-            libasound2-dev libssl-dev libusb-1.0-0-dev libudev-dev socat wget
+            libasound2-dev libssl-dev libusb-1.0-0-dev libudev-dev uuid-dev socat wget
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
