@@ -1,0 +1,25 @@
+[sip]
+server = "pbx.example.com"
+port = 5060
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+transport = "udp"              # udp, tcp, or tls
+local_port = 5060
+display_name = "GSM Bridge"
+tls_verify = "strict"          # strict or skip
+
+[bridge]
+sip_destination = ""           # empty = DID passthrough, or fixed extension e.g. "100"
+sip_dial_timeout_sec = 30      # range: 5-120
+
+[sms]
+enabled = true
+discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
+db_path = "/data/store.db"
+
+[metrics]
+port = 9091                    # overridden by METRICS_PORT env var if set
+
+[modules]
+retry_interval_sec = 30        # range: 5-600
+max_concurrent = 8             # range: 1-8
