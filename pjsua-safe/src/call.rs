@@ -39,7 +39,8 @@ impl Call {
             ensure_pjsip_thread();
             use std::ffi::CString;
 
-            unsafe {
+            unsafe // SAFETY: PJSIP initialized after ensure_pjsip_thread; stack structs and C strings valid for this FFI call
+            {
                 let uri_cstr = CString::new(dest_uri)
                     .map_err(|_| PjsipError::CallMake("invalid destination URI".into()))?;
                 let uri = pjsua_sys::pj_str(uri_cstr.as_ptr() as *mut i8);
@@ -117,7 +118,8 @@ impl Call {
         #[cfg(feature = "pjsip-linked")]
         {
             ensure_pjsip_thread();
-            unsafe {
+            unsafe // SAFETY: PJSIP initialized; call_id valid for hangup on this call
+            {
                 let status = pjsua_sys::pjsua_call_hangup(
                     self.call_id,
                     200,
@@ -141,9 +143,9 @@ impl Call {
     pub fn conf_slot(&self) -> Option<SlotId> {
         #[cfg(feature = "pjsip-linked")]
         {
-            // SAFETY: call_id is valid if state is Confirmed
             if self.state == CallState::Confirmed {
-                unsafe {
+                unsafe // SAFETY: call_id valid when Confirmed; writable stack pjsua_call_info for out-param
+                {
                     let info = std::mem::zeroed::<pjsua_sys::pjsua_call_info>();
                     let status =
                         pjsua_sys::pjsua_call_get_info(self.call_id, &info as *const _ as *mut _);

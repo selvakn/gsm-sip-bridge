@@ -21,7 +21,8 @@ pub fn get_log_callback() -> pjsua_sys::pj_log_func {
 }
 
 #[cfg(feature = "pjsip-linked")]
-unsafe extern "C" fn pjsip_log_callback(level: i32, data: *const i8, len: i32) {
+#[rustfmt::skip]
+unsafe extern "C" fn pjsip_log_callback(level: i32, data: *const i8, len: i32) { // SAFETY: PJSIP passes buffer/len; null and len<=0 rejected before from_raw_parts
     if data.is_null() || len <= 0 {
         return;
     }

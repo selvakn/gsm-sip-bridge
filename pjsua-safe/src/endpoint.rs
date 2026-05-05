@@ -36,9 +36,8 @@ impl Endpoint {
     pub fn create(config: EndpointConfig) -> Result<Self, PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
-            // SAFETY: pjsua_create must be called exactly once before any other pjsua API.
-            // We ensure this by taking ownership in Endpoint::create which can only succeed once.
-            unsafe {
+            unsafe // SAFETY: Single init path; zeroed configs passed to PJSIP default/init/start APIs until success or destroy
+            {
                 let status = pjsua_sys::pjsua_create();
                 if status != PJ_SUCCESS {
                     return Err(PjsipError::InitFailed(format!(
@@ -127,7 +126,8 @@ impl Endpoint {
 
     pub fn conf_slot_count(&self) -> u32 {
         #[cfg(feature = "pjsip-linked")]
-        unsafe {
+        unsafe // SAFETY: pjsua started; pjsua_conf_get_active_ports valid post-init
+        {
             pjsua_sys::pjsua_conf_get_active_ports() as u32
         }
         #[cfg(not(feature = "pjsip-linked"))]
@@ -138,7 +138,8 @@ impl Endpoint {
         #[cfg(feature = "pjsip-linked")]
         {
             self.ensure_thread_registered();
-            unsafe {
+            unsafe // SAFETY: Registered PJSIP thread; device IDs valid for pjsua_set_snd_dev
+            {
                 let status = pjsua_sys::pjsua_set_snd_dev(capture_id, playback_id);
                 if status != PJ_SUCCESS {
                     return Err(PjsipError::MediaPort(format!(
@@ -160,7 +161,8 @@ impl Endpoint {
         #[cfg(feature = "pjsip-linked")]
         {
             self.ensure_thread_registered();
-            unsafe {
+            unsafe // SAFETY: Registered PJSIP thread; null sound device is supported after pjsua start
+            {
                 let status = pjsua_sys::pjsua_set_null_snd_dev();
                 if status != PJ_SUCCESS {
                     return Err(PjsipError::MediaPort(format!(
@@ -186,7 +188,8 @@ impl Endpoint {
 
             let alsa_card_name = card_num.and_then(|n| read_alsa_card_name(n));
 
-            unsafe {
+            unsafe // SAFETY: Registered PJSIP thread; device indices and pjmedia_aud_dev_info out-params match API contract
+            {
                 let count = pjsua_sys::pjmedia_aud_dev_count() as i32;
                 tracing::debug!(
                     count,
@@ -244,7 +247,8 @@ impl Drop for Endpoint {
         if self.started {
             #[cfg(feature = "pjsip-linked")]
             {
-                unsafe {
+                unsafe // SAFETY: pjsua_destroy pairs with successful create/init when started is true
+                {
                     pjsua_sys::pjsua_destroy();
                 }
             }
@@ -257,7 +261,8 @@ impl Drop for Endpoint {
 pub fn ensure_pjsip_thread() {
     #[cfg(feature = "pjsip-linked")]
     {
-        unsafe {
+        unsafe // SAFETY: pj_thread_register uses thread-local storage so descriptor and handle live for the thread
+        {
             if pjsua_sys::pj_thread_is_registered() == 0 {
                 thread_local! {
                     static THREAD_DESC: std::cell::RefCell<[u8; 256]> = std::cell::RefCell::new([0u8; 256]);
@@ -289,7 +294,8 @@ fn read_alsa_card_name(card_num: u32) -> Option<String> {
 }
 
 #[cfg(feature = "pjsip-linked")]
-unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
+#[rustfmt::skip]
+unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) { // SAFETY: PJSIP invokes with valid call_id after init; stack call_info writable for get_info
     let mut info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
     let status = pjsua_sys::pjsua_call_get_info(call_id, &mut info);
     if status != PJ_SUCCESS {
@@ -309,7 +315,8 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
 }
 
 #[cfg(feature = "pjsip-linked")]
-unsafe extern "C" fn on_call_state_cb(
+#[rustfmt::skip]
+unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_id after init; stack call_info writable; event is library-managed
     call_id: pjsua_sys::pjsua_call_id,
     _event: *mut pjsua_sys::pjsip_event,
 ) {
@@ -348,7 +355,8 @@ static mut RINGBACK_SLOT: i32 = -1;
 static mut RINGBACK_PORT: *mut pjsua_sys::pjmedia_port = std::ptr::null_mut();
 
 #[cfg(feature = "pjsip-linked")]
-unsafe fn start_ringback_tone() {
+#[rustfmt::skip]
+unsafe fn start_ringback_tone() { // SAFETY: Called only from PJSIP call-state callback after pjsua start; statics follow start/stop pairing
     use std::ffi::CString;
 
     if RINGBACK_ACTIVE.load(Ordering::Acquire) {
@@ -405,7 +413,8 @@ unsafe fn start_ringback_tone() {
 }
 
 #[cfg(feature = "pjsip-linked")]
-unsafe fn stop_ringback_tone() {
+#[rustfmt::skip]
+unsafe fn stop_ringback_tone() { // SAFETY: Complements start_ringback_tone; conf slot valid when active; statics reset under RINGBACK_ACTIVE guard
     if !RINGBACK_ACTIVE.load(Ordering::Acquire) {
         return;
     }

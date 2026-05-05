@@ -32,7 +32,8 @@ impl Account {
         {
             use std::ffi::CString;
 
-            unsafe {
+            unsafe // SAFETY: PJSIP initialized; acc_cfg and pj_str sources live until pjsua_acc_add returns
+            {
                 let mut acc_cfg: pjsua_sys::pjsua_acc_config = std::mem::zeroed();
                 pjsua_sys::pjsua_acc_config_default(&mut acc_cfg);
 
@@ -100,8 +101,8 @@ impl Account {
     pub fn unregister(&mut self) {
         #[cfg(feature = "pjsip-linked")]
         {
-            // SAFETY: account_id is valid if registered is true
-            unsafe {
+            unsafe // SAFETY: account_id valid for an added account while unregister runs before clear
+            {
                 pjsua_sys::pjsua_acc_set_registration(self.account_id, 0);
             }
         }

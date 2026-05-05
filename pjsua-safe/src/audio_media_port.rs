@@ -41,8 +41,8 @@ impl MediaPortHandle {
     pub fn connect_to(&self, _dest_slot: SlotId) -> Result<(), PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
-            // SAFETY: Both slot IDs are valid conference bridge slots
-            unsafe {
+            unsafe // SAFETY: PJSIP initialized; slot IDs valid conference bridge ports for connect
+            {
                 let status = pjsua_sys::pjsua_conf_connect(self.slot_id, _dest_slot);
                 if status != crate::error::PJ_SUCCESS {
                     return Err(PjsipError::MediaPort(format!(
@@ -57,8 +57,8 @@ impl MediaPortHandle {
     pub fn disconnect_from(&self, _dest_slot: SlotId) -> Result<(), PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
-            // SAFETY: Both slot IDs are valid conference bridge slots
-            unsafe {
+            unsafe // SAFETY: PJSIP initialized; slot IDs valid conference bridge ports for disconnect
+            {
                 let status = pjsua_sys::pjsua_conf_disconnect(self.slot_id, _dest_slot);
                 if status != crate::error::PJ_SUCCESS {
                     return Err(PjsipError::MediaPort(format!(
