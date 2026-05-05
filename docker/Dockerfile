@@ -4,7 +4,7 @@ ARG PJSIP_VERSION=2.16
 FROM debian:bookworm-slim AS pjsip-builder
 ARG PJSIP_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential wget pkg-config libssl-dev libuuid1 uuid-dev && \
+    build-essential wget ca-certificates pkg-config libssl-dev libuuid1 uuid-dev && \
     rm -rf /var/lib/apt/lists/*
 RUN wget -q "https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSION}.tar.gz" && \
     tar xzf "${PJSIP_VERSION}.tar.gz" && \
