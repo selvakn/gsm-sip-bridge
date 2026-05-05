@@ -269,6 +269,9 @@ impl CardPool {
 
                 if let Err(e) = self.sip_bridge.set_sound_device(&audio_device) {
                     tracing::error!(error = %e, "failed to set sound device");
+                    metrics::AUDIO_ERRORS_TOTAL
+                        .with_label_values(&[&module_id, "sound_device"])
+                        .inc();
                     return;
                 }
 
@@ -278,6 +281,13 @@ impl CardPool {
                         error = %e,
                         "SIP outbound call failed"
                     );
+                    metrics::SIP_CALLS_TOTAL
+                        .with_label_values(&[&module_id, "error"])
+                        .inc();
+                } else {
+                    metrics::SIP_CALLS_TOTAL
+                        .with_label_values(&[&module_id, "initiated"])
+                        .inc();
                 }
             }
             BridgeEvent::Hangup { module_id } => {
