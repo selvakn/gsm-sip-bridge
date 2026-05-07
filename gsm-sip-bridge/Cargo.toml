@@ -32,6 +32,8 @@ reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-feature
 rusqlite = { version = "0.32", features = ["bundled"] }
 prometheus = "0.13"
 crossbeam-queue = "0.3"
+alsa = "0.9"
+libc = "0.2"
 crossbeam-channel = "0.5"
 rusb = { version = "0.9", features = ["vendored"] }
 serialport = "4"

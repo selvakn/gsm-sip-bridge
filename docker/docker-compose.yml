@@ -3,6 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     restart: unless-stopped
     privileged: true
