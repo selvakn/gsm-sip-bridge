@@ -1,0 +1,6 @@
+[profile.default]
+# Kill individual tests that hang (e.g. serial-port tests waiting for hardware,
+# or store-thread tests where a panicking worker leaves the receiver stuck).
+# The baseline clean run takes ~15s total; 20s per-test is generous for any
+# single test while still being well inside cargo-mutants' 30s overall timeout.
+slow-timeout = { period = "20s", terminate-after = 1 }

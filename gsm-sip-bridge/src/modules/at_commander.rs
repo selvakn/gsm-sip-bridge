@@ -473,4 +473,61 @@ mod tests {
         assert_eq!(NetworkMode::Wcdma.to_string(), "3g");
         assert_eq!(NetworkMode::Auto.to_string(), "auto");
     }
+
+    // Kills: NetworkType::fmt replaced with Ok(Default::default())
+    #[test]
+    fn test_network_type_display() {
+        assert_eq!(NetworkType::FourGLte.to_string(), "4G/LTE");
+        assert_eq!(NetworkType::ThreeGUmts.to_string(), "3G/UMTS");
+        assert_eq!(NetworkType::TwoGEdge.to_string(), "2G/EDGE");
+        assert_eq!(NetworkType::NoSignal.to_string(), "No Signal");
+        assert_eq!(NetworkType::NoSim.to_string(), "No SIM");
+        assert_eq!(NetworkType::Unknown.to_string(), "Unknown");
+    }
+
+    // Kills: NetworkMode::at_value returning wrong constant (0 or 1 for any variant)
+    #[test]
+    fn test_network_mode_at_value() {
+        assert_eq!(NetworkMode::Auto.at_value(), 0);
+        assert_eq!(NetworkMode::Gsm.at_value(), 1);
+        assert_eq!(NetworkMode::Wcdma.at_value(), 2);
+        assert_eq!(NetworkMode::Lte.at_value(), 3);
+    }
+
+    // Kills: NetworkMode::from_at_value match arms 0-3 deleted
+    #[test]
+    fn test_network_mode_from_at_value() {
+        assert_eq!(NetworkMode::from_at_value(0), Some(NetworkMode::Auto));
+        assert_eq!(NetworkMode::from_at_value(1), Some(NetworkMode::Gsm));
+        assert_eq!(NetworkMode::from_at_value(2), Some(NetworkMode::Wcdma));
+        assert_eq!(NetworkMode::from_at_value(3), Some(NetworkMode::Lte));
+        assert_eq!(NetworkMode::from_at_value(4), None);
+        assert_eq!(NetworkMode::from_at_value(255), None);
+    }
+
+    // Kills: || → && at line 296 (before UMTS) and 297 (before HSPA)
+    #[test]
+    fn test_query_network_type_umts_keyword() {
+        let mut at = make_commander("+QNWINFO: \"UMTS\",\"46001\",\"UMTS 2100\",10812\r\nOK\r\n");
+        assert_eq!(at.query_network_type().unwrap(), NetworkType::ThreeGUmts);
+    }
+
+    #[test]
+    fn test_query_network_type_hspa_keyword() {
+        let mut at = make_commander("+QNWINFO: \"HSPA\",\"46001\",\"WCDMA 2100\",10812\r\nOK\r\n");
+        assert_eq!(at.query_network_type().unwrap(), NetworkType::ThreeGUmts);
+    }
+
+    // Kills: || → && at line 301 (before GPRS) and 302 (before EDGE)
+    #[test]
+    fn test_query_network_type_gprs_keyword() {
+        let mut at = make_commander("+QNWINFO: \"GPRS\",\"46001\",\"GSM 900\",80\r\nOK\r\n");
+        assert_eq!(at.query_network_type().unwrap(), NetworkType::TwoGEdge);
+    }
+
+    #[test]
+    fn test_query_network_type_edge_keyword() {
+        let mut at = make_commander("+QNWINFO: \"EDGE\",\"46001\",\"GSM 900\",80\r\nOK\r\n");
+        assert_eq!(at.query_network_type().unwrap(), NetworkType::TwoGEdge);
+    }
 }

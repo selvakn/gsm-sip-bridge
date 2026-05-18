@@ -144,4 +144,18 @@ mod tests {
         let conn = open_db();
         assert_eq!(lookup_slot(&conn, "999999999999999").unwrap(), None);
     }
+
+    // Kills: assign_slot `next_slot > MAX_SLOTS` mutated to >=, ==, or <.
+    // Slots 0-7 (8 cards) must all succeed; slot 8 must fail.
+    #[test]
+    fn test_assign_slot_boundary() {
+        let conn = open_db();
+        for i in 0u32..8 {
+            let imei = format!("{:015}", i);
+            let slot = assign_slot(&conn, &imei, &format!("usb{i}")).unwrap();
+            assert_eq!(slot, i);
+        }
+        let err = assign_slot(&conn, "999999999999999", "usb8");
+        assert!(err.is_err(), "slot 8 should be rejected (MAX_SLOTS=7)");
+    }
 }

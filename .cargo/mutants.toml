@@ -1,10 +1,15 @@
 # cargo-mutants configuration — see https://mutants.rs/config-file.html
 # Run with: LD_PRELOAD=/tmp/rename_shim.so cargo mutants [options]
 
-# Kill hung mutants (socat/PTY, ALSA, PJSUA FFI) quickly.
-# Baseline test suite runs in ~5s; 30s is 6× headroom.
+# Use nextest so that per-test timeouts (nextest.toml: 20s) kill hung tests
+# (socat/PTY, store-thread panics) before the overall mutant timeout fires.
+# This converts false TIMEOUTs into CAUGHT when the unit test wins the race.
+test_tool = "nextest"
+
+# Overall mutant timeout: 4× baseline (~60s). Nextest per-test timeout (20s)
+# fires first for individual hangers.
 timeout_multiplier = 4.0
-minimum_test_timeout = 30
+minimum_test_timeout = 60
 
 # Exclude modules that require real hardware, spawn async tasks with no
 # deterministic test exit, or are pure FFI bindings with no testable logic.
