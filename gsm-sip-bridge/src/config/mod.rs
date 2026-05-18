@@ -5,7 +5,15 @@ use secret::Secret;
 use std::path::Path;
 use toml::Value;
 
-const TOP_LEVEL_SECTIONS: &[&str] = &["sip", "bridge", "sms", "metrics", "modules"];
+const TOP_LEVEL_SECTIONS: &[&str] = &[
+    "sip",
+    "bridge",
+    "sms",
+    "metrics",
+    "modules",
+    "resilience",
+    "control",
+];
 const SIP_KEYS: &[&str] = &[
     "server",
     "port",
@@ -20,7 +28,16 @@ const BRIDGE_KEYS: &[&str] = &["sip_destination", "sip_dial_timeout_sec"];
 const SMS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "db_path"];
 const METRICS_KEYS: &[&str] = &["port"];
 const MODULES_KEYS: &[&str] = &["retry_interval_sec", "max_concurrent"];
+const RESILIENCE_KEYS: &[&str] = &[
+    "initial_backoff_sec",
+    "max_backoff_sec",
+    "max_retries",
+    "network_loss_timeout_sec",
+    "network_poll_interval_sec",
+];
+const CONTROL_KEYS: &[&str] = &["socket_path"];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
+pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SipTransport {
@@ -72,12 +89,48 @@ pub struct ModulesConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct ResilienceConfig {
+    pub initial_backoff_sec: u64,
+    pub max_backoff_sec: u64,
+    pub max_retries: u32,
+    pub network_loss_timeout_sec: u64,
+    pub network_poll_interval_sec: u64,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            initial_backoff_sec: 5,
+            max_backoff_sec: 120,
+            max_retries: 10,
+            network_loss_timeout_sec: 60,
+            network_poll_interval_sec: 30,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlConfig {
+    pub socket_path: String,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: DEFAULT_CONTROL_SOCKET.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct AppConfig {
     pub sip: SipConfig,
     pub bridge: BridgeSection,
     pub sms: SmsConfig,
     pub metrics: MetricsConfig,
     pub modules: ModulesConfig,
+    pub resilience: ResilienceConfig,
+    pub control: ControlConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -95,6 +148,8 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let sms = parse_sms(table)?;
     let metrics = parse_metrics(table)?;
     let modules = parse_modules(table)?;
+    let resilience = parse_resilience(table)?;
+    let control = parse_control(table)?;
 
     Ok(AppConfig {
         sip,
@@ -102,6 +157,8 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         sms,
         metrics,
         modules,
+        resilience,
+        control,
     })
 }
 
@@ -437,4 +494,137 @@ fn parse_modules(root: &toml::map::Map<String, Value>) -> BridgeResult<ModulesCo
         retry_interval_sec,
         max_concurrent,
     })
+}
+
+fn parse_resilience(root: &toml::map::Map<String, Value>) -> BridgeResult<ResilienceConfig> {
+    let Some(val) = root.get("resilience") else {
+        return Ok(ResilienceConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[resilience] must be a table".into()))?;
+    warn_unknown_keys_in(t, RESILIENCE_KEYS, "resilience");
+
+    let initial_backoff_sec = t
+        .get("initial_backoff_sec")
+        .map(|v| as_u64_range(v, "resilience.initial_backoff_sec", false, 1..=600))
+        .transpose()?
+        .unwrap_or(5);
+    let max_backoff_sec = t
+        .get("max_backoff_sec")
+        .map(|v| as_u64_range(v, "resilience.max_backoff_sec", false, 1..=3600))
+        .transpose()?
+        .unwrap_or(120);
+    let max_retries = t
+        .get("max_retries")
+        .map(|v| as_u64_range(v, "resilience.max_retries", false, 1..=1000))
+        .transpose()?
+        .unwrap_or(10) as u32;
+    let network_loss_timeout_sec = t
+        .get("network_loss_timeout_sec")
+        .map(|v| as_u64_range(v, "resilience.network_loss_timeout_sec", false, 10..=600))
+        .transpose()?
+        .unwrap_or(60);
+    let network_poll_interval_sec = t
+        .get("network_poll_interval_sec")
+        .map(|v| as_u64_range(v, "resilience.network_poll_interval_sec", false, 5..=300))
+        .transpose()?
+        .unwrap_or(30);
+
+    Ok(ResilienceConfig {
+        initial_backoff_sec,
+        max_backoff_sec,
+        max_retries,
+        network_loss_timeout_sec,
+        network_poll_interval_sec,
+    })
+}
+
+fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlConfig> {
+    let Some(val) = root.get("control") else {
+        return Ok(ControlConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[control] must be a table".into()))?;
+    warn_unknown_keys_in(t, CONTROL_KEYS, "control");
+
+    let socket_path = t
+        .get("socket_path")
+        .map(|v| as_string(v, "control.socket_path", false))
+        .transpose()?
+        .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_string());
+
+    Ok(ControlConfig { socket_path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> AppConfig {
+        let root: toml::Value = toml.parse().unwrap();
+        let table = root.as_table().unwrap();
+        let sip = parse_sip(table).unwrap();
+        let bridge = parse_bridge(table).unwrap();
+        let sms = parse_sms(table).unwrap();
+        let metrics = parse_metrics(table).unwrap();
+        let modules = parse_modules(table).unwrap();
+        let resilience = parse_resilience(table).unwrap();
+        let control = parse_control(table).unwrap();
+        AppConfig {
+            sip,
+            bridge,
+            sms,
+            metrics,
+            modules,
+            resilience,
+            control,
+        }
+    }
+
+    const MINIMAL_TOML: &str = r#"
+[sip]
+server = "sip.example.com"
+username = "user"
+password = "pass"
+"#;
+
+    #[test]
+    fn resilience_defaults_when_section_absent() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.resilience.initial_backoff_sec, 5);
+        assert_eq!(cfg.resilience.max_backoff_sec, 120);
+        assert_eq!(cfg.resilience.max_retries, 10);
+        assert_eq!(cfg.resilience.network_loss_timeout_sec, 60);
+        assert_eq!(cfg.resilience.network_poll_interval_sec, 30);
+    }
+
+    #[test]
+    fn resilience_overrides_applied() {
+        let toml = format!(
+            "{}\n[resilience]\ninitial_backoff_sec = 10\nmax_retries = 3\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.resilience.initial_backoff_sec, 10);
+        assert_eq!(cfg.resilience.max_retries, 3);
+        assert_eq!(cfg.resilience.max_backoff_sec, 120); // default preserved
+    }
+
+    #[test]
+    fn control_default_socket_path() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.control.socket_path, "/tmp/gsm-sip-bridge.sock");
+    }
+
+    #[test]
+    fn control_custom_socket_path() {
+        let toml = format!(
+            "{}\n[control]\nsocket_path = \"/run/gsm/ctrl.sock\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.control.socket_path, "/run/gsm/ctrl.sock");
+    }
 }
