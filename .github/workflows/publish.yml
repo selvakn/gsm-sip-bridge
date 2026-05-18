@@ -98,6 +98,10 @@ jobs:
             docker buildx imagetools create -t "$TAG" "$SOURCE_AMD64" "$SOURCE_ARM64"
           done
 
+      - name: Compute version without v prefix
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Read release notes
         id: release_notes
         run: |
@@ -141,7 +145,7 @@ jobs:
             ## Docker Image
 
             ```
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
             ```
 
             **Platforms:** linux/amd64, linux/arm64
