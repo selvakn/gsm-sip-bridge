@@ -340,6 +340,7 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
         AUDIO_MONITOR_RUNNING.store(true, Ordering::Release);
 
         std::thread::spawn(|| {
+            ensure_pjsip_thread();
             while AUDIO_MONITOR_RUNNING.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 if !AUDIO_MONITOR_RUNNING.load(Ordering::Acquire) {
