@@ -1,5 +1,10 @@
 # Release Notes
 
+## v5.3.0
+
+- **Card Restart Reboots Modem** -- `card restart` now issues `AT+CFUN=1,1` to perform a hardware modem reboot before re-initializing. Re-initialization is delayed 10 seconds to allow the EC20 to fully boot. Previously only the software state was reset without touching the modem hardware.
+- **Audio Level Logging at Call End** -- At the end of every bridged call, logs per-direction signal levels sampled once per second via `pjsua_conf_get_signal_level`. Fields `gsm_to_sip_avg`, `sip_to_gsm_avg`, `gsm_to_sip_total`, and `sip_to_gsm_total` (scale 0=silence, 255=max) appear in the call-end log line to help diagnose no-audio issues.
+
 ## v5.2.0
 
 - **Fix Repeated Discovery Log** -- `discovered EC20 module` was logged at INFO every 5 seconds for already-managed modules due to the hotplug rescan. Downgraded to DEBUG; startup visibility is provided by `module initialized` and new hotplug cards by `new module detected`.
