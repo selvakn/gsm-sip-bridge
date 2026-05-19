@@ -1,5 +1,9 @@
 # Release Notes
 
+## v5.3.1
+
+- **Fix SIGABRT on Call Start** -- Audio monitor thread called `pjsua_conf_get_signal_level` without registering with pjlib, triggering the `pj_thread_this` assertion and crashing with exit code 139. Fixed by calling `ensure_pjsip_thread()` at the start of the spawned thread.
+
 ## v5.3.0
 
 - **Card Restart Reboots Modem** -- `card restart` now issues `AT+CFUN=1,1` to perform a hardware modem reboot before re-initializing. Re-initialization is delayed 10 seconds to allow the EC20 to fully boot. Previously only the software state was reset without touching the modem hardware.
