@@ -14,7 +14,7 @@ fn main() -> ExitCode {
         "starting sip-echo (SIP audio echo, no GSM)"
     );
 
-    let config = match load_config(&cli.config) {
+    let config = match load_config(cli.config.as_deref().unwrap_or(std::path::Path::new(""))) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "configuration failed");

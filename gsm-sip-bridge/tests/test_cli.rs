@@ -15,17 +15,17 @@ fn test_parse_full_args() {
     ];
 
     let cli = Cli::try_parse_from(args).unwrap();
-    assert_eq!(cli.config.to_str().unwrap(), "/etc/config.toml");
+    assert_eq!(cli.config.unwrap().to_str().unwrap(), "/etc/config.toml");
     assert!(cli.verbose);
     assert_eq!(cli.serial.unwrap().to_str().unwrap(), "/dev/ttyUSB3");
     assert_eq!(cli.audio.unwrap(), "hw:2,0");
 }
 
 #[test]
-fn test_config_required() {
+fn test_config_optional() {
     let args = vec!["gsm-sip-bridge"];
-    let result = Cli::try_parse_from(args);
-    assert!(result.is_err());
+    let cli = Cli::try_parse_from(args).unwrap();
+    assert!(cli.config.is_none());
 }
 
 #[test]

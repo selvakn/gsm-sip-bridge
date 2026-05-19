@@ -28,7 +28,7 @@ fn main() -> ExitCode {
         "starting gsm-sip-bridge"
     );
 
-    let config = match load_config(&cli.config) {
+    let config = match load_config(cli.config.as_deref().unwrap_or(std::path::Path::new(""))) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "configuration failed");
@@ -114,13 +114,12 @@ fn main() -> ExitCode {
 }
 
 fn handle_card_command(args: &gsm_sip_bridge::cli::CardArgs, cli: &Cli) -> ExitCode {
-    let socket_path = if cli.config.as_os_str().is_empty() {
-        gsm_sip_bridge::config::DEFAULT_CONTROL_SOCKET.to_string()
-    } else {
-        match load_config(&cli.config) {
+    let socket_path = match cli.config.as_deref() {
+        None => gsm_sip_bridge::config::DEFAULT_CONTROL_SOCKET.to_string(),
+        Some(p) => match load_config(p) {
             Ok(c) => c.control.socket_path,
             Err(_) => gsm_sip_bridge::config::DEFAULT_CONTROL_SOCKET.to_string(),
-        }
+        },
     };
 
     let cmd = match build_control_cmd(args) {

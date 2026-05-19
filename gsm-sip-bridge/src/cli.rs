@@ -16,8 +16,8 @@ For the v4.1.x -> v5.0.0 migration, see docs/migrating-from-v4.1.x.md."#;
     after_long_help = AFTER_LONG_HELP
 )]
 pub struct Cli {
-    #[arg(short = 'c', long = "config", default_value = "")]
-    pub config: PathBuf,
+    #[arg(short = 'c', long = "config")]
+    pub config: Option<PathBuf>,
 
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
