@@ -29,3 +29,6 @@ max_concurrent = 8             # range: 1-8
 # "lan" — SIP server on the same machine or local network (default, lowest latency).
 # "wan" — Internet SIP trunk; adds headroom for packet jitter and higher RTT.
 profile = "lan"
+# Enable PJMEDIA voice activity detection and noise suppression on the capture path.
+# Reduces GSM line noise heard by the SIP side. Set to false only for diagnostics.
+vad = true

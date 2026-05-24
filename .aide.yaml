@@ -1,0 +1,7 @@
+sandbox:
+    readable_extra:
+capabilities:
+    - ssh
+    - rust
+    - github
+    - git-remote

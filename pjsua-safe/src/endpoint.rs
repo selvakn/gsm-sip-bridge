@@ -39,6 +39,8 @@ pub struct EndpointConfig {
     pub jb_min_pre: i32,
     /// PJMEDIA jitter-buffer hard ceiling (ms). -1 = unbounded.
     pub jb_max_ms: i32,
+    /// When `true`, PJMEDIA VAD and noise suppression are active on the capture path.
+    pub vad_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +85,7 @@ impl Endpoint {
                 media_cfg.clock_rate = 8000;
                 media_cfg.snd_clock_rate = 8000;
                 media_cfg.channel_count = 1;
-                media_cfg.no_vad = 1;
+                media_cfg.no_vad = if config.vad_enabled { 0 } else { 1 };
                 media_cfg.ec_tail_len = 0;
                 media_cfg.quality = 10;
                 media_cfg.ptime = 20;

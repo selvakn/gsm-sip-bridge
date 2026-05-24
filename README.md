@@ -2,7 +2,7 @@
 
 Bridge incoming GSM calls on Quectel EC20 modules to a SIP extension over VoIP. When someone dials the GSM number, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously. Incoming SMS messages are persisted to a local database and optionally forwarded to Discord.
 
-**Version**: 5.4.0 | **Language**: Rust | **Platform**: Linux (amd64, arm64)
+**Version**: 5.4.1 | **Language**: Rust | **Platform**: Linux (amd64, arm64)
 
 ## Features
 
@@ -325,6 +325,8 @@ The `[audio]` section selects a preset that tunes two independent latency contri
 **Use `wan`** when pointing `sip.server` at an internet SIP trunk. The wider ring and larger jitter buffer absorb burst packet loss and higher RTT without causing audible glitches. Expected one-way delay: ~180–340 ms depending on trunk latency.
 
 The profile is read at startup. Changing it requires a process restart.
+
+The `vad` field controls PJMEDIA's voice activity detection and noise suppression on the capture path (GSM → SIP direction). When enabled (default), PJMEDIA suppresses background noise and line hiss from the GSM air interface. Set to `false` only to diagnose audio issues, as it restores raw passthrough behaviour.
 
 ### Call and SMS Database
 

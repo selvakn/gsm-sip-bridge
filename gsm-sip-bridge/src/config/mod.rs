@@ -37,7 +37,7 @@ const RESILIENCE_KEYS: &[&str] = &[
     "network_poll_interval_sec",
 ];
 const CONTROL_KEYS: &[&str] = &["socket_path"];
-const AUDIO_KEYS: &[&str] = &["profile"];
+const AUDIO_KEYS: &[&str] = &["profile", "vad"];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
@@ -160,13 +160,20 @@ impl AudioProfileSettings {
 pub struct AudioConfig {
     pub profile: AudioProfile,
     pub settings: AudioProfileSettings,
+    /// When `true`, PJMEDIA VAD and noise suppression are active on the capture path.
+    /// Disable only for diagnostics; leave enabled in production.
+    pub vad: bool,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
         let profile = AudioProfile::Lan;
         let settings = AudioProfileSettings::for_profile(&profile);
-        Self { profile, settings }
+        Self {
+            profile,
+            settings,
+            vad: true,
+        }
     }
 }
 
@@ -625,7 +632,17 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
     };
 
     let settings = AudioProfileSettings::for_profile(&profile);
-    Ok(AudioConfig { profile, settings })
+    let vad = t
+        .get("vad")
+        .map(|v| as_bool(v, "audio.vad"))
+        .transpose()?
+        .unwrap_or(true);
+
+    Ok(AudioConfig {
+        profile,
+        settings,
+        vad,
+    })
 }
 
 fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlConfig> {
@@ -726,6 +743,21 @@ password = "pass"
         assert_eq!(cfg.audio.settings.jb_init_ms, 20);
         assert_eq!(cfg.audio.settings.jb_min_pre, 1);
         assert_eq!(cfg.audio.settings.jb_max_ms, 40);
+        assert!(cfg.audio.vad, "VAD must default to enabled");
+    }
+
+    #[test]
+    fn audio_vad_can_be_disabled() {
+        let toml = format!("{}\n[audio]\nvad = false\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert!(!cfg.audio.vad);
+    }
+
+    #[test]
+    fn audio_vad_defaults_true_when_key_absent() {
+        let toml = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert!(cfg.audio.vad);
     }
 
     #[test]

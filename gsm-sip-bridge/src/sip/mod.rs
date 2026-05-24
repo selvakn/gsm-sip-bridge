@@ -35,6 +35,7 @@ struct SipBridgeConfig {
     jb_init_ms: i32,
     jb_min_pre: i32,
     jb_max_ms: i32,
+    vad_enabled: bool,
 }
 
 impl SipBridge {
@@ -53,6 +54,7 @@ impl SipBridge {
             jb_init_ms: config.audio.settings.jb_init_ms,
             jb_min_pre: config.audio.settings.jb_min_pre,
             jb_max_ms: config.audio.settings.jb_max_ms,
+            vad_enabled: config.audio.vad,
         };
 
         Self {
@@ -80,6 +82,7 @@ impl SipBridge {
             jb_init_ms: self.config.jb_init_ms,
             jb_min_pre: self.config.jb_min_pre,
             jb_max_ms: self.config.jb_max_ms,
+            vad_enabled: self.config.vad_enabled,
         };
 
         let endpoint = Endpoint::create(ep_config).map_err(|e| {
