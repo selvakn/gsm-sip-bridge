@@ -23,3 +23,9 @@ port = 9091                    # overridden by METRICS_PORT env var if set
 [modules]
 retry_interval_sec = 30        # range: 5-600
 max_concurrent = 8             # range: 1-8
+
+[audio]
+# Latency profile for the audio pipeline and PJSIP jitter buffer.
+# "lan" — SIP server on the same machine or local network (default, lowest latency).
+# "wan" — Internet SIP trunk; adds headroom for packet jitter and higher RTT.
+profile = "lan"

@@ -18,13 +18,18 @@ pub struct CardInstance {
 }
 
 impl CardInstance {
-    pub fn new(id: String, serial_port: std::path::PathBuf, audio_device: String) -> Self {
+    pub fn new(
+        id: String,
+        serial_port: std::path::PathBuf,
+        audio_device: String,
+        ring_capacity: usize,
+    ) -> Self {
         Self {
             id,
             serial_port,
             audio_device,
             state: CardState::Idle,
-            pipeline: AudioPipeline::new(),
+            pipeline: AudioPipeline::with_capacity(ring_capacity),
         }
     }
 }

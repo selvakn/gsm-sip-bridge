@@ -185,6 +185,7 @@ impl CardPool {
         let mut slots: HashMap<u32, SlotState> = HashMap::new();
         let mut tasks: JoinSet<(u32, String)> = JoinSet::new();
         let resilience = self.config.resilience.clone();
+        let ring_capacity = self.config.audio.settings.ring_capacity;
 
         for module in modules {
             match self.try_init_module(&module) {
@@ -220,9 +221,14 @@ impl CardPool {
                     let evt_tx = event_tx.clone();
                     tasks.spawn_blocking(move || {
                         let sid = slot;
-                        if let Err(e) =
-                            run_module_loop(module_clone.clone(), store_tx, sms_enabled, evt_tx, cmd_rx)
-                        {
+                        if let Err(e) = run_module_loop(
+                            module_clone.clone(),
+                            store_tx,
+                            sms_enabled,
+                            evt_tx,
+                            cmd_rx,
+                            ring_capacity,
+                        ) {
                             tracing::error!(module = %module_clone.id, error = %e, "module loop exited with error");
                         }
                         (sid, module_clone.id)
@@ -368,7 +374,14 @@ impl CardPool {
                                 let module_clone = module.clone();
                                 let evt_tx = event_tx.clone();
                                 tasks.spawn_blocking(move || {
-                                    if let Err(e) = run_module_loop(module_clone.clone(), store_tx, sms_enabled, evt_tx, cmd_rx) {
+                                    if let Err(e) = run_module_loop(
+                                        module_clone.clone(),
+                                        store_tx,
+                                        sms_enabled,
+                                        evt_tx,
+                                        cmd_rx,
+                                        ring_capacity,
+                                    ) {
                                         tracing::error!(module = %module_clone.id, error = %e, "module loop exited");
                                     }
                                     (new_slot, module_clone.id)
@@ -413,7 +426,7 @@ impl CardPool {
 
                     // USB rescan for new modules
                     if now >= rescan_deadline {
-                        self.rescan_new_modules(&mut slots, &mut tasks, &event_tx);
+                        self.rescan_new_modules(&mut slots, &mut tasks, &event_tx, ring_capacity);
                         rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                     }
 
@@ -509,6 +522,7 @@ impl CardPool {
         slots: &mut HashMap<u32, SlotState>,
         tasks: &mut JoinSet<(u32, String)>,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
+        ring_capacity: usize,
     ) {
         let known_serials: std::collections::HashSet<PathBuf> = slots
             .values()
@@ -537,9 +551,14 @@ impl CardPool {
                     let module_clone = module.clone();
                     let evt_tx = event_tx.clone();
                     tasks.spawn_blocking(move || {
-                        if let Err(e) =
-                            run_module_loop(module_clone.clone(), store_tx, sms_enabled, evt_tx, cmd_rx)
-                        {
+                        if let Err(e) = run_module_loop(
+                            module_clone.clone(),
+                            store_tx,
+                            sms_enabled,
+                            evt_tx,
+                            cmd_rx,
+                            ring_capacity,
+                        ) {
                             tracing::error!(module = %module_clone.id, error = %e, "module loop exited");
                         }
                         (slot, module_clone.id)
@@ -847,6 +866,7 @@ fn run_module_loop(
     _sms_enabled: bool,
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
+    ring_capacity: usize,
 ) -> Result<(), String> {
     let mut at = AtCommander::open(&module.serial_port).map_err(|e| e.to_string())?;
 
@@ -866,6 +886,7 @@ fn run_module_loop(
         module.id.clone(),
         module.serial_port.clone(),
         module.audio_device.clone(),
+        ring_capacity,
     );
 
     let mut call_ctx: Option<CallContext> = None;

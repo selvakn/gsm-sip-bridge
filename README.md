@@ -2,7 +2,7 @@
 
 Bridge incoming GSM calls on Quectel EC20 modules to a SIP extension over VoIP. When someone dials the GSM number, the system auto-answers, dials a configurable SIP extension, and routes audio bidirectionally between the two parties. Supports multiple EC20 modules simultaneously. Incoming SMS messages are persisted to a local database and optionally forwarded to Discord.
 
-**Version**: 5.1.0 | **Language**: Rust | **Platform**: Linux (amd64, arm64)
+**Version**: 5.4.0 | **Language**: Rust | **Platform**: Linux (amd64, arm64)
 
 ## Features
 
@@ -20,6 +20,7 @@ Bridge incoming GSM calls on Quectel EC20 modules to a SIP extension over VoIP. 
 - **Prometheus Metrics** -- Exposes call counts, SIP registration state, module health, audio errors, SMS throughput, uptime, and call duration histograms on a `/metrics` endpoint.
 - **Grafana Dashboard** -- Ships a pre-provisioned dashboard with panels for system overview, call rates, active calls, duration percentiles, module health, and SMS forwarding.
 - **Docker Compose Stack** -- One-command deployment with the bridge, Prometheus, Grafana, and sqlite-web running in host network mode.
+- **Audio Latency Profiles** -- `lan` and `wan` presets tune the ALSA ring buffer depth and PJSIP jitter buffer ceiling to match the deployment topology. `lan` (default) targets same-machine SIP for ~120–150 ms one-way latency; `wan` adds headroom for internet trunks.
 - **Comfort Ringback Tone** -- Plays a 400 Hz ringback tone to the GSM caller while the SIP extension is being dialed (via PJSIP tonegen).
 - **USB Device Auto-Discovery** -- Scans the USB bus by vendor/product ID, matches serial numbers for stable identification, and maps AT command ports to ALSA audio devices.
 - **Memory Safety** -- Zero `unsafe` in the application binary; all FFI confined to the `pjsua-sys` and `pjsua-safe` crates with documented safety invariants.
@@ -274,6 +275,9 @@ port = 9091
 
 [modules]
 max_concurrent = 8
+
+[audio]
+profile = "lan"   # "lan" or "wan" — see Audio Latency Profiles below
 ```
 
 | Section | Field | Default | Description |
@@ -298,8 +302,29 @@ max_concurrent = 8
 | `[resilience]` | `network_loss_timeout_sec` | `60` | Seconds before a loss of network registration triggers recovery |
 | `[resilience]` | `network_poll_interval_sec` | `30` | How often to check network registration status (seconds) |
 | `[control]` | `socket_path` | `/tmp/gsm-sip-bridge.sock` | Path for the Unix domain socket used by CLI subcommands |
+| `[audio]` | `profile` | `lan` | Audio latency preset: `lan` or `wan` (see below) |
 
 Secrets support `env:VAR_NAME` syntax to avoid plaintext in config files.
+
+### Audio Latency Profiles
+
+The `[audio]` section selects a preset that tunes two independent latency contributors:
+
+- **Audio ring buffer** (`ring_capacity`) — the `ArrayQueue` between the ALSA capture thread and the PJSIP media thread. Oversizing this lets stale audio queue up invisibly, adding hundreds of milliseconds of delay.
+- **PJSIP jitter buffer** (`jb_init_ms`, `jb_min_pre`, `jb_max_ms`) — PJMEDIA's adaptive jitter buffer. Without a hard ceiling it ratchets upward on any CPU spike and never recovers.
+
+| Setting | `lan` (default) | `wan` |
+|---|---|---|
+| `ring_capacity` | 4 frames (80 ms slack) | 16 frames (320 ms slack) |
+| `jb_init_ms` | 20 ms | 60 ms |
+| `jb_min_pre` | 1 frame | 2 frames |
+| `jb_max_ms` | 40 ms (hard cap) | 200 ms (hard cap) |
+
+**Use `lan`** when the SIP server is on the same machine or local network (loopback or LAN). There is no packet jitter on this path, so the smallest ring and tightest jitter buffer caps give the best end-to-end latency. Expected one-way delay through the bridge: ~120–150 ms (dominated by the GSM air interface, which is fixed at ~80–110 ms).
+
+**Use `wan`** when pointing `sip.server` at an internet SIP trunk. The wider ring and larger jitter buffer absorb burst packet loss and higher RTT without causing audible glitches. Expected one-way delay: ~180–340 ms depending on trunk latency.
+
+The profile is read at startup. Changing it requires a process restart.
 
 ### Call and SMS Database
 

@@ -12,6 +12,7 @@ fn test_three_cards_independent_state() {
                 format!("ec20-{:06X}", i),
                 format!("/dev/ttyUSB{}", i * 4 + 3).into(),
                 format!("hw:{},0", i + 2),
+                4,
             )
         })
         .collect();
@@ -45,6 +46,7 @@ fn test_one_teardown_does_not_affect_others() {
                 format!("ec20-{:06X}", i),
                 format!("/dev/ttyUSB{}", i * 4 + 3).into(),
                 format!("hw:{},0", i + 2),
+                4,
             )
         })
         .collect();

@@ -1,11 +1,25 @@
 use pjsua_safe::{Endpoint, EndpointConfig, TransportType};
 
+fn lan_ep_config(local_port: u16) -> EndpointConfig {
+    EndpointConfig {
+        transport: TransportType::Udp,
+        local_port,
+        tls_verify: false,
+        jb_init_ms: 20,
+        jb_min_pre: 1,
+        jb_max_ms: 40,
+    }
+}
+
 #[test]
 fn test_endpoint_create_stub_mode() {
     let config = EndpointConfig {
         transport: TransportType::Udp,
         local_port: 15060,
         tls_verify: true,
+        jb_init_ms: 20,
+        jb_min_pre: 1,
+        jb_max_ms: 40,
     };
     let ep = Endpoint::create(config).unwrap();
     assert!(ep.is_started());
@@ -15,12 +29,7 @@ fn test_endpoint_create_stub_mode() {
 fn test_account_register_stub_mode() {
     use pjsua_safe::{Account, AccountConfig};
 
-    let ep_config = EndpointConfig {
-        transport: TransportType::Udp,
-        local_port: 15061,
-        tls_verify: false,
-    };
-    let ep = Endpoint::create(ep_config).unwrap();
+    let ep = Endpoint::create(lan_ep_config(15061)).unwrap();
 
     let acc_config = AccountConfig {
         sip_server: "127.0.0.1".into(),
@@ -37,12 +46,7 @@ fn test_account_register_stub_mode() {
 fn test_call_make_stub_mode() {
     use pjsua_safe::{Account, AccountConfig, Call};
 
-    let ep_config = EndpointConfig {
-        transport: TransportType::Udp,
-        local_port: 15062,
-        tls_verify: false,
-    };
-    let ep = Endpoint::create(ep_config).unwrap();
+    let ep = Endpoint::create(lan_ep_config(15062)).unwrap();
 
     let acc_config = AccountConfig {
         sip_server: "127.0.0.1".into(),

@@ -33,6 +33,12 @@ pub struct EndpointConfig {
     pub transport: TransportType,
     pub local_port: u16,
     pub tls_verify: bool,
+    /// PJMEDIA jitter-buffer initial pre-fill (ms). 0 = PJMEDIA default (~80 ms).
+    pub jb_init_ms: i32,
+    /// PJMEDIA jitter-buffer minimum pre-fetch frames.
+    pub jb_min_pre: i32,
+    /// PJMEDIA jitter-buffer hard ceiling (ms). -1 = unbounded.
+    pub jb_max_ms: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +87,9 @@ impl Endpoint {
                 media_cfg.ec_tail_len = 0;
                 media_cfg.quality = 10;
                 media_cfg.ptime = 20;
-                media_cfg.jb_max = -1;
+                media_cfg.jb_init = config.jb_init_ms;
+                media_cfg.jb_min_pre = config.jb_min_pre;
+                media_cfg.jb_max = config.jb_max_ms;
 
                 let status = pjsua_sys::pjsua_init(&cfg, &log_cfg, &media_cfg);
                 if status != PJ_SUCCESS {

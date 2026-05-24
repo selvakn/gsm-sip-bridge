@@ -2,8 +2,10 @@ use crossbeam_queue::ArrayQueue;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const FRAME_SIZE: usize = 160; // 20ms at 8kHz mono
-const RING_CAPACITY: usize = 50; // ~1 second of buffering
+pub const FRAME_SIZE: usize = 160; // 20ms at 8kHz mono
+
+// Large enough for tests that push many frames without caring about profile capacity.
+const TEST_RING_CAPACITY: usize = 50;
 
 pub type AudioFrame = [i16; FRAME_SIZE];
 
@@ -14,12 +16,19 @@ pub struct AudioPipeline {
 }
 
 impl AudioPipeline {
-    pub fn new() -> Self {
+    /// Production constructor — capacity comes from the active `AudioProfileSettings`.
+    pub fn with_capacity(ring_capacity: usize) -> Self {
         Self {
-            capture_ring: Arc::new(ArrayQueue::new(RING_CAPACITY)),
-            playback_ring: Arc::new(ArrayQueue::new(RING_CAPACITY)),
+            capture_ring: Arc::new(ArrayQueue::new(ring_capacity)),
+            playback_ring: Arc::new(ArrayQueue::new(ring_capacity)),
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Convenience constructor for tests; uses a large fixed capacity so tests are
+    /// not coupled to any particular profile's ring size.
+    pub fn new() -> Self {
+        Self::with_capacity(TEST_RING_CAPACITY)
     }
 
     pub fn start(&self, _audio_device: &str) -> Result<(), String> {

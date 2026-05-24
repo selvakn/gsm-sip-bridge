@@ -32,6 +32,9 @@ struct SipBridgeConfig {
     tls_verify: TlsVerify,
     dial_timeout_sec: u64,
     sip_destination: String,
+    jb_init_ms: i32,
+    jb_min_pre: i32,
+    jb_max_ms: i32,
 }
 
 impl SipBridge {
@@ -47,6 +50,9 @@ impl SipBridge {
             tls_verify: config.sip.tls_verify.clone(),
             dial_timeout_sec: config.bridge.sip_dial_timeout_sec,
             sip_destination: config.bridge.sip_destination.clone(),
+            jb_init_ms: config.audio.settings.jb_init_ms,
+            jb_min_pre: config.audio.settings.jb_min_pre,
+            jb_max_ms: config.audio.settings.jb_max_ms,
         };
 
         Self {
@@ -71,6 +77,9 @@ impl SipBridge {
             transport,
             local_port: self.config.local_port,
             tls_verify: self.config.tls_verify == TlsVerify::Strict,
+            jb_init_ms: self.config.jb_init_ms,
+            jb_min_pre: self.config.jb_min_pre,
+            jb_max_ms: self.config.jb_max_ms,
         };
 
         let endpoint = Endpoint::create(ep_config).map_err(|e| {

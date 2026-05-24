@@ -13,6 +13,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "modules",
     "resilience",
     "control",
+    "audio",
 ];
 const SIP_KEYS: &[&str] = &[
     "server",
@@ -36,6 +37,7 @@ const RESILIENCE_KEYS: &[&str] = &[
     "network_poll_interval_sec",
 ];
 const CONTROL_KEYS: &[&str] = &["socket_path"];
+const AUDIO_KEYS: &[&str] = &["profile"];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
@@ -114,6 +116,60 @@ pub struct ControlConfig {
     pub socket_path: String,
 }
 
+/// Selects the audio latency preset.  `lan` targets same-machine / local-network SIP servers
+/// where there is no packet jitter.  `wan` adds headroom for internet SIP trunks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioProfile {
+    Lan,
+    Wan,
+}
+
+/// The concrete numeric knobs derived from an `AudioProfile`.
+#[derive(Clone, Debug)]
+pub struct AudioProfileSettings {
+    /// `ArrayQueue` depth for the capture and playback rings (frames of 20 ms each).
+    pub ring_capacity: usize,
+    /// PJMEDIA jitter-buffer initial pre-fill in milliseconds.
+    pub jb_init_ms: i32,
+    /// PJMEDIA jitter-buffer minimum pre-fetch frames.
+    pub jb_min_pre: i32,
+    /// PJMEDIA jitter-buffer hard ceiling in milliseconds.
+    pub jb_max_ms: i32,
+}
+
+impl AudioProfileSettings {
+    pub fn for_profile(profile: &AudioProfile) -> Self {
+        match profile {
+            AudioProfile::Lan => Self {
+                ring_capacity: 4,
+                jb_init_ms: 20,
+                jb_min_pre: 1,
+                jb_max_ms: 40,
+            },
+            AudioProfile::Wan => Self {
+                ring_capacity: 16,
+                jb_init_ms: 60,
+                jb_min_pre: 2,
+                jb_max_ms: 200,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioConfig {
+    pub profile: AudioProfile,
+    pub settings: AudioProfileSettings,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        let profile = AudioProfile::Lan;
+        let settings = AudioProfileSettings::for_profile(&profile);
+        Self { profile, settings }
+    }
+}
+
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
@@ -131,6 +187,7 @@ pub struct AppConfig {
     pub modules: ModulesConfig,
     pub resilience: ResilienceConfig,
     pub control: ControlConfig,
+    pub audio: AudioConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -150,6 +207,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let modules = parse_modules(table)?;
     let resilience = parse_resilience(table)?;
     let control = parse_control(table)?;
+    let audio = parse_audio(table)?;
 
     Ok(AppConfig {
         sip,
@@ -159,6 +217,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         modules,
         resilience,
         control,
+        audio,
     })
 }
 
@@ -540,6 +599,35 @@ fn parse_resilience(root: &toml::map::Map<String, Value>) -> BridgeResult<Resili
     })
 }
 
+fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig> {
+    let Some(val) = root.get("audio") else {
+        return Ok(AudioConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[audio] must be a table".into()))?;
+    warn_unknown_keys_in(t, AUDIO_KEYS, "audio");
+
+    let profile = match t.get("profile") {
+        Some(v) => match as_string(v, "audio.profile", false)?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "lan" => AudioProfile::Lan,
+            "wan" => AudioProfile::Wan,
+            other => {
+                return Err(BridgeError::Config(format!(
+                    "audio.profile must be \"lan\" or \"wan\"; got \"{other}\""
+                )))
+            }
+        },
+        None => AudioProfile::Lan,
+    };
+
+    let settings = AudioProfileSettings::for_profile(&profile);
+    Ok(AudioConfig { profile, settings })
+}
+
 fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlConfig> {
     let Some(val) = root.get("control") else {
         return Ok(ControlConfig::default());
@@ -572,6 +660,7 @@ mod tests {
         let modules = parse_modules(table).unwrap();
         let resilience = parse_resilience(table).unwrap();
         let control = parse_control(table).unwrap();
+        let audio = parse_audio(table).unwrap();
         AppConfig {
             sip,
             bridge,
@@ -580,6 +669,7 @@ mod tests {
             modules,
             resilience,
             control,
+            audio,
         }
     }
 
@@ -626,5 +716,48 @@ password = "pass"
         );
         let cfg = parse(&toml);
         assert_eq!(cfg.control.socket_path, "/run/gsm/ctrl.sock");
+    }
+
+    #[test]
+    fn audio_defaults_to_lan_when_section_absent() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.audio.profile, AudioProfile::Lan);
+        assert_eq!(cfg.audio.settings.ring_capacity, 4);
+        assert_eq!(cfg.audio.settings.jb_init_ms, 20);
+        assert_eq!(cfg.audio.settings.jb_min_pre, 1);
+        assert_eq!(cfg.audio.settings.jb_max_ms, 40);
+    }
+
+    #[test]
+    fn audio_lan_profile_explicit() {
+        let toml = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.audio.profile, AudioProfile::Lan);
+        assert_eq!(cfg.audio.settings.ring_capacity, 4);
+    }
+
+    #[test]
+    fn audio_wan_profile() {
+        let toml = format!("{}\n[audio]\nprofile = \"wan\"\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.audio.profile, AudioProfile::Wan);
+        assert_eq!(cfg.audio.settings.ring_capacity, 16);
+        assert_eq!(cfg.audio.settings.jb_init_ms, 60);
+        assert_eq!(cfg.audio.settings.jb_min_pre, 2);
+        assert_eq!(cfg.audio.settings.jb_max_ms, 200);
+    }
+
+    #[test]
+    fn audio_unknown_profile_returns_error() {
+        let root: toml::Value = format!("{}\n[audio]\nprofile = \"fiber\"\n", MINIMAL_TOML)
+            .parse()
+            .unwrap();
+        let table = root.as_table().unwrap();
+        let result = parse_audio(table);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("audio.profile must be"));
     }
 }
