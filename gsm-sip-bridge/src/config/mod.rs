@@ -14,6 +14,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "resilience",
     "control",
     "audio",
+    "scheduled_restart",
 ];
 const SIP_KEYS: &[&str] = &[
     "server",
@@ -38,6 +39,13 @@ const RESILIENCE_KEYS: &[&str] = &[
 ];
 const CONTROL_KEYS: &[&str] = &["socket_path"];
 const AUDIO_KEYS: &[&str] = &["profile", "vad"];
+const SCHEDULED_RESTART_KEYS: &[&str] = &[
+    "enabled",
+    "cron",
+    "start_jitter_seconds",
+    "inter_card_gap_seconds",
+    "inter_card_gap_jitter_seconds",
+];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
@@ -186,6 +194,36 @@ impl Default for ControlConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct ScheduledRestartConfig {
+    pub enabled: bool,
+    pub cron: String,
+    pub start_jitter_seconds: u64,
+    pub inter_card_gap_seconds: u64,
+    pub inter_card_gap_jitter_seconds: u64,
+}
+
+impl Default for ScheduledRestartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cron: "0 1 * * *".to_string(),
+            start_jitter_seconds: 600,
+            inter_card_gap_seconds: 30,
+            inter_card_gap_jitter_seconds: 15,
+        }
+    }
+}
+
+impl ScheduledRestartConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct AppConfig {
     pub sip: SipConfig,
     pub bridge: BridgeSection,
@@ -195,6 +233,7 @@ pub struct AppConfig {
     pub resilience: ResilienceConfig,
     pub control: ControlConfig,
     pub audio: AudioConfig,
+    pub scheduled_restart: ScheduledRestartConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -215,6 +254,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let resilience = parse_resilience(table)?;
     let control = parse_control(table)?;
     let audio = parse_audio(table)?;
+    let scheduled_restart = parse_scheduled_restart(table);
 
     Ok(AppConfig {
         sip,
@@ -225,6 +265,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         resilience,
         control,
         audio,
+        scheduled_restart,
     })
 }
 
@@ -645,6 +686,126 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
     })
 }
 
+fn parse_scheduled_restart(root: &toml::map::Map<String, Value>) -> ScheduledRestartConfig {
+    let defaults = ScheduledRestartConfig::default();
+
+    let Some(val) = root.get("scheduled_restart") else {
+        return defaults;
+    };
+    let Some(t) = val.as_table() else {
+        tracing::error!(
+            "[scheduled_restart] must be a table; scheduled restart disabled for this run"
+        );
+        return ScheduledRestartConfig::disabled();
+    };
+    warn_unknown_keys_in(t, SCHEDULED_RESTART_KEYS, "scheduled_restart");
+
+    let enabled = match t.get("enabled") {
+        None => defaults.enabled,
+        Some(v) => match as_bool(v, "scheduled_restart.enabled") {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "scheduled restart disabled");
+                return ScheduledRestartConfig::disabled();
+            }
+        },
+    };
+
+    let cron = match t.get("cron") {
+        None => defaults.cron.clone(),
+        Some(v) => match as_string(v, "scheduled_restart.cron", false) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                tracing::error!(
+                    "scheduled_restart.cron is empty; scheduled restart disabled for this run"
+                );
+                return ScheduledRestartConfig::disabled();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "scheduled restart disabled");
+                return ScheduledRestartConfig::disabled();
+            }
+        },
+    };
+
+    let start_jitter_seconds = match t.get("start_jitter_seconds") {
+        None => defaults.start_jitter_seconds,
+        Some(v) => match as_u64_range(
+            v,
+            "scheduled_restart.start_jitter_seconds",
+            false,
+            0..=86400,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "scheduled restart disabled");
+                return ScheduledRestartConfig::disabled();
+            }
+        },
+    };
+
+    let inter_card_gap_seconds = match t.get("inter_card_gap_seconds") {
+        None => defaults.inter_card_gap_seconds,
+        Some(v) => match as_u64_range(
+            v,
+            "scheduled_restart.inter_card_gap_seconds",
+            false,
+            0..=3600,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "scheduled restart disabled");
+                return ScheduledRestartConfig::disabled();
+            }
+        },
+    };
+
+    let inter_card_gap_jitter_seconds = match t.get("inter_card_gap_jitter_seconds") {
+        None => defaults.inter_card_gap_jitter_seconds,
+        Some(v) => match as_u64_range(
+            v,
+            "scheduled_restart.inter_card_gap_jitter_seconds",
+            false,
+            0..=3600,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "scheduled restart disabled");
+                return ScheduledRestartConfig::disabled();
+            }
+        },
+    };
+
+    if inter_card_gap_jitter_seconds > inter_card_gap_seconds {
+        tracing::error!(
+            jitter = inter_card_gap_jitter_seconds,
+            gap = inter_card_gap_seconds,
+            "scheduled_restart.inter_card_gap_jitter_seconds must be <= inter_card_gap_seconds; scheduled restart disabled for this run"
+        );
+        return ScheduledRestartConfig::disabled();
+    }
+
+    // Validate cron expression: we use the cron crate's 7-field syntax; map our
+    // 5-field input by prepending "0 " (seconds) and appending " *" (year).
+    let translated = format!("0 {cron} *");
+    if let Err(e) = translated.parse::<cron::Schedule>() {
+        tracing::error!(
+            cron = %cron,
+            error = %e,
+            "scheduled_restart.cron is not a valid 5-field cron expression; scheduled restart disabled for this run"
+        );
+        return ScheduledRestartConfig::disabled();
+    }
+
+    ScheduledRestartConfig {
+        enabled,
+        cron,
+        start_jitter_seconds,
+        inter_card_gap_seconds,
+        inter_card_gap_jitter_seconds,
+    }
+}
+
 fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlConfig> {
     let Some(val) = root.get("control") else {
         return Ok(ControlConfig::default());
@@ -678,6 +839,7 @@ mod tests {
         let resilience = parse_resilience(table).unwrap();
         let control = parse_control(table).unwrap();
         let audio = parse_audio(table).unwrap();
+        let scheduled_restart = parse_scheduled_restart(table);
         AppConfig {
             sip,
             bridge,
@@ -687,6 +849,7 @@ mod tests {
             resilience,
             control,
             audio,
+            scheduled_restart,
         }
     }
 
@@ -777,6 +940,75 @@ password = "pass"
         assert_eq!(cfg.audio.settings.jb_init_ms, 60);
         assert_eq!(cfg.audio.settings.jb_min_pre, 2);
         assert_eq!(cfg.audio.settings.jb_max_ms, 200);
+    }
+
+    #[test]
+    fn scheduled_restart_defaults_when_section_absent() {
+        let cfg = parse(MINIMAL_TOML);
+        assert!(cfg.scheduled_restart.enabled);
+        assert_eq!(cfg.scheduled_restart.cron, "0 1 * * *");
+        assert_eq!(cfg.scheduled_restart.start_jitter_seconds, 600);
+        assert_eq!(cfg.scheduled_restart.inter_card_gap_seconds, 30);
+        assert_eq!(cfg.scheduled_restart.inter_card_gap_jitter_seconds, 15);
+    }
+
+    #[test]
+    fn scheduled_restart_disabled_via_flag() {
+        let toml = format!("{}\n[scheduled_restart]\nenabled = false\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert!(!cfg.scheduled_restart.enabled);
+    }
+
+    #[test]
+    fn scheduled_restart_custom_cron_applied() {
+        let toml = format!(
+            "{}\n[scheduled_restart]\ncron = \"30 2 * * 1-5\"\nstart_jitter_seconds = 0\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.scheduled_restart.cron, "30 2 * * 1-5");
+        assert_eq!(cfg.scheduled_restart.start_jitter_seconds, 0);
+        assert!(cfg.scheduled_restart.enabled);
+    }
+
+    #[test]
+    fn scheduled_restart_invalid_cron_disables_feature() {
+        let toml = format!(
+            "{}\n[scheduled_restart]\ncron = \"0 25 * * *\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert!(
+            !cfg.scheduled_restart.enabled,
+            "invalid cron must disable the feature"
+        );
+    }
+
+    #[test]
+    fn scheduled_restart_jitter_greater_than_gap_disables() {
+        let toml = format!(
+            "{}\n[scheduled_restart]\ninter_card_gap_seconds = 10\ninter_card_gap_jitter_seconds = 20\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert!(!cfg.scheduled_restart.enabled);
+    }
+
+    #[test]
+    fn scheduled_restart_jitter_out_of_range_disables() {
+        let toml = format!(
+            "{}\n[scheduled_restart]\nstart_jitter_seconds = 999999\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert!(!cfg.scheduled_restart.enabled);
+    }
+
+    #[test]
+    fn scheduled_restart_empty_cron_disables() {
+        let toml = format!("{}\n[scheduled_restart]\ncron = \"\"\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert!(!cfg.scheduled_restart.enabled);
     }
 
     #[test]

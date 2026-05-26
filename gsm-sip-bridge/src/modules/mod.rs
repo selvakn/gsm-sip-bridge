@@ -3,6 +3,7 @@ pub mod audio_pipeline;
 pub mod beep;
 pub mod card;
 pub mod discovery;
+pub mod scheduler;
 
 use crate::config::AppConfig;
 use crate::control::protocol::{ControlCmd, ControlResp, SlotInfo};
@@ -10,6 +11,10 @@ use crate::metrics;
 use crate::modules::at_commander::{AtCommander, AtResponse, NetworkMode, NetworkType};
 use crate::modules::card::{CardInstance, CardState};
 use crate::modules::discovery::{scan_modules, DiscoveredModule};
+use crate::modules::scheduler::{
+    AttemptType, CycleOutcome, CyclePhase, CycleState, Outcome, RestartProgress, SchedulerAction,
+    SkipReason, SlotView,
+};
 use crate::sip::SipBridge;
 use crate::sms::discord::DiscordClient;
 use crate::sms::SmsHandler;
@@ -17,7 +22,7 @@ use crate::store::calls::CallRecord;
 use crate::store::sms::{SmsForwardingByTimeUpdate, SmsRecord};
 use crate::store::{StoreCommand, StoreHandle};
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -81,6 +86,7 @@ struct SlotState {
     retry_count: u32,
     next_retry_at: Option<tokio::time::Instant>,
     cmd_tx: Option<crossbeam_channel::Sender<ModuleCmd>>,
+    has_active_call: bool,
 }
 
 impl SlotState {
@@ -110,6 +116,49 @@ pub struct CardPool {
     sip_bridge: SipBridge,
     sms_handler: SmsHandler,
     discord_client: Option<DiscordClient>,
+    cron_schedule: Option<cron::Schedule>,
+    cycle: Option<CycleState>,
+    next_scheduled_at: Option<tokio::time::Instant>,
+    last_fired_tick: Option<chrono::DateTime<chrono::Local>>,
+}
+
+/// `SlotView` implementation backed by the pool's slot map. Built fresh on
+/// each scheduler tick because the borrow it holds is short-lived.
+struct PoolSlotView<'a> {
+    slots: &'a HashMap<u32, SlotState>,
+}
+
+impl<'a> SlotView for PoolSlotView<'a> {
+    fn is_ready(&self, slot: u32) -> bool {
+        self.slots
+            .get(&slot)
+            .is_some_and(|s| s.lifecycle == LifecycleState::Ready)
+    }
+
+    fn non_ready_skip_reason(&self, slot: u32) -> Option<String> {
+        match self.slots.get(&slot) {
+            None => Some("slot not present".to_string()),
+            Some(s) if s.lifecycle == LifecycleState::Ready => None,
+            Some(s) => Some(s.lifecycle.to_string()),
+        }
+    }
+
+    fn has_active_call(&self, slot: u32) -> bool {
+        self.slots.get(&slot).is_some_and(|s| s.has_active_call)
+    }
+
+    fn restart_progress(&self, slot: u32) -> RestartProgress {
+        match self.slots.get(&slot) {
+            None => RestartProgress::Gone,
+            Some(s) => match s.lifecycle {
+                LifecycleState::Ready => RestartProgress::Succeeded,
+                LifecycleState::GivenUp => RestartProgress::Failed,
+                LifecycleState::Initializing | LifecycleState::Recovering => {
+                    RestartProgress::InFlight
+                }
+            },
+        }
+    }
 }
 
 impl CardPool {
@@ -132,13 +181,82 @@ impl CardPool {
             None
         };
 
+        let cron_schedule = if config.scheduled_restart.enabled {
+            match scheduler::parse_cron_5field(&config.scheduled_restart.cron) {
+                Ok(s) => {
+                    tracing::info!(
+                        cron = %config.scheduled_restart.cron,
+                        start_jitter_seconds = config.scheduled_restart.start_jitter_seconds,
+                        inter_card_gap_seconds = config.scheduled_restart.inter_card_gap_seconds,
+                        inter_card_gap_jitter_seconds =
+                            config.scheduled_restart.inter_card_gap_jitter_seconds,
+                        "scheduled_restart enabled"
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cron = %config.scheduled_restart.cron,
+                        error = %e,
+                        "scheduled_restart disabled: cron expression failed to parse"
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::info!("scheduled_restart disabled (enabled = false in config)");
+            None
+        };
+
         Self {
             config,
             store,
             sip_bridge,
             sms_handler,
             discord_client,
+            cron_schedule,
+            cycle: None,
+            next_scheduled_at: None,
+            last_fired_tick: None,
         }
+    }
+
+    /// Compute the next jittered cycle start instant from the cron schedule.
+    /// Returns `None` if the schedule is disabled or has no future occurrence.
+    fn recompute_next_scheduled_at(&mut self) {
+        let Some(schedule) = self.cron_schedule.as_ref() else {
+            self.next_scheduled_at = None;
+            return;
+        };
+        let now_local = chrono::Local::now();
+        let after = self
+            .last_fired_tick
+            .as_ref()
+            .filter(|t| **t > now_local)
+            .cloned()
+            .unwrap_or(now_local);
+        let Some(next_tick) = schedule.after(&after).next() else {
+            tracing::warn!("scheduled_restart has no future cron occurrence; disabling scheduler");
+            self.cron_schedule = None;
+            self.next_scheduled_at = None;
+            return;
+        };
+        let mut rng = rand::thread_rng();
+        let jitter =
+            scheduler::jitter_offset(&mut rng, self.config.scheduled_restart.start_jitter_seconds);
+        let delta_sec = (next_tick - now_local).num_seconds() + jitter;
+        let now_instant = tokio::time::Instant::now();
+        let target = if delta_sec <= 0 {
+            now_instant
+        } else {
+            now_instant + Duration::from_secs(delta_sec as u64)
+        };
+        self.next_scheduled_at = Some(target);
+        tracing::info!(
+            next_cron_tick = %next_tick,
+            jittered_delta_seconds = delta_sec,
+            "scheduled_restart next cycle armed"
+        );
     }
 
     pub async fn run(
@@ -214,6 +332,7 @@ impl CardPool {
                         retry_count: 0,
                         next_retry_at: None,
                         cmd_tx: Some(cmd_tx),
+                        has_active_call: false,
                     };
                     let store_tx = self.store.sender();
                     let sms_enabled = self.sms_handler.is_enabled();
@@ -262,6 +381,7 @@ impl CardPool {
                                     ),
                             ),
                             cmd_tx: None,
+                            has_active_call: false,
                         },
                     );
                 }
@@ -299,6 +419,8 @@ impl CardPool {
         // USB rescan for hotplug reconnect (every 60 s — hot-plug is rare)
         let mut rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
+        self.recompute_next_scheduled_at();
+
         loop {
             // Compute next retry deadline across all recovering/initializing slots
             let next_slot_retry = slots
@@ -307,7 +429,13 @@ impl CardPool {
                 .min()
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
-            let earliest_wakeup = next_slot_retry.min(rescan_deadline);
+            let mut earliest_wakeup = next_slot_retry.min(rescan_deadline);
+            if let Some(sched) = self.next_scheduled_at {
+                earliest_wakeup = earliest_wakeup.min(sched);
+            }
+            if let Some(cycle) = self.cycle.as_ref() {
+                earliest_wakeup = earliest_wakeup.min(cycle.next_action_at);
+            }
 
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -429,6 +557,9 @@ impl CardPool {
                         self.rescan_new_modules(&mut slots, &mut tasks, &event_tx, ring_capacity);
                         rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                     }
+
+                    // Scheduled restart: start cycle if armed, or advance running cycle.
+                    self.advance_scheduler(&mut slots, now);
 
                     metrics::MODULES_ACTIVE.set(slots.values().filter(|s| s.lifecycle == LifecycleState::Ready).count() as f64);
                     metrics::MODULES_FAILED.set(slots.values().filter(|s| s.lifecycle != LifecycleState::Ready).count() as f64);
@@ -576,6 +707,7 @@ impl CardPool {
                             retry_count: 0,
                             next_retry_at: None,
                             cmd_tx: Some(cmd_tx),
+                            has_active_call: false,
                         },
                     );
                 }
@@ -602,6 +734,7 @@ impl CardPool {
                                     ),
                             ),
                             cmd_tx: None,
+                            has_active_call: false,
                         },
                     );
                 }
@@ -609,8 +742,273 @@ impl CardPool {
         }
     }
 
-    fn handle_control_cmd(
+    fn advance_scheduler(
+        &mut self,
+        slots: &mut HashMap<u32, SlotState>,
+        now: tokio::time::Instant,
+    ) {
+        // 1) If no cycle is active and the scheduled instant has arrived, start one.
+        if self.cycle.is_none() {
+            let Some(scheduled) = self.next_scheduled_at else {
+                return;
+            };
+            if now < scheduled {
+                return;
+            }
+            self.start_cycle(slots, now);
+            return;
+        }
+
+        // 2) If a cycle is active and its next-action deadline has arrived, tick it.
+        let Some(cycle) = self.cycle.as_mut() else {
+            return;
+        };
+        if now < cycle.next_action_at {
+            return;
+        }
+
+        let view = PoolSlotView { slots };
+        let mut rng = rand::thread_rng();
+        let actions = scheduler::tick_scheduler(
+            cycle,
+            &view,
+            now,
+            &mut rng,
+            self.config.scheduled_restart.inter_card_gap_seconds,
+            self.config.scheduled_restart.inter_card_gap_jitter_seconds,
+        );
+
+        let mut complete = false;
+        for action in actions {
+            match action {
+                SchedulerAction::SendReboot { slot } => {
+                    self.apply_send_reboot(slots, slot, now);
+                }
+                SchedulerAction::RecordOutcome { slot, outcome } => {
+                    self.record_outcome(slot, &outcome);
+                }
+                SchedulerAction::Complete => {
+                    complete = true;
+                }
+            }
+        }
+
+        if complete {
+            self.complete_cycle();
+        }
+    }
+
+    fn start_cycle(&mut self, slots: &HashMap<u32, SlotState>, now: tokio::time::Instant) {
+        // FR-014 guard belongs here too: if a previous cycle is somehow still
+        // active (shouldn't be — we cleared next_scheduled_at on cycle start)
+        // bail out.
+        if self.cycle.is_some() {
+            tracing::warn!(
+                "scheduled_restart cycle-trigger-dropped: a previous cycle is still active"
+            );
+            return;
+        }
+
+        let cron_tick = chrono::Local::now();
+        let id = cron_tick.timestamp().max(0) as u64;
+
+        let mut as_vec: Vec<u32> = slots.keys().copied().collect();
+        as_vec.sort_unstable();
+        let pending: VecDeque<u32> = as_vec.iter().copied().collect();
+
+        tracing::info!(
+            cycle_id = id,
+            cron_tick = %cron_tick,
+            actual_start = %chrono::Local::now(),
+            n_slots = pending.len(),
+            pending_slots = ?as_vec,
+            "scheduled_restart cycle-start"
+        );
+
+        // Mark this tick as fired BEFORE we clear `next_scheduled_at` so the
+        // next recompute doesn't refire the same tick.
+        self.last_fired_tick = Some(cron_tick);
+        self.next_scheduled_at = None;
+
+        self.cycle = Some(CycleState {
+            id,
+            cron_tick,
+            started_at: now,
+            phase: CyclePhase::Initial,
+            pending,
+            deferred: VecDeque::new(),
+            current: None,
+            next_action_at: now,
+            outcomes: Vec::new(),
+        });
+    }
+
+    fn apply_send_reboot(
         &self,
+        slots: &mut HashMap<u32, SlotState>,
+        slot: u32,
+        now: tokio::time::Instant,
+    ) {
+        let Some(state) = slots.get_mut(&slot) else {
+            tracing::warn!(
+                slot = slot,
+                "scheduled_restart attempted to reboot a slot that vanished mid-cycle"
+            );
+            return;
+        };
+
+        tracing::info!(
+            cycle_id = self.cycle.as_ref().map(|c| c.id).unwrap_or(0),
+            slot = slot,
+            module = %state.module.id,
+            attempt = %self.cycle
+                .as_ref()
+                .and_then(|c| c.current.as_ref().map(|cc| cc.attempt))
+                .unwrap_or(AttemptType::Initial),
+            "scheduled_restart per-card-start"
+        );
+
+        // Mirror the manual `card restart` code path: send Reboot via the worker
+        // if present, else open the serial port directly.
+        if let Some(cmd_tx) = state.cmd_tx.take() {
+            let _ = cmd_tx.send(ModuleCmd::Reboot);
+        } else if let Ok(mut at) = AtCommander::open(&state.module.serial_port) {
+            at.reboot();
+        }
+        state.lifecycle = LifecycleState::Recovering;
+        state.retry_count = 0;
+        state.next_retry_at = Some(now + Duration::from_secs(10));
+    }
+
+    fn record_outcome(&self, slot: u32, outcome: &CycleOutcome) {
+        let cycle_id = self.cycle.as_ref().map(|c| c.id).unwrap_or(0);
+        let label = outcome.outcome.metric_label();
+        metrics::SCHEDULED_RESTART_TOTAL
+            .with_label_values(&[&slot.to_string(), label])
+            .inc();
+
+        match &outcome.outcome {
+            Outcome::Success => {
+                tracing::info!(
+                    cycle_id = cycle_id,
+                    slot = slot,
+                    attempt = %outcome.attempt,
+                    outcome = "success",
+                    duration_ms = outcome.duration.as_millis() as u64,
+                    "scheduled_restart per-card-outcome"
+                );
+            }
+            Outcome::Failed { reason } => {
+                tracing::warn!(
+                    cycle_id = cycle_id,
+                    slot = slot,
+                    attempt = %outcome.attempt,
+                    outcome = "failed",
+                    reason = %reason,
+                    duration_ms = outcome.duration.as_millis() as u64,
+                    "scheduled_restart per-card-outcome"
+                );
+            }
+            Outcome::TimedOut => {
+                tracing::warn!(
+                    cycle_id = cycle_id,
+                    slot = slot,
+                    attempt = %outcome.attempt,
+                    outcome = "timed-out",
+                    duration_ms = outcome.duration.as_millis() as u64,
+                    "scheduled_restart per-card-outcome"
+                );
+            }
+            Outcome::Deferred { reason } => {
+                tracing::debug!(
+                    cycle_id = cycle_id,
+                    slot = slot,
+                    attempt = %outcome.attempt,
+                    outcome = "deferred",
+                    reason = %reason,
+                    "scheduled_restart per-card-outcome"
+                );
+            }
+            Outcome::Skipped { reason } => {
+                let reason_str = match reason {
+                    SkipReason::NonReady(s) => format!("non-ready: {s}"),
+                    SkipReason::ActiveCall => "active-call (after deferred retry)".to_string(),
+                    SkipReason::SlotDisappeared => "slot disappeared".to_string(),
+                };
+                tracing::debug!(
+                    cycle_id = cycle_id,
+                    slot = slot,
+                    attempt = %outcome.attempt,
+                    outcome = "skipped",
+                    reason = %reason_str,
+                    "scheduled_restart per-card-outcome"
+                );
+            }
+            Outcome::AlreadyRestartedByManual => {
+                tracing::debug!(
+                    cycle_id = cycle_id,
+                    slot = slot,
+                    attempt = %outcome.attempt,
+                    outcome = "skipped-already-restarted-by-manual",
+                    "scheduled_restart per-card-outcome"
+                );
+            }
+        }
+    }
+
+    fn complete_cycle(&mut self) {
+        let Some(cycle) = self.cycle.take() else {
+            return;
+        };
+
+        let total = cycle.outcomes.len();
+        let succeeded = cycle
+            .outcomes
+            .iter()
+            .filter(|o| matches!(o.outcome, Outcome::Success))
+            .count();
+        let failed = cycle
+            .outcomes
+            .iter()
+            .filter(|o| matches!(o.outcome, Outcome::Failed { .. } | Outcome::TimedOut))
+            .count();
+        let deferred_recovered = cycle
+            .outcomes
+            .iter()
+            .filter(|o| {
+                matches!(o.outcome, Outcome::Success) && o.attempt == AttemptType::DeferredRetry
+            })
+            .count();
+        let skipped = cycle
+            .outcomes
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.outcome,
+                    Outcome::Skipped { .. } | Outcome::AlreadyRestartedByManual
+                )
+            })
+            .count();
+        let duration_ms = tokio::time::Instant::now()
+            .duration_since(cycle.started_at)
+            .as_millis() as u64;
+
+        tracing::info!(
+            cycle_id = cycle.id,
+            total = total,
+            succeeded = succeeded,
+            failed = failed,
+            deferred_recovered = deferred_recovered,
+            skipped = skipped,
+            duration_ms = duration_ms,
+            "scheduled_restart cycle-complete"
+        );
+
+        self.recompute_next_scheduled_at();
+    }
+
+    fn handle_control_cmd(
+        &mut self,
         cmd: ControlCmd,
         reply: oneshot::Sender<ControlResp>,
         slots: &mut HashMap<u32, SlotState>,
@@ -710,6 +1108,32 @@ impl CardPool {
             }
 
             ControlCmd::CardRestart { slot } => {
+                // FR-014a: cycle concurrency rules.
+                use scheduler::{handle_manual_restart_during_cycle, ManualRestartCycleAdvice};
+                let cycle_advice = self
+                    .cycle
+                    .as_mut()
+                    .map(|c| handle_manual_restart_during_cycle(c, slot))
+                    .unwrap_or(ManualRestartCycleAdvice::Proceed);
+                match cycle_advice {
+                    ManualRestartCycleAdvice::Reject { error } => {
+                        let _ = reply.send(ControlResp::err(error));
+                        return;
+                    }
+                    ManualRestartCycleAdvice::PreemptAndProceed => {
+                        // The pure helper already pushed the outcome into the
+                        // cycle's outcome log; mirror it to tracing+metrics.
+                        let outcome = CycleOutcome {
+                            slot,
+                            attempt: AttemptType::Initial,
+                            outcome: Outcome::AlreadyRestartedByManual,
+                            duration: Duration::ZERO,
+                        };
+                        self.record_outcome(slot, &outcome);
+                    }
+                    ManualRestartCycleAdvice::Proceed => {}
+                }
+
                 if let Some(state) = slots.get_mut(&slot) {
                     tracing::info!(slot = slot, module = %state.module.id, "card restart requested");
                     if let Some(cmd_tx) = state.cmd_tx.take() {
@@ -755,6 +1179,9 @@ impl CardPool {
                 caller_id,
                 audio_device,
             } => {
+                if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
+                    state.has_active_call = true;
+                }
                 if self.sip_bridge.state != crate::sip::RegistrationState::Registered {
                     tracing::warn!(
                         module = %module_id,
@@ -796,6 +1223,9 @@ impl CardPool {
                 }
             }
             BridgeEvent::Hangup { module_id } => {
+                if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
+                    state.has_active_call = false;
+                }
                 tracing::info!(module = %module_id, "GSM call ended, tearing down SIP call");
                 self.sip_bridge.hangup_active_call();
             }

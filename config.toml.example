@@ -32,3 +32,23 @@ profile = "lan"
 # Enable PJMEDIA voice activity detection and noise suppression on the capture path.
 # Reduces GSM line noise heard by the SIP side. Set to false only for diagnostics.
 vad = true
+
+[scheduled_restart]
+# Preventive nightly card-restart cycle. The daemon walks every known slot in
+# ascending order and reboots each modem (AT+CFUN=1,1) with a randomized gap
+# between cards. Cards on an active call are deferred to the end of the cycle.
+# Manual `card restart` issued during a cycle takes precedence; see
+# specs/010-scheduled-card-restart/quickstart.md for full details.
+enabled = true
+# Standard 5-field cron expression in system local time.  Default: 1 AM daily.
+# Examples: "0 3 * * 0" = 3 AM Sunday;  "30 2 * * 1-5" = 02:30 Mon-Fri.
+# Invalid expressions disable the scheduler without aborting the daemon.
+cron = "0 1 * * *"
+# Symmetric jitter applied to the cron-tick start time, in seconds.
+# Range 0..=86400.  0 disables jitter.  Default 600 (±10 minutes).
+start_jitter_seconds = 600
+# Base wait between consecutive per-card restarts, in seconds. Range 0..=3600.
+inter_card_gap_seconds = 30
+# Symmetric jitter applied to the inter-card gap, in seconds.
+# Must be <= inter_card_gap_seconds.  Range 0..=3600.
+inter_card_gap_jitter_seconds = 15
