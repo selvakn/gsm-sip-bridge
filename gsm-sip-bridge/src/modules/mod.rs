@@ -229,18 +229,19 @@ impl CardPool {
             return;
         };
         let now_local = chrono::Local::now();
-        let after = self
-            .last_fired_tick
-            .as_ref()
-            .filter(|t| **t > now_local)
-            .cloned()
-            .unwrap_or(now_local);
+        // Use the last natural cron tick as the lower bound so we never re-fire
+        // the same occurrence regardless of jitter direction.  On the very first
+        // call `last_fired_tick` is None, so we fall back to `now_local`.
+        let after = self.last_fired_tick.unwrap_or(now_local);
         let Some(next_tick) = schedule.after(&after).next() else {
             tracing::warn!("scheduled_restart has no future cron occurrence; disabling scheduler");
             self.cron_schedule = None;
             self.next_scheduled_at = None;
             return;
         };
+        // Persist the natural tick immediately so the next recompute call always
+        // advances past this occurrence, even if the jittered start lands earlier.
+        self.last_fired_tick = Some(next_tick);
         let mut rng = rand::thread_rng();
         let jitter =
             scheduler::jitter_offset(&mut rng, self.config.scheduled_restart.start_jitter_seconds);
@@ -825,9 +826,8 @@ impl CardPool {
             "scheduled_restart cycle-start"
         );
 
-        // Mark this tick as fired BEFORE we clear `next_scheduled_at` so the
-        // next recompute doesn't refire the same tick.
-        self.last_fired_tick = Some(cron_tick);
+        // `last_fired_tick` is already set by `recompute_next_scheduled_at` to
+        // the natural cron tick, so the next recompute advances past it.
         self.next_scheduled_at = None;
 
         self.cycle = Some(CycleState {
@@ -1171,6 +1171,12 @@ impl CardPool {
                         state.lifecycle = LifecycleState::Recovering;
                         state.network_type = NetworkType::NoSignal;
                         state.cmd_tx = None;
+                    }
+                    // Network loss tears down any in-progress call; clear the flag so
+                    // the scheduler does not permanently defer this slot.
+                    if state.has_active_call {
+                        tracing::warn!(module = %module_id, slot = state.slot, "active call terminated by network loss");
+                        state.has_active_call = false;
                     }
                 }
             }

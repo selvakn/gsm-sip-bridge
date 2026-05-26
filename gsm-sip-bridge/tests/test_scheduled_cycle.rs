@@ -327,18 +327,17 @@ fn non_ready_slot_skipped_immediately() {
 fn metric_counter_increments_for_every_outcome_label() {
     // Reset is impossible (counters are monotonic), but we can capture
     // before/after values and assert the delta.
-    let before = {
-        // Touch every metric we expect to see, to ensure they're registered.
-        let success = metrics::SCHEDULED_RESTART_TOTAL
-            .with_label_values(&["0", "success"])
-            .get();
-        let skipped_nonready = metrics::SCHEDULED_RESTART_TOTAL
-            .with_label_values(&["1", "skipped-non-ready"])
-            .get();
-        (success, skipped_nonready)
-    };
+    let before_success = metrics::SCHEDULED_RESTART_TOTAL
+        .with_label_values(&["0", "success"])
+        .get();
+    let before_nonready = metrics::SCHEDULED_RESTART_TOTAL
+        .with_label_values(&["1", "skipped-non-ready"])
+        .get();
+    let before_disappeared = metrics::SCHEDULED_RESTART_TOTAL
+        .with_label_values(&["2", "skipped-slot-disappeared"])
+        .get();
 
-    // Simulate two outcomes by calling the same `metric_label()` path the pool uses.
+    // Simulate three outcomes by calling the same `metric_label()` path the pool uses.
     metrics::SCHEDULED_RESTART_TOTAL
         .with_label_values(&["0", Outcome::Success.metric_label()])
         .inc();
@@ -351,25 +350,36 @@ fn metric_counter_increments_for_every_outcome_label() {
             .metric_label(),
         ])
         .inc();
-
-    let after_success = metrics::SCHEDULED_RESTART_TOTAL
-        .with_label_values(&["0", "success"])
-        .get();
-    let after_skipped = metrics::SCHEDULED_RESTART_TOTAL
-        .with_label_values(&["1", "skipped-non-ready"])
-        .get();
+    metrics::SCHEDULED_RESTART_TOTAL
+        .with_label_values(&[
+            "2",
+            Outcome::Skipped {
+                reason: SkipReason::SlotDisappeared,
+            }
+            .metric_label(),
+        ])
+        .inc();
 
     assert!(
-        after_success > before.0,
-        "success counter must increment ({} -> {})",
-        before.0,
-        after_success
+        metrics::SCHEDULED_RESTART_TOTAL
+            .with_label_values(&["0", "success"])
+            .get()
+            > before_success,
+        "success counter must increment"
     );
     assert!(
-        after_skipped > before.1,
-        "skipped-non-ready counter must increment ({} -> {})",
-        before.1,
-        after_skipped
+        metrics::SCHEDULED_RESTART_TOTAL
+            .with_label_values(&["1", "skipped-non-ready"])
+            .get()
+            > before_nonready,
+        "skipped-non-ready counter must increment"
+    );
+    assert!(
+        metrics::SCHEDULED_RESTART_TOTAL
+            .with_label_values(&["2", "skipped-slot-disappeared"])
+            .get()
+            > before_disappeared,
+        "skipped-slot-disappeared counter must increment (distinct from skipped-non-ready)"
     );
 }
 

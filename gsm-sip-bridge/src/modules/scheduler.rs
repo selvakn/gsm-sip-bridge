@@ -103,7 +103,7 @@ impl Outcome {
             Outcome::Skipped { reason } => match reason {
                 SkipReason::NonReady(_) => "skipped-non-ready",
                 SkipReason::ActiveCall => "skipped-active-call",
-                SkipReason::SlotDisappeared => "skipped-non-ready",
+                SkipReason::SlotDisappeared => "skipped-slot-disappeared",
             },
             Outcome::TimedOut => "timed-out",
             Outcome::AlreadyRestartedByManual => "skipped-already-restarted-by-manual",
