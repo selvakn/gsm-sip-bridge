@@ -1,5 +1,19 @@
 # Release Notes
 
+## v5.5.0
+
+- **Scheduled Card Auto-Restart** -- Cards are now automatically restarted via `AT+CFUN=1,1` on a configurable cron schedule (default: `0 1 * * *`, 1 AM nightly). Restarts happen one card at a time in slot order. A random jitter is applied to the start time and to the gap between cards to avoid synchronised reboots. Cards with active calls are deferred and retried once after all other cards have been processed. Manual restarts during a scheduled cycle are serialised to prevent double-restarts. Adds `gsm_scheduled_restart_total{slot, outcome}` Prometheus counter for observability.
+
+  Configure via `config.toml`:
+  ```toml
+  [scheduled_restart]
+  enabled           = true
+  cron              = "0 1 * * *"
+  start_jitter_secs = 300
+  gap_secs          = 30
+  gap_jitter_secs   = 15
+  ```
+
 ## v5.3.1
 
 - **Fix SIGABRT on Call Start** -- Audio monitor thread called `pjsua_conf_get_signal_level` without registering with pjlib, triggering the `pj_thread_this` assertion and crashing with exit code 139. Fixed by calling `ensure_pjsip_thread()` at the start of the spawned thread.
