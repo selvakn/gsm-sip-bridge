@@ -173,6 +173,17 @@ pub static UPTIME_SECONDS: Lazy<Gauge> = Lazy::new(|| {
     .unwrap()
 });
 
+pub static SCHEDULED_RESTART_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_scheduled_restart_total",
+            "Scheduled-restart attempts per slot and outcome"
+        ),
+        &["slot", "outcome"]
+    )
+    .unwrap()
+});
+
 pub static BUILD_INFO: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         opts!("gsm_sip_bridge_build_info", "Build metadata"),

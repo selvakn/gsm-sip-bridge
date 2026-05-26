@@ -52,7 +52,7 @@ coverage: ## Generate code coverage report (requires cargo-llvm-cov)
 	@cargo llvm-cov report --workspace
 
 mutants: ## Mutation test core logic (store, AT parser, control protocol) — fast, no hardware needed
-	@LD_PRELOAD=/tmp/rename_shim.so cargo mutants \
+	@cargo mutants \
 	  --package gsm-sip-bridge \
 	  --re 'store/schema|store/slots|control/protocol|modules/at_commander' \
 	  --timeout 30 \
@@ -60,7 +60,7 @@ mutants: ## Mutation test core logic (store, AT parser, control protocol) — fa
 	  --output mutants-out/
 
 mutants-full: ## Mutation test all non-hardware modules (slower, includes config + modules/mod.rs)
-	@LD_PRELOAD=/tmp/rename_shim.so cargo mutants \
+	@cargo mutants \
 	  --package gsm-sip-bridge \
 	  --timeout 45 \
 	  --jobs 2 \
