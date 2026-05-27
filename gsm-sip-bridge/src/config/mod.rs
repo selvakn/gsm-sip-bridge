@@ -171,11 +171,11 @@ pub struct AudioConfig {
     /// When `true`, PJMEDIA VAD and noise suppression are active on the capture path.
     /// Disable only for diagnostics; leave enabled in production.
     pub vad: bool,
-    /// EC20 earpiece/playback gain sent as `AT+QRXGAIN=<val>` during module init.
+    /// EC20 downlink digital gain sent as `AT+QRXGAIN=<val>` during module init.
     /// Controls how loud SIP audio sounds on the GSM caller's end (SIP→GSM direction).
     /// `None` (default) leaves the modem's firmware default untouched.
-    /// Range 0–100; the EC20 firmware default is typically 80–100.
-    pub rx_gain: Option<u8>,
+    /// Range 0–65535; default varies by audio mode (typically ~32768).
+    pub rx_gain: Option<u32>,
     /// PJSUA conference-bridge software gain applied to the capture→SIP path
     /// (`pjsua_conf_adjust_tx_level`).  1.0 = unity, <1.0 attenuates, >1.0 amplifies.
     /// Range 0.0–2.0, default 1.0.
@@ -722,12 +722,12 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
     let rx_gain = match t.get("rx_gain") {
         Some(v) => {
             let n = as_integer(v, "audio.rx_gain")?;
-            if !(0..=100).contains(&n) {
+            if !(0..=65535).contains(&n) {
                 return Err(BridgeError::Config(format!(
-                    "audio.rx_gain must be 0–100; got {n}"
+                    "audio.rx_gain must be 0–65535; got {n}"
                 )));
             }
-            Some(n as u8)
+            Some(n as u32)
         }
         None => None,
     };

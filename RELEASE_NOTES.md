@@ -1,5 +1,9 @@
 # Release Notes
 
+## v5.5.3
+
+- **Fix: AT+QRXGAIN range corrected to 0–65535** -- Per the Quectel EC20 AT manual, `<rxgain>` is a 16-bit downlink digital gain value (0–65535), not 0–100. The config key `rx_gain` now accepts the full range as a `u32`. Typical tuning value: `rx_gain = 35000`.
+
 ## v5.5.2
 
 - **Fix: SIP→GSM audio muted by AT+QRXGAIN** -- v5.5.1 incorrectly sent `AT+QRXGAIN=50` unconditionally during module init. `AT+QRXGAIN` controls the earpiece/playback gain (SIP→GSM direction), not the receive-from-network direction. Setting it to 50 overrode the modem's firmware default (~80–100), near-muting what the GSM caller hears from SIP. The command is now only sent when `rx_gain` is explicitly set in `config.toml`; the modem firmware default is left untouched otherwise.

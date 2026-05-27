@@ -1309,7 +1309,7 @@ fn run_module_loop(
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
     ring_capacity: usize,
-    rx_gain: Option<u8>,
+    rx_gain: Option<u32>,
 ) -> Result<(), String> {
     let mut at = AtCommander::open(&module.serial_port).map_err(|e| e.to_string())?;
 
@@ -1656,7 +1656,7 @@ fn route_audio_to_usb(at: &mut AtCommander, module_id: &str) {
     }
 }
 
-fn set_rx_gain(at: &mut AtCommander, module_id: &str, gain: u8) {
+fn set_rx_gain(at: &mut AtCommander, module_id: &str, gain: u32) {
     let cmd = format!("AT+QRXGAIN={gain}");
     match at.send_command(&cmd) {
         Ok(AtResponse::Ok(_)) => {
