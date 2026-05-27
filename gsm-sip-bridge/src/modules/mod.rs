@@ -1309,7 +1309,7 @@ fn run_module_loop(
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
     ring_capacity: usize,
-    rx_gain: u8,
+    rx_gain: Option<u8>,
 ) -> Result<(), String> {
     let mut at = AtCommander::open(&module.serial_port).map_err(|e| e.to_string())?;
 
@@ -1320,7 +1320,9 @@ fn run_module_loop(
     at.send_command("AT+CREG=1").ok();
     at.send_command("AT+CEREG=1").ok();
     route_audio_to_usb(&mut at, &module.id);
-    set_rx_gain(&mut at, &module.id, rx_gain);
+    if let Some(gain) = rx_gain {
+        set_rx_gain(&mut at, &module.id, gain);
+    }
 
     if let Ok((rssi, _ber)) = at.check_signal() {
         tracing::info!(module = %module.id, rssi = rssi, "signal quality");
