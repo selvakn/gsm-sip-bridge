@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /home/selva/projects/ec20/audio-echo/specs/008-rust-rewrite/checklists)",
+      "Bash(cp /home/selva/projects/ec20/audio-echo/.specify/templates/spec-template.md /home/selva/projects/ec20/audio-echo/specs/008-rust-rewrite/spec.md)",
+      "Bash(.specify/scripts/bash/check-prerequisites.sh *)",
+      "Bash(.specify/scripts/bash/setup-plan.sh *)",
+      "Bash(.specify/scripts/bash/setup-tasks.sh *)"
+    ]
+  }
+}

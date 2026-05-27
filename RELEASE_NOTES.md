@@ -1,5 +1,10 @@
 # Release Notes
 
+## v5.5.1
+
+- **GSM Receive Gain Control** -- New `[audio] rx_gain` key (integer 0–100, default 50) sends `AT+QRXGAIN=<val>` to the EC20 modem during module init. Controls the hardware gain on audio arriving from the GSM network before it reaches the ALSA interface — i.e. how loud the remote GSM caller sounds on the SIP side. Lower this if the GSM audio sounds too loud or distorted.
+- **SIP Conference Bridge Gain** -- New `[audio] tx_level` key (float 0.0–2.0, default 1.0) applies a software gain on the GSM→SIP path via `pjsua_conf_adjust_tx_level` on every call start. 1.0 = unity, 0.7 ≈ −3 dB, 0.5 ≈ −6 dB. Use `rx_gain` first (hardware attenuation); `tx_level` is a post-ALSA digital trim.
+
 ## v5.5.0
 
 - **Scheduled Card Auto-Restart** -- Cards are now automatically restarted via `AT+CFUN=1,1` on a configurable cron schedule (default: `0 1 * * *`, 1 AM nightly). Restarts happen one card at a time in slot order. A random jitter is applied to the start time and to the gap between cards to avoid synchronised reboots. Cards with active calls are deferred and retried once after all other cards have been processed. Manual restarts during a scheduled cycle are serialised to prevent double-restarts. Adds `gsm_scheduled_restart_total{slot, outcome}` Prometheus counter for observability.

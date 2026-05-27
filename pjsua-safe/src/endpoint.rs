@@ -24,6 +24,11 @@ static AUDIO_SIP_TO_GSM_SUM: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "pjsip-linked")]
 static AUDIO_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// Configured GSM→SIP software gain (stored as fixed-point: actual = value / 1000).
+// Set once at endpoint creation and read in the media-state callback.
+#[cfg(feature = "pjsip-linked")]
+static CONF_TX_LEVEL_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
 pub fn is_sip_peer_disconnected() -> bool {
     SIP_PEER_DISCONNECTED.swap(false, Ordering::AcqRel)
 }
@@ -41,6 +46,10 @@ pub struct EndpointConfig {
     pub jb_max_ms: i32,
     /// When `true`, PJMEDIA VAD and noise suppression are active on the capture path.
     pub vad_enabled: bool,
+    /// Software gain applied to the GSM→SIP path on the PJSUA conference bridge
+    /// via `pjsua_conf_adjust_tx_level(sound_dev_slot, tx_level)`.
+    /// 1.0 = unity, <1.0 attenuates, >1.0 amplifies.
+    pub tx_level: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +101,9 @@ impl Endpoint {
                 media_cfg.jb_init = config.jb_init_ms;
                 media_cfg.jb_min_pre = config.jb_min_pre;
                 media_cfg.jb_max = config.jb_max_ms;
+
+                // Store the configured tx_level so the media-state callback can apply it.
+                CONF_TX_LEVEL_MILLI.store((config.tx_level * 1000.0) as u32, Ordering::Relaxed);
 
                 let status = pjsua_sys::pjsua_init(&cfg, &log_cfg, &media_cfg);
                 if status != PJ_SUCCESS {
@@ -336,6 +348,14 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
         let call_slot = info.conf_slot as i32;
         pjsua_sys::pjsua_conf_connect(call_slot, 0);
         pjsua_sys::pjsua_conf_connect(0, call_slot);
+
+        // Apply configured GSM→SIP software gain on the sound-device slot (slot 0).
+        let tx_level = CONF_TX_LEVEL_MILLI.load(Ordering::Relaxed) as f32 / 1000.0;
+        if (tx_level - 1.0_f32).abs() > 0.001 {
+            pjsua_sys::pjsua_conf_adjust_tx_level(0, tx_level);
+            tracing::info!(call_id, tx_level, "GSM→SIP conference tx_level adjusted");
+        }
+
         tracing::info!(
             call_id,
             call_slot,

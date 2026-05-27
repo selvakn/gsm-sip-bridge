@@ -1,5 +1,6 @@
 sandbox:
-    readable_extra:
+    network:
+        mode: unrestricted
 capabilities:
     - ssh
     - rust

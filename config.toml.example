@@ -32,6 +32,16 @@ profile = "lan"
 # Enable PJMEDIA voice activity detection and noise suppression on the capture path.
 # Reduces GSM line noise heard by the SIP side. Set to false only for diagnostics.
 vad = true
+# EC20 hardware receive gain applied via AT+QRXGAIN at module init.
+# Controls the gain on audio arriving FROM the GSM network (the remote caller's voice)
+# before it reaches the USB/ALSA interface. Range 0–100, default 50.
+# Lower this first if the GSM side sounds too loud or distorted on the SIP end.
+rx_gain = 50
+# PJSUA conference-bridge software gain on the GSM→SIP capture path.
+# Applied via pjsua_conf_adjust_tx_level on every call start.
+# 1.0 = unity (no change), 0.7 ≈ -3 dB, 0.5 ≈ -6 dB, 2.0 = +6 dB.
+# Use rx_gain first (hardware); tx_level is a post-ALSA digital trim.
+tx_level = 1.0
 
 [scheduled_restart]
 # Preventive nightly card-restart cycle. The daemon walks every known slot in

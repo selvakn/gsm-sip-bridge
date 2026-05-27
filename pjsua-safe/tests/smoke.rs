@@ -9,6 +9,7 @@ fn lan_ep_config(local_port: u16) -> EndpointConfig {
         jb_min_pre: 1,
         jb_max_ms: 40,
         vad_enabled: true,
+        tx_level: 1.0,
     }
 }
 
@@ -22,6 +23,7 @@ fn test_endpoint_create_stub_mode() {
         jb_min_pre: 1,
         jb_max_ms: 40,
         vad_enabled: true,
+        tx_level: 1.0,
     };
     let ep = Endpoint::create(config).unwrap();
     assert!(ep.is_started());

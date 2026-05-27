@@ -38,7 +38,7 @@ const RESILIENCE_KEYS: &[&str] = &[
     "network_poll_interval_sec",
 ];
 const CONTROL_KEYS: &[&str] = &["socket_path"];
-const AUDIO_KEYS: &[&str] = &["profile", "vad"];
+const AUDIO_KEYS: &[&str] = &["profile", "vad", "rx_gain", "tx_level"];
 const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "enabled",
     "cron",
@@ -171,6 +171,15 @@ pub struct AudioConfig {
     /// When `true`, PJMEDIA VAD and noise suppression are active on the capture path.
     /// Disable only for diagnostics; leave enabled in production.
     pub vad: bool,
+    /// EC20 hardware receive gain sent as `AT+QRXGAIN=<val>` during module init.
+    /// Controls the gain on audio arriving from the GSM network before it reaches
+    /// the USB/ALSA interface — i.e. how loud the GSM caller sounds on the SIP side.
+    /// Range 0–100, default 50 (EC20 factory default).
+    pub rx_gain: u8,
+    /// PJSUA conference-bridge software gain applied to the capture→SIP path
+    /// (`pjsua_conf_adjust_tx_level`).  1.0 = unity, <1.0 attenuates, >1.0 amplifies.
+    /// Range 0.0–2.0, default 1.0.
+    pub tx_level: f32,
 }
 
 impl Default for AudioConfig {
@@ -181,6 +190,8 @@ impl Default for AudioConfig {
             profile,
             settings,
             vad: true,
+            rx_gain: 50,
+            tx_level: 1.0,
         }
     }
 }
@@ -389,6 +400,35 @@ fn as_bool(v: &Value, key: &str) -> BridgeResult<bool> {
         _ => Err(BridgeError::Config(format!(
             "field {key} must be a boolean"
         ))),
+    }
+}
+
+fn as_integer(v: &Value, key: &str) -> BridgeResult<i64> {
+    match v {
+        Value::Integer(n) => Ok(*n),
+        Value::String(s) => {
+            let resolved = resolve_env_reference(s, key, false)?;
+            resolved
+                .parse::<i64>()
+                .map_err(|_| BridgeError::Config(format!("field {key} must be an integer")))
+        }
+        _ => Err(BridgeError::Config(format!(
+            "field {key} must be an integer"
+        ))),
+    }
+}
+
+fn as_float(v: &Value, key: &str) -> BridgeResult<f64> {
+    match v {
+        Value::Float(f) => Ok(*f),
+        Value::Integer(n) => Ok(*n as f64),
+        Value::String(s) => {
+            let resolved = resolve_env_reference(s, key, false)?;
+            resolved
+                .parse::<f64>()
+                .map_err(|_| BridgeError::Config(format!("field {key} must be a number")))
+        }
+        _ => Err(BridgeError::Config(format!("field {key} must be a number"))),
     }
 }
 
@@ -679,10 +719,38 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         .transpose()?
         .unwrap_or(true);
 
+    let rx_gain = match t.get("rx_gain") {
+        Some(v) => {
+            let n = as_integer(v, "audio.rx_gain")?;
+            if !(0..=100).contains(&n) {
+                return Err(BridgeError::Config(format!(
+                    "audio.rx_gain must be 0–100; got {n}"
+                )));
+            }
+            n as u8
+        }
+        None => 50,
+    };
+
+    let tx_level = match t.get("tx_level") {
+        Some(v) => {
+            let f = as_float(v, "audio.tx_level")?;
+            if !(0.0..=2.0).contains(&f) {
+                return Err(BridgeError::Config(format!(
+                    "audio.tx_level must be 0.0–2.0; got {f}"
+                )));
+            }
+            f as f32
+        }
+        None => 1.0,
+    };
+
     Ok(AudioConfig {
         profile,
         settings,
         vad,
+        rx_gain,
+        tx_level,
     })
 }
 
