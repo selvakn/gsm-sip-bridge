@@ -38,6 +38,13 @@ vad = true
 # Range 0–65535; default varies by audio mode (per Quectel EC20 AT manual).
 # Lower this if the GSM caller reports SIP audio is too loud.
 # rx_gain = 35000
+# EC20 echo-canceller mode word sent via AT+QEEC=2,<val> at module init.
+# Controls which EC subsystems (AEC, DENS noise suppressor, NLPP) are active.
+# Leave unset to keep the modem's firmware default (12543 = all subsystems on).
+# Set to 0 to disable all EC — recommended for USB audio bridges where there is
+# no acoustic echo path and the EC only introduces noise artefacts on the uplink.
+# Range 0–65535.
+eec_mode = 0
 # PJSUA conference-bridge software gain on the GSM→SIP capture path.
 # Applied via pjsua_conf_adjust_tx_level on every call start.
 # 1.0 = unity (no change), 0.7 ≈ -3 dB, 0.5 ≈ -6 dB, 2.0 = +6 dB.

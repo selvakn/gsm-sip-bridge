@@ -339,7 +339,10 @@ impl CardPool {
                     let sms_enabled = self.sms_handler.is_enabled();
                     let module_clone = module.clone();
                     let evt_tx = event_tx.clone();
-                    let rx_gain = self.config.audio.rx_gain;
+                    let audio_init = ModuleAudioInit {
+                        rx_gain: self.config.audio.rx_gain,
+                        eec_mode: self.config.audio.eec_mode,
+                    };
                     tasks.spawn_blocking(move || {
                         let sid = slot;
                         if let Err(e) = run_module_loop(
@@ -349,7 +352,7 @@ impl CardPool {
                             evt_tx,
                             cmd_rx,
                             ring_capacity,
-                            rx_gain,
+                            audio_init,
                         ) {
                             tracing::error!(module = %module_clone.id, error = %e, "module loop exited with error");
                         }
@@ -504,7 +507,10 @@ impl CardPool {
                                 let sms_enabled = self.sms_handler.is_enabled();
                                 let module_clone = module.clone();
                                 let evt_tx = event_tx.clone();
-                                let rx_gain = self.config.audio.rx_gain;
+                                let audio_init = ModuleAudioInit {
+                                    rx_gain: self.config.audio.rx_gain,
+                                    eec_mode: self.config.audio.eec_mode,
+                                };
                                 tasks.spawn_blocking(move || {
                                     if let Err(e) = run_module_loop(
                                         module_clone.clone(),
@@ -513,7 +519,7 @@ impl CardPool {
                                         evt_tx,
                                         cmd_rx,
                                         ring_capacity,
-                                        rx_gain,
+                                        audio_init,
                                     ) {
                                         tracing::error!(module = %module_clone.id, error = %e, "module loop exited");
                                     }
@@ -686,7 +692,10 @@ impl CardPool {
                     let sms_enabled = self.sms_handler.is_enabled();
                     let module_clone = module.clone();
                     let evt_tx = event_tx.clone();
-                    let rx_gain = self.config.audio.rx_gain;
+                    let audio_init = ModuleAudioInit {
+                        rx_gain: self.config.audio.rx_gain,
+                        eec_mode: self.config.audio.eec_mode,
+                    };
                     tasks.spawn_blocking(move || {
                         if let Err(e) = run_module_loop(
                             module_clone.clone(),
@@ -695,7 +704,7 @@ impl CardPool {
                             evt_tx,
                             cmd_rx,
                             ring_capacity,
-                            rx_gain,
+                            audio_init,
                         ) {
                             tracing::error!(module = %module_clone.id, error = %e, "module loop exited");
                         }
@@ -1302,6 +1311,11 @@ struct CallContext {
     started_at: chrono::DateTime<Utc>,
 }
 
+struct ModuleAudioInit {
+    rx_gain: Option<u32>,
+    eec_mode: Option<u32>,
+}
+
 fn run_module_loop(
     module: DiscoveredModule,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
@@ -1309,7 +1323,7 @@ fn run_module_loop(
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
     ring_capacity: usize,
-    rx_gain: Option<u32>,
+    audio_init: ModuleAudioInit,
 ) -> Result<(), String> {
     let mut at = AtCommander::open(&module.serial_port).map_err(|e| e.to_string())?;
 
@@ -1320,8 +1334,11 @@ fn run_module_loop(
     at.send_command("AT+CREG=1").ok();
     at.send_command("AT+CEREG=1").ok();
     route_audio_to_usb(&mut at, &module.id);
-    if let Some(gain) = rx_gain {
+    if let Some(gain) = audio_init.rx_gain {
         set_rx_gain(&mut at, &module.id, gain);
+    }
+    if let Some(mode) = audio_init.eec_mode {
+        set_eec_mode(&mut at, &module.id, mode);
     }
 
     if let Ok((rssi, _ber)) = at.check_signal() {
@@ -1664,6 +1681,18 @@ fn set_rx_gain(at: &mut AtCommander, module_id: &str, gain: u32) {
         }
         _ => {
             tracing::warn!(module = %module_id, gain, "AT+QRXGAIN command failed; using modem default");
+        }
+    }
+}
+
+fn set_eec_mode(at: &mut AtCommander, module_id: &str, mode: u32) {
+    let cmd = format!("AT+QEEC=2,{mode}");
+    match at.send_command(&cmd) {
+        Ok(AtResponse::Ok(_)) => {
+            tracing::info!(module = %module_id, mode, "EC20 echo-canceller mode set (AT+QEEC)");
+        }
+        _ => {
+            tracing::warn!(module = %module_id, mode, "AT+QEEC command failed; using modem default");
         }
     }
 }

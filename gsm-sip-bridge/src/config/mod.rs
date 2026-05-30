@@ -38,7 +38,7 @@ const RESILIENCE_KEYS: &[&str] = &[
     "network_poll_interval_sec",
 ];
 const CONTROL_KEYS: &[&str] = &["socket_path"];
-const AUDIO_KEYS: &[&str] = &["profile", "vad", "rx_gain", "tx_level"];
+const AUDIO_KEYS: &[&str] = &["profile", "vad", "rx_gain", "tx_level", "eec_mode"];
 const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "enabled",
     "cron",
@@ -176,6 +176,13 @@ pub struct AudioConfig {
     /// `None` (default) leaves the modem's firmware default untouched.
     /// Range 0–65535; default varies by audio mode (typically ~32768).
     pub rx_gain: Option<u32>,
+    /// EC20 echo-canceller mode word sent as `AT+QEEC=2,<val>` during module init.
+    /// Controls which EC subsystems (AEC, DENS noise suppressor, NLPP) are active.
+    /// `None` (default) leaves the modem's firmware default untouched.
+    /// `Some(0)` disables all EC — recommended for USB audio bridges where there
+    /// is no acoustic echo path and the EC only introduces noise artefacts.
+    /// Range 0–65535.
+    pub eec_mode: Option<u32>,
     /// PJSUA conference-bridge software gain applied to the capture→SIP path
     /// (`pjsua_conf_adjust_tx_level`).  1.0 = unity, <1.0 attenuates, >1.0 amplifies.
     /// Range 0.0–2.0, default 1.0.
@@ -191,6 +198,7 @@ impl Default for AudioConfig {
             settings,
             vad: true,
             rx_gain: None,
+            eec_mode: None,
             tx_level: 1.0,
         }
     }
@@ -745,12 +753,26 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         None => 1.0,
     };
 
+    let eec_mode = match t.get("eec_mode") {
+        Some(v) => {
+            let n = as_integer(v, "audio.eec_mode")?;
+            if !(0..=65535).contains(&n) {
+                return Err(BridgeError::Config(format!(
+                    "audio.eec_mode must be 0–65535; got {n}"
+                )));
+            }
+            Some(n as u32)
+        }
+        None => None,
+    };
+
     Ok(AudioConfig {
         profile,
         settings,
         vad,
         rx_gain,
         tx_level,
+        eec_mode,
     })
 }
 
