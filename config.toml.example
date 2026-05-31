@@ -51,6 +51,14 @@ eec_mode = 0
 # Attenuates the GSM caller's voice as heard by SIP. Use this to reduce
 # noise or loudness on the SIP side.
 tx_level = 1.0
+# ALSA sound-device ring-buffer depth in milliseconds for the EC20 USB-audio path.
+# snd_rec_latency_ms sizes the capture buffer (GSM→SIP); snd_play_latency_ms sizes
+# the playback buffer (SIP→GSM). Larger values absorb scheduling jitter and prevent
+# XRUNs — heard as choppy/robotic GSM audio — at the cost of added one-way latency.
+# Range 20–2000. Defaults 150 (PJSUA stock is 100/140). Raise these first if the logs
+# report "alsa_capture_overrun" / "alsa_playback_underrun" events.
+snd_rec_latency_ms = 150
+snd_play_latency_ms = 150
 
 [scheduled_restart]
 # Preventive nightly card-restart cycle. The daemon walks every known slot in

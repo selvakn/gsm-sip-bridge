@@ -50,6 +50,11 @@ pub struct EndpointConfig {
     /// via `pjsua_conf_adjust_tx_level(sound_dev_slot, tx_level)`.
     /// 1.0 = unity, <1.0 attenuates, >1.0 amplifies.
     pub tx_level: f32,
+    /// ALSA capture (GSM→SIP) ring-buffer depth in ms, applied to `pjsua_media_config.snd_rec_latency`.
+    /// Larger values absorb scheduling jitter / XRUNs at the cost of one-way latency.
+    pub snd_rec_latency_ms: u32,
+    /// ALSA playback (SIP→GSM) ring-buffer depth in ms, applied to `pjsua_media_config.snd_play_latency`.
+    pub snd_play_latency_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +103,17 @@ impl Endpoint {
                 media_cfg.ec_tail_len = 0;
                 media_cfg.quality = 10;
                 media_cfg.ptime = 20;
+                // Size the ALSA sound-device ring buffers. Defaults come from config
+                // (150 ms) — a bump over PJSUA's 100/140 ms to ride out scheduling
+                // jitter / XRUNs on the EC20 USB-audio capture path.
+                media_cfg.snd_rec_latency = config.snd_rec_latency_ms;
+                media_cfg.snd_play_latency = config.snd_play_latency_ms;
+                tracing::info!(
+                    target: "sip",
+                    snd_rec_latency_ms = config.snd_rec_latency_ms,
+                    snd_play_latency_ms = config.snd_play_latency_ms,
+                    "configured ALSA sound-device latency"
+                );
                 media_cfg.jb_init = config.jb_init_ms;
                 media_cfg.jb_min_pre = config.jb_min_pre;
                 media_cfg.jb_max = config.jb_max_ms;

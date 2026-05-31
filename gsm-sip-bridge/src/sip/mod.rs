@@ -37,6 +37,8 @@ struct SipBridgeConfig {
     jb_max_ms: i32,
     vad_enabled: bool,
     tx_level: f32,
+    snd_rec_latency_ms: u32,
+    snd_play_latency_ms: u32,
 }
 
 impl SipBridge {
@@ -57,6 +59,8 @@ impl SipBridge {
             jb_max_ms: config.audio.settings.jb_max_ms,
             vad_enabled: config.audio.vad,
             tx_level: config.audio.tx_level,
+            snd_rec_latency_ms: config.audio.snd_rec_latency_ms,
+            snd_play_latency_ms: config.audio.snd_play_latency_ms,
         };
 
         Self {
@@ -86,6 +90,8 @@ impl SipBridge {
             jb_max_ms: self.config.jb_max_ms,
             vad_enabled: self.config.vad_enabled,
             tx_level: self.config.tx_level,
+            snd_rec_latency_ms: self.config.snd_rec_latency_ms,
+            snd_play_latency_ms: self.config.snd_play_latency_ms,
         };
 
         let endpoint = Endpoint::create(ep_config).map_err(|e| {
@@ -146,6 +152,11 @@ impl SipBridge {
             .as_ref()
             .ok_or_else(|| "PJSIP endpoint not initialized".to_string())?;
 
+        // Diagnostic: confirm the EC20 capture device can run natively at PJMEDIA's
+        // 8 kHz clock. If not, pjmedia silently resamples, which introduces the
+        // high-frequency imaging artefacts heard as "noise" on the GSM leg.
+        verify_native_rate(alsa_device, 8000);
+
         let dev_index = endpoint
             .find_audio_device(alsa_device)
             .map_err(|e| format!("{e}"))?;
@@ -202,5 +213,63 @@ impl SipBridge {
         self.state = RegistrationState::Unregistered;
         crate::metrics::SIP_REGISTERED.set(0.0);
         tracing::info!("SIP unregistered");
+    }
+}
+
+/// Best-effort check that `device` supports `expected_rate` (Hz) natively for capture.
+///
+/// PJMEDIA runs the sound device at 8 kHz; if the EC20 USB-audio device only offers a
+/// different native rate, pjmedia resamples on the fly and the GSM-leg audio picks up
+/// high-frequency imaging artefacts. This logs a WARN so the mismatch is visible in the
+/// monitoring stack instead of being silently masked. Never fails the call path.
+fn verify_native_rate(device: &str, expected_rate: u32) {
+    use alsa::pcm::{HwParams, PCM};
+    use alsa::Direction;
+
+    let pcm = match PCM::new(device, Direction::Capture, false) {
+        Ok(p) => p,
+        Err(e) => {
+            // Device busy (already opened) or unusual name — non-fatal.
+            tracing::debug!(device, error = %e, "native-rate check: could not open capture device");
+            return;
+        }
+    };
+    let hwp = match HwParams::any(&pcm) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::debug!(device, error = %e, "native-rate check: HwParams::any failed");
+            return;
+        }
+    };
+    let min = hwp.get_rate_min().ok();
+    let max = hwp.get_rate_max().ok();
+    match (min, max) {
+        (Some(lo), Some(hi)) => {
+            let supported = expected_rate >= lo && expected_rate <= hi;
+            if supported {
+                tracing::info!(
+                    device,
+                    expected_rate,
+                    rate_min = lo,
+                    rate_max = hi,
+                    "capture device supports the PJMEDIA clock rate natively"
+                );
+            } else {
+                tracing::warn!(
+                    device,
+                    expected_rate,
+                    rate_min = lo,
+                    rate_max = hi,
+                    "capture device does NOT support the PJMEDIA clock rate natively; \
+                     pjmedia will resample and may introduce high-frequency artefacts on the GSM leg"
+                );
+            }
+        }
+        _ => {
+            tracing::debug!(
+                device,
+                "native-rate check: device did not report a rate range"
+            );
+        }
     }
 }

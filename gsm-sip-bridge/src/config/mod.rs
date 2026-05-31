@@ -38,7 +38,15 @@ const RESILIENCE_KEYS: &[&str] = &[
     "network_poll_interval_sec",
 ];
 const CONTROL_KEYS: &[&str] = &["socket_path"];
-const AUDIO_KEYS: &[&str] = &["profile", "vad", "rx_gain", "tx_level", "eec_mode"];
+const AUDIO_KEYS: &[&str] = &[
+    "profile",
+    "vad",
+    "rx_gain",
+    "tx_level",
+    "eec_mode",
+    "snd_rec_latency_ms",
+    "snd_play_latency_ms",
+];
 const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "enabled",
     "cron",
@@ -187,7 +195,20 @@ pub struct AudioConfig {
     /// (`pjsua_conf_adjust_tx_level`).  1.0 = unity, <1.0 attenuates, >1.0 amplifies.
     /// Range 0.0–2.0, default 1.0.
     pub tx_level: f32,
+    /// ALSA capture (GSM→SIP) ring-buffer depth in milliseconds, passed to PJMEDIA as
+    /// `snd_rec_latency`. Larger values absorb scheduling jitter / XRUNs at the cost of
+    /// added one-way latency. Range 20–2000; default 150 (PJSUA default is 100).
+    pub snd_rec_latency_ms: u32,
+    /// ALSA playback (SIP→GSM) ring-buffer depth in milliseconds, passed to PJMEDIA as
+    /// `snd_play_latency`. Range 20–2000; default 150 (PJSUA default is 140).
+    pub snd_play_latency_ms: u32,
 }
+
+/// Default ALSA capture latency (ms) — a modest bump over PJSUA's 100 ms to tolerate
+/// containerized scheduling jitter without adding excessive one-way delay.
+pub const DEFAULT_SND_REC_LATENCY_MS: u32 = 150;
+/// Default ALSA playback latency (ms).
+pub const DEFAULT_SND_PLAY_LATENCY_MS: u32 = 150;
 
 impl Default for AudioConfig {
     fn default() -> Self {
@@ -200,6 +221,8 @@ impl Default for AudioConfig {
             rx_gain: None,
             eec_mode: None,
             tx_level: 1.0,
+            snd_rec_latency_ms: DEFAULT_SND_REC_LATENCY_MS,
+            snd_play_latency_ms: DEFAULT_SND_PLAY_LATENCY_MS,
         }
     }
 }
@@ -766,6 +789,10 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         None => None,
     };
 
+    let snd_rec_latency_ms = parse_latency_ms(t, "snd_rec_latency_ms", DEFAULT_SND_REC_LATENCY_MS)?;
+    let snd_play_latency_ms =
+        parse_latency_ms(t, "snd_play_latency_ms", DEFAULT_SND_PLAY_LATENCY_MS)?;
+
     Ok(AudioConfig {
         profile,
         settings,
@@ -773,7 +800,30 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         rx_gain,
         tx_level,
         eec_mode,
+        snd_rec_latency_ms,
+        snd_play_latency_ms,
     })
+}
+
+/// Parse an ALSA latency knob (milliseconds) from the `[audio]` table, validating the
+/// 20–2000 ms range and falling back to `default` when the key is absent.
+fn parse_latency_ms(
+    t: &toml::map::Map<String, Value>,
+    key: &str,
+    default: u32,
+) -> BridgeResult<u32> {
+    match t.get(key) {
+        Some(v) => {
+            let n = as_integer(v, &format!("audio.{key}"))?;
+            if !(20..=2000).contains(&n) {
+                return Err(BridgeError::Config(format!(
+                    "audio.{key} must be 20–2000 (ms); got {n}"
+                )));
+            }
+            Ok(n as u32)
+        }
+        None => Ok(default),
+    }
 }
 
 fn parse_scheduled_restart(root: &toml::map::Map<String, Value>) -> ScheduledRestartConfig {
@@ -1113,5 +1163,41 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("audio.profile must be"));
+    }
+
+    #[test]
+    fn audio_snd_latency_defaults_when_omitted() {
+        let root: toml::Value = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML)
+            .parse()
+            .unwrap();
+        let audio = parse_audio(root.as_table().unwrap()).unwrap();
+        assert_eq!(audio.snd_rec_latency_ms, DEFAULT_SND_REC_LATENCY_MS);
+        assert_eq!(audio.snd_play_latency_ms, DEFAULT_SND_PLAY_LATENCY_MS);
+    }
+
+    #[test]
+    fn audio_snd_latency_custom_values_parsed() {
+        let root: toml::Value = format!(
+            "{}\n[audio]\nsnd_rec_latency_ms = 300\nsnd_play_latency_ms = 250\n",
+            MINIMAL_TOML
+        )
+        .parse()
+        .unwrap();
+        let audio = parse_audio(root.as_table().unwrap()).unwrap();
+        assert_eq!(audio.snd_rec_latency_ms, 300);
+        assert_eq!(audio.snd_play_latency_ms, 250);
+    }
+
+    #[test]
+    fn audio_snd_latency_out_of_range_returns_error() {
+        let root: toml::Value = format!("{}\n[audio]\nsnd_rec_latency_ms = 5\n", MINIMAL_TOML)
+            .parse()
+            .unwrap();
+        let result = parse_audio(root.as_table().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("audio.snd_rec_latency_ms must be 20–2000"));
     }
 }

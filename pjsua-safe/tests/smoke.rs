@@ -10,6 +10,8 @@ fn lan_ep_config(local_port: u16) -> EndpointConfig {
         jb_max_ms: 40,
         vad_enabled: true,
         tx_level: 1.0,
+        snd_rec_latency_ms: 150,
+        snd_play_latency_ms: 150,
     }
 }
 
@@ -24,6 +26,8 @@ fn test_endpoint_create_stub_mode() {
         jb_max_ms: 40,
         vad_enabled: true,
         tx_level: 1.0,
+        snd_rec_latency_ms: 150,
+        snd_play_latency_ms: 150,
     };
     let ep = Endpoint::create(config).unwrap();
     assert!(ep.is_started());
