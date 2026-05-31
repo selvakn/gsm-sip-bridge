@@ -1,5 +1,18 @@
 # Release Notes
 
+## v5.6.0
+
+Audio-quality release targeting the noisy/choppy GSM-leg audio traced to ALSA capture-layer corruption (XRUNs, frozen/repeated frames) on the EC20 USB-audio path — not network noise, so gain/echo tuning could not fix it.
+
+- **Larger, configurable ALSA sound-device buffers** -- New `[audio] snd_rec_latency_ms` and `snd_play_latency_ms` keys (range 20–2000, default 150 ms vs PJSUA's 100/140) size the capture/playback ring buffers, absorbing scheduling jitter that caused XRUNs. Raise these if the logs report `alsa_capture_overrun` / `alsa_playback_underrun`.
+- **Real-time audio thread scheduling** -- New `[audio] rt_audio_prio` key (0 = off, 1–99 = `SCHED_FIFO` priority) promotes PJMEDIA's `media` sound-device thread to real-time once a call's audio device opens, so the ALSA buffer is serviced ahead of best-effort work. Requires `CAP_SYS_NICE` (privileged container); best-effort and logged, never fails the call.
+- **XRUN visibility** -- PJMEDIA overrun/underrun log lines are now detected, counted, and surfaced as structured `WARN` events (`kind`, `direction`, running `total`) for log-based alerting.
+- **Native sample-rate verification** -- On call setup the EC20 capture device is probed and a `WARN` is logged if it cannot run natively at PJMEDIA's 8 kHz clock (silent resampling injects high-frequency artefacts on the GSM leg).
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:5.6.0
+```
+
 ## v5.5.3
 
 - **Fix: AT+QRXGAIN range corrected to 0–65535** -- Per the Quectel EC20 AT manual, `<rxgain>` is a 16-bit downlink digital gain value (0–65535), not 0–100. The config key `rx_gain` now accepts the full range as a `u32`. Typical tuning value: `rx_gain = 35000`.
