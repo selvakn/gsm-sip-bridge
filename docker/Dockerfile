@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 COPY --from=pjsip-builder /usr/local/include /usr/local/include
 COPY --from=pjsip-builder /usr/local/lib/pkgconfig /usr/local/lib/pkgconfig
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /gen
 COPY pjsua-sys/Cargo.toml pjsua-sys/build.rs ./pjsua-sys/
@@ -41,7 +41,7 @@ RUN apk add --no-cache \
     alsa-lib-dev alsa-lib libusb-dev eudev-dev \
     openssl-dev openssl-libs-static \
     util-linux-dev util-linux-static
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 COPY --from=pjsip-builder /usr/local/lib /usr/local/lib
 COPY --from=pjsip-builder /usr/local/include /usr/local/include
