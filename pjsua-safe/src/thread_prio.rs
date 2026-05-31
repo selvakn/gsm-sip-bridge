@@ -69,11 +69,15 @@ pub fn promote_threads_fifo(prio: i32, names: &[&str]) -> usize {
 
 /// Apply `SCHED_FIFO` at `prio` to a single kernel thread id. Returns the OS errno on failure.
 fn set_thread_fifo(tid: i32, prio: i32) -> Result<(), i32> {
-    let param = libc::sched_param {
-        sched_priority: prio,
-    };
+    // Zero-initialize then set only `sched_priority`: `sched_param` is a C POD whose layout
+    // differs across libc implementations (musl adds `sched_ss_*` fields), so a struct
+    // literal naming a single field fails to compile on musl. Zeroing is correct for the
+    // unused fields under SCHED_FIFO.
+    // SAFETY: `sched_param` is plain old data for which an all-zero bit pattern is valid.
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = prio;
     // SAFETY: `tid` is a kernel thread id read from /proc/self/task (a thread of this
-    // process); `param` is a valid, fully-initialized sched_param living for the call.
+    // process); `param` is a valid, initialized sched_param living for the call.
     let rc = unsafe { libc::sched_setscheduler(tid, libc::SCHED_FIFO, &param) };
     if rc == 0 {
         Ok(())

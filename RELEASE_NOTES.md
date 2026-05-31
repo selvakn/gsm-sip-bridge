@@ -1,6 +1,9 @@
 # Release Notes
 
-## v5.6.0
+## v5.6.1
+
+Same scope as the v5.6.0 tag, which failed to publish (musl build error in the new
+real-time scheduling code); v5.6.1 is the first image-producing release of this work.
 
 Audio-quality release targeting the noisy/choppy GSM-leg audio traced to ALSA capture-layer corruption (XRUNs, frozen/repeated frames) on the EC20 USB-audio path — not network noise, so gain/echo tuning could not fix it.
 
@@ -10,7 +13,7 @@ Audio-quality release targeting the noisy/choppy GSM-leg audio traced to ALSA ca
 - **Native sample-rate verification** -- On call setup the EC20 capture device is probed and a `WARN` is logged if it cannot run natively at PJMEDIA's 8 kHz clock (silent resampling injects high-frequency artefacts on the GSM leg).
 
 ```
-docker pull ghcr.io/selvakn/gsm-sip-bridge:5.6.0
+docker pull ghcr.io/selvakn/gsm-sip-bridge:5.6.1
 ```
 
 ## v5.5.3
