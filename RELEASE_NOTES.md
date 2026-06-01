@@ -1,5 +1,16 @@
 # Release Notes
 
+## v5.6.2
+
+Makes the `rt_audio_prio` real-time scheduling from v5.6.1 actually take effect (it was a no-op on the musl release binary).
+
+- **Fix: RT scheduling was a no-op on musl** -- musl's `sched_setscheduler()` libc wrapper is a stub that always returns `ENOSYS`, so the promotion silently failed (`errno=38`). Now invokes the `sched_setscheduler` syscall directly, which works on both glibc and musl.
+- **Fix: targeted the wrong threads** -- promotion looked for a thread named `media`, but the threads that actually drive ALSA I/O are `alsasound_captu` (capture / GSM→SIP) and `alsasound_playb` (playback). Now prefix-matches `alsasound`, `media`, and `clock`, so the capture thread that matters for overruns is promoted. Log wording also distinguishes "no thread matched" from "matched but promotion failed".
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:5.6.2
+```
+
 ## v5.6.1
 
 Same scope as the v5.6.0 tag, which failed to publish (musl build error in the new

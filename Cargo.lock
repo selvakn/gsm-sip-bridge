@@ -619,7 +619,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gsm-sip-bridge"
-version = "5.6.1"
+version = "5.6.2"
 dependencies = [
  "alsa",
  "axum",
@@ -1267,7 +1267,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pjsua-safe"
-version = "5.6.1"
+version = "5.6.2"
 dependencies = [
  "libc",
  "pjsua-sys",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "pjsua-sys"
-version = "5.6.1"
+version = "5.6.2"
 dependencies = [
  "bindgen",
  "pkg-config",

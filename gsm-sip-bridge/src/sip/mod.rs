@@ -173,9 +173,13 @@ impl SipBridge {
         // serviced ahead of best-effort work (prevents XRUNs / choppy GSM audio). Opt-in
         // via [audio] rt_audio_prio; best-effort, never fails the call path.
         if self.config.rt_audio_prio > 0 {
+            // Prefix-match the PJMEDIA audio threads: the ALSA capture/playback I/O threads
+            // (`alsasound_captu`/`alsasound_playb`, 15-char-truncated comm) plus the
+            // `media`/`clock` timing threads. The capture thread is the one that matters
+            // most for preventing GSM-leg overruns.
             let promoted = pjsua_safe::thread_prio::promote_threads_fifo(
                 self.config.rt_audio_prio as i32,
-                &["media"],
+                &["alsasound", "media", "clock"],
             );
             tracing::info!(
                 prio = self.config.rt_audio_prio,
