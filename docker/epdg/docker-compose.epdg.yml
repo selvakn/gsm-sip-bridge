@@ -34,12 +34,15 @@ services:
       - path: .env
         required: false
     environment:
-      MCC: "404"
-      MNC: "043"
-      APN: "ims"
-      MODEM_PORT: "/dev/ttyUSB6"
-      # EPDG_IP: ""        # optional override; otherwise resolved via public DNS
-      # SRC_ADDR: ""       # optional; otherwise auto-detected
+      MCC: "${MCC:-404}"
+      MNC: "${MNC:-043}"
+      APN: "${APN:-ims}"
+      MODEM_PORT: "${MODEM_PORT:-/dev/ttyUSB6}"
+      EPDG_IP: "${EPDG_IP:-}"
+      EPDG_FQDN: "${EPDG_FQDN:-}"
+      NETNS: "${NETNS:-ims}"
+      SRC_ADDR: "${SRC_ADDR:-}"
+      KEEPALIVE_INTERVAL: "${KEEPALIVE_INTERVAL:-20}"
     restart: "no"          # experimental — don't auto-loop into failures
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]

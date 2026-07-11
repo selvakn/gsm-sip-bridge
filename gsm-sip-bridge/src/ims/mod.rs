@@ -29,13 +29,13 @@ use crate::error::{BridgeError, BridgeResult};
 use crate::modules::at_commander::AtCommander;
 use crate::modules::usim::{self, AkaResult};
 use sip_client::{
-    build_register, extract_challenge, parse_digest_challenge, random_hex, RegisterRequest,
-    SipTransport,
+    build_register, extract_challenge, format_sip_addr, parse_digest_challenge, random_hex,
+    RegisterRequest, SipTransport,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-const DEFAULT_EXPIRES: u32 = 600;
+const DEFAULT_EXPIRES: u32 = 3600;
 /// RFC 3310 §4.4: on a sync failure the client re-sends with an empty
 /// password and an `auts` parameter; the server then issues a fresh
 /// challenge. Cap resync attempts so a persistently out-of-sync SIM (or a
@@ -93,6 +93,12 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     let realm = format!("ims.mnc{}.mcc{}.3gppnetwork.org", cfg.mnc, cfg.mcc);
     let impi_uri = format!("{imsi}@{realm}");
     let pcscf: SocketAddr = SocketAddr::new(cfg.pcscf_addr, cfg.pcscf_port);
+    // PJSIP-based implementations (e.g. Asterisk's res_pjsip_outbound_registration,
+    // via pjsip_regc_init's srv_url) set the REGISTER Request-URI to the
+    // literal P-CSCF address from `server_uri`, not the home-network realm —
+    // matching that is what gets past this network's registrar (a realm
+    // Request-URI got an instant `406 User Unknown` on Airtel).
+    let request_uri = format_sip_addr(pcscf);
 
     let call_id = random_hex(8);
     let from_tag = random_hex(4);
@@ -105,23 +111,38 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     let mut transport = SipTransport::connect(pcscf, cfg.use_tcp)?;
     let local_addr = transport.local_addr()?;
     tracing::info!(local = %local_addr, peer = %pcscf, "connected to P-CSCF");
+    let via_transport = if cfg.use_tcp { "TCP" } else { "UDP" };
 
-    let sec_agree_headers = if cfg.sec_agree {
+    // Mandated by TS 24.229 for a WLAN-access (VoWiFi/SWu) REGISTER so the
+    // P-CSCF can attribute the request to the right access leg; real UEs and
+    // Asterisk's Gm transport both always send this.
+    let mut extra_headers = vec!["P-Access-Network-Info: 3GPP-WLAN".to_string()];
+    // A plain `Supported: sec-agree` (advertising the capability) was not
+    // enough on Airtel — captured wire traffic from a working Asterisk
+    // registration shows it sends `Require`/`Proxy-Require: sec-agree`
+    // (mandating the extension) plus `Supported: path, sec-agree`, and
+    // already attaches an empty placeholder `Authorization` header on the
+    // very first, pre-challenge REGISTER.
+    let placeholder_auth = format!(
+        "Digest uri=\"sip:{realm}\",username=\"{impi_uri}\",response=\"\",realm=\"{realm}\",nonce=\"\""
+    );
+    if cfg.sec_agree {
+        extra_headers.push("Require: sec-agree".to_string());
+        extra_headers.push("Proxy-Require: sec-agree".to_string());
+        extra_headers.push("Supported: path, sec-agree".to_string());
         let proposal = SaProposal {
             spi_c: rand::random::<u32>() | 0x1,
             spi_s: rand::random::<u32>() | 0x1,
             port_c: local_addr.port(),
             port_s: local_addr.port().wrapping_add(2),
         };
-        build_security_client_headers(&proposal)
-    } else {
-        Vec::new()
-    };
+        extra_headers.extend(build_security_client_headers(&proposal));
+    }
 
     // First REGISTER — no credentials; expect a 401 challenge.
     let branch = format!("z9hG4bK{}", random_hex(6));
     let initial = build_register(&RegisterRequest {
-        registrar_uri: &realm,
+        registrar_uri: &request_uri,
         impi_uri: &impi_uri,
         local_addr,
         call_id: &call_id,
@@ -129,8 +150,13 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
         branch: &branch,
         cseq,
         expires: DEFAULT_EXPIRES,
-        authorization: None,
-        extra_headers: &sec_agree_headers,
+        transport: via_transport,
+        authorization: if cfg.sec_agree {
+            Some(&placeholder_auth)
+        } else {
+            None
+        },
+        extra_headers: &extra_headers,
     });
 
     let mut resp = transport.send_and_recv(&initial)?;
@@ -174,7 +200,9 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
         let aka = usim::authenticate(&mut at, &rand_arr, &autn_arr)?;
 
         cseq += 1;
-        let uri = format!("sip:{}", challenge.realm);
+        // RFC 2617 requires this to match the Request-URI of the message it's
+        // attached to (it feeds into the HA2 digest and the server checks it).
+        let uri = format!("sip:{request_uri}");
         let (auth_header, was_resync) = match aka {
             AkaResult::Success { res, .. } => {
                 tracing::info!("AKA success, building Authorization response");
@@ -203,7 +231,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
 
         let branch = format!("z9hG4bK{}", random_hex(6));
         let retry = build_register(&RegisterRequest {
-            registrar_uri: &realm,
+            registrar_uri: &request_uri,
             impi_uri: &impi_uri,
             local_addr,
             call_id: &call_id,
@@ -211,8 +239,9 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
             branch: &branch,
             cseq,
             expires: DEFAULT_EXPIRES,
+            transport: via_transport,
             authorization: Some(&auth_header),
-            extra_headers: &sec_agree_headers,
+            extra_headers: &extra_headers,
         });
 
         let next_resp = transport.send_and_recv(&retry)?;
@@ -265,19 +294,34 @@ pub struct SaProposal {
 
 /// Build the `Supported: sec-agree` + `Security-Client: ipsec-3gpp` header
 /// pair (RFC 3329 / TS 24.229 Annex H) that some networks require even to
-/// get past an initial `421 Extension Required`. `alg=hmac-sha-1-96` is the
-/// mandatory-to-support integrity algorithm; `ealg=des-ede3-cbc` is the only
-/// non-null encryption algorithm RFC 3329 defines for this mechanism — an
-/// `ealg=null` (integrity-only) proposal was flatly rejected (494, no
-/// counter-parameters) by Vodafone India's P-CSCF, so this proposes the real
-/// mechanism to see whether the network negotiates at all.
+/// get past an initial `421 Extension Required`.
+///
+/// The wire format here matches sysmocom's `volte.c` as actually captured
+/// from a real `200 OK` registration on Airtel India, not the generic RFC
+/// 3329 grammar: one `Security-Client` header whose value is a comma-joined
+/// list of `ipsec-3gpp;alg=<alg>;ealg=<ealg>;spi-c=..;spi-s=..;port-c=..;
+/// port-s=..` tuples — no spaces around `;`, no `prot=`/`mod=`/`q=`, one
+/// tuple per integrity algorithm (`hmac-md5-96`/`hmac-sha-1-96`), each with
+/// `ealg=null` (no ESP encryption, integrity only — what the captured
+/// working REGISTER proposed).
 fn build_security_client_headers(proposal: &SaProposal) -> Vec<String> {
+    const ALGS: [&str; 2] = ["hmac-md5-96", "hmac-sha-1-96"];
+    const EALGS: [&str; 1] = ["null"];
+
+    let tuples: Vec<String> = ALGS
+        .iter()
+        .flat_map(|alg| EALGS.iter().map(move |ealg| (alg, ealg)))
+        .map(|(alg, ealg)| {
+            format!(
+                "ipsec-3gpp;alg={alg};ealg={ealg};spi-c={};spi-s={};port-c={};port-s={}",
+                proposal.spi_c, proposal.spi_s, proposal.port_c, proposal.port_s
+            )
+        })
+        .collect();
+
     vec![
         "Supported: sec-agree".to_string(),
-        format!(
-            "Security-Client: ipsec-3gpp ; q=0.1 ; alg=hmac-sha-1-96 ; ealg=des-ede3-cbc ; prot=esp ; mod=trans ; spi-c={} ; spi-s={} ; port-c={} ; port-s={}",
-            proposal.spi_c, proposal.spi_s, proposal.port_c, proposal.port_s
-        ),
+        format!("Security-Client: {}", tuples.join(", ")),
     ]
 }
 
@@ -353,12 +397,17 @@ mod tests {
         assert_eq!(headers[0], "Supported: sec-agree");
         let sc = &headers[1];
         assert!(sc.starts_with("Security-Client: ipsec-3gpp"));
+        assert!(sc.contains("alg=hmac-md5-96"));
         assert!(sc.contains("alg=hmac-sha-1-96"));
-        assert!(sc.contains("ealg=des-ede3-cbc"));
+        assert!(sc.contains("ealg=null"));
         assert!(sc.contains("spi-c=111"));
         assert!(sc.contains("spi-s=222"));
         assert!(sc.contains("port-c=5062"));
         assert!(sc.contains("port-s=5064"));
+        assert!(!sc.contains(" ;"));
+        assert!(!sc.contains("prot="));
+        assert!(!sc.contains("mod="));
+        assert!(!sc.contains("q="));
     }
 
     #[test]

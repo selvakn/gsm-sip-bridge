@@ -1,39 +1,118 @@
-# Fixes for SWu-IKEv2's get_res_ck_ik() (AT+CSIM EAP-AKA path) against the
-# Quectel EC200U / Vodafone (Vi) India USIM:
+# Fixes for SWu-IKEv2's get_res_ck_ik() (AT+CSIM EAP-AKA path) needed for
+# real hardware SIMs beyond the upstream script's hardcoded assumptions:
 #
-#  1. The card rejects SELECT with P2=0x00 ("wrong P1/P2", SW 6B00). It needs
-#     P2=0x0C. The hardcoded generic USIM AID also doesn't match this card;
-#     the real AID (read from EF_DIR) is A0000000871002FFF605FF89000001FF.
-#  2. The EC200U auto-chains GET RESPONSE internally and returns the full
-#     AUTHENTICATE result with SW 9000 directly — there is no "61XX" marker
-#     to trigger the script's follow-up GET RESPONSE call, which crashed with
-#     UnboundLocalError (len_result unset). Skip that call when SW is
-#     already 9000 with full data.
+#  1. SELECT with P2=0x00 (the upstream script's hardcoded value) is
+#     rejected by some cards as "wrong P1/P2" (SW 6B00). P2=0x0C works
+#     broadly. (Verified: Quectel EC200U + Vodafone/Vi India USIM.)
+#  2. The upstream script hardcodes a generic USIM AID that doesn't match
+#     every real card (verified different AIDs on two different SIMs from
+#     two different operators: Vi India uses
+#     A0000000871002FFF605FF89000001FF, Airtel India uses
+#     A0000000871002FF49FFFF89030900FF). Rather than hardcoding either,
+#     this discovers the real AID at runtime by reading EF_DIR (SELECT
+#     3F00, SELECT 2F00, READ RECORD until a 61<len>4F<len><AID> template
+#     whose AID starts with the 3GPP USIM RID A0000000871002 is found),
+#     falling back to the original generic AID if discovery fails.
+#  3. Some modems (verified: Quectel EC200U) auto-chain GET RESPONSE
+#     internally and return the full AUTHENTICATE result with SW 9000
+#     directly — there is no "61XX" marker to trigger the script's
+#     follow-up GET RESPONSE call, which crashed with UnboundLocalError
+#     (len_result unset). Skip that call when SW is already 9000 with full
+#     data.
+#  4. The upstream script's per-command retry fires a duplicate AT+CSIM
+#     send if no OK/ERROR appears within 0.5s. A local/dummy AUTHENTICATE
+#     answers fast, but a real network challenge's SIM computation can
+#     legitimately take longer, so 0.5s spuriously retransmits while the
+#     first response is still arriving — two overlapping "+CSIM: ..."
+#     replies land in the same buffer and the text-based parser picks up a
+#     fragment of AT command/response framing instead of hex APDU data
+#     (observed: RES == "+CSIM: 4," -> crashes on unhexlify). Raised the
+#     retry threshold to 5s and made the parser only accept fragments that
+#     are actually valid hex, as a second line of defense.
 #
 # Without this patch, EAP-AKA silently falls back to the DEFAULT RES/CK/IK
-# and the ePDG rejects authentication (EAP FAILURE).
+# (or crashes) and the ePDG rejects authentication (EAP FAILURE).
 --- a/swu_emulator.py
 +++ b/swu_emulator.py
-@@ -3355,9 +3355,9 @@
-     CLI = []
-    
-     #CLI.append('AT+CRSM=178,12032,1,4,0\r\n')
+@@ -3349,51 +3349,76 @@
+     res = None
+     ck = None
+     ik = None
+-    
++
+     ser = serial.Serial(serial_interface,38400, timeout=0.5,xonxoff=True, rtscts=True, dsrdtr=True, exclusive =True)
+ 
+-    CLI = []
+-   
+-    #CLI.append('AT+CRSM=178,12032,1,4,0\r\n')
 -    CLI.append('AT+CSIM=14,"00A40000023F00"\r\n')
 -    CLI.append('AT+CSIM=14,"00A40000022F00"\r\n')
 -    CLI.append('AT+CSIM=42,"00A4040010A0000000871002FFFFFFFF8903050001"\r\n')
-+    CLI.append('AT+CSIM=14,"00A4000C023F00"\r\n')
-+    CLI.append('AT+CSIM=14,"00A4000C022F00"\r\n')
-+    CLI.append('AT+CSIM=42,"00A4040C10A0000000871002FFF605FF89000001FF"\r\n')
-     CLI.append('AT+CSIM=78,\"008800812210' + rand.upper() + '10' + autn.upper() + '\"\r\n')
- 
-     a = time.time()
-@@ -3373,18 +3373,21 @@
- 
+-    CLI.append('AT+CSIM=78,\"008800812210' + rand.upper() + '10' + autn.upper() + '\"\r\n')
+-
+-    a = time.time()
+-    for i in CLI:
+-        ser.write(i.encode())
++    def is_hex(s):
++        return len(s) > 0 and all(c in '0123456789ABCDEFabcdef' for c in s)
++
++    def send_and_wait(cmd):
++        # A real network AUTHENTICATE round-trip (SIM crypto + modem) can take
++        # longer than a quick local/dummy test; a short retry window here would
++        # resend while the first response is still arriving, corrupting the
++        # buffer with two overlapping +CSIM replies.
++        a = time.time()
++        ser.write(cmd.encode())
+         buffer = ''
+-    
+         while "OK" not in buffer and "ERROR" not in buffer:
+-            buffer +=  ser.read().decode("utf-8")
+-        
+-            if time.time()-a > 0.5:
+-                ser.write(i.encode())
+-
++            buffer += ser.read().decode("utf-8")
++            if time.time()-a > 5.0:
++                ser.write(cmd.encode())
                  a = time.time() + 1
-                 
+-                
++        return buffer
++
++    send_and_wait('AT+CSIM=14,"00A4000C023F00"\r\n')
++    send_and_wait('AT+CSIM=14,"00A4000C022F00"\r\n')
++
++    aid = None
++    for record in range(1, 17):
++        rec_buf = send_and_wait('AT+CSIM=10,"00B2%02X0400"\r\n' % record)
++        for chunk in rec_buf.split('"'):
++            if not chunk.startswith('61'):
++                continue
++            idx = chunk.find('4F')
++            if idx == -1:
++                continue
++            try:
++                aid_len = int(chunk[idx+2:idx+4], 16)
++            except ValueError:
++                continue
++            candidate = chunk[idx+4:idx+4+aid_len*2]
++            if candidate.startswith('A0000000871002'):
++                aid = candidate
++        if aid:
++            break
++
++    if aid is None:
++        # EF_DIR read failed to yield a USIM AID; fall back to the
++        # generic AID the upstream script always used.
++        aid = 'A0000000871002FFFFFFFF8903050001'
++
++    send_and_wait('AT+CSIM=%d,"00A4040C%02X%s"\r\n' % (10 + len(aid), len(aid)//2, aid))
++
++    buffer = send_and_wait('AT+CSIM=78,\"008800812210' + rand.upper() + '10' + autn.upper() + '\"\r\n')
++
 +    len_result = None
      for i in buffer.split('"'):
-         if len(i)==4:
+-        if len(i)==4:
++        if len(i)==4 and is_hex(i):
              if i[0:2] == '61':
                  len_result = i[-2:]
 -    
@@ -44,16 +123,24 @@
 -    while "OK\r\n" not in buffer and "ERROR\r\n" not in buffer:
 -        buffer +=  ser.read().decode("utf-8")
 -        
-+
+-    for result in buffer.split('"'):
+-        if len(result) > 10:
+-        
+ 
 +    if len_result is not None:
-+        LAST_CLI = 'AT+CSIM=10,"00C00000' + len_result + '\"\r\n'
-+        ser.write(LAST_CLI.encode())
-+        buffer = ''
-+        while "OK\r\n" not in buffer and "ERROR\r\n" not in buffer:
-+            buffer +=  ser.read().decode("utf-8")
++        buffer = send_and_wait('AT+CSIM=10,"00C00000' + len_result + '\"\r\n')
 +    # else: modem (e.g. Quectel EC200U) already auto-chained GET RESPONSE and
 +    # returned the full data with SW 9000 in the AUTHENTICATE reply itself.
 +
-     for result in buffer.split('"'):
-         if len(result) > 10:
-         
++    for result in buffer.split('"'):
++        if len(result) > 10 and is_hex(result):
+             res = result[4:20]
+             ck = result[22:54]
+             ik = result[56:88]
+-    
+-    ser.close()    
++
++    ser.close()
+     return res, ck, ik
+     
+ 
