@@ -1,9 +1,15 @@
 # Plan: real Gm IPsec (kernel XFRM) for the Rust IMS-AKA client
 
-**Status:** not started. Written as a handoff plan after `gsm-sip-bridge
-ims-register --tcp --sec-agree` reached a real `401` + AKA challenge against
-Airtel India (see `docker/epdg/README.md`, "Phase 2: IMS-AKA SIP REGISTER —
-findings"). This is the one remaining piece to reach `200 OK`.
+**Status: implemented and verified — `gsm-sip-bridge ims-register --tcp
+--sec-agree` now reaches a real `200 OK` against Airtel India.** Originally
+written as a handoff plan after reaching a real `401` + AKA challenge; the
+plan below turned out to match the real kernel/`volte.c` behavior closely,
+with five additional non-obvious fixes found only by testing live (exact
+`ip xfrm` CLI syntax quirks, a `SO_LINGER`-0 abortive close needed before
+rebinding the same local port, and a `Security-Verify` header the plan
+hadn't anticipated). See `docker/epdg/README.md`'s "Phase 2" section for the
+full list of what it took to get from this plan to a working `200 OK`; this
+document is kept as the design rationale/reference, not updated blow-by-blow.
 
 ## Why this is needed
 
