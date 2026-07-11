@@ -23,11 +23,13 @@
 //! request/response transaction directly instead.
 
 mod digest;
+mod gm_ipsec;
 mod sip_client;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::at_commander::AtCommander;
 use crate::modules::usim::{self, AkaResult};
+use gm_ipsec::GmEndpoints;
 use sip_client::{
     build_register, extract_challenge, format_sip_addr, parse_digest_challenge, random_hex,
     RegisterRequest, SipTransport,
@@ -108,8 +110,11 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     // carry our real tunnel-assigned address rather than a placeholder —
     // some P-CSCFs silently drop a REGISTER with an unspecified Contact.
     // The same connection is reused for the challenge-response retry too.
-    let mut transport = SipTransport::connect(pcscf, cfg.use_tcp)?;
-    let local_addr = transport.local_addr()?;
+    // `Option` so the Gm IPsec reconnect below can explicitly drop (close)
+    // this connection before rebinding its exact local port for the new one
+    // — SO_REUSEADDR alone doesn't help while the old socket is still open.
+    let mut transport = Some(SipTransport::connect(pcscf, cfg.use_tcp)?);
+    let mut local_addr = transport.as_ref().unwrap().local_addr()?;
     tracing::info!(local = %local_addr, peer = %pcscf, "connected to P-CSCF");
     let via_transport = if cfg.use_tcp { "TCP" } else { "UDP" };
 
@@ -126,18 +131,25 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     let placeholder_auth = format!(
         "Digest uri=\"sip:{realm}\",username=\"{impi_uri}\",response=\"\",realm=\"{realm}\",nonce=\"\""
     );
+    let mut proposal: Option<SaProposal> = None;
     if cfg.sec_agree {
         extra_headers.push("Require: sec-agree".to_string());
         extra_headers.push("Proxy-Require: sec-agree".to_string());
         extra_headers.push("Supported: path, sec-agree".to_string());
-        let proposal = SaProposal {
+        let p = SaProposal {
             spi_c: rand::random::<u32>() | 0x1,
             spi_s: rand::random::<u32>() | 0x1,
             port_c: local_addr.port(),
             port_s: local_addr.port().wrapping_add(2),
         };
-        extra_headers.extend(build_security_client_headers(&proposal));
+        extra_headers.extend(build_security_client_headers(&p));
+        proposal = Some(p);
     }
+    let xfrm_proto = if cfg.use_tcp { "tcp" } else { "udp" };
+    // Populated once Gm IPsec SAs are installed, so they can be torn down
+    // before this function returns rather than leaking kernel XFRM state
+    // across repeated `ims-register` invocations.
+    let mut gm_state: Option<(GmEndpoints, SaProposal, gm_ipsec::SecurityServerParams)> = None;
 
     // First REGISTER — no credentials; expect a 401 challenge.
     let branch = format!("z9hG4bK{}", random_hex(6));
@@ -159,7 +171,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
         extra_headers: &extra_headers,
     });
 
-    let mut resp = transport.send_and_recv(&initial)?;
+    let mut resp = transport.as_mut().unwrap().send_and_recv(&initial)?;
     tracing::info!(status = resp.status, reason = %resp.reason, "initial REGISTER response");
     if let Some(sec_server) = resp.header("Security-Server") {
         tracing::info!(security_server = %sec_server, "network proposed Gm IPsec parameters");
@@ -203,9 +215,65 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
         // RFC 2617 requires this to match the Request-URI of the message it's
         // attached to (it feeds into the HA2 digest and the server checks it).
         let uri = format!("sip:{request_uri}");
+        let sec_server_hdr = resp.header("Security-Server").map(|s| s.to_string());
         let (auth_header, was_resync) = match aka {
-            AkaResult::Success { res, .. } => {
+            AkaResult::Success { res, ck, ik } => {
                 tracing::info!("AKA success, building Authorization response");
+                if let (Some(p), Some(sec_server)) = (proposal.as_ref(), sec_server_hdr.as_deref())
+                {
+                    match gm_ipsec::parse_security_server(sec_server) {
+                        Ok(theirs) => {
+                            let endpoints =
+                                GmEndpoints::new(local_addr.ip(), pcscf.ip(), p, &theirs);
+                            match gm_ipsec::install_gm_sas(
+                                &endpoints, p, &theirs, xfrm_proto, &ik, &ck,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!("Gm IPsec SAs installed");
+                                    let new_dst = SocketAddr::new(pcscf.ip(), theirs.port_s);
+                                    // Must close the existing plaintext connection before
+                                    // rebinding its exact local port (our proposed port-c)
+                                    // for the Gm-protected one — SO_REUSEADDR alone doesn't
+                                    // let a new socket claim a port an open one still holds.
+                                    if let Some(t) = transport.as_ref() {
+                                        t.force_close();
+                                    }
+                                    drop(transport.take());
+                                    match SipTransport::connect_from(p.port_c, new_dst, cfg.use_tcp)
+                                    {
+                                        Ok(new_transport) => {
+                                            local_addr = new_transport.local_addr()?;
+                                            transport = Some(new_transport);
+                                            tracing::info!(local = %local_addr, peer = %new_dst, "reconnected over Gm IPsec transport");
+                                            // RFC 3329 §2.4: echo the network's own
+                                            // Security-Server value back in a Security-Verify
+                                            // header on the request sent over the now-selected
+                                            // SA, confirming which negotiated association is in
+                                            // use (a captured working Asterisk registration
+                                            // always includes this on the post-IPsec retry).
+                                            extra_headers
+                                                .push(format!("Security-Verify: {sec_server}"));
+                                            gm_state = Some((endpoints, p.clone(), theirs));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "failed to reconnect over the negotiated Gm port; reopening the original connection");
+                                            transport =
+                                                Some(SipTransport::connect(pcscf, cfg.use_tcp)?);
+                                            local_addr =
+                                                transport.as_ref().unwrap().local_addr()?;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to install Gm IPsec SAs; resending on the original transport")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to parse Security-Server header")
+                        }
+                    }
+                }
                 (
                     build_authorization(&impi_uri, &challenge, &uri, &res),
                     false,
@@ -244,7 +312,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
             extra_headers: &extra_headers,
         });
 
-        let next_resp = transport.send_and_recv(&retry)?;
+        let next_resp = transport.as_mut().unwrap().send_and_recv(&retry)?;
         tracing::info!(status = next_resp.status, reason = %next_resp.reason, "REGISTER response");
         if let Some(sec_server) = next_resp.header("Security-Server") {
             tracing::info!(security_server = %sec_server, "network proposed Gm IPsec parameters");
@@ -260,6 +328,12 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
             continue;
         }
         break;
+    }
+
+    // A one-shot diagnostic CLI, not a persistent registration — kernel XFRM
+    // state would otherwise leak across repeated invocations.
+    if let Some((endpoints, p, theirs)) = gm_state {
+        gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, xfrm_proto);
     }
 
     match resp.status {
@@ -285,6 +359,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
 /// authoritative for `port-c`/`spi-c` (a port on itself), while our own
 /// `port-s`/`spi-s` (a port on us) stands as proposed unless the response
 /// says otherwise.
+#[derive(Clone)]
 pub struct SaProposal {
     pub spi_c: u32,
     pub spi_s: u32,

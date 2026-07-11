@@ -210,21 +210,63 @@ the captured ground truth:
 
 With all of the above, `gsm-sip-bridge ims-register --tcp --sec-agree`
 against Airtel gets a real `401 Unauthorized` with a genuine AKA challenge
-(`WWW-Authenticate` + populated `Security-Server`), runs RAND/AUTN through
-the SIM, and resends a correct digest `Authorization`. That resend still
-gets a fresh `401` rather than `200 OK` — expected, and not a bug: Asterisk's
-own captured wire trace shows its *second* REGISTER goes out on a **new TCP
-connection to the P-CSCF's negotiated `port-s` (6000, not 5060)**, which only
-works because it has already set up a real Gm IPsec SA (kernel XFRM, via
-`libmnl` in `volte.c`) deriving ESP keys from the AKA `CK`/`IK` (TS 33.203
-Annex H). Until this client does the same — install XFRM SAs in the `ims`
-netns and resend the authenticated REGISTER over that protected transport to
-the negotiated port — it cannot get past this second challenge. This is a
-substantial, separate piece of work (kernel netlink/XFRM from Rust, e.g. via
-the `rtnetlink`/`nix` crates or shelling out to `ip xfrm`), not yet
-implemented here.
+(`WWW-Authenticate` + populated `Security-Server`) and runs RAND/AUTN through
+the SIM.
+
+**Update — full `200 OK` reached, with real Gm IPsec (kernel XFRM), no
+Asterisk/PJProject needed.** Implemented in `gsm-sip-bridge/src/ims/gm_ipsec.rs`
+per the plan in `docs/gm-ipsec-xfrm-plan.md` (derived from sysmocom's
+`volte.c` and a wire capture of a working Asterisk registration):
+
+1. **Key derivation (TS 33.203 Annex H)**: the AKA `IK`/`CK` are used
+   *directly* as the XFRM auth/cipher keys — no KDF. `hmac-sha-1-96` needs a
+   160-bit key but `IK` is only 128 bits, so it's zero-padded to 20 bytes.
+2. **Topology**: two logical tunnels (`local_c<->remote_s`,
+   `local_s<->remote_c`), each needing an outbound + inbound XFRM state (4
+   total) and a matching policy (4 total) — see the plan doc for the full
+   derivation of which SPI/port goes where.
+3. **Shells out to `ip xfrm`** (not raw netlink) to stay consistent with this
+   crate's zero-`unsafe` policy. Two non-obvious syntax quirks found only by
+   testing against the real kernel/iproute2 build in the container:
+   - `proto esp` **requires** an `enc`/`aead` clause even for a null cipher
+     (`ALGO-TYPE value "enc" or "aead" is required with XFRM-PROTO value
+     "esp"`) — but the keymat must be a **truly empty string** (`""`), not
+     `0x` or a dummy zero byte (both get `EINVAL`, since `cipher_null`
+     expects exactly a zero-length key).
+   - The policy selector's `proto` must be a **numeric** IP protocol number
+     (`6` for TCP, `17` for UDP) — the literal names `tcp`/`udp` are rejected
+     as `"PROTO value is invalid"` on this iproute2 build, despite being
+     valid per `ip xfrm policy help`'s own grammar. Selector order also
+     matters: `proto` before `sport`/`dport`.
+4. **Reconnecting over the negotiated port** (once SAs are installed, the
+   authenticated REGISTER must go out on a *new* connection from our
+   proposed `port-c` to the network's negotiated `port-s`, not the original
+   socket/port) needs the old connection's exact local port back — and a
+   plain `SO_REUSEADDR` bind wasn't enough: closing a TCP socket via a
+   normal (graceful, FIN-based) `drop()` immediately before rebinding the
+   same port raced with the kernel's `TIME_WAIT`/`FIN_WAIT` teardown and hit
+   `Address already in use`. Fixed by forcing an abortive close
+   (`SO_LINGER` 0, sends `RST`) right before dropping the old connection —
+   see `SipTransport::force_close()`.
+5. **`Security-Verify` header** (RFC 3329 §2.4): the retry sent over the new
+   Gm-protected connection must echo the network's own `Security-Server`
+   value back verbatim in a `Security-Verify` header, confirming which
+   negotiated SA is in use. Missing this got a *different*, later-stage
+   `406 User Unknown` (structurally distinct from the earlier blanket
+   rejections — it came with a `Date` header and a differently-formatted
+   `To` tag, i.e. from a different network element than the SBC/P-CSCF that
+   issues the generic ones) even with the SAs correctly installed and the
+   connection successfully reconnected over the negotiated port.
+
+With all five, a real `200 OK` comes back from Airtel's IMS core, complete
+with `P-Associated-URI` (the actual MSISDN), `Path`, and `Service-Route`
+headers — the same outcome Asterisk reaches, achieved here without Asterisk
+or PJProject at all. Verified reproducible across repeated runs; XFRM state
+is torn down at the end of each run (success or failure) so repeat
+invocations don't collide with stale SAs from a previous one.
 
 See `gsm-sip-bridge/src/ims/mod.rs` module docs for the full design rationale
-(including why this bypasses PJSIP's built-in digest auth entirely).
+(including why this bypasses PJSIP's built-in digest auth entirely), and
+`gsm-sip-bridge/src/ims/gm_ipsec.rs` for the Gm IPsec implementation.
 
 See `specs`/the plan for the full design and rationale.

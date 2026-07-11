@@ -185,12 +185,78 @@ impl SipTransport {
         }
     }
 
+    /// Open a *new* connection from an explicitly chosen local port to a
+    /// (possibly different) destination — needed to resend the authenticated
+    /// REGISTER once Gm IPsec is set up: the retry must go out from the same
+    /// local port we proposed as `port-c` in `Security-Client`, to the
+    /// network's negotiated `port-s` (from `Security-Server`), since the
+    /// installed XFRM policy's selector matches on exactly that 4-tuple.
+    pub fn connect_from(local_port: u16, dst: SocketAddr, use_tcp: bool) -> BridgeResult<Self> {
+        let domain = if dst.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let bind_addr: SocketAddr = match dst {
+            SocketAddr::V4(_) => format!("0.0.0.0:{local_port}").parse().unwrap(),
+            SocketAddr::V6(_) => format!("[::]:{local_port}").parse().unwrap(),
+        };
+
+        if use_tcp {
+            let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)
+                .map_err(|e| BridgeError::Ims(format!("socket() failed: {e}")))?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| BridgeError::Ims(format!("SO_REUSEADDR failed: {e}")))?;
+            socket
+                .bind(&bind_addr.into())
+                .map_err(|e| BridgeError::Ims(format!("bind to {bind_addr} failed: {e}")))?;
+            socket
+                .connect_timeout(&dst.into(), RECV_TIMEOUT)
+                .map_err(|e| BridgeError::Ims(format!("TCP connect to {dst} failed: {e}")))?;
+            let stream: TcpStream = socket.into();
+            stream
+                .set_read_timeout(Some(RECV_TIMEOUT))
+                .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
+            Ok(Self::Tcp(stream))
+        } else {
+            let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
+                .map_err(|e| BridgeError::Ims(format!("socket() failed: {e}")))?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| BridgeError::Ims(format!("SO_REUSEADDR failed: {e}")))?;
+            socket
+                .bind(&bind_addr.into())
+                .map_err(|e| BridgeError::Ims(format!("bind to {bind_addr} failed: {e}")))?;
+            socket
+                .connect(&dst.into())
+                .map_err(|e| BridgeError::Ims(format!("UDP connect to {dst} failed: {e}")))?;
+            let sock: UdpSocket = socket.into();
+            sock.set_read_timeout(Some(RECV_TIMEOUT))
+                .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
+            Ok(Self::Udp(sock))
+        }
+    }
+
     pub fn local_addr(&self) -> BridgeResult<SocketAddr> {
         let addr = match self {
             Self::Udp(s) => s.local_addr(),
             Self::Tcp(s) => s.local_addr(),
         };
         addr.map_err(|e| BridgeError::Ims(format!("local_addr failed: {e}")))
+    }
+
+    /// For TCP, force an abortive close (`SO_LINGER` 0, sends RST) instead
+    /// of the default graceful FIN — needed right before dropping a
+    /// connection we're about to rebind its exact local port for. A normal
+    /// close leaves the port in `FIN_WAIT`/`TIME_WAIT`, which `SO_REUSEADDR`
+    /// on the new socket doesn't reliably bypass if the old one hasn't
+    /// reached `TIME_WAIT` yet by the time we rebind (a near-certainty when
+    /// rebinding immediately after the last write, as here). No-op for UDP.
+    pub fn force_close(&self) {
+        if let Self::Tcp(stream) = self {
+            let _ = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO));
+        }
     }
 
     pub fn send_and_recv(&mut self, message: &str) -> BridgeResult<SipResponse> {
