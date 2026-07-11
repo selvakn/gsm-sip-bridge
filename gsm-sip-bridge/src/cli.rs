@@ -82,6 +82,18 @@ pub struct ImsRegisterArgs {
     /// the network proceeds on the header proposal alone.
     #[arg(long)]
     pub sec_agree: bool,
+
+    /// Use this MSISDN (E.164, e.g. +919876543210) as the Public User
+    /// Identity in To/From/Contact instead of the IMSI-derived temporary
+    /// IMPU (`sip:<IMSI>@<realm>`). The Authorization header's username
+    /// (the actual authentication identity, IMPI) is unaffected — it's
+    /// always IMSI-based per TS 33.203, regardless of this flag. Some
+    /// networks' HSS may reject binding a Contact to the private identity
+    /// directly; this tests that hypothesis without needing the SIM to have
+    /// an MSISDN provisioned in EF_MSISDN (queryable via `AT+CNUM`, but not
+    /// every SIM has it written).
+    #[arg(long)]
+    pub msisdn: Option<String>,
 }
 
 #[derive(Parser, Debug)]

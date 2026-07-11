@@ -82,7 +82,7 @@ impl SipResponse {
 /// Everything needed to build a REGISTER request.
 pub struct RegisterRequest<'a> {
     pub registrar_uri: &'a str,
-    pub impi_uri: &'a str,
+    pub public_uri: &'a str,
     pub local_addr: SocketAddr,
     pub call_id: &'a str,
     pub from_tag: &'a str,
@@ -115,11 +115,11 @@ pub fn build_register(req: &RegisterRequest) -> String {
         "REGISTER sip:{registrar} SIP/2.0\r\n\
          Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
          Max-Forwards: 70\r\n\
-         From: <sip:{impi}>;tag={from_tag}\r\n\
-         To: <sip:{impi}>\r\n\
+         From: <sip:{public}>;tag={from_tag}\r\n\
+         To: <sip:{public}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{impi_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:000000000000000>\"\r\n\
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:000000000000000>\"\r\n\
          Expires: {expires}\r\n\
          Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n",
@@ -127,12 +127,12 @@ pub fn build_register(req: &RegisterRequest) -> String {
         transport = req.transport,
         via_addr = via_addr,
         branch = req.branch,
-        impi = req.impi_uri,
+        public = req.public_uri,
         from_tag = req.from_tag,
         call_id = req.call_id,
         cseq = req.cseq,
         contact_addr = contact_addr,
-        impi_user = req.impi_uri.split('@').next().unwrap_or(req.impi_uri),
+        public_user = req.public_uri.split('@').next().unwrap_or(req.public_uri),
         expires = req.expires,
     );
     if let Some(auth) = req.authorization {
@@ -424,7 +424,7 @@ mod tests {
         let addr: SocketAddr = "[2402:8100::1]:5060".parse().unwrap();
         let req = RegisterRequest {
             registrar_uri: "ims.mnc043.mcc404.3gppnetwork.org",
-            impi_uri: "404438083996440@ims.mnc043.mcc404.3gppnetwork.org",
+            public_uri: "404438083996440@ims.mnc043.mcc404.3gppnetwork.org",
             local_addr: addr,
             call_id: "callid123",
             from_tag: "tag123",
@@ -456,7 +456,7 @@ mod tests {
         ];
         let req = RegisterRequest {
             registrar_uri: "example.org",
-            impi_uri: "user@example.org",
+            public_uri: "user@example.org",
             local_addr: addr,
             call_id: "callid",
             from_tag: "tag",
