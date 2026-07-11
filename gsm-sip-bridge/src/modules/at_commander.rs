@@ -261,6 +261,18 @@ impl AtCommander {
         }
     }
 
+    pub fn query_imsi(&mut self) -> BridgeResult<String> {
+        match self.send_command("AT+CIMI")? {
+            AtResponse::Ok(lines) => lines
+                .into_iter()
+                .find(|l| l.chars().all(|c| c.is_ascii_digit()) && l.len() >= 6)
+                .ok_or_else(|| BridgeError::Discovery("AT+CIMI: no IMSI in response".into())),
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+                Err(BridgeError::Discovery(format!("AT+CIMI failed: {e}")))
+            }
+        }
+    }
+
     pub fn query_phone_number(&mut self) -> BridgeResult<String> {
         match self.send_command("AT+CNUM")? {
             AtResponse::Ok(lines) => {
@@ -417,6 +429,18 @@ mod tests {
     fn test_query_imei() {
         let mut at = make_commander("867584030123456\r\nOK\r\n");
         assert_eq!(at.query_imei().unwrap(), "867584030123456");
+    }
+
+    #[test]
+    fn test_query_imsi() {
+        let mut at = make_commander("404438083996440\r\nOK\r\n");
+        assert_eq!(at.query_imsi().unwrap(), "404438083996440");
+    }
+
+    #[test]
+    fn test_query_imsi_error() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(at.query_imsi().is_err());
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub enum BridgeError {
     Discovery(String),
     #[error("SMS error: {0}")]
     Sms(String),
+    #[error("IMS error: {0}")]
+    Ims(String),
 }
 
 impl From<rusqlite::Error> for BridgeError {

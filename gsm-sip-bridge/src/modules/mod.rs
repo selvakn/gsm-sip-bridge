@@ -4,6 +4,7 @@ pub mod beep;
 pub mod card;
 pub mod discovery;
 pub mod scheduler;
+pub mod usim;
 
 use crate::config::AppConfig;
 use crate::control::protocol::{ControlCmd, ControlResp, SlotInfo};

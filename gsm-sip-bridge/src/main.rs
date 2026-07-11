@@ -23,6 +23,10 @@ fn main() -> ExitCode {
         return handle_card_command(card_args, &cli);
     }
 
+    if let Some(Commands::ImsRegister(args)) = &cli.command {
+        return handle_ims_register_command(args);
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"
@@ -134,6 +138,39 @@ fn handle_card_command(args: &gsm_sip_bridge::cli::CardArgs, cli: &Cli) -> ExitC
         Ok(resp) => print_resp(resp),
         Err(e) => {
             eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_ims_register_command(args: &gsm_sip_bridge::cli::ImsRegisterArgs) -> ExitCode {
+    use gsm_sip_bridge::ims::{run_register, ImsRegisterConfig, RegisterOutcome};
+
+    let cfg = ImsRegisterConfig {
+        modem_port: args.modem.clone(),
+        pcscf_addr: args.pcscf,
+        pcscf_port: args.pcscf_port,
+        mcc: args.mcc.clone(),
+        mnc: args.mnc.clone(),
+        imsi: args.imsi.clone(),
+        use_tcp: args.tcp,
+        sec_agree: args.sec_agree,
+    };
+
+    match run_register(&cfg) {
+        Ok(RegisterOutcome::Success { status, headers }) => {
+            println!("REGISTER succeeded: {status} OK");
+            for (k, v) in headers {
+                println!("  {k}: {v}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(RegisterOutcome::Rejected { status, reason }) => {
+            eprintln!("REGISTER rejected: {status} {reason}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
