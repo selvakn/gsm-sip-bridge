@@ -1,0 +1,59 @@
+# Fixes for SWu-IKEv2's get_res_ck_ik() (AT+CSIM EAP-AKA path) against the
+# Quectel EC200U / Vodafone (Vi) India USIM:
+#
+#  1. The card rejects SELECT with P2=0x00 ("wrong P1/P2", SW 6B00). It needs
+#     P2=0x0C. The hardcoded generic USIM AID also doesn't match this card;
+#     the real AID (read from EF_DIR) is A0000000871002FFF605FF89000001FF.
+#  2. The EC200U auto-chains GET RESPONSE internally and returns the full
+#     AUTHENTICATE result with SW 9000 directly — there is no "61XX" marker
+#     to trigger the script's follow-up GET RESPONSE call, which crashed with
+#     UnboundLocalError (len_result unset). Skip that call when SW is
+#     already 9000 with full data.
+#
+# Without this patch, EAP-AKA silently falls back to the DEFAULT RES/CK/IK
+# and the ePDG rejects authentication (EAP FAILURE).
+--- a/swu_emulator.py
++++ b/swu_emulator.py
+@@ -3355,9 +3355,9 @@
+     CLI = []
+    
+     #CLI.append('AT+CRSM=178,12032,1,4,0\r\n')
+-    CLI.append('AT+CSIM=14,"00A40000023F00"\r\n')
+-    CLI.append('AT+CSIM=14,"00A40000022F00"\r\n')
+-    CLI.append('AT+CSIM=42,"00A4040010A0000000871002FFFFFFFF8903050001"\r\n')
++    CLI.append('AT+CSIM=14,"00A4000C023F00"\r\n')
++    CLI.append('AT+CSIM=14,"00A4000C022F00"\r\n')
++    CLI.append('AT+CSIM=42,"00A4040C10A0000000871002FFF605FF89000001FF"\r\n')
+     CLI.append('AT+CSIM=78,\"008800812210' + rand.upper() + '10' + autn.upper() + '\"\r\n')
+ 
+     a = time.time()
+@@ -3373,18 +3373,21 @@
+ 
+                 a = time.time() + 1
+                 
++    len_result = None
+     for i in buffer.split('"'):
+         if len(i)==4:
+             if i[0:2] == '61':
+                 len_result = i[-2:]
+-    
+-    LAST_CLI = 'AT+CSIM=10,"00C00000' + len_result + '\"\r\n'
+-    ser.write(LAST_CLI.encode())
+-    buffer = ''
+-    
+-    while "OK\r\n" not in buffer and "ERROR\r\n" not in buffer:
+-        buffer +=  ser.read().decode("utf-8")
+-        
++
++    if len_result is not None:
++        LAST_CLI = 'AT+CSIM=10,"00C00000' + len_result + '\"\r\n'
++        ser.write(LAST_CLI.encode())
++        buffer = ''
++        while "OK\r\n" not in buffer and "ERROR\r\n" not in buffer:
++            buffer +=  ser.read().decode("utf-8")
++    # else: modem (e.g. Quectel EC200U) already auto-chained GET RESPONSE and
++    # returned the full data with SW 9000 in the AUTHENTICATE reply itself.
++
+     for result in buffer.split('"'):
+         if len(result) > 10:
+         
