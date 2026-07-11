@@ -42,6 +42,31 @@ cp .env.example .env        # optional — defaults already target Vi India
 docker compose -f docker-compose.epdg.yml up --build
 ```
 
+### Running `gsm-sip-bridge ims-register` against the tunnel (Phase 2)
+
+The `gsm-sip-bridge` binary needs to run *inside* the `ims` network namespace
+that `entrypoint.sh` creates, since that's the only place the tunnel-assigned
+address and route to the P-CSCF exist. The container's base image (Debian
+bookworm-slim) doesn't have a matching glibc for a binary built on an
+arbitrary host — build it in a matching environment first:
+
+```bash
+# from the repo root
+docker run --rm -v "$PWD:/src" -w /src -e CARGO_TARGET_DIR=/tmp/bt rust:1-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq libasound2-dev pkg-config libudev-dev
+  cargo build -p gsm-sip-bridge --bin gsm-sip-bridge
+  cp /tmp/bt/debug/gsm-sip-bridge /src/gsm-sip-bridge-bookworm'
+docker exec -u root epdg-tunnel bash -c "apt-get update -qq && apt-get install -y -qq libasound2 || apt-get install -y -qq libasound2t64"
+docker cp gsm-sip-bridge-bookworm epdg-tunnel:/usr/local/bin/gsm-sip-bridge
+rm gsm-sip-bridge-bookworm
+
+PCSCF=$(docker exec epdg-tunnel cat /tmp/pcscf)
+docker exec epdg-tunnel ip netns exec ims /usr/local/bin/gsm-sip-bridge -v ims-register \
+  --modem /dev/ttyUSB6 --pcscf "$PCSCF" --mcc 404 --mnc 043 [--sec-agree] [--tcp]
+```
+
+See "Phase 2" findings below for what to expect.
+
 ## Verify (Phase 1 exit criteria)
 
 - Logs show the EAP-AKA exchange **succeed** (progress past `STATE 2`, no
@@ -99,6 +124,44 @@ vary by card/modem firmware).
 
 - **Reliability fallback:** the strongSwan path (osmocom "Option 2"), which needs
   a virtual PC/SC reader bridging the modem's SIM to `eap-sim-pcsc`.
-- **Phase 2:** SIP/IMS registration to the P-CSCF (IMS-AKA) and a voice call.
+
+## Phase 2: IMS-AKA SIP REGISTER — findings
+
+Implemented as `gsm-sip-bridge ims-register` (see `gsm-sip-bridge/src/ims/`,
+`modules/usim.rs`). It reads the IMSI, discovers/selects the USIM ADF, opens a
+UDP/TCP connection to the P-CSCF (learning the real tunnel-assigned local
+address *before* building the first REGISTER — an unspecified Contact gets
+silently dropped by some networks), sends an unauthenticated REGISTER, and on
+a 401 challenge runs the RAND/AUTN through the SIM (`AT+CSIM` AUTHENTICATE,
+reusing the Phase 1 EC200U fixes) to compute an RFC 3310 AKAv1-MD5 digest
+response (RES used as the raw-byte "password" in H(A1), not hex-encoded).
+AKA sync-failure (AUTS) resync is implemented per RFC 3310 §4.4.
+
+**Status: blocked, precisely diagnosed, real Gm IPsec required.** Vodafone
+India's P-CSCF rejects a plain digest REGISTER outright:
+- No `Security-Client` header → `421 Extension Required` / `Require: sec-agree`.
+- With a `Security-Client: ipsec-3gpp` proposal (tried `ealg=null`, then the
+  spec's only other option `ealg=des-ede3-cbc` with `alg=hmac-sha-1-96`,
+  `prot=esp`, `mod=trans`, correct RFC 3329 syntax, distinct `port-c`/`port-s`)
+  → `494 Security Agreement Required`, every time, with an **empty**
+  `Security-Server: ipsec-3gpp ; q=0.1` (no counter-proposed spi/port/alg).
+- All three structurally different proposals produced a **byte-identical**
+  response in ~200ms — strong evidence the server isn't evaluating our
+  specific header values at all, i.e. this isn't a "wrong algorithm" problem.
+- Subscription/provisioning was ruled out: VoWiFi works on a real phone (Moto)
+  with this same SIM, so the network does support this IMSI for VoWiFi.
+- This means the real client sends something in its REGISTER we aren't
+  replicating (header set, ordering, or content beyond what RFC 3329/TS 24.229
+  document). **Closing this gap needs ground truth** — a packet capture of a
+  real phone's actual VoWiFi REGISTER on this network, to diff header-by-header
+  against ours. Guessing further at the wire format without that capture has
+  demonstrated ~zero yield (3 attempts, identical canned rejection each time).
+- Reaching an actual `200 OK` also requires implementing the real Gm IPsec SA
+  once negotiation succeeds: deriving ESP keys from the AKA `CK`/`IK` (TS
+  33.203 Annex H) and installing kernel XFRM SAs in the `ims` netns — not yet
+  attempted, since negotiation itself doesn't yet succeed.
+
+See `gsm-sip-bridge/src/ims/mod.rs` module docs for the full design rationale
+(including why this bypasses PJSIP's built-in digest auth entirely).
 
 See `specs`/the plan for the full design and rationale.

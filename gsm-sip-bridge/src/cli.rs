@@ -36,6 +36,52 @@ pub struct Cli {
 pub enum Commands {
     /// Manage GSM cards
     Card(CardArgs),
+    /// Register to the operator's IMS core over a VoWiFi/ePDG tunnel using
+    /// IMS-AKA (SIP digest authenticated via the SIM's AKA response). This
+    /// is a standalone diagnostic mode — it does not start the GSM->SIP
+    /// daemon or touch the CardPool.
+    ImsRegister(ImsRegisterArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ImsRegisterArgs {
+    /// Modem AT port used for AT+CIMI / AT+CSIM (EAP/IMS-AKA against the SIM)
+    #[arg(long)]
+    pub modem: PathBuf,
+
+    /// P-CSCF (IMS SIP registrar) IP address, as assigned by the ePDG tunnel
+    #[arg(long)]
+    pub pcscf: std::net::IpAddr,
+
+    /// P-CSCF SIP port
+    #[arg(long, default_value_t = 5060)]
+    pub pcscf_port: u16,
+
+    /// Mobile Country Code (3 digits)
+    #[arg(long)]
+    pub mcc: String,
+
+    /// Mobile Network Code (3 digits, zero-padded)
+    #[arg(long)]
+    pub mnc: String,
+
+    /// Override the IMSI instead of reading it from the SIM via AT+CIMI
+    #[arg(long)]
+    pub imsi: Option<String>,
+
+    /// Use TCP instead of UDP to reach the P-CSCF (some networks/paths only
+    /// carry SIP signaling over TCP; ICMP being filtered is not a signal
+    /// either way, but a UDP REGISTER timeout is worth retrying over TCP)
+    #[arg(long)]
+    pub tcp: bool,
+
+    /// Advertise Supported: sec-agree + a Security-Client: ipsec-3gpp
+    /// proposal on every REGISTER. Required by networks that reject a plain
+    /// digest REGISTER with 421 Extension Required (confirmed: Vodafone
+    /// India). Does not set up the actual Gm IPsec SA — only tests whether
+    /// the network proceeds on the header proposal alone.
+    #[arg(long)]
+    pub sec_agree: bool,
 }
 
 #[derive(Parser, Debug)]
