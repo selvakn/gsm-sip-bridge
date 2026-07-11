@@ -155,6 +155,7 @@ fn handle_ims_register_command(args: &gsm_sip_bridge::cli::ImsRegisterArgs) -> E
         imsi: args.imsi.clone(),
         use_tcp: args.tcp,
         sec_agree: args.sec_agree,
+        msisdn: args.msisdn.clone(),
     };
 
     match run_register(&cfg) {

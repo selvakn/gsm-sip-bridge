@@ -287,9 +287,24 @@ happened on Airtel, where the fuller request is what's required to get
 anywhere — reinforcing that Vi's block is a deliberate network-side policy
 (most likely fingerprinting `Require: sec-agree` + the full header
 combination as non-partner traffic) rather than a protocol gap on our end.
-No further action taken here; this is the same conclusion the original
-Vi investigation reached, just re-confirmed against the complete,
-now-`200-OK`-capable implementation.
+
+**Ruled out: IMPI-vs-IMPU identity in To/From/Contact.** A plausible
+alternative theory (raised externally) was that using the IMSI-derived
+temporary IMPU (`sip:<IMSI>@<realm>`) in To/From/Contact — rather than an
+MSISDN-based Public User Identity — could itself trigger the block, since
+strictly that IMSI-based URI is the *private* identity (IMPI) and some HSS
+implementations reject binding a Contact to it directly. Tested directly
+with `--msisdn +91XXXXXXXXXX` (added as a CLI flag specifically for this:
+see `ImsRegisterConfig::msisdn` in `gsm-sip-bridge/src/ims/mod.rs` — it only
+changes To/From/Contact, the `Authorization` header's username stays
+IMSI-based per TS 33.203 regardless). Result: **byte-identical** `421`/`403`
+responses whether the identity is MSISDN- or IMSI-based, in both the plain
+and full-`sec-agree` cases. This is expected in hindsight — `421 Extension
+Required` and this `403` both fire before any identity/HSS lookup would
+happen at all — but it's now empirically ruled out rather than assumed. (Our
+own Airtel `200 OK` was already evidence this mechanism works on real
+networks — TS 23.003 §13.4's "temporary Public User Identity" — but Vi could
+have been stricter; it isn't, at least not at this stage of the exchange.)
 
 See `gsm-sip-bridge/src/ims/mod.rs` module docs for the full design rationale
 (including why this bypasses PJSIP's built-in digest auth entirely), and

@@ -62,6 +62,11 @@ pub struct ImsRegisterConfig {
     /// tests whether the network will proceed on the strength of the header
     /// proposal alone, in case it's lenient about actually enforcing it.
     pub sec_agree: bool,
+    /// Use this MSISDN (E.164) as the Public User Identity in
+    /// To/From/Contact instead of the IMSI-derived temporary IMPU. The
+    /// Authorization header's username (IMPI) is unaffected — see the CLI
+    /// help text in `cli.rs` for the rationale.
+    pub msisdn: Option<String>,
 }
 
 #[derive(Debug)]
@@ -93,7 +98,18 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
 
     let realm = format!("ims.mnc{}.mcc{}.3gppnetwork.org", cfg.mnc, cfg.mcc);
+    // The IMPI (private identity) — always IMSI-based per TS 33.203,
+    // regardless of --msisdn. Used only for the Authorization header's
+    // username and the digest HA1 computation, never for To/From/Contact.
     let impi_uri = format!("{imsi}@{realm}");
+    // The Public User Identity used in To/From/Contact: either the
+    // IMSI-derived temporary IMPU (default, works on Airtel) or an
+    // MSISDN-based IMPU if --msisdn is given (testing whether a network's
+    // HSS is pickier about binding a Contact to the private identity).
+    let public_uri = match &cfg.msisdn {
+        Some(msisdn) => format!("{msisdn}@{realm}"),
+        None => impi_uri.clone(),
+    };
     let pcscf: SocketAddr = SocketAddr::new(cfg.pcscf_addr, cfg.pcscf_port);
     // PJSIP-based implementations (e.g. Asterisk's res_pjsip_outbound_registration,
     // via pjsip_regc_init's srv_url) set the REGISTER Request-URI to the
@@ -155,7 +171,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     let branch = format!("z9hG4bK{}", random_hex(6));
     let initial = build_register(&RegisterRequest {
         registrar_uri: &request_uri,
-        impi_uri: &impi_uri,
+        public_uri: &public_uri,
         local_addr,
         call_id: &call_id,
         from_tag: &from_tag,
@@ -300,7 +316,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
         let branch = format!("z9hG4bK{}", random_hex(6));
         let retry = build_register(&RegisterRequest {
             registrar_uri: &request_uri,
-            impi_uri: &impi_uri,
+            public_uri: &public_uri,
             local_addr,
             call_id: &call_id,
             from_tag: &from_tag,
