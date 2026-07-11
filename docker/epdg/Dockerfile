@@ -27,8 +27,11 @@ RUN git clone --depth 1 https://github.com/fasferraz/SWu-IKEv2.git \
 
 # Fixes needed for the Quectel EC200U / Vodafone India USIM — see the patch
 # file for details (P2 byte + AT+CSIM response-chaining quirks).
+# Upstream stores swu_emulator.py with CRLF line endings; our patch's context
+# uses LF, so normalize before applying (patch --binary matches EOLs exactly).
 COPY patches/0001-ec200u-at-csim-fixes.patch /tmp/
-RUN patch --binary -p1 -d SWu-IKEv2 < /tmp/0001-ec200u-at-csim-fixes.patch \
+RUN sed -i 's/\r$//' SWu-IKEv2/swu_emulator.py \
+    && patch --binary -p1 -d SWu-IKEv2 < /tmp/0001-ec200u-at-csim-fixes.patch \
     && rm /tmp/0001-ec200u-at-csim-fixes.patch
 
 # Python deps. Use pyserial (NOT the 'serial' PyPI pkg) to provide `import serial`.

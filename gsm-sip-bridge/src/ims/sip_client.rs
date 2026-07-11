@@ -89,6 +89,9 @@ pub struct RegisterRequest<'a> {
     pub branch: &'a str,
     pub cseq: u32,
     pub expires: u32,
+    /// Via/branch transport token — must match the transport actually used
+    /// to send the request (RFC 3261 §18.1.1), e.g. "UDP" or "TCP".
+    pub transport: &'a str,
     pub authorization: Option<&'a str>,
     /// Verbatim extra header lines (no trailing CRLF), e.g. `Supported:
     /// sec-agree` / `Security-Client: ipsec-3gpp; ...` for networks that
@@ -97,7 +100,7 @@ pub struct RegisterRequest<'a> {
     pub extra_headers: &'a [String],
 }
 
-fn format_sip_addr(addr: SocketAddr) -> String {
+pub fn format_sip_addr(addr: SocketAddr) -> String {
     match addr.ip() {
         IpAddr::V6(ip) => format!("[{ip}]:{}", addr.port()),
         IpAddr::V4(ip) => format!("{ip}:{}", addr.port()),
@@ -110,16 +113,18 @@ pub fn build_register(req: &RegisterRequest) -> String {
 
     let mut msg = format!(
         "REGISTER sip:{registrar} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP {via_addr};branch={branch};rport\r\n\
+         Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
          Max-Forwards: 70\r\n\
          From: <sip:{impi}>;tag={from_tag}\r\n\
          To: <sip:{impi}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{impi_user}@{contact_addr}>\r\n\
+         Contact: <sip:{impi_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:000000000000000>\"\r\n\
          Expires: {expires}\r\n\
-         User-Agent: gsm-sip-bridge-ims-register/1\r\n",
+         Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER\r\n\
+         User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n",
         registrar = req.registrar_uri,
+        transport = req.transport,
         via_addr = via_addr,
         branch = req.branch,
         impi = req.impi_uri,
@@ -360,6 +365,7 @@ mod tests {
             branch: "z9hG4bKbranch",
             cseq: 1,
             expires: 600,
+            transport: "UDP",
             authorization: None,
             extra_headers: &[],
         };
@@ -391,6 +397,7 @@ mod tests {
             branch: "branch",
             cseq: 1,
             expires: 600,
+            transport: "UDP",
             authorization: None,
             extra_headers: &extra,
         };
