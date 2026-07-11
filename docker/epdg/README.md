@@ -265,6 +265,32 @@ or PJProject at all. Verified reproducible across repeated runs; XFRM state
 is torn down at the end of each run (success or failure) so repeat
 invocations don't collide with stale SAs from a previous one.
 
+**Re-tested against Vi with the now-complete header set: still blocked, and
+the block got *more* aggressive.** With the Vodafone SIM swapped back in and
+the full Airtel-derived recipe (`Require`/`Proxy-Require: sec-agree`,
+enriched `Contact`, `P-Access-Network-Info`, etc. — everything that reaches
+`200 OK` on Airtel):
+- `--tcp --sec-agree` (the full recipe): instant `403 Forbidden`, no
+  `WWW-Authenticate`, no `Security-Server`, no `Date` header — a
+  content-free rejection matching the earlier "blanket SBC block" signature.
+- `--tcp` alone (no sec-agree headers): `421 Extension Required` with an
+  **empty** `Security-Server: ipsec-3gpp ; q=0.1` (no counter-proposed
+  spi/port/alg) — matching the *original* Vi finding from before any of
+  this session's fixes, byte-for-byte the same shape.
+
+Notably the *plainer* request gets the more informative response (`421`
+with a real, if empty, `Security-Server`, plus a `Date` header and a
+differently-formatted `To` tag suggesting it reached a real network element)
+while the *fuller*, spec-compliant request gets slapped down harder and
+earlier (`403`, no information at all). That's the opposite of what
+happened on Airtel, where the fuller request is what's required to get
+anywhere — reinforcing that Vi's block is a deliberate network-side policy
+(most likely fingerprinting `Require: sec-agree` + the full header
+combination as non-partner traffic) rather than a protocol gap on our end.
+No further action taken here; this is the same conclusion the original
+Vi investigation reached, just re-confirmed against the complete,
+now-`200-OK`-capable implementation.
+
 See `gsm-sip-bridge/src/ims/mod.rs` module docs for the full design rationale
 (including why this bypasses PJSIP's built-in digest auth entirely), and
 `gsm-sip-bridge/src/ims/gm_ipsec.rs` for the Gm IPsec implementation.
