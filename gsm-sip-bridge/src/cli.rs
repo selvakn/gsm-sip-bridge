@@ -41,6 +41,15 @@ pub enum Commands {
     /// is a standalone diagnostic mode — it does not start the GSM->SIP
     /// daemon or touch the CardPool.
     ImsRegister(ImsRegisterArgs),
+    /// Register (as `ims-register`) and then place a real call over the
+    /// live network, exchanging a test tone for outgoing audio and
+    /// recording whatever comes back to a WAV file. Offers G.711 μ-law
+    /// (PCMU) always, plus AMR-WB when this binary was built with the
+    /// `amr-linked` feature (VoWiFi/VoLTE networks typically require
+    /// AMR-WB and reject a PCMU-only offer with `488 Not Acceptable
+    /// Here` — confirmed on a real Airtel test call). Standalone
+    /// diagnostic mode, same as `ims-register`.
+    ImsCall(ImsCallArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -94,6 +103,31 @@ pub struct ImsRegisterArgs {
     /// every SIM has it written).
     #[arg(long)]
     pub msisdn: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct ImsCallArgs {
+    #[command(flatten)]
+    pub register: ImsRegisterArgs,
+
+    /// Callee, E.164 (e.g. +919789063708). This places a REAL call over
+    /// the live network to this number — make sure whoever's on the other
+    /// end is expecting it.
+    #[arg(long)]
+    pub to: String,
+
+    /// Where to write the recorded (received) audio — a 16-bit PCM mono
+    /// WAV file at 8kHz (G.711's rate).
+    #[arg(long)]
+    pub record: PathBuf,
+
+    /// How long to wait for the callee to answer before giving up.
+    #[arg(long, default_value_t = 30)]
+    pub ring_timeout_secs: u64,
+
+    /// How long to hold the call open (exchanging audio) once answered.
+    #[arg(long, default_value_t = 15)]
+    pub call_duration_secs: u64,
 }
 
 #[derive(Parser, Debug)]

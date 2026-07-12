@@ -18,12 +18,14 @@ pub fn random_hex(n_bytes: usize) -> String {
 }
 
 /// A parsed SIP response: status line + headers (in original order, values
-/// joined if a header name repeats) + reason phrase.
+/// joined if a header name repeats) + reason phrase + body (e.g. an SDP
+/// answer on an INVITE's 200 OK).
 #[derive(Debug, Clone)]
 pub struct SipResponse {
     pub status: u16,
     pub reason: String,
     pub headers: Vec<(String, String)>,
+    pub body: String,
 }
 
 impl SipResponse {
@@ -34,8 +36,20 @@ impl SipResponse {
             .map(|(_, v)| v.as_str())
     }
 
-    fn parse(raw: &str) -> BridgeResult<Self> {
-        let mut lines = raw.split("\r\n");
+    /// Try to parse ONE complete SIP message from the front of `buf` (a
+    /// message is complete once the header/body separator is present *and*
+    /// `buf` holds at least `Content-Length` more bytes after it — a single
+    /// TCP `read()` can return a partial message, or several messages back
+    /// to back, e.g. `100 Trying` immediately followed by `180 Ringing`).
+    /// Returns `Ok(None)` if `buf` doesn't yet hold a full message, along
+    /// with how many bytes were consumed so the caller can drain them.
+    fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
+        let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
+            return Ok(None);
+        };
+        let header_part = &buf[..header_len];
+
+        let mut lines = header_part.split("\r\n");
         let status_line = lines
             .next()
             .ok_or_else(|| BridgeError::Ims("empty SIP response".into()))?;
@@ -63,7 +77,7 @@ impl SipResponse {
             }
         }
 
-        let headers = unfolded
+        let headers: Vec<(String, String)> = unfolded
             .into_iter()
             .filter_map(|line| {
                 line.split_once(':')
@@ -71,11 +85,27 @@ impl SipResponse {
             })
             .collect();
 
-        Ok(Self {
-            status,
-            reason,
-            headers,
-        })
+        let content_length: usize = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .unwrap_or(0);
+
+        let total_len = header_len + content_length;
+        if buf.len() < total_len {
+            return Ok(None);
+        }
+        let body = buf[header_len..total_len].to_string();
+
+        Ok(Some((
+            Self {
+                status,
+                reason,
+                headers,
+                body,
+            },
+            total_len,
+        )))
     }
 }
 
@@ -148,26 +178,34 @@ pub fn build_register(req: &RegisterRequest) -> String {
     msg
 }
 
-/// A single UDP or TCP connection to the P-CSCF, held open for the whole
-/// REGISTER transaction (initial request + challenge response) so that:
-/// (a) the local address is known *before* building the first request (an
-/// unspecified `0.0.0.0`/`::` Via/Contact in the first REGISTER is grounds
-/// for a P-CSCF to silently drop it), and (b) — for TCP — the same
-/// connection carries both requests, as most SIP stacks expect.
-pub enum SipTransport {
+enum Socket {
     Udp(UdpSocket),
     Tcp(TcpStream),
 }
 
+/// A single UDP or TCP connection to the P-CSCF, held open for a whole
+/// transaction (REGISTER + challenge response, or INVITE + provisional
+/// responses + final response) so that: (a) the local address is known
+/// *before* building the first request (an unspecified `0.0.0.0`/`::`
+/// Via/Contact is grounds for a P-CSCF to silently drop it), and (b) — for
+/// TCP — the same connection carries every message, as most SIP stacks
+/// expect. `buf` holds bytes read but not yet consumed into a full message
+/// — a single `read()` can return a partial message, or several back to
+/// back (e.g. `100 Trying` immediately followed by `180 Ringing`).
+pub struct SipTransport {
+    socket: Socket,
+    buf: String,
+}
+
 impl SipTransport {
     pub fn connect(pcscf: SocketAddr, use_tcp: bool) -> BridgeResult<Self> {
-        if use_tcp {
+        let socket = if use_tcp {
             let stream = TcpStream::connect_timeout(&pcscf, RECV_TIMEOUT)
                 .map_err(|e| BridgeError::Ims(format!("TCP connect to {pcscf} failed: {e}")))?;
             stream
                 .set_read_timeout(Some(RECV_TIMEOUT))
                 .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
-            Ok(Self::Tcp(stream))
+            Socket::Tcp(stream)
         } else {
             let bind_addr: SocketAddr = match pcscf {
                 SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
@@ -181,8 +219,12 @@ impl SipTransport {
             socket
                 .set_read_timeout(Some(RECV_TIMEOUT))
                 .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
-            Ok(Self::Udp(socket))
-        }
+            Socket::Udp(socket)
+        };
+        Ok(Self {
+            socket,
+            buf: String::new(),
+        })
     }
 
     /// Open a *new* connection from an explicitly chosen local port to a
@@ -202,7 +244,7 @@ impl SipTransport {
             SocketAddr::V6(_) => format!("[::]:{local_port}").parse().unwrap(),
         };
 
-        if use_tcp {
+        let socket = if use_tcp {
             let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)
                 .map_err(|e| BridgeError::Ims(format!("socket() failed: {e}")))?;
             socket
@@ -218,7 +260,7 @@ impl SipTransport {
             stream
                 .set_read_timeout(Some(RECV_TIMEOUT))
                 .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
-            Ok(Self::Tcp(stream))
+            Socket::Tcp(stream)
         } else {
             let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
                 .map_err(|e| BridgeError::Ims(format!("socket() failed: {e}")))?;
@@ -234,19 +276,23 @@ impl SipTransport {
             let sock: UdpSocket = socket.into();
             sock.set_read_timeout(Some(RECV_TIMEOUT))
                 .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
-            Ok(Self::Udp(sock))
-        }
+            Socket::Udp(sock)
+        };
+        Ok(Self {
+            socket,
+            buf: String::new(),
+        })
     }
 
     pub fn local_addr(&self) -> BridgeResult<SocketAddr> {
-        let addr = match self {
-            Self::Udp(s) => s.local_addr(),
-            Self::Tcp(s) => s.local_addr(),
+        let addr = match &self.socket {
+            Socket::Udp(s) => s.local_addr(),
+            Socket::Tcp(s) => s.local_addr(),
         };
         addr.map_err(|e| BridgeError::Ims(format!("local_addr failed: {e}")))
     }
 
-    /// For TCP, force an abortive close (`SO_LINGER` 0, sends RST) instead
+    /// For TCP, force an abortive close (`SO_LINGER` 0, sends `RST`) instead
     /// of the default graceful FIN — needed right before dropping a
     /// connection we're about to rebind its exact local port for. A normal
     /// close leaves the port in `FIN_WAIT`/`TIME_WAIT`, which `SO_REUSEADDR`
@@ -254,40 +300,111 @@ impl SipTransport {
     /// reached `TIME_WAIT` yet by the time we rebind (a near-certainty when
     /// rebinding immediately after the last write, as here). No-op for UDP.
     pub fn force_close(&self) {
-        if let Self::Tcp(stream) = self {
+        if let Socket::Tcp(stream) = &self.socket {
             let _ = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO));
         }
     }
 
-    pub fn send_and_recv(&mut self, message: &str) -> BridgeResult<SipResponse> {
+    pub fn send(&mut self, message: &str) -> BridgeResult<()> {
         tracing::debug!(message = %message, "sending SIP request");
-        let mut buf = [0u8; MAX_MSG_LEN];
-        let n = match self {
-            Self::Udp(socket) => {
+        match &mut self.socket {
+            Socket::Udp(socket) => {
                 socket
                     .send(message.as_bytes())
                     .map_err(|e| BridgeError::Ims(format!("UDP send failed: {e}")))?;
-                socket
-                    .recv(&mut buf)
-                    .map_err(|e| BridgeError::Ims(format!("UDP recv failed/timed out: {e}")))?
             }
-            Self::Tcp(stream) => {
+            Socket::Tcp(stream) => {
                 stream
                     .write_all(message.as_bytes())
                     .map_err(|e| BridgeError::Ims(format!("TCP send failed: {e}")))?;
-                stream
-                    .read(&mut buf)
-                    .map_err(|e| BridgeError::Ims(format!("TCP recv failed/timed out: {e}")))?
             }
         };
-        if n == 0 {
-            return Err(BridgeError::Ims(
+        Ok(())
+    }
+
+    /// Try one read. Returns `Ok(true)` if new data was appended to
+    /// `self.buf`, `Ok(false)` if the read timed out (the underlying
+    /// socket's `RECV_TIMEOUT`) with no new data — not necessarily a
+    /// problem, e.g. while waiting for a phone to ring for longer than
+    /// that — or `Err` on a real I/O failure.
+    fn read_more(&mut self) -> BridgeResult<bool> {
+        let mut tmp = [0u8; MAX_MSG_LEN];
+        let result = match &mut self.socket {
+            Socket::Udp(socket) => socket.recv(&mut tmp),
+            Socket::Tcp(stream) => stream.read(&mut tmp),
+        };
+        match result {
+            Ok(0) => Err(BridgeError::Ims(
                 "connection closed by peer with no data (0 bytes read)".into(),
-            ));
+            )),
+            Ok(n) => {
+                self.buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                Ok(true)
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(BridgeError::Ims(format!("recv failed: {e}"))),
         }
-        let text = String::from_utf8_lossy(&buf[..n]).to_string();
-        tracing::debug!(bytes = n, response = %text, "received SIP response");
-        SipResponse::parse(&text)
+    }
+
+    /// Block until one complete SIP message (headers + `Content-Length`
+    /// bytes of body) is available, then return it — draining exactly that
+    /// message from the internal buffer so a message that arrived alongside
+    /// (or ahead of) it isn't lost. A read timing out with no data at all is
+    /// treated as failure here — fine for REGISTER, which expects a prompt
+    /// reply; `recv_final_response` is the one that tolerates a long wait.
+    pub fn recv_response(&mut self) -> BridgeResult<SipResponse> {
+        loop {
+            if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
+                tracing::debug!(response = %self.buf[..consumed], "received SIP response");
+                self.buf.drain(..consumed);
+                return Ok(resp);
+            }
+            if !self.read_more()? {
+                return Err(BridgeError::Ims(
+                    "timed out waiting for a SIP response".into(),
+                ));
+            }
+        }
+    }
+
+    /// Send a request and wait for the *first* response — fine for
+    /// REGISTER, where a `401` challenge is always the final response to
+    /// that transaction (no provisional responses expected).
+    pub fn send_and_recv(&mut self, message: &str) -> BridgeResult<SipResponse> {
+        self.send(message)?;
+        self.recv_response()
+    }
+
+    /// Wait for a *final* (status >= 200) response, logging and skipping
+    /// any provisional ones (`100 Trying`, `180 Ringing`, ...) along the
+    /// way — needed for INVITE, which can take several seconds (or tens of
+    /// seconds, well past a single socket read's `RECV_TIMEOUT`) to ring
+    /// before the callee answers or declines.
+    pub fn recv_final_response(&mut self, overall_timeout: Duration) -> BridgeResult<SipResponse> {
+        let deadline = std::time::Instant::now() + overall_timeout;
+        loop {
+            if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
+                self.buf.drain(..consumed);
+                if resp.status >= 200 {
+                    return Ok(resp);
+                }
+                tracing::info!(status = resp.status, reason = %resp.reason, "provisional response");
+                continue;
+            }
+            self.read_more()?;
+            if std::time::Instant::now() >= deadline {
+                return Err(BridgeError::Ims(
+                    "timed out waiting for a final response".into(),
+                ));
+            }
+        }
     }
 }
 
@@ -381,7 +498,8 @@ mod tests {
                    Via: SIP/2.0/UDP 1.2.3.4:5060\r\n\
                    WWW-Authenticate: Digest realm=\"ims.example.org\", nonce=\"abc==\", algorithm=AKAv1-MD5\r\n\
                    Content-Length: 0\r\n\r\n";
-        let resp = SipResponse::parse(raw).unwrap();
+        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        assert_eq!(consumed, raw.len());
         assert_eq!(resp.status, 401);
         assert_eq!(resp.reason, "Unauthorized");
         assert!(resp
@@ -395,11 +513,25 @@ mod tests {
         let raw = "SIP/2.0 200 OK\r\n\
                    Contact: <sip:foo@bar>\r\n\
                    \t;expires=600\r\n\r\n";
-        let resp = SipResponse::parse(raw).unwrap();
+        let (resp, _) = SipResponse::try_parse(raw).unwrap().unwrap();
         assert_eq!(
             resp.header("Contact").unwrap(),
             "<sip:foo@bar> ;expires=600"
         );
+    }
+
+    #[test]
+    fn try_parse_returns_none_when_incomplete() {
+        let raw = "SIP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nhel";
+        assert!(SipResponse::try_parse(raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn try_parse_extracts_body_and_leaves_remainder_for_next_message() {
+        let raw = "SIP/2.0 200 OK\r\nContent-Length: 2\r\n\r\nhiSIP/2.0 100 Trying\r\n\r\n";
+        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        assert_eq!(resp.body, "hi");
+        assert_eq!(&raw[consumed..], "SIP/2.0 100 Trying\r\n\r\n");
     }
 
     #[test]

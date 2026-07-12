@@ -61,7 +61,6 @@ docker run --rm -v "$PWD:/src" -w /src -e CARGO_TARGET_DIR=/tmp/bt rust:1-bookwo
   apt-get update -qq && apt-get install -y -qq libasound2-dev pkg-config libudev-dev
   cargo build -p gsm-sip-bridge --bin gsm-sip-bridge
   cp /tmp/bt/debug/gsm-sip-bridge /src/gsm-sip-bridge-bookworm'
-docker exec -u root epdg-tunnel bash -c "apt-get update -qq && apt-get install -y -qq libasound2 || apt-get install -y -qq libasound2t64"
 docker cp gsm-sip-bridge-bookworm epdg-tunnel:/usr/local/bin/gsm-sip-bridge
 rm gsm-sip-bridge-bookworm
 
@@ -70,7 +69,42 @@ docker exec epdg-tunnel ip netns exec ims /usr/local/bin/gsm-sip-bridge -v ims-r
   --modem /dev/ttyUSB6 --pcscf "$PCSCF" --mcc 404 --mnc 043 [--sec-agree] [--tcp]
 ```
 
+(`libasound2`/`libvo-amrwbenc0`/`libopencore-amrwb0` are already installed in
+the `epdg-tunnel` image itself — see the Dockerfile — so no `docker exec ...
+apt-get install` step is needed here anymore.)
+
 See "Phase 2" findings below for what to expect.
+
+### Running `gsm-sip-bridge ims-call` (Phase 3: an actual test call)
+
+Same binary, but built with AMR-WB support (`--features
+gsm-sip-bridge/amr-linked`) — a live test call against Airtel found VoWiFi
+requires AMR-WB and rejects a PCMU-only offer with `488 Not Acceptable
+Here`; see "Phase 3" findings below. Needs the AMR-WB *build-time* dev
+headers in the build container (the *runtime* shared libs are already in
+the `epdg-tunnel` image, same as above):
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src -e CARGO_TARGET_DIR=/tmp/bt rust:1-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq \
+    libasound2-dev pkg-config libudev-dev \
+    libvo-amrwbenc-dev libopencore-amrwb-dev
+  cargo build -p gsm-sip-bridge --bin gsm-sip-bridge --features gsm-sip-bridge/amr-linked
+  cp /tmp/bt/debug/gsm-sip-bridge /src/gsm-sip-bridge-bookworm'
+docker cp gsm-sip-bridge-bookworm epdg-tunnel:/usr/local/bin/gsm-sip-bridge
+rm gsm-sip-bridge-bookworm
+
+PCSCF=$(docker exec epdg-tunnel cat /tmp/pcscf)
+docker exec epdg-tunnel mkdir -p /tmp/recordings
+docker exec epdg-tunnel ip netns exec ims /usr/local/bin/gsm-sip-bridge -v ims-call \
+  --modem /dev/ttyUSB6 --pcscf "$PCSCF" --mcc 404 --mnc 094 --tcp --sec-agree \
+  --to "+91XXXXXXXXXX" --record /tmp/recordings/test-call.wav \
+  --ring-timeout-secs 30 --call-duration-secs 15
+docker cp epdg-tunnel:/tmp/recordings/test-call.wav .
+```
+
+This places a **real call** over the live network — make sure the callee
+knows to expect and answer it.
 
 ## Verify (Phase 1 exit criteria)
 
@@ -309,5 +343,71 @@ have been stricter; it isn't, at least not at this stage of the exchange.)
 See `gsm-sip-bridge/src/ims/mod.rs` module docs for the full design rationale
 (including why this bypasses PJSIP's built-in digest auth entirely), and
 `gsm-sip-bridge/src/ims/gm_ipsec.rs` for the Gm IPsec implementation.
+
+## Phase 3: a real, answered call with recorded audio — findings
+
+Implemented as `gsm-sip-bridge ims-call` (`gsm-sip-bridge/src/ims/call.rs`),
+reusing Phase 2's registration and Gm IPsec session, then sending an INVITE,
+exchanging RTP audio for a fixed duration, and recording what's received to
+a WAV file (`gsm-sip-bridge/src/ims/rtp.rs`'s `WavWriter`).
+
+**First attempt: PCMU-only offer got `488 Not Acceptable Here`.** VoWiFi/
+VoLTE networks mandate AMR-WB and most won't fall back to G.711 — this
+client only had PCMU (μ-law, no codec library needed) implemented at that
+point.
+
+**Second finding: the INVITE never rang the phone at all (`487 Request
+Terminated` after ~23s, twice, no `180 Ringing`) until the Request-URI/To
+carried `;user=phone`** (RFC 3261 §19.1.1 / TS 24.229) — without it, a bare
+`sip:+91XXXXXXXXXX@realm` URI reached a terminating application server that
+apparently couldn't resolve it to a real destination and just timed out
+silently. Adding `;user=phone` fixed this immediately (response time for
+the *next* rejection dropped from ~23s to under 1s, and it started
+producing meaningful status codes instead of a blind timeout).
+
+**Added real AMR-WB support** (`amr-sys`/`amr-safe` crates, FFI-wrapping
+the system `vo-amrwbenc` (encode) and `opencore-amrwb` (decode) libraries —
+opencore's own encoder was stripped for patent reasons years ago, hence two
+separate libraries) rather than attempting a hand-written ACELP codec from
+scratch, which would be an enormous undertaking with a real risk of not
+interoperating correctly with a live network's bit-exact decoder. Confirmed
+against the real library rather than assumed from the spec:
+- `E_IF_encode`'s output is 1 TOC/header byte + packed speech data, and that
+  TOC byte is bit-for-bit identical to one RFC 4867 octet-aligned ToC entry
+  (`F` + `FT` + `Q` + padding) — so the RTP payload for one frame per packet
+  is just `[CMR byte (0xF0, "no request")] + E_IF_encode's output, verbatim`.
+  No manual bit-packing needed.
+- Frame sizes per mode (e.g. mode 8 @ 23.85kbps = 61 bytes) were measured
+  directly rather than trusted from memory/spec tables.
+- Gated behind an `amr-linked` Cargo feature (default off, mirroring
+  `pjsua-safe`'s `pjsip-linked`) so the workspace keeps building without
+  `libvo-amrwbenc`/`libopencore-amrwb` installed; the `epdg-tunnel` image
+  now installs the runtime shared libs unconditionally (see Dockerfile).
+- SDP offers **both** PCMU and AMR-WB (`m=audio <port> RTP/AVP 0 96`,
+  `a=fmtp:96 octet-align=1` — RFC 4867's default is bit-packed
+  "bandwidth-efficient" mode, which isn't implemented, so this must be
+  explicit) and the answer's chosen payload type picks which codec/framing
+  `ims::call`'s RTP loop uses.
+
+**Result: a real, answered call with real recorded audio**, against Airtel
+India, to a second phone under the user's control:
+```
+180 Ringing (phone audibly rang)
+200 OK (answered after ~16s)
+call answered — recorded 120480 samples to /tmp/recordings/test-call.wav
+```
+The far end (interestingly) chose **PCMU**, not AMR-WB, despite both being
+offered — plausibly because the far end wasn't itself on VoWiFi (e.g.
+answered over regular cellular voice, with the network transcoding), or
+simply preferred the first-listed codec. The recorded WAV
+(120480 samples @ 8kHz = 15.06s, matching `--call-duration-secs 15`) has
+genuinely varying RMS energy (~900–5200) for the first ~10 seconds — real
+audio, not silence or decode noise — before dropping to near-silence for
+the last ~5 seconds. AMR-WB's encode/decode path itself is implemented and
+unit-tested against the real library (`amr-safe`'s tests, run with
+`--features amr-linked`), but hasn't yet been exercised end-to-end against
+a network that actually selects it — worth re-testing with a callee whose
+own path is VoWiFi/VoLIP-only, if the "which codec gets picked" question
+matters for future work.
 
 See `specs`/the plan for the full design and rationale.

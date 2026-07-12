@@ -22,8 +22,11 @@
 //! 2617/3310 digest math in `ims::digest`), this module handles the SIP
 //! request/response transaction directly instead.
 
+pub mod call;
 mod digest;
 mod gm_ipsec;
+mod rtp;
+mod sdp;
 mod sip_client;
 
 use crate::error::{BridgeError, BridgeResult};
@@ -81,10 +84,56 @@ pub enum RegisterOutcome {
     },
 }
 
+/// A REGISTER transaction's outcome plus everything needed to send further
+/// requests (e.g. INVITE, in `ims::call`) over the *same* session — reusing
+/// the live transport (which, once Gm IPsec is set up, is the *only* place
+/// the negotiated XFRM policy's selector matches) rather than reconnecting.
+struct RegisteredSession {
+    transport: SipTransport,
+    realm: String,
+    public_uri: String,
+    local_addr: SocketAddr,
+    use_tcp: bool,
+    /// Next `CSeq` to use for a request on this session (already advanced
+    /// past whatever REGISTER used).
+    cseq: u32,
+    gm_state: Option<(GmEndpoints, SaProposal, gm_ipsec::SecurityServerParams)>,
+    xfrm_proto: &'static str,
+    status: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+}
+
+impl RegisteredSession {
+    /// Tear down any installed Gm IPsec state — a one-shot diagnostic CLI
+    /// isn't a persistent registration, so kernel XFRM state would
+    /// otherwise leak across repeated invocations.
+    fn cleanup(&mut self) {
+        if let Some((endpoints, p, theirs)) = self.gm_state.take() {
+            gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, self.xfrm_proto);
+        }
+    }
+}
+
 /// Run the IMS-AKA REGISTER flow to completion (one challenge/response
 /// round, plus up to `MAX_RESYNC_ATTEMPTS` AKA resyncs) and report the
 /// final SIP status.
 pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
+    let mut session = register_session(cfg)?;
+    session.cleanup();
+    match session.status {
+        200 => Ok(RegisterOutcome::Success {
+            status: session.status,
+            headers: session.headers,
+        }),
+        _ => Ok(RegisterOutcome::Rejected {
+            status: session.status,
+            reason: session.reason,
+        }),
+    }
+}
+
+fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
     let mut at = AtCommander::open(&cfg.modem_port)?;
 
     let imsi = match &cfg.imsi {
@@ -346,22 +395,23 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
         break;
     }
 
-    // A one-shot diagnostic CLI, not a persistent registration — kernel XFRM
-    // state would otherwise leak across repeated invocations.
-    if let Some((endpoints, p, theirs)) = gm_state {
-        gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, xfrm_proto);
-    }
+    let transport = transport
+        .take()
+        .ok_or_else(|| BridgeError::Ims("transport unexpectedly absent after REGISTER".into()))?;
 
-    match resp.status {
-        200 => Ok(RegisterOutcome::Success {
-            status: resp.status,
-            headers: resp.headers,
-        }),
-        _ => Ok(RegisterOutcome::Rejected {
-            status: resp.status,
-            reason: resp.reason,
-        }),
-    }
+    Ok(RegisteredSession {
+        transport,
+        realm,
+        public_uri,
+        local_addr,
+        use_tcp: cfg.use_tcp,
+        cseq: cseq + 1,
+        gm_state,
+        xfrm_proto,
+        status: resp.status,
+        reason: resp.reason,
+        headers: resp.headers,
+    })
 }
 
 /// Proposed identifiers for our end of the Gm IPsec SA pair, sent in the
