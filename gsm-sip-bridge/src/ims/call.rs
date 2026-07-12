@@ -60,7 +60,13 @@ pub struct CallConfig {
     pub register: ImsRegisterConfig,
     /// E.164, e.g. +919789063708.
     pub callee: String,
+    /// Where to record the received (incoming, far-end) audio.
     pub record_path: PathBuf,
+    /// Where to record the sent (outgoing, our test pattern) audio, for a
+    /// side-by-side comparison of both directions. Optional since it's
+    /// purely diagnostic — `record_path` alone is enough to check whether
+    /// the call carried real audio at all.
+    pub record_sent_path: Option<PathBuf>,
     /// How long to wait for the callee to answer before giving up.
     pub ring_timeout: Duration,
     /// How long to hold the call open (exchanging audio) once answered.
@@ -72,6 +78,8 @@ pub enum CallOutcome {
     Answered {
         recorded_path: PathBuf,
         recorded_samples: u32,
+        sent_path: Option<PathBuf>,
+        sent_samples: u32,
     },
     NotAnswered {
         status: u16,
@@ -191,7 +199,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
     });
     session.transport.send(&ack)?;
 
-    let recorded_samples = run_rtp_session(&rtp_socket, answer.remote_rtp, answer.codec, cfg)?;
+    let rtp_result = run_rtp_session(&rtp_socket, answer.remote_rtp, answer.codec, cfg)?;
 
     let bye_branch = format!("z9hG4bK{}", random_hex(6));
     let bye = build_bye(&AckParts {
@@ -217,12 +225,77 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
     session.cleanup();
     Ok(CallOutcome::Answered {
         recorded_path: cfg.record_path.clone(),
-        recorded_samples,
+        recorded_samples: rtp_result.received_samples,
+        sent_path: cfg.record_sent_path.clone(),
+        sent_samples: rtp_result.sent_samples,
     })
 }
 
-/// Sends a looping tone as outgoing audio and records whatever comes back,
-/// for `cfg.call_duration`. Runs the receive side on a background thread
+/// A short, recognizable test signal — three ascending tones (440/660/880Hz,
+/// a major-ish triad chosen just to sound distinct from a single continuous
+/// tone) separated by brief silence, then a longer pause, looped for the
+/// call's whole duration. Recognizable by ear in a recording (unlike a
+/// continuous sine, which gives no indication whether audio cut out
+/// partway through — a gap in the *pattern* is obvious, a gap in a
+/// continuous tone might just sound like... more tone, or silence, with no
+/// landmark to tell where in the call it happened).
+struct TonePattern {
+    // (duration_samples, Some(freq_hz) | None-for-silence) segments,
+    // pre-computed for a given sample rate so the per-sample generator
+    // doesn't redo float math every call.
+    segments: Vec<(u64, Option<f64>)>,
+    period_samples: u64,
+}
+
+impl TonePattern {
+    fn new(sample_rate: u32) -> Self {
+        let sr = sample_rate as f64;
+        let ms = |m: f64, f: Option<f64>| ((m / 1000.0 * sr) as u64, f);
+        let segments = vec![
+            ms(300.0, Some(440.0)),
+            ms(100.0, None),
+            ms(300.0, Some(660.0)),
+            ms(100.0, None),
+            ms(300.0, Some(880.0)),
+            ms(700.0, None),
+        ];
+        let period_samples = segments.iter().map(|(len, _)| len).sum();
+        Self {
+            segments,
+            period_samples,
+        }
+    }
+
+    /// `sample_index` is the absolute sample count since the pattern
+    /// started (not wrapped) — wrapping into the pattern's period happens
+    /// internally, so callers just keep counting up across packets.
+    fn sample_at(&self, sample_index: u64, sample_rate: u32) -> i16 {
+        let mut pos = sample_index % self.period_samples;
+        for &(len, freq) in &self.segments {
+            if pos < len {
+                return match freq {
+                    Some(f) => {
+                        let t = sample_index as f64 / sample_rate as f64;
+                        (0.3 * (2.0 * std::f64::consts::PI * f * t).sin() * i16::MAX as f64) as i16
+                    }
+                    None => 0,
+                };
+            }
+            pos -= len;
+        }
+        0 // unreachable given period_samples == sum of segment lengths
+    }
+}
+
+struct RtpSessionResult {
+    received_samples: u32,
+    sent_samples: u32,
+}
+
+/// Sends the looping test pattern as outgoing audio and records whatever
+/// comes back, for `cfg.call_duration` — optionally also recording the
+/// sent audio itself (`cfg.record_sent_path`) for a side-by-side comparison
+/// of both directions. Runs the receive side on a background thread
 /// (sharing the same connected UDP socket via `try_clone`) so sending stays
 /// on a steady 20ms packetization clock regardless of how much incoming
 /// audio there is to drain. `codec` picks the framing/encode/decode used on
@@ -232,7 +305,7 @@ fn run_rtp_session(
     remote_rtp: std::net::SocketAddr,
     codec: NegotiatedCodec,
     cfg: &CallConfig,
-) -> BridgeResult<u32> {
+) -> BridgeResult<RtpSessionResult> {
     rtp_socket
         .connect(remote_rtp)
         .map_err(|e| BridgeError::Ims(format!("RTP connect to {remote_rtp} failed: {e}")))?;
@@ -315,23 +388,29 @@ fn run_rtp_session(
         ),
         NegotiatedCodec::Pcmu => None,
     };
+    let mut sent_wav = cfg
+        .record_sent_path
+        .as_ref()
+        .map(|p| super::rtp::WavWriter::create(p, sample_rate))
+        .transpose()?;
 
+    let tone = TonePattern::new(sample_rate);
     let ssrc: u32 = rand::random();
     let mut seq: u16 = rand::random();
     let mut timestamp: u32 = 0;
     let mut sample_index: u64 = 0;
-    let tone_freq = 440.0;
     let start = Instant::now();
 
     while start.elapsed() < cfg.call_duration {
         let mut pcm = Vec::with_capacity(params.samples_per_packet);
         for i in 0..params.samples_per_packet {
-            let t = (sample_index + i as u64) as f64 / sample_rate as f64;
-            let sample =
-                (0.3 * (2.0 * std::f64::consts::PI * tone_freq * t).sin() * i16::MAX as f64) as i16;
-            pcm.push(sample);
+            pcm.push(tone.sample_at(sample_index + i as u64, sample_rate));
         }
         sample_index += params.samples_per_packet as u64;
+
+        if let Some(wav) = sent_wav.as_mut() {
+            wav.write_samples(&pcm)?;
+        }
 
         let rtp_payload = match codec {
             NegotiatedCodec::Pcmu => pcm.iter().map(|&s| super::rtp::linear_to_ulaw(s)).collect(),
@@ -367,10 +446,24 @@ fn run_rtp_session(
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    let sent_samples = match sent_wav {
+        Some(wav) => {
+            let n = wav.samples_written();
+            wav.finish()?;
+            n
+        }
+        None => 0,
+    };
+
     stop.store(true, Ordering::Relaxed);
-    recv_handle
+    let received_samples = recv_handle
         .join()
-        .map_err(|_| BridgeError::Ims("RTP receive thread panicked".into()))?
+        .map_err(|_| BridgeError::Ims("RTP receive thread panicked".into()))??;
+
+    Ok(RtpSessionResult {
+        received_samples,
+        sent_samples,
+    })
 }
 
 struct InviteParts<'a> {
@@ -485,6 +578,44 @@ fn build_in_dialog_request(method: &str, p: &AckParts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tone_pattern_period_matches_segment_sum() {
+        let pattern = TonePattern::new(8000);
+        // 300+100+300+100+300+700 = 1800ms @ 8kHz = 14400 samples.
+        assert_eq!(pattern.period_samples, 14400);
+    }
+
+    #[test]
+    fn tone_pattern_silence_gaps_are_actually_silent() {
+        let pattern = TonePattern::new(8000);
+        // The 100ms gap after the first tone starts at sample 300ms*8 = 2400.
+        let silence_start = (300.0 / 1000.0 * 8000.0) as u64;
+        for i in 0..10 {
+            assert_eq!(pattern.sample_at(silence_start + i, 8000), 0);
+        }
+    }
+
+    #[test]
+    fn tone_pattern_tone_segments_are_non_silent() {
+        let pattern = TonePattern::new(8000);
+        // Well inside the first 440Hz segment (avoiding the zero-crossing
+        // at t=0), some samples should be non-zero.
+        let any_nonzero = (0..50).any(|i| pattern.sample_at(i, 8000) != 0);
+        assert!(any_nonzero);
+    }
+
+    #[test]
+    fn tone_pattern_repeats_identically_across_periods() {
+        let pattern = TonePattern::new(8000);
+        for i in [0u64, 100, 5000, 14399] {
+            assert_eq!(
+                pattern.sample_at(i, 8000),
+                pattern.sample_at(i + pattern.period_samples, 8000),
+                "sample {i} should repeat one period later"
+            );
+        }
+    }
 
     #[test]
     fn build_invite_includes_sdp_body_and_content_length() {

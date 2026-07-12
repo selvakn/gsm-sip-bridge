@@ -195,6 +195,7 @@ fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode 
         register: build_ims_register_config(&args.register),
         callee: args.to.clone(),
         record_path: args.record.clone(),
+        record_sent_path: args.record_sent.clone(),
         ring_timeout: Duration::from_secs(args.ring_timeout_secs),
         call_duration: Duration::from_secs(args.call_duration_secs),
     };
@@ -203,11 +204,19 @@ fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode 
         Ok(CallOutcome::Answered {
             recorded_path,
             recorded_samples,
+            sent_path,
+            sent_samples,
         }) => {
             println!(
-                "call answered — recorded {recorded_samples} samples to {}",
+                "call answered — recorded {recorded_samples} received samples to {}",
                 recorded_path.display()
             );
+            if let Some(sent_path) = sent_path {
+                println!(
+                    "  and {sent_samples} sent samples to {}",
+                    sent_path.display()
+                );
+            }
             ExitCode::SUCCESS
         }
         Ok(CallOutcome::NotAnswered { status, reason }) => {
