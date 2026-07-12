@@ -15,6 +15,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "control",
     "audio",
     "scheduled_restart",
+    "vowifi",
 ];
 const SIP_KEYS: &[&str] = &[
     "server",
@@ -54,6 +55,18 @@ const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "start_jitter_seconds",
     "inter_card_gap_seconds",
     "inter_card_gap_jitter_seconds",
+];
+const VOWIFI_KEYS: &[&str] = &[
+    "enabled",
+    "mcc",
+    "mnc",
+    "modem_port",
+    "use_tcp",
+    "sec_agree",
+    "pcscf_source_path",
+    "veth_local_addr",
+    "veth_peer_addr",
+    "control_port",
 ];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
@@ -272,6 +285,63 @@ impl ScheduledRestartConfig {
     }
 }
 
+/// Configuration for the inbound VoWiFi-to-SIP bridge (feature
+/// `011-vowifi-sip-bridge`) — a second, independent inbound call path
+/// alongside the existing circuit-switched GSM-to-SIP bridge. See
+/// `specs/011-vowifi-sip-bridge/plan.md`. Disabled by default: this section
+/// only matters when running one of the `vowifi-ims-agent`/`vowifi-sip-agent`
+/// subcommands inside the `docker/epdg/` deployment, not for the normal
+/// daemon path.
+#[derive(Clone, Debug)]
+pub struct VowifiConfig {
+    /// Master switch — the two `vowifi-*-agent` subcommands refuse to start
+    /// (see `main.rs`) when this is `false`, so an operator who hasn't
+    /// provisioned VoWiFi can't accidentally bring the mode up.
+    pub enabled: bool,
+    /// Mobile Country Code of the home network, e.g. `"404"`.
+    pub mcc: String,
+    /// Mobile Network Code of the home network, e.g. `"094"` (Airtel).
+    pub mnc: String,
+    /// Serial AT port for the modem whose SIM authenticates the IMS
+    /// registration (same device the existing `ims-register`/`ims-call`
+    /// CLI tools use), e.g. `/dev/ttyUSB6`.
+    pub modem_port: String,
+    /// Use TCP (not UDP) for the SIP transport to the P-CSCF. `true` is the
+    /// combination that reached `200 OK` on Airtel (see `ims::mod` docs).
+    pub use_tcp: bool,
+    /// Advertise `Require: sec-agree` / `Security-Client` and negotiate Gm
+    /// IPsec. Required by networks (e.g. Vi) that reject a plain REGISTER;
+    /// also the combination that worked on Airtel.
+    pub sec_agree: bool,
+    /// Path Agent A reads the tunnel-assigned P-CSCF address from —
+    /// `docker/epdg/entrypoint.sh` writes this once the SWu tunnel is up.
+    pub pcscf_source_path: String,
+    /// Agent A's address on the dedicated veth link (the `ims`-netns end).
+    pub veth_local_addr: String,
+    /// Agent B's address on the dedicated veth link (the default-netns end).
+    pub veth_peer_addr: String,
+    /// TCP port the Agent A↔B control channel listens on/connects to over
+    /// the veth link (`contracts/agent-control-protocol.md`).
+    pub control_port: u16,
+}
+
+impl Default for VowifiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mcc: String::new(),
+            mnc: String::new(),
+            modem_port: "/dev/ttyUSB6".to_string(),
+            use_tcp: true,
+            sec_agree: true,
+            pcscf_source_path: "/tmp/pcscf".to_string(),
+            veth_local_addr: "10.99.0.1".to_string(),
+            veth_peer_addr: "10.99.0.2".to_string(),
+            control_port: 7050,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub sip: SipConfig,
@@ -283,6 +353,7 @@ pub struct AppConfig {
     pub control: ControlConfig,
     pub audio: AudioConfig,
     pub scheduled_restart: ScheduledRestartConfig,
+    pub vowifi: VowifiConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -304,6 +375,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let control = parse_control(table)?;
     let audio = parse_audio(table)?;
     let scheduled_restart = parse_scheduled_restart(table);
+    let vowifi = parse_vowifi(table)?;
 
     Ok(AppConfig {
         sip,
@@ -315,6 +387,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         control,
         audio,
         scheduled_restart,
+        vowifi,
     })
 }
 
@@ -986,6 +1059,89 @@ fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlCo
     Ok(ControlConfig { socket_path })
 }
 
+fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConfig> {
+    let Some(val) = root.get("vowifi") else {
+        return Ok(VowifiConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[vowifi] must be a table".into()))?;
+    warn_unknown_keys_in(t, VOWIFI_KEYS, "vowifi");
+
+    let defaults = VowifiConfig::default();
+
+    let enabled = t
+        .get("enabled")
+        .map(|v| as_bool(v, "vowifi.enabled"))
+        .transpose()?
+        .unwrap_or(defaults.enabled);
+    let mcc = t
+        .get("mcc")
+        .map(|v| as_string(v, "vowifi.mcc", false))
+        .transpose()?
+        .unwrap_or(defaults.mcc);
+    let mnc = t
+        .get("mnc")
+        .map(|v| as_string(v, "vowifi.mnc", false))
+        .transpose()?
+        .unwrap_or(defaults.mnc);
+
+    if enabled && (mcc.is_empty() || mnc.is_empty()) {
+        return Err(BridgeError::Config(
+            "vowifi.mcc and vowifi.mnc are required when vowifi.enabled = true".into(),
+        ));
+    }
+
+    let modem_port = t
+        .get("modem_port")
+        .map(|v| as_string(v, "vowifi.modem_port", false))
+        .transpose()?
+        .unwrap_or(defaults.modem_port);
+    let use_tcp = t
+        .get("use_tcp")
+        .map(|v| as_bool(v, "vowifi.use_tcp"))
+        .transpose()?
+        .unwrap_or(defaults.use_tcp);
+    let sec_agree = t
+        .get("sec_agree")
+        .map(|v| as_bool(v, "vowifi.sec_agree"))
+        .transpose()?
+        .unwrap_or(defaults.sec_agree);
+    let pcscf_source_path = t
+        .get("pcscf_source_path")
+        .map(|v| as_string(v, "vowifi.pcscf_source_path", false))
+        .transpose()?
+        .unwrap_or(defaults.pcscf_source_path);
+    let veth_local_addr = t
+        .get("veth_local_addr")
+        .map(|v| as_string(v, "vowifi.veth_local_addr", false))
+        .transpose()?
+        .unwrap_or(defaults.veth_local_addr);
+    let veth_peer_addr = t
+        .get("veth_peer_addr")
+        .map(|v| as_string(v, "vowifi.veth_peer_addr", false))
+        .transpose()?
+        .unwrap_or(defaults.veth_peer_addr);
+    let control_port = t
+        .get("control_port")
+        .map(|v| as_u16_port(v, "vowifi.control_port"))
+        .transpose()?
+        .unwrap_or(defaults.control_port);
+
+    Ok(VowifiConfig {
+        enabled,
+        mcc,
+        mnc,
+        modem_port,
+        use_tcp,
+        sec_agree,
+        pcscf_source_path,
+        veth_local_addr,
+        veth_peer_addr,
+        control_port,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1158,7 @@ mod tests {
         let control = parse_control(table).unwrap();
         let audio = parse_audio(table).unwrap();
         let scheduled_restart = parse_scheduled_restart(table);
+        let vowifi = parse_vowifi(table).unwrap();
         AppConfig {
             sip,
             bridge,
@@ -1012,6 +1169,7 @@ mod tests {
             control,
             audio,
             scheduled_restart,
+            vowifi,
         }
     }
 
@@ -1252,5 +1410,51 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("audio.rt_audio_prio must be 0 (off) or 1–99"));
+    }
+
+    #[test]
+    fn vowifi_disabled_by_default_when_section_absent() {
+        let cfg = parse(MINIMAL_TOML);
+        assert!(!cfg.vowifi.enabled);
+        assert_eq!(cfg.vowifi.modem_port, "/dev/ttyUSB6");
+        assert!(cfg.vowifi.use_tcp);
+        assert!(cfg.vowifi.sec_agree);
+        assert_eq!(cfg.vowifi.control_port, 7050);
+    }
+
+    #[test]
+    fn vowifi_enabled_requires_mcc_and_mnc() {
+        let toml = format!("{}\n[vowifi]\nenabled = true\n", MINIMAL_TOML);
+        let root: toml::Value = toml.parse().unwrap();
+        let result = parse_vowifi(root.as_table().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vowifi.mcc and vowifi.mnc are required"));
+    }
+
+    #[test]
+    fn vowifi_enabled_with_mcc_mnc_parses() {
+        let toml = format!(
+            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert!(cfg.vowifi.enabled);
+        assert_eq!(cfg.vowifi.mcc, "404");
+        assert_eq!(cfg.vowifi.mnc, "094");
+    }
+
+    #[test]
+    fn vowifi_custom_veth_and_control_port() {
+        let toml = format!(
+            "{}\n[vowifi]\nveth_local_addr = \"10.1.1.1\"\nveth_peer_addr = \"10.1.1.2\"\ncontrol_port = 9999\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.veth_local_addr, "10.1.1.1");
+        assert_eq!(cfg.vowifi.veth_peer_addr, "10.1.1.2");
+        assert_eq!(cfg.vowifi.control_port, 9999);
     }
 }

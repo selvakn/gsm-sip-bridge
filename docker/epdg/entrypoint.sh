@@ -48,9 +48,15 @@ fi
 # --- Cleanup on exit -------------------------------------------------------
 KEEPALIVE_PID=""
 SWU_PID=""
+IMS_AGENT_SUPERVISOR_PID=""
+SIP_AGENT_SUPERVISOR_PID=""
 cleanup() {
     log "shutting down ..."
     [ -n "$KEEPALIVE_PID" ] && kill "$KEEPALIVE_PID" 2>/dev/null
+    [ -n "$IMS_AGENT_SUPERVISOR_PID" ] && kill "$IMS_AGENT_SUPERVISOR_PID" 2>/dev/null
+    [ -n "$SIP_AGENT_SUPERVISOR_PID" ] && kill "$SIP_AGENT_SUPERVISOR_PID" 2>/dev/null
+    pkill -f vowifi-ims-agent 2>/dev/null
+    pkill -f vowifi-sip-agent 2>/dev/null
     [ -n "$SWU_PID" ] && kill "$SWU_PID" 2>/dev/null
     ip netns del "$NETNS" 2>/dev/null
     true
@@ -113,6 +119,64 @@ else
         done
     ) &
     KEEPALIVE_PID=$!
+
+    # --- veth pair for the inbound VoWiFi bridge agents (specs/011-vowifi-sip-bridge) ---
+    # Agent A (vowifi-ims-agent) runs inside netns "$NETNS" alongside the SWu
+    # tunnel/Gm-IPsec state; Agent B (vowifi-sip-agent) runs in this
+    # container's default namespace (epdg-net -> LAN, reachable to the PBX).
+    # Addresses default to VowifiConfig's veth_local_addr (Agent A / ims-netns
+    # end) / veth_peer_addr (Agent B / default-netns end) — override both ends
+    # together if the config file's [vowifi] section is customized.
+    VETH_SIP="${VETH_SIP:-veth-sip}"
+    VETH_IMS="${VETH_IMS:-veth-ims}"
+    VETH_IMS_ADDR="${VETH_IMS_ADDR:-10.99.0.1/30}"
+    VETH_SIP_ADDR="${VETH_SIP_ADDR:-10.99.0.2/30}"
+    log "creating veth pair ($VETH_SIP <-> $VETH_IMS in netns $NETNS) for the VoWiFi bridge agents..."
+    if ! ip link show "$VETH_SIP" >/dev/null 2>&1; then
+        ip link add "$VETH_SIP" type veth peer name "$VETH_IMS" netns "$NETNS"
+    else
+        log "veth pair already exists, reusing"
+    fi
+    ip addr replace "$VETH_SIP_ADDR" dev "$VETH_SIP"
+    ip link set "$VETH_SIP" up
+    ip netns exec "$NETNS" ip addr replace "$VETH_IMS_ADDR" dev "$VETH_IMS"
+    ip netns exec "$NETNS" ip link set "$VETH_IMS" up
+    log "veth ready: $VETH_SIP=$VETH_SIP_ADDR (default netns), $VETH_IMS=$VETH_IMS_ADDR (netns $NETNS)"
+
+    # --- launch + supervise the two VoWiFi bridge agents ---------------------
+    # Replaces the old manual `docker exec ... ims-call` one-shot flow
+    # (still documented in README.md as a diagnostic fallback) with an
+    # always-on pair of agents, per specs/011-vowifi-sip-bridge. The binary
+    # isn't baked into this image (see README.md's build-and-`docker cp`
+    # instructions) — skip supervision with a clear message if it isn't
+    # there yet, rather than crash-looping.
+    GSM_SIP_BRIDGE_BIN="${GSM_SIP_BRIDGE_BIN:-/usr/local/bin/gsm-sip-bridge}"
+    GSM_SIP_BRIDGE_CONFIG="${GSM_SIP_BRIDGE_CONFIG:-/etc/gsm-sip-bridge/config.toml}"
+    if [ ! -x "$GSM_SIP_BRIDGE_BIN" ]; then
+        log "NOTE: $GSM_SIP_BRIDGE_BIN not present — skipping vowifi-*-agent launch." \
+            "Build+copy it in (see README.md), set GSM_SIP_BRIDGE_BIN, and restart the container to enable it."
+    elif [ ! -f "$GSM_SIP_BRIDGE_CONFIG" ]; then
+        log "NOTE: $GSM_SIP_BRIDGE_CONFIG not present — skipping vowifi-*-agent launch." \
+            "Mount a config.toml with [vowifi] enabled = true (see config.toml.example) to enable it."
+    else
+        log "starting vowifi-ims-agent (netns $NETNS) and vowifi-sip-agent (default netns), supervised..."
+        (
+            while true; do
+                ip netns exec "$NETNS" "$GSM_SIP_BRIDGE_BIN" -v --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-ims-agent
+                log "vowifi-ims-agent exited (status $?); restarting in 5s"
+                sleep 5
+            done
+        ) &
+        IMS_AGENT_SUPERVISOR_PID=$!
+        (
+            while true; do
+                "$GSM_SIP_BRIDGE_BIN" -v --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-sip-agent
+                log "vowifi-sip-agent exited (status $?); restarting in 5s"
+                sleep 5
+            done
+        ) &
+        SIP_AGENT_SUPERVISOR_PID=$!
+    fi
 fi
 
 # --- Block on the dialer ---------------------------------------------------

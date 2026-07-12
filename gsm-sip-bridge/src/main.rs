@@ -31,6 +31,18 @@ fn main() -> ExitCode {
         return handle_ims_call_command(args);
     }
 
+    if let Some(Commands::VowifiImsAgent) = &cli.command {
+        return handle_vowifi_ims_agent_command(&cli);
+    }
+
+    if let Some(Commands::VowifiSipAgent) = &cli.command {
+        return handle_vowifi_sip_agent_command(&cli);
+    }
+
+    if let Some(Commands::VowifiStatus) = &cli.command {
+        return handle_vowifi_status_command(&cli);
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"
@@ -228,6 +240,52 @@ fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode 
             ExitCode::FAILURE
         }
     }
+}
+
+/// Shared by the three `vowifi-*` subcommands: `--config` is mandatory for
+/// these (unlike the daemon path, which tolerates a missing path via
+/// `cli.config.as_deref().unwrap_or(...)` for its own defaulting), and
+/// `[vowifi].enabled` must be `true` — this is the guard that stops an
+/// operator who hasn't provisioned VoWiFi from accidentally starting one of
+/// these agents (see `config::VowifiConfig::enabled` docs).
+fn load_vowifi_config(cli: &Cli) -> Result<gsm_sip_bridge::config::AppConfig, ExitCode> {
+    let Some(path) = cli.config.as_deref() else {
+        eprintln!("error: --config is required for vowifi-* subcommands");
+        return Err(ExitCode::FAILURE);
+    };
+    let config = load_config(path).map_err(|e| {
+        eprintln!("error: {e}");
+        ExitCode::FAILURE
+    })?;
+    if !config.vowifi.enabled {
+        eprintln!("error: [vowifi].enabled is false in the config file");
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(config)
+}
+
+fn handle_vowifi_ims_agent_command(cli: &Cli) -> ExitCode {
+    let config = match load_vowifi_config(cli) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    gsm_sip_bridge::ims::agent::run(&config.vowifi)
+}
+
+fn handle_vowifi_sip_agent_command(cli: &Cli) -> ExitCode {
+    let config = match load_vowifi_config(cli) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    gsm_sip_bridge::vowifi::run(&config)
+}
+
+fn handle_vowifi_status_command(cli: &Cli) -> ExitCode {
+    let config = match load_vowifi_config(cli) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    gsm_sip_bridge::vowifi::print_status(&config.vowifi)
 }
 
 fn build_control_cmd(args: &gsm_sip_bridge::cli::CardArgs) -> Result<ControlCmd, String> {

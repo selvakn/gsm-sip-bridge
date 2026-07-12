@@ -411,3 +411,65 @@ own path is VoWiFi/VoLIP-only, if the "which codec gets picked" question
 matters for future work.
 
 See `specs`/the plan for the full design and rationale.
+
+## Phase 4: always-on inbound VoWiFi-to-SIP bridge
+
+Implemented per `specs/011-vowifi-sip-bridge/`. Where Phase 3's `ims-call` is
+a one-shot, manually-invoked diagnostic that *places* a single outbound call
+and exits, this phase adds two long-running, supervised processes that
+*receive* inbound VoWiFi calls continuously and bridge them to the existing
+SIP/PBX destination — the actual point of combining the GSM-SIP bridge with
+the VoWiFi tunnel work above:
+
+- **`vowifi-ims-agent`** ("Agent A") — runs inside the `ims` network
+  namespace alongside the tunnel/Gm-IPsec state. Keeps the IMS-AKA
+  registration (Phase 2) alive indefinitely (re-registering before it
+  expires), answers inbound `INVITE`s from the carrier, and relays audio to
+  Agent B over a dedicated `veth` link `entrypoint.sh` creates automatically
+  once the tunnel is up.
+- **`vowifi-sip-agent`** ("Agent B") — runs in the container's default
+  namespace (LAN-reachable to the PBX). Registers to the configured `[sip]`
+  destination and, for each call Agent A signals, places a matching call to
+  the PBX plus a second call back to Agent A across the veth link, then
+  bridges them via PJSIP's conference bridge.
+
+Both are launched and supervised automatically by `entrypoint.sh` once the
+tunnel is up — **if** a `gsm-sip-bridge` binary and a config file with
+`[vowifi] enabled = true` are present in the container (see
+`config.toml.example`'s `[vowifi]` section). Since the binary isn't baked
+into this image, get it there the same way as Phase 2/3's manual build
+(see above), just at a path the entrypoint checks for automatically:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src -e CARGO_TARGET_DIR=/tmp/bt rust:1-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq libasound2-dev pkg-config libudev-dev
+  cargo build -p gsm-sip-bridge --bin gsm-sip-bridge
+  cp /tmp/bt/debug/gsm-sip-bridge /src/gsm-sip-bridge-bookworm'
+docker cp gsm-sip-bridge-bookworm epdg-tunnel:/usr/local/bin/gsm-sip-bridge
+docker cp your-config.toml epdg-tunnel:/etc/gsm-sip-bridge/config.toml
+rm gsm-sip-bridge-bookworm
+docker restart epdg-tunnel
+```
+
+Check both agents came up:
+
+```bash
+docker exec epdg-tunnel pgrep -a -f vowifi-ims-agent
+docker exec epdg-tunnel pgrep -a -f vowifi-sip-agent
+docker logs epdg-tunnel --tail 50
+```
+
+If either binary/config isn't present when the tunnel comes up, the
+entrypoint logs a clear note and skips agent supervision rather than
+crash-looping — the tunnel itself still comes up normally, so Phase 2/3's
+manual diagnostic commands keep working either way.
+
+**Verification status**: the SIP/SDP protocol logic, the Agent A↔B control
+protocol, the RTP relay, and the two-call PJSIP conference-bridging (via
+`pjsua-safe`'s `Endpoint::pair_calls`) are unit- and integration-tested
+without live hardware — see `specs/011-vowifi-sip-bridge/tasks.md`. A full
+live inbound call (real carrier network, real PBX, real audio both ways)
+has not yet been exercised end-to-end against a live network — do that per
+`specs/011-vowifi-sip-bridge/quickstart.md` before relying on this in
+production, the same way Phase 2/3's findings above were only trusted once
+verified against a real network.

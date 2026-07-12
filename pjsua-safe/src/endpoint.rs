@@ -5,10 +5,25 @@ use crate::log_bridge;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "pjsip-linked")]
 use std::sync::atomic::{AtomicI32, AtomicU64};
+#[cfg(feature = "pjsip-linked")]
+use std::sync::{LazyLock, Mutex};
 
 static SIP_PEER_DISCONNECTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "pjsip-linked")]
 static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Maps a call's `pjsua_call_id` to the peer call it should be
+/// conference-bridged to, for the two-call bridging used by the inbound
+/// VoWiFi-to-SIP feature (`specs/011-vowifi-sip-bridge/`, Agent B). Entries
+/// are added in pairs by `Endpoint::pair_calls` (both directions) and
+/// removed by `Endpoint::unpair_call`. A call with **no** entry here falls
+/// back to the original, unconditional slot-0 (sound device) bridging that
+/// the existing circuit-switched GSM-to-SIP bridge already relies on — that
+/// is the only path exercised by the daemon today, so this table stays
+/// empty and behavior is byte-for-byte unchanged for it.
+#[cfg(feature = "pjsip-linked")]
+static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 // Audio level monitor — populated by a per-call sampling thread (slot 0 = sound device).
 // tx_level from slot 0 = ALSA capture → bridge = GSM→SIP
@@ -235,6 +250,43 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Register two calls to be conference-bridged to *each other* once both
+    /// have active media, instead of the default slot-0 (sound device)
+    /// bridging `on_call_media_state_cb` otherwise applies. Used by the
+    /// inbound VoWiFi-to-SIP bridge (Agent B) to connect its PBX-side leg to
+    /// its veth-side leg. Idempotent to call before either call's media has
+    /// gone active — the actual `pjsua_conf_connect` calls happen lazily,
+    /// the first time either call's media-active callback observes its peer
+    /// already has an active conf slot too.
+    pub fn pair_calls(&self, call_a: i32, call_b: i32) {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            let mut pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            pairs.insert(call_a, call_b);
+            pairs.insert(call_b, call_a);
+        }
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            let _ = (call_a, call_b);
+        }
+    }
+
+    /// Remove a call's pairing (both directions), e.g. once it hangs up.
+    /// Safe to call even if the call was never paired.
+    pub fn unpair_call(&self, call_id: i32) {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            let mut pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(peer) = pairs.remove(&call_id) {
+                pairs.remove(&peer);
+            }
+        }
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            let _ = call_id;
+        }
+    }
+
     pub fn find_audio_device(&self, alsa_hint: &str) -> Result<i32, PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
@@ -362,6 +414,46 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
 
     if info.media_status == pjsua_sys::pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE {
         let call_slot = info.conf_slot as i32;
+
+        let peer_call_id = {
+            let pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            pairs.get(&call_id).copied()
+        };
+
+        if let Some(peer_id) = peer_call_id {
+            // Two-call bridging (inbound VoWiFi-to-SIP feature, Agent B):
+            // connect this call's slot directly to its paired peer's slot,
+            // bypassing slot 0 (the sound device — absent/null in this
+            // process) entirely. Deliberately skips the tx_level adjustment
+            // and audio-level monitor below, both of which are specific to
+            // the single-call, real-sound-device GSM bridge.
+            let mut peer_info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
+            if pjsua_sys::pjsua_call_get_info(peer_id, &mut peer_info) == PJ_SUCCESS
+                && peer_info.media_status == pjsua_sys::pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE
+            {
+                let peer_slot = peer_info.conf_slot as i32;
+                pjsua_sys::pjsua_conf_connect(call_slot, peer_slot);
+                pjsua_sys::pjsua_conf_connect(peer_slot, call_slot);
+                tracing::info!(
+                    call_id,
+                    peer_id,
+                    call_slot,
+                    peer_slot,
+                    "paired calls' media active, conference-connected to each other"
+                );
+            } else {
+                // Peer isn't active yet — its own media-active callback will
+                // find this call already active (via the same BRIDGE_PAIRS
+                // lookup) and complete the connection symmetrically then.
+                tracing::debug!(
+                    call_id,
+                    peer_id,
+                    "call media active, awaiting paired peer's media to become active"
+                );
+            }
+            return;
+        }
+
         pjsua_sys::pjsua_conf_connect(call_slot, 0);
         pjsua_sys::pjsua_conf_connect(0, call_slot);
 
@@ -435,6 +527,13 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
         }
         s if s == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED => {
             stop_ringback_tone();
+
+            {
+                let mut pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(peer) = pairs.remove(&call_id) {
+                    pairs.remove(&peer);
+                }
+            }
 
             AUDIO_MONITOR_RUNNING.store(false, Ordering::Release);
             let count = AUDIO_SAMPLE_COUNT.load(Ordering::Relaxed);

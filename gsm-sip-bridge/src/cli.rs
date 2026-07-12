@@ -50,6 +50,23 @@ pub enum Commands {
     /// Here` — confirmed on a real Airtel test call). Standalone
     /// diagnostic mode, same as `ims-register`.
     ImsCall(ImsCallArgs),
+    /// Agent A of the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge):
+    /// keeps a persistent IMS-AKA registration alive, answers inbound calls
+    /// arriving over VoWiFi, and relays their audio to Agent B
+    /// (`vowifi-sip-agent`) over a dedicated veth link. Reads its settings
+    /// from the `[vowifi]` config section. Long-running — intended to run
+    /// inside the ePDG tunnel's `ims` network namespace, supervised by
+    /// `docker/epdg/entrypoint.sh`.
+    VowifiImsAgent,
+    /// Agent B of the inbound VoWiFi-to-SIP bridge: registers to the
+    /// SIP/PBX destination (`[sip]`/`[bridge]`) and, on each call signaled
+    /// by Agent A, places a matching PBX-side call plus a veth-side call
+    /// back to Agent A, then bridges them. Long-running — intended to run
+    /// in the container's default network namespace.
+    VowifiSipAgent,
+    /// Query the running VoWiFi agents for current registration health and
+    /// recent call outcomes.
+    VowifiStatus,
 }
 
 #[derive(Parser, Debug)]
