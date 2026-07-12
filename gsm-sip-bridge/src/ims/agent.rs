@@ -258,7 +258,7 @@ fn dispatch_loop(
                 tracing::debug!("received ACK, dialog confirmed");
             }
             Some(SipMessage::Request(req)) => {
-                tracing::debug!(method = %req.method, "ignoring unsupported inbound request");
+                tracing::info!(method = %req.method, "ignoring unsupported inbound request");
             }
             Some(SipMessage::Response(resp)) => {
                 tracing::debug!(
