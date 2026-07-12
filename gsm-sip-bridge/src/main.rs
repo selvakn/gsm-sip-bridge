@@ -27,6 +27,10 @@ fn main() -> ExitCode {
         return handle_ims_register_command(args);
     }
 
+    if let Some(Commands::ImsCall(args)) = &cli.command {
+        return handle_ims_call_command(args);
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"
@@ -143,10 +147,10 @@ fn handle_card_command(args: &gsm_sip_bridge::cli::CardArgs, cli: &Cli) -> ExitC
     }
 }
 
-fn handle_ims_register_command(args: &gsm_sip_bridge::cli::ImsRegisterArgs) -> ExitCode {
-    use gsm_sip_bridge::ims::{run_register, ImsRegisterConfig, RegisterOutcome};
-
-    let cfg = ImsRegisterConfig {
+fn build_ims_register_config(
+    args: &gsm_sip_bridge::cli::ImsRegisterArgs,
+) -> gsm_sip_bridge::ims::ImsRegisterConfig {
+    gsm_sip_bridge::ims::ImsRegisterConfig {
         modem_port: args.modem.clone(),
         pcscf_addr: args.pcscf,
         pcscf_port: args.pcscf_port,
@@ -156,7 +160,13 @@ fn handle_ims_register_command(args: &gsm_sip_bridge::cli::ImsRegisterArgs) -> E
         use_tcp: args.tcp,
         sec_agree: args.sec_agree,
         msisdn: args.msisdn.clone(),
-    };
+    }
+}
+
+fn handle_ims_register_command(args: &gsm_sip_bridge::cli::ImsRegisterArgs) -> ExitCode {
+    use gsm_sip_bridge::ims::{run_register, RegisterOutcome};
+
+    let cfg = build_ims_register_config(args);
 
     match run_register(&cfg) {
         Ok(RegisterOutcome::Success { status, headers }) => {
@@ -168,6 +178,40 @@ fn handle_ims_register_command(args: &gsm_sip_bridge::cli::ImsRegisterArgs) -> E
         }
         Ok(RegisterOutcome::Rejected { status, reason }) => {
             eprintln!("REGISTER rejected: {status} {reason}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode {
+    use gsm_sip_bridge::ims::call::{run_call, CallConfig, CallOutcome};
+    use std::time::Duration;
+
+    let cfg = CallConfig {
+        register: build_ims_register_config(&args.register),
+        callee: args.to.clone(),
+        record_path: args.record.clone(),
+        ring_timeout: Duration::from_secs(args.ring_timeout_secs),
+        call_duration: Duration::from_secs(args.call_duration_secs),
+    };
+
+    match run_call(&cfg) {
+        Ok(CallOutcome::Answered {
+            recorded_path,
+            recorded_samples,
+        }) => {
+            println!(
+                "call answered — recorded {recorded_samples} samples to {}",
+                recorded_path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(CallOutcome::NotAnswered { status, reason }) => {
+            eprintln!("call not answered: {status} {reason}");
             ExitCode::FAILURE
         }
         Err(e) => {

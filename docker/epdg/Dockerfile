@@ -10,11 +10,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   build-essential/swig/python3-dev/libpcsclite-dev -> build pyscard
 #   iproute2 + net-tools -> the dialer calls BOTH `ip` and net-tools `route`
 #   iputils-ping/dnsutils/procps -> entrypoint DNS resolve + keepalive
+#   libasound2/libvo-amrwbenc0/libopencore-amrwb0 -> runtime shared libs for
+#     the gsm-sip-bridge binary (built elsewhere, docker cp'd in) — audio
+#     playback, AMR-WB encode/decode for `ims-call` (see gsm-sip-bridge's
+#     amr-linked feature; VoWiFi/VoLTE networks require AMR-WB, a PCMU-only
+#     offer got 488 Not Acceptable Here on a real Airtel test call)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev \
         build-essential swig libpcsclite-dev \
         git ca-certificates \
         iproute2 net-tools iputils-ping dnsutils procps \
+        libasound2 libvo-amrwbenc0 libopencore-amrwb0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Vendor the dialer and the mitshell 'card' module. Per the osmocom wiki the

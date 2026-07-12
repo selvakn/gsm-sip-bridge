@@ -1,5 +1,5 @@
 [workspace]
-members = ["pjsua-sys", "pjsua-safe", "gsm-sip-bridge"]
+members = ["pjsua-sys", "pjsua-safe", "amr-sys", "amr-safe", "gsm-sip-bridge"]
 resolver = "2"
 
 [workspace.package]

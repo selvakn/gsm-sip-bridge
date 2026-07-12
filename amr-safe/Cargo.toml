@@ -1,0 +1,11 @@
+[package]
+name = "amr-safe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+amr-linked = []
+
+[dependencies]
+amr-sys = { path = "../amr-sys" }

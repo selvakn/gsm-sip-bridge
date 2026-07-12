@@ -18,9 +18,11 @@ path = "src/bin/sip_echo.rs"
 
 [features]
 pjsip-linked = ["pjsua-safe/pjsip-linked"]
+amr-linked = ["amr-safe/amr-linked"]
 
 [dependencies]
 pjsua-safe = { path = "../pjsua-safe" }
+amr-safe = { path = "../amr-safe" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
