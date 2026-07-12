@@ -17,7 +17,10 @@ services:
     networks:
       - epdg-net
     cap_add:
-      - NET_ADMIN   # create/configure tun + program routes
+      - NET_ADMIN   # create/configure tun + program routes; also covers the
+                    # veth pair entrypoint.sh creates for the VoWiFi bridge
+                    # agents (specs/011-vowifi-sip-bridge) — no extra
+                    # capability needed beyond what the tunnel already grants.
       - NET_RAW     # user-space ESP over raw sockets + UDP/500,4500
       - SYS_ADMIN   # `ip netns add`/`exec` (bind-mounts + setns)
     # The default docker-default AppArmor profile denies `mount --make-shared`

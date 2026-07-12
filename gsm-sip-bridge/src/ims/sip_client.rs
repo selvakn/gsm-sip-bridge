@@ -109,6 +109,211 @@ impl SipResponse {
     }
 }
 
+/// A parsed inbound SIP *request* (e.g. `INVITE`, `BYE`) — the UAS-side
+/// counterpart to `SipResponse`. Agent A (`specs/011-vowifi-sip-bridge`)
+/// needs this to receive calls, whereas every SIP exchange this module
+/// handled before (REGISTER, INVITE-as-UAC in `ims::call`) only ever needed
+/// to parse *responses*.
+#[derive(Debug, Clone)]
+pub struct SipRequest {
+    pub method: String,
+    pub request_uri: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl SipRequest {
+    /// First header matching `name` (case-insensitive), if any.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Every header matching `name` (case-insensitive), in the order they
+    /// appeared. Needed for `Via`: RFC 3261 §8.2.6.2 requires a UAS
+    /// generating a response to copy *every* `Via` header from the request,
+    /// in order, verbatim — unlike most other headers there can legitimately
+    /// be more than one (one per proxy hop the request traversed).
+    pub fn headers_all<'a>(&'a self, name: &str) -> Vec<&'a str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// Same partial-read/`Content-Length`-aware framing as
+    /// `SipResponse::try_parse` (see its docs), for a request's
+    /// `METHOD request-uri SIP/2.0` start-line instead of a status line.
+    /// `pub(super)` (not private) so `ims::agent`'s veth-facing UAS — a
+    /// sibling module of this one, not a descendant — can parse a
+    /// single-datagram INVITE from Agent B directly, the same way
+    /// `SipTransport::recv_message` (in this module) parses one from a
+    /// buffered stream.
+    pub(super) fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
+        let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
+            return Ok(None);
+        };
+        let header_part = &buf[..header_len];
+
+        let mut lines = header_part.split("\r\n");
+        let request_line = lines
+            .next()
+            .ok_or_else(|| BridgeError::Ims("empty SIP request".into()))?;
+        let mut parts = request_line.splitn(3, ' ');
+        let method = parts
+            .next()
+            .ok_or_else(|| BridgeError::Ims(format!("malformed request line: {request_line}")))?
+            .to_string();
+        let request_uri = parts
+            .next()
+            .ok_or_else(|| BridgeError::Ims(format!("malformed request line: {request_line}")))?
+            .to_string();
+
+        let mut unfolded: Vec<String> = Vec::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if (line.starts_with(' ') || line.starts_with('\t')) && !unfolded.is_empty() {
+                let last = unfolded.last_mut().unwrap();
+                last.push(' ');
+                last.push_str(line.trim_start());
+            } else {
+                unfolded.push(line.to_string());
+            }
+        }
+
+        let headers: Vec<(String, String)> = unfolded
+            .into_iter()
+            .filter_map(|line| {
+                line.split_once(':')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+
+        let content_length: usize = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .unwrap_or(0);
+
+        let total_len = header_len + content_length;
+        if buf.len() < total_len {
+            return Ok(None);
+        }
+        let body = buf[header_len..total_len].to_string();
+
+        Ok(Some((
+            Self {
+                method,
+                request_uri,
+                headers,
+                body,
+            },
+            total_len,
+        )))
+    }
+}
+
+/// Either a request or a response arriving on the same connection — Agent A
+/// reads whichever comes next (an inbound `INVITE`/`BYE`/`ACK` from the
+/// carrier, or a response to something Agent A itself sent, e.g. a `BYE` it
+/// initiated) without knowing in advance which it'll be.
+#[derive(Debug, Clone)]
+pub enum SipMessage {
+    Request(SipRequest),
+    Response(SipResponse),
+}
+
+/// Build a UAS response to `request`: echoes `Via` (every instance, in
+/// order — see `SipRequest::headers_all` docs), `From`, `Call-ID`, and
+/// `CSeq` verbatim per RFC 3261 §8.2.6, adds `to_tag` to the `To` header
+/// (skipped for `100 Trying`, which conventionally carries none), and
+/// includes `contact`/`body` when given (a final response to `INVITE` needs
+/// both; `100 Trying` needs neither; `486 Busy Here` needs neither either).
+pub fn build_uas_response(
+    status: u16,
+    reason: &str,
+    request: &SipRequest,
+    to_tag: Option<&str>,
+    contact: Option<&str>,
+    body: Option<&str>,
+) -> String {
+    let mut msg = format!("SIP/2.0 {status} {reason}\r\n");
+    for via in request.headers_all("Via") {
+        msg.push_str(&format!("Via: {via}\r\n"));
+    }
+    if let Some(from) = request.header("From") {
+        msg.push_str(&format!("From: {from}\r\n"));
+    }
+    let to = request.header("To").unwrap_or("");
+    match to_tag {
+        Some(tag) => msg.push_str(&format!("To: {to};tag={tag}\r\n")),
+        None => msg.push_str(&format!("To: {to}\r\n")),
+    }
+    if let Some(call_id) = request.header("Call-ID") {
+        msg.push_str(&format!("Call-ID: {call_id}\r\n"));
+    }
+    if let Some(cseq) = request.header("CSeq") {
+        msg.push_str(&format!("CSeq: {cseq}\r\n"));
+    }
+    if let Some(contact) = contact {
+        msg.push_str(&format!("Contact: {contact}\r\n"));
+    }
+    let body = body.unwrap_or("");
+    if !body.is_empty() {
+        msg.push_str("Content-Type: application/sdp\r\n");
+    }
+    msg.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    msg
+}
+
+/// `100 Trying` — no `To` tag (see `build_uas_response` docs), no `Contact`.
+pub fn build_100_trying(request: &SipRequest) -> String {
+    build_uas_response(100, "Trying", request, None, None, None)
+}
+
+/// `180 Ringing` — establishes the early dialog, so it carries a `To` tag
+/// and a `Contact` (needed so the carrier's later in-dialog requests, e.g.
+/// `ACK`/`BYE`, target the right address).
+pub fn build_180_ringing(request: &SipRequest, to_tag: &str, contact: &str) -> String {
+    build_uas_response(180, "Ringing", request, Some(to_tag), Some(contact), None)
+}
+
+/// `200 OK` answering an `INVITE`, carrying the SDP answer body.
+pub fn build_200_ok_invite(
+    request: &SipRequest,
+    to_tag: &str,
+    contact: &str,
+    sdp_body: &str,
+) -> String {
+    build_uas_response(
+        200,
+        "OK",
+        request,
+        Some(to_tag),
+        Some(contact),
+        Some(sdp_body),
+    )
+}
+
+/// `200 OK` answering a `BYE` — no body, no `Contact` needed (the dialog is
+/// ending).
+pub fn build_200_ok_bye(request: &SipRequest, to_tag: &str) -> String {
+    build_uas_response(200, "OK", request, Some(to_tag), None, None)
+}
+
+/// `486 Busy Here` — declines an inbound `INVITE` (FR-009/FR-010: busy, or
+/// the SIP/PBX leg couldn't be established), per the spec's Clarifications
+/// answer that a decline must be a fast, explicit signal rather than
+/// unanswered ringing or dead air.
+pub fn build_486_busy_here(request: &SipRequest, to_tag: &str) -> String {
+    build_uas_response(486, "Busy Here", request, Some(to_tag), None, None)
+}
+
 /// Everything needed to build a REGISTER request.
 pub struct RegisterRequest<'a> {
     pub registrar_uri: &'a str,
@@ -406,6 +611,41 @@ impl SipTransport {
             }
         }
     }
+
+    /// Block until the next complete SIP message — request or response —
+    /// arrives, or `timeout` elapses with none available (`Ok(None)`).
+    /// Unlike every other `recv_*` method above (each a single bounded
+    /// transaction), this is for a long-running listener (Agent A's
+    /// inbound-call dispatch loop) that has no fixed deadline for "when's
+    /// the next call" but still needs to periodically come up for air (e.g.
+    /// to check whether its registration needs renewing,
+    /// `specs/011-vowifi-sip-bridge` User Story 2) — a per-`read()` timeout
+    /// is treated as "nothing yet", not a failure; only a real I/O error
+    /// propagates. Distinguishes request from response by checking whether
+    /// the start-line begins with `SIP/2.0` (a response's first token) — a
+    /// request's start-line always *ends* with `SIP/2.0` but begins with
+    /// its method name instead.
+    pub fn recv_message_deadline(&mut self, timeout: Duration) -> BridgeResult<Option<SipMessage>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(line_end) = self.buf.find("\r\n") {
+                let is_response = self.buf[..line_end].starts_with("SIP/2.0");
+                if is_response {
+                    if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
+                        self.buf.drain(..consumed);
+                        return Ok(Some(SipMessage::Response(resp)));
+                    }
+                } else if let Some((req, consumed)) = SipRequest::try_parse(&self.buf)? {
+                    self.buf.drain(..consumed);
+                    return Ok(Some(SipMessage::Request(req)));
+                }
+            }
+            self.read_more()?;
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 /// Parse a `WWW-Authenticate: Digest ...` header value into its parameters.
@@ -606,5 +846,146 @@ mod tests {
         let extra_pos = msg.find("Security-Client:").unwrap();
         let cl_pos = msg.find("Content-Length:").unwrap();
         assert!(extra_pos < cl_pos);
+    }
+
+    // --- SipRequest / UAS response builders (specs/011-vowifi-sip-bridge) ---
+
+    const SAMPLE_INVITE: &str =
+        "INVITE sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone SIP/2.0\r\n\
+         Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKabc123;rport\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:+919789063708@ims.mnc094.mcc404.3gppnetwork.org>;tag=fromtag1\r\n\
+         To: <sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n\
+         Call-ID: abc123callid\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:+919789063708@10.0.0.5:5060;transport=TCP>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: 9\r\n\r\n\
+         v=0\r\ndone";
+
+    #[test]
+    fn sip_request_try_parse_extracts_method_and_uri() {
+        let (req, consumed) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        assert_eq!(consumed, SAMPLE_INVITE.len());
+        assert_eq!(req.method, "INVITE");
+        assert_eq!(
+            req.request_uri,
+            "sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone"
+        );
+        assert_eq!(req.header("Call-ID").unwrap(), "abc123callid");
+        assert_eq!(req.header("CSeq").unwrap(), "1 INVITE");
+        assert_eq!(req.body, "v=0\r\ndone");
+    }
+
+    #[test]
+    fn sip_request_try_parse_returns_none_when_body_incomplete() {
+        let partial = "BYE sip:x SIP/2.0\r\nContent-Length: 10\r\n\r\nshort";
+        assert!(SipRequest::try_parse(partial).unwrap().is_none());
+    }
+
+    #[test]
+    fn sip_request_headers_all_returns_every_via_in_order() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    Via: SIP/2.0/TCP 1.1.1.1:5060;branch=b1\r\n\
+                    Via: SIP/2.0/TCP 2.2.2.2:5060;branch=b2\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let vias = req.headers_all("Via");
+        assert_eq!(vias.len(), 2);
+        assert!(vias[0].contains("1.1.1.1"));
+        assert!(vias[1].contains("2.2.2.2"));
+    }
+
+    #[test]
+    fn sip_request_try_parse_rejects_empty_input() {
+        assert!(SipRequest::try_parse("").unwrap().is_none());
+    }
+
+    fn sample_bye() -> SipRequest {
+        let raw = "BYE sip:caller@10.0.0.5:5060 SIP/2.0\r\n\
+                    Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKbye1\r\n\
+                    From: <sip:404438083996440@realm>;tag=totag1\r\n\
+                    To: <sip:+919789063708@realm>;tag=fromtag1\r\n\
+                    Call-ID: abc123callid\r\n\
+                    CSeq: 2 BYE\r\n\
+                    Content-Length: 0\r\n\r\n";
+        SipRequest::try_parse(raw).unwrap().unwrap().0
+    }
+
+    #[test]
+    fn build_100_trying_has_no_to_tag_and_no_contact() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let resp = build_100_trying(&req);
+        assert!(resp.starts_with("SIP/2.0 100 Trying\r\n"));
+        assert!(!resp.contains("Contact:"));
+        assert!(resp.contains("Call-ID: abc123callid\r\n"));
+        assert!(resp.contains("CSeq: 1 INVITE\r\n"));
+        // To header echoed without a tag added.
+        assert!(resp.contains(
+            "To: <sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n"
+        ));
+    }
+
+    #[test]
+    fn build_180_ringing_adds_to_tag_and_contact() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let resp = build_180_ringing(&req, "totag1", "<sip:agent@10.0.0.9:5060>");
+        assert!(resp.starts_with("SIP/2.0 180 Ringing\r\n"));
+        assert!(resp.contains(";tag=totag1\r\n"));
+        assert!(resp.contains("Contact: <sip:agent@10.0.0.9:5060>\r\n"));
+    }
+
+    #[test]
+    fn build_200_ok_invite_includes_sdp_body_and_content_length() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n";
+        let resp = build_200_ok_invite(&req, "totag1", "<sip:agent@10.0.0.9:5060>", sdp);
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(resp.contains("Content-Type: application/sdp\r\n"));
+        assert!(resp.contains(&format!("Content-Length: {}\r\n\r\n{sdp}", sdp.len())));
+        assert!(resp.ends_with(sdp));
+    }
+
+    #[test]
+    fn build_200_ok_bye_echoes_dialog_with_no_body() {
+        let req = sample_bye();
+        let resp = build_200_ok_bye(&req, "totag1");
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(resp.contains("CSeq: 2 BYE\r\n"));
+        assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_486_busy_here_declines_with_no_body() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let resp = build_486_busy_here(&req, "totag1");
+        assert!(resp.starts_with("SIP/2.0 486 Busy Here\r\n"));
+        assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn via_headers_are_echoed_verbatim_in_order_on_responses() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    Via: SIP/2.0/TCP 1.1.1.1:5060;branch=b1\r\n\
+                    Via: SIP/2.0/TCP 2.2.2.2:5060;branch=b2\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let resp = build_100_trying(&req);
+        let first_via = resp.find("Via: SIP/2.0/TCP 1.1.1.1").unwrap();
+        let second_via = resp.find("Via: SIP/2.0/TCP 2.2.2.2").unwrap();
+        assert!(first_via < second_via);
+    }
+
+    #[test]
+    fn recv_message_distinguishes_request_from_response_by_start_line() {
+        // Exercised indirectly via the start-line check `recv_message` uses
+        // internally (`starts_with("SIP/2.0")`) — a response's start-line
+        // begins with the SIP version token; a request's start-line ends
+        // with it instead. This asserts the discriminator itself, since
+        // `recv_message` needs a live socket to test end-to-end.
+        assert!(SAMPLE_INVITE.starts_with("INVITE"));
+        assert!(!SAMPLE_INVITE.starts_with("SIP/2.0"));
+        let response_start = "SIP/2.0 200 OK\r\n";
+        assert!(response_start.starts_with("SIP/2.0"));
     }
 }

@@ -87,3 +87,31 @@ inter_card_gap_seconds = 30
 # Symmetric jitter applied to the inter-card gap, in seconds.
 # Must be <= inter_card_gap_seconds.  Range 0..=3600.
 inter_card_gap_jitter_seconds = 15
+
+[vowifi]
+# Inbound VoWiFi-to-SIP bridge (see specs/011-vowifi-sip-bridge/) — a second,
+# independent inbound call path alongside the [sip]/[bridge] circuit-switched
+# bridge above. Only read by the `vowifi-ims-agent`/`vowifi-sip-agent`
+# subcommands run inside the docker/epdg/ deployment; ignored by the normal
+# daemon path. The SIP/PBX destination for a bridged VoWiFi call reuses
+# [bridge].sip_destination above rather than a separate setting.
+enabled = false
+# Home network MCC/MNC, required when enabled = true. Example: Airtel India.
+mcc = "404"
+mnc = "094"
+# Serial AT port for the modem whose SIM authenticates the IMS registration —
+# same device the ims-register/ims-call CLI tools use.
+modem_port = "/dev/ttyUSB6"
+# Use TCP (not UDP) for SIP signaling to the P-CSCF, and advertise sec-agree /
+# negotiate Gm IPsec. Both true is the combination that reached 200 OK on
+# Airtel; some networks (e.g. Vi) reject a plain UDP/no-sec-agree REGISTER.
+use_tcp = true
+sec_agree = true
+# Path Agent A reads the tunnel-assigned P-CSCF address from; written by
+# docker/epdg/entrypoint.sh once the SWu tunnel is up.
+pcscf_source_path = "/tmp/pcscf"
+# Addresses on the dedicated veth link between Agent A (ims netns) and
+# Agent B (default netns), and the TCP port their control channel uses.
+veth_local_addr = "10.99.0.1"
+veth_peer_addr = "10.99.0.2"
+control_port = 7050

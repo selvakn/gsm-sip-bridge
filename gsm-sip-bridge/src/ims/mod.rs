@@ -22,6 +22,7 @@
 //! 2617/3310 digest math in `ims::digest`), this module handles the SIP
 //! request/response transaction directly instead.
 
+pub mod agent;
 pub mod call;
 mod digest;
 mod gm_ipsec;
@@ -112,6 +113,61 @@ impl RegisteredSession {
         if let Some((endpoints, p, theirs)) = self.gm_state.take() {
             gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, self.xfrm_proto);
         }
+    }
+}
+
+/// Current lifecycle state of a *persistent* IMS-AKA registration
+/// (`specs/011-vowifi-sip-bridge` User Story 2's Agent A, which keeps
+/// re-registering indefinitely) — distinct from `RegisterOutcome`, which
+/// only reports a one-shot CLI transaction's final result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationState {
+    Unregistered,
+    Registering,
+    Registered,
+    Renewing,
+    Failed,
+}
+
+/// Snapshot of Agent A's registration health, per
+/// `specs/011-vowifi-sip-bridge/data-model.md`'s "VoWiFi Line Registration"
+/// entity — what FR-008/User Story 3's status reporting needs.
+#[derive(Debug, Clone)]
+pub struct RegistrationStatus {
+    pub state: RegistrationState,
+    pub registered_at: Option<std::time::SystemTime>,
+    pub expires_at: Option<std::time::SystemTime>,
+    pub last_failure: Option<(std::time::SystemTime, String)>,
+}
+
+impl Default for RegistrationStatus {
+    fn default() -> Self {
+        Self {
+            state: RegistrationState::Unregistered,
+            registered_at: None,
+            expires_at: None,
+            last_failure: None,
+        }
+    }
+}
+
+/// Whether a registration expiring at `expires_at` should be renewed *now*,
+/// given the current time and how much headroom to leave before the actual
+/// expiry — renewing early leaves margin for the renewal's own network
+/// round-trip and AKA challenge to finish before the old registration would
+/// actually lapse (FR-001/FR-007: no gap in which an inbound call would go
+/// unanswered). Pure and clock-injectable so it's testable without waiting
+/// on a real timer.
+pub fn renewal_due(
+    now: std::time::SystemTime,
+    expires_at: std::time::SystemTime,
+    headroom: std::time::Duration,
+) -> bool {
+    match expires_at.checked_sub(headroom) {
+        Some(renew_at) => now >= renew_at,
+        // headroom >= time-to-expiry (or expires_at is implausibly close to
+        // the epoch): nothing left to wait for, renew immediately.
+        None => true,
     }
 }
 
@@ -525,6 +581,54 @@ fn build_resync_authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn renewal_not_due_when_well_before_expiry() {
+        let expires_at = SystemTime::now() + Duration::from_secs(3600);
+        let now = SystemTime::now();
+        assert!(!renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn renewal_due_once_inside_the_headroom_window() {
+        let now = SystemTime::now();
+        let expires_at = now + Duration::from_secs(200);
+        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn renewal_due_exactly_at_the_headroom_boundary() {
+        let now = SystemTime::now();
+        let expires_at = now + Duration::from_secs(300);
+        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn renewal_due_when_already_past_expiry() {
+        let now = SystemTime::now();
+        let expires_at = now - Duration::from_secs(10);
+        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn renewal_due_when_headroom_exceeds_time_to_expiry() {
+        // expires_at is so close that subtracting headroom would underflow
+        // (or would if SystemTime allowed negative time) — must still
+        // report "due", not panic or silently say "not due".
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn registration_status_defaults_to_unregistered() {
+        let status = RegistrationStatus::default();
+        assert_eq!(status.state, RegistrationState::Unregistered);
+        assert!(status.registered_at.is_none());
+        assert!(status.expires_at.is_none());
+        assert!(status.last_failure.is_none());
+    }
 
     #[test]
     fn security_client_header_includes_proposal_values() {
