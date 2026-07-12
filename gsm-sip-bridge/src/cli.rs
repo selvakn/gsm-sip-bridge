@@ -116,10 +116,16 @@ pub struct ImsCallArgs {
     #[arg(long)]
     pub to: String,
 
-    /// Where to write the recorded (received) audio — a 16-bit PCM mono
-    /// WAV file at 8kHz (G.711's rate).
+    /// Where to write the recorded (received, far-end) audio — a 16-bit
+    /// PCM mono WAV file at 8kHz (PCMU) or 16kHz (AMR-WB), matching
+    /// whichever codec the network selects.
     #[arg(long)]
     pub record: PathBuf,
+
+    /// Where to write the sent (outgoing, our own test pattern) audio, for
+    /// a side-by-side comparison of both directions. Optional.
+    #[arg(long)]
+    pub record_sent: Option<PathBuf>,
 
     /// How long to wait for the callee to answer before giving up.
     #[arg(long, default_value_t = 30)]
