@@ -2,13 +2,21 @@
 # docker/docker-compose.yml (which is host-networked) so `docker compose up`
 # never brings this experimental service up alongside the production bridge.
 #
+# Run from the repo root (the build context the Dockerfile needs to see the
+# whole Cargo workspace, not just docker/epdg/):
+#
 #   docker compose -f docker/epdg/docker-compose.epdg.yml up --build
 #
+# `docker compose up --build` alone produces a fully working image — the
+# gsm-sip-bridge binary (real, statically-linked PJSIP; see Dockerfile's
+# builder stage) is baked in at build time. Only config.toml is provided at
+# run time, via the bind mount below; put yours at docker/epdg/config.toml
+# (gitignored, same as the repo root's config.toml) with [vowifi] enabled.
 services:
   epdg-tunnel:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: docker/epdg/Dockerfile
     image: gsm-sip-bridge-epdg:latest
     container_name: epdg-tunnel
     # Network isolated from the host: a dedicated bridge network gives the
@@ -33,6 +41,12 @@ services:
       - /dev/ttyUSB6:/dev/ttyUSB6   # EC200U AT port for AT+CIMI / AT+CSIM (EAP-AKA)
     group_add:
       - dialout
+    volumes:
+      # Your [vowifi]-enabled config.toml, read-only. entrypoint.sh checks
+      # for exactly this path before launching vowifi-ims-agent/
+      # vowifi-sip-agent — omit this mount (or point CONFIG_HOST_PATH at a
+      # missing file) to run the tunnel alone, same as before this file existed.
+      - "${CONFIG_HOST_PATH:-./config.toml}:/etc/gsm-sip-bridge/config.toml:ro"
     env_file:
       - path: .env
         required: false
