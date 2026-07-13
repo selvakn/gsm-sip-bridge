@@ -171,6 +171,46 @@ impl Call {
         self.state
     }
 
+    /// The call's state as PJSIP sees it *right now*, rather than the cached
+    /// `state` field (which only changes when someone calls `set_state`).
+    ///
+    /// Needed to tell "the INVITE has been sent" apart from "a human actually
+    /// picked up": the inbound VoWiFi bridge must not answer the carrier until
+    /// the PBX leg reaches `Confirmed`, or the caller's ringback is cut off and
+    /// replaced by dead air while the extension is still ringing.
+    pub fn poll_state(&self) -> CallState {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            ensure_pjsip_thread();
+            unsafe // SAFETY: PJSIP initialized; call_id owned by this Call; writable stack out-param
+            {
+                let mut info = std::mem::zeroed::<pjsua_sys::pjsua_call_info>();
+                if pjsua_sys::pjsua_call_get_info(self.call_id, &mut info) != crate::error::PJ_SUCCESS
+                {
+                    // The call is gone as far as PJSIP is concerned.
+                    return CallState::Disconnected;
+                }
+                #[allow(non_upper_case_globals)]
+                return match info.state {
+                    pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_NULL => CallState::Null,
+                    pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_CALLING => CallState::Calling,
+                    pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_INCOMING => CallState::Incoming,
+                    pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_EARLY => CallState::Early,
+                    pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_CONNECTING => CallState::Connecting,
+                    pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_CONFIRMED => CallState::Confirmed,
+                    _ => CallState::Disconnected,
+                };
+            }
+        }
+
+        // Stub builds have no real call to poll; report the cached state so
+        // unit tests can drive it with `set_state`.
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            self.state
+        }
+    }
+
     pub fn set_state(&mut self, state: CallState) {
         self.state = state;
     }

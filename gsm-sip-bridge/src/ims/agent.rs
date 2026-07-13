@@ -33,10 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-/// How long Agent A waits for Agent B to reply to `IncomingCall` (place its
-/// two legs and either pair them or fail) before giving up and declining the
-/// carrier's INVITE — must leave headroom under SC-001's 5s answer target,
-/// since it sits directly in that critical path.
+/// How long Agent A waits for Agent B to *place* its two legs (`BridgeReady`)
+/// before giving up and declining the carrier's INVITE. Only covers getting the
+/// PBX ringing — the wait for a human to actually pick up is `RING_TIMEOUT`,
+/// and the caller hears ringback throughout it.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long Agent A waits for Agent B's veth-side `INVITE` to arrive after
 /// signaling `IncomingCall` — Agent B places its veth call as part of
@@ -44,6 +44,15 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 /// `CONTROL_TIMEOUT` in the success case; this is the ceiling for the
 /// separate thread that's listening for it.
 const VETH_INVITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the PBX extension may ring — with the caller hearing real ringback
+/// throughout — before we give up and return `480`. Must stay under the
+/// carrier's own no-answer timer so *we* decide the outcome, not the network.
+/// `crate::vowifi`'s `PBX_RING_TIMEOUT` is deliberately a little shorter, so
+/// Agent B normally reports `BridgeFailed` before this fires.
+const RING_TIMEOUT: Duration = Duration::from_secs(50);
+/// How often, while ringing, to check the control channel and the carrier's
+/// signaling. Bounds how fast a caller's `CANCEL` gets answered.
+const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the RTP relay's blocking `recv` wakes up to check whether it
 /// should stop — bounds how quickly a hangup actually silences the relay.
 const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -453,7 +462,7 @@ fn dispatch_loop(
                     let _ = sink.send(&build_486_busy_here(&req, &random_hex(4)));
                     continue;
                 }
-                match handle_invite(session, &req, &sink, control_addr, veth_local_ip) {
+                match handle_invite(session, &req, &sink, inbound, control_addr, veth_local_ip) {
                     Ok(call) => active_call = call,
                     Err(e) => tracing::warn!(error = %e, "failed to handle inbound INVITE"),
                 }
@@ -563,6 +572,7 @@ fn handle_invite(
     session: &super::RegisteredSession,
     req: &SipRequest,
     sink: &SipSink,
+    inbound: &Inbound,
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
 ) -> BridgeResult<Option<ActiveCall>> {
@@ -614,8 +624,9 @@ fn handle_invite(
         "<sip:{public_user}@{};transport={via_transport}>",
         format_sip_addr(session.contact_addr)
     );
-    // Let the carrier know we're working on it while we wait on Agent B —
-    // otherwise it hears nothing for up to CONTROL_TIMEOUT.
+    // Ring the caller. The network turns this into audible ringback and keeps
+    // playing it until we answer — which we now deliberately don't do until a
+    // human picks up the PBX extension (see `await_pbx_answer`).
     sink.send(&build_180_ringing(req, &to_tag, &contact))?;
 
     let mut control = TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT)
@@ -628,12 +639,14 @@ fn handle_invite(
         },
     )
     .map_err(BridgeError::Ims)?;
-    let mut control_reader = BufReader::new(
+    let ctrl_rx = spawn_control_reader(
         control
             .try_clone()
             .map_err(|e| BridgeError::Ims(format!("control connection clone failed: {e}")))?,
     );
-    let reply = read_msg(&mut control_reader).map_err(BridgeError::Ims)?;
+    let reply = ctrl_rx
+        .recv_timeout(CONTROL_TIMEOUT)
+        .map_err(|_| BridgeError::Ims("timed out waiting for Agent B to place its legs".into()))?;
 
     match reply {
         ControlMessage::BridgeReady { .. } => {
@@ -664,6 +677,28 @@ fn handle_invite(
                 &offer,
                 amr_safe::is_available(),
             )?;
+
+            // Do NOT answer yet. The PBX extension is only ringing; our
+            // `180 Ringing` above is what makes the network play ringback to
+            // the caller, and a `200 OK` here would cut that off and leave them
+            // in silence until someone picks up. Wait for Agent B to report a
+            // real answer — while still watching the carrier's own signaling,
+            // since the caller may give up (`CANCEL`) while it rings.
+            match await_pbx_answer(&call_id, &ctrl_rx, inbound, req, &to_tag, sink)? {
+                RingOutcome::Answered => {}
+                RingOutcome::PbxDeclined => return Ok(None),
+                RingOutcome::Abandoned { reason } => {
+                    // Agent B is still ringing the extension — stop it.
+                    let _ = write_msg(
+                        &mut control,
+                        &ControlMessage::CallEnded {
+                            call_id: call_id.clone(),
+                            reason: reason.to_string(),
+                        },
+                    );
+                    return Ok(None);
+                }
+            }
 
             sink.send(&build_200_ok_invite(req, &to_tag, &contact, &answer_sdp))?;
 
@@ -723,6 +758,126 @@ fn handle_invite(
             "unexpected control-channel reply to IncomingCall: {other:?}"
         ))),
     }
+}
+
+/// Why we stopped ringing. The carrier has already been sent its final
+/// response in every case; the distinction is whether **Agent B** still needs
+/// telling — if it does and we don't, the PBX extension keeps ringing at
+/// someone long after the call is over.
+enum RingOutcome {
+    /// A human picked up the PBX extension; answer the carrier.
+    Answered,
+    /// Agent B gave up on the PBX itself (`BridgeFailed`) and has already torn
+    /// its own legs down. Nothing more to tell it.
+    PbxDeclined,
+    /// We stopped ringing while Agent B still thinks the call is alive — the
+    /// caller hung up, or we hit our own ring timeout. Agent B must be told to
+    /// stop ringing the extension.
+    Abandoned { reason: &'static str },
+}
+
+/// Hold the carrier in the ringing state until Agent B reports the PBX
+/// extension was actually answered.
+///
+/// While waiting, the carrier's own signaling still has to be serviced: the
+/// caller can give up at any point, which arrives as a `CANCEL` and must be
+/// answered promptly (`200 OK` to the CANCEL, `487` to the INVITE it cancels —
+/// RFC 3261 §9.2) or the network keeps retransmitting and the caller is left
+/// listening to a phone that has already been hung up. So this polls both the
+/// control channel and the inbound SIP queue rather than blocking on either.
+fn await_pbx_answer(
+    call_id: &str,
+    ctrl_rx: &mpsc::Receiver<ControlMessage>,
+    inbound: &Inbound,
+    invite: &SipRequest,
+    to_tag: &str,
+    sink: &SipSink,
+) -> BridgeResult<RingOutcome> {
+    let decline = |status: u16, reason: &str| {
+        respond(
+            sink,
+            reason,
+            &build_uas_response(status, reason, invite, Some(to_tag), None, None),
+        );
+    };
+
+    let deadline = std::time::Instant::now() + RING_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        // 1. Did the caller give up while it rang? A CANCEL must be answered
+        //    promptly or the network keeps retransmitting it.
+        while let Ok((msg, cancel_sink)) = inbound.rx.try_recv() {
+            let SipMessage::Request(req) = msg else {
+                continue;
+            };
+            if req.method == "CANCEL" && req.header("Call-ID") == Some(call_id) {
+                tracing::info!(call_id = %call_id, "caller hung up while the PBX was still ringing");
+                // RFC 3261 §9.2: 200 OK to the CANCEL, 487 to the INVITE it
+                // cancels. The CANCEL is its own transaction, so it is answered
+                // on the connection it arrived on.
+                respond(
+                    &cancel_sink,
+                    "200 OK (CANCEL)",
+                    &build_uas_response(200, "OK", &req, Some(to_tag), None, None),
+                );
+                decline(487, "Request Terminated");
+                return Ok(RingOutcome::Abandoned {
+                    reason: reason::CALLER_CANCELLED,
+                });
+            }
+            tracing::debug!(method = %req.method, "ignoring inbound request received while ringing");
+        }
+
+        // 2. Did Agent B report an answer, or give up on the PBX?
+        match ctrl_rx.recv_timeout(RING_POLL_INTERVAL) {
+            Ok(ControlMessage::CallAnswered { .. }) => return Ok(RingOutcome::Answered),
+            Ok(ControlMessage::BridgeFailed { reason, .. }) => {
+                tracing::info!(call_id = %call_id, reason = %reason, "PBX leg did not answer; declining");
+                decline(480, "Temporarily Unavailable");
+                return Ok(RingOutcome::PbxDeclined);
+            }
+            Ok(other) => {
+                tracing::warn!(call_id = %call_id, message = ?other, "unexpected control message while ringing");
+            }
+            // Still ringing.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BridgeError::Ims(
+                    "Agent B's control connection closed while the PBX was ringing".into(),
+                ));
+            }
+        }
+    }
+
+    tracing::info!(call_id = %call_id, "PBX extension rang out; declining");
+    decline(480, "Temporarily Unavailable");
+    Ok(RingOutcome::Abandoned {
+        reason: reason::PBX_NO_ANSWER,
+    })
+}
+
+/// Reads Agent B's control messages on a thread, so the caller can wait on
+/// them with a timeout while also servicing the carrier's SIP signaling —
+/// without a partially-read line ever corrupting the newline-JSON framing,
+/// which is what polling the socket with a read timeout would risk.
+fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlMessage> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        loop {
+            match read_msg(&mut reader) {
+                Ok(msg) => {
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Agent B control connection reader stopped");
+                    return;
+                }
+            }
+        }
+    });
+    rx
 }
 
 fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall) {

@@ -6,3 +6,5 @@ capabilities:
     - rust
     - github
     - git-remote
+    - docker
+    - devtty

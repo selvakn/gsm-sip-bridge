@@ -28,8 +28,16 @@ pub enum ControlMessage {
     /// Agent A → Agent B. The carrier-side leg received a `BYE`.
     CallEnded { call_id: String, reason: String },
     /// Agent B → Agent A. Both the PBX-side and veth-side legs are placed
-    /// and conference-bridged.
+    /// and conference-bridged. The PBX leg is *ringing*, not yet answered —
+    /// Agent A must keep the carrier in the ringing state (its `180 Ringing`
+    /// is what makes the network play ringback to the caller) and wait for
+    /// `CallAnswered` before sending `200 OK`.
     BridgeReady { call_id: String, veth_rtp_port: u16 },
+    /// Agent B → Agent A. A human picked up the PBX extension (the PBX leg
+    /// reached `Confirmed`). Only now may Agent A answer the carrier —
+    /// answering any earlier cuts the caller's ringback off and leaves them
+    /// listening to dead air while the extension is still ringing.
+    CallAnswered { call_id: String },
     /// Agent B → Agent A. The PBX-side or veth-side leg could not be
     /// established; Agent A must decline the inbound INVITE (486 Busy Here).
     BridgeFailed { call_id: String, reason: String },
@@ -62,6 +70,7 @@ impl ControlMessage {
             ControlMessage::IncomingCall { call_id, .. }
             | ControlMessage::CallEnded { call_id, .. }
             | ControlMessage::BridgeReady { call_id, .. }
+            | ControlMessage::CallAnswered { call_id, .. }
             | ControlMessage::BridgeFailed { call_id, .. }
             | ControlMessage::HangupAck { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
@@ -93,6 +102,10 @@ pub struct CallRecord {
 pub mod reason {
     pub const PBX_UNREACHABLE: &str = "pbx_unreachable";
     pub const PBX_REJECTED: &str = "pbx_rejected";
+    /// Nobody picked up the PBX extension before the ring timeout.
+    pub const PBX_NO_ANSWER: &str = "pbx_no_answer";
+    /// The caller gave up (`CANCEL`) while the PBX extension was still ringing.
+    pub const CALLER_CANCELLED: &str = "caller_cancelled";
     pub const VETH_LEG_FAILED: &str = "veth_leg_failed";
     pub const CALLER_HANGUP: &str = "caller_hangup";
     pub const TRANSPORT_ERROR: &str = "transport_error";
@@ -160,6 +173,41 @@ mod tests {
             veth_rtp_port: 40100,
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn call_answered_roundtrips() {
+        let msg = ControlMessage::CallAnswered {
+            call_id: "a1b2c3".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// `BridgeReady` and `CallAnswered` are distinct events and must stay
+    /// distinguishable on the wire: conflating them is exactly the bug that
+    /// made the caller hear dead air instead of ringback, because Agent A
+    /// answered the carrier as soon as the PBX leg had been *placed* rather
+    /// than when it was *answered*.
+    #[test]
+    fn bridge_ready_and_call_answered_are_distinct_events() {
+        let mut ready = Vec::new();
+        write_msg(
+            &mut ready,
+            &ControlMessage::BridgeReady {
+                call_id: "c".to_string(),
+                veth_rtp_port: 0,
+            },
+        )
+        .unwrap();
+        let mut answered = Vec::new();
+        write_msg(
+            &mut answered,
+            &ControlMessage::CallAnswered {
+                call_id: "c".to_string(),
+            },
+        )
+        .unwrap();
+        assert_ne!(ready, answered);
     }
 
     #[test]
