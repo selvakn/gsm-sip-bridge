@@ -1,0 +1,63 @@
+# swanctl connection template for the "ims" ePDG tunnel
+# (specs/012-strongswan-epdg). Rendered by docker/entrypoint.sh's
+# `strongswan` branch into /etc/swanctl/conf.d/epdg.conf, substituting:
+#
+#   @IMSI@       - read via `gsm-sip-bridge vowifi-imsi` (or the IMSI env
+#                  override), used to build the EAP-AKA NAI identity
+#   @MCC@ @MNC@  - 3-digit-padded, from the MCC/MNC env vars (same
+#                  convention docker/entrypoint.sh already uses for the
+#                  legacy SWu dialer's -M/-N flags and EPDG_FQDN)
+#   @EPDG_IP@    - resolved ePDG address (same resolution entrypoint.sh
+#                  already does for the legacy engine)
+#   @SRC_ADDR@   - optional; entrypoint deletes the local_addrs line
+#                  entirely when unset, letting charon auto-select based on
+#                  routing to @EPDG_IP@ (mirrors the legacy engine's
+#                  optional `-s`/SRC_ADDR flag)
+#
+# No `secrets{}` block: authentication runs live EAP-AKA against the SIM
+# inside the modem via `vowifi-usim-bridge` (pcscd/vpcd), not a static key.
+#
+# if_id_in/if_id_out = 23 binds this connection's CHILD_SA to the
+# pre-created XFRM interface inside network namespace "ims" (research.md
+# item 3) — the piece that lets rekeys/reconnects swap SAs without ever
+# deleting the namespace or interface (FR-005).
+connections {
+    ims {
+        local_addrs  = @SRC_ADDR@
+        remote_addrs = @EPDG_IP@
+
+        # Request both an IPv4 and an IPv6 inner address — carriers assign
+        # one or the other (sometimes only one family), matching the
+        # legacy engine's dual-family handling.
+        vips = 0.0.0.0, ::
+
+        local {
+            auth = eap-aka
+            id = 0@IMSI@@nai.epc.mnc@MNC@.mcc@MCC@.3gppnetwork.org
+        }
+        remote {
+            # Literal "ims", not a variable — the wiki's Option 2
+            # walkthrough is explicit that the ePDG selects the IMS APN
+            # based on this remote identity string.
+            id = ims
+        }
+        children {
+            ims {
+                remote_ts = 0.0.0.0/0, ::/0
+                updown = /etc/strongswan.d/ims.updown
+                if_id_in = 23
+                if_id_out = 23
+            }
+        }
+        version = 2
+
+        # Unlimited retry (FR-004: no bounded give-up); paired with
+        # charon-extra.conf's retry_initiate_interval for backoff between
+        # attempts.
+        keyingtries = 0
+
+        # Dead-peer-detection cadence (FR-004's "detect a dead peer / broken
+        # path" — the reliability primitive Option 1 never had at all).
+        dpd_delay = 30s
+    }
+}
