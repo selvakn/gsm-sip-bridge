@@ -22,12 +22,14 @@ pub mod control;
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
 use crate::error::{BridgeError, BridgeResult};
 use control::{read_msg, write_msg, CallRecord, ControlMessage};
-use pjsua_safe::{Account, AccountConfig, Call, Endpoint, EndpointConfig, TransportType};
+use pjsua_safe::{
+    Account, AccountConfig, Call, CallState, Endpoint, EndpointConfig, TransportType,
+};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Fixed port Agent A listens on for Agent B's inbound (veth-internal) SIP
 /// call. Not user-configurable — this is a private implementation detail of
@@ -220,10 +222,60 @@ fn handle_connection(
             )
             .map_err(BridgeError::Ims)?;
 
+            // Read Agent A's messages on a thread from here on. While the PBX
+            // rings we must still notice a `CallEnded` (the caller gave up) —
+            // blocking on the PBX's state alone would leave the extension
+            // ringing for the whole timeout after the caller had already hung
+            // up.
+            let ctrl_rx = spawn_control_reader(reader);
+
+            // The PBX extension is only *ringing* at this point. Agent A holds
+            // the carrier in the ringing state (so the network keeps playing
+            // ringback to the caller) until we tell it a human actually picked
+            // up — answering the carrier the moment the INVITE went out would
+            // replace the caller's ringback with dead air.
+            match wait_for_pbx_answer(&pbx_call, &ctrl_rx) {
+                PbxOutcome::Answered => {
+                    tracing::info!(call_id = %call_id, "PBX extension answered");
+                    write_msg(
+                        &mut writer,
+                        &ControlMessage::CallAnswered {
+                            call_id: call_id.clone(),
+                        },
+                    )
+                    .map_err(BridgeError::Ims)?;
+                }
+                outcome => {
+                    let reason = outcome.reason();
+                    tracing::info!(call_id = %call_id, reason, "PBX leg never answered; declining");
+                    let _ = write_msg(
+                        &mut writer,
+                        &ControlMessage::BridgeFailed {
+                            call_id: call_id.clone(),
+                            reason: reason.to_string(),
+                        },
+                    );
+                    endpoint.unpair_call(pbx_call.call_id());
+                    let _ = pbx_call.hangup();
+                    let _ = veth_call.hangup();
+                    recent_calls
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(CallRecord {
+                            call_id,
+                            caller,
+                            outcome: format!("declined:{reason}"),
+                            started_at,
+                            ended_at: Some(now_unix()),
+                        });
+                    return Ok(());
+                }
+            }
+
             // Block until Agent A reports the call ended, then tear down
             // both legs. One call at a time per the spec's single-line
             // assumption, so a blocking read here is correct.
-            let end_reason = match read_msg(&mut reader) {
+            let end_reason = match ctrl_rx.recv() {
                 Ok(ControlMessage::CallEnded { reason, .. }) => {
                     tracing::info!(call_id = %call_id, reason = %reason, "call ended, tearing down both legs");
                     reason
@@ -281,6 +333,90 @@ fn handle_connection(
             Ok(())
         }
     }
+}
+
+/// How long to let the PBX extension ring before giving up. The caller hears
+/// ringback for this whole window, so it wants to be a natural ring duration —
+/// long enough for someone to walk to the phone, short enough that the carrier
+/// doesn't time the call out from its own end first.
+const PBX_RING_TIMEOUT: Duration = Duration::from_secs(45);
+/// How often to re-check the PBX leg's state while it rings. PJSIP's state is
+/// polled rather than pushed (see `Call::poll_state`); 100ms is imperceptible
+/// against a human picking up a phone and costs nothing.
+const PBX_RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What became of the PBX leg while the caller listened to ringback.
+enum PbxOutcome {
+    /// A human picked up.
+    Answered,
+    /// The PBX hung up on us — busy, rejected, or the extension is gone.
+    Rejected,
+    /// It just rang out.
+    NoAnswer,
+    /// The caller gave up before anyone picked up. Agent A has already told
+    /// the carrier; we only need to stop ringing the extension.
+    CallerGone,
+}
+
+impl PbxOutcome {
+    fn reason(&self) -> &'static str {
+        match self {
+            // Only ever called on the paths that didn't answer.
+            PbxOutcome::Answered => "answered",
+            PbxOutcome::Rejected => control::reason::PBX_REJECTED,
+            PbxOutcome::NoAnswer => control::reason::PBX_NO_ANSWER,
+            PbxOutcome::CallerGone => control::reason::CALLER_CANCELLED,
+        }
+    }
+}
+
+/// Ring the PBX extension until someone answers, the PBX gives up on us, the
+/// caller hangs up, or `PBX_RING_TIMEOUT` elapses.
+fn wait_for_pbx_answer(pbx_call: &Call, ctrl_rx: &mpsc::Receiver<ControlMessage>) -> PbxOutcome {
+    let deadline = Instant::now() + PBX_RING_TIMEOUT;
+    while Instant::now() < deadline {
+        match pbx_call.poll_state() {
+            CallState::Confirmed => return PbxOutcome::Answered,
+            CallState::Disconnected => return PbxOutcome::Rejected,
+            // Calling/Early — still ringing.
+            _ => {}
+        }
+        // The caller may hang up mid-ring; stop ringing the extension at once
+        // rather than making it ring on for the rest of the timeout.
+        match ctrl_rx.recv_timeout(PBX_RING_POLL_INTERVAL) {
+            Ok(ControlMessage::CallEnded { .. }) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return PbxOutcome::CallerGone
+            }
+            Ok(other) => {
+                tracing::debug!(message = ?other, "ignoring control message while the PBX rings")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    PbxOutcome::NoAnswer
+}
+
+/// Reads Agent A's control messages on a thread so the ring loop can wait on
+/// the PBX's state and the control channel at the same time. Mirrors
+/// `ims::agent::spawn_control_reader`.
+fn spawn_control_reader(
+    mut reader: std::io::BufReader<TcpStream>,
+) -> mpsc::Receiver<ControlMessage> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        match read_msg(&mut reader) {
+            Ok(msg) => {
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Agent A control connection reader stopped");
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// Places both legs — the PBX-side call (reusing the same destination-URI

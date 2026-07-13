@@ -5,7 +5,19 @@
       "Bash(cp /home/selva/projects/ec20/audio-echo/.specify/templates/spec-template.md /home/selva/projects/ec20/audio-echo/specs/008-rust-rewrite/spec.md)",
       "Bash(.specify/scripts/bash/check-prerequisites.sh *)",
       "Bash(.specify/scripts/bash/setup-plan.sh *)",
-      "Bash(.specify/scripts/bash/setup-tasks.sh *)"
+      "Bash(.specify/scripts/bash/setup-tasks.sh *)",
+      "Bash(ssh *)",
+      "Bash(make lint *)",
+      "Bash(grep -v \"^Warning:\\\\|^Welcome\\\\|^\\\\*\\\\|^ \\\\*\\\\|^$\\\\|Documentation\\\\|Management\\\\|Support\\\\|System info\\\\|System load\\\\|Usage of\\\\|Memory\\\\|Swap\\\\|Temperature\\\\|Processes\\\\|Users\\\\|IPv4\\\\|updates can\\\\|additional\\\\|Learn more\\\\|ESM\\\\|restart required\\\\|ubuntu\\\\|landscape\\\\|engage\\\\|ESM Apps\")",
+      "Bash(grep -v \"^Warning:\\\\|^Welcome\\\\|^\\\\*\\\\|^ \\\\*\\\\|^$\\\\|Documentation\\\\|Management\\\\|Support\\\\|System\\\\|Usage\\\\|Memory\\\\|Swap\\\\|Temp\\\\|Process\\\\|Users\\\\|IPv4\\\\|updates\\\\|additional\\\\|Learn\\\\|ESM\\\\|restart\\\\|ubuntu\\\\|landscape\\\\|engage\\\\|Restarting\\\\|Started\")",
+      "Bash(grep -v \"^Warning:\\\\|^Welcome\\\\|^\\\\*\\\\|^ \\\\*\\\\|^$\\\\|Documentation\\\\|Management\\\\|Support\\\\|System\\\\|Usage\\\\|Memory\\\\|Swap\\\\|Temp\\\\|Process\\\\|Users\\\\|IPv4\\\\|updates\\\\|additional\\\\|Learn\\\\|ESM\\\\|restart\\\\|ubuntu\\\\|landscape\\\\|engage\")",
+      "Bash(cargo fmt *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git tag *)",
+      "Bash(git push *)",
+      "Bash(git commit *)",
+      "Bash(grep -v \"^Warning:\\\\|^Welcome\\\\|^\\\\*\\\\|^ \\\\*\\\\|^$\\\\|Documentation\\\\|Management\\\\|Support\\\\|System\\\\|Usage\\\\|Memory\\\\|Swap\\\\|Temp\\\\|Process\\\\|Users\\\\|IPv4\\\\|updates\\\\|additional\\\\|Learn\\\\|ESM\\\\|restart\\\\|ubuntu\\\\|landscape\\\\|engage\\\\|Already\\\\|Pulling\")"
     ]
   }
 }
