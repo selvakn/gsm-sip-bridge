@@ -1,15 +1,24 @@
 # One image, two optional subsystems (see docker/entrypoint.sh):
 #   1. the circuit-switched GSM-to-SIP daemon — always attempted, no-ops
 #      gracefully with no supported modem attached
-#   2. the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — the
-#      SWu-IKEv2 ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, started
-#      only when [vowifi].enabled = true in the mounted config.toml
+#   2. the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — an
+#      ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, started only when
+#      [vowifi].enabled = true in the mounted config.toml. The tunnel
+#      engine is chosen via the TUNNEL_ENGINE env var (.env — see
+#      .env.example), specs/012-strongswan-epdg: "swu" (default during the
+#      strongSwan proving period) is the original SWu-IKEv2 Python dialer;
+#      "strongswan" is the new engine with proper IKE rekeying/re-auth/
+#      DPD/MOBIKE and a network namespace that survives reconnects.
+#      Switching is a container restart, not a rebuild — both engines ship
+#      in this one image.
 #
 # `privileged: true` + host networking + full /dev,/sys mounts are needed
 # for the circuit-switched daemon's arbitrary-USB-modem hot-plug discovery,
 # and happen to be a strict superset of everything the VoWiFi tunnel needs
-# too (NET_ADMIN/NET_RAW/SYS_ADMIN, /dev/net/tun, netns/veth setup) — no
-# separate capability profile required for either subsystem.
+# too (NET_ADMIN/NET_RAW/SYS_ADMIN, /dev/net/tun, netns/veth setup for the
+# swu engine; NET_ADMIN/SYS_ADMIN, netns/XFRM-interface setup for the
+# strongswan engine) — no separate capability profile required for either
+# subsystem or engine.
 services:
   gsm-sip-bridge:
     build:

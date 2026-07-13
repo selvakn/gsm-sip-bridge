@@ -234,14 +234,21 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
 **Independent Test**: same image runs both engines successfully, switched only by env
 (quickstart.md §6).
 
-- [ ] T028 [US4] Finalize selection docs: `TUNNEL_ENGINE` semantics + default in
+- [X] T028 [US4] Finalize selection docs: `TUNNEL_ENGINE` semantics + default in
       `docker/epdg/.env` and a comment block in `docker/docker-compose.yml`; default remains
-      `swu` until SC-001..004 are recorded as passed (US4 acceptance scenario 3)
-- [ ] T029 [US4] Equivalence review of the `swu` path: diff `docker/entrypoint.sh`'s
+      `swu` until SC-001..004 are recorded as passed (US4 acceptance scenario 3).
+      `docker/epdg/.env` is untracked/stale (predates the 011 image unification, superseded by
+      `.env.example` per `docker-compose.yml`'s `env_file: .env`) — documented there instead.
+- [~] T029 [US4] Equivalence review of the `swu` path: diff `docker/entrypoint.sh`'s
       `TUNNEL_ENGINE=swu` flow against the pre-feature script (git history) — behavior
       byte-for-byte equivalent apart from the branch plumbing; then **LIVE** spot check: one
       container start with `TUNNEL_ENGINE=swu` reaches tunnel-up + agents (SC-006, US4
-      acceptance scenario 1) (depends on T010, T026)
+      acceptance scenario 1) (depends on T010, T026). Diff review done: `git diff
+      62fd92b..HEAD -- docker/entrypoint.sh` confirms every swu-specific command (dialer
+      invocation, readiness wait, P-CSCF extraction, keepalive) is byte-for-byte unchanged;
+      only the veth+agent tail moved into a shared function, called at the same point with the
+      same commands. The **LIVE** spot check (real tunnel-up + agents against a live carrier)
+      still needs hardware access.
 - [ ] T030 [US4] **LIVE** Engine-switch drill per quickstart.md §6: `strongswan` → `swu` →
       `strongswan` on the same image, env-only changes, tunnel + agents return each time
       (SC-005, US4 acceptance scenario 2) (depends on T029)
