@@ -56,7 +56,7 @@ pub enum Commands {
     /// (`vowifi-sip-agent`) over a dedicated veth link. Reads its settings
     /// from the `[vowifi]` config section. Long-running — intended to run
     /// inside the ePDG tunnel's `ims` network namespace, supervised by
-    /// `docker/epdg/entrypoint.sh`.
+    /// `docker/entrypoint.sh`.
     VowifiImsAgent,
     /// Agent B of the inbound VoWiFi-to-SIP bridge: registers to the
     /// SIP/PBX destination (`[sip]`/`[bridge]`) and, on each call signaled
@@ -67,6 +67,23 @@ pub enum Commands {
     /// Query the running VoWiFi agents for current registration health and
     /// recent call outcomes.
     VowifiStatus,
+    /// Read-only config introspection, for shell scripts (entrypoint.sh)
+    /// that need a single answer without hand-rolling TOML parsing in bash.
+    Config(ConfigArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub subcommand: ConfigSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigSubcommand {
+    /// Exit 0 if [vowifi].enabled = true in the given --config file, exit 1
+    /// otherwise (including if the file can't be loaded at all). Prints
+    /// nothing — only the exit code is meant to be used.
+    VowifiEnabled,
 }
 
 #[derive(Parser, Debug)]
@@ -94,6 +111,14 @@ pub struct ImsRegisterArgs {
     /// Override the IMSI instead of reading it from the SIM via AT+CIMI
     #[arg(long)]
     pub imsi: Option<String>,
+
+    /// Override the IMEI instead of reading it from the modem via AT+CGSN.
+    /// Sent as the Contact header's +sip.instance — real UEs always send
+    /// their genuine IMEI here, not a placeholder, and a network's
+    /// terminating-call routing may key off it even when REGISTER succeeds
+    /// regardless.
+    #[arg(long)]
+    pub imei: Option<String>,
 
     /// Use TCP instead of UDP to reach the P-CSCF (some networks/paths only
     /// carry SIP signaling over TCP; ICMP being filtered is not a signal

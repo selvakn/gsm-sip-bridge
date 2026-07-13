@@ -403,6 +403,39 @@ fn read_alsa_card_name(card_num: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// The audio codec PJSIP actually negotiated for `call_id` — name (e.g.
+/// "PCMU", "AMR-WB"), clock rate in Hz, and channel count — read from the
+/// live stream rather than inferred from what we offered, so it reports what
+/// the two ends really settled on.
+///
+/// # Safety
+/// Caller must ensure PJSUA is initialized and `call_id` is a valid, active
+/// call (both hold inside `on_call_media_state_cb`).
+#[cfg(feature = "pjsip-linked")]
+unsafe fn negotiated_audio_codec(call_id: pjsua_sys::pjsua_call_id) -> Option<(String, u32, u32)> {
+    let mut si: pjsua_sys::pjsua_stream_info = std::mem::zeroed();
+    // Media index 0: these are audio-only calls, so the first stream is it.
+    if pjsua_sys::pjsua_call_get_stream_info(call_id, 0, &mut si) != PJ_SUCCESS {
+        return None;
+    }
+    if si.type_ != pjsua_sys::pjmedia_type_PJMEDIA_TYPE_AUDIO {
+        return None;
+    }
+    let fmt = si.info.aud.fmt;
+    if fmt.encoding_name.ptr.is_null() || fmt.encoding_name.slen <= 0 {
+        return None;
+    }
+    let name = std::slice::from_raw_parts(
+        fmt.encoding_name.ptr as *const u8,
+        fmt.encoding_name.slen as usize,
+    );
+    Some((
+        String::from_utf8_lossy(name).into_owned(),
+        fmt.clock_rate,
+        fmt.channel_cnt,
+    ))
+}
+
 #[cfg(feature = "pjsip-linked")]
 #[rustfmt::skip]
 unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) { // SAFETY: PJSIP invokes with valid call_id after init; stack call_info writable for get_info
@@ -414,6 +447,17 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
 
     if info.media_status == pjsua_sys::pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE {
         let call_slot = info.conf_slot as i32;
+
+        match negotiated_audio_codec(call_id) {
+            Some((name, clock_rate, channels)) => tracing::info!(
+                call_id,
+                codec = %name,
+                sample_rate = clock_rate,
+                channels,
+                "SIP call media active — negotiated audio codec"
+            ),
+            None => tracing::warn!(call_id, "SIP call media active but the negotiated codec could not be read"),
+        }
 
         let peer_call_id = {
             let pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
@@ -550,7 +594,15 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
                     "call audio levels (0=silence 255=max)",
                 );
             } else {
-                tracing::info!(call_id, "call ended — no audio samples collected (media never became active)");
+                // The level monitor samples the *sound-device* slot, which only
+                // the circuit-switched GSM bridge uses. A VoWiFi bridge call is
+                // conference-connected to its peer call with a null sound device
+                // (see `pair_calls`), so it legitimately collects no samples —
+                // this is not evidence that its media failed.
+                tracing::debug!(
+                    call_id,
+                    "call ended with no sound-device audio samples (expected for a paired bridge call)"
+                );
             }
 
             tracing::info!(call_id, "SIP peer disconnected, signaling GSM hangup");

@@ -6,7 +6,7 @@
 //! Gated behind the `amr-linked` feature (default off, same convention as
 //! `pjsua-safe`'s `pjsip-linked`) so the workspace keeps building in
 //! environments without `libvo-amrwbenc`/`libopencore-amrwb` installed —
-//! see `docker/epdg/Dockerfile` for where a linked build installs them.
+//! see `docker/Dockerfile` for where a linked build installs them.
 //!
 //! Unlike `pjsua-safe`'s stubs (which return dummy *success* so daemon unit
 //! tests don't need a real PJSIP), encode/decode here return a clear `Err`
@@ -40,6 +40,29 @@ pub enum Mode {
     R1985 = 6,
     R2305 = 7,
     R2385 = 8,
+}
+
+/// 20ms of audio at AMR-**narrowband**'s fixed 8kHz sample rate.
+pub const NB_FRAME_SAMPLES: usize = 160;
+pub const NB_SAMPLE_RATE: u32 = 8000;
+/// Mode 7 (12.2kbps) is the largest AMR-NB frame: 1 header byte + 31 bytes.
+#[cfg(feature = "amr-linked")]
+const NB_MAX_FRAME_BYTES: usize = 32;
+
+/// AMR-NB's 8 speech modes (TS 26.101). Distinct from AMR-WB's `Mode`: the
+/// same numeric index means a different bit rate *and* a different frame bit
+/// count in each codec, so mixing them up would produce frames the far end
+/// silently mis-decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NbMode {
+    R475 = 0,
+    R515 = 1,
+    R590 = 2,
+    R670 = 3,
+    R740 = 4,
+    R795 = 5,
+    R1020 = 6,
+    R1220 = 7,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,8 +199,153 @@ impl Drop for WbDecoder {
     }
 }
 
+pub struct NbEncoder {
+    #[cfg(feature = "amr-linked")]
+    state: *mut std::os::raw::c_void,
+}
+
+// SAFETY: see WbEncoder's Send impl — opencore-amrnb's state is likewise a
+// self-contained, reentrant per-instance struct.
+#[cfg(feature = "amr-linked")]
+unsafe impl Send for NbEncoder {}
+
+impl NbEncoder {
+    #[cfg(feature = "amr-linked")]
+    pub fn new() -> Result<Self, NotLinked> {
+        // SAFETY: Encoder_Interface_init returns an opaque handle owned
+        // exclusively by this NbEncoder until Drop. dtx=0: no discontinuous
+        // transmission, so every frame is a speech frame.
+        let state = unsafe { amr_sys::Encoder_Interface_init(0) };
+        Ok(Self { state })
+    }
+
+    #[cfg(not(feature = "amr-linked"))]
+    pub fn new() -> Result<Self, NotLinked> {
+        Err(NotLinked)
+    }
+
+    /// Encodes one 20ms frame, returning the header-byte-prefixed frame (the
+    /// same layout as an RFC 4867 octet-aligned ToC entry + frame data — see
+    /// `ims::amr_rtp`, which repacks it for whichever framing was negotiated).
+    #[cfg(feature = "amr-linked")]
+    pub fn encode(&mut self, mode: NbMode, pcm: &[i16; NB_FRAME_SAMPLES]) -> Vec<u8> {
+        let mut out = [0u8; NB_MAX_FRAME_BYTES];
+        // SAFETY: `self.state` is a valid, exclusively-owned encoder handle;
+        // `pcm` has exactly NB_FRAME_SAMPLES elements as the library requires;
+        // `out` has room for the largest possible frame. force_speech=1 keeps
+        // it from emitting comfort-noise frames we'd have to special-case.
+        let n = unsafe {
+            amr_sys::Encoder_Interface_Encode(
+                self.state,
+                mode as i32,
+                pcm.as_ptr(),
+                out.as_mut_ptr(),
+                1,
+            )
+        };
+        out[..n.max(0) as usize].to_vec()
+    }
+
+    #[cfg(not(feature = "amr-linked"))]
+    pub fn encode(&mut self, _mode: NbMode, _pcm: &[i16; NB_FRAME_SAMPLES]) -> Vec<u8> {
+        unreachable!("NbEncoder::new() always errors when amr-linked is disabled")
+    }
+}
+
+#[cfg(feature = "amr-linked")]
+impl Drop for NbEncoder {
+    fn drop(&mut self) {
+        // SAFETY: created by Encoder_Interface_init in `new()`, exclusively
+        // owned by this instance, dropped exactly once.
+        unsafe { amr_sys::Encoder_Interface_exit(self.state) };
+    }
+}
+
+pub struct NbDecoder {
+    #[cfg(feature = "amr-linked")]
+    state: *mut std::os::raw::c_void,
+}
+
+// SAFETY: see WbEncoder's Send impl — same reasoning.
+#[cfg(feature = "amr-linked")]
+unsafe impl Send for NbDecoder {}
+
+impl NbDecoder {
+    #[cfg(feature = "amr-linked")]
+    pub fn new() -> Result<Self, NotLinked> {
+        // SAFETY: Decoder_Interface_init returns an opaque handle owned
+        // exclusively by this NbDecoder until Drop.
+        let state = unsafe { amr_sys::Decoder_Interface_init() };
+        Ok(Self { state })
+    }
+
+    #[cfg(not(feature = "amr-linked"))]
+    pub fn new() -> Result<Self, NotLinked> {
+        Err(NotLinked)
+    }
+
+    /// Decodes one header-byte-prefixed frame (see `NbEncoder::encode`) to
+    /// 160 samples (20ms @ 8kHz) of linear PCM.
+    #[cfg(feature = "amr-linked")]
+    pub fn decode(&mut self, toc_and_data: &[u8]) -> [i16; NB_FRAME_SAMPLES] {
+        let mut synth = [0i16; NB_FRAME_SAMPLES];
+        // SAFETY: `self.state` is a valid, exclusively-owned decoder handle;
+        // the library reads `toc_and_data` up to the frame length encoded in
+        // its own header byte; `synth` has exactly NB_FRAME_SAMPLES elements.
+        unsafe {
+            amr_sys::Decoder_Interface_Decode(
+                self.state,
+                toc_and_data.as_ptr(),
+                synth.as_mut_ptr(),
+                0, // bfi: 0 = good frame
+            )
+        };
+        synth
+    }
+
+    #[cfg(not(feature = "amr-linked"))]
+    pub fn decode(&mut self, _toc_and_data: &[u8]) -> [i16; NB_FRAME_SAMPLES] {
+        unreachable!("NbDecoder::new() always errors when amr-linked is disabled")
+    }
+}
+
+#[cfg(feature = "amr-linked")]
+impl Drop for NbDecoder {
+    fn drop(&mut self) {
+        // SAFETY: created by Decoder_Interface_init in `new()`, exclusively
+        // owned by this instance, dropped exactly once.
+        unsafe { amr_sys::Decoder_Interface_exit(self.state) };
+    }
+}
+
 #[cfg(all(test, feature = "amr-linked"))]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn nb_encode_produces_a_header_prefixed_frame_of_the_documented_size() {
+        let mut enc = NbEncoder::new().unwrap();
+        let pcm = [0i16; NB_FRAME_SAMPLES];
+        let frame = enc.encode(NbMode::R1220, &pcm);
+        // Mode 7 (12.2kbps): 1 header byte + 31 bytes of speech.
+        assert_eq!(frame.len(), 32);
+        // Header byte: F=0, FT=7 (bits 6-3), Q=1 (bit 2).
+        assert_eq!((frame[0] >> 3) & 0x0f, 7);
+    }
+
+    #[test]
+    fn nb_encode_then_decode_roundtrips_without_panicking() {
+        let mut enc = NbEncoder::new().unwrap();
+        let mut dec = NbDecoder::new().unwrap();
+        let pcm = [0i16; NB_FRAME_SAMPLES];
+        let frame = enc.encode(NbMode::R1220, &pcm);
+        let synth = dec.decode(&frame);
+        assert_eq!(synth.len(), NB_FRAME_SAMPLES);
+    }
+}
+
+#[cfg(all(test, feature = "amr-linked"))]
+mod wb_tests {
     use super::*;
 
     #[test]
