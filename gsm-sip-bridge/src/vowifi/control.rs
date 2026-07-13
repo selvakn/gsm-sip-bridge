@@ -64,6 +64,20 @@ pub enum ControlMessage {
     },
     /// Agent B → `vowifi-status`. Recent call outcomes, newest first.
     CallHistoryReply { calls: Vec<CallRecord> },
+    /// Agent A → Agent B. An inbound SIP `MESSAGE` (RFC 3428) — the carrier's
+    /// transport for SMS over VoWiFi/IMS, the counterpart to `AT+CMTI`/
+    /// `AT+CMGR` in the circuit-switched bridge (`modules::mod::handle_cmti`).
+    /// Not scoped to any call, so it carries no `call_id`. Agent A has
+    /// already acknowledged the carrier (`200 OK`) by the time this is sent;
+    /// Agent B forwards it to Discord using the same `[sms]` webhook config
+    /// and embed format as the AT-command flow, since Agent B — unlike
+    /// Agent A, confined to the IMS tunnel netns — has both that config and
+    /// LAN/Internet reachability.
+    SmsReceived {
+        sender: String,
+        body: String,
+        received_at: String,
+    },
 }
 
 impl ControlMessage {
@@ -79,7 +93,8 @@ impl ControlMessage {
             | ControlMessage::HangupAck { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
             | ControlMessage::RegistrationStatusReply { .. }
-            | ControlMessage::CallHistoryReply { .. } => None,
+            | ControlMessage::CallHistoryReply { .. }
+            | ControlMessage::SmsReceived { .. } => None,
         }
     }
 }
@@ -305,6 +320,29 @@ mod tests {
         let second = read_msg(&mut cursor).unwrap();
         assert!(matches!(first, ControlMessage::IncomingCall { .. }));
         assert!(matches!(second, ControlMessage::HangupAck { .. }));
+    }
+
+    #[test]
+    fn sms_received_roundtrips() {
+        let msg = ControlMessage::SmsReceived {
+            sender: "+919789063708".to_string(),
+            body: "hello over VoWiFi".to_string(),
+            received_at: "2026-07-13T00:00:00+00:00".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn sms_received_has_no_call_id() {
+        assert_eq!(
+            ControlMessage::SmsReceived {
+                sender: "+919789063708".to_string(),
+                body: "hi".to_string(),
+                received_at: "2026-07-13T00:00:00+00:00".to_string(),
+            }
+            .call_id(),
+            None
+        );
     }
 
     #[test]

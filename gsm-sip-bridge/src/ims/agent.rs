@@ -19,8 +19,8 @@ use crate::error::{BridgeError, BridgeResult};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_200_ok_bye, build_200_ok_invite,
-    build_486_busy_here, build_bye, build_uas_response, format_sip_addr, random_hex,
-    spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
+    build_200_ok_message, build_486_busy_here, build_bye, build_uas_response, format_sip_addr,
+    random_hex, spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
 };
 use crate::ims::ImsRegisterConfig;
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
@@ -429,6 +429,39 @@ fn handle_notify(sink: &SipSink, req: &SipRequest) {
     }
 }
 
+/// Acknowledges an inbound SIP `MESSAGE` (RFC 3428) — the carrier's
+/// VoWiFi/IMS transport for SMS, the counterpart to `AT+CMTI`/`AT+CMGR` in
+/// `modules::mod`'s circuit-switched flow — and relays it to Agent B over
+/// the control channel so it can be forwarded to Discord the same way.
+/// Acks first, unconditionally: a relay/Discord hiccup on Agent B's end must
+/// never make the carrier retransmit the same `MESSAGE`. Agent B, not Agent
+/// A, owns the actual Discord post — it holds the `[sms]` webhook config and
+/// has LAN/Internet reachability, whereas Agent A's netns is IMS-tunnel-only
+/// (see `ControlMessage::SmsReceived` docs).
+fn handle_message(sink: &SipSink, req: &SipRequest, control_addr: SocketAddr) {
+    let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
+
+    let sender = extract_caller(req);
+    let body = req.body.clone();
+    tracing::info!(sender = %sender, "received SIP MESSAGE");
+
+    let msg = ControlMessage::SmsReceived {
+        sender,
+        body,
+        received_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT) {
+        Ok(mut control) => {
+            if let Err(e) = write_msg(&mut control, &msg) {
+                tracing::warn!(error = %e, "failed to relay SIP MESSAGE to Agent B");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to reach Agent B control channel to relay SIP MESSAGE");
+        }
+    }
+}
+
 /// Holds what's needed to tear a bridged call down again once a `BYE`
 /// arrives — the control connection Agent B expects `CallEnded` on, and the
 /// flag that stops the background RTP relay threads.
@@ -593,6 +626,9 @@ fn dispatch_loop(
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "NOTIFY" => {
                 handle_notify(&sink, &req);
+            }
+            Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
+                handle_message(&sink, &req, control_addr);
             }
             Ok((SipMessage::Request(req), _)) => {
                 tracing::info!(method = %req.method, "ignoring unsupported inbound request");

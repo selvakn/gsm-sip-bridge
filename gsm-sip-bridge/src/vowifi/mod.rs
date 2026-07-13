@@ -21,15 +21,20 @@ pub mod control;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
 use crate::error::{BridgeError, BridgeResult};
+use crate::sms;
+use crate::sms::discord::DiscordClient;
+use crate::store::{StoreCommand, StoreHandle};
 use control::{read_msg, write_msg, CallRecord, ControlMessage};
 use pjsua_safe::{
     Account, AccountConfig, Call, CallState, Endpoint, EndpointConfig, TransportType,
 };
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::runtime::Runtime;
 
 /// Fixed port Agent A listens on for Agent B's inbound (veth-internal) SIP
 /// call. Not user-configurable — this is a private implementation detail of
@@ -166,6 +171,23 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
 
     let recent_calls = Arc::new(Mutex::new(RecentCalls::new(RECENT_CALLS_CAPACITY)));
 
+    // Agent B (this process), not Agent A, owns the actual Discord post for a
+    // relayed SIP `MESSAGE` (see `ControlMessage::SmsReceived` docs): it has
+    // the `[sms]` webhook config and LAN/Internet reachability, whereas Agent
+    // A's netns is IMS-tunnel-only. This whole accept loop is otherwise
+    // synchronous (`std::thread`, no async runtime), so a small runtime is
+    // built just to fire off the async `DiscordClient::forward_sms` call
+    // without blocking the loop from accepting the next connection.
+    let discord_client = build_discord_client(config);
+    let sms_runtime = Runtime::new()
+        .map_err(|e| BridgeError::Ims(format!("failed to build SMS-forwarding runtime: {e}")))?;
+    // Same `[sms].db_path` sqlite file the circuit-switched daemon writes to
+    // (WAL mode, see `store::schema`, is exactly what makes two independent
+    // processes safely sharing one file work) — so VoWiFi SMS lands in the
+    // same `sms` table/history as AT-command SMS, not a separate store.
+    let store = StoreHandle::open(Path::new(&config.sms.db_path))
+        .map_err(|e| BridgeError::Ims(format!("failed to open SMS store: {e}")))?;
+
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -174,11 +196,51 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
                 continue;
             }
         };
-        if let Err(e) = handle_connection(stream, &endpoint, &account, config, &recent_calls) {
+        if let Err(e) = handle_connection(
+            stream,
+            &endpoint,
+            &account,
+            config,
+            &recent_calls,
+            &discord_client,
+            &sms_runtime,
+            store.sender(),
+        ) {
             tracing::warn!(error = %e, "error handling Agent A control connection");
         }
     }
     Ok(())
+}
+
+/// Module label Agent B reports to Discord for VoWiFi-originated SMS
+/// (`DiscordClient::forward_sms`'s `module_id`) — there is no GSM card
+/// involved on this path, so a fixed string distinguishes it from the
+/// circuit-switched flow's real card ids in the same Discord channel.
+const VOWIFI_SMS_MODULE_ID: &str = "vowifi";
+
+/// Builds the Discord client used to forward relayed VoWiFi `MESSAGE`s,
+/// mirroring `modules::mod::CardPool::new`'s gating: only if SMS monitoring
+/// is enabled and a webhook URL is actually configured.
+fn build_discord_client(config: &AppConfig) -> Option<DiscordClient> {
+    if !config.sms.enabled {
+        tracing::info!(
+            "SMS monitoring disabled via configuration; VoWiFi SMS will not be forwarded"
+        );
+        return None;
+    }
+    if config.sms.discord_webhook_url.expose_secret().is_empty() {
+        tracing::info!(
+            "SMS forwarding disabled (no webhook URL configured); VoWiFi SMS will not be forwarded"
+        );
+        return None;
+    }
+    match DiscordClient::new(config.sms.discord_webhook_url.clone()) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create Discord client");
+            None
+        }
+    }
 }
 
 /// PJSIP's G.722 codec id. Wideband (16 kHz internally, whatever RFC 3551's
@@ -220,12 +282,16 @@ fn prioritize_wideband_codecs(endpoint: &Endpoint) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: TcpStream,
     endpoint: &Endpoint,
     account: &Account,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<RecentCalls>>,
+    discord_client: &Option<DiscordClient>,
+    sms_runtime: &Runtime,
+    store_tx: crossbeam_channel::Sender<StoreCommand>,
 ) -> BridgeResult<()> {
     let mut reader = std::io::BufReader::new(
         stream
@@ -246,9 +312,24 @@ fn handle_connection(
                 .map_err(BridgeError::Ims)?;
             return Ok(());
         }
+        ControlMessage::SmsReceived {
+            sender,
+            body,
+            received_at,
+        } => {
+            forward_vowifi_sms(
+                store_tx,
+                discord_client,
+                sms_runtime,
+                sender,
+                body,
+                received_at,
+            );
+            return Ok(());
+        }
         other => {
             return Err(BridgeError::Ims(format!(
-                "expected IncomingCall or StatusQuery as the first message on a control connection, got {other:?}"
+                "expected IncomingCall, StatusQuery, or SmsReceived as the first message on a control connection, got {other:?}"
             )));
         }
     };
@@ -394,6 +475,34 @@ fn handle_connection(
             Ok(())
         }
     }
+}
+
+/// Persists a relayed VoWiFi `MESSAGE` and forwards it to Discord, via the
+/// same `sms::record_and_forward` the circuit-switched flow's AT-command SMS
+/// uses (`modules::mod`'s `BridgeEvent::SmsReceived` handler) — one `sms`
+/// table, one forwarding/retry/status-update implementation, regardless of
+/// which transport the message arrived on. Runs on `sms_runtime`
+/// (`run_inner`'s dedicated small runtime, since this whole accept loop is
+/// otherwise synchronous): the connection carrying this message doesn't wait
+/// for a reply, so there is nothing to block on here, and blocking the
+/// accept loop on Discord's round trip would delay the next inbound call.
+fn forward_vowifi_sms(
+    store_tx: crossbeam_channel::Sender<StoreCommand>,
+    discord_client: &Option<DiscordClient>,
+    sms_runtime: &Runtime,
+    sender: String,
+    body: String,
+    received_at: String,
+) {
+    sms::record_and_forward(
+        sms_runtime.handle(),
+        store_tx,
+        discord_client.clone(),
+        VOWIFI_SMS_MODULE_ID.to_string(),
+        sender,
+        body,
+        received_at,
+    );
 }
 
 /// How long to let the PBX extension ring before giving up. The caller hears

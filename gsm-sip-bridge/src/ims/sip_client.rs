@@ -319,6 +319,13 @@ pub fn build_486_busy_here(request: &SipRequest, to_tag: &str) -> String {
     build_uas_response(486, "Busy Here", request, Some(to_tag), None, None)
 }
 
+/// `200 OK` acknowledging an inbound `MESSAGE` (RFC 3428) — no body, no
+/// `Contact`: a `MESSAGE` is a standalone transaction, not a dialog, so
+/// there is no future in-dialog request that would need one.
+pub fn build_200_ok_message(request: &SipRequest, to_tag: &str) -> String {
+    build_uas_response(200, "OK", request, Some(to_tag), None, None)
+}
+
 /// Everything needed to end a dialog we answered as a UAS — i.e. to hang up
 /// on the *carrier* for an inbound call.
 ///
@@ -1401,6 +1408,35 @@ mod tests {
         let resp = build_486_busy_here(&req, "totag1");
         assert!(resp.starts_with("SIP/2.0 486 Busy Here\r\n"));
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    fn sample_message() -> SipRequest {
+        let raw = "MESSAGE sip:404438083996440@realm SIP/2.0\r\n\
+                    Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKmsg1\r\n\
+                    From: <sip:+919789063708@realm>;tag=fromtag1\r\n\
+                    To: <sip:404438083996440@realm>\r\n\
+                    Call-ID: msgcallid\r\n\
+                    CSeq: 1 MESSAGE\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: 5\r\n\r\n\
+                    hello";
+        SipRequest::try_parse(raw).unwrap().unwrap().0
+    }
+
+    #[test]
+    fn build_200_ok_message_echoes_dialog_with_no_body() {
+        let req = sample_message();
+        let resp = build_200_ok_message(&req, "totag1");
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(resp.contains("CSeq: 1 MESSAGE\r\n"));
+        assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn sip_request_try_parse_extracts_message_body() {
+        let req = sample_message();
+        assert_eq!(req.method, "MESSAGE");
+        assert_eq!(req.body, "hello");
     }
 
     #[test]

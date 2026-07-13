@@ -17,10 +17,10 @@ use crate::modules::scheduler::{
     SkipReason, SlotView,
 };
 use crate::sip::SipBridge;
+use crate::sms;
 use crate::sms::discord::DiscordClient;
 use crate::sms::SmsHandler;
 use crate::store::calls::CallRecord;
-use crate::store::sms::{SmsForwardingByTimeUpdate, SmsRecord};
 use crate::store::{StoreCommand, StoreHandle};
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
@@ -1266,50 +1266,15 @@ impl CardPool {
                 body,
                 received_at,
             } => {
-                if let Some(ref client) = self.discord_client {
-                    let client = client.clone();
-                    let store_tx = self.store.sender();
-                    tokio::spawn(async move {
-                        let result = client
-                            .forward_sms(&module_id, &sender, &body, &received_at)
-                            .await;
-                        let (status_str, discord_code) = match &result {
-                            Ok(code) => ("sent", Some(*code as i32)),
-                            Err(_) => ("failed", None),
-                        };
-                        let _ = store_tx.send(StoreCommand::UpdateSmsForwardingByTime(
-                            SmsForwardingByTimeUpdate {
-                                module_id: module_id.clone(),
-                                received_at: received_at.clone(),
-                                forwarding_status: status_str.to_string(),
-                                forwarded_at: Some(Utc::now().to_rfc3339()),
-                                discord_status_code: discord_code,
-                            },
-                        ));
-                        match result {
-                            Ok(status) => {
-                                tracing::info!(
-                                    module = %module_id,
-                                    status = status,
-                                    "SMS forwarded to Discord"
-                                );
-                                metrics::SMS_FORWARDED_TOTAL
-                                    .with_label_values(&[&module_id, "sent"])
-                                    .inc();
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    module = %module_id,
-                                    error = %e,
-                                    "SMS Discord forwarding failed"
-                                );
-                                metrics::SMS_FORWARDED_TOTAL
-                                    .with_label_values(&[&module_id, "failed"])
-                                    .inc();
-                            }
-                        }
-                    });
-                }
+                sms::record_and_forward(
+                    &tokio::runtime::Handle::current(),
+                    self.store.sender(),
+                    self.discord_client.clone(),
+                    module_id,
+                    sender,
+                    body,
+                    received_at,
+                );
             }
         }
     }
@@ -1429,7 +1394,7 @@ fn run_module_loop(
         } else if trimmed == "NO CARRIER" {
             handle_hangup(&module, &mut card, &event_tx, &store_tx, &mut call_ctx);
         } else if trimmed.starts_with("+CMTI:") {
-            handle_cmti(&module, &mut at, trimmed, &store_tx, &event_tx);
+            handle_cmti(&module, &mut at, trimmed, &event_tx);
         } else if trimmed.starts_with("+CREG:") || trimmed.starts_with("+CEREG:") {
             handle_creg_urc(&module, trimmed, &event_tx);
         }
@@ -1609,7 +1574,6 @@ fn handle_cmti(
     module: &DiscoveredModule,
     at: &mut AtCommander,
     line: &str,
-    store_tx: &crossbeam_channel::Sender<StoreCommand>,
     event_tx: &mpsc::UnboundedSender<BridgeEvent>,
 ) {
     tracing::info!(module = %module.id, notification = line, "SMS notification received");
@@ -1626,16 +1590,6 @@ fn handle_cmti(
 
                     let (sender, body) = parse_sms_response(&lines);
                     let received_at = Utc::now().to_rfc3339();
-                    let record = SmsRecord {
-                        module_id: module.id.clone(),
-                        sender: sender.clone(),
-                        body: body.clone(),
-                        received_at: received_at.clone(),
-                        forwarding_status: "pending".to_string(),
-                    };
-                    if let Err(e) = store_tx.send(StoreCommand::InsertSms(record)) {
-                        tracing::error!(error = %e, "failed to send SMS record to store");
-                    }
 
                     let _ = event_tx.send(BridgeEvent::SmsReceived {
                         module_id: module.id.clone(),
