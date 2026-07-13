@@ -259,20 +259,47 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T031 [P] Documentation: add the strongSwan-engine section to
+- [X] T031 [P] Documentation: add the strongSwan-engine section to
       `docs/vowifi-epdg-research-notes.md` (or a new `docs/vowifi-strongswan.md` linked from
       it): architecture chain, per-carrier live findings from T018/T019/T025, and the
       Option 1 → Option 2 migration status; update `specs/012-strongswan-epdg/quickstart.md`
       with actually-observed log lines where the plan's expectations differed
-- [ ] T032 [P] FR-013 audit: sweep the feature's diff for newly hardcoded single-line
+- [X] T032 [P] FR-013 audit: sweep the feature's diff for newly hardcoded single-line
       assumptions — netns name, `if_id`, vpcd host/port, modem port, `/tmp/pcscf`,
       `/tmp/charon.log` must all be parametrized (env vars / CLI flags) with current
       defaults; fix any stragglers
-- [ ] T033 Final gate: `cargo fmt --all && make lint && cargo test --workspace` clean on the
+- [X] T033 Final gate: `cargo fmt --all && make lint && cargo test --workspace` clean on the
       full branch; `tools/count-unsafe.sh` still reports 0 unsafe blocks in
       `gsm-sip-bridge/src`; confirm every spec Success Criterion (SC-001..006) has a recorded
       pass/fail + evidence pointer, and flag the Option-1-removal follow-up feature if all
-      passed
+      passed.
+
+      Gate: clean (`gsm-sip-bridge/src`: 0 unsafe blocks; `pjsua-safe/src`: 26/1.71%,
+      unchanged from before this feature; 246 lib tests + full workspace suite passing).
+
+      Success Criteria status:
+      - **SC-001** (24h unattended uptime through a rekey) — **NOT RUN**, needs live carrier
+        (T025).
+      - **SC-002** (outage recovery ≤90s) — **NOT RUN**, needs live carrier (T024). Partially
+        de-risked: netns/veth persistence across repeated entrypoint runs verified directly
+        (idempotency testing, see docs/vowifi-epdg-research-notes.md Phase 5).
+      - **SC-003** (inbound call ≤5s even ≥12h after start) — **NOT RUN**, needs live carrier +
+        PBX (T027).
+      - **SC-004** (EAP-AKA on both carriers, no PC/SC reader) — **NOT RUN** in full (needs real
+        SIM, T019), but structurally exercised: a real IKE_SA_INIT negotiation completed
+        against Airtel India's actual ePDG and IKE_AUTH correctly requested PCSCF4/PCSCF6 (see
+        research notes); the vpcd↔AT+CSIM bridge itself is unit/integration-tested (T011-T017).
+      - **SC-005** (engine switch is config-only) — **NOT RUN** live (T030), but the `swu` path
+        is confirmed byte-for-byte unaffected by the branch (T029's diff review) and both
+        engines build into the one image (T007).
+      - **SC-006** (`swu` path regression-free) — **PASS**. Diff-confirmed byte-for-byte
+        equivalence (T029) plus a direct re-run reaching the same dialer-launch point as
+        pre-feature behavior.
+
+      **Not flagging the Option-1-removal follow-up**: SC-001..005 all still need live-carrier
+      verification (T018/T019/T024/T025/T027/T029's live half/T030) before `strongswan` can be
+      recommended as the default engine, let alone before removing the `swu` fallback. Revisit
+      once those LIVE tasks are run and recorded.
 
 ---
 

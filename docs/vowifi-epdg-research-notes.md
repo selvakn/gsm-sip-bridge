@@ -486,3 +486,127 @@ has not yet been exercised end-to-end against a live network — do that per
 `specs/011-vowifi-sip-bridge/quickstart.md` before relying on this in
 production, the same way Phase 2/3's findings above were only trusted once
 verified against a real network.
+
+## Phase 5: strongSwan tunnel engine (specs/012-strongswan-epdg)
+
+Phase 4's SWu-IKEv2 dialer proved the end-to-end pipeline works, but it has
+no rekeying, no re-authentication, no dead-peer detection, and — worst of
+all — deletes and recreates network namespace `ims` on every reconnect,
+severing the veth link the Phase 4 agents depend on. This phase replaces
+just the tunnel layer with **strongSwan** (the osmocom `strongswan-epdg`
+fork, `jolly/work` branch — the wiki's "Option 2"), selectable at deploy
+time via `TUNNEL_ENGINE` (`swu` default during the proving period,
+`strongswan` to opt in) so the proven SWu path stays available as a
+fallback. See `specs/012-strongswan-epdg/` for the full spec/plan/research.
+
+### Architecture
+
+```
+charon (strongSwan)  ──IKEv2/IPsec──►  carrier's ePDG
+     │  eap-sim-pcsc plugin
+     ▼
+pcscd  ──vpcd protocol (TCP :35963)──►  vowifi-usim-bridge (gsm-sip-bridge)
+                                              │  AT+CSIM
+                                              ▼
+                                        SIM inside the EC200U modem
+```
+
+`vowifi-usim-bridge` is the piece that doesn't exist in any upstream
+project: it implements vpcd's virtual-card wire protocol so `eap-sim-pcsc`
+can run EAP-AKA against a SIM that's only reachable via `AT+CSIM`, with no
+physical PC/SC reader. It also absorbs the same EC200U/SIM quirks the SWu
+patch (above) had to work around — GET RESPONSE auto-chaining, SELECT
+`P2=0x00` rejection, per-operator USIM AID differences — at the APDU
+boundary, rather than patching strongSwan itself. The XFRM tunnel interface
+(`tun23`, `if_id 23`) is pre-created by `docker/entrypoint.sh` inside netns
+`ims` *before* charon ever starts, and only its address changes across
+rekeys/reconnects — the namespace and interface themselves are never
+deleted, which is the actual fix for Phase 4's biggest weakness.
+
+### Build findings (Alpine/musl)
+
+Both the fork and vsmartcard's `vpcd` build cleanly on Alpine/musl — no
+patches needed, unlike the SWu dialer. Two build-time and one runtime
+surprise, none anticipated by the original research:
+
+- The fork needs `gperf` (generates a keyword-lookup table) beyond the
+  plugin/crypto dev packages research anticipated — without it, `configure`
+  fails outright (`GNU gperf required to generate ...`).
+- vsmartcard's `ifd-vpcd` driver needs `src/vpcd` built first
+  (`libvpcd.la` is a link dependency) — `make -C src/ifd-vpcd` alone fails.
+  Explicit `--enable-serialdropdir=/usr/lib/pcsc/drivers/serial
+  --enable-serialconfdir=/etc/reader.conf.d` avoids a doubled-prefix
+  install path (`/usr/usr/lib/...`) that the auto-detected defaults produce
+  when `--prefix` and `pkg-config`'s already-absolute `usbdropdir` combine.
+- **The fork's own default `strongswan.conf` sets `load_modular = yes`**,
+  which silently loads *zero* plugins — none of the fork's own generated
+  per-plugin conf files set an explicit `load = yes`, and modular mode's
+  default is "don't load" rather than upstream's usual "load unless
+  disabled". Charon aborted at startup (`critical plugin 'charon' has
+  unmet dependency: NONCE_GEN`) with no plugins actually active. Fixed by
+  overriding `load_modular = no` in our own `charon-extra.conf` — the
+  plugin set is already curated at `configure` time
+  (`--disable-defaults` + explicit `--enable-*`), so the classic
+  load-everything-unless-disabled model is the right one here regardless.
+- `swanctl.conf` itself needs an explicit `include conf.d/*.conf` line
+  (the fork's default is an empty file) or `swanctl --load-conns` finds
+  nothing no matter what's dropped into `conf.d/`.
+- Also needed beyond `--enable-openssl`: `--enable-random --enable-nonce
+  --enable-hmac` — without them the same `NONCE_GEN`/`HASH_SHA1` unmet
+  dependencies fire even with `load_modular = no`, since those primitives
+  simply aren't compiled in at all.
+
+Image size: 113MB → 116MB (+3MB) for both engines side by side — in line
+with the "single-digit MB" estimate in research.md, nowhere near the
+629MB→113MB scale of the original Alpine migration.
+
+### Entrypoint findings
+
+`ip netns list` appends `(id: N)` to a namespace's name once *any*
+interface has ever lived in it (e.g. `ims (id: 1)`, not just `ims`) — an
+exact-match `grep -qx "$NETNS"` existence check silently breaks the moment
+the XFRM interface is created, tried `ip netns add` again on every
+subsequent entrypoint run, and got a "File exists" error. Fixed by
+checking `[ -e "/var/run/netns/$NETNS" ]` instead — a plain file-existence
+check that doesn't depend on `ip netns list`'s variable formatting. Caught
+by actually running the entrypoint's netns setup twice in a row, not by
+reading the `ip-netns` man page.
+
+### Live validation (no SIM/no live network egress from this environment)
+
+With no physical modem/SIM available, an `IMSI` env var override was used
+to exercise everything downstream of SIM auth. The rendered swanctl
+connection was real enough that charon completed a genuine **IKE_SA_INIT**
+negotiation with Airtel India's actual ePDG (resolved via the real
+`epdg.epc.mnc094.mcc404.pub.3gppnetwork.org` FQDN) — DH group
+renegotiation (peer rejected `ECP_256`, requested `MODP_8192`, matching the
+same class of renegotiation the wiki's own transcript shows for a
+different group pair), proposal selection, and an `IKE_AUTH` request
+correctly carrying `CPRQ(... PCSCF4 PCSCF6)` — confirming the `p-cscf`
+plugin is wired and requesting exactly what this feature needs. `IKE_AUTH`
+then retransmitted with no reply from the ePDG, consistent with this
+project's prior documented finding that ePDGs geoblock/rate-limit
+non-operator source IPs (the same signature noted in Phase 1's
+troubleshooting table above) — expected from a generic cloud egress IP,
+not a defect. The 90×2s readiness-wait loop correctly timed out into its
+`WARNING: could not confirm P-CSCF assignment` fallback (charon left
+running, not treated as fatal), identical in shape to the SWu engine's own
+equivalent fallback.
+
+**Still needed before recommending `strongswan` as the default engine**
+(specs/012-strongswan-epdg's LIVE-tagged tasks — real modem/SIM/carrier
+access required, none of it automatable):
+- Trace `eap-sim-pcsc`'s real APDU sequence against the vpcd bridge and
+  confirm/refute the ATR-is-opaque and SELECT-`P2` assumptions (T018).
+- Full EAP-AKA success on both carriers via the bridge, no PC/SC reader
+  (T019, SC-004).
+- A forced-outage recovery drill and a 24h rekey soak proving the
+  namespace/veth/agents genuinely survive unattended (T024/T025,
+  SC-001/SC-002).
+- An end-to-end inbound call bridged over the strongSwan tunnel (T027,
+  SC-003) and one live spot-check of the unchanged `swu` path (T029).
+- An engine-switch drill, `strongswan` → `swu` → `strongswan` on one image
+  (T030, SC-005).
+
+Until all of those pass, `TUNNEL_ENGINE` defaults to `swu` — see
+`.env.example`.
