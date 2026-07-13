@@ -43,7 +43,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /usr/local
-          key: pjsip-${{ env.PJSIP_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          key: pjsip-${{ env.PJSIP_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('docker/pjsip-config-site.h') }}
 
       - name: Build and install PJSIP
         if: steps.pjsip-cache.outputs.cache-hit != 'true'
@@ -51,6 +51,7 @@ jobs:
           wget -q https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSION}.tar.gz
           tar xzf ${PJSIP_VERSION}.tar.gz
           cd pjproject-${PJSIP_VERSION}
+          cp ../docker/pjsip-config-site.h pjlib/include/pj/config_site.h
           ./configure --prefix=/usr/local \
             --enable-shared \
             --disable-video \
