@@ -27,11 +27,11 @@ pub enum AkaResult {
     SyncFailure { auts: Vec<u8> },
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
-fn hex_decode(s: &str) -> BridgeResult<Vec<u8>> {
+pub(crate) fn hex_decode(s: &str) -> BridgeResult<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(BridgeError::Ims(format!("odd-length hex string: {s}")));
     }
@@ -46,7 +46,7 @@ fn hex_decode(s: &str) -> BridgeResult<Vec<u8>> {
 
 /// Send one `AT+CSIM` command carrying a raw APDU (as an uppercase hex
 /// string, no separators) and return the raw hex response (data + SW1SW2).
-fn csim(at: &mut AtCommander, apdu_hex: &str) -> BridgeResult<String> {
+pub(crate) fn csim(at: &mut AtCommander, apdu_hex: &str) -> BridgeResult<String> {
     let cmd = format!(r#"AT+CSIM={},"{}""#, apdu_hex.len(), apdu_hex);
     match at.send_command(&cmd)? {
         AtResponse::Ok(lines) => lines

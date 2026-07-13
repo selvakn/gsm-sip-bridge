@@ -43,9 +43,12 @@ fn main() -> ExitCode {
         return handle_vowifi_status_command(&cli);
     }
 
-    if let Some(Commands::VowifiUsimBridge(_args)) = &cli.command {
-        eprintln!("error: vowifi-usim-bridge not yet implemented");
-        return ExitCode::FAILURE;
+    if let Some(Commands::VowifiUsimBridge(args)) = &cli.command {
+        return gsm_sip_bridge::vowifi::usim_bridge::run(
+            &args.modem,
+            &args.vpcd_host,
+            args.vpcd_port,
+        );
     }
 
     if let Some(Commands::VowifiImsi(args)) = &cli.command {
