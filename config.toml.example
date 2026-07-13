@@ -1,3 +1,9 @@
+[logging]
+# tracing filter level: trace, debug, info (default), warn, or error. Applies
+# to the daemon and both vowifi-*-agent subcommands. Overridden by the
+# RUST_LOG env var if set, or by -v/--verbose (always forces trace) on the CLI.
+level = "info"
+
 [sip]
 server = "pbx.example.com"
 port = 5060
