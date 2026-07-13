@@ -187,7 +187,7 @@ start_shared_tail() {
     log "starting vowifi-ims-agent (netns $NETNS) and vowifi-sip-agent (default netns), supervised..."
     (
         while true; do
-            ip netns exec "$NETNS" "$GSM_SIP_BRIDGE_BIN" -v --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-ims-agent
+            ip netns exec "$NETNS" "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-ims-agent
             log "vowifi-ims-agent exited (status $?); restarting in 5s"
             sleep 5
         done
@@ -195,7 +195,7 @@ start_shared_tail() {
     IMS_AGENT_SUPERVISOR_PID=$!
     (
         while true; do
-            "$GSM_SIP_BRIDGE_BIN" -v --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-sip-agent
+            "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-sip-agent
             log "vowifi-sip-agent exited (status $?); restarting in 5s"
             sleep 5
         done
@@ -278,7 +278,7 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     log "starting vowifi-usim-bridge (default netns, talks to the modem + pcscd's vpcd), supervised..."
     (
         while true; do
-            "$GSM_SIP_BRIDGE_BIN" -v vowifi-usim-bridge --modem "$MODEM_PORT" \
+            "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-usim-bridge --modem "$MODEM_PORT" \
                 --vpcd-host "$VPCD_HOST" --vpcd-port "$VPCD_PORT"
             log "vowifi-usim-bridge exited (status $?); restarting in 5s"
             sleep 5

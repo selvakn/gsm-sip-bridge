@@ -7,7 +7,12 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let cli = Cli::parse_args();
-    logging::init(cli.verbose);
+    let log_level = cli
+        .config
+        .as_deref()
+        .map(gsm_sip_bridge::config::read_log_level)
+        .unwrap_or_else(|| "info".to_string());
+    logging::init(&log_level, cli.verbose);
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),

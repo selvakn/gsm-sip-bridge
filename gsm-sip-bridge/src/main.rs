@@ -16,7 +16,15 @@ use tokio::sync::{mpsc, watch};
 fn main() -> ExitCode {
     let cli = Cli::parse_args();
 
-    logging::init(cli.verbose);
+    // Read [logging].level ahead of the full config load below (which may
+    // legitimately fail, e.g. an unset secret env var) so logging is set up
+    // before anything else runs.
+    let log_level = cli
+        .config
+        .as_deref()
+        .map(gsm_sip_bridge::config::read_log_level)
+        .unwrap_or_else(|| "info".to_string());
+    logging::init(&log_level, cli.verbose);
 
     // Handle card subcommands before daemon startup
     if let Some(Commands::Card(card_args)) = &cli.command {

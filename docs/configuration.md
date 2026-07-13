@@ -4,6 +4,12 @@ The bridge reads a single TOML configuration file specified via `--config`.
 
 ## Sections
 
+### `[logging]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `level` | enum | `info` | `trace`, `debug`, `info`, `warn`, or `error`. Applies to the daemon and both `vowifi-*-agent` subcommands. Overridden by the `RUST_LOG` env var if set, or by `-v`/`--verbose` on the CLI (always forces `trace`). |
+
 ### `[sip]` (required)
 
 | Key | Type | Default | Description |

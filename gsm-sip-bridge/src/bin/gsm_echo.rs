@@ -30,7 +30,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    logging::init(cli.verbose);
+    logging::init("info", cli.verbose);
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),

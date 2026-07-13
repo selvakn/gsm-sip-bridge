@@ -15,14 +15,21 @@ const REDACTED_FIELD_NAMES: &[&str] = &[
 
 const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 
-pub fn init(verbose: bool) {
-    let filter = if verbose {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("debug,gsm_sip_bridge=trace,pjsua_safe=debug"))
-    } else {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,gsm_sip_bridge=info"))
+/// `level` is the resolved `[logging].level` from config.toml (default
+/// `"info"`); `verbose` is the `-v`/`--verbose` CLI flag, which always forces
+/// `trace` regardless of config — a manual escape hatch for ad-hoc
+/// debugging. `RUST_LOG`, if set, wins over both.
+pub fn init(level: &str, verbose: bool) {
+    let effective_level = if verbose { "trace" } else { level };
+    let default_directive = match effective_level.to_ascii_lowercase().as_str() {
+        "trace" => "debug,gsm_sip_bridge=trace,pjsua_safe=debug",
+        "debug" => "debug,gsm_sip_bridge=debug,pjsua_safe=debug",
+        "warn" => "warn,gsm_sip_bridge=warn",
+        "error" => "error,gsm_sip_bridge=error",
+        _ => "info,gsm_sip_bridge=info",
     };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive));
 
     tracing_subscriber::registry()
         .with(filter)

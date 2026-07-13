@@ -16,6 +16,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "audio",
     "scheduled_restart",
     "vowifi",
+    "logging",
 ];
 const SIP_KEYS: &[&str] = &[
     "server",
@@ -56,6 +57,8 @@ const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "inter_card_gap_seconds",
     "inter_card_gap_jitter_seconds",
 ];
+const LOGGING_KEYS: &[&str] = &["level"];
+const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 const VOWIFI_KEYS: &[&str] = &[
     "enabled",
     "mcc",
@@ -270,6 +273,21 @@ impl Default for ControlConfig {
     }
 }
 
+/// tracing filter level, passed to `observability::logging::init`.  One of
+/// `trace`, `debug`, `info` (the default), `warn`, `error`.
+#[derive(Clone, Debug)]
+pub struct LoggingConfig {
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScheduledRestartConfig {
     pub enabled: bool,
@@ -441,6 +459,7 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     pub scheduled_restart: ScheduledRestartConfig,
     pub vowifi: VowifiConfig,
+    pub logging: LoggingConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -463,6 +482,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let audio = parse_audio(table)?;
     let scheduled_restart = parse_scheduled_restart(table);
     let vowifi = parse_vowifi(table)?;
+    let logging = parse_logging(table)?;
 
     Ok(AppConfig {
         sip,
@@ -475,7 +495,28 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         audio,
         scheduled_restart,
         vowifi,
+        logging,
     })
+}
+
+/// Best-effort read of `[logging].level`, used to pick the tracing filter
+/// before `load_config` runs. Falls back to `"info"` for a missing file,
+/// missing section/key, or any parse error — the full `load_config` call
+/// (which may legitimately fail, e.g. an unset secret env var) still runs
+/// afterwards and reports a real error for an invalid `level` value.
+pub fn read_log_level(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.parse::<Value>().ok())
+        .and_then(|root| {
+            root.as_table()?
+                .get("logging")?
+                .as_table()?
+                .get("level")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| LoggingConfig::default().level)
 }
 
 fn warn_unknown_keys_in(table: &toml::map::Map<String, Value>, allowed: &[&str], section: &str) {
@@ -1154,6 +1195,31 @@ fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlCo
     Ok(ControlConfig { socket_path })
 }
 
+fn parse_logging(root: &toml::map::Map<String, Value>) -> BridgeResult<LoggingConfig> {
+    let Some(val) = root.get("logging") else {
+        return Ok(LoggingConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[logging] must be a table".into()))?;
+    warn_unknown_keys_in(t, LOGGING_KEYS, "logging");
+
+    let level = match t.get("level") {
+        Some(v) => {
+            let s = as_string(v, "logging.level", false)?.to_ascii_lowercase();
+            if !LOGGING_LEVELS.contains(&s.as_str()) {
+                return Err(BridgeError::Config(format!(
+                    "logging.level must be one of {LOGGING_LEVELS:?}; got {s:?}"
+                )));
+            }
+            s
+        }
+        None => LoggingConfig::default().level,
+    };
+
+    Ok(LoggingConfig { level })
+}
+
 fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConfig> {
     let Some(val) = root.get("vowifi") else {
         return Ok(VowifiConfig::default());
@@ -1339,6 +1405,7 @@ mod tests {
         let audio = parse_audio(table).unwrap();
         let scheduled_restart = parse_scheduled_restart(table);
         let vowifi = parse_vowifi(table).unwrap();
+        let logging = parse_logging(table).unwrap();
         AppConfig {
             sip,
             bridge,
@@ -1350,6 +1417,7 @@ mod tests {
             audio,
             scheduled_restart,
             vowifi,
+            logging,
         }
     }
 
@@ -1590,6 +1658,58 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("audio.rt_audio_prio must be 0 (off) or 1–99"));
+    }
+
+    #[test]
+    fn logging_defaults_to_info_when_section_absent() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.logging.level, "info");
+    }
+
+    #[test]
+    fn logging_level_override_applied() {
+        let toml = format!("{}\n[logging]\nlevel = \"debug\"\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn logging_level_is_case_insensitive() {
+        let toml = format!("{}\n[logging]\nlevel = \"WARN\"\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.logging.level, "warn");
+    }
+
+    #[test]
+    fn logging_level_rejects_unknown_value() {
+        let toml = format!("{}\n[logging]\nlevel = \"verbose\"\n", MINIMAL_TOML);
+        let root: toml::Value = toml.parse().unwrap();
+        let result = parse_logging(root.as_table().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("logging.level must be one of"));
+    }
+
+    #[test]
+    fn read_log_level_defaults_to_info_for_missing_file() {
+        let level = read_log_level(Path::new("/nonexistent/config.toml"));
+        assert_eq!(level, "info");
+    }
+
+    #[test]
+    fn read_log_level_reads_configured_value() {
+        let dir = std::env::temp_dir().join(format!("gsm-sip-bridge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!("{}\n[logging]\nlevel = \"trace\"\n", MINIMAL_TOML),
+        )
+        .unwrap();
+        assert_eq!(read_log_level(&path), "trace");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
