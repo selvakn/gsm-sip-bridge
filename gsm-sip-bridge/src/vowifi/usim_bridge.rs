@@ -73,6 +73,13 @@ fn is_get_response(apdu: &[u8]) -> bool {
 /// AID starts with, regardless of the operator-specific suffix.
 const USIM_RID: [u8; 7] = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02];
 
+/// Structural check only (`INS=0xA4 P1=0x04`) — used to decide whether
+/// lazy AID discovery is worth paying for at all, before we know what the
+/// discovered AID even is.
+fn is_select_by_aid(apdu: &[u8]) -> bool {
+    apdu.len() >= 5 && apdu[1] == 0xA4 && apdu[2] == 0x04
+}
+
 /// SELECT-by-AID (`INS=0xA4 P1=0x04`) redirect: if the client is selecting
 /// a USIM application AID (RID matches) that differs from the one this
 /// session already discovered via EF_DIR, substitute the discovered AID —
@@ -142,6 +149,40 @@ fn forward_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
     Ok(resp)
 }
 
+/// SELECT (`INS=0xA4`) and AUTHENTICATE (`INS=0x88`) — the two commands a
+/// classic ISO7816-4 T=0 PC/SC client drives via the two-step
+/// `61xx` + GET RESPONSE dance, confirmed by reading strongSwan's own
+/// `eap_sim_pcsc_card.c`: it hard-requires `SW1==0x61` after SELECT
+/// EF.DIR/SELECT ADF.USIM/AUTHENTICATE and discards the whole reader as
+/// failed on anything else — *even a same-shot `SW=9000` success with the
+/// data already attached*. This is the confirmed root cause of a
+/// live-testing finding (specs/012-strongswan-epdg T018): the bridge's
+/// SELECT EF.DIR response was structurally valid (real FCP template,
+/// correct file ID, SW=9000) and yet charon logged "Select EF.DIR failed"
+/// and rejected EAP-AKA outright. READ RECORD/GET RESPONSE are confirmed
+/// by the same source to expect an immediate `SW=9000` instead, so they
+/// are deliberately left alone.
+fn expects_classic_chaining(apdu: &[u8]) -> bool {
+    matches!(apdu.get(1), Some(0xA4) | Some(0x88))
+}
+
+/// If `apdu` is one `expects_classic_chaining`, and the modem's real
+/// response already carried data with `SW1=0x90` (EC200U's own
+/// auto-chained behavior — see `forward_apdu`'s doc comment), replace it
+/// with a synthetic `61 <len>` "more data available" response instead of
+/// handing the client the data directly. The client is expected to follow
+/// up with a literal GET RESPONSE next, which `handle_apdu`'s existing
+/// cache (`last_response`, set to the *real* `resp` by the caller before
+/// this substitution) already serves without touching the modem again —
+/// this function only decides what to present for *this* APDU.
+fn synthesize_61xx_if_needed(apdu: &[u8], resp: &[u8]) -> Vec<u8> {
+    if !expects_classic_chaining(apdu) || resp.len() <= 2 || resp[resp.len() - 2] != 0x90 {
+        return resp.to_vec();
+    }
+    let data_len = (resp.len() - 2).min(0xFF) as u8;
+    vec![0x61, data_len]
+}
+
 /// Bounded-retry, backing-off attempt to open the modem serial port —
 /// generic over how a fresh `AtCommander` is actually obtained so tests
 /// can inject a scripted transport instead of a real serial device.
@@ -172,7 +213,9 @@ enum SessionState {
     Unpowered,
     Powered {
         serial: AtCommander,
-        aid: Vec<u8>,
+        /// Discovered lazily (see `power_on`'s doc comment), not eagerly
+        /// at power-on.
+        aid: Option<Vec<u8>>,
         /// Last full response (data ‖ SW), for client-issued GET RESPONSE
         /// short-circuiting (vpcd-bridge-protocol.md normalization 1a).
         last_response: Option<Vec<u8>>,
@@ -190,35 +233,37 @@ impl Session {
         }
     }
 
-    /// Power-on prologue: acquire the serial port and discover the real
-    /// USIM AID via EF_DIR (`usim::discover_usim_aid`, which also performs
-    /// the SELECT MF a client's own session would start with — redundant
-    /// with what the client does next, but idempotent and harmless).
-    /// Failure leaves the session `Unpowered` — this is a soft failure
-    /// (mutes subsequent APDUs with SW=6F00), not a fatal one.
+    /// Power-on: acquire the serial port only. USIM AID discovery
+    /// (`usim::discover_usim_aid`, 3 sequential `AT+CSIM` round trips —
+    /// confirmed against real hardware to take ~1.5s) is deliberately
+    /// *not* run here anymore — it's deferred to the first APDU that
+    /// actually needs it (a SELECT-by-AID redirect decision), in
+    /// `handle_apdu`. Originally this ran eagerly, but live-testing
+    /// against a real `eap-sim-pcsc` plugin/carrier showed the client's
+    /// very first APDU is often a plain SELECT-by-path (not by AID) that
+    /// needs no discovery at all, and the vpcd message loop is
+    /// single-threaded — blocking here for ~1.5s made the bridge
+    /// unresponsive to `RequestAtr`/card-presence checks for that whole
+    /// window, which lined up suspiciously with `eap-sim-pcsc` logging
+    /// "SCardConnect: No smart card inserted" despite the *same* SELECT
+    /// then succeeding moments later. Failure to open the port leaves the
+    /// session `Unpowered` — a soft failure (mutes subsequent APDUs with
+    /// SW=6F00), not a fatal one.
     fn power_on(&mut self, open_modem: &mut impl FnMut() -> BridgeResult<AtCommander>) {
         if matches!(self.state, SessionState::Powered { .. }) {
             return;
         }
-        let mut at = match try_open_with_backoff(open_modem) {
-            Ok(at) => at,
-            Err(e) => {
-                tracing::warn!(error = %e, "modem unavailable at power-on; APDUs will be muted");
-                self.state = SessionState::Unpowered;
-                return;
-            }
-        };
-        match usim::discover_usim_aid(&mut at) {
-            Ok(aid) => {
-                tracing::info!(aid = %usim::hex_encode(&aid), "USIM session started");
+        match try_open_with_backoff(open_modem) {
+            Ok(at) => {
+                tracing::info!("USIM session started (AID discovered lazily, on first need)");
                 self.state = SessionState::Powered {
                     serial: at,
-                    aid,
+                    aid: None,
                     last_response: None,
                 };
             }
             Err(e) => {
-                tracing::warn!(error = %e, "USIM AID discovery failed; APDUs will be muted");
+                tracing::warn!(error = %e, "modem unavailable at power-on; APDUs will be muted");
                 self.state = SessionState::Unpowered;
             }
         }
@@ -270,7 +315,31 @@ impl Session {
             }
         }
 
-        let redirected = redirect_select_aid(apdu, aid);
+        // Lazy AID discovery (see power_on's doc comment): only pay for
+        // the ~1.5s EF_DIR walk when the client actually sends a
+        // SELECT-by-AID, not on every session.
+        if aid.is_none() && is_select_by_aid(apdu) {
+            match usim::discover_usim_aid(serial) {
+                Ok(discovered) => {
+                    tracing::info!(
+                        aid = %usim::hex_encode(&discovered),
+                        "lazily discovered USIM AID for SELECT-by-AID redirect"
+                    );
+                    *aid = Some(discovered);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "lazy AID discovery failed; forwarding SELECT-by-AID unmodified"
+                    );
+                }
+            }
+        }
+
+        let redirected = match aid {
+            Some(known_aid) => redirect_select_aid(apdu, known_aid),
+            None => apdu.to_vec(),
+        };
         if redirected != apdu {
             tracing::trace!(
                 original = %usim::hex_encode(apdu),
@@ -280,9 +349,18 @@ impl Session {
         }
         match forward_apdu(serial, &redirected) {
             Ok(resp) => {
-                tracing::trace!(resp = %usim::hex_encode(&resp), "APDU response to vpcd client");
                 *last_response = Some(resp.clone());
-                resp
+                let to_send = synthesize_61xx_if_needed(&redirected, &resp);
+                if to_send != resp {
+                    tracing::trace!(
+                        real = %usim::hex_encode(&resp),
+                        synthesized = %usim::hex_encode(&to_send),
+                        "presenting classic SW=61xx; real data cached for the follow-up GET RESPONSE"
+                    );
+                } else {
+                    tracing::trace!(resp = %usim::hex_encode(&resp), "APDU response to vpcd client");
+                }
+                to_send
             }
             Err(e) => {
                 tracing::warn!(error = %e, "APDU forwarding failed; responding SW=6F00");
@@ -591,7 +669,7 @@ mod tests {
         let mut session = Session {
             state: SessionState::Powered {
                 serial: AtCommander::from_stream(ScriptedModem::new(&[]), Duration::from_secs(1)),
-                aid: vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF],
+                aid: Some(vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF]),
                 last_response: Some(vec![0x11, 0x22, 0x90, 0x00]),
             },
         };
@@ -615,6 +693,88 @@ mod tests {
         let apdu = [0x00, 0x88, 0x00, 0x81, 0x22];
         let resp = forward_apdu(&mut at, &apdu).unwrap();
         assert_eq!(resp, vec![0xAA, 0xBB, 0xCC, 0xDD, 0x90, 0x00]);
+    }
+
+    #[test]
+    fn synthesize_61xx_if_needed_converts_select_data_response_to_classic_chaining() {
+        // The real root cause found live-testing against a real carrier
+        // (T018): the EC200U returns SELECT EF.DIR's data + SW=9000 in one
+        // shot, but strongSwan's eap_sim_pcsc_card.c hard-requires SW1=0x61
+        // after SELECT and discards the whole reader as failed on anything
+        // else — even a structurally valid SW=9000-with-data response.
+        let select_apdu = [0x00, 0xA4, 0x08, 0x04, 0x02, 0x2F, 0x00, 0x00];
+        let real_resp = [0x62, 0x1A, 0x82, 0x05, 0x90, 0x00]; // truncated FCP + SW=9000
+        let sent = synthesize_61xx_if_needed(&select_apdu, &real_resp);
+        assert_eq!(sent, vec![0x61, 0x04]); // 4 bytes of data available
+    }
+
+    #[test]
+    fn synthesize_61xx_if_needed_leaves_authenticate_data_response_synthesized_too() {
+        let auth_apdu = [0x00, 0x88, 0x00, 0x81, 0x22];
+        let real_resp = [0xAA, 0xBB, 0xCC, 0xDD, 0x90, 0x00];
+        assert_eq!(
+            synthesize_61xx_if_needed(&auth_apdu, &real_resp),
+            vec![0x61, 0x04]
+        );
+    }
+
+    #[test]
+    fn synthesize_61xx_if_needed_leaves_sw_only_response_untouched() {
+        let select_apdu = [0x00, 0xA4, 0x08, 0x04, 0x02, 0x2F, 0x00, 0x00];
+        let sw_only = [0x90, 0x00];
+        assert_eq!(
+            synthesize_61xx_if_needed(&select_apdu, &sw_only),
+            vec![0x90, 0x00]
+        );
+    }
+
+    #[test]
+    fn synthesize_61xx_if_needed_leaves_non_chaining_commands_untouched() {
+        // READ RECORD (INS=0xB2) is confirmed by the same source to expect
+        // an immediate SW=9000-with-data, not the 61xx dance.
+        let read_record_apdu = [0x00, 0xB2, 0x01, 0x04, 0x00];
+        let real_resp = [0xAA, 0xBB, 0xCC, 0xDD, 0x90, 0x00];
+        assert_eq!(
+            synthesize_61xx_if_needed(&read_record_apdu, &real_resp),
+            real_resp.to_vec()
+        );
+    }
+
+    #[test]
+    fn handle_apdu_serves_real_select_data_from_cache_after_synthetic_61xx() {
+        // End-to-end: SELECT EF.DIR gets the synthetic 61xx; the client's
+        // follow-up GET RESPONSE (the exact APDU eap_sim_pcsc_card.c sends,
+        // Le copied from the 61xx's SW2) is served the *real* cached data
+        // without touching the modem again (empty ScriptedModem queue
+        // proves it — a real second AT+CSIM attempt would EOF and mute).
+        let mut session = Session {
+            state: SessionState::Powered {
+                serial: AtCommander::from_stream(
+                    ScriptedModem::new(&[&format!(
+                        "+CSIM: {},\"{EF_DIR_RECORD}\"\r\nOK\r\n",
+                        EF_DIR_RECORD.len()
+                    )]),
+                    Duration::from_secs(1),
+                ),
+                aid: None,
+                last_response: None,
+            },
+        };
+        let select_ef_dir = [0x00, 0xA4, 0x08, 0x04, 0x02, 0x2F, 0x00, 0x00];
+        let first = session.handle_apdu(&select_ef_dir);
+        assert_eq!(
+            first[0], 0x61,
+            "expected a synthetic 61xx, got {first:02X?}"
+        );
+        let le = first[1];
+
+        let get_response = [0x00, 0xC0, 0x00, 0x00, le];
+        let second = session.handle_apdu(&get_response);
+        let expected_data = usim::hex_decode(EF_DIR_RECORD).unwrap();
+        assert_eq!(
+            second, expected_data,
+            "GET RESPONSE must return the real cached data"
+        );
     }
 
     #[test]
@@ -689,6 +849,79 @@ mod tests {
     }
 
     #[test]
+    fn handle_apdu_does_not_discover_aid_for_a_non_select_by_aid_apdu() {
+        // Found by live-testing against a real eap-sim-pcsc plugin/carrier
+        // (specs/012-strongswan-epdg T018): the client's first APDU is
+        // often SELECT-by-path (P1=0x08), not SELECT-by-AID — an empty
+        // ScriptedModem queue proves discovery is never attempted for it
+        // (a real discover_usim_aid call would try to read from the
+        // modem, hit EOF, and error/mute the response instead of
+        // returning the scripted SW=9000 below).
+        let mut session = Session {
+            state: SessionState::Powered {
+                serial: AtCommander::from_stream(
+                    ScriptedModem::new(&["+CSIM: 4,\"9000\"\r\nOK\r\n"]),
+                    Duration::from_secs(1),
+                ),
+                aid: None,
+                last_response: None,
+            },
+        };
+        let select_by_path = [0x00, 0xA4, 0x08, 0x04, 0x02, 0x2F, 0x00, 0x00];
+        let resp = session.handle_apdu(&select_by_path);
+        assert_eq!(resp, vec![0x90, 0x00]);
+        let SessionState::Powered { aid, .. } = &session.state else {
+            panic!("expected Powered");
+        };
+        assert_eq!(
+            *aid, None,
+            "AID must stay undiscovered for a non-SELECT-by-AID APDU"
+        );
+    }
+
+    #[test]
+    fn handle_apdu_lazily_discovers_aid_only_for_select_by_aid() {
+        let mut session = Session {
+            state: SessionState::Powered {
+                serial: AtCommander::from_stream(
+                    ScriptedModem::new(&[
+                        "+CSIM: 4,\"9000\"\r\nOK\r\n", // SELECT MF (discovery)
+                        "+CSIM: 4,\"9000\"\r\nOK\r\n", // SELECT EF_DIR (discovery)
+                        &format!(
+                            "+CSIM: {},\"{EF_DIR_RECORD}\"\r\nOK\r\n",
+                            EF_DIR_RECORD.len()
+                        ), // READ RECORD 1 (discovery)
+                        "+CSIM: 4,\"9000\"\r\nOK\r\n", // the redirected SELECT itself
+                    ]),
+                    Duration::from_secs(1),
+                ),
+                aid: None,
+                last_response: None,
+            },
+        };
+        // SELECT-by-AID carrying a generic/wrong AID, same RID.
+        let generic_aid = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0xFF];
+        let mut apdu = vec![0x00, 0xA4, 0x04, 0x0C, generic_aid.len() as u8];
+        apdu.extend_from_slice(&generic_aid);
+
+        let resp = session.handle_apdu(&apdu);
+        assert_eq!(resp, vec![0x90, 0x00]);
+
+        let SessionState::Powered { aid, .. } = &session.state else {
+            panic!("expected Powered");
+        };
+        assert_eq!(
+            aid.as_deref(),
+            Some(
+                &[
+                    0xA0u8, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0xF6, 0x05, 0xFF, 0x89, 0x00,
+                    0x00, 0x01, 0xFF
+                ][..]
+            )
+        );
+    }
+
+    #[test]
     fn send_raw_apdu_rejects_non_hex_csim_reply() {
         // Quirk (e): a fragment that isn't valid hex must be rejected, not
         // silently misparsed.
@@ -727,7 +960,7 @@ mod tests {
                     ScriptedModem::new(&["ERROR\r\n"]),
                     Duration::from_secs(1),
                 ),
-                aid: vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02],
+                aid: Some(vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]),
                 last_response: None,
             },
         };
