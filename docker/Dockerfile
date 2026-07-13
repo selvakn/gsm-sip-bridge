@@ -8,25 +8,29 @@
 # docker/entrypoint.sh decides at container start which of these to launch,
 # by asking the binary itself (`gsm-sip-bridge config vowifi-enabled`)
 # rather than hand-parsing TOML in bash.
-ARG PJSIP_VERSION=2.16
-
-# Stage 1: build gsm-sip-bridge with a real, statically-linked PJSIP.
 #
-# Debian doesn't package libpjproject, so it's built from source here.
-# Single glibc/Debian stage (no separate Alpine+bindgen split like this
-# Dockerfile used before) — the runtime image below needs to be
-# glibc/Debian anyway for the SWu-IKEv2 dialer's Python toolchain
-# (pyscard/pcsclite), so there's no cross-libc mismatch to work around by
-# splitting stages. Only PJSIP itself is statically linked; OpenSSL, ALSA,
-# libuuid, and libudev stay ordinary dynamic Debian runtime packages,
-# already available in both this stage and the runtime stage below.
-FROM rust:1-bookworm AS builder
+# Alpine/musl throughout (not Debian/glibc): the only reason this was ever
+# Debian was to build pyscard in the same stage it shipped in. Splitting the
+# Python build into its own stage removes that constraint, and Alpine's
+# apk repos carry every native dependency this image needs — PJSIP's own
+# build deps, the AMR-NB/AMR-WB codec libs, and pcsclite for pyscard — so
+# there's no reason to carry glibc's and Debian's much larger base + apt
+# footprint. See docker/patches/ for the one carrier/modem-specific patch
+# applied to the vendored SWu-IKEv2 dialer.
+ARG PJSIP_VERSION=2.16
+ARG ALPINE_VERSION=3.21
+
+# Stage 1: build PJSIP as static libraries.
+#
+# Only PJSIP itself ends up statically linked (--disable-shared
+# --enable-static below); OpenSSL, ALSA, libuuid, and libudev stay ordinary
+# dynamic Alpine runtime packages — see pjsua-sys/build.rs's `system_libs`
+# set, which force-dynamic-links exactly those even when PJSUA_SYS_STATIC=1.
+FROM alpine:${ALPINE_VERSION} AS pjsip-builder
 ARG PJSIP_VERSION
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential wget pkg-config \
-        libssl-dev libasound2-dev uuid-dev libudev-dev \
-        clang libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+        build-base wget pkgconf \
+        openssl-dev alsa-lib-dev util-linux-dev linux-headers
 
 # PJSIP's build-time config: enables L16/16000, which the VoWiFi bridge's
 # wideband path needs and which pjproject does not register by default.
@@ -41,16 +45,13 @@ RUN wget -q "https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSIO
         CFLAGS="-fPIC" && \
     make -j"$(nproc)" dep && make -j"$(nproc)" && make install
 
-# Only installed now, after PJSIP's own ./configure/build: if these -dev
-# packages are present earlier, PJSIP's configure auto-detects them and
-# tries to statically link its own bundled AMR-WB codec plugin against
-# them — but the apt packages only ship the shared .so, not a static .a,
-# which breaks the fully-static PJSIP build above. Installing them here
-# means only our own amr-sys crate's pkg-config probe (below) sees them;
-# it links dynamically, which these packages support fine.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libvo-amrwbenc-dev libopencore-amrwb-dev libopencore-amrnb-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Stage 2: build gsm-sip-bridge against the static PJSIP from stage 1.
+FROM rust:1-alpine${ALPINE_VERSION} AS rust-builder
+RUN apk add --no-cache \
+        build-base pkgconf clang-dev \
+        openssl-dev alsa-lib-dev util-linux-dev eudev-dev linux-headers \
+        opencore-amr-dev vo-amrwbenc-dev
+COPY --from=pjsip-builder /usr/local /usr/local
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
@@ -62,42 +63,25 @@ COPY gsm-sip-bridge/ gsm-sip-bridge/
 
 ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"
 ENV PJSUA_SYS_STATIC="1"
+# musl's default Rust target statically links the whole binary, including
+# libc — which would prevent the dynamic libs above (ssl, asound, uuid,
+# udev) from resolving at link/run time. -crt-static off keeps those dynamic,
+# matching how the previous Debian/glibc build linked them.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN cargo build --release -p gsm-sip-bridge --bin gsm-sip-bridge \
     --features gsm-sip-bridge/pjsip-linked,gsm-sip-bridge/amr-linked
 
-# Stage 2: runtime image — gsm-sip-bridge (real PJSIP linked, from stage 1)
-# plus the SWu-IKEv2 Python dialer for the VoWiFi/ePDG tunnel.
-FROM debian:bookworm-slim
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Runtime + build deps:
-#   build-essential/swig/python3-dev/libpcsclite-dev -> build pyscard
-#   iproute2 + net-tools -> the SWu dialer calls BOTH `ip` and net-tools `route`;
-#     also used directly by entrypoint.sh for the vowifi bridge's veth pair
-#   iputils-ping/dnsutils/procps -> entrypoint DNS resolve + keepalive + pgrep
-#   libasound2/libssl3/libuuid1/libudev1 -> runtime shared libs for the
-#     gsm-sip-bridge binary above (PJSIP itself is statically linked; these
-#     are its dynamic dependencies — libudev1 via the `serialport` crate,
-#     the rest per pjsua-sys/build.rs's `system_libs` set)
-#   libvo-amrwbenc0/libopencore-amrwb0/libopencore-amrnb0 -> AMR encode/decode
-#     runtime libs (amr-linked is enabled in the build above). Needed in both
-#     directions: an *outbound* offer that doesn't list AMR-WB is rejected even
-#     when the network then negotiates PCMU (commit 830ac87), and an *inbound*
-#     carrier offer frequently carries no PCMU at all — Airtel offers AMR-WB +
-#     AMR-NB on some mobile-terminating calls and AMR-NB alone on others, so
-#     without both codecs those calls can only be declined.
-#   wget -> HEALTHCHECK's metrics-endpoint probe
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-dev \
-        build-essential swig libpcsclite-dev \
-        git ca-certificates wget \
-        iproute2 net-tools iputils-ping dnsutils procps \
-        libasound2 libssl3 libuuid1 libudev1 \
-        libvo-amrwbenc0 libopencore-amrwb0 libopencore-amrnb0 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN addgroup --system bridge && adduser --system --ingroup bridge --home /data bridge
+# Stage 3: build the SWu-IKEv2 Python dialer's dependencies (pyscard et al)
+# in isolation, so the compiler toolchain that only exists to build them
+# (build-base, swig, python3-dev, pcsc-lite-dev) never reaches the runtime
+# image. `pip install --target` (not a venv) so the result is a plain
+# directory tree that COPYs cleanly into the runtime stage without needing
+# a matching venv interpreter symlink there.
+FROM alpine:${ALPINE_VERSION} AS python-builder
+RUN apk add --no-cache \
+        python3 py3-pip python3-dev \
+        build-base swig pcsc-lite-dev \
+        git
 
 # Vendor the SWu-IKEv2 dialer and the mitshell 'card' module. Per the
 # osmocom wiki the 'card' package must be copied in as a local module — do
@@ -117,12 +101,52 @@ RUN sed -i 's/\r$//' SWu-IKEv2/swu_emulator.py \
     && rm /tmp/0001-ec200u-at-csim-fixes.patch
 
 # Python deps. Use pyserial (NOT the 'serial' PyPI pkg) to provide `import serial`.
-RUN pip install --no-cache-dir --break-system-packages \
+RUN pip install --no-cache-dir --target=/opt/pydeps \
         wheel pyserial requests cryptography pycryptodome pyscard \
-    && pip install --no-cache-dir --break-system-packages \
+    && pip install --no-cache-dir --target=/opt/pydeps \
         git+https://github.com/mitshell/CryptoMobile.git
 
-COPY --from=builder /app/target/release/gsm-sip-bridge /usr/local/bin/gsm-sip-bridge
+# Stage 4: runtime image — gsm-sip-bridge (stage 2) + the SWu-IKEv2 Python
+# dialer (stage 3), on plain Alpine with only the shared libs both need.
+FROM alpine:${ALPINE_VERSION}
+
+# bash: docker/entrypoint.sh and healthcheck.sh use arrays, process
+#   substitution, and /dev/tcp/* redirection — none of which busybox ash
+#   (Alpine's default /bin/sh) supports.
+# python3 -> must match python-builder's python3 (same ALPINE_VERSION base)
+#   for the compiled pyscard/cryptography extensions copied in below to load.
+# iproute2 + net-tools -> the SWu dialer calls BOTH `ip` and net-tools `route`;
+#   also used directly by entrypoint.sh for the vowifi bridge's veth pair
+# iputils/bind-tools/procps -> entrypoint DNS resolve (dig) + keepalive + pgrep
+# alsa-lib/libssl3/libcrypto3/libuuid/eudev-libs/libgcc -> runtime shared libs
+#   for the gsm-sip-bridge binary (PJSIP itself is statically linked; these
+#   are its dynamic dependencies — eudev-libs via the `serialport` crate,
+#   the rest per pjsua-sys/build.rs's `system_libs` set)
+# opencore-amr/vo-amrwbenc -> AMR encode/decode runtime libs (amr-linked is
+#   enabled in the build above). Needed in both directions: an *outbound*
+#   offer that doesn't list AMR-WB is rejected even when the network then
+#   negotiates PCMU (commit 830ac87), and an *inbound* carrier offer
+#   frequently carries no PCMU at all — Airtel offers AMR-WB + AMR-NB on some
+#   mobile-terminating calls and AMR-NB alone on others, so without both
+#   codecs those calls can only be declined.
+# pcsc-lite-libs -> pyscard's runtime dependency (libpcsclite.so)
+# wget -> HEALTHCHECK's metrics-endpoint probe
+RUN apk add --no-cache \
+        bash \
+        python3 \
+        iproute2 net-tools iputils bind-tools procps \
+        alsa-lib libssl3 libcrypto3 libuuid eudev-libs libgcc \
+        opencore-amr vo-amrwbenc \
+        pcsc-lite-libs \
+        ca-certificates wget
+
+RUN addgroup -S bridge && adduser -S -G bridge -h /data bridge
+
+COPY --from=python-builder /opt/SWu-IKEv2 /opt/SWu-IKEv2
+COPY --from=python-builder /opt/pydeps /opt/pydeps
+ENV PYTHONPATH="/opt/pydeps"
+
+COPY --from=rust-builder /app/target/release/gsm-sip-bridge /usr/local/bin/gsm-sip-bridge
 COPY etc/99-ec20-gsm-sip-bridge.rules /etc/udev/rules.d/
 
 RUN mkdir -p /data /etc/gsm-sip-bridge && chown bridge:bridge /data
