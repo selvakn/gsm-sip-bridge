@@ -43,6 +43,14 @@ pub struct ParsedPacket<'a> {
     pub payload: &'a [u8],
 }
 
+/// Parses an RTP packet (RFC 3550 §5.1), including the header extension (`X`)
+/// and trailing padding (`P`) — both valid, on-the-wire forms a carrier may
+/// send (e.g. an RFC 8285 one-byte/two-byte extension). Earlier versions of
+/// this parser ignored both bits: an extension's bytes leaked into the
+/// returned "payload" (corrupting/desyncing the decoder), and padding bytes
+/// at the end were passed through as if they were audio — silent media
+/// corruption rather than an outright reject, found via review (Greptile,
+/// PR #2) rather than a live symptom.
 pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket<'_>> {
     if data.len() < RTP_HEADER_LEN {
         return None;
@@ -51,21 +59,44 @@ pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket<'_>> {
     if version != RTP_VERSION {
         return None;
     }
+    let padding = data[0] & 0x20 != 0;
+    let extension = data[0] & 0x10 != 0;
     let cc = (data[0] & 0x0f) as usize;
     let payload_type = data[1] & 0x7f;
     let seq = u16::from_be_bytes([data[2], data[3]]);
     let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-    let header_len = RTP_HEADER_LEN + cc * 4;
-    if data.len() < header_len {
+    let mut start = RTP_HEADER_LEN + cc * 4;
+    if data.len() < start {
         return None;
+    }
+    if extension {
+        // Extension header: 2 bytes profile-defined ID + 2 bytes length (in
+        // 32-bit words, not counting this 4-byte header itself).
+        if data.len() < start + 4 {
+            return None;
+        }
+        let ext_words = u16::from_be_bytes([data[start + 2], data[start + 3]]) as usize;
+        start += 4 + ext_words * 4;
+        if data.len() < start {
+            return None;
+        }
+    }
+    let mut end = data.len();
+    if padding {
+        // The last byte holds the padding length, including itself.
+        let pad_len = data[data.len() - 1] as usize;
+        if pad_len == 0 || end - start < pad_len {
+            return None; // malformed: padding count exceeds the remaining payload
+        }
+        end -= pad_len;
     }
     Some(ParsedPacket {
         seq,
         timestamp,
         ssrc,
         payload_type,
-        payload: &data[header_len..],
+        payload: &data[start..end],
     })
 }
 
@@ -217,6 +248,43 @@ mod tests {
     #[test]
     fn parse_packet_rejects_too_short_buffer() {
         assert!(parse_packet(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn parse_packet_skips_header_extension() {
+        let payload = [0xaau8, 0xbb, 0xcc];
+        let mut pkt = build_packet(1, 100, 0x1234, 0, &payload);
+        pkt[0] |= 0x10; // set X (extension present)
+                        // Extension header (4 bytes: 2-byte profile ID + 2-byte length-in-words)
+                        // plus 2 words (8 bytes) of extension data, inserted right after the
+                        // fixed 12-byte header (CC=0, so no CSRC list).
+        let ext: [u8; 12] = [0xbe, 0xde, 0x00, 0x02, 1, 2, 3, 4, 5, 6, 7, 8];
+        let mut with_ext = pkt[..RTP_HEADER_LEN].to_vec();
+        with_ext.extend_from_slice(&ext);
+        with_ext.extend_from_slice(&payload);
+
+        let parsed = parse_packet(&with_ext).unwrap();
+        assert_eq!(parsed.payload, &payload);
+    }
+
+    #[test]
+    fn parse_packet_strips_trailing_padding() {
+        let payload = [0xaau8, 0xbb, 0xcc];
+        let mut pkt = build_packet(1, 100, 0x1234, 0, &payload);
+        pkt[0] |= 0x20; // set P (padding present)
+        pkt.extend_from_slice(&[0, 0, 3]); // 3 bytes of padding; last byte = count
+
+        let parsed = parse_packet(&pkt).unwrap();
+        assert_eq!(parsed.payload, &payload);
+    }
+
+    #[test]
+    fn parse_packet_rejects_padding_count_exceeding_payload() {
+        let mut pkt = build_packet(1, 100, 0x1234, 0, &[0xaa]);
+        pkt[0] |= 0x20; // set P, but the last byte (payload itself) claims
+                        // a padding count larger than what's available.
+        pkt[RTP_HEADER_LEN] = 200;
+        assert!(parse_packet(&pkt).is_none());
     }
 
     #[test]
