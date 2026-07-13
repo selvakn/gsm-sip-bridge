@@ -290,8 +290,8 @@ impl ScheduledRestartConfig {
 /// alongside the existing circuit-switched GSM-to-SIP bridge. See
 /// `specs/011-vowifi-sip-bridge/plan.md`. Disabled by default: this section
 /// only matters when running one of the `vowifi-ims-agent`/`vowifi-sip-agent`
-/// subcommands inside the `docker/epdg/` deployment, not for the normal
-/// daemon path.
+/// subcommands (started automatically by `docker/entrypoint.sh` when
+/// enabled), not for the normal daemon path.
 #[derive(Clone, Debug)]
 pub struct VowifiConfig {
     /// Master switch — the two `vowifi-*-agent` subcommands refuse to start
@@ -314,7 +314,7 @@ pub struct VowifiConfig {
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
     /// Path Agent A reads the tunnel-assigned P-CSCF address from —
-    /// `docker/epdg/entrypoint.sh` writes this once the SWu tunnel is up.
+    /// `docker/entrypoint.sh` writes this once the SWu tunnel is up.
     pub pcscf_source_path: String,
     /// Agent A's address on the dedicated veth link (the `ims`-netns end).
     pub veth_local_addr: String,

@@ -1,3 +1,15 @@
+# One image, two optional subsystems (see docker/entrypoint.sh):
+#   1. the circuit-switched GSM-to-SIP daemon — always attempted, no-ops
+#      gracefully with no supported modem attached
+#   2. the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — the
+#      SWu-IKEv2 ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, started
+#      only when [vowifi].enabled = true in the mounted config.toml
+#
+# `privileged: true` + host networking + full /dev,/sys mounts are needed
+# for the circuit-switched daemon's arbitrary-USB-modem hot-plug discovery,
+# and happen to be a strict superset of everything the VoWiFi tunnel needs
+# too (NET_ADMIN/NET_RAW/SYS_ADMIN, /dev/net/tun, netns/veth setup) — no
+# separate capability profile required for either subsystem.
 services:
   gsm-sip-bridge:
     build:
@@ -9,7 +21,10 @@ services:
     privileged: true
     volumes:
       - bridge-data:/data
-      - ./config.toml:/etc/gsm-sip-bridge/config.toml:ro
+      # Root-level config.toml is canonical (config.toml.example documents
+      # it; same file `cargo run -- --config config.toml` uses locally).
+      # Override with CONFIG_HOST_PATH for an alternate config.
+      - "${CONFIG_HOST_PATH:-../config.toml}:/etc/gsm-sip-bridge/config.toml:ro"
       - /dev:/dev
       - /sys:/sys:ro
     env_file:
@@ -18,10 +33,10 @@ services:
       - audio
       - dialout
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9091/metrics"]
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 15s
       retries: 3
 
   prometheus:

@@ -2,24 +2,28 @@
 
 **Feature**: 011-vowifi-sip-bridge | **Date**: 2026-07-12
 
-This walks through bringing the feature up end-to-end once implemented, building on the existing
-`docker/epdg/` tunnel setup and the existing `[sip]`/`[bridge]` configuration already used by the
-circuit-switched bridge.
+This walks through bringing the feature up end-to-end once implemented, building on the VoWiFi/ePDG
+tunnel (now baked into the same image as the daemon, see `docker/`) and the existing
+`[sip]`/`[bridge]` configuration already used by the circuit-switched bridge.
 
 ## Prerequisites
 
 - Quectel EC200U modem on `/dev/ttyUSB6`, SIM provisioned for VoWiFi/IMS by the carrier, as already
   required by the existing `ims-register`/`ims-call` CLI tools.
-- A network path to the carrier's ePDG (see `docker/epdg/README.md` for the known-working carrier;
-  the other carrier tested is currently blocked by carrier-side policy — see this feature's spec
-  Assumptions).
+- A network path to the carrier's ePDG (see `docs/vowifi-epdg-research-notes.md` for the
+  known-working carrier; the other carrier tested is currently blocked by carrier-side policy — see
+  this feature's spec Assumptions).
 - An existing, reachable SIP/PBX destination — the same one already configured for the
   circuit-switched GSM-to-SIP bridge (`[sip]` / `[bridge]` in `config.toml`).
 
-## 1. Bring up the tunnel and both agents
+## 1. Bring up the daemon and the VoWiFi bridge agents
+
+With `[vowifi].enabled = true` (plus `mcc`/`mnc`/`modem_port`) in the repo-root `config.toml`,
+`docker/entrypoint.sh` starts both the circuit-switched daemon and the VoWiFi tunnel/agents
+automatically:
 
 ```bash
-docker compose -f docker/epdg/docker-compose.epdg.yml up --build
+docker compose -f docker/docker-compose.yml up --build
 ```
 
 `entrypoint.sh` now, after the SWu tunnel is confirmed up and `/tmp/pcscf` is written:

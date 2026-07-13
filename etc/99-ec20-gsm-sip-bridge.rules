@@ -1,8 +1,12 @@
-# Prevent ModemManager from probing the Quectel EC20 AT command port.
+# Prevent ModemManager from probing the Quectel EC20/EC200 AT command port.
 # Install: sudo cp 99-ec20-gsm-sip-bridge.rules /etc/udev/rules.d/
 #          sudo udevadm control --reload-rules && sudo udevadm trigger
 #
-# The EC20 exposes 4 ttyUSB ports (0-3). Port 2 is the primary AT channel.
+# EC20 exposes 4 ttyUSB ports (0-3), interface 04 is the primary AT channel
+# (see gsm-sip-bridge/src/modules/discovery.rs's KNOWN_DEVICES table).
+# EC200 (VoWiFi-only — no CS-bridge audio path, see discovery.rs) has its
+# own port layout; its AT port is whichever [vowifi].modem_port names.
 # ENV{ID_MM_DEVICE_IGNORE} tells ModemManager to skip the entire USB device.
 
 ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0125", ENV{ID_MM_DEVICE_IGNORE}="1"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0901", ENV{ID_MM_DEVICE_IGNORE}="1"

@@ -1,4 +1,17 @@
-# VoWiFi ePDG tunnel (Phase 1)
+# VoWiFi ePDG tunnel — research notes (historical)
+
+> **Superseded as a deployment guide.** The standalone `docker/epdg/`
+> container this document originally described has been merged into the
+> main `docker/` image — one `docker compose up --build` from `docker/`
+> now builds and runs both the circuit-switched daemon and (when
+> `[vowifi].enabled = true` in the mounted `config.toml`) this VoWiFi/ePDG
+> tunnel + bridge agents together. See `docker/docker-compose.yml` and
+> `docker/entrypoint.sh` for the current setup, and `docs/vowifi-bridge.md`
+> for the inbound-bridge architecture. This file is kept as-is for its
+> engineering findings below (the AKA/Gm-IPsec debugging history, per-carrier
+> behavior, and the EC200U patch rationale) — the specific `docker exec`/
+> `docker cp` commands in the walkthroughs below are no longer how this is
+> actually run.
 
 Establishes an IKEv2/IPsec **VoWiFi tunnel to the mobile operator's ePDG**
 (Evolved Packet Data Gateway) so we can later reach the operator's IMS core for
