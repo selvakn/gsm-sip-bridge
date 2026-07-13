@@ -156,6 +156,7 @@ fn run_inner(config: &VowifiConfig) -> BridgeResult<()> {
         &status,
         control_addr,
         veth_local_ip,
+        config.wideband,
     );
     session.cleanup();
     result
@@ -513,6 +514,7 @@ fn respond(sink: &SipSink, what: &str, message: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_loop(
     session: &mut super::RegisteredSession,
     inbound: &mut Inbound,
@@ -520,6 +522,7 @@ fn dispatch_loop(
     status: &Arc<Mutex<super::RegistrationStatus>>,
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
+    wideband: bool,
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
     let mut backoff = RETRY_INITIAL_BACKOFF;
@@ -564,7 +567,15 @@ fn dispatch_loop(
                     let _ = sink.send(&build_486_busy_here(&req, &random_hex(4)));
                     continue;
                 }
-                match handle_invite(session, &req, &sink, inbound, control_addr, veth_local_ip) {
+                match handle_invite(
+                    session,
+                    &req,
+                    &sink,
+                    inbound,
+                    control_addr,
+                    veth_local_ip,
+                    wideband,
+                ) {
                     Ok(call) => active_call = call,
                     Err(e) => tracing::warn!(error = %e, "failed to handle inbound INVITE"),
                 }
@@ -677,6 +688,7 @@ fn handle_invite(
     inbound: &Inbound,
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
+    wideband: bool,
 ) -> BridgeResult<Option<ActiveCall>> {
     let call_id = req.header("Call-ID").unwrap_or_default().to_string();
     let caller = extract_caller(req);
@@ -693,9 +705,10 @@ fn handle_invite(
     // A carrier's mobile-terminating VoWiFi INVITE often offers no PCMU at
     // all (Airtel: AMR-WB+AMR-NB on some calls, AMR-NB alone on others), so
     // anything AMR gets answered and transcoded rather than declined. Uses
-    // `sdp::select_codec` — the same decision `build_answer` makes below — so
-    // we can never accept a call we then can't build an answer for.
-    if sdp::select_codec(&offer, amr_safe::is_available()).is_none() {
+    // `sdp::select_codec` — the same decision `build_answer` makes below, with
+    // the same arguments — so we can never accept a call we then can't build an
+    // answer for.
+    let Some(precheck) = sdp::select_codec(&offer, amr_safe::is_available(), wideband) else {
         tracing::info!(
             call_id = %call_id,
             amr_linked = amr_safe::is_available(),
@@ -704,9 +717,14 @@ fn handle_invite(
         );
         sink.send(&build_486_busy_here(req, &random_hex(4)))?;
         return Ok(None);
-    }
+    };
 
-    let veth_rx = spawn_veth_uas_listener(veth_local_ip)?;
+    // Only a wideband *carrier* leg has anything for a wideband veth leg to
+    // preserve. A narrowband call (PCMU or AMR-NB — the two shapes Airtel
+    // sends when the originating leg is narrowband) keeps the veth link on
+    // PCMU, exactly the path it took before L16 existed.
+    let veth_wideband = precheck.codec == NegotiatedCodec::AmrWb;
+    let veth_rx = spawn_veth_uas_listener(veth_local_ip, veth_wideband)?;
 
     // Generated once and reused for every response in this dialog (180 and
     // 200 OK alike) — RFC 3261 requires the same To-tag across all
@@ -767,17 +785,17 @@ fn handle_invite(
                 .map_err(|e| BridgeError::Ims(format!("IMS RTP connect failed: {e}")))?;
 
             let session_id: u64 = rand::random::<u32>() as u64;
-            // `build_answer` prefers PCMU and falls back to AMR only when the
-            // offer leaves it no choice — which is exactly when the
-            // transcoding relay below is needed. It hands back the payload
-            // type and framing it committed us to, both of which the media
-            // path must honour exactly.
+            // Re-runs the same selection as the `precheck` above and so lands
+            // on the same codec. It hands back the payload type and framing it
+            // committed us to, both of which the media path must honour
+            // exactly.
             let (answer_sdp, chosen) = sdp::build_answer(
                 session.local_addr.ip(),
                 ims_rtp_port,
                 session_id,
                 &offer,
                 amr_safe::is_available(),
+                wideband,
             )?;
 
             // Do NOT answer yet. The PBX extension is only ringing; our
@@ -805,39 +823,34 @@ fn handle_invite(
             sink.send(&build_200_ok_invite(req, &to_tag, &contact, &answer_sdp))?;
 
             let stop = Arc::new(AtomicBool::new(false));
-            match chosen.codec {
+            let transcoding = chosen.codec != veth.codec.codec;
+            if transcoding {
+                // The two legs speak different codecs (or the same codec at
+                // different rates), so it has to be terminated on each side
+                // and re-encoded.
+                super::transcode::spawn_transcoding_relay(
+                    ims_rtp_socket,
+                    veth.rtp_socket,
+                    chosen,
+                    veth.codec,
+                    stop.clone(),
+                )?;
+            } else {
                 // Both legs speak PCMU: forward the payloads untouched.
-                NegotiatedCodec::Pcmu => spawn_relay(ims_rtp_socket, veth.rtp_socket, stop.clone()),
-                // The carrier leg is AMR and Agent B's PJSIP leg is fixed
-                // PCMU/8k, so the codec has to be terminated on each side and
-                // re-encoded.
-                NegotiatedCodec::AmrNb | NegotiatedCodec::AmrWb => {
-                    super::transcode::spawn_transcoding_relay(
-                        ims_rtp_socket,
-                        veth.rtp_socket,
-                        chosen,
-                        stop.clone(),
-                    )?
-                }
+                spawn_relay(ims_rtp_socket, veth.rtp_socket, stop.clone());
             }
-            // Both sides of Agent A's bridge, so a one-way-audio report can be
-            // read straight off the log: what the carrier negotiated, and what
-            // goes over the veth to Agent B (always PCMU — its PJSIP leg is
-            // fixed 8kHz, which is why anything else needs `ims::transcode`).
-            let (carrier_codec, carrier_rate) = match chosen.codec {
-                NegotiatedCodec::Pcmu => ("PCMU", 8000),
-                NegotiatedCodec::AmrNb => ("AMR", amr_safe::NB_SAMPLE_RATE),
-                NegotiatedCodec::AmrWb => ("AMR-WB", amr_safe::SAMPLE_RATE),
-            };
+            // Both sides of Agent A's bridge, so a one-way-audio or
+            // lost-your-wideband report can be read straight off the log: what
+            // the carrier negotiated, and what goes over the veth to Agent B.
             tracing::info!(
                 call_id = %call_id,
-                carrier_codec,
-                carrier_sample_rate = carrier_rate,
+                carrier_codec = chosen.codec.name(),
+                carrier_sample_rate = chosen.codec.sample_rate(),
                 carrier_payload_type = chosen.payload_type,
                 carrier_octet_aligned = chosen.octet_aligned,
-                veth_codec = "PCMU",
-                veth_sample_rate = 8000,
-                transcoding = chosen.codec != NegotiatedCodec::Pcmu,
+                veth_codec = veth.codec.codec.name(),
+                veth_sample_rate = veth.codec.codec.sample_rate(),
+                transcoding,
                 "call answered and bridged"
             );
 
@@ -1034,6 +1047,10 @@ fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall) {
 /// Result of Agent A's veth-facing UAS answering Agent B's inbound call.
 struct VethUasResult {
     rtp_socket: UdpSocket,
+    /// The codec this UAS answered Agent B's offer with — `L16/16000` when the
+    /// carrier leg is wideband and PJSIP offered it, PCMU otherwise. The media
+    /// path must speak exactly this.
+    codec: sdp::ChosenCodec,
 }
 
 /// Starts a background thread listening for Agent B's veth-side `INVITE`
@@ -1045,6 +1062,7 @@ struct VethUasResult {
 /// actually reaches it.
 fn spawn_veth_uas_listener(
     veth_local_ip: IpAddr,
+    wideband: bool,
 ) -> BridgeResult<mpsc::Receiver<BridgeResult<VethUasResult>>> {
     let sip_socket = UdpSocket::bind((veth_local_ip, VETH_SIP_PORT))
         .map_err(|e| BridgeError::Ims(format!("veth SIP socket bind failed: {e}")))?;
@@ -1054,7 +1072,7 @@ fn spawn_veth_uas_listener(
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(accept_veth_invite(&sip_socket, veth_local_ip));
+        let _ = tx.send(accept_veth_invite(&sip_socket, veth_local_ip, wideband));
     });
     Ok(rx)
 }
@@ -1062,6 +1080,7 @@ fn spawn_veth_uas_listener(
 fn accept_veth_invite(
     sip_socket: &UdpSocket,
     veth_local_ip: IpAddr,
+    wideband: bool,
 ) -> BridgeResult<VethUasResult> {
     let mut buf = [0u8; 4096];
     let (n, peer) = sip_socket
@@ -1086,10 +1105,11 @@ fn accept_veth_invite(
         .port();
 
     let session_id: u64 = rand::random::<u32>() as u64;
-    // No AMR-WB fallback on this internal leg — Agent B's PJSIP always
-    // offers PCMU (fixed 8kHz media config, pjsua-safe/src/endpoint.rs).
-    let (answer_sdp, _codec) =
-        sdp::build_answer(veth_local_ip, rtp_port, session_id, &offer, false)?;
+    // No AMR on this internal leg — Agent B's PJSIP offers PCMU always and
+    // (with its 16 kHz conference bridge) L16/16000, which `build_veth_answer`
+    // takes whenever the carrier leg has wideband worth carrying.
+    let (answer_sdp, codec) =
+        sdp::build_veth_answer(veth_local_ip, rtp_port, session_id, &offer, wideband)?;
     let to_tag = random_hex(4);
     let contact = format!("<sip:agent-a@{veth_local_ip}:{VETH_SIP_PORT}>");
     let response = build_200_ok_invite(&req, &to_tag, &contact, &answer_sdp);
@@ -1118,7 +1138,7 @@ fn accept_veth_invite(
         .connect(rtp_dst)
         .map_err(|e| BridgeError::Ims(format!("veth RTP connect to {rtp_dst} failed: {e}")))?;
 
-    Ok(VethUasResult { rtp_socket })
+    Ok(VethUasResult { rtp_socket, codec })
 }
 
 fn spawn_relay(a: UdpSocket, b: UdpSocket, stop: Arc<AtomicBool>) {

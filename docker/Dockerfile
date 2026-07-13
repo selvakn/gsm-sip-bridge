@@ -28,9 +28,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# PJSIP's build-time config: enables L16/16000, which the VoWiFi bridge's
+# wideband path needs and which pjproject does not register by default.
+COPY docker/pjsip-config-site.h /tmp/config_site.h
+
 RUN wget -q "https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSION}.tar.gz" && \
     tar xzf "${PJSIP_VERSION}.tar.gz" && \
     cd "pjproject-${PJSIP_VERSION}" && \
+    cp /tmp/config_site.h pjlib/include/pj/config_site.h && \
     ./configure --prefix=/usr/local --disable-shared --enable-static \
         --disable-video --disable-v4l2 --with-external-pa=no \
         CFLAGS="-fPIC" && \

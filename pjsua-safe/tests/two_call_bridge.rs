@@ -27,6 +27,9 @@ fn ep_config(local_port: u16) -> EndpointConfig {
         transport: TransportType::Udp,
         local_port,
         tls_verify: false,
+        // 16 kHz: the wideband conference bridge Agent B runs, so this
+        // exercises the same media config the real VoWiFi bridge uses.
+        clock_rate: 16000,
         jb_init_ms: 20,
         jb_min_pre: 1,
         jb_max_ms: 40,

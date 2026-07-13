@@ -111,6 +111,11 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
         transport,
         local_port: AGENT_B_SIP_LOCAL_PORT,
         tls_verify: config.sip.tls_verify == TlsVerify::Strict,
+        // Everything crossing PJMEDIA's conference bridge is resampled to this
+        // rate, so it is the ceiling on what the PBX leg can carry: at 8000, a
+        // carrier's 16 kHz AMR-WB would be squeezed through 8 kHz here even if
+        // the PBX had happily agreed to G.722.
+        clock_rate: if config.vowifi.wideband { 16000 } else { 8000 },
         jb_init_ms: config.audio.settings.jb_init_ms,
         jb_min_pre: config.audio.settings.jb_min_pre,
         jb_max_ms: config.audio.settings.jb_max_ms,
@@ -126,6 +131,9 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
     endpoint
         .set_null_sound_device()
         .map_err(|e| BridgeError::Ims(format!("null sound device setup failed: {e}")))?;
+    if config.vowifi.wideband {
+        prioritize_wideband_codecs(&endpoint);
+    }
 
     let acc_config = AccountConfig {
         sip_server: config.sip.server.clone(),
@@ -171,6 +179,45 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
         }
     }
     Ok(())
+}
+
+/// PJSIP's G.722 codec id. Wideband (16 kHz internally, whatever RFC 3551's
+/// historical `G722/8000` rtpmap says), built into pjproject with no external
+/// library, and understood by every mainstream PBX without an extra module —
+/// which is why it, rather than Opus, is what the PBX leg reaches for.
+const G722_CODEC_ID: &str = "G722/16000/1";
+/// PJSIP's 16 kHz linear-PCM codec id — uncompressed, and used only on the
+/// veth link to Agent A (see `ims::sdp::NegotiatedCodec::L16`).
+const L16_16K_CODEC_ID: &str = "L16/16000/1";
+
+/// Make Agent B's two calls offer the codecs a wideband bridge needs: G.722
+/// first (what the PBX should pick), and L16/16000 enabled so it appears in the
+/// offer at all (what Agent A picks on the veth link, by name — so its low
+/// priority here doesn't matter; it only keeps L16 out of the PBX's way).
+///
+/// Priorities are endpoint-global, and best-effort: a PJSIP build missing
+/// either codec just logs a warning and carries on. Nothing here can fail a
+/// call — without G.722 the PBX leg falls back to PCMU, and without L16 the
+/// veth link does, which is exactly how this bridge behaved before wideband.
+fn prioritize_wideband_codecs(endpoint: &Endpoint) {
+    for (codec_id, priority) in [(G722_CODEC_ID, 200), (L16_16K_CODEC_ID, 1)] {
+        if let Err(e) = endpoint.set_codec_priority(codec_id, priority) {
+            tracing::warn!(
+                codec = codec_id,
+                error = %e,
+                "could not set codec priority; this PJSIP build may not have the codec"
+            );
+        }
+    }
+    tracing::info!(
+        codecs = ?endpoint
+            .codecs()
+            .iter()
+            .filter(|c| c.priority > 0)
+            .map(|c| (c.id.clone(), c.priority))
+            .collect::<Vec<_>>(),
+        "PJSIP codecs offered, in priority order"
+    );
 }
 
 fn handle_connection(

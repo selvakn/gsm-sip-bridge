@@ -48,11 +48,31 @@ pub fn is_sip_peer_disconnected() -> bool {
     SIP_PEER_DISCONNECTED.swap(false, Ordering::AcqRel)
 }
 
+/// The conference bridge's clock rate, in Hz, as configured by the endpoint
+/// that created it. Read by the ringback tone generator, whose port PJMEDIA
+/// requires to run at exactly the bridge's rate — creating it at a hardcoded
+/// 8000 while the bridge runs at 16000 makes `pjsua_conf_add_port` fail and
+/// leaves a call ringing in silence.
+#[cfg(feature = "pjsip-linked")]
+static CONF_CLOCK_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8000);
+
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
     pub transport: TransportType,
     pub local_port: u16,
     pub tls_verify: bool,
+    /// Clock rate (Hz) of the PJMEDIA conference bridge and of the sound
+    /// device. Everything crossing the bridge is resampled to this rate, so it
+    /// is the ceiling on audio bandwidth for the whole process: at 8000 a
+    /// wideband codec is negotiable but pointless, since PJMEDIA downsamples
+    /// it into the bridge and back out again.
+    ///
+    /// The circuit-switched GSM bridge uses 8000 — its audio comes off the
+    /// modem's 8 kHz USB sound device, so there is no wideband to preserve.
+    /// The VoWiFi bridge's Agent B uses 16000, which is what lets a carrier's
+    /// AMR-WB call reach the PBX as G.722 without being squeezed through 8 kHz
+    /// on the way (`specs/011-vowifi-sip-bridge/`).
+    pub clock_rate: u32,
     /// PJMEDIA jitter-buffer initial pre-fill (ms). 0 = PJMEDIA default (~80 ms).
     pub jb_init_ms: i32,
     /// PJMEDIA jitter-buffer minimum pre-fetch frames.
@@ -77,6 +97,28 @@ pub enum TransportType {
     Udp,
     Tcp,
     Tls,
+}
+
+/// One codec PJSIP has registered, as `Endpoint::codecs` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecInfo {
+    /// Unique id, e.g. `"PCMU/8000/1"` or `"G722/16000/1"` — the string
+    /// `Endpoint::set_codec_priority` takes.
+    pub id: String,
+    /// 0-255; 0 means disabled.
+    pub priority: u8,
+}
+
+/// A `pj_str_t` is a pointer/length pair over memory PJSIP owns, and is not
+/// NUL-terminated — so it must be read by length, not as a C string.
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe fn pj_str_to_string(s: &pjsua_sys::pj_str_t) -> String { // SAFETY: caller passes a pj_str_t PJSIP filled in; ptr/slen are valid together
+    if s.ptr.is_null() || s.slen <= 0 {
+        return String::new();
+    }
+    let bytes = std::slice::from_raw_parts(s.ptr as *const u8, s.slen as usize);
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 pub struct Endpoint {
@@ -111,9 +153,10 @@ impl Endpoint {
 
                 let mut media_cfg: pjsua_sys::pjsua_media_config = std::mem::zeroed();
                 pjsua_sys::pjsua_media_config_default(&mut media_cfg);
-                media_cfg.clock_rate = 8000;
-                media_cfg.snd_clock_rate = 8000;
+                media_cfg.clock_rate = config.clock_rate;
+                media_cfg.snd_clock_rate = config.clock_rate;
                 media_cfg.channel_count = 1;
+                CONF_CLOCK_RATE.store(config.clock_rate, Ordering::Relaxed);
                 media_cfg.no_vad = if config.vad_enabled { 0 } else { 1 };
                 media_cfg.ec_tail_len = 0;
                 media_cfg.quality = 10;
@@ -248,6 +291,70 @@ impl Endpoint {
 
         #[cfg(not(feature = "pjsip-linked"))]
         Ok(())
+    }
+
+    /// Every audio codec PJSIP has registered, with its current priority.
+    /// Useful both for choosing what to prioritize and for logging what this
+    /// build actually shipped with — whether G.722 or Opus is present depends
+    /// on how pjproject was configured, not on anything in this crate.
+    pub fn codecs(&self) -> Vec<CodecInfo> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            self.ensure_thread_registered();
+            unsafe // SAFETY: pjsua started; array and count are sized together per the pjsua_enum_codecs contract
+            {
+                let mut infos: [pjsua_sys::pjsua_codec_info; 32] = std::mem::zeroed();
+                let mut count: std::os::raw::c_uint = infos.len() as std::os::raw::c_uint;
+                if pjsua_sys::pjsua_enum_codecs(infos.as_mut_ptr(), &mut count) != PJ_SUCCESS {
+                    return Vec::new();
+                }
+                return infos[..count as usize]
+                    .iter()
+                    .map(|info| CodecInfo {
+                        id: pj_str_to_string(&info.codec_id),
+                        priority: info.priority,
+                    })
+                    .collect();
+            }
+        }
+        #[cfg(not(feature = "pjsip-linked"))]
+        Vec::new()
+    }
+
+    /// Set a codec's priority: 0 disables it entirely, higher values win, and
+    /// the order codecs appear in our SDP offer follows it. `codec_id` is the
+    /// id `codecs()` reports (e.g. `"G722/16000/1"`); PJSIP also accepts a
+    /// partial id, which matches every codec sharing that prefix.
+    ///
+    /// Priorities are endpoint-global, not per-call. Agent B's two calls (PBX
+    /// and veth) therefore share one offer order — which is fine, because the
+    /// only peer that *must* land on a specific codec is Agent A, and it picks
+    /// from our offer by its own rules rather than by our ordering.
+    pub fn set_codec_priority(&self, codec_id: &str, priority: u8) -> Result<(), PjsipError> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            self.ensure_thread_registered();
+            unsafe // SAFETY: pjsua started; pj_str_t borrows codec_id, which outlives the call
+            {
+                let id = pjsua_sys::pj_str_t {
+                    ptr: codec_id.as_ptr() as *mut std::os::raw::c_char,
+                    slen: codec_id.len() as pjsua_sys::pj_ssize_t,
+                };
+                let status = pjsua_sys::pjsua_codec_set_priority(&id, priority);
+                if status != PJ_SUCCESS {
+                    return Err(PjsipError::MediaPort(format!(
+                        "pjsua_codec_set_priority({codec_id}, {priority}) returned {status}"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            let _ = (codec_id, priority);
+            Ok(())
+        }
     }
 
     /// Register two calls to be conference-bridged to *each other* once both
@@ -633,15 +740,20 @@ unsafe fn start_ringback_tone() { // SAFETY: Called only from PJSIP call-state c
 
     let name = CString::new("ringback").unwrap();
     let mut port: *mut pjsua_sys::pjmedia_port = std::ptr::null_mut();
+    // A conference port must run at the bridge's own clock rate, or
+    // `pjsua_conf_add_port` below rejects it.
+    let clock_rate = CONF_CLOCK_RATE.load(Ordering::Relaxed);
     let status = pjsua_sys::pjmedia_tonegen_create(
-        pool, 8000, // clock rate
-        1,    // channel count
-        160,  // samples per frame (20ms)
-        16,   // bits per sample
-        0,    // options
+        pool,
+        clock_rate,
+        1,               // channel count
+        clock_rate / 50, // samples per frame (20ms)
+        16,              // bits per sample
+        0,               // options
         &mut port,
     );
     if status != PJ_SUCCESS || port.is_null() {
+        tracing::warn!(status, clock_rate, "ringback tone generator creation failed");
         return;
     }
 

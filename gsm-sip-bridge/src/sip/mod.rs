@@ -87,6 +87,11 @@ impl SipBridge {
             transport,
             local_port: self.config.local_port,
             tls_verify: self.config.tls_verify == TlsVerify::Strict,
+            // The circuit-switched bridge's audio comes off the modem's 8 kHz
+            // USB sound device, so there is no wideband to preserve and no
+            // reason to run the conference bridge any faster. (The VoWiFi
+            // bridge's Agent B does run at 16 kHz — see `crate::vowifi`.)
+            clock_rate: 8000,
             jb_init_ms: self.config.jb_init_ms,
             jb_min_pre: self.config.jb_min_pre,
             jb_max_ms: self.config.jb_max_ms,
