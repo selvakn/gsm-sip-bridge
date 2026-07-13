@@ -207,10 +207,18 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
       `$PCSCF:5060` running unchanged (FR-012). Container logs must show
       connecting/established/rekeyed/reauth/disconnected/retrying transitions (FR-010)
       (depends on T022)
-- [ ] T024 [US1] **LIVE** Forced-outage drill per quickstart.md §3: ≤60 s WAN interruption →
+- [X] T024 [US1] **LIVE** Forced-outage drill per quickstart.md §3: ≤60 s WAN interruption →
       back in service ≤90 s, netns + veth + agent PIDs untouched throughout (SC-002, US1
       acceptance scenario 2) (depends on T023; agents present via Phase 5's T026 or run
-      without agents and verify netns/iface only, then re-verify after Phase 5)
+      without agents and verify netns/iface only, then re-verify after Phase 5). **PASS,
+      exceeding the bar**: a real 60s outage was injected (a scoped `ip route add blackhole`
+      to just the ePDG's IP — surgical, no other host traffic affected), confirmed to
+      actually trigger DPD ("sending DPD request" + 3 retransmits while blocked, real
+      evidence the outage was genuine, not a no-op). The IKE_SA never needed to be
+      re-established at all — same SPI pair throughout, weathered via IKEv2's own
+      retransmission (MOBIKE support noted earlier in the session) — and charon/both
+      agents' PIDs, the `ims` netns, and both veth interfaces were all byte-for-byte
+      identical before/during/after, with zero re-registration events logged.
 - [ ] T025 [US1] **LIVE** 24 h rekey soak per quickstart.md §4: ≥1 carrier-scheduled rekey
       (and any re-auth — US2 acceptance scenario 2 closes here), zero tunnel-attributable
       agent restarts, `/tmp/pcscf` still valid at the end (SC-001, US1 acceptance
@@ -272,9 +280,15 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
       only the veth+agent tail moved into a shared function, called at the same point with the
       same commands. The **LIVE** spot check (real tunnel-up + agents against a live carrier)
       still needs hardware access.
-- [ ] T030 [US4] **LIVE** Engine-switch drill per quickstart.md §6: `strongswan` → `swu` →
+- [X] T030 [US4] **LIVE** Engine-switch drill per quickstart.md §6: `strongswan` → `swu` →
       `strongswan` on the same image, env-only changes, tunnel + agents return each time
-      (SC-005, US4 acceptance scenario 2) (depends on T029)
+      (SC-005, US4 acceptance scenario 2) (depends on T029). **PASS**, exercised as a real
+      round trip across this session rather than an isolated drill: started from a live
+      `swu` deployment (running 3h prior to this session), switched to `strongswan` via
+      `.env`'s `TUNNEL_ENGINE` + `docker compose up --build` (no image/compose changes) —
+      proven repeatedly across T018/T019/T024/T027 — then switched back to `swu` the same
+      way. Both directions came up clean: real tunnel, veth, both agents registered, no
+      manual intervention beyond the env edit + restart.
 
 **Checkpoint**: safe rollback exists; proving period can run in production.
 
@@ -312,11 +326,12 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
       - **SC-001** (24h unattended uptime through a rekey) — **NOT RUN**, needs a real 24h
         window (T025) — genuinely not attempted this session (would hold the live SWu bridge
         down for a full day; deferred to a dedicated window with the user's separate go-ahead).
-      - **SC-002** (outage recovery ≤90s) — **NOT RUN** as the specific forced-outage drill
-        (T024), but the underlying mechanism it tests is now proven live: the supervisor loop
-        (post-churn-fix) correctly detects a missing CHILD_SA and re-initiates, and did so
-        organically several times this session (see commit 501b6fb/80261f1), each time
-        recovering within the observed 30s poll cadence.
+      - **SC-002** (outage recovery ≤90s) — **PASS**, exceeding the bar (T024): a real 60s
+        outage (scoped blackhole route to just the ePDG's IP) confirmed via actual DPD
+        activity in charon's log, not a no-op. The IKE_SA never even needed
+        re-establishment — same SPI pair throughout, weathered via IKEv2 retransmission —
+        and charon/both agents' PIDs, the `ims` netns, and both veth interfaces were
+        byte-for-byte identical before/during/after.
       - **SC-003** (inbound call ≤5s even ≥12h after start) — **Immediate case: PASS.** A real
         inbound call was answered and bridged well under 5s with real two-way audio; see T027.
         The ≥12h-later repeat still needs T025's soak.
@@ -324,14 +339,15 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
         cleanly 3 times: real IKE_SA + CHILD_SA established against Airtel's actual ePDG using
         the SIM inside the EC200U via AT+CSIM, zero PC/SC hardware. **Vi: not run** (no Vi SIM
         available this session) — see T019's notes.
-      - **SC-005** (engine switch is config-only) — **NOT RUN** as the full drill (T030), but
-        this session's own operation *was* exactly this: `.env`'s `TUNNEL_ENGINE` was flipped
-        to `strongswan`, the container rebuilt/restarted via plain `docker compose up`, tested,
-        and (per the plan) will be flipped back to `swu` and restarted the same way to restore
-        the pre-session state — the mechanism SC-005 asks for, exercised in both directions.
+      - **SC-005** (engine switch is config-only) — **PASS** (T030): a real round trip across
+        this session — started from a live `swu` deployment (running 3h prior), switched to
+        `strongswan` via `.env`'s `TUNNEL_ENGINE` + `docker compose up --build` (no other
+        changes), proven repeatedly, then switched back to `swu` the same way. Both
+        directions came up clean with no manual intervention beyond the env edit + restart.
       - **SC-006** (`swu` path regression-free) — **PASS**. Diff-confirmed byte-for-byte
         equivalence (T029) plus a direct re-run reaching the same dialer-launch point as
-        pre-feature behavior.
+        pre-feature behavior, and now also a real post-strongswan restoration to full
+        working `swu` state (T030), healthy and both agents registered.
 
       **Still not flagging the Option-1-removal follow-up**: T025's 24h soak and a Vi-side
       SC-004 check are the two pieces of live evidence still missing before `strongswan` can be
