@@ -143,6 +143,47 @@ extract_latest_pcscf() {
     echo "$v6"
 }
 
+# --- strongswan engine only: idempotently ensure the netns + pre-created
+# XFRM interface exist (T020, FR-005/FR-011). Called once at startup and
+# again by the reliability supervisor below if the interface is ever found
+# missing while charon still reports the CHILD_SA established — observed
+# live: the SA/policy can stay ESTABLISHED/INSTALLED in swanctl's view even
+# after the tun23 netdevice itself has vanished from the kernel (root cause
+# not confirmed — reproduced once, not on a subsequent 18-minute run), which
+# leaves every packet ENETUNREACH despite the tunnel looking healthy.
+# Recreating the interface alone doesn't restore the negotiated addresses —
+# the supervisor pairs this with a `swanctl --terminate`+`--initiate` cycle.
+ensure_epdg_interface() {
+    if [ ! -e "/var/run/netns/$NETNS" ]; then
+        ip netns add "$NETNS"
+        log "created netns $NETNS"
+    else
+        log "netns $NETNS already exists, reusing"
+    fi
+    ip netns exec "$NETNS" ip link set lo up
+
+    if ! ip netns exec "$NETNS" ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
+        if ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
+            # Leftover in the default netns from a previous run that didn't
+            # get moved — absorb rather than fail (idempotent startup).
+            ip link set "$STRONGSWAN_TUN_IFACE" netns "$NETNS"
+        else
+            ip link add "$STRONGSWAN_TUN_IFACE" type xfrm if_id "$STRONGSWAN_IF_ID"
+            ip link set "$STRONGSWAN_TUN_IFACE" netns "$NETNS"
+        fi
+        log "created XFRM interface $STRONGSWAN_TUN_IFACE (if_id=$STRONGSWAN_IF_ID) in netns $NETNS"
+    else
+        log "XFRM interface $STRONGSWAN_TUN_IFACE already in netns $NETNS, reusing"
+    fi
+    ip netns exec "$NETNS" ip link set "$STRONGSWAN_TUN_IFACE" up
+    ip netns exec "$NETNS" ip route replace default dev "$STRONGSWAN_TUN_IFACE" 2>/dev/null || true
+    ip netns exec "$NETNS" ip -6 route replace default dev "$STRONGSWAN_TUN_IFACE" 2>/dev/null || true
+    # Received IPsec traffic gets dropped if IPsec policy isn't disabled on
+    # the interface itself (osmocom wiki's Option 2 walkthrough — "Very
+    # important", reason unknown/FIXME upstream too).
+    ip netns exec "$NETNS" sh -c "echo 1 > /proc/sys/net/ipv6/conf/$STRONGSWAN_TUN_IFACE/disable_policy" 2>/dev/null || true
+}
+
 # --- Shared tail: veth pair + both VoWiFi bridge agents -------------------
 # Called by either engine once its tunnel is up and $PCSCF_ADDR is known.
 # Identical regardless of engine (FR-007/FR-006 — the agents don't know or
@@ -210,40 +251,15 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     # --- Idempotent netns + XFRM interface (T020, FR-005/FR-011) -----------
     # Pre-created once, here, by the entrypoint — not by charon or the
     # updown script — so it survives every future rekey/reconnect: only
-    # ims.updown's address install/remove touches it after this point.
-    # File-existence check, not `ip netns list | grep -x`: once an
-    # interface lives in the namespace, iproute2 annotates the list output
-    # with an id ("ims (id: 1)"), breaking an exact-name match — confirmed
-    # by testing (a second entrypoint run against an already-populated
-    # namespace mismatched and tried `ip netns add` again).
-    if [ ! -e "/var/run/netns/$NETNS" ]; then
-        ip netns add "$NETNS"
-        log "created netns $NETNS"
-    else
-        log "netns $NETNS already exists, reusing"
-    fi
-    ip netns exec "$NETNS" ip link set lo up
-
-    if ! ip netns exec "$NETNS" ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
-        if ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
-            # Leftover in the default netns from a previous run that didn't
-            # get moved — absorb rather than fail (idempotent startup).
-            ip link set "$STRONGSWAN_TUN_IFACE" netns "$NETNS"
-        else
-            ip link add "$STRONGSWAN_TUN_IFACE" type xfrm if_id "$STRONGSWAN_IF_ID"
-            ip link set "$STRONGSWAN_TUN_IFACE" netns "$NETNS"
-        fi
-        log "created XFRM interface $STRONGSWAN_TUN_IFACE (if_id=$STRONGSWAN_IF_ID) in netns $NETNS"
-    else
-        log "XFRM interface $STRONGSWAN_TUN_IFACE already in netns $NETNS, reusing"
-    fi
-    ip netns exec "$NETNS" ip link set "$STRONGSWAN_TUN_IFACE" up
-    ip netns exec "$NETNS" ip route replace default dev "$STRONGSWAN_TUN_IFACE" 2>/dev/null || true
-    ip netns exec "$NETNS" ip -6 route replace default dev "$STRONGSWAN_TUN_IFACE" 2>/dev/null || true
-    # Received IPsec traffic gets dropped if IPsec policy isn't disabled on
-    # the interface itself (osmocom wiki's Option 2 walkthrough — "Very
-    # important", reason unknown/FIXME upstream too).
-    ip netns exec "$NETNS" sh -c "echo 1 > /proc/sys/net/ipv6/conf/$STRONGSWAN_TUN_IFACE/disable_policy" 2>/dev/null || true
+    # ims.updown's address install/remove touches it after this point (in
+    # the common case; the reliability supervisor below also recreates it
+    # on the rare occasions it's found missing). File-existence check, not
+    # `ip netns list | grep -x`: once an interface lives in the namespace,
+    # iproute2 annotates the list output with an id ("ims (id: 1)"),
+    # breaking an exact-name match — confirmed by testing (a second
+    # entrypoint run against an already-populated namespace mismatched and
+    # tried `ip netns add` again).
+    ensure_epdg_interface
 
     # --- Render the swanctl connection (T021) -------------------------------
     if [ -n "$IMSI" ]; then
@@ -384,6 +400,25 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     (
         while true; do
             sleep 30
+
+            # Observed live: tun23 can vanish from the kernel entirely while
+            # swanctl still reports the CHILD_SA ESTABLISHED/INSTALLED — the
+            # "^ims:" check below would never catch this (the SA is right
+            # there in the output), yet every packet gets ENETUNREACH with
+            # no interface to route through. Root cause not confirmed
+            # (reproduced once in ~30 min of live testing, not on a
+            # subsequent 18-minute run) — recreate the interface and force
+            # a clean terminate+reinitiate rather than trying to patch the
+            # existing (already-desynced) SA state back onto it.
+            if ! ip netns exec "$NETNS" ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
+                log "$STRONGSWAN_TUN_IFACE missing from netns $NETNS (SA state alone doesn't catch this); recreating and forcing reinitiate"
+                ensure_epdg_interface
+                swanctl --terminate --ike ims >/dev/null 2>&1 || true
+                swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
+                pkill -f vowifi-ims-agent 2>/dev/null || true
+                continue
+            fi
+
             SAS_OUTPUT="$(swanctl --list-sas 2>/dev/null)"
             # A here-string, not a pipe: grep reads it from an fd bash
             # already fully wrote, so there's no live producer process for
