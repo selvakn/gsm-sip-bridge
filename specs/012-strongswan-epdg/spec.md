@@ -13,6 +13,30 @@ SIM that lives inside the EC200U modem via AT+CSIM (there is no PC/SC card reade
 Rust agents must keep working unchanged. The SWu-IKEv2 path stays available as a deploy-time
 fallback until strongSwan is proven against both carriers."
 
+## Clarifications
+
+### Session 2026-07-13
+
+- Q: Do we still need the dedicated `ims` network namespace if we are using strongSwan? → A:
+  **Yes — keep it.** strongSwan removes the namespace's *fragility* (it now survives
+  reconnects), not the *need* for it: the namespace keeps the SIP-layer Gm IPsec state
+  (`ims/gm_ipsec.rs` installs its own transport-mode XFRM SAs/policies) in its own kernel XFRM
+  database, separated from the tunnel engine's tunnel-mode policies in the default namespace;
+  it makes carrier-assigned RFC1918 inner/P-CSCF addresses structurally collision-proof
+  against LAN/Docker address space; and it preserves the unchanged 011 two-agent/veth
+  architecture (FR-007). A single-namespace design (virtual IP + policy routing) was
+  considered and rejected.
+- Q: With multiple cards from the same carrier, can one tunnel carry multiple registrations —
+  or does tunnel setup need credentials from the SIM? → A: **The tunnel is cryptographically
+  bound to one SIM**: IKE_AUTH runs EAP-AKA against that card (IMSI-derived NAI, RAND/AUTN
+  answered by that SIM), and the assigned inner address is that subscriber's PDN session, which
+  the carrier correlates with the IMS registration. One tunnel = one line; N cards need N
+  tunnels + N registrations. Feature 012 stays single-line in scope but must be
+  **multi-ready**: no newly hardcoded single-line assumptions (see FR-013) — a future
+  multi-line feature adds strongSwan connections via configuration, not rework (one charon
+  supports N connections; the legacy SWu dialer cannot run N instances, another reason for
+  this migration).
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Tunnel survives unattended long-running operation (Priority: P1)
@@ -157,7 +181,9 @@ agents bridge a call in both configurations.
   automatically, indefinitely (no bounded retry count that gives up permanently).
 - **FR-005**: The `ims` network namespace, the tunnel interface inside it, and the veth link to
   the default namespace MUST persist across tunnel reconnects and rekeys (only the tunnel's
-  addresses/keys may change).
+  addresses/keys may change). The dedicated namespace is a deliberate, retained design element
+  under both engines — not an Option 1 artifact (see Clarifications: Gm-IPsec separation,
+  carrier-address isolation, unchanged agent architecture).
 - **FR-006**: The P-CSCF address(es) assigned by the carrier during tunnel establishment MUST
   be published to the same location the bridge agents already read
   (`/tmp/pcscf` by default), refreshed on every (re)connect.
@@ -177,6 +203,11 @@ agents bridge a call in both configurations.
 - **FR-012**: The keepalive mechanism that prevents carrier-side idle timeout of the tunnel
   MUST be preserved (operators drop idle tunnels; ICMP is filtered, so the existing TCP-based
   keepalive to the P-CSCF stays).
+- **FR-013**: The feature MUST NOT introduce new hardcoded single-line assumptions: the
+  namespace name, tunnel interface identifier, virtual-reader address/port, and modem port
+  MUST remain parametrized (current defaults preserved), so that a future multi-card feature
+  can instantiate additional tunnels — one per SIM, as the carrier architecture requires (see
+  Clarifications) — by adding configuration rather than reworking this one.
 
 ### Key Entities
 
@@ -184,7 +215,9 @@ agents bridge a call in both configurations.
   the encrypted tunnel; one of `strongswan` (new) or `swu` (legacy), selected at deploy time.
 - **VoWiFi Line**: The carrier-facing service made available through the tunnel — characterized
   by carrier identity (MCC/MNC), the SIM identity (IMSI, read at runtime), assigned inner
-  address(es), and assigned P-CSCF address(es).
+  address(es), and assigned P-CSCF address(es). Bound 1:1 to a SIM: the tunnel authenticates
+  with that card's credentials (EAP-AKA) and its inner address is that subscription's session,
+  so a line can never be shared across cards (see Clarifications).
 - **SIM Authentication Channel**: The path by which EAP-AKA challenges reach the SIM — the
   modem's AT port, shared with other subsystems, exclusive per transaction.
 
@@ -220,6 +253,9 @@ agents bridge a call in both configurations.
   creation); no new host-level privileges are assumed beyond what feature 011 already requires.
 - The 24 h soak (SC-001) and long-idle call (SC-003) are operator-run live verifications, not
   CI — consistent with how features 003–011 validated carrier-facing behavior.
-- One tunnel/one SIM at a time stays the scope; multi-line support remains out of scope.
+- One tunnel/one SIM at a time stays the scope; multi-line support remains out of scope —
+  but per Clarifications (FR-013), the design stays multi-ready: a future multi-card feature
+  scales by adding one tunnel per SIM through configuration, which the strongSwan engine
+  supports and the legacy dialer does not.
 - IPv4 remains the preferred inner address family when the carrier offers both (matches current
   agent behavior of preferring the IPv4 P-CSCF).

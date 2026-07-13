@@ -66,6 +66,10 @@ config templates). No new crate.
 - With `TUNNEL_ENGINE=swu`, `entrypoint.sh` behavior must remain equivalent to today's (SC-006).
 - Both engines ship in the one Alpine/musl image (FR-009); Python stays until the fallback is
   retired (follow-up feature).
+- Multi-ready, single-line (FR-013, from clarification): a tunnel is bound 1:1 to a SIM
+  (EAP-AKA), so multi-card VoWiFi means one tunnel per card later — nothing new may hardcode
+  the netns name, `if_id`, vpcd port, or modem port beyond their existing parametrized
+  defaults (`NETNS`, `MODEM_PORT`, `--vpcd-port`, etc.).
 
 **Scale/Scope**: Single SIM / single tunnel / one call at a time — unchanged from 011.
 
