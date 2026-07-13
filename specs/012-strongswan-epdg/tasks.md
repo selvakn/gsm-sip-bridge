@@ -37,16 +37,16 @@ vpcd Docker build stages, and the config-template surface. Nothing here makes an
 scenario pass on its own, but T005 is where the biggest non-code risk (fork-on-musl) gets
 burned down, so it goes first, not last.
 
-- [ ] T001 Create `gsm-sip-bridge/src/vowifi/usim_bridge.rs` (empty module) and register
+- [X] T001 Create `gsm-sip-bridge/src/vowifi/usim_bridge.rs` (empty module) and register
       `pub mod usim_bridge;` in `gsm-sip-bridge/src/vowifi/mod.rs`
-- [ ] T002 [P] Add `VowifiUsimBridge` (args: `--modem`, `--vpcd-host` default `127.0.0.1`,
+- [X] T002 [P] Add `VowifiUsimBridge` (args: `--modem`, `--vpcd-host` default `127.0.0.1`,
       `--vpcd-port` default `35963`) and `VowifiImsi` (arg: `--modem`) variants to the
       `Commands` enum in `gsm-sip-bridge/src/cli.rs`, mirroring `ImsRegisterArgs`' style
-- [ ] T003 Wire both new variants into the pre-daemon dispatch in
+- [X] T003 Wire both new variants into the pre-daemon dispatch in
       `gsm-sip-bridge/src/main.rs` (mirroring `Commands::ImsRegister`/`ImsCall` handling),
       initially calling stub handlers that log "not yet implemented" and exit non-zero
       (depends on T001, T002)
-- [ ] T004 [P] Create `docker/strongswan/` config templates per research.md items 3/4/9:
+- [X] T004 [P] Create `docker/strongswan/` config templates per research.md items 3/4/9:
       `charon-logging.conf` (filelog → `/tmp/charon.log`, `ike = 1`, `cfg = 1`,
       `flush_line = yes`), `p-cscf.conf` (`load = yes`, `enable { ims = yes }`),
       `osmo-epdg.conf` (`load = no`), `charon-extra.conf` (`install_virtual_ip = no`,
@@ -55,17 +55,17 @@ burned down, so it goes first, not last.
       `@MCC@` `@MNC@` `@EPDG_IP@` `@SRC_ADDR@`, `keyingtries = 0`, `dpd_delay = 30s`), and
       `ims.updown` handling **both** `up-client`/`down-client` and `-v6` variants
       (wiki's script only did v6 — research.md item 3 verify-note)
-- [ ] T005 [P] Add `strongswan-builder` stage to `docker/Dockerfile`: clone
+- [X] T005 [P] Add `strongswan-builder` stage to `docker/Dockerfile`: clone
       `https://gitea.osmocom.org/ims-volte-vowifi/strongswan-epdg.git` branch `jolly/work`,
       `autoreconf -if`, `./configure` with `--enable-eap-aka --enable-eap-sim
       --enable-eap-sim-pcsc --enable-p-cscf --enable-openssl` (+ minimal plugin set),
       `make install` into a staging tree. **Burn down research.md item 8's musl risk here**;
       if the fork trips on musl, carry a patch in `docker/patches/` (precedent: the SWu patch)
       or fall back to a Debian-built static stage — record the outcome in research.md
-- [ ] T006 [P] Add `vpcd-builder` stage to `docker/Dockerfile`: build vsmartcard's
+- [X] T006 [P] Add `vpcd-builder` stage to `docker/Dockerfile`: build vsmartcard's
       `virtualsmartcard` (autotools, `pcsc-lite-dev`), staging the vpcd IFD-handler `.so` and
       its `/etc/reader.conf.d/vpcd` snippet; pin a commit/tag for reproducibility
-- [ ] T007 Extend the runtime stage in `docker/Dockerfile`: add the `pcsc-lite` daemon
+- [X] T007 Extend the runtime stage in `docker/Dockerfile`: add the `pcsc-lite` daemon
       package, COPY the strongSwan staging tree, vpcd driver + reader conf, and
       `docker/strongswan/` templates into place. Acceptance: image builds; `charon --version`
       and `swanctl --version` run; pcscd starts and lists the vpcd reader; the SWu/Python

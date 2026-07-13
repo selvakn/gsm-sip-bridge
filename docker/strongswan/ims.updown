@@ -1,0 +1,46 @@
+#!/bin/sh
+# charon updown script for the "ims" CHILD_SA (specs/012-strongswan-epdg).
+# Installs/removes the carrier-assigned inner address on the pre-created
+# XFRM interface living inside network namespace "$NETNS" — the interface
+# and namespace themselves are created once by docker/entrypoint.sh and
+# never touched here (research.md item 3: this is what lets rekeys and
+# reconnects swap addresses without ever deleting the namespace, FR-005).
+#
+# The osmocom wiki's own ims.updown only handles the "-v6" verbs (its
+# example carrier only assigned IPv6). This one handles both address
+# families, since carriers here have been observed assigning IPv4-only,
+# IPv6-only, or both (docs/vowifi-epdg-research-notes.md).
+#
+# NETNS/TUN_IFACE default to the same values docker/entrypoint.sh uses;
+# both are inherited from the container environment set before charon
+# starts, kept overridable here (not hardcoded) per FR-013.
+set -u
+
+NETNS="${NETNS:-ims}"
+TUN_IFACE="${STRONGSWAN_TUN_IFACE:-tun23}"
+
+log() { echo "[ims.updown] $*" >&2; }
+
+case "$PLUTO_VERB:$1" in
+up-client:* | up-client-v6:*)
+    if [ -z "${PLUTO_MY_CLIENT:-}" ]; then
+        log "no PLUTO_MY_CLIENT set on $PLUTO_VERB; nothing to install"
+        exit 0
+    fi
+    log "installing $PLUTO_MY_CLIENT on $TUN_IFACE in netns $NETNS"
+    ip netns exec "$NETNS" ip addr add "$PLUTO_MY_CLIENT" dev "$TUN_IFACE" 2>/dev/null || true
+    ;;
+down-client:* | down-client-v6:*)
+    if [ -z "${PLUTO_MY_CLIENT:-}" ]; then
+        log "no PLUTO_MY_CLIENT set on $PLUTO_VERB; nothing to remove"
+        exit 0
+    fi
+    log "removing $PLUTO_MY_CLIENT from $TUN_IFACE in netns $NETNS"
+    ip netns exec "$NETNS" ip addr del "$PLUTO_MY_CLIENT" dev "$TUN_IFACE" 2>/dev/null || true
+    ;;
+*)
+    log "unhandled verb '$PLUTO_VERB' (arg: '$1') — ignoring"
+    ;;
+esac
+
+exit 0

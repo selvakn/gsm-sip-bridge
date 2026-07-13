@@ -67,6 +67,17 @@ pub enum Commands {
     /// Query the running VoWiFi agents for current registration health and
     /// recent call outcomes.
     VowifiStatus,
+    /// Bridges strongSwan's `eap-sim-pcsc` plugin (via pcscd's `vpcd`
+    /// virtual reader) to the SIM inside the modem, forwarding APDUs over
+    /// `AT+CSIM` (specs/012-strongswan-epdg). Long-running — supervised by
+    /// `docker/entrypoint.sh` alongside charon, in the container's default
+    /// network namespace (where the modem device and pcscd both live).
+    VowifiUsimBridge(VowifiUsimBridgeArgs),
+    /// Prints the SIM's IMSI (via `AT+CIMI`) and exits. Used by
+    /// `docker/entrypoint.sh` to render the strongSwan swanctl connection's
+    /// EAP identity without hand-parsing `AT+CIMI` in bash — the same
+    /// "ask the binary" precedent as `config vowifi-enabled`.
+    VowifiImsi(VowifiImsiArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -176,6 +187,29 @@ pub struct ImsCallArgs {
     /// How long to hold the call open (exchanging audio) once answered.
     #[arg(long, default_value_t = 15)]
     pub call_duration_secs: u64,
+}
+
+#[derive(Parser, Debug)]
+pub struct VowifiUsimBridgeArgs {
+    /// Modem AT port used for AT+CSIM (EAP-AKA APDUs forwarded from the
+    /// virtual PC/SC reader to the SIM inside the modem)
+    #[arg(long)]
+    pub modem: PathBuf,
+
+    /// Host running the vpcd virtual smart-card reader (pcscd's vpcd driver)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub vpcd_host: String,
+
+    /// TCP port vpcd listens on
+    #[arg(long, default_value_t = 35963)]
+    pub vpcd_port: u16,
+}
+
+#[derive(Parser, Debug)]
+pub struct VowifiImsiArgs {
+    /// Modem AT port used for AT+CIMI
+    #[arg(long)]
+    pub modem: PathBuf,
 }
 
 #[derive(Parser, Debug)]
