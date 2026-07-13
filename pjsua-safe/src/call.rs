@@ -81,11 +81,23 @@ impl Call {
                     &msg_data as *const _
                 };
 
+                // One audio stream, nothing else. PJSUA 2.16 defaults
+                // `txt_cnt` to 1, which puts a T.140 `m=text` section in every
+                // offer — a stream nothing here bridges, whose payload types
+                // are numbered independently of the audio section's (it reuses
+                // 100 for `red/1000`, colliding with audio's L16), and which
+                // our own SDP answer in `ims::agent` doesn't echo back at all.
+                let mut opt: pjsua_sys::pjsua_call_setting = std::mem::zeroed();
+                pjsua_sys::pjsua_call_setting_default(&mut opt);
+                opt.aud_cnt = 1;
+                opt.vid_cnt = 0;
+                opt.txt_cnt = 0;
+
                 let mut call_id: pjsua_sys::pjsua_call_id = -1;
                 let status = pjsua_sys::pjsua_call_make_call(
                     _account.account_id(),
                     &uri,
-                    std::ptr::null(),
+                    &opt,
                     std::ptr::null_mut(),
                     msg_data_ptr,
                     &mut call_id,
