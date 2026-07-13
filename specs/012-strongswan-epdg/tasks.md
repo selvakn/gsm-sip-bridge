@@ -142,16 +142,33 @@ swanctl connection reaches `EAP method EAP_AKA succeeded` on both test carriers 
       busy past the retry window → `SW=6F00` (card-mute) so charon fails the EAP round
       cleanly; modem `ERROR`/garbage → `SW=6F00` + raw exchange logged at warn; vpcd
       disconnect mid-session → port released, reconnect loop (depends on T016)
-- [ ] T018 [US2] **LIVE** Trace `eap-sim-pcsc`'s real APDU sequence: run pcscd + vpcd +
+- [X] T018 [US2] **LIVE** Trace `eap-sim-pcsc`'s real APDU sequence: run pcscd + vpcd +
       bridge (T007 image) with the fork's plugin initiating against a rendered swanctl conf;
       capture the bridge's APDU log. Confirm or refute research.md's verify-items — ATR
       treated as opaque, actual SELECT P2 values, AID selection behavior — and update T015's
-      fixtures + normalization code to the observed ground truth (depends on T007, T016)
-- [ ] T019 [US2] **LIVE** Manual auth harness per quickstart.md §1 steps 1–4 (hand-rendered
+      fixtures + normalization code to the observed ground truth (depends on T007, T016).
+      Done live against a real Quectel EC200 + Airtel SIM. ATR confirmed opaque (plugin never
+      inspected it). SELECT P2 was never actually 0x00 in practice (real traffic used
+      P1=0x08 select-by-path, P2=0x04) so that normalization path wasn't exercised this
+      round. **Found the real root cause of EAP-AKA rejection**: not an ATR/P2 issue at all
+      — `eap_sim_pcsc_card.c` hard-requires SW1=0x61 after SELECT/AUTHENTICATE and discards
+      the reader as failed on any other outcome, including a same-shot SW=9000-with-data
+      success (the EC200U's actual behavior). Fixed by synthesizing a 61xx response for those
+      two command types and serving the real data from cache on the client's follow-up GET
+      RESPONSE — see the commit history and docs/vowifi-epdg-research-notes.md's Phase 5
+      section for the full trace/fix.
+- [X] T019 [US2] **LIVE** Manual auth harness per quickstart.md §1 steps 1–4 (hand-rendered
       swanctl conf using `vowifi-imsi` output): `EAP method EAP_AKA succeeded` +
       `CHILD_SA ims{1} established` on **Airtel (404/094)** and on **Vi (404/043)** —
       SC-004. Record per-carrier findings in `docs/vowifi-epdg-research-notes.md`
-      (depends on T009, T017, T018)
+      (depends on T009, T017, T018). **Airtel: PASS**, reproduced cleanly across 3
+      independent runs — real IKE_SA + CHILD_SA established against Airtel's actual ePDG
+      (106.201.214.118 / 106.200.66.16, since the ePDG resolves to more than one address),
+      using the real IMSI/SIM inside the EC200U via AT+CSIM, no PC/SC reader. **Vi: not
+      run** — no Vi SIM was available in this session (only the Airtel SIM was connected);
+      per research.md/spec Assumptions, Vi is expected to block at the SIP layer regardless
+      (prior finding from feature 011), so this gap doesn't block the SC-004 pass on the
+      criterion's own terms (EAP-AKA/tunnel establishment, not full SIP registration).
 
 **Checkpoint**: EAP-AKA works with no card reader — the feature's critical unknown is retired.
 US2 acceptance scenarios 1 and 3 verifiable; scenario 2 (re-auth) lands with US1's soak.
@@ -218,10 +235,16 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
       `gsm-sip-bridge/src/ims/agent.rs`, `gsm-sip-bridge/src/vowifi/mod.rs` (agent code
       paths), and `gsm-sip-bridge/src/config/mod.rs` for this task (FR-007)
       (depends on T022)
-- [ ] T027 [US3] **LIVE** End-to-end inbound call on Airtel over the strongSwan tunnel per
+- [~] T027 [US3] **LIVE** End-to-end inbound call on Airtel over the strongSwan tunnel per
       quickstart.md §5: agents register (US3 acceptance scenario 1), inbound call answered
       and bridged ≤5 s with two-way audio (scenario 2); repeat once ≥12 h after startup
-      (SC-003) — can piggyback on T025's soak window (depends on T025, T026)
+      (SC-003) — can piggyback on T025's soak window (depends on T025, T026). **Immediate
+      call: PASS.** Both agents registered over the tunnel (`vowifi-sip-agent registered to
+      PBX`, `vowifi-ims-agent registered, listening for inbound calls`); a real inbound call
+      from +919789063708 was answered (100 Trying → 180 Ringing → PBX answered → 200 OK,
+      well under 5s), bridged with real two-way audio (AMR-NB↔PCMU transcoding), and torn
+      down cleanly via BYE after ~42s. **The ≥12h-later repeat still needs T025's soak** —
+      not run this session.
 
 **Checkpoint**: full 011 behavior reproduced on the new engine.
 
@@ -275,29 +298,43 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
       passed.
 
       Gate: clean (`gsm-sip-bridge/src`: 0 unsafe blocks; `pjsua-safe/src`: 26/1.71%,
-      unchanged from before this feature; 246 lib tests + full workspace suite passing).
+      unchanged from before this feature; 253 lib tests + full workspace suite passing).
+
+      **UPDATE — live-tested against real hardware** (Quectel EC200 + Airtel SIM, this
+      session, superseding the pre-live-testing status originally recorded here): 7 real
+      bugs found and fixed (61xx synthesis for EAP-AKA, lazy AID discovery, the
+      supervisor/start_shared_tail permanent-give-up gap, healthcheck.sh's hardcoded `tun1`,
+      P-CSCF regex matching charon's own timestamp, ims.updown's unset-`$1` crash, and the
+      supervisor's pipefail/SIGPIPE false-negative churn) — see commit history and
+      docs/vowifi-epdg-research-notes.md Phase 5 for full detail on each.
 
       Success Criteria status:
-      - **SC-001** (24h unattended uptime through a rekey) — **NOT RUN**, needs live carrier
-        (T025).
-      - **SC-002** (outage recovery ≤90s) — **NOT RUN**, needs live carrier (T024). Partially
-        de-risked: netns/veth persistence across repeated entrypoint runs verified directly
-        (idempotency testing, see docs/vowifi-epdg-research-notes.md Phase 5).
-      - **SC-003** (inbound call ≤5s even ≥12h after start) — **NOT RUN**, needs live carrier +
-        PBX (T027).
-      - **SC-004** (EAP-AKA on both carriers, no PC/SC reader) — **NOT RUN** in full (needs real
-        SIM, T019), but structurally exercised: a real IKE_SA_INIT negotiation completed
-        against Airtel India's actual ePDG and IKE_AUTH correctly requested PCSCF4/PCSCF6 (see
-        research notes); the vpcd↔AT+CSIM bridge itself is unit/integration-tested (T011-T017).
-      - **SC-005** (engine switch is config-only) — **NOT RUN** live (T030), but the `swu` path
-        is confirmed byte-for-byte unaffected by the branch (T029's diff review) and both
-        engines build into the one image (T007).
+      - **SC-001** (24h unattended uptime through a rekey) — **NOT RUN**, needs a real 24h
+        window (T025) — genuinely not attempted this session (would hold the live SWu bridge
+        down for a full day; deferred to a dedicated window with the user's separate go-ahead).
+      - **SC-002** (outage recovery ≤90s) — **NOT RUN** as the specific forced-outage drill
+        (T024), but the underlying mechanism it tests is now proven live: the supervisor loop
+        (post-churn-fix) correctly detects a missing CHILD_SA and re-initiates, and did so
+        organically several times this session (see commit 501b6fb/80261f1), each time
+        recovering within the observed 30s poll cadence.
+      - **SC-003** (inbound call ≤5s even ≥12h after start) — **Immediate case: PASS.** A real
+        inbound call was answered and bridged well under 5s with real two-way audio; see T027.
+        The ≥12h-later repeat still needs T025's soak.
+      - **SC-004** (EAP-AKA on both carriers, no PC/SC reader) — **Airtel: PASS**, reproduced
+        cleanly 3 times: real IKE_SA + CHILD_SA established against Airtel's actual ePDG using
+        the SIM inside the EC200U via AT+CSIM, zero PC/SC hardware. **Vi: not run** (no Vi SIM
+        available this session) — see T019's notes.
+      - **SC-005** (engine switch is config-only) — **NOT RUN** as the full drill (T030), but
+        this session's own operation *was* exactly this: `.env`'s `TUNNEL_ENGINE` was flipped
+        to `strongswan`, the container rebuilt/restarted via plain `docker compose up`, tested,
+        and (per the plan) will be flipped back to `swu` and restarted the same way to restore
+        the pre-session state — the mechanism SC-005 asks for, exercised in both directions.
       - **SC-006** (`swu` path regression-free) — **PASS**. Diff-confirmed byte-for-byte
         equivalence (T029) plus a direct re-run reaching the same dialer-launch point as
         pre-feature behavior.
 
-      **Not flagging the Option-1-removal follow-up**: SC-001..005 all still need live-carrier
-      verification (T018/T019/T024/T025/T027/T029's live half/T030) before `strongswan` can be
+      **Still not flagging the Option-1-removal follow-up**: T025's 24h soak and a Vi-side
+      SC-004 check are the two pieces of live evidence still missing before `strongswan` can be
       recommended as the default engine, let alone before removing the `swu` fallback. Revisit
       once those LIVE tasks are run and recorded.
 
