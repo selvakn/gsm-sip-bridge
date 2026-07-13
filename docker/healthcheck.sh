@@ -8,17 +8,20 @@ set -uo pipefail
 
 GSM_SIP_BRIDGE_BIN="${GSM_SIP_BRIDGE_BIN:-/usr/local/bin/gsm-sip-bridge}"
 GSM_SIP_BRIDGE_CONFIG="${GSM_SIP_BRIDGE_CONFIG:-/etc/gsm-sip-bridge/config.toml}"
-NETNS="${NETNS:-ims}"
-METRICS_PORT="${METRICS_PORT:-9091}"
+
+# All non-secret configuration lives in config.toml's [vowifi] section (plus
+# [metrics].port) — ask the binary for the resolved values instead of
+# hand-parsing TOML or reading raw env vars (specs/012-strongswan-epdg
+# config consolidation; see docker/entrypoint.sh for the same pattern).
+eval "$("$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config vowifi-shell-env)" || exit 1
+
 # Tunnel interface name depends on TUNNEL_ENGINE (specs/012-strongswan-epdg):
 # "tun1" for the swu engine (named by the SWu-IKEv2 dialer itself), the
-# strongswan engine's own XFRM interface otherwise. Must track
-# docker/entrypoint.sh's TUNNEL_ENGINE/STRONGSWAN_TUN_IFACE defaults —
-# hardcoding "tun1" here made every strongswan-engine container report
+# strongswan engine's own XFRM interface (STRONGSWAN_TUN_IFACE) otherwise.
+# Hardcoding "tun1" here made every strongswan-engine container report
 # unhealthy regardless of real tunnel state (found by live-testing).
-TUNNEL_ENGINE="${TUNNEL_ENGINE:-strongswan}"
 if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
-    TUN_IFACE="${STRONGSWAN_TUN_IFACE:-tun23}"
+    TUN_IFACE="$STRONGSWAN_TUN_IFACE"
 else
     TUN_IFACE="tun1"
 fi

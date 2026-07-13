@@ -645,3 +645,12 @@ still open, not a claim that every proving criterion in spec.md has
 passed. `swu` remains fully supported as an explicit fallback
 (`TUNNEL_ENGINE=swu`) for exactly that reason. Revisit whether to retire
 `swu` entirely once the soak and the Vi check are run.
+
+**Post-hoc note**: the engine selector (and every other env var this phase
+introduced — MCC/MNC/APN/NETNS/keepalive/veth names/strongswan
+iface/if_id/vpcd host+port/IMSI override) was later moved from `.env`/raw
+process env vars into `config.toml`'s `[vowifi]` section as
+`tunnel_engine` (config consolidation — `.env` now holds secrets only; see
+`docker/entrypoint.sh` and `docs/configuration.md`). All engine-switch
+narration above ("a plain `.env` edit") describes how it was tested at the
+time; switching is now a `config.toml` edit + restart instead.

@@ -18,7 +18,7 @@ discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
 db_path = "/data/store.db"
 
 [metrics]
-port = 9091                    # overridden by METRICS_PORT env var if set
+port = 9091
 
 [modules]
 retry_interval_sec = 30        # range: 5-600
@@ -124,3 +124,43 @@ control_port = 7050
 # before, over a PCMU veth link. Set false to keep every leg at 8 kHz (e.g. if
 # the PBX mishandles a G.722 offer).
 wideband = true
+# --- ePDG tunnel + docker/entrypoint.sh / healthcheck.sh settings ---------
+# Everything below used to be read from env vars (MCC/MNC/APN/TUNNEL_ENGINE/
+# etc. in .env) — it now lives here instead, so .env only ever holds secrets
+# (specs/012-strongswan-epdg config consolidation). docker/entrypoint.sh
+# fetches these via `gsm-sip-bridge config vowifi-shell-env`.
+#
+# APN used by the swu engine's dialer.
+apn = "ims"
+# Network namespace the ePDG tunnel lives in.
+netns = "ims"
+# ePDG FQDN to resolve via DNS. Leave unset to derive the 3GPP-standard name
+# from mcc/mnc above (epdg.epc.mnc<mnc>.mcc<mcc>.pub.3gppnetwork.org).
+# epdg_fqdn = "epdg.epc.mnc094.mcc404.pub.3gppnetwork.org"
+# Skip DNS resolution and dial this ePDG IP directly. Leave unset to resolve
+# epdg_fqdn at startup.
+# epdg_ip = "1.2.3.4"
+# Force this as the tunnel's local source address. Leave unset to let the
+# kernel/charon pick one via routing to the ePDG.
+# src_addr = "192.0.2.10"
+# Idle-tunnel keepalive interval (seconds) — a TCP connect to the P-CSCF's
+# SIP port (operators commonly filter ICMP over the tunnel).
+keepalive_interval_sec = 20
+# veth pair names between Agent A (ims netns) and Agent B (default netns).
+veth_sip_iface = "veth-sip"
+veth_ims_iface = "veth-ims"
+# ePDG tunnel engine: "strongswan" (proper IKE rekeying/re-auth/DPD/MOBIKE,
+# netns survives reconnects — the default) or "swu" (the original SWu-IKEv2
+# Python dialer, kept as an explicit fallback until strongswan is proven
+# against every carrier — see specs/012-strongswan-epdg/tasks.md).
+tunnel_engine = "strongswan"
+# strongswan engine only: XFRM interface name/if_id created inside netns.
+strongswan_tun_iface = "tun23"
+strongswan_if_id = 23
+# strongswan engine only: pcscd's vpcd virtual smart-card reader, bridged to
+# the modem's SIM by vowifi-usim-bridge.
+vpcd_host = "127.0.0.1"
+vpcd_port = 35963
+# strongswan engine only: use this IMSI instead of reading it from the SIM
+# via AT+CIMI. Diagnostic escape hatch — leave unset normally.
+# imsi_override = "404940123456789"
