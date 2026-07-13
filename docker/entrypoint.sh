@@ -428,8 +428,10 @@ else
     # may not exist yet, and every step below that touches "$NETNS" fails with
     # "Cannot open network namespace" / "Invalid netns value" if it loses.
     log "waiting for tunnel (P-CSCF assignment + netns/tun1 setup) ..."
+    CONNECTED=0
     for _ in $(seq 1 90); do
         if grep -q "STATE CONNECTED" "$LOG" 2>/dev/null; then
+            CONNECTED=1
             break
         fi
         if ! kill -0 "$SWU_PID" 2>/dev/null; then
@@ -438,6 +440,17 @@ else
         fi
         sleep 2
     done
+    # A live-but-never-connected dialer (stuck retrying internally, or wedged)
+    # used to fall through to a WARNING and just leave the container running
+    # with neither VoWiFi agent ever started — silently degraded forever,
+    # since `restart: unless-stopped` only triggers on container *exit*, not
+    # on this kind of internal stall (found via review, Greptile PR #2). Fail
+    # fast instead so Docker actually restarts the container and retries the
+    # whole dialer + tunnel setup from scratch.
+    if [ "$CONNECTED" -ne 1 ]; then
+        log "FATAL: tunnel did not reach STATE CONNECTED within 180s (see $LOG)"
+        exit 1
+    fi
 
     # Extract first P-CSCF (prefer IPv4).
     PCSCF="$(grep 'P-CSCF IPV4 ADDRESS' "$LOG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
@@ -447,25 +460,32 @@ else
     fi
 
     if [ -z "$PCSCF" ] && [ -z "$PCSCF6" ]; then
-        log "WARNING: could not confirm P-CSCF assignment; leaving dialer running (inspect log)."
-    else
-        PCSCF_ADDR="${PCSCF:-$PCSCF6}"
-        log "tunnel UP. P-CSCF: $PCSCF_ADDR"
-        echo "$PCSCF_ADDR" > /tmp/pcscf
-        ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
-        # Keepalive — idle SWu tunnels drop after a while. Use a TCP connect to the
-        # P-CSCF's SIP port rather than ping: operators commonly filter ICMP over
-        # the tunnel (confirmed on Vodafone India) while the SIP port stays open.
-        (
-            while true; do
-                ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
-                sleep "$KEEPALIVE_INTERVAL"
-            done
-        ) &
-        KEEPALIVE_PID=$!
-
-        start_shared_tail "$PCSCF_ADDR"
+        # STATE CONNECTED implies the P-CSCF address line already appeared
+        # (the dialer prints it earlier, in the IKE_AUTH response handler —
+        # see the comment above this loop), so reaching this point means log
+        # parsing itself is broken, not a normal timing race. Same fail-fast
+        # reasoning as the timeout case above: better a container restart
+        # than a bridge that looks up but has no working VoWiFi agents.
+        log "FATAL: STATE CONNECTED but no P-CSCF address found in $LOG"
+        exit 1
     fi
+
+    PCSCF_ADDR="${PCSCF:-$PCSCF6}"
+    log "tunnel UP. P-CSCF: $PCSCF_ADDR"
+    echo "$PCSCF_ADDR" > /tmp/pcscf
+    ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
+    # Keepalive — idle SWu tunnels drop after a while. Use a TCP connect to the
+    # P-CSCF's SIP port rather than ping: operators commonly filter ICMP over
+    # the tunnel (confirmed on Vodafone India) while the SIP port stays open.
+    (
+        while true; do
+            ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
+            sleep "$KEEPALIVE_INTERVAL"
+        done
+    ) &
+    KEEPALIVE_PID=$!
+
+    start_shared_tail "$PCSCF_ADDR"
 fi
 
 # --- Block on everything -----------------------------------------------------
