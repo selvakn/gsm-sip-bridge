@@ -116,3 +116,11 @@ pcscf_source_path = "/tmp/pcscf"
 veth_local_addr = "10.99.0.1"
 veth_peer_addr = "10.99.0.2"
 control_port = 7050
+# Carry the carrier's wideband (16 kHz) audio all the way to the PBX instead of
+# narrowing it to 8 kHz at the first hop: Agent A prefers the carrier's AMR-WB
+# over its PCMU, hands it to Agent B as L16/16000 over the veth link, and Agent
+# B offers G.722 to the PBX from a 16 kHz conference bridge. Narrowband calls
+# are unaffected — a carrier offering only PCMU or AMR-NB is bridged exactly as
+# before, over a PCMU veth link. Set false to keep every leg at 8 kHz (e.g. if
+# the PBX mishandles a G.722 offer).
+wideband = true

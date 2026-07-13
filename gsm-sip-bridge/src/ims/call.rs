@@ -53,6 +53,7 @@ impl CodecParams {
                 rtp_payload_type: AMR_WB_RTP_PAYLOAD_TYPE,
             },
             NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
+            NegotiatedCodec::L16 => unreachable!("{L16_UNREACHABLE}"),
         }
     }
 }
@@ -63,6 +64,11 @@ impl CodecParams {
 /// (AMR-NB arrives only on carrier-originated *inbound* offers, which the
 /// bridge handles in `ims::agent`/`ims::transcode`.)
 const AMR_NB_UNREACHABLE: &str = "ims-call never offers AMR-NB, so parse_answer cannot select it";
+/// Same reasoning for L16: it exists only on the VoWiFi bridge's internal veth
+/// link between Agent A and Agent B (`ims::sdp::NegotiatedCodec::L16`), is
+/// never offered to a carrier, and so can never be what a carrier answered
+/// this module's outbound offer with.
+const L16_UNREACHABLE: &str = "ims-call never offers L16, so parse_answer cannot select it";
 
 pub struct CallConfig {
     pub register: ImsRegisterConfig,
@@ -342,6 +348,7 @@ fn run_rtp_session(
             ),
             NegotiatedCodec::Pcmu => None,
             NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
+            NegotiatedCodec::L16 => unreachable!("{L16_UNREACHABLE}"),
         };
         let mut buf = [0u8; 2048];
         while !stop_recv.load(Ordering::Relaxed) {
@@ -371,6 +378,7 @@ fn run_rtp_session(
                                 .to_vec()
                         }
                         NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
+                        NegotiatedCodec::L16 => unreachable!("{L16_UNREACHABLE}"),
                     };
                     wav.write_samples(&samples)?;
                 }
@@ -399,6 +407,7 @@ fn run_rtp_session(
         ),
         NegotiatedCodec::Pcmu => None,
         NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
+        NegotiatedCodec::L16 => unreachable!("{L16_UNREACHABLE}"),
     };
     let mut sent_wav = cfg
         .record_sent_path
@@ -446,6 +455,7 @@ fn run_rtp_session(
                 payload
             }
             NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
+            NegotiatedCodec::L16 => unreachable!("{L16_UNREACHABLE}"),
         };
 
         let pkt =

@@ -41,9 +41,9 @@ two processes joined by a `veth` pair that `docker/entrypoint.sh` creates automa
   `crate::vowifi::VETH_SIP_PORT` that Agent B's PJSIP dials into once it decides to bridge a call.
   Both reuse the same `SipRequest`/`build_*` primitives in `ims/sip_client.rs` — only the
   carrier-facing side needs IMS-AKA/Gm-IPsec.
-- Relays RTP between the two legs as raw UDP byte-forwarding (`relay_rtp`), not
-  decode/re-encode — both legs are PCMU by construction (an AMR-WB-only carrier offer is declined,
-  since there's no transcode path to Agent B's fixed-PCMU PJSIP leg yet).
+- Relays RTP between the two legs, either as raw UDP byte-forwarding (`relay_rtp`, when both legs
+  agreed on PCMU) or by terminating the codec on each side and re-encoding (`ims/transcode.rs`) —
+  see the audio path below.
 - Answers `vowifi-status` registration-health queries on `crate::vowifi::AGENT_A_STATUS_PORT`.
 
 ## Agent B — `gsm-sip-bridge/src/vowifi/mod.rs`
@@ -65,6 +65,37 @@ slot to slot 0 (the sound device). This feature generalizes that: a `BRIDGE_PAIR
 (`Endpoint::pair_calls`/`unpair_call`) lets two calls be paired to bridge to *each other* instead.
 A call with no pairing registered falls back to the original slot-0 behavior unchanged — this is
 the only path the CS-GSM bridge exercises, so its behavior is byte-for-byte unmodified (FR-006).
+
+## The audio path — where the sample rate is decided
+
+A carrier's VoWiFi call is often **AMR-WB: real 16 kHz wideband audio**. Getting it to the PBX
+intact means nothing along the way may be 8 kHz — and three things in this bridge independently
+could be. With `[vowifi].wideband = true` (the default):
+
+| hop | codec | who decides |
+|---|---|---|
+| carrier → Agent A | AMR-WB / 16 kHz | `sdp::select_codec` prefers AMR-WB over PCMU |
+| Agent A → Agent B (veth) | L16 / 16 kHz | `sdp::select_veth_codec`; Agent A decodes AMR-WB and sends the PCM uncompressed |
+| Agent B's PJMEDIA conference bridge | 16 kHz | `EndpointConfig::clock_rate` |
+| Agent B → PBX | G.722 / 16 kHz | `prioritize_wideband_codecs` ranks G.722 above PCMU |
+
+The veth link is uncompressed (`L16/16000`, RFC 3551) on purpose: it is a point-to-point link
+inside one container, so its 256 kbit/s costs nothing, it is lossless, and it means Agent A — which
+speaks RTP by hand — needs no new codec at all, since decoding AMR-WB already leaves it holding
+16 kHz PCM. G.722 is likewise chosen over Opus because pjproject builds it in with no external
+library and every mainstream PBX already speaks it.
+
+**Narrowband still works, unchanged.** A carrier that offers only PCMU or AMR-NB (both 8 kHz —
+Airtel sends both shapes) is answered exactly as before, with the veth link staying on PCMU: byte
+passthrough for PCMU, transcode for AMR-NB. Each fallback is independent, so a PJSIP build without
+L16, or a PBX that won't take G.722, degrades one hop rather than failing the call. `[vowifi].wideband
+= false` puts every leg back at 8 kHz.
+
+Two build-time facts this rests on, both in `docker/`: pjproject registers **L16 only at 44.1 kHz**
+unless told otherwise, so `docker/pjsip-config-site.h` sets `PJMEDIA_CODEC_L16_HAS_16KHZ_MONO`; and
+G.722 needs nothing. The negotiated codec and rate of every leg is logged when a call connects —
+Agent A logs `carrier_codec`/`veth_codec` with their sample rates, and `on_call_media_state_cb`
+logs what PJSIP settled on with the PBX.
 
 ## Agent A ↔ Agent B control channel — `gsm-sip-bridge/src/vowifi/control.rs`
 

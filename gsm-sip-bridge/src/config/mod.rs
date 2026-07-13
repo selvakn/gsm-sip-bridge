@@ -67,6 +67,7 @@ const VOWIFI_KEYS: &[&str] = &[
     "veth_local_addr",
     "veth_peer_addr",
     "control_port",
+    "wideband",
 ];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
@@ -323,6 +324,19 @@ pub struct VowifiConfig {
     /// TCP port the Agent A↔B control channel listens on/connects to over
     /// the veth link (`contracts/agent-control-protocol.md`).
     pub control_port: u16,
+    /// Carry the carrier's wideband audio all the way to the PBX instead of
+    /// narrowing it to 8 kHz at the first hop.
+    ///
+    /// With this on, Agent A prefers the carrier's AMR-WB (16 kHz) over its
+    /// PCMU, hands it to Agent B as `L16/16000` over the veth link, and Agent B
+    /// runs a 16 kHz PJMEDIA conference bridge offering G.722 to the PBX. With
+    /// it off, every leg is 8 kHz — the behavior before wideband existed.
+    ///
+    /// Narrowband calls are unaffected either way: a carrier that offers only
+    /// PCMU or AMR-NB (both 8 kHz) is answered and bridged exactly as before,
+    /// with the veth link staying on PCMU. Turn this off only if the PBX
+    /// mishandles a G.722 offer.
+    pub wideband: bool,
 }
 
 impl Default for VowifiConfig {
@@ -338,6 +352,7 @@ impl Default for VowifiConfig {
             veth_local_addr: "10.99.0.1".to_string(),
             veth_peer_addr: "10.99.0.2".to_string(),
             control_port: 7050,
+            wideband: true,
         }
     }
 }
@@ -1127,6 +1142,11 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_u16_port(v, "vowifi.control_port"))
         .transpose()?
         .unwrap_or(defaults.control_port);
+    let wideband = t
+        .get("wideband")
+        .map(|v| as_bool(v, "vowifi.wideband"))
+        .transpose()?
+        .unwrap_or(defaults.wideband);
 
     Ok(VowifiConfig {
         enabled,
@@ -1139,6 +1159,7 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         veth_local_addr,
         veth_peer_addr,
         control_port,
+        wideband,
     })
 }
 
