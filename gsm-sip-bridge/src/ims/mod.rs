@@ -1,6 +1,6 @@
 //! IMS-AKA SIP REGISTER — an alternate mode alongside the existing GSM->SIP
 //! voice flow, for registering to a mobile operator's IMS core over a
-//! VoWiFi/ePDG tunnel (see `docker/epdg/`) using the SIM inside the modem.
+//! VoWiFi/ePDG tunnel (see `docker/`) using the SIM inside the modem.
 //!
 //! ## Why this doesn't go through the existing PJSIP-backed `SipBridge`
 //!
@@ -23,12 +23,14 @@
 //! request/response transaction directly instead.
 
 pub mod agent;
+mod amr_rtp;
 pub mod call;
 mod digest;
 mod gm_ipsec;
 mod rtp;
 mod sdp;
 mod sip_client;
+mod transcode;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::at_commander::AtCommander;
@@ -56,6 +58,9 @@ pub struct ImsRegisterConfig {
     pub mnc: String,
     /// Overrides the IMSI read from the SIM via AT+CIMI, if set.
     pub imsi: Option<String>,
+    /// Overrides the IMEI read from the modem via AT+CGSN, if set. Sent as
+    /// the Contact header's `+sip.instance` — see `sip_client::RegisterRequest::imei`.
+    pub imei: Option<String>,
     pub use_tcp: bool,
     /// Advertise `Supported: sec-agree` and a `Security-Client: ipsec-3gpp`
     /// proposal (RFC 3329 / TS 24.229 Annex H) on every REGISTER. Some
@@ -94,6 +99,12 @@ struct RegisteredSession {
     realm: String,
     public_uri: String,
     local_addr: SocketAddr,
+    /// The address the network reaches us on — our Gm protected *server*
+    /// port (`port-s`), not `local_addr` (the *client* port we send from).
+    /// Every `Contact` we advertise must carry this, or nothing
+    /// network-initiated can ever be delivered. See
+    /// `sip_client::RegisterRequest::contact_addr`.
+    contact_addr: SocketAddr,
     use_tcp: bool,
     /// Next `CSeq` to use for a request on this session (already advanced
     /// past whatever REGISTER used).
@@ -106,6 +117,16 @@ struct RegisteredSession {
 }
 
 impl RegisteredSession {
+    /// Our Gm **protected server port** (`port-s`) endpoint — where the
+    /// network opens connections to deliver everything it originates
+    /// (reg-event `NOTIFY`s, mobile-terminating `INVITE`s). `None` when the
+    /// registration negotiated no Gm SA at all (`--sec-agree` off), in which
+    /// case there is no such port and nothing can be delivered to us.
+    /// See `sip_client::spawn_gm_server`.
+    fn gm_server_addr(&self) -> Option<SocketAddr> {
+        self.gm_state.as_ref().map(|(e, _, _)| e.local_s)
+    }
+
     /// Tear down any installed Gm IPsec state — a one-shot diagnostic CLI
     /// isn't a persistent registration, so kernel XFRM state would
     /// otherwise leak across repeated invocations.
@@ -198,6 +219,12 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
     };
     tracing::info!(imsi = %imsi, "read IMSI from SIM");
 
+    let imei = match &cfg.imei {
+        Some(imei) => imei.clone(),
+        None => at.query_imei()?,
+    };
+    tracing::info!(imei = %imei, "read IMEI from modem");
+
     let aid = usim::discover_usim_aid(&mut at)?;
     usim::select_usim(&mut at, &aid)?;
     tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
@@ -266,6 +293,13 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
         extra_headers.extend(build_security_client_headers(&p));
         proposal = Some(p);
     }
+    // The port the network will deliver to. Chosen up front (it is part of
+    // the Security-Client proposal) so even the first, pre-IPsec REGISTER
+    // advertises it, exactly as a real UE does.
+    let mut contact_addr = match &proposal {
+        Some(p) => SocketAddr::new(local_addr.ip(), p.port_s),
+        None => local_addr,
+    };
     let xfrm_proto = if cfg.use_tcp { "tcp" } else { "udp" };
     // Populated once Gm IPsec SAs are installed, so they can be torn down
     // before this function returns rather than leaking kernel XFRM state
@@ -278,6 +312,7 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
         registrar_uri: &request_uri,
         public_uri: &public_uri,
         local_addr,
+        contact_addr,
         call_id: &call_id,
         from_tag: &from_tag,
         branch: &branch,
@@ -290,6 +325,7 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
             None
         },
         extra_headers: &extra_headers,
+        imei: &imei,
     });
 
     let mut resp = transport.as_mut().unwrap().send_and_recv(&initial)?;
@@ -364,6 +400,7 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
                                     {
                                         Ok(new_transport) => {
                                             local_addr = new_transport.local_addr()?;
+                                            contact_addr = endpoints.local_s;
                                             transport = Some(new_transport);
                                             tracing::info!(local = %local_addr, peer = %new_dst, "reconnected over Gm IPsec transport");
                                             // RFC 3329 §2.4: echo the network's own
@@ -423,6 +460,7 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
             registrar_uri: &request_uri,
             public_uri: &public_uri,
             local_addr,
+            contact_addr,
             call_id: &call_id,
             from_tag: &from_tag,
             branch: &branch,
@@ -431,6 +469,7 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
             transport: via_transport,
             authorization: Some(&auth_header),
             extra_headers: &extra_headers,
+            imei: &imei,
         });
 
         let next_resp = transport.as_mut().unwrap().send_and_recv(&retry)?;
@@ -460,6 +499,7 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
         realm,
         public_uri,
         local_addr,
+        contact_addr,
         use_tcp: cfg.use_tcp,
         cseq: cseq + 1,
         gm_state,

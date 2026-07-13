@@ -52,9 +52,17 @@ impl CodecParams {
                 sample_rate: amr_safe::SAMPLE_RATE,
                 rtp_payload_type: AMR_WB_RTP_PAYLOAD_TYPE,
             },
+            NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
         }
     }
 }
+
+/// `ims-call` places *outbound* calls, and `sdp::build_offer` only ever
+/// offers PCMU and AMR-WB — `sdp::parse_answer` correspondingly only maps
+/// those two payload types, so an AMR-NB answer cannot reach this module.
+/// (AMR-NB arrives only on carrier-originated *inbound* offers, which the
+/// bridge handles in `ims::agent`/`ims::transcode`.)
+const AMR_NB_UNREACHABLE: &str = "ims-call never offers AMR-NB, so parse_answer cannot select it";
 
 pub struct CallConfig {
     pub register: ImsRegisterConfig,
@@ -139,6 +147,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         route_headers: &route_headers,
         via_transport,
         local_addr: session.local_addr,
+        contact_addr: session.contact_addr,
         public_uri: &session.public_uri,
         callee_uri: &callee_uri,
         call_id: &call_id,
@@ -332,6 +341,7 @@ fn run_rtp_session(
                     .map_err(|e| BridgeError::Ims(format!("AMR-WB decoder init failed: {e}")))?,
             ),
             NegotiatedCodec::Pcmu => None,
+            NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
         };
         let mut buf = [0u8; 2048];
         while !stop_recv.load(Ordering::Relaxed) {
@@ -360,6 +370,7 @@ fn run_rtp_session(
                                 .decode(&pkt.payload[1..])
                                 .to_vec()
                         }
+                        NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
                     };
                     wav.write_samples(&samples)?;
                 }
@@ -387,6 +398,7 @@ fn run_rtp_session(
                 .map_err(|e| BridgeError::Ims(format!("AMR-WB encoder init failed: {e}")))?,
         ),
         NegotiatedCodec::Pcmu => None,
+        NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
     };
     let mut sent_wav = cfg
         .record_sent_path
@@ -433,6 +445,7 @@ fn run_rtp_session(
                 payload.extend_from_slice(&encoded);
                 payload
             }
+            NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
         };
 
         let pkt =
@@ -470,7 +483,12 @@ struct InviteParts<'a> {
     request_uri: &'a str,
     route_headers: &'a [String],
     via_transport: &'a str,
+    /// Sent from (Via) — the Gm protected client port.
     local_addr: std::net::SocketAddr,
+    /// Reached at (Contact) — the Gm protected server port, where the far
+    /// end's in-dialog requests (its BYE) are delivered. See
+    /// `super::RegisteredSession::contact_addr`.
+    contact_addr: std::net::SocketAddr,
     public_uri: &'a str,
     callee_uri: &'a str,
     call_id: &'a str,
@@ -482,6 +500,7 @@ struct InviteParts<'a> {
 
 fn build_invite(p: &InviteParts) -> String {
     let via_addr = format_sip_addr(p.local_addr);
+    let contact_addr = format_sip_addr(p.contact_addr);
     let public_user = p.public_uri.split('@').next().unwrap_or(p.public_uri);
     let mut msg = format!(
         "INVITE sip:{request_uri} SIP/2.0\r\n\
@@ -501,7 +520,7 @@ fn build_invite(p: &InviteParts) -> String {
          To: <sip:{callee_uri}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} INVITE\r\n\
-         Contact: <sip:{public_user}@{via_addr};transport={transport}>\r\n\
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>\r\n\
          Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n\
          P-Access-Network-Info: 3GPP-WLAN\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
@@ -514,7 +533,7 @@ fn build_invite(p: &InviteParts) -> String {
         call_id = p.call_id,
         cseq = p.cseq,
         public_user = public_user,
-        via_addr = via_addr,
+        contact_addr = contact_addr,
         transport = p.via_transport,
         body_len = p.body.len(),
         body = p.body,
@@ -625,6 +644,7 @@ mod tests {
             route_headers: &[],
             via_transport: "TCP",
             local_addr: addr,
+            contact_addr: addr,
             public_uri: "12345@realm",
             callee_uri: "+919789063708@realm",
             call_id: "callid",
@@ -639,6 +659,30 @@ mod tests {
         assert!(msg.contains("CSeq: 1 INVITE"));
     }
 
+    /// Via carries the port we send from; Contact carries the Gm protected
+    /// server port the far end's BYE must reach us on.
+    #[test]
+    fn build_invite_advertises_the_protected_server_port_in_contact() {
+        let client: std::net::SocketAddr = "1.2.3.4:48584".parse().unwrap();
+        let server: std::net::SocketAddr = "1.2.3.4:48586".parse().unwrap();
+        let msg = build_invite(&InviteParts {
+            request_uri: "x@realm",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: client,
+            contact_addr: server,
+            public_uri: "u@realm",
+            callee_uri: "x@realm",
+            call_id: "c",
+            from_tag: "f",
+            cseq: 1,
+            branch: "b",
+            body: "",
+        });
+        assert!(msg.contains("Via: SIP/2.0/TCP 1.2.3.4:48584;branch=b;rport\r\n"));
+        assert!(msg.contains("Contact: <sip:u@1.2.3.4:48586;transport=TCP>\r\n"));
+    }
+
     #[test]
     fn build_invite_includes_route_headers_in_order() {
         let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
@@ -648,6 +692,7 @@ mod tests {
             route_headers: &routes,
             via_transport: "TCP",
             local_addr: addr,
+            contact_addr: addr,
             public_uri: "u@realm",
             callee_uri: "x@realm",
             call_id: "c",

@@ -43,6 +43,10 @@ fn main() -> ExitCode {
         return handle_vowifi_status_command(&cli);
     }
 
+    if let Some(Commands::Config(args)) = &cli.command {
+        return handle_config_command(args, &cli);
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"
@@ -169,6 +173,7 @@ fn build_ims_register_config(
         mcc: args.mcc.clone(),
         mnc: args.mnc.clone(),
         imsi: args.imsi.clone(),
+        imei: args.imei.clone(),
         use_tcp: args.tcp,
         sec_agree: args.sec_agree,
         msisdn: args.msisdn.clone(),
@@ -286,6 +291,26 @@ fn handle_vowifi_status_command(cli: &Cli) -> ExitCode {
         Err(code) => return code,
     };
     gsm_sip_bridge::vowifi::print_status(&config.vowifi)
+}
+
+/// Deliberately silent (no stdout/stderr on the success path) — callers
+/// (`docker/entrypoint.sh`) only care about the exit code, e.g.
+/// `if gsm-sip-bridge --config "$CONFIG" config vowifi-enabled; then ...`.
+/// Unlike `load_vowifi_config`, does NOT require `[vowifi].enabled = true`
+/// — that's exactly the thing being checked, not a precondition.
+fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> ExitCode {
+    use gsm_sip_bridge::cli::ConfigSubcommand;
+    match &args.subcommand {
+        ConfigSubcommand::VowifiEnabled => {
+            let Some(path) = cli.config.as_deref() else {
+                return ExitCode::FAILURE;
+            };
+            match load_config(path) {
+                Ok(config) if config.vowifi.enabled => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+    }
 }
 
 fn build_control_cmd(args: &gsm_sip_bridge::cli::CardArgs) -> Result<ControlCmd, String> {

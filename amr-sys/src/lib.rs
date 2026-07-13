@@ -49,3 +49,46 @@ unsafe extern "C" {
 
     pub fn D_IF_exit(state: *mut c_void);
 }
+
+// AMR **narrowband** (`opencore-amrnb`), which — unlike AMR-WB — ships both
+// directions in one library. Needed because a carrier's mobile-terminating
+// VoWiFi INVITE does not always offer AMR-WB: Airtel was observed offering
+// `AMR/8000` alone on some calls, which is unanswerable without this.
+//
+// Same 3GPP reference lineage and the same MIME/storage frame layout as the
+// wideband functions above (one ToC-style header byte, then packed speech),
+// so `amr-safe` wraps both with near-identical code — only the frame size
+// (160 samples @ 8kHz) and the per-mode bit counts differ.
+// Declarations confirmed against `/usr/include/opencore-amrnb/interf_enc.h`
+// and `interf_dec.h`.
+unsafe extern "C" {
+    /// `dtx`: 0 disables discontinuous transmission (we always send speech).
+    pub fn Encoder_Interface_init(dtx: c_int) -> *mut c_void;
+
+    /// Encodes 160 samples (20ms @ 8kHz) at `mode` (0-7, see `amr-safe`'s
+    /// `NbMode`). `out` needs room for 32 bytes (mode 7 @ 12.2kbps, the
+    /// largest: 1 header byte + 31 bytes of speech). `force_speech` = 1
+    /// suppresses comfort-noise frames. Returns bytes written.
+    pub fn Encoder_Interface_Encode(
+        state: *mut c_void,
+        mode: c_int,
+        speech: *const i16,
+        out: *mut c_uchar,
+        force_speech: c_int,
+    ) -> c_int;
+
+    pub fn Encoder_Interface_exit(state: *mut c_void);
+
+    pub fn Decoder_Interface_init() -> *mut c_void;
+
+    /// Decodes one header-byte-prefixed frame to 160 samples (20ms @ 8kHz).
+    /// `bfi` (bad frame indicator) is 0 for a good frame.
+    pub fn Decoder_Interface_Decode(
+        state: *mut c_void,
+        bits: *const c_uchar,
+        synth: *mut i16,
+        bfi: c_int,
+    );
+
+    pub fn Decoder_Interface_exit(state: *mut c_void);
+}

@@ -5,11 +5,16 @@
 use crate::error::{BridgeError, BridgeResult};
 use rand::RngCore;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MSG_LEN: usize = 8192;
+/// How often the Gm server's `accept()` comes up for air to notice that its
+/// `GmServer` handle has been dropped (there is no interruptible `accept`).
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
@@ -318,7 +323,17 @@ pub fn build_486_busy_here(request: &SipRequest, to_tag: &str) -> String {
 pub struct RegisterRequest<'a> {
     pub registrar_uri: &'a str,
     pub public_uri: &'a str,
+    /// Where this request is sent *from* — the Gm protected **client** port
+    /// (`port-c`) once IPsec is up. Goes in `Via` (RFC 3261 §18.1.1).
     pub local_addr: SocketAddr,
+    /// Where the network should reach *us* — the Gm protected **server**
+    /// port (`port-s`), which is a different port from `local_addr` and the
+    /// only one anything network-initiated is delivered to (TS 24.229
+    /// §5.1.1.2: the UE puts the protected server port in `Contact`).
+    /// Advertising `local_addr` here instead points the P-CSCF at our
+    /// outbound socket, where its connection attempt is met with an RST and
+    /// every mobile-terminating request is silently lost.
+    pub contact_addr: SocketAddr,
     pub call_id: &'a str,
     pub from_tag: &'a str,
     pub branch: &'a str,
@@ -333,6 +348,12 @@ pub struct RegisterRequest<'a> {
     /// mandate Gm IPsec negotiation (RFC 3329 / TS 24.229) before accepting
     /// REGISTER.
     pub extra_headers: &'a [String],
+    /// The device IMEI, sent as the `Contact` header's `+sip.instance`
+    /// (`urn:gsma:imei:<imei>`) — real UEs always send their genuine IMEI
+    /// here, not a placeholder. A network's terminating-call routing may
+    /// key off this (device fingerprinting / entitlement checks) even when
+    /// a fake value doesn't stop REGISTER itself from succeeding.
+    pub imei: &'a str,
 }
 
 pub fn format_sip_addr(addr: SocketAddr) -> String {
@@ -344,7 +365,7 @@ pub fn format_sip_addr(addr: SocketAddr) -> String {
 
 pub fn build_register(req: &RegisterRequest) -> String {
     let via_addr = format_sip_addr(req.local_addr);
-    let contact_addr = format_sip_addr(req.local_addr);
+    let contact_addr = format_sip_addr(req.contact_addr);
 
     let mut msg = format!(
         "REGISTER sip:{registrar} SIP/2.0\r\n\
@@ -354,7 +375,7 @@ pub fn build_register(req: &RegisterRequest) -> String {
          To: <sip:{public}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:000000000000000>\"\r\n\
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:{imei}>\"\r\n\
          Expires: {expires}\r\n\
          Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n",
@@ -369,6 +390,7 @@ pub fn build_register(req: &RegisterRequest) -> String {
         contact_addr = contact_addr,
         public_user = req.public_uri.split('@').next().unwrap_or(req.public_uri),
         expires = req.expires,
+        imei = req.imei,
     );
     if let Some(auth) = req.authorization {
         msg.push_str("Authorization: ");
@@ -636,6 +658,7 @@ impl SipTransport {
                         return Ok(Some(SipMessage::Response(resp)));
                     }
                 } else if let Some((req, consumed)) = SipRequest::try_parse(&self.buf)? {
+                    tracing::debug!(request = %self.buf[..consumed], "received SIP request");
                     self.buf.drain(..consumed);
                     return Ok(Some(SipMessage::Request(req)));
                 }
@@ -646,6 +669,306 @@ impl SipTransport {
             }
         }
     }
+}
+
+/// The write half of a SIP connection — cloneable and shareable across
+/// threads, and detached from the reader.
+///
+/// A UAS must answer a request on the connection that request arrived on
+/// (RFC 3261 §18.2.2). Over Gm that is *not* always the connection we
+/// registered over: the network opens a fresh connection to our protected
+/// server port for every mobile-terminating request (see `spawn_gm_server`),
+/// so responses have to be routed back per-message rather than through one
+/// globally-owned transport.
+#[derive(Clone)]
+pub struct SipSink {
+    inner: Arc<SinkInner>,
+}
+
+enum SinkInner {
+    Tcp(Mutex<TcpStream>),
+    /// A server-side UDP socket is not `connect()`ed to one peer, so the
+    /// address to answer is captured per-message from `recv_from`.
+    Udp(UdpSocket, SocketAddr),
+}
+
+impl SipSink {
+    pub fn send(&self, message: &str) -> BridgeResult<()> {
+        tracing::debug!(message = %message, "sending SIP message");
+        match &*self.inner {
+            SinkInner::Tcp(stream) => stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .write_all(message.as_bytes())
+                .map_err(|e| BridgeError::Ims(format!("TCP send failed: {e}"))),
+            SinkInner::Udp(socket, peer) => socket
+                .send_to(message.as_bytes(), peer)
+                .map(|_| ())
+                .map_err(|e| BridgeError::Ims(format!("UDP send failed: {e}"))),
+        }
+    }
+}
+
+impl SipTransport {
+    /// Wrap an already-accepted TCP connection (from the Gm server port).
+    fn from_tcp(stream: TcpStream) -> BridgeResult<Self> {
+        stream
+            .set_read_timeout(Some(RECV_TIMEOUT))
+            .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
+        Ok(Self {
+            socket: Socket::Tcp(stream),
+            buf: String::new(),
+        })
+    }
+
+    /// A cloneable write handle onto this same connection.
+    pub fn sink(&self) -> BridgeResult<SipSink> {
+        let inner = match &self.socket {
+            Socket::Tcp(s) => SinkInner::Tcp(Mutex::new(
+                s.try_clone()
+                    .map_err(|e| BridgeError::Ims(format!("TCP try_clone failed: {e}")))?,
+            )),
+            Socket::Udp(s) => {
+                let peer = s
+                    .peer_addr()
+                    .map_err(|e| BridgeError::Ims(format!("UDP peer_addr failed: {e}")))?;
+                SinkInner::Udp(
+                    s.try_clone()
+                        .map_err(|e| BridgeError::Ims(format!("UDP try_clone failed: {e}")))?,
+                    peer,
+                )
+            }
+        };
+        Ok(SipSink {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// A second handle onto the same connection, for a dedicated reader
+    /// thread. The caller must then read *only* through the returned handle
+    /// and write only through `sink()` — two readers on one socket would
+    /// race for bytes. Any bytes already buffered in `self` stay with `self`
+    /// and would be lost to the reader, so this is only sound while `self`'s
+    /// buffer is empty (i.e. immediately after a completed transaction).
+    pub fn try_clone_reader(&self) -> BridgeResult<Self> {
+        if !self.buf.is_empty() {
+            tracing::warn!(
+                buffered = self.buf.len(),
+                "cloning a SIP transport whose buffer is non-empty; buffered bytes will not reach the reader"
+            );
+        }
+        let socket = match &self.socket {
+            Socket::Tcp(s) => Socket::Tcp(
+                s.try_clone()
+                    .map_err(|e| BridgeError::Ims(format!("TCP try_clone failed: {e}")))?,
+            ),
+            Socket::Udp(s) => Socket::Udp(
+                s.try_clone()
+                    .map_err(|e| BridgeError::Ims(format!("UDP try_clone failed: {e}")))?,
+            ),
+        };
+        Ok(Self {
+            socket,
+            buf: String::new(),
+        })
+    }
+}
+
+/// Owns the Gm protected-server-port listener. Dropping it stops the accept
+/// loop (and, once their peers hang up, the per-connection reader threads).
+pub struct GmServer {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for GmServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Listen on the Gm **protected server port** (`port-s` of the
+/// `Security-Client`/`Security-Server` negotiation, TS 33.203 Annex H) for
+/// network-initiated requests, delivering each one — paired with a `SipSink`
+/// that answers on the connection it came in on — to `tx`.
+///
+/// This is what makes a registration reachable at all. The P-CSCF does not
+/// reuse the connection the UE registered over for anything it originates:
+/// the reg-event `NOTIFY`, and every mobile-terminating `INVITE`, arrive on
+/// a *new* connection it opens to this port. With nothing bound here the
+/// kernel answers the network's SYN with an RST, the P-CSCF concludes the UE
+/// is unreachable, and inbound calls are never delivered — while REGISTER and
+/// outbound calls, both client-initiated, keep working and hide the fault.
+pub fn spawn_gm_server(
+    local: SocketAddr,
+    use_tcp: bool,
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
+) -> BridgeResult<GmServer> {
+    let stop = Arc::new(AtomicBool::new(false));
+    if use_tcp {
+        spawn_gm_tcp_server(local, tx, stop.clone())?;
+    } else {
+        spawn_gm_udp_server(local, tx, stop.clone())?;
+    }
+    tracing::info!(local = %local, transport = if use_tcp { "TCP" } else { "UDP" }, "listening on the Gm protected server port for network-initiated requests");
+    Ok(GmServer { stop })
+}
+
+fn bind_gm_socket(
+    local: SocketAddr,
+    ty: socket2::Type,
+    timeout: Duration,
+) -> BridgeResult<socket2::Socket> {
+    let domain = if local.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, ty, None)
+        .map_err(|e| BridgeError::Ims(format!("Gm server socket() failed: {e}")))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| BridgeError::Ims(format!("Gm server SO_REUSEADDR failed: {e}")))?;
+    socket
+        .bind(&local.into())
+        .map_err(|e| BridgeError::Ims(format!("Gm server bind to {local} failed: {e}")))?;
+    // Bounds how long accept()/recv() blocks, so the loop can notice `stop`.
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| BridgeError::Ims(format!("Gm server set_read_timeout failed: {e}")))?;
+    Ok(socket)
+}
+
+fn spawn_gm_tcp_server(
+    local: SocketAddr,
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
+    stop: Arc<AtomicBool>,
+) -> BridgeResult<()> {
+    let socket = bind_gm_socket(local, socket2::Type::STREAM, ACCEPT_POLL_INTERVAL)?;
+    socket
+        .listen(8)
+        .map_err(|e| BridgeError::Ims(format!("Gm server listen on {local} failed: {e}")))?;
+    let listener: TcpListener = socket.into();
+
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    tracing::info!(peer = %peer, "network opened a connection to the Gm server port");
+                    let tx = tx.clone();
+                    let stop = stop.clone();
+                    std::thread::spawn(move || serve_gm_connection(stream, peer, tx, stop));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Gm server accept failed; stopping");
+                    return;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+fn serve_gm_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut transport = match SipTransport::from_tcp(stream) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(peer = %peer, error = %e, "failed to set up the Gm server connection");
+            return;
+        }
+    };
+    let sink = match transport.sink() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(peer = %peer, error = %e, "failed to derive a sink for the Gm server connection");
+            return;
+        }
+    };
+    while !stop.load(Ordering::Relaxed) {
+        match transport.recv_message_deadline(RECV_TIMEOUT) {
+            Ok(Some(msg)) => {
+                if tx.send((msg, sink.clone())).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(peer = %peer, error = %e, "Gm server connection closed");
+                return;
+            }
+        }
+    }
+}
+
+fn spawn_gm_udp_server(
+    local: SocketAddr,
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
+    stop: Arc<AtomicBool>,
+) -> BridgeResult<()> {
+    let socket = bind_gm_socket(local, socket2::Type::DGRAM, ACCEPT_POLL_INTERVAL)?;
+    let socket: UdpSocket = socket.into();
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; MAX_MSG_LEN];
+        while !stop.load(Ordering::Relaxed) {
+            let (n, peer) = match socket.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Gm server recv failed; stopping");
+                    return;
+                }
+            };
+            // Every SIP datagram is a complete message, so unlike the TCP
+            // path there is no cross-read buffering to do here.
+            let text = String::from_utf8_lossy(&buf[..n]);
+            let parsed = if text.starts_with("SIP/2.0") {
+                SipResponse::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
+            } else {
+                SipRequest::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Request(r)))
+            };
+            let msg = match parsed {
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    tracing::warn!(peer = %peer, "incomplete SIP datagram on the Gm server port");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer, error = %e, "unparseable SIP datagram on the Gm server port");
+                    continue;
+                }
+            };
+            let sink = match socket.try_clone() {
+                Ok(s) => SipSink {
+                    inner: Arc::new(SinkInner::Udp(s, peer)),
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "Gm server UDP try_clone failed");
+                    continue;
+                }
+            };
+            if tx.send((msg, sink)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Parse a `WWW-Authenticate: Digest ...` header value into its parameters.
@@ -798,6 +1121,7 @@ mod tests {
             registrar_uri: "ims.mnc043.mcc404.3gppnetwork.org",
             public_uri: "404438083996440@ims.mnc043.mcc404.3gppnetwork.org",
             local_addr: addr,
+            contact_addr: addr,
             call_id: "callid123",
             from_tag: "tag123",
             branch: "z9hG4bKbranch",
@@ -806,12 +1130,41 @@ mod tests {
             transport: "UDP",
             authorization: None,
             extra_headers: &[],
+            imei: "000000000000000",
         };
         let msg = build_register(&req);
         assert!(msg.starts_with("REGISTER sip:ims.mnc043.mcc404.3gppnetwork.org SIP/2.0\r\n"));
         assert!(msg.contains("[2402:8100::1]:5060"));
         assert!(msg.contains("CSeq: 1 REGISTER"));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// The Contact must advertise the Gm protected *server* port, while the
+    /// Via carries the *client* port we sent from — they are different
+    /// ports, and pointing Contact at the client port makes the
+    /// registration unreachable for everything the network originates.
+    #[test]
+    fn build_register_advertises_the_protected_server_port_in_contact() {
+        let client: SocketAddr = "[2402:8100::1]:48584".parse().unwrap();
+        let server: SocketAddr = "[2402:8100::1]:48586".parse().unwrap();
+        let req = RegisterRequest {
+            registrar_uri: "example.org",
+            public_uri: "user@example.org",
+            local_addr: client,
+            contact_addr: server,
+            call_id: "callid",
+            from_tag: "tag",
+            branch: "branch",
+            cseq: 1,
+            expires: 600,
+            transport: "TCP",
+            authorization: None,
+            extra_headers: &[],
+            imei: "000000000000000",
+        };
+        let msg = build_register(&req);
+        assert!(msg.contains("Via: SIP/2.0/TCP [2402:8100::1]:48584;branch=branch;rport\r\n"));
+        assert!(msg.contains("Contact: <sip:user@[2402:8100::1]:48586;transport=TCP>"));
     }
 
     #[test]
@@ -830,6 +1183,7 @@ mod tests {
             registrar_uri: "example.org",
             public_uri: "user@example.org",
             local_addr: addr,
+            contact_addr: addr,
             call_id: "callid",
             from_tag: "tag",
             branch: "branch",
@@ -838,6 +1192,7 @@ mod tests {
             transport: "UDP",
             authorization: None,
             extra_headers: &extra,
+            imei: "000000000000000",
         };
         let msg = build_register(&req);
         assert!(msg.contains("Supported: sec-agree\r\n"));
