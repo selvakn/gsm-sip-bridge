@@ -36,7 +36,7 @@ The bridge reads a single TOML configuration file specified via `--config`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `port` | integer | 9091 | `METRICS_PORT` env var wins |
+| `port` | integer | 9091 | Metrics HTTP server port |
 
 ### `[modules]`
 
@@ -64,6 +64,44 @@ Configures the Unix domain socket used by `card` CLI subcommands to communicate 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `socket_path` | string | `/tmp/gsm-sip-bridge.sock` | Filesystem path for the control socket. Must be writable by the bridge process and readable by CLI users. |
+
+### `[vowifi]`
+
+The inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — a second,
+independent inbound call path alongside `[sip]`/`[bridge]`. Only read by the
+`vowifi-*-agent` subcommands and `docker/entrypoint.sh`/`healthcheck.sh`
+(via `gsm-sip-bridge config vowifi-shell-env`), never by the normal daemon
+path. All ePDG-tunnel configuration lives here — none of it is read from
+environment variables; `.env` holds secrets only (specs/012-strongswan-epdg
+config consolidation).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch |
+| `mcc` | string | `""` | Home network MCC, required when `enabled = true` |
+| `mnc` | string | `""` | Home network MNC, required when `enabled = true` |
+| `modem_port` | string | `/dev/ttyUSB6` | AT port for the modem whose SIM authenticates |
+| `use_tcp` | boolean | `true` | SIP transport to the P-CSCF |
+| `sec_agree` | boolean | `true` | Advertise `Require: sec-agree` / negotiate Gm IPsec |
+| `pcscf_source_path` | string | `/tmp/pcscf` | Path Agent A reads the tunnel-assigned P-CSCF from |
+| `veth_local_addr` | string | `10.99.0.1` | Agent A's (ims-netns end) veth address |
+| `veth_peer_addr` | string | `10.99.0.2` | Agent B's (default-netns end) veth address |
+| `control_port` | integer | 7050 | Agent A↔B control channel TCP port |
+| `wideband` | boolean | `true` | Carry AMR-WB/G.722 end-to-end instead of narrowing to 8 kHz |
+| `apn` | string | `ims` | APN used by the `swu` engine's dialer |
+| `netns` | string | `ims` | Network namespace the ePDG tunnel lives in |
+| `epdg_fqdn` | string | derived from `mcc`/`mnc` | ePDG FQDN to resolve via DNS |
+| `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly |
+| `src_addr` | string | unset (auto-select) | Force the tunnel's local source address |
+| `keepalive_interval_sec` | integer | 20 | Idle-tunnel TCP keepalive interval |
+| `veth_sip_iface` | string | `veth-sip` | veth end in the default netns |
+| `veth_ims_iface` | string | `veth-ims` | veth end inside `netns` |
+| `tunnel_engine` | enum | `strongswan` | `strongswan` or `swu` (specs/012-strongswan-epdg) |
+| `strongswan_tun_iface` | string | `tun23` | strongswan engine's XFRM interface name |
+| `strongswan_if_id` | integer | 23 | strongswan engine's XFRM interface `if_id` |
+| `vpcd_host` | string | `127.0.0.1` | pcscd's vpcd virtual reader host (strongswan engine) |
+| `vpcd_port` | integer | 35963 | pcscd's vpcd virtual reader port (strongswan engine) |
+| `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch (strongswan engine) |
 
 ## Examples
 

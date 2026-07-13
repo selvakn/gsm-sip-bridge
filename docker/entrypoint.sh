@@ -10,47 +10,45 @@
 #      started only if [vowifi].enabled = true in the mounted config.toml
 #      (checked via `gsm-sip-bridge config vowifi-enabled` rather than
 #      hand-parsing TOML in bash). The tunnel engine itself is selectable
-#      via TUNNEL_ENGINE (specs/012-strongswan-epdg): "strongswan" (the
-#      default) has proper IKE rekeying/re-auth/DPD/MOBIKE and a network
-#      namespace that survives reconnects, live-verified against Airtel
-#      India (SC-002/003/004(Airtel)/005/006 all passed — see
+#      via [vowifi].tunnel_engine (specs/012-strongswan-epdg): "strongswan"
+#      (the default) has proper IKE rekeying/re-auth/DPD/MOBIKE and a
+#      network namespace that survives reconnects, live-verified against
+#      Airtel India (SC-002/003/004(Airtel)/005/006 all passed — see
 #      specs/012-strongswan-epdg/tasks.md); "swu" is the original
 #      SWu-IKEv2 Python dialer, kept as an explicit fallback (set
-#      TUNNEL_ENGINE=swu) since the 24h soak (SC-001) and the Vi-carrier
-#      half of SC-004 are still outstanding.
+#      tunnel_engine = "swu") since the 24h soak (SC-001) and the
+#      Vi-carrier half of SC-004 are still outstanding.
 #
 # The VoWiFi subsystem's tunnel setup creates network namespace "$NETNS"
 # and installs the split-default routes THERE, so the container's own
 # routing (used to reach the SIP server / ePDG) is untouched.
+#
+# All non-secret configuration (MCC/MNC/APN/tunnel engine/interface names/
+# etc.) lives in config.toml's [vowifi] section, not env vars — this script
+# only bootstraps how to find the binary and its config file, then asks the
+# binary itself for everything else via `config vowifi-shell-env`
+# (specs/012-strongswan-epdg config consolidation).
 set -uo pipefail
-
-TUNNEL_ENGINE="${TUNNEL_ENGINE:-strongswan}"
-case "$TUNNEL_ENGINE" in
-    swu | strongswan) ;;
-    *)
-        echo "[entrypoint] FATAL: invalid TUNNEL_ENGINE '$TUNNEL_ENGINE' (must be 'swu' or 'strongswan')" >&2
-        exit 1
-        ;;
-esac
 
 GSM_SIP_BRIDGE_BIN="${GSM_SIP_BRIDGE_BIN:-/usr/local/bin/gsm-sip-bridge}"
 GSM_SIP_BRIDGE_CONFIG="${GSM_SIP_BRIDGE_CONFIG:-/etc/gsm-sip-bridge/config.toml}"
 
-MCC="${MCC:-404}"
-MNC="${MNC:-043}"
-APN="${APN:-ims}"
-MODEM_PORT="${MODEM_PORT:-/dev/ttyUSB6}"
-EPDG_FQDN="${EPDG_FQDN:-epdg.epc.mnc${MNC}.mcc${MCC}.pub.3gppnetwork.org}"
-NETNS="${NETNS:-ims}"
-EPDG_IP="${EPDG_IP:-}"
-SRC_ADDR="${SRC_ADDR:-}"
-KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-20}"
-VETH_SIP="${VETH_SIP:-veth-sip}"
-VETH_IMS="${VETH_IMS:-veth-ims}"
-VETH_IMS_ADDR="${VETH_IMS_ADDR:-10.99.0.1/30}"
-VETH_SIP_ADDR="${VETH_SIP_ADDR:-10.99.0.2/30}"
-
 log() { echo "[entrypoint] $*"; }
+
+if [ ! -x "$GSM_SIP_BRIDGE_BIN" ]; then
+    log "FATAL: $GSM_SIP_BRIDGE_BIN not present in this image (build problem)"
+    exit 1
+fi
+if [ ! -f "$GSM_SIP_BRIDGE_CONFIG" ]; then
+    log "FATAL: $GSM_SIP_BRIDGE_CONFIG not mounted — see docker-compose.yml's config.toml volume"
+    exit 1
+fi
+
+SHELL_ENV="$("$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config vowifi-shell-env)" || {
+    log "FATAL: 'config vowifi-shell-env' failed — see error above (bad config.toml?)"
+    exit 1
+}
+eval "$SHELL_ENV"
 
 # --- Cleanup on exit ---------------------------------------------------------
 DAEMON_SUPERVISOR_PID=""
@@ -85,15 +83,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- 1. Circuit-switched GSM-to-SIP daemon (always attempted) ---------------
-if [ ! -x "$GSM_SIP_BRIDGE_BIN" ]; then
-    log "FATAL: $GSM_SIP_BRIDGE_BIN not present in this image (build problem)"
-    exit 1
-fi
-if [ ! -f "$GSM_SIP_BRIDGE_CONFIG" ]; then
-    log "FATAL: $GSM_SIP_BRIDGE_CONFIG not mounted — see docker-compose.yml's config.toml volume"
-    exit 1
-fi
-
 log "starting the circuit-switched GSM-to-SIP daemon, supervised..."
 (
     while true; do
@@ -197,11 +186,6 @@ start_shared_tail() {
 
 if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     # --- strongSwan engine (specs/012-strongswan-epdg) -----------------------
-    STRONGSWAN_TUN_IFACE="${STRONGSWAN_TUN_IFACE:-tun23}"
-    STRONGSWAN_IF_ID="${STRONGSWAN_IF_ID:-23}"
-    VPCD_HOST="${VPCD_HOST:-127.0.0.1}"
-    VPCD_PORT="${VPCD_PORT:-35963}"
-
     # --- Idempotent netns + XFRM interface (T020, FR-005/FR-011) -----------
     # Pre-created once, here, by the entrypoint — not by charon or the
     # updown script — so it survives every future rekey/reconnect: only
@@ -241,8 +225,8 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     ip netns exec "$NETNS" sh -c "echo 1 > /proc/sys/net/ipv6/conf/$STRONGSWAN_TUN_IFACE/disable_policy" 2>/dev/null || true
 
     # --- Render the swanctl connection (T021) -------------------------------
-    if [ -n "${IMSI:-}" ]; then
-        log "using IMSI override from IMSI env var"
+    if [ -n "$IMSI" ]; then
+        log "using IMSI override from vowifi.imsi_override"
     else
         IMSI="$("$GSM_SIP_BRIDGE_BIN" vowifi-imsi --modem "$MODEM_PORT")"
         if [ -z "$IMSI" ]; then

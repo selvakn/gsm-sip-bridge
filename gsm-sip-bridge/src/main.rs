@@ -322,6 +322,57 @@ fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> E
                 _ => ExitCode::FAILURE,
             }
         }
+        ConfigSubcommand::VowifiShellEnv => {
+            let Some(path) = cli.config.as_deref() else {
+                eprintln!("config vowifi-shell-env: --config is required");
+                return ExitCode::FAILURE;
+            };
+            match load_config(path) {
+                Ok(config) => {
+                    print_vowifi_shell_env(&config);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("config vowifi-shell-env: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+/// Single-quotes `s` for safe use as a POSIX shell word, escaping any
+/// embedded single quotes (`'` -> `'\''`).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn print_vowifi_shell_env(config: &gsm_sip_bridge::config::AppConfig) {
+    let v = &config.vowifi;
+    let lines: Vec<(&str, String)> = vec![
+        ("MCC", v.mcc.clone()),
+        ("MNC", v.mnc.clone()),
+        ("APN", v.apn.clone()),
+        ("MODEM_PORT", v.modem_port.clone()),
+        ("NETNS", v.netns.clone()),
+        ("EPDG_FQDN", v.epdg_fqdn.clone()),
+        ("EPDG_IP", v.epdg_ip.clone().unwrap_or_default()),
+        ("SRC_ADDR", v.src_addr.clone().unwrap_or_default()),
+        ("KEEPALIVE_INTERVAL", v.keepalive_interval_sec.to_string()),
+        ("VETH_SIP", v.veth_sip_iface.clone()),
+        ("VETH_IMS", v.veth_ims_iface.clone()),
+        ("VETH_IMS_ADDR", format!("{}/30", v.veth_local_addr)),
+        ("VETH_SIP_ADDR", format!("{}/30", v.veth_peer_addr)),
+        ("TUNNEL_ENGINE", v.tunnel_engine.clone()),
+        ("STRONGSWAN_TUN_IFACE", v.strongswan_tun_iface.clone()),
+        ("STRONGSWAN_IF_ID", v.strongswan_if_id.to_string()),
+        ("VPCD_HOST", v.vpcd_host.clone()),
+        ("VPCD_PORT", v.vpcd_port.to_string()),
+        ("IMSI", v.imsi_override.clone().unwrap_or_default()),
+        ("METRICS_PORT", config.metrics.port.to_string()),
+    ];
+    for (key, value) in lines {
+        println!("{key}={}", shell_quote(&value));
     }
 }
 

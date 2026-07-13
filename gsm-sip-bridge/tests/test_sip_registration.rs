@@ -21,7 +21,6 @@ transport = "udp"
     )
     .unwrap();
 
-    std::env::remove_var("METRICS_PORT");
     load_config(f.path()).unwrap()
 }
 

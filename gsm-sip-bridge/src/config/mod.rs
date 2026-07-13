@@ -68,6 +68,20 @@ const VOWIFI_KEYS: &[&str] = &[
     "veth_peer_addr",
     "control_port",
     "wideband",
+    "apn",
+    "netns",
+    "epdg_fqdn",
+    "epdg_ip",
+    "src_addr",
+    "keepalive_interval_sec",
+    "veth_sip_iface",
+    "veth_ims_iface",
+    "tunnel_engine",
+    "strongswan_tun_iface",
+    "strongswan_if_id",
+    "vpcd_host",
+    "vpcd_port",
+    "imsi_override",
 ];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
@@ -337,6 +351,50 @@ pub struct VowifiConfig {
     /// with the veth link staying on PCMU. Turn this off only if the PBX
     /// mishandles a G.722 offer.
     pub wideband: bool,
+    /// APN used by the `swu` engine's dialer (specs/011-vowifi-sip-bridge).
+    pub apn: String,
+    /// Network namespace the ePDG tunnel lives in — created by
+    /// `docker/entrypoint.sh`, used by both engines.
+    pub netns: String,
+    /// ePDG FQDN, resolved to `epdg_ip` via DNS by `docker/entrypoint.sh`.
+    /// Defaults to the 3GPP-standard derivation from `mcc`/`mnc` when not
+    /// set explicitly in `[vowifi]`.
+    pub epdg_fqdn: String,
+    /// Skip DNS resolution and dial this ePDG IP directly. `None` (the
+    /// default) means resolve `epdg_fqdn` at startup.
+    pub epdg_ip: Option<String>,
+    /// Force this as the tunnel's local source address instead of letting
+    /// the kernel/charon pick one via routing to the ePDG. `None` (the
+    /// default) means auto-select.
+    pub src_addr: Option<String>,
+    /// Idle-tunnel keepalive interval (seconds) — a TCP connect to the
+    /// P-CSCF's SIP port, since operators commonly filter ICMP over the
+    /// tunnel (confirmed on Vodafone India).
+    pub keepalive_interval_sec: u64,
+    /// Name of the veth interface end in the container's default netns
+    /// (Agent B's side).
+    pub veth_sip_iface: String,
+    /// Name of the veth interface end inside `netns` (Agent A's side).
+    pub veth_ims_iface: String,
+    /// ePDG tunnel engine: `"strongswan"` (the default — proper IKE
+    /// rekeying/re-auth/DPD/MOBIKE, netns survives reconnects) or `"swu"`
+    /// (the original SWu-IKEv2 Python dialer, kept as an explicit fallback
+    /// — see specs/012-strongswan-epdg).
+    pub tunnel_engine: String,
+    /// XFRM interface name the strongswan engine creates inside `netns`.
+    pub strongswan_tun_iface: String,
+    /// XFRM interface's `if_id`, pinned so it (and `netns`) survive
+    /// reconnects (specs/012-strongswan-epdg FR-005/FR-011).
+    pub strongswan_if_id: u32,
+    /// Host running the vpcd virtual smart-card reader (pcscd's vpcd
+    /// driver) that `vowifi-usim-bridge` connects to.
+    pub vpcd_host: String,
+    /// TCP port vpcd listens on.
+    pub vpcd_port: u16,
+    /// Use this IMSI instead of reading it from the SIM via `vowifi-imsi`
+    /// (AT+CIMI) — a test/diagnostic escape hatch for the strongswan
+    /// engine's swanctl connection rendering.
+    pub imsi_override: Option<String>,
 }
 
 impl Default for VowifiConfig {
@@ -353,6 +411,20 @@ impl Default for VowifiConfig {
             veth_peer_addr: "10.99.0.2".to_string(),
             control_port: 7050,
             wideband: true,
+            apn: "ims".to_string(),
+            netns: "ims".to_string(),
+            epdg_fqdn: String::new(),
+            epdg_ip: None,
+            src_addr: None,
+            keepalive_interval_sec: 20,
+            veth_sip_iface: "veth-sip".to_string(),
+            veth_ims_iface: "veth-ims".to_string(),
+            tunnel_engine: "strongswan".to_string(),
+            strongswan_tun_iface: "tun23".to_string(),
+            strongswan_if_id: 23,
+            vpcd_host: "127.0.0.1".to_string(),
+            vpcd_port: 35963,
+            imsi_override: None,
         }
     }
 }
@@ -467,6 +539,26 @@ fn require_string(
 fn as_u16_port(v: &Value, key: &str) -> BridgeResult<u16> {
     let n = as_u64_range(v, key, false, 1..=65535)?;
     Ok(n as u16)
+}
+
+fn as_u32(v: &Value, key: &str) -> BridgeResult<u32> {
+    let n = as_u64_range(v, key, false, 0..=u32::MAX as u64)?;
+    Ok(n as u32)
+}
+
+/// Like `as_string`, but an absent key or an empty/blank-after-`env:`
+/// resolution value both mean "unset" (`None`) rather than an empty string —
+/// used for `[vowifi]` fields whose absence means "auto-detect"
+/// (`epdg_ip`, `src_addr`, `imsi_override`).
+fn as_optional_string(
+    t: &toml::map::Map<String, Value>,
+    field: &str,
+    key: &str,
+) -> BridgeResult<Option<String>> {
+    t.get(field)
+        .map(|v| as_string(v, key, false))
+        .transpose()
+        .map(|opt| opt.filter(|s| !s.is_empty()))
 }
 
 fn as_u64_range(
@@ -723,18 +815,6 @@ fn parse_metrics(root: &toml::map::Map<String, Value>) -> BridgeResult<MetricsCo
         warn_unknown_keys_in(t, METRICS_KEYS, "metrics");
         if let Some(v) = t.get("port") {
             port = as_u16_port(v, "metrics.port")?;
-        }
-    }
-    if let Ok(s) = std::env::var("METRICS_PORT") {
-        if !s.is_empty() {
-            port = s.parse::<u16>().map_err(|_| {
-                BridgeError::Config(format!("METRICS_PORT must be 1..=65535, got {s:?}"))
-            })?;
-            if port == 0 {
-                return Err(BridgeError::Config(
-                    "METRICS_PORT must be in 1..=65535".into(),
-                ));
-            }
         }
     }
     Ok(MetricsConfig { port })
@@ -1148,6 +1228,71 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .transpose()?
         .unwrap_or(defaults.wideband);
 
+    let apn = t
+        .get("apn")
+        .map(|v| as_string(v, "vowifi.apn", false))
+        .transpose()?
+        .unwrap_or(defaults.apn);
+    let netns = t
+        .get("netns")
+        .map(|v| as_string(v, "vowifi.netns", false))
+        .transpose()?
+        .unwrap_or(defaults.netns);
+    let epdg_fqdn = t
+        .get("epdg_fqdn")
+        .map(|v| as_string(v, "vowifi.epdg_fqdn", false))
+        .transpose()?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org"));
+    let epdg_ip = as_optional_string(t, "epdg_ip", "vowifi.epdg_ip")?;
+    let src_addr = as_optional_string(t, "src_addr", "vowifi.src_addr")?;
+    let keepalive_interval_sec = t
+        .get("keepalive_interval_sec")
+        .map(|v| as_u64_range(v, "vowifi.keepalive_interval_sec", false, 1..=3600))
+        .transpose()?
+        .unwrap_or(defaults.keepalive_interval_sec);
+    let veth_sip_iface = t
+        .get("veth_sip_iface")
+        .map(|v| as_string(v, "vowifi.veth_sip_iface", false))
+        .transpose()?
+        .unwrap_or(defaults.veth_sip_iface);
+    let veth_ims_iface = t
+        .get("veth_ims_iface")
+        .map(|v| as_string(v, "vowifi.veth_ims_iface", false))
+        .transpose()?
+        .unwrap_or(defaults.veth_ims_iface);
+    let tunnel_engine = t
+        .get("tunnel_engine")
+        .map(|v| as_string(v, "vowifi.tunnel_engine", false))
+        .transpose()?
+        .unwrap_or(defaults.tunnel_engine);
+    if tunnel_engine != "swu" && tunnel_engine != "strongswan" {
+        return Err(BridgeError::Config(format!(
+            "vowifi.tunnel_engine must be \"swu\" or \"strongswan\", got {tunnel_engine:?}"
+        )));
+    }
+    let strongswan_tun_iface = t
+        .get("strongswan_tun_iface")
+        .map(|v| as_string(v, "vowifi.strongswan_tun_iface", false))
+        .transpose()?
+        .unwrap_or(defaults.strongswan_tun_iface);
+    let strongswan_if_id = t
+        .get("strongswan_if_id")
+        .map(|v| as_u32(v, "vowifi.strongswan_if_id"))
+        .transpose()?
+        .unwrap_or(defaults.strongswan_if_id);
+    let vpcd_host = t
+        .get("vpcd_host")
+        .map(|v| as_string(v, "vowifi.vpcd_host", false))
+        .transpose()?
+        .unwrap_or(defaults.vpcd_host);
+    let vpcd_port = t
+        .get("vpcd_port")
+        .map(|v| as_u16_port(v, "vowifi.vpcd_port"))
+        .transpose()?
+        .unwrap_or(defaults.vpcd_port);
+    let imsi_override = as_optional_string(t, "imsi_override", "vowifi.imsi_override")?;
+
     Ok(VowifiConfig {
         enabled,
         mcc,
@@ -1160,6 +1305,20 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         veth_peer_addr,
         control_port,
         wideband,
+        apn,
+        netns,
+        epdg_fqdn,
+        epdg_ip,
+        src_addr,
+        keepalive_interval_sec,
+        veth_sip_iface,
+        veth_ims_iface,
+        tunnel_engine,
+        strongswan_tun_iface,
+        strongswan_if_id,
+        vpcd_host,
+        vpcd_port,
+        imsi_override,
     })
 }
 
@@ -1477,5 +1636,69 @@ password = "pass"
         assert_eq!(cfg.vowifi.veth_local_addr, "10.1.1.1");
         assert_eq!(cfg.vowifi.veth_peer_addr, "10.1.1.2");
         assert_eq!(cfg.vowifi.control_port, 9999);
+    }
+
+    #[test]
+    fn vowifi_tunnel_engine_defaults_to_strongswan() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.vowifi.tunnel_engine, "strongswan");
+        assert_eq!(cfg.vowifi.strongswan_tun_iface, "tun23");
+        assert_eq!(cfg.vowifi.strongswan_if_id, 23);
+        assert_eq!(cfg.vowifi.netns, "ims");
+        assert_eq!(cfg.vowifi.apn, "ims");
+        assert_eq!(cfg.vowifi.keepalive_interval_sec, 20);
+        assert_eq!(cfg.vowifi.vpcd_host, "127.0.0.1");
+        assert_eq!(cfg.vowifi.vpcd_port, 35963);
+        assert_eq!(cfg.vowifi.epdg_ip, None);
+        assert_eq!(cfg.vowifi.src_addr, None);
+        assert_eq!(cfg.vowifi.imsi_override, None);
+    }
+
+    #[test]
+    fn vowifi_tunnel_engine_rejects_unknown_value() {
+        let toml = format!("{}\n[vowifi]\ntunnel_engine = \"bogus\"\n", MINIMAL_TOML);
+        let root: toml::Value = toml.parse().unwrap();
+        let result = parse_vowifi(root.as_table().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vowifi.tunnel_engine must be"));
+    }
+
+    #[test]
+    fn vowifi_epdg_fqdn_derived_from_mcc_mnc_when_unset() {
+        let toml = format!(
+            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(
+            cfg.vowifi.epdg_fqdn,
+            "epdg.epc.mnc094.mcc404.pub.3gppnetwork.org"
+        );
+    }
+
+    #[test]
+    fn vowifi_epdg_fqdn_override_respected() {
+        let toml = format!(
+            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\nepdg_fqdn = \"epdg.example.org\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.epdg_fqdn, "epdg.example.org");
+    }
+
+    #[test]
+    fn vowifi_optional_overrides_parsed() {
+        let toml = format!(
+            "{}\n[vowifi]\nepdg_ip = \"1.2.3.4\"\nsrc_addr = \"9.9.9.9\"\nimsi_override = \"404940123456789\"\ntunnel_engine = \"swu\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.epdg_ip.as_deref(), Some("1.2.3.4"));
+        assert_eq!(cfg.vowifi.src_addr.as_deref(), Some("9.9.9.9"));
+        assert_eq!(cfg.vowifi.imsi_override.as_deref(), Some("404940123456789"));
+        assert_eq!(cfg.vowifi.tunnel_engine, "swu");
     }
 }

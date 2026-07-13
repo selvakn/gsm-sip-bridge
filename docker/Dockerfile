@@ -5,8 +5,8 @@
 #      ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, gated on
 #      [vowifi].enabled in the mounted config.toml. Two tunnel engines ship
 #      side by side (specs/012-strongswan-epdg), selected at deploy time by
-#      TUNNEL_ENGINE: the original SWu-IKEv2 Python dialer ("swu", default
-#      during the proving period) or strongSwan ("strongswan" — proper IKE
+#      [vowifi].tunnel_engine: the original SWu-IKEv2 Python dialer ("swu")
+#      or strongSwan ("strongswan", the default — proper IKE
 #      rekeying/re-auth/DPD/MOBIKE and a network namespace that survives
 #      reconnects, via a pcscd/vpcd bridge to the SIM inside the modem).
 #
@@ -181,8 +181,9 @@ RUN make -C src/ifd-vpcd install DESTDIR=/staging
 # dialer (stage 3), and the strongSwan/vpcd engine (stages 5-6), on plain
 # Alpine with only the shared libs all of them need. Both ePDG tunnel
 # engines ship in the one image, selectable at deploy time via
-# TUNNEL_ENGINE (specs/012-strongswan-epdg) — the legacy SWu engine stays
-# until strongSwan is proven against both carriers (spec FR-001/FR-009).
+# [vowifi].tunnel_engine in config.toml (specs/012-strongswan-epdg) — the
+# legacy SWu engine stays until strongSwan is proven against both carriers
+# (spec FR-001/FR-009).
 FROM alpine:${ALPINE_VERSION}
 
 # bash: docker/entrypoint.sh and healthcheck.sh use arrays, process

@@ -4,15 +4,16 @@
 #   2. the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — an
 #      ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, started only when
 #      [vowifi].enabled = true in the mounted config.toml. The tunnel
-#      engine is chosen via the TUNNEL_ENGINE env var (.env — see
-#      .env.example), specs/012-strongswan-epdg: "strongswan" (the
-#      default) has proper IKE rekeying/re-auth/DPD/MOBIKE and a network
-#      namespace that survives reconnects, live-verified against Airtel
-#      India; "swu" is the original SWu-IKEv2 Python dialer, kept as an
-#      explicit fallback (the 24h soak and the Vi-carrier EAP-AKA check
-#      are still outstanding — see specs/012-strongswan-epdg/tasks.md).
-#      Switching is a container restart, not a rebuild — both engines ship
-#      in this one image.
+#      engine is chosen via [vowifi].tunnel_engine in that same config.toml
+#      (specs/012-strongswan-epdg): "strongswan" (the default) has proper
+#      IKE rekeying/re-auth/DPD/MOBIKE and a network namespace that
+#      survives reconnects, live-verified against Airtel India; "swu" is
+#      the original SWu-IKEv2 Python dialer, kept as an explicit fallback
+#      (the 24h soak and the Vi-carrier EAP-AKA check are still outstanding
+#      — see specs/012-strongswan-epdg/tasks.md). Switching is a container
+#      restart, not a rebuild — both engines ship in this one image. .env
+#      holds secrets only (see .env.example) — all other configuration,
+#      VoWiFi included, lives in config.toml.
 #
 # `privileged: true` + host networking + full /dev,/sys mounts are needed
 # for the circuit-switched daemon's arbitrary-USB-modem hot-plug discovery,

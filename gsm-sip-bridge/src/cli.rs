@@ -2,10 +2,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 const AFTER_LONG_HELP: &str = r#"ENVIRONMENT:
-    METRICS_PORT             Override the metrics HTTP port (default: 9091)
     RUST_LOG                 Standard tracing-subscriber filter
 
-For configuration reference, see docs/configuration.md.
+All other configuration lives in config.toml, referenced via --config (see
+docs/configuration.md); secrets may be pulled from process env vars using
+the "env:VAR_NAME" syntax on any string field.
 For the v4.1.x -> v5.0.0 migration, see docs/migrating-from-v4.1.x.md."#;
 
 #[derive(Parser, Debug)]
@@ -95,6 +96,14 @@ pub enum ConfigSubcommand {
     /// otherwise (including if the file can't be loaded at all). Prints
     /// nothing — only the exit code is meant to be used.
     VowifiEnabled,
+    /// Prints the resolved `[vowifi]` section (plus `[metrics].port`) as
+    /// `KEY=VALUE` shell-quoted lines, for `docker/entrypoint.sh` /
+    /// `docker/healthcheck.sh` to `eval`/`source` instead of hand-parsing
+    /// TOML or reading their own raw environment variables
+    /// (specs/012-strongswan-epdg config consolidation: config.toml is the
+    /// single source of truth for all non-secret configuration). Exits
+    /// non-zero and prints nothing on config-load failure.
+    VowifiShellEnv,
 }
 
 #[derive(Parser, Debug)]
