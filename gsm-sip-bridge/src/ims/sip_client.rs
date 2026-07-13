@@ -319,6 +319,62 @@ pub fn build_486_busy_here(request: &SipRequest, to_tag: &str) -> String {
     build_uas_response(486, "Busy Here", request, Some(to_tag), None, None)
 }
 
+/// Everything needed to end a dialog we answered as a UAS — i.e. to hang up
+/// on the *carrier* for an inbound call.
+///
+/// Extracted from the original `INVITE` at answer time (see
+/// `DialogInfo::from_invite`), because by the time we want to send the BYE the
+/// request itself is long gone. Note the role reversal: our `From` is the
+/// INVITE's `To` (plus the tag we generated), and our `To` is the INVITE's
+/// `From` — a BYE from the answerer flows in the opposite direction to the
+/// INVITE it terminates.
+pub struct ByeRequest<'a> {
+    /// The remote target: the URI from the caller's `Contact`, not the
+    /// original Request-URI (RFC 3261 §12.2.1.1 — in-dialog requests go to
+    /// the peer's Contact).
+    pub request_uri: &'a str,
+    /// The dialog's route set: the `Record-Route` headers from the INVITE, in
+    /// reverse order (§12.2.1.1 again — the UAS's route set is the reverse of
+    /// what it received).
+    pub route_headers: &'a [String],
+    pub via_transport: &'a str,
+    pub local_addr: SocketAddr,
+    /// Full header values, tags included, already role-swapped.
+    pub from: &'a str,
+    pub to: &'a str,
+    pub call_id: &'a str,
+    pub cseq: u32,
+    pub branch: &'a str,
+}
+
+pub fn build_bye(req: &ByeRequest) -> String {
+    let via_addr = format_sip_addr(req.local_addr);
+    let mut msg = format!(
+        "BYE {request_uri} SIP/2.0\r\n\
+         Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n",
+        request_uri = req.request_uri,
+        transport = req.via_transport,
+        branch = req.branch,
+    );
+    for route in req.route_headers {
+        msg.push_str(route);
+        msg.push_str("\r\n");
+    }
+    msg.push_str(&format!(
+        "From: {from}\r\n\
+         To: {to}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} BYE\r\n\
+         Content-Length: 0\r\n\r\n",
+        from = req.from,
+        to = req.to,
+        call_id = req.call_id,
+        cseq = req.cseq,
+    ));
+    msg
+}
+
 /// Everything needed to build a REGISTER request.
 pub struct RegisterRequest<'a> {
     pub registrar_uri: &'a str,
@@ -1143,6 +1199,35 @@ mod tests {
     /// Via carries the *client* port we sent from — they are different
     /// ports, and pointing Contact at the client port makes the
     /// registration unreachable for everything the network originates.
+    #[test]
+    /// A BYE from the side that *answered* flows opposite to the INVITE: our
+    /// From is the INVITE's To and vice versa, and it goes to the caller's
+    /// Contact rather than the original Request-URI. Getting this backwards
+    /// produces a BYE the network drops, so the caller stays on a dead call.
+    #[test]
+    fn build_bye_reverses_the_dialog_roles_and_targets_the_remote_contact() {
+        let msg = build_bye(&ByeRequest {
+            request_uri: "sip:caller@pcscf.example:5060",
+            route_headers: &["Route: <sip:pcscf.example;lr>".to_string()],
+            via_transport: "TCP",
+            local_addr: "1.2.3.4:48584".parse().unwrap(),
+            // Ours (was the INVITE's To), with the tag we generated.
+            from: "<sip:+919043062139@ims.example>;tag=ourtag",
+            // Theirs (was the INVITE's From), with the tag they generated.
+            to: "\"Caller\" <sip:+919789063708@ims.example>;tag=theirtag",
+            call_id: "callid1",
+            cseq: 1,
+            branch: "z9hG4bKbye1",
+        });
+        assert!(msg.starts_with("BYE sip:caller@pcscf.example:5060 SIP/2.0\r\n"));
+        assert!(msg.contains("Route: <sip:pcscf.example;lr>\r\n"));
+        assert!(msg.contains("From: <sip:+919043062139@ims.example>;tag=ourtag\r\n"));
+        assert!(msg.contains("To: \"Caller\" <sip:+919789063708@ims.example>;tag=theirtag\r\n"));
+        assert!(msg.contains("Call-ID: callid1\r\n"));
+        assert!(msg.contains("CSeq: 1 BYE\r\n"));
+        assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
     #[test]
     fn build_register_advertises_the_protected_server_port_in_contact() {
         let client: SocketAddr = "[2402:8100::1]:48584".parse().unwrap();
