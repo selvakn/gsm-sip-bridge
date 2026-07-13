@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long Agent A waits for Agent B to *place* its two legs (`BridgeReady`)
 /// before giving up and declining the carrier's INVITE. Only covers getting the
@@ -559,6 +559,15 @@ fn dispatch_loop(
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
     let mut backoff = RETRY_INITIAL_BACKOFF;
+    // Set after a failed renewal, cleared on success. Gates *retries* only —
+    // unlike a blocking `thread::sleep(backoff)` (the previous approach),
+    // this loop keeps calling `inbound.rx.recv_timeout` every iteration
+    // regardless, so an inbound INVITE/BYE arriving during the backoff
+    // window is still dispatched immediately instead of queuing unanswered
+    // until the sleep ends (a carrier's transaction timer can expire and
+    // drop an otherwise-valid call within that window — found in review,
+    // not live-testing).
+    let mut next_renewal_attempt: Option<Instant> = None;
     loop {
         // A hangup can start on *either* side. The carrier's arrives as a BYE
         // below; the PBX's arrives here, as a `CallEnded` from Agent B — and
@@ -664,6 +673,15 @@ fn dispatch_loop(
                 if !super::renewal_due(SystemTime::now(), expires_at, RENEWAL_HEADROOM) {
                     continue;
                 }
+                // A previous attempt failed and its backoff hasn't elapsed
+                // yet — `renewal_due` alone would otherwise fire again on
+                // every idle wake-up regardless of backoff, hammering a
+                // still-failing renewal every poll interval.
+                if let Some(next_attempt) = next_renewal_attempt {
+                    if Instant::now() < next_attempt {
+                        continue;
+                    }
+                }
                 status.lock().unwrap_or_else(|e| e.into_inner()).state =
                     super::RegistrationState::Renewing;
                 match attempt_renewal(reg_cfg) {
@@ -681,6 +699,7 @@ fn dispatch_loop(
                         );
                         drop(guard);
                         backoff = RETRY_INITIAL_BACKOFF;
+                        next_renewal_attempt = None;
                         tracing::info!("registration renewed");
                         subscribe_reg_event(session);
                     }
@@ -694,7 +713,10 @@ fn dispatch_loop(
                         guard.state = super::RegistrationState::Failed;
                         guard.last_failure = Some((SystemTime::now(), e.to_string()));
                         drop(guard);
-                        std::thread::sleep(backoff);
+                        // Not a blocking sleep: the loop keeps dispatching
+                        // inbound SIP every iteration in the meantime (see
+                        // `next_renewal_attempt`'s doc comment above).
+                        next_renewal_attempt = Some(Instant::now() + backoff);
                         backoff = next_backoff(backoff, RETRY_MAX_BACKOFF);
                     }
                 }
