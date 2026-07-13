@@ -19,8 +19,8 @@ use crate::error::{BridgeError, BridgeResult};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_200_ok_bye, build_200_ok_invite,
-    build_486_busy_here, build_uas_response, format_sip_addr, random_hex, spawn_gm_server,
-    GmServer, SipMessage, SipRequest, SipSink,
+    build_486_busy_here, build_bye, build_uas_response, format_sip_addr, random_hex,
+    spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
 };
 use crate::ims::ImsRegisterConfig;
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
@@ -53,6 +53,10 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// How often, while ringing, to check the control channel and the carrier's
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the dispatch loop comes up for air while a call is up, so a
+/// hangup that starts on the PBX side is turned into a `BYE` toward the carrier
+/// promptly rather than leaving the caller on a dead line.
+const ACTIVE_CALL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the RTP relay's blocking `recv` wakes up to check whether it
 /// should stop — bounds how quickly a hangup actually silences the relay.
 const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -429,9 +433,74 @@ fn handle_notify(sink: &SipSink, req: &SipRequest) {
 /// flag that stops the background RTP relay threads.
 struct ActiveCall {
     control: TcpStream,
+    /// Agent B's side of the control channel. Kept alive for the whole call so
+    /// the dispatch loop hears about a hangup that starts on the *PBX* side —
+    /// without it, only a carrier-originated `BYE` could ever end a call, and
+    /// hanging up the SIP extension would leave the caller on a dead line.
+    ctrl_rx: mpsc::Receiver<ControlMessage>,
     stop: Arc<AtomicBool>,
     call_id: String,
     to_tag: String,
+    /// What's needed to hang up on the carrier ourselves, captured from the
+    /// INVITE while we still had it.
+    dialog: DialogInfo,
+}
+
+/// The dialog state needed to send an in-dialog request (a `BYE`) on a call we
+/// answered as a UAS. See `sip_client::ByeRequest` for the role reversal.
+struct DialogInfo {
+    /// The caller's `Contact` URI — where in-dialog requests must be sent.
+    remote_target: String,
+    /// `Record-Route` from the INVITE, reversed.
+    route_headers: Vec<String>,
+    /// Our `From` on outgoing in-dialog requests: the INVITE's `To` plus our tag.
+    from: String,
+    /// Our `To`: the INVITE's `From`, tag included.
+    to: String,
+    local_addr: SocketAddr,
+    use_tcp: bool,
+    /// Our own CSeq counter for this dialog. We answered the INVITE, so the
+    /// caller's CSeq space is theirs; ours starts fresh.
+    cseq: u32,
+}
+
+impl DialogInfo {
+    fn from_invite(invite: &SipRequest, to_tag: &str, session: &super::RegisteredSession) -> Self {
+        // Fall back to the Request-URI if the caller sent no Contact — a BYE to
+        // the wrong target is still better than never hanging up at all.
+        let remote_target = invite
+            .header("Contact")
+            .and_then(|c| {
+                let start = c.find('<')? + 1;
+                let end = c[start..].find('>')? + start;
+                Some(c[start..end].to_string())
+            })
+            .unwrap_or_else(|| invite.request_uri.clone());
+
+        let route_headers: Vec<String> = invite
+            .headers_all("Record-Route")
+            .iter()
+            .rev()
+            .map(|v| format!("Route: {v}"))
+            .collect();
+
+        let from = match invite.header("To") {
+            Some(to) if to.contains(";tag=") => to.to_string(),
+            Some(to) => format!("{to};tag={to_tag}"),
+            None => format!("<sip:{}>;tag={to_tag}", session.public_uri),
+        };
+        let to = invite.header("From").unwrap_or_default().to_string();
+
+        Self {
+            remote_target,
+            route_headers,
+            from,
+            to,
+            local_addr: session.local_addr,
+            use_tcp: session.use_tcp,
+            cseq: 1,
+        }
+    }
 }
 
 /// Answers on the connection a request arrived on, logging rather than
@@ -455,7 +524,40 @@ fn dispatch_loop(
     let mut active_call: Option<ActiveCall> = None;
     let mut backoff = RETRY_INITIAL_BACKOFF;
     loop {
-        match inbound.rx.recv_timeout(REGISTRATION_POLL_INTERVAL) {
+        // A hangup can start on *either* side. The carrier's arrives as a BYE
+        // below; the PBX's arrives here, as a `CallEnded` from Agent B — and
+        // must be turned into a BYE toward the carrier, or hanging up the SIP
+        // extension would leave the caller listening to a call that is already
+        // over.
+        if let Some(call) = &mut active_call {
+            match call.ctrl_rx.try_recv() {
+                Ok(ControlMessage::CallEnded { reason, .. }) => {
+                    let call = active_call.take().expect("just matched Some");
+                    hangup_carrier(session, call, &reason);
+                    continue;
+                }
+                Ok(other) => {
+                    tracing::debug!(message = ?other, "ignoring control message during an active call");
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Agent B is gone; we can't keep a half-bridged call up.
+                    let call = active_call.take().expect("just matched Some");
+                    tracing::warn!(call_id = %call.call_id, "Agent B's control connection dropped mid-call");
+                    hangup_carrier(session, call, reason::TRANSPORT_ERROR);
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Poll fast enough to notice a PBX-side hangup promptly while a call is
+        // up; idle otherwise, where the only deadline is registration renewal.
+        let poll = if active_call.is_some() {
+            ACTIVE_CALL_POLL_INTERVAL
+        } else {
+            REGISTRATION_POLL_INTERVAL
+        };
+        match inbound.rx.recv_timeout(poll) {
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {
                 if active_call.is_some() {
                     tracing::info!("declining inbound call: another VoWiFi call is already active");
@@ -741,7 +843,9 @@ fn handle_invite(
 
             Ok(Some(ActiveCall {
                 control,
+                ctrl_rx,
                 stop,
+                dialog: DialogInfo::from_invite(req, &to_tag, session),
                 call_id,
                 to_tag,
             }))
@@ -878,6 +982,38 @@ fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlMessage> {
         }
     });
     rx
+}
+
+/// End a call that was hung up on the *PBX* side, by sending a `BYE` to the
+/// carrier. The mirror image of `handle_bye` (which handles the carrier hanging
+/// up on us); between them, a hangup from either end tears the whole bridge
+/// down.
+///
+/// The BYE goes out on the registered client transport, like every other
+/// request we originate — it is routed by the dialog's route set, not by which
+/// connection the INVITE happened to arrive on.
+fn hangup_carrier(session: &mut super::RegisteredSession, call: ActiveCall, reason: &str) {
+    call.stop.store(true, Ordering::Relaxed);
+    let d = &call.dialog;
+    let bye = build_bye(&ByeRequest {
+        request_uri: &d.remote_target,
+        route_headers: &d.route_headers,
+        via_transport: if d.use_tcp { "TCP" } else { "UDP" },
+        local_addr: d.local_addr,
+        from: &d.from,
+        to: &d.to,
+        call_id: &call.call_id,
+        cseq: d.cseq,
+        branch: &format!("z9hG4bK{}", random_hex(6)),
+    });
+    match session.transport.send(&bye) {
+        Ok(()) => {
+            tracing::info!(call_id = %call.call_id, reason, "PBX hung up; sent BYE to the carrier")
+        }
+        Err(e) => {
+            tracing::warn!(call_id = %call.call_id, error = %e, "failed to BYE the carrier after a PBX hangup")
+        }
+    }
 }
 
 fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall) {

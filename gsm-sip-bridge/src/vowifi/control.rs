@@ -25,7 +25,11 @@ pub enum ControlMessage {
     /// Agent A blocks its own SIP response to the carrier until it gets a
     /// `BridgeReady`/`BridgeFailed` reply.
     IncomingCall { call_id: String, caller: String },
-    /// Agent A → Agent B. The carrier-side leg received a `BYE`.
+    /// Either direction. Whichever agent sees its own leg drop first sends
+    /// this; the receiver tears its side down and does not echo it back.
+    /// Agent A → Agent B when the carrier sends a `BYE` (or the caller
+    /// `CANCEL`s while ringing); Agent B → Agent A when the PBX extension hangs
+    /// up, which Agent A turns into a `BYE` toward the carrier.
     CallEnded { call_id: String, reason: String },
     /// Agent B → Agent A. Both the PBX-side and veth-side legs are placed
     /// and conference-bridged. The PBX leg is *ringing*, not yet answered —
@@ -108,6 +112,9 @@ pub mod reason {
     pub const CALLER_CANCELLED: &str = "caller_cancelled";
     pub const VETH_LEG_FAILED: &str = "veth_leg_failed";
     pub const CALLER_HANGUP: &str = "caller_hangup";
+    /// The PBX/SIP side hung up first. Agent A turns this into a `BYE` toward
+    /// the carrier — either side dropping must end the whole bridged call.
+    pub const PBX_HANGUP: &str = "pbx_hangup";
     pub const TRANSPORT_ERROR: &str = "transport_error";
 }
 

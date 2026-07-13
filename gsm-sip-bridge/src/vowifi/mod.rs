@@ -272,21 +272,35 @@ fn handle_connection(
                 }
             }
 
-            // Block until Agent A reports the call ended, then tear down
-            // both legs. One call at a time per the spec's single-line
-            // assumption, so a blocking read here is correct.
-            let end_reason = match ctrl_rx.recv() {
-                Ok(ControlMessage::CallEnded { reason, .. }) => {
-                    tracing::info!(call_id = %call_id, reason = %reason, "call ended, tearing down both legs");
-                    reason
+            // A hangup can start on either side. Blocking on Agent A alone
+            // would miss the PBX extension hanging up first, leaving the caller
+            // on a line that is already dead — so watch our own leg too, and
+            // tell Agent A when it drops so it can BYE the carrier.
+            let end_reason = loop {
+                match ctrl_rx.recv_timeout(PBX_RING_POLL_INTERVAL) {
+                    Ok(ControlMessage::CallEnded { reason, .. }) => {
+                        tracing::info!(call_id = %call_id, reason = %reason, "call ended, tearing down both legs");
+                        break reason;
+                    }
+                    Ok(other) => {
+                        tracing::warn!(call_id = %call_id, message = ?other, "unexpected message during an active call");
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::warn!(call_id = %call_id, "control connection lost mid-call; tearing down anyway");
+                        break "control_connection_lost".to_string();
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                Ok(other) => {
-                    tracing::warn!(call_id = %call_id, message = ?other, "unexpected message while waiting for CallEnded");
-                    "unexpected_message".to_string()
-                }
-                Err(e) => {
-                    tracing::warn!(call_id = %call_id, error = %e, "control connection lost before CallEnded; tearing down anyway");
-                    "control_connection_lost".to_string()
+                if pbx_call.poll_state() == CallState::Disconnected {
+                    tracing::info!(call_id = %call_id, "PBX side hung up; telling Agent A to end the carrier leg");
+                    let _ = write_msg(
+                        &mut writer,
+                        &ControlMessage::CallEnded {
+                            call_id: call_id.clone(),
+                            reason: control::reason::PBX_HANGUP.to_string(),
+                        },
+                    );
+                    break control::reason::PBX_HANGUP.to_string();
                 }
             };
             endpoint.unpair_call(pbx_call.call_id());
