@@ -401,6 +401,21 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
         while true; do
             sleep 30
 
+            # Greptile PR #2 (P1): nothing past the initial wait loop ever
+            # re-checked charon itself. If it died, the XFRM interface and
+            # /tmp/pcscf stay in place and `swanctl --initiate`/`--list-sas`
+            # below would just fail against a dead vici socket forever — the
+            # agents and container stay up, looking healthy, while VoWiFi is
+            # silently and permanently dead. Same treatment as the swu
+            # engine's SWU_WATCHDOG_PID: exit so `restart: unless-stopped`
+            # recovers the container, rather than nursing a charon-less
+            # connection that can never come back on its own.
+            if ! kill -0 "$CHARON_PID" 2>/dev/null; then
+                log "FATAL: charon exited after the tunnel was established (see /tmp/charon.log); exiting for a container restart"
+                kill -TERM $$
+                exit 0
+            fi
+
             # Observed live: tun23 can vanish from the kernel entirely while
             # swanctl still reports the CHILD_SA ESTABLISHED/INSTALLED — the
             # "^ims:" check below would never catch this (the SA is right
@@ -420,6 +435,17 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
             fi
 
             SAS_OUTPUT="$(swanctl --list-sas 2>/dev/null)"
+            SAS_STATUS=$?
+            # Distinct from "ims: absent" below: a healthy vici connection
+            # with zero SAs still exits 0. Non-zero here means swanctl
+            # couldn't talk to charon at all (a broken/stuck vici socket
+            # that CHARON_PID being alive wouldn't catch) — same fatal
+            # treatment as a dead charon, for the same reason.
+            if [ "$SAS_STATUS" -ne 0 ]; then
+                log "FATAL: swanctl --list-sas failed (vici connection broken, exit $SAS_STATUS); exiting for a container restart"
+                kill -TERM $$
+                exit 0
+            fi
             # A here-string, not a pipe: grep reads it from an fd bash
             # already fully wrote, so there's no live producer process for
             # grep's early exit to SIGPIPE (unlike piping swanctl directly).
