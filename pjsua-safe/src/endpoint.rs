@@ -519,7 +519,8 @@ fn read_alsa_card_name(card_num: u32) -> Option<String> {
 /// Caller must ensure PJSUA is initialized and `call_id` is a valid, active
 /// call (both hold inside `on_call_media_state_cb`).
 #[cfg(feature = "pjsip-linked")]
-unsafe fn negotiated_audio_codec(call_id: pjsua_sys::pjsua_call_id) -> Option<(String, u32, u32)> {
+#[rustfmt::skip]
+unsafe fn negotiated_audio_codec(call_id: pjsua_sys::pjsua_call_id) -> Option<(String, u32, u32)> { // SAFETY: caller guarantees pjsua is initialized and call_id is a live call (see the doc above); stack stream_info is writable for get_stream_info
     let mut si: pjsua_sys::pjsua_stream_info = std::mem::zeroed();
     // Media index 0: these are audio-only calls, so the first stream is it.
     if pjsua_sys::pjsua_call_get_stream_info(call_id, 0, &mut si) != PJ_SUCCESS {
