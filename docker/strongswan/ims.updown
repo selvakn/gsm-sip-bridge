@@ -21,7 +21,12 @@ TUN_IFACE="${STRONGSWAN_TUN_IFACE:-tun23}"
 
 log() { echo "[ims.updown] $*" >&2; }
 
-case "$PLUTO_VERB:$1" in
+# charon invokes this script with no positional arguments at all (only
+# PLUTO_* env vars) — a bare "$1" under `set -u` aborts with "1: parameter
+# not set" (confirmed live: this crashed on every real up-client-v6 event
+# until fixed). "${1:-}" tolerates that; the trailing ":*" glob in each
+# case arm never needed a real $1 value anyway.
+case "$PLUTO_VERB:${1:-}" in
 up-client:* | up-client-v6:*)
     if [ -z "${PLUTO_MY_CLIENT:-}" ]; then
         log "no PLUTO_MY_CLIENT set on $PLUTO_VERB; nothing to install"
@@ -39,7 +44,7 @@ down-client:* | down-client-v6:*)
     ip netns exec "$NETNS" ip addr del "$PLUTO_MY_CLIENT" dev "$TUN_IFACE" 2>/dev/null || true
     ;;
 *)
-    log "unhandled verb '$PLUTO_VERB' (arg: '$1') — ignoring"
+    log "unhandled verb '$PLUTO_VERB' (arg: '${1:-}') — ignoring"
     ;;
 esac
 

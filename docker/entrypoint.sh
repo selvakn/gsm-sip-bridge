@@ -299,66 +299,95 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     # readiness ourselves instead of waiting on its exit.
     swanctl --initiate --child ims >/tmp/swanctl-initiate.log 2>&1 &
 
-    # --- Wait for tunnel readiness (T022) -------------------------------------
+    # --- Wait for tunnel readiness, indefinitely (T022/T023 merged) --------
+    # A single foreground loop, not a "wait once, then give up and hand off
+    # to a separate background supervisor" split: that split was tried and
+    # is a real bug (found by live-testing against a real carrier, not by
+    # reading the code) — an EAP-AKA round can be flatly rejected (a
+    # definitive per-protocol outcome, not a timeout `keyingtries`/
+    # `retry_initiate_interval` retry), and if the first attempt fails
+    # before `start_shared_tail`/the keepalive/the ongoing supervisor ever
+    # run, NOTHING re-checks even though charon (and a fresh
+    # `swanctl --initiate`) may well succeed a few attempts later — the
+    # veth pair and both agents would simply never start, indefinitely,
+    # which directly defeats FR-004/FR-005's "no permanent give-up".
+    # Logs progress periodically rather than hanging silently for however
+    # long the network takes.
     log "waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ..."
-    for _ in $(seq 1 90); do
+    ATTEMPT=0
+    while true; do
         if grep -q "CHILD_SA.*established" /tmp/charon.log 2>/dev/null; then
-            break
+            # Extract only the text AFTER "received P-CSCF server IP" before
+            # applying the address regex — charon's filelog prefixes every
+            # line with a "HH:MM:SS" timestamp, and the IPv6 regex below
+            # (hex groups separated by colons) matches that timestamp too;
+            # applying it to the whole line silently picked up "14:00:45"
+            # as the "P-CSCF address" instead of the real one (confirmed
+            # live: /tmp/pcscf ended up containing a timestamp, and
+            # vowifi-ims-agent then refused to start with "invalid P-CSCF
+            # address ... invalid IP address syntax").
+            PCSCF_LINES="$(grep -oE 'received P-CSCF server IP .*' /tmp/charon.log | sed 's/^received P-CSCF server IP //')"
+            PCSCF="$(echo "$PCSCF_LINES" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+            PCSCF6=""
+            if [ -z "$PCSCF" ]; then
+                PCSCF6="$(echo "$PCSCF_LINES" | grep -oE '^([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+$' | head -1)"
+            fi
+            if [ -n "$PCSCF" ] || [ -n "$PCSCF6" ]; then
+                break
+            fi
+            log "CHILD_SA established but no P-CSCF line found yet; still waiting"
         fi
         if ! kill -0 "$CHARON_PID" 2>/dev/null; then
             log "FATAL: charon exited before establishing the tunnel (see /tmp/charon.log)."
             exit 1
         fi
+        ATTEMPT=$((ATTEMPT + 1))
+        if [ $((ATTEMPT % 15)) -eq 0 ]; then
+            # ~30s of no CHILD_SA since the last (re-)initiate — a plain
+            # timeout, or a rejected EAP round, both look the same from out
+            # here: fire another attempt. keyingtries=0 keeps charon's own
+            # internal retry going regardless; this covers the case where
+            # the whole IKE_SA was torn down instead of merely retried.
+            log "still waiting after ${ATTEMPT}x2s; re-initiating"
+            swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
+        fi
         sleep 2
     done
 
-    # Extract first P-CSCF (prefer IPv4), from charon's own filelog line
-    # ("received P-CSCF server IP <addr>") — same extraction technique the
-    # swu engine already uses on its own dialer's stdout log, different
-    # regex/source.
-    PCSCF="$(grep 'received P-CSCF server IP' /tmp/charon.log | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-    PCSCF6=""
-    if [ -z "$PCSCF" ]; then
-        PCSCF6="$(grep 'received P-CSCF server IP' /tmp/charon.log | grep -oE '([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+' | head -1)"
-    fi
+    PCSCF_ADDR="${PCSCF:-$PCSCF6}"
+    log "tunnel UP. P-CSCF: $PCSCF_ADDR"
+    echo "$PCSCF_ADDR" >/tmp/pcscf
+    ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
 
-    if [ -z "$PCSCF" ] && [ -z "$PCSCF6" ]; then
-        log "WARNING: could not confirm P-CSCF assignment; leaving charon running (inspect /tmp/charon.log)."
-    else
-        PCSCF_ADDR="${PCSCF:-$PCSCF6}"
-        log "tunnel UP. P-CSCF: $PCSCF_ADDR"
-        echo "$PCSCF_ADDR" >/tmp/pcscf
-        ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
+    # --- Reliability supervision (T023) -----------------------------------
+    # From here on the tunnel is up at least once; this loop's only job is
+    # noticing if the CHILD_SA later disappears entirely (e.g. after an
+    # unrecoverable rekey failure) and re-triggering --initiate — the
+    # capability the swu engine never had at all (FR-004). Started only
+    # now (not earlier) because it has nothing to check before the first
+    # success; the loop above already covers "not up yet".
+    (
+        while true; do
+            sleep 30
+            if ! swanctl --list-sas 2>/dev/null | grep -q '^ims:'; then
+                log "ims CHILD_SA missing; re-initiating"
+                swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
+            fi
+        done
+    ) &
+    STRONGSWAN_SUPERVISOR_PID=$!
 
-        # --- Reliability supervision (T023) -----------------------------------
-        # charon retries IKE internally (keyingtries=0 +
-        # retry_initiate_interval), but if the CHILD_SA disappears entirely
-        # (e.g. after an unrecoverable rekey failure) nothing re-triggers
-        # --initiate on its own — poll and kick it if needed. This is the
-        # capability the swu engine never had at all (FR-004).
-        (
-            while true; do
-                sleep 30
-                if ! swanctl --list-sas 2>/dev/null | grep -q '^ims:'; then
-                    log "ims CHILD_SA missing; re-initiating"
-                    swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
-                fi
-            done
-        ) &
-        STRONGSWAN_SUPERVISOR_PID=$!
+    # Same idle-tunnel keepalive rationale as the swu engine (TCP
+    # connect, not ICMP — operators filter ICMP over the tunnel).
+    (
+        while true; do
+            ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
+            sleep "$KEEPALIVE_INTERVAL"
+        done
+    ) &
+    KEEPALIVE_PID=$!
 
-        # Same idle-tunnel keepalive rationale as the swu engine (TCP
-        # connect, not ICMP — operators filter ICMP over the tunnel).
-        (
-            while true; do
-                ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
-                sleep "$KEEPALIVE_INTERVAL"
-            done
-        ) &
-        KEEPALIVE_PID=$!
-
-        start_shared_tail "$PCSCF_ADDR"
-    fi
+    start_shared_tail "$PCSCF_ADDR"
 else
     # --- swu engine: SWu-IKEv2 Python dialer (specs/011-vowifi-sip-bridge) --
     [ -c /dev/net/tun ] || { log "FATAL: /dev/net/tun missing (need --device /dev/net/tun + cap NET_ADMIN)"; exit 1; }
