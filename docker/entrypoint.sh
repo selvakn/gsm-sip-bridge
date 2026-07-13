@@ -54,6 +54,7 @@ eval "$SHELL_ENV"
 DAEMON_SUPERVISOR_PID=""
 KEEPALIVE_PID=""
 SWU_PID=""
+SWU_WATCHDOG_PID=""
 IMS_AGENT_SUPERVISOR_PID=""
 SIP_AGENT_SUPERVISOR_PID=""
 PCSCD_PID=""
@@ -70,6 +71,7 @@ cleanup() {
     [ -n "$SIP_AGENT_SUPERVISOR_PID" ] && kill "$SIP_AGENT_SUPERVISOR_PID" 2>/dev/null
     pkill -f vowifi-ims-agent 2>/dev/null
     pkill -f vowifi-sip-agent 2>/dev/null
+    [ -n "$SWU_WATCHDOG_PID" ] && kill "$SWU_WATCHDOG_PID" 2>/dev/null
     [ -n "$SWU_PID" ] && kill "$SWU_PID" 2>/dev/null
     [ -n "$STRONGSWAN_SUPERVISOR_PID" ] && kill "$STRONGSWAN_SUPERVISOR_PID" 2>/dev/null
     [ -n "$USIM_BRIDGE_SUPERVISOR_PID" ] && kill "$USIM_BRIDGE_SUPERVISOR_PID" 2>/dev/null
@@ -121,6 +123,25 @@ else
     fi
     log "resolved ePDG: $EPDG_IP"
 fi
+
+# --- strongswan engine only: latest P-CSCF from charon's growing log -----
+# charon.log is truncated once at startup (`: >/tmp/charon.log`) and never
+# again, so it accumulates every "received P-CSCF server IP" line for the
+# life of the container — including ones from a later re-auth/rekey that
+# assigned a *different* P-CSCF than the first. Always takes the last
+# (`tail -1`), not the first, match so a later reconnect's address wins.
+# Prefers IPv4, falling back to IPv6 only if no IPv4 line exists at all.
+extract_latest_pcscf() {
+    local lines v4 v6
+    lines="$(grep -oE 'received P-CSCF server IP .*' /tmp/charon.log 2>/dev/null | sed 's/^received P-CSCF server IP //')"
+    v4="$(echo "$lines" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)"
+    if [ -n "$v4" ]; then
+        echo "$v4"
+        return
+    fi
+    v6="$(echo "$lines" | grep -oE '^([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+$' | tail -1)"
+    echo "$v6"
+}
 
 # --- Shared tail: veth pair + both VoWiFi bridge agents -------------------
 # Called by either engine once its tunnel is up and $PCSCF_ADDR is known.
@@ -305,22 +326,14 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     ATTEMPT=0
     while true; do
         if grep -q "CHILD_SA.*established" /tmp/charon.log 2>/dev/null; then
-            # Extract only the text AFTER "received P-CSCF server IP" before
-            # applying the address regex — charon's filelog prefixes every
-            # line with a "HH:MM:SS" timestamp, and the IPv6 regex below
-            # (hex groups separated by colons) matches that timestamp too;
-            # applying it to the whole line silently picked up "14:00:45"
-            # as the "P-CSCF address" instead of the real one (confirmed
-            # live: /tmp/pcscf ended up containing a timestamp, and
-            # vowifi-ims-agent then refused to start with "invalid P-CSCF
-            # address ... invalid IP address syntax").
-            PCSCF_LINES="$(grep -oE 'received P-CSCF server IP .*' /tmp/charon.log | sed 's/^received P-CSCF server IP //')"
-            PCSCF="$(echo "$PCSCF_LINES" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
-            PCSCF6=""
-            if [ -z "$PCSCF" ]; then
-                PCSCF6="$(echo "$PCSCF_LINES" | grep -oE '^([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+$' | head -1)"
-            fi
-            if [ -n "$PCSCF" ] || [ -n "$PCSCF6" ]; then
+            # Extraction (and the timestamp-collision fix: applying the
+            # regex only to the text AFTER "received P-CSCF server IP", not
+            # the whole line, which starts with an "HH:MM:SS" charon
+            # timestamp the IPv6 regex also matches — confirmed live) lives
+            # in extract_latest_pcscf, shared with the reliability
+            # supervisor below so both use the exact same logic.
+            PCSCF_ADDR="$(extract_latest_pcscf)"
+            if [ -n "$PCSCF_ADDR" ]; then
                 break
             fi
             log "CHILD_SA established but no P-CSCF line found yet; still waiting"
@@ -342,7 +355,6 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
         sleep 2
     done
 
-    PCSCF_ADDR="${PCSCF:-$PCSCF6}"
     log "tunnel UP. P-CSCF: $PCSCF_ADDR"
     echo "$PCSCF_ADDR" >/tmp/pcscf
     ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
@@ -380,15 +392,41 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
                 log "ims CHILD_SA missing; re-initiating"
                 swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
             fi
+
+            # A CHILD_SA rekey/re-auth can assign a *different* P-CSCF
+            # without "ims:" ever going missing from --list-sas above (a
+            # routine, gapless re-auth, not an outage) — that branch alone
+            # would never notice. vowifi-ims-agent only reads /tmp/pcscf
+            # once at its own startup, so refresh the file here and
+            # restart it (IMS_AGENT_SUPERVISOR_PID's own loop relaunches it
+            # immediately, picking up the new address) whenever the log's
+            # latest P-CSCF differs from what's on disk, instead of leaving
+            # it registered against a dead address until someone notices
+            # (found via review, Greptile PR #2).
+            LATEST_PCSCF="$(extract_latest_pcscf)"
+            if [ -n "$LATEST_PCSCF" ]; then
+                CURRENT_PCSCF="$(cat /tmp/pcscf 2>/dev/null || true)"
+                if [ "$LATEST_PCSCF" != "$CURRENT_PCSCF" ]; then
+                    log "P-CSCF changed ($CURRENT_PCSCF -> $LATEST_PCSCF); refreshing and restarting vowifi-ims-agent"
+                    echo "$LATEST_PCSCF" >/tmp/pcscf
+                    pkill -f vowifi-ims-agent 2>/dev/null || true
+                fi
+            fi
         done
     ) &
     STRONGSWAN_SUPERVISOR_PID=$!
 
-    # Same idle-tunnel keepalive rationale as the swu engine (TCP
-    # connect, not ICMP — operators filter ICMP over the tunnel).
+    # Same idle-tunnel keepalive rationale as the swu engine (TCP connect,
+    # not ICMP — operators filter ICMP over the tunnel). Re-reads
+    # /tmp/pcscf every cycle rather than closing over the startup
+    # $PCSCF_ADDR value, so it keeps pinging the right address after the
+    # supervisor above refreshes it.
     (
         while true; do
-            ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
+            PCSCF_NOW="$(cat /tmp/pcscf 2>/dev/null || true)"
+            if [ -n "$PCSCF_NOW" ]; then
+                ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_NOW/5060'" >/dev/null 2>&1
+            fi
             sleep "$KEEPALIVE_INTERVAL"
         done
     ) &
@@ -484,6 +522,28 @@ else
         done
     ) &
     KEEPALIVE_PID=$!
+
+    # Nothing watched $SWU_PID past this point before — the loop above only
+    # checks it while waiting for the *first* connection. If the dialer dies
+    # later (tunnel failure, uncaught exception), the container just kept
+    # running with the keepalive/agent supervisors alive but the tunnel
+    # gone, and restart: unless-stopped never fired since nothing exited
+    # (found via review, Greptile PR #2). The swu engine has no
+    # re-initiate-in-place concept (unlike strongswan's supervisor above),
+    # so the only real recovery is a full container restart: signal the
+    # main script (still PID 1's $$, even from this subshell) so the
+    # existing `trap cleanup EXIT INT TERM` runs and the container exits.
+    (
+        while true; do
+            sleep 5
+            if ! kill -0 "$SWU_PID" 2>/dev/null; then
+                log "FATAL: SWu-IKEv2 dialer exited after the tunnel was established (see $LOG)"
+                kill -TERM $$
+                exit 0
+            fi
+        done
+    ) &
+    SWU_WATCHDOG_PID=$!
 
     start_shared_tail "$PCSCF_ADDR"
 fi
