@@ -128,19 +128,17 @@ fi
 # charon.log is truncated once at startup (`: >/tmp/charon.log`) and never
 # again, so it accumulates every "received P-CSCF server IP" line for the
 # life of the container — including ones from a later re-auth/rekey that
-# assigned a *different* P-CSCF than the first. Always takes the last
-# (`tail -1`), not the first, match so a later reconnect's address wins.
-# Prefers IPv4, falling back to IPv6 only if no IPv4 line exists at all.
+# assigned a *different* P-CSCF than the first. Picks the chronologically
+# last matching line overall (`tail -1` after filtering to valid v4/v6
+# addresses), not the last of one family checked first — a family
+# preference applied across the whole history would keep returning an
+# older IPv4 assignment even after a later re-auth assigned only a new
+# IPv6 P-CSCF, since the routine used to check "any IPv4 line ever seen"
+# before recency (found via review, Greptile PR #2).
 extract_latest_pcscf() {
-    local lines v4 v6
+    local lines
     lines="$(grep -oE 'received P-CSCF server IP .*' /tmp/charon.log 2>/dev/null | sed 's/^received P-CSCF server IP //')"
-    v4="$(echo "$lines" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)"
-    if [ -n "$v4" ]; then
-        echo "$v4"
-        return
-    fi
-    v6="$(echo "$lines" | grep -oE '^([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+$' | tail -1)"
-    echo "$v6"
+    echo "$lines" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|^([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+$' | tail -1
 }
 
 # --- strongswan engine only: idempotently ensure the netns + pre-created
