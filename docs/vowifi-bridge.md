@@ -8,9 +8,9 @@ code itself.
 
 The existing GSM-SIP bridge answers circuit-switched calls arriving on a modem's cellular voice
 channel and bridges them to a SIP/PBX destination. This feature adds a second, independent inbound
-path: calls arriving over the carrier's VoWiFi/IMS service (via the ePDG tunnel in `docker/epdg/`)
-are answered and bridged the same way. The two paths coexist — the carrier network decides which
-one actually delivers a given call.
+path: calls arriving over the carrier's VoWiFi/IMS service (via the ePDG tunnel, built into the
+same image as the daemon — see `docker/`) are answered and bridged the same way. The two paths
+coexist — the carrier network decides which one actually delivers a given call.
 
 ## Why two processes
 
@@ -18,7 +18,8 @@ The VoWiFi leg must run inside the ePDG tunnel's `ims` network namespace — tha
 the tunnel's routes and the Gm IPsec (kernel XFRM) policy negotiated during IMS registration
 actually match. The SIP/PBX leg needs ordinary LAN reachability to the PBX, which only exists in
 the container's default namespace. One process can't satisfy both constraints, so the feature is
-two processes joined by a `veth` pair that `docker/epdg/entrypoint.sh` creates automatically:
+two processes joined by a `veth` pair that `docker/entrypoint.sh` creates automatically (only when
+`[vowifi].enabled = true` — see that script's structure):
 
 ```
           netns "ims"                                    container default netns

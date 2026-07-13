@@ -39,6 +39,15 @@ pub const VETH_SIP_PORT: u16 = 5070;
 /// queries (`ControlMessage::StatusQuery` → `RegistrationStatusReply`).
 /// Same "private implementation detail" status as `VETH_SIP_PORT`.
 pub const AGENT_A_STATUS_PORT: u16 = 5071;
+/// Agent B's own local SIP port for its PJSIP endpoint — deliberately NOT
+/// `[sip].local_port`. Both the circuit-switched daemon and Agent B share
+/// one config file and, in the merged deployment (`docker/entrypoint.sh`),
+/// one network namespace (host networking) — reusing `[sip].local_port` for
+/// both means two independent `pjsua_create`/transport-bind calls racing for
+/// the same UDP port, which fails outright for whichever one starts second.
+/// Same "private implementation detail" status as `VETH_SIP_PORT`/
+/// `AGENT_A_STATUS_PORT`.
+pub const AGENT_B_SIP_LOCAL_PORT: u16 = 5072;
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -98,7 +107,7 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
     };
     let ep_config = EndpointConfig {
         transport,
-        local_port: config.sip.local_port,
+        local_port: AGENT_B_SIP_LOCAL_PORT,
         tls_verify: config.sip.tls_verify == TlsVerify::Strict,
         jb_init_ms: config.audio.settings.jb_init_ms,
         jb_min_pre: config.audio.settings.jb_min_pre,

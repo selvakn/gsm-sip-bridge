@@ -7,7 +7,7 @@
 //!
 //! Shells out to `ip xfrm` rather than speaking raw netlink, to stay
 //! consistent with this crate's zero-`unsafe` policy and the pattern
-//! `docker/epdg/entrypoint.sh` already uses for netns/route setup.
+//! `docker/entrypoint.sh` already uses for netns/route setup.
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::SaProposal;
@@ -289,9 +289,13 @@ impl GmEndpoints {
 ///
 /// - Tunnel A (client-initiated: our `local_c` <-> their `remote_s`) is what
 ///   carries our authenticated REGISTER and its response.
-/// - Tunnel B (server-initiated: our `local_s` <-> their `remote_c`) is
-///   installed for parity with a real client, though nothing in this
-///   REGISTER-only flow currently listens on `local_s`.
+/// - Tunnel B (server-initiated: our `local_s` <-> their `remote_c`) carries
+///   everything the *network* originates — the reg-event `NOTIFY` and every
+///   mobile-terminating `INVITE`. `sip_client::spawn_gm_server` listens on
+///   `local_s` for exactly this; without a listener there the kernel RSTs the
+///   P-CSCF's connection attempt and inbound calls are never delivered at all,
+///   while REGISTER and outbound calls (both client-initiated, tunnel A) keep
+///   working and hide the fault.
 pub fn install_gm_sas(
     endpoints: &GmEndpoints,
     ours: &SaProposal,

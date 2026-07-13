@@ -92,9 +92,10 @@ inter_card_gap_jitter_seconds = 15
 # Inbound VoWiFi-to-SIP bridge (see specs/011-vowifi-sip-bridge/) — a second,
 # independent inbound call path alongside the [sip]/[bridge] circuit-switched
 # bridge above. Only read by the `vowifi-ims-agent`/`vowifi-sip-agent`
-# subcommands run inside the docker/epdg/ deployment; ignored by the normal
-# daemon path. The SIP/PBX destination for a bridged VoWiFi call reuses
-# [bridge].sip_destination above rather than a separate setting.
+# subcommands (started automatically by docker/entrypoint.sh when enabled
+# here); ignored by the normal daemon path. The SIP/PBX destination for a
+# bridged VoWiFi call reuses [bridge].sip_destination above rather than a
+# separate setting.
 enabled = false
 # Home network MCC/MNC, required when enabled = true. Example: Airtel India.
 mcc = "404"
@@ -108,7 +109,7 @@ modem_port = "/dev/ttyUSB6"
 use_tcp = true
 sec_agree = true
 # Path Agent A reads the tunnel-assigned P-CSCF address from; written by
-# docker/epdg/entrypoint.sh once the SWu tunnel is up.
+# docker/entrypoint.sh once the SWu tunnel is up.
 pcscf_source_path = "/tmp/pcscf"
 # Addresses on the dedicated veth link between Agent A (ims netns) and
 # Agent B (default netns), and the TCP port their control channel uses.
