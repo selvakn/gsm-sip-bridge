@@ -71,7 +71,7 @@ pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
         let usb_name = entry.file_name().to_string_lossy().to_string();
 
         let Some(at_interface_number) = device.at_interface_number else {
-            tracing::info!(
+            tracing::debug!(
                 model = device.model,
                 usb_path = %usb_name,
                 "detected a VoWiFi-only module (no circuit-switched audio path) — \
