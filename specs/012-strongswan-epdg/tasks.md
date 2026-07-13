@@ -106,25 +106,25 @@ pcscd → vpcd → `vowifi-usim-bridge` → `AT+CSIM` (contracts/vpcd-bridge-pro
 **Independent Test**: with only the modem attached (no PC/SC reader), a manually-initiated
 swanctl connection reaches `EAP method EAP_AKA succeeded` on both test carriers (SC-004).
 
-- [ ] T011 [P] [US2] Unit tests for the vpcd framing codec in
+- [X] T011 [P] [US2] Unit tests for the vpcd framing codec in
       `gsm-sip-bridge/src/vowifi/usim_bridge.rs` `#[cfg(test)]`: 2-byte big-endian
       length-prefix encode/decode (empty, 1-byte control, max-length APDU, short-read
       handling), control-message parsing (`0x00`/`0x01`/`0x02`/`0x04`), APDU-vs-control
       discrimination by length. Must fail first
-- [ ] T012 [US2] Implement the framing codec + message types in
+- [X] T012 [US2] Implement the framing codec + message types in
       `gsm-sip-bridge/src/vowifi/usim_bridge.rs` (depends on T011)
-- [ ] T013 [P] [US2] Integration test (same file, `#[cfg(test)]`): real in-process TCP
+- [X] T013 [P] [US2] Integration test (same file, `#[cfg(test)]`): real in-process TCP
       socket pair — test plays the vpcd side (connect-accept, power on → ATR request →
       command APDU → power off), bridge runs against a scripted modem transport; assert the
       full session transcript including canned-ATR reply and APDU round-trip. No transport
       mocks (constitution I). Must fail first
-- [ ] T014 [US2] Implement the bridge session loop per data-model.md's state machine:
+- [X] T014 [US2] Implement the bridge session loop per data-model.md's state machine:
       vpcd connect/reconnect with backoff, power-on acquires the serial port
       (retry/backoff while busy — `serialport` opens with `TIOCEXCL`), power-off/disconnect
       releases it, reset re-runs the session prologue (SELECT MF, EF_DIR AID discovery via
       `modules/usim.rs::discover_usim_aid`), ATR request served from a canned USIM ATR
       constant (depends on T012, T013)
-- [ ] T015 [P] [US2] Table-driven fixture tests for APDU normalization in
+- [X] T015 [P] [US2] Table-driven fixture tests for APDU normalization in
       `gsm-sip-bridge/src/vowifi/usim_bridge.rs` `#[cfg(test)]`, one case per documented
       EC200U/SIM quirk from `docker/patches/0001-ec200u-at-csim-fixes.patch`: (a) modem
       returns full data + `9000` while client drives classic `61xx`+GET RESPONSE — bridge
@@ -132,13 +132,13 @@ swanctl connection reaches `EAP method EAP_AKA succeeded` on both test carriers 
       against the modem; (c) SELECT `P2=0x00` → `6B00` → retried once with `P2=0x0C`;
       (d) SELECT of a foreign USIM AID (RID `A0…871002`) redirected to the discovered AID;
       (e) non-hex `+CSIM` fragment rejected. Must fail first
-- [ ] T016 [US2] Implement APDU forwarding + normalization per
+- [X] T016 [US2] Implement APDU forwarding + normalization per
       contracts/vpcd-bridge-protocol.md: hex-encode into `AT+CSIM=<len>,"<hex>"`,
       slow-AUTHENTICATE wait discipline (no retransmit inside a pending transaction), the
       five normalizations from T015, verbatim pass-through for everything else (AUTHENTICATE
       INS `88` stays opaque, AUTS included). If `modules/usim.rs` needs a raw-APDU helper,
       add it without touching existing callers' behavior (depends on T014, T015)
-- [ ] T017 [US2] Error mapping + tests in `gsm-sip-bridge/src/vowifi/usim_bridge.rs`: serial
+- [X] T017 [US2] Error mapping + tests in `gsm-sip-bridge/src/vowifi/usim_bridge.rs`: serial
       busy past the retry window → `SW=6F00` (card-mute) so charon fails the EAP round
       cleanly; modem `ERROR`/garbage → `SW=6F00` + raw exchange logged at warn; vpcd
       disconnect mid-session → port released, reconnect loop (depends on T016)
