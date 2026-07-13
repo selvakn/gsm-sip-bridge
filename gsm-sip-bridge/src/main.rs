@@ -48,9 +48,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if let Some(Commands::VowifiImsi(_args)) = &cli.command {
-        eprintln!("error: vowifi-imsi not yet implemented");
-        return ExitCode::FAILURE;
+    if let Some(Commands::VowifiImsi(args)) = &cli.command {
+        return gsm_sip_bridge::vowifi::imsi::run(&args.modem);
     }
 
     if let Some(Commands::Config(args)) = &cli.command {
