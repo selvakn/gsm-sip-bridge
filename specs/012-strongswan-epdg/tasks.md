@@ -81,15 +81,15 @@ work lands inside a branch that leaves the default `swu` path untouched from day
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T008 [P] Unit test for the `vowifi-imsi` handler in `gsm-sip-bridge/src/vowifi/mod.rs`
+- [X] T008 [P] Unit test for the `vowifi-imsi` handler in `gsm-sip-bridge/src/vowifi/mod.rs`
       (or a small `vowifi/imsi.rs`): scripted `AtCommander` transport (existing `MockStream`
       pattern in `gsm-sip-bridge/src/modules/at_commander.rs`, whose hardware-unavailable
       justification already stands) returns a canned `AT+CIMI` response; assert the handler
       yields exactly the IMSI string. Test must fail first
-- [ ] T009 Implement `vowifi-imsi`: read IMSI via `AtCommander::query_imsi()`, print to
+- [X] T009 Implement `vowifi-imsi`: read IMSI via `AtCommander::query_imsi()`, print to
       stdout (nothing else — the entrypoint consumes it verbatim), non-zero exit on failure;
       replace T003's stub (depends on T008)
-- [ ] T010 Add the `TUNNEL_ENGINE` skeleton to `docker/entrypoint.sh`: validate
+- [X] T010 Add the `TUNNEL_ENGINE` skeleton to `docker/entrypoint.sh`: validate
       `swu`|`strongswan` (unknown value → fatal, per data-model.md), default `swu`; `swu`
       branch is the existing flow verbatim; `strongswan` branch initially logs "not yet
       implemented" and exits. Also document `TUNNEL_ENGINE` in `docker/epdg/.env`

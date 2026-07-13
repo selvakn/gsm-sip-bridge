@@ -5,17 +5,29 @@
 #   1. The circuit-switched GSM-to-SIP daemon — always started; it already
 #      no-ops gracefully ("no EC20 modules found — waiting for retry") when
 #      no supported modem is attached, so there's nothing to gate this on.
-#   2. The inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — the
-#      SWu-IKEv2 ePDG tunnel, a veth pair, and vowifi-ims-agent/
-#      vowifi-sip-agent — started only if [vowifi].enabled = true in the
-#      mounted config.toml (checked via `gsm-sip-bridge config
-#      vowifi-enabled` rather than hand-parsing TOML in bash).
+#   2. The inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — an
+#      ePDG tunnel, a veth pair, and vowifi-ims-agent/vowifi-sip-agent —
+#      started only if [vowifi].enabled = true in the mounted config.toml
+#      (checked via `gsm-sip-bridge config vowifi-enabled` rather than
+#      hand-parsing TOML in bash). The tunnel engine itself is selectable
+#      via TUNNEL_ENGINE (specs/012-strongswan-epdg): "swu" (default during
+#      the proving period) is the original SWu-IKEv2 Python dialer; the
+#      "strongswan" flag is validated here but not yet implemented — that
+#      lands in specs/012-strongswan-epdg Phase 4.
 #
-# The VoWiFi subsystem's tunnel setup creates network namespace "$NETNS",
-# opens tun1, moves it into the namespace, and installs the split-default
-# routes THERE, so the container's own routing (used to reach the SIP
-# server / ePDG) is untouched.
+# The VoWiFi subsystem's tunnel setup creates network namespace "$NETNS"
+# and installs the split-default routes THERE, so the container's own
+# routing (used to reach the SIP server / ePDG) is untouched.
 set -uo pipefail
+
+TUNNEL_ENGINE="${TUNNEL_ENGINE:-swu}"
+case "$TUNNEL_ENGINE" in
+    swu | strongswan) ;;
+    *)
+        echo "[entrypoint] FATAL: invalid TUNNEL_ENGINE '$TUNNEL_ENGINE' (must be 'swu' or 'strongswan')" >&2
+        exit 1
+        ;;
+esac
 
 GSM_SIP_BRIDGE_BIN="${GSM_SIP_BRIDGE_BIN:-/usr/local/bin/gsm-sip-bridge}"
 GSM_SIP_BRIDGE_CONFIG="${GSM_SIP_BRIDGE_CONFIG:-/etc/gsm-sip-bridge/config.toml}"
@@ -84,17 +96,16 @@ if ! "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config vowifi-enabl
     exit 0
 fi
 
-log "[vowifi].enabled — starting the VoWiFi/ePDG tunnel and bridge agents"
+log "[vowifi].enabled — starting the VoWiFi/ePDG tunnel and bridge agents (engine: $TUNNEL_ENGINE)"
 
-# --- Preflight ---------------------------------------------------------------
-[ -c /dev/net/tun ] || { log "FATAL: /dev/net/tun missing (need --device /dev/net/tun + cap NET_ADMIN)"; exit 1; }
+# --- Preflight (shared by both engines) --------------------------------------
 [ -e "$MODEM_PORT" ] || { log "FATAL: modem port $MODEM_PORT not present in container (check devices:)"; exit 1; }
 if ! ip netns add __probe 2>/dev/null; then
     log "FATAL: cannot create network namespaces — add cap_add: SYS_ADMIN (and NET_ADMIN)"; exit 1
 fi
 ip netns del __probe 2>/dev/null || true
 
-# --- Resolve ePDG IP -------------------------------------------------------
+# --- Resolve ePDG IP (shared by both engines) --------------------------------
 if [ -n "$EPDG_IP" ]; then
     log "using ePDG IP from EPDG_IP override: $EPDG_IP"
 else
@@ -106,6 +117,19 @@ else
     fi
     log "resolved ePDG: $EPDG_IP"
 fi
+
+# --- strongSwan engine (specs/012-strongswan-epdg) ---------------------------
+# Netns/XFRM plumbing, engine startup, readiness/P-CSCF extraction, and
+# reliability supervision land in Phase 4 (T020-T023); the shared veth+agent
+# tail below is wired to run after either engine's readiness signal in
+# Phase 5 (T026). Until then this is a validated no-op path.
+if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
+    log "FATAL: TUNNEL_ENGINE=strongswan is not yet implemented (specs/012-strongswan-epdg Phase 4). Use TUNNEL_ENGINE=swu (the default) until then."
+    exit 1
+fi
+
+# --- swu engine: SWu-IKEv2 Python dialer (specs/011-vowifi-sip-bridge) ------
+[ -c /dev/net/tun ] || { log "FATAL: /dev/net/tun missing (need --device /dev/net/tun + cap NET_ADMIN)"; exit 1; }
 
 # --- Launch the SWu-IKEv2 dialer --------------------------------------------
 SRC_OPT=()

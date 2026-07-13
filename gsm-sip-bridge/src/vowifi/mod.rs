@@ -18,6 +18,7 @@
 //! existing circuit-switched call path completely untouched (FR-006).
 
 pub mod control;
+pub mod imsi;
 pub mod usim_bridge;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
