@@ -10,17 +10,21 @@
 #      started only if [vowifi].enabled = true in the mounted config.toml
 #      (checked via `gsm-sip-bridge config vowifi-enabled` rather than
 #      hand-parsing TOML in bash). The tunnel engine itself is selectable
-#      via TUNNEL_ENGINE (specs/012-strongswan-epdg): "swu" (default during
-#      the proving period) is the original SWu-IKEv2 Python dialer; the
-#      "strongswan" flag is validated here but not yet implemented — that
-#      lands in specs/012-strongswan-epdg Phase 4.
+#      via TUNNEL_ENGINE (specs/012-strongswan-epdg): "strongswan" (the
+#      default) has proper IKE rekeying/re-auth/DPD/MOBIKE and a network
+#      namespace that survives reconnects, live-verified against Airtel
+#      India (SC-002/003/004(Airtel)/005/006 all passed — see
+#      specs/012-strongswan-epdg/tasks.md); "swu" is the original
+#      SWu-IKEv2 Python dialer, kept as an explicit fallback (set
+#      TUNNEL_ENGINE=swu) since the 24h soak (SC-001) and the Vi-carrier
+#      half of SC-004 are still outstanding.
 #
 # The VoWiFi subsystem's tunnel setup creates network namespace "$NETNS"
 # and installs the split-default routes THERE, so the container's own
 # routing (used to reach the SIP server / ePDG) is untouched.
 set -uo pipefail
 
-TUNNEL_ENGINE="${TUNNEL_ENGINE:-swu}"
+TUNNEL_ENGINE="${TUNNEL_ENGINE:-strongswan}"
 case "$TUNNEL_ENGINE" in
     swu | strongswan) ;;
     *)

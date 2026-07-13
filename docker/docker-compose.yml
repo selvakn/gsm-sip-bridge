@@ -5,10 +5,12 @@
 #      ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, started only when
 #      [vowifi].enabled = true in the mounted config.toml. The tunnel
 #      engine is chosen via the TUNNEL_ENGINE env var (.env — see
-#      .env.example), specs/012-strongswan-epdg: "swu" (default during the
-#      strongSwan proving period) is the original SWu-IKEv2 Python dialer;
-#      "strongswan" is the new engine with proper IKE rekeying/re-auth/
-#      DPD/MOBIKE and a network namespace that survives reconnects.
+#      .env.example), specs/012-strongswan-epdg: "strongswan" (the
+#      default) has proper IKE rekeying/re-auth/DPD/MOBIKE and a network
+#      namespace that survives reconnects, live-verified against Airtel
+#      India; "swu" is the original SWu-IKEv2 Python dialer, kept as an
+#      explicit fallback (the 24h soak and the Vi-carrier EAP-AKA check
+#      are still outstanding — see specs/012-strongswan-epdg/tasks.md).
 #      Switching is a container restart, not a rebuild — both engines ship
 #      in this one image.
 #

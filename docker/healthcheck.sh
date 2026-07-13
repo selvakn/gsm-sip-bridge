@@ -16,7 +16,7 @@ METRICS_PORT="${METRICS_PORT:-9091}"
 # docker/entrypoint.sh's TUNNEL_ENGINE/STRONGSWAN_TUN_IFACE defaults —
 # hardcoding "tun1" here made every strongswan-engine container report
 # unhealthy regardless of real tunnel state (found by live-testing).
-TUNNEL_ENGINE="${TUNNEL_ENGINE:-swu}"
+TUNNEL_ENGINE="${TUNNEL_ENGINE:-strongswan}"
 if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     TUN_IFACE="${STRONGSWAN_TUN_IFACE:-tun23}"
 else

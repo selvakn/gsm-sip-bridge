@@ -595,7 +595,8 @@ equivalent fallback.
 
 **Still needed before recommending `strongswan` as the default engine**
 (specs/012-strongswan-epdg's LIVE-tagged tasks — real modem/SIM/carrier
-access required, none of it automatable):
+access required, none of it automatable) — as things stood before the real
+hardware became available:
 - Trace `eap-sim-pcsc`'s real APDU sequence against the vpcd bridge and
   confirm/refute the ATR-is-opaque and SELECT-`P2` assumptions (T018).
 - Full EAP-AKA success on both carriers via the bridge, no PC/SC reader
@@ -608,5 +609,39 @@ access required, none of it automatable):
 - An engine-switch drill, `strongswan` → `swu` → `strongswan` on one image
   (T030, SC-005).
 
-Until all of those pass, `TUNNEL_ENGINE` defaults to `swu` — see
-`.env.example`.
+### Live hardware results (Quectel EC200 + Airtel SIM) and the default switch
+
+All of the above except the 24h soak and the Vi-carrier check were run
+against a real, connected Quectel EC200 modem and a live Airtel India SIM
+(the tunnel's own actual traffic, not a sandbox stand-in). Full detail —
+including 7 real bugs found and fixed along the way (EAP-AKA rejection
+root-caused to strongSwan's own hardcoded 61xx expectation; lazy AID
+discovery; the supervisor's permanent-give-up gap; `healthcheck.sh`'s
+hardcoded `tun1`; a P-CSCF-regex/timestamp collision; `ims.updown`'s
+unset-`$1` crash; a `pipefail`/`SIGPIPE` false-negative in the supervisor's
+own SA check) — is in `specs/012-strongswan-epdg/tasks.md`'s per-task
+notes and the corresponding commit history. Summary:
+
+- **T018/SC-004 (Airtel)** — PASS, reproduced 3×: real IKE_SA + CHILD_SA
+  established against Airtel's actual ePDG via the SIM inside the EC200U,
+  zero PC/SC hardware.
+- **T024/SC-002** — PASS, exceeding the bar: a genuine 60s outage (DPD
+  activity confirmed in charon's log) was weathered via IKEv2
+  retransmission with the IKE_SA never even torn down; netns/veth/agent
+  PIDs identical before/during/after.
+- **T027/SC-003 (immediate case)** — PASS: a real inbound call was
+  answered and bridged well under 5s with two-way audio (AMR-NB↔PCMU
+  transcoding), clean BYE teardown.
+- **T030/SC-005** — PASS: a real `swu` → `strongswan` → `swu` round trip
+  across one session, each direction a plain `.env` edit + `docker compose
+  up --build`, nothing else.
+- **Still outstanding**: SC-001 (the 24h soak) and the Vi-carrier half of
+  SC-004 — no Vi SIM was available in that session; the soak needs its own
+  dedicated window since it holds the container down for a full day.
+
+**Given this, `TUNNEL_ENGINE` now defaults to `strongswan`** (previously
+`swu`) — an explicit decision made with SC-001 and the Vi-carrier check
+still open, not a claim that every proving criterion in spec.md has
+passed. `swu` remains fully supported as an explicit fallback
+(`TUNNEL_ENGINE=swu`) for exactly that reason. Revisit whether to retire
+`swu` entirely once the soak and the Vi check are run.
