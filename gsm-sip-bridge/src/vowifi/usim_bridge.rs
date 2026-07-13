@@ -125,6 +125,7 @@ fn forward_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
     let mut resp = send_raw_apdu(at, apdu)?;
 
     if is_select_with_p2(apdu, 0x00) && trailing_sw(&resp) == Some(0x6B00) {
+        tracing::trace!("SELECT P2=0x00 rejected (SW=6B00); retrying with P2=0x0C");
         let retried = rewrite_select_p2(apdu, 0x0C);
         resp = send_raw_apdu(at, &retried)?;
     }
@@ -132,6 +133,7 @@ fn forward_apdu(at: &mut AtCommander, apdu: &[u8]) -> BridgeResult<Vec<u8>> {
     if let Some(sw) = trailing_sw(&resp) {
         if (sw >> 8) == 0x61 {
             let le = (sw & 0xFF) as u8;
+            tracing::trace!(le, "modem returned SW=61xx; chasing GET RESPONSE");
             let get_response = [0x00, 0xC0, 0x00, 0x00, le];
             resp = send_raw_apdu(at, &get_response)?;
         }
@@ -240,6 +242,14 @@ impl Session {
     }
 
     fn handle_apdu(&mut self, apdu: &[u8]) -> Vec<u8> {
+        // T018 (specs/012-strongswan-epdg): the whole point of this trace
+        // is to observe, against the real eap-sim-pcsc plugin, which of
+        // research.md's unverified assumptions hold — does the client ever
+        // issue a literal GET RESPONSE, what P2 does it actually send on
+        // SELECT, does it select a foreign AID. `-v` (trace level) is what
+        // docker/entrypoint.sh already passes vowifi-usim-bridge.
+        tracing::trace!(apdu = %usim::hex_encode(apdu), "APDU from vpcd client");
+
         let SessionState::Powered {
             serial,
             aid,
@@ -252,13 +262,25 @@ impl Session {
 
         if is_get_response(apdu) {
             if let Some(cached) = last_response {
+                tracing::trace!(
+                    resp = %usim::hex_encode(cached),
+                    "client issued GET RESPONSE; served from cache, modem not touched"
+                );
                 return cached.clone();
             }
         }
 
-        let apdu = redirect_select_aid(apdu, aid);
-        match forward_apdu(serial, &apdu) {
+        let redirected = redirect_select_aid(apdu, aid);
+        if redirected != apdu {
+            tracing::trace!(
+                original = %usim::hex_encode(apdu),
+                redirected = %usim::hex_encode(&redirected),
+                "SELECT-by-AID redirected to the discovered AID"
+            );
+        }
+        match forward_apdu(serial, &redirected) {
             Ok(resp) => {
+                tracing::trace!(resp = %usim::hex_encode(&resp), "APDU response to vpcd client");
                 *last_response = Some(resp.clone());
                 resp
             }
@@ -287,7 +309,9 @@ where
             Ok(None) => return Ok(()),
             Err(e) => return Err(BridgeError::Ims(format!("vpcd read failed: {e}"))),
         };
-        match VpcdMessage::from_payload(&payload) {
+        let msg = VpcdMessage::from_payload(&payload);
+        tracing::trace!(?msg, "vpcd message");
+        match msg {
             VpcdMessage::PowerOff => session.power_off(),
             VpcdMessage::PowerOn => session.power_on(&mut open_modem),
             VpcdMessage::Reset => session.reset(&mut open_modem),
