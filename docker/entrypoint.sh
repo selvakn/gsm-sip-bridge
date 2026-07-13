@@ -54,6 +54,11 @@ KEEPALIVE_PID=""
 SWU_PID=""
 IMS_AGENT_SUPERVISOR_PID=""
 SIP_AGENT_SUPERVISOR_PID=""
+PCSCD_PID=""
+CHARON_PID=""
+CHARON_LOG_TAIL_PID=""
+USIM_BRIDGE_SUPERVISOR_PID=""
+STRONGSWAN_SUPERVISOR_PID=""
 cleanup() {
     log "shutting down ..."
     [ -n "$DAEMON_SUPERVISOR_PID" ] && kill "$DAEMON_SUPERVISOR_PID" 2>/dev/null
@@ -64,6 +69,12 @@ cleanup() {
     pkill -f vowifi-ims-agent 2>/dev/null
     pkill -f vowifi-sip-agent 2>/dev/null
     [ -n "$SWU_PID" ] && kill "$SWU_PID" 2>/dev/null
+    [ -n "$STRONGSWAN_SUPERVISOR_PID" ] && kill "$STRONGSWAN_SUPERVISOR_PID" 2>/dev/null
+    [ -n "$USIM_BRIDGE_SUPERVISOR_PID" ] && kill "$USIM_BRIDGE_SUPERVISOR_PID" 2>/dev/null
+    pkill -f vowifi-usim-bridge 2>/dev/null
+    [ -n "$CHARON_LOG_TAIL_PID" ] && kill "$CHARON_LOG_TAIL_PID" 2>/dev/null
+    [ -n "$CHARON_PID" ] && kill "$CHARON_PID" 2>/dev/null
+    [ -n "$PCSCD_PID" ] && kill "$PCSCD_PID" 2>/dev/null
     ip netns del "$NETNS" 2>/dev/null
     true
 }
@@ -118,99 +129,31 @@ else
     log "resolved ePDG: $EPDG_IP"
 fi
 
-# --- strongSwan engine (specs/012-strongswan-epdg) ---------------------------
-# Netns/XFRM plumbing, engine startup, readiness/P-CSCF extraction, and
-# reliability supervision land in Phase 4 (T020-T023); the shared veth+agent
-# tail below is wired to run after either engine's readiness signal in
-# Phase 5 (T026). Until then this is a validated no-op path.
-if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
-    log "FATAL: TUNNEL_ENGINE=strongswan is not yet implemented (specs/012-strongswan-epdg Phase 4). Use TUNNEL_ENGINE=swu (the default) until then."
-    exit 1
-fi
+# --- Shared tail: veth pair + both VoWiFi bridge agents -------------------
+# Called by either engine once its tunnel is up and $PCSCF_ADDR is known.
+# Identical regardless of engine (FR-007/FR-006 — the agents don't know or
+# care which engine built the tunnel they're sitting in).
+start_shared_tail() {
+    local pcscf_addr="$1"
 
-# --- swu engine: SWu-IKEv2 Python dialer (specs/011-vowifi-sip-bridge) ------
-[ -c /dev/net/tun ] || { log "FATAL: /dev/net/tun missing (need --device /dev/net/tun + cap NET_ADMIN)"; exit 1; }
-
-# --- Launch the SWu-IKEv2 dialer --------------------------------------------
-SRC_OPT=()
-[ -n "$SRC_ADDR" ] && SRC_OPT=(-s "$SRC_ADDR")
-
-LOG=/tmp/swu.log
-: > "$LOG"
-log "starting SWu-IKEv2: modem=$MODEM_PORT apn=$APN mcc=$MCC mnc=$MNC epdg=$EPDG_IP netns=$NETNS"
-# Once connected, the dialer's main loop does select() on stdin alongside the
-# IKE sockets to accept interactive q/i/c/r keystrokes. If stdin is closed or
-# /dev/null (EOF), select() reports it ready on every iteration and the loop
-# busy-spins printing its prompt — millions of lines/sec, no delay. Feed it a
-# pipe that stays open and never delivers data/EOF so select() only wakes on
-# real IKE traffic. Using process substitution (not a `|` pipeline) keeps
-# SWU_PID pointing at swu_emulator.py itself, not at tail/tee.
-( cd /opt/SWu-IKEv2 && \
-  python3 -u swu_emulator.py -m "$MODEM_PORT" -a "$APN" -M "$MCC" -N "$MNC" \
-        -d "$EPDG_IP" -n "$NETNS" "${SRC_OPT[@]}" < <(tail -f /dev/null) \
-        > >(tee "$LOG") 2>&1 ) &
-SWU_PID=$!
-
-# --- Wait for tunnel readiness --------------------------------------------
-# Wait for "STATE CONNECTED", not just the P-CSCF address line: the dialer
-# prints P-CSCF IPV[46] ADDRESS from inside its IKE_AUTH response handler,
-# but only calls set_routes() (which creates network namespace "$NETNS" and
-# moves tun1 into it) afterwards, as a later step in its own state machine.
-# Proceeding as soon as the address line appears is a race — the namespace
-# may not exist yet, and every step below that touches "$NETNS" fails with
-# "Cannot open network namespace" / "Invalid netns value" if it loses.
-log "waiting for tunnel (P-CSCF assignment + netns/tun1 setup) ..."
-for _ in $(seq 1 90); do
-    if grep -q "STATE CONNECTED" "$LOG" 2>/dev/null; then
-        break
-    fi
-    if ! kill -0 "$SWU_PID" 2>/dev/null; then
-        log "FATAL: dialer exited before establishing the tunnel (see log above)."
-        exit 1
-    fi
-    sleep 2
-done
-
-# Extract first P-CSCF (prefer IPv4).
-PCSCF="$(grep 'P-CSCF IPV4 ADDRESS' "$LOG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-PCSCF6=""
-if [ -z "$PCSCF" ]; then
-    PCSCF6="$(grep 'P-CSCF IPV6 ADDRESS' "$LOG" | grep -oE '([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+' | head -1)"
-fi
-
-if [ -z "$PCSCF" ] && [ -z "$PCSCF6" ]; then
-    log "WARNING: could not confirm P-CSCF assignment; leaving dialer running (inspect log)."
-else
-    PCSCF_ADDR="${PCSCF:-$PCSCF6}"
-    log "tunnel UP. P-CSCF: $PCSCF_ADDR"
-    echo "$PCSCF_ADDR" > /tmp/pcscf
-    ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
-    # Keepalive — idle SWu tunnels drop after a while. Use a TCP connect to the
-    # P-CSCF's SIP port rather than ping: operators commonly filter ICMP over
-    # the tunnel (confirmed on Vodafone India) while the SIP port stays open.
-    (
-        while true; do
-            ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
-            sleep "$KEEPALIVE_INTERVAL"
-        done
-    ) &
-    KEEPALIVE_PID=$!
-
-    # --- veth pair for the inbound VoWiFi bridge agents ---------------------
-    # Agent A (vowifi-ims-agent) runs inside netns "$NETNS" alongside the SWu
+    # Agent A (vowifi-ims-agent) runs inside netns "$NETNS" alongside the
     # tunnel/Gm-IPsec state; Agent B (vowifi-sip-agent) runs in this
     # container's default namespace (LAN, reachable to the PBX). Addresses
     # default to VowifiConfig's veth_local_addr (Agent A / ims-netns end) /
     # veth_peer_addr (Agent B / default-netns end) — override both ends
     # together if the config file's [vowifi] section is customized.
     log "creating veth pair ($VETH_SIP <-> $VETH_IMS in netns $NETNS) for the VoWiFi bridge agents..."
-    # Both ends must be checked, not just ours. The tunnel dialer deletes and
-    # recreates netns "$NETNS" on every reconnect, which destroys the
-    # $VETH_IMS end with it while leaving our $VETH_SIP end behind — a
-    # half-pair that looks fine from this side but leaves Agent A with no
-    # route to Agent B ("Network is unreachable" on the control channel, with
-    # the inbound call already answered). Rebuild the pair whenever the far
-    # end is missing.
+    # Both ends must be checked, not just ours. Under the swu engine the
+    # tunnel dialer deletes and recreates netns "$NETNS" on every
+    # reconnect, which destroys the $VETH_IMS end with it while leaving our
+    # $VETH_SIP end behind — a half-pair that looks fine from this side but
+    # leaves Agent A with no route to Agent B ("Network is unreachable" on
+    # the control channel, with the inbound call already answered).
+    # Rebuild the pair whenever the far end is missing. Under the
+    # strongswan engine the namespace itself never gets deleted on
+    # reconnect (FR-005) so this should be a no-op there in practice — kept
+    # anyway since it's a correct, idempotent safety net regardless of
+    # engine.
     if ip link show "$VETH_SIP" >/dev/null 2>&1 &&
         ! ip netns exec "$NETNS" ip link show "$VETH_IMS" >/dev/null 2>&1; then
         log "$VETH_IMS is gone from netns $NETNS (tunnel reconnect); rebuilding the veth pair"
@@ -227,7 +170,6 @@ else
     ip netns exec "$NETNS" ip link set "$VETH_IMS" up
     log "veth ready: $VETH_SIP=$VETH_SIP_ADDR (default netns), $VETH_IMS=$VETH_IMS_ADDR (netns $NETNS)"
 
-    # --- launch + supervise the two VoWiFi bridge agents ---------------------
     log "starting vowifi-ims-agent (netns $NETNS) and vowifi-sip-agent (default netns), supervised..."
     (
         while true; do
@@ -245,6 +187,249 @@ else
         done
     ) &
     SIP_AGENT_SUPERVISOR_PID=$!
+
+    : "$pcscf_addr" # reserved for future per-tail use; P-CSCF already on disk
+}
+
+if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
+    # --- strongSwan engine (specs/012-strongswan-epdg) -----------------------
+    STRONGSWAN_TUN_IFACE="${STRONGSWAN_TUN_IFACE:-tun23}"
+    STRONGSWAN_IF_ID="${STRONGSWAN_IF_ID:-23}"
+    VPCD_HOST="${VPCD_HOST:-127.0.0.1}"
+    VPCD_PORT="${VPCD_PORT:-35963}"
+
+    # --- Idempotent netns + XFRM interface (T020, FR-005/FR-011) -----------
+    # Pre-created once, here, by the entrypoint — not by charon or the
+    # updown script — so it survives every future rekey/reconnect: only
+    # ims.updown's address install/remove touches it after this point.
+    # File-existence check, not `ip netns list | grep -x`: once an
+    # interface lives in the namespace, iproute2 annotates the list output
+    # with an id ("ims (id: 1)"), breaking an exact-name match — confirmed
+    # by testing (a second entrypoint run against an already-populated
+    # namespace mismatched and tried `ip netns add` again).
+    if [ ! -e "/var/run/netns/$NETNS" ]; then
+        ip netns add "$NETNS"
+        log "created netns $NETNS"
+    else
+        log "netns $NETNS already exists, reusing"
+    fi
+    ip netns exec "$NETNS" ip link set lo up
+
+    if ! ip netns exec "$NETNS" ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
+        if ip link show "$STRONGSWAN_TUN_IFACE" >/dev/null 2>&1; then
+            # Leftover in the default netns from a previous run that didn't
+            # get moved — absorb rather than fail (idempotent startup).
+            ip link set "$STRONGSWAN_TUN_IFACE" netns "$NETNS"
+        else
+            ip link add "$STRONGSWAN_TUN_IFACE" type xfrm if_id "$STRONGSWAN_IF_ID"
+            ip link set "$STRONGSWAN_TUN_IFACE" netns "$NETNS"
+        fi
+        log "created XFRM interface $STRONGSWAN_TUN_IFACE (if_id=$STRONGSWAN_IF_ID) in netns $NETNS"
+    else
+        log "XFRM interface $STRONGSWAN_TUN_IFACE already in netns $NETNS, reusing"
+    fi
+    ip netns exec "$NETNS" ip link set "$STRONGSWAN_TUN_IFACE" up
+    ip netns exec "$NETNS" ip route replace default dev "$STRONGSWAN_TUN_IFACE" 2>/dev/null || true
+    ip netns exec "$NETNS" ip -6 route replace default dev "$STRONGSWAN_TUN_IFACE" 2>/dev/null || true
+    # Received IPsec traffic gets dropped if IPsec policy isn't disabled on
+    # the interface itself (osmocom wiki's Option 2 walkthrough — "Very
+    # important", reason unknown/FIXME upstream too).
+    ip netns exec "$NETNS" sh -c "echo 1 > /proc/sys/net/ipv6/conf/$STRONGSWAN_TUN_IFACE/disable_policy" 2>/dev/null || true
+
+    # --- Render the swanctl connection (T021) -------------------------------
+    if [ -n "${IMSI:-}" ]; then
+        log "using IMSI override from IMSI env var"
+    else
+        IMSI="$("$GSM_SIP_BRIDGE_BIN" vowifi-imsi --modem "$MODEM_PORT")"
+        if [ -z "$IMSI" ]; then
+            log "FATAL: failed to read IMSI from $MODEM_PORT (AT+CIMI) — see vowifi-imsi's own error above"
+            exit 1
+        fi
+        log "read IMSI from SIM"
+    fi
+
+    SED_ARGS=(-e "s/@IMSI@/$IMSI/" -e "s/@MCC@/$MCC/" -e "s/@MNC@/$MNC/" -e "s/@EPDG_IP@/$EPDG_IP/")
+    if [ -n "$SRC_ADDR" ]; then
+        SED_ARGS+=(-e "s/@SRC_ADDR@/$SRC_ADDR/")
+    else
+        # No override: drop the local_addrs line entirely so charon
+        # auto-selects a source address based on routing to $EPDG_IP
+        # (mirrors the legacy engine's optional -s/SRC_ADDR flag).
+        SED_ARGS+=(-e "/local_addrs.*@SRC_ADDR@/d")
+    fi
+    sed "${SED_ARGS[@]}" /etc/strongswan.d/swanctl-epdg.conf.template >/etc/swanctl/conf.d/epdg.conf
+    log "rendered swanctl connection for mcc=$MCC mnc=$MNC epdg=$EPDG_IP"
+
+    # --- pcscd + vowifi-usim-bridge (the virtual PC/SC reader) --------------
+    mkdir -p /run/pcscd
+    pcscd --foreground >/tmp/pcscd.log 2>&1 &
+    PCSCD_PID=$!
+    log "started pcscd (pid $PCSCD_PID)"
+
+    log "starting vowifi-usim-bridge (default netns, talks to the modem + pcscd's vpcd), supervised..."
+    (
+        while true; do
+            "$GSM_SIP_BRIDGE_BIN" -v vowifi-usim-bridge --modem "$MODEM_PORT" \
+                --vpcd-host "$VPCD_HOST" --vpcd-port "$VPCD_PORT"
+            log "vowifi-usim-bridge exited (status $?); restarting in 5s"
+            sleep 5
+        done
+    ) &
+    USIM_BRIDGE_SUPERVISOR_PID=$!
+
+    # --- Start charon (T021) -------------------------------------------------
+    mkdir -p /run
+    : >/tmp/charon.log
+    /usr/libexec/ipsec/charon &
+    CHARON_PID=$!
+    log "started charon (pid $CHARON_PID)"
+    # Surface charon's filelog on docker logs, same purpose as the swu
+    # engine's `tee` of /tmp/swu.log — FR-010's observability requirement.
+    tail -f /tmp/charon.log 2>/dev/null | sed 's/^/[charon] /' &
+    CHARON_LOG_TAIL_PID=$!
+
+    sleep 2 # let the vici socket come up before swanctl talks to it
+    if ! swanctl --load-all >/tmp/swanctl-load.log 2>&1; then
+        log "WARNING: swanctl --load-all reported problems (see /tmp/swanctl-load.log)"
+    fi
+
+    # keyingtries=0 means charon retries forever internally, so
+    # `swanctl --initiate` can block indefinitely waiting for a terminal
+    # event that may never come — run it in the background and poll
+    # readiness ourselves instead of waiting on its exit.
+    swanctl --initiate --child ims >/tmp/swanctl-initiate.log 2>&1 &
+
+    # --- Wait for tunnel readiness (T022) -------------------------------------
+    log "waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ..."
+    for _ in $(seq 1 90); do
+        if grep -q "CHILD_SA.*established" /tmp/charon.log 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$CHARON_PID" 2>/dev/null; then
+            log "FATAL: charon exited before establishing the tunnel (see /tmp/charon.log)."
+            exit 1
+        fi
+        sleep 2
+    done
+
+    # Extract first P-CSCF (prefer IPv4), from charon's own filelog line
+    # ("received P-CSCF server IP <addr>") — same extraction technique the
+    # swu engine already uses on its own dialer's stdout log, different
+    # regex/source.
+    PCSCF="$(grep 'received P-CSCF server IP' /tmp/charon.log | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    PCSCF6=""
+    if [ -z "$PCSCF" ]; then
+        PCSCF6="$(grep 'received P-CSCF server IP' /tmp/charon.log | grep -oE '([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+' | head -1)"
+    fi
+
+    if [ -z "$PCSCF" ] && [ -z "$PCSCF6" ]; then
+        log "WARNING: could not confirm P-CSCF assignment; leaving charon running (inspect /tmp/charon.log)."
+    else
+        PCSCF_ADDR="${PCSCF:-$PCSCF6}"
+        log "tunnel UP. P-CSCF: $PCSCF_ADDR"
+        echo "$PCSCF_ADDR" >/tmp/pcscf
+        ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
+
+        # --- Reliability supervision (T023) -----------------------------------
+        # charon retries IKE internally (keyingtries=0 +
+        # retry_initiate_interval), but if the CHILD_SA disappears entirely
+        # (e.g. after an unrecoverable rekey failure) nothing re-triggers
+        # --initiate on its own — poll and kick it if needed. This is the
+        # capability the swu engine never had at all (FR-004).
+        (
+            while true; do
+                sleep 30
+                if ! swanctl --list-sas 2>/dev/null | grep -q '^ims:'; then
+                    log "ims CHILD_SA missing; re-initiating"
+                    swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
+                fi
+            done
+        ) &
+        STRONGSWAN_SUPERVISOR_PID=$!
+
+        # Same idle-tunnel keepalive rationale as the swu engine (TCP
+        # connect, not ICMP — operators filter ICMP over the tunnel).
+        (
+            while true; do
+                ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
+                sleep "$KEEPALIVE_INTERVAL"
+            done
+        ) &
+        KEEPALIVE_PID=$!
+
+        start_shared_tail "$PCSCF_ADDR"
+    fi
+else
+    # --- swu engine: SWu-IKEv2 Python dialer (specs/011-vowifi-sip-bridge) --
+    [ -c /dev/net/tun ] || { log "FATAL: /dev/net/tun missing (need --device /dev/net/tun + cap NET_ADMIN)"; exit 1; }
+
+    # --- Launch the SWu-IKEv2 dialer --------------------------------------------
+    SRC_OPT=()
+    [ -n "$SRC_ADDR" ] && SRC_OPT=(-s "$SRC_ADDR")
+
+    LOG=/tmp/swu.log
+    : > "$LOG"
+    log "starting SWu-IKEv2: modem=$MODEM_PORT apn=$APN mcc=$MCC mnc=$MNC epdg=$EPDG_IP netns=$NETNS"
+    # Once connected, the dialer's main loop does select() on stdin alongside the
+    # IKE sockets to accept interactive q/i/c/r keystrokes. If stdin is closed or
+    # /dev/null (EOF), select() reports it ready on every iteration and the loop
+    # busy-spins printing its prompt — millions of lines/sec, no delay. Feed it a
+    # pipe that stays open and never delivers data/EOF so select() only wakes on
+    # real IKE traffic. Using process substitution (not a `|` pipeline) keeps
+    # SWU_PID pointing at swu_emulator.py itself, not at tail/tee.
+    ( cd /opt/SWu-IKEv2 && \
+      python3 -u swu_emulator.py -m "$MODEM_PORT" -a "$APN" -M "$MCC" -N "$MNC" \
+            -d "$EPDG_IP" -n "$NETNS" "${SRC_OPT[@]}" < <(tail -f /dev/null) \
+            > >(tee "$LOG") 2>&1 ) &
+    SWU_PID=$!
+
+    # --- Wait for tunnel readiness --------------------------------------------
+    # Wait for "STATE CONNECTED", not just the P-CSCF address line: the dialer
+    # prints P-CSCF IPV[46] ADDRESS from inside its IKE_AUTH response handler,
+    # but only calls set_routes() (which creates network namespace "$NETNS" and
+    # moves tun1 into it) afterwards, as a later step in its own state machine.
+    # Proceeding as soon as the address line appears is a race — the namespace
+    # may not exist yet, and every step below that touches "$NETNS" fails with
+    # "Cannot open network namespace" / "Invalid netns value" if it loses.
+    log "waiting for tunnel (P-CSCF assignment + netns/tun1 setup) ..."
+    for _ in $(seq 1 90); do
+        if grep -q "STATE CONNECTED" "$LOG" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$SWU_PID" 2>/dev/null; then
+            log "FATAL: dialer exited before establishing the tunnel (see log above)."
+            exit 1
+        fi
+        sleep 2
+    done
+
+    # Extract first P-CSCF (prefer IPv4).
+    PCSCF="$(grep 'P-CSCF IPV4 ADDRESS' "$LOG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    PCSCF6=""
+    if [ -z "$PCSCF" ]; then
+        PCSCF6="$(grep 'P-CSCF IPV6 ADDRESS' "$LOG" | grep -oE '([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+' | head -1)"
+    fi
+
+    if [ -z "$PCSCF" ] && [ -z "$PCSCF6" ]; then
+        log "WARNING: could not confirm P-CSCF assignment; leaving dialer running (inspect log)."
+    else
+        PCSCF_ADDR="${PCSCF:-$PCSCF6}"
+        log "tunnel UP. P-CSCF: $PCSCF_ADDR"
+        echo "$PCSCF_ADDR" > /tmp/pcscf
+        ip netns exec "$NETNS" ip addr show 2>/dev/null | sed 's/^/[epdg][netns] /'
+        # Keepalive — idle SWu tunnels drop after a while. Use a TCP connect to the
+        # P-CSCF's SIP port rather than ping: operators commonly filter ICMP over
+        # the tunnel (confirmed on Vodafone India) while the SIP port stays open.
+        (
+            while true; do
+                ip netns exec "$NETNS" bash -c "timeout 3 bash -c '>/dev/tcp/$PCSCF_ADDR/5060'" >/dev/null 2>&1
+                sleep "$KEEPALIVE_INTERVAL"
+            done
+        ) &
+        KEEPALIVE_PID=$!
+
+        start_shared_tail "$PCSCF_ADDR"
+    fi
 fi
 
 # --- Block on everything -----------------------------------------------------

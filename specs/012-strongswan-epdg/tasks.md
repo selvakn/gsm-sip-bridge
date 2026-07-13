@@ -167,24 +167,24 @@ and outages (tunnel-engine contract obligations 1–8).
 **Independent Test**: tunnel up via `TUNNEL_ENGINE=strongswan`, survives one carrier rekey
 cycle and one forced outage with namespace/agents untouched (quickstart.md §3–4).
 
-- [ ] T020 [P] [US1] Implement idempotent netns/interface plumbing in the `strongswan`
+- [X] T020 [P] [US1] Implement idempotent netns/interface plumbing in the `strongswan`
       branch of `docker/entrypoint.sh` (FR-011): create netns `$NETNS` if absent, `ip link
       add tun23 type xfrm if_id 23` (skip/replace if present), move into netns, `lo` +
       interface up, default routes both families via the interface,
       `disable_policy=1` sysctl on it (research.md item 3); absorb leftover state from a
       previous run
-- [ ] T021 [US1] Implement engine startup in the same branch: resolve ePDG (reuse the
+- [X] T021 [US1] Implement engine startup in the same branch: resolve ePDG (reuse the
       existing `EPDG_IP`/`dig` block), render `/etc/swanctl/conf.d/epdg.conf` from
       `docker/strongswan/swanctl-epdg.conf.template` (IMSI via `vowifi-imsi`, `IMSI` env
       override honored, MCC/MNC zero-padded), start pcscd, supervise `vowifi-usim-bridge`
       (restart-on-exit like the agents), start charon, `swanctl --load-all`, `swanctl
       --initiate --child ims` (depends on T010, T020, and Phase 3)
-- [ ] T022 [US1] Implement readiness + P-CSCF publication per the tunnel-engine contract:
+- [X] T022 [US1] Implement readiness + P-CSCF publication per the tunnel-engine contract:
       watch `/tmp/charon.log` for `CHILD_SA` establishment (backstop: poll `swanctl
       --list-sas`), extract `received P-CSCF server IP` lines, prefer IPv4, write
       `/tmp/pcscf` (never partial/empty — data-model.md validation), and refresh it on every
       re-establishment (depends on T021)
-- [ ] T023 [US1] Reliability supervision: re-initiate loop if the `ims` CHILD_SA disappears
+- [X] T023 [US1] Reliability supervision: re-initiate loop if the `ims` CHILD_SA disappears
       (`swanctl --list-sas` poll), confirm `keyingtries = 0` + `retry_initiate_interval` +
       `dpd_delay = 30s` land from T004's templates, keep the existing TCP keepalive to
       `$PCSCF:5060` running unchanged (FR-012). Container logs must show
@@ -210,7 +210,7 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
 **Independent Test**: inbound VoWiFi call bridges end-to-end over a strongSwan tunnel
 (quickstart.md §1 step 6 + §5).
 
-- [ ] T026 [US3] Wire the existing shared tail (veth pair creation, both agent supervisors,
+- [X] T026 [US3] Wire the existing shared tail (veth pair creation, both agent supervisors,
       keepalive) to run after the `strongswan` branch's readiness signal in
       `docker/entrypoint.sh`, exactly as it runs after the `swu` branch's; keep the veth
       half-pair rebuild check (still needed while `swu` is selectable — tunnel-engine
