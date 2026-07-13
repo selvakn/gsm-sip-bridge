@@ -340,6 +340,7 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     # long the network takes.
     log "waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ..."
     ATTEMPT=0
+    STUCK_WITHOUT_PCSCF=0
     while true; do
         if grep -q "CHILD_SA.*established" /tmp/charon.log 2>/dev/null; then
             # Extraction (and the timestamp-collision fix: applying the
@@ -353,6 +354,9 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
                 break
             fi
             log "CHILD_SA established but no P-CSCF line found yet; still waiting"
+            STUCK_WITHOUT_PCSCF=1
+        else
+            STUCK_WITHOUT_PCSCF=0
         fi
         if ! kill -0 "$CHARON_PID" 2>/dev/null; then
             log "FATAL: charon exited before establishing the tunnel (see /tmp/charon.log)."
@@ -360,12 +364,25 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
         fi
         ATTEMPT=$((ATTEMPT + 1))
         if [ $((ATTEMPT % 15)) -eq 0 ]; then
-            # ~30s of no CHILD_SA since the last (re-)initiate — a plain
-            # timeout, or a rejected EAP round, both look the same from out
-            # here: fire another attempt. keyingtries=0 keeps charon's own
-            # internal retry going regardless; this covers the case where
-            # the whole IKE_SA was torn down instead of merely retried.
-            log "still waiting after ${ATTEMPT}x2s; re-initiating"
+            if [ "$STUCK_WITHOUT_PCSCF" -eq 1 ]; then
+                # Greptile PR #2 (P1): a bare `--initiate` here would be a
+                # no-op — the CHILD_SA is already up, just without a
+                # parseable P-CSCF, so charon has nothing left to retry on
+                # its own. Terminate it first so the next `--initiate`
+                # forces a genuinely fresh IKE_AUTH round rather than
+                # spinning here forever (start_shared_tail, and both
+                # agents with it, never run until this loop breaks).
+                log "CHILD_SA established but no P-CSCF after ${ATTEMPT}x2s; terminating and re-initiating fresh"
+                swanctl --terminate --ike ims >/dev/null 2>&1 || true
+            else
+                # ~30s of no CHILD_SA since the last (re-)initiate — a plain
+                # timeout, or a rejected EAP round, both look the same from
+                # out here: fire another attempt. keyingtries=0 keeps
+                # charon's own internal retry going regardless; this covers
+                # the case where the whole IKE_SA was torn down instead of
+                # merely retried.
+                log "still waiting after ${ATTEMPT}x2s; re-initiating"
+            fi
             swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
         fi
         sleep 2
