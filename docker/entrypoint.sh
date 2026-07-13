@@ -366,10 +366,29 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     # capability the swu engine never had at all (FR-004). Started only
     # now (not earlier) because it has nothing to check before the first
     # success; the loop above already covers "not up yet".
+    #
+    # Found live-testing: `swanctl --list-sas 2>/dev/null | grep -q
+    # '^ims:'` looked right but was a *deterministic* false negative on
+    # every single check, not a flake. `set -o pipefail` (top of this
+    # script) makes a pipeline's exit status the first non-zero exit among
+    # *all* stages — and `grep -q` exits the instant it finds its match,
+    # which SIGPIPEs `swanctl` mid-write (it was still emitting later
+    # lines/closing its vici connection). swanctl's SIGPIPE-induced exit
+    # then outranks grep's own successful match under pipefail, so the
+    # `if` sees "failed" even though the SA was right there in the output
+    # — confirmed by the exact charon-side symptom this produced every
+    # time: "vici header read error: Connection reset by peer" followed by
+    # a needless CREATE_CHILD_SA. Fixed by capturing the full output first
+    # (swanctl runs to completion, nothing SIGPIPEs it) and matching
+    # against the captured string instead of a live pipe.
     (
         while true; do
             sleep 30
-            if ! swanctl --list-sas 2>/dev/null | grep -q '^ims:'; then
+            SAS_OUTPUT="$(swanctl --list-sas 2>/dev/null)"
+            # A here-string, not a pipe: grep reads it from an fd bash
+            # already fully wrote, so there's no live producer process for
+            # grep's early exit to SIGPIPE (unlike piping swanctl directly).
+            if ! grep -q '^ims:' <<<"$SAS_OUTPUT"; then
                 log "ims CHILD_SA missing; re-initiating"
                 swanctl --initiate --child ims >>/tmp/swanctl-initiate.log 2>&1 &
             fi
