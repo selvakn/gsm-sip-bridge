@@ -47,11 +47,48 @@ connections {
             ims {
                 remote_ts = 0.0.0.0/0, ::/0
                 updown = /etc/strongswan.d/ims.updown
+
+                # Same reasoning as `proposals` below, for the CHILD_SA.
+                # Carriers here are stuck on AES-CBC + HMAC-SHA1, which
+                # modern charon no longer offers by default: an ESP
+                # proposal of only aes256gcm8/aes128-sha256 gets a flat
+                # NO_PROPOSAL_CHOSEN back in the IKE_AUTH response from
+                # Vodafone India (confirmed live). This is the SWu dialer's
+                # own child list, which is known-good on these networks;
+                # Vodafone selects AES_CBC_128/HMAC_SHA1_96.
+                esp_proposals = aes256gcm8-noesn, aes128-sha256-noesn, aes256-sha384-noesn, aes256-sha512-noesn, aes256-md5-noesn, aes128-sha1-noesn, aes256-sha1-noesn
+
                 if_id_in = 23
                 if_id_out = 23
             }
         }
         version = 2
+
+        # Pinned, deliberately small IKE proposal list — do NOT drop this
+        # and fall back to charon's defaults.
+        #
+        # charon's default proposal set is large and modern, and it makes
+        # the IKE_SA_INIT request 852 bytes. Vodafone India's ePDG answers
+        # that with a bare INVALID_SYNTAX notify — every single time, before
+        # any EAP-AKA/SIM interaction happens at all (confirmed live: the
+        # tunnel never came up, and pinning these proposals is the entire
+        # fix — the request drops to ~424 bytes and the ePDG accepts it).
+        # The failure looks alarming (a flatly malformed message) but is
+        # really just an ePDG that can't cope with the offer; nothing about
+        # the SIM, the PLMN or the credentials was ever wrong.
+        #
+        # The first two are the 3GPP-mandated baseline (TS 33.402) and are
+        # exactly what the SWu dialer offers, so they're proven on the
+        # carriers this project targets — Vodafone selects
+        # AES_CBC_128/HMAC_SHA1_96/PRF_HMAC_SHA1/MODP_1024. The third is a
+        # stronger modern option for any ePDG that prefers it; keep the list
+        # short, since the packet growing back toward ~850 bytes is what
+        # broke Vodafone in the first place.
+        #
+        # Note the KE payload carries the *first* proposal's DH group
+        # (MODP_1024). An ePDG wanting another group answers
+        # INVALID_KE_PAYLOAD and charon retries with it — normal, handled.
+        proposals = aes128-sha1-prfsha1-modp1024, aes128-sha1-prfsha1-modp2048, aes256-sha256-prfsha256-modp2048
 
         # Unlimited retry (FR-004: no bounded give-up); paired with
         # charon-extra.conf's retry_initiate_interval for backoff between
