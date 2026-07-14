@@ -24,6 +24,11 @@ SIP voice calls — the same mechanism a phone uses for Wi‑Fi Calling.
 - **Auth:** EAP-AKA is run against the real SIM via `AT+CSIM` — no Ki/OPc needed.
 - **Tool:** [`fasferraz/SWu-IKEv2`](https://github.com/fasferraz/SWu-IKEv2)
   (osmocom foss-ims-client "Option 1"), vendored at build time.
+- **Reference:** [Osmocom's VoWiFi with Asterisk wiki](https://osmocom.org/projects/foss-ims-client/wiki/VoWiFi_with_Asterisk)
+  — the roadmap ("Option 1"/"Option 2", tooling, and transcripts) that this
+  entire effort followed. The osmocom/sysmocom foundation work (the wiki,
+  the `strongswan-epdg` fork, the VoLTE Asterisk patches) is what made this
+  feasible; findings here build directly on it.
 
 This is **standalone** and does not touch the main `gsm-sip-bridge` service.
 

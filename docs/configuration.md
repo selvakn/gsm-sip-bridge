@@ -51,6 +51,69 @@ The bridge reads a single TOML configuration file specified via `--config`.
 | `retry_interval_sec` | integer | 30 | Range: 5-600 |
 | `max_concurrent` | integer | 8 | Range: 1-8 |
 
+### `[audio]`
+
+Latency and audio-quality tuning for the circuit-switched (EC20 USB audio)
+path. All keys are optional. The section is read at startup; changes
+require a process restart. See `docs/audio-tuning-log.md` for the empirical
+history behind the modem-side defaults.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `profile` | enum | `lan` | Latency preset: `lan` or `wan` (see below) |
+| `vad` | boolean | `true` | PJMEDIA voice activity detection / noise suppression on the capture path (GSM → SIP). Set `false` only to diagnose audio issues (raw passthrough). |
+| `rx_gain` | integer | unset (firmware default) | EC20 downlink digital gain (`AT+QRXGAIN`, 0–65535), applied at module init. Controls how loud SIP audio sounds to the GSM caller. |
+| `eec_mode` | integer | unset (firmware default, 12543) | EC20 echo-canceller mode word (`AT+QEEC=2,<val>`). `0` disables all EC — recommended for USB audio bridges, which have no acoustic echo path. |
+| `tx_level` | float | `1.0` | PJSUA conference-bridge software gain on the GSM → SIP path (`1.0` = unity, `0.5` ≈ −6 dB, `2.0` = +6 dB). |
+| `snd_rec_latency_ms` | integer | `150` | ALSA capture ring-buffer depth (GSM → SIP), 20–2000 ms. Raise if logs report `alsa_capture_overrun`. |
+| `snd_play_latency_ms` | integer | `150` | ALSA playback ring-buffer depth (SIP → GSM), 20–2000 ms. Raise if logs report `alsa_playback_underrun`. |
+| `rt_audio_prio` | integer | `0` (off) | `SCHED_FIFO` priority (1–99) for PJMEDIA's sound-device threads; prevents XRUNs/choppy audio under load. Requires `CAP_SYS_NICE`; best-effort. |
+
+#### Latency profiles
+
+The `profile` preset tunes two independent latency contributors:
+
+- **Audio ring buffer** (`ring_capacity`) — the queue between the ALSA
+  capture thread and the PJSIP media thread. Oversizing this lets stale
+  audio queue up invisibly, adding hundreds of milliseconds of delay.
+- **PJSIP jitter buffer** (`jb_init_ms`, `jb_min_pre`, `jb_max_ms`) —
+  PJMEDIA's adaptive jitter buffer. Without a hard ceiling it ratchets
+  upward on any CPU spike and never recovers.
+
+| Setting | `lan` (default) | `wan` |
+|---|---|---|
+| `ring_capacity` | 4 frames (80 ms slack) | 16 frames (320 ms slack) |
+| `jb_init_ms` | 20 ms | 60 ms |
+| `jb_min_pre` | 1 frame | 2 frames |
+| `jb_max_ms` | 40 ms (hard cap) | 200 ms (hard cap) |
+
+**Use `lan`** when the SIP server is on the same machine or local network.
+There is no packet jitter on this path, so the smallest ring and tightest
+jitter buffer caps give the best end-to-end latency. Expected one-way delay
+through the bridge: ~120–150 ms (dominated by the GSM air interface, which
+is fixed at ~80–110 ms).
+
+**Use `wan`** when pointing `sip.server` at an internet SIP trunk. The
+wider ring and larger jitter buffer absorb burst packet loss and higher RTT
+without causing audible glitches. Expected one-way delay: ~180–340 ms
+depending on trunk latency.
+
+### `[scheduled_restart]`
+
+Preventive nightly card-restart cycle: the daemon walks every known slot in
+ascending order and reboots each modem (`AT+CFUN=1,1`) with a randomized
+gap between cards. Cards on an active call are deferred to the end of the
+cycle; a manual `card restart` issued during a cycle takes precedence. See
+`specs/010-scheduled-card-restart/quickstart.md` for full details.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Master switch |
+| `cron` | string | `0 1 * * *` | Standard 5-field cron expression in system local time. Invalid expressions disable the scheduler without aborting the daemon. |
+| `start_jitter_seconds` | integer | `600` | Symmetric jitter on the cycle start time. Range 0–86400; 0 disables. |
+| `inter_card_gap_seconds` | integer | `30` | Base wait between consecutive per-card restarts. Range 0–3600. |
+| `inter_card_gap_jitter_seconds` | integer | `15` | Symmetric jitter on the inter-card gap; must be ≤ `inter_card_gap_seconds`. |
+
 ### `[resilience]`
 
 Controls automatic card recovery behavior. All keys are optional; defaults cover typical homelab use.

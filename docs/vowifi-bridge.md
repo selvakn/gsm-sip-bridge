@@ -4,6 +4,12 @@ See `specs/011-vowifi-sip-bridge/` (spec, plan, research, data model, contracts,
 full requirements and design rationale. This doc is a shorter map for future maintainers of the
 code itself.
 
+> **Credit:** the whole VoWiFi path (ePDG tunnel, IMS-AKA, Gm IPsec) follows the trail mapped
+> out by the [Osmocom](https://osmocom.org/) project's
+> [VoWiFi with Asterisk](https://osmocom.org/projects/foss-ims-client/wiki/VoWiFi_with_Asterisk)
+> research — their foss-ims-client wiki, `strongswan-epdg` fork, and sysmocom's VoLTE Asterisk
+> patches are the foundation this implementation was built and validated against.
+
 ## The problem this solves
 
 The existing GSM-SIP bridge answers circuit-switched calls arriving on a modem's cellular voice
