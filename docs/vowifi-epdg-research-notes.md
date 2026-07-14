@@ -218,6 +218,51 @@ Vi's P-CSCF rejects a plain digest REGISTER outright:
 - Subscription/provisioning was ruled out: VoWiFi works on a real phone (Moto)
   with this same SIM, so the network does support this IMSI for VoWiFi.
 
+**Update (2026-07-14) — Vi SOLVED: `200 OK` on Vodafone India. The `403` was
+Vi's P-CSCF demanding `ealg=aes-cbc` (encrypted Gm), which our Airtel-tuned
+`Security-Client` never offered.** Full story, since the failure mode is
+deeply misleading:
+- With the strongSwan engine and the auto-derived PLMN (MCC 404 / MNC 043),
+  the ePDG tunnel establishes and EAP-AKA succeeds (see the swanctl
+  proposal-pinning fix in `docker/strongswan/swanctl-epdg.conf.template`;
+  charon's default proposal set made `IKE_SA_INIT` 852 bytes and this ePDG
+  answered every one with a bare `INVALID_SYNTAX`). The network assigns an
+  **IPv6-only** inner address and one IPv6 P-CSCF.
+- The initial sec-agree REGISTER then got an instant `403 Forbidden`
+  (~100–270ms): no `WWW-Authenticate`, no `Security-Server`. Byte-identical
+  regardless of transport (TCP/UDP), Request-URI (literal P-CSCF vs realm),
+  placeholder-`Authorization` presence/format, Contact/PANI/Expires details —
+  and even a deliberately **wrong** realm MNC. That last one looks like proof
+  the server isn't evaluating the request at all, and (with a real phone
+  registering fine on the same SIM) reads exactly like a network-side
+  subscriber/policy block. It is not.
+- Bisected with a raw-REGISTER prober (hand-built SIP over the live tunnel —
+  the first REGISTER needs no SIM material, so header permutations are free):
+  the moment the `Security-Client` offer includes an `ealg=aes-cbc` tuple,
+  the very same request gets the real `401` + AKA challenge and a **populated**
+  `Security-Server` (`alg=hmac-sha-1-96` or `hmac-md5-96`, `ealg=aes-cbc`,
+  real spi/port values). Vi's P-CSCF blanket-403s any offer whose only
+  `ealg` is `null` — Airtel's accepted (and the captured Asterisk trace only
+  ever proposed) integrity-only Gm, which is why the client never offered
+  encryption. The old pre-Airtel-fixes client got `494` + empty
+  `Security-Server` for the same underlying reason.
+- Fix: `build_security_client_headers` now offers `ealg=aes-cbc` alongside
+  `ealg=null` for both integrity algorithms. `gm_ipsec.rs` already handled
+  `aes-cbc` end-to-end (kernel `cbc(aes)`, keyed with the AKA `CK` directly
+  per TS 33.203 Annex H) — that path just had never been exercised live.
+  `des-ede3-cbc` is deliberately not offered (192-bit key needs the Annex I
+  CK expansion we don't implement, and a network could select it if listed).
+- Result on Vi: `401` → AKA → AES-CBC-encrypted Gm SAs installed → protected
+  REGISTER over the negotiated port (`port-s=6000`) → **`200 OK`**, reg-event
+  SUBSCRIBE accepted, NOTIFY `state="active"` binding the registration to the
+  subscriber's real `sip:+91...`/`tel:+91...` IMPUs. `vowifi-ims-agent` runs
+  the identical code path and registers/stays registered.
+- Practical lesson: a P-CSCF `403` with no challenge and no diagnostics can
+  mean "your security offer is below my policy floor", and at least Vi's
+  implementation short-circuits *before* looking at identity — so "the
+  response doesn't change when I change X" proves nothing about whether the
+  server cares about X once the offer is acceptable.
+
 **Update — confirmed working on Airtel India, via a real IMS stack.** On the
 sibling `feature/epdg-asterisk-ims` branch, a full Asterisk + PJProject build
 (the wiki's "Option 2") reached a real `401` + AKA challenge + populated

@@ -537,13 +537,24 @@ pub struct SaProposal {
 /// from a real `200 OK` registration on Airtel India, not the generic RFC
 /// 3329 grammar: one `Security-Client` header whose value is a comma-joined
 /// list of `ipsec-3gpp;alg=<alg>;ealg=<ealg>;spi-c=..;spi-s=..;port-c=..;
-/// port-s=..` tuples — no spaces around `;`, no `prot=`/`mod=`/`q=`, one
-/// tuple per integrity algorithm (`hmac-md5-96`/`hmac-sha-1-96`), each with
-/// `ealg=null` (no ESP encryption, integrity only — what the captured
-/// working REGISTER proposed).
+/// port-s=..` tuples — no spaces around `;`, no `prot=`/`mod=`/`q=`.
+///
+/// Both `ealg=aes-cbc` and `ealg=null` are offered for each integrity
+/// algorithm. The `null` tuples are what the captured working Airtel
+/// REGISTER proposed; the `aes-cbc` tuples are REQUIRED by Vodafone India,
+/// whose P-CSCF rejects any Security-Client offering only `ealg=null` with
+/// an instant blanket `403 Forbidden` — no challenge, no Security-Server,
+/// identical bytes regardless of every other header (bisected live with a
+/// raw-REGISTER prober; the moment an `aes-cbc` tuple appears, the same
+/// request gets the real `401` + AKA challenge and a populated
+/// `Security-Server` selecting `alg=hmac-sha-1-96; ealg=aes-cbc`).
+/// `des-ede3-cbc` is deliberately NOT offered: its 192-bit key needs the
+/// TS 33.203 Annex I CK-expansion we don't implement, and a network could
+/// legitimately select it if offered. `gm_ipsec` keys `aes-cbc` with the
+/// AKA CK directly (TS 33.203 Annex H), same as it always did for IK.
 fn build_security_client_headers(proposal: &SaProposal) -> Vec<String> {
     const ALGS: [&str; 2] = ["hmac-md5-96", "hmac-sha-1-96"];
-    const EALGS: [&str; 1] = ["null"];
+    const EALGS: [&str; 2] = ["aes-cbc", "null"];
 
     let tuples: Vec<String> = ALGS
         .iter()
@@ -685,6 +696,10 @@ mod tests {
         assert!(sc.contains("alg=hmac-md5-96"));
         assert!(sc.contains("alg=hmac-sha-1-96"));
         assert!(sc.contains("ealg=null"));
+        // Vodafone India 403s any offer without an aes-cbc tuple — see
+        // build_security_client_headers' docs.
+        assert!(sc.contains("ealg=aes-cbc"));
+        assert!(!sc.contains("des-ede3"));
         assert!(sc.contains("spi-c=111"));
         assert!(sc.contains("spi-s=222"));
         assert!(sc.contains("port-c=5062"));
