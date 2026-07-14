@@ -1,5 +1,22 @@
 # Release Notes
 
+## v6.0.0
+
+The VoWiFi release. Alongside the existing circuit-switched GSM bridge, the system now answers calls the carrier delivers over Wi-Fi Calling (VoWiFi/IMS) and bridges them to the same SIP/PBX destination — the carrier decides which path delivers a given call. Built on the foundation work of the [Osmocom foss-ims-client project](https://osmocom.org/projects/foss-ims-client/wiki/VoWiFi_with_Asterisk).
+
+- **Inbound VoWiFi-to-SIP bridge** (`specs/011-vowifi-sip-bridge`) — an IKEv2/IPsec ePDG tunnel to the carrier, IMS-AKA registration with real Gm IPsec (kernel XFRM), and two supervised agent processes (one inside the tunnel's `ims` network namespace, one PBX-facing) joined by a veth pair. Enabled via the new `[vowifi]` section in `config.toml`; disabled by default. Live-validated end-to-end against Airtel India. See `docs/vowifi-bridge.md`.
+- **Wideband audio end-to-end** — a carrier's AMR-WB (16 kHz) call stays wideband all the way to the PBX (AMR-WB → L16/16000 over the veth link → G.722), instead of narrowing to 8 kHz. Narrowband carriers (PCMU/AMR-NB) bridge exactly as before.
+- **strongSwan ePDG engine, now the default** (`specs/012-strongswan-epdg`) — proper IKE rekeying, re-authentication, and dead-peer detection; the network namespace and veth link survive reconnects. Includes a vpcd/pcscd USIM bridge (`vowifi-usim-bridge`) that runs EAP-AKA against the SIM inside the modem via `AT+CSIM`, with no physical smart-card reader. The original SWu dialer remains available as `tunnel_engine = "swu"`.
+- **SMS over VoWiFi** — SMS delivered via IMS is captured and forwarded to Discord like modem SMS.
+- **Breaking: config consolidation** — all non-secret settings moved from `.env`/environment variables into `config.toml` (`MCC`/`MNC`/`APN`/`TUNNEL_ENGINE`/veth names/keepalive → `[vowifi]`; log level → `[logging].level`). `.env` now holds secrets only. Review `config.toml.example` when upgrading.
+- **Breaking: Alpine/musl image** — the Docker image was rebuilt on Alpine, dropping from 629 MB to ~116 MB, and the CS-GSM and VoWiFi/ePDG images were unified into one (`docker compose up --build` from `docker/` runs both paths).
+- **EC200 support** — USB discovery now recognizes the Quectel EC200 series alongside the EC20.
+- **Documentation overhaul** — restructured README, a docs index (`docs/README.md`), and new architecture, hardware-setup, observability, and development guides.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:6.0.0
+```
+
 ## v5.6.4
 
 - **Fix: timezone support in Alpine container** — Alpine's musl libc requires the `tzdata` package to read timezone information from `/usr/share/zoneinfo`. Without it, the `TZ` environment variable has no effect and the container reports all times in UTC, making logs hard to correlate with local events. Added `tzdata` to the runtime stage so `TZ=Asia/Kolkata` (or any other timezone in `.env`) now correctly converts timestamps.
