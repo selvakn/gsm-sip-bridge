@@ -1,5 +1,18 @@
 # Release Notes
 
+## v6.2.0
+
+VoWiFi on a VoLTE-capable modem, and two failures that made it look like the SIM or the modem was at fault.
+
+- **The modem's own IMS/VoLTE stack is now disabled while VoWiFi is enabled.** Our `REGISTER` carries `+sip.instance="<urn:gsma:imei:$IMEI>"` — the modem's own IMEI — so a VoLTE-registered modem claims the same IMPU with the same instance-id. Per RFC 5626 the network does not see two devices: it treats whichever registration arrives second as a re-registration of the first and deactivates the older binding. Against Airtel the tunnel came up, EAP-AKA authenticated and `REGISTER` returned `200 OK` — then ~0.7s later a reg-event `NOTIFY` arrived carrying `state="terminated" event="deactivated" reason=noresource` for our own contact, the modem's VoLTE registration won, and no terminating call could ever reach the bridge. The entrypoint now reconciles `AT+QCFG="ims"` against `[vowifi].enabled` on boot (2 = forcibly disabled for VoWiFi, 1 = forcibly enabled otherwise, so VoLTE keeps working when the bridge is off), rebooting the module only when it is in the wrong mode. **Note:** the modem persists this setting across power cycles, and correcting it costs one ~30s module reboot on the boot that fixes it. With VoLTE off, circuit-switched calls fall back to 2G/3G via CSFB.
+- **vpcd's port moved off the kernel's ephemeral range** (35963 → 15963, `[vowifi].vpcd_port`). vsmartcard's upstream default sits inside `net.ipv4.ip_local_port_range` (32768-60999), and under `network_mode: host` the container shares that namespace — so an unrelated outbound connection can already hold the port when pcscd starts. The driver's `bind()` then fails with `EADDRINUSE`, the virtual reader is never registered, and VoWiFi dies with two symptoms that name neither the port nor each other: charon reports `no smart card reader` and `vowifi-usim-bridge` spins forever on `Connection refused`. Found in the field with a redis client parked on 35964. The port is now rendered into `/etc/reader.conf.d/vpcd` from config, so the driver's listener and the bridge's dial target always agree.
+- **The entrypoint fails loudly when the vpcd reader does not come up**, and pcscd's log is surfaced in `docker logs` as `[pcscd]`, instead of leaving an unexplained reconnect loop.
+- **Docs:** `network_mode: host` is *not* what grants USB/ALSA access (that is `privileged` + the `/dev` mount) — a false rationale that hid the port collision above. New `operations.md` entries for the two failures above, and for the host-firewall rule VoWiFi needs when running with host networking (a default-deny ufw drops Agent A's control channel and RTP across the veth, so calls arrive and then fail).
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:6.2.0
+```
+
 ## v6.1.0
 
 Vodafone India VoWiFi interop, plus automatic MCC/MNC.
