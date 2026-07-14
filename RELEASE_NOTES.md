@@ -1,5 +1,19 @@
 # Release Notes
 
+## v6.1.0
+
+Vodafone India VoWiFi interop, plus automatic MCC/MNC.
+
+- **VoWiFi now works on Vodafone India** — two independent fixes were needed to get from "tunnel won't establish" to a stable `200 OK` registration:
+  - The strongSwan `ims` connection now pins its IKE and CHILD_SA proposals to the classic 3GPP baseline (matching the known-good SWu dialer). charon's default proposal set made the `IKE_SA_INIT` request 852 bytes, which Vodafone's ePDG rejected outright with `INVALID_SYNTAX` before any SIM interaction happened.
+  - The `Security-Client` header now offers `ealg=aes-cbc` (encrypted Gm IPsec) alongside the existing `ealg=null`. Vodafone's P-CSCF blanket-refuses integrity-only offers with an instant `403 Forbidden` and no challenge — a response so uninformative it initially looked like a network-side subscriber block. `gm_ipsec.rs` already implemented AES-CBC end-to-end; it had just never been exercised against a network that requires it.
+  - See `docs/vowifi-epdg-research-notes.md` for the full bisection story.
+- **Automatic MCC/MNC** — `vowifi.mcc`/`vowifi.mnc` are now optional. Left unset, they're derived from the SIM at startup: MCC from the IMSI (`AT+CIMI`), and the MNC's 2-vs-3-digit length from the SIM's EF_AD file (`AT+CRSM`), falling back to the registered PLMN (`AT+COPS`) when EF_AD is unreadable. Explicit config values still take precedence.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:6.1.0
+```
+
 ## v6.0.0
 
 The VoWiFi release. Alongside the existing circuit-switched GSM bridge, the system now answers calls the carrier delivers over Wi-Fi Calling (VoWiFi/IMS) and bridges them to the same SIP/PBX destination — the carrier decides which path delivers a given call. Built on the foundation work of the [Osmocom foss-ims-client project](https://osmocom.org/projects/foss-ims-client/wiki/VoWiFi_with_Asterisk).
