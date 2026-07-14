@@ -273,6 +273,98 @@ impl AtCommander {
         }
     }
 
+    /// Number of MNC digits (2 or 3) in the home network's IMSI, read from
+    /// the SIM's EF_AD administrative data file (3GPP TS 31.102 §4.2.18):
+    /// `AT+CRSM=176,28589,0,0,4` is READ BINARY (176) of file 0x6FAD
+    /// (28589), 4 bytes. On success the response is e.g.
+    /// `+CRSM: 144,0,"00000002"` — sw1=144 (0x90, success) and the 4th
+    /// octet's low nibble is the MNC length. Errors out (rather than
+    /// guessing) when the byte is absent or invalid — legacy 2G SIMs may
+    /// omit it entirely (TS 51.011 makes it optional), and callers are
+    /// expected to fall back to `query_cops_plmn`.
+    pub fn query_mnc_length(&mut self) -> BridgeResult<u8> {
+        match self.send_command("AT+CRSM=176,28589,0,0,4")? {
+            AtResponse::Ok(lines) => {
+                for line in &lines {
+                    if let Some(rest) = line.strip_prefix("+CRSM:") {
+                        let parts: Vec<&str> = rest.splitn(3, ',').collect();
+                        if parts.len() < 3 {
+                            return Err(BridgeError::Discovery(format!(
+                                "EF_AD read returned no data: +CRSM:{rest}"
+                            )));
+                        }
+                        let sw1: u32 = parts[0].trim().parse().unwrap_or(0);
+                        if sw1 != 144 {
+                            return Err(BridgeError::Discovery(format!(
+                                "EF_AD read rejected by the SIM: +CRSM:{rest}"
+                            )));
+                        }
+                        let data = parts[2].trim().trim_matches('"');
+                        let Some(byte4) = data.get(6..8) else {
+                            return Err(BridgeError::Discovery(format!(
+                                "EF_AD shorter than 4 bytes (no MNC length byte): {data:?}"
+                            )));
+                        };
+                        let mnc_len = u8::from_str_radix(byte4, 16).map_err(|_| {
+                            BridgeError::Discovery(format!("EF_AD byte 4 not hex: {data:?}"))
+                        })? & 0x0F;
+                        if mnc_len == 2 || mnc_len == 3 {
+                            return Ok(mnc_len);
+                        }
+                        return Err(BridgeError::Discovery(format!(
+                            "EF_AD MNC length not 2 or 3 (unprogrammed?): {mnc_len}"
+                        )));
+                    }
+                }
+                Err(BridgeError::Discovery(
+                    "AT+CRSM: no +CRSM line in response".into(),
+                ))
+            }
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+                Err(BridgeError::Discovery(format!("AT+CRSM failed: {e}")))
+            }
+        }
+    }
+
+    /// The registered (serving) PLMN as the raw numeric MCC+MNC string —
+    /// 5 or 6 digits, so the MNC digit count is unambiguous. Sets numeric
+    /// operator format and reads it as one concatenated command
+    /// (`AT+COPS=3,2;+COPS?` — a single response round trip) rather than
+    /// two, so the format switch and the query can't interleave with
+    /// another AT user. Response: `+COPS: 0,2,"40443",7`. Errors when not
+    /// registered to a network (`+COPS: 0` carries no operator field).
+    pub fn query_cops_plmn(&mut self) -> BridgeResult<String> {
+        match self.send_command("AT+COPS=3,2;+COPS?")? {
+            AtResponse::Ok(lines) => {
+                for line in &lines {
+                    if let Some(rest) = line.strip_prefix("+COPS:") {
+                        let parts: Vec<&str> = rest.splitn(4, ',').collect();
+                        if parts.len() < 3 {
+                            return Err(BridgeError::Discovery(format!(
+                                "not registered to a network: +COPS:{rest}"
+                            )));
+                        }
+                        let plmn = parts[2].trim().trim_matches('"');
+                        if (plmn.len() == 5 || plmn.len() == 6)
+                            && plmn.chars().all(|c| c.is_ascii_digit())
+                        {
+                            return Ok(plmn.to_string());
+                        }
+                        return Err(BridgeError::Discovery(format!(
+                            "unexpected operator field in +COPS:{rest}"
+                        )));
+                    }
+                }
+                Err(BridgeError::Discovery(
+                    "AT+COPS: no +COPS line in response".into(),
+                ))
+            }
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+                Err(BridgeError::Discovery(format!("AT+COPS failed: {e}")))
+            }
+        }
+    }
+
     pub fn query_phone_number(&mut self) -> BridgeResult<String> {
         match self.send_command("AT+CNUM")? {
             AtResponse::Ok(lines) => {
@@ -532,6 +624,70 @@ mod tests {
         assert_eq!(NetworkMode::from_at_value(3), Some(NetworkMode::Lte));
         assert_eq!(NetworkMode::from_at_value(4), None);
         assert_eq!(NetworkMode::from_at_value(255), None);
+    }
+
+    #[test]
+    fn test_query_mnc_length_two_digits() {
+        let mut at = make_commander("+CRSM: 144,0,\"00000002\"\r\nOK\r\n");
+        assert_eq!(at.query_mnc_length().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_query_mnc_length_three_digits() {
+        let mut at = make_commander("+CRSM: 144,0,\"01000003\"\r\nOK\r\n");
+        assert_eq!(at.query_mnc_length().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_query_mnc_length_rejects_sim_error_status() {
+        // sw1=106 (0x6A, file not found) — the SIM refused the read
+        let mut at = make_commander("+CRSM: 106,130\r\nOK\r\n");
+        assert!(at.query_mnc_length().is_err());
+    }
+
+    #[test]
+    fn test_query_mnc_length_rejects_short_ef_ad() {
+        // Legacy 2G SIM: EF_AD present but only 3 bytes, no MNC length byte
+        let mut at = make_commander("+CRSM: 144,0,\"000000\"\r\nOK\r\n");
+        assert!(at.query_mnc_length().is_err());
+    }
+
+    #[test]
+    fn test_query_mnc_length_rejects_unprogrammed_value() {
+        // 0xFF low nibble = 15 — neither 2 nor 3
+        let mut at = make_commander("+CRSM: 144,0,\"000000FF\"\r\nOK\r\n");
+        assert!(at.query_mnc_length().is_err());
+    }
+
+    #[test]
+    fn test_query_mnc_length_at_error() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(at.query_mnc_length().is_err());
+    }
+
+    #[test]
+    fn test_query_cops_plmn_five_digits() {
+        let mut at = make_commander("+COPS: 0,2,\"40443\",7\r\nOK\r\n");
+        assert_eq!(at.query_cops_plmn().unwrap(), "40443");
+    }
+
+    #[test]
+    fn test_query_cops_plmn_six_digits() {
+        let mut at = make_commander("+COPS: 0,2,\"405840\",7\r\nOK\r\n");
+        assert_eq!(at.query_cops_plmn().unwrap(), "405840");
+    }
+
+    #[test]
+    fn test_query_cops_plmn_not_registered() {
+        // No operator field when unregistered
+        let mut at = make_commander("+COPS: 0\r\nOK\r\n");
+        assert!(at.query_cops_plmn().is_err());
+    }
+
+    #[test]
+    fn test_query_cops_plmn_at_error() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(at.query_cops_plmn().is_err());
     }
 
     // Kills: || → && at line 296 (before UMTS) and 297 (before HSPA)

@@ -79,6 +79,13 @@ pub enum Commands {
     /// EAP identity without hand-parsing `AT+CIMI` in bash — the same
     /// "ask the binary" precedent as `config vowifi-enabled`.
     VowifiImsi(VowifiImsiArgs),
+    /// Prints the home network's MCC and MNC (space-separated, MNC
+    /// zero-padded to 3 digits) derived from the SIM, and exits: MCC is the
+    /// IMSI's first 3 digits, the 2-vs-3-digit MNC ambiguity is resolved
+    /// via the SIM's EF_AD file (`AT+CRSM`), falling back to the registered
+    /// PLMN from numeric `AT+COPS`. Used by `docker/entrypoint.sh` when
+    /// `vowifi.mcc`/`vowifi.mnc` are left unset in config.toml.
+    VowifiPlmn(VowifiPlmnArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -217,6 +224,13 @@ pub struct VowifiUsimBridgeArgs {
 #[derive(Parser, Debug)]
 pub struct VowifiImsiArgs {
     /// Modem AT port used for AT+CIMI
+    #[arg(long)]
+    pub modem: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+pub struct VowifiPlmnArgs {
+    /// Modem AT port used for AT+CIMI / AT+CRSM / AT+COPS
     #[arg(long)]
     pub modem: PathBuf,
 }

@@ -147,8 +147,8 @@ config consolidation).
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch |
-| `mcc` | string | `""` | Home network MCC, required when `enabled = true` |
-| `mnc` | string | `""` | Home network MNC, required when `enabled = true` |
+| `mcc` | string | `""` (auto-derive) | Home network MCC; empty means derive from the SIM (IMSI + EF_AD, `AT+COPS` fallback). Must be set together with `mnc` or not at all |
+| `mnc` | string | `""` (auto-derive) | Home network MNC, zero-padded to 3 digits; empty means derive from the SIM |
 | `modem_port` | string | `/dev/ttyUSB6` | AT port for the modem whose SIM authenticates |
 | `use_tcp` | boolean | `true` | SIP transport to the P-CSCF |
 | `sec_agree` | boolean | `true` | Advertise `Require: sec-agree` / negotiate Gm IPsec |
@@ -159,7 +159,7 @@ config consolidation).
 | `wideband` | boolean | `true` | Carry AMR-WB/G.722 end-to-end instead of narrowing to 8 kHz |
 | `apn` | string | `ims` | APN used by the `swu` engine's dialer |
 | `netns` | string | `ims` | Network namespace the ePDG tunnel lives in |
-| `epdg_fqdn` | string | derived from `mcc`/`mnc` | ePDG FQDN to resolve via DNS |
+| `epdg_fqdn` | string | derived from `mcc`/`mnc` (configured or SIM-derived) | ePDG FQDN to resolve via DNS |
 | `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly |
 | `src_addr` | string | unset (auto-select) | Force the tunnel's local source address |
 | `keepalive_interval_sec` | integer | 20 | Idle-tunnel TCP keepalive interval |

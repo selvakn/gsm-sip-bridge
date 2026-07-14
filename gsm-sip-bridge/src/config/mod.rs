@@ -331,9 +331,13 @@ pub struct VowifiConfig {
     /// (see `main.rs`) when this is `false`, so an operator who hasn't
     /// provisioned VoWiFi can't accidentally bring the mode up.
     pub enabled: bool,
-    /// Mobile Country Code of the home network, e.g. `"404"`.
+    /// Mobile Country Code of the home network, e.g. `"404"`. Leave empty
+    /// (together with `mnc`) to auto-derive it from the SIM at startup —
+    /// IMSI via `AT+CIMI`, with the 2-vs-3-digit MNC ambiguity resolved via
+    /// EF_AD (`AT+CRSM`), falling back to numeric `AT+COPS`.
     pub mcc: String,
-    /// Mobile Network Code of the home network, e.g. `"094"` (Airtel).
+    /// Mobile Network Code of the home network, zero-padded to 3 digits,
+    /// e.g. `"094"` (Airtel). Empty means auto-derive — see `mcc`.
     pub mnc: String,
     /// Serial AT port for the modem whose SIM authenticates the IMS
     /// registration (same device the existing `ims-register`/`ims-call`
@@ -1247,9 +1251,14 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .transpose()?
         .unwrap_or(defaults.mnc);
 
-    if enabled && (mcc.is_empty() || mnc.is_empty()) {
+    // Both set = explicit; both unset = auto-derive from the SIM at startup
+    // (entrypoint.sh via `vowifi-plmn`, vowifi-ims-agent internally). One
+    // without the other is always a config mistake.
+    if mcc.is_empty() != mnc.is_empty() {
         return Err(BridgeError::Config(
-            "vowifi.mcc and vowifi.mnc are required when vowifi.enabled = true".into(),
+            "vowifi.mcc and vowifi.mnc must be set together \
+             (or both left unset to auto-derive them from the SIM)"
+                .into(),
         ));
     }
 
@@ -1304,12 +1313,20 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_string(v, "vowifi.netns", false))
         .transpose()?
         .unwrap_or(defaults.netns);
+    // Stays empty when mcc/mnc are auto-derived — entrypoint.sh applies the
+    // same 3GPP derivation itself once `vowifi-plmn` has answered.
     let epdg_fqdn = t
         .get("epdg_fqdn")
         .map(|v| as_string(v, "vowifi.epdg_fqdn", false))
         .transpose()?
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org"));
+        .unwrap_or_else(|| {
+            if mcc.is_empty() {
+                String::new()
+            } else {
+                format!("epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org")
+            }
+        });
     let epdg_ip = as_optional_string(t, "epdg_ip", "vowifi.epdg_ip")?;
     let src_addr = as_optional_string(t, "src_addr", "vowifi.src_addr")?;
     let keepalive_interval_sec = t
@@ -1723,15 +1740,47 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_enabled_requires_mcc_and_mnc() {
+    fn vowifi_enabled_without_mcc_mnc_means_auto_derive() {
         let toml = format!("{}\n[vowifi]\nenabled = true\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert!(cfg.vowifi.enabled);
+        assert!(cfg.vowifi.mcc.is_empty());
+        assert!(cfg.vowifi.mnc.is_empty());
+        // No PLMN yet, so no FQDN can be derived at parse time either —
+        // entrypoint.sh fills it in after `vowifi-plmn` answers.
+        assert!(cfg.vowifi.epdg_fqdn.is_empty());
+    }
+
+    #[test]
+    fn vowifi_rejects_mcc_without_mnc() {
+        let toml = format!(
+            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\n",
+            MINIMAL_TOML
+        );
         let root: toml::Value = toml.parse().unwrap();
         let result = parse_vowifi(root.as_table().unwrap());
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("vowifi.mcc and vowifi.mnc are required"));
+            .contains("vowifi.mcc and vowifi.mnc must be set together"));
+    }
+
+    #[test]
+    fn vowifi_rejects_mnc_without_mcc() {
+        let toml = format!("{}\n[vowifi]\nmnc = \"094\"\n", MINIMAL_TOML);
+        let root: toml::Value = toml.parse().unwrap();
+        assert!(parse_vowifi(root.as_table().unwrap()).is_err());
+    }
+
+    #[test]
+    fn vowifi_epdg_fqdn_override_respected_without_mcc_mnc() {
+        let toml = format!(
+            "{}\n[vowifi]\nenabled = true\nepdg_fqdn = \"epdg.example.org\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.epdg_fqdn, "epdg.example.org");
     }
 
     #[test]

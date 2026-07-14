@@ -103,7 +103,13 @@ inter_card_gap_jitter_seconds = 15
 # bridged VoWiFi call reuses [bridge].sip_destination above rather than a
 # separate setting.
 enabled = false
-# Home network MCC/MNC, required when enabled = true. Example: Airtel India.
+# Home network MCC/MNC (MNC zero-padded to 3 digits). Example: Airtel India.
+# Optional: leave both unset to auto-derive them from the SIM at startup —
+# IMSI via AT+CIMI, with the 2-vs-3-digit MNC ambiguity resolved via the
+# SIM's EF_AD file (AT+CRSM), falling back to the registered PLMN from
+# AT+COPS. Set them explicitly if the SIM predates EF_AD's MNC-length byte
+# AND the modem may be roaming (the COPS fallback reads the serving
+# network, not the home one).
 mcc = "404"
 mnc = "094"
 # Serial AT port for the modem whose SIM authenticates the IMS registration —

@@ -63,6 +63,10 @@ fn main() -> ExitCode {
         return gsm_sip_bridge::vowifi::imsi::run(&args.modem);
     }
 
+    if let Some(Commands::VowifiPlmn(args)) = &cli.command {
+        return gsm_sip_bridge::vowifi::plmn::run(&args.modem);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }

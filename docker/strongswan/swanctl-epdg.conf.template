@@ -4,7 +4,9 @@
 #
 #   @IMSI@       - read via `gsm-sip-bridge vowifi-imsi` (or the IMSI env
 #                  override), used to build the EAP-AKA NAI identity
-#   @MCC@ @MNC@  - 3-digit-padded, from the MCC/MNC env vars (same
+#   @MCC@ @MNC@  - 3-digit-padded, from the MCC/MNC env vars — configured
+#                  in [vowifi], or auto-derived from the SIM via
+#                  `gsm-sip-bridge vowifi-plmn` when left unset (same
 #                  convention docker/entrypoint.sh already uses for the
 #                  legacy SWu dialer's -M/-N flags and EPDG_FQDN)
 #   @EPDG_IP@    - resolved ePDG address (same resolution entrypoint.sh

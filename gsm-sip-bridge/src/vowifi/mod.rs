@@ -19,6 +19,7 @@
 
 pub mod control;
 pub mod imsi;
+pub mod plmn;
 pub mod usim_bridge;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};

@@ -111,6 +111,27 @@ if ! ip netns add __probe 2>/dev/null; then
 fi
 ip netns del __probe 2>/dev/null || true
 
+# --- Auto-derive MCC/MNC from the SIM (shared by both engines) ---------------
+# Empty MCC/MNC means vowifi.mcc/mnc were left unset: derive them from the
+# SIM via `vowifi-plmn` (IMSI + EF_AD, AT+COPS fallback) instead of failing.
+# Must run before ePDG resolution below — EPDG_FQDN is empty too in that
+# case (config can't derive it without a PLMN) and gets built here. Runs
+# before pcscd/vowifi-usim-bridge/charon start, so nothing else is talking
+# to the modem port yet.
+if [ -z "$MCC" ] || [ -z "$MNC" ]; then
+    log "vowifi.mcc/mnc not set — deriving the home PLMN from the SIM ..."
+    PLMN="$("$GSM_SIP_BRIDGE_BIN" vowifi-plmn --modem "$MODEM_PORT")" || PLMN=""
+    read -r MCC MNC <<<"$PLMN"
+    if [ -z "${MCC:-}" ] || [ -z "${MNC:-}" ]; then
+        log "FATAL: could not derive MCC/MNC from $MODEM_PORT (see vowifi-plmn's error above) — set vowifi.mcc/mnc in config.toml"
+        exit 1
+    fi
+    log "derived home PLMN from SIM: mcc=$MCC mnc=$MNC"
+fi
+if [ -z "$EPDG_FQDN" ]; then
+    EPDG_FQDN="epdg.epc.mnc${MNC}.mcc${MCC}.pub.3gppnetwork.org"
+fi
+
 # --- Resolve ePDG IP (shared by both engines) --------------------------------
 if [ -n "$EPDG_IP" ]; then
     log "using ePDG IP from EPDG_IP override: $EPDG_IP"

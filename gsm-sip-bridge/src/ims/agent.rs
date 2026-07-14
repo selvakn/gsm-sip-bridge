@@ -97,12 +97,27 @@ fn read_pcscf(path: &str) -> BridgeResult<IpAddr> {
 
 fn run_inner(config: &VowifiConfig) -> BridgeResult<()> {
     let pcscf_addr = read_pcscf(&config.pcscf_source_path)?;
+    // Empty mcc/mnc means auto-derive (config::VowifiConfig::mcc docs). The
+    // IMS realm is built from these, so derive them from the SIM the same
+    // way entrypoint.sh's `vowifi-plmn` call does for the tunnel side —
+    // opening the modem here is nothing new, registration already uses it
+    // for AT+CIMI/AT+CSIM below.
+    let (mcc, mnc) = if config.mcc.is_empty() {
+        let mut at = crate::modules::at_commander::AtCommander::open(std::path::Path::new(
+            &config.modem_port,
+        ))?;
+        let plmn = crate::vowifi::plmn::derive_plmn(&mut at)?;
+        tracing::info!(mcc = %plmn.mcc, mnc = %plmn.mnc, "derived home PLMN from the SIM");
+        (plmn.mcc, plmn.mnc)
+    } else {
+        (config.mcc.clone(), config.mnc.clone())
+    };
     let reg_cfg = ImsRegisterConfig {
         modem_port: PathBuf::from(&config.modem_port),
         pcscf_addr,
         pcscf_port: 5060,
-        mcc: config.mcc.clone(),
-        mnc: config.mnc.clone(),
+        mcc,
+        mnc,
         imsi: None,
         imei: None,
         use_tcp: config.use_tcp,
