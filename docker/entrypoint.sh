@@ -373,17 +373,27 @@ EOF
     # smart card reader" while the bridge spins on ECONNREFUSED forever —
     # neither of which names the real fault.
     #
-    # The listener must belong to *pcscd*: a plain connect probe is not
-    # enough, because the very failure this guards against (some unrelated
-    # process holding the port) leaves that process listening and answering
-    # the probe — and the bridge would then speak the vpcd protocol at it.
+    # A plain connect probe is not sufficient on its own: the very failure
+    # this guards against (an unrelated process holding the port) leaves that
+    # process listening and answering the probe, and the bridge would then
+    # speak the vpcd protocol at it. But the listener cannot be attributed to
+    # pcscd by PID either — under `network_mode: host` the socket table is the
+    # host's while /proc is the container's, so netstat reports the owner as
+    # "-" for every row and a PID match can never succeed (it would FATAL on a
+    # perfectly healthy system).
+    #
+    # So take pcscd's own verdict: the driver logs its failed bind. An empty
+    # log plus an answering port means the reader really is ours.
     VPCD_READY=0
     for _ in $(seq 1 20); do
         if ! kill -0 "$PCSCD_PID" 2>/dev/null; then
             break # pcscd died; no point waiting out the timeout
         fi
-        if netstat -ltnp 2>/dev/null |
-            grep -qE ":$VPCD_PORT[[:space:]]+.*LISTEN[[:space:]]+$PCSCD_PID/"; then
+        if grep -qiE "address in use|Open Port .* Failed" /tmp/pcscd.log 2>/dev/null; then
+            break # the driver could not bind — the port answering is somebody else
+        fi
+        if (exec 3<>"/dev/tcp/$VPCD_HOST/$VPCD_PORT") 2>/dev/null; then
+            exec 3<&- 3>&-
             VPCD_READY=1
             break
         fi
