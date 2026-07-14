@@ -174,6 +174,55 @@ access USB devices and ALSA (the shipped `docker/docker-compose.yml`
 already does). Note this is *not* what `network_mode: host` is for —
 device and audio access work the same in any network mode.
 
+### VoWiFi: "failed to reach Agent B control channel: connection timed out"
+
+The tunnel is up, the IMS registration succeeded and the carrier's `INVITE`
+arrived — but Agent A (inside netns `ims`) cannot reach Agent B across the
+veth pair, so every inbound call fails.
+
+Under `network_mode: host` (the shipped default) the veth's Agent B end,
+`veth-sip`, lives in the **host's** network namespace, so Agent A's traffic
+arrives as *inbound host traffic* and is filtered by the host firewall.
+A default-deny firewall (ufw, firewalld) drops it. The giveaway is that ICMP
+still works — `ip netns exec ims ping 10.99.0.2` succeeds while TCP to
+`10.99.0.2:7050` times out.
+
+With ufw:
+
+```bash
+sudo ufw allow in on veth-sip from 10.99.0.1 comment 'gsm-sip-bridge VoWiFi agents'
+```
+
+Allow the **whole interface**, not just the control port: the call's RTP
+audio crosses the same veth on PJSUA-allocated media ports (base 4000,
+incrementing per call), so a rule for TCP/7050 alone yields a connected call
+with no audio — a more confusing failure than no call at all. `veth-sip` is a
+private /30 whose only peer is the bridge's own netns. The rule keys on the
+interface name, which survives the tunnel reconnects that delete and recreate
+the pair.
+
+Not an issue under bridge networking, where the veth's host end sits in the
+container's own namespace, out of the host firewall's reach.
+
+### VoWiFi: registration is granted, then torn down seconds later
+
+Symptom: `REGISTER response status=200`, immediately followed by
+`NOTIFY reports a terminated state` carrying `event="deactivated"` and
+`reason=noresource` for our own contact — after which terminating calls never
+arrive.
+
+The modem's own IMS/VoLTE stack is registered too. Our `REGISTER` carries
+`+sip.instance="<urn:gsma:imei:$IMEI>"` — the modem's IMEI — so a
+VoLTE-registered modem claims the same IMPU with the same instance-id, and per
+RFC 5626 the network treats one registration as a re-registration of the other
+and deactivates the older binding. The modem wins, and the bridge can never
+receive a call.
+
+Since v6.2.0 the entrypoint reconciles this automatically on boot
+(`AT+QCFG="ims"` must be `2` when `[vowifi].enabled`), rebooting the module if
+it was wrong. If it fails, check the modem supports `AT+QCFG="ims"` at all —
+`ims_conf=1` with `volte_cap=1` is the state that causes this.
+
 ### VoWiFi: "no smart card reader" / vpcd connection refused
 
 Symptom: charon logs `SCardListReaders: Cannot find a smart card reader`
