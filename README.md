@@ -75,8 +75,10 @@ This starts the full stack:
 | Grafana | `http://localhost:3000` | Dashboards (admin/admin) |
 | sqlite-web | `http://localhost:8088` | Browse call and SMS database (read-only) |
 
-The container runs in `privileged` + `network_mode: host` to access USB
-devices and ALSA audio. To update later:
+The container runs `privileged` with `/dev` bind-mounted, to access USB
+devices and ALSA audio. It also defaults to `network_mode: host` for the
+SIP/RTP media path — that part is independent of device access. To update
+later:
 
 ```bash
 docker compose pull && docker compose up -d

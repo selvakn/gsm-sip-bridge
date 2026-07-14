@@ -169,7 +169,7 @@ config consolidation).
 | `strongswan_tun_iface` | string | `tun23` | strongswan engine's XFRM interface name |
 | `strongswan_if_id` | integer | 23 | strongswan engine's XFRM interface `if_id` |
 | `vpcd_host` | string | `127.0.0.1` | pcscd's vpcd virtual reader host (strongswan engine) |
-| `vpcd_port` | integer | 35963 | pcscd's vpcd virtual reader port (strongswan engine) |
+| `vpcd_port` | integer | 15963 | pcscd's vpcd virtual reader port (strongswan engine). Keep it **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
 | `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch (strongswan engine) |
 
 ## Examples

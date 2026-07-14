@@ -411,7 +411,10 @@ pub struct VowifiConfig {
     /// Host running the vpcd virtual smart-card reader (pcscd's vpcd
     /// driver) that `vowifi-usim-bridge` connects to.
     pub vpcd_host: String,
-    /// TCP port vpcd listens on.
+    /// TCP port vpcd listens on. Rendered into `/etc/reader.conf.d/vpcd`
+    /// (the driver's listener) and dialled by `vowifi-usim-bridge`, so both
+    /// ends move together. Keep it below the kernel's ephemeral range
+    /// (`net.ipv4.ip_local_port_range`) — see `vpcd_port`'s CLI docs.
     pub vpcd_port: u16,
     /// Use this IMSI instead of reading it from the SIM via `vowifi-imsi`
     /// (AT+CIMI) — a test/diagnostic escape hatch for the strongswan
@@ -445,7 +448,7 @@ impl Default for VowifiConfig {
             strongswan_tun_iface: "tun23".to_string(),
             strongswan_if_id: 23,
             vpcd_host: "127.0.0.1".to_string(),
-            vpcd_port: 35963,
+            vpcd_port: 15963,
             imsi_override: None,
         }
     }
@@ -1817,7 +1820,7 @@ password = "pass"
         assert_eq!(cfg.vowifi.apn, "ims");
         assert_eq!(cfg.vowifi.keepalive_interval_sec, 20);
         assert_eq!(cfg.vowifi.vpcd_host, "127.0.0.1");
-        assert_eq!(cfg.vowifi.vpcd_port, 35963);
+        assert_eq!(cfg.vowifi.vpcd_port, 15963);
         assert_eq!(cfg.vowifi.epdg_ip, None);
         assert_eq!(cfg.vowifi.src_addr, None);
         assert_eq!(cfg.vowifi.imsi_override, None);

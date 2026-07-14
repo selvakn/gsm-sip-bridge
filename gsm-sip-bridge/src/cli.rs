@@ -216,8 +216,12 @@ pub struct VowifiUsimBridgeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub vpcd_host: String,
 
-    /// TCP port vpcd listens on
-    #[arg(long, default_value_t = 35963)]
+    /// TCP port vpcd listens on. Must stay below the kernel's ephemeral
+    /// range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) —
+    /// vsmartcard's upstream 35963 sits inside it, so under
+    /// `network_mode: host` an unrelated outbound connection can squat the
+    /// port before pcscd binds it, and the reader then fails to come up.
+    #[arg(long, default_value_t = 15963)]
     pub vpcd_port: u16,
 }
 

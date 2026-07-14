@@ -58,6 +58,7 @@ SWU_WATCHDOG_PID=""
 IMS_AGENT_SUPERVISOR_PID=""
 SIP_AGENT_SUPERVISOR_PID=""
 PCSCD_PID=""
+PCSCD_LOG_TAIL_PID=""
 CHARON_PID=""
 CHARON_LOG_TAIL_PID=""
 USIM_BRIDGE_SUPERVISOR_PID=""
@@ -78,6 +79,7 @@ cleanup() {
     pkill -f vowifi-usim-bridge 2>/dev/null
     [ -n "$CHARON_LOG_TAIL_PID" ] && kill "$CHARON_LOG_TAIL_PID" 2>/dev/null
     [ -n "$CHARON_PID" ] && kill "$CHARON_PID" 2>/dev/null
+    [ -n "$PCSCD_LOG_TAIL_PID" ] && kill "$PCSCD_LOG_TAIL_PID" 2>/dev/null
     [ -n "$PCSCD_PID" ] && kill "$PCSCD_PID" 2>/dev/null
     ip netns del "$NETNS" 2>/dev/null
     true
@@ -305,10 +307,61 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     log "rendered swanctl connection for mcc=$MCC mnc=$MNC epdg=$EPDG_IP"
 
     # --- pcscd + vowifi-usim-bridge (the virtual PC/SC reader) --------------
+    # vpcd's port is configured in two places that MUST agree: the driver's
+    # listener (/etc/reader.conf.d/vpcd, read by pcscd) and the bridge's dial
+    # target (--vpcd-port). Render the reader.conf from $VPCD_PORT so a
+    # [vowifi].vpcd_port override moves both ends together — the image's
+    # upstream copy hardcodes vsmartcard's 35963, which sits inside the
+    # kernel's ephemeral range (net.ipv4.ip_local_port_range, 32768-60999).
+    # Under `network_mode: host` an unrelated outbound connection can hold
+    # that port when pcscd starts, the driver's bind() then fails with
+    # EADDRINUSE, and the reader never registers.
+    VPCD_PORT_HEX="$(printf '0x%04X' "$VPCD_PORT")"
+    cat >/etc/reader.conf.d/vpcd <<EOF
+FRIENDLYNAME "Virtual PCD"
+DEVICENAME   /dev/null:$VPCD_PORT_HEX
+LIBPATH      /usr/lib/pcsc/drivers/serial/libifdvpcd.so
+CHANNELID    $VPCD_PORT_HEX
+EOF
+
     mkdir -p /run/pcscd
     pcscd --foreground >/tmp/pcscd.log 2>&1 &
     PCSCD_PID=$!
     log "started pcscd (pid $PCSCD_PID)"
+    # Surface pcscd's log on docker logs, same as charon's below: a driver
+    # that fails to bind says so only here, and it is the difference between
+    # a one-line diagnosis and an unexplained ECONNREFUSED loop.
+    tail -f /tmp/pcscd.log 2>/dev/null | sed 's/^/[pcscd] /' &
+    PCSCD_LOG_TAIL_PID=$!
+
+    # Gate the bridge on the driver's listener actually being up. Without
+    # this, a reader that failed to register leaves charon reporting "no
+    # smart card reader" while the bridge spins on ECONNREFUSED forever —
+    # neither of which names the real fault.
+    #
+    # The listener must belong to *pcscd*: a plain connect probe is not
+    # enough, because the very failure this guards against (some unrelated
+    # process holding the port) leaves that process listening and answering
+    # the probe — and the bridge would then speak the vpcd protocol at it.
+    VPCD_READY=0
+    for _ in $(seq 1 20); do
+        if ! kill -0 "$PCSCD_PID" 2>/dev/null; then
+            break # pcscd died; no point waiting out the timeout
+        fi
+        if netstat -ltnp 2>/dev/null |
+            grep -qE ":$VPCD_PORT[[:space:]]+.*LISTEN[[:space:]]+$PCSCD_PID/"; then
+            VPCD_READY=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$VPCD_READY" -ne 1 ]; then
+        log "FATAL: pcscd's vpcd reader never came up on $VPCD_HOST:$VPCD_PORT (see [pcscd] lines above)."
+        log "       If pcscd logged 'Address in use', another process holds $VPCD_PORT — pick a"
+        log "       [vowifi].vpcd_port below the ephemeral range (cat /proc/sys/net/ipv4/ip_local_port_range)."
+        exit 1
+    fi
+    log "vpcd reader ready on $VPCD_HOST:$VPCD_PORT"
 
     log "starting vowifi-usim-bridge (default netns, talks to the modem + pcscd's vpcd), supervised..."
     (

@@ -172,7 +172,11 @@ strongswan_if_id = 23
 # strongswan engine only: pcscd's vpcd virtual smart-card reader, bridged to
 # the modem's SIM by vowifi-usim-bridge.
 vpcd_host = "127.0.0.1"
-vpcd_port = 35963
+# Must stay below the kernel's ephemeral port range
+# (net.ipv4.ip_local_port_range, 32768-60999 by default): under
+# `network_mode: host` an unrelated outbound connection can otherwise grab
+# this port first, and pcscd's reader then fails to start.
+vpcd_port = 15963
 # strongswan engine only: use this IMSI instead of reading it from the SIM
 # via AT+CIMI. Diagnostic escape hatch — leave unset normally.
 # imsi_override = "404940123456789"

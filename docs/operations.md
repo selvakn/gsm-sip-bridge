@@ -169,9 +169,39 @@ Verify the ALSA device is accessible and not claimed by another process
 
 ### Docker container not finding USB/audio devices
 
-The container must run with `privileged` and `network_mode: host` to
+The container must run with `privileged` and the `/dev` bind-mount to
 access USB devices and ALSA (the shipped `docker/docker-compose.yml`
-already does).
+already does). Note this is *not* what `network_mode: host` is for —
+device and audio access work the same in any network mode.
+
+### VoWiFi: "no smart card reader" / vpcd connection refused
+
+Symptom: charon logs `SCardListReaders: Cannot find a smart card reader`
+and `no USIM found with quintuplets ...`, while `vowifi-usim-bridge`
+restarts forever on `failed to connect to vpcd ... Connection refused`.
+
+Both are the same fault: pcscd never registered the vpcd virtual reader,
+so nothing listens on `[vowifi].vpcd_port`. Check the `[pcscd]` lines in
+`docker compose logs`. If they say:
+
+```
+Address in use
+ifd-vpcd.c:130:IFDHCreateChannel() Could not initialize connection to virtual ICC
+```
+
+then something already holds the port when pcscd starts. This bites
+specifically under `network_mode: host`, where the container shares the
+host's network namespace: vsmartcard's upstream default (35963) sits
+inside the kernel's ephemeral port range
+(`cat /proc/sys/net/ipv4/ip_local_port_range`, typically 32768-60999), so
+any outbound connection on the host can randomly squat it — an
+intermittent failure that looks like a modem or SIM problem but is not.
+
+The default `vpcd_port` (15963) is below that range and is therefore safe.
+If you override it, keep it below the ephemeral range too. Reserving the
+port instead (`net.ipv4.ip_local_reserved_ports`) also works, but it is a
+host-wide kernel setting and will not evict a connection already holding
+the port.
 
 ### Discord forwarding failing
 
