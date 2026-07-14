@@ -18,6 +18,7 @@
 //! existing circuit-switched call path completely untouched (FR-006).
 
 pub mod control;
+pub mod ims_mode;
 pub mod imsi;
 pub mod plmn;
 pub mod usim_bridge;

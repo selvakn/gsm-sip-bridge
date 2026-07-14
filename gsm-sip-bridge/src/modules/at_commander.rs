@@ -478,6 +478,55 @@ impl AtCommander {
         }
         Ok(confirmed)
     }
+
+    /// The modem's `<ims_conf>` (`AT+QCFG="ims"` → `+QCFG: "ims",<ims_conf>,
+    /// <volte_cap>`): 0 = follow the MBN default, 1 = forcibly enable IMS,
+    /// 2 = forcibly disable it. Only `<ims_conf>` is returned — `<volte_cap>`
+    /// is derived by the modem from it and is not separately settable.
+    pub fn query_ims_conf(&mut self) -> BridgeResult<u8> {
+        match self.send_command(r#"AT+QCFG="ims""#)? {
+            AtResponse::Ok(lines) => {
+                for line in &lines {
+                    if let Some(rest) = line.trim().strip_prefix(r#"+QCFG: "ims","#) {
+                        return rest
+                            .split(',')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .parse()
+                            .map_err(|_| {
+                                BridgeError::Discovery(format!(
+                                    r#"AT+QCFG="ims": unparseable ims_conf in {line:?}"#
+                                ))
+                            });
+                    }
+                }
+                Err(BridgeError::Discovery(
+                    r#"AT+QCFG="ims": no +QCFG line in response"#.into(),
+                ))
+            }
+            // Firmware without an IMS stack rejects the command outright.
+            // That is a hard error, not "IMS is off": VoWiFi's correctness
+            // depends on knowing the modem is not IMS-registered, and an
+            // ERROR tells us nothing either way.
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => Err(BridgeError::Discovery(
+                format!(r#"AT+QCFG="ims" failed: {e}"#),
+            )),
+        }
+    }
+
+    /// Sets `<ims_conf>`. The modem only applies it after a reboot
+    /// (`AT+CFUN=1,1`) and persists it across power cycles, so the caller
+    /// owns both the reboot and the re-verification — see
+    /// `vowifi::ims_mode`.
+    pub fn set_ims_conf(&mut self, ims_conf: u8) -> BridgeResult<()> {
+        match self.send_command(&format!(r#"AT+QCFG="ims",{ims_conf}"#))? {
+            AtResponse::Ok(_) => Ok(()),
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => Err(BridgeError::Discovery(
+                format!(r#"AT+QCFG="ims",{ims_conf} failed: {e}"#),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

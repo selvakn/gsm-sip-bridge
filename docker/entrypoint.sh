@@ -86,6 +86,40 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# --- 0. Modem IMS mode -------------------------------------------------------
+# Must run before ANY of the below opens the modem: reconciling the mode can
+# reboot the module (~30s), which would yank the port out from under the card
+# pool mid-discovery.
+#
+# VoWiFi and the modem's own VoLTE stack cannot both be registered: they share
+# the SIM's IMPU and the modem's IMEI-derived +sip.instance, so the network
+# treats the second registration as a re-registration of the first and
+# deactivates the older binding (observed against Airtel: our binding torn down
+# ~0.7s after it was granted). See gsm-sip-bridge/src/vowifi/ims_mode.rs.
+#
+# Not fatal when VoWiFi is off: a circuit-switched-only deployment on a modem
+# without AT+QCFG="ims" (non-Quectel) must keep booting exactly as it did
+# before this check existed.
+if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config vowifi-enabled; then
+    VOWIFI_ENABLED=1
+else
+    VOWIFI_ENABLED=0
+fi
+if [ -n "$MODEM_PORT" ] && [ -e "$MODEM_PORT" ]; then
+    log "reconciling the modem's IMS mode with [vowifi].enabled ..."
+    if ! "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" modem-ims --modem "$MODEM_PORT"; then
+        if [ "$VOWIFI_ENABLED" -eq 1 ]; then
+            log "FATAL: could not put the modem's IMS stack in the mode VoWiFi needs (see the error above)."
+            log "       Registering anyway would get the binding torn down by the network seconds later."
+            exit 1
+        fi
+        log "WARNING: could not reconcile the modem's IMS mode; continuing (VoWiFi is off, so nothing depends on it)"
+    fi
+elif [ "$VOWIFI_ENABLED" -eq 1 ]; then
+    log "FATAL: [vowifi].enabled but modem_port '$MODEM_PORT' is unset or absent — cannot verify the modem's IMS is off"
+    exit 1
+fi
+
 # --- 1. Circuit-switched GSM-to-SIP daemon (always attempted) ---------------
 log "starting the circuit-switched GSM-to-SIP daemon, supervised..."
 (

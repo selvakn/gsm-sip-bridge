@@ -67,6 +67,10 @@ fn main() -> ExitCode {
         return gsm_sip_bridge::vowifi::plmn::run(&args.modem);
     }
 
+    if let Some(Commands::ModemIms(args)) = &cli.command {
+        return handle_modem_ims_command(args, &cli);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -322,6 +326,25 @@ fn handle_vowifi_status_command(cli: &Cli) -> ExitCode {
 /// `if gsm-sip-bridge --config "$CONFIG" config vowifi-enabled; then ...`.
 /// Unlike `load_vowifi_config`, does NOT require `[vowifi].enabled = true`
 /// — that's exactly the thing being checked, not a precondition.
+/// Loads the full config (not `load_vowifi_config`, which insists VoWiFi is
+/// enabled): the whole point here is to act on `[vowifi].enabled` in *both*
+/// directions — disable the modem's IMS when the bridge is on, re-enable it
+/// when the bridge is off and VoLTE should work again.
+fn handle_modem_ims_command(args: &gsm_sip_bridge::cli::ModemImsArgs, cli: &Cli) -> ExitCode {
+    let Some(path) = cli.config.as_deref() else {
+        eprintln!("modem-ims: --config is required");
+        return ExitCode::FAILURE;
+    };
+    let config = match load_config(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("modem-ims: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    gsm_sip_bridge::vowifi::ims_mode::run(&args.modem, config.vowifi.enabled)
+}
+
 fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> ExitCode {
     use gsm_sip_bridge::cli::ConfigSubcommand;
     match &args.subcommand {

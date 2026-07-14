@@ -86,9 +86,25 @@ pub enum Commands {
     /// PLMN from numeric `AT+COPS`. Used by `docker/entrypoint.sh` when
     /// `vowifi.mcc`/`vowifi.mnc` are left unset in config.toml.
     VowifiPlmn(VowifiPlmnArgs),
+    /// Reconciles the modem's own IMS/VoLTE stack with `[vowifi].enabled`
+    /// and exits. VoWiFi requires the modem's IMS to be OFF: a
+    /// VoLTE-registered modem registers the same IMPU with the same
+    /// IMEI-derived `+sip.instance` as the bridge, so the network treats one
+    /// as a re-registration of the other and tears our binding down (see
+    /// `vowifi::ims_mode`). Rewrites `AT+QCFG="ims"` and reboots the module
+    /// only when it is in the wrong mode, so it is a no-op on a healthy boot.
+    /// Run by `docker/entrypoint.sh` before anything else opens the modem.
+    ModemIms(ModemImsArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ModemImsArgs {
+    /// Modem AT port used for `AT+QCFG="ims"` / `AT+CFUN=1,1`
+    #[arg(long)]
+    pub modem: PathBuf,
 }
 
 #[derive(Parser, Debug)]
