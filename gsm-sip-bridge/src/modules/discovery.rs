@@ -1,21 +1,24 @@
 use crate::error::BridgeResult;
+use crate::modules::at_commander::{AtCommander, AtResponse};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// One Quectel module variant this project knows how to recognize on USB.
-/// `at_interface_number` is `None` for models with no usable
-/// circuit-switched audio path (e.g. the EC200 tested here exposes no ALSA
-/// device, unlike the EC20) — such a module is VoWiFi-only: still fully
-/// usable via `[vowifi].modem_port` (which takes a plain user-set serial
-/// path and never goes through this discovery table at all), but
-/// deliberately excluded from circuit-switched-bridge discovery below
-/// rather than partially discovered and left to fail later, more
-/// confusingly, when a call actually tries to bridge audio.
+/// `has_audio_capability` is a static property of the model — `false` for
+/// modules with no usable circuit-switched audio path at all (e.g. the
+/// EC200 tested here exposes no ALSA device, unlike the EC20). Unlike the
+/// AT-capable interface (found by live probing below, specs/013-multi-card-
+/// vowifi FR-002), a model's audio capability isn't something a boot-time
+/// probe can discover — an audio-capable model with no ALSA device
+/// enumerated *this* boot is still audio-capable and stays eligible for the
+/// circuit-switched pool (`scan_modules` below), whereas an audio-less model
+/// never is, regardless of what's live.
 struct KnownDevice {
     vendor_id: &'static str,
     product_id: &'static str,
     model: &'static str,
-    at_interface_number: Option<&'static str>,
+    has_audio_capability: bool,
 }
 
 const KNOWN_DEVICES: &[KnownDevice] = &[
@@ -23,15 +26,21 @@ const KNOWN_DEVICES: &[KnownDevice] = &[
         vendor_id: "2c7c",
         product_id: "0125",
         model: "EC20",
-        at_interface_number: Some("04"),
+        has_audio_capability: true,
     },
     KnownDevice {
         vendor_id: "2c7c",
         product_id: "0901",
         model: "EC200",
-        at_interface_number: None,
+        has_audio_capability: false,
     },
 ];
+
+/// Per-candidate timeout for the AT probe (specs/013-multi-card-vowifi
+/// FR-002) — short because a modem may expose several serial interfaces
+/// that are never going to answer AT (diagnostic/NMEA ports), and probing
+/// tries each one in turn.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredModule {
@@ -51,15 +60,95 @@ pub fn derive_module_id(identifier: &str) -> String {
     format!("ec20-{}", suffix.to_ascii_uppercase())
 }
 
-pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
-    let mut modules = Vec::new();
+/// SIM identity/readiness observed while probing a discovered modem
+/// (specs/013-multi-card-vowifi FR-004/FR-006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimStatus {
+    Ready { imsi: String },
+    Absent,
+    Locked,
+    Unreadable(String),
+}
+
+/// Every USB-recognized modem, probed for its AT-capable interface and SIM
+/// identity, before any circuit-switched/VoWiFi role assignment
+/// (specs/013-multi-card-vowifi's shared inventory scan, research.md item
+/// 1). `scan_modules` (below) narrows this down to the audio-capable subset
+/// for the circuit-switched pool — unchanged behavior from before this
+/// feature. `vowifi::discovery` narrows it down the other way for VoWiFi
+/// lines.
+#[derive(Debug, Clone)]
+pub struct ProbedModem {
+    pub card_id: String,
+    pub model: &'static str,
+    pub usb_serial: String,
+    pub has_audio_capability: bool,
+    pub audio_device: Option<String>,
+    pub at_port: Option<PathBuf>,
+    /// `None` only when `at_port` is `None` too — there was nothing to ask.
+    pub sim_status: Option<SimStatus>,
+}
+
+/// The shared inventory scan: walks the USB bus, recognizes every known
+/// modem (audio-capable or not, FR-003), probes each one's serial
+/// interfaces for a live AT response instead of assuming a fixed interface
+/// number (FR-002), and reads SIM identity/readiness for any modem that
+/// answers (FR-004/FR-006). Both `scan_modules` (circuit-switched) and
+/// `vowifi::discovery`'s role assignment are built on top of this.
+///
+/// Always a clean, unbiased probe of every recognized device — deliberately
+/// does NOT consult "which modems does an existing line-resolution file
+/// already claim" (see `scan_modules`'s different treatment of that
+/// question): this is also what `gsm-sip-bridge discover` itself calls, and
+/// a `docker restart` (same container, same `/tmp`) can leave a stale
+/// resolution file from the *previous* run on disk — `discover` re-probing
+/// everything fresh regardless of that stale content is correct; treating
+/// it as "already claimed" would make discovery refuse to ever re-find its
+/// own line after a restart.
+pub fn scan_all() -> BridgeResult<Vec<ProbedModem>> {
+    scan_all_preferring(&[])
+}
+
+/// Like `scan_all`, but when a device exposes *several* AT-capable serial
+/// interfaces (real hardware: an EC200 was found live-testing to answer AT
+/// on more than one `ttyUSB*`, e.g. both a primary and a diagnostic port),
+/// and one of `preferred_ports` is among that device's candidates, that one
+/// is used instead of whichever candidate the plain first-match probe would
+/// otherwise settle on. Without this, an operator's `[vowifi].modem_port`/
+/// `[[vowifi.line]]` override naming a *working but non-first* AT port on a
+/// multi-port modem would silently fail to match `ProbedModem.at_port`
+/// (found live-testing) — defeating "that port is used as-is"
+/// (FR-009/FR-020, acceptance scenario 5). `main.rs`'s `discover` handler
+/// passes `vowifi::discovery::effective_line_overrides`' configured ports
+/// here; a plain `scan_all()` (no hints) behaves exactly as before.
+pub fn scan_all_preferring(preferred_ports: &[PathBuf]) -> BridgeResult<Vec<ProbedModem>> {
+    scan_all_inner(preferred_ports, &std::collections::HashSet::new())
+}
+
+/// Shared implementation. `skip_card_ids` are devices whose serial ports
+/// must not be opened at all this call — not merely omitted from the
+/// result afterward — because something else already has them open. Only
+/// `scan_modules` passes a non-empty set (see `active_vowifi_card_ids`'s
+/// doc comment for why `scan_all`/`scan_all_preferring` never do): its
+/// *ongoing* rescans run for the container's entire lifetime, concurrently
+/// with already-running `vowifi-usim-bridge`/agent processes, and probing
+/// (opening + sending `AT`) a port those processes are mid-transaction on
+/// was observed live to intermittently disrupt them (`AT+CPIN?: no status
+/// in response` on the *already-registered* line's own port) — the
+/// "modem claimed by both subsystems" hazard the spec's edge cases warn
+/// about, just manifesting after startup instead of at it.
+fn scan_all_inner(
+    preferred_ports: &[PathBuf],
+    skip_card_ids: &std::collections::HashSet<String>,
+) -> BridgeResult<Vec<ProbedModem>> {
+    let mut modems = Vec::new();
 
     let usb_devices = Path::new("/sys/bus/usb/devices");
     let entries = match fs::read_dir(usb_devices) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(error = %e, "cannot read /sys/bus/usb/devices");
-            return Ok(modules);
+            return Ok(modems);
         }
     };
 
@@ -70,71 +159,189 @@ pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
         };
         let usb_name = entry.file_name().to_string_lossy().to_string();
 
-        let Some(at_interface_number) = device.at_interface_number else {
-            tracing::debug!(
-                model = device.model,
-                usb_path = %usb_name,
-                "detected a VoWiFi-only module (no circuit-switched audio path) — \
-                 not eligible for the circuit-switched bridge; use [vowifi].modem_port \
-                 to enable VoWiFi mode on it instead"
-            );
-            continue;
-        };
-
         let serial = read_sysfs_attr(&dev_path, "serial").unwrap_or_default();
         let identifier = if serial.is_empty() {
             usb_name.clone()
         } else {
             serial.clone()
         };
-        let id = derive_module_id(&identifier);
+        let card_id = derive_module_id(&identifier);
 
-        let serial_port = find_at_port(&dev_path, at_interface_number);
+        if skip_card_ids.contains(&card_id) {
+            tracing::debug!(
+                module_id = %card_id,
+                model = device.model,
+                usb_path = %usb_name,
+                "modem already claimed by an active VoWiFi line; not re-probing its serial ports"
+            );
+            modems.push(ProbedModem {
+                card_id,
+                model: device.model,
+                usb_serial: serial,
+                has_audio_capability: device.has_audio_capability,
+                audio_device: find_alsa_card(&dev_path),
+                at_port: None,
+                sim_status: None,
+            });
+            continue;
+        }
+
         let audio_device = find_alsa_card(&dev_path);
+        let at_port = probe_at_port(&dev_path, preferred_ports);
+        let sim_status = at_port.as_ref().map(|port| probe_sim_status_at(port));
 
-        match (&serial_port, &audio_device) {
-            (Some(port), Some(card)) => {
-                tracing::debug!(
-                    module_id = %id,
+        match (&at_port, &sim_status) {
+            (Some(port), Some(SimStatus::Ready { imsi })) => {
+                tracing::info!(
+                    module_id = %card_id,
                     model = device.model,
                     usb_path = %usb_name,
                     serial_port = %port.display(),
-                    audio_device = %card,
-                    "discovered module"
+                    imsi = %imsi,
+                    has_audio_capability = device.has_audio_capability,
+                    "discovered modem"
                 );
-                modules.push(DiscoveredModule {
-                    id,
-                    serial_port: port.clone(),
-                    audio_device: card.clone(),
-                    usb_serial: serial,
-                });
             }
-            (Some(port), None) => {
+            (Some(port), Some(reason)) => {
                 tracing::warn!(
-                    module_id = %id,
+                    module_id = %card_id,
                     model = device.model,
                     usb_path = %usb_name,
                     serial_port = %port.display(),
-                    "module found but no ALSA audio device — audio bridging unavailable"
+                    reason = ?reason,
+                    "modem's SIM is not usable; excluded from line/card tables"
                 );
-                modules.push(DiscoveredModule {
-                    id,
-                    serial_port: port.clone(),
-                    audio_device: String::new(),
-                    usb_serial: serial,
-                });
             }
             _ => {
                 tracing::warn!(
+                    module_id = %card_id,
                     model = device.model,
                     usb_path = %usb_name,
-                    "module found but cannot resolve serial port"
+                    "no AT-capable interface found among this modem's serial ports"
                 );
             }
         }
+
+        modems.push(ProbedModem {
+            card_id,
+            model: device.model,
+            usb_serial: serial,
+            has_audio_capability: device.has_audio_capability,
+            audio_device,
+            at_port,
+            sim_status,
+        });
     }
 
-    Ok(modules)
+    Ok(modems)
+}
+
+/// The circuit-switched pool's view of `scan_all`: audio-capable modems
+/// only (today's exact behavior, FR-021 — VoWiFi-only models were always
+/// excluded here), minus any modem a resolved VoWiFi line table has already
+/// claimed (FR-007, read from the line-resolution file
+/// `vowifi::discovery::DEFAULT_LINES_FILE` writes — see
+/// `excluded_ports_from_lines_file`). A missing/unparsable resolution file
+/// excludes nothing, so a fleet that never runs `discover` (VoWiFi
+/// permanently disabled) behaves exactly as before this feature.
+pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
+    let excluded = excluded_ports_from_lines_file();
+    // Skips re-probing any modem an active VoWiFi line already owns, not
+    // just filtering it out afterward — see `scan_all_inner`'s doc comment.
+    let modems = scan_all_inner(&[], &active_vowifi_card_ids())?;
+    Ok(modems
+        .into_iter()
+        .filter(|m| m.has_audio_capability)
+        .filter_map(|m| {
+            let serial_port = m.at_port?;
+            if excluded.contains(&serial_port) {
+                tracing::info!(
+                    module_id = %m.card_id,
+                    serial_port = %serial_port.display(),
+                    "modem claimed by VoWiFi; excluded from the circuit-switched pool"
+                );
+                return None;
+            }
+            Some(DiscoveredModule {
+                id: m.card_id,
+                serial_port,
+                audio_device: m.audio_device.unwrap_or_default(),
+                usb_serial: m.usb_serial,
+            })
+        })
+        .collect())
+}
+
+/// Default path for the VoWiFi line-resolution artifact
+/// (specs/013-multi-card-vowifi, `contracts/discover-cli-contract.md`).
+/// Defined here (not in `vowifi::discovery`) so this module — the
+/// lower-level shared scan both subsystems build on — has no dependency on
+/// the `vowifi` module; `vowifi::discovery`'s writer imports this constant
+/// instead, the natural direction (a specific feature depending on shared
+/// infrastructure, not the reverse).
+pub const DEFAULT_LINES_FILE: &str = "/tmp/gsm-sip-bridge-lines.json";
+/// Env var overriding `DEFAULT_LINES_FILE`, read by both the writer
+/// (`gsm-sip-bridge discover`) and this reader.
+pub const LINES_FILE_ENV: &str = "GSM_SIP_BRIDGE_LINES_FILE";
+
+/// Resolves the line-resolution file path every reader/writer of it
+/// (`main.rs`'s `discover`/`--line` handling, `vowifi::mod`'s Agent B
+/// listener setup, `vowifi-status`) should use: `LINES_FILE_ENV` if set,
+/// else `DEFAULT_LINES_FILE`.
+pub fn lines_file_path() -> PathBuf {
+    PathBuf::from(std::env::var(LINES_FILE_ENV).unwrap_or_else(|_| DEFAULT_LINES_FILE.to_string()))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LinesFileExcerpt {
+    #[serde(default)]
+    circuit_switched_excluded_ports: Vec<String>,
+    #[serde(default)]
+    lines: Vec<LineCardIdExcerpt>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LineCardIdExcerpt {
+    #[serde(default)]
+    card_id: String,
+}
+
+fn read_lines_file_excerpt() -> LinesFileExcerpt {
+    let path = std::env::var(LINES_FILE_ENV).unwrap_or_else(|_| DEFAULT_LINES_FILE.to_string());
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return LinesFileExcerpt::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_else(|e| {
+        tracing::warn!(
+            path = %path,
+            error = %e,
+            "failed to parse VoWiFi line-resolution file; treating it as absent"
+        );
+        LinesFileExcerpt::default()
+    })
+}
+
+fn excluded_ports_from_lines_file() -> std::collections::HashSet<PathBuf> {
+    read_lines_file_excerpt()
+        .circuit_switched_excluded_ports
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Card ids of every currently-resolved VoWiFi line — used only by
+/// `scan_modules`'s *ongoing* rescans (FR-007), never by a fresh `discover`
+/// run: a `docker restart` (same container, same `/tmp`) can leave a stale
+/// resolution file from the previous run on disk, and `discover` itself
+/// must still do a clean, unbiased probe of everything at that moment (see
+/// `scan_all`/`scan_all_preferring`'s doc comments).
+fn active_vowifi_card_ids() -> std::collections::HashSet<String> {
+    read_lines_file_excerpt()
+        .lines
+        .into_iter()
+        .map(|l| l.card_id)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn match_known_device(path: &Path) -> Option<&'static KnownDevice> {
@@ -145,22 +352,118 @@ fn match_known_device(path: &Path) -> Option<&'static KnownDevice> {
         .find(|d| d.vendor_id == vendor && d.product_id == product)
 }
 
-fn find_at_port(dev_path: &Path, at_interface_number: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dev_path).ok()?;
+/// Every `ttyUSB*` serial interface this USB device exposes, in a stable
+/// (sorted) order — regardless of `bInterfaceNumber`, since which interface
+/// answers AT varies by model/firmware (FR-002) and is no longer assumed.
+fn candidate_tty_ports(dev_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Ok(entries) = fs::read_dir(dev_path) else {
+        return candidates;
+    };
     for entry in entries.flatten() {
         let iface_path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.contains(":") {
+        if !name.contains(':') {
             continue;
         }
-        let iface_num = read_sysfs_attr(&iface_path, "bInterfaceNumber").unwrap_or_default();
-        if iface_num == at_interface_number {
-            if let Some(tty) = find_tty_in_path(&iface_path) {
-                return Some(PathBuf::from(format!("/dev/{tty}")));
+        if let Some(tty) = find_tty_in_path(&iface_path) {
+            candidates.push(PathBuf::from(format!("/dev/{tty}")));
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
+/// Reorders `candidates` so any that appear in `preferred` come first (each
+/// in its original relative order otherwise) — a device with several
+/// AT-capable interfaces should try an operator-named port before falling
+/// through to "whichever answers first" (see `scan_all_preferring`'s doc
+/// comment). Pure and unit-tested; `probe_at_port` (real serial I/O) is not.
+fn order_candidates_with_preference(
+    candidates: Vec<PathBuf>,
+    preferred: &[PathBuf],
+) -> Vec<PathBuf> {
+    let (mut first, mut rest): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|c| preferred.contains(c));
+    first.append(&mut rest);
+    first
+}
+
+/// Tries every candidate serial interface in turn (an operator-preferred
+/// one first, if present — see `order_candidates_with_preference`), opening
+/// it and sending a bare `AT`, and returns the first one that answers `OK` —
+/// the live probe replacing the old fixed-interface-number lookup (FR-002).
+/// Real hardware I/O; not unit-tested directly (same boundary as the rest of
+/// this file's sysfs/serial-opening helpers) — the AT-response
+/// interpretation itself (`probe_is_at_capable`) is unit-tested against a
+/// fake transport below.
+fn probe_at_port(dev_path: &Path, preferred: &[PathBuf]) -> Option<PathBuf> {
+    let candidates = order_candidates_with_preference(candidate_tty_ports(dev_path), preferred);
+    for candidate in candidates {
+        match AtCommander::open_with_timeout(&candidate, PROBE_TIMEOUT) {
+            Ok(mut at) => {
+                if probe_is_at_capable(&mut at) {
+                    return Some(candidate);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    port = %candidate.display(),
+                    error = %e,
+                    "could not open candidate serial port during AT probe"
+                );
             }
         }
     }
     None
+}
+
+/// Sends a bare `AT` and returns whether the device answered with a
+/// well-formed response (`OK`) — the core of the AT-probe (FR-002). Takes
+/// an already-open `AtCommander`, so it's exercised in tests against a fake
+/// in-memory transport (mirroring `at_commander.rs`'s own `MockStream`)
+/// without touching real hardware.
+pub fn probe_is_at_capable(at: &mut AtCommander) -> bool {
+    matches!(at.send_command("AT"), Ok(AtResponse::Ok(_)))
+}
+
+/// Opens `port` fresh and reads its SIM status — real hardware I/O, not
+/// unit-tested directly; `probe_sim_status` (below) carries the tested
+/// interpretation logic.
+fn probe_sim_status_at(port: &Path) -> SimStatus {
+    match AtCommander::open_with_timeout(port, PROBE_TIMEOUT) {
+        Ok(mut at) => probe_sim_status(&mut at),
+        Err(e) => SimStatus::Unreadable(e.to_string()),
+    }
+}
+
+/// Interprets `AT+CPIN?` (and, if ready, `AT+CIMI`) into a `SimStatus`
+/// (FR-004/FR-006). Pure given an `AtCommander`, so it's exercised in tests
+/// against a fake transport.
+pub fn probe_sim_status(at: &mut AtCommander) -> SimStatus {
+    // Sends AT+CPIN? directly (rather than through `AtCommander::query_cpin`)
+    // so a `+CME ERROR: 10` ("SIM not inserted", 3GPP TS 27.007) is matched
+    // by its numeric code, not by re-parsing an already-stringified error.
+    match at.send_command("AT+CPIN?") {
+        Ok(AtResponse::Ok(lines)) => {
+            let status = lines.iter().find_map(|l| {
+                l.strip_prefix("+CPIN:")
+                    .map(|s| s.trim().to_ascii_uppercase())
+            });
+            match status.as_deref() {
+                Some("READY") => match at.query_imsi() {
+                    Ok(imsi) => SimStatus::Ready { imsi },
+                    Err(e) => SimStatus::Unreadable(e.to_string()),
+                },
+                Some(s) if s.contains("PIN") || s.contains("PUK") => SimStatus::Locked,
+                Some(s) => SimStatus::Unreadable(format!("unexpected AT+CPIN? status: {s}")),
+                None => SimStatus::Unreadable("AT+CPIN?: no status in response".to_string()),
+            }
+        }
+        Ok(AtResponse::CmeError(10, _)) => SimStatus::Absent,
+        Ok(AtResponse::Error(e)) | Ok(AtResponse::CmeError(_, e)) => SimStatus::Unreadable(e),
+        Err(e) => SimStatus::Unreadable(e.to_string()),
+    }
 }
 
 fn find_tty_in_path(iface_path: &Path) -> Option<String> {
@@ -224,7 +527,7 @@ mod tests {
         fake_device_dir(dir.path(), "2c7c", "0125");
         let device = match_known_device(dir.path()).unwrap();
         assert_eq!(device.model, "EC20");
-        assert_eq!(device.at_interface_number, Some("04"));
+        assert!(device.has_audio_capability);
     }
 
     #[test]
@@ -233,9 +536,10 @@ mod tests {
         fake_device_dir(dir.path(), "2c7c", "0901");
         let device = match_known_device(dir.path()).unwrap();
         assert_eq!(device.model, "EC200");
-        assert_eq!(
-            device.at_interface_number, None,
-            "EC200 has no circuit-switched audio path, so no AT interface is scanned for it"
+        assert!(
+            !device.has_audio_capability,
+            "EC200 has no circuit-switched audio path, but is still recognized \
+             (not skipped) so it can be probed for VoWiFi (FR-003)"
         );
     }
 
@@ -252,5 +556,225 @@ mod tests {
         // No idVendor/idProduct files at all — e.g. a non-device directory
         // that happened to be listed under /sys/bus/usb/devices.
         assert!(match_known_device(dir.path()).is_none());
+    }
+
+    fn fake_tty_interface(dev_dir: &Path, iface_name: &str, tty_name: &str, iface_num: &str) {
+        let iface_dir = dev_dir.join(iface_name);
+        fs::create_dir_all(&iface_dir).unwrap();
+        fs::write(iface_dir.join("bInterfaceNumber"), iface_num).unwrap();
+        let tty_tty_dir = iface_dir.join(tty_name).join("tty").join(tty_name);
+        fs::create_dir_all(&tty_tty_dir).unwrap();
+    }
+
+    #[test]
+    fn candidate_tty_ports_finds_every_interface_regardless_of_number() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three candidate interfaces, arbitrary bInterfaceNumber values —
+        // acceptance scenario 4: probing must not assume a fixed one.
+        fake_tty_interface(dir.path(), "1-1:1.0", "ttyUSB0", "00");
+        fake_tty_interface(dir.path(), "1-1:1.2", "ttyUSB2", "02");
+        fake_tty_interface(dir.path(), "1-1:1.4", "ttyUSB4", "04");
+        let candidates = candidate_tty_ports(dir.path());
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/dev/ttyUSB0"),
+                PathBuf::from("/dev/ttyUSB2"),
+                PathBuf::from("/dev/ttyUSB4"),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidate_tty_ports_empty_when_no_interfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(candidate_tty_ports(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn candidate_tty_ports_ignores_non_interface_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("idVendor"), "2c7c").unwrap();
+        fake_tty_interface(dir.path(), "1-1:1.4", "ttyUSB4", "04");
+        let candidates = candidate_tty_ports(dir.path());
+        assert_eq!(candidates, vec![PathBuf::from("/dev/ttyUSB4")]);
+    }
+
+    #[test]
+    fn order_candidates_prefers_configured_port_when_present() {
+        // Found live-testing: a real EC200 answered AT on both ttyUSB0 and
+        // ttyUSB6. An operator-configured port must win over "whichever
+        // sorts first" so an existing single-line config naming a
+        // non-default AT port still gets used as-is (FR-009/FR-020).
+        let candidates = vec![
+            PathBuf::from("/dev/ttyUSB0"),
+            PathBuf::from("/dev/ttyUSB2"),
+            PathBuf::from("/dev/ttyUSB6"),
+        ];
+        let preferred = vec![PathBuf::from("/dev/ttyUSB6")];
+        assert_eq!(
+            order_candidates_with_preference(candidates, &preferred),
+            vec![
+                PathBuf::from("/dev/ttyUSB6"),
+                PathBuf::from("/dev/ttyUSB0"),
+                PathBuf::from("/dev/ttyUSB2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn order_candidates_unchanged_when_no_preference_matches() {
+        let candidates = vec![PathBuf::from("/dev/ttyUSB0"), PathBuf::from("/dev/ttyUSB2")];
+        let preferred = vec![PathBuf::from("/dev/ttyUSB9")];
+        assert_eq!(
+            order_candidates_with_preference(candidates.clone(), &preferred),
+            candidates
+        );
+    }
+
+    #[test]
+    fn order_candidates_unchanged_when_no_preference_given() {
+        let candidates = vec![PathBuf::from("/dev/ttyUSB0"), PathBuf::from("/dev/ttyUSB2")];
+        assert_eq!(
+            order_candidates_with_preference(candidates.clone(), &[]),
+            candidates
+        );
+    }
+
+    // --- probe_is_at_capable: fake in-memory transport, mirroring
+    // at_commander.rs's own MockStream (no real hardware). ---
+
+    struct MockStream {
+        reader: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl MockStream {
+        fn new(response: &str) -> Self {
+            Self {
+                reader: std::io::Cursor::new(response.as_bytes().to_vec()),
+            }
+        }
+    }
+
+    impl std::io::Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.reader, buf)
+        }
+    }
+
+    impl std::io::Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_commander(response: &str) -> AtCommander {
+        AtCommander::from_stream(MockStream::new(response), Duration::from_secs(1))
+    }
+
+    #[test]
+    fn probe_is_at_capable_true_on_ok() {
+        let mut at = make_commander("OK\r\n");
+        assert!(probe_is_at_capable(&mut at));
+    }
+
+    #[test]
+    fn probe_is_at_capable_false_on_error() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(!probe_is_at_capable(&mut at));
+    }
+
+    #[test]
+    fn probe_is_at_capable_false_on_cme_error() {
+        let mut at = make_commander("+CME ERROR: 100\r\n");
+        assert!(!probe_is_at_capable(&mut at));
+    }
+
+    // `probe_sim_status`'s READY+IMSI path sends two AT commands
+    // (AT+CPIN? then AT+CIMI) against one `AtCommander`. As documented in
+    // `modules/usim.rs` (`ef_dir_record_matches_usim_aid_from_real_card`),
+    // `AtCommander::read_response` builds a fresh `BufReader` per
+    // `send_command` call, which over-reads and silently drops any
+    // buffered-but-unconsumed bytes from a single-shot `Cursor`-backed mock
+    // stream across more than one call — a pre-existing quirk unrelated to
+    // this feature, not something to work around here. The two commands'
+    // individual response parsing is covered directly instead:
+    // `at_commander::tests::test_query_cpin_ready` and `test_query_imsi`.
+
+    #[test]
+    fn probe_sim_status_locked_on_sim_pin() {
+        let mut at = make_commander("+CPIN: SIM PIN\r\nOK\r\n");
+        assert_eq!(probe_sim_status(&mut at), SimStatus::Locked);
+    }
+
+    #[test]
+    fn probe_sim_status_locked_on_sim_puk() {
+        let mut at = make_commander("+CPIN: SIM PUK\r\nOK\r\n");
+        assert_eq!(probe_sim_status(&mut at), SimStatus::Locked);
+    }
+
+    #[test]
+    fn probe_sim_status_absent_on_cme_error_10() {
+        let mut at = make_commander("+CME ERROR: 10\r\n");
+        assert_eq!(probe_sim_status(&mut at), SimStatus::Absent);
+    }
+
+    #[test]
+    fn probe_sim_status_unreadable_on_generic_error() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(matches!(
+            probe_sim_status(&mut at),
+            SimStatus::Unreadable(_)
+        ));
+    }
+
+    // A single test, not two — both set the same process-wide
+    // GSM_SIP_BRIDGE_LINES_FILE env var, which `cargo test`'s default
+    // parallel-within-binary execution would otherwise race (see
+    // test_config.rs's convention of giving each env-var test its own
+    // unique variable name; that isn't available here since the variable
+    // name itself is the thing under test).
+    #[test]
+    fn excluded_ports_from_lines_file_behavior() {
+        std::env::set_var(LINES_FILE_ENV, "/tmp/does-not-exist-013.json");
+        assert!(
+            excluded_ports_from_lines_file().is_empty(),
+            "missing file excludes nothing"
+        );
+        assert!(
+            active_vowifi_card_ids().is_empty(),
+            "missing file has no active lines"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.json");
+        fs::write(
+            &path,
+            r#"{"circuit_switched_excluded_ports": ["/dev/ttyUSB6", "/dev/ttyUSB10"], "lines": [{"index": 0, "card_id": "ec20-AAAAAA", "modem_port": "/dev/ttyUSB6"}], "failed": []}"#,
+        )
+        .unwrap();
+        std::env::set_var(LINES_FILE_ENV, &path);
+        let excluded = excluded_ports_from_lines_file();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.contains(&PathBuf::from("/dev/ttyUSB6")));
+        assert!(excluded.contains(&PathBuf::from("/dev/ttyUSB10")));
+        let active = active_vowifi_card_ids();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains("ec20-AAAAAA"));
+
+        fs::write(&path, "not json").unwrap();
+        assert!(
+            excluded_ports_from_lines_file().is_empty(),
+            "unparsable file excludes nothing, just warns"
+        );
+        assert!(
+            active_vowifi_card_ids().is_empty(),
+            "unparsable file has no active lines either"
+        );
+
+        std::env::remove_var(LINES_FILE_ENV);
     }
 }

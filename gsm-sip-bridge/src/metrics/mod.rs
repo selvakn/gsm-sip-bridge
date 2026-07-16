@@ -184,6 +184,45 @@ pub static SCHEDULED_RESTART_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// 1 if this VoWiFi line's ePDG tunnel (CHILD_SA) is up, 0 otherwise —
+/// labeled `card_id` (specs/013-multi-card-vowifi FR-017; no VoWiFi metric
+/// existed at all before this feature, single-line or otherwise).
+pub static VOWIFI_TUNNEL_UP: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_tunnel_up",
+            "1 if this VoWiFi line's ePDG tunnel is up, 0 otherwise"
+        ),
+        &["card_id"]
+    )
+    .unwrap()
+});
+
+/// 1 if this VoWiFi line's IMS-AKA registration is active, 0 otherwise.
+pub static VOWIFI_REGISTERED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_registered",
+            "1 if this VoWiFi line's IMS registration is active, 0 otherwise"
+        ),
+        &["card_id"]
+    )
+    .unwrap()
+});
+
+/// Bridged-call outcomes per VoWiFi line (FR-017's per-line call
+/// attribution, mirrored in metrics form).
+pub static VOWIFI_CALLS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_calls_total",
+            "VoWiFi call outcomes per line"
+        ),
+        &["card_id", "outcome"]
+    )
+    .unwrap()
+});
+
 pub static BUILD_INFO: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         opts!("gsm_sip_bridge_build_info", "Build metadata"),

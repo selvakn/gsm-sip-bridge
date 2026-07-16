@@ -85,7 +85,13 @@ const VOWIFI_KEYS: &[&str] = &[
     "vpcd_host",
     "vpcd_port",
     "imsi_override",
+    "max_lines",
+    "line",
 ];
+/// Allowed keys inside each `[[vowifi.line]]` entry (specs/013-multi-card-vowifi
+/// FR-009 — an operator override that pins a specific modem to VoWiFi
+/// regardless of the default audio-capability-based role assignment).
+const VOWIFI_LINE_KEYS: &[&str] = &["modem_serial", "modem_port", "mcc", "mnc", "imsi_override"];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
@@ -325,7 +331,7 @@ impl ScheduledRestartConfig {
 /// only matters when running one of the `vowifi-ims-agent`/`vowifi-sip-agent`
 /// subcommands (started automatically by `docker/entrypoint.sh` when
 /// enabled), not for the normal daemon path.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VowifiConfig {
     /// Master switch — the two `vowifi-*-agent` subcommands refuse to start
     /// (see `main.rs`) when this is `false`, so an operator who hasn't
@@ -341,7 +347,12 @@ pub struct VowifiConfig {
     pub mnc: String,
     /// Serial AT port for the modem whose SIM authenticates the IMS
     /// registration (same device the existing `ims-register`/`ims-call`
-    /// CLI tools use), e.g. `/dev/ttyUSB6`.
+    /// CLI tools use), e.g. `/dev/ttyUSB6`. Empty (the default) means
+    /// auto-discover every VoWiFi-capable modem instead
+    /// (specs/013-multi-card-vowifi) — a non-empty value is fed to
+    /// `gsm-sip-bridge discover` as an implicit single-line override
+    /// (FR-009/FR-020: an existing single-SIM config that names a port
+    /// explicitly keeps using exactly that port, undisturbed by discovery).
     pub modem_port: String,
     /// Use TCP (not UDP) for the SIP transport to the P-CSCF. `true` is the
     /// combination that reached `200 OK` on Airtel (see `ims::mod` docs).
@@ -420,6 +431,40 @@ pub struct VowifiConfig {
     /// (AT+CIMI) — a test/diagnostic escape hatch for the strongswan
     /// engine's swanctl connection rendering.
     pub imsi_override: Option<String>,
+    /// Upper bound on concurrently supported VoWiFi lines
+    /// (specs/013-multi-card-vowifi FR-016) — modems discovered beyond this
+    /// count are reported and skipped rather than silently dropped. Same
+    /// order of magnitude as `[modules].max_concurrent`, the circuit-switched
+    /// equivalent.
+    pub max_lines: u32,
+    /// Explicit per-line overrides (specs/013-multi-card-vowifi FR-009):
+    /// pins a specific modem to VoWiFi regardless of the default
+    /// audio-capability-based role assignment, and/or fixes that line's
+    /// mcc/mnc/imsi instead of auto-deriving them. Empty (the default) means
+    /// every VoWiFi line is fully auto-discovered.
+    pub line_overrides: Vec<VowifiLineOverride>,
+}
+
+/// One `[[vowifi.line]]` entry — see `VowifiConfig::line_overrides`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VowifiLineOverride {
+    /// Match a modem by its USB hardware serial (`modules::discovery`'s
+    /// `usb_serial`), the same identity `derive_module_id` hashes into a
+    /// card id. Preferred over `modem_port` since a serial number survives
+    /// the device path changing across reboots/USB re-enumeration.
+    pub modem_serial: Option<String>,
+    /// Match (or force) a modem by its AT serial device path directly —
+    /// the escape hatch for a modem discovery can't identify by serial
+    /// (e.g. it reports an empty `serial` sysfs attribute).
+    pub modem_port: Option<String>,
+    /// Fix this line's home network identity instead of auto-deriving it
+    /// from the SIM. Must be set together with `mnc`, like the top-level
+    /// `[vowifi].mcc`/`mnc` pair.
+    pub mcc: Option<String>,
+    pub mnc: Option<String>,
+    /// Same escape hatch as the top-level `[vowifi].imsi_override`, scoped
+    /// to this one line.
+    pub imsi_override: Option<String>,
 }
 
 impl Default for VowifiConfig {
@@ -428,7 +473,7 @@ impl Default for VowifiConfig {
             enabled: false,
             mcc: String::new(),
             mnc: String::new(),
-            modem_port: "/dev/ttyUSB6".to_string(),
+            modem_port: String::new(),
             use_tcp: true,
             sec_agree: true,
             pcscf_source_path: "/tmp/pcscf".to_string(),
@@ -450,6 +495,8 @@ impl Default for VowifiConfig {
             vpcd_host: "127.0.0.1".to_string(),
             vpcd_port: 15963,
             imsi_override: None,
+            max_lines: 8,
+            line_overrides: Vec::new(),
         }
     }
 }
@@ -1378,6 +1425,13 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .transpose()?
         .unwrap_or(defaults.vpcd_port);
     let imsi_override = as_optional_string(t, "imsi_override", "vowifi.imsi_override")?;
+    let max_lines = t
+        .get("max_lines")
+        .map(|v| as_u64_range(v, "vowifi.max_lines", false, 1..=64))
+        .transpose()?
+        .map(|n| n as u32)
+        .unwrap_or(defaults.max_lines);
+    let line_overrides = parse_vowifi_line_overrides(t)?;
 
     Ok(VowifiConfig {
         enabled,
@@ -1405,7 +1459,47 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         vpcd_host,
         vpcd_port,
         imsi_override,
+        max_lines,
+        line_overrides,
     })
+}
+
+/// Parses the optional `[[vowifi.line]]` array (FR-009). Absent = no
+/// overrides, every line fully auto-discovered.
+fn parse_vowifi_line_overrides(
+    t: &toml::map::Map<String, Value>,
+) -> BridgeResult<Vec<VowifiLineOverride>> {
+    let Some(val) = t.get("line") else {
+        return Ok(Vec::new());
+    };
+    let arr = val
+        .as_array()
+        .ok_or_else(|| BridgeError::Config("vowifi.line must be an array of tables".into()))?;
+    let mut overrides = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let et = entry
+            .as_table()
+            .ok_or_else(|| BridgeError::Config(format!("vowifi.line[{i}] must be a table")))?;
+        warn_unknown_keys_in(et, VOWIFI_LINE_KEYS, "vowifi.line");
+        let modem_serial = as_optional_string(et, "modem_serial", "vowifi.line.modem_serial")?;
+        let modem_port = as_optional_string(et, "modem_port", "vowifi.line.modem_port")?;
+        let mcc = as_optional_string(et, "mcc", "vowifi.line.mcc")?;
+        let mnc = as_optional_string(et, "mnc", "vowifi.line.mnc")?;
+        if mcc.is_some() != mnc.is_some() {
+            return Err(BridgeError::Config(format!(
+                "vowifi.line[{i}]: mcc and mnc must be set together"
+            )));
+        }
+        let imsi_override = as_optional_string(et, "imsi_override", "vowifi.line.imsi_override")?;
+        overrides.push(VowifiLineOverride {
+            modem_serial,
+            modem_port,
+            mcc,
+            mnc,
+            imsi_override,
+        });
+    }
+    Ok(overrides)
 }
 
 #[cfg(test)]
@@ -1736,7 +1830,7 @@ password = "pass"
     fn vowifi_disabled_by_default_when_section_absent() {
         let cfg = parse(MINIMAL_TOML);
         assert!(!cfg.vowifi.enabled);
-        assert_eq!(cfg.vowifi.modem_port, "/dev/ttyUSB6");
+        assert_eq!(cfg.vowifi.modem_port, "");
         assert!(cfg.vowifi.use_tcp);
         assert!(cfg.vowifi.sec_agree);
         assert_eq!(cfg.vowifi.control_port, 7050);
@@ -1872,5 +1966,81 @@ password = "pass"
         assert_eq!(cfg.vowifi.src_addr.as_deref(), Some("9.9.9.9"));
         assert_eq!(cfg.vowifi.imsi_override.as_deref(), Some("404940123456789"));
         assert_eq!(cfg.vowifi.tunnel_engine, "swu");
+    }
+
+    #[test]
+    fn vowifi_max_lines_defaults_to_eight() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.vowifi.max_lines, 8);
+        assert!(cfg.vowifi.line_overrides.is_empty());
+    }
+
+    #[test]
+    fn vowifi_max_lines_custom_value_parses() {
+        let toml = format!("{}\n[vowifi]\nmax_lines = 4\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.max_lines, 4);
+    }
+
+    #[test]
+    fn vowifi_max_lines_rejects_zero() {
+        let toml = format!("{}\n[vowifi]\nmax_lines = 0\n", MINIMAL_TOML);
+        let root: toml::Value = toml.parse().unwrap();
+        assert!(parse_vowifi(root.as_table().unwrap()).is_err());
+    }
+
+    #[test]
+    fn vowifi_line_overrides_absent_is_empty() {
+        let cfg = parse(MINIMAL_TOML);
+        assert!(cfg.vowifi.line_overrides.is_empty());
+    }
+
+    #[test]
+    fn vowifi_line_overrides_single_entry_parses() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.line_overrides.len(), 1);
+        let line = &cfg.vowifi.line_overrides[0];
+        assert_eq!(line.modem_serial.as_deref(), Some("ABC123"));
+        assert_eq!(line.mcc.as_deref(), Some("404"));
+        assert_eq!(line.mnc.as_deref(), Some("094"));
+        assert_eq!(line.modem_port, None);
+        assert_eq!(line.imsi_override, None);
+    }
+
+    #[test]
+    fn vowifi_line_overrides_multiple_entries_parse_in_order() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB6\"\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB10\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.line_overrides.len(), 2);
+        assert_eq!(
+            cfg.vowifi.line_overrides[0].modem_port.as_deref(),
+            Some("/dev/ttyUSB6")
+        );
+        assert_eq!(
+            cfg.vowifi.line_overrides[1].modem_port.as_deref(),
+            Some("/dev/ttyUSB10")
+        );
+    }
+
+    #[test]
+    fn vowifi_line_override_rejects_mcc_without_mnc() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB6\"\nmcc = \"404\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let result = parse_vowifi(root.as_table().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mcc and mnc must be set together"));
     }
 }

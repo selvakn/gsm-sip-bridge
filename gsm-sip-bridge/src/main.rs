@@ -39,8 +39,8 @@ fn main() -> ExitCode {
         return handle_ims_call_command(args);
     }
 
-    if let Some(Commands::VowifiImsAgent) = &cli.command {
-        return handle_vowifi_ims_agent_command(&cli);
+    if let Some(Commands::VowifiImsAgent(args)) = &cli.command {
+        return handle_vowifi_ims_agent_command(&cli, args.line);
     }
 
     if let Some(Commands::VowifiSipAgent) = &cli.command {
@@ -73,6 +73,10 @@ fn main() -> ExitCode {
 
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
+    }
+
+    if let Some(Commands::Discover(args)) = &cli.command {
+        return handle_discover_command(args, &cli);
     }
 
     tracing::info!(
@@ -297,12 +301,54 @@ fn load_vowifi_config(cli: &Cli) -> Result<gsm_sip_bridge::config::AppConfig, Ex
     Ok(config)
 }
 
-fn handle_vowifi_ims_agent_command(cli: &Cli) -> ExitCode {
+/// Without `--line`, behaves exactly as before this feature (the single
+/// `[vowifi]` config section — FR-020). With `--line N`, loads that line's
+/// fully-derived `VowifiConfig` from the `discover` subcommand's
+/// line-resolution file instead — see
+/// `specs/013-multi-card-vowifi/contracts/agent-topology-contract.md`.
+/// Deliberately does NOT re-run discovery itself: doing so would re-probe
+/// modems a sibling `vowifi-usim-bridge`/other line's agent may already have
+/// open (research.md item 3).
+fn handle_vowifi_ims_agent_command(cli: &Cli, line: Option<u32>) -> ExitCode {
     let config = match load_vowifi_config(cli) {
         Ok(c) => c,
         Err(code) => return code,
     };
-    gsm_sip_bridge::ims::agent::run(&config.vowifi)
+    let Some(index) = line else {
+        return gsm_sip_bridge::ims::agent::run(
+            gsm_sip_bridge::vowifi::LEGACY_LINE_CARD_ID,
+            &config.vowifi,
+        );
+    };
+    let (card_id, line_config) = match load_line_config(index) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    gsm_sip_bridge::ims::agent::run(&card_id, &line_config)
+}
+
+/// Reads the `discover` subcommand's line-resolution file and returns line
+/// `index`'s card id and fully-derived `VowifiConfig`.
+fn load_line_config(index: u32) -> Result<(String, gsm_sip_bridge::config::VowifiConfig), String> {
+    let path = lines_file_path();
+    let resolution = gsm_sip_bridge::vowifi::discovery::read_line_resolution(&path)?;
+    resolution
+        .line(index)
+        .map(|l| (l.card_id.clone(), l.config.clone()))
+        .ok_or_else(|| {
+            format!(
+                "line {index} not found in {} (run `gsm-sip-bridge discover` first; \
+                 does that many usable VoWiFi lines actually exist?)",
+                path.display()
+            )
+        })
+}
+
+fn lines_file_path() -> std::path::PathBuf {
+    gsm_sip_bridge::modules::discovery::lines_file_path()
 }
 
 fn handle_vowifi_sip_agent_command(cli: &Cli) -> ExitCode {
@@ -409,6 +455,184 @@ fn print_vowifi_shell_env(config: &gsm_sip_bridge::config::AppConfig) {
     for (key, value) in lines {
         println!("{key}={}", shell_quote(&value));
     }
+}
+
+/// `gsm-sip-bridge discover` (specs/013-multi-card-vowifi,
+/// contracts/discover-cli-contract.md): runs the shared scan + VoWiFi role
+/// assignment/line-table resolution exactly once, writes it to `--out` (JSON,
+/// consumed by `main()`'s daemon-startup path via
+/// `modules::discovery::scan_modules`'s own exclusion read and by
+/// `--line`-selecting `vowifi-ims-agent`/`vowifi-status`), and optionally
+/// prints `entrypoint.sh`-`eval`-able shell output.
+fn handle_discover_command(args: &gsm_sip_bridge::cli::DiscoverArgs, cli: &Cli) -> ExitCode {
+    let out_path = args.out.clone().unwrap_or_else(lines_file_path);
+
+    if args.from_file {
+        let resolution =
+            gsm_sip_bridge::vowifi::discovery::read_line_resolution(&out_path).unwrap_or_default();
+        if args.shell_env {
+            print_discover_shell_env(&resolution);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(path) = cli.config.as_deref() else {
+        eprintln!("error: --config is required for the discover subcommand");
+        return ExitCode::FAILURE;
+    };
+    let config = match load_config(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let resolution = if !config.vowifi.enabled {
+        tracing::info!("[vowifi].enabled is false — discovery still runs for the circuit-switched pool, but no VoWiFi lines are resolved");
+        gsm_sip_bridge::vowifi::discovery::LineResolution::default()
+    } else {
+        let overrides = gsm_sip_bridge::vowifi::discovery::effective_line_overrides(&config.vowifi);
+        // A device with several AT-capable interfaces means an override's
+        // named port isn't necessarily the one the plain first-match probe
+        // would settle on (found live-testing an EC200 that answers AT on
+        // more than one ttyUSB) — pass every configured port as a
+        // preference so probing tries it first on that device.
+        let preferred_ports: Vec<std::path::PathBuf> = overrides
+            .iter()
+            .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
+            .collect();
+        let modems = match gsm_sip_bridge::modules::discovery::scan_all_preferring(&preferred_ports)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: modem discovery failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let assignment =
+            gsm_sip_bridge::vowifi::discovery::RoleAssignment::from_probed(&modems, &overrides);
+        let result = gsm_sip_bridge::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
+        for failed in &result.failed {
+            tracing::error!(
+                card_id = %failed.card_id,
+                reason = %failed.reason,
+                "VoWiFi line discovery: modem not usable as a line"
+            );
+        }
+        if result.lines.is_empty() {
+            // The spec's clarification: degrade, don't fail — the caller
+            // (entrypoint.sh) still starts the circuit-switched daemon.
+            tracing::error!(
+                "[vowifi].enabled is true but no usable VoWiFi line was discovered; \
+                 the VoWiFi subsystem will not start this run"
+            );
+        }
+        gsm_sip_bridge::vowifi::discovery::LineResolution::from_result(
+            &assignment.circuit_switched,
+            &result,
+        )
+    };
+
+    if let Err(e) = write_line_resolution(&out_path, &resolution) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    if args.shell_env {
+        print_discover_shell_env(&resolution);
+    }
+    ExitCode::SUCCESS
+}
+
+fn write_line_resolution(
+    path: &std::path::Path,
+    resolution: &gsm_sip_bridge::vowifi::discovery::LineResolution,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(resolution)
+        .map_err(|e| format!("failed to serialize line resolution: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn print_discover_shell_env(resolution: &gsm_sip_bridge::vowifi::discovery::LineResolution) {
+    fn arr<T: ToString>(vals: impl Iterator<Item = T>) -> String {
+        format!(
+            "({})",
+            vals.map(|v| shell_quote(&v.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+
+    println!("LINE_COUNT={}", resolution.lines.len());
+    println!(
+        "LINE_CARD_ID={}",
+        arr(resolution.lines.iter().map(|l| l.card_id.clone()))
+    );
+    println!(
+        "LINE_MODEM_PORT={}",
+        arr(resolution.lines.iter().map(|l| l.modem_port.clone()))
+    );
+    println!(
+        "LINE_NETNS={}",
+        arr(resolution.lines.iter().map(|l| l.netns.clone()))
+    );
+    println!(
+        "LINE_CONTROL_PORT={}",
+        arr(resolution.lines.iter().map(|l| l.control_port))
+    );
+    println!(
+        "LINE_VETH_LOCAL_ADDR={}",
+        arr(resolution.lines.iter().map(|l| l.veth_local_addr.clone()))
+    );
+    println!(
+        "LINE_VETH_PEER_ADDR={}",
+        arr(resolution.lines.iter().map(|l| l.veth_peer_addr.clone()))
+    );
+    println!(
+        "LINE_VPCD_PORT={}",
+        arr(resolution.lines.iter().map(|l| l.vpcd_port))
+    );
+    println!(
+        "LINE_STRONGSWAN_IF_ID={}",
+        arr(resolution.lines.iter().map(|l| l.strongswan_if_id))
+    );
+    println!(
+        "LINE_STRONGSWAN_TUN_IFACE={}",
+        arr(resolution
+            .lines
+            .iter()
+            .map(|l| l.strongswan_tun_iface.clone()))
+    );
+    println!(
+        "LINE_PCSCF_SOURCE_PATH={}",
+        arr(resolution.lines.iter().map(|l| l.pcscf_source_path.clone()))
+    );
+    println!(
+        "LINE_VETH_SIP_IFACE={}",
+        arr(resolution
+            .lines
+            .iter()
+            .map(|l| l.config.veth_sip_iface.clone()))
+    );
+    println!(
+        "LINE_VETH_IMS_IFACE={}",
+        arr(resolution
+            .lines
+            .iter()
+            .map(|l| l.config.veth_ims_iface.clone()))
+    );
+    println!(
+        "LINE_MCC={}",
+        arr(resolution.lines.iter().map(|l| l.mcc.clone()))
+    );
+    println!(
+        "LINE_MNC={}",
+        arr(resolution.lines.iter().map(|l| l.mnc.clone()))
+    );
+    println!(
+        "CS_EXCLUDED_PORTS={}",
+        arr(resolution.circuit_switched_excluded_ports.iter().cloned())
+    );
 }
 
 fn build_control_cmd(args: &gsm_sip_bridge::cli::CardArgs) -> Result<ControlCmd, String> {
