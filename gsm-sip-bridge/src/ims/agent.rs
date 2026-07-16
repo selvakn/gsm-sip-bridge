@@ -23,6 +23,7 @@ use crate::ims::sip_client::{
     random_hex, spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
 };
 use crate::ims::ImsRegisterConfig;
+use crate::metrics;
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
 use crate::vowifi::VETH_SIP_PORT;
 use std::io::BufReader;
@@ -77,8 +78,12 @@ const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 
 /// Entry point for the `vowifi-ims-agent` subcommand.
-pub fn run(config: &VowifiConfig) -> ExitCode {
-    match run_inner(config) {
+/// `card_id` labels this line's `vowifi_tunnel_up`/`vowifi_registered`
+/// metrics (specs/013-multi-card-vowifi FR-017) — pass
+/// `crate::vowifi::LEGACY_LINE_CARD_ID` for a deployment with no resolved
+/// line table (today's pre-multi-card behavior, `main.rs`).
+pub fn run(card_id: &str, config: &VowifiConfig) -> ExitCode {
+    match run_inner(card_id, config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -95,7 +100,7 @@ fn read_pcscf(path: &str) -> BridgeResult<IpAddr> {
         .map_err(|e| BridgeError::Ims(format!("invalid P-CSCF address in {path}: {e}")))
 }
 
-fn run_inner(config: &VowifiConfig) -> BridgeResult<()> {
+fn run_inner(card_id: &str, config: &VowifiConfig) -> BridgeResult<()> {
     let pcscf_addr = read_pcscf(&config.pcscf_source_path)?;
     // Empty mcc/mnc means auto-derive (config::VowifiConfig::mcc docs). The
     // IMS realm is built from these, so derive them from the SIM the same
@@ -138,10 +143,22 @@ fn run_inner(config: &VowifiConfig) -> BridgeResult<()> {
         let status = session.status;
         let reason = session.reason.clone();
         session.cleanup();
+        metrics::VOWIFI_REGISTERED
+            .with_label_values(&[card_id])
+            .set(0.0);
+        metrics::VOWIFI_TUNNEL_UP
+            .with_label_values(&[card_id])
+            .set(0.0);
         return Err(BridgeError::Ims(format!(
             "IMS registration failed: {status} {reason}"
         )));
     }
+    metrics::VOWIFI_REGISTERED
+        .with_label_values(&[card_id])
+        .set(1.0);
+    metrics::VOWIFI_TUNNEL_UP
+        .with_label_values(&[card_id])
+        .set(1.0);
     tracing::info!("vowifi-ims-agent registered, listening for inbound calls");
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection.
@@ -165,6 +182,7 @@ fn run_inner(config: &VowifiConfig) -> BridgeResult<()> {
     }
 
     let result = dispatch_loop(
+        card_id,
         &mut session,
         &mut inbound,
         &reg_cfg,
@@ -564,6 +582,7 @@ fn respond(sink: &SipSink, what: &str, message: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_loop(
+    card_id: &str,
     session: &mut super::RegisteredSession,
     inbound: &mut Inbound,
     reg_cfg: &ImsRegisterConfig,
@@ -713,6 +732,12 @@ fn dispatch_loop(
                             SystemTime::now() + Duration::from_secs(super::DEFAULT_EXPIRES as u64),
                         );
                         drop(guard);
+                        metrics::VOWIFI_REGISTERED
+                            .with_label_values(&[card_id])
+                            .set(1.0);
+                        metrics::VOWIFI_TUNNEL_UP
+                            .with_label_values(&[card_id])
+                            .set(1.0);
                         backoff = RETRY_INITIAL_BACKOFF;
                         next_renewal_attempt = None;
                         tracing::info!("registration renewed");
@@ -728,6 +753,12 @@ fn dispatch_loop(
                         guard.state = super::RegistrationState::Failed;
                         guard.last_failure = Some((SystemTime::now(), e.to_string()));
                         drop(guard);
+                        metrics::VOWIFI_REGISTERED
+                            .with_label_values(&[card_id])
+                            .set(0.0);
+                        metrics::VOWIFI_TUNNEL_UP
+                            .with_label_values(&[card_id])
+                            .set(0.0);
                         // Not a blocking sleep: the loop keeps dispatching
                         // inbound SIP every iteration in the meantime (see
                         // `next_renewal_attempt`'s doc comment above).

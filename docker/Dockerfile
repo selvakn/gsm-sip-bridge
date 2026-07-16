@@ -169,9 +169,21 @@ RUN autoreconf -vis
 # double up the prefix with pkg-config's already-absolute usbdropdir
 # (producing /usr/usr/...) — verified while proving this stage; pin the
 # correct absolute paths instead.
+#
+# --enable-vpcdslots=8 (default is 2): multi-card VoWiFi
+# (specs/013-multi-card-vowifi) runs ONE pcscd exposing one vpcd reader with
+# N slots — vpcd opens one listening socket per slot on incrementing ports
+# (35963, 35964, ...), one per VoWiFi line. This is vpcd's own intended
+# multi-card mode (`ctx[slot]` is per-slot, no shared global state to
+# collide), and it's what lets a single pcscd serve every line: charon's
+# eap-sim-pcsc plugin scans all slots and selects each line's SIM by IMSI
+# (`strstr(full_nai, imsi)` in eap_sim_pcsc_card.c — it is explicitly built
+# to disambiguate multiple readers this way). 8 matches [vowifi].max_lines'
+# default; raising max_lines beyond 8 needs a matching bump here.
 RUN ./configure --prefix=/usr \
         --enable-serialdropdir=/usr/lib/pcsc/drivers/serial \
-        --enable-serialconfdir=/etc/reader.conf.d
+        --enable-serialconfdir=/etc/reader.conf.d \
+        --enable-vpcdslots=8
 RUN make -j"$(nproc)" -C src/vpcd
 RUN make -j"$(nproc)" -C src/ifd-vpcd
 RUN make -C src/vpcd install DESTDIR=/staging

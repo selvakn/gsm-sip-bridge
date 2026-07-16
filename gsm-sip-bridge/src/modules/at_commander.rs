@@ -110,8 +110,16 @@ impl FromStr for NetworkMode {
 
 impl AtCommander {
     pub fn open(path: &Path) -> BridgeResult<Self> {
+        Self::open_with_timeout(path, DEFAULT_TIMEOUT)
+    }
+
+    /// Like `open`, but with an explicit read timeout — used by
+    /// `modules::discovery`'s AT-probe (specs/013-multi-card-vowifi FR-002),
+    /// which tries several candidate serial interfaces per modem and wants a
+    /// short per-candidate timeout rather than `DEFAULT_TIMEOUT`'s 5s.
+    pub fn open_with_timeout(path: &Path, timeout: Duration) -> BridgeResult<Self> {
         let port = serialport::new(path.to_string_lossy(), BAUD_RATE)
-            .timeout(DEFAULT_TIMEOUT)
+            .timeout(timeout)
             .open()
             .map_err(|e| {
                 BridgeError::Discovery(format!("failed to open serial {}: {e}", path.display()))
@@ -269,6 +277,22 @@ impl AtCommander {
                 .ok_or_else(|| BridgeError::Discovery("AT+CIMI: no IMSI in response".into())),
             AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
                 Err(BridgeError::Discovery(format!("AT+CIMI failed: {e}")))
+            }
+        }
+    }
+
+    /// Raw `AT+CPIN?` status string (e.g. `"READY"`, `"SIM PIN"`, `"SIM
+    /// PUK"`) — interpreting what that means for a line's usability is the
+    /// caller's job (`modules::discovery::probe_sim_status`,
+    /// specs/013-multi-card-vowifi FR-006).
+    pub fn query_cpin(&mut self) -> BridgeResult<String> {
+        match self.send_command("AT+CPIN?")? {
+            AtResponse::Ok(lines) => lines
+                .into_iter()
+                .find_map(|l| l.strip_prefix("+CPIN:").map(|s| s.trim().to_string()))
+                .ok_or_else(|| BridgeError::Discovery("AT+CPIN?: no status in response".into())),
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+                Err(BridgeError::Discovery(format!("AT+CPIN? failed: {e}")))
             }
         }
     }
@@ -582,6 +606,24 @@ mod tests {
     fn test_query_imsi_error() {
         let mut at = make_commander("ERROR\r\n");
         assert!(at.query_imsi().is_err());
+    }
+
+    #[test]
+    fn test_query_cpin_ready() {
+        let mut at = make_commander("+CPIN: READY\r\nOK\r\n");
+        assert_eq!(at.query_cpin().unwrap(), "READY");
+    }
+
+    #[test]
+    fn test_query_cpin_locked() {
+        let mut at = make_commander("+CPIN: SIM PIN\r\nOK\r\n");
+        assert_eq!(at.query_cpin().unwrap(), "SIM PIN");
+    }
+
+    #[test]
+    fn test_query_cpin_error_no_sim() {
+        let mut at = make_commander("+CME ERROR: 10\r\n");
+        assert!(at.query_cpin().is_err());
     }
 
     #[test]

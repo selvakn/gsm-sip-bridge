@@ -18,6 +18,7 @@
 //! existing circuit-switched call path completely untouched (FR-006).
 
 pub mod control;
+pub mod discovery;
 pub mod ims_mode;
 pub mod imsi;
 pub mod plmn;
@@ -25,6 +26,7 @@ pub mod usim_bridge;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
 use crate::error::{BridgeError, BridgeResult};
+use crate::modules::discovery::lines_file_path;
 use crate::sms;
 use crate::sms::discord::DiscordClient;
 use crate::store::{StoreCommand, StoreHandle};
@@ -32,7 +34,7 @@ use control::{read_msg, write_msg, CallRecord, ControlMessage};
 use pjsua_safe::{
     Account, AccountConfig, Call, CallState, Endpoint, EndpointConfig, TransportType,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::ExitCode;
@@ -100,6 +102,51 @@ impl RecentCalls {
 /// How many recent call outcomes to remember for `vowifi-status`.
 const RECENT_CALLS_CAPACITY: usize = 20;
 
+/// One VoWiFi line as far as Agent B and `vowifi-status` care: just enough
+/// to open a control-channel listener (Agent B) or query one (`vowifi-
+/// status`) — `card_id`, Agent A's veth-local address (status port, same
+/// netns Agent A runs in but reachable from the default netns over the
+/// veth link) and Agent B's own veth-peer address/control port (the
+/// control-channel listener this line's Agent A connects to).
+/// specs/013-multi-card-vowifi, `contracts/agent-topology-contract.md`.
+#[derive(Debug, Clone)]
+struct RuntimeLine {
+    index: u32,
+    card_id: String,
+    veth_local_addr: String,
+    veth_peer_addr: String,
+    control_port: u16,
+}
+
+/// Reads the `discover` subcommand's line-resolution file and returns every
+/// resolved VoWiFi line. Falls back to a single legacy line built straight
+/// from `config` (today's pre-multi-card behavior, `LEGACY_LINE_CARD_ID` as
+/// its card id) when the file is missing/empty — the common case for an
+/// existing single-SIM deployment that has never run `discover` (FR-020).
+fn resolve_runtime_lines(config: &VowifiConfig) -> Vec<RuntimeLine> {
+    let path = lines_file_path();
+    match discovery::read_line_resolution(&path) {
+        Ok(resolution) if !resolution.lines.is_empty() => resolution
+            .lines
+            .iter()
+            .map(|l| RuntimeLine {
+                index: l.index,
+                card_id: l.card_id.clone(),
+                veth_local_addr: l.veth_local_addr.clone(),
+                veth_peer_addr: l.veth_peer_addr.clone(),
+                control_port: l.control_port,
+            })
+            .collect(),
+        _ => vec![RuntimeLine {
+            index: 0,
+            card_id: LEGACY_LINE_CARD_ID.to_string(),
+            veth_local_addr: config.veth_local_addr.clone(),
+            veth_peer_addr: config.veth_peer_addr.clone(),
+            control_port: config.control_port,
+        }],
+    }
+}
+
 pub fn run(config: &AppConfig) -> ExitCode {
     match run_inner(config) {
         Ok(()) => ExitCode::SUCCESS,
@@ -159,29 +206,33 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
         "vowifi-sip-agent registered to PBX"
     );
 
-    let listen_addr = (
-        config.vowifi.veth_peer_addr.as_str(),
-        config.vowifi.control_port,
-    );
-    let listener = TcpListener::bind(listen_addr)
-        .map_err(|e| BridgeError::Ims(format!("control channel listen failed: {e}")))?;
+    // One SIP identity/registration for every line (the spec's own
+    // Assumptions section) — what varies per line below is only which
+    // veth-peer address/control-port listener accepted the connection.
+    let lines = resolve_runtime_lines(&config.vowifi);
     tracing::info!(
-        addr = %listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default(),
-        "vowifi-sip-agent listening for Agent A"
+        line_count = lines.len(),
+        lines = ?lines.iter().map(|l| l.card_id.clone()).collect::<Vec<_>>(),
+        "vowifi-sip-agent resolved lines"
     );
 
-    let recent_calls = Arc::new(Mutex::new(RecentCalls::new(RECENT_CALLS_CAPACITY)));
+    // Keyed by card_id (specs/013-multi-card-vowifi FR-017) — replaces the
+    // single-line `RecentCalls` instance with one per line, sharing one lock
+    // since call volume across a handful of lines never contends on it.
+    let recent_calls: Arc<Mutex<HashMap<String, RecentCalls>>> = Arc::new(Mutex::new(
+        lines
+            .iter()
+            .map(|l| (l.card_id.clone(), RecentCalls::new(RECENT_CALLS_CAPACITY)))
+            .collect(),
+    ));
 
     // Agent B (this process), not Agent A, owns the actual Discord post for a
     // relayed SIP `MESSAGE` (see `ControlMessage::SmsReceived` docs): it has
     // the `[sms]` webhook config and LAN/Internet reachability, whereas Agent
-    // A's netns is IMS-tunnel-only. This whole accept loop is otherwise
+    // A's netns is IMS-tunnel-only. Each line's accept loop is otherwise
     // synchronous (`std::thread`, no async runtime), so a small runtime is
     // built just to fire off the async `DiscordClient::forward_sms` call
-    // without blocking the loop from accepting the next connection.
+    // without blocking a loop from accepting its next connection.
     let discord_client = build_discord_client(config);
     let sms_runtime = Runtime::new()
         .map_err(|e| BridgeError::Ims(format!("failed to build SMS-forwarding runtime: {e}")))?;
@@ -192,35 +243,109 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
     let store = StoreHandle::open(Path::new(&config.sms.db_path))
         .map_err(|e| BridgeError::Ims(format!("failed to open SMS store: {e}")))?;
 
+    // One accept-loop thread per line, all sharing the one endpoint/account/
+    // Discord client/store/runtime above — `std::thread::scope` blocks until
+    // every thread finishes, which in practice is never (each loops forever
+    // like the pre-multi-card single loop did), so this call never returns
+    // in normal operation, matching today's behavior for the N=1 case.
+    std::thread::scope(|scope| {
+        for line in &lines {
+            let endpoint = &endpoint;
+            let account = &account;
+            let recent_calls = Arc::clone(&recent_calls);
+            let discord_client = &discord_client;
+            let sms_runtime = &sms_runtime;
+            let store_tx = store.sender();
+            let card_id = line.card_id.clone();
+            let listen_addr = (line.veth_peer_addr.clone(), line.control_port);
+            scope.spawn(move || {
+                run_line_listener(
+                    listen_addr,
+                    &card_id,
+                    endpoint,
+                    account,
+                    config,
+                    &recent_calls,
+                    discord_client,
+                    sms_runtime,
+                    store_tx,
+                );
+            });
+        }
+    });
+    Ok(())
+}
+
+/// One line's whole accept loop — binds `listen_addr` and handles every
+/// connection Agent A opens on it, tagging everything with `card_id`
+/// (FR-017). Runs on its own thread (see `run_inner`); a bind failure here
+/// is logged and the thread simply exits, leaving the other lines' threads
+/// (and this process) running — one line's misconfiguration shouldn't take
+/// the whole Agent B process down.
+#[allow(clippy::too_many_arguments)]
+fn run_line_listener(
+    listen_addr: (String, u16),
+    card_id: &str,
+    endpoint: &Endpoint,
+    account: &Account,
+    config: &AppConfig,
+    recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
+    discord_client: &Option<DiscordClient>,
+    sms_runtime: &Runtime,
+    store_tx: crossbeam_channel::Sender<StoreCommand>,
+) {
+    let listener = match TcpListener::bind((listen_addr.0.as_str(), listen_addr.1)) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(
+                card_id = %card_id,
+                addr = %format!("{}:{}", listen_addr.0, listen_addr.1),
+                error = %e,
+                "control channel listen failed for this line; it will not receive calls"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        card_id = %card_id,
+        addr = %listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
+        "vowifi-sip-agent listening for Agent A"
+    );
+
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, "control channel accept failed");
+                tracing::warn!(card_id = %card_id, error = %e, "control channel accept failed");
                 continue;
             }
         };
         if let Err(e) = handle_connection(
             stream,
-            &endpoint,
-            &account,
+            card_id,
+            endpoint,
+            account,
             config,
-            &recent_calls,
-            &discord_client,
-            &sms_runtime,
-            store.sender(),
+            recent_calls,
+            discord_client,
+            sms_runtime,
+            store_tx.clone(),
         ) {
-            tracing::warn!(error = %e, "error handling Agent A control connection");
+            tracing::warn!(card_id = %card_id, error = %e, "error handling Agent A control connection");
         }
     }
-    Ok(())
 }
 
-/// Module label Agent B reports to Discord for VoWiFi-originated SMS
-/// (`DiscordClient::forward_sms`'s `module_id`) — there is no GSM card
-/// involved on this path, so a fixed string distinguishes it from the
-/// circuit-switched flow's real card ids in the same Discord channel.
-const VOWIFI_SMS_MODULE_ID: &str = "vowifi";
+/// Fallback card id used only when no `discover`-produced line resolution
+/// exists (`resolve_runtime_lines`'s legacy single-line branch, and
+/// `main.rs`'s `vowifi-ims-agent` with no `--line`) — the pre-multi-card
+/// label, kept as the default so an unresolved deployment's Discord/log/
+/// metrics attribution doesn't change (FR-020). A resolved multi-line
+/// deployment uses each line's real card id instead (FR-017).
+pub const LEGACY_LINE_CARD_ID: &str = "vowifi";
 
 /// Builds the Discord client used to forward relayed VoWiFi `MESSAGE`s,
 /// mirroring `modules::mod::CardPool::new`'s gating: only if SMS monitoring
@@ -286,13 +411,35 @@ fn prioritize_wideband_codecs(endpoint: &Endpoint) {
     );
 }
 
+/// Records a call outcome under `card_id`'s own history — inserts an entry
+/// if this is somehow the first time this card_id is seen (shouldn't
+/// happen; `recent_calls` is pre-populated from the same line list this
+/// listener was spawned from, but a missing entry degrading to "start
+/// empty" is safer than losing the record).
+fn push_recent_call(
+    recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
+    card_id: &str,
+    record: CallRecord,
+) {
+    crate::metrics::VOWIFI_CALLS_TOTAL
+        .with_label_values(&[card_id, &record.outcome])
+        .inc();
+    recent_calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(card_id.to_string())
+        .or_insert_with(|| RecentCalls::new(RECENT_CALLS_CAPACITY))
+        .push(record);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: TcpStream,
+    card_id: &str,
     endpoint: &Endpoint,
     account: &Account,
     config: &AppConfig,
-    recent_calls: &Arc<Mutex<RecentCalls>>,
+    recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
     discord_client: &Option<DiscordClient>,
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
@@ -311,7 +458,9 @@ fn handle_connection(
             let calls = recent_calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .snapshot();
+                .get(card_id)
+                .map(RecentCalls::snapshot)
+                .unwrap_or_default();
             write_msg(&mut writer, &ControlMessage::CallHistoryReply { calls })
                 .map_err(BridgeError::Ims)?;
             return Ok(());
@@ -325,6 +474,7 @@ fn handle_connection(
                 store_tx,
                 discord_client,
                 sms_runtime,
+                card_id.to_string(),
                 sender,
                 body,
                 received_at,
@@ -337,7 +487,7 @@ fn handle_connection(
             )));
         }
     };
-    tracing::info!(call_id = %call_id, caller = %caller, "incoming VoWiFi call signaled by Agent A");
+    tracing::info!(card_id = %card_id, call_id = %call_id, caller = %caller, "incoming VoWiFi call signaled by Agent A");
     let started_at = now_unix();
 
     match bridge_call(endpoint, account, config, &caller) {
@@ -390,16 +540,17 @@ fn handle_connection(
                     endpoint.unpair_call(pbx_call.call_id());
                     let _ = pbx_call.hangup();
                     let _ = veth_call.hangup();
-                    recent_calls
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(CallRecord {
+                    push_recent_call(
+                        recent_calls,
+                        card_id,
+                        CallRecord {
                             call_id,
                             caller,
                             outcome: format!("declined:{reason}"),
                             started_at,
                             ended_at: Some(now_unix()),
-                        });
+                        },
+                    );
                     return Ok(());
                 }
             }
@@ -444,20 +595,21 @@ fn handle_connection(
                     call_id: call_id.clone(),
                 },
             );
-            recent_calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(CallRecord {
+            push_recent_call(
+                recent_calls,
+                card_id,
+                CallRecord {
                     call_id,
                     caller,
                     outcome: format!("answered:{end_reason}"),
                     started_at,
                     ended_at: Some(now_unix()),
-                });
+                },
+            );
             Ok(())
         }
         Err(e) => {
-            tracing::warn!(call_id = %call_id, error = %e, "failed to bridge call");
+            tracing::warn!(card_id = %card_id, call_id = %call_id, error = %e, "failed to bridge call");
             write_msg(
                 &mut writer,
                 &ControlMessage::BridgeFailed {
@@ -466,16 +618,17 @@ fn handle_connection(
                 },
             )
             .map_err(BridgeError::Ims)?;
-            recent_calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(CallRecord {
+            push_recent_call(
+                recent_calls,
+                card_id,
+                CallRecord {
                     call_id,
                     caller,
                     outcome: format!("failed:{e}"),
                     started_at,
                     ended_at: Some(now_unix()),
-                });
+                },
+            );
             Ok(())
         }
     }
@@ -494,6 +647,7 @@ fn forward_vowifi_sms(
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     discord_client: &Option<DiscordClient>,
     sms_runtime: &Runtime,
+    card_id: String,
     sender: String,
     body: String,
     received_at: String,
@@ -502,7 +656,7 @@ fn forward_vowifi_sms(
         sms_runtime.handle(),
         store_tx,
         discord_client.clone(),
-        VOWIFI_SMS_MODULE_ID.to_string(),
+        card_id,
         sender,
         body,
         received_at,
@@ -650,71 +804,79 @@ fn pbx_dest_uri(config: &AppConfig, caller_did: &str) -> String {
     format!("sip:{dest}@{}:{}", config.sip.server, config.sip.port)
 }
 
-/// Entry point for the `vowifi-status` subcommand: queries Agent A's
-/// registration health (`AGENT_A_STATUS_PORT`) and Agent B's recent call
-/// history (`[vowifi].control_port`) and prints both — FR-008/User Story 3.
-/// Either query failing independently (e.g. one agent not running) is
-/// reported, not fatal to reporting the other.
+/// Entry point for the `vowifi-status` subcommand: queries every resolved
+/// line's Agent A registration health (`AGENT_A_STATUS_PORT`, reached via
+/// that line's own veth-local address) and Agent B's per-line recent call
+/// history (that line's own veth-peer address/control port), printing one
+/// labeled block per line — FR-018/User Story 3. A query failing for one
+/// line is reported for that line only, not fatal to reporting the others
+/// (acceptance scenario 1); overall failure means *every* line's queries
+/// failed.
 pub fn print_status(config: &VowifiConfig) -> ExitCode {
-    let mut ok = true;
+    let lines = resolve_runtime_lines(config);
+    let mut any_ok = false;
 
-    println!("VoWiFi registration (Agent A):");
-    match query_status(&format!("{}:{AGENT_A_STATUS_PORT}", config.veth_local_addr)) {
-        Ok(ControlMessage::RegistrationStatusReply {
-            state,
-            registered_at,
-            expires_at,
-            last_failure,
-        }) => {
-            println!("  state: {state}");
-            println!("  registered_at: {}", format_unix(registered_at));
-            println!("  expires_at: {}", format_unix(expires_at));
-            match last_failure {
-                Some((t, msg)) => println!("  last_failure: {} {msg}", format_unix(Some(t))),
-                None => println!("  last_failure: none"),
+    for line in &lines {
+        println!("Line {} (card {}):", line.index, line.card_id);
+        let mut line_ok = true;
+
+        println!("  VoWiFi registration (Agent A):");
+        match query_status(&format!("{}:{AGENT_A_STATUS_PORT}", line.veth_local_addr)) {
+            Ok(ControlMessage::RegistrationStatusReply {
+                state,
+                registered_at,
+                expires_at,
+                last_failure,
+            }) => {
+                println!("    state: {state}");
+                println!("    registered_at: {}", format_unix(registered_at));
+                println!("    expires_at: {}", format_unix(expires_at));
+                match last_failure {
+                    Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
+                    None => println!("    last_failure: none"),
+                }
+            }
+            Ok(other) => {
+                println!("    unexpected reply: {other:?}");
+                line_ok = false;
+            }
+            Err(e) => {
+                println!("    unreachable: {e}");
+                line_ok = false;
             }
         }
-        Ok(other) => {
-            println!("  unexpected reply: {other:?}");
-            ok = false;
-        }
-        Err(e) => {
-            println!("  unreachable: {e}");
-            ok = false;
-        }
-    }
 
-    println!("Recent calls (Agent B):");
-    match query_status(&format!(
-        "{}:{}",
-        config.veth_peer_addr, config.control_port
-    )) {
-        Ok(ControlMessage::CallHistoryReply { calls }) if calls.is_empty() => {
-            println!("  (none)");
-        }
-        Ok(ControlMessage::CallHistoryReply { calls }) => {
-            for c in calls {
-                println!(
-                    "  {} caller={} outcome={} started={} ended={}",
-                    c.call_id,
-                    c.caller,
-                    c.outcome,
-                    format_unix(Some(c.started_at)),
-                    format_unix(c.ended_at)
-                );
+        println!("  Recent calls (Agent B):");
+        match query_status(&format!("{}:{}", line.veth_peer_addr, line.control_port)) {
+            Ok(ControlMessage::CallHistoryReply { calls }) if calls.is_empty() => {
+                println!("    (none)");
+            }
+            Ok(ControlMessage::CallHistoryReply { calls }) => {
+                for c in calls {
+                    println!(
+                        "    {} caller={} outcome={} started={} ended={}",
+                        c.call_id,
+                        c.caller,
+                        c.outcome,
+                        format_unix(Some(c.started_at)),
+                        format_unix(c.ended_at)
+                    );
+                }
+            }
+            Ok(other) => {
+                println!("    unexpected reply: {other:?}");
+                line_ok = false;
+            }
+            Err(e) => {
+                println!("    unreachable: {e}");
+                line_ok = false;
             }
         }
-        Ok(other) => {
-            println!("  unexpected reply: {other:?}");
-            ok = false;
-        }
-        Err(e) => {
-            println!("  unreachable: {e}");
-            ok = false;
-        }
+
+        any_ok = any_ok || line_ok;
     }
 
-    if ok {
+    if any_ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

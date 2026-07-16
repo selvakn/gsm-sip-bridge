@@ -136,41 +136,57 @@ Configures the Unix domain socket used by `card` CLI subcommands to communicate 
 
 ### `[vowifi]`
 
-The inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — a second,
-independent inbound call path alongside `[sip]`/`[bridge]`. Only read by the
-`vowifi-*-agent` subcommands and `docker/entrypoint.sh`/`healthcheck.sh`
-(via `gsm-sip-bridge config vowifi-shell-env`), never by the normal daemon
-path. All ePDG-tunnel configuration lives here — none of it is read from
-environment variables; `.env` holds secrets only (specs/012-strongswan-epdg
-config consolidation).
+The inbound VoWiFi-to-SIP bridge — a second, independent inbound call path
+alongside `[sip]`/`[bridge]`. Only read by the `vowifi-*-agent`/`discover`
+subcommands and `docker/entrypoint.sh`/`healthcheck.sh` (via
+`gsm-sip-bridge config vowifi-shell-env`/`gsm-sip-bridge discover
+--shell-env`), never by the normal daemon path. All ePDG-tunnel
+configuration lives here — none of it is read from environment variables;
+`.env` holds secrets only (specs/012-strongswan-epdg config consolidation).
+
+**Multi-line (specs/013-multi-card-vowifi)**: as of this feature, VoWiFi
+auto-discovers *every* attached VoWiFi-capable modem — no `modem_port`
+needs to be set at all. Each discovered SIM becomes its own **line**: its
+own tunnel, IMS registration, network namespace, and inbound call path,
+running concurrently, up to `max_lines`. `[vowifi].mcc`/`mnc`/`modem_port`/
+etc. below are still honored as-is when exactly one line resolves (an
+existing single-SIM setup is unaffected, byte-for-byte — see FR-020); with
+more than one line, every per-line resource (netns, XFRM `if_id`/interface
+name, veth interface names/addresses, `vpcd_port`, `pcscf_source_path`) is
+*derived* from each line's position in the discovered line table rather
+than read from config, so there is nothing new to hand-configure per line.
+Run `gsm-sip-bridge --config config.toml discover --shell-env` to see what
+gets discovered/resolved.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch |
-| `mcc` | string | `""` (auto-derive) | Home network MCC; empty means derive from the SIM (IMSI + EF_AD, `AT+COPS` fallback). Must be set together with `mnc` or not at all |
+| `mcc` | string | `""` (auto-derive) | Home network MCC; empty means derive from the SIM (IMSI + EF_AD, `AT+COPS` fallback). Must be set together with `mnc` or not at all. Only meaningful for the single-line case — see "Multi-line" above |
 | `mnc` | string | `""` (auto-derive) | Home network MNC, zero-padded to 3 digits; empty means derive from the SIM |
-| `modem_port` | string | `/dev/ttyUSB6` | AT port for the modem whose SIM authenticates |
+| `modem_port` | string | `""` (auto-discover) | AT port for the modem whose SIM authenticates. Empty means auto-discover every VoWiFi-capable modem instead (specs/013-multi-card-vowifi) |
 | `use_tcp` | boolean | `true` | SIP transport to the P-CSCF |
 | `sec_agree` | boolean | `true` | Advertise `Require: sec-agree` / negotiate Gm IPsec |
-| `pcscf_source_path` | string | `/tmp/pcscf` | Path Agent A reads the tunnel-assigned P-CSCF from |
-| `veth_local_addr` | string | `10.99.0.1` | Agent A's (ims-netns end) veth address |
-| `veth_peer_addr` | string | `10.99.0.2` | Agent B's (default-netns end) veth address |
-| `control_port` | integer | 7050 | Agent A↔B control channel TCP port |
+| `pcscf_source_path` | string | `/tmp/pcscf` | Path Agent A reads the tunnel-assigned P-CSCF from (single-line default; per-line derived otherwise) |
+| `veth_local_addr` | string | `10.99.0.1` | Agent A's (ims-netns end) veth address (single-line default; per-line derived otherwise) |
+| `veth_peer_addr` | string | `10.99.0.2` | Agent B's (default-netns end) veth address (single-line default; per-line derived otherwise) |
+| `control_port` | integer | 7050 | Agent A↔B control channel TCP port — shared across lines; lines are told apart by `veth_peer_addr`, not this port |
 | `wideband` | boolean | `true` | Carry AMR-WB/G.722 end-to-end instead of narrowing to 8 kHz |
-| `apn` | string | `ims` | APN used by the `swu` engine's dialer |
-| `netns` | string | `ims` | Network namespace the ePDG tunnel lives in |
+| `apn` | string | `ims` | APN used by the `swu` engine's dialer — shared across lines |
+| `netns` | string | `ims` | Network namespace the ePDG tunnel lives in (single-line default; per-line derived otherwise) |
 | `epdg_fqdn` | string | derived from `mcc`/`mnc` (configured or SIM-derived) | ePDG FQDN to resolve via DNS |
-| `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly |
-| `src_addr` | string | unset (auto-select) | Force the tunnel's local source address |
+| `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly — shared across lines if set |
+| `src_addr` | string | unset (auto-select) | Force the tunnel's local source address — shared across lines if set |
 | `keepalive_interval_sec` | integer | 20 | Idle-tunnel TCP keepalive interval |
-| `veth_sip_iface` | string | `veth-sip` | veth end in the default netns |
-| `veth_ims_iface` | string | `veth-ims` | veth end inside `netns` |
+| `veth_sip_iface` | string | `veth-sip` | veth end in the default netns (single-line default; per-line derived otherwise) |
+| `veth_ims_iface` | string | `veth-ims` | veth end inside `netns` (single-line default; per-line derived otherwise) |
 | `tunnel_engine` | enum | `strongswan` | `strongswan` or `swu` (specs/012-strongswan-epdg) |
-| `strongswan_tun_iface` | string | `tun23` | strongswan engine's XFRM interface name |
-| `strongswan_if_id` | integer | 23 | strongswan engine's XFRM interface `if_id` |
+| `strongswan_tun_iface` | string | `tun23` | strongswan engine's XFRM interface name (single-line default; per-line derived otherwise) |
+| `strongswan_if_id` | integer | 23 | strongswan engine's XFRM interface `if_id` (single-line default; per-line derived otherwise) |
 | `vpcd_host` | string | `127.0.0.1` | pcscd's vpcd virtual reader host (strongswan engine) |
-| `vpcd_port` | integer | 15963 | pcscd's vpcd virtual reader port (strongswan engine). Keep it **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
+| `vpcd_port` | integer | 15963 | pcscd's vpcd virtual reader port (single-line default; per-line derived otherwise — each line's slot is `base + index`, see specs/013-multi-card-vowifi). Keep the base **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
 | `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch (strongswan engine) |
+| `max_lines` | integer | 8 | Upper bound on concurrently supported VoWiFi lines (specs/013-multi-card-vowifi FR-016); modems discovered beyond this count are reported and skipped |
+| `[[vowifi.line]]` | array of tables | none | Explicit per-line overrides (FR-009): `modem_serial` or `modem_port` pins a specific modem to VoWiFi regardless of the default audio-capability-based role assignment; optional `mcc`/`mnc`/`imsi_override` fix that one line's home network/IMSI instead of auto-deriving it |
 
 ## Examples
 

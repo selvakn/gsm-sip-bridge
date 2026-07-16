@@ -55,10 +55,11 @@ pub enum Commands {
     /// keeps a persistent IMS-AKA registration alive, answers inbound calls
     /// arriving over VoWiFi, and relays their audio to Agent B
     /// (`vowifi-sip-agent`) over a dedicated veth link. Reads its settings
-    /// from the `[vowifi]` config section. Long-running — intended to run
-    /// inside the ePDG tunnel's `ims` network namespace, supervised by
-    /// `docker/entrypoint.sh`.
-    VowifiImsAgent,
+    /// from the `[vowifi]` config section (or, with `--line`, one line's
+    /// resolved slice of it — specs/013-multi-card-vowifi). Long-running —
+    /// intended to run inside the ePDG tunnel's `ims` network namespace,
+    /// supervised by `docker/entrypoint.sh`.
+    VowifiImsAgent(VowifiImsAgentArgs),
     /// Agent B of the inbound VoWiFi-to-SIP bridge: registers to the
     /// SIP/PBX destination (`[sip]`/`[bridge]`) and, on each call signaled
     /// by Agent A, places a matching PBX-side call plus a veth-side call
@@ -98,6 +99,13 @@ pub enum Commands {
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
+    /// Runs the shared USB modem scan once, assigns each recognized modem to
+    /// the circuit-switched or VoWiFi subsystem, resolves the VoWiFi line
+    /// table (specs/013-multi-card-vowifi), and writes the result so both
+    /// the circuit-switched daemon and `docker/entrypoint.sh` can act on it
+    /// without each re-scanning independently (which would otherwise race —
+    /// see `specs/013-multi-card-vowifi/research.md` item 3).
+    Discover(DiscoverArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -253,6 +261,40 @@ pub struct VowifiPlmnArgs {
     /// Modem AT port used for AT+CIMI / AT+CRSM / AT+COPS
     #[arg(long)]
     pub modem: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+pub struct VowifiImsAgentArgs {
+    /// Which resolved VoWiFi line (0-based index into the `discover`
+    /// subcommand's line-resolution file) to run as. Omitted means "the
+    /// single line" (index 0) — the pre-multi-card behavior, still correct
+    /// for a single-SIM deployment (specs/013-multi-card-vowifi FR-020).
+    #[arg(long)]
+    pub line: Option<u32>,
+}
+
+#[derive(Parser, Debug)]
+pub struct DiscoverArgs {
+    /// Where to write the line-resolution JSON. Defaults to
+    /// `GSM_SIP_BRIDGE_LINES_FILE`, or
+    /// `modules::discovery::DEFAULT_LINES_FILE` if that's unset too.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Also print shell-sourceable `KEY=value`/indexed-array output to
+    /// stdout, for `docker/entrypoint.sh` to `eval`.
+    #[arg(long)]
+    pub shell_env: bool,
+
+    /// Skip the USB/AT scan entirely and just re-print the existing
+    /// line-resolution file's contents (as `--shell-env`, if requested).
+    /// For read-only consumers that must NOT re-probe modems the running
+    /// VoWiFi agents already hold open — `docker/healthcheck.sh`, in
+    /// particular, which polls every 30s and would otherwise both waste
+    /// time re-scanning and risk colliding with a live `vowifi-usim-bridge`
+    /// session on the same serial port.
+    #[arg(long)]
+    pub from_file: bool,
 }
 
 #[derive(Parser, Debug)]

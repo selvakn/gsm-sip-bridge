@@ -17,7 +17,9 @@
       "Bash(git tag *)",
       "Bash(git push *)",
       "Bash(git commit *)",
-      "Bash(grep -v \"^Warning:\\\\|^Welcome\\\\|^\\\\*\\\\|^ \\\\*\\\\|^$\\\\|Documentation\\\\|Management\\\\|Support\\\\|System\\\\|Usage\\\\|Memory\\\\|Swap\\\\|Temp\\\\|Process\\\\|Users\\\\|IPv4\\\\|updates\\\\|additional\\\\|Learn\\\\|ESM\\\\|restart\\\\|ubuntu\\\\|landscape\\\\|engage\\\\|Already\\\\|Pulling\")"
+      "Bash(grep -v \"^Warning:\\\\|^Welcome\\\\|^\\\\*\\\\|^ \\\\*\\\\|^$\\\\|Documentation\\\\|Management\\\\|Support\\\\|System\\\\|Usage\\\\|Memory\\\\|Swap\\\\|Temp\\\\|Process\\\\|Users\\\\|IPv4\\\\|updates\\\\|additional\\\\|Learn\\\\|ESM\\\\|restart\\\\|ubuntu\\\\|landscape\\\\|engage\\\\|Already\\\\|Pulling\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo test *)"
     ]
   }
 }

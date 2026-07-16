@@ -19,6 +19,17 @@ const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 /// `"info"`); `verbose` is the `-v`/`--verbose` CLI flag, which always forces
 /// `trace` regardless of config — a manual escape hatch for ad-hoc
 /// debugging. `RUST_LOG`, if set, wins over both.
+///
+/// Called unconditionally at the top of `main()` for every subcommand,
+/// including `config vowifi-shell-env` and `discover --shell-env`
+/// (specs/013-multi-card-vowifi) — both of which `docker/entrypoint.sh`
+/// captures via `$(...)` and `eval`s as `KEY=value` shell assignments.
+/// `fmt::layer()` writes to stdout by default, which would otherwise
+/// interleave log lines into that captured output and get `eval`'d as
+/// bogus shell commands (found live-testing: a color-coded log line landed
+/// in the captured string and errored as "command not found") — routing it
+/// to stderr instead is what keeps stdout exclusively the command's actual
+/// answer.
 pub fn init(level: &str, verbose: bool) {
     let effective_level = if verbose { "trace" } else { level };
     let default_directive = match effective_level.to_ascii_lowercase().as_str() {
@@ -34,7 +45,7 @@ pub fn init(level: &str, verbose: bool) {
     tracing_subscriber::registry()
         .with(filter)
         .with(RedactionLayer)
-        .with(fmt::layer().with_target(true))
+        .with(fmt::layer().with_target(true).with_writer(std::io::stderr))
         .init();
 }
 
