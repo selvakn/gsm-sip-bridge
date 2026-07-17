@@ -64,6 +64,7 @@ SIP_AGENT_SUPERVISOR_PID=""
 # selects each line's SIM by IMSI across all of the one pcscd's vpcd slots
 # (specs/013-multi-card-vowifi; vpcd built with --enable-vpcdslots, see
 # docker/Dockerfile).
+PCSCD_PID=""
 PCSCD_LOG_TAIL_PID=""
 declare -a CHARON_PIDS=()
 declare -a CHARON_LOG_TAIL_PIDS=()
