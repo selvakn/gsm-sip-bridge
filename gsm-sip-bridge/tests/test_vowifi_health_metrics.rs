@@ -63,8 +63,14 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
     obs.set_tunnel_up(true);
     wait_for(
         || {
-            metrics::VOWIFI_REGISTERED.with_label_values(&[&module_id]).get() == 1.0
-                && metrics::VOWIFI_TUNNEL_UP.with_label_values(&[&module_id]).get() == 1.0
+            metrics::VOWIFI_REGISTERED
+                .with_label_values(&[&module_id])
+                .get()
+                == 1.0
+                && metrics::VOWIFI_TUNNEL_UP
+                    .with_label_values(&[&module_id])
+                    .get()
+                    == 1.0
         },
         Duration::from_secs(5),
     )
@@ -80,8 +86,14 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
     obs.set_tunnel_up(false);
     wait_for(
         || {
-            metrics::VOWIFI_REGISTERED.with_label_values(&[&module_id]).get() == 0.0
-                && metrics::VOWIFI_TUNNEL_UP.with_label_values(&[&module_id]).get() == 0.0
+            metrics::VOWIFI_REGISTERED
+                .with_label_values(&[&module_id])
+                .get()
+                == 0.0
+                && metrics::VOWIFI_TUNNEL_UP
+                    .with_label_values(&[&module_id])
+                    .get()
+                    == 0.0
         },
         Duration::from_secs(5),
     )

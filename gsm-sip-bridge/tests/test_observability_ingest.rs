@@ -42,6 +42,8 @@ async fn test_observe_report_lands_in_scraped_metrics() {
     let report = AgentReport {
         agent: AgentKind::Ims,
         module_id: module_id.clone(),
+        epoch: 1,
+        seq: 1,
         state: AgentState {
             active_calls: Some(0),
             registered: Some(true),
@@ -105,6 +107,8 @@ async fn test_observe_heartbeat_with_no_events_still_updates_liveness() {
     let report = AgentReport {
         agent: AgentKind::Sip,
         module_id: "test-ingest-heartbeat".to_string(),
+        epoch: 1,
+        seq: 1,
         state: AgentState::default(),
         events: vec![],
         dropped: 3,

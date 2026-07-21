@@ -9,6 +9,18 @@ use crossbeam_channel::{Receiver, Sender};
 use rusqlite::Connection;
 use std::path::Path;
 use std::thread;
+use std::time::Duration;
+
+/// How long a connection waits for a lock before giving up as `SQLITE_BUSY`.
+/// WAL mode (see `schema::SCHEMA_SQL`) lets readers and writers coexist, but
+/// SQLite still allows only one writer at a time — and this database now has
+/// up to three independent writer processes (the daemon, and both VoWiFi
+/// agents, specs/014-vowifi-metrics-restore). Without this, a write that
+/// loses a brief race for the lock fails immediately instead of waiting for
+/// it, and a VoWiFi call completing at the same moment as an unrelated write
+/// elsewhere would be silently dropped from history rather than merely
+/// delayed by a few milliseconds.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Which path carried a call or SMS: the circuit-switched daemon, or one of
 /// the VoWiFi agents (specs/014-vowifi-metrics-restore). Persisted as the
@@ -63,10 +75,15 @@ impl StoreHandle {
 
         let conn = Connection::open(&path)
             .map_err(|e| BridgeError::Store(format!("failed to open store: {e}")))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| BridgeError::Store(format!("failed to set busy_timeout: {e}")))?;
         schema::init_schema(&conn)?;
 
         let read_conn = Connection::open(&path)
             .map_err(|e| BridgeError::Store(format!("failed to open read connection: {e}")))?;
+        read_conn
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| BridgeError::Store(format!("failed to set busy_timeout: {e}")))?;
 
         let (tx, rx): (Sender<StoreCommand>, Receiver<StoreCommand>) =
             crossbeam_channel::unbounded();

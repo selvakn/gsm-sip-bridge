@@ -22,6 +22,12 @@ const TRANSPORT_VOWIFI: &str = "vowifi";
 #[derive(Debug, Clone, Copy)]
 struct AgentRecord {
     last_report: Instant,
+    /// The `(epoch, seq)` of the last report actually *applied* (as opposed
+    /// to merely received) for this agent — see `AgentReport`'s doc comment.
+    /// A report whose `epoch` matches and whose `seq` is `<=` this is a
+    /// replay of an already-applied report (its acknowledgement was lost,
+    /// so the reporter retried it) and must not be applied twice.
+    last_applied: (u64, u64),
 }
 
 /// Keyed by `(agent kind, module_id)`, not just agent kind — with
@@ -39,25 +45,47 @@ fn liveness() -> &'static Mutex<HashMap<(AgentKind, String), AgentRecord>> {
 /// individual event is impossible by construction (the wire type is a
 /// closed Rust enum), and there is nothing else here that can go wrong in a
 /// way the caller needs to react to.
+///
+/// Idempotent per `(epoch, seq)`: a report that has already been applied —
+/// identified by matching `epoch` and a `seq` no greater than the last one
+/// applied — is a replay (the reporter retrying because it never saw this
+/// report's acknowledgement) and is skipped rather than double-applied.
+/// Liveness is still refreshed either way, since the retry itself proves the
+/// agent is alive.
 pub fn apply_report(report: &AgentReport) {
     let module_id = report.module_id.as_str();
+    let key = (report.agent, module_id.to_string());
+    let mut guard = liveness().lock().unwrap();
+    let existing = guard.get(&key);
 
-    apply_state(report.agent, module_id, &report.state);
+    let is_replay = existing.is_some_and(|record| {
+        record.last_applied.0 == report.epoch && report.seq <= record.last_applied.1
+    });
 
-    for event in &report.events {
-        apply_event(module_id, event);
+    if !is_replay {
+        apply_state(report.agent, module_id, &report.state);
+
+        for event in &report.events {
+            apply_event(module_id, event);
+        }
+
+        if report.dropped > 0 {
+            metrics::OBSERVABILITY_EVENTS_DROPPED_TOTAL
+                .with_label_values(&[report.agent.as_str(), module_id])
+                .inc_by(report.dropped as f64);
+        }
     }
 
-    if report.dropped > 0 {
-        metrics::OBSERVABILITY_EVENTS_DROPPED_TOTAL
-            .with_label_values(&[report.agent.as_str(), module_id])
-            .inc_by(report.dropped as f64);
-    }
-
-    liveness().lock().unwrap().insert(
-        (report.agent, module_id.to_string()),
+    let last_applied = if is_replay {
+        existing.unwrap().last_applied
+    } else {
+        (report.epoch, report.seq)
+    };
+    guard.insert(
+        key,
         AgentRecord {
             last_report: Instant::now(),
+            last_applied,
         },
     );
 }
@@ -181,6 +209,8 @@ mod tests {
         apply_report(&AgentReport {
             agent: AgentKind::Ims,
             module_id: "test-ingest-calls".to_string(),
+            epoch: 9001,
+            seq: 1,
             state: AgentState {
                 active_calls: Some(0),
                 ..Default::default()
@@ -203,15 +233,19 @@ mod tests {
         apply_report(&AgentReport {
             agent: AgentKind::Sip,
             module_id: "test-ingest-liveness".to_string(),
+            epoch: 9002,
+            seq: 1,
             state: AgentState::default(),
             events: vec![],
             dropped: 0,
         });
 
         let states = evaluate_liveness(std::time::Duration::from_secs(30));
-        let sip = states.iter().find(|s| s.agent == AgentKind::Sip).unwrap();
+        let sip = states
+            .iter()
+            .find(|s| s.agent == AgentKind::Sip && s.module_id == "test-ingest-liveness")
+            .unwrap();
         assert!(sip.up);
-        assert_eq!(sip.module_id, "test-ingest-liveness");
     }
 
     #[test]
@@ -223,6 +257,8 @@ mod tests {
         apply_report(&AgentReport {
             agent: AgentKind::Ims,
             module_id: "test-ingest-dropped".to_string(),
+            epoch: 9003,
+            seq: 1,
             state: AgentState::default(),
             events: vec![],
             dropped: 7,
@@ -232,5 +268,54 @@ mod tests {
             .with_label_values(&["ims", "test-ingest-dropped"])
             .get();
         assert_eq!(after, before + 7.0);
+    }
+
+    #[test]
+    fn test_replayed_report_is_not_applied_twice() {
+        let module_id = "test-ingest-replay".to_string();
+        let make_report = |seq: u64| AgentReport {
+            agent: AgentKind::Sip,
+            module_id: module_id.clone(),
+            epoch: 9004,
+            seq,
+            state: AgentState::default(),
+            events: vec![ObservedEvent::SmsReceived],
+            dropped: 0,
+        };
+
+        let before = metrics::SMS_RECEIVED_TOTAL
+            .with_label_values(&[&module_id, "vowifi"])
+            .get();
+
+        apply_report(&make_report(1));
+        // Same epoch, same seq — exactly what the reporter sends on a retry
+        // after a lost acknowledgement (contracts/observability-protocol.md).
+        apply_report(&make_report(1));
+
+        let after = metrics::SMS_RECEIVED_TOTAL
+            .with_label_values(&[&module_id, "vowifi"])
+            .get();
+        assert_eq!(
+            after,
+            before + 1.0,
+            "a replayed report (same epoch, non-advancing seq) must not double-count"
+        );
+
+        // A genuinely new report (seq advances) must still apply normally.
+        apply_report(&make_report(2));
+        let final_count = metrics::SMS_RECEIVED_TOTAL
+            .with_label_values(&[&module_id, "vowifi"])
+            .get();
+        assert_eq!(final_count, before + 2.0);
+
+        // A new epoch (agent restarted) must apply even with a lower seq —
+        // it is not a replay of anything the daemon has seen before.
+        let mut restarted = make_report(1);
+        restarted.epoch = 9005;
+        apply_report(&restarted);
+        let after_restart = metrics::SMS_RECEIVED_TOTAL
+            .with_label_values(&[&module_id, "vowifi"])
+            .get();
+        assert_eq!(after_restart, before + 3.0);
     }
 }

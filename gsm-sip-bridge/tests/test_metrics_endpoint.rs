@@ -50,11 +50,15 @@ fn init_all_metrics() {
     // VoWiFi-specific health (specs/014-vowifi-metrics-restore) — never
     // touched by the circuit-switched path, so these must be exercisable
     // (and absent from the disabled-path assertions below) independently.
-    metrics::VOWIFI_REGISTERED.with_label_values(&["test"]).set(0.0);
+    metrics::VOWIFI_REGISTERED
+        .with_label_values(&["test"])
+        .set(0.0);
     metrics::VOWIFI_REGISTRATIONS_TOTAL
         .with_label_values(&["test", "success"])
         .inc();
-    metrics::VOWIFI_TUNNEL_UP.with_label_values(&["test"]).set(0.0);
+    metrics::VOWIFI_TUNNEL_UP
+        .with_label_values(&["test"])
+        .set(0.0);
     metrics::VOWIFI_BRIDGE_FAILURES_TOTAL
         .with_label_values(&["test", "ring_timeout"])
         .inc();
@@ -71,8 +75,12 @@ fn init_all_metrics() {
 
 #[test]
 fn test_build_info_metric_has_labels() {
+    // Deliberately does not reset() BUILD_INFO before setting this test's own
+    // label combination: other tests in this file run concurrently against
+    // the same global registry and may be reading/setting it at the same
+    // time, so a reset() here would be a race that intermittently wipes
+    // their series out from under them.
     init_all_metrics();
-    metrics::BUILD_INFO.reset();
     metrics::BUILD_INFO
         .with_label_values(&["5.0.0", "abc1234", "2.16", "1.80.0"])
         .set(1.0);

@@ -95,12 +95,18 @@ durable per-call state and is well inside the spec's best-effort loss policy.
 
 ## R4. What survives the collector being unavailable? (FR-019 family)
 
-**Decision**: Each agent runs one `Reporter` — an unbounded-in-name-only channel
-feeding a bounded `VecDeque` (capacity **1024 reports**) drained by a dedicated
-sender thread. On send failure the report stays queued. When the queue is full
-the **oldest** report is discarded and a local `dropped` counter increments; that
-count rides along on the next successful report and becomes
-`gsm_sip_bridge_observability_events_dropped_total` on the daemon.
+**Decision**: Each agent runs one `Reporter` — a bounded `mpsc::sync_channel`
+(capacity **1024**, non-blocking `try_send` from the call site) feeding a
+bounded `VecDeque` (also capacity **1024**) drained by a dedicated sender
+thread. Both stages are bounded, not just the ring buffer: `send_one` can
+stall for up to `SOCKET_TIMEOUT` (2s) against a daemon that accepted the
+connection but never responds, and during that stall the ingress channel is
+the only thing standing between a burst of calls and unbounded memory growth.
+On send failure the report stays queued. When either stage is full the
+**oldest**/newest-rejected report is discarded and a local `dropped` counter
+increments; that count rides along on the next successful report and becomes
+`gsm_sip_bridge_observability_events_dropped_total` on the daemon, identically
+regardless of which stage the drop happened at.
 
 **Rationale**:
 
@@ -227,3 +233,28 @@ literally written. Values and panels are unaffected. See plan.md § Spec Delta.
 **Alternatives considered**: separate metric names for VoWiFi (rejected —
 existing panels would keep showing nothing, defeating FR-016); a new table for
 VoWiFi history (rejected by FR-010, and would double every query).
+
+---
+
+## R9. Concurrent SQLite writers across three processes (post-review addendum)
+
+**Decision**: `store::StoreHandle::open` sets `PRAGMA busy_timeout` (5s) on
+every connection it opens, both the writer-thread connection and the
+synchronous read connection.
+
+**Rationale**: this feature makes Agent A a *third* independent writer against
+the shared `calls`/`sms` database, alongside the daemon and Agent B. SQLite's
+WAL mode (already in use, `schema::SCHEMA_SQL`) lets readers and writers
+coexist without blocking each other, but still serializes writers against
+writers — with no `busy_timeout` set, a write that loses a brief race for that
+single-writer lock fails immediately as `SQLITE_BUSY` rather than waiting for
+it, and `store::writer_loop` does not retry, so the record is logged as an
+error and silently dropped. `busy_timeout` makes SQLite itself wait/retry
+internally for up to the timeout before giving up, which is the standard fix
+for exactly this shape of multi-process contention and requires no explicit
+retry logic in `writer_loop`.
+
+**Scope**: this gap predates this feature — the daemon and Agent B were
+already two independent writers before Agent A's history-writing was added —
+but its likelihood rises with a third writer, and it surfaced during review of
+this change, so the fix is included here rather than filed separately.
