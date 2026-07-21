@@ -25,6 +25,12 @@ db_path = "/data/store.db"
 
 [metrics]
 port = 9091
+# How often each VoWiFi agent (vowifi-ims-agent, vowifi-sip-agent) re-reports
+# its call/SMS/health state to this process over the control socket. Also
+# sets the staleness threshold (3x this) after which an agent that has
+# stopped reporting is marked down (gsm_sip_bridge_agent_up) and the gauges
+# it owns are zeroed. Ignored entirely when [vowifi].enabled is false.
+agent_report_interval_seconds = 10
 
 [modules]
 retry_interval_sec = 30        # range: 5-600

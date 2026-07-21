@@ -10,6 +10,31 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::thread;
 
+/// Which path carried a call or SMS: the circuit-switched daemon, or one of
+/// the VoWiFi agents (specs/014-vowifi-metrics-restore). Persisted as the
+/// `transport` column added by the schema v3 migration, and used as the
+/// Prometheus label of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Cs,
+    Vowifi,
+}
+
+impl Transport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Transport::Cs => "cs",
+            Transport::Vowifi => "vowifi",
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub enum StoreCommand {
     InsertCall(calls::CallRecord),
     InsertSms(sms::SmsRecord),

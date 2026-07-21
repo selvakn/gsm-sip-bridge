@@ -2,6 +2,7 @@ mod common;
 
 use gsm_sip_bridge::store::calls::{insert_call, CallRecord};
 use gsm_sip_bridge::store::schema::init_schema;
+use gsm_sip_bridge::store::Transport;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
@@ -21,6 +22,7 @@ fn test_store_survives_restart() {
             duration_seconds: 120.0,
             status: "answered".into(),
             sip_destination: "sip:200@pbx:5060".into(),
+            transport: Transport::Cs,
         };
         insert_call(&conn, &record).unwrap();
     }
@@ -39,6 +41,6 @@ fn test_store_survives_restart() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "2");
+        assert_eq!(schema_version, "3");
     }
 }

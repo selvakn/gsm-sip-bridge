@@ -100,6 +100,41 @@
         { "expr": "gsm_sip_bridge_sip_registered", "legendFormat": "registered" },
         { "expr": "rate(gsm_sip_bridge_sip_registrations_total[5m])", "legendFormat": "reg attempts {{status}}" }
       ]
+    },
+    {
+      "title": "VoWiFi Registration & Tunnel State",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [
+        { "expr": "gsm_sip_bridge_vowifi_registered", "legendFormat": "IMS registered" },
+        { "expr": "gsm_sip_bridge_vowifi_tunnel_up", "legendFormat": "ePDG tunnel up" },
+        { "expr": "rate(gsm_sip_bridge_vowifi_registrations_total[5m])", "legendFormat": "reg attempts {{status}}" }
+      ]
+    },
+    {
+      "title": "VoWiFi Bridge Failures",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [
+        { "expr": "rate(gsm_sip_bridge_vowifi_bridge_failures_total[5m])", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "title": "VoWiFi Agent Liveness",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "targets": [
+        { "expr": "gsm_sip_bridge_agent_up", "legendFormat": "{{agent}} up" },
+        { "expr": "gsm_sip_bridge_agent_last_report_seconds", "legendFormat": "{{agent}} age" }
+      ]
+    },
+    {
+      "title": "Observability Events Dropped",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
+      "targets": [
+        { "expr": "rate(gsm_sip_bridge_observability_events_dropped_total[5m])", "legendFormat": "{{agent}}" }
+      ]
     }
   ],
   "refresh": "10s",
@@ -110,5 +145,5 @@
   "time": { "from": "now-1h", "to": "now" },
   "title": "GSM-SIP Bridge",
   "uid": "gsm-sip-bridge-v5",
-  "version": 1
+  "version": 2
 }

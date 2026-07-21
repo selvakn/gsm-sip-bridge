@@ -14,18 +14,22 @@
 //! only the carrier-facing one needs IMS-AKA/Gm-IPsec, since the veth link
 //! is a private, trusted point-to-point connection between the two agents.
 
-use crate::config::VowifiConfig;
+use crate::control::protocol::{AgentKind, BridgeFailureReason, CallStatus, RegistrationStatus};
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::observability;
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_200_ok_bye, build_200_ok_invite,
     build_200_ok_message, build_486_busy_here, build_bye, build_uas_response, format_sip_addr,
     random_hex, spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
 };
+use crate::config::VowifiConfig;
 use crate::ims::ImsRegisterConfig;
-use crate::metrics;
+use crate::observability::reporter::Reporter;
+use crate::store::StoreHandle;
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
 use crate::vowifi::VETH_SIP_PORT;
+use chrono::Utc;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
@@ -77,13 +81,25 @@ const RENEWAL_HEADROOM: Duration = Duration::from_secs(300);
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 
-/// Entry point for the `vowifi-ims-agent` subcommand.
-/// `card_id` labels this line's `vowifi_tunnel_up`/`vowifi_registered`
-/// metrics (specs/013-multi-card-vowifi FR-017) — pass
+/// Entry point for the `vowifi-ims-agent` subcommand. `card_id` labels this
+/// line's metrics/history (specs/013-multi-card-vowifi FR-017) — pass
 /// `crate::vowifi::LEGACY_LINE_CARD_ID` for a deployment with no resolved
-/// line table (today's pre-multi-card behavior, `main.rs`).
-pub fn run(card_id: &str, config: &VowifiConfig) -> ExitCode {
-    match run_inner(card_id, config) {
+/// line table (today's pre-multi-card behavior, `main.rs`). `vowifi_config`
+/// is this line's settings — `&app_config.vowifi` with no `--line`, or a
+/// line-specific override read from the `discover` resolution file
+/// otherwise; `app_config` is still needed in full alongside it because
+/// restoring observability (specs/014-vowifi-metrics-restore) needs
+/// `[control].socket_path` (where to send reports),
+/// `[metrics].agent_report_interval_seconds` (how often), `[sms].db_path`
+/// (the shared call/SMS history database), and `[bridge].sip_destination`
+/// (recorded on every VoWiFi call row, the same destination Agent B dials)
+/// — none of which live in `VowifiConfig` itself.
+pub fn run(
+    card_id: &str,
+    vowifi_config: &VowifiConfig,
+    app_config: &crate::config::AppConfig,
+) -> ExitCode {
+    match run_inner(card_id, vowifi_config, app_config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -100,7 +116,11 @@ fn read_pcscf(path: &str) -> BridgeResult<IpAddr> {
         .map_err(|e| BridgeError::Ims(format!("invalid P-CSCF address in {path}: {e}")))
 }
 
-fn run_inner(card_id: &str, config: &VowifiConfig) -> BridgeResult<()> {
+fn run_inner(
+    card_id: &str,
+    config: &VowifiConfig,
+    app_config: &crate::config::AppConfig,
+) -> BridgeResult<()> {
     let pcscf_addr = read_pcscf(&config.pcscf_source_path)?;
     // Empty mcc/mnc means auto-derive (config::VowifiConfig::mcc docs). The
     // IMS realm is built from these, so derive them from the SIM the same
@@ -138,28 +158,60 @@ fn run_inner(card_id: &str, config: &VowifiConfig) -> BridgeResult<()> {
         .parse()
         .map_err(|e| BridgeError::Ims(format!("invalid vowifi control address: {e}")))?;
 
-    let mut session = super::register_session(&reg_cfg)?;
+    // Best-effort: a store that fails to open must not stop the agent from
+    // registering and carrying calls (FR-018) — VoWiFi call history is
+    // simply unavailable for this run, logged once here rather than on
+    // every insert attempt.
+    let history_store = match StoreHandle::open(std::path::Path::new(&app_config.sms.db_path)) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open call/SMS store; VoWiFi call history will not be recorded this run");
+            None
+        }
+    };
+    // `card_id` (specs/013-multi-card-vowifi) is the same
+    // `derive_module_id`-derived card identity `resolve_module_id_for_port`
+    // would otherwise re-derive from the modem port at every agent startup —
+    // main.rs already resolves it once, at discovery time, and passes it in,
+    // so it doubles as this line's observability module id (FR-011a).
+    let reporter = Reporter::spawn(
+        app_config.control.socket_path.clone(),
+        AgentKind::Ims,
+        card_id.to_string(),
+        Duration::from_secs(app_config.metrics.agent_report_interval_seconds),
+    );
+    let obs = observability::AgentObservability::new(
+        reporter,
+        card_id.to_string(),
+        history_store,
+        app_config.bridge.sip_destination.clone(),
+    );
+
+    let mut session = match super::register_session(&reg_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            obs.report_registration_attempt(map_registration_error(&e));
+            obs.set_registered(false);
+            obs.set_tunnel_up(false);
+            return Err(e);
+        }
+    };
     if session.status != 200 {
         let status = session.status;
         let reason = session.reason.clone();
+        obs.report_registration_attempt(map_registration_status_code(status));
+        obs.set_registered(false);
+        obs.set_tunnel_up(false);
         session.cleanup();
-        metrics::VOWIFI_REGISTERED
-            .with_label_values(&[card_id])
-            .set(0.0);
-        metrics::VOWIFI_TUNNEL_UP
-            .with_label_values(&[card_id])
-            .set(0.0);
         return Err(BridgeError::Ims(format!(
             "IMS registration failed: {status} {reason}"
         )));
     }
-    metrics::VOWIFI_REGISTERED
-        .with_label_values(&[card_id])
-        .set(1.0);
-    metrics::VOWIFI_TUNNEL_UP
-        .with_label_values(&[card_id])
-        .set(1.0);
     tracing::info!("vowifi-ims-agent registered, listening for inbound calls");
+    obs.report_registration_attempt(RegistrationStatus::Success);
+    obs.set_registered(true);
+    obs.set_tunnel_up(true);
+    obs.set_active_calls(0);
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection.
     let mut inbound = start_inbound(&session)?;
@@ -182,7 +234,6 @@ fn run_inner(card_id: &str, config: &VowifiConfig) -> BridgeResult<()> {
     }
 
     let result = dispatch_loop(
-        card_id,
         &mut session,
         &mut inbound,
         &reg_cfg,
@@ -190,9 +241,35 @@ fn run_inner(card_id: &str, config: &VowifiConfig) -> BridgeResult<()> {
         control_addr,
         veth_local_ip,
         config.wideband,
+        &obs,
     );
     session.cleanup();
     result
+}
+
+/// Best-effort classification of a registration failure's `BridgeError`
+/// message into one of the four closed `RegistrationStatus` values
+/// (FR-014) — `register_session`/`attempt_renewal` don't return a
+/// structured failure category, so this is a substring heuristic over the
+/// error text rather than an exhaustive mapping.
+fn map_registration_error(e: &BridgeError) -> RegistrationStatus {
+    let msg = e.to_string().to_ascii_lowercase();
+    if msg.contains("auth") || msg.contains("aka") || msg.contains("challenge") {
+        RegistrationStatus::AuthFailed
+    } else if msg.contains("timeout") || msg.contains("timed out") {
+        RegistrationStatus::Timeout
+    } else {
+        RegistrationStatus::Rejected
+    }
+}
+
+/// Maps a SIP REGISTER final-response status code onto `RegistrationStatus`.
+fn map_registration_status_code(status: u16) -> RegistrationStatus {
+    match status {
+        401 | 403 | 407 => RegistrationStatus::AuthFailed,
+        408 | 504 => RegistrationStatus::Timeout,
+        _ => RegistrationStatus::Rejected,
+    }
 }
 
 /// Every SIP message the network sends us, from either of the two
@@ -511,6 +588,12 @@ struct ActiveCall {
     /// What's needed to hang up on the carrier ourselves, captured from the
     /// INVITE while we still had it.
     dialog: DialogInfo,
+    /// Observability bookkeeping (specs/014-vowifi-metrics-restore): who
+    /// called and when the call was answered, needed at hangup time to
+    /// report `CallCompleted`/write the history row.
+    caller: String,
+    answered_at: chrono::DateTime<Utc>,
+    answered_instant: Instant,
 }
 
 /// The dialog state needed to send an in-dialog request (a `BYE`) on a call we
@@ -582,7 +665,6 @@ fn respond(sink: &SipSink, what: &str, message: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_loop(
-    card_id: &str,
     session: &mut super::RegisteredSession,
     inbound: &mut Inbound,
     reg_cfg: &ImsRegisterConfig,
@@ -590,6 +672,7 @@ fn dispatch_loop(
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
     wideband: bool,
+    obs: &observability::AgentObservability,
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
     let mut backoff = RETRY_INITIAL_BACKOFF;
@@ -612,6 +695,7 @@ fn dispatch_loop(
             match call.ctrl_rx.try_recv() {
                 Ok(ControlMessage::CallEnded { reason, .. }) => {
                     let call = active_call.take().expect("just matched Some");
+                    report_answered_call_ended(obs, &call);
                     hangup_carrier(session, call, &reason);
                     continue;
                 }
@@ -622,6 +706,7 @@ fn dispatch_loop(
                     // Agent B is gone; we can't keep a half-bridged call up.
                     let call = active_call.take().expect("just matched Some");
                     tracing::warn!(call_id = %call.call_id, "Agent B's control connection dropped mid-call");
+                    report_answered_call_ended(obs, &call);
                     hangup_carrier(session, call, reason::TRANSPORT_ERROR);
                     continue;
                 }
@@ -641,6 +726,12 @@ fn dispatch_loop(
                 if active_call.is_some() {
                     tracing::info!("declining inbound call: another VoWiFi call is already active");
                     let _ = sink.send(&build_486_busy_here(&req, &random_hex(4)));
+                    obs.report_call_not_answered(
+                        CallStatus::Failed,
+                        BridgeFailureReason::BridgeSetupFailed,
+                        &extract_caller(&req),
+                        Utc::now(),
+                    );
                     continue;
                 }
                 match handle_invite(
@@ -651,14 +742,31 @@ fn dispatch_loop(
                     control_addr,
                     veth_local_ip,
                     wideband,
+                    obs,
                 ) {
-                    Ok(call) => active_call = call,
-                    Err(e) => tracing::warn!(error = %e, "failed to handle inbound INVITE"),
+                    Ok(call) => {
+                        if call.is_some() {
+                            obs.set_active_calls(1);
+                        }
+                        active_call = call;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to handle inbound INVITE");
+                        obs.report_call_not_answered(
+                            CallStatus::Failed,
+                            BridgeFailureReason::AgentUnreachable,
+                            &extract_caller(&req),
+                            Utc::now(),
+                        );
+                    }
                 }
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "BYE" => {
                 match active_call.take() {
-                    Some(call) => handle_bye(&sink, &req, call),
+                    Some(call) => {
+                        report_answered_call_ended(obs, &call);
+                        handle_bye(&sink, &req, call);
+                    }
                     None => {
                         let _ = sink.send(&build_200_ok_bye(&req, &random_hex(4)));
                     }
@@ -732,15 +840,12 @@ fn dispatch_loop(
                             SystemTime::now() + Duration::from_secs(super::DEFAULT_EXPIRES as u64),
                         );
                         drop(guard);
-                        metrics::VOWIFI_REGISTERED
-                            .with_label_values(&[card_id])
-                            .set(1.0);
-                        metrics::VOWIFI_TUNNEL_UP
-                            .with_label_values(&[card_id])
-                            .set(1.0);
                         backoff = RETRY_INITIAL_BACKOFF;
                         next_renewal_attempt = None;
                         tracing::info!("registration renewed");
+                        obs.report_registration_attempt(RegistrationStatus::Success);
+                        obs.set_registered(true);
+                        obs.set_tunnel_up(true);
                         subscribe_reg_event(session);
                     }
                     Err(e) => {
@@ -749,16 +854,13 @@ fn dispatch_loop(
                             retry_in_secs = backoff.as_secs(),
                             "registration renewal failed, retrying with backoff"
                         );
+                        obs.report_registration_attempt(map_registration_error(&e));
+                        obs.set_registered(false);
+                        obs.set_tunnel_up(false);
                         let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
                         guard.state = super::RegistrationState::Failed;
                         guard.last_failure = Some((SystemTime::now(), e.to_string()));
                         drop(guard);
-                        metrics::VOWIFI_REGISTERED
-                            .with_label_values(&[card_id])
-                            .set(0.0);
-                        metrics::VOWIFI_TUNNEL_UP
-                            .with_label_values(&[card_id])
-                            .set(0.0);
                         // Not a blocking sleep: the loop keeps dispatching
                         // inbound SIP every iteration in the meantime (see
                         // `next_renewal_attempt`'s doc comment above).
@@ -769,6 +871,19 @@ fn dispatch_loop(
             }
         }
     }
+}
+
+/// Reports an answered call ending — `CallCompleted{Answered}`, the history
+/// row, and `active_calls` back to 0 — shared by every path that can end an
+/// `ActiveCall` (carrier `BYE`, PBX-originated `CallEnded`, Agent B's
+/// control connection dropping mid-call).
+fn report_answered_call_ended(obs: &observability::AgentObservability, call: &ActiveCall) {
+    obs.report_call_answered_and_ended(
+        &call.caller,
+        call.answered_at,
+        call.answered_instant.elapsed().as_secs_f64(),
+    );
+    obs.set_active_calls(0);
 }
 
 fn extract_caller(req: &SipRequest) -> String {
@@ -785,6 +900,7 @@ fn extract_caller(req: &SipRequest) -> String {
 /// Agent B couldn't bridge it) — every decline path sends a fast, explicit
 /// `486 Busy Here` per the spec's Clarifications answer, never silence or
 /// unanswered ringing (FR-009/FR-010).
+#[allow(clippy::too_many_arguments)]
 fn handle_invite(
     session: &super::RegisteredSession,
     req: &SipRequest,
@@ -793,9 +909,11 @@ fn handle_invite(
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
     wideband: bool,
+    obs: &observability::AgentObservability,
 ) -> BridgeResult<Option<ActiveCall>> {
     let call_id = req.header("Call-ID").unwrap_or_default().to_string();
     let caller = extract_caller(req);
+    let started_at = Utc::now();
     tracing::info!(
         call_id = %call_id,
         caller = %caller,
@@ -820,6 +938,12 @@ fn handle_invite(
             "offer has no codec we can answer with; declining"
         );
         sink.send(&build_486_busy_here(req, &random_hex(4)))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
         return Ok(None);
     };
 
@@ -859,7 +983,7 @@ fn handle_invite(
         &mut control,
         &ControlMessage::IncomingCall {
             call_id: call_id.clone(),
-            caller,
+            caller: caller.clone(),
         },
     )
     .map_err(BridgeError::Ims)?;
@@ -910,7 +1034,15 @@ fn handle_invite(
             // since the caller may give up (`CANCEL`) while it rings.
             match await_pbx_answer(&call_id, &ctrl_rx, inbound, req, &to_tag, sink)? {
                 RingOutcome::Answered => {}
-                RingOutcome::PbxDeclined => return Ok(None),
+                RingOutcome::PbxDeclined => {
+                    obs.report_call_not_answered(
+                        CallStatus::Missed,
+                        BridgeFailureReason::PbxDeclined,
+                        &caller,
+                        started_at,
+                    );
+                    return Ok(None);
+                }
                 RingOutcome::Abandoned { reason } => {
                     // Agent B is still ringing the extension — stop it.
                     let _ = write_msg(
@@ -919,6 +1051,12 @@ fn handle_invite(
                             call_id: call_id.clone(),
                             reason: reason.to_string(),
                         },
+                    );
+                    obs.report_call_not_answered(
+                        CallStatus::Missed,
+                        observability::map_bridge_failure_reason(reason),
+                        &caller,
+                        started_at,
                     );
                     return Ok(None);
                 }
@@ -965,6 +1103,9 @@ fn handle_invite(
                 dialog: DialogInfo::from_invite(req, &to_tag, session),
                 call_id,
                 to_tag,
+                caller,
+                answered_at: Utc::now(),
+                answered_instant: Instant::now(),
             }))
         }
         ControlMessage::BridgeFailed {
@@ -973,6 +1114,12 @@ fn handle_invite(
         } => {
             tracing::info!(call_id = %call_id, reason = %fail_reason, "Agent B could not bridge the call, declining");
             sink.send(&build_486_busy_here(req, &random_hex(4)))?;
+            obs.report_call_not_answered(
+                CallStatus::Failed,
+                observability::map_bridge_failure_reason(&fail_reason),
+                &caller,
+                started_at,
+            );
             Ok(None)
         }
         other => Err(BridgeError::Ims(format!(

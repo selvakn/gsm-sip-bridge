@@ -30,7 +30,7 @@ const SIP_KEYS: &[&str] = &[
 ];
 const BRIDGE_KEYS: &[&str] = &["sip_destination", "sip_dial_timeout_sec"];
 const SMS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "db_path"];
-const METRICS_KEYS: &[&str] = &["port"];
+const METRICS_KEYS: &[&str] = &["port", "agent_report_interval_seconds"];
 const MODULES_KEYS: &[&str] = &["retry_interval_sec", "max_concurrent"];
 const RESILIENCE_KEYS: &[&str] = &[
     "initial_backoff_sec",
@@ -136,6 +136,11 @@ pub struct SmsConfig {
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {
     pub port: u16,
+    /// How often each VoWiFi agent re-reports its state
+    /// (specs/014-vowifi-metrics-restore). Also sets the staleness
+    /// threshold (3x this) after which `metrics::server` marks an agent
+    /// down and zeros the gauges it owns.
+    pub agent_report_interval_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -903,6 +908,7 @@ fn parse_sms(root: &toml::map::Map<String, Value>) -> BridgeResult<SmsConfig> {
 
 fn parse_metrics(root: &toml::map::Map<String, Value>) -> BridgeResult<MetricsConfig> {
     let mut port = 9091u16;
+    let mut agent_report_interval_seconds = 10u64;
     if let Some(val) = root.get("metrics") {
         let t = val
             .as_table()
@@ -911,8 +917,15 @@ fn parse_metrics(root: &toml::map::Map<String, Value>) -> BridgeResult<MetricsCo
         if let Some(v) = t.get("port") {
             port = as_u16_port(v, "metrics.port")?;
         }
+        if let Some(v) = t.get("agent_report_interval_seconds") {
+            agent_report_interval_seconds =
+                as_u64_range(v, "metrics.agent_report_interval_seconds", false, 1..=3600)?;
+        }
     }
-    Ok(MetricsConfig { port })
+    Ok(MetricsConfig {
+        port,
+        agent_report_interval_seconds,
+    })
 }
 
 fn parse_modules(root: &toml::map::Map<String, Value>) -> BridgeResult<ModulesConfig> {

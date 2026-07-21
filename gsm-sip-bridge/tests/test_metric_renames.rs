@@ -4,15 +4,17 @@ use gsm_sip_bridge::metrics;
 
 fn init_metrics() {
     metrics::CALLS_TOTAL
-        .with_label_values(&["test", "answered"])
+        .with_label_values(&["test", "answered", "cs"])
         .inc();
     metrics::SIP_CALLS_TOTAL
-        .with_label_values(&["test", "success"])
+        .with_label_values(&["test", "success", "cs"])
         .inc();
     metrics::CALL_DURATION_SECONDS
-        .with_label_values(&["test"])
+        .with_label_values(&["test", "cs"])
         .observe(1.0);
-    metrics::ACTIVE_CALLS.with_label_values(&["test"]).set(0.0);
+    metrics::ACTIVE_CALLS
+        .with_label_values(&["test", "cs"])
+        .set(0.0);
     metrics::SIP_REGISTRATIONS_TOTAL
         .with_label_values(&["success"])
         .inc();
@@ -29,10 +31,10 @@ fn init_metrics() {
         .with_label_values(&["test", "underrun"])
         .inc();
     metrics::SMS_RECEIVED_TOTAL
-        .with_label_values(&["test"])
+        .with_label_values(&["test", "cs"])
         .inc();
     metrics::SMS_FORWARDED_TOTAL
-        .with_label_values(&["test", "sent"])
+        .with_label_values(&["test", "sent", "cs"])
         .inc();
     metrics::SMS_DB_WRITES_TOTAL
         .with_label_values(&["success"])

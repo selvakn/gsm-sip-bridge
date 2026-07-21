@@ -1175,6 +1175,16 @@ impl CardPool {
                     )));
                 }
             }
+
+            ControlCmd::Observe { .. } => {
+                // `control::server::handle_connection` applies this to the
+                // metrics registry directly and never forwards it here — an
+                // Observe reaching CardPool would mean that short-circuit
+                // regressed (specs/014-vowifi-metrics-restore).
+                let _ = reply.send(ControlResp::err(
+                    "observe commands are handled by the control server, not CardPool",
+                ));
+            }
         }
     }
 
@@ -1245,11 +1255,11 @@ impl CardPool {
                         "SIP outbound call failed"
                     );
                     metrics::SIP_CALLS_TOTAL
-                        .with_label_values(&[&module_id, "error"])
+                        .with_label_values(&[&module_id, "error", "cs"])
                         .inc();
                 } else {
                     metrics::SIP_CALLS_TOTAL
-                        .with_label_values(&[&module_id, "initiated"])
+                        .with_label_values(&[&module_id, "initiated", "cs"])
                         .inc();
                 }
             }
@@ -1274,6 +1284,8 @@ impl CardPool {
                     sender,
                     body,
                     received_at,
+                    crate::store::Transport::Cs,
+                    None,
                 );
             }
         }
@@ -1331,7 +1343,7 @@ fn run_module_loop(
 
     tracing::info!(module = %module.id, "module worker started, monitoring for events");
     metrics::ACTIVE_CALLS
-        .with_label_values(&[&module.id])
+        .with_label_values(&[&module.id, "cs"])
         .set(0.0);
 
     loop {
@@ -1454,7 +1466,7 @@ fn handle_ring(
     tracing::info!(module = %module.id, "incoming call (RING)");
     card.state = CardState::Ringing;
     metrics::CALLS_TOTAL
-        .with_label_values(&[&module.id, "incoming"])
+        .with_label_values(&[&module.id, "incoming", "cs"])
         .inc();
 
     let caller_id = extract_caller_id(at);
@@ -1482,17 +1494,17 @@ fn handle_ring(
 
             card.state = CardState::Bridged;
             metrics::ACTIVE_CALLS
-                .with_label_values(&[&module.id])
+                .with_label_values(&[&module.id, "cs"])
                 .set(1.0);
             metrics::CALLS_TOTAL
-                .with_label_values(&[&module.id, "answered"])
+                .with_label_values(&[&module.id, "answered", "cs"])
                 .inc();
         }
         Err(e) => {
             tracing::error!(module = %module.id, error = %e, "failed to answer call");
             card.state = CardState::Idle;
             metrics::CALLS_TOTAL
-                .with_label_values(&[&module.id, "missed"])
+                .with_label_values(&[&module.id, "missed", "cs"])
                 .inc();
         }
     }
@@ -1553,7 +1565,7 @@ fn record_call_end(
             .num_seconds() as f64;
 
         metrics::CALL_DURATION_SECONDS
-            .with_label_values(&[module_id])
+            .with_label_values(&[module_id, "cs"])
             .observe(duration);
 
         let record = CallRecord {
@@ -1563,6 +1575,7 @@ fn record_call_end(
             duration_seconds: duration,
             status: status.to_string(),
             sip_destination: ctx.sip_destination,
+            transport: crate::store::Transport::Cs,
         };
         if let Err(e) = store_tx.send(StoreCommand::InsertCall(record)) {
             tracing::error!(error = %e, "failed to send call record to store");
@@ -1578,7 +1591,7 @@ fn handle_cmti(
 ) {
     tracing::info!(module = %module.id, notification = line, "SMS notification received");
     metrics::SMS_RECEIVED_TOTAL
-        .with_label_values(&[&module.id])
+        .with_label_values(&[&module.id, "cs"])
         .inc();
 
     if let Some(idx_str) = line.split(',').next_back() {

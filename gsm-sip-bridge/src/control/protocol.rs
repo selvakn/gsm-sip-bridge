@@ -5,10 +5,176 @@ use std::io::{BufRead, Write};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlCmd {
-    CardRestart { slot: u32 },
-    SetMode { slot: u32, mode: String },
-    GetMode { slot: u32 },
+    CardRestart {
+        slot: u32,
+    },
+    SetMode {
+        slot: u32,
+        mode: String,
+    },
+    GetMode {
+        slot: u32,
+    },
     ListSlots,
+    /// A VoWiFi agent (`ims::agent` or `vowifi::mod`) reporting call/SMS
+    /// events and current gauge state (specs/014-vowifi-metrics-restore).
+    /// Routed straight to `metrics::ingest::apply_report` by
+    /// `control::server::handle_connection`, never reaching `CardPool`'s
+    /// mailbox — see contracts/observability-protocol.md.
+    Observe {
+        report: AgentReport,
+    },
+}
+
+/// Which VoWiFi agent sent an `AgentReport`. Liveness (`AGENT_UP`) is
+/// tracked per kind, independently of `module_id` — a card can be replaced
+/// or fail to resolve, but the agent process identity is always one of
+/// these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    /// Agent A: `ims::agent`, runs inside the ePDG tunnel's `ims` netns.
+    Ims,
+    /// Agent B: `vowifi::mod`, runs in the default netns.
+    Sip,
+}
+
+impl AgentKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentKind::Ims => "ims",
+            AgentKind::Sip => "sip",
+        }
+    }
+}
+
+/// One message an agent sends over the observability protocol: absolute
+/// gauge state (always present, which is what makes an empty-`events`
+/// report a heartbeat) plus zero or more counter deltas since the last
+/// successfully delivered report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentReport {
+    pub agent: AgentKind,
+    pub module_id: String,
+    pub state: AgentState,
+    #[serde(default)]
+    pub events: Vec<ObservedEvent>,
+    #[serde(default)]
+    pub dropped: u64,
+}
+
+/// Absolute, latest-wins gauge state. `None` means "this agent does not
+/// report this signal" — distinct from `Some(false)`, which means "reports
+/// it, and it is currently down". The daemon never invents a value for
+/// `None` (data-model.md §1).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct AgentState {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tunnel_up: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pbx_registered: Option<bool>,
+}
+
+/// A counter delta or histogram observation. Every enumerated field below is
+/// a closed Rust enum rather than a free string — the mechanism that keeps
+/// metric label cardinality bounded regardless of what an agent observes
+/// (FR-014).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ObservedEvent {
+    CallCompleted {
+        status: CallStatus,
+        duration_seconds: f64,
+    },
+    PbxLegCompleted {
+        outcome: SmsOutcome,
+    },
+    BridgeFailed {
+        reason: BridgeFailureReason,
+    },
+    SmsReceived,
+    SmsForwarded {
+        outcome: SmsOutcome,
+    },
+    RegistrationAttempt {
+        status: RegistrationStatus,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallStatus {
+    Answered,
+    Missed,
+    Failed,
+}
+
+impl CallStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CallStatus::Answered => "answered",
+            CallStatus::Missed => "missed",
+            CallStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Reused for both `PbxLegCompleted`'s outcome (`success`/`failed`, matching
+/// `modules::mod`'s existing `SIP_CALLS_TOTAL` status values) and
+/// `SmsForwarded`'s outcome (`sent`/`failed`, matching the existing
+/// `SMS_FORWARDED_TOTAL` values) — same two-value shape, different label
+/// vocabulary per call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmsOutcome {
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeFailureReason {
+    BridgeSetupFailed,
+    RingTimeout,
+    CallerCancelled,
+    PbxDeclined,
+    AgentUnreachable,
+}
+
+impl BridgeFailureReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BridgeFailureReason::BridgeSetupFailed => "bridge_setup_failed",
+            BridgeFailureReason::RingTimeout => "ring_timeout",
+            BridgeFailureReason::CallerCancelled => "caller_cancelled",
+            BridgeFailureReason::PbxDeclined => "pbx_declined",
+            BridgeFailureReason::AgentUnreachable => "agent_unreachable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationStatus {
+    Success,
+    AuthFailed,
+    Rejected,
+    Timeout,
+}
+
+impl RegistrationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RegistrationStatus::Success => "success",
+            RegistrationStatus::AuthFailed => "auth_failed",
+            RegistrationStatus::Rejected => "rejected",
+            RegistrationStatus::Timeout => "timeout",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

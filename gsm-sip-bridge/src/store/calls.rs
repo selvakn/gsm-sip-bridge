@@ -1,4 +1,5 @@
 use crate::error::BridgeResult;
+use crate::store::Transport;
 use rusqlite::Connection;
 
 #[derive(Debug, Clone)]
@@ -9,11 +10,12 @@ pub struct CallRecord {
     pub duration_seconds: f64,
     pub status: String,
     pub sip_destination: String,
+    pub transport: Transport,
 }
 
 pub fn insert_call(conn: &Connection, record: &CallRecord) -> BridgeResult<()> {
     conn.execute(
-        "INSERT INTO calls (module_id, caller_id, started_at, duration_seconds, status, sip_destination) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO calls (module_id, caller_id, started_at, duration_seconds, status, sip_destination, transport) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             record.module_id,
             record.caller_id,
@@ -21,6 +23,7 @@ pub fn insert_call(conn: &Connection, record: &CallRecord) -> BridgeResult<()> {
             record.duration_seconds,
             record.status,
             record.sip_destination,
+            record.transport.as_str(),
         ],
     )?;
     Ok(())

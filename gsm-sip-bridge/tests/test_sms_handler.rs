@@ -4,6 +4,7 @@ use gsm_sip_bridge::store::schema::init_schema;
 use gsm_sip_bridge::store::sms::{
     insert_sms, update_sms_forwarding, SmsForwardingUpdate, SmsRecord,
 };
+use gsm_sip_bridge::store::Transport;
 use rusqlite::Connection;
 
 fn mem_db() -> Connection {
@@ -22,6 +23,7 @@ fn test_sms_full_path_persist_then_forward() {
         body: "Test message".into(),
         received_at: "2026-05-04T20:00:00Z".into(),
         forwarding_status: "pending".into(),
+        transport: Transport::Cs,
     };
     insert_sms(&conn, &record).unwrap();
 
@@ -62,6 +64,7 @@ fn test_sms_discord_unreachable_marks_failed() {
         body: "Another message".into(),
         received_at: "2026-05-04T21:00:00Z".into(),
         forwarding_status: "pending".into(),
+        transport: Transport::Cs,
     };
     insert_sms(&conn, &record).unwrap();
     let id: i64 = conn.last_insert_rowid();
@@ -95,6 +98,7 @@ fn test_sms_disabled_skips_forwarding() {
         body: "Skipped".into(),
         received_at: "2026-05-04T22:00:00Z".into(),
         forwarding_status: "skipped".into(),
+        transport: Transport::Cs,
     };
     insert_sms(&conn, &record).unwrap();
 
