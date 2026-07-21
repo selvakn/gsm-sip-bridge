@@ -1390,7 +1390,7 @@ fn run_module_loop(
             record_call_end(&module.id, &store_tx, &mut call_ctx, "answered");
             card.state = CardState::Idle;
             metrics::ACTIVE_CALLS
-                .with_label_values(&[&module.id])
+                .with_label_values(&[&module.id, "cs"])
                 .set(0.0);
         }
 
@@ -1541,7 +1541,7 @@ fn handle_hangup(
     if card.state == CardState::Bridged || card.state == CardState::Answering {
         tracing::info!(module = %module.id, "call ended (NO CARRIER)");
         metrics::ACTIVE_CALLS
-            .with_label_values(&[&module.id])
+            .with_label_values(&[&module.id, "cs"])
             .set(0.0);
         let _ = event_tx.send(BridgeEvent::Hangup {
             module_id: module.id.clone(),

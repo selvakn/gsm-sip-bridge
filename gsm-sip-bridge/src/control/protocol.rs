@@ -52,10 +52,24 @@ impl AgentKind {
 /// gauge state (always present, which is what makes an empty-`events`
 /// report a heartbeat) plus zero or more counter deltas since the last
 /// successfully delivered report.
+///
+/// `epoch`/`seq` make a report idempotent to replay: the reporter's
+/// send/retry loop is single-threaded per agent (one report in flight at a
+/// time), so if the daemon applies a report but the acknowledgement is lost
+/// — a torn connection right as the response was written — the reporter
+/// retries the *same* report rather than knowing it already landed. `seq` is
+/// a per-agent-process counter assigned once when a report is enqueued and
+/// kept across retries of that same report; `epoch` is a random value fixed
+/// for the reporter's process lifetime, so a restarted agent's `seq`
+/// resetting to 1 is never mistaken for a replay of a previous run's
+/// already-applied `seq` values (`metrics::ingest` only compares `seq`
+/// within a matching `epoch`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentReport {
     pub agent: AgentKind,
     pub module_id: String,
+    pub epoch: u64,
+    pub seq: u64,
     pub state: AgentState,
     #[serde(default)]
     pub events: Vec<ObservedEvent>,

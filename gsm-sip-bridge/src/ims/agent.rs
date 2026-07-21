@@ -14,6 +14,7 @@
 //! only the carrier-facing one needs IMS-AKA/Gm-IPsec, since the veth link
 //! is a private, trusted point-to-point connection between the two agents.
 
+use crate::config::VowifiConfig;
 use crate::control::protocol::{AgentKind, BridgeFailureReason, CallStatus, RegistrationStatus};
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::observability;
@@ -23,7 +24,6 @@ use crate::ims::sip_client::{
     build_200_ok_message, build_486_busy_here, build_bye, build_uas_response, format_sip_addr,
     random_hex, spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
 };
-use crate::config::VowifiConfig;
 use crate::ims::ImsRegisterConfig;
 use crate::observability::reporter::Reporter;
 use crate::store::StoreHandle;

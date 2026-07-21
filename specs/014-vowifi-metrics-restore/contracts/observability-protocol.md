@@ -23,6 +23,8 @@ leaves the socket's path visible in the shared mount tree.
   "report": {
     "agent": "ims",
     "module_id": "ec20-A1B2C3",
+    "epoch": 7461920385609324441,
+    "seq": 42,
     "state": {
       "active_calls": 1,
       "registered": true,
@@ -45,6 +47,8 @@ A heartbeat with nothing to report is the same message with `"events": []`.
 |---|---|---|---|
 | `agent` | yes | `"ims"` \| `"sip"` | Liveness is tracked per agent kind |
 | `module_id` | yes | string | Label applied to every metric this report feeds |
+| `epoch` | yes | integer | Random, fixed for the reporting process's lifetime — see "Delivery semantics" |
+| `seq` | yes | integer | Monotonic per `epoch`, assigned once when the report is enqueued and unchanged across retries |
 | `state` | yes | object | Absolute gauge values; presence is what makes this a heartbeat |
 | `state.active_calls` | no | integer ≥ 0 | Omitted by agents that do not own call state |
 | `state.registered` | no | boolean | Omitted ⇒ this agent does not report it (≠ `false`) |
@@ -95,16 +99,25 @@ for a parse rejection, which is a permanent failure and is discarded immediately
 
 ## Delivery semantics
 
-- **At-most-once per report, with retry.** A report that is written but whose
-  response is lost will be retried, so a counter delta can in principle be
-  applied twice. This is accepted: the window is a torn connection during the
-  daemon's own restart, and the spec's loss policy is explicitly best-effort. It
-  is bounded and far smaller than the loss it replaces.
-- **No ordering guarantee** between reports. Counter deltas commute, and gauge
-  state is absolute-and-latest-wins, so out-of-order arrival is harmless. The
-  daemon applies gauges unconditionally rather than trying to detect staleness.
-- **Buffer bound**: 1024 reports per agent, discarding oldest-first. See
-  research.md § R4.
+- **Effectively-once per report, via `(epoch, seq)`.** The reporter sends one
+  report at a time per agent (never concurrently), so a retry after a lost
+  acknowledgement is always a retry of the *same* report, carrying the *same*
+  `epoch`/`seq` it was assigned at enqueue time. The daemon tracks the last
+  `(epoch, seq)` it actually applied per agent kind; a report whose `epoch`
+  matches and whose `seq` is no greater is recognised as a replay and is
+  acknowledged `ok` without being re-applied. `epoch` is regenerated randomly
+  on every agent process start specifically so a restarted agent's `seq`
+  resetting to 1 is never mistaken for a replay of a previous run's already-
+  applied values — a new `epoch` always applies, regardless of `seq`.
+- **No ordering guarantee** between reports from *different* connections, but
+  within one agent's lifetime `seq` is strictly increasing in the order
+  reports were enqueued, which is what the replay check above relies on.
+  Gauge state is separately still applied absolute-and-latest-wins.
+- **Buffer bound**: 1024 reports at both the agent's ingress channel (a report
+  `try_send` can't even hand to the worker) and its ring buffer (a report the
+  worker couldn't deliver in time), discarding oldest-first at each stage
+  independently. Either kind of drop is folded into the next delivered
+  report's `dropped` field identically. See research.md § R4.
 
 ---
 
