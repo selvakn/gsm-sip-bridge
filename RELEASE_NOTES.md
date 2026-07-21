@@ -1,5 +1,16 @@
 # Release Notes
 
+## v6.3.0
+
+Multi-card VoWiFi, and Grafana call/SMS metrics restored on that path.
+
+- **VoWiFi now supports multiple SIMs concurrently** (`specs/013-multi-card-vowifi`), matching the capability the circuit-switched USB-audio path has had since feature 004. Attach several VoWiFi-capable modems and the system auto-discovers each one's AT-command interface, runs one ePDG tunnel/IMS registration per SIM (a "line"), and bridges inbound calls and SMS from all of them concurrently — no more hand-typing a single serial port in config. A new `discover` CLI subcommand scans once and writes the resolved line list; `vowifi-ims-agent` takes a `--line N` flag to run a specific one. `[vowifi].max_lines` caps how many the scanner will bring up (default 8), and `[[vowifi.line]]` entries let an operator pin or override individual lines. If VoWiFi is enabled but discovery finds no usable modem, the subsystem now degrades and logs loudly instead of crash-looping the whole container.
+- **Grafana's call and SMS panels stopped updating for VoWiFi traffic when the v6.0.0 split moved calls onto two separate agent processes** (`specs/014-vowifi-metrics-restore`) — only the main daemon's registry was ever scraped, and neither agent exported metrics or wrote to the `calls`/`sms` tables, so VoWiFi activity was invisible to both Grafana and sqlite-web call history even though the bridge itself worked. Both agents now forward call/SMS/registration events over the existing control socket to the daemon's single Prometheus registry and SQLite store, tagged per-line via the same card identifier `discover` assigns. Existing circuit-switched metrics are unchanged in value, gaining only a `transport="cs"|"vowifi"` label. New: per-line IMS registration and ePDG tunnel-state gauges, bridge-failure-reason counters (ring timeout, PBX decline, caller cancel, agent unreachable), and an `agent_up`/`agent_last_report_seconds` liveness pair so a crashed or silent agent is visible before its next supervised restart, without ever double-counting across a restart.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:6.3.0
+```
+
 ## v6.2.0
 
 VoWiFi on a VoLTE-capable modem, and two failures that made it look like the SIM or the modem was at fault.
