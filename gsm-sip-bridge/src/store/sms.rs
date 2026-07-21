@@ -1,4 +1,5 @@
 use crate::error::BridgeResult;
+use crate::store::Transport;
 use rusqlite::Connection;
 
 #[derive(Debug, Clone)]
@@ -8,6 +9,7 @@ pub struct SmsRecord {
     pub body: String,
     pub received_at: String,
     pub forwarding_status: String,
+    pub transport: Transport,
 }
 
 #[derive(Debug, Clone)]
@@ -29,13 +31,14 @@ pub struct SmsForwardingByTimeUpdate {
 
 pub fn insert_sms(conn: &Connection, record: &SmsRecord) -> BridgeResult<()> {
     conn.execute(
-        "INSERT INTO sms (module_id, sender, body, received_at, forwarding_status) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO sms (module_id, sender, body, received_at, forwarding_status, transport) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             record.module_id,
             record.sender,
             record.body,
             record.received_at,
             record.forwarding_status,
+            record.transport.as_str(),
         ],
     )?;
     Ok(())

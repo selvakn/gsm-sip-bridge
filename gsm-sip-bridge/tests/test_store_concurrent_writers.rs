@@ -3,6 +3,7 @@ mod common;
 use gsm_sip_bridge::store::calls::{insert_call, CallRecord};
 use gsm_sip_bridge::store::schema::init_schema;
 use gsm_sip_bridge::store::sms::{insert_sms, SmsRecord};
+use gsm_sip_bridge::store::Transport;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +30,7 @@ fn test_concurrent_writes_via_single_connection() {
                     duration_seconds: (i as f64) * 0.5,
                     status: "answered".into(),
                     sip_destination: "sip:100@pbx:5060".into(),
+                    transport: Transport::Cs,
                 };
                 insert_call(&guard, &record).unwrap();
             } else {
@@ -38,6 +40,7 @@ fn test_concurrent_writes_via_single_connection() {
                     body: format!("Message #{i}"),
                     received_at: format!("2026-05-04T{:02}:{:02}:00Z", i / 60 % 24, i % 60),
                     forwarding_status: "sent".into(),
+                    transport: Transport::Cs,
                 };
                 insert_sms(&guard, &record).unwrap();
             }

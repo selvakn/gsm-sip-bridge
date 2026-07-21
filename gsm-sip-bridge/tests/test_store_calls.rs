@@ -2,6 +2,7 @@ mod common;
 
 use gsm_sip_bridge::store::calls::{insert_call, CallRecord};
 use gsm_sip_bridge::store::schema::init_schema;
+use gsm_sip_bridge::store::Transport;
 use rusqlite::Connection;
 
 fn mem_db() -> Connection {
@@ -20,6 +21,7 @@ fn test_insert_and_query_answered_call() {
         duration_seconds: 42.5,
         status: "answered".into(),
         sip_destination: "sip:100@pbx:5060".into(),
+        transport: Transport::Cs,
     };
     insert_call(&conn, &record).unwrap();
 
@@ -43,6 +45,7 @@ fn test_insert_missed_call() {
         duration_seconds: 0.0,
         status: "missed".into(),
         sip_destination: "".into(),
+        transport: Transport::Cs,
     };
     insert_call(&conn, &record).unwrap();
 
@@ -66,6 +69,7 @@ fn test_insert_failed_call() {
         duration_seconds: 0.0,
         status: "failed".into(),
         sip_destination: "sip:unreachable@pbx:5060".into(),
+        transport: Transport::Cs,
     };
     insert_call(&conn, &record).unwrap();
 
@@ -90,6 +94,7 @@ fn test_recent_calls_view_newest_first() {
             duration_seconds: 10.0,
             status: "answered".into(),
             sip_destination: "sip:100@pbx:5060".into(),
+            transport: Transport::Cs,
         };
         insert_call(&conn, &record).unwrap();
     }

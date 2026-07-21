@@ -25,8 +25,10 @@ pub mod plmn;
 pub mod usim_bridge;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
+use crate::control::protocol::{AgentKind, AgentState, ObservedEvent, SmsOutcome};
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::discovery::lines_file_path;
+use crate::observability::reporter::Reporter;
 use crate::sms;
 use crate::sms::discord::DiscordClient;
 use crate::store::{StoreCommand, StoreHandle};
@@ -282,6 +284,13 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
 /// is logged and the thread simply exits, leaving the other lines' threads
 /// (and this process) running — one line's misconfiguration shouldn't take
 /// the whole Agent B process down.
+///
+/// Owns a `Reporter` scoped to this one line/`card_id`
+/// (specs/014-vowifi-metrics-restore): with several lines sharing this one
+/// process (specs/013-multi-card-vowifi), a single shared `Reporter` could
+/// only ever report on behalf of one fixed module id, so each line gets its
+/// own — cheap (a channel plus a background thread) and matches how Agent A
+/// naturally gets one per process, one per line, for free.
 #[allow(clippy::too_many_arguments)]
 fn run_line_listener(
     listen_addr: (String, u16),
@@ -294,6 +303,20 @@ fn run_line_listener(
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
 ) {
+    let reporter = Reporter::spawn(
+        config.control.socket_path.clone(),
+        AgentKind::Sip,
+        card_id.to_string(),
+        Duration::from_secs(config.metrics.agent_report_interval_seconds),
+    );
+    reporter.report(
+        AgentState {
+            pbx_registered: Some(true),
+            ..Default::default()
+        },
+        Vec::new(),
+    );
+
     let listener = match TcpListener::bind((listen_addr.0.as_str(), listen_addr.1)) {
         Ok(l) => l,
         Err(e) => {
@@ -333,6 +356,7 @@ fn run_line_listener(
             discord_client,
             sms_runtime,
             store_tx.clone(),
+            &reporter,
         ) {
             tracing::warn!(card_id = %card_id, error = %e, "error handling Agent A control connection");
         }
@@ -416,14 +440,21 @@ fn prioritize_wideband_codecs(endpoint: &Endpoint) {
 /// happen; `recent_calls` is pre-populated from the same line list this
 /// listener was spawned from, but a missing entry degrading to "start
 /// empty" is safer than losing the record).
+///
+/// Deliberately does not also touch a metric here: the overall call outcome
+/// (answered/missed/failed) is Agent A's to report, not Agent B's — Agent A
+/// sees every inbound INVITE, including ones that never reach this far
+/// (specs/014-vowifi-metrics-restore, research.md §R3's ownership table).
+/// Reporting it again here, from a different vantage point with a
+/// differently-shaped vocabulary (`record.outcome`'s free-form
+/// `"declined:<reason>"` strings), would both double-count and reintroduce
+/// unbounded label cardinality (FR-014) — `record.outcome` is arbitrary text
+/// interpolated with an error's `Display` output in the `Err(e)` path above.
 fn push_recent_call(
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
     card_id: &str,
     record: CallRecord,
 ) {
-    crate::metrics::VOWIFI_CALLS_TOTAL
-        .with_label_values(&[card_id, &record.outcome])
-        .inc();
     recent_calls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -443,6 +474,7 @@ fn handle_connection(
     discord_client: &Option<DiscordClient>,
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
+    reporter: &Reporter,
 ) -> BridgeResult<()> {
     let mut reader = std::io::BufReader::new(
         stream
@@ -470,6 +502,7 @@ fn handle_connection(
             body,
             received_at,
         } => {
+            reporter.report(AgentState::default(), vec![ObservedEvent::SmsReceived]);
             forward_vowifi_sms(
                 store_tx,
                 discord_client,
@@ -478,6 +511,7 @@ fn handle_connection(
                 sender,
                 body,
                 received_at,
+                reporter.clone(),
             );
             return Ok(());
         }
@@ -519,6 +553,12 @@ fn handle_connection(
             match wait_for_pbx_answer(&pbx_call, &ctrl_rx) {
                 PbxOutcome::Answered => {
                     tracing::info!(call_id = %call_id, "PBX extension answered");
+                    reporter.report(
+                        AgentState::default(),
+                        vec![ObservedEvent::PbxLegCompleted {
+                            outcome: SmsOutcome::Sent,
+                        }],
+                    );
                     write_msg(
                         &mut writer,
                         &ControlMessage::CallAnswered {
@@ -530,6 +570,12 @@ fn handle_connection(
                 outcome => {
                     let reason = outcome.reason();
                     tracing::info!(call_id = %call_id, reason, "PBX leg never answered; declining");
+                    reporter.report(
+                        AgentState::default(),
+                        vec![ObservedEvent::PbxLegCompleted {
+                            outcome: SmsOutcome::Failed,
+                        }],
+                    );
                     let _ = write_msg(
                         &mut writer,
                         &ControlMessage::BridgeFailed {
@@ -610,6 +656,12 @@ fn handle_connection(
         }
         Err(e) => {
             tracing::warn!(card_id = %card_id, call_id = %call_id, error = %e, "failed to bridge call");
+            reporter.report(
+                AgentState::default(),
+                vec![ObservedEvent::PbxLegCompleted {
+                    outcome: SmsOutcome::Failed,
+                }],
+            );
             write_msg(
                 &mut writer,
                 &ControlMessage::BridgeFailed {
@@ -643,6 +695,7 @@ fn handle_connection(
 /// otherwise synchronous): the connection carrying this message doesn't wait
 /// for a reply, so there is nothing to block on here, and blocking the
 /// accept loop on Discord's round trip would delay the next inbound call.
+#[allow(clippy::too_many_arguments)]
 fn forward_vowifi_sms(
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     discord_client: &Option<DiscordClient>,
@@ -651,6 +704,7 @@ fn forward_vowifi_sms(
     sender: String,
     body: String,
     received_at: String,
+    reporter: Reporter,
 ) {
     sms::record_and_forward(
         sms_runtime.handle(),
@@ -660,6 +714,8 @@ fn forward_vowifi_sms(
         sender,
         body,
         received_at,
+        crate::store::Transport::Vowifi,
+        Some(reporter),
     );
 }
 

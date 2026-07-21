@@ -27,6 +27,7 @@ mod amr_rtp;
 pub mod call;
 mod digest;
 mod gm_ipsec;
+pub mod observability;
 mod rtp;
 mod sdp;
 mod sip_client;

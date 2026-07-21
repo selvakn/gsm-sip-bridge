@@ -118,8 +118,11 @@ fn main() -> ExitCode {
 
     rt.block_on(async {
         let metrics_port = config.metrics.port;
+        let agent_report_interval_seconds = config.metrics.agent_report_interval_seconds;
         let metrics_handle = tokio::spawn(async move {
-            if let Err(e) = metrics::server::serve(metrics_port).await {
+            if let Err(e) =
+                metrics::server::serve(metrics_port, agent_report_interval_seconds).await
+            {
                 tracing::error!(error = %e, "metrics server failed");
             }
         });
@@ -318,6 +321,7 @@ fn handle_vowifi_ims_agent_command(cli: &Cli, line: Option<u32>) -> ExitCode {
         return gsm_sip_bridge::ims::agent::run(
             gsm_sip_bridge::vowifi::LEGACY_LINE_CARD_ID,
             &config.vowifi,
+            &config,
         );
     };
     let (card_id, line_config) = match load_line_config(index) {
@@ -327,7 +331,7 @@ fn handle_vowifi_ims_agent_command(cli: &Cli, line: Option<u32>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    gsm_sip_bridge::ims::agent::run(&card_id, &line_config)
+    gsm_sip_bridge::ims::agent::run(&card_id, &line_config, &config)
 }
 
 /// Reads the `discover` subcommand's line-resolution file and returns line
