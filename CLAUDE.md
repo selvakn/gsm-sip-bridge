@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/013-multi-card-vowifi/plan.md`.
+`specs/014-vowifi-metrics-restore/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
