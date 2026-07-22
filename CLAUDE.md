@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/016-volte-calls/plan.md`.
+`specs/017-volte-inbound-bridge/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
