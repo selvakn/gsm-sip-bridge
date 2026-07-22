@@ -90,12 +90,56 @@ fn ip_addrtype(ip: IpAddr) -> &'static str {
 /// caller's job to only pass `true` when a real AMR-WB codec is actually
 /// linked in (see `amr_safe::is_available()`), since offering a codec we
 /// can't actually encode/decode would be worse than not offering it.
-pub fn build_offer(local_ip: IpAddr, rtp_port: u16, session_id: u64, offer_amr_wb: bool) -> String {
+/// Which formats to offer, and in what order.
+///
+/// Order is not cosmetic: a carrier picks the first payload type it also
+/// supports, so listing narrowband first gets narrowband. A live VoLTE call to
+/// Vodafone India negotiated PCMU purely because it led the list — the offer
+/// did include AMR-WB — which made the call's audio narrowband and any quality
+/// judgement from it meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecOffer {
+    /// Narrowband only — the build has no wideband codec linked.
+    PcmuOnly,
+    /// Narrowband first, wideband second. **The historical order**, kept for
+    /// the VoWiFi path so its offer stays byte-identical (FR-020). Carriers on
+    /// that path require wideband and reject a PCMU-only offer anyway, so the
+    /// ordering never mattered there.
+    PcmuThenWideband,
+    /// Wideband first. What a call wants when the audio quality is the point.
+    WidebandThenPcmu,
+}
+
+impl CodecOffer {
+    /// Picks the best offer this build can make.
+    pub fn preferring_wideband(wideband_available: bool) -> Self {
+        if wideband_available {
+            CodecOffer::WidebandThenPcmu
+        } else {
+            CodecOffer::PcmuOnly
+        }
+    }
+
+    /// The historical VoWiFi ordering.
+    pub fn legacy(wideband_available: bool) -> Self {
+        if wideband_available {
+            CodecOffer::PcmuThenWideband
+        } else {
+            CodecOffer::PcmuOnly
+        }
+    }
+}
+
+pub fn build_offer(local_ip: IpAddr, rtp_port: u16, session_id: u64, offer: CodecOffer) -> String {
     let addrtype = ip_addrtype(local_ip);
-    let payload_types = if offer_amr_wb {
-        format!("{PCMU_PAYLOAD_TYPE} {AMR_WB_PAYLOAD_TYPE}")
-    } else {
-        PCMU_PAYLOAD_TYPE.to_string()
+    let payload_types = match offer {
+        CodecOffer::PcmuOnly => PCMU_PAYLOAD_TYPE.to_string(),
+        CodecOffer::PcmuThenWideband => {
+            format!("{PCMU_PAYLOAD_TYPE} {AMR_WB_PAYLOAD_TYPE}")
+        }
+        CodecOffer::WidebandThenPcmu => {
+            format!("{AMR_WB_PAYLOAD_TYPE} {PCMU_PAYLOAD_TYPE}")
+        }
     };
 
     let mut sdp = format!(
@@ -104,14 +148,25 @@ pub fn build_offer(local_ip: IpAddr, rtp_port: u16, session_id: u64, offer_amr_w
          s=gsm-sip-bridge test call\r\n\
          c=IN {addrtype} {local_ip}\r\n\
          t=0 0\r\n\
-         m=audio {rtp_port} RTP/AVP {payload_types}\r\n\
-         a=rtpmap:{PCMU_PAYLOAD_TYPE} PCMU/8000\r\n",
+         m=audio {rtp_port} RTP/AVP {payload_types}\r\n",
     );
-    if offer_amr_wb {
-        sdp.push_str(&format!(
-            "a=rtpmap:{AMR_WB_PAYLOAD_TYPE} AMR-WB/16000\r\n\
-             a=fmtp:{AMR_WB_PAYLOAD_TYPE} octet-align=1\r\n",
-        ));
+    // rtpmap lines follow the same order as the m= line, so the preference is
+    // stated consistently rather than only in the payload-type list.
+    let wideband_rtpmap = format!(
+        "a=rtpmap:{AMR_WB_PAYLOAD_TYPE} AMR-WB/16000\r\n\
+         a=fmtp:{AMR_WB_PAYLOAD_TYPE} octet-align=1\r\n",
+    );
+    let pcmu_rtpmap = format!("a=rtpmap:{PCMU_PAYLOAD_TYPE} PCMU/8000\r\n");
+    match offer {
+        CodecOffer::PcmuOnly => sdp.push_str(&pcmu_rtpmap),
+        CodecOffer::PcmuThenWideband => {
+            sdp.push_str(&pcmu_rtpmap);
+            sdp.push_str(&wideband_rtpmap);
+        }
+        CodecOffer::WidebandThenPcmu => {
+            sdp.push_str(&wideband_rtpmap);
+            sdp.push_str(&pcmu_rtpmap);
+        }
     }
     sdp.push_str("a=sendrecv\r\n");
     sdp
@@ -500,12 +555,84 @@ fn build_answer_for(
 }
 
 #[cfg(test)]
+mod codec_offer_tests {
+    use super::*;
+
+    /// The defect a live call exposed: the offer *did* include wideband, but
+    /// narrowband led the list, so the carrier took narrowband and the call's
+    /// audio — and any quality judgement from it — was worthless.
+    #[test]
+    fn preferring_wideband_lists_it_first_in_both_places() {
+        let sdp = build_offer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            1,
+            CodecOffer::WidebandThenPcmu,
+        );
+
+        assert!(
+            sdp.contains("m=audio 40000 RTP/AVP 96 0\r\n"),
+            "wideband must lead the payload-type list, got: {sdp}"
+        );
+        let amr_at = sdp.find("a=rtpmap:96 AMR-WB").unwrap();
+        let pcmu_at = sdp.find("a=rtpmap:0 PCMU").unwrap();
+        assert!(
+            amr_at < pcmu_at,
+            "rtpmap order must agree with the m= line, or the preference is stated twice \
+             and inconsistently"
+        );
+    }
+
+    #[test]
+    fn every_offer_still_includes_narrowband_as_a_fallback() {
+        for offer in [
+            CodecOffer::PcmuOnly,
+            CodecOffer::PcmuThenWideband,
+            CodecOffer::WidebandThenPcmu,
+        ] {
+            let sdp = build_offer("1.2.3.4".parse().unwrap(), 40000, 1, offer);
+            assert!(
+                sdp.contains("a=rtpmap:0 PCMU/8000"),
+                "{offer:?} dropped the narrowband fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_without_the_wideband_codec_never_offers_it() {
+        // Offering a codec this build cannot encode would negotiate a call we
+        // could not then carry.
+        assert_eq!(CodecOffer::preferring_wideband(false), CodecOffer::PcmuOnly);
+        assert_eq!(CodecOffer::legacy(false), CodecOffer::PcmuOnly);
+
+        let sdp = build_offer("1.2.3.4".parse().unwrap(), 40000, 1, CodecOffer::PcmuOnly);
+        assert!(!sdp.contains("AMR-WB"));
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"));
+    }
+
+    #[test]
+    fn the_two_paths_choose_different_orders() {
+        // VoLTE wants quality; VoWiFi keeps the order it has always sent.
+        assert_eq!(
+            CodecOffer::preferring_wideband(true),
+            CodecOffer::WidebandThenPcmu
+        );
+        assert_eq!(CodecOffer::legacy(true), CodecOffer::PcmuThenWideband);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn build_offer_includes_pcmu_only_when_amr_wb_not_offered() {
-        let sdp = build_offer("2402:8100::1".parse().unwrap(), 40000, 12345, false);
+        let sdp = build_offer(
+            "2402:8100::1".parse().unwrap(),
+            40000,
+            12345,
+            CodecOffer::PcmuOnly,
+        );
         assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"));
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000"));
         assert!(!sdp.contains("AMR-WB"));
@@ -514,8 +641,17 @@ mod tests {
 
     #[test]
     fn build_offer_includes_both_codecs_when_amr_wb_offered() {
-        let sdp = build_offer("1.2.3.4".parse().unwrap(), 40000, 12345, true);
+        let sdp = build_offer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            12345,
+            CodecOffer::PcmuThenWideband,
+        );
         assert!(sdp.contains("m=audio 40000 RTP/AVP 0 96\r\n"));
+        // The historical order, kept so the VoWiFi offer is byte-identical.
+        let pcmu_at = sdp.find("a=rtpmap:0 PCMU").unwrap();
+        let amr_at = sdp.find("a=rtpmap:96 AMR-WB").unwrap();
+        assert!(pcmu_at < amr_at, "legacy order lists narrowband first");
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000"));
         assert!(sdp.contains("a=rtpmap:96 AMR-WB/16000"));
         assert!(sdp.contains("a=fmtp:96 octet-align=1"));
