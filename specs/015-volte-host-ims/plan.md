@@ -231,7 +231,7 @@ so no phase depends on an unmet gate.
 | 3 | Discovery probes as **diagnostics**; `volte-discover` reports per-method results | US2 (P3) | — | ✅ **Done — verified on live hardware** |
 | 4 | **G3**: acquire a P-CSCF address | — | **G3** | ✅ **Done — `2400:5200:a100:819::6`** |
 | 5 | Registration over the LTE transport | US3 | ~~G2, G3~~ | ✅ **Done — 200 OK on live network** |
-| 6 | Renewal, registration history | US4 | — | After phase 5 |
+| 6 | Renewal + status reporting | US4 | — | ✅ **Done** |
 
 Phase 1 must land and prove FR-019 (VoWiFi unchanged) before any VoLTE code is
 written. That ordering is what keeps the production path safe.
@@ -265,6 +265,39 @@ after a deactivate, and succeeds a second later. Attaching straight after a
 teardown was therefore intermittently failing; activation is now retried.
 
 **Success criteria met**: SC-003 (registration accepted, well under 60s).
+
+### Phase 6 completion — US4
+
+`volte-register` now stays up and renews by default (`--once` for the one-shot
+diagnostic), and publishes state that `volte-status` reads:
+
+```
+  registration   : registered
+  expires in     : 3599s
+```
+
+Reuses `ims::renewal_due`, `RegistrationState` and `RegistrationStatus`
+unchanged — the same types and the same 300s headroom the production VoWiFi
+agent uses, so the two paths share one renewal policy and one vocabulary
+(FR-022, SC-007) rather than drifting apart.
+
+The registration lifetime is taken from what the **network granted**, not what
+was requested: a registrar may grant less, and renewing on the requested value
+would leave a window where the binding has lapsed while we still believe it is
+live. Vi grants the full 3600s.
+
+State is published to a file rather than over the VoWiFi control socket. That
+protocol exists because several long-lived agents each own state no other
+process can see; here there is one process, one registration, and a local
+reader. Constitution Principle V favours the option with fewer moving parts —
+revisit if VoLTE ever grows multiple concurrent lines.
+
+**SC-004 (survives two consecutive renewals) is NOT yet verified on hardware.**
+Vi grants 3600s and the headroom is 300s, so two renewals take ~110 minutes of
+wall clock. The renewal *decision* is `ims::renewal_due`, which is unit-tested
+and already carries the production VoWiFi path, and the backoff bound and
+granted-expiry parsing are unit-tested here — but the full cycle has not been
+observed end to end. A soak is required to close it.
 
 ## Ways forward (post-G3)
 
