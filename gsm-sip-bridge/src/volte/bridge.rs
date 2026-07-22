@@ -543,6 +543,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
                     true,
                     vec![telephony_line],
                     "volte-bridge",
+                    crate::store::Transport::Volte,
                 ) {
                     tracing::error!(error = %e, "the telephone-side half stopped");
                 }

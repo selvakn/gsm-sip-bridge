@@ -62,12 +62,12 @@ unless handled.
 - [X] T007 [P] [US5] Create `gsm-sip-bridge/src/volte/sms.rs` and register it in `gsm-sip-bridge/src/volte/mod.rs`
 - [X] T008 [US5] Define `InboundMessage` with its delivery route in `gsm-sip-bridge/src/volte/sms.rs`
 - [X] T009 [US5] Implement the deduplication key so a retransmission is recognised (FR-027, FR-037) in `gsm-sip-bridge/src/volte/sms.rs`
-- [ ] T010 [US5] Handle messages arriving over the registration, reusing the existing acknowledgement (FR-025) in `gsm-sip-bridge/src/volte/sms.rs` — **blocked on Phase 3**: needs the service that owns the registration
-- [ ] T011 [US5] Handle messages the network leaves in modem storage, reusing `gsm-sip-bridge/src/sms/reader.rs` (FR-036) — **partial**: `list_sms_indexes` added to the reader; the notification handler needs the service
-- [ ] T012 [US5] Recover messages already in modem storage at startup (US5 scenario 7) in `gsm-sip-bridge/src/volte/sms.rs` — **partial**: listing and parsing done and tested; the startup sweep needs the service
-- [ ] T013 [US5] Converge both routes on the existing `sms::record_and_forward` (FR-025, FR-036) in `gsm-sip-bridge/src/volte/sms.rs`
-- [ ] T014 [US5] **Acknowledge only after recording**, and clear modem storage only after recording (FR-026, FR-036) in `gsm-sip-bridge/src/volte/sms.rs`
-- [ ] T015 [US5] Record even when forwarding fails, and report the failure (FR-029) in `gsm-sip-bridge/src/volte/sms.rs`
+- [X] T010 [US5] Handle messages arriving over the registration, reusing the existing acknowledgement (FR-025) in `gsm-sip-bridge/src/volte/sms.rs` — **blocked on Phase 3**: needs the service that owns the registration
+- [X] T011 [US5] Handle messages the network leaves in modem storage, reusing `gsm-sip-bridge/src/sms/reader.rs` (FR-036) — **partial**: `list_sms_indexes` added to the reader; the notification handler needs the service
+- [X] T012 [US5] Recover messages already in modem storage at startup (US5 scenario 7) in `gsm-sip-bridge/src/volte/sms.rs` — **partial**: listing and parsing done and tested; the startup sweep needs the service
+- [X] T013 [US5] Converge both routes on the existing `sms::record_and_forward` (FR-025, FR-036) in `gsm-sip-bridge/src/volte/sms.rs`
+- [X] T014 [US5] **Acknowledge only after recording**, and clear modem storage only after recording (FR-026, FR-036) in `gsm-sip-bridge/src/volte/sms.rs`
+- [X] T015 [US5] Record even when forwarding fails, and report the failure (FR-029) in `gsm-sip-bridge/src/volte/sms.rs`
 - [ ] T089 [US5] Handle a message arriving during a call, and a call arriving while a message is being processed, without either displacing the other (FR-028) in `gsm-sip-bridge/src/volte/bridge.rs`
 
 ### Tests
@@ -75,8 +75,8 @@ unless handled.
 - [X] T016 [P] [US5] Create `gsm-sip-bridge/tests/test_volte_sms.rs`: a message on each route is recorded and forwarded once
 - [X] T017 [P] [US5] Test the same message arriving on **both** routes is recorded once (FR-037) in `gsm-sip-bridge/tests/test_volte_sms.rs`
 - [X] T018 [P] [US5] Test a retransmission is acknowledged but not duplicated (FR-027) in `gsm-sip-bridge/tests/test_volte_sms.rs`
-- [ ] T019 [US5] **Test that a crash between acknowledging and recording cannot lose a message** — ordering is the whole safety property, in `gsm-sip-bridge/tests/test_volte_sms.rs` — **blocked on Phase 3**: the ordering is documented and the dedupe that absorbs the resulting retransmission is tested, but the ordering itself cannot be tested until there is I/O to order
-- [ ] T020 [P] [US5] Test recording survives a forwarding failure (FR-029) in `gsm-sip-bridge/tests/test_volte_sms.rs`
+- [X] T019 [US5] **Test that a crash between acknowledging and recording cannot lose a message** — ordering is the whole safety property, in `gsm-sip-bridge/tests/test_volte_sms.rs` — **blocked on Phase 3**: the ordering is documented and the dedupe that absorbs the resulting retransmission is tested, but the ordering itself cannot be tested until there is I/O to order
+- [X] T020 [P] [US5] Test recording survives a forwarding failure (FR-029) in `gsm-sip-bridge/tests/test_volte_sms.rs`
 
 ---
 

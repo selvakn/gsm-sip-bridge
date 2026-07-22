@@ -174,6 +174,7 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
         config.vowifi.wideband,
         lines,
         "vowifi-sip-agent",
+        crate::store::Transport::Vowifi,
     )
 }
 
@@ -195,6 +196,10 @@ pub(crate) fn run_telephony_side(
     wideband: bool,
     lines: Vec<RuntimeLine>,
     agent_label: &str,
+    // `record_transport` is which transport this line's calls and messages are
+    // recorded under — named apart from the PJSIP `transport` below, which is
+    // a different thing entirely.
+    record_transport: crate::store::Transport,
 ) -> BridgeResult<()> {
     let transport = match config.sip.transport {
         ConfigSipTransport::Udp => TransportType::Udp,
@@ -305,6 +310,7 @@ pub(crate) fn run_telephony_side(
                     &card_id,
                     &leg_addr,
                     leg_port,
+                    record_transport,
                     endpoint,
                     account,
                     config,
@@ -338,6 +344,7 @@ fn run_line_listener(
     card_id: &str,
     leg_addr: &str,
     leg_port: u16,
+    transport: crate::store::Transport,
     endpoint: &Endpoint,
     account: &Account,
     config: &AppConfig,
@@ -394,6 +401,7 @@ fn run_line_listener(
             card_id,
             leg_addr,
             leg_port,
+            transport,
             endpoint,
             account,
             config,
@@ -514,6 +522,7 @@ fn handle_connection(
     card_id: &str,
     leg_addr: &str,
     leg_port: u16,
+    transport: crate::store::Transport,
     endpoint: &Endpoint,
     account: &Account,
     config: &AppConfig,
@@ -559,6 +568,7 @@ fn handle_connection(
                 body,
                 received_at,
                 reporter.clone(),
+                transport,
             );
             return Ok(());
         }
@@ -752,7 +762,11 @@ fn forward_vowifi_sms(
     body: String,
     received_at: String,
     reporter: Reporter,
+    transport: crate::store::Transport,
 ) {
+    // Records first (status "pending"), forwards second, updates the status
+    // after — so a message survives a downstream outage rather than being
+    // lost with it (specs/017 FR-029).
     sms::record_and_forward(
         sms_runtime.handle(),
         store_tx,
@@ -761,7 +775,7 @@ fn forward_vowifi_sms(
         sender,
         body,
         received_at,
-        crate::store::Transport::Vowifi,
+        transport,
         Some(reporter),
     );
 }
