@@ -20,6 +20,7 @@
 //! Until that is resolved, a P-CSCF must be supplied explicitly.
 
 pub mod netcfg;
+pub mod pcscf;
 pub mod pdn;
 
 use crate::error::BridgeResult;
@@ -170,7 +171,27 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
         if let Some(assigned) = brought_up.pdn.ipv6 {
             // FR-024. Without this the PDN is bound but unusable — the
             // carrier's router advertisements never reach us.
+            // The modem's data path needs a moment after QNETDEVCTL before the
+            // host interface has carrier. Configuring first would leave the
+            // link-local stuck tentative, since DAD cannot run without it.
+            if !netcfg::wait_for_carrier(&settings.iface, std::time::Duration::from_secs(10)) {
+                tracing::warn!(
+                    iface = %settings.iface,
+                    "no carrier before configuring; the modem may not have finished binding"
+                );
+            }
             netcfg::configure(&settings.iface, assigned)?;
+            // `configure` toggles the link, so wait for carrier again before
+            // expecting duplicate address detection to make progress.
+            netcfg::wait_for_carrier(&settings.iface, std::time::Duration::from_secs(10));
+            // The kernel sends no Router Solicitation while the link-local is
+            // tentative, so soliciting before DAD finishes is simply ignored.
+            if !netcfg::wait_for_link_local(&settings.iface, std::time::Duration::from_secs(8))? {
+                tracing::warn!(
+                    iface = %settings.iface,
+                    "the link-local address did not complete duplicate address detection"
+                );
+            }
             netcfg::solicit_router(&settings.iface)?;
             // The default route, not the address, is what proves the RA was
             // accepted — we installed the address ourselves.

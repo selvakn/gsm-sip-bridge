@@ -82,7 +82,7 @@ pub fn link_local_from_assigned(addr: Ipv6Addr) -> Ipv6Addr {
 /// `+CGCONTRDP` mixes bare integers with quoted strings, and the quoted
 /// address fields are dot-separated (never comma-separated), so quote-aware
 /// splitting is enough — no full CSV parser required.
-fn split_at_fields(s: &str) -> Vec<String> {
+pub fn split_at_fields(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
@@ -275,6 +275,48 @@ pub fn read_pdn(
     }))
 }
 
+/// Reads the PDN, waiting for the network to actually assign an address.
+///
+/// `AT+CGACT=1` returns `OK` as soon as the context is *active*, which is
+/// before the address assignment lands. Reading `AT+CGPADDR` immediately
+/// therefore races the network and intermittently reports a PDN with no
+/// address at all — which then silently skips host interface configuration and
+/// leaves an attachment that cannot carry traffic. Observed on live hardware;
+/// it looks like an interface bug and is not one.
+///
+/// An active context that never produces an address is a real failure, so this
+/// is bounded rather than infinite.
+pub fn read_pdn_when_addressed(
+    at: &mut AtCommander,
+    cid: u8,
+    apn: &str,
+    timeout: std::time::Duration,
+) -> BridgeResult<ImsPdn> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last: Option<ImsPdn>;
+    loop {
+        match read_pdn(at, cid, apn)? {
+            Some(pdn) if pdn.ipv4.is_some() || pdn.ipv6.is_some() => return Ok(pdn),
+            other => last = other,
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    match last {
+        Some(pdn) => Err(BridgeError::Ims(format!(
+            "context {cid} (APN \"{}\") is active but the network assigned no address \
+             within {timeout:?}; the PDN cannot carry traffic",
+            pdn.apn_assigned
+        ))),
+        None => Err(BridgeError::Ims(format!(
+            "the network did not grant an IMS PDN on cid {cid} (APN \"{apn}\"): \
+             no assigned APN reported"
+        ))),
+    }
+}
+
 /// Outcome of bringing the PDN up, so callers can tell the operator whether
 /// anything actually changed (US1 scenario 2) and what was displaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,12 +345,7 @@ pub fn bring_up(at: &mut AtCommander, cid: u8, apn: &str) -> BridgeResult<PdnBri
         expect_ok(at.send_command(&format!("AT+CGACT=1,{cid}"))?, "AT+CGACT")?;
     }
 
-    let pdn = read_pdn(at, cid, apn)?.ok_or_else(|| {
-        BridgeError::Ims(format!(
-            "the network did not grant an IMS PDN on cid {cid} (APN \"{apn}\"): \
-             no assigned APN reported"
-        ))
-    })?;
+    let pdn = read_pdn_when_addressed(at, cid, apn, std::time::Duration::from_secs(15))?;
 
     if previously_bound != Some(cid) {
         expect_ok(
