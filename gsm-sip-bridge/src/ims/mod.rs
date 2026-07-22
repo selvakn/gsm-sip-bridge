@@ -32,6 +32,7 @@ pub mod media_stats;
 pub mod observability;
 mod rtp;
 pub mod sdp;
+pub mod session;
 mod sip_client;
 mod transcode;
 pub mod transport;
@@ -111,7 +112,7 @@ pub enum RegisterOutcome {
 /// requests (e.g. INVITE, in `ims::call`) over the *same* session — reusing
 /// the live transport (which, once Gm IPsec is set up, is the *only* place
 /// the negotiated XFRM policy's selector matches) rather than reconnecting.
-struct RegisteredSession {
+pub(crate) struct RegisteredSession {
     transport: SipTransport,
     realm: String,
     public_uri: String,
@@ -227,7 +228,7 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     }
 }
 
-fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
+pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
     let mut at = AtCommander::open(&cfg.modem_port)?;
 
     let imsi = match &cfg.imsi {

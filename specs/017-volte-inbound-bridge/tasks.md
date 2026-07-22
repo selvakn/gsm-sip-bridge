@@ -39,12 +39,12 @@ implementation serves both paths (FR-019, SC-008). **MUST complete before any
 user story**, and **MUST land alone** — it touches the production Wi-Fi path,
 and nothing else should be in flight when it does.
 
-- [ ] T001 Identify the reusable surface in `gsm-sip-bridge/src/ims/agent.rs`: inbound request dispatch, renewal deferral, message acknowledgement, status reporting
-- [ ] T002 Extract inbound request dispatch into a transport-agnostic form in `gsm-sip-bridge/src/ims/agent.rs`
-- [ ] T003 Extract the registration-lifecycle loop (renewal deferral while a call is active) into a reusable form in `gsm-sip-bridge/src/ims/agent.rs`
-- [ ] T004 Make the extracted pieces reachable from `volte/` without duplicating them, in `gsm-sip-bridge/src/ims/mod.rs`
-- [ ] T005 **Prove the Wi-Fi path unchanged**: its suite passes unmodified after the extraction (FR-020)
-- [ ] T006 **Place a live Wi-Fi call** to confirm no behavioural regression (SC-007) — outstanding since the transport refactor in feature 015
+- [X] T001 Identify the reusable surface in `gsm-sip-bridge/src/ims/agent.rs`: inbound request dispatch, renewal deferral, message acknowledgement, status reporting
+- [X] T002 Extract inbound request dispatch into a transport-agnostic form in `gsm-sip-bridge/src/ims/agent.rs`
+- [X] T003 Extract the registration-lifecycle loop (renewal deferral while a call is active) into a reusable form in `gsm-sip-bridge/src/ims/agent.rs`
+- [X] T004 Make the extracted pieces reachable from `volte/` without duplicating them, in `gsm-sip-bridge/src/ims/mod.rs`
+- [X] T005 **Prove the Wi-Fi path unchanged**: its suite passes unmodified after the extraction (FR-020)
+- [ ] T006 **Place a live Wi-Fi call** to confirm no behavioural regression (SC-007) — outstanding since the transport refactor in feature 015. **Cannot be done from this environment**: production Wi-Fi runs elsewhere and the SIM here is the cellular test line. Operator to run before merge
 
 ---
 
