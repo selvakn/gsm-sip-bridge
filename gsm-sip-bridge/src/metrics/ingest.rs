@@ -113,21 +113,38 @@ fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
             .with_label_values(&[module_id, transport])
             .set(active_calls as f64);
     }
+    // Registration and attachment health goes to the gauge belonging to the
+    // path that actually holds it (specs/017 FR-031). Routing the cellular
+    // service's state to the VoWiFi gauges would report a phantom Wi-Fi line
+    // *and* leave the VoLTE gauges reading zero while the service is
+    // perfectly healthy — so an operator alerting on either one would be
+    // told the opposite of the truth. Observed live before it was fixed:
+    // `gsm_sip_bridge_vowifi_tunnel_up{module="volte"} 1`, claiming an ePDG
+    // tunnel that does not exist on this path.
     if let Some(registered) = state.registered {
-        metrics::VOWIFI_REGISTERED
-            .with_label_values(&[module_id])
-            .set(if registered { 1.0 } else { 0.0 });
+        let up = if registered { 1.0 } else { 0.0 };
+        match agent {
+            AgentKind::Volte => metrics::VOLTE_REGISTERED.set(up),
+            AgentKind::Ims | AgentKind::Sip => metrics::VOWIFI_REGISTERED
+                .with_label_values(&[module_id])
+                .set(up),
+        }
     }
     if let Some(tunnel_up) = state.tunnel_up {
-        metrics::VOWIFI_TUNNEL_UP
-            .with_label_values(&[module_id])
-            .set(if tunnel_up { 1.0 } else { 0.0 });
+        let up = if tunnel_up { 1.0 } else { 0.0 };
+        match agent {
+            // The LTE path's equivalent of "the tunnel is up" is the IMS PDN
+            // being attached and routable.
+            AgentKind::Volte => metrics::VOLTE_PDN_UP.set(up),
+            AgentKind::Ims | AgentKind::Sip => metrics::VOWIFI_TUNNEL_UP
+                .with_label_values(&[module_id])
+                .set(up),
+        }
     }
     // pbx_registered (Agent B) has no dedicated gauge yet — sip_registered
     // remains the daemon's own PBX registration (metrics-inventory.md
     // "Unchanged" note); tracked here only so liveness has somewhere to
     // record Agent B reported it, for future use.
-    let _ = agent;
 }
 
 fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
@@ -349,6 +366,43 @@ mod tests {
         assert_ne!(
             transport_label(AgentKind::Volte),
             transport_label(AgentKind::Ims)
+        );
+    }
+
+    #[test]
+    fn each_paths_registration_health_lands_on_its_own_gauge() {
+        // Observed live: the cellular service's registration was reported as
+        // `gsm_sip_bridge_vowifi_registered{module="volte"} 1`, and its
+        // attachment as a VoWiFi *tunnel* that does not exist on that path.
+        // An operator alerting on either gauge was told the opposite of the
+        // truth (FR-031).
+        let module_id = "test-ingest-gauge-routing";
+        metrics::VOLTE_REGISTERED.set(0.0);
+        metrics::VOWIFI_REGISTERED
+            .with_label_values(&[module_id])
+            .set(0.0);
+
+        apply_state(
+            AgentKind::Volte,
+            module_id,
+            &AgentState {
+                registered: Some(true),
+                tunnel_up: Some(true),
+                ..AgentState::default()
+            },
+        );
+
+        assert_eq!(
+            metrics::VOLTE_REGISTERED.get(),
+            1.0,
+            "the cellular path's own gauge must reflect it"
+        );
+        assert_eq!(
+            metrics::VOWIFI_REGISTERED
+                .with_label_values(&[module_id])
+                .get(),
+            0.0,
+            "and it must not appear as a phantom VoWiFi line"
         );
     }
 }

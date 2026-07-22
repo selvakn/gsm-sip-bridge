@@ -284,3 +284,61 @@ while every dashboard continued to look healthy.
 The label is now derived from the agent kind. `AgentKind::Volte` exists purely
 for this distinction, with a test asserting the two do not collapse.
 
+## R16: The LTE metrics were never published, and the entrypoint could never start the service
+
+**Status**: ✅ Both found by running the service, both pre-existing, both fixed.
+
+Two defects from feature 015 that no test could have caught, found within
+minutes of actually starting the thing.
+
+**The entrypoint could never start it.** When `[vowifi].enabled` was not true,
+`entrypoint.sh` ran `wait; exit 0` — terminating before the host-side LTE block
+far below it. Since enabling both sections together is fatal by design, the LTE
+block was **unreachable in every possible configuration**. The VoWiFi stack is
+now skipped rather than terminal, so execution reaches the LTE block either
+way.
+
+**Every `gsm_bridge_volte_*` metric was invisible.** They register into
+`metrics::REGISTRY`; the scrape handler called `prometheus::gather()`, which
+collects the *default* registry. The gauges were set faithfully and collected
+by nobody. This is precisely the failure `sms::record_and_forward` already
+warns about in its own doc comment — "would land in a Prometheus registry
+nothing ever reads" — reached by a different route.
+
+Found while checking SC-013, that this path's health is distinguishable from
+the Wi-Fi path's. It was not — because it was not published at all. What made
+it visible was asking the live `/metrics` endpoint rather than reading the code
+that sets the gauges.
+
+A third, milder one on top: agent reports routed the cellular service's
+registration to the *VoWiFi* gauges, producing
+`gsm_sip_bridge_vowifi_tunnel_up{module="volte"} 1` — claiming an ePDG tunnel
+that does not exist on this path — while the VoLTE gauges read zero. An
+operator alerting on either would have been told the opposite of the truth.
+
+**Lesson, consistent with every previous feature in this series**: hardware
+finds what unit tests cannot. Here it was not even hardware — merely *running
+the service and reading its own output* found three defects that a green suite
+had nothing to say about.
+
+### Verified live after the fixes
+
+```
+[volte].enabled + bridge_inbound — answering inbound calls over LTE
+IMS PDN established  apn=ims.mnc043.mcc404.gprs  bearer=6  IPv6-only
+IMS PDN attached     iface=enx024bb3b9ebe5  routed=true
+P-Access-Network-Info 3GPP-E-UTRAN-FDD  cell=40443D55E62E831F
+registered to PBX    rsp.selvakn.in:6060   agent="volte-bridge"
+listening for Agent A 127.0.0.1:5075       (loopback, not a veth)
+REGISTER 401 -> 200 OK
+registered, listening for inbound calls    agent="volte-ims-agent"
+NOTIFY event=reg subscription_state=active
+
+gsm_bridge_volte_registered 1
+gsm_bridge_volte_pdn_up 1
+gsm_sip_bridge_active_calls{module="volte",transport="volte"} 0
+```
+
+One process, both halves as threads, its own SIP port (5073) alongside the
+circuit-switched daemon's — no bind race (research R3).
+

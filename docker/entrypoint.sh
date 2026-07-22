@@ -164,11 +164,13 @@ log "starting the circuit-switched GSM-to-SIP daemon, supervised..."
 DAEMON_SUPERVISOR_PID=$!
 
 # --- 3. Inbound VoWiFi-to-SIP bridge (only if [vowifi].enabled) ------------
-if [ "$VOWIFI_ENABLED" -ne 1 ]; then
-    log "[vowifi].enabled is not true in $GSM_SIP_BRIDGE_CONFIG — VoWiFi bridge not started"
-    wait
-    exit 0
-fi
+# NOTE: this used to `wait; exit 0` when VoWiFi was disabled, which made the
+# host-side LTE block far below UNREACHABLE — and since the two are mutually
+# exclusive (enabling both is fatal), that meant [volte] could never start from
+# this script at all. The VoWiFi stack is now *skipped* rather than terminal,
+# so execution reaches the LTE block either way and one `wait` at the end
+# covers whichever supervisors were started.
+if [ "$VOWIFI_ENABLED" -eq 1 ]; then
 
 if [ "$LINE_COUNT" -eq 0 ]; then
     log "PROMINENT ERROR: [vowifi].enabled is true but no usable VoWiFi line was discovered \
@@ -856,6 +858,10 @@ log "starting vowifi-sip-agent (default netns, one shared process for all lines)
     done
 ) &
 SIP_AGENT_SUPERVISOR_PID=$!
+
+else
+    log "[vowifi].enabled is not true in $GSM_SIP_BRIDGE_CONFIG — VoWiFi bridge not started"
+fi
 
 # --- Host-side IMS over LTE (specs/015-volte-host-ims) ----------------------
 # Opt-in via [volte].enabled. Mutually exclusive with VoWiFi on the same SIM:
