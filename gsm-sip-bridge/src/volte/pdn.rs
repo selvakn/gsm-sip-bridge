@@ -56,16 +56,6 @@ impl ImsPdn {
             (false, false) => "none",
         }
     }
-
-    /// The link-local address the host must adopt on the bound interface.
-    ///
-    /// See `research.md` R7: the network unicasts its Router Advertisements to
-    /// the link-local form of the interface identifier it assigned, *not* to
-    /// `ff02::1`. A host-generated identifier therefore causes every RA to be
-    /// silently discarded and leaves the PDN unusable. This is FR-024.
-    pub fn required_link_local(&self) -> Option<Ipv6Addr> {
-        self.ipv6.map(link_local_from_assigned)
-    }
 }
 
 /// `2402:8100:6ffe:8ae6:0:c:de2b:3801` -> `fe80::c:de2b:3801`.
@@ -480,21 +470,6 @@ mod tests {
         let ll = link_local_from_assigned(assigned);
 
         assert_eq!(ll, "fe80::c:de2b:3801".parse::<Ipv6Addr>().unwrap());
-    }
-
-    #[test]
-    fn required_link_local_is_none_without_an_ipv6_address() {
-        let pdn = ImsPdn {
-            cid: 3,
-            apn_requested: "ims".into(),
-            apn_assigned: "ims.mnc043.mcc404.gprs".into(),
-            bearer_id: 6,
-            ipv4: Some("10.0.0.1".parse().unwrap()),
-            ipv6: None,
-        };
-
-        assert_eq!(pdn.required_link_local(), None);
-        assert_eq!(pdn.family(), "IPv4-only");
     }
 
     #[test]

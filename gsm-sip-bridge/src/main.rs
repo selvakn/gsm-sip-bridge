@@ -497,6 +497,20 @@ fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> E
 fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) -> ExitCode {
     use gsm_sip_bridge::ims::RegisterOutcome;
 
+    // Refuse to displace a live VoWiFi registration. Checked before anything
+    // touches the modem, so a refusal leaves the system exactly as it was.
+    if let Err(e) = gsm_sip_bridge::volte::guard::check_no_vowifi_conflict(args.force) {
+        eprintln!("volte-register: {e}");
+        return ExitCode::FAILURE;
+    }
+    let _lock = match gsm_sip_bridge::volte::guard::RegistrationGuard::acquire(&args.lock_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("volte-register: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let settings = gsm_sip_bridge::volte::VolteSettings {
         modem_port: args.modem.clone(),
         iface: args.iface.clone().unwrap_or_default(),

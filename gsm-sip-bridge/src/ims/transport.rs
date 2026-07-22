@@ -16,7 +16,7 @@
 //! trait existed. That equivalence is the point: adopting the trait must not
 //! change VoWiFi's behaviour in any observable way (FR-019).
 
-use crate::error::{BridgeError, BridgeResult};
+use crate::error::BridgeError;
 use std::net::{IpAddr, SocketAddr};
 
 /// Where a transport failed, so a failure survives the abstraction boundary
@@ -172,12 +172,6 @@ impl ImsTransport for EpdgTransport {
     fn name(&self) -> &'static str {
         "epdg"
     }
-}
-
-/// Convenience for callers that just want the address and are happy to
-/// surface a transport failure as a plain `BridgeError`.
-pub fn prepare_pcscf<T: ImsTransport>(transport: &mut T) -> BridgeResult<SocketAddr> {
-    Ok(transport.prepare()?.pcscf)
 }
 
 #[cfg(test)]

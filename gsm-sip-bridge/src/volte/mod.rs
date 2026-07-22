@@ -19,6 +19,7 @@
 //! usable resolver is offered. See `research.md` R2 and `plan.md` Gate G3.
 //! Until that is resolved, a P-CSCF must be supplied explicitly.
 
+pub mod guard;
 pub mod netcfg;
 pub mod pcscf;
 pub mod pdn;
@@ -27,7 +28,7 @@ pub mod registration;
 use crate::error::BridgeResult;
 use crate::ims::transport::{ImsTransport, ImsTransportHandle, TransportError, TransportResult};
 use crate::modules::at_commander::AtCommander;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Default PDP context id for the IMS PDN. Chosen to sit clear of the
@@ -328,11 +329,6 @@ impl ImsTransport for LteImsPdnTransport {
     }
 }
 
-/// Convenience for callers holding an `IpAddr` rather than a `SocketAddr`.
-pub fn pcscf_socket(addr: IpAddr, port: Option<u16>) -> SocketAddr {
-    SocketAddr::new(addr, port.unwrap_or(DEFAULT_PCSCF_PORT))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,13 +425,6 @@ mod tests {
         let err = t.prepare().unwrap_err();
 
         assert_eq!(err.stage, TransportStage::Attaching);
-    }
-
-    #[test]
-    fn pcscf_socket_defaults_to_the_sip_port() {
-        let s = pcscf_socket("2402:8100::1".parse().unwrap(), None);
-
-        assert_eq!(s.port(), DEFAULT_PCSCF_PORT);
     }
 
     #[test]
