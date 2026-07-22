@@ -138,20 +138,20 @@ after.
 
 **Independent test**: Query while idle, during a call, and after a failure.
 
-- [ ] T047 [US3] Answer a live status query over the existing control channel (FR-014, FR-033) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T048 [US3] Report registration state, current call and remaining lifetime in the shared vocabulary (FR-014, FR-018) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T049 [US3] Derive `can_answer`, and never optimistically (SC-009) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T050 [US3] Record recent call outcomes with enough detail to tell a normal call from a failed one (FR-015) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T051 [US3] Name the stage a failed call reached (FR-016) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T052 [US3] **Never report a call that carried no audio, or one-way audio, as successful** — reuse the existing verdict (FR-017) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T053 [US3] Report calls through the **existing** call measurements, tagged as this path (FR-030) in `gsm-sip-bridge/src/metrics/mod.rs`
-- [ ] T054 [US3] Keep registration and attachment measurements distinct from the other paths' (FR-031) in `gsm-sip-bridge/src/metrics/mod.rs`
+- [X] T047 [US3] Answer a live status query over the existing control channel (FR-014, FR-033) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T048 [US3] Report registration state, current call and remaining lifetime in the shared vocabulary (FR-014, FR-018) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T049 [US3] Derive `can_answer`, and never optimistically (SC-009) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T050 [US3] Record recent call outcomes with enough detail to tell a normal call from a failed one (FR-015) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T051 [US3] Name the stage a failed call reached (FR-016) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T052 [US3] **Never report a call that carried no audio, or one-way audio, as successful** — reuse the existing verdict (FR-017) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T053 [US3] Report calls through the **existing** call measurements, tagged as this path (FR-030) in `gsm-sip-bridge/src/metrics/mod.rs`
+- [X] T054 [US3] Keep registration and attachment measurements distinct from the other paths' (FR-031) in `gsm-sip-bridge/src/metrics/mod.rs`
 - [ ] T055 [US3] Extend the status command to query this service in `gsm-sip-bridge/src/main.rs`
 
 ### Tests
 
-- [ ] T056 [P] [US3] Test `can_answer` is false when unregistered, unattached, or busy, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
-- [ ] T057 [P] [US3] Test a one-way call is reported as failed with the direction named, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
+- [X] T056 [P] [US3] Test `can_answer` is false when unregistered, unattached, or busy, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
+- [X] T057 [P] [US3] Test a one-way call is reported as failed with the direction named, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
 
 ---
 

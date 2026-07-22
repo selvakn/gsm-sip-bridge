@@ -223,3 +223,88 @@ fn maintenance_while_the_line_is_idle_is_never_held_back() {
     }
     assert_eq!(policy.deferred(), None);
 }
+
+// ---- live status (US3, FR-014/SC-009) -------------------------------------
+
+use gsm_sip_bridge::volte::bridge::ServiceHealth;
+
+fn healthy() -> ServiceHealth {
+    ServiceHealth {
+        registered: true,
+        attached: true,
+        busy: false,
+        deferred: None,
+    }
+}
+
+#[test]
+fn a_healthy_idle_service_can_answer() {
+    assert!(healthy().can_answer());
+    assert_eq!(healthy().blocked_reason(), None);
+}
+
+#[test]
+fn can_answer_is_false_whenever_the_service_could_not_in_fact_answer() {
+    // Exclusive card assignment removes the circuit-switched fallback, so a
+    // wrong answer here means silently missed calls rather than a merely
+    // misleading dashboard (SC-009).
+    for (health, what) in [
+        (
+            ServiceHealth {
+                registered: false,
+                ..healthy()
+            },
+            "unregistered",
+        ),
+        (
+            ServiceHealth {
+                attached: false,
+                ..healthy()
+            },
+            "unattached",
+        ),
+        (
+            ServiceHealth {
+                busy: true,
+                ..healthy()
+            },
+            "busy",
+        ),
+    ] {
+        assert!(!health.can_answer(), "{what} must not report can_answer");
+        assert!(
+            health.blocked_reason().is_some(),
+            "{what} must say why it cannot answer"
+        );
+    }
+}
+
+#[test]
+fn being_registered_does_not_by_itself_imply_being_able_to_answer() {
+    // The registration is allowed to outlive the attachment briefly, which is
+    // precisely the window where inferring one from the other would be wrong.
+    let health = ServiceHealth {
+        registered: true,
+        attached: false,
+        busy: false,
+        deferred: None,
+    };
+    assert!(!health.can_answer());
+    assert_eq!(
+        health.blocked_reason(),
+        Some("the network attachment is down"),
+        "the attachment is named, since that is what has to be fixed"
+    );
+}
+
+#[test]
+fn deferred_maintenance_does_not_stop_the_service_answering() {
+    // Deferral means a call is up, not that the service is unhealthy — the
+    // busy flag is what makes it unable to take a *second* call.
+    let health = ServiceHealth {
+        busy: false,
+        deferred: Some(Maintenance::Reattachment),
+        ..healthy()
+    };
+    assert!(health.can_answer());
+}
