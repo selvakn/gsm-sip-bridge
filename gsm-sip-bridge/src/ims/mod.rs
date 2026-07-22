@@ -45,7 +45,7 @@ use sip_client::{
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-const DEFAULT_EXPIRES: u32 = 3600;
+pub const DEFAULT_EXPIRES: u32 = 3600;
 /// RFC 3310 §4.4: on a sync failure the client re-sends with an empty
 /// password and an `auts` parameter; the server then issues a fresh
 /// challenge. Cap resync attempts so a persistently out-of-sync SIM (or a

@@ -22,6 +22,7 @@
 pub mod netcfg;
 pub mod pcscf;
 pub mod pdn;
+pub mod registration;
 
 use crate::error::BridgeResult;
 use crate::ims::transport::{ImsTransport, ImsTransportHandle, TransportError, TransportResult};

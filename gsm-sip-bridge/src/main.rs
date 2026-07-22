@@ -476,10 +476,11 @@ fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> E
     match gsm_sip_bridge::volte::status(&settings) {
         Ok(Some(report)) => {
             print!("{}", report.summary());
-            // Registration state is reported here once registration over LTE
-            // lands (US3/US4); it is blocked on obtaining a P-CSCF address
-            // (specs/015-volte-host-ims, Gate G3).
-            println!("  registration   : not implemented (blocked on Gate G3)");
+            let status = gsm_sip_bridge::volte::registration::read_status(&args.status_path);
+            print!(
+                "{}",
+                gsm_sip_bridge::volte::registration::status_summary(status.as_ref())
+            );
             ExitCode::SUCCESS
         }
         Ok(None) => {
@@ -553,7 +554,14 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
         access_network_info: gsm_sip_bridge::volte::read_access_network_info(&args.modem),
     };
 
-    let result = gsm_sip_bridge::ims::run_register(&reg_cfg);
+    // Staying up and renewing is the default; --once is the one-shot
+    // diagnostic. A rejected first attempt never enters the renewal loop.
+    let result = gsm_sip_bridge::volte::registration::run(
+        &reg_cfg,
+        args.once,
+        &args.status_path,
+        gsm_sip_bridge::ims::DEFAULT_EXPIRES,
+    );
 
     if !args.keep_pdn {
         if let Err(e) = gsm_sip_bridge::volte::detach(&settings, attach.displaced_cid) {

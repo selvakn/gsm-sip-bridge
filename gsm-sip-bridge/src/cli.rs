@@ -263,6 +263,13 @@ pub struct VolteRegisterArgs {
     /// inspection. By default it is released.
     #[arg(long)]
     pub keep_pdn: bool,
+    /// Register once and exit instead of staying up and renewing before
+    /// expiry.
+    #[arg(long)]
+    pub once: bool,
+    /// Where to publish registration state for `volte-status`.
+    #[arg(long, default_value = crate::volte::registration::DEFAULT_STATUS_PATH)]
+    pub status_path: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -277,6 +284,9 @@ pub struct VolteStatusArgs {
     pub cid: u8,
     #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
     pub apn: String,
+    /// Where `volte-register` publishes its registration state.
+    #[arg(long, default_value = crate::volte::registration::DEFAULT_STATUS_PATH)]
+    pub status_path: PathBuf,
 }
 
 #[derive(Parser, Debug)]
