@@ -18,6 +18,21 @@ pub fn read_sms(at: &mut AtCommander, index: u32) -> BridgeResult<IncomingSms> {
     }
 }
 
+/// Lists the indexes of messages already sitting in the modem's storage.
+///
+/// Needed at startup: texts that arrived while nothing was reading the modem
+/// would otherwise be stepped over and eventually lost when storage filled
+/// (specs/017-volte-inbound-bridge US5).
+pub fn list_sms_indexes(at: &mut AtCommander) -> BridgeResult<Vec<u32>> {
+    // 4 = all messages, read and unread, in text mode.
+    match at.send_command("AT+CMGL=\"ALL\"")? {
+        AtResponse::Ok(lines) => Ok(crate::volte::sms::parse_cmgl_indexes(&lines)),
+        AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+            Err(BridgeError::Sms(format!("CMGL failed: {e}")))
+        }
+    }
+}
+
 pub fn delete_sms(at: &mut AtCommander, index: u32) -> BridgeResult<()> {
     let cmd = format!("AT+CMGD={index}");
     match at.send_command(&cmd)? {
