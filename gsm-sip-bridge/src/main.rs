@@ -91,6 +91,10 @@ fn main() -> ExitCode {
         return handle_volte_call_command(args);
     }
 
+    if let Some(Commands::VolteListen(args)) = &cli.command {
+        return handle_volte_listen_command(args);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -502,6 +506,133 @@ fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> E
         }
         Err(e) => {
             eprintln!("volte-status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_volte_listen_command(args: &gsm_sip_bridge::cli::VolteListenArgs) -> ExitCode {
+    use std::time::Duration;
+
+    if let Err(e) = gsm_sip_bridge::volte::guard::check_no_vowifi_conflict(args.force) {
+        eprintln!("volte-listen: {e}");
+        return ExitCode::FAILURE;
+    }
+    let _lock = match gsm_sip_bridge::volte::guard::RegistrationGuard::acquire(&args.lock_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("volte-listen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (pcscf_addr, _src) = match args.pcscf {
+        Some(a) => (a, "--pcscf".to_string()),
+        None => {
+            let cache = std::path::PathBuf::from(&args.pcscf_source_path);
+            match gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache).found() {
+                Some(a) => (a, format!("ePDG capture at {}", cache.display())),
+                None => {
+                    eprintln!("volte-listen: [discovering-pcscf] no P-CSCF address available; pass --pcscf");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    let settings = gsm_sip_bridge::volte::VolteSettings {
+        modem_port: args.modem.clone(),
+        iface: args.iface.clone().unwrap_or_default(),
+        cid: args.cid,
+        apn: args.apn.clone(),
+        pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+    };
+    let attach = match gsm_sip_bridge::volte::attach(&settings) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("volte-listen: [attaching] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let plmn = match gsm_sip_bridge::modules::at_commander::AtCommander::open(&args.modem)
+        .and_then(|mut at| gsm_sip_bridge::vowifi::plmn::derive_plmn(&mut at))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("volte-listen: [attaching] could not derive the home PLMN: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let reg_cfg = gsm_sip_bridge::ims::ImsRegisterConfig {
+        modem_port: args.modem.clone(),
+        pcscf_addr,
+        pcscf_port: args.pcscf_port,
+        mcc: plmn.mcc,
+        mnc: plmn.mnc,
+        imsi: None,
+        imei: None,
+        use_tcp: true,
+        sec_agree: true,
+        msisdn: args.msisdn.clone(),
+        access_network_info: gsm_sip_bridge::volte::read_access_network_info(&args.modem),
+    };
+
+    println!(
+        "Registering, then listening {}s for anything the network delivers.\n\
+         DIAL THE SIM NOW — the call will be declined with a busy response, not answered.",
+        args.listen_secs
+    );
+
+    let result =
+        gsm_sip_bridge::ims::agent::probe_inbound(&reg_cfg, Duration::from_secs(args.listen_secs));
+
+    if !args.keep_pdn {
+        if let Err(e) = gsm_sip_bridge::volte::detach(&settings, attach.displaced_cid) {
+            tracing::warn!(error = %e, "failed to release the IMS PDN");
+        }
+    }
+
+    match result {
+        Ok(report) => {
+            println!("\ninbound probe report");
+            println!(
+                "  port reachable : {}",
+                if report.port_proven_reachable {
+                    "YES — the network delivered something to us"
+                } else {
+                    "UNPROVEN — nothing arrived at all"
+                }
+            );
+            println!("  incoming calls : {}", report.invites);
+            println!("  other requests : {}", report.other_requests);
+            for entry in &report.log {
+                println!("    - {entry}");
+            }
+            if report.invites > 0 {
+                println!("\nThe carrier DOES route incoming calls to us over this registration.");
+                ExitCode::SUCCESS
+            } else {
+                if report.port_proven_reachable {
+                    println!(
+                        "\nThe network CAN reach us — something was delivered — but no \
+                         incoming call arrived. If the SIM was dialled during the window, \
+                         the carrier is not routing calls to this registration."
+                    );
+                } else {
+                    println!(
+                        "\nNothing arrived at all, so this run proves nothing: it cannot \
+                         distinguish 'the carrier does not route calls here' from 'our \
+                         protected port is unreachable'. Investigate reachability before \
+                         concluding anything about incoming calls."
+                    );
+                }
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("volte-listen: {e}");
             ExitCode::FAILURE
         }
     }

@@ -194,7 +194,13 @@ An operator with several cards wants to select, per card, whether incoming cellu
 
 **Open questions this feature is expected to settle**
 
-- **Whether the carrier routes incoming calls to the bridge at all.** Everything else here depends on it. It should be established as early as possible, because a negative answer invalidates the feature rather than merely delaying it.
+- ~~**Whether the carrier routes incoming calls to the bridge at all.**~~ ✅ **RESOLVED, positively, 2026-07-22 — before any bridging code was written.** A probe held the registration open with the protected port listening and declined calls with a busy response. Four incoming calls were delivered over the registration, each carrying the caller's number and display name, and each followed by an acknowledgement of our response — so the inbound path works in *both* directions. The feature is buildable.
+
+  Two notes on how that was established, because the first attempt got it wrong. An initial probe saw nothing at all and looked like a negative result; it had **no positive control**, so it could not distinguish "the carrier does not route calls here" from "our port is unreachable". Adding a control — subscribing to registration events, so that a notification arriving proves reachability — made the subsequent absence-or-presence of a call meaningful. It fired 95ms after registering.
+
+  The retest also changed the listening window and pinned down the dial timing, so **the difference cannot be attributed to any single change**, and is not claimed to be.
+
+  A hypothesis raised and **disproved** in the process: that disabling the modem's own IMS stack would make the network fall back to circuit-switched paging for incoming calls. The modem was watched throughout and never paged. Disabling it does not prevent IMS delivery.
 - **Whether the network grants an incoming call the same conversational-voice treatment it grants outgoing ones.** Verified for outgoing calls previously; unverified in this direction.
 
 **Reasonable defaults chosen**
