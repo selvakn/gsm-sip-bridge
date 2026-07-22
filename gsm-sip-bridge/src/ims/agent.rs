@@ -389,27 +389,58 @@ fn run_status_listener(
 /// A, owns the actual Discord post — it holds the `[sms]` webhook config and
 /// has LAN/Internet reachability, whereas Agent A's netns is IMS-tunnel-only
 /// (see `ControlMessage::SmsReceived` docs).
+/// Handles an inbound SIP `MESSAGE` (RFC 3428).
+///
+/// # Hand it on before acknowledging it
+///
+/// The acknowledgement goes out **after** the message has been handed to the
+/// half that records it, never before. This ordering is the whole safety
+/// property (specs/017 FR-026):
+///
+/// - Acknowledge first, and a crash in the window between the two loses the
+///   message outright — while the network believes it was delivered, so it
+///   never retries. A lost text announces itself to nobody.
+/// - Acknowledge after, and the same crash costs a retransmission, which
+///   `volte::sms::Dedupe` absorbs.
+///
+/// One ordering loses data; the other costs a duplicate that is then
+/// suppressed. So a relay failure deliberately leaves the message
+/// *unacknowledged*: the network retrying is the recovery mechanism, and
+/// acknowledging something we failed to record would throw that away.
 fn handle_message(sink: &SipSink, req: &SipRequest, control_addr: SocketAddr) {
-    let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
-
     let sender = extract_caller(req);
     let body = req.body.clone();
     tracing::info!(sender = %sender, "received SIP MESSAGE");
 
     let msg = ControlMessage::SmsReceived {
-        sender,
+        sender: sender.clone(),
         body,
         received_at: chrono::Utc::now().to_rfc3339(),
     };
-    match TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT) {
-        Ok(mut control) => {
-            if let Err(e) = write_msg(&mut control, &msg) {
-                tracing::warn!(error = %e, "failed to relay SIP MESSAGE to Agent B");
+    let relayed = match TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT) {
+        Ok(mut control) => match write_msg(&mut control, &msg) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to relay SIP MESSAGE for recording");
+                false
             }
-        }
+        },
         Err(e) => {
-            tracing::warn!(error = %e, "failed to reach Agent B control channel to relay SIP MESSAGE");
+            tracing::warn!(error = %e, "failed to reach the control channel to relay SIP MESSAGE");
+            false
         }
+    };
+
+    if relayed {
+        let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
+    } else {
+        // Deliberately silent toward the network: an unacknowledged MESSAGE is
+        // retransmitted, which is the recovery we want. Acknowledging one we
+        // failed to record would discard the only chance to get it back.
+        tracing::warn!(
+            sender = %sender,
+            "not acknowledging the MESSAGE so the network retransmits it"
+        );
     }
 }
 
