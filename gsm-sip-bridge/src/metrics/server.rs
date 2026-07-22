@@ -53,7 +53,21 @@ async fn metrics_handler() -> impl IntoResponse {
     refresh_agent_liveness();
 
     let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
+    // Both registries, not just the default one.
+    //
+    // `prometheus::gather()` collects the *default* registry. The host-side
+    // LTE gauges (`gsm_bridge_volte_*`) register into `metrics::REGISTRY`
+    // instead, so for as long as they have existed they have been invisible
+    // to every scrape — set faithfully by the code, collected by nobody.
+    // Found live (specs/017 research R16) while checking that this path's
+    // health was distinguishable from the Wi-Fi path's: it was not, because
+    // it was not published at all.
+    //
+    // This is the failure `sms::record_and_forward` already warns about in
+    // its own doc comment — "would land in a Prometheus registry nothing ever
+    // reads" — reached by a different route.
+    let mut metric_families = prometheus::gather();
+    metric_families.extend(super::REGISTRY.gather());
 
     match encoder.encode_to_string(&metric_families) {
         Ok(output) => (

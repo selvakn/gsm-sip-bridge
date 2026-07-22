@@ -178,7 +178,7 @@ after.
 
 **Gates**: B1, B2, B3, B4. None of this can be simulated.
 
-- [ ] T067 Stop anything else holding the registration — they displace each other
+- [X] T067 Stop anything else holding the registration — they displace each other
 - [ ] T068 Re-confirm incoming calls still reach us with `volte-listen`, isolating "the network is fine" from "our service is broken"
 - [ ] T069 **Gate B1**: first bridged call — telephone system rings promptly, is answered, and carries a conversation both ways for 60s (SC-001, SC-002)
 - [ ] T070 Test teardown from the calling side, then from the telephone-system side; both legs end cleanly each way
@@ -187,7 +187,7 @@ after.
 - [ ] T073 Send a text during a call; both must be handled
 - [ ] T074 Restart with a text already in modem storage; confirm it is recovered
 - [ ] T075 **Gate B3**: confirm existing call dashboards show these calls with no panel modified, and identify any panel that splits by transport (FR-032, SC-012)
-- [ ] T076 Confirm this registration's health is distinguishable from the Wi-Fi path's while one is down and the other up (SC-013)
+- [X] T076 Confirm this registration's health is distinguishable from the Wi-Fi path's while one is down and the other up (SC-013)
 - [ ] T077 Dial a second call while one is bridged; expect busy, first call undisturbed
 - [ ] T078 Stop the telephone system, then dial in; expect a defined outcome quickly, not silence
 - [ ] T079 **US2 soak**: run 4+ hours across at least one attachment teardown and several renewals; a call connects at the end (SC-003)
