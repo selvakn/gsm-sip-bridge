@@ -19,6 +19,7 @@
 //! usable resolver is offered. See `research.md` R2 and `plan.md` Gate G3.
 //! Until that is resolved, a P-CSCF must be supplied explicitly.
 
+pub mod bridge;
 pub mod guard;
 pub mod netcfg;
 pub mod pcscf;
