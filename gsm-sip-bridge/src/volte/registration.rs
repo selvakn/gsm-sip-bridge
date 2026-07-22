@@ -18,6 +18,7 @@
 //! If VoLTE ever grows to multiple concurrent lines, this is the piece to
 //! revisit.
 
+use super::VolteSettings;
 use crate::error::BridgeResult;
 use crate::ims::{self, ImsRegisterConfig, RegisterOutcome, RegistrationState, RegistrationStatus};
 use crate::metrics;
@@ -186,6 +187,34 @@ pub fn status_summary(status: Option<&RegistrationStatus>) -> String {
     out
 }
 
+/// Re-establishes the network attachment before a renewal.
+///
+/// A dropped PDN is invisible to `ims::run_register` — it simply fails to
+/// connect — so without this the loop retries REGISTER forever against a dead
+/// attachment and can never recover. Observed on a soak: the carrier
+/// deactivated the IMS context after roughly two hours, the modem unbound the
+/// host netdev, and every subsequent renewal failed with "No route to host"
+/// while the radio itself was perfectly healthy.
+///
+/// `attach` is idempotent, so this is a cheap no-op when the PDN is fine.
+/// Returns whether the attachment is usable — attached *and* routable.
+fn refresh_attachment(settings: &VolteSettings) -> Result<(), String> {
+    match super::attach(settings) {
+        Ok(report) if report.routed || report.iface.is_empty() => {
+            metrics::VOLTE_PDN_UP.set(1.0);
+            Ok(())
+        }
+        Ok(_) => {
+            metrics::VOLTE_PDN_UP.set(0.0);
+            Err("the IMS PDN is attached but has no default route".to_string())
+        }
+        Err(e) => {
+            metrics::VOLTE_PDN_UP.set(0.0);
+            Err(format!("could not re-establish the IMS PDN: {e}"))
+        }
+    }
+}
+
 /// Registers, then keeps the registration alive until interrupted.
 ///
 /// Returns the outcome of the **first** attempt, so a caller can report and
@@ -193,6 +222,7 @@ pub fn status_summary(status: Option<&RegistrationStatus>) -> String {
 /// that was never accepted.
 pub fn run(
     cfg: &ImsRegisterConfig,
+    settings: Option<&VolteSettings>,
     once: bool,
     status_path: &Path,
     requested_expires: u32,
@@ -250,6 +280,30 @@ pub fn run(
 
         status.state = RegistrationState::Renewing;
         write_status(status_path, &status);
+
+        // Verify the attachment before spending a REGISTER on it. When the PDN
+        // has gone, saying so is far more useful than the connect timeout that
+        // would otherwise surface, and it avoids waiting out that timeout on
+        // every retry.
+        if let Some(settings) = settings {
+            if let Err(reason) = refresh_attachment(settings) {
+                tracing::warn!(
+                    error = %reason,
+                    retry_in_secs = backoff.as_secs(),
+                    "cannot renew: the network attachment is down"
+                );
+                status.state = RegistrationState::Failed;
+                status.last_failure = Some((SystemTime::now(), reason));
+                write_status(status_path, &status);
+                metrics::VOLTE_REGISTRATIONS_TOTAL
+                    .with_label_values(&["attachment_down"])
+                    .inc();
+                metrics::VOLTE_REGISTERED.set(0.0);
+                std::thread::sleep(backoff);
+                backoff = next_backoff(backoff);
+                continue;
+            }
+        }
 
         match ims::run_register(cfg) {
             Ok(RegisterOutcome::Success { headers, .. }) => {
@@ -338,6 +392,25 @@ mod tests {
     #[test]
     fn ignores_an_unparseable_expires() {
         assert_eq!(granted_expires(&h(&[("Expires", "soon")]), 3600), 3600);
+    }
+
+    #[test]
+    fn a_down_attachment_is_reported_as_such_not_as_a_connect_error() {
+        // The soak's failure mode: the PDN was gone and every renewal surfaced
+        // "No route to host", which points at the network rather than at the
+        // real cause. A modem path that cannot open stands in for the PDN
+        // being unavailable.
+        let settings = VolteSettings {
+            modem_port: std::path::PathBuf::from("/nonexistent/tty"),
+            ..VolteSettings::default()
+        };
+
+        let err = refresh_attachment(&settings).unwrap_err();
+
+        assert!(
+            err.contains("could not re-establish the IMS PDN"),
+            "got: {err}"
+        );
     }
 
     #[test]

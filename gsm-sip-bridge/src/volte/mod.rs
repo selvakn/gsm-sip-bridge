@@ -311,8 +311,14 @@ impl ImsTransport for LteImsPdnTransport {
         let handle = ImsTransportHandle {
             pcscf,
             descriptor: format!(
-                "LTE IMS PDN (cid {}, APN {}), P-CSCF from configuration",
-                report.pdn.cid, report.pdn.apn_assigned
+                "LTE IMS PDN (cid {}, APN {}, {}), P-CSCF from configuration",
+                report.pdn.cid,
+                report.pdn.apn_assigned,
+                if report.routed {
+                    "routable"
+                } else {
+                    "NOT routable"
+                }
             ),
         };
         self.prepared = Some(handle.clone());

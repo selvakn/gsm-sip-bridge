@@ -192,7 +192,7 @@ Success is a complete, accurate report — not necessarily a discovered address.
 - [x] T080 [P] [US4] Unit tests for granted-expiry precedence, backoff bounding, status round-trip in `gsm-sip-bridge/src/volte/registration.rs`
 - [x] T081 [P] [US4] Test that an injected newline in a failure reason cannot corrupt the status format in `gsm-sip-bridge/src/volte/registration.rs`
 - [x] T082 [US4] Hardware validation: registration accepted, status published, `volte-status` reports state
-- [ ] T083 [US4] **SC-004**: observe two consecutive automatic renewals on hardware (**1 of 2 observed** at 10:16:40, exactly 55 min after registration = 3600s expiry − 300s headroom; second due ~11:11)
+- [x] T083 [US4] **SC-004**: two consecutive automatic renewals observed on hardware at 10:16:40 and 11:11:42, both exactly 3300s apart (3600s granted expiry − 300s headroom)
 
 ---
 
@@ -215,6 +215,7 @@ Success is a complete, accurate report — not necessarily a discovered address.
 - [x] T098 [P] Document host-side VoLTE in `README.md` and `docs/operations.md`
 - [x] T099 [P] Clarify in `docs/ec20-volte-setup.md` that it covers modem-internal VoLTE on EC20, not this path
 - [ ] T100 Resolve research R9: confirm which source address the network routes
+- [x] T101 Re-establish the attachment before each renewal, and stop caching it in the transport (research R15) in `gsm-sip-bridge/src/volte/registration.rs` and `gsm-sip-bridge/src/volte/mod.rs`
 
 ---
 
@@ -270,9 +271,9 @@ transcripts.
 
 | | Count |
 |---|---|
-| Total tasks | 100 |
-| Verified implemented | **98** |
-| Outstanding | **2** |
+| Total tasks | 101 |
+| Verified implemented | **100** |
+| Outstanding | **1** |
 
 **443 workspace tests pass; `make lint` clean; 0 `unsafe` in `gsm-sip-bridge/src`.**
 
@@ -305,12 +306,18 @@ they all pass. Outside `volte/`, the feature touched only `cli.rs`,
 
 ## Outstanding tasks
 
-Two remain, both blocked on elapsed time or live traffic rather than on work.
+One remains, blocked on live traffic rather than on work.
 
 | ID | Task | Why it is still open |
 |---|---|---|
-| **T083** | Observe two consecutive renewals (SC-004) | **1 of 2 observed.** The first fired at 10:16:40, exactly 55 min after registration (3600s granted expiry − 300s headroom), and was accepted. The second needs another ~55 min of soak. Renewal *timing* is therefore already proven on hardware; only the "two consecutive" wording remains |
 | **T100** | Resolve research R9 (routed source address) | Needs real traffic to settle which of the two installed addresses the network routes. Benign today because both the network-assigned `/128` and the SLAAC address are installed, so signalling works either way. Expect the calls feature to answer it |
+
+**T083 closed**: two consecutive renewals observed at 10:16:40 and 11:11:42,
+both exactly 3300s apart. The soak then kept running and exposed R15 — the
+carrier tears the IMS PDN down after roughly two hours, and the renewal loop
+had no way to recover from that. Fixed under T101 and the recovery verified on
+hardware. **Leaving the soak running past its success criterion is what found
+the most serious defect in the feature.**
 
 ### Cleared since the first cross-validation
 
