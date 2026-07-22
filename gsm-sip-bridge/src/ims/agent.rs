@@ -192,6 +192,7 @@ fn run_inner(
         // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
         // has no attachment of its own to refresh.
         answer_preference: sdp::AnswerPreference::legacy(),
+        veth_sip_port: VETH_SIP_PORT,
         pre_renewal: None,
         app_config,
         agent_label: "vowifi-ims-agent",
@@ -214,6 +215,9 @@ pub(crate) struct InboundParams<'a> {
     pub control_addr: SocketAddr,
     pub wideband: bool,
     pub answer_preference: sdp::AnswerPreference,
+    /// Port the telephone-side half dials for its leg. The two halves must
+    /// agree; see `handle_invite`.
+    pub veth_sip_port: u16,
     pub pre_renewal: Option<&'a PreRenewalHook>,
     pub app_config: &'a crate::config::AppConfig,
     /// What to call this agent in logs.
@@ -238,6 +242,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         control_addr,
         wideband,
         answer_preference,
+        veth_sip_port,
         pre_renewal,
         app_config,
         agent_label,
@@ -326,6 +331,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         local_ip,
         wideband,
         answer_preference,
+        veth_sip_port,
         pre_renewal,
         &obs,
     );
@@ -535,6 +541,7 @@ pub(crate) fn dispatch_loop(
     veth_local_ip: IpAddr,
     wideband: bool,
     answer_preference: sdp::AnswerPreference,
+    veth_sip_port: u16,
     pre_renewal: Option<&PreRenewalHook>,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<()> {
@@ -607,6 +614,7 @@ pub(crate) fn dispatch_loop(
                     veth_local_ip,
                     wideband,
                     answer_preference,
+                    veth_sip_port,
                     obs,
                 ) {
                     Ok(call) => {
@@ -617,6 +625,30 @@ pub(crate) fn dispatch_loop(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to handle inbound INVITE");
+                        // Tell the caller. Without this the carrier never gets
+                        // a final response, so the caller keeps hearing the
+                        // ringback our earlier `180` started and waits out the
+                        // network's own timer — a call that rings forever and
+                        // never connects, with no indication anything failed
+                        // (FR-005, observed live: specs/017 R17).
+                        //
+                        // `480 Temporarily Unavailable` rather than `486 Busy`:
+                        // the line is not busy, the bridge could not be built.
+                        // Saying which is the difference between a caller
+                        // redialling now and one redialling later.
+                        if let Err(send_err) = sink.send(&build_uas_response(
+                            480,
+                            "Temporarily Unavailable",
+                            &req,
+                            Some(&random_hex(4)),
+                            None,
+                            None,
+                        )) {
+                            tracing::warn!(
+                                error = %send_err,
+                                "could not tell the caller the bridge failed"
+                            );
+                        }
                         obs.report_call_not_answered(
                             CallStatus::Failed,
                             BridgeFailureReason::AgentUnreachable,
@@ -789,6 +821,11 @@ fn handle_invite(
     veth_local_ip: IpAddr,
     wideband: bool,
     answer_preference: sdp::AnswerPreference,
+    // `veth_sip_port` is the port on `veth_local_ip` where the telephone-side
+    // half's leg is expected. It MUST match what that half dials — a mismatch
+    // produces a call that rings the PBX, is answered, and then times out with
+    // the caller still hearing ringback (observed live, specs/017 R17).
+    veth_sip_port: u16,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<Option<ActiveCall>> {
     let call_id = req.header("Call-ID").unwrap_or_default().to_string();
@@ -837,7 +874,7 @@ fn handle_invite(
     // sends when the originating leg is narrowband) keeps the veth link on
     // PCMU, exactly the path it took before L16 existed.
     let veth_wideband = precheck.codec == NegotiatedCodec::AmrWb;
-    let veth_rx = spawn_veth_uas_listener(veth_local_ip, veth_wideband)?;
+    let veth_rx = spawn_veth_uas_listener(veth_local_ip, veth_sip_port, veth_wideband)?;
 
     // Generated once and reused for every response in this dialog (180 and
     // 200 OK alike) — RFC 3261 requires the same To-tag across all
@@ -1199,9 +1236,10 @@ struct VethUasResult {
 /// actually reaches it.
 fn spawn_veth_uas_listener(
     veth_local_ip: IpAddr,
+    veth_sip_port: u16,
     wideband: bool,
 ) -> BridgeResult<mpsc::Receiver<BridgeResult<VethUasResult>>> {
-    let sip_socket = UdpSocket::bind((veth_local_ip, VETH_SIP_PORT))
+    let sip_socket = UdpSocket::bind((veth_local_ip, veth_sip_port))
         .map_err(|e| BridgeError::Ims(format!("veth SIP socket bind failed: {e}")))?;
     sip_socket
         .set_read_timeout(Some(VETH_INVITE_TIMEOUT))
@@ -1209,14 +1247,21 @@ fn spawn_veth_uas_listener(
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(accept_veth_invite(&sip_socket, veth_local_ip, wideband));
+        let _ = tx.send(accept_veth_invite(
+            &sip_socket,
+            veth_local_ip,
+            veth_sip_port,
+            wideband,
+        ));
     });
     Ok(rx)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_veth_invite(
     sip_socket: &UdpSocket,
     veth_local_ip: IpAddr,
+    veth_sip_port: u16,
     wideband: bool,
 ) -> BridgeResult<VethUasResult> {
     let mut buf = [0u8; 4096];
@@ -1248,7 +1293,7 @@ fn accept_veth_invite(
     let (answer_sdp, codec) =
         sdp::build_veth_answer(veth_local_ip, rtp_port, session_id, &offer, wideband)?;
     let to_tag = random_hex(4);
-    let contact = format!("<sip:agent-a@{veth_local_ip}:{VETH_SIP_PORT}>");
+    let contact = format!("<sip:agent-a@{veth_local_ip}:{veth_sip_port}>");
     let response = build_200_ok_invite(&req, &to_tag, &contact, &answer_sdp);
     sip_socket
         .send_to(response.as_bytes(), peer)

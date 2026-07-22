@@ -574,6 +574,9 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         // is that it sounds better than the modem-internal one.
         wideband: true,
         answer_preference: sdp::AnswerPreference::cellular(),
+        // Must equal the telephony line's `sip_leg_port` above. They are set
+        // from the same constant so they cannot drift apart again.
+        veth_sip_port: LOOPBACK_SIP_PORT,
         pre_renewal: Some(&pre_renewal),
         app_config,
         agent_label: "volte-ims-agent",

@@ -308,3 +308,28 @@ fn deferred_maintenance_does_not_stop_the_service_answering() {
     };
     assert!(health.can_answer());
 }
+
+// ---- the two halves must agree on where to meet --------------------------
+
+#[test]
+fn the_halves_agree_on_the_leg_port() {
+    // Found live: the telephone-side half dialled LOOPBACK_SIP_PORT while the
+    // carrier-side listener still bound the Wi-Fi path's hardcoded
+    // VETH_SIP_PORT. The symptom was not an obvious failure — the INVITE
+    // arrived, both legs were placed, the PBX rang and a human ANSWERED, and
+    // only then did it time out, leaving the caller listening to ringback for
+    // a call that was never going to connect.
+    //
+    // Both sides now read this one constant. This test exists so that stays
+    // true.
+    use gsm_sip_bridge::volte::bridge::{LOOPBACK_CONTROL_PORT, LOOPBACK_SIP_PORT, SIP_LOCAL_PORT};
+
+    assert_ne!(
+        LOOPBACK_SIP_PORT, SIP_LOCAL_PORT,
+        "the leg port and the PJSIP local port must not collide"
+    );
+    assert_ne!(
+        LOOPBACK_SIP_PORT, LOOPBACK_CONTROL_PORT,
+        "SIP signalling and the control channel need separate ports"
+    );
+}
