@@ -2,6 +2,7 @@
 
 **Purpose**: Validate specification completeness and quality before proceeding to planning
 **Created**: 2026-07-22
+**Clarified**: 2026-07-22 (5 questions, all answered — see spec `## Clarifications`)
 **Feature**: [spec.md](../spec.md)
 
 ## Content Quality
@@ -31,8 +32,18 @@
 
 ## Notes
 
-**Validation passed on first iteration.** 16/16. 24 functional requirements,
-8 success criteria, 4 user stories, 9 edge cases, zero clarification markers.
+**Validation passed on first iteration.** 16/16. Now **28 functional
+requirements** (24 original + 4 added during clarification), 8 success
+criteria, 4 user stories, 9 edge cases, zero clarification markers.
+
+**Re-validated after clarification (2026-07-22).** All 16 items still pass.
+The mandatory sections were re-scanned for protocol and technology
+identifiers after every integration; none leaked. One escape clause was
+*removed* rather than added to: FR-014's original "or state that this could
+not be determined" would have been satisfiable by an implementation that
+always answered "undetermined", so it was replaced by a positive obligation
+to sample the modem before, during and after the call, with FR-026 making an
+undetermined result an explicit, reasoned outcome.
 
 Verified mechanically as well as by reading: the mandatory sections (User
 Scenarios through Success Criteria) were scanned for protocol and technology
