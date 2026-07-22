@@ -71,6 +71,14 @@ fn main() -> ExitCode {
         return handle_modem_ims_command(args, &cli);
     }
 
+    if let Some(Commands::VoltePdn(args)) = &cli.command {
+        return handle_volte_pdn_command(args);
+    }
+
+    if let Some(Commands::VolteStatus(args)) = &cli.command {
+        return handle_volte_status_command(args);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -393,6 +401,87 @@ fn handle_modem_ims_command(args: &gsm_sip_bridge::cli::ModemImsArgs, cli: &Cli)
         }
     };
     gsm_sip_bridge::vowifi::ims_mode::run(&args.modem, config.vowifi.enabled)
+}
+
+fn volte_settings(
+    modem: &std::path::Path,
+    iface: &Option<String>,
+    cid: u8,
+    apn: &str,
+) -> gsm_sip_bridge::volte::VolteSettings {
+    gsm_sip_bridge::volte::VolteSettings {
+        modem_port: modem.to_path_buf(),
+        iface: iface.clone().unwrap_or_default(),
+        cid,
+        apn: apn.to_string(),
+        pcscf: None,
+    }
+}
+
+fn handle_volte_pdn_command(args: &gsm_sip_bridge::cli::VoltePdnArgs) -> ExitCode {
+    use gsm_sip_bridge::cli::VoltePdnAction;
+    let settings = volte_settings(&args.modem, &args.iface, args.cid, &args.apn);
+
+    match args.action {
+        VoltePdnAction::Up => match gsm_sip_bridge::volte::attach(&settings) {
+            Ok(report) => {
+                print!("{}", report.summary());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("volte-pdn: failed to attach the IMS PDN: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        VoltePdnAction::Down => match gsm_sip_bridge::volte::detach(&settings, args.restore_cid) {
+            Ok(()) => {
+                println!("IMS PDN released (context {}).", args.cid);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("volte-pdn: failed to release the IMS PDN: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // `status` exits 0 whether or not a PDN exists: the state belongs in
+        // the output, not the exit code.
+        VoltePdnAction::Status => match gsm_sip_bridge::volte::status(&settings) {
+            Ok(Some(report)) => {
+                print!("{}", report.summary());
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("No IMS PDN attached on context {}.", args.cid);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("volte-pdn: failed to read IMS PDN state: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> ExitCode {
+    let settings = volte_settings(&args.modem, &args.iface, args.cid, &args.apn);
+    match gsm_sip_bridge::volte::status(&settings) {
+        Ok(Some(report)) => {
+            print!("{}", report.summary());
+            // Registration state is reported here once registration over LTE
+            // lands (US3/US4); it is blocked on obtaining a P-CSCF address
+            // (specs/015-volte-host-ims, Gate G3).
+            println!("  registration   : not implemented (blocked on Gate G3)");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            println!("No IMS PDN attached on context {}.", args.cid);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("volte-status: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> ExitCode {
