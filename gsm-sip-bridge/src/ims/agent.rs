@@ -24,6 +24,7 @@ use crate::ims::sip_client::{
     build_200_ok_message, build_486_busy_here, build_bye, build_uas_response, format_sip_addr,
     random_hex, spawn_gm_server, ByeRequest, GmServer, SipMessage, SipRequest, SipSink,
 };
+use crate::ims::transport::{EpdgTransport, ImsTransport};
 use crate::ims::ImsRegisterConfig;
 use crate::observability::reporter::Reporter;
 use crate::store::StoreHandle;
@@ -108,20 +109,24 @@ pub fn run(
     }
 }
 
-fn read_pcscf(path: &str) -> BridgeResult<IpAddr> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| BridgeError::Ims(format!("failed to read P-CSCF address from {path}: {e}")))?;
-    raw.trim()
-        .parse()
-        .map_err(|e| BridgeError::Ims(format!("invalid P-CSCF address in {path}: {e}")))
-}
-
 fn run_inner(
     card_id: &str,
     config: &VowifiConfig,
     app_config: &crate::config::AppConfig,
 ) -> BridgeResult<()> {
-    let pcscf_addr = read_pcscf(&config.pcscf_source_path)?;
+    // The ePDG tunnel is one of two `ImsTransport`s feeding the same
+    // registration machinery (specs/015-volte-host-ims); the LTE IMS PDN is
+    // the other. For VoWiFi this is exactly the P-CSCF file read that used to
+    // sit inline here — same source, same port, same error text.
+    let mut transport = EpdgTransport::new(config.pcscf_source_path.clone(), 5060);
+    let transport_handle = transport.prepare()?;
+    tracing::info!(
+        transport = transport.name(),
+        pcscf = %transport_handle.pcscf,
+        descriptor = %transport_handle.descriptor,
+        "IMS transport ready"
+    );
+    let pcscf_addr = transport_handle.pcscf.ip();
     // Empty mcc/mnc means auto-derive (config::VowifiConfig::mcc docs). The
     // IMS realm is built from these, so derive them from the SIM the same
     // way entrypoint.sh's `vowifi-plmn` call does for the tunnel side —
@@ -140,7 +145,7 @@ fn run_inner(
     let reg_cfg = ImsRegisterConfig {
         modem_port: PathBuf::from(&config.modem_port),
         pcscf_addr,
-        pcscf_port: 5060,
+        pcscf_port: transport_handle.pcscf.port(),
         mcc,
         mnc,
         imsi: None,
