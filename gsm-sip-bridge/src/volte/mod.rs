@@ -212,6 +212,9 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
         }
     }
 
+    // Attached-but-unroutable is not "up": see research.md R10.
+    crate::metrics::VOLTE_PDN_UP.set(if routed { 1.0 } else { 0.0 });
+
     Ok(AttachReport {
         pdn: brought_up.pdn,
         iface: settings.iface.clone(),
@@ -229,6 +232,7 @@ pub fn detach(settings: &VolteSettings, restore_cid: Option<u8>) -> BridgeResult
     }
     let mut at = AtCommander::open(Path::new(&settings.modem_port))?;
     pdn::tear_down(&mut at, settings.cid, restore_cid)?;
+    crate::metrics::VOLTE_PDN_UP.set(0.0);
     tracing::info!(cid = settings.cid, "IMS PDN released");
     Ok(())
 }

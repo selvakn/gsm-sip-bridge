@@ -186,3 +186,44 @@ vpcd_port = 15963
 # strongswan engine only: use this IMSI instead of reading it from the SIM
 # via AT+CIMI. Diagnostic escape hatch — leave unset normally.
 # imsi_override = "404940123456789"
+
+# --- Host-side IMS over LTE (VoLTE) -------------------------------------
+# specs/015-volte-host-ims. The bridge runs its OWN IMS registration over an
+# LTE IMS PDN, instead of delegating to the modem's internal IMS stack.
+#
+# WARNING: do not enable this alongside [vowifi] on the same SIM. Both
+# register the same IMPU with the same IMEI-derived +sip.instance, so the
+# network treats one as a re-registration of the other and tears the first
+# binding down. `volte-register` refuses to start while a VoWiFi agent is
+# running unless --force is given.
+[volte]
+# Off by default; the volte-* subcommands work without it as diagnostics.
+enabled = false
+modem_port = "/dev/ttyUSB0"
+# Host interface carrying the modem's data path. Leave empty to manage the
+# PDN only and skip host interface configuration. NOTE: binding the IMS PDN
+# displaces general connectivity through the modem — it exposes a single
+# host-facing data path.
+iface = ""
+# PDP context id for the IMS PDN. Must not collide with the contexts the
+# modem uses for general internet access (1 and 2 on the reference hardware).
+cid = 3
+# The network resolves this to its own name (e.g. ims.mnc043.mcc404.gprs),
+# which is what gets reported back.
+apn = "ims"
+# Explicit P-CSCF. Leave empty to use the address the VoWiFi/ePDG path
+# captured (see pcscf_source_path). Automatic discovery does NOT work on
+# every carrier — on Vodafone India, DHCPv6 returns no RFC 3319 options, the
+# router advertisement carries none, and no resolver is offered. Run
+# `volte-discover` to see what your carrier does.
+pcscf = ""
+pcscf_port = 5060
+# Where the VoWiFi/ePDG path deposits the P-CSCF it learned from the IKEv2
+# config payload. Shared with [vowifi].pcscf_source_path so a captured
+# address is picked up automatically.
+pcscf_source_path = "/tmp/pcscf"
+use_tcp = true
+# Vodafone India rejects a plain digest REGISTER without sec-agree.
+sec_agree = true
+status_path = "/tmp/volte-registration-status"
+lock_path = "/tmp/volte-registration.lock"

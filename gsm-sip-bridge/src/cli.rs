@@ -228,6 +228,9 @@ pub struct VolteDiscoverArgs {
     /// Operator-supplied P-CSCF. Short-circuits discovery entirely (FR-010).
     #[arg(long)]
     pub pcscf: Option<std::net::IpAddr>,
+    /// File the VoWiFi/ePDG path writes its captured P-CSCF to.
+    #[arg(long, default_value = "/tmp/pcscf")]
+    pub pcscf_source_path: String,
 }
 
 #[derive(Parser, Debug)]
@@ -242,10 +245,14 @@ pub struct VolteRegisterArgs {
     pub cid: u8,
     #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
     pub apn: String,
-    /// P-CSCF address. Required: automatic discovery does not work on the
-    /// tested carrier.
+    /// P-CSCF address. When omitted, the address captured by the VoWiFi/ePDG
+    /// path (see --pcscf-source-path) is used — automatic discovery does not
+    /// work on the tested carrier.
     #[arg(long)]
-    pub pcscf: std::net::IpAddr,
+    pub pcscf: Option<std::net::IpAddr>,
+    /// File the VoWiFi/ePDG path writes its captured P-CSCF to.
+    #[arg(long, default_value = "/tmp/pcscf")]
+    pub pcscf_source_path: String,
     #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
     pub pcscf_port: u16,
     /// Use TCP rather than UDP for SIP.

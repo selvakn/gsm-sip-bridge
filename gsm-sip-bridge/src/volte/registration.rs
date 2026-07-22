@@ -20,6 +20,7 @@
 
 use crate::error::BridgeResult;
 use crate::ims::{self, ImsRegisterConfig, RegisterOutcome, RegistrationState, RegistrationStatus};
+use crate::metrics;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -222,6 +223,10 @@ pub fn run(
     status.registered_at = Some(SystemTime::now());
     status.expires_at = Some(SystemTime::now() + Duration::from_secs(expires as u64));
     write_status(status_path, &status);
+    metrics::VOLTE_REGISTRATIONS_TOTAL
+        .with_label_values(&["accepted"])
+        .inc();
+    metrics::VOLTE_REGISTERED.set(1.0);
     tracing::info!(expires_secs = expires, "registration accepted");
 
     if once {
@@ -255,6 +260,10 @@ pub fn run(
                 status.last_failure = None;
                 backoff = RETRY_INITIAL_BACKOFF;
                 write_status(status_path, &status);
+                metrics::VOLTE_REGISTRATIONS_TOTAL
+                    .with_label_values(&["renewed"])
+                    .inc();
+                metrics::VOLTE_REGISTERED.set(1.0);
                 tracing::info!(expires_secs = expires, "registration renewed");
             }
             other => {
@@ -273,6 +282,12 @@ pub fn run(
                 status.state = RegistrationState::Failed;
                 status.last_failure = Some((SystemTime::now(), reason));
                 write_status(status_path, &status);
+                metrics::VOLTE_REGISTRATIONS_TOTAL
+                    .with_label_values(&["renewal_failed"])
+                    .inc();
+                // The old binding may still be live until it expires, but we
+                // can no longer assert that it is.
+                metrics::VOLTE_REGISTERED.set(0.0);
                 std::thread::sleep(backoff);
                 backoff = next_backoff(backoff);
                 // Retry on the next poll rather than immediately: expires_at
