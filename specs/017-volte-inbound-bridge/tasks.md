@@ -93,7 +93,7 @@ conversation is possible both ways.
 - [X] T024 [US1] **Give this service its own telephone-side local port** — two endpoints already race for one; a third must not join them (research R3) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T025 [US1] Place the telephone-system leg and pair the two legs (FR-002) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T026 [US1] Present the caller's number and display name onward (FR-003) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T027 [US1] Choose the answer's audio format deliberately, preferring wideband (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
+- [X] T027 [US1] Choose the answer's audio format deliberately, preferring wideband (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
 - [X] T028 [US1] End both legs when either ends, recording which (FR-004) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T029 [US1] Give the caller a defined outcome when the telephone system does not answer or is unreachable (FR-005) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [X] T030 [US1] Reject a second concurrent call as busy, without disturbing the call in progress (FR-006) in `gsm-sip-bridge/src/volte/bridge.rs`
@@ -104,7 +104,7 @@ conversation is possible both ways.
 ### Tests
 
 - [ ] T034 [P] [US1] Create `gsm-sip-bridge/tests/test_volte_bridge.rs`: a second call while bridged is rejected busy and the first is undisturbed
-- [ ] T035 [P] [US1] Test the answer-side format preference selects wideband when the offer allows it (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
+- [X] T035 [P] [US1] Test the answer-side format preference selects wideband when the offer allows it (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
 - [X] T036 [P] [US1] Test call-stage transitions, including that only `Bridged` can succeed, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
 
 ---
