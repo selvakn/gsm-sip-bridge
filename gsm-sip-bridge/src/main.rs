@@ -79,6 +79,10 @@ fn main() -> ExitCode {
         return handle_volte_status_command(args);
     }
 
+    if let Some(Commands::VolteDiscover(args)) = &cli.command {
+        return handle_volte_discover_command(args);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -479,6 +483,61 @@ fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> E
         }
         Err(e) => {
             eprintln!("volte-status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_volte_discover_command(args: &gsm_sip_bridge::cli::VolteDiscoverArgs) -> ExitCode {
+    use gsm_sip_bridge::cli::VolteDiscoverMethod;
+    use gsm_sip_bridge::volte::pcscf::{self, DiscoveryInputs, DiscoveryMethod};
+
+    let only = match args.method {
+        VolteDiscoverMethod::Auto => None,
+        VolteDiscoverMethod::Dhcpv6 => Some(DiscoveryMethod::Dhcpv6),
+        VolteDiscoverMethod::Pco => Some(DiscoveryMethod::Pco),
+        VolteDiscoverMethod::Dns => Some(DiscoveryMethod::Dns),
+    };
+
+    // The DNS probe needs the home realm. Deriving it from the SIM keeps the
+    // command usable with no arguments, matching how the VoWiFi path resolves
+    // its PLMN.
+    let realm = match (&args.mcc, &args.mnc) {
+        (Some(mcc), Some(mnc)) => Some(pcscf::home_realm(mcc, mnc)),
+        _ => match gsm_sip_bridge::modules::at_commander::AtCommander::open(&args.modem)
+            .and_then(|mut at| gsm_sip_bridge::vowifi::plmn::derive_plmn(&mut at))
+        {
+            Ok(plmn) => Some(pcscf::home_realm(&plmn.mcc, &plmn.mnc)),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not derive the home PLMN; the DNS probe will be skipped");
+                None
+            }
+        },
+    };
+
+    let iface = args.iface.clone().unwrap_or_default();
+    let inputs = DiscoveryInputs {
+        iface: &iface,
+        cid: args.cid,
+        modem_port: &args.modem,
+        realm,
+        override_pcscf: args.pcscf,
+        only,
+    };
+
+    match pcscf::discover(&inputs) {
+        Ok(report) => {
+            print!("{}", report.summary());
+            // The breakdown is printed either way; the exit code reflects only
+            // whether an address was determined.
+            if report.outcome.is_some() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("volte-discover: {e}");
             ExitCode::FAILURE
         }
     }

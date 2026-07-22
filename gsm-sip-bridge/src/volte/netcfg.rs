@@ -243,6 +243,72 @@ pub fn wait_for_router(iface: &str, timeout: std::time::Duration) -> BridgeResul
     }
 }
 
+/// True when the interface has physical-layer carrier.
+///
+/// After `QNETDEVCTL` rebinds the modem's data path, the host interface takes
+/// a moment to come up. Duplicate address detection cannot complete without
+/// carrier, so configuring immediately leaves the link-local `tentative`
+/// forever and every later step fails for reasons that look unrelated.
+pub fn carrier_up(iface: &str) -> bool {
+    // Reads "1" when up. Errors (rather than returning 0) while the link is
+    // administratively down, which is why the error case is simply "not up".
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Waits for physical-layer carrier on the interface.
+pub fn wait_for_carrier(iface: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if carrier_up(iface) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// True when the link-local address has finished duplicate address detection.
+///
+/// This gate matters more than it looks. While the link-local is `tentative`
+/// the kernel will not emit a Router Solicitation and cannot select a source
+/// address, so *both* the router wait and any link-local multicast send fail —
+/// the latter as a bare `Network is unreachable`, which points nowhere useful.
+/// Waiting here turns two confusing intermittent failures into a non-event.
+pub fn link_local_ready(iface: &str) -> BridgeResult<bool> {
+    let out = Command::new("ip")
+        .args(["-6", "-o", "addr", "show", "dev", iface, "scope", "link"])
+        .output()
+        .map_err(|e| BridgeError::Ims(format!("failed to spawn `ip addr show`: {e}")))?;
+    Ok(parse_link_local_ready(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+/// True when the output shows a link-local address that is not `tentative`.
+pub fn parse_link_local_ready(out: &str) -> bool {
+    out.lines().any(|line| {
+        line.contains("inet6 fe80") && !line.contains("tentative") && !line.contains("dadfailed")
+    })
+}
+
+/// Waits out duplicate address detection on the link-local.
+pub fn wait_for_link_local(iface: &str, timeout: std::time::Duration) -> BridgeResult<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if link_local_ready(iface)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// True when a default route exists via this interface.
 pub fn has_default_route(iface: &str) -> BridgeResult<bool> {
     let out = Command::new("ip")
@@ -423,5 +489,38 @@ mod tests {
     #[test]
     fn parse_ip_addr_show_tolerates_empty_output() {
         assert!(parse_ip_addr_show("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dad_tests {
+    use super::*;
+
+    #[test]
+    fn a_tentative_link_local_is_not_ready() {
+        // Sending before DAD completes fails as "Network is unreachable".
+        let out =
+            "1648: enx0    inet6 fe80::25:ff2c:2501/64 scope link tentative \\ valid_lft forever\n";
+
+        assert!(!parse_link_local_ready(out));
+    }
+
+    #[test]
+    fn a_settled_link_local_is_ready() {
+        let out = "1648: enx0    inet6 fe80::25:ff2c:2501/64 scope link \\ valid_lft forever\n";
+
+        assert!(parse_link_local_ready(out));
+    }
+
+    #[test]
+    fn a_dadfailed_link_local_is_not_ready() {
+        let out = "1648: enx0    inet6 fe80::25:ff2c:2501/64 scope link dadfailed\n";
+
+        assert!(!parse_link_local_ready(out));
+    }
+
+    #[test]
+    fn no_link_local_at_all_is_not_ready() {
+        assert!(!parse_link_local_ready(""));
     }
 }

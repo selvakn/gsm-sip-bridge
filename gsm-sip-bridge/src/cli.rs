@@ -111,6 +111,19 @@ pub enum Commands {
     VoltePdn(VoltePdnArgs),
     /// Reports LTE IMS PDN attachment state without changing it.
     VolteStatus(VolteStatusArgs),
+    /// Probe for the carrier's P-CSCF address and report what each mechanism
+    /// returned (specs/015-volte-host-ims, US2).
+    ///
+    /// These probes are DIAGNOSTICS. The Gate G1 investigation established
+    /// that the tested carrier publishes no P-CSCF by any mechanism reachable
+    /// from the host, so an empty result is the expected outcome there, not a
+    /// fault — supply an address with `--pcscf` on `volte-register` instead.
+    /// The value of running them is detecting a carrier, SIM, or firmware that
+    /// behaves differently, without needing a code change.
+    ///
+    /// Exits 0 when an address was determined by any means, non-zero when none
+    /// was; the per-method breakdown is printed either way.
+    VolteDiscover(VolteDiscoverArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -163,6 +176,44 @@ pub struct VoltePdnArgs {
     /// the data path unbound.
     #[arg(long)]
     pub restore_cid: Option<u8>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolteDiscoverMethod {
+    /// Try every mechanism in order (the default).
+    Auto,
+    /// DHCPv6 Information-Request, RFC 3319 options 21/22.
+    Dhcpv6,
+    /// Protocol Configuration Options, read over AT.
+    Pco,
+    /// NAPTR on the home network realm.
+    Dns,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteDiscoverArgs {
+    /// Modem AT port.
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    /// Host network interface carrying the IMS PDN. Required for the DHCPv6
+    /// probe.
+    #[arg(long)]
+    pub iface: Option<String>,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    /// Restrict the run to one mechanism, to evaluate it in isolation.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub method: VolteDiscoverMethod,
+    /// Home network MCC, for the DNS probe's realm. Derived from the SIM when
+    /// unset.
+    #[arg(long)]
+    pub mcc: Option<String>,
+    /// Home network MNC (zero-padded to 3 digits).
+    #[arg(long)]
+    pub mnc: Option<String>,
+    /// Operator-supplied P-CSCF. Short-circuits discovery entirely (FR-010).
+    #[arg(long)]
+    pub pcscf: Option<std::net::IpAddr>,
 }
 
 #[derive(Parser, Debug)]

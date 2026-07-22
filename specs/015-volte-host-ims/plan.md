@@ -218,7 +218,7 @@ so no phase depends on an unmet gate.
 |---|---|---|---|---|
 | 1 | `ImsTransport` seam; VoWiFi refactored onto it with **zero behavioural change** | — (FR-017/018) | — | ✅ **Done** |
 | 2 | IMS PDN lifecycle + **IID-aware interface config (FR-024)**; `volte-pdn`, `volte-status` | US1 | — | ✅ **Done — verified on live hardware** |
-| 3 | Discovery probes as **diagnostics**; `volte-discover` reports per-method results | US2 (P3) | — | Ready |
+| 3 | Discovery probes as **diagnostics**; `volte-discover` reports per-method results | US2 (P3) | — | ✅ **Done — verified on live hardware** |
 | 4 | **G3**: acquire a P-CSCF address | — | **G3** | ⚠️ Blocked |
 | 5 | **G2 verification**, then registration over the LTE transport | US3 | **G2, G3** | ⚠️ Blocked on G3 |
 | 6 | Renewal, registration history | US4 | — | After phase 5 |
@@ -256,6 +256,32 @@ R10 was found *by this hardware run* and would not have been caught by unit
 tests: the first build reported success on an unroutable interface. The fix —
 waiting on the default route rather than on address presence — is why the
 `routed` flag exists.
+
+**Phase 3** — `volte/pcscf.rs` plus `volte-discover`. The chain shipped as
+**DHCPv6 → PCO → DNS**, *not* the DHCPv6 → RA → DNS the plan first specified.
+That was a mistake in the original plan: an RA carries no standard P-CSCF
+option, and the RA is already consumed by `netcfg` for the default route.
+TS 24.229 §9.2.1 names DHCPv6 and the PCO; DNS is the TS 23.228 fallback. The
+PCO probe is the one that names the real culprit on this hardware — it reports
+that the *firmware* truncates `+CGCONTRDP` after the DNS fields, rather than
+implying the carrier withheld the address.
+
+The probes independently reproduce the Gate G1 findings through production
+code, which is the point of keeping them:
+
+```
+dhcpv6   no result — server answered but provided no RFC 3319 SIP-server
+                     options; reply carried: client-id, server-id,
+                     dns-servers(all zero)
+pco      no result — firmware truncates +CGCONTRDP after the DNS fields
+                     (7 fields; the P-CSCF fields would be 8 and 9)
+dns      no result — no resolver is offered on the IMS PDN
+```
+
+Two further hardware-only defects were found and fixed here (R11, R12): the
+`CGACT` address-assignment race, and the carrier/DAD ordering that made both
+routability and the DHCPv6 probe fail intermittently for unrelated-looking
+reasons. Neither was reachable from unit tests.
 
 **Deferred from Phase 2**: `[volte]` config-file support. `config/mod.rs` uses
 a hand-rolled parser with a `KNOWN_KEYS` list, and the CLI defaults

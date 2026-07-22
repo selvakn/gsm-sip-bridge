@@ -353,6 +353,53 @@ operator-facing summary states routability in as many words. Reporting an
 attachment that cannot carry traffic as success is exactly the kind of failure
 FR-015 exists to prevent.
 
+---
+
+## R11: `CGACT=1` returns before the address is assigned
+
+**Decision**: Poll `AT+CGPADDR` after activation until an address appears,
+bounded. Never read it once.
+
+**Status**: ✅ Verified — found by running Phase 3 against live hardware.
+
+`AT+CGACT=1` returns `OK` as soon as the context is *active*, which is earlier
+than the network assigning an address. Reading `AT+CGPADDR` immediately races
+that assignment and intermittently reports a PDN with no address at all. The
+downstream effect is badly misleading: address family reads `none`, host
+interface configuration is skipped silently, and the operator sees an
+interface that is administratively down with no addresses — which looks like a
+bug in the interface code and is not one.
+
+This is intermittent by nature. It did not appear in the first hardware runs
+because the PDN had been active for some time already; it appeared reliably
+only when attaching straight after a teardown.
+
+**Consequence**: `read_pdn_when_addressed` waits up to 15s. An active context
+that never produces an address is a genuine failure and is reported as one,
+rather than being passed downstream as a PDN with no address.
+
+## R12: Duplicate address detection and carrier gate everything else
+
+**Decision**: Wait for carrier, then for DAD to complete on the link-local,
+before soliciting a router or sending any link-local multicast.
+
+**Status**: ✅ Verified alongside R11.
+
+Two failures share this root cause, and neither names it:
+
+- The kernel emits no Router Solicitation while the link-local is `tentative`,
+  so the default route never arrives and the attachment reports unroutable.
+- Sending to `ff02::1:2` (DHCPv6) with no settled link-local source fails as
+  `Network is unreachable` — which reads as a routing problem and is not one.
+
+The interface also needs a moment after `AT+QNETDEVCTL` before it has carrier,
+and DAD cannot progress without it.
+
+**Consequence**: `netcfg` gained `carrier_up`/`wait_for_carrier` and
+`link_local_ready`/`wait_for_link_local`, and the DHCPv6 probe checks for a
+ready link-local up front so it reports the real precondition rather than
+`ENETUNREACH`.
+
 ## Unresolved items carried into planning
 
 | ID | Item | Blocking? | Status |
