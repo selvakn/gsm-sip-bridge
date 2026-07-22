@@ -66,8 +66,26 @@ docker run --rm --privileged --network host -v /dev:/dev \
     --duration 30 --record /tmp/far-end.wav --record-sent /tmp/sent.wav
 ```
 
-**Answer the phone.** Speak for the duration — the far end's speech is what
-gets recorded and what the quality judgement rests on.
+**Answer the phone with a HANDSET, not a speakerphone**, and **talk**.
+
+You will hear **your own voice echoed back** over the full round trip. That is
+the test: people are acutely sensitive to distortion, delay and dropouts in
+their own voice, so you can judge the call directly while speaking naturally —
+no script, and no audio files involved anywhere.
+
+A speakerphone can feed back, because the microphone hears the returned audio
+and sends it round again (Gate C3). Attenuation and re-echo suppression should
+hold it, but a handset removes the question.
+
+**What you are listening for**:
+
+| What you hear | What it means |
+|---|---|
+| Your voice, clear, with a noticeable delay | Working. The delay is the round trip and is expected |
+| Your voice, but muffled or watery | Codec or transcoding problem — check the negotiated format |
+| Your voice cutting in and out | Loss or jitter — check those figures in the report |
+| A periodic beep and nothing else | Nothing of yours is reaching us; the beep is the independent marker |
+| Nothing at all | Neither direction is working, or the call never carried media |
 
 ### While it is up, sample the quality class again
 
@@ -115,7 +133,7 @@ Then judge, using both the recording and the report:
 
 | Signal | What it tells you |
 |---|---|
-| Recording sounds clear, wideband format, class-1 present | The goal is met |
+| Echo sounds clear, wideband format, class-1 present | The goal is met |
 | Recording sounds clear, but no class-1 entry | It works, but without prioritisation — quality may degrade under load |
 | Narrowband format negotiated | The judgement is not valid; find out why the wideband offer was refused |
 | Low loss and jitter but poor audio | Suspect the codec path or the jitter handling, not the network |
@@ -137,9 +155,13 @@ volte-call --callee +919789063708 --pcscf <wrong-address>   # expect a named sta
 # start volte-register in parallel, then:
 volte-call --callee +919789063708               # expect refusal naming the conflict
 
-# audio source selection
-volte-call --callee +919789063708 --tone        # legacy pattern
-volte-call --callee +919789063708 --audio my-voice.wav
+# echo behaviour
+volte-call --callee +919789063708 --echo-attenuation 0.5   # quieter return
+volte-call --callee +919789063708 --marker-interval 2      # more frequent marker
+
+# direction attribution: stay silent for the whole call.
+# Expect SendOnly (the marker is still going out), never Neither.
+volte-call --callee +919789063708 --duration 30
 ```
 
 ### Success criteria mapping
@@ -147,7 +169,7 @@ volte-call --callee +919789063708 --audio my-voice.wav
 | Check | Criterion |
 |---|---|
 | Phone rings and can be answered with one command | SC-001 |
-| Far end hears us; recording contains their speech | SC-002 |
+| Far end hears their own voice returned; recording contains their speech | SC-002 |
 | Report states direction, and which side failed | SC-003 |
 | Recording + measurements support a quality judgement | SC-004 |
 | Every induced failure names its stage | SC-005 |
@@ -157,10 +179,14 @@ volte-call --callee +919789063708 --audio my-voice.wav
 
 ## Warnings
 
-**Never send `samples/` audio.** Those are real call recordings named after
-real subscriber numbers (research R3). Transmitting one over a live carrier to
-a test number would be a privacy problem. Use the generated signal, or your own
-voice via `--audio`.
+**No audio files are involved at all.** The test signal is the far end's own
+voice, returned. This is deliberate: the only recordings to hand are in
+`samples/`, which holds real calls named after real subscriber numbers
+(research R3), and sending one over a live carrier would be a privacy problem
+rather than a test. With echo there is nothing to choose, so there is nothing
+to choose wrongly.
+
+**Use a handset at the far end.** Echoing into a speakerphone can feed back.
 
 **Restart the registration loop afterwards** if you had one running — the call
 command does not restore it.

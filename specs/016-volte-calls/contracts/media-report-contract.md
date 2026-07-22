@@ -36,6 +36,18 @@ The verdict MUST name which direction failed (FR-015, FR-028):
 incident from a mystery into a diagnosis. It MUST NOT be collapsed into a
 single "no audio" state.
 
+### The verdict survives the echo design
+
+Because outbound audio is the far end's own audio returned, the two directions
+are **not independent by default** — a total receive failure would produce a
+total send failure, and `SendOnly` would become unreachable.
+
+The independent generated marker (FR-029) is what makes the verdict meaningful
+anyway: outbound audio is never zero, so "we are transmitting and nothing is
+coming back" stays distinguishable from "everything is silent". An
+implementation that dropped the marker would satisfy every other rule here and
+quietly destroy the diagnostic.
+
 ### The verdict is a ratio, not a floor
 
 Derived from received-versus-sent **as a proportion**, per direction, against
@@ -98,6 +110,9 @@ Pure over synthetic packet streams — no hardware, no carrier.
 | Quality class present only during | Reported as preferential handling established |
 | Quality class never present | Reported as not established — a result, not an error |
 | Modem declines | `unavailable` with a reason naming what was asked |
+| Nothing received at all | Outbound is still non-zero (marker), so the verdict is `SendOnly`, **not** `Neither` |
+| Echo returns what was received | Round-trip delay reported; returned audio attenuated below unity |
+| Re-echo suppression active | A returned signal is not returned a second time |
 
 ## Non-goals
 
@@ -105,5 +120,8 @@ Pure over synthetic packet streams — no hardware, no carrier.
   clarification; the operator compares by ear. The old path cannot supply most
   of these measurements, so a symmetric comparison would promise a rigour it
   does not have.
+- **No echo cancellation.** Attenuation and re-echo suppression bound the loop;
+  full acoustic cancellation is out of scope, and a speakerphone at the far end
+  is a documented limitation rather than a problem to solve here.
 - **No opinion on whether the audio "sounds good".** The report supplies
   evidence; the judgement is the operator's, informed also by the recording.

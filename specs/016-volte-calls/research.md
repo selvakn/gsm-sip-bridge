@@ -85,46 +85,79 @@ unit-testable without hardware, unlike most of this feature.
 
 ---
 
-## R3: What speech does the bridge send? *(FR-025)*
+## R3: What audio does the bridge send? *(FR-025, FR-029)*
 
-**Decision**: Generate a **speech-like signal** in code by default; accept a
-real recording via an explicit option; keep the existing tone pattern
-available.
+**Decision**: **Echo the far end's audio back to the far end**, plus a small
+independent repeating signal. No audio assets of any kind.
 
-**Status**: ✅ Decided, with a privacy constraint discovered during research.
+**Status**: ✅ Decided (revised — supersedes the earlier "synthetic speech
+sample" decision).
 
-### ⚠️ The obvious asset must not be used
+### Why echo is better than sending a sample
 
-The repository working tree contains `samples/` with **real call recordings**,
-named after **real subscriber numbers**:
+It was originally planned to send generated speech-like audio. Echo is
+strictly better for this feature's purpose:
 
-```
-samples/Call_record_between_+9198947xxxxx_and_201_from_02-06-2026 ....mp3
-samples/Call_record_between_+9199941xxxxx_and_201_from_02-06-2026 ....mp3
-```
+| | Sending a sample | Echoing the far end |
+|---|---|---|
+| Needs an asset | Yes | **No** |
+| What the listener judges | A stranger's voice, one-way | **Their own voice, round trip** |
+| Sensitivity to defects | Moderate | **High** — people notice distortion, delay and dropouts in their own voice far more readily than in someone else's |
+| Reveals round-trip delay | No | **Yes, audibly** |
+| Degradation covered | One direction | **Both directions combined** |
+| Requires a script to read | Yes | No — the person just talks |
 
-**These must not be used as the outgoing test audio.** Doing so would transmit
-a real person's recorded conversation over a live carrier network to a test
-number — a privacy problem, not a technical one. They are currently untracked;
-they should stay out of the repository deliberately rather than by accident.
+A clean-sounding echo is therefore *stronger* evidence than a clean one-way
+sample, because it has survived the full round trip.
 
-### What is sent instead
+### ⚠️ Echo alone would destroy direction attribution
 
-Today's outgoing audio is a deliberately-designed three-tone pattern
-(440/660/880 Hz with silence gaps, `call.rs`), chosen so a dropout is audible
-where a continuous sine would hide it. That reasoning is sound and the pattern
-is kept — but a tone still cannot support a *quality* judgement, which is why
-the spec's clarification changed the default.
+This is the consequence that matters, and it is not obvious.
 
-Default becomes a synthetic **speech-like** signal: voiced formant structure,
-varying pitch, a natural amplitude envelope, and pauses. It stresses a
-speech-optimised codec far closer to real speech than steady tones do, needs
-no asset and carries no licence or privacy question.
+If what the bridge sends is derived entirely from what it receives, then the
+two directions stop being independent:
 
-**Honest limitation**: synthetic speech-like audio is not real speech, and for
-a final quality judgement a real sample is better. Hence the explicit option
-to supply one — the operator can use their own voice recording, which carries
-no third-party privacy issue.
+| Situation | With an independent sample | With pure echo |
+|---|---|---|
+| Nothing received | We still transmit → `SendOnly`; the fault is on their side or in our decode | We transmit nothing → `Neither`; **indistinguishable from our transmit path being dead** |
+| Our uplink dead | Far end hears nothing; our counts still show us sending | Same — but now undetectable from our side either way |
+
+Pure echo would therefore have quietly undone FR-015 and FR-028 — the exact
+direction attribution that diagnosed the previous one-way-audio incident
+(`docs/incidents/2026-07-15-vowifi-oneway-audio.md`). The feature would have
+gained an elegant test signal and lost its best diagnostic.
+
+**Mitigation (FR-029)**: mix a small, regularly-repeating generated marker into
+the outbound stream regardless of what has been received. It is generated in
+code, so it is still "no sample files", and it keeps outbound non-zero at all
+times — restoring the ability to say "we are transmitting and nothing is coming
+back" rather than "everything is silent".
+
+The existing three-tone pattern in `call.rs` (440/660/880 Hz with gaps, chosen
+so dropouts are audible) is already exactly such a generated signal and can
+serve directly, at low level and low duty cycle so it does not intrude on the
+echo.
+
+### Feedback risk
+
+Echoing into a speakerphone creates a loop that grows until it howls. Two
+mitigations, both cheap:
+
+- **Attenuate** what is returned, so loop gain stays below unity.
+- **Do not re-echo what was just echoed** — a short suppression window after
+  outbound audio, so a returned signal is not sent a second time.
+
+Operationally, the answering party should use a handset. The quickstart must
+say so.
+
+### Privacy — the original reason for looking hard at this
+
+The working tree's `samples/` directory holds **real call recordings named
+after real subscriber numbers**. Sending one over a live carrier to a test
+number would be a privacy problem, not a test. Echo removes the temptation
+entirely: there is no asset to choose, so there is nothing to choose wrongly.
+Those files should stay out of the repository deliberately rather than by
+accident.
 
 ---
 
@@ -246,5 +279,6 @@ existing defaults.
 | ID | Item | Blocking? | Where resolved |
 |---|---|---|---|
 | R4a | Whether a class-1 entry actually appears during a call | **Yes, for US2** | Gate C1 — first live call |
+| R3a | Whether echo attenuation and suppression are enough to avoid feedback on a speakerphone | No — handset use is the primary control | First live call |
 | R6a | Which source address the network routes (spec 015 R9) | No — media proves it either way | First live call |
 | R2a | Whether the carrier's jitter/loss is low enough for the quality goal | No | Measured, not gated |

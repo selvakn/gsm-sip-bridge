@@ -22,7 +22,8 @@ One outbound call.
 | `call_duration` | duration | **(exists)** How long to hold the call once answered (FR-027) |
 | `record_path` | path | **(exists)** Where the far end's audio is written |
 | `record_sent_path` | optional path | **(exists)** Where our outgoing audio is written |
-| `audio_source` | `SpeechSynthetic` \| `File(path)` \| `Tone` | **NEW** (FR-025) |
+| `echo_attenuation` | gain factor | **NEW** (FR-025) — how much the returned audio is reduced, to keep feedback loop gain below unity |
+| `marker_interval` | duration | **NEW** (FR-029) — how often the independent generated signal is emitted, regardless of what is received |
 | `end_reason` | `DurationElapsed` \| `FarEndHungUp` \| `OperatorInterrupted` \| `AttachmentLost` | **NEW** (FR-005) |
 
 ### Validation rules
@@ -32,9 +33,13 @@ One outbound call.
   is recorded in `call.rs` as observed behaviour, not theory.
 - `call_duration` must be long enough for a quality judgement; the default
   must satisfy SC-006's 30 seconds.
-- `audio_source = File` must reference a readable audio file; **it must never
-  default to anything under `samples/`** (research R3 — real recordings of
-  real people).
+- `echo_attenuation` must be below unity, or the returned audio can drive a
+  feedback loop on a speakerphone.
+- `marker_interval` must be short enough that outbound audio is never zero over
+  a measurement window — **this is what preserves direction attribution** once
+  outbound audio is otherwise derived from inbound (research R3).
+- **No audio asset is referenced at all.** There is no sample path to get
+  wrong, which is deliberate: `samples/` holds real recordings of real people.
 
 ### Call state transitions
 
@@ -50,6 +55,27 @@ Idle ──dial──> Attempting ──network accepts──> Ringing ──ans
 other terminal state produces a stage-attributed failure instead (FR-017).
 
 ---
+
+## EchoState **NEW**
+
+The outbound audio is derived from the inbound audio, so it needs state.
+
+| Field | Type | Notes |
+|---|---|---|
+| `pending` | audio buffer | Received audio awaiting return |
+| `attenuation` | gain factor | Applied before returning (< 1.0) |
+| `suppress_until` | timestamp | Nothing is echoed while set — stops a returned signal being returned again |
+| `last_marker_at` | timestamp | Drives the independent generated signal (FR-029) |
+
+### Invariants
+
+- **Outbound audio is never silent for longer than `marker_interval`.** If it
+  were, a total receive failure would silence both directions and become
+  indistinguishable from a transmit failure — see the table in research R3.
+- Nothing received while `suppress_until` is set is echoed, so the loop
+  gain over successive round trips stays bounded.
+- Echo introduces the full round-trip delay by construction; that is a
+  *feature* here (it makes latency audible), not a defect to compensate for.
 
 ## NegotiatedAudioFormat **(exists — `ims::sdp::NegotiatedCodec`)**
 
@@ -80,6 +106,7 @@ What actually happened to the audio. The core of US2.
 | `lost_packets` | count | **NEW** — derived from sequence gaps |
 | `reordered_packets` | count | **NEW** — sequence arriving out of order |
 | `jitter` | duration | **NEW** — inter-arrival variance |
+| `round_trip_delay` | optional duration | **NEW** — derivable because the outbound audio *is* the inbound audio; unavailable if nothing was echoed |
 | `direction_verdict` | `BothWays` \| `SendOnly` \| `ReceiveOnly` \| `Neither` | **NEW** (FR-015, FR-028) |
 
 ### Validation rules
@@ -151,9 +178,13 @@ safe to merge — no existing deployment changes behaviour unless it asks to.
 
 ```
 CallAttempt ──produces──> MediaReport ──contains──> direction_verdict
-     │                          ▲
+     │                          ▲                     round_trip_delay
      │                          │ derived from
      │                    RTP sequence + arrival times
+     │
+     ├──drives──────> EchoState ──feeds──> outbound audio
+     │                    ▲                    │
+     │                    └── inbound audio ───┘  (plus an independent marker)
      │
      ├──negotiates──> NegotiatedAudioFormat
      ├──samples─────> QosObservation  (Before / During / After)

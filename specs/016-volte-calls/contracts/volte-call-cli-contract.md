@@ -11,7 +11,8 @@ start the daemon or touch the CardPool.
 ```
 gsm-sip-bridge volte-call --callee <e164> [--modem <path>] [--iface <if>]
                           [--pcscf <addr>] [--duration <secs>] [--ring-timeout <secs>]
-                          [--audio <file> | --tone] [--record <path>] [--record-sent <path>]
+                          [--echo-attenuation <factor>] [--marker-interval <secs>]
+                          [--record <path>] [--record-sent <path>]
                           [--one-way-threshold <percent>] [--force] [--keep-pdn]
 ```
 
@@ -20,8 +21,8 @@ gsm-sip-bridge volte-call --callee <e164> [--modem <path>] [--iface <if>]
 | `--callee` | **required** | E.164. Dialled as a telephone number, not a resolvable address |
 | `--duration` | 30s | How long to hold the call once answered (FR-027). Default satisfies SC-006 |
 | `--ring-timeout` | existing default | How long to wait for an answer |
-| `--audio` | unset | Send this recording instead of the generated speech-like signal |
-| `--tone` | off | Send the legacy tone pattern — the cheap "is there an audio path at all" check |
+| `--echo-attenuation` | below unity | How much the returned audio is reduced, to keep feedback bounded |
+| `--marker-interval` | a few seconds | How often the independent generated signal is emitted regardless of what is received (FR-029) |
 | `--record` | generated | Where the far end's audio is written |
 | `--record-sent` | generated | Where our outgoing audio is written, separately |
 | `--one-way-threshold` | 10% | Proportion below which a direction counts as failed |
@@ -89,12 +90,22 @@ script.
 
 ### Audio it sends
 
-Speech-like audio by default (FR-025); `--audio` for a real recording; `--tone`
-for the legacy pattern.
+**Echoes the far end's own audio back to them** (FR-025), attenuated, with
+re-echo suppression. The answering party hears their own voice over the full
+round trip — a stronger quality test than a recording, and one that makes
+latency audible.
 
-**MUST NOT default to anything under `samples/`.** Those are real call
-recordings of real subscribers (research R3); transmitting one over a live
-carrier to a test number would be a privacy problem, not a test.
+MUST additionally emit a small independent generated signal at a regular
+interval (FR-029), so outbound audio is never zero. Without it the two
+directions become dependent and the direction verdict is destroyed — see the
+media report contract.
+
+**Uses no audio assets whatsoever.** There is nothing to configure and nothing
+to get wrong — which also removes any possibility of reaching for `samples/`,
+the real subscriber call recordings in the working tree (research R3).
+
+MUST warn the operator to have the far end use a **handset**: echoing into a
+speakerphone can feed back (Gate C3).
 
 ## Cross-cutting
 
