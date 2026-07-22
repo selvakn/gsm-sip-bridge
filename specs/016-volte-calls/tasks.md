@@ -82,25 +82,25 @@ own voice returned.
 **Independent test**: One command; the phone rings, a person answers and
 speaks, they hear themselves, and a recording of what arrived exists.
 
-- [ ] T020 [US1] Add `echo_attenuation` and `marker_interval` to `CallConfig`, with defaults, in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T021 [US1] Replace the outbound test-pattern generator with the echo path plus marker, keeping the change additive so `ims-call` is unaffected, in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T022 [US1] Add `end_reason` (duration elapsed / far end hung up / operator interrupted / attachment lost) to `CallOutcome` (FR-005) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T023 [US1] End the call early when the far end hangs up rather than holding it open for the remaining duration (FR-027) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T024 [US1] Detect a missing wideband codec **before dialling** via `amr_safe::is_available()` and refuse with the reason (FR-010, **Gate C2**) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T025 [US1] Report the audio formats offered when the carrier refuses them all (FR-009) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T026 [US1] Implement call orchestration over the LTE transport — one outbound call over the bridge's own registration, no second registration (FR-001, FR-002) in `gsm-sip-bridge/src/volte/mod.rs`
-- [ ] T027 [US1] Add the `volte-call` subcommand per the CLI contract in `gsm-sip-bridge/src/cli.rs`
-- [ ] T028 [US1] Wire the handler, resolving the P-CSCF in the same order as `volte-register`, in `gsm-sip-bridge/src/main.rs`
-- [ ] T029 [US1] Refuse before dialling when a Wi-Fi calling agent is running or another host-side registration holds the lock (FR-022), reusing `gsm-sip-bridge/src/volte/guard.rs`
-- [ ] T072 [US1] Report call progress through attempting → ringing → answered → ended (FR-004) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T073 [US1] Confirm the call's signalling is protected by the registration's own security association rather than a new one — inherited from `register_session`, so verify rather than build (FR-003) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T074 [US1] Confirm the received audio is written to a playable file — already provided by `record_path`, so verify it survives the echo change (FR-008) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T030 [US1] Make the refusal message name the remedy — stop the registration loop, run the call, restart it (research R1) — in `gsm-sip-bridge/src/main.rs`
+- [X] T020 [US1] Add `echo_attenuation` and `marker_interval` to `CallConfig`, with defaults, in `gsm-sip-bridge/src/ims/call.rs`
+- [X] T021 [US1] Replace the outbound test-pattern generator with the echo path plus marker, keeping the change additive so `ims-call` is unaffected, in `gsm-sip-bridge/src/ims/call.rs`
+- [X] T022 [US1] Add `end_reason` (duration elapsed / far end hung up / operator interrupted / attachment lost) to `CallOutcome` (FR-005) in `gsm-sip-bridge/src/ims/call.rs`
+- [ ] T023 [US1] End the call early when the far end hangs up rather than holding it open for the remaining duration (FR-027) in `gsm-sip-bridge/src/ims/call.rs` — **partial**: the loop now exits when the media path stops (`EndReason::MediaStopped`), but an in-dialog `BYE` arriving mid-call is still not listened for, so `EndReason::FarEndHungUp` is never produced
+- [X] T024 [US1] Detect a missing wideband codec **before dialling** via `amr_safe::is_available()` and refuse with the reason (FR-010, **Gate C2**) in `gsm-sip-bridge/src/ims/call.rs`
+- [ ] T025 [US1] Report the audio formats offered when the carrier refuses them all (FR-009) in `gsm-sip-bridge/src/ims/call.rs` — **not started**: the SDP refusal path is untouched
+- [X] T026 [US1] Implement call orchestration over the LTE transport — one outbound call over the bridge's own registration, no second registration (FR-001, FR-002) in `gsm-sip-bridge/src/volte/mod.rs`
+- [X] T027 [US1] Add the `volte-call` subcommand per the CLI contract in `gsm-sip-bridge/src/cli.rs`
+- [X] T028 [US1] Wire the handler, resolving the P-CSCF in the same order as `volte-register`, in `gsm-sip-bridge/src/main.rs`
+- [X] T029 [US1] Refuse before dialling when a Wi-Fi calling agent is running or another host-side registration holds the lock (FR-022), reusing `gsm-sip-bridge/src/volte/guard.rs`
+- [ ] T072 [US1] Report call progress through attempting → ringing → answered → ended (FR-004) in `gsm-sip-bridge/src/ims/call.rs` — **not started**
+- [X] T073 [US1] Confirm the call's signalling is protected by the registration's own security association rather than a new one — inherited from `register_session`, so verify rather than build (FR-003) in `gsm-sip-bridge/src/ims/call.rs`
+- [X] T074 [US1] Confirm the received audio is written to a playable file — already provided by `record_path`, so verify it survives the echo change (FR-008) in `gsm-sip-bridge/src/ims/call.rs`
+- [X] T030 [US1] Make the refusal message name the remedy — stop the registration loop, run the call, restart it (research R1) — in `gsm-sip-bridge/src/main.rs`
 
 ### Tests
 
-- [ ] T031 [P] [US1] Test that a missing wideband codec is refused before any dial is attempted, in `gsm-sip-bridge/tests/test_echo.rs`
-- [ ] T032 [US1] Verify `ims-call` behaviour is unchanged after the shared call path is modified, confirming one shared implementation rather than a fork (FR-019, FR-020)
+- [ ] T031 [P] [US1] Test that a missing wideband codec is refused before any dial is attempted, in `gsm-sip-bridge/tests/test_echo.rs` — **verified manually only**: the check sits in the CLI handler, so it needs extracting to be unit-testable
+- [X] T032 [US1] Verify `ims-call` behaviour is unchanged after the shared call path is modified, confirming one shared implementation rather than a fork (FR-019, FR-020)
 
 ---
 
