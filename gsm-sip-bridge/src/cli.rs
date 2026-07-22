@@ -96,6 +96,21 @@ pub enum Commands {
     /// only when it is in the wrong mode, so it is a no-op on a healthy boot.
     /// Run by `docker/entrypoint.sh` before anything else opens the modem.
     ModemIms(ModemImsArgs),
+    /// Manage the LTE IMS PDN attachment (specs/015-volte-host-ims, US1):
+    /// activates a PDP context on the carrier's IMS APN and binds the modem's
+    /// host-facing data path to it, so the bridge's own IMS stack can signal
+    /// over LTE rather than delegating to the modem's internal IMS stack.
+    ///
+    /// Standalone diagnostic mode, like `ims-register` — it does not start
+    /// the daemon or touch the CardPool. Requires CAP_NET_ADMIN: run it
+    /// inside the privileged container.
+    ///
+    /// NOTE: the modem exposes a single host data path, so attaching the IMS
+    /// PDN displaces general connectivity through the modem until `--action
+    /// down`.
+    VoltePdn(VoltePdnArgs),
+    /// Reports LTE IMS PDN attachment state without changing it.
+    VolteStatus(VolteStatusArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -113,6 +128,55 @@ pub struct ModemImsArgs {
     /// Modem AT port used for `AT+QCFG="ims"` / `AT+CFUN=1,1`
     #[arg(long)]
     pub modem: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoltePdnAction {
+    /// Attach the IMS PDN and bind the host data path to it.
+    Up,
+    /// Release the IMS PDN and restore the previous binding.
+    Down,
+    /// Report attachment state without changing anything.
+    Status,
+}
+
+#[derive(Parser, Debug)]
+pub struct VoltePdnArgs {
+    #[arg(long, value_enum)]
+    pub action: VoltePdnAction,
+    /// Modem AT port.
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    /// Host network interface carrying the modem's data path. Leave unset to
+    /// manage the PDN only and skip host interface configuration.
+    #[arg(long)]
+    pub iface: Option<String>,
+    /// PDP context id for the IMS PDN. Must not collide with the contexts the
+    /// modem uses for general internet access.
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    /// APN to request. The network resolves this to its own fully-qualified
+    /// name, which is what gets reported back.
+    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
+    pub apn: String,
+    /// On `--action down`, restore this context's binding instead of leaving
+    /// the data path unbound.
+    #[arg(long)]
+    pub restore_cid: Option<u8>,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteStatusArgs {
+    /// Modem AT port.
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    /// Host network interface carrying the modem's data path.
+    #[arg(long)]
+    pub iface: Option<String>,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
+    pub apn: String,
 }
 
 #[derive(Parser, Debug)]
