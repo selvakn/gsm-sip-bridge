@@ -159,18 +159,18 @@ after.
 
 **Goal**: Per-card selection, opt-in, exclusive.
 
-- [ ] T058 [US4] Add per-card selection to the `[volte]` section (FR-023) in `gsm-sip-bridge/src/config/mod.rs`
-- [ ] T059 [US4] **Default to the existing arrangement when unset**, leaving the modem-internal path available and unchanged (FR-021, FR-024) — what makes this safe to merge — in `gsm-sip-bridge/src/config/mod.rs`
-- [ ] T060 [US4] Add this service as a third exclusive subsystem in `gsm-sip-bridge/src/modules/discovery.rs`
-- [ ] T061 [US4] Ensure a card assigned here is not driven by the circuit-switched daemon (FR-034) in `gsm-sip-bridge/src/modules/discovery.rs`
-- [ ] T062 [US4] Refuse when both this path and the Wi-Fi path are enabled for one subscriber (US4 scenario 3) in `docker/entrypoint.sh`
-- [ ] T063 [US4] Supervise the service from `docker/entrypoint.sh`, releasing the attachment on shutdown
-- [ ] T064 [P] [US4] Document the selection in `config.toml.example`
+- [X] T058 [US4] Add per-card selection to the `[volte]` section (FR-023) in `gsm-sip-bridge/src/config/mod.rs`
+- [X] T059 [US4] **Default to the existing arrangement when unset**, leaving the modem-internal path available and unchanged (FR-021, FR-024) — what makes this safe to merge — in `gsm-sip-bridge/src/config/mod.rs`
+- [X] T060 [US4] Add this service as a third exclusive subsystem in `gsm-sip-bridge/src/modules/discovery.rs`
+- [X] T061 [US4] Ensure a card assigned here is not driven by the circuit-switched daemon (FR-034) in `gsm-sip-bridge/src/modules/discovery.rs`
+- [X] T062 [US4] Refuse when both this path and the Wi-Fi path are enabled for one subscriber (US4 scenario 3) in `docker/entrypoint.sh`
+- [X] T063 [US4] Supervise the service from `docker/entrypoint.sh`, releasing the attachment on shutdown
+- [X] T064 [P] [US4] Document the selection in `config.toml.example`
 
 ### Tests
 
-- [ ] T065 [P] [US4] Test an absent selection yields the existing arrangement, in `gsm-sip-bridge/src/config/mod.rs`
-- [ ] T066 [P] [US4] Test a card cannot be claimed by two subsystems, in `gsm-sip-bridge/src/modules/discovery.rs`
+- [X] T065 [P] [US4] Test an absent selection yields the existing arrangement, in `gsm-sip-bridge/src/config/mod.rs`
+- [X] T066 [P] [US4] Test a card cannot be claimed by two subsystems, in `gsm-sip-bridge/src/modules/discovery.rs`
 
 ---
 

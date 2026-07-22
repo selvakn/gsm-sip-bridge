@@ -73,6 +73,7 @@ const VOLTE_KEYS: &[&str] = &[
     "sec_agree",
     "status_path",
     "lock_path",
+    "bridge_inbound",
 ];
 
 const VOWIFI_KEYS: &[&str] = &[
@@ -548,6 +549,16 @@ pub struct VolteConfig {
     pub sec_agree: bool,
     pub status_path: String,
     pub lock_path: String,
+    /// Answer inbound calls and bridge them to the telephone system
+    /// (specs/017-volte-inbound-bridge), rather than only holding the
+    /// registration open.
+    ///
+    /// **Defaults to false**, which leaves the existing arrangement exactly
+    /// as it was: the modem-internal path stays available and this section
+    /// keeps doing what it did before (FR-021, FR-023, FR-024). Opting in is
+    /// what makes the feature safe to merge — an absent selection changes
+    /// nothing.
+    pub bridge_inbound: bool,
 }
 
 impl Default for VolteConfig {
@@ -567,6 +578,7 @@ impl Default for VolteConfig {
             sec_agree: true,
             status_path: "/tmp/volte-registration-status".to_string(),
             lock_path: "/tmp/volte-registration.lock".to_string(),
+            bridge_inbound: false,
         }
     }
 }
@@ -1427,6 +1439,11 @@ fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig
             .unwrap_or(d.sec_agree),
         status_path: str_key("status_path", "volte.status_path", d.status_path)?,
         lock_path: str_key("lock_path", "volte.lock_path", d.lock_path)?,
+        bridge_inbound: t
+            .get("bridge_inbound")
+            .map(|v| as_bool(v, "volte.bridge_inbound"))
+            .transpose()?
+            .unwrap_or(d.bridge_inbound),
     })
 }
 
@@ -2247,5 +2264,42 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("mcc and mnc must be set together"));
+    }
+
+    #[test]
+    fn an_absent_inbound_selection_leaves_todays_arrangement_untouched() {
+        // specs/017 FR-021/FR-024: the feature is opt-in. A config that
+        // predates it must keep behaving exactly as it did — that default is
+        // what makes the feature safe to merge rather than a flag day.
+        let cfg: VolteConfig = Default::default();
+        assert!(!cfg.bridge_inbound);
+
+        let parsed = parse_volte(
+            &"[volte]\nenabled = true\nmodem_port = \"/dev/ttyUSB6\"\n"
+                .parse::<Value>()
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .clone(),
+        )
+        .expect("a config with no inbound selection must parse");
+        assert!(
+            !parsed.bridge_inbound,
+            "an unset selection must not silently enable inbound bridging"
+        );
+    }
+
+    #[test]
+    fn the_inbound_selection_is_honoured_when_set() {
+        let parsed = parse_volte(
+            &"[volte]\nenabled = true\nbridge_inbound = true\n"
+                .parse::<Value>()
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .clone(),
+        )
+        .expect("parses");
+        assert!(parsed.bridge_inbound);
     }
 }

@@ -91,6 +91,7 @@ cleanup() {
     if [ -n "${VOLTE_SUPERVISOR_PID:-}" ]; then
         kill "$VOLTE_SUPERVISOR_PID" 2>/dev/null
         pkill -f "volte-register" 2>/dev/null
+        pkill -f "volte-bridge" 2>/dev/null
         # Release the IMS PDN so the modem's single host data path goes back
         # to whatever it was bound to before (FR-005). Best-effort: a failure
         # here must not stop the rest of cleanup.
@@ -877,23 +878,40 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
         exit 1
     fi
 
-    log "[volte].enabled — starting host-side IMS over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+    # [volte].bridge_inbound picks which of the two services runs
+    # (specs/017-volte-inbound-bridge FR-023). Unset means today's behaviour:
+    # hold the registration open and nothing more.
+    if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
+        log "[volte].enabled + bridge_inbound — answering inbound calls over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+    else
+        log "[volte].enabled — starting host-side IMS over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+    fi
     (
         while true; do
-            # --pcscf is omitted deliberately: volte-register resolves it from
+            # --pcscf is omitted deliberately: both subcommands resolve it from
             # the ePDG capture at pcscf_source_path when no address is
             # configured, so a VoWiFi run on this SIM primes the LTE path.
-            "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-register \
-                --modem "$VOLTE_MODEM_PORT" \
-                ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
-                --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
-                ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
-                --pcscf-port "$VOLTE_PCSCF_PORT" \
-                --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
-                --status-path "$VOLTE_STATUS_PATH" \
-                --lock-path "$VOLTE_LOCK_PATH" \
-                --keep-pdn
-            log "volte-register exited (status $?); restarting in 15s"
+            if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
+                "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-bridge \
+                    --modem "$VOLTE_MODEM_PORT" \
+                    ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
+                    --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
+                    ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
+                    --pcscf-port "$VOLTE_PCSCF_PORT" \
+                    --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH"
+            else
+                "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-register \
+                    --modem "$VOLTE_MODEM_PORT" \
+                    ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
+                    --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
+                    ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
+                    --pcscf-port "$VOLTE_PCSCF_PORT" \
+                    --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
+                    --status-path "$VOLTE_STATUS_PATH" \
+                    --lock-path "$VOLTE_LOCK_PATH" \
+                    --keep-pdn
+            fi
+            log "the LTE IMS service exited (status $?); restarting in 15s"
             # Longer than the 5s used elsewhere: a restart re-runs PDN
             # attachment and a full IMS-AKA exchange, so a tight loop would
             # hammer both the modem and the carrier's registrar.
