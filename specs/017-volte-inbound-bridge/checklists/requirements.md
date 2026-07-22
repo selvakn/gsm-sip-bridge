@@ -2,6 +2,7 @@
 
 **Purpose**: Validate specification completeness and quality before proceeding to planning
 **Created**: 2026-07-22
+**Clarified**: 2026-07-22 (5 questions, all answered — see spec `## Clarifications`)
 **Feature**: [spec.md](../spec.md)
 
 ## Content Quality
@@ -31,8 +32,25 @@
 
 ## Notes
 
-**Validation passed on first iteration.** 16/16. 24 functional requirements,
-9 success criteria, 4 user stories, 9 edge cases, zero clarification markers.
+**Validation passed on first iteration.** 16/16.
+
+**Re-validated after clarification.** Still 16/16, now with **37 functional
+requirements, 13 success criteria, 5 user stories** and 14 edge cases — grown
+from 24/9/4/9 because clarification uncovered a whole capability the spec had
+wrongly excluded. The mandatory sections were re-scanned for protocol,
+technology and tooling identifiers after every integration; none leaked.
+
+**The clarification pass found a data-loss hole the spec had created.** An
+earlier draft declared text messaging out of scope. Investigation showed the
+Wi-Fi calling path already receives texts over its registration, using the same
+code that builds the same contact — so holding this registration means texts
+arrive here, and "out of scope" would have meant them being silently discarded.
+A lost text announces itself to nobody. That is now a P1 story.
+
+A second hole opened *between* two answers, neither wrong alone: putting
+messaging in scope, and making card assignment exclusive so the circuit-switched
+daemon no longer reads the modem's own message storage. Texts delivered through
+the modem would then have had no reader at all. Both routes are now covered.
 
 Verified mechanically as well as by reading: the mandatory sections were
 scanned for protocol names, signalling terminology, library names, network
