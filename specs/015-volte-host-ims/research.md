@@ -400,6 +400,78 @@ and DAD cannot progress without it.
 ready link-local up front so it reports the real precondition rather than
 `ENETUNREACH`.
 
+---
+
+## R13: The P-CSCF, captured from a Vi ePDG tunnel — Gate G3 PASSED
+
+**Decision**: Obtain the P-CSCF from the existing VoWiFi/ePDG path and supply
+it to the LTE transport. **Verified reachable from the LTE IMS PDN.**
+
+**Status**: ✅ **Gate G3 exit criterion met, 2026-07-22.**
+
+**Capture.** The production VoWiFi stack was run unmodified against the Vi SIM.
+Its config needed no edits: `mcc`/`mnc` are commented out, so the home PLMN is
+derived from the SIM, which produced `mcc=404 mnc=043` and resolved
+`epdg.epc.mnc043.mcc404.pub.3gppnetwork.org`. The tunnel came up with live
+EAP-AKA against the SIM over `AT+CSIM`:
+
+```
+EAP method EAP_AKA succeeded, MSK established
+IKE_SA established  192.168.15.10 ... 203.88.4.88
+received P-CSCF server IP  2400:5200:a100:819::6
+installing new virtual IP  2402:8100:7889:1d45:0:22:1e10:e901
+```
+
+| Item | Value |
+|---|---|
+| **P-CSCF** | **`2400:5200:a100:819::6`** (SIP port 5060) |
+| ePDG | `epdg.epc.mnc043.mcc404.pub.3gppnetwork.org` → `203.88.4.88` (**also has IPv4** — `203.88.11.33` too) |
+| MSISDN | `+918807793613`, from the reg-event NOTIFY |
+| IMPU realm | `ims.mnc043.mcc404.3gppnetwork.org` |
+
+Note the ePDG publishes **both** A and AAAA records. An earlier `dig +short
+NAME A AAAA` returned only the AAAA answers — `dig` treats the trailing
+arguments as one type/class, so that was a single query, not two. The IPv4
+path exists and is what the tunnel actually used, which matters because this
+host has no IPv6 internet.
+
+**Reachability from LTE.** With the VoWiFi stack stopped and the LTE IMS PDN
+up (source `2402:3a80:2314:bb3d:0:25:ff2c:2501`):
+
+| Target | Result |
+|---|---|
+| `[2400:5200:a100:819::6]:5060` | ✅ **TCP CONNECTED** (confirmed twice, Python and `nc`) |
+| `[2400:5200:a100:819::6]:6000` | timed out — expected; 6000 was that ePDG session's negotiated Gm port, not a listener |
+| IMS PDN gateway `:5060` | timed out — confirms this is not a blanket "everything connects" |
+| ICMP to the P-CSCF | no reply — normal, ICMP to a P-CSCF is typically blocked |
+
+**Remaining risk**: reachability is not acceptance. The P-CSCF answers TCP from
+the LTE access, but whether it will *accept* an IMS-AKA REGISTER over a
+different IP-CAN is unproven. Expect to need `P-Access-Network-Info` describing
+E-UTRAN rather than IEEE-802.11, and note the LTE PDN address
+(`2402:3a80:…`) sits in a different prefix from the ePDG inner address
+(`2402:8100:…`). Only an actual registration settles it.
+
+## R14: Gate G2 answered as a side effect — Gm IPsec over IPv6 works
+
+**Status**: ✅ **Gate G2 met.** No separate verification task is needed.
+
+The same VoWiFi run carried the authenticated REGISTER over Gm IPsec **on
+IPv6**, against this exact carrier:
+
+```
+network proposed Gm IPsec  alg=hmac-md5-96; ealg=aes-cbc;
+                           spi-c=7192031; spi-s=7192030; port-c=32813; port-s=6000
+Gm IPsec SAs installed
+reconnected over Gm IPsec transport  peer=[2400:5200:a100:819::6]:6000
+REGISTER response  status=200 OK
+```
+
+This was the one untested surface flagged in R3: `ims/gm_ipsec.rs` had never
+had its XFRM states and policies exercised with IPv6 selectors. They install
+and carry traffic correctly. Note the cipher is `aes-cbc`, not the null cipher
+— so the encryption path is exercised too, not just authentication.
+
 ## Unresolved items carried into planning
 
 | ID | Item | Blocking? | Status |

@@ -70,7 +70,18 @@ three-method fallback chain that would have failed on every path.
 
 **Consequences** — see "Post-G1 plan revision" below.
 
-### Gate G3 — Obtain a Vi India P-CSCF address *(NEW; blocks US3)*
+### Gate G3 — Obtain a Vi India P-CSCF address — ✅ **PASSED 2026-07-22**
+
+**Outcome**: captured `2400:5200:a100:819::6` from a live Vi ePDG tunnel using
+the production VoWiFi stack unmodified, and **verified it accepts TCP on 5060
+from the LTE IMS PDN**. Full evidence in `research.md` R13. Avenue 1 worked;
+avenues 2 and 3 (firmware, vendor query) are unnecessary.
+
+Residual risk: reachability is not acceptance — see R13.
+
+*Original gate text follows.*
+
+#### Gate G3 (original) — Obtain a Vi India P-CSCF address
 
 G1 removed the assumed route to a P-CSCF address, so acquiring one is now its
 own gate. US3 cannot start without it. Ordered by cost:
@@ -86,12 +97,11 @@ own gate. US3 cannot start without it. Ordered by cost:
 **If all three fail**, this feature cannot reach US3 on this hardware. US1 is
 still independently valuable and complete, and should ship regardless.
 
-### Gate G2 — Gm IPsec over IPv6 *(blocks US3)*
+### Gate G2 — Gm IPsec over IPv6 — ✅ **PASSED 2026-07-22**
 
-Research R3 found the SIP layer already IPv6-clean, but `ims/gm_ipsec.rs` has
-never had its XFRM states and policies exercised with IPv6 selectors. Verify
-ESP transport-mode SA installation over IPv6 **independently of registration**,
-so a failure here is not misdiagnosed as a registration failure.
+Answered as a side effect of the G3 capture: the same VoWiFi run installed Gm
+IPsec SAs over IPv6 with `aes-cbc` and carried an authenticated REGISTER to a
+`200 OK`. The exercise planned here is no longer needed. See `research.md` R14.
 
 ## Project Structure
 
@@ -219,15 +229,42 @@ so no phase depends on an unmet gate.
 | 1 | `ImsTransport` seam; VoWiFi refactored onto it with **zero behavioural change** | — (FR-017/018) | — | ✅ **Done** |
 | 2 | IMS PDN lifecycle + **IID-aware interface config (FR-024)**; `volte-pdn`, `volte-status` | US1 | — | ✅ **Done — verified on live hardware** |
 | 3 | Discovery probes as **diagnostics**; `volte-discover` reports per-method results | US2 (P3) | — | ✅ **Done — verified on live hardware** |
-| 4 | **G3**: acquire a P-CSCF address | — | **G3** | ⚠️ Blocked |
-| 5 | **G2 verification**, then registration over the LTE transport | US3 | **G2, G3** | ⚠️ Blocked on G3 |
+| 4 | **G3**: acquire a P-CSCF address | — | **G3** | ✅ **Done — `2400:5200:a100:819::6`** |
+| 5 | Registration over the LTE transport | US3 | ~~G2, G3~~ | **Unblocked** |
 | 6 | Renewal, registration history | US4 | — | After phase 5 |
 
 Phase 1 must land and prove FR-019 (VoWiFi unchanged) before any VoLTE code is
 written. That ordering is what keeps the production path safe.
 
-Phases 1–3 are unblocked and account for most of the implementation. Phase 4
-(G3) is a research task, not a coding task, and can run in parallel.
+**Both gates are now cleared and US3 is unblocked.** Phase 5 is the remaining
+implementation work; see "Ways forward" below.
+
+## Ways forward (post-G3)
+
+1. **Wire `volte-register` (Phase 5).** Everything needed exists: the
+   `ImsTransport` seam, the PDN attachment, and a P-CSCF. Pass
+   `--pcscf 2400:5200:a100:819::6` into `LteImsPdnTransport` and drive the
+   existing `ims::run_register`. Expect to add `P-Access-Network-Info`
+   describing E-UTRAN rather than IEEE-802.11 — the most likely reason a
+   registration that is *reachable* still gets rejected.
+
+2. **Make the ePDG capture automatic rather than manual.** The VoWiFi path
+   already writes the P-CSCF to `pcscf_source_path`. Adding that file as a
+   fourth discovery source — an `EpdgCache` method, ranked after `Pco` — turns
+   today's manual `--pcscf` into an automatic hand-off between the two
+   transports, with the source still named in the report. This is the single
+   highest-value follow-up and costs very little.
+
+3. **Do not register both transports concurrently.** VoWiFi and VoLTE would
+   present the same IMPU with the same IMEI-derived `+sip.instance`, so the
+   network treats one as a re-registration of the other and tears the first
+   binding down. This is the same hazard `vowifi::ims_mode` already documents
+   for the modem's internal IMS stack. Whatever drives the two transports must
+   enforce one-at-a-time.
+
+4. **Re-validate the P-CSCF periodically.** It was learned from one ePDG
+   session and is not guaranteed stable. Treat a hard-coded address as a
+   cached value with a refresh path, not a constant.
 
 ### Phases 1–2 completion notes
 
