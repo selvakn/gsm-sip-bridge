@@ -324,6 +324,14 @@ pub enum ConfigSubcommand {
     /// single source of truth for all non-secret configuration). Exits
     /// non-zero and prints nothing on config-load failure.
     VowifiShellEnv,
+    /// Exit 0 if `[volte].enabled = true`, exit 1 otherwise (including when
+    /// the file cannot be loaded). Prints nothing — only the exit code is
+    /// meant to be used, matching `vowifi-enabled`.
+    VolteEnabled,
+    /// Prints the resolved `[volte]` section as shell-quoted `KEY=VALUE`
+    /// lines for `docker/entrypoint.sh` to `eval`, so the supervisor never
+    /// hand-parses TOML (specs/015-volte-host-ims).
+    VolteShellEnv,
 }
 
 #[derive(Parser, Debug)]

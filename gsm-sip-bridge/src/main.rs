@@ -691,6 +691,43 @@ fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> E
                 _ => ExitCode::FAILURE,
             }
         }
+        ConfigSubcommand::VolteEnabled => {
+            let Some(path) = cli.config.as_deref() else {
+                return ExitCode::FAILURE;
+            };
+            match load_config(path) {
+                Ok(config) if config.volte.enabled => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        ConfigSubcommand::VolteShellEnv => {
+            let Some(path) = cli.config.as_deref() else {
+                eprintln!("config volte-shell-env: --config is required");
+                return ExitCode::FAILURE;
+            };
+            let config = match load_config(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("config volte-shell-env: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let v = &config.volte;
+            let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            println!("VOLTE_ENABLED={}", if v.enabled { 1 } else { 0 });
+            println!("VOLTE_MODEM_PORT={}", q(&v.modem_port));
+            println!("VOLTE_IFACE={}", q(&v.iface));
+            println!("VOLTE_CID={}", v.cid);
+            println!("VOLTE_APN={}", q(&v.apn));
+            println!("VOLTE_PCSCF={}", q(&v.pcscf));
+            println!("VOLTE_PCSCF_PORT={}", v.pcscf_port);
+            println!("VOLTE_PCSCF_SOURCE_PATH={}", q(&v.pcscf_source_path));
+            println!("VOLTE_USE_TCP={}", if v.use_tcp { 1 } else { 0 });
+            println!("VOLTE_SEC_AGREE={}", if v.sec_agree { 1 } else { 0 });
+            println!("VOLTE_STATUS_PATH={}", q(&v.status_path));
+            println!("VOLTE_LOCK_PATH={}", q(&v.lock_path));
+            ExitCode::SUCCESS
+        }
         ConfigSubcommand::VowifiShellEnv => {
             let Some(path) = cli.config.as_deref() else {
                 eprintln!("config vowifi-shell-env: --config is required");

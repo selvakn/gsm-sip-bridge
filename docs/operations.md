@@ -271,3 +271,78 @@ Check:
 2. Run: `sqlite3 /var/lib/gsm-sip-bridge/store.db "PRAGMA integrity_check;"`
 3. If corrupt, restore from backup
 4. Restart the bridge (it will create a fresh DB if needed)
+
+## Host-side IMS over LTE (VoLTE)
+
+`specs/015-volte-host-ims`. The bridge runs **its own** IMS registration over
+an LTE IMS PDN, instead of delegating to the modem's internal IMS stack and
+re-bridging its decoded audio. Opt in with `[volte].enabled`; the `volte-*`
+subcommands work as standalone diagnostics without it.
+
+All of them need `CAP_NET_ADMIN` — run them inside the container.
+
+```bash
+gsm-sip-bridge volte-pdn --action up --iface <ifname>   # attach the IMS PDN
+gsm-sip-bridge volte-discover --iface <ifname>          # what does the carrier publish?
+gsm-sip-bridge volte-register                           # register, then keep it alive
+gsm-sip-bridge volte-status --iface <ifname>            # attachment + registration state
+gsm-sip-bridge volte-pdn --action down --iface <ifname> # release, restoring the previous binding
+```
+
+### Never enable VoWiFi and VoLTE on the same SIM
+
+Both register the same IMPU with the same IMEI-derived `+sip.instance`, so per
+RFC 5626 the network treats one registration as a re-registration of the other
+and deactivates the older binding — the same failure documented above for the
+modem's internal IMS stack. `volte-register` refuses to start while a
+`vowifi-ims-agent` is running (override with `--force` only when deliberately
+testing this), and `entrypoint.sh` refuses to start at all if both sections are
+enabled.
+
+### The P-CSCF usually has to be captured, not discovered
+
+On the tested carrier (Vodafone India) **no automatic mechanism yields a
+P-CSCF**: DHCPv6 replies but carries no RFC 3319 SIP-server options, the router
+advertisement carries none, and no usable resolver is offered. `volte-discover`
+reports this per-method rather than failing opaquely — an empty result there is
+the expected outcome, not a fault.
+
+The working route is to let the VoWiFi/ePDG path capture one: it writes the
+address it learned from the IKEv2 config payload to `[vowifi].pcscf_source_path`
+(default `/tmp/pcscf`), and `volte-register` picks that file up automatically
+when `[volte].pcscf` is unset. So running VoWiFi once on the SIM primes the LTE
+path. `--pcscf` overrides everything.
+
+### Symptom: attached but nothing works
+
+`volte-pdn --action up` reports `routable: NO — no default route`.
+
+The carrier **unicasts its router advertisements to the link-local form of the
+interface identifier it assigned**, not to `ff02::1`. If the host uses its own
+generated link-local, every RA is silently discarded and the PDN looks dead
+while the RAs are arriving the whole time. The bridge handles this
+(`addr_gen_mode=none` plus the identifier from `AT+CGPADDR`), so seeing this
+means something upstream failed — check that the interface has carrier and that
+`AT+QNETDEVCTL?` reports the IMS context bound.
+
+Note that "attached" and "usable" are different states: the assigned address is
+installed by the bridge regardless, so **the default route — not the presence
+of an address — is what proves the RA was accepted**.
+
+### Symptom: general connectivity through the modem disappears
+
+Expected. The module exposes a single host-facing data path, so binding the IMS
+PDN displaces whatever it carried before. `volte-pdn --action down` restores the
+previous binding, and the container does the same on shutdown.
+
+### Metrics
+
+| Metric | Meaning |
+|---|---|
+| `gsm_bridge_volte_registered` | 1 when the host-side LTE registration is accepted |
+| `gsm_bridge_volte_pdn_up` | 1 when the IMS PDN is attached **and routable** |
+| `gsm_bridge_volte_registrations_total{outcome}` | `accepted` / `renewed` / `rejected` / `renewal_failed` |
+
+Deliberately separate from `gsm_bridge_sip_registered` (the PBX side) and from
+the VoWiFi agent's gauges — when something is down you need to know *which*
+registration, not that one of them is.

@@ -115,7 +115,7 @@ the full `[vowifi]` reference — is documented in
 |---|---|
 | **Getting started** | [Hardware setup](docs/hardware-setup.md) · [Configuration reference](docs/configuration.md) |
 | **Running it** | [Operations runbook & troubleshooting](docs/operations.md) · [Metrics & dashboards](docs/observability.md) |
-| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [EC20 VoLTE setup](docs/ec20-volte-setup.md) |
+| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [Host-side IMS over LTE](specs/015-volte-host-ims/quickstart.md) · [EC20 VoLTE setup (modem-internal)](docs/ec20-volte-setup.md) |
 | **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |
 
 The full index, including design notes and engineering history, is at

@@ -1,5 +1,19 @@
 # EC20 VoLTE Setup Guide
 
+> **This guide is about the modem's *internal* VoLTE stack — not the bridge's
+> own.** It configures the EC20 so the *module* registers to IMS and the bridge
+> receives decoded PCM audio over the AT/audio path.
+>
+> Since `specs/015-volte-host-ims`, there is a second, independent path: the
+> bridge runs **its own** IMS registration over an LTE IMS PDN
+> (`volte-register`), keeping SIP and media under software control. The two are
+> mutually exclusive on one SIM — see [Operations →
+> Host-side IMS over LTE](operations.md#host-side-ims-over-lte-volte).
+>
+> This guide was written for an **EC20 with an Airtel India SIM**; the
+> host-side path was developed on an **EC200U with a Vodafone India SIM**,
+> which is UNISOC-based and behaves differently (no QMI, AT only).
+
 The Quectel EC20 module does not enable VoLTE by default. The `ROW_Generic_3GPP`
 MBN profile locks the IMS voice flag to `0`, preventing VoLTE registration.
 This guide documents the steps to enable VoLTE on an EC20 module with an

@@ -2,6 +2,7 @@
 
 **Purpose**: Validate specification completeness and quality before proceeding to planning
 **Created**: 2026-07-22
+**Last re-validated**: 2026-07-22, against the spec **as amended after Gate G1**
 **Feature**: [spec.md](../spec.md)
 
 ## Content Quality
@@ -31,35 +32,56 @@
 
 ## Notes
 
-**Validation passed on first iteration.** All 16 items pass.
+### Re-validation (2026-07-22, post-amendment)
 
-Deliberate judgement calls made during validation, recorded for the reviewer:
+The original pass validated the spec as first written. Gate G1's negative
+result then forced amendments — US2 retitled and demoted P1 → P3, SC-002
+rewritten, FR-007 softened, FR-024 added, three Assumptions rewritten — so the
+earlier pass no longer covered the document that exists. This is that re-run.
 
-1. **Hardware findings kept in Assumptions, not Requirements.** The specific
-   modem, carrier, control-channel commands, and the confirmed/refuted
-   capabilities discovered during live investigation are material to whether
-   this feature is achievable at all. They are recorded as *environment
-   dependencies* under Assumptions rather than as requirements, keeping the
-   Requirements and Success Criteria sections free of implementation detail
-   while not discarding the evidence the spec rests on. The concrete command
-   transcripts belong in `research.md` at the planning stage.
+**One item initially FAILED and was fixed rather than excused.**
+
+*"No implementation details"* — the amended rationale for US2 had named
+`DHCPv6`, `RFC 3319`, `Router Advertisement` and DNS resolvers **inside a
+mandatory User Scenarios section**. Recording the G1 evidence was right; putting
+protocol names in a user story was not. The rationale was rewritten to state the
+outcome ("every standard mechanism was tried and none yields one") and point at
+`research.md` R2 for the specifics. Verified afterwards by scanning User
+Scenarios → Requirements → Success Criteria for protocol identifiers: none
+remain.
+
+All 16 items pass as of this re-run.
+
+### Standing judgement calls (unchanged from the original validation)
+
+1. **Hardware findings live in Assumptions, not Requirements.** The specific
+   modem, carrier and confirmed/refuted capabilities are material to whether
+   the feature is achievable, and Assumptions/Dependencies is the section for
+   environment facts. Requirements and Success Criteria stay free of them.
+   Protocol names *are* permitted there and appear deliberately — that is the
+   distinction drawn above, not an inconsistency.
 
 2. **"Non-technical stakeholder" is interpreted within the domain.** This is
-   carrier-network infrastructure; terms like *registration*, *carrier*,
-   *subscriber identity*, and *attachment* are unavoidable. The spec avoids
-   protocol names, header names, RFC numbers, command syntax, and source
-   module names throughout the mandatory sections, which is the meaningful
-   version of this criterion here.
+   carrier-network infrastructure; *registration*, *carrier*, *attachment* are
+   unavoidable. The meaningful version of the criterion is: no protocol names,
+   header names, RFC numbers, command syntax or source module names in the
+   mandatory sections. That now holds.
 
-3. **Two P1 stories, deliberately.** US1 (attachment) and US2 (entry-point
-   discovery) are both P1 because each independently resolves a
-   feature-gating unknown, and each delivers standalone diagnostic value
-   before any registration is attempted. US3 carries the headline outcome but
-   depends on both, so it is sequenced at P2.
+3. **Two P1 stories was correct at the time.** US1 and US2 each resolved a
+   feature-gating unknown. G1 resolved US2's — negatively — which is exactly
+   why it could be demoted afterwards. The original priority was not a mistake;
+   the information changed.
 
-4. **The riskiest assumption is flagged as such.** "The carrier will grant an
-   IMS network attachment to a host-controlled request" is called out in
-   Assumptions as the assumption the feature most depends on. It was
-   confirmed by live investigation rather than presumed.
+4. **The riskiest assumption is still flagged as such.** "The carrier will
+   grant an IMS attachment to a host-controlled request" was confirmed by live
+   investigation before the spec was written, and remains labelled as the
+   assumption the feature most depends on.
+
+### Post-implementation note
+
+Every functional requirement now has a verified implementation; see
+[tasks.md](../tasks.md) for the task-by-task cross-validation, including the
+seven items still outstanding and the caveats on what "verified" means for the
+hardware-only checks.
 
 - Items marked incomplete require spec updates before `/speckit-clarify` or `/speckit-plan`
