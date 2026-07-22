@@ -87,6 +87,10 @@ fn main() -> ExitCode {
         return handle_volte_register_command(args);
     }
 
+    if let Some(Commands::VolteCall(args)) = &cli.command {
+        return handle_volte_call_command(args);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -267,6 +271,11 @@ fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode 
         record_sent_path: args.record_sent.clone(),
         ring_timeout: Duration::from_secs(args.ring_timeout_secs),
         call_duration: Duration::from_secs(args.call_duration_secs),
+        // `ims-call` keeps sending the tone pattern, unchanged: echo is opt-in
+        // so the VoWiFi diagnostic behaves exactly as it did (FR-020).
+        echo: None,
+        one_way_threshold_percent:
+            gsm_sip_bridge::ims::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT,
     };
 
     match run_call(&cfg) {
@@ -275,6 +284,7 @@ fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode 
             recorded_samples,
             sent_path,
             sent_samples,
+            ..
         }) => {
             println!(
                 "call answered — recorded {recorded_samples} received samples to {}",
@@ -492,6 +502,209 @@ fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> E
             ExitCode::FAILURE
         }
     }
+}
+
+fn handle_volte_call_command(args: &gsm_sip_bridge::cli::VolteCallArgs) -> ExitCode {
+    use gsm_sip_bridge::ims::call::{run_call, CallConfig, CallOutcome, EchoSettings};
+    use std::time::Duration;
+
+    // Refuse before anything touches the modem, so a refusal leaves the system
+    // exactly as it was (FR-022).
+    if let Err(e) = gsm_sip_bridge::volte::guard::check_no_vowifi_conflict(args.force) {
+        eprintln!("volte-call: {e}");
+        return ExitCode::FAILURE;
+    }
+    let _lock = match gsm_sip_bridge::volte::guard::RegistrationGuard::acquire(&args.lock_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "volte-call: {e}. The call places its own registration, so it cannot run \
+                 alongside volte-register — stop the registration loop, run the call, then \
+                 restart it."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A quality judgement made on a narrowband fallback is meaningless, so
+    // find out before dialling rather than from a rejection (FR-010).
+    if !amr_safe::is_available() {
+        eprintln!(
+            "volte-call: [preparing] this build has no wideband codec linked, so only a \
+             narrowband offer could be made and any quality judgement would be meaningless. \
+             Run the container build."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let (pcscf_addr, pcscf_source) = match args.pcscf {
+        Some(addr) => (addr, "--pcscf".to_string()),
+        None => {
+            let cache = std::path::PathBuf::from(&args.pcscf_source_path);
+            match gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache).found() {
+                Some(addr) => (addr, format!("ePDG capture at {}", cache.display())),
+                None => {
+                    eprintln!(
+                        "volte-call: [discovering-pcscf] no P-CSCF address available. Pass \
+                         --pcscf, or run the VoWiFi path once so it writes one to {}.",
+                        cache.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    tracing::info!(pcscf = %pcscf_addr, source = %pcscf_source, "resolved P-CSCF");
+
+    let settings = gsm_sip_bridge::volte::VolteSettings {
+        modem_port: args.modem.clone(),
+        iface: args.iface.clone().unwrap_or_default(),
+        cid: args.cid,
+        apn: args.apn.clone(),
+        pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+    };
+
+    let attach = match gsm_sip_bridge::volte::attach(&settings) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("volte-call: [attaching] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !attach.routed && !settings.iface.is_empty() {
+        eprintln!("volte-call: [attaching] the IMS PDN has no default route; media cannot flow");
+        return ExitCode::FAILURE;
+    }
+
+    let plmn = match gsm_sip_bridge::modules::at_commander::AtCommander::open(&args.modem)
+        .and_then(|mut at| gsm_sip_bridge::vowifi::plmn::derive_plmn(&mut at))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("volte-call: [attaching] could not derive the home PLMN: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let cfg = CallConfig {
+        register: gsm_sip_bridge::ims::ImsRegisterConfig {
+            modem_port: args.modem.clone(),
+            pcscf_addr,
+            pcscf_port: args.pcscf_port,
+            mcc: plmn.mcc.clone(),
+            mnc: plmn.mnc.clone(),
+            imsi: None,
+            imei: None,
+            use_tcp: true,
+            sec_agree: true,
+            msisdn: args.msisdn.clone(),
+            access_network_info: gsm_sip_bridge::volte::read_access_network_info(&args.modem),
+        },
+        callee: args.callee.clone(),
+        record_path: args.record.clone(),
+        record_sent_path: Some(args.record_sent.clone()),
+        ring_timeout: Duration::from_secs(args.ring_timeout_secs),
+        call_duration: Duration::from_secs(args.duration_secs),
+        echo: Some(EchoSettings {
+            attenuation: args.echo_attenuation,
+            marker_interval: Duration::from_secs(args.marker_interval_secs),
+        }),
+        one_way_threshold_percent: args.one_way_threshold,
+    };
+
+    println!(
+        "Placing a call to {}. The answering party will hear their OWN VOICE returned — \
+         have them use a handset, not a speakerphone.",
+        args.callee
+    );
+
+    let result = run_call(&cfg);
+
+    if !args.keep_pdn {
+        if let Err(e) = gsm_sip_bridge::volte::detach(&settings, attach.displaced_cid) {
+            tracing::warn!(error = %e, "failed to release the IMS PDN");
+        }
+    }
+
+    match result {
+        Ok(CallOutcome::Answered {
+            recorded_path,
+            sent_path,
+            end_reason,
+            media,
+            ..
+        }) => {
+            print!(
+                "{}",
+                render_call_report(&media, end_reason, &recorded_path, sent_path.as_deref())
+            );
+            // An answered call whose audio only flowed one way is a failure —
+            // the previous one-way-audio incident was painful precisely
+            // because a broken call looked like a working one (FR-016).
+            if media.is_success() {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("\nvolte-call: [media] {}", media.verdict.diagnosis());
+                ExitCode::FAILURE
+            }
+        }
+        Ok(CallOutcome::NotAnswered { status, reason }) => {
+            eprintln!("volte-call: [signalling] the call was not answered: {status} {reason}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("volte-call: [signalling] {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Operator-facing media report. Direction is printed first, because it is the
+/// line that decides whether the call worked at all.
+fn render_call_report(
+    media: &gsm_sip_bridge::ims::call::MediaReport,
+    end_reason: gsm_sip_bridge::ims::call::EndReason,
+    recorded: &std::path::Path,
+    sent: Option<&std::path::Path>,
+) -> String {
+    let s = &media.stats;
+    let mut out = String::from("\ncall report\n");
+    out.push_str(&format!(
+        "  direction      : {} — {}\n",
+        media.verdict.as_str(),
+        media.verdict.diagnosis()
+    ));
+    out.push_str(&format!("  ended by       : {}\n", end_reason.as_str()));
+    out.push_str(&format!(
+        "  sent           : {} packets / {} samples\n",
+        media.sent_packets, media.sent_samples
+    ));
+    out.push_str(&format!(
+        "  received       : {} packets / {} samples\n",
+        s.received_packets, media.received_samples
+    ));
+    out.push_str(&format!(
+        "  loss           : {} ({:.1}%)\n",
+        s.lost_packets,
+        s.loss_percent()
+    ));
+    out.push_str(&format!("  reordered      : {}\n", s.reordered_packets));
+    out.push_str(&format!(
+        "  jitter         : {:.1} ms\n",
+        s.jitter.as_secs_f64() * 1000.0
+    ));
+    match media.round_trip_delay {
+        Some(d) => out.push_str(&format!(
+            "  round trip     : {:.0} ms\n",
+            d.as_secs_f64() * 1000.0
+        )),
+        None => out.push_str("  round trip     : not measured\n"),
+    }
+    out.push_str(&format!("  recording      : {}\n", recorded.display()));
+    if let Some(p) = sent {
+        out.push_str(&format!("  sent audio     : {}\n", p.display()));
+    }
+    out
 }
 
 fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) -> ExitCode {

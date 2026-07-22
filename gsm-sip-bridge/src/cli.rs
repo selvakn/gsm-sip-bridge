@@ -138,6 +138,20 @@ pub enum Commands {
     /// the network treats one as a re-registration of the other and tears the
     /// first binding down.
     VolteRegister(VolteRegisterArgs),
+    /// Place a diagnostic voice call over the host-side LTE IMS registration
+    /// (specs/016-volte-calls) and report what happened to the audio.
+    ///
+    /// The far end hears their OWN VOICE returned over the full round trip —
+    /// no audio files are involved. People notice distortion, delay and
+    /// dropouts in their own voice far more readily than in a stranger's, and
+    /// the echo carries the degradation of both directions at once.
+    ///
+    /// Have the answering party use a HANDSET: echoing into a speakerphone
+    /// can feed back.
+    ///
+    /// Exits 0 only when the call was answered AND audio flowed both ways —
+    /// an answered-but-silent call is a failure, not a success.
+    VolteCall(VolteCallArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -285,6 +299,67 @@ pub struct VolteRegisterArgs {
     /// Lock file preventing two concurrent VoLTE registrations on one SIM.
     #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
     pub lock_path: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteCallArgs {
+    /// Destination in E.164, e.g. +919789063708.
+    #[arg(long)]
+    pub callee: String,
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    /// Host network interface carrying the IMS PDN.
+    #[arg(long)]
+    pub iface: Option<String>,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
+    pub apn: String,
+    /// P-CSCF address. When omitted, the address captured by the VoWiFi/ePDG
+    /// path is used.
+    #[arg(long)]
+    pub pcscf: Option<std::net::IpAddr>,
+    #[arg(long, default_value = "/tmp/pcscf")]
+    pub pcscf_source_path: String,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
+    pub pcscf_port: u16,
+    /// How long to hold the call once answered. The default is long enough to
+    /// judge audio quality.
+    #[arg(long, default_value_t = 30)]
+    pub duration_secs: u64,
+    #[arg(long, default_value_t = 40)]
+    pub ring_timeout_secs: u64,
+    /// Gain applied to the returned audio. Clamped below unity so the
+    /// feedback loop converges.
+    #[arg(long, default_value_t = crate::ims::echo::DEFAULT_ATTENUATION)]
+    pub echo_attenuation: f32,
+    /// How often the independent generated marker is emitted, regardless of
+    /// what has been received. Without it, echo would make the two directions
+    /// dependent and destroy the direction attribution.
+    #[arg(long, default_value_t = 5)]
+    pub marker_interval_secs: u64,
+    /// Where the far end's audio is written.
+    #[arg(long, default_value = "/tmp/volte-call-received.wav")]
+    pub record: PathBuf,
+    /// Where our outgoing audio is written, separately — so a defect can be
+    /// attributed to a direction.
+    #[arg(long, default_value = "/tmp/volte-call-sent.wav")]
+    pub record_sent: PathBuf,
+    /// Proportion of the busier direction the quieter one must carry before it
+    /// counts as working.
+    #[arg(long, default_value_t = crate::ims::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT)]
+    pub one_way_threshold: u8,
+    /// Use this MSISDN as the Public User Identity.
+    #[arg(long)]
+    pub msisdn: Option<String>,
+    /// Place the call even when a VoWiFi agent is running.
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
+    pub lock_path: PathBuf,
+    /// Leave the IMS PDN attached afterwards, for inspection.
+    #[arg(long)]
+    pub keep_pdn: bool,
 }
 
 #[derive(Parser, Debug)]

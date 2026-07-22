@@ -18,7 +18,7 @@ use std::io;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const RTP_TIMEOUT: Duration = Duration::from_millis(200);
@@ -85,6 +85,76 @@ pub struct CallConfig {
     pub ring_timeout: Duration,
     /// How long to hold the call open (exchanging audio) once answered.
     pub call_duration: Duration,
+    /// Return the far end's own audio to them instead of sending a test
+    /// pattern (specs/016-volte-calls FR-025). `None` keeps the historical
+    /// tone-only behaviour, which is what `ims-call` still uses — the change
+    /// is additive so the VoWiFi diagnostic is untouched (FR-020).
+    pub echo: Option<EchoSettings>,
+    /// Proportion of the busier direction the quieter one must carry before it
+    /// counts as working (FR-016).
+    pub one_way_threshold_percent: u8,
+}
+
+/// Echo behaviour for a diagnostic call.
+#[derive(Debug, Clone, Copy)]
+pub struct EchoSettings {
+    /// Applied to returned audio; clamped below unity so the feedback loop
+    /// converges.
+    pub attenuation: f32,
+    /// How often the independent generated marker is emitted **regardless of
+    /// what has been received** (FR-029). Without it, echo would make the two
+    /// directions dependent and destroy the direction attribution.
+    pub marker_interval: Duration,
+}
+
+impl Default for EchoSettings {
+    fn default() -> Self {
+        Self {
+            attenuation: super::echo::DEFAULT_ATTENUATION,
+            marker_interval: super::echo::DEFAULT_MARKER_INTERVAL,
+        }
+    }
+}
+
+/// What ended a call, so "the duration elapsed" is never confused with "the
+/// far end hung up" (FR-005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    DurationElapsed,
+    FarEndHungUp,
+    MediaStopped,
+}
+
+impl EndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EndReason::DurationElapsed => "the configured duration elapsed",
+            EndReason::FarEndHungUp => "the far end hung up",
+            EndReason::MediaStopped => "the media path stopped",
+        }
+    }
+}
+
+/// What happened to the audio. The deliverable of the quality question.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaReport {
+    pub sent_samples: u64,
+    pub received_samples: u64,
+    pub sent_packets: u64,
+    pub stats: super::media_stats::ReceiveStats,
+    pub verdict: super::media_stats::DirectionVerdict,
+    /// Needs a tone detector to spot our own marker returning; only
+    /// verifiable on a live call, so absent for now.
+    pub round_trip_delay: Option<Duration>,
+}
+
+impl MediaReport {
+    /// An answered call whose audio only flowed one way is a **failure**
+    /// (FR-016). The previous one-way-audio incident was painful precisely
+    /// because a broken call looked like a working one.
+    pub fn is_success(&self) -> bool {
+        self.verdict.is_success()
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +164,10 @@ pub enum CallOutcome {
         recorded_samples: u32,
         sent_path: Option<PathBuf>,
         sent_samples: u32,
+        /// What ended the call (FR-005).
+        end_reason: EndReason,
+        /// What happened to the media (FR-012, FR-013, FR-015).
+        media: MediaReport,
     },
     NotAnswered {
         status: u16,
@@ -239,6 +313,8 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
 
     session.cleanup();
     Ok(CallOutcome::Answered {
+        end_reason: rtp_result.end_reason,
+        media: rtp_result.media,
         recorded_path: cfg.record_path.clone(),
         recorded_samples: rtp_result.received_samples,
         sent_path: cfg.record_sent_path.clone(),
@@ -260,6 +336,12 @@ struct TonePattern {
     // doesn't redo float math every call.
     segments: Vec<(u64, Option<f64>)>,
     period_samples: u64,
+}
+
+impl super::echo::MarkerSource for TonePattern {
+    fn sample_at(&self, sample_index: u64, sample_rate: u32) -> i16 {
+        TonePattern::sample_at(self, sample_index, sample_rate)
+    }
 }
 
 impl TonePattern {
@@ -305,6 +387,8 @@ impl TonePattern {
 struct RtpSessionResult {
     received_samples: u32,
     sent_samples: u32,
+    end_reason: EndReason,
+    media: MediaReport,
 }
 
 /// Sends the looping test pattern as outgoing audio and records whatever
@@ -337,7 +421,15 @@ fn run_rtp_session(
     let stop_recv = stop.clone();
     let record_path = cfg.record_path.clone();
     let sample_rate = params.sample_rate;
+    // Shared with the send loop: the receive thread pushes decoded far-end
+    // audio, the send loop returns it (specs/016-volte-calls FR-025).
+    let echo_buffer = cfg.echo.map(|_| super::echo::EchoBuffer::new(sample_rate));
+    let echo_buffer_recv = echo_buffer.clone();
+    let stats = Arc::new(Mutex::new(super::media_stats::ReceiveTracker::new()));
+    let stats_recv = stats.clone();
+    let clock_rate = params.sample_rate;
     let recv_handle = std::thread::spawn(move || -> BridgeResult<u32> {
+        let media_start = Instant::now();
         let mut wav = super::rtp::WavWriter::create(&record_path, sample_rate)?;
         // Constructed once per call (not per packet) since it's stateful —
         // AMR-WB decoding carries filter/predictor history across frames.
@@ -380,6 +472,15 @@ fn run_rtp_session(
                         NegotiatedCodec::AmrNb => unreachable!("{AMR_NB_UNREACHABLE}"),
                         NegotiatedCodec::L16 => unreachable!("{L16_UNREACHABLE}"),
                     };
+                    // Sequence and arrival timing are what make loss and
+                    // jitter measurable; they were parsed and discarded before.
+                    stats_recv
+                        .lock()
+                        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner())
+                        .on_packet(pkt.seq, pkt.timestamp, media_start.elapsed(), clock_rate);
+                    if let Some(buf) = &echo_buffer_recv {
+                        buf.push(&samples);
+                    }
                     wav.write_samples(&samples)?;
                 }
                 Err(e)
@@ -416,6 +517,17 @@ fn run_rtp_session(
         .transpose()?;
 
     let tone = TonePattern::new(sample_rate);
+    let mut mixer = match (&echo_buffer, cfg.echo) {
+        (Some(buf), Some(settings)) => Some(super::echo::EchoMixer::new(
+            buf.clone(),
+            sample_rate,
+            settings.attenuation,
+            settings.marker_interval,
+        )),
+        _ => None,
+    };
+    let mut sent_packets: u64 = 0;
+    let mut end_reason = EndReason::DurationElapsed;
     let ssrc: u32 = rand::random();
     let mut seq: u16 = rand::random();
     let mut timestamp: u32 = 0;
@@ -423,10 +535,23 @@ fn run_rtp_session(
     let start = Instant::now();
 
     while start.elapsed() < cfg.call_duration {
-        let mut pcm = Vec::with_capacity(params.samples_per_packet);
-        for i in 0..params.samples_per_packet {
-            pcm.push(tone.sample_at(sample_index + i as u64, sample_rate));
+        // The receive thread exiting means media stopped — usually because the
+        // far end went away. Ending here rather than holding the call open for
+        // the remaining duration is FR-027.
+        if recv_handle.is_finished() {
+            end_reason = EndReason::MediaStopped;
+            break;
         }
+
+        let pcm: Vec<i16> = match mixer.as_mut() {
+            Some(m) => {
+                let (pcm, _kind) = m.next_packet(start.elapsed(), params.samples_per_packet, &tone);
+                pcm
+            }
+            None => (0..params.samples_per_packet)
+                .map(|i| tone.sample_at(sample_index + i as u64, sample_rate))
+                .collect(),
+        };
         sample_index += params.samples_per_packet as u64;
 
         if let Some(wav) = sent_wav.as_mut() {
@@ -464,6 +589,7 @@ fn run_rtp_session(
             .send(&pkt)
             .map_err(|e| BridgeError::Ims(format!("RTP send failed: {e}")))?;
         seq = seq.wrapping_add(1);
+        sent_packets += 1;
         timestamp = timestamp.wrapping_add(params.samples_per_packet as u32);
 
         std::thread::sleep(Duration::from_millis(20));
@@ -483,9 +609,30 @@ fn run_rtp_session(
         .join()
         .map_err(|_| BridgeError::Ims("RTP receive thread panicked".into()))??;
 
+    let receive_stats = stats
+        .lock()
+        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner())
+        .stats(clock_rate);
+    let verdict = super::media_stats::verdict(
+        sent_samples as u64,
+        received_samples as u64,
+        cfg.one_way_threshold_percent,
+    );
+
     Ok(RtpSessionResult {
         received_samples,
         sent_samples,
+        end_reason,
+        media: MediaReport {
+            sent_samples: sent_samples as u64,
+            received_samples: received_samples as u64,
+            sent_packets,
+            stats: receive_stats,
+            verdict,
+            // Needs a tone detector for our own marker returning; only
+            // verifiable on a live call.
+            round_trip_delay: None,
+        },
     })
 }
 
