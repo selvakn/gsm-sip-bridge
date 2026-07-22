@@ -436,3 +436,73 @@ code does what it was built to do.
 (whether a voice bearer is granted for mobile-terminating calls). None of these
 can be answered until the network stops rejecting the session.
 
+## R18: The 5065 rejection is not ours — everything under our control is verified correct
+
+**Status**: ⚠️ Blocked on the carrier. Every hypothesis we could test is eliminated.
+
+After the operator restarted and the service re-registered cleanly, three more
+inbound calls were placed. All three bridged successfully and all three were
+torn down with the identical reason:
+
+```
+Reason: SIP;cause=503;text="PT: AAA: result_code=0 exp_result_code=5065"
+```
+
+### What was eliminated, and how
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Stale IP-CAN session from repeated re-attach | Operator restart, fresh PDN + registration | ❌ Identical 5065 |
+| Inbound-specific | Placed an **outbound** call on the same registration | ❌ Also fails (`380 Alternative Service`) |
+| Wrong media address | Compared SDP `c=` against the interface | ❌ Correct; both globals are in the assigned `/64` |
+| Illegal SDP answer | Compared answer against the offer, payload by payload | ❌ Legal — pt 101 was offered, fmtp echoed correctly |
+| Bad signalling | Read the full exchange at SIP level | ❌ Correct — **the network ACKs our 200 OK**, then BYEs 65ms later |
+| Modem's own IMS competing | `AT+QCFG="ims"`, `AT+QIMS?` | ❌ `2,0` / `DISABLE` — correctly off |
+| Not attached to LTE | `AT+CEREG?` | ❌ `0,1` — registered, home |
+
+The offer/answer pair from one call, for the record:
+
+```
+offer:  m=audio 15662 RTP/AVP 96 8 18 100 101 97 106
+        a=rtpmap:101 AMR-WB/16000
+        a=fmtp:101 max-red=0
+answer: m=audio 32808 RTP/AVP 101
+        a=rtpmap:101 AMR-WB/16000
+        a=fmtp:101 max-red=0
+```
+
+Note also that the carrier's offer **differs between calls** — one carried EVS
+plus four AMR-WB variants, another only AMR/AMR-WB with no EVS. Both were
+answered correctly, and both were rejected identically, so codec selection is
+not the variable.
+
+### What this leaves
+
+Diameter Rx 5065 is `IP-CAN_SESSION_NOT_AVAILABLE`: the PCRF could not bind the
+media session to an IP-CAN session for our address. Every input we control is
+correct, so the remaining explanations are carrier-side:
+
+1. The subscriber is not (or no longer) provisioned for VoLTE media on a
+   host-managed IMS PDN, and the PCRF has no Gx session to bind against.
+2. `result_code=0` is not a valid Diameter result — it suggests the AAR got
+   **no answer** from the PCRF, i.e. a P-CSCF↔PCRF failure internal to the
+   network, with 5065 as the SBC's fallback interpretation.
+
+Corroborating: **VoWiFi on this same SIM works perfectly today** (a full call
+was bridged over the ePDG at 17:31 with AMR-WB and a clean teardown). The ePDG
+path has its own policy binding, so a VoLTE-specific policy failure would look
+exactly like this.
+
+### The honest state of the feature
+
+**The bridging code is done and proven.** Inbound INVITEs arrive; both legs are
+placed and paired; the PBX rings and answers; AMR-WB is negotiated on the
+carrier leg; the transcoding relay starts; the network confirms the dialog with
+its own ACK. That is the whole of US1's signalling path, demonstrated
+repeatedly on live hardware.
+
+**Gates B1, B2 and the US2 soak cannot be closed from here.** They need the
+carrier to authorise the media session. No amount of further work on this
+codebase changes that, and pretending otherwise by declaring B1 passed on
+"it bridged" would be exactly the kind of claim FR-017 exists to prevent.
+
