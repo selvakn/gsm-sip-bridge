@@ -11,6 +11,11 @@ suite on every commit (Principle II).
 US2 are both P1; US1 is sequenced first only because US2 measures the call US1
 places.
 
+**Numbering**: T001–T071 were the original breakdown; T072–T080 were added
+after a coverage audit found requirements and success criteria with no task
+against them. IDs are append-only so existing references stay valid, which is
+why the numbers are not contiguous within a phase.
+
 **Status**: Generated before implementation. Every task is unchecked —
 verified against the tree: `ims/echo.rs`, `ims/media_stats.rs` and
 `volte/qos.rs` do not exist and `volte-call` is not in the CLI.
@@ -48,13 +53,13 @@ requirement surface with none of the carrier risk.
 - [ ] T005 Implement receive-side sequence tracking: expected-vs-observed, deriving lost packets, in `gsm-sip-bridge/src/ims/media_stats.rs`
 - [ ] T006 Distinguish reordered packets from lost ones in `gsm-sip-bridge/src/ims/media_stats.rs`
 - [ ] T007 Implement inter-arrival jitter over a clock-injectable time source in `gsm-sip-bridge/src/ims/media_stats.rs`
-- [ ] T008 Implement the one-way verdict as a **ratio** of received to sent, per direction, with a documented default threshold of 10% (FR-016, FR-028) in `gsm-sip-bridge/src/ims/media_stats.rs`
+- [ ] T008 Implement the one-way verdict as a **ratio** of received to sent, per direction, with a documented default threshold of 10%, naming the failing direction (FR-015, FR-016, FR-028) in `gsm-sip-bridge/src/ims/media_stats.rs`
 - [ ] T009 Implement round-trip delay estimation, available because the outbound audio *is* the inbound audio (research R3) in `gsm-sip-bridge/src/ims/media_stats.rs`
 
 ### Echo — `ims::echo`
 
 - [ ] T010 [P] Create `gsm-sip-bridge/src/ims/echo.rs` and register it in `gsm-sip-bridge/src/ims/mod.rs`
-- [ ] T011 Implement the echo path: return received audio attenuated below unity (FR-025) in `gsm-sip-bridge/src/ims/echo.rs`
+- [ ] T011 Implement the echo path: return received audio attenuated below unity, so the far end hears audio and we receive theirs (FR-007, FR-025) in `gsm-sip-bridge/src/ims/echo.rs`
 - [ ] T012 Implement a re-echo suppression window so a returned signal is not returned again in `gsm-sip-bridge/src/ims/echo.rs`
 - [ ] T013 Implement the independent generated marker, emitted on an interval **regardless of what was received** (FR-029) in `gsm-sip-bridge/src/ims/echo.rs`
 - [ ] T014 Reuse the existing three-tone pattern from `gsm-sip-bridge/src/ims/call.rs` as the marker source rather than generating a second signal
@@ -83,16 +88,19 @@ speaks, they hear themselves, and a recording of what arrived exists.
 - [ ] T023 [US1] End the call early when the far end hangs up rather than holding it open for the remaining duration (FR-027) in `gsm-sip-bridge/src/ims/call.rs`
 - [ ] T024 [US1] Detect a missing wideband codec **before dialling** via `amr_safe::is_available()` and refuse with the reason (FR-010, **Gate C2**) in `gsm-sip-bridge/src/ims/call.rs`
 - [ ] T025 [US1] Report the audio formats offered when the carrier refuses them all (FR-009) in `gsm-sip-bridge/src/ims/call.rs`
-- [ ] T026 [US1] Implement call orchestration over the LTE transport in `gsm-sip-bridge/src/volte/mod.rs`
+- [ ] T026 [US1] Implement call orchestration over the LTE transport — one outbound call over the bridge's own registration, no second registration (FR-001, FR-002) in `gsm-sip-bridge/src/volte/mod.rs`
 - [ ] T027 [US1] Add the `volte-call` subcommand per the CLI contract in `gsm-sip-bridge/src/cli.rs`
 - [ ] T028 [US1] Wire the handler, resolving the P-CSCF in the same order as `volte-register`, in `gsm-sip-bridge/src/main.rs`
 - [ ] T029 [US1] Refuse before dialling when a Wi-Fi calling agent is running or another host-side registration holds the lock (FR-022), reusing `gsm-sip-bridge/src/volte/guard.rs`
+- [ ] T072 [US1] Report call progress through attempting → ringing → answered → ended (FR-004) in `gsm-sip-bridge/src/ims/call.rs`
+- [ ] T073 [US1] Confirm the call's signalling is protected by the registration's own security association rather than a new one — inherited from `register_session`, so verify rather than build (FR-003) in `gsm-sip-bridge/src/ims/call.rs`
+- [ ] T074 [US1] Confirm the received audio is written to a playable file — already provided by `record_path`, so verify it survives the echo change (FR-008) in `gsm-sip-bridge/src/ims/call.rs`
 - [ ] T030 [US1] Make the refusal message name the remedy — stop the registration loop, run the call, restart it (research R1) — in `gsm-sip-bridge/src/main.rs`
 
 ### Tests
 
 - [ ] T031 [P] [US1] Test that a missing wideband codec is refused before any dial is attempted, in `gsm-sip-bridge/tests/test_echo.rs`
-- [ ] T032 [US1] Verify `ims-call` behaviour is unchanged after the shared call path is modified (FR-020)
+- [ ] T032 [US1] Verify `ims-call` behaviour is unchanged after the shared call path is modified, confirming one shared implementation rather than a fork (FR-019, FR-020)
 
 ---
 
@@ -119,7 +127,7 @@ to the media and how the network treated it, plus a recording to listen to.
 - [ ] T040 [US2] Report sent and received volumes separately, in comparable units (FR-012) in `gsm-sip-bridge/src/ims/call.rs`
 - [ ] T041 [US2] **Report an answered call whose verdict is not `BothWays` as a failure, not a success** (FR-016) in `gsm-sip-bridge/src/main.rs`
 - [ ] T042 [US2] Exit non-zero on a one-way or silent call so it cannot pass in a script, in `gsm-sip-bridge/src/main.rs`
-- [ ] T043 [US2] Render the operator-facing report in the shape `quickstart.md` documents, in `gsm-sip-bridge/src/volte/mod.rs`
+- [ ] T043 [US2] Render the operator-facing report in the shape `quickstart.md` documents, including loss, reordering and jitter so condition in transit is judgeable without specialist tooling (FR-013), in `gsm-sip-bridge/src/volte/mod.rs`
 
 ### Tests
 
@@ -165,6 +173,12 @@ hardware-independent; this phase is where the feature's premise is tested.
 - [ ] T059 Settle spec 015 research R9 — confirm which source address the network actually routes, now that media proves it
 - [ ] T060 Verify SC-006: a 30-second unattended call with continuous two-way audio, ending without operator intervention
 - [ ] T061 Verify direction attribution on hardware: stay silent for a whole call and confirm the verdict is `SendOnly`, never `Neither` (FR-029)
+- [ ] T075 Verify **SC-001**: one command, phone rings, answerable, under the documented setup
+- [ ] T076 Verify **SC-002**: the answering party hears their own voice returned, and the recording contains their speech
+- [ ] T077 Verify **SC-003**: the report alone states whether audio flowed both ways and which direction failed
+- [ ] T078 Verify **SC-004**: the recording plus the measurements are together sufficient to judge the audio quality
+- [ ] T079 Verify **SC-005**: each induced failure from Phase 5 produces a report naming the failing stage
+- [ ] T080 Verify **SC-008**: call setup, format negotiation and audio handling exist once and serve both transports — no duplicated implementation
 - [ ] T062 Record the findings — including any negative result — in `specs/016-volte-calls/research.md`
 
 ---
@@ -173,8 +187,8 @@ hardware-independent; this phase is where the feature's premise is tested.
 
 **Goal**: Select per card, defaulting to the existing modem-internal path.
 
-- [ ] T063 [US4] Add per-card voice-path selection to the `[volte]` section in `gsm-sip-bridge/src/config/mod.rs`
-- [ ] T064 [US4] **Default to the modem-internal path when unset** (FR-024) — this is what makes the feature safe to merge — in `gsm-sip-bridge/src/config/mod.rs`
+- [ ] T063 [US4] Add per-card voice-path selection to the `[volte]` section (FR-023) in `gsm-sip-bridge/src/config/mod.rs`
+- [ ] T064 [US4] **Default to the modem-internal path when unset**, leaving that path available and unchanged (FR-021, FR-024) — this is what makes the feature safe to merge — in `gsm-sip-bridge/src/config/mod.rs`
 - [ ] T065 [P] [US4] Document the selection in `config.toml.example`
 - [ ] T066 [P] [US4] Test that an absent selection yields the modem-internal path, in `gsm-sip-bridge/src/config/mod.rs`
 
