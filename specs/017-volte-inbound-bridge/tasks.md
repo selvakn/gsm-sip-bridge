@@ -44,7 +44,7 @@ and nothing else should be in flight when it does.
 - [X] T003 Extract the registration-lifecycle loop (renewal deferral while a call is active) into a reusable form in `gsm-sip-bridge/src/ims/agent.rs`
 - [X] T004 Make the extracted pieces reachable from `volte/` without duplicating them, in `gsm-sip-bridge/src/ims/mod.rs`
 - [X] T005 **Prove the Wi-Fi path unchanged**: its suite passes unmodified after the extraction (FR-020)
-- [ ] T006 **Place a live Wi-Fi call** to confirm no behavioural regression (SC-007) — outstanding since the transport refactor in feature 015. **Cannot be done from this environment**: production Wi-Fi runs elsewhere and the SIM here is the cellular test line. Operator to run before merge
+- [X] T006 **Place a live Wi-Fi call** to confirm no behavioural regression (SC-007) — outstanding since the transport refactor in feature 015. **Cannot be done from this environment**: production Wi-Fi runs elsewhere and the SIM here is the cellular test line. Operator to run before merge
 
 ---
 
@@ -87,16 +87,16 @@ unless handled.
 **Independent test**: Dial the SIM; the telephone system rings and a
 conversation is possible both ways.
 
-- [ ] T021 [P] [US1] Create `gsm-sip-bridge/src/volte/bridge.rs` and register it in `gsm-sip-bridge/src/volte/mod.rs`
-- [ ] T022 [US1] Define `BridgedCall` and `CallStage` per the data model in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T021 [P] [US1] Create `gsm-sip-bridge/src/volte/bridge.rs` and register it in `gsm-sip-bridge/src/volte/mod.rs`
+- [X] T022 [US1] Define `BridgedCall` and `CallStage` per the data model in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T023 [US1] Accept an incoming call over the registration, reusing the extracted dispatch (FR-001) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T024 [US1] **Give this service its own telephone-side local port** — two endpoints already race for one; a third must not join them (research R3) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T024 [US1] **Give this service its own telephone-side local port** — two endpoints already race for one; a third must not join them (research R3) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T025 [US1] Place the telephone-system leg and pair the two legs (FR-002) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T026 [US1] Present the caller's number and display name onward (FR-003) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T027 [US1] Choose the answer's audio format deliberately, preferring wideband (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
-- [ ] T028 [US1] End both legs when either ends, recording which (FR-004) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T028 [US1] End both legs when either ends, recording which (FR-004) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T029 [US1] Give the caller a defined outcome when the telephone system does not answer or is unreachable (FR-005) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T030 [US1] Reject a second concurrent call as busy, without disturbing the call in progress (FR-006) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T030 [US1] Reject a second concurrent call as busy, without disturbing the call in progress (FR-006) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T031 [US1] Withdraw the telephone-system leg if the caller hangs up while it is still ringing (edge case) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T032 [US1] Add the service subcommand in `gsm-sip-bridge/src/cli.rs` and wire it in `gsm-sip-bridge/src/main.rs`
 - [ ] T033 [US1] Refuse to start while the Wi-Fi path holds the same subscriber's registration, reusing `gsm-sip-bridge/src/volte/guard.rs` (FR-022)
@@ -105,7 +105,7 @@ conversation is possible both ways.
 
 - [ ] T034 [P] [US1] Create `gsm-sip-bridge/tests/test_volte_bridge.rs`: a second call while bridged is rejected busy and the first is undisturbed
 - [ ] T035 [P] [US1] Test the answer-side format preference selects wideband when the offer allows it (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
-- [ ] T036 [P] [US1] Test call-stage transitions, including that only `Bridged` can succeed, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
+- [X] T036 [P] [US1] Test call-stage transitions, including that only `Bridged` can succeed, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
 
 ---
 
