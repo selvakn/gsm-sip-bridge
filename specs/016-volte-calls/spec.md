@@ -13,7 +13,7 @@ Cellular voice today works, but the bridge only ever receives an *already-decode
 
 Placing the call over the bridge's own registration removes the hand-off entirely: the bridge negotiates the codec, sends and receives the audio itself, and can measure exactly what happened.
 
-**Scope is deliberately one outbound call.** An operator runs a command, the bridge calls a number over the cellular registration, sends a speech sample, and records what comes back. That is the smallest thing that proves the media path end to end — and it is also the only way to answer the question the whole effort rests on: **is the audio actually better?** Answering the question is a first-class goal here, not a side effect.
+**Scope is deliberately one outbound call.** An operator runs a command, the bridge calls a number over the cellular registration, echoes the answering party's own voice back to them, and records what came in. That is the smallest thing that proves the media path end to end — and it is also the only way to answer the question the whole effort rests on: **is the audio actually better?** Answering the question is a first-class goal here, not a side effect.
 
 Answering inbound calls, and bridging calls to the operator's telephone system, are explicitly a follow-up.
 
@@ -21,7 +21,8 @@ Answering inbound calls, and bridging calls to the operator's telephone system, 
 
 ### Session 2026-07-22
 
-- Q: What audio does the bridge send during the call? → A: A speech sample by default, with a test tone selectable
+- Q: What audio does the bridge send during the call? → A: ~~A speech sample by default, with a test tone selectable~~ **Superseded below**
+- Q: (revised) What audio does the bridge send during the call? → A: Echo the far end's own audio back to them; no audio sample files at all
 - Q: What counts as evidence that the network gave the call preferential handling? → A: Query the modem before, during and after the call and report the change; report "undetermined" explicitly when the modem will not answer
 - Q: How does the call end? → A: A default call duration, overridable; ends early if the far end hangs up; operator interrupt also ends it cleanly
 - Q: Does this feature produce the modem-internal comparison call? → A: No. The operator compares manually; no comparison tooling is built
@@ -35,12 +36,12 @@ An operator with an established cellular IMS registration wants the bridge to pl
 
 **Why this priority**: It is the feature. Everything else here either measures this call or diagnoses it when it fails.
 
-**Independent Test**: The operator runs one command with a destination number. The called phone rings, a person answers, the bridge sends recognisable audio the answering party can assess, and afterwards the operator has a recording containing the answering party's speech.
+**Independent Test**: The operator runs one command with a destination number. The called phone rings, a person answers and speaks, they hear their own voice echoed back, and afterwards the operator has a recording of what the bridge received.
 
 **Acceptance Scenarios**:
 
 1. **Given** an accepted cellular IMS registration, **When** the operator places a call to a reachable number, **Then** the called party's phone rings and the bridge reports the call progressing through ringing to answered.
-2. **Given** the call is answered, **When** audio flows, **Then** the far end hears the bridge's outgoing audio clearly enough to judge its quality, and the bridge records the far end's audio to a file the operator can play back.
+2. **Given** the call is answered, **When** the answering party speaks, **Then** they hear their own voice returned to them over the round trip, clearly enough to judge its quality, and the bridge records the audio it received to a file the operator can play back.
 3. **Given** the call is in progress, **When** the configured duration elapses, **Then** the bridge terminates the call cleanly, the far end sees it end normally, and the report says the duration ended it.
 6. **Given** the call is in progress, **When** the far end hangs up first, **Then** the bridge ends immediately rather than waiting out the remaining duration, and reports that the far end ended it.
 4. **Given** the called party does not answer or is busy, **When** the attempt completes, **Then** the bridge reports that specific outcome rather than a generic failure.
@@ -111,6 +112,8 @@ An operator with several cards wants to select, per card, whether cellular voice
 - **The Wi-Fi calling path is active on the same subscriber.** The two cannot register simultaneously; attempting a call while the other path holds the registration must be refused with the reason.
 - **The destination is unreachable, busy, or unanswered.** Each is a distinct, normal outcome and must be reported as itself.
 - **The far end answers and immediately hangs up.** Must produce a valid, if short, result rather than an error.
+- **The answering party uses a speakerphone.** Echoing audio back to a device whose microphone can hear its own speaker creates a feedback loop that grows until it howls. The bridge must limit this — by attenuating what it returns, and by not returning what it has just returned — and the operator must be told to use a handset.
+- **Nothing is received at all.** Because what the bridge sends is derived from what it receives, a total receive failure would silence both directions and look identical to a transmit failure. The independent repeating signal (FR-029) is what keeps the two distinguishable.
 
 ## Requirements *(mandatory)*
 
@@ -133,7 +136,8 @@ An operator with several cards wants to select, per card, whether cellular voice
 - **FR-009**: The bridge MUST offer the audio formats the carrier accepts, and MUST report when the carrier refuses all of them, including which were offered.
 - **FR-010**: The bridge MUST detect, before dialling, that a required audio format is unavailable in the running build, and report it rather than making an offer that cannot succeed.
 - **FR-011**: The bridge MUST report which audio format was actually used for the call.
-- **FR-025**: The bridge MUST send speech-like audio by default, and MUST allow a simple tone to be selected instead. *(A tone survives codec artefacts, loss concealment and jitter far more gracefully than speech, so it can sound perfect on a call a listener would find unusable — it cannot support the quality judgement SC-004 requires.)*
+- **FR-025**: The bridge MUST echo the audio it receives from the far end back to the far end, so the answering party hears their own voice returned over the full round trip. It MUST NOT require any audio asset to do so.
+- **FR-029**: The bridge MUST also emit a small, regularly-repeating generated sound of its own, independent of anything received. *(Echo alone makes what the bridge sends depend on what it receives, so a total receive failure would silence both directions and make the two indistinguishable — destroying the direction attribution FR-015 and FR-028 exist for. A constant independent signal keeps "we are transmitting" observable even when nothing is arriving.)*
 
 **Measuring the result**
 
@@ -212,6 +216,8 @@ An operator with several cards wants to select, per card, whether cellular voice
 - Audio quality is assessed both by a person listening to a recording and by the measurements in the media report; neither alone is sufficient, since measurements can look healthy while audio is unusable, and listening alone gives nothing actionable.
 - The recording captures the far end only. Capturing both directions mixed would make it impossible to tell which side a defect came from.
 - A call is judged one-way by comparing received audio against sent audio as a proportion, defaulting to 10%. A ratio rather than an absolute count is what diagnosed the previous one-way-audio incident, and it stays correct whatever the call's length. A quiet answering party still produces audio frames, so this distinguishes "nothing is reaching us" from "they said nothing" — which a loudness measurement would not.
-- Outgoing audio is speech by default because the feature's headline outcome is a quality judgement, and only speech exposes the artefacts a listener would object to. A tone remains selectable for the cheaper "is there an audio path at all" check.
+- Outgoing audio is the far end's own voice echoed back. This needs no audio asset — which removes a licensing question and, more importantly, a privacy one (see below) — and it is a *better* subjective test than playing a stranger's recording: people are acutely sensitive to distortion, delay and dropouts in their own voice, so the answering party can judge the round trip directly, while speaking naturally rather than reading a script.
+- The echo carries the degradation of **both** directions, so a clean-sounding echo is stronger evidence than a clean one-way sample would be. It also makes round-trip delay directly audible, which no pre-recorded sample could reveal.
+- An audio sample file is deliberately **not** used. Besides needing an asset, the only recordings to hand are real calls involving real subscribers, and transmitting one over a live carrier would be a privacy problem rather than a test.
 - Failure reporting follows the conventions already established by the registration work, so operators do not learn a second vocabulary.
 - The call runs for a fixed default duration rather than until interrupted, so that the quality outcome (SC-006) is reproducibly testable and the command can be scripted into validation runs instead of depending on someone hanging up at the right moment. Ending early on far-end hangup keeps the busy/no-answer/hung-up outcomes distinguishable.
