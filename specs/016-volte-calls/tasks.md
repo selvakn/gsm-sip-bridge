@@ -34,8 +34,8 @@ Single Rust workspace. Source at `gsm-sip-bridge/src/`, integration tests at
 
 ## Phase 1: Setup
 
-- [ ] T001 Verify the wideband codec is linked in the container image (**Gate C2**) — `ldd` the shipped binary for `libopencore-amrnb`, `libopencore-amrwb`, `libvo-amrwbenc`
-- [ ] T002 [P] Add `samples/` to `.gitignore` so the real subscriber call recordings stay out of the repository deliberately rather than by accident (research R3)
+- [X] T001 Verify the wideband codec is linked in the container image (**Gate C2**) — `ldd` the shipped binary for `libopencore-amrnb`, `libopencore-amrwb`, `libvo-amrwbenc`
+- [X] T002 [P] Add `samples/` to `.gitignore` so the real subscriber call recordings stay out of the repository deliberately rather than by accident (research R3)
 
 ---
 
@@ -48,29 +48,29 @@ requirement surface with none of the carrier risk.
 
 ### Media statistics — `ims::media_stats`
 
-- [ ] T003 [P] Create `gsm-sip-bridge/src/ims/media_stats.rs` and register it in `gsm-sip-bridge/src/ims/mod.rs`
-- [ ] T004 Expose the sequence number and arrival time `rtp::parse_packet` already extracts but discards, in `gsm-sip-bridge/src/ims/rtp.rs`
-- [ ] T005 Implement receive-side sequence tracking: expected-vs-observed, deriving lost packets, in `gsm-sip-bridge/src/ims/media_stats.rs`
-- [ ] T006 Distinguish reordered packets from lost ones in `gsm-sip-bridge/src/ims/media_stats.rs`
-- [ ] T007 Implement inter-arrival jitter over a clock-injectable time source in `gsm-sip-bridge/src/ims/media_stats.rs`
-- [ ] T008 Implement the one-way verdict as a **ratio** of received to sent, per direction, with a documented default threshold of 10%, naming the failing direction (FR-015, FR-016, FR-028) in `gsm-sip-bridge/src/ims/media_stats.rs`
-- [ ] T009 Implement round-trip delay estimation, available because the outbound audio *is* the inbound audio (research R3) in `gsm-sip-bridge/src/ims/media_stats.rs`
+- [X] T003 [P] Create `gsm-sip-bridge/src/ims/media_stats.rs` and register it in `gsm-sip-bridge/src/ims/mod.rs`
+- [X] T004 Expose the sequence number and arrival time `rtp::parse_packet` already extracts but discards, in `gsm-sip-bridge/src/ims/rtp.rs`
+- [X] T005 Implement receive-side sequence tracking: expected-vs-observed, deriving lost packets, in `gsm-sip-bridge/src/ims/media_stats.rs`
+- [X] T006 Distinguish reordered packets from lost ones in `gsm-sip-bridge/src/ims/media_stats.rs`
+- [X] T007 Implement inter-arrival jitter over a clock-injectable time source in `gsm-sip-bridge/src/ims/media_stats.rs`
+- [X] T008 Implement the one-way verdict as a **ratio** of received to sent, per direction, with a documented default threshold of 10%, naming the failing direction (FR-015, FR-016, FR-028) in `gsm-sip-bridge/src/ims/media_stats.rs`
+- [ ] T009 Implement round-trip delay estimation, available because the outbound audio *is* the inbound audio (research R3) in `gsm-sip-bridge/src/ims/media_stats.rs` — **deferred**: needs detecting our own marker returning (a tone detector), and is only verifiable on a live call. `MediaReport.round_trip_delay` stays `None` until then, which the data model already allows
 
 ### Echo — `ims::echo`
 
-- [ ] T010 [P] Create `gsm-sip-bridge/src/ims/echo.rs` and register it in `gsm-sip-bridge/src/ims/mod.rs`
-- [ ] T011 Implement the echo path: return received audio attenuated below unity, so the far end hears audio and we receive theirs (FR-007, FR-025) in `gsm-sip-bridge/src/ims/echo.rs`
-- [ ] T012 Implement a re-echo suppression window so a returned signal is not returned again in `gsm-sip-bridge/src/ims/echo.rs`
-- [ ] T013 Implement the independent generated marker, emitted on an interval **regardless of what was received** (FR-029) in `gsm-sip-bridge/src/ims/echo.rs`
-- [ ] T014 Reuse the existing three-tone pattern from `gsm-sip-bridge/src/ims/call.rs` as the marker source rather than generating a second signal
+- [X] T010 [P] Create `gsm-sip-bridge/src/ims/echo.rs` and register it in `gsm-sip-bridge/src/ims/mod.rs`
+- [X] T011 Implement the echo path: return received audio attenuated below unity, so the far end hears audio and we receive theirs (FR-007, FR-025) in `gsm-sip-bridge/src/ims/echo.rs`
+- [X] T012 Implement a re-echo suppression window so a returned signal is not returned again in `gsm-sip-bridge/src/ims/echo.rs`
+- [X] T013 Implement the independent generated marker, emitted on an interval **regardless of what was received** (FR-029) in `gsm-sip-bridge/src/ims/echo.rs`
+- [X] T014 Reuse the existing three-tone pattern from `gsm-sip-bridge/src/ims/call.rs` as the marker source rather than generating a second signal
 
 ### Tests
 
-- [ ] T015 [P] Create `gsm-sip-bridge/tests/test_media_stats.rs` covering the media-report contract's 9 statistics tests against synthetic packet streams
-- [ ] T016 [P] Test that a long call with a tiny absolute receive count **fails**, proving an absolute floor would have wrongly passed it, in `gsm-sip-bridge/tests/test_media_stats.rs`
-- [ ] T017 [P] Test that a short, proportionally-healthy call **passes**, proving length-independence, in `gsm-sip-bridge/tests/test_media_stats.rs`
-- [ ] T018 [P] Create `gsm-sip-bridge/tests/test_echo.rs`: attenuation is below unity, suppression prevents re-echo, echoed output matches input
-- [ ] T019 **Test the FR-029 invariant explicitly**: with a receive stream of zero, outbound audio is still non-zero, so the verdict is `SendOnly` and never `Neither` — in `gsm-sip-bridge/tests/test_echo.rs`
+- [X] T015 [P] Create `gsm-sip-bridge/tests/test_media_stats.rs` covering the media-report contract's 9 statistics tests against synthetic packet streams
+- [X] T016 [P] Test that a long call with a tiny absolute receive count **fails**, proving an absolute floor would have wrongly passed it, in `gsm-sip-bridge/tests/test_media_stats.rs`
+- [X] T017 [P] Test that a short, proportionally-healthy call **passes**, proving length-independence, in `gsm-sip-bridge/tests/test_media_stats.rs`
+- [X] T018 [P] Create `gsm-sip-bridge/tests/test_echo.rs`: attenuation is below unity, suppression prevents re-echo, echoed output matches input
+- [X] T019 **Test the FR-029 invariant explicitly**: with a receive stream of zero, outbound audio is still non-zero, so the verdict is `SendOnly` and never `Neither` — in `gsm-sip-bridge/tests/test_echo.rs`
 
 ---
 
