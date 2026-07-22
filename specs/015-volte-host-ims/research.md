@@ -472,6 +472,65 @@ had its XFRM states and policies exercised with IPv6 selectors. They install
 and carry traffic correctly. Note the cipher is `aes-cbc`, not the null cipher
 — so the encryption path is exercised too, not just authentication.
 
+---
+
+## R15: The IMS PDN does not outlive the registration
+
+**Decision**: Re-establish the network attachment before every renewal, and
+treat a down attachment as its own failure rather than letting it surface as a
+connect error.
+
+**Status**: ✅ Found by the SC-004 soak; fixed and the fix verified on hardware.
+
+The soak registered at 09:21:38 and renewed cleanly at 10:16:40 and 11:11:42 —
+both exactly 3300s apart (3600s granted expiry − 300s headroom), confirming
+SC-004. It then kept running, and at 12:06:47 the third renewal began failing:
+
+```
+renewal failed ... No route to host   retry_in_secs=5
+renewal failed ... connection timed out retry_in_secs=20
+renewal failed ... No route to host   retry_in_secs=80
+```
+
+**The carrier had torn the IMS PDN down** after roughly two hours, while the
+radio stayed perfectly healthy:
+
+| Check | Value |
+|---|---|
+| `AT+CGACT?` cid 3 | `0` — deactivated |
+| `AT+QNETDEVCTL?` | `0,0,0,0` — netdev unbound |
+| `AT+CGPADDR=3` | all zeros |
+| Host interface | `DOWN`, route marked `linkdown`, stale addresses still installed |
+| `AT+CEREG?` / `AT+CSQ` | `0,1` / `21` — radio fine |
+
+**Two defects, both invisible to unit tests:**
+
+1. The renewal loop retried `run_register` forever but never re-established the
+   *transport*. A dropped PDN can never be recovered by retrying REGISTER, so
+   the loop would have backed off to its 300s ceiling and spun indefinitely
+   against a dead attachment.
+2. `LteImsPdnTransport::prepare` cached its handle and returned early, making
+   the transport blind to exactly this. "Idempotent" in the contract means
+   *does not create a second attachment* — which `attach` already guarantees at
+   the modem level — not *cached*.
+
+A third, smaller one: `gsm_bridge_volte_pdn_up` was set at attach and cleared
+only at detach, so it kept reporting `1` throughout the outage — the metric
+would have lied to a dashboard during precisely the incident it exists for.
+
+**Fix**: `prepare` re-verifies rather than caching; the renewal loop calls
+`refresh_attachment` before each renewal (a cheap no-op when healthy); a down
+attachment is reported as `attachment_down` with its own reason and skips the
+doomed REGISTER entirely; and the PDN gauge follows the refresh result.
+
+**Verified**: restarted against the dead PDN left by the soak — re-attached,
+routable, and registered within ~4 seconds.
+
+**What the soak validated in passing**: the bounded backoff (5→10→20→40→80,
+heading for the 300s cap, FR-016), failure recording with a reason (FR-023),
+and stage-attributed errors (FR-015) all behaved correctly under a real
+failure, not just in tests.
+
 ## Unresolved items carried into planning
 
 | ID | Item | Blocking? | Status |

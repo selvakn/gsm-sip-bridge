@@ -596,6 +596,9 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
     // diagnostic. A rejected first attempt never enters the renewal loop.
     let result = gsm_sip_bridge::volte::registration::run(
         &reg_cfg,
+        // Lets the renewal loop re-establish the PDN when it drops; without
+        // it a dropped attachment is unrecoverable.
+        Some(&settings),
         args.once,
         &args.status_path,
         gsm_sip_bridge::ims::DEFAULT_EXPIRES,
