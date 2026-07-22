@@ -346,3 +346,72 @@ previous binding, and the container does the same on shutdown.
 Deliberately separate from `gsm_bridge_sip_registered` (the PBX side) and from
 the VoWiFi agent's gauges — when something is down you need to know *which*
 registration, not that one of them is.
+
+### Bridging incoming calls (`[volte].bridge_inbound`)
+
+`specs/017-volte-inbound-bridge`. With `enabled` alone, the LTE registration is
+held open and nothing more. Adding `bridge_inbound = true` makes the bridge
+**answer incoming calls on it** and connect them through to the PBX:
+
+```toml
+[volte]
+enabled = true
+bridge_inbound = true
+```
+
+`entrypoint.sh` then supervises `volte-bridge` in place of `volte-register`.
+Run it by hand the same way:
+
+```bash
+gsm-sip-bridge volte-bridge --iface <ifname>
+```
+
+**This is opt-in, and unset means unchanged.** A config written before this
+feature keeps behaving exactly as it did, with the modem-internal path still
+available.
+
+#### What it costs: the card becomes exclusive
+
+A card assigned here belongs to this service alone. The circuit-switched daemon
+will not drive it, so **while this path is down, that card takes no calls at
+all** — there is no fallback. That makes the health signals load-bearing rather
+than decorative:
+
+| Watch | Because |
+|---|---|
+| `gsm_bridge_volte_registered` | 0 means calls are being missed, not merely delayed |
+| `gsm_bridge_volte_pdn_up` | attached-but-unrouted is a real, observed state |
+| `gsm_sip_bridge_active_calls{transport="volte"}` | this path's calls, distinct from `vowifi` and `cs` |
+
+Call and message records carry `transport="volte"`, a third value on the
+*existing* label rather than a new metric — existing dashboard queries keep
+matching unchanged. A panel that explicitly *groups by* transport will gain a
+series.
+
+#### One call at a time
+
+The bridge fronts a single subscriber line. A second concurrent call is refused
+as busy rather than queued, and the refusal does not disturb the call in
+progress.
+
+#### Maintenance yields to a call
+
+The carrier tears the LTE attachment down roughly every two hours and the
+service re-attaches automatically. Both that re-attachment and registration
+renewal are **deferred while a call is in progress** — either one mid-call
+would take the call down with it. A call is deliberately allowed to outlive its
+registration rather than be cut short.
+
+Consequence worth knowing before it surprises you: a long call can leave the
+registration lapsing slightly late. That is the intended trade, not a fault.
+
+#### Text messages still arrive
+
+Holding this registration means the network delivers the subscriber's texts
+here. Both delivery routes are handled — over the registration, and via the
+modem's own storage — converging on the same record-and-forward path, recorded
+exactly once even if both routes deliver the same message.
+
+Messages are acknowledged **after** being recorded, never before, so an
+ill-timed crash costs a retransmission (which is de-duplicated) rather than a
+silently lost text.

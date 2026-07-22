@@ -199,12 +199,12 @@ after.
 
 ## Phase 8: Polish
 
-- [ ] T083 [P] Document the service in `docs/operations.md`
+- [X] T083 [P] Document the service in `docs/operations.md`
 - [ ] T084 [P] Update `specs/017-volte-inbound-bridge/quickstart.md` with anything the live run proved wrong
-- [ ] T085 Keep `make lint` clean and the workspace suite green on every commit
-- [ ] T086 [P] Verify SC-005: no failure mode exercised reports a silent call as successful
-- [ ] T087 [P] Verify SC-006: every failure mode names its stage
-- [ ] T088 Verify SC-008: registration, authentication, signalling protection, call handling and audio exist **once** and serve both paths
+- [X] T085 Keep `make lint` clean and the workspace suite green on every commit
+- [X] T086 [P] Verify SC-005: no failure mode exercised reports a silent call as successful
+- [X] T087 [P] Verify SC-006: every failure mode names its stage
+- [X] T088 Verify SC-008: registration, authentication, signalling protection, call handling and audio exist **once** and serve both paths
 
 ---
 

@@ -227,3 +227,60 @@ command, but is not the mechanism here: it cannot answer "is a call in progress
 | R10 | Whether Vi delivers messages over the registration on LTE, or via the modem | No — both routes covered | Observed during the first message test |
 | R11 | Whether a dashboard panel grouping by transport splits visibly | No | Gate B3, checked against the running stack |
 | R12 | What a call outliving its registration actually does at the network | No — spec chooses to let it continue | Observed on a long call |
+
+---
+
+## R13: SC-008 verified mechanically, not by assertion
+
+**Status**: ✅ Verified after Phase 6.
+
+FR-019/SC-008 require registration, authentication, signalling protection,
+call handling and audio to exist **once** and serve both paths. A copy would
+satisfy neither while looking like it did, so this was checked by counting
+definitions rather than by reading:
+
+| Capability | Definitions |
+|---|---|
+| `register_session`, `dispatch_loop`, `handle_invite` | 1 each |
+| `serve_inbound`, `run_telephony_side` | 1 each |
+| `bridge_call`, `relay_rtp`, `attempt_renewal` | 1 each |
+| `build_answer`, `spawn_gm_server`, `handle_message` | 1 each |
+
+Both transports call the same two shared halves — `serve_inbound` (carrier
+side) and `run_telephony_side` (telephone side) — from exactly one call site
+each. The only apparent duplicates were test functions.
+
+## R14: An acknowledgement-ordering defect found in the production Wi-Fi path
+
+**Status**: ✅ Found and fixed while implementing US5.
+
+`ims::agent::handle_message` acknowledged an inbound SIP `MESSAGE` **before**
+relaying it for recording. A crash in that window loses the text outright, and
+because the network was told it was delivered it never retries.
+
+This was not found by testing the new path — it was found by writing down the
+ordering rule US5 requires and then checking whether the existing code obeyed
+it. It did not, and had not for as long as the Wi-Fi path has carried messages.
+
+Fixed by reversing the order. A relay failure now leaves the `MESSAGE`
+unacknowledged deliberately: the network retransmitting is the recovery
+mechanism, and `volte::sms::Dedupe` absorbs the duplicate.
+
+**Process note worth keeping**: the spec originally declared messaging out of
+scope. Clarification pulled it in on the grounds that "out of scope" would mean
+texts silently discarded. That decision is what surfaced this defect — the
+feature would otherwise never have looked at this code.
+
+## R15: The transport label was about to be silently wrong
+
+**Status**: ✅ Found and fixed in Phase 5.
+
+`metrics::ingest` hardcoded `transport="vowifi"` for every agent report. The
+cellular service runs the *same agent code* as the Wi-Fi one, so every VoLTE
+call would have been filed under `vowifi` — making the two paths
+indistinguishable in exactly the comparison this whole effort exists to make,
+while every dashboard continued to look healthy.
+
+The label is now derived from the agent kind. `AgentKind::Volte` exists purely
+for this distinction, with a test asserting the two do not collapse.
+
