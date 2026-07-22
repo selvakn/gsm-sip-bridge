@@ -245,7 +245,32 @@ fn scan_all_inner(
 /// excludes nothing, so a fleet that never runs `discover` (VoWiFi
 /// permanently disabled) behaves exactly as before this feature.
 pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
-    let excluded = excluded_ports_from_lines_file();
+    scan_modules_excluding(&[])
+}
+
+/// The port the host-side cellular service owns, if it is enabled.
+///
+/// A card belongs to exactly one subsystem (FR-034). The hazard of getting
+/// this wrong is already documented in this module by name — "modem claimed
+/// by both subsystems" — with a live symptom recorded: probing a port another
+/// subsystem was mid-transaction on produced `AT+CPIN?: no status in
+/// response` on an already-registered line.
+///
+/// Disabled `[volte]` claims nothing, so a deployment that never turns this
+/// on behaves exactly as it did before the feature existed (FR-021, FR-024).
+/// That default is what makes this safe to merge.
+pub fn volte_claimed_ports(config: &crate::config::VolteConfig) -> Vec<PathBuf> {
+    if !config.enabled || config.modem_port.is_empty() {
+        return Vec::new();
+    }
+    vec![PathBuf::from(&config.modem_port)]
+}
+
+/// [`scan_modules`] with an explicit extra exclusion set, so the caller can
+/// state which ports another subsystem owns rather than this module guessing.
+pub fn scan_modules_excluding(also_excluded: &[PathBuf]) -> BridgeResult<Vec<DiscoveredModule>> {
+    let mut excluded = excluded_ports_from_lines_file();
+    excluded.extend(also_excluded.iter().cloned());
     // Skips re-probing any modem an active VoWiFi line already owns, not
     // just filtering it out afterward — see `scan_all_inner`'s doc comment.
     let modems = scan_all_inner(&[], &active_vowifi_card_ids())?;
@@ -258,7 +283,7 @@ pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
                 tracing::info!(
                     module_id = %m.card_id,
                     serial_port = %serial_port.display(),
-                    "modem claimed by VoWiFi; excluded from the circuit-switched pool"
+                    "modem claimed by another subsystem; excluded from the circuit-switched pool"
                 );
                 return None;
             }
@@ -776,5 +801,65 @@ mod tests {
         );
 
         std::env::remove_var(LINES_FILE_ENV);
+    }
+
+    // ---- exclusive card assignment (specs/017 T060/T061/T066) -------------
+
+    #[test]
+    fn a_disabled_cellular_service_claims_no_card() {
+        // The feature is opt-in and changes nothing until asked (FR-024) —
+        // which is what makes it safe to merge.
+        let config = crate::config::VolteConfig {
+            enabled: false,
+            modem_port: "/dev/ttyUSB6".to_string(),
+            ..Default::default()
+        };
+        assert!(volte_claimed_ports(&config).is_empty());
+    }
+
+    #[test]
+    fn an_enabled_cellular_service_claims_its_card() {
+        let config = crate::config::VolteConfig {
+            enabled: true,
+            modem_port: "/dev/ttyUSB6".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            volte_claimed_ports(&config),
+            vec![PathBuf::from("/dev/ttyUSB6")]
+        );
+    }
+
+    #[test]
+    fn an_enabled_service_with_no_port_claims_nothing_rather_than_everything() {
+        // An empty port must not be read as "claims the empty path" and then
+        // silently match nothing — or worse, be treated as a wildcard.
+        let config = crate::config::VolteConfig {
+            enabled: true,
+            modem_port: String::new(),
+            ..Default::default()
+        };
+        assert!(volte_claimed_ports(&config).is_empty());
+    }
+
+    #[test]
+    fn a_card_claimed_by_the_cellular_service_is_kept_out_of_the_circuit_switched_pool() {
+        // The "modem claimed by both subsystems" hazard this module already
+        // documents by name. Its live symptom was `AT+CPIN?: no status in
+        // response` on an already-registered line, because two subsystems
+        // were interleaving AT transactions on one port.
+        let config = crate::config::VolteConfig {
+            enabled: true,
+            modem_port: "/dev/ttyUSB6".to_string(),
+            ..Default::default()
+        };
+        let claimed = volte_claimed_ports(&config);
+        assert!(claimed.contains(&PathBuf::from("/dev/ttyUSB6")));
+
+        // The exclusion set the circuit-switched scan applies is the union of
+        // the VoWiFi line table and this, so a card can belong to exactly one.
+        let mut excluded: std::collections::HashSet<PathBuf> = excluded_ports_from_lines_file();
+        excluded.extend(claimed.iter().cloned());
+        assert!(excluded.contains(&PathBuf::from("/dev/ttyUSB6")));
     }
 }

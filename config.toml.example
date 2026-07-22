@@ -199,6 +199,18 @@ vpcd_port = 15963
 [volte]
 # Off by default; the volte-* subcommands work without it as diagnostics.
 enabled = false
+# Answer incoming calls over this registration and bridge them to the PBX
+# (specs/017-volte-inbound-bridge), instead of only holding the registration
+# open.
+#
+# Off by default, which leaves everything exactly as it was: the
+# modem-internal VoLTE path stays available and this section keeps doing what
+# it did before. Turning it on makes the card EXCLUSIVE to this service — the
+# circuit-switched daemon will not drive it, so that card has no fallback and
+# takes no calls at all whenever this path is down. Watch
+# gsm_sip_bridge_active_calls{transport="volte"} and the volte_* registration
+# gauges accordingly.
+bridge_inbound = false
 modem_port = "/dev/ttyUSB0"
 # Host interface carrying the modem's data path. Leave empty to manage the
 # PDN only and skip host interface configuration. NOTE: binding the IMS PDN

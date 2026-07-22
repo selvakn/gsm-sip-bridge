@@ -11,7 +11,7 @@ use crate::control::protocol::{ControlCmd, ControlResp, SlotInfo};
 use crate::metrics;
 use crate::modules::at_commander::{AtCommander, AtResponse, NetworkMode, NetworkType};
 use crate::modules::card::{CardInstance, CardState};
-use crate::modules::discovery::{scan_modules, DiscoveredModule};
+use crate::modules::discovery::DiscoveredModule;
 use crate::modules::scheduler::{
     AttemptType, CycleOutcome, CyclePhase, CycleState, Outcome, RestartProgress, SchedulerAction,
     SkipReason, SlotView,
@@ -289,7 +289,12 @@ impl CardPool {
                     usb_serial: String::new(),
                 }]
             }
-            None => match scan_modules() {
+            // A card assigned to the host-side cellular service belongs to it
+            // alone (FR-034) — probing a port another subsystem is
+            // mid-transaction on is the documented "claimed by both" hazard.
+            None => match discovery::scan_modules_excluding(&discovery::volte_claimed_ports(
+                &self.config.volte,
+            )) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "module discovery failed");
@@ -672,7 +677,8 @@ impl CardPool {
             .map(|s| s.module.serial_port.clone())
             .collect();
 
-        let new_modules = match scan_modules() {
+        let volte_ports = discovery::volte_claimed_ports(&self.config.volte);
+        let new_modules = match discovery::scan_modules_excluding(&volte_ports) {
             Ok(m) => m
                 .into_iter()
                 .filter(|m| !known_serials.contains(&m.serial_port))

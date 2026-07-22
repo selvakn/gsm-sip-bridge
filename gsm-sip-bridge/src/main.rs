@@ -1141,6 +1141,10 @@ fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> E
             println!("VOLTE_SEC_AGREE={}", if v.sec_agree { 1 } else { 0 });
             println!("VOLTE_STATUS_PATH={}", q(&v.status_path));
             println!("VOLTE_LOCK_PATH={}", q(&v.lock_path));
+            println!(
+                "VOLTE_BRIDGE_INBOUND={}",
+                if v.bridge_inbound { 1 } else { 0 }
+            );
             ExitCode::SUCCESS
         }
         ConfigSubcommand::VowifiShellEnv => {
