@@ -274,6 +274,75 @@ existing defaults.
 
 ---
 
+## R9: Gate C1 — the network *does* prioritise the call **(RESOLVED, positive)**
+
+**Status**: ✅ **Verified on live hardware, 2026-07-22.**
+
+Sampling `AT+CGEQOSRDP` on the second AT port throughout a call:
+
+| Phase | Contexts reported |
+|---|---|
+| Before | `3,5,0,0,0,0` — IMS signalling only |
+| **During** | `3,5,0,0,0,0` **+ `6,1,136,136,136,136`** |
+| After | `3,5,0,0,0,0` — gone |
+
+Context 6 at **QCI 1** (conversational voice) with **136 kbps guaranteed**
+both ways, established for the call and torn down after. This was the largest
+open risk in the plan and it resolves in favour of the feature.
+
+## R10: Codec ordering gated whether the call got voice treatment at all
+
+**Status**: ✅ Verified by two live calls ten minutes apart, same modem, same
+carrier, one variable changed.
+
+The first live call negotiated **PCMU**. The offer *did* include AMR-WB — but
+narrowband led the payload-type list, and the carrier takes the first type it
+supports. Reordering the offer so wideband leads changed the outcome
+completely:
+
+| | Call 1 (PCMU) | Call 2 (AMR-WB) |
+|---|---|---|
+| Sample rate | 8 kHz | **16 kHz** |
+| Packet loss | **107 (13.6%)** | **3 (0.3%)** |
+| Received packets | 677 | 1144 |
+| Jitter | 11.7 ms | 12.5 ms |
+
+**A 45-fold reduction in loss from a one-line ordering change.** The most
+plausible reading is that the network grants the QCI-1 bearer based on what
+was negotiated: the PCMU call rode the default bearer as ordinary data, which
+is where 13.6% loss came from.
+
+So codec ordering was never merely a quality preference — it decided whether
+the call received voice treatment. Ordering is now explicit (`CodecOffer`)
+rather than incidental, with a test pinning wideband-first in both the `m=`
+line and the `rtpmap` order.
+
+**Process note**: Gate C2 as originally written checked that the codec was
+*linked into the build*, and I treated that as sufficient. What mattered was
+the codec that got **negotiated**, which nothing checked. The gate passed while
+the thing it existed to protect failed. Only the live call caught it.
+
+## R11: SC-004 is met — the audio really is better
+
+**Status**: ✅ Both halves agree.
+
+The measurements above, and the operator's own judgement on hearing their
+voice returned over both calls: markedly better on the wideband call. That is
+the question the whole effort existed to answer, and the answer is yes.
+
+## R12: DTX invalidates part of the one-way threshold rationale
+
+**Status**: ⚠️ Reasoning corrected; the threshold itself still holds.
+
+The spec argued that a ratio beats a loudness test because "a quiet answering
+party still produces audio frames". **With discontinuous transmission that is
+false** — a silent handset sends nothing at all. Both live calls show it:
+1144 received against 1462 sent, with the shortfall being silence, not loss.
+
+The 10% threshold survived comfortably here, but the justification behind it
+was wrong, and a genuinely quiet call could trip it. Worth revisiting before
+this judgement is relied on unattended.
+
 ## Unresolved items carried into planning
 
 | ID | Item | Blocking? | Where resolved |

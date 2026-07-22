@@ -276,6 +276,9 @@ fn handle_ims_call_command(args: &gsm_sip_bridge::cli::ImsCallArgs) -> ExitCode 
         echo: None,
         one_way_threshold_percent:
             gsm_sip_bridge::ims::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT,
+        // Historical ordering, so the VoWiFi diagnostic's offer is unchanged
+        // (FR-020). Carriers on that path require wideband anyway.
+        codec_offer: gsm_sip_bridge::ims::sdp::CodecOffer::legacy(amr_safe::is_available()),
     };
 
     match run_call(&cfg) {
@@ -610,6 +613,11 @@ fn handle_volte_call_command(args: &gsm_sip_bridge::cli::VolteCallArgs) -> ExitC
             marker_interval: Duration::from_secs(args.marker_interval_secs),
         }),
         one_way_threshold_percent: args.one_way_threshold,
+        // Wideband first. Offering narrowband first is what made the first
+        // live call negotiate PCMU and rendered its quality result meaningless.
+        codec_offer: gsm_sip_bridge::ims::sdp::CodecOffer::preferring_wideband(
+            amr_safe::is_available(),
+        ),
     };
 
     println!(

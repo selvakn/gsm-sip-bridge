@@ -93,6 +93,13 @@ pub struct CallConfig {
     /// Proportion of the busier direction the quieter one must carry before it
     /// counts as working (FR-016).
     pub one_way_threshold_percent: u8,
+    /// Which audio formats to offer, and in what order.
+    ///
+    /// Order decides the outcome: a carrier takes the first payload type it
+    /// also supports. A live VoLTE call negotiated narrowband purely because
+    /// narrowband led the list, making the call's audio — and any quality
+    /// judgement from it — worthless.
+    pub codec_offer: sdp::CodecOffer,
 }
 
 /// Echo behaviour for a diagnostic call.
@@ -208,7 +215,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         session.local_addr.ip(),
         rtp_port,
         session_id,
-        amr_safe::is_available(),
+        cfg.codec_offer,
     );
 
     // `;user=phone` (RFC 3261 §19.1.1 / TS 24.229) tells the network this is

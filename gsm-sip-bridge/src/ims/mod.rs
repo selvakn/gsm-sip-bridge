@@ -31,7 +31,7 @@ mod gm_ipsec;
 pub mod media_stats;
 pub mod observability;
 mod rtp;
-mod sdp;
+pub mod sdp;
 mod sip_client;
 mod transcode;
 pub mod transport;

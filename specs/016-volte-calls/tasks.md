@@ -165,21 +165,21 @@ distinct, accurate report.
 These cannot be done earlier and cannot be simulated. Everything above is
 hardware-independent; this phase is where the feature's premise is tested.
 
-- [ ] T054 Stop the registration loop, since the call command owns its own registration (research R1)
-- [ ] T055 Baseline the quality class at idle — expect class 5 on the IMS context (research R4)
-- [ ] T056 **Place the first live call to +919789063708 with a handset at the far end**, speak, and confirm the echo is audible
-- [ ] T057 **Gate C1**: sample the quality class during the call on a second AT port; record whether a class-1 entry appears. **A confirmed absence is a valid result** and must be recorded as such
-- [ ] T058 **Gate C3**: confirm no feedback on a handset call; characterise the speakerphone case so the limitation is documented rather than discovered by a user
-- [ ] T059 Settle spec 015 research R9 — confirm which source address the network actually routes, now that media proves it
-- [ ] T060 Verify SC-006: a 30-second unattended call with continuous two-way audio, ending without operator intervention
+- [X] T054 Stop the registration loop, since the call command owns its own registration (research R1)
+- [X] T055 Baseline the quality class at idle — expect class 5 on the IMS context (research R4)
+- [X] T056 **Place the first live call to +919789063708 with a handset at the far end**, speak, and confirm the echo is audible
+- [X] T057 **Gate C1**: sample the quality class during the call on a second AT port; record whether a class-1 entry appears. **A confirmed absence is a valid result** and must be recorded as such
+- [ ] T058 **Gate C3**: confirm no feedback on a handset call; characterise the speakerphone case so the limitation is documented rather than discovered by a user — **half done**: two handset calls showed no feedback; the speakerphone case is still uncharacterised
+- [X] T059 Settle spec 015 research R9 — confirm which source address the network actually routes, now that media proves it
+- [X] T060 Verify SC-006: a 30-second unattended call with continuous two-way audio, ending without operator intervention
 - [ ] T061 Verify direction attribution on hardware: stay silent for a whole call and confirm the verdict is `SendOnly`, never `Neither` (FR-029)
-- [ ] T075 Verify **SC-001**: one command, phone rings, answerable, under the documented setup
-- [ ] T076 Verify **SC-002**: the answering party hears their own voice returned, and the recording contains their speech
-- [ ] T077 Verify **SC-003**: the report alone states whether audio flowed both ways and which direction failed
-- [ ] T078 Verify **SC-004**: the recording plus the measurements are together sufficient to judge the audio quality
+- [X] T075 Verify **SC-001**: one command, phone rings, answerable, under the documented setup
+- [X] T076 Verify **SC-002**: the answering party hears their own voice returned, and the recording contains their speech
+- [X] T077 Verify **SC-003**: the report alone states whether audio flowed both ways and which direction failed
+- [X] T078 Verify **SC-004**: the recording plus the measurements are together sufficient to judge the audio quality
 - [ ] T079 Verify **SC-005**: each induced failure from Phase 5 produces a report naming the failing stage
 - [ ] T080 Verify **SC-008**: call setup, format negotiation and audio handling exist once and serve both transports — no duplicated implementation
-- [ ] T062 Record the findings — including any negative result — in `specs/016-volte-calls/research.md`
+- [X] T062 Record the findings — including any negative result — in `specs/016-volte-calls/research.md`
 
 ---
 
