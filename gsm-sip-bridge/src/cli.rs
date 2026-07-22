@@ -157,6 +157,14 @@ pub enum Commands {
     /// (specs/017-volte-inbound-bridge). Declines any call with a busy
     /// response rather than answering it.
     VolteListen(VolteListenArgs),
+    /// Answer incoming cellular calls over the host-side LTE registration and
+    /// bridge them to the operator's telephone system
+    /// (specs/017-volte-inbound-bridge).
+    ///
+    /// A long-lived service, not a one-shot: it holds one registration open,
+    /// renews it before expiry, and answers calls as they arrive. Renewal and
+    /// re-attachment both yield to a call in progress.
+    VolteBridge(VolteBridgeArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -394,6 +402,36 @@ pub struct VolteListenArgs {
     pub lock_path: PathBuf,
     #[arg(long)]
     pub keep_pdn: bool,
+}
+
+/// Options for the long-lived inbound bridging service.
+#[derive(Parser, Debug)]
+pub struct VolteBridgeArgs {
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    #[arg(long)]
+    pub iface: Option<String>,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
+    pub apn: String,
+    #[arg(long)]
+    pub pcscf: Option<std::net::IpAddr>,
+    #[arg(long, default_value = "/tmp/pcscf")]
+    pub pcscf_source_path: String,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
+    pub pcscf_port: u16,
+    #[arg(long)]
+    pub msisdn: Option<String>,
+    /// Labels this line's metrics and call history.
+    #[arg(long)]
+    pub card_id: Option<String>,
+    /// Start even if the Wi-Fi path appears to hold the same subscriber's
+    /// registration. An escape hatch for a stale detection, not a default:
+    /// two live registrations for one subscriber means the network delivers
+    /// calls to whichever bound last, silently.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Parser, Debug)]

@@ -198,7 +198,7 @@ pub fn status_summary(status: Option<&RegistrationStatus>) -> String {
 ///
 /// `attach` is idempotent, so this is a cheap no-op when the PDN is fine.
 /// Returns whether the attachment is usable — attached *and* routable.
-fn refresh_attachment(settings: &VolteSettings) -> Result<(), String> {
+pub fn refresh_attachment(settings: &VolteSettings) -> Result<(), String> {
     match super::attach(settings) {
         Ok(report) if report.routed || report.iface.is_empty() => {
             metrics::VOLTE_PDN_UP.set(1.0);

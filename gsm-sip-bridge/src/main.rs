@@ -95,6 +95,10 @@ fn main() -> ExitCode {
         return handle_volte_listen_command(args);
     }
 
+    if let Some(Commands::VolteBridge(args)) = &cli.command {
+        return handle_volte_bridge_command(args, &cli);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -1032,6 +1036,62 @@ fn handle_volte_discover_command(args: &gsm_sip_bridge::cli::VolteDiscoverArgs) 
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs the long-lived inbound bridging service
+/// (specs/017-volte-inbound-bridge). Unlike `volte-listen`, which registers
+/// for a fixed window and declines everything, this holds the registration
+/// open and answers calls until stopped.
+fn handle_volte_bridge_command(
+    args: &gsm_sip_bridge::cli::VolteBridgeArgs,
+    cli: &gsm_sip_bridge::cli::Cli,
+) -> ExitCode {
+    let app_config = match load_config(cli.config.as_deref().unwrap_or(std::path::Path::new(""))) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("volte-bridge: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let pcscf_addr = match args.pcscf {
+        Some(a) => a,
+        None => {
+            let cache = std::path::PathBuf::from(&args.pcscf_source_path);
+            match gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache).found() {
+                Some(a) => a,
+                None => {
+                    eprintln!(
+                        "volte-bridge: [discovering-pcscf] no P-CSCF address available; pass --pcscf"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    let settings = gsm_sip_bridge::volte::VolteSettings {
+        modem_port: args.modem.clone(),
+        iface: args.iface.clone().unwrap_or_default(),
+        cid: args.cid,
+        apn: args.apn.clone(),
+        pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+    };
+
+    let card_id = args
+        .card_id
+        .clone()
+        .unwrap_or_else(|| gsm_sip_bridge::volte::bridge::DEFAULT_CARD_ID.to_string());
+
+    gsm_sip_bridge::volte::bridge::run(
+        gsm_sip_bridge::volte::bridge::ServiceConfig {
+            card_id,
+            settings,
+            msisdn: args.msisdn.clone(),
+            force: args.force,
+        },
+        &app_config,
+    )
 }
 
 fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> ExitCode {
