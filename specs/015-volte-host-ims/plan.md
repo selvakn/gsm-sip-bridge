@@ -230,7 +230,7 @@ so no phase depends on an unmet gate.
 | 2 | IMS PDN lifecycle + **IID-aware interface config (FR-024)**; `volte-pdn`, `volte-status` | US1 | — | ✅ **Done — verified on live hardware** |
 | 3 | Discovery probes as **diagnostics**; `volte-discover` reports per-method results | US2 (P3) | — | ✅ **Done — verified on live hardware** |
 | 4 | **G3**: acquire a P-CSCF address | — | **G3** | ✅ **Done — `2400:5200:a100:819::6`** |
-| 5 | Registration over the LTE transport | US3 | ~~G2, G3~~ | **Unblocked** |
+| 5 | Registration over the LTE transport | US3 | ~~G2, G3~~ | ✅ **Done — 200 OK on live network** |
 | 6 | Renewal, registration history | US4 | — | After phase 5 |
 
 Phase 1 must land and prove FR-019 (VoWiFi unchanged) before any VoLTE code is
@@ -238,6 +238,33 @@ written. That ordering is what keeps the production path safe.
 
 **Both gates are now cleared and US3 is unblocked.** Phase 5 is the remaining
 implementation work; see "Ways forward" below.
+
+### Phase 5 completion — US3 achieved
+
+`volte-register` obtained a **200 OK from Vodafone India over LTE** on
+2026-07-22, using the SIM's own credentials and the shared `ims/` stack:
+
+```
+P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=40443D55E62E831F
+connected to P-CSCF [2400:5200:a100:819::6]:5060
+initial REGISTER response  status=401
+network proposed Gm IPsec  ealg=aes-cbc; port-s=6000
+AKA success, building Authorization response
+Gm IPsec SAs installed
+REGISTER response  status=200 OK
+```
+
+This settles R13's residual risk: the P-CSCF does not merely answer from the
+LTE access, it **accepts an IMS-AKA registration** over it. The E-UTRAN
+`P-Access-Network-Info` was supplied rather than the VoWiFi `3GPP-WLAN` value;
+whether the network would have rejected the WLAN value was not tested, so
+treat the correct access token as load-bearing until proven otherwise.
+
+Also fixed here: `AT+CGACT=1` returns `+CME ERROR: 3` when issued too soon
+after a deactivate, and succeeds a second later. Attaching straight after a
+teardown was therefore intermittently failing; activation is now retried.
+
+**Success criteria met**: SC-003 (registration accepted, well under 60s).
 
 ## Ways forward (post-G3)
 

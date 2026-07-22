@@ -275,6 +275,32 @@ pub fn read_pdn(
     }))
 }
 
+/// Activates the context, retrying transient refusals.
+///
+/// Observed on hardware: activating straight after a deactivate returns
+/// `+CME ERROR: 3` (operation not allowed) while the modem is still settling,
+/// and the identical command succeeds a second later. Failing the whole
+/// attachment on that would make teardown-then-attach an intermittent error
+/// for no reason.
+fn activate_with_retry(at: &mut AtCommander, cid: u8) -> BridgeResult<()> {
+    const ATTEMPTS: usize = 4;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match at.send_command(&format!("AT+CGACT=1,{cid}"))? {
+            AtResponse::Ok(_) => return Ok(()),
+            AtResponse::Error(e) => last = e,
+            AtResponse::CmeError(code, msg) => last = format!("+CME ERROR: {code} ({msg})"),
+        }
+        if attempt < ATTEMPTS {
+            tracing::debug!(cid, attempt, error = %last, "CGACT refused; retrying");
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+    }
+    Err(BridgeError::Ims(format!(
+        "AT+CGACT failed after {ATTEMPTS} attempts: {last}"
+    )))
+}
+
 /// Reads the PDN, waiting for the network to actually assign an address.
 ///
 /// `AT+CGACT=1` returns `OK` as soon as the context is *active*, which is
@@ -342,7 +368,7 @@ pub fn bring_up(at: &mut AtCommander, cid: u8, apn: &str) -> BridgeResult<PdnBri
             at.send_command(&format!("AT+CGDCONT={cid},\"IPV4V6\",\"{apn}\""))?,
             "AT+CGDCONT",
         )?;
-        expect_ok(at.send_command(&format!("AT+CGACT=1,{cid}"))?, "AT+CGACT")?;
+        activate_with_retry(at, cid)?;
     }
 
     let pdn = read_pdn_when_addressed(at, cid, apn, std::time::Duration::from_secs(15))?;
