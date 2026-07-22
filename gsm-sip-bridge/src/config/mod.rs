@@ -16,6 +16,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "audio",
     "scheduled_restart",
     "vowifi",
+    "volte",
     "logging",
 ];
 const SIP_KEYS: &[&str] = &[
@@ -59,6 +60,21 @@ const SCHEDULED_RESTART_KEYS: &[&str] = &[
 ];
 const LOGGING_KEYS: &[&str] = &["level"];
 const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+const VOLTE_KEYS: &[&str] = &[
+    "enabled",
+    "modem_port",
+    "iface",
+    "cid",
+    "apn",
+    "pcscf",
+    "pcscf_port",
+    "pcscf_source_path",
+    "use_tcp",
+    "sec_agree",
+    "status_path",
+    "lock_path",
+];
+
 const VOWIFI_KEYS: &[&str] = &[
     "enabled",
     "mcc",
@@ -506,6 +522,55 @@ impl Default for VowifiConfig {
     }
 }
 
+/// `[volte]` — host-side IMS over LTE (specs/015-volte-host-ims).
+///
+/// Deliberately mirrors the CLI flags of `volte-pdn`/`volte-register` so the
+/// two never disagree; the CLI remains the diagnostic entry point and this is
+/// what lets the same settings be supplied unattended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolteConfig {
+    pub enabled: bool,
+    pub modem_port: String,
+    /// Host interface carrying the modem's data path. Empty means manage the
+    /// PDN only and skip host interface configuration.
+    pub iface: String,
+    pub cid: u8,
+    pub apn: String,
+    /// Explicit P-CSCF. Empty means fall back to `pcscf_source_path`, then to
+    /// discovery — which does not work on every carrier (see the feature's
+    /// research notes), hence the explicit option.
+    pub pcscf: String,
+    pub pcscf_port: u16,
+    /// File the VoWiFi/ePDG path writes its discovered P-CSCF to. Reused here
+    /// so a captured address is picked up automatically rather than by hand.
+    pub pcscf_source_path: String,
+    pub use_tcp: bool,
+    pub sec_agree: bool,
+    pub status_path: String,
+    pub lock_path: String,
+}
+
+impl Default for VolteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            modem_port: "/dev/ttyUSB0".to_string(),
+            iface: String::new(),
+            cid: 3,
+            apn: "ims".to_string(),
+            pcscf: String::new(),
+            pcscf_port: 5060,
+            // Same default the [vowifi] section uses, so a captured address is
+            // found without configuring anything.
+            pcscf_source_path: "/tmp/pcscf".to_string(),
+            use_tcp: true,
+            sec_agree: true,
+            status_path: "/tmp/volte-registration-status".to_string(),
+            lock_path: "/tmp/volte-registration.lock".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub sip: SipConfig,
@@ -518,6 +583,7 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     pub scheduled_restart: ScheduledRestartConfig,
     pub vowifi: VowifiConfig,
+    pub volte: VolteConfig,
     pub logging: LoggingConfig,
 }
 
@@ -541,6 +607,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let audio = parse_audio(table)?;
     let scheduled_restart = parse_scheduled_restart(table);
     let vowifi = parse_vowifi(table)?;
+    let volte = parse_volte(table)?;
     let logging = parse_logging(table)?;
 
     Ok(AppConfig {
@@ -554,6 +621,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         audio,
         scheduled_restart,
         vowifi,
+        volte,
         logging,
     })
 }
@@ -1287,6 +1355,81 @@ fn parse_logging(root: &toml::map::Map<String, Value>) -> BridgeResult<LoggingCo
     Ok(LoggingConfig { level })
 }
 
+fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig> {
+    let Some(val) = root.get("volte") else {
+        return Ok(VolteConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[volte] must be a table".into()))?;
+    warn_unknown_keys_in(t, VOLTE_KEYS, "volte");
+
+    let d = VolteConfig::default();
+    let str_key = |key: &str, field: &str, default: String| -> BridgeResult<String> {
+        Ok(t.get(key)
+            .map(|v| as_string(v, field, false))
+            .transpose()?
+            .unwrap_or(default))
+    };
+
+    let pcscf = str_key("pcscf", "volte.pcscf", d.pcscf)?;
+    // Fail at load time rather than at registration time, where the operator
+    // has already waited for a PDN to come up.
+    if !pcscf.is_empty() && pcscf.parse::<std::net::IpAddr>().is_err() {
+        return Err(BridgeError::Config(format!(
+            "volte.pcscf is not a valid IP address: {pcscf}"
+        )));
+    }
+
+    let cid = t
+        .get("cid")
+        .map(|v| as_integer(v, "volte.cid"))
+        .transpose()?
+        .map(|n| n as u8)
+        .unwrap_or(d.cid);
+    if cid == 0 {
+        return Err(BridgeError::Config(
+            "volte.cid must be a non-zero PDP context id".into(),
+        ));
+    }
+
+    Ok(VolteConfig {
+        enabled: t
+            .get("enabled")
+            .map(|v| as_bool(v, "volte.enabled"))
+            .transpose()?
+            .unwrap_or(d.enabled),
+        modem_port: str_key("modem_port", "volte.modem_port", d.modem_port)?,
+        iface: str_key("iface", "volte.iface", d.iface)?,
+        cid,
+        apn: str_key("apn", "volte.apn", d.apn)?,
+        pcscf,
+        pcscf_port: t
+            .get("pcscf_port")
+            .map(|v| as_integer(v, "volte.pcscf_port"))
+            .transpose()?
+            .map(|n| n as u16)
+            .unwrap_or(d.pcscf_port),
+        pcscf_source_path: str_key(
+            "pcscf_source_path",
+            "volte.pcscf_source_path",
+            d.pcscf_source_path,
+        )?,
+        use_tcp: t
+            .get("use_tcp")
+            .map(|v| as_bool(v, "volte.use_tcp"))
+            .transpose()?
+            .unwrap_or(d.use_tcp),
+        sec_agree: t
+            .get("sec_agree")
+            .map(|v| as_bool(v, "volte.sec_agree"))
+            .transpose()?
+            .unwrap_or(d.sec_agree),
+        status_path: str_key("status_path", "volte.status_path", d.status_path)?,
+        lock_path: str_key("lock_path", "volte.lock_path", d.lock_path)?,
+    })
+}
+
 fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConfig> {
     let Some(val) = root.get("vowifi") else {
         return Ok(VowifiConfig::default());
@@ -1532,6 +1675,7 @@ mod tests {
         let audio = parse_audio(table).unwrap();
         let scheduled_restart = parse_scheduled_restart(table);
         let vowifi = parse_vowifi(table).unwrap();
+        let volte = parse_volte(table).unwrap();
         let logging = parse_logging(table).unwrap();
         AppConfig {
             sip,
@@ -1544,8 +1688,56 @@ mod tests {
             audio,
             scheduled_restart,
             vowifi,
+            volte,
             logging,
         }
+    }
+
+    #[test]
+    fn volte_section_defaults_when_absent() {
+        let c = parse(MINIMAL_TOML);
+
+        assert!(!c.volte.enabled, "must be opt-in");
+        assert_eq!(c.volte.cid, 3);
+        assert_eq!(c.volte.apn, "ims");
+        // Same default the VoWiFi path writes to, so a captured address is
+        // found without configuring anything.
+        assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf");
+    }
+
+    #[test]
+    fn volte_section_is_parsed() {
+        let toml = format!(
+            "{MINIMAL_TOML}\n[volte]\nenabled = true\niface = \"wwan0\"\ncid = 4\n\
+             pcscf = \"2400:5200:a100:819::6\"\nsec_agree = false\n"
+        );
+
+        let c = parse(&toml);
+
+        assert!(c.volte.enabled);
+        assert_eq!(c.volte.iface, "wwan0");
+        assert_eq!(c.volte.cid, 4);
+        assert_eq!(c.volte.pcscf, "2400:5200:a100:819::6");
+        assert!(!c.volte.sec_agree);
+    }
+
+    #[test]
+    fn volte_rejects_a_malformed_pcscf_at_load_time() {
+        // Better here than after the operator has waited for a PDN to come up.
+        let toml = format!("{MINIMAL_TOML}\n[volte]\npcscf = \"not-an-address\"\n");
+        let root: Value = toml.parse().unwrap();
+
+        let err = parse_volte(root.as_table().unwrap()).unwrap_err();
+
+        assert!(err.to_string().contains("not a valid IP address"));
+    }
+
+    #[test]
+    fn volte_rejects_a_zero_context_id() {
+        let toml = format!("{MINIMAL_TOML}\n[volte]\ncid = 0\n");
+        let root: Value = toml.parse().unwrap();
+
+        assert!(parse_volte(root.as_table().unwrap()).is_err());
     }
 
     const MINIMAL_TOML: &str = r#"

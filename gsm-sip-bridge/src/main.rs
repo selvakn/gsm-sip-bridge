@@ -511,12 +511,36 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
         }
     };
 
+    // P-CSCF resolution order: explicit flag, then the address captured by the
+    // VoWiFi/ePDG path. Automatic discovery is not consulted here because it
+    // is known not to yield an address on the tested carrier and would only
+    // add latency before a failure the operator can already act on.
+    let (pcscf_addr, pcscf_source) = match args.pcscf {
+        Some(addr) => (addr, "--pcscf".to_string()),
+        None => {
+            let cache = std::path::PathBuf::from(&args.pcscf_source_path);
+            match gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache).found() {
+                Some(addr) => (addr, format!("ePDG capture at {}", cache.display())),
+                None => {
+                    eprintln!(
+                        "volte-register: [discovering-pcscf] no P-CSCF address available. \
+                         Pass --pcscf, or run the VoWiFi path once so it writes one to {}. \
+                         `volte-discover` reports what each mechanism returned.",
+                        cache.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    tracing::info!(pcscf = %pcscf_addr, source = %pcscf_source, "resolved P-CSCF");
+
     let settings = gsm_sip_bridge::volte::VolteSettings {
         modem_port: args.modem.clone(),
         iface: args.iface.clone().unwrap_or_default(),
         cid: args.cid,
         apn: args.apn.clone(),
-        pcscf: Some(std::net::SocketAddr::new(args.pcscf, args.pcscf_port)),
+        pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
     };
 
     // Stage 1: the network attachment. Reported separately so a failure here
@@ -556,7 +580,7 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
     // Stage 2: registration, over the same shared code the VoWiFi path uses.
     let reg_cfg = gsm_sip_bridge::ims::ImsRegisterConfig {
         modem_port: args.modem.clone(),
-        pcscf_addr: args.pcscf,
+        pcscf_addr,
         pcscf_port: args.pcscf_port,
         mcc: plmn.mcc.clone(),
         mnc: plmn.mnc.clone(),
@@ -634,6 +658,7 @@ fn handle_volte_discover_command(args: &gsm_sip_bridge::cli::VolteDiscoverArgs) 
         realm,
         override_pcscf: args.pcscf,
         only,
+        epdg_cache_path: Some(std::path::PathBuf::from(&args.pcscf_source_path)),
     };
 
     match pcscf::discover(&inputs) {

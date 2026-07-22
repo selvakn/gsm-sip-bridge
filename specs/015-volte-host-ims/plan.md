@@ -308,14 +308,16 @@ observed end to end. A soak is required to close it.
    describing E-UTRAN rather than IEEE-802.11 — the most likely reason a
    registration that is *reachable* still gets rejected.
 
-2. **Make the ePDG capture automatic rather than manual.** The VoWiFi path
-   already writes the P-CSCF to `pcscf_source_path`. Adding that file as a
-   fourth discovery source — an `EpdgCache` method, ranked after `Pco` — turns
-   today's manual `--pcscf` into an automatic hand-off between the two
-   transports, with the source still named in the report. This is the single
-   highest-value follow-up and costs very little.
+2. ~~**Make the ePDG capture automatic rather than manual.**~~ ✅ **Done.**
+   `EpdgCache` is now the third link in the discovery chain (after `Dhcpv6`
+   and `Pco`, ahead of `Dns`), and `volte-register` resolves its P-CSCF from
+   `--pcscf` → the ePDG capture, reporting which source won. Live mechanisms
+   are ranked ahead of the cache so a carrier that *does* publish an address
+   always beats a possibly-stale file.
 
-3. **Do not register both transports concurrently.** VoWiFi and VoLTE would
+3. ~~**Do not register both transports concurrently.**~~ ✅ **Enforced.**
+   `volte-register` refuses while a VoWiFi agent is running, checked before
+   anything touches the modem, with `--force` to override. Original note: VoWiFi and VoLTE would
    present the same IMPU with the same IMEI-derived `+sip.instance`, so the
    network treats one as a re-registration of the other and tears the first
    binding down. This is the same hazard `vowifi::ims_mode` already documents
@@ -380,8 +382,9 @@ Two further hardware-only defects were found and fixed here (R11, R12): the
 routability and the DHCPv6 probe fail intermittently for unrelated-looking
 reasons. Neither was reachable from unit tests.
 
-**Deferred from Phase 2**: `[volte]` config-file support. `config/mod.rs` uses
-a hand-rolled parser with a `KNOWN_KEYS` list, and the CLI defaults
-(`--modem`, `--cid`, `--apn`, `--iface`) cover every current use. The
-`volte-cli-contract.md` wording "from `[volte]` config" is therefore not yet
-satisfied; fold it in when the daemon needs to bring the PDN up unattended.
+**Deferred from Phase 2 — now delivered**: the `[volte]` config section
+exists, validated at load time (a malformed `pcscf` or a zero `cid` fails
+there rather than after the operator has waited for a PDN to come up). The
+CLI remains the diagnostic entry point; config is what makes unattended
+operation possible. Not yet wired into `docker/entrypoint.sh` supervision —
+that is the remaining integration gap.

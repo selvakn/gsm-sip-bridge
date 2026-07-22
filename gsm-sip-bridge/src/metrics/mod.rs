@@ -4,7 +4,7 @@ pub mod server;
 use once_cell::sync::Lazy;
 use prometheus::{
     opts, register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
-    CounterVec, Gauge, GaugeVec, HistogramVec, Registry,
+    CounterVec, Gauge, GaugeVec, HistogramVec, Opts, Registry,
 };
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -70,6 +70,46 @@ pub static SIP_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
         "1 if SIP registered, 0 otherwise"
     ))
     .unwrap()
+});
+
+/// 1 when the host-side VoLTE registration is currently accepted.
+/// Deliberately separate from `SIP_REGISTERED` (the PBX-side registration) and
+/// from the VoWiFi agent's gauge — an operator needs to see which of the three
+/// is down, not an aggregate.
+pub static VOLTE_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
+    let g = Gauge::new(
+        "gsm_bridge_volte_registered",
+        "1 when the host-side IMS registration over LTE is accepted, 0 otherwise",
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+/// 1 when the IMS PDN is attached and routable.
+pub static VOLTE_PDN_UP: Lazy<Gauge> = Lazy::new(|| {
+    let g = Gauge::new(
+        "gsm_bridge_volte_pdn_up",
+        "1 when the LTE IMS PDN is attached and has a default route, 0 otherwise",
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+/// Registration attempts by outcome, so a flapping renewal is visible as a
+/// rate rather than only in logs.
+pub static VOLTE_REGISTRATIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let c = CounterVec::new(
+        Opts::new(
+            "gsm_bridge_volte_registrations_total",
+            "Host-side VoLTE IMS registration attempts by outcome",
+        ),
+        &["outcome"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
 });
 
 pub static MODULE_INIT_TOTAL: Lazy<CounterVec> = Lazy::new(|| {

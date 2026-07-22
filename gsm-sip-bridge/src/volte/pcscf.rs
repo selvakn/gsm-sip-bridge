@@ -61,6 +61,13 @@ pub enum DiscoveryMethod {
     Pco,
     /// NAPTR / AAAA on the home network realm.
     Dns,
+    /// The address the VoWiFi/ePDG path already learned and wrote to disk.
+    ///
+    /// Not a network probe at all — it is a cache of a real capture. Ranked
+    /// after the live mechanisms so a carrier that *does* publish a P-CSCF is
+    /// always preferred over a possibly-stale file, but ahead of DNS because
+    /// on the tested carrier it is the only thing that ever yields an address.
+    EpdgCache,
 }
 
 impl DiscoveryMethod {
@@ -70,14 +77,16 @@ impl DiscoveryMethod {
             DiscoveryMethod::Dhcpv6 => "dhcpv6",
             DiscoveryMethod::Pco => "pco",
             DiscoveryMethod::Dns => "dns",
+            DiscoveryMethod::EpdgCache => "epdg-cache",
         }
     }
 
     /// The chain, in the order it is attempted (FR-008).
-    pub fn chain() -> [DiscoveryMethod; 3] {
+    pub fn chain() -> [DiscoveryMethod; 4] {
         [
             DiscoveryMethod::Dhcpv6,
             DiscoveryMethod::Pco,
+            DiscoveryMethod::EpdgCache,
             DiscoveryMethod::Dns,
         ]
     }
@@ -471,6 +480,36 @@ pub fn probe_pco(at: &mut AtCommander, cid: u8) -> MethodResult {
 }
 
 // ---------------------------------------------------------------------------
+// ePDG cache
+// ---------------------------------------------------------------------------
+
+/// Reads the P-CSCF the VoWiFi/ePDG path captured.
+///
+/// The tunnel dialer writes the address it learned from the IKEv2 config
+/// payload to this file. Reading it here turns what was a manual `--pcscf`
+/// into an automatic hand-off between the two transports — the address was
+/// verified reachable and acceptable from the LTE access, so it is a genuine
+/// source rather than a guess.
+pub fn probe_epdg_cache(path: &std::path::Path) -> MethodResult {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) => {
+            return MethodResult::NoResult(format!(
+                "no ePDG capture at {} ({e}); run the VoWiFi path once to populate it",
+                path.display()
+            ))
+        }
+    };
+    match raw.trim().parse::<IpAddr>() {
+        Ok(addr) => MethodResult::Found(addr),
+        Err(e) => MethodResult::Failed(format!(
+            "{} does not contain an IP address: {e}",
+            path.display()
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DNS
 // ---------------------------------------------------------------------------
 
@@ -561,6 +600,8 @@ pub struct DiscoveryInputs<'a> {
     pub override_pcscf: Option<IpAddr>,
     /// Restrict the run to a single method, for isolating one probe.
     pub only: Option<DiscoveryMethod>,
+    /// Where the VoWiFi path deposits a captured P-CSCF.
+    pub epdg_cache_path: Option<std::path::PathBuf>,
 }
 
 /// Runs the discovery chain and returns a complete report (FR-008, FR-011).
@@ -603,6 +644,10 @@ pub fn discover(inputs: &DiscoveryInputs) -> BridgeResult<DiscoveryReport> {
                     probe_dns(&[], &realm, Duration::from_secs(4))
                 }
             }
+            DiscoveryMethod::EpdgCache => match &inputs.epdg_cache_path {
+                Some(path) => probe_epdg_cache(path),
+                None => MethodResult::NoResult("no ePDG capture path configured".to_string()),
+            },
             DiscoveryMethod::ConfigOverride => continue,
         };
         report.record(method, result, started.elapsed());
@@ -748,6 +793,55 @@ mod tests {
     }
 
     #[test]
+    fn epdg_cache_yields_the_captured_address() {
+        let path = std::env::temp_dir().join(format!("epdg-cache-{}", std::process::id()));
+        std::fs::write(&path, "2400:5200:a100:819::6\n").unwrap();
+
+        let r = probe_epdg_cache(&path);
+
+        assert_eq!(
+            r.found(),
+            Some("2400:5200:a100:819::6".parse::<IpAddr>().unwrap())
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_missing_epdg_capture_points_at_how_to_create_one() {
+        let r = probe_epdg_cache(std::path::Path::new("/nonexistent/pcscf"));
+
+        match r {
+            MethodResult::NoResult(d) => assert!(d.contains("VoWiFi"), "got: {d}"),
+            other => panic!("expected NoResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_corrupt_epdg_capture_is_a_failure_not_an_empty_result() {
+        let path = std::env::temp_dir().join(format!("epdg-bad-{}", std::process::id()));
+        std::fs::write(&path, "not-an-address").unwrap();
+
+        assert!(matches!(probe_epdg_cache(&path), MethodResult::Failed(_)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn live_mechanisms_are_preferred_over_the_cached_capture() {
+        // A carrier that does publish a P-CSCF must win over a stale file.
+        let chain = DiscoveryMethod::chain();
+        let pco = chain
+            .iter()
+            .position(|m| *m == DiscoveryMethod::Pco)
+            .unwrap();
+        let cache = chain
+            .iter()
+            .position(|m| *m == DiscoveryMethod::EpdgCache)
+            .unwrap();
+
+        assert!(pco < cache);
+    }
+
+    #[test]
     fn dns_probe_says_there_is_nowhere_to_ask_rather_than_timing_out() {
         let r = probe_dns(&[], "ims.mnc043.mcc404.3gppnetwork.org", Duration::ZERO);
 
@@ -786,6 +880,7 @@ mod tests {
             realm: None,
             override_pcscf: Some(addr),
             only: None,
+            epdg_cache_path: None,
         };
 
         let report = discover(&inputs).unwrap();
@@ -804,6 +899,7 @@ mod tests {
             [
                 DiscoveryMethod::Dhcpv6,
                 DiscoveryMethod::Pco,
+                DiscoveryMethod::EpdgCache,
                 DiscoveryMethod::Dns
             ]
         );
