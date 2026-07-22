@@ -342,3 +342,97 @@ gsm_sip_bridge_active_calls{module="volte",transport="volte"} 0
 One process, both halves as threads, its own SIP port (5073) alongside the
 circuit-switched daemon's — no bind race (research R3).
 
+## R17: The first live bridged calls — three of ours, then one of theirs
+
+**Status**: ⚠️ Bridge proven end to end; blocked on a carrier policy rejection.
+
+Three dials, each finding something different.
+
+### Dial 1 — the two halves could not find each other
+
+Collapsing the Agent A/B split onto loopback gave the telephone-side half a new
+port (`LOOPBACK_SIP_PORT`), but the carrier-side listener still bound the Wi-Fi
+path's hardcoded `VETH_SIP_PORT`. Both sides now read one constant.
+
+What makes this worth recording is **how far it got before failing**: the INVITE
+arrived, both legs were placed, the PBX rang, and *a human answered* — only then
+did it time out. A port mismatch that surfaces only after someone picks up a
+phone is not the failure mode anyone predicts.
+
+Second defect on the same dial: the setup failure sent no final response, so
+the caller kept hearing the ringback our `180` started until they gave up. Now
+answered with `480 Temporarily Unavailable` — not `486 Busy`, because the line
+is not busy and the distinction is what tells a caller whether to redial now or
+later (FR-005).
+
+### Dial 2 — bridged, then dropped in 170ms
+
+The bridge worked:
+
+```
+transcoding relay  carrier=AmrWb pt=101 octet_aligned=false <-> veth L16
+call answered and bridged
+... 170ms later: call ended, reason=caller_hangup
+```
+
+### Dial 3 — with SIP-level logging, the carrier said why
+
+```
+BYE
+Reason: SIP;cause=503;text="PT: AAA: result_code=0 exp_result_code=5065"
+```
+
+Diameter experimental result **5065 = IP-CAN_SESSION_NOT_AVAILABLE**
+(TS 29.214). The P-CSCF asked the PCRF over Rx to authorise media for the
+session; the PCRF could not bind it to an IP-CAN session for our address.
+
+Our signalling is correct and complete: `100`, `180`, `200 OK` with a valid
+answer, and **the network ACKed it** (`received ACK, dialog confirmed`) before
+tearing down 65ms later. This is a policy/charging rejection, not a signalling
+fault.
+
+### The control that made it interpretable: an outbound call now fails too
+
+Rather than assume this was inbound-specific, the same registration was used to
+place an outbound call — the exact thing feature 016 verified working, with a
+dedicated voice bearer and 0.3% packet loss:
+
+```
+183 Session Progress -> 180 Ringing -> 380 Alternative Service
+```
+
+**So it is not inbound-specific.** Something in how the network treats this
+PDN/registration has changed since feature 016. Candidates, none yet
+distinguished:
+
+- The PDN was torn down and re-attached ~6 times in quick succession during
+  this session; a stale IP-CAN session or a rate limit at the PGW/PCRF would
+  present exactly this way.
+- `380 Alternative Service` conventionally means "use the CS domain", which
+  would suggest the network is currently declining to serve this subscriber
+  over PS at all.
+
+This is the same lesson as R1: a negative result without a positive control is
+uninterpretable. Checking the outbound direction cost one command and moved the
+diagnosis from "the inbound bridge is broken" to "the network is currently
+refusing both directions".
+
+### Also found and fixed: a malformed `To` header on in-dialog responses
+
+`build_uas_response` appended `;tag=` unconditionally. An initial INVITE
+arrives untagged and our response establishes the dialog — correct. But an
+**in-dialog** request (BYE) arrives with our tag already present, so we emitted
+`To: <...>;tag=X;tag=X`, which RFC 3261 §8.2.6.2 forbids. Benign here (the
+dialog was ending anyway) and live on the Wi-Fi path too.
+
+### What is proven, and what is not
+
+**Proven**: inbound INVITEs reach the service; both legs are placed and paired;
+the PBX rings and answers; the carrier leg negotiates AMR-WB; the transcoding
+relay starts; the dialog is confirmed by the network's own ACK. The bridging
+code does what it was built to do.
+
+**Not proven**: that a call survives, that audio flows both ways, and Gate B2
+(whether a voice bearer is granted for mobile-terminating calls). None of these
+can be answered until the network stops rejecting the session.
+

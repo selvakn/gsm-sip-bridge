@@ -255,9 +255,22 @@ pub fn build_uas_response(
         msg.push_str(&format!("From: {from}\r\n"));
     }
     let to = request.header("To").unwrap_or("");
+    // Only add a tag if the request's `To` does not already carry one.
+    //
+    // An *initial* INVITE arrives with an untagged `To`, and our response is
+    // what establishes the dialog by adding the tag. An **in-dialog** request
+    // (BYE, and any re-INVITE) arrives with our tag already on it, so
+    // appending unconditionally produced `To: <...>;tag=X;tag=X` — malformed
+    // per RFC 3261 §8.2.6.2, which allows exactly one. Observed live on the
+    // 200 OK answering a carrier's BYE (specs/017 R17).
+    let to_already_tagged = to
+        .to_ascii_lowercase()
+        .split(';')
+        .skip(1)
+        .any(|p| p.trim_start().starts_with("tag="));
     match to_tag {
-        Some(tag) => msg.push_str(&format!("To: {to};tag={tag}\r\n")),
-        None => msg.push_str(&format!("To: {to}\r\n")),
+        Some(tag) if !to_already_tagged => msg.push_str(&format!("To: {to};tag={tag}\r\n")),
+        _ => msg.push_str(&format!("To: {to}\r\n")),
     }
     if let Some(call_id) = request.header("Call-ID") {
         msg.push_str(&format!("Call-ID: {call_id}\r\n"));
@@ -1463,5 +1476,38 @@ mod tests {
         assert!(!SAMPLE_INVITE.starts_with("SIP/2.0"));
         let response_start = "SIP/2.0 200 OK\r\n";
         assert!(response_start.starts_with("SIP/2.0"));
+    }
+
+    #[test]
+    fn an_in_dialog_response_does_not_duplicate_the_to_tag() {
+        // A BYE arrives with our tag already on its `To`. Appending another
+        // produced `To: <...>;tag=X;tag=X` — RFC 3261 §8.2.6.2 allows exactly
+        // one. Observed live answering a carrier's BYE.
+        let bye = sample_bye();
+        let response = build_200_ok_bye(&bye, "fromtag1");
+        let to_line = response
+            .lines()
+            .find(|l| l.starts_with("To:"))
+            .expect("a To header");
+        assert_eq!(
+            to_line.matches("tag=").count(),
+            1,
+            "exactly one To tag, got: {to_line}"
+        );
+        assert!(to_line.contains("tag=fromtag1"));
+    }
+
+    #[test]
+    fn an_initial_invite_response_still_adds_the_tag_that_creates_the_dialog() {
+        // The other half of the rule: an initial INVITE has an untagged `To`,
+        // and our response is what establishes the dialog.
+        let (invite, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let response = build_uas_response(200, "OK", &invite, Some("mine"), None, None);
+        let to_line = response
+            .lines()
+            .find(|l| l.starts_with("To:"))
+            .expect("a To header");
+        assert_eq!(to_line.matches("tag=").count(), 1);
+        assert!(to_line.contains("tag=mine"));
     }
 }
