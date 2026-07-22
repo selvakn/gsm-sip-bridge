@@ -552,10 +552,12 @@ pub fn build_answer(
     offer: &SdpOffer,
     amr_available: bool,
     wideband: bool,
+    preference: AnswerPreference,
 ) -> BridgeResult<(String, ChosenCodec)> {
-    let chosen = select_codec(offer, amr_available, wideband).ok_or_else(|| {
-        BridgeError::Ims("SDP offer has no codec this client can answer with".into())
-    })?;
+    let chosen =
+        select_codec_with(offer, amr_available, wideband, preference).ok_or_else(|| {
+            BridgeError::Ims("SDP offer has no codec this client can answer with".into())
+        })?;
     Ok(build_answer_for(local_ip, rtp_port, session_id, chosen))
 }
 
@@ -928,6 +930,7 @@ mod tests {
             &offer,
             true,
             false,
+            AnswerPreference::legacy(),
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrWb);
@@ -963,6 +966,7 @@ mod tests {
             &offer,
             true,
             false,
+            AnswerPreference::legacy(),
         )
         .unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
@@ -994,6 +998,7 @@ mod tests {
             &offer,
             true,
             false,
+            AnswerPreference::legacy(),
         )
         .unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrNb);
@@ -1019,7 +1024,8 @@ mod tests {
             1,
             &offer,
             false,
-            false
+            false,
+            AnswerPreference::legacy(),
         )
         .is_err());
     }
@@ -1044,8 +1050,16 @@ mod tests {
     #[test]
     fn build_answer_prefers_pcmu_when_offered() {
         let offer = parse_offer(AIRTEL_LIKE_OFFER).unwrap();
-        let (sdp, codec) =
-            build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, true, false).unwrap();
+        let (sdp, codec) = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            true,
+            false,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::Pcmu);
         assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"));
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000"));
@@ -1059,8 +1073,16 @@ mod tests {
         let body = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 97\r\n\
                      a=rtpmap:97 AMR-WB/16000\r\na=fmtp:97 octet-align=1\r\n";
         let offer = parse_offer(body).unwrap();
-        let (sdp, codec) =
-            build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, true, false).unwrap();
+        let (sdp, codec) = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            true,
+            false,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrWb);
         // Echoes the offer's own payload type (97), not the hardcoded 96.
         assert!(sdp.contains("m=audio 40000 RTP/AVP 97\r\n"));
@@ -1072,7 +1094,15 @@ mod tests {
         let body = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 96\r\n\
                      a=rtpmap:96 AMR-WB/16000\r\n";
         let offer = parse_offer(body).unwrap();
-        let result = build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, false, false);
+        let result = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            false,
+            false,
+            AnswerPreference::legacy(),
+        );
         assert!(result.is_err());
     }
 
@@ -1081,7 +1111,15 @@ mod tests {
         let body = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 3\r\n\
                      a=rtpmap:3 GSM/8000\r\n";
         let offer = parse_offer(body).unwrap();
-        let result = build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, true, false);
+        let result = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            true,
+            false,
+            AnswerPreference::legacy(),
+        );
         assert!(result.is_err());
     }
 
@@ -1092,8 +1130,16 @@ mod tests {
     #[test]
     fn build_answer_prefers_amr_wb_over_pcmu_in_wideband_mode() {
         let offer = parse_offer(AIRTEL_LIKE_OFFER).unwrap();
-        let (sdp, codec) =
-            build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, true, true).unwrap();
+        let (sdp, codec) = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrWb);
         assert!(sdp.contains("AMR-WB/16000"));
     }
@@ -1104,8 +1150,16 @@ mod tests {
     fn wideband_mode_still_answers_a_pcmu_only_offer_with_pcmu() {
         let body = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 0\r\n";
         let offer = parse_offer(body).unwrap();
-        let (_, codec) =
-            build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, true, true).unwrap();
+        let (_, codec) = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::Pcmu);
     }
 
@@ -1116,8 +1170,16 @@ mod tests {
         let body = "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 108\r\n\
                      a=rtpmap:108 AMR/8000\r\n";
         let offer = parse_offer(body).unwrap();
-        let (_, codec) =
-            build_answer("1.2.3.4".parse().unwrap(), 40000, 999, &offer, true, true).unwrap();
+        let (_, codec) = build_answer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            999,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrNb);
     }
 

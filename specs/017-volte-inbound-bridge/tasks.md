@@ -117,8 +117,8 @@ conversation is possible both ways.
 after.
 
 - [ ] T037 [US2] Hold one registration for both liveness and calls, renewed before expiry; never a second per call (FR-008, FR-012) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T038 [US2] Defer renewal while a call is in progress, reusing the extracted lifecycle (FR-009) in `gsm-sip-bridge/src/volte/registration.rs`
-- [ ] T039 [US2] **Defer re-attachment while a call is in progress** — the genuinely new hazard; the existing deferral covers renewal only (FR-009, research R2) in `gsm-sip-bridge/src/volte/registration.rs`
+- [X] T038 [US2] Defer renewal while a call is in progress, reusing the extracted lifecycle (FR-009) in `gsm-sip-bridge/src/volte/registration.rs`
+- [X] T039 [US2] **Defer re-attachment while a call is in progress** — the genuinely new hazard; the existing deferral covers renewal only (FR-009, research R2) in `gsm-sip-bridge/src/volte/registration.rs`
 - [ ] T040 [US2] Recover attachment and registration automatically when lost while idle (FR-010) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T041 [US2] End a call with the attachment named as the cause when it is genuinely lost mid-call, distinct from the caller hanging up (FR-011) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T042 [US2] Let a call outlive its registration rather than cutting it short (spec Assumptions) in `gsm-sip-bridge/src/volte/registration.rs`

@@ -86,6 +86,21 @@ const RENEWAL_HEADROOM: Duration = Duration::from_secs(300);
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 
+/// Work that must succeed before a renewal is worth attempting.
+///
+/// Exists for the LTE path, where the carrier tears the network attachment
+/// down roughly every two hours (specs/015 research R15) and renewing over a
+/// dead attachment only produces a connect timeout. The Wi-Fi path passes
+/// `None` — its tunnel is maintained by charon, not by us.
+///
+/// **This is also what defers re-attachment during a call**, and deliberately
+/// so: the hook runs inside the block the dispatch loop already skips while
+/// `active_call.is_some()`, so re-attachment inherits renewal's deferral
+/// rather than carrying a second policy that could drift from it. An
+/// unguarded re-attach would drop a live call every two hours
+/// (specs/017 T039).
+pub(crate) type PreRenewalHook = dyn Fn() -> Result<(), String> + Send + Sync;
+
 /// Entry point for the `vowifi-ims-agent` subcommand. `card_id` labels this
 /// line's metrics/history (specs/013-multi-card-vowifi FR-017) — pass
 /// `crate::vowifi::LEGACY_LINE_CARD_ID` for a deployment with no resolved
@@ -251,6 +266,10 @@ fn run_inner(
         control_addr,
         veth_local_ip,
         config.wideband,
+        // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
+        // has no attachment of its own to refresh.
+        sdp::AnswerPreference::legacy(),
+        None,
         &obs,
     );
     session.cleanup();
@@ -419,7 +438,7 @@ impl DialogInfo {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_loop(
+pub(crate) fn dispatch_loop(
     session: &mut super::RegisteredSession,
     inbound: &mut Inbound,
     reg_cfg: &ImsRegisterConfig,
@@ -427,6 +446,8 @@ fn dispatch_loop(
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
     wideband: bool,
+    answer_preference: sdp::AnswerPreference,
+    pre_renewal: Option<&PreRenewalHook>,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
@@ -497,6 +518,7 @@ fn dispatch_loop(
                     control_addr,
                     veth_local_ip,
                     wideband,
+                    answer_preference,
                     obs,
                 ) {
                     Ok(call) => {
@@ -581,6 +603,28 @@ fn dispatch_loop(
                 }
                 status.lock().unwrap_or_else(|e| e.into_inner()).state =
                     super::RegistrationState::Renewing;
+                // Rebuild the layer underneath before spending a REGISTER on
+                // it. Reaching here already means no call is in progress (the
+                // `active_call` check above), which is precisely how
+                // re-attachment inherits renewal's deferral instead of
+                // needing its own — see `PreRenewalHook`.
+                if let Some(hook) = pre_renewal {
+                    if let Err(reason) = hook() {
+                        tracing::warn!(
+                            error = %reason,
+                            retry_in_secs = backoff.as_secs(),
+                            "cannot renew: the network attachment is down"
+                        );
+                        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.state = super::RegistrationState::Failed;
+                        guard.last_failure = Some((SystemTime::now(), reason));
+                        drop(guard);
+                        obs.set_registered(false);
+                        next_renewal_attempt = Some(Instant::now() + backoff);
+                        backoff = next_backoff(backoff, RETRY_MAX_BACKOFF);
+                        continue;
+                    }
+                }
                 match attempt_renewal(reg_cfg) {
                     Ok(new_session) => {
                         session.cleanup();
@@ -656,6 +700,7 @@ fn handle_invite(
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
     wideband: bool,
+    answer_preference: sdp::AnswerPreference,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<Option<ActiveCall>> {
     let call_id = req.header("Call-ID").unwrap_or_default().to_string();
@@ -677,7 +722,12 @@ fn handle_invite(
     // `sdp::select_codec` — the same decision `build_answer` makes below, with
     // the same arguments — so we can never accept a call we then can't build an
     // answer for.
-    let Some(precheck) = sdp::select_codec(&offer, amr_safe::is_available(), wideband) else {
+    let Some(precheck) = sdp::select_codec_with(
+        &offer,
+        amr_safe::is_available(),
+        wideband,
+        answer_preference,
+    ) else {
         tracing::info!(
             call_id = %call_id,
             amr_linked = amr_safe::is_available(),
@@ -771,6 +821,7 @@ fn handle_invite(
                 &offer,
                 amr_safe::is_available(),
                 wideband,
+                answer_preference,
             )?;
 
             // Do NOT answer yet. The PBX extension is only ringing; our
