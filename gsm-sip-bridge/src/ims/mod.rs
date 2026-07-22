@@ -32,6 +32,7 @@ mod rtp;
 mod sdp;
 mod sip_client;
 mod transcode;
+pub mod transport;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::at_commander::AtCommander;
