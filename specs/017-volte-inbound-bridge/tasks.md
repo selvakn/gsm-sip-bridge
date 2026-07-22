@@ -103,7 +103,7 @@ conversation is possible both ways.
 
 ### Tests
 
-- [ ] T034 [P] [US1] Create `gsm-sip-bridge/tests/test_volte_bridge.rs`: a second call while bridged is rejected busy and the first is undisturbed
+- [X] T034 [P] [US1] Create `gsm-sip-bridge/tests/test_volte_bridge.rs`: a second call while bridged is rejected busy and the first is undisturbed
 - [X] T035 [P] [US1] Test the answer-side format preference selects wideband when the offer allows it (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
 - [X] T036 [P] [US1] Test call-stage transitions, including that only `Bridged` can succeed, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
 
@@ -121,14 +121,14 @@ after.
 - [X] T039 [US2] **Defer re-attachment while a call is in progress** — the genuinely new hazard; the existing deferral covers renewal only (FR-009, research R2) in `gsm-sip-bridge/src/volte/registration.rs`
 - [X] T040 [US2] Recover attachment and registration automatically when lost while idle (FR-010) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T041 [US2] End a call with the attachment named as the cause when it is genuinely lost mid-call, distinct from the caller hanging up (FR-011) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T042 [US2] Let a call outlive its registration rather than cutting it short (spec Assumptions) in `gsm-sip-bridge/src/volte/registration.rs`
-- [ ] T043 [US2] Make a persistent inability to register or attach visible rather than silent (FR-013, FR-035) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T042 [US2] Let a call outlive its registration rather than cutting it short (spec Assumptions) in `gsm-sip-bridge/src/volte/registration.rs`
+- [X] T043 [US2] Make a persistent inability to register or attach visible rather than silent (FR-013, FR-035) in `gsm-sip-bridge/src/volte/bridge.rs`
 
 ### Tests
 
-- [ ] T044 [P] [US2] Test renewal falling due during a call is deferred until it ends, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
-- [ ] T045 [P] [US2] **Test re-attachment falling due during a call is deferred** — the case the existing implementation does not cover, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
-- [ ] T046 [P] [US2] Test a genuine attachment loss mid-call ends the call attributed to the attachment, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
+- [X] T044 [P] [US2] Test renewal falling due during a call is deferred until it ends, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
+- [X] T045 [P] [US2] **Test re-attachment falling due during a call is deferred** — the case the existing implementation does not cover, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
+- [X] T046 [P] [US2] Test a genuine attachment loss mid-call ends the call attributed to the attachment, in `gsm-sip-bridge/tests/test_volte_bridge.rs`
 
 ---
 
