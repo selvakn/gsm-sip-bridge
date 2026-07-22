@@ -195,6 +195,7 @@ fn run_inner(
         pre_renewal: None,
         app_config,
         agent_label: "vowifi-ims-agent",
+        agent_kind: AgentKind::Ims,
     })
 }
 
@@ -217,6 +218,10 @@ pub(crate) struct InboundParams<'a> {
     pub app_config: &'a crate::config::AppConfig,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
+    /// Which agent this is, for the `transport` label its reports land under.
+    /// Both paths run this same code, so reporting it is the only thing that
+    /// keeps their metrics distinguishable.
+    pub agent_kind: AgentKind,
 }
 
 /// Holds a registration open and answers inbound calls on it until stopped.
@@ -236,6 +241,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         pre_renewal,
         app_config,
         agent_label,
+        agent_kind,
     } = p;
 
     // Best-effort: a store that fails to open must not stop the agent from
@@ -251,7 +257,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     };
     let reporter = Reporter::spawn(
         app_config.control.socket_path.clone(),
-        AgentKind::Ims,
+        agent_kind,
         card_id.to_string(),
         Duration::from_secs(app_config.metrics.agent_report_interval_seconds),
     );

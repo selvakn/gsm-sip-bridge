@@ -30,6 +30,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum Transport {
     Cs,
     Vowifi,
+    /// Host-side IMS over LTE (specs/017-volte-inbound-bridge). A third
+    /// value on the *existing* label rather than a new metric, so dashboards
+    /// keep matching — label matching is by subset (research R5).
+    Volte,
 }
 
 impl Transport {
@@ -37,6 +41,7 @@ impl Transport {
         match self {
             Transport::Cs => "cs",
             Transport::Vowifi => "vowifi",
+            Transport::Volte => "volte",
         }
     }
 }

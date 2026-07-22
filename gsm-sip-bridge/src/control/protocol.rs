@@ -37,6 +37,12 @@ pub enum AgentKind {
     Ims,
     /// Agent B: `vowifi::mod`, runs in the default netns.
     Sip,
+    /// The host-side cellular bridging service
+    /// (specs/017-volte-inbound-bridge). Distinct from `Ims` **only** so its
+    /// calls carry the right `transport` label: both run the same agent code,
+    /// but a VoLTE call reported as `vowifi` would be invisible in exactly
+    /// the comparison this feature exists to make.
+    Volte,
 }
 
 impl AgentKind {
@@ -44,6 +50,7 @@ impl AgentKind {
         match self {
             AgentKind::Ims => "ims",
             AgentKind::Sip => "sip",
+            AgentKind::Volte => "volte",
         }
     }
 }

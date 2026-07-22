@@ -401,6 +401,58 @@ impl MaintenancePolicy {
     }
 }
 
+/// What a live status query answers (FR-014, FR-033).
+///
+/// Assembled from parts that already exist rather than tracked separately,
+/// so it cannot disagree with the thing it describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceHealth {
+    /// Whether the registration is currently accepted.
+    pub registered: bool,
+    /// Whether the network attachment is up **and routable** — attached but
+    /// unrouted is the failure mode specs/015 R15 spent two hours proving is
+    /// real, so "attached" alone is not enough.
+    pub attached: bool,
+    /// Whether a call is in progress.
+    pub busy: bool,
+    /// Maintenance currently being held back for a call, if any.
+    pub deferred: Option<Maintenance>,
+}
+
+impl ServiceHealth {
+    /// Whether an incoming call could actually be answered right now.
+    ///
+    /// # Why this must never be optimistic
+    ///
+    /// Card assignment is exclusive (FR-034): a card on this path has **no
+    /// circuit-switched fallback**, so when the path is down that card takes
+    /// no calls at all. A `can_answer` that says yes when the answer is no
+    /// does not merely mislead a dashboard — it means calls are being missed
+    /// and nothing is reporting it (SC-009).
+    ///
+    /// So every condition must hold, and each is checked independently rather
+    /// than inferred from another. In particular `registered` does not imply
+    /// `attached`: the registration is allowed to outlive the attachment
+    /// briefly, which is exactly when an optimistic answer would be wrong.
+    pub fn can_answer(&self) -> bool {
+        self.registered && self.attached && !self.busy
+    }
+
+    /// Why the service cannot answer, for an operator who needs to fix it
+    /// rather than merely observe it. `None` when it can.
+    pub fn blocked_reason(&self) -> Option<&'static str> {
+        if !self.attached {
+            Some("the network attachment is down")
+        } else if !self.registered {
+            Some("not registered")
+        } else if self.busy {
+            Some("a call is already in progress")
+        } else {
+            None
+        }
+    }
+}
+
 /// Loopback — both halves are threads in this process, so neither leg ever
 /// leaves the host.
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -524,6 +576,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         pre_renewal: Some(&pre_renewal),
         app_config,
         agent_label: "volte-ims-agent",
+        agent_kind: crate::control::protocol::AgentKind::Volte,
     })
 }
 

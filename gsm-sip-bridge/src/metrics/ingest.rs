@@ -18,6 +18,22 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 const TRANSPORT_VOWIFI: &str = "vowifi";
+/// Host-side IMS over LTE. A third value on the existing `transport` label,
+/// which is additive for dashboard queries (research R5).
+const TRANSPORT_VOLTE: &str = "volte";
+
+/// Which `transport` label an agent's reports belong under.
+///
+/// Derived from the agent kind rather than hardcoded: the cellular service
+/// runs the same agent code as the Wi-Fi one, so assuming `vowifi` here would
+/// file every VoLTE call under the wrong transport and make the two paths
+/// indistinguishable — in exactly the comparison this feature exists to make.
+fn transport_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Volte => TRANSPORT_VOLTE,
+        AgentKind::Ims | AgentKind::Sip => TRANSPORT_VOWIFI,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AgentRecord {
@@ -66,7 +82,7 @@ pub fn apply_report(report: &AgentReport) {
         apply_state(report.agent, module_id, &report.state);
 
         for event in &report.events {
-            apply_event(module_id, event);
+            apply_event(report.agent, module_id, event);
         }
 
         if report.dropped > 0 {
@@ -91,9 +107,10 @@ pub fn apply_report(report: &AgentReport) {
 }
 
 fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
+    let transport = transport_label(agent);
     if let Some(active_calls) = state.active_calls {
         metrics::ACTIVE_CALLS
-            .with_label_values(&[module_id, TRANSPORT_VOWIFI])
+            .with_label_values(&[module_id, transport])
             .set(active_calls as f64);
     }
     if let Some(registered) = state.registered {
@@ -113,18 +130,19 @@ fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
     let _ = agent;
 }
 
-fn apply_event(module_id: &str, event: &ObservedEvent) {
+fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
+    let transport = transport_label(agent);
     match event {
         ObservedEvent::CallCompleted {
             status,
             duration_seconds,
         } => {
             metrics::CALLS_TOTAL
-                .with_label_values(&[module_id, status.as_str(), TRANSPORT_VOWIFI])
+                .with_label_values(&[module_id, status.as_str(), transport])
                 .inc();
             if *status == CallStatus::Answered {
                 metrics::CALL_DURATION_SECONDS
-                    .with_label_values(&[module_id, TRANSPORT_VOWIFI])
+                    .with_label_values(&[module_id, transport])
                     .observe(*duration_seconds);
             }
         }
@@ -134,7 +152,7 @@ fn apply_event(module_id: &str, event: &ObservedEvent) {
                 SmsOutcome::Failed => "failed",
             };
             metrics::SIP_CALLS_TOTAL
-                .with_label_values(&[module_id, status, TRANSPORT_VOWIFI])
+                .with_label_values(&[module_id, status, transport])
                 .inc();
         }
         ObservedEvent::BridgeFailed { reason } => {
@@ -144,7 +162,7 @@ fn apply_event(module_id: &str, event: &ObservedEvent) {
         }
         ObservedEvent::SmsReceived => {
             metrics::SMS_RECEIVED_TOTAL
-                .with_label_values(&[module_id, TRANSPORT_VOWIFI])
+                .with_label_values(&[module_id, transport])
                 .inc();
         }
         ObservedEvent::SmsForwarded { outcome } => {
@@ -153,7 +171,7 @@ fn apply_event(module_id: &str, event: &ObservedEvent) {
                 SmsOutcome::Failed => "failed",
             };
             metrics::SMS_FORWARDED_TOTAL
-                .with_label_values(&[module_id, outcome_str, TRANSPORT_VOWIFI])
+                .with_label_values(&[module_id, outcome_str, transport])
                 .inc();
         }
         ObservedEvent::RegistrationAttempt { status } => {
@@ -317,5 +335,20 @@ mod tests {
             .with_label_values(&[&module_id, "vowifi"])
             .get();
         assert_eq!(after_restart, before + 3.0);
+    }
+
+    #[test]
+    fn the_two_ims_paths_do_not_collapse_into_one_transport() {
+        // Both paths run the same agent code. If the label were assumed
+        // rather than derived, every VoLTE call would be filed as `vowifi`
+        // and the two would be indistinguishable — in exactly the comparison
+        // this feature exists to make.
+        assert_eq!(transport_label(AgentKind::Ims), TRANSPORT_VOWIFI);
+        assert_eq!(transport_label(AgentKind::Sip), TRANSPORT_VOWIFI);
+        assert_eq!(transport_label(AgentKind::Volte), TRANSPORT_VOLTE);
+        assert_ne!(
+            transport_label(AgentKind::Volte),
+            transport_label(AgentKind::Ims)
+        );
     }
 }
