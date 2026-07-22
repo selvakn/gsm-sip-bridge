@@ -426,6 +426,68 @@ pub fn select_codec(
     amr_available: bool,
     wideband: bool,
 ) -> Option<&OfferedCodec> {
+    select_codec_with(offer, amr_available, wideband, AnswerPreference::Legacy)
+}
+
+/// Which codec to answer a mobile-terminating call with, when the fallback
+/// order matters as much as the first choice.
+///
+/// # Why this exists (specs/017 T027, research R7)
+///
+/// Feature 016 measured what the equivalent *offer*-side decision costs:
+/// putting narrowband first made the carrier select it and packet loss went
+/// from 0.3% to 13.6% — a 45-fold difference — because the network grants the
+/// conversational-voice bearer based on what was negotiated. Answering a call
+/// carelessly reproduces that in the direction that matters more, since an
+/// inbound call is a real conversation rather than a test.
+///
+/// The first choice is not where the risk is: both variants prefer AMR-WB.
+/// **The risk is the fallback**, when the caller's offer has no AMR-WB — and
+/// that is exactly where the two paths must diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerPreference {
+    /// The Wi-Fi path's long-standing order: AMR-WB, then **PCMU**, then
+    /// AMR-NB. Preserved byte-for-byte because that path is in production and
+    /// must not change behaviour (specs/017 FR-020).
+    Legacy,
+    /// For calls arriving over the cellular registration: AMR-WB, then
+    /// **AMR-NB**, then PCMU.
+    ///
+    /// The single difference from [`Legacy`](Self::Legacy) is that AMR-NB
+    /// outranks PCMU. AMR is the 3GPP-native codec family the voice bearer is
+    /// specified around; PCMU on a cellular IMS leg is the odd one out. When
+    /// the caller offers AMR-NB and PCMU but no AMR-WB, answering with PCMU
+    /// risks the network declining to treat the call as conversational voice
+    /// — the same class of mistake feature 016 paid for, and the reason that
+    /// decision is not left to whichever branch happened to be written first.
+    Cellular,
+}
+
+impl AnswerPreference {
+    /// The Wi-Fi path's preference. Named rather than defaulted so that
+    /// choosing it is visible at the call site.
+    pub fn legacy() -> Self {
+        AnswerPreference::Legacy
+    }
+
+    /// The cellular path's preference — keeps 3GPP-native codecs ahead of
+    /// PCMU so the voice bearer is not put at risk by the fallback.
+    pub fn cellular() -> Self {
+        AnswerPreference::Cellular
+    }
+}
+
+/// [`select_codec`] with the fallback order stated explicitly.
+///
+/// `wideband == false` means the caller does not want AMR-WB at all, and both
+/// preferences collapse to the historical narrowband-first order — that path
+/// is unchanged for either transport.
+pub fn select_codec_with(
+    offer: &SdpOffer,
+    amr_available: bool,
+    wideband: bool,
+    preference: AnswerPreference,
+) -> Option<&OfferedCodec> {
     let pick = |codec: NegotiatedCodec| -> Option<&OfferedCodec> {
         if !amr_available && codec != NegotiatedCodec::Pcmu {
             return None;
@@ -434,9 +496,14 @@ pub fn select_codec(
     };
 
     if wideband && amr_available {
-        pick(NegotiatedCodec::AmrWb)
-            .or_else(|| pick(NegotiatedCodec::Pcmu))
-            .or_else(|| pick(NegotiatedCodec::AmrNb))
+        match preference {
+            AnswerPreference::Legacy => pick(NegotiatedCodec::AmrWb)
+                .or_else(|| pick(NegotiatedCodec::Pcmu))
+                .or_else(|| pick(NegotiatedCodec::AmrNb)),
+            AnswerPreference::Cellular => pick(NegotiatedCodec::AmrWb)
+                .or_else(|| pick(NegotiatedCodec::AmrNb))
+                .or_else(|| pick(NegotiatedCodec::Pcmu)),
+        }
     } else {
         pick(NegotiatedCodec::Pcmu)
             .or_else(|| pick(NegotiatedCodec::AmrWb))
@@ -624,6 +691,108 @@ mod codec_offer_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An inbound offer listing exactly `codecs`, e.g. `[(0, "PCMU/8000")]`.
+    fn offer_of(codecs: &[(u8, &str)]) -> SdpOffer {
+        let pts = codecs
+            .iter()
+            .map(|(pt, _)| pt.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut body = format!(
+            "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
+             t=0 0\r\nm=audio 40000 RTP/AVP {pts}\r\n"
+        );
+        for (pt, rtpmap) in codecs {
+            body.push_str(&format!("a=rtpmap:{pt} {rtpmap}\r\n"));
+            if rtpmap.starts_with("AMR") {
+                body.push_str(&format!("a=fmtp:{pt} octet-align=1\r\n"));
+            }
+        }
+        parse_offer(&body).expect("test offer must parse")
+    }
+
+    // ---- answer-side codec preference (specs/017 T027/T035) ---------------
+
+    #[test]
+    fn both_preferences_answer_wideband_when_it_is_offered() {
+        // The first choice is not where the risk lives; both must take AMR-WB.
+        let offer = offer_of(&[(0, "PCMU/8000"), (96, "AMR-WB/16000")]);
+        for pref in [AnswerPreference::legacy(), AnswerPreference::cellular()] {
+            let chosen =
+                select_codec_with(&offer, true, true, pref).expect("a codec is selectable");
+            assert_eq!(chosen.codec, NegotiatedCodec::AmrWb, "{pref:?}");
+        }
+    }
+
+    #[test]
+    fn the_cellular_fallback_prefers_amr_nb_over_pcmu() {
+        // The case that matters: no AMR-WB on offer. AMR is the 3GPP-native
+        // family the voice bearer is specified around, so answering with PCMU
+        // here risks the network declining conversational-voice treatment —
+        // the same class of mistake feature 016 measured at 45x packet loss.
+        let offer = offer_of(&[(0, "PCMU/8000"), (97, "AMR/8000")]);
+        let chosen = select_codec_with(&offer, true, true, AnswerPreference::cellular())
+            .expect("a codec is selectable");
+        assert_eq!(chosen.codec, NegotiatedCodec::AmrNb);
+    }
+
+    #[test]
+    fn the_legacy_fallback_is_unchanged_so_the_wifi_path_does_not_move() {
+        // FR-020: the production Wi-Fi path must not change behaviour. Same
+        // offer as the test above, opposite answer — that contrast is the
+        // whole point of splitting the preference.
+        let offer = offer_of(&[(0, "PCMU/8000"), (97, "AMR/8000")]);
+        let chosen = select_codec_with(&offer, true, true, AnswerPreference::legacy())
+            .expect("a codec is selectable");
+        assert_eq!(chosen.codec, NegotiatedCodec::Pcmu);
+    }
+
+    #[test]
+    fn select_codec_still_means_exactly_what_it_did() {
+        // `select_codec` is the Wi-Fi path's call site. It must stay a pure
+        // alias for the legacy order, or the non-regression claim is empty.
+        for codecs in [
+            &[(0u8, "PCMU/8000"), (97, "AMR/8000")][..],
+            &[(0, "PCMU/8000"), (96, "AMR-WB/16000")][..],
+            &[(96, "AMR-WB/16000"), (97, "AMR/8000")][..],
+            &[(0, "PCMU/8000")][..],
+        ] {
+            let offer = offer_of(codecs);
+            for amr in [true, false] {
+                for wideband in [true, false] {
+                    assert_eq!(
+                        select_codec(&offer, amr, wideband).map(|c| c.codec),
+                        select_codec_with(&offer, amr, wideband, AnswerPreference::Legacy)
+                            .map(|c| c.codec),
+                        "codecs={codecs:?} amr={amr} wideband={wideband}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrowband_only_offer_is_answered_the_same_way_by_both() {
+        let offer = offer_of(&[(0, "PCMU/8000")]);
+        for pref in [AnswerPreference::legacy(), AnswerPreference::cellular()] {
+            let chosen = select_codec_with(&offer, true, true, pref).expect("PCMU is answerable");
+            assert_eq!(chosen.codec, NegotiatedCodec::Pcmu);
+        }
+    }
+
+    #[test]
+    fn without_amr_linked_neither_preference_can_conjure_it() {
+        // Answering with a codec we cannot decode would connect the call and
+        // then deliver silence, which is worse than declining it.
+        let offer = offer_of(&[(96, "AMR-WB/16000"), (97, "AMR/8000")]);
+        for pref in [AnswerPreference::legacy(), AnswerPreference::cellular()] {
+            assert!(
+                select_codec_with(&offer, false, true, pref).is_none(),
+                "{pref:?} must decline rather than answer into silence"
+            );
+        }
+    }
 
     #[test]
     fn build_offer_includes_pcmu_only_when_amr_wb_not_offered() {
