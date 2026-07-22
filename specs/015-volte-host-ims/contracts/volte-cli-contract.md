@@ -25,9 +25,14 @@ gsm-sip-bridge volte-pdn --action <up|down|status> [--modem <path>] [--cid <n>] 
 
 | Option | Default | Notes |
 |---|---|---|
-| `--modem` | from `[volte]` config | AT control port |
-| `--cid` | from config | PDP context id for the IMS PDN. Must not collide with the internet context |
+| `--modem` | `/dev/ttyUSB0` | AT control port |
+| `--iface` | unset | Host interface carrying the data path. Unset manages the PDN only and skips host interface configuration |
+| `--cid` | `3` | PDP context id for the IMS PDN. Must not collide with the internet context |
 | `--apn` | `ims` | What to request. The network's resolved value is reported back |
+
+> **Defaults are CLI-level, not configuration-level.** An earlier draft of this
+> contract said these came "from `[volte]` config". No such section exists yet;
+> see `plan.md` → "Deferred from Phase 2".
 
 ### `--action up`
 
@@ -59,10 +64,16 @@ attachment exists; the state is in the output, not the exit code.
 
 ## `volte-discover`
 
-Discover the P-CSCF. (US2)
+Probe for the P-CSCF and report what each mechanism returned. (US2)
+
+**These probes are diagnostics, not the supported way to get an address.**
+Gate G1 established that the tested carrier publishes no P-CSCF by any
+mechanism reachable from the host, so an empty result is the expected outcome
+there. The chain is `dhcpv6` → `pco` → `dns`.
 
 ```
-gsm-sip-bridge volte-discover [--modem <path>] [--method <auto|dhcpv6|ra|dns>]
+gsm-sip-bridge volte-discover [--modem <path>] [--iface <if>] [--method <auto|dhcpv6|pco|dns>]
+                              [--mcc <n>] [--mnc <n>] [--pcscf <addr>]
 ```
 
 Requires an active attachment; if none exists, fails at stage
@@ -88,19 +99,44 @@ Exit 0 if an endpoint was determined by any means; non-zero if all failed.
 
 ## `volte-register`
 
-Register to the IMS core over LTE. (US3)
+Register to the IMS core over LTE. (US3, US4)
 
 ```
-gsm-sip-bridge volte-register [--modem <path>] [--pcscf <addr>] [--msisdn <e164>] [--once]
+gsm-sip-bridge volte-register --pcscf <addr> [--modem <path>] [--iface <if>]
+                              [--cid <n>] [--apn <name>] [--pcscf-port <n>]
+                              [--tcp <bool>] [--sec-agree <bool>] [--msisdn <e164>]
+                              [--once] [--keep-pdn] [--status-path <path>]
+                              [--force] [--lock-path <path>]
 ```
 
-Runs the full sequence: attach (reusing an existing attachment), discover
-(unless `--pcscf` overrides), then register — so it works as a single command
-while each stage remains independently invokable.
+| Option | Default | Notes |
+|---|---|---|
+| `--pcscf` | **required** | Automatic discovery does not work on the tested carrier |
+| `--pcscf-port` | `5060` | |
+| `--tcp` | `true` | |
+| `--sec-agree` | `true` | Vodafone India rejects a plain digest REGISTER without it |
+| `--once` | off | Register once and exit rather than staying up and renewing (US4) |
+| `--keep-pdn` | off | Leave the IMS PDN attached afterwards, for inspection |
+| `--status-path` | `/tmp/volte-registration-status` | Where state is published for `volte-status` |
+| `--force` | off | Register despite a running VoWiFi agent — see below |
+| `--lock-path` | `/tmp/volte-registration.lock` | Prevents two concurrent VoLTE registrations |
 
-`--pcscf` is the FR-010 override. `--once` performs a single registration and
-exits rather than entering the renewal loop; the default keeps the
-registration alive (FR-016).
+**Mutual exclusion.** The command MUST refuse to run while a VoWiFi agent is
+registered, before touching the modem, so a refusal leaves the system exactly
+as it was. Both paths present the same IMPU with the same IMEI-derived
+`+sip.instance`, so the network treats one registration as a re-registration of
+the other and tears the first binding down. `--force` overrides, for
+deliberately testing that interference. A second concurrent `volte-register` is
+refused by the lock file; a lock left by a crashed run is taken over rather
+than requiring manual cleanup.
+
+**Renewal.** By default the registration is kept alive, renewed ahead of expiry
+using the lifetime the *network granted* (FR-016). Renewal failures are
+recorded with the reason and retried on a bounded backoff.
+
+Runs the full sequence: attach (reusing an existing attachment) then register,
+so it works as a single command while each stage remains independently
+invokable.
 
 **On failure, must name the stage reached** (FR-015), distinguishing at
 minimum: attachment failure, discovery failure, credential/identity rejection,

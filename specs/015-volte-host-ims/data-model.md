@@ -74,8 +74,14 @@ Ordered; the chain attempts each in turn and stops at the first success
 |---|---|---|
 | `ConfigOverride` | tried first | Operator-supplied; when present, skips discovery entirely (FR-010) |
 | `Dhcpv6` | 1 | RFC 3319 options 21/22 |
-| `RouterAdvertisement` | 2 | Also the source of the host's global address |
-| `DnsNaptr` | 3 | On the home-network realm |
+| `Pco` | 2 | Protocol Configuration Options, read over AT |
+| `Dns` | 3 | NAPTR on the home-network realm |
+
+> **Corrected after implementation.** This table originally listed
+> `RouterAdvertisement` as method 2. That was wrong on two counts: an RA
+> carries no standard P-CSCF option, and the RA is already consumed by the
+> host-interface configuration for the default route. TS 24.229 §9.2.1 names
+> DHCPv6 and the **PCO** as the two mechanisms, so the PCO took that slot.
 
 ## DiscoveryReport
 

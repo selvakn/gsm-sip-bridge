@@ -270,6 +270,14 @@ pub struct VolteRegisterArgs {
     /// Where to publish registration state for `volte-status`.
     #[arg(long, default_value = crate::volte::registration::DEFAULT_STATUS_PATH)]
     pub status_path: PathBuf,
+    /// Register even when a VoWiFi agent is running. The two present the same
+    /// IMPU and instance-id, so they will displace each other — only useful
+    /// when deliberately testing that interference.
+    #[arg(long)]
+    pub force: bool,
+    /// Lock file preventing two concurrent VoLTE registrations on one SIM.
+    #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
+    pub lock_path: PathBuf,
 }
 
 #[derive(Parser, Debug)]
