@@ -209,11 +209,11 @@ Success is a complete, accurate report — not necessarily a discovered address.
 - [x] T092 [P] Correct the discovery-method table in `specs/015-volte-host-ims/data-model.md`
 - [x] T093 [P] Correct the CLI contract to match the shipped commands in `specs/015-volte-host-ims/contracts/volte-cli-contract.md`
 - [x] T094 Keep `make lint` clean and the workspace suite green on every commit (Constitution II)
-- [ ] T095 [P] Refresh `specs/015-volte-host-ims/quickstart.md` step 4 to the final CLI surface
-- [ ] T096 [P] Re-validate `specs/015-volte-host-ims/checklists/requirements.md` against the amended spec
-- [ ] T097 Supervise VoLTE from `docker/entrypoint.sh` alongside VoWiFi
-- [ ] T098 [P] Document host-side VoLTE in `README.md` and `docs/operations.md`
-- [ ] T099 [P] Clarify in `docs/ec20-volte-setup.md` that it covers modem-internal VoLTE on EC20, not this path
+- [x] T095 [P] Refresh `specs/015-volte-host-ims/quickstart.md` step 4 to the final CLI surface
+- [x] T096 [P] Re-validate `specs/015-volte-host-ims/checklists/requirements.md` against the amended spec (found and fixed a real leak — see its Notes)
+- [x] T097 Supervise VoLTE from `docker/entrypoint.sh`, refusing to start when both paths are enabled
+- [x] T098 [P] Document host-side VoLTE in `README.md` and `docs/operations.md`
+- [x] T099 [P] Clarify in `docs/ec20-volte-setup.md` that it covers modem-internal VoLTE on EC20, not this path
 - [ ] T100 Resolve research R9: confirm which source address the network routes
 
 ---
@@ -271,8 +271,8 @@ transcripts.
 | | Count |
 |---|---|
 | Total tasks | 100 |
-| Verified implemented | **93** |
-| Outstanding | **7** |
+| Verified implemented | **98** |
+| Outstanding | **2** |
 
 **443 workspace tests pass; `make lint` clean; 0 `unsafe` in `gsm-sip-bridge/src`.**
 
@@ -305,15 +305,22 @@ they all pass. Outside `volte/`, the feature touched only `cli.rs`,
 
 ## Outstanding tasks
 
-| ID | Task | Why it matters |
+Two remain, both blocked on elapsed time or live traffic rather than on work.
+
+| ID | Task | Why it is still open |
 |---|---|---|
-| **T083** | Observe two consecutive renewals (SC-004) | **The only unmet success criterion — now half met.** The first renewal fired at 10:16:40, exactly 55 min after registration (3600s granted expiry − 300s headroom), and was accepted; the status file advanced accordingly. The second is due ~11:11. The renewal *timing* is therefore proven on hardware; only "two consecutive" remains |
-| T095 | Refresh `quickstart.md` step 4 | Lists pre-final commands; misleads a new operator |
-| T096 | Re-validate the spec checklist | Records a pass against the pre-amendment spec |
-| T097 | `entrypoint.sh` supervision | The real integration gap — VoLTE cannot run unattended. Unblocked now that `[volte]` config exists |
-| T098 | README / operations docs | Host-side VoLTE is undocumented for operators |
-| T099 | Clarify `ec20-volte-setup.md` | Covers EC20 + Airtel modem-internal VoLTE; can mislead now a competing path exists |
-| T100 | Resolve R9 (routed source address) | Benign today — both addresses are installed — but unproven |
+| **T083** | Observe two consecutive renewals (SC-004) | **1 of 2 observed.** The first fired at 10:16:40, exactly 55 min after registration (3600s granted expiry − 300s headroom), and was accepted. The second needs another ~55 min of soak. Renewal *timing* is therefore already proven on hardware; only the "two consecutive" wording remains |
+| **T100** | Resolve research R9 (routed source address) | Needs real traffic to settle which of the two installed addresses the network routes. Benign today because both the network-assigned `/128` and the SLAAC address are installed, so signalling works either way. Expect the calls feature to answer it |
+
+### Cleared since the first cross-validation
+
+| ID | What was done |
+|---|---|
+| T095 | `quickstart.md` step 4 rewritten to the shipped CLI, with mutual-exclusion and unattended-operation sections and a full SC mapping |
+| T096 | Checklist re-run against the amended spec. **It failed one item and the spec was fixed**: US2's amended rationale had leaked `DHCPv6`/`RFC 3319`/`Router Advertisement` into a mandatory User Scenarios section. Rewritten to state the outcome and defer specifics to `research.md` |
+| T097 | `docker/entrypoint.sh` now supervises `volte-register` behind `[volte].enabled`, via new `config volte-enabled` / `volte-shell-env` subcommands, releases the PDN on shutdown, and **refuses to start when both `[vowifi]` and `[volte]` are enabled** |
+| T098 | `docs/operations.md` gained a Host-side IMS over LTE runbook (commands, the mutual-exclusion warning, the P-CSCF capture route, the two "attached but not usable" symptoms, and the metrics table); `README.md` links it |
+| T099 | `docs/ec20-volte-setup.md` now opens by stating it covers the **modem-internal** stack on EC20/Airtel, and points at the host-side path |
 
 ## Honest caveats on "verified"
 

@@ -155,42 +155,67 @@ v6 surface.
 
 ## Step 4 — Validate the feature
 
-Once implemented:
+Everything below is the shipped CLI surface. Run inside the privileged
+container.
 
 ```bash
-# US1 — attachment
-gsm-sip-bridge volte-pdn --action up
-#   expect: assigned APN ims.mnc043.mcc404.gprs, bearer 6, IPv6, host iface named
-gsm-sip-bridge volte-pdn --action up          # idempotent: reports reuse, exit 0
-gsm-sip-bridge volte-pdn --action status
+# --- US1: attachment -----------------------------------------------------
+gsb volte-pdn --action up --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5
+#   expect: APN assigned ims.mnc043.mcc404.gprs, bearer 6, IPv6-only,
+#           routable: yes (default route via the carrier)
+gsb volte-pdn --action up --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5
+#   expect: "already attached; reusing it", exit 0  (FR-004)
+gsb volte-pdn --action status --modem /dev/ttyUSB0
 
-# US2 — discovery
-gsm-sip-bridge volte-discover
-#   expect: per-method report, and which method won
-gsm-sip-bridge volte-discover --method dhcpv6  # isolate a single method
+# --- US2: discovery diagnostics ------------------------------------------
+gsb volte-discover --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5
+#   expect on Vi India: all methods report no result, and the output says so
+#   per method. That is the correct outcome, not a failure.
+gsb volte-discover --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5 --method pco
+#   isolate one mechanism
 
-# US3 — registration
-gsm-sip-bridge volte-register --once
-#   expect: accepted registration, or a named failing stage
+# --- US3: registration ----------------------------------------------------
+# --pcscf may be omitted once the VoWiFi path has captured one to /tmp/pcscf.
+gsb volte-register --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5 \
+    --pcscf 2400:5200:a100:819::6 --once --keep-pdn
+#   expect: "IMS registration over LTE ACCEPTED (status 200)."
 
-# US4 — lifecycle
-gsm-sip-bridge volte-register                  # stays up, renews
-gsm-sip-bridge volte-status
+# --- US4: lifecycle -------------------------------------------------------
+gsb volte-register --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5   # stays up, renews
+gsb volte-status  --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5
+#   expect: registration : registered / expires in : <n>s
 
-# teardown restores the previous data-path binding
-gsm-sip-bridge volte-pdn --action down
+# --- teardown -------------------------------------------------------------
+gsb volte-pdn --action down --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5
 ```
+
+### Mutual exclusion
+
+`volte-register` refuses while a `vowifi-ims-agent` is running, and
+`entrypoint.sh` refuses to start if both `[vowifi].enabled` and
+`[volte].enabled` are set. To check the refusal deliberately:
+
+```bash
+gsb volte-register --pcscf <addr> --once            # expect refusal + reason
+gsb volte-register --pcscf <addr> --once --force    # override
+```
+
+### Unattended operation
+
+Set `[volte].enabled = true` (see `config.toml.example`) and the container
+supervises `volte-register` itself, releasing the PDN on shutdown.
 
 ### Success criteria mapping
 
 | Check | Criterion |
 |---|---|
-| `volte-pdn --action up` succeeds in <60s, no hand-entered address | SC-001 |
-| `volte-discover` finds the P-CSCF and names the method | SC-002 |
-| `volte-register --once` accepted in <60s | SC-003 |
+| `volte-pdn --action up` succeeds <60s, no hand-entered address | SC-001 |
+| `volte-discover` reports every method and names the source in use | SC-002 |
+| `volte-register --once` accepted <60s | SC-003 |
 | Registration survives two renewals | SC-004 |
 | Each induced failure names its stage | SC-005 |
 | VoWiFi suite passes unchanged **and a live VoWiFi call completes** | SC-006 |
+| Registration/AKA/Gm logic exists once, shared by both transports | SC-007 |
 | `volte-status` shows registration state | SC-008 |
 
 ## Non-regression (SC-006) — mandatory

@@ -88,6 +88,17 @@ cleanup() {
         "${SWU_PIDS[@]:-}" "${CHARON_LOG_TAIL_PIDS[@]:-}" "${CHARON_PIDS[@]:-}"; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null
     done
+    if [ -n "${VOLTE_SUPERVISOR_PID:-}" ]; then
+        kill "$VOLTE_SUPERVISOR_PID" 2>/dev/null
+        pkill -f "volte-register" 2>/dev/null
+        # Release the IMS PDN so the modem's single host data path goes back
+        # to whatever it was bound to before (FR-005). Best-effort: a failure
+        # here must not stop the rest of cleanup.
+        "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-pdn \
+            --action down --modem "${VOLTE_MODEM_PORT:-/dev/ttyUSB0}" \
+            ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} --cid "${VOLTE_CID:-3}" \
+            >/dev/null 2>&1
+    fi
     [ -n "$PCSCD_LOG_TAIL_PID" ] && kill "$PCSCD_LOG_TAIL_PID" 2>/dev/null
     [ -n "$PCSCD_PID" ] && kill "$PCSCD_PID" 2>/dev/null
     pkill -x pcscd 2>/dev/null
@@ -844,6 +855,53 @@ log "starting vowifi-sip-agent (default netns, one shared process for all lines)
     done
 ) &
 SIP_AGENT_SUPERVISOR_PID=$!
+
+# --- Host-side IMS over LTE (specs/015-volte-host-ims) ----------------------
+# Opt-in via [volte].enabled. Mutually exclusive with VoWiFi on the same SIM:
+# both register the same IMPU with the same IMEI-derived +sip.instance, so the
+# network treats one as a re-registration of the other and tears the first
+# binding down. `volte-register` enforces this itself (it refuses while a
+# vowifi-ims-agent is running), but refusing here too keeps the container from
+# spawning a supervisor that could only ever fail.
+if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled; then
+    VOLTE_ENV="$("$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-shell-env)" || {
+        log "FATAL: 'config volte-shell-env' failed — see error above (bad config.toml?)"
+        exit 1
+    }
+    eval "$VOLTE_ENV"
+
+    if [ "$VOWIFI_ENABLED" -eq 1 ]; then
+        log "FATAL: [volte].enabled and [vowifi].enabled are both true. They register the"
+        log "       same IMPU with the same instance-id, so each would tear the other's"
+        log "       binding down. Enable exactly one."
+        exit 1
+    fi
+
+    log "[volte].enabled — starting host-side IMS over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+    (
+        while true; do
+            # --pcscf is omitted deliberately: volte-register resolves it from
+            # the ePDG capture at pcscf_source_path when no address is
+            # configured, so a VoWiFi run on this SIM primes the LTE path.
+            "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-register \
+                --modem "$VOLTE_MODEM_PORT" \
+                ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
+                --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
+                ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
+                --pcscf-port "$VOLTE_PCSCF_PORT" \
+                --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
+                --status-path "$VOLTE_STATUS_PATH" \
+                --lock-path "$VOLTE_LOCK_PATH" \
+                --keep-pdn
+            log "volte-register exited (status $?); restarting in 15s"
+            # Longer than the 5s used elsewhere: a restart re-runs PDN
+            # attachment and a full IMS-AKA exchange, so a tight loop would
+            # hammer both the modem and the carrier's registrar.
+            sleep 15
+        done
+    ) &
+    VOLTE_SUPERVISOR_PID=$!
+fi
 
 # --- Block on everything -----------------------------------------------------
 wait
