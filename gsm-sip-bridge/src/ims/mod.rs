@@ -52,6 +52,11 @@ const DEFAULT_EXPIRES: u32 = 3600;
 /// server that never accepts the resync) can't loop forever.
 const MAX_RESYNC_ATTEMPTS: u32 = 2;
 
+/// `P-Access-Network-Info` value for the ePDG/VoWiFi access leg. This is the
+/// value the registration path hard-coded before the field was configurable,
+/// so it remains the VoWiFi default (FR-019: no behavioural change).
+pub const ACCESS_NETWORK_WLAN: &str = "3GPP-WLAN";
+
 pub struct ImsRegisterConfig {
     pub modem_port: PathBuf,
     pub pcscf_addr: IpAddr,
@@ -78,6 +83,14 @@ pub struct ImsRegisterConfig {
     /// Authorization header's username (IMPI) is unaffected — see the CLI
     /// help text in `cli.rs` for the rationale.
     pub msisdn: Option<String>,
+    /// Value for the `P-Access-Network-Info` header, describing the access
+    /// network this registration is arriving over (TS 24.229 §7.2A.4).
+    ///
+    /// `ACCESS_NETWORK_WLAN` for the ePDG/VoWiFi path — which is what every
+    /// caller sent before this field existed, so it is what they still send.
+    /// The LTE path supplies an E-UTRAN value instead; see
+    /// `crate::volte::access_network_info`.
+    pub access_network_info: String,
 }
 
 #[derive(Debug)]
@@ -268,10 +281,16 @@ fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> 
     tracing::info!(local = %local_addr, peer = %pcscf, "connected to P-CSCF");
     let via_transport = if cfg.use_tcp { "TCP" } else { "UDP" };
 
-    // Mandated by TS 24.229 for a WLAN-access (VoWiFi/SWu) REGISTER so the
-    // P-CSCF can attribute the request to the right access leg; real UEs and
-    // Asterisk's Gm transport both always send this.
-    let mut extra_headers = vec!["P-Access-Network-Info: 3GPP-WLAN".to_string()];
+    // Mandated by TS 24.229 so the P-CSCF can attribute the request to the
+    // right access leg; real UEs and Asterisk's Gm transport both always send
+    // this. The value must describe the access actually in use — `3GPP-WLAN`
+    // over an ePDG tunnel, `3GPP-E-UTRAN-FDD` (with a cell id) over LTE — and
+    // getting it wrong is a plausible reason for a P-CSCF to reject a
+    // registration that is otherwise perfectly reachable.
+    let mut extra_headers = vec![format!(
+        "P-Access-Network-Info: {}",
+        cfg.access_network_info
+    )];
     // A plain `Supported: sec-agree` (advertising the capability) was not
     // enough on Airtel — captured wire traffic from a working Asterisk
     // registration shows it sends `Require`/`Proxy-Require: sec-agree`

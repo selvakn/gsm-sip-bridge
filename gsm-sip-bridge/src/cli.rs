@@ -124,6 +124,20 @@ pub enum Commands {
     /// Exits 0 when an address was determined by any means, non-zero when none
     /// was; the per-method breakdown is printed either way.
     VolteDiscover(VolteDiscoverArgs),
+    /// Register to the operator's IMS core over LTE using IMS-AKA
+    /// (specs/015-volte-host-ims, US3): brings up the IMS PDN, then runs the
+    /// same registration, IMS-AKA and Gm IPsec code the VoWiFi path uses.
+    ///
+    /// A P-CSCF address is required — this carrier publishes none by any
+    /// mechanism the host can reach (see `volte-discover`). One can be
+    /// captured from a VoWiFi/ePDG tunnel, which writes it to
+    /// `[vowifi].pcscf_source_path`.
+    ///
+    /// WARNING: do not run this while the VoWiFi agent is registered. Both
+    /// present the same IMPU with the same IMEI-derived `+sip.instance`, so
+    /// the network treats one as a re-registration of the other and tears the
+    /// first binding down.
+    VolteRegister(VolteRegisterArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -214,6 +228,41 @@ pub struct VolteDiscoverArgs {
     /// Operator-supplied P-CSCF. Short-circuits discovery entirely (FR-010).
     #[arg(long)]
     pub pcscf: Option<std::net::IpAddr>,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteRegisterArgs {
+    /// Modem AT port.
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    /// Host network interface carrying the IMS PDN.
+    #[arg(long)]
+    pub iface: Option<String>,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
+    pub apn: String,
+    /// P-CSCF address. Required: automatic discovery does not work on the
+    /// tested carrier.
+    #[arg(long)]
+    pub pcscf: std::net::IpAddr,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
+    pub pcscf_port: u16,
+    /// Use TCP rather than UDP for SIP.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub tcp: bool,
+    /// Negotiate Gm IPsec (RFC 3329 sec-agree). Vodafone India rejects a
+    /// plain digest REGISTER without it.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub sec_agree: bool,
+    /// Use this MSISDN as the Public User Identity instead of the
+    /// IMSI-derived temporary IMPU.
+    #[arg(long)]
+    pub msisdn: Option<String>,
+    /// Leave the IMS PDN attached after the registration attempt, for
+    /// inspection. By default it is released.
+    #[arg(long)]
+    pub keep_pdn: bool,
 }
 
 #[derive(Parser, Debug)]

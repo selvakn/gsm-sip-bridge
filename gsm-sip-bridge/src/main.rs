@@ -83,6 +83,10 @@ fn main() -> ExitCode {
         return handle_volte_discover_command(args);
     }
 
+    if let Some(Commands::VolteRegister(args)) = &cli.command {
+        return handle_volte_register_command(args);
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -224,6 +228,7 @@ fn build_ims_register_config(
         use_tcp: args.tcp,
         sec_agree: args.sec_agree,
         msisdn: args.msisdn.clone(),
+        access_network_info: gsm_sip_bridge::ims::ACCESS_NETWORK_WLAN.to_string(),
     }
 }
 
@@ -483,6 +488,90 @@ fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> E
         }
         Err(e) => {
             eprintln!("volte-status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) -> ExitCode {
+    use gsm_sip_bridge::ims::RegisterOutcome;
+
+    let settings = gsm_sip_bridge::volte::VolteSettings {
+        modem_port: args.modem.clone(),
+        iface: args.iface.clone().unwrap_or_default(),
+        cid: args.cid,
+        apn: args.apn.clone(),
+        pcscf: Some(std::net::SocketAddr::new(args.pcscf, args.pcscf_port)),
+    };
+
+    // Stage 1: the network attachment. Reported separately so a failure here
+    // is never mistaken for a credential problem (FR-015).
+    let attach = match gsm_sip_bridge::volte::attach(&settings) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("volte-register: [attaching] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", attach.summary());
+    if !attach.routed && !settings.iface.is_empty() {
+        eprintln!(
+            "volte-register: [attaching] the IMS PDN is attached but has no default route, \
+             so signalling cannot reach the P-CSCF"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // The IMS realm is built from the home PLMN, so derive it from the SIM
+    // exactly as the VoWiFi agent does rather than making the operator pass
+    // it in.
+    let plmn = match gsm_sip_bridge::modules::at_commander::AtCommander::open(&args.modem)
+        .and_then(|mut at| gsm_sip_bridge::vowifi::plmn::derive_plmn(&mut at))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "volte-register: [attaching] could not derive the home PLMN from the SIM: {e}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(mcc = %plmn.mcc, mnc = %plmn.mnc, "derived home PLMN from the SIM");
+
+    // Stage 2: registration, over the same shared code the VoWiFi path uses.
+    let reg_cfg = gsm_sip_bridge::ims::ImsRegisterConfig {
+        modem_port: args.modem.clone(),
+        pcscf_addr: args.pcscf,
+        pcscf_port: args.pcscf_port,
+        mcc: plmn.mcc.clone(),
+        mnc: plmn.mnc.clone(),
+        imsi: None,
+        imei: None,
+        use_tcp: args.tcp,
+        sec_agree: args.sec_agree,
+        msisdn: args.msisdn.clone(),
+        access_network_info: gsm_sip_bridge::volte::read_access_network_info(&args.modem),
+    };
+
+    let result = gsm_sip_bridge::ims::run_register(&reg_cfg);
+
+    if !args.keep_pdn {
+        if let Err(e) = gsm_sip_bridge::volte::detach(&settings, attach.displaced_cid) {
+            tracing::warn!(error = %e, "failed to release the IMS PDN");
+        }
+    }
+
+    match result {
+        Ok(RegisterOutcome::Success { status, .. }) => {
+            println!("\nIMS registration over LTE ACCEPTED (status {status}).");
+            ExitCode::SUCCESS
+        }
+        Ok(RegisterOutcome::Rejected { status, reason }) => {
+            eprintln!("\nvolte-register: [registering] the network rejected the registration: {status} {reason}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("\nvolte-register: [registering] {e}");
             ExitCode::FAILURE
         }
     }

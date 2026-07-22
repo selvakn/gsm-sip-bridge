@@ -153,6 +153,7 @@ fn run_inner(
         use_tcp: config.use_tcp,
         sec_agree: config.sec_agree,
         msisdn: None,
+        access_network_info: crate::ims::ACCESS_NETWORK_WLAN.to_string(),
     };
 
     let veth_local_ip: IpAddr = config
