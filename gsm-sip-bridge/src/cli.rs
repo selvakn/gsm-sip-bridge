@@ -152,6 +152,11 @@ pub enum Commands {
     /// Exits 0 only when the call was answered AND audio flowed both ways —
     /// an answered-but-silent call is a failure, not a success.
     VolteCall(VolteCallArgs),
+    /// Register over LTE and listen for anything the network delivers, to
+    /// establish whether the carrier routes incoming calls to us at all
+    /// (specs/017-volte-inbound-bridge). Declines any call with a busy
+    /// response rather than answering it.
+    VolteListen(VolteListenArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -358,6 +363,35 @@ pub struct VolteCallArgs {
     #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
     pub lock_path: PathBuf,
     /// Leave the IMS PDN attached afterwards, for inspection.
+    #[arg(long)]
+    pub keep_pdn: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteListenArgs {
+    #[arg(long, default_value = "/dev/ttyUSB0")]
+    pub modem: PathBuf,
+    #[arg(long)]
+    pub iface: Option<String>,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
+    pub cid: u8,
+    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
+    pub apn: String,
+    #[arg(long)]
+    pub pcscf: Option<std::net::IpAddr>,
+    #[arg(long, default_value = "/tmp/pcscf")]
+    pub pcscf_source_path: String,
+    #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
+    pub pcscf_port: u16,
+    /// How long to stay registered and listening.
+    #[arg(long, default_value_t = 180)]
+    pub listen_secs: u64,
+    #[arg(long)]
+    pub msisdn: Option<String>,
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
+    pub lock_path: PathBuf,
     #[arg(long)]
     pub keep_pdn: bool,
 }
