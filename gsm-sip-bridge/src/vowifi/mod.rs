@@ -112,12 +112,17 @@ const RECENT_CALLS_CAPACITY: usize = 20;
 /// control-channel listener this line's Agent A connects to).
 /// specs/013-multi-card-vowifi, `contracts/agent-topology-contract.md`.
 #[derive(Debug, Clone)]
-struct RuntimeLine {
-    index: u32,
-    card_id: String,
-    veth_local_addr: String,
-    veth_peer_addr: String,
-    control_port: u16,
+pub(crate) struct RuntimeLine {
+    pub index: u32,
+    pub card_id: String,
+    pub veth_local_addr: String,
+    pub veth_peer_addr: String,
+    pub control_port: u16,
+    /// SIP port on `veth_local_addr` where the carrier-side half listens for
+    /// this half's leg. [`VETH_SIP_PORT`] over a veth for the Wi-Fi path;
+    /// `volte::bridge::LOOPBACK_SIP_PORT` over loopback for the cellular one,
+    /// which is the only thing that differs between them here.
+    pub sip_leg_port: u16,
 }
 
 /// Reads the `discover` subcommand's line-resolution file and returns every
@@ -137,6 +142,7 @@ fn resolve_runtime_lines(config: &VowifiConfig) -> Vec<RuntimeLine> {
                 veth_local_addr: l.veth_local_addr.clone(),
                 veth_peer_addr: l.veth_peer_addr.clone(),
                 control_port: l.control_port,
+                sip_leg_port: VETH_SIP_PORT,
             })
             .collect(),
         _ => vec![RuntimeLine {
@@ -145,6 +151,7 @@ fn resolve_runtime_lines(config: &VowifiConfig) -> Vec<RuntimeLine> {
             veth_local_addr: config.veth_local_addr.clone(),
             veth_peer_addr: config.veth_peer_addr.clone(),
             control_port: config.control_port,
+            sip_leg_port: VETH_SIP_PORT,
         }],
     }
 }
@@ -160,6 +167,35 @@ pub fn run(config: &AppConfig) -> ExitCode {
 }
 
 fn run_inner(config: &AppConfig) -> BridgeResult<()> {
+    let lines = resolve_runtime_lines(&config.vowifi);
+    run_telephony_side(
+        config,
+        AGENT_B_SIP_LOCAL_PORT,
+        config.vowifi.wideband,
+        lines,
+        "vowifi-sip-agent",
+    )
+}
+
+/// The telephone-system half: one PJSIP endpoint, one PBX registration, and
+/// an accept loop per line waiting for the carrier-side half to signal a call.
+///
+/// Parameterised rather than duplicated because the host-side cellular service
+/// (specs/017-volte-inbound-bridge) needs exactly this, differing only in
+/// which local port it binds and which addresses its lines sit on — a copy
+/// would be a second implementation of PBX registration, codec priority and
+/// call bridging, which FR-019 exists to prevent.
+///
+/// `local_port` **must** be distinct per caller: two `pjsua_create`/
+/// transport-bind calls racing for one UDP port fail outright for whichever
+/// starts second (research R3).
+pub(crate) fn run_telephony_side(
+    config: &AppConfig,
+    local_port: u16,
+    wideband: bool,
+    lines: Vec<RuntimeLine>,
+    agent_label: &str,
+) -> BridgeResult<()> {
     let transport = match config.sip.transport {
         ConfigSipTransport::Udp => TransportType::Udp,
         ConfigSipTransport::Tcp => TransportType::Tcp,
@@ -167,13 +203,13 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
     };
     let ep_config = EndpointConfig {
         transport,
-        local_port: AGENT_B_SIP_LOCAL_PORT,
+        local_port,
         tls_verify: config.sip.tls_verify == TlsVerify::Strict,
         // Everything crossing PJMEDIA's conference bridge is resampled to this
         // rate, so it is the ceiling on what the PBX leg can carry: at 8000, a
         // carrier's 16 kHz AMR-WB would be squeezed through 8 kHz here even if
         // the PBX had happily agreed to G.722.
-        clock_rate: if config.vowifi.wideband { 16000 } else { 8000 },
+        clock_rate: if wideband { 16000 } else { 8000 },
         jb_init_ms: config.audio.settings.jb_init_ms,
         jb_min_pre: config.audio.settings.jb_min_pre,
         jb_max_ms: config.audio.settings.jb_max_ms,
@@ -189,7 +225,7 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
     endpoint
         .set_null_sound_device()
         .map_err(|e| BridgeError::Ims(format!("null sound device setup failed: {e}")))?;
-    if config.vowifi.wideband {
+    if wideband {
         prioritize_wideband_codecs(&endpoint);
     }
 
@@ -205,17 +241,18 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
     tracing::info!(
         server = %config.sip.server,
         port = config.sip.port,
-        "vowifi-sip-agent registered to PBX"
+        agent = agent_label,
+        "registered to PBX"
     );
 
     // One SIP identity/registration for every line (the spec's own
     // Assumptions section) — what varies per line below is only which
     // veth-peer address/control-port listener accepted the connection.
-    let lines = resolve_runtime_lines(&config.vowifi);
     tracing::info!(
         line_count = lines.len(),
         lines = ?lines.iter().map(|l| l.card_id.clone()).collect::<Vec<_>>(),
-        "vowifi-sip-agent resolved lines"
+        agent = agent_label,
+        "resolved lines"
     );
 
     // Keyed by card_id (specs/013-multi-card-vowifi FR-017) — replaces the
@@ -260,10 +297,14 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
             let store_tx = store.sender();
             let card_id = line.card_id.clone();
             let listen_addr = (line.veth_peer_addr.clone(), line.control_port);
+            let leg_addr = line.veth_local_addr.clone();
+            let leg_port = line.sip_leg_port;
             scope.spawn(move || {
                 run_line_listener(
                     listen_addr,
                     &card_id,
+                    &leg_addr,
+                    leg_port,
                     endpoint,
                     account,
                     config,
@@ -295,6 +336,8 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
 fn run_line_listener(
     listen_addr: (String, u16),
     card_id: &str,
+    leg_addr: &str,
+    leg_port: u16,
     endpoint: &Endpoint,
     account: &Account,
     config: &AppConfig,
@@ -349,6 +392,8 @@ fn run_line_listener(
         if let Err(e) = handle_connection(
             stream,
             card_id,
+            leg_addr,
+            leg_port,
             endpoint,
             account,
             config,
@@ -467,6 +512,8 @@ fn push_recent_call(
 fn handle_connection(
     stream: TcpStream,
     card_id: &str,
+    leg_addr: &str,
+    leg_port: u16,
     endpoint: &Endpoint,
     account: &Account,
     config: &AppConfig,
@@ -524,7 +571,7 @@ fn handle_connection(
     tracing::info!(card_id = %card_id, call_id = %call_id, caller = %caller, "incoming VoWiFi call signaled by Agent A");
     let started_at = now_unix();
 
-    match bridge_call(endpoint, account, config, &caller) {
+    match bridge_call(endpoint, account, config, &caller, leg_addr, leg_port) {
         Ok((mut pbx_call, mut veth_call)) => {
             write_msg(
                 &mut writer,
@@ -816,6 +863,8 @@ fn bridge_call(
     account: &Account,
     config: &AppConfig,
     caller: &str,
+    leg_addr: &str,
+    leg_port: u16,
 ) -> BridgeResult<(Call, Call)> {
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
@@ -829,10 +878,7 @@ fn bridge_call(
     let pbx_call = Call::make(account, &pbx_uri, None, &headers)
         .map_err(|e| BridgeError::Ims(format!("PBX-side call failed: {e}")))?;
 
-    let veth_uri = format!(
-        "sip:agent-a@{}:{}",
-        config.vowifi.veth_local_addr, VETH_SIP_PORT
-    );
+    let veth_uri = format!("sip:agent-a@{leg_addr}:{leg_port}");
     let veth_call = Call::make(account, &veth_uri, None, &[])
         .map_err(|e| BridgeError::Ims(format!("veth-side call failed: {e}")))?;
 

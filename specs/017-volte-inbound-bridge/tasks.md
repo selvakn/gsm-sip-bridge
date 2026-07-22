@@ -89,17 +89,17 @@ conversation is possible both ways.
 
 - [X] T021 [P] [US1] Create `gsm-sip-bridge/src/volte/bridge.rs` and register it in `gsm-sip-bridge/src/volte/mod.rs`
 - [X] T022 [US1] Define `BridgedCall` and `CallStage` per the data model in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T023 [US1] Accept an incoming call over the registration, reusing the extracted dispatch (FR-001) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T023 [US1] Accept an incoming call over the registration, reusing the extracted dispatch (FR-001) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [X] T024 [US1] **Give this service its own telephone-side local port** — two endpoints already race for one; a third must not join them (research R3) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T025 [US1] Place the telephone-system leg and pair the two legs (FR-002) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T026 [US1] Present the caller's number and display name onward (FR-003) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T025 [US1] Place the telephone-system leg and pair the two legs (FR-002) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T026 [US1] Present the caller's number and display name onward (FR-003) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [X] T027 [US1] Choose the answer's audio format deliberately, preferring wideband (FR-007) in `gsm-sip-bridge/src/ims/sdp.rs`
 - [X] T028 [US1] End both legs when either ends, recording which (FR-004) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T029 [US1] Give the caller a defined outcome when the telephone system does not answer or is unreachable (FR-005) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T029 [US1] Give the caller a defined outcome when the telephone system does not answer or is unreachable (FR-005) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [X] T030 [US1] Reject a second concurrent call as busy, without disturbing the call in progress (FR-006) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T031 [US1] Withdraw the telephone-system leg if the caller hangs up while it is still ringing (edge case) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T032 [US1] Add the service subcommand in `gsm-sip-bridge/src/cli.rs` and wire it in `gsm-sip-bridge/src/main.rs`
-- [ ] T033 [US1] Refuse to start while the Wi-Fi path holds the same subscriber's registration, reusing `gsm-sip-bridge/src/volte/guard.rs` (FR-022)
+- [X] T031 [US1] Withdraw the telephone-system leg if the caller hangs up while it is still ringing (edge case) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T032 [US1] Add the service subcommand in `gsm-sip-bridge/src/cli.rs` and wire it in `gsm-sip-bridge/src/main.rs`
+- [X] T033 [US1] Refuse to start while the Wi-Fi path holds the same subscriber's registration, reusing `gsm-sip-bridge/src/volte/guard.rs` (FR-022)
 
 ### Tests
 
@@ -116,10 +116,10 @@ conversation is possible both ways.
 **Independent test**: Run for hours across a teardown; calls connect before and
 after.
 
-- [ ] T037 [US2] Hold one registration for both liveness and calls, renewed before expiry; never a second per call (FR-008, FR-012) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T037 [US2] Hold one registration for both liveness and calls, renewed before expiry; never a second per call (FR-008, FR-012) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [X] T038 [US2] Defer renewal while a call is in progress, reusing the extracted lifecycle (FR-009) in `gsm-sip-bridge/src/volte/registration.rs`
 - [X] T039 [US2] **Defer re-attachment while a call is in progress** — the genuinely new hazard; the existing deferral covers renewal only (FR-009, research R2) in `gsm-sip-bridge/src/volte/registration.rs`
-- [ ] T040 [US2] Recover attachment and registration automatically when lost while idle (FR-010) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T040 [US2] Recover attachment and registration automatically when lost while idle (FR-010) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T041 [US2] End a call with the attachment named as the cause when it is genuinely lost mid-call, distinct from the caller hanging up (FR-011) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [ ] T042 [US2] Let a call outlive its registration rather than cutting it short (spec Assumptions) in `gsm-sip-bridge/src/volte/registration.rs`
 - [ ] T043 [US2] Make a persistent inability to register or attach visible rather than silent (FR-013, FR-035) in `gsm-sip-bridge/src/volte/bridge.rs`

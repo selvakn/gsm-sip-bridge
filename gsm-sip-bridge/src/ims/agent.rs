@@ -183,22 +183,72 @@ fn run_inner(
         .parse()
         .map_err(|e| BridgeError::Ims(format!("invalid vowifi control address: {e}")))?;
 
+    serve_inbound(InboundParams {
+        card_id,
+        reg_cfg: &reg_cfg,
+        local_ip: veth_local_ip,
+        control_addr,
+        wideband: config.wideband,
+        // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
+        // has no attachment of its own to refresh.
+        answer_preference: sdp::AnswerPreference::legacy(),
+        pre_renewal: None,
+        app_config,
+        agent_label: "vowifi-ims-agent",
+    })
+}
+
+/// Everything the carrier-facing half needs that is not the transport itself.
+///
+/// A struct rather than a long argument list because the two callers differ in
+/// only four of these, and a positional list of nine would make it easy to
+/// swap two addresses silently.
+pub(crate) struct InboundParams<'a> {
+    pub card_id: &'a str,
+    pub reg_cfg: &'a ImsRegisterConfig,
+    /// Address the status listener and the telephone-side leg's UAS bind to —
+    /// the veth-local address for Wi-Fi, loopback for cellular.
+    pub local_ip: IpAddr,
+    /// Where the telephone-side half is listening for call signalling.
+    pub control_addr: SocketAddr,
+    pub wideband: bool,
+    pub answer_preference: sdp::AnswerPreference,
+    pub pre_renewal: Option<&'a PreRenewalHook>,
+    pub app_config: &'a crate::config::AppConfig,
+    /// What to call this agent in logs.
+    pub agent_label: &'a str,
+}
+
+/// Holds a registration open and answers inbound calls on it until stopped.
+///
+/// Shared verbatim by the Wi-Fi and host-side cellular paths — FR-019/SC-008
+/// require one implementation, and a copy would drift while looking like it
+/// had not. Everything transport-specific is already resolved by the caller
+/// and arrives in [`InboundParams`].
+pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
+    let InboundParams {
+        card_id,
+        reg_cfg,
+        local_ip,
+        control_addr,
+        wideband,
+        answer_preference,
+        pre_renewal,
+        app_config,
+        agent_label,
+    } = p;
+
     // Best-effort: a store that fails to open must not stop the agent from
-    // registering and carrying calls (FR-018) — VoWiFi call history is
-    // simply unavailable for this run, logged once here rather than on
-    // every insert attempt.
+    // registering and carrying calls (FR-018) — call history is simply
+    // unavailable for this run, logged once here rather than on every insert
+    // attempt.
     let history_store = match StoreHandle::open(std::path::Path::new(&app_config.sms.db_path)) {
         Ok(s) => Some(s),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to open call/SMS store; VoWiFi call history will not be recorded this run");
+            tracing::warn!(error = %e, "failed to open call/SMS store; call history will not be recorded this run");
             None
         }
     };
-    // `card_id` (specs/013-multi-card-vowifi) is the same
-    // `derive_module_id`-derived card identity `resolve_module_id_for_port`
-    // would otherwise re-derive from the modem port at every agent startup —
-    // main.rs already resolves it once, at discovery time, and passes it in,
-    // so it doubles as this line's observability module id (FR-011a).
     let reporter = Reporter::spawn(
         app_config.control.socket_path.clone(),
         AgentKind::Ims,
@@ -212,7 +262,7 @@ fn run_inner(
         app_config.bridge.sip_destination.clone(),
     );
 
-    let mut session = match super::register_session(&reg_cfg) {
+    let mut session = match super::register_session(reg_cfg) {
         Ok(s) => s,
         Err(e) => {
             obs.report_registration_attempt(map_registration_error(&e));
@@ -232,7 +282,10 @@ fn run_inner(
             "IMS registration failed: {status} {reason}"
         )));
     }
-    tracing::info!("vowifi-ims-agent registered, listening for inbound calls");
+    tracing::info!(
+        agent = agent_label,
+        "registered, listening for inbound calls"
+    );
     obs.report_registration_attempt(RegistrationStatus::Success);
     obs.set_registered(true);
     obs.set_tunnel_up(true);
@@ -252,7 +305,7 @@ fn run_inner(
     {
         let status_for_listener = status.clone();
         std::thread::spawn(move || {
-            if let Err(e) = run_status_listener(veth_local_ip, status_for_listener) {
+            if let Err(e) = run_status_listener(local_ip, status_for_listener) {
                 tracing::warn!(error = %e, "registration-status listener failed");
             }
         });
@@ -261,15 +314,13 @@ fn run_inner(
     let result = dispatch_loop(
         &mut session,
         &mut inbound,
-        &reg_cfg,
+        reg_cfg,
         &status,
         control_addr,
-        veth_local_ip,
-        config.wideband,
-        // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
-        // has no attachment of its own to refresh.
-        sdp::AnswerPreference::legacy(),
-        None,
+        local_ip,
+        wideband,
+        answer_preference,
+        pre_renewal,
         &obs,
     );
     session.cleanup();

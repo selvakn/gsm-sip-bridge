@@ -42,7 +42,15 @@
 //! R15) and the registration loop re-attaches automatically. Unguarded, that
 //! would drop a live call roughly every two hours. See [`MaintenancePolicy`].
 
+use crate::config::AppConfig;
+use crate::error::{BridgeError, BridgeResult};
+use crate::ims::sdp;
+use crate::ims::ImsRegisterConfig;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
+
+use super::VolteSettings;
 
 /// This service's own telephone-side local port.
 ///
@@ -58,6 +66,10 @@ pub const LOOPBACK_SIP_PORT: u16 = 5074;
 /// Loopback control port joining the two halves. Same protocol the Wi-Fi path
 /// uses, same message shapes.
 pub const LOOPBACK_CONTROL_PORT: u16 = 5075;
+
+/// Card label used when none is supplied — the single-line case, mirroring
+/// `vowifi::LEGACY_LINE_CARD_ID`.
+pub const DEFAULT_CARD_ID: &str = "volte";
 
 /// How far a call got. The basis of FR-016's outcome reporting.
 ///
@@ -388,6 +400,135 @@ impl MaintenancePolicy {
         self.deferred.take()
     }
 }
+
+/// Loopback — both halves are threads in this process, so neither leg ever
+/// leaves the host.
+const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// Everything the service needs to start.
+pub struct ServiceConfig {
+    /// Labels this line's metrics and call history.
+    pub card_id: String,
+    /// The LTE attachment this registration rides on.
+    pub settings: VolteSettings,
+    pub msisdn: Option<String>,
+    /// Proceed even if the Wi-Fi path appears to hold the same subscriber's
+    /// registration. An escape hatch for a stale detection, not a default.
+    pub force: bool,
+}
+
+/// Entry point for the host-side cellular bridging service.
+pub fn run(service: ServiceConfig, app_config: &AppConfig) -> ExitCode {
+    match run_inner(service, app_config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()> {
+    // Both paths register the *same* subscriber, with the same IMPU and the
+    // same IMEI-derived instance id. Two live registrations would have the
+    // network deliver calls to whichever bound last, silently — so refuse to
+    // start rather than produce an outage that looks like a carrier fault
+    // (FR-022).
+    super::guard::check_no_vowifi_conflict(service.force).map_err(BridgeError::Ims)?;
+
+    let attach = super::attach(&service.settings)?;
+    tracing::info!(
+        iface = %attach.iface,
+        routed = attach.routed,
+        "IMS PDN attached"
+    );
+
+    let pcscf = service
+        .settings
+        .pcscf
+        .ok_or_else(|| BridgeError::Ims("no P-CSCF configured for the LTE IMS transport".into()))?;
+
+    let plmn = {
+        let mut at = crate::modules::at_commander::AtCommander::open(&service.settings.modem_port)?;
+        crate::vowifi::plmn::derive_plmn(&mut at)?
+    };
+
+    let reg_cfg = ImsRegisterConfig {
+        modem_port: service.settings.modem_port.clone(),
+        pcscf_addr: pcscf.ip(),
+        pcscf_port: pcscf.port(),
+        mcc: plmn.mcc,
+        mnc: plmn.mnc,
+        imsi: None,
+        imei: None,
+        use_tcp: true,
+        sec_agree: true,
+        msisdn: service.msisdn.clone(),
+        // Names the serving cell, so the network can apply the right policy
+        // and an operator can tell which radio a call actually used.
+        access_network_info: super::read_access_network_info(&service.settings.modem_port),
+    };
+
+    // The telephone-system half, on its own thread and its own SIP port. It
+    // is the exact same code the Wi-Fi path runs; only the port and the
+    // addresses differ.
+    let telephony_line = crate::vowifi::RuntimeLine {
+        index: 0,
+        card_id: service.card_id.clone(),
+        veth_local_addr: LOOPBACK.to_string(),
+        veth_peer_addr: LOOPBACK.to_string(),
+        control_port: LOOPBACK_CONTROL_PORT,
+        sip_leg_port: LOOPBACK_SIP_PORT,
+    };
+    {
+        let app_config = app_config.clone();
+        std::thread::Builder::new()
+            .name("volte-telephony".into())
+            .spawn(move || {
+                if let Err(e) = crate::vowifi::run_telephony_side(
+                    &app_config,
+                    SIP_LOCAL_PORT,
+                    true,
+                    vec![telephony_line],
+                    "volte-bridge",
+                ) {
+                    tracing::error!(error = %e, "the telephone-side half stopped");
+                }
+            })
+            .map_err(|e| BridgeError::Ims(format!("failed to start the telephone side: {e}")))?;
+    }
+
+    // Give the telephone-side half a moment to bind its control port before
+    // the carrier side can be offered a call. A call arriving in this window
+    // would otherwise fail its control connection and be declined — rare, but
+    // it costs nothing to close.
+    std::thread::sleep(TELEPHONY_STARTUP_GRACE);
+
+    let control_addr = SocketAddr::new(LOOPBACK, LOOPBACK_CONTROL_PORT);
+
+    // Rebuilding the attachment is what must never happen mid-call. Passing it
+    // as the renewal hook is what makes that true structurally — see
+    // `ims::agent::PreRenewalHook`.
+    let settings = service.settings.clone();
+    let pre_renewal = move || super::registration::refresh_attachment(&settings);
+
+    crate::ims::agent::serve_inbound(crate::ims::agent::InboundParams {
+        card_id: &service.card_id,
+        reg_cfg: &reg_cfg,
+        local_ip: LOOPBACK,
+        control_addr,
+        // An inbound call is a real conversation; the whole point of this path
+        // is that it sounds better than the modem-internal one.
+        wideband: true,
+        answer_preference: sdp::AnswerPreference::cellular(),
+        pre_renewal: Some(&pre_renewal),
+        app_config,
+        agent_label: "volte-ims-agent",
+    })
+}
+
+/// How long to let the telephone-side half bind before answering calls.
+const TELEPHONY_STARTUP_GRACE: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 mod tests {
