@@ -131,6 +131,10 @@ pub mod reason {
     /// the carrier — either side dropping must end the whole bridged call.
     pub const PBX_HANGUP: &str = "pbx_hangup";
     pub const TRANSPORT_ERROR: &str = "transport_error";
+    /// The network attachment underneath the call was genuinely lost mid-call
+    /// — distinct from the caller hanging up, because the two demand opposite
+    /// responses (FR-011). LTE-only: the Wi-Fi path has no such attachment.
+    pub const ATTACHMENT_LOST: &str = "attachment_lost";
 }
 
 /// Read one newline-terminated JSON `ControlMessage` from `reader`, blocking

@@ -585,6 +585,17 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
     let settings = service.settings.clone();
     let pre_renewal = move || super::registration::refresh_attachment(&settings);
 
+    // FR-011: if the attachment genuinely dies mid-call, this is how the call
+    // is ended with the cause stated. Reads `CEREG` under the shared modem lock
+    // — only when the carrier leg has already gone silent, so it costs nothing
+    // on a healthy call.
+    let attach_modem = service.settings.modem_port.clone();
+    let attach_lock = modem_lock.clone();
+    let attachment_check = move || {
+        let _guard = attach_lock.lock().unwrap_or_else(|e| e.into_inner());
+        super::is_attached(&attach_modem)
+    };
+
     crate::ims::agent::serve_inbound(crate::ims::agent::InboundParams {
         card_id: &service.card_id,
         reg_cfg: &reg_cfg,
@@ -598,6 +609,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         // from the same constant so they cannot drift apart again.
         veth_sip_port: LOOPBACK_SIP_PORT,
         pre_renewal: Some(&pre_renewal),
+        attachment_check: Some(&attachment_check),
         modem_lock: Some(modem_lock),
         app_config,
         agent_label: "volte-ims-agent",

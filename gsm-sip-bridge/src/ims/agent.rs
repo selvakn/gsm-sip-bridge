@@ -101,6 +101,36 @@ const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// (specs/017 T039).
 pub(crate) type PreRenewalHook = dyn Fn() -> Result<(), String> + Send + Sync;
 
+/// Answers "is the network attachment still up?" during a call, so a call whose
+/// attachment genuinely dies mid-call can be ended with the cause stated,
+/// distinct from the caller hanging up (FR-011).
+///
+/// Returns `true` while attached. LTE-only — the cellular path reads `CEREG`;
+/// the Wi-Fi path passes `None`, because its ePDG tunnel is charon's to watch
+/// and a lost tunnel already surfaces as the control connection dropping.
+///
+/// It is consulted only *during* a call and only after the media has stalled,
+/// so it costs no modem traffic on a healthy call, and confirming genuine loss
+/// before ending a call is what keeps a transient silence from being mistaken
+/// for a dropped attachment.
+pub(crate) type AttachmentHook = dyn Fn() -> bool + Send + Sync;
+
+/// How long the carrier leg may carry no audio before the attachment is
+/// checked. A real conversation with DTX still sends comfort-noise frames, so a
+/// full stall this long is already abnormal; the check then decides whether it
+/// is silence or a genuinely dead attachment.
+const MEDIA_STALL_BEFORE_ATTACHMENT_CHECK: Duration = Duration::from_secs(6);
+
+/// Consecutive attachment checks that must report "down" before a call is ended
+/// for attachment loss. More than one so a single glitched `CEREG` read cannot
+/// tear down a live call.
+const ATTACHMENT_LOSS_CONFIRMATIONS: u32 = 2;
+
+/// Minimum gap between attachment probes once the media has stalled — so a
+/// stalled call is confirmed dead over a few seconds, not hammered at the
+/// dispatch loop's fast poll rate.
+const ATTACHMENT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Entry point for the `vowifi-ims-agent` subcommand. `card_id` labels this
 /// line's metrics/history (specs/013-multi-card-vowifi FR-017) — pass
 /// `crate::vowifi::LEGACY_LINE_CARD_ID` for a deployment with no resolved
@@ -194,6 +224,9 @@ fn run_inner(
         answer_preference: sdp::AnswerPreference::legacy(),
         veth_sip_port: VETH_SIP_PORT,
         pre_renewal: None,
+        // The ePDG tunnel is charon's to watch, and a lost tunnel already
+        // surfaces as the control connection dropping — no mid-call probe here.
+        attachment_check: None,
         // No LTE modem on this path, so nothing competes for an AT port.
         modem_lock: None,
         app_config,
@@ -221,6 +254,9 @@ pub(crate) struct InboundParams<'a> {
     /// agree; see `handle_invite`.
     pub veth_sip_port: u16,
     pub pre_renewal: Option<&'a PreRenewalHook>,
+    /// Checks the network attachment during a call so a mid-call loss ends it
+    /// with the cause stated (FR-011). `None` on the Wi-Fi path.
+    pub attachment_check: Option<&'a AttachmentHook>,
     /// Serialises this half's modem AT access (registration, renewal) with any
     /// other user of the same port — the cellular path's modem SMS reader.
     /// `None` on the Wi-Fi path, which has no such competitor and no LTE modem.
@@ -250,6 +286,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         answer_preference,
         veth_sip_port,
         pre_renewal,
+        attachment_check,
         modem_lock,
         app_config,
         agent_label,
@@ -356,6 +393,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         answer_preference,
         veth_sip_port,
         pre_renewal,
+        attachment_check,
         modem_lock.as_ref(),
         &obs,
     );
@@ -570,6 +608,7 @@ pub(crate) fn dispatch_loop(
     answer_preference: sdp::AnswerPreference,
     veth_sip_port: u16,
     pre_renewal: Option<&PreRenewalHook>,
+    attachment_check: Option<&AttachmentHook>,
     modem_lock: Option<&Arc<Mutex<()>>>,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<()> {
@@ -584,6 +623,8 @@ pub(crate) fn dispatch_loop(
     // drop an otherwise-valid call within that window — found in review,
     // not live-testing).
     let mut next_renewal_attempt: Option<Instant> = None;
+    // FR-011 mid-call attachment watch, reset per call (see the INVITE branch).
+    let mut watch = AttachmentWatch::default();
     loop {
         // A hangup can start on *either* side. The carrier's arrives as a BYE
         // below; the PBX's arrives here, as a `CallEnded` from Agent B — and
@@ -610,6 +651,27 @@ pub(crate) fn dispatch_loop(
                     continue;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        // FR-011: end a call whose attachment genuinely died mid-call, stated
+        // as such rather than as a caller hangup. Cheap on a healthy call —
+        // the modem is only touched once the carrier leg has gone fully silent,
+        // and even then only to tell a dead attachment from a quiet caller.
+        if let Some(call) = &active_call {
+            if let Some(check) = attachment_check {
+                if watch.attachment_lost(call.meter.carrier_rx(), check) {
+                    let call = active_call.take().expect("just matched Some");
+                    tracing::warn!(
+                        call_id = %call.call_id,
+                        "ending call: the network attachment was lost mid-call \
+                         (not a caller hangup) — FR-011"
+                    );
+                    report_answered_call_ended(obs, &call);
+                    end_call_attachment_lost(session, call);
+                    watch = AttachmentWatch::default();
+                    continue;
+                }
             }
         }
 
@@ -648,6 +710,10 @@ pub(crate) fn dispatch_loop(
                     Ok(call) => {
                         if call.is_some() {
                             obs.set_active_calls(1);
+                            // Fresh call, fresh media baseline (the meter starts
+                            // at zero) — so a previous call's counts cannot read
+                            // as a stall on this one.
+                            watch = AttachmentWatch::default();
                         }
                         active_call = call;
                     }
@@ -1239,6 +1305,95 @@ fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlMessage> {
 /// The BYE goes out on the registered client transport, like every other
 /// request we originate — it is routed by the dialog's route set, not by which
 /// connection the INVITE happened to arrive on.
+/// Watches a call's carrier leg for a genuinely lost attachment (FR-011).
+///
+/// The signal is two-stage on purpose. Downlink packets stalling is cheap to
+/// notice and happens first, but on its own it cannot tell a dropped attachment
+/// from a caller who simply went quiet. So a stall only *arms* the check; the
+/// authoritative answer — "is the modem still attached?" — is asked over the AT
+/// port, and only after a stall has persisted, so a healthy call never touches
+/// the modem at all. Loss is declared only after it is confirmed more than once,
+/// so a single glitched read cannot tear down a live call.
+#[derive(Default)]
+struct AttachmentWatch {
+    carrier_rx_mark: u64,
+    media_stalled_since: Option<Instant>,
+    last_probe: Option<Instant>,
+    down_count: u32,
+}
+
+impl AttachmentWatch {
+    /// Feeds the current downlink packet count and, once the carrier leg has
+    /// been silent long enough, probes `check`. Returns `true` only when the
+    /// attachment is confirmed lost.
+    fn attachment_lost(&mut self, carrier_rx: u64, check: &AttachmentHook) -> bool {
+        if carrier_rx > self.carrier_rx_mark {
+            // Audio is still arriving from the carrier — healthy; reset.
+            self.carrier_rx_mark = carrier_rx;
+            self.media_stalled_since = None;
+            self.last_probe = None;
+            self.down_count = 0;
+            return false;
+        }
+        // The carrier leg is silent. Wait out the stall window before spending
+        // an AT round-trip on it.
+        let stalled_since = *self.media_stalled_since.get_or_insert_with(Instant::now);
+        if stalled_since.elapsed() < MEDIA_STALL_BEFORE_ATTACHMENT_CHECK {
+            return false;
+        }
+        if let Some(last) = self.last_probe {
+            if last.elapsed() < ATTACHMENT_PROBE_INTERVAL {
+                return false;
+            }
+        }
+        self.last_probe = Some(Instant::now());
+        if check() {
+            // Attached: the silence is the caller, not a lost attachment. Rearm
+            // the stall window rather than re-probing on every tick.
+            self.media_stalled_since = Some(Instant::now());
+            self.down_count = 0;
+            false
+        } else {
+            self.down_count += 1;
+            self.down_count >= ATTACHMENT_LOSS_CONFIRMATIONS
+        }
+    }
+}
+
+/// Ends a call because the network attachment was lost mid-call (FR-011).
+///
+/// The same coordinated teardown as a carrier `BYE` — stop the relay, tell
+/// Agent B over the control channel so it drops the PBX leg — plus a
+/// best-effort `BYE` toward the carrier. That `BYE` will usually not arrive
+/// (the attachment it would travel over is the thing that died), but sending it
+/// costs nothing and closes the dialog on any path that survived.
+fn end_call_attachment_lost(session: &mut super::RegisteredSession, mut call: ActiveCall) {
+    call.stop.store(true, Ordering::Relaxed);
+    if let Err(e) = write_msg(
+        &mut call.control,
+        &ControlMessage::CallEnded {
+            call_id: call.call_id.clone(),
+            reason: reason::ATTACHMENT_LOST.to_string(),
+        },
+    ) {
+        tracing::warn!(call_id = %call.call_id, error = %e, "failed to notify Agent B of the attachment-loss teardown");
+    }
+    let d = &call.dialog;
+    let bye = build_bye(&ByeRequest {
+        request_uri: &d.remote_target,
+        route_headers: &d.route_headers,
+        via_transport: if d.use_tcp { "TCP" } else { "UDP" },
+        local_addr: d.local_addr,
+        from: &d.from,
+        to: &d.to,
+        call_id: &call.call_id,
+        cseq: d.cseq,
+        branch: &format!("z9hG4bK{}", random_hex(6)),
+    });
+    let _ = session.transport.send(&bye);
+    tracing::info!(call_id = %call.call_id, reason = reason::ATTACHMENT_LOST, "call ended");
+}
+
 fn hangup_carrier(session: &mut super::RegisteredSession, call: ActiveCall, reason: &str) {
     call.stop.store(true, Ordering::Relaxed);
     let d = &call.dialog;
@@ -1465,6 +1620,43 @@ mod tests {
 
     fn loopback_socket() -> UdpSocket {
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()
+    }
+
+    #[test]
+    fn a_call_with_flowing_audio_never_probes_the_attachment() {
+        // The load-bearing safety property of FR-011's watch: while audio keeps
+        // arriving from the carrier, it must never touch the modem — and so can
+        // never mistake a healthy call for a dropped attachment. If this holds,
+        // a live call cannot be torn down by the watch.
+        let mut w = AttachmentWatch::default();
+        let probed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probed_c = probed.clone();
+        let check = move || {
+            probed_c.store(true, Ordering::Relaxed);
+            false // would report "down" — but must never be consulted here
+        };
+        for rx in 1..=1000 {
+            assert!(
+                !w.attachment_lost(rx, &check),
+                "a call with flowing audio must never be declared lost"
+            );
+        }
+        assert!(
+            !probed.load(Ordering::Relaxed),
+            "a healthy call must never probe the modem"
+        );
+    }
+
+    #[test]
+    fn a_call_that_never_carried_downlink_does_not_immediately_declare_loss() {
+        // A brand-new call sits at carrier_rx=0 for its first ticks before media
+        // ramps up; the watch must not fire during that window on the strength
+        // of the stall alone — the stall only *arms* the modem probe, which has
+        // not even been reached yet here.
+        let mut w = AttachmentWatch::default();
+        let check = || false;
+        assert!(!w.attachment_lost(0, &check));
+        assert!(!w.attachment_lost(0, &check));
     }
 
     #[test]
