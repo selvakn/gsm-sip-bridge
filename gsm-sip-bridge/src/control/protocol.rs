@@ -37,12 +37,24 @@ pub enum AgentKind {
     Ims,
     /// Agent B: `vowifi::mod`, runs in the default netns.
     Sip,
-    /// The host-side cellular bridging service
-    /// (specs/017-volte-inbound-bridge). Distinct from `Ims` **only** so its
-    /// calls carry the right `transport` label: both run the same agent code,
-    /// but a VoLTE call reported as `vowifi` would be invisible in exactly
-    /// the comparison this feature exists to make.
+    /// The carrier side of the host-side cellular bridging service
+    /// (specs/017-volte-inbound-bridge) — `ims::agent`, but over LTE rather
+    /// than an ePDG tunnel. Distinct from `Ims` **only** so its calls carry
+    /// the right `transport` label: both run the same agent code, but a VoLTE
+    /// call reported as `vowifi` would be invisible in exactly the comparison
+    /// this feature exists to make.
     Volte,
+    /// The telephone-system side of that same VoLTE bridge — the identical
+    /// `vowifi::mod` code `Sip` runs, but as a half of the cellular service,
+    /// so its PBX-leg outcomes must be labelled `volte`, not `vowifi`. This
+    /// is to `Volte` what `Sip` is to `Ims`.
+    ///
+    /// It is a separate kind from `Volte` (not just a shared label) because
+    /// the two halves run as **independent reporters** with their own
+    /// `epoch`/`seq` counters; sharing one `(kind, module_id)` liveness key
+    /// would let each erase the record the other needs to detect a replay,
+    /// re-applying already-counted events. See `metrics::ingest::liveness`.
+    VolteSip,
 }
 
 impl AgentKind {
@@ -51,6 +63,7 @@ impl AgentKind {
             AgentKind::Ims => "ims",
             AgentKind::Sip => "sip",
             AgentKind::Volte => "volte",
+            AgentKind::VolteSip => "volte_sip",
         }
     }
 }

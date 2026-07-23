@@ -30,7 +30,7 @@ const TRANSPORT_VOLTE: &str = "volte";
 /// indistinguishable — in exactly the comparison this feature exists to make.
 fn transport_label(agent: AgentKind) -> &'static str {
     match agent {
-        AgentKind::Volte => TRANSPORT_VOLTE,
+        AgentKind::Volte | AgentKind::VolteSip => TRANSPORT_VOLTE,
         AgentKind::Ims | AgentKind::Sip => TRANSPORT_VOWIFI,
     }
 }
@@ -128,6 +128,11 @@ fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
             AgentKind::Ims | AgentKind::Sip => metrics::VOWIFI_REGISTERED
                 .with_label_values(&[module_id])
                 .set(up),
+            // The telephony half reports `pbx_registered`, never `registered`
+            // — the IMS registration belongs to the `Volte` carrier half — so
+            // this arm is unreachable and must not touch a gauge it does not
+            // own.
+            AgentKind::VolteSip => {}
         }
     }
     if let Some(tunnel_up) = state.tunnel_up {
@@ -139,6 +144,9 @@ fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
             AgentKind::Ims | AgentKind::Sip => metrics::VOWIFI_TUNNEL_UP
                 .with_label_values(&[module_id])
                 .set(up),
+            // The telephony half has no tunnel/PDN of its own; unreachable,
+            // same as `registered` above.
+            AgentKind::VolteSip => {}
         }
     }
     // pbx_registered (Agent B) has no dedicated gauge yet — sip_registered
@@ -367,6 +375,26 @@ mod tests {
             transport_label(AgentKind::Volte),
             transport_label(AgentKind::Ims)
         );
+    }
+
+    #[test]
+    fn both_halves_of_the_volte_bridge_report_the_volte_transport() {
+        // The bridge is one process with two independently-reporting halves:
+        // the carrier side (`Volte`) and the telephone side (`VolteSip`, the
+        // same code the Wi-Fi path runs as `Sip`). If the telephone side kept
+        // reporting as `Sip`, its PBX-leg counter (`SIP_CALLS_TOTAL`) would be
+        // filed under `vowifi` while the carrier side's `CALLS_TOTAL` sat under
+        // `volte` — the same two calls split across two transports. Observed
+        // live before this fix.
+        assert_eq!(transport_label(AgentKind::VolteSip), TRANSPORT_VOLTE);
+        assert_eq!(
+            transport_label(AgentKind::Volte),
+            transport_label(AgentKind::VolteSip)
+        );
+        // Same transport, but they must remain distinct kinds: each is its own
+        // reporter with its own epoch/seq, and a shared liveness key would
+        // corrupt replay detection across the two.
+        assert_ne!(AgentKind::Volte, AgentKind::VolteSip);
     }
 
     #[test]
