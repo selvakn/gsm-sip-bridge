@@ -68,7 +68,7 @@ unless handled.
 - [X] T013 [US5] Converge both routes on the existing `sms::record_and_forward` (FR-025, FR-036) in `gsm-sip-bridge/src/volte/sms.rs`
 - [X] T014 [US5] **Acknowledge only after recording**, and clear modem storage only after recording (FR-026, FR-036) in `gsm-sip-bridge/src/volte/sms.rs`
 - [X] T015 [US5] Record even when forwarding fails, and report the failure (FR-029) in `gsm-sip-bridge/src/volte/sms.rs`
-- [ ] T089 [US5] Handle a message arriving during a call, and a call arriving while a message is being processed, without either displacing the other (FR-028) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T089 [US5] Handle a message arriving during a call, and a call arriving while a message is being processed, without either displacing the other (FR-028) in `gsm-sip-bridge/src/volte/bridge.rs` — the modem SMS reader and the registration's renewal/re-attach share one AT-port lock; a call's media rides the data bearer (not the AT port) and renewal is deferred during a call, so neither displaces the other. This also completes the runtime half of T011/T012 (modem-route handling + startup recovery). Live validation is Gate B4 / T072–T074.
 
 ### Tests
 
