@@ -146,7 +146,7 @@ after.
 - [X] T052 [US3] **Never report a call that carried no audio, or one-way audio, as successful** — reuse the existing verdict (FR-017) in `gsm-sip-bridge/src/volte/bridge.rs`
 - [X] T053 [US3] Report calls through the **existing** call measurements, tagged as this path (FR-030) in `gsm-sip-bridge/src/metrics/mod.rs`
 - [X] T054 [US3] Keep registration and attachment measurements distinct from the other paths' (FR-031) in `gsm-sip-bridge/src/metrics/mod.rs`
-- [ ] T055 [US3] Extend the status command to query this service in `gsm-sip-bridge/src/main.rs`
+- [X] T055 [US3] Extend the status command to query this service in `gsm-sip-bridge/src/main.rs` — queries the running service over its loopback control channel first (FR-033), and only falls back to a direct modem read when nothing answers, since the service owns the modem's AT port exclusively (R6). Live-verified against the running bridge.
 
 ### Tests
 

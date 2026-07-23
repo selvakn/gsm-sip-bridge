@@ -1009,7 +1009,7 @@ pub fn print_status(config: &VowifiConfig) -> ExitCode {
     }
 }
 
-fn format_unix(t: Option<u64>) -> String {
+pub fn format_unix(t: Option<u64>) -> String {
     t.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
@@ -1018,7 +1018,7 @@ fn format_unix(t: Option<u64>) -> String {
 /// port and Agent B's control port — each answers with the reply variant
 /// it actually has data for (`RegistrationStatusReply` /
 /// `CallHistoryReply` respectively).
-fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
+pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
     let socket_addr: std::net::SocketAddr = addr
         .parse()
         .map_err(|e| BridgeError::Ims(format!("invalid address {addr}: {e}")))?;
