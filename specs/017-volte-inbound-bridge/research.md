@@ -450,9 +450,13 @@ Reason: SIP;cause=503;text="PT: AAA: result_code=0 exp_result_code=5065"
 
 ### What was eliminated, and how
 
+> ⚠️ **Superseded by R19.** The first row of this table is wrong, and the
+> conclusion that follows from it is wrong. The hypothesis was right; the test
+> was incapable of falsifying it. Read R19 before acting on anything here.
+
 | Hypothesis | Test | Result |
 |---|---|---|
-| Stale IP-CAN session from repeated re-attach | Operator restart, fresh PDN + registration | ❌ Identical 5065 |
+| Stale IP-CAN session from repeated re-attach | Operator restart, fresh PDN + registration | ⚠️ **Test was invalid — see R19.** A restart never detaches from EPS |
 | Inbound-specific | Placed an **outbound** call on the same registration | ❌ Also fails (`380 Alternative Service`) |
 | Wrong media address | Compared SDP `c=` against the interface | ❌ Correct; both globals are in the assigned `/64` |
 | Illegal SDP answer | Compared answer against the offer, payload by payload | ❌ Legal — pt 101 was offered, fmtp echoed correctly |
@@ -506,3 +510,184 @@ carrier to authorise the media session. No amount of further work on this
 codebase changes that, and pretending otherwise by declaring B1 passed on
 "it bridged" would be exactly the kind of claim FR-017 exists to prevent.
 
+## R19: It *was* the stale IP-CAN session — the test that "eliminated" it could not have detected it
+
+**Status**: ✅ **RESOLVED on the outbound path.** A full EPS detach cleared it;
+the next call connected with two-way audio. Inbound remains to be re-tested.
+
+R18 closed with "no amount of further work on this codebase changes that". That
+was wrong, and the way it was wrong is the most useful thing in this document.
+
+### The invalid test
+
+R18's first row eliminated "stale IP-CAN session" on the evidence of an
+operator restart with a "fresh PDN". Measured directly this time, immediately
+after a clean `docker stop` — i.e. after `pdn::tear_down` had run to completion:
+
+```
+AT+CGACT?    +CGACT: 1,0  +CGACT: 2,0  +CGACT: 3,0   ← all contexts down
+AT+CGATT?    +CGATT: 1                               ← still attached
+AT+CEREG?    +CEREG: 0,1                             ← registered, home
+AT+CGPADDR   all zeros                               ← addresses released
+```
+
+`pdn::tear_down` issues `AT+CGACT=0` and nothing else (`pdn.rs:398`). It
+deactivates the PDP context; it never detaches from EPS. **The UE never left
+the network**, on any restart performed during this investigation, including
+the operator's. So "fresh PDN" meant a new PDP context on a *continuous* EPS
+attach — which is precisely the condition under which a stale Gx session at the
+PCRF would survive. The test could not have distinguished the hypothesis it was
+used to reject.
+
+Every hypothesis in R18's table was tested against something we could observe.
+This one was tested against something we could only observe *from the host*,
+and the state that mattered lived in the core network.
+
+### The actual detach, and what it changed
+
+```
+AT+CGATT=0   → +CGATT: 0,  +CEREG: 0,2    ← packet-domain detach, searching
+AT+CFUN=4    → +CFUN: 4,   +CEREG: 0,0    ← RF off, fully deregistered
+             ← 90 s quiesce with RF off →
+AT+CFUN=1    → +CEREG: 0,1, +CGATT: 1     ← re-attached, stable over 3 polls
+```
+
+The PDN came back on an **entirely different prefix** — `2402:8100:78f1:dae4::/64`,
+where every previous attach in this session had landed inside
+`2402:8100:78b9:85f5::/64`. A new prefix is a new IP-CAN session, which is the
+observable signal that the old one was actually released rather than reused.
+
+### The result
+
+An outbound call on the same registration, the same control R18 used to prove
+the failure was not inbound-specific:
+
+```
+100 Trying → 183 Session Progress ×3 → 180 Ringing → 200 OK
+call answered, starting RTP  remote_rtp=[2400:5200:a100:826::4]:40486  codec=AmrWb
+
+call report
+  direction : both-ways — audio flowed in both directions
+  sent      : 975 packets / 312000 samples
+  received  : 767 packets / 245440 samples
+  loss      : 5 (0.6%)
+  jitter    : 11.1 ms
+```
+
+No `380 Alternative Service`. No `5065`. Twenty seconds of conversational
+audio in both directions at 0.6% loss — comparable to the 0.3% feature 016
+measured on a healthy dedicated voice bearer, and 20-fold better than the
+13.6% that feature's research recorded when the call was *not* given voice
+treatment (016 research R10).
+
+`volte-call` exits 0 only when the call was answered **and** audio flowed both
+ways, so this is the tool's own verdict, not an interpretation of the log.
+
+### Corrections this forces elsewhere
+
+**R18's second remaining explanation is also wrong.** It read `result_code=0`
+as "the AAR got no answer from the PCRF". A Diameter answer carries *either*
+`Result-Code` *or* `Experimental-Result-Code`, never both; the SBC prints both
+fields of its result structure and the unused one reads as `0`. The AAR **was**
+answered — the PCRF affirmatively said `IP-CAN_SESSION_NOT_AVAILABLE`. Which
+is exactly what a PCRF holding a stale session for a different address would
+say, and is consistent with everything above.
+
+Both of R18's "remaining explanations" were therefore carrier-side and neither
+was correct. The cause was on our side after all: not in the bridging code, but
+in what our teardown path fails to do.
+
+### The lesson
+
+R18 is a well-built elimination table with one row whose test was incapable of
+producing a negative. The table's *form* — hypothesis, test, result — is what
+made it persuasive, and the form is intact; only the power of one test was
+absent, and nothing in the format prompted anyone to ask about it.
+
+The general rule this suggests: **when a hypothesis concerns state held by
+something outside the system under test, the test must be shown to have reached
+that state.** "We restarted and it was identical" is evidence only if the
+restart provably did something to the remote state. Here it provably did not,
+and `AT+CGATT?` would have said so at any point over those several hours.
+
+The corollary is that the fix belongs in the code, not in an operator runbook:
+teardown that cannot detach is teardown that cannot recover. That is
+`hardening.md` H2, which was written as speculative hardening an hour before it
+turned out to be the root cause.
+
+### Process note: the deployed image lagged the commits describing it
+
+Noticed while preparing the re-test. The `docker-gsm-sip-bridge:latest` image
+in use was built at 00:08; commit `42f783e` — which contains the `To`-header
+fix R17 records as "found and fixed" — landed at 00:21. The live trace at 00:15
+still shows `To: <...>;tag=f142a42c;tag=f142a42c`, so the image genuinely
+predated the fix, and every call discussed in R17 and R18 ran on a binary
+older than the research describing them.
+
+None of it changes those conclusions — the defect is benign and 5065 is decided
+well below SIP. But "we fixed it" and "the thing we tested had the fix" are
+separate claims, and only the first was being tracked. The image is rebuilt from
+`HEAD` before any gate is closed.
+
+### What is proven now, and what is not
+
+**Proven**: the carrier authorises media for this SIM on a host-managed IMS PDN
+after a clean detach; outbound calls connect and carry two-way audio at
+conversational quality.
+
+**Not proven**: that an **inbound** bridged call now survives. The whole of
+US1's signalling path was already demonstrated repeatedly (R17, R18) and the
+only thing that ever killed those calls was the Rx rejection — but Gate B1
+requires a call that rings the telephone system, is answered, and carries audio
+both ways for 60 seconds, and no such call has been placed since the detach.
+**B1 stays open until someone dials the SIM.** B2 (whether a dedicated voice
+bearer appears for mobile-terminating calls) is likewise still unmeasured.
+
+
+## R20: Hardening applied after the 5065 fix — and what was already covered
+
+**Status**: ✅ Code changes landed. This folds in the durable content of the
+former `hardening.md`, which was a working backlog written while the
+investigation was blocked and is deleted now that its items are resolved.
+
+The list originally opened "these are not fixes for the 5065 rejection." One of
+them (H2) was the fix. That is why the backlog is worth preserving in the
+research record rather than dropped: writing down what was
+unprincipled-but-working is what surfaced what was already broken.
+
+### The metrics-label bug the fix surfaced
+
+Confirming the recovered calls were on VoLTE (not VoWiFi over some stray ePDG
+tunnel) turned up a labelling defect of the same class as R15. The two call
+counters disagreed on transport for the *same* calls:
+
+```
+gsm_sip_bridge_calls_total{module="volte",...,transport="volte"}      2   ✓
+gsm_sip_bridge_sip_calls_total{module="volte",...,transport="vowifi"} 2   ✗
+```
+
+The bridge is one process with two independently-reporting halves. The carrier
+half reports `AgentKind::Volte` → `transport="volte"`. The telephone half runs
+the shared Wi-Fi telephony code, which reported `AgentKind::Sip` →
+`transport="vowifi"`, so every VoLTE call's PBX-leg outcome
+(`SIP_CALLS_TOTAL`) was filed under Wi-Fi. R15 fixed the gauges and
+`CALLS_TOTAL`; this counter was missed because that code path legitimately *is*
+`Sip` on the real Wi-Fi path.
+
+Fixed by adding `AgentKind::VolteSip` — the telephone half of the VoLTE bridge,
+to `Volte` what `Sip` is to `Ims`. It maps to `transport="volte"` but stays a
+distinct kind, because the two halves are independent reporters with their own
+`epoch`/`seq`: sharing one `(kind, module_id)` liveness key would let each
+erase the replay-detection record the other needs, re-applying already-counted
+events. The telephony reporter now derives its kind from the transport it is
+bridging.
+
+### The five hardening items
+
+| ID | Resolution |
+|---|---|
+| **H2** | **Fixed — this was the root cause.** `pdn::tear_down` now forces a packet-domain detach (`AT+CGATT=0`) after deactivating the context, logging the `CEREG` transition so a detach that the modem refuses is visible rather than silent. See R19 for the confirmation. |
+| **H1** | **Fixed.** `netcfg::configure_steps` now sets `autoconf=0` alongside `accept_ra=2`, so the accepted RA installs the default route but the kernel no longer mints a second, SLAAC-derived global from the MAC. One deterministic source address instead of two left to RFC 6724 tie-breaking. Not the 5065 cause (both globals sat in the same delegated `/64`), but nothing in the code *chose* the right one. |
+| **H3** | **Already covered — no new code.** The re-attach back-off H3 asked for already exists: both renewal loops (`registration::run` and `ims::agent::serve_inbound`) back off exponentially, 5 s → 300 s, and `bring_up` is idempotent. The incident's churn was not a tight attach loop — it was teardown→restart *cycling*, each leaving a stale session, which H2 fixes. Adding another back-off would be redundant and would risk slowing the ~2-hourly recovery. |
+| **H4** | **Closed — not implementable, tested on the modem. Do not retry.** A real VoLTE handset marks its context with the P-CSCF-discovery and IM-CN-signalling parameters of `+CGDCONT` (TS 27.007 positions 9–10). The EC200U caps `+CGDCONT` at eight parameters: `AT+CGDCONT=?` lists `(0,1),(0,1)` ending at position 8, and setting position 9 returns `+CME ERROR: 53` while eight parameters returns `OK`. This corroborates 015 Gate G1 from the *request* side (that gate tested the read side — `CGCONTRDP`, `QPCO`, `QCFG="pcscf"`), and it eliminates the theory that our PDN could be made to look "more IMS" to the network. Configuration-as-primary (`--pcscf`) remains the only route on this hardware. |
+| **H5** | **Done.** R18's reading of `result_code=0` as "no answer from the PCRF" is corrected in R19: a Diameter answer carries either `Result-Code` or `Experimental-Result-Code`, never both, so the AAR *was* answered — with `IP-CAN_SESSION_NOT_AVAILABLE`. |
