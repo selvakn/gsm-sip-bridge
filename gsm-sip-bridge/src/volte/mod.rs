@@ -61,6 +61,11 @@ pub struct VolteSettings {
     pub apn: String,
     /// Explicitly configured P-CSCF. Required today — see the module docs.
     pub pcscf: Option<SocketAddr>,
+    /// Where to record the context id this attach displaces, so an external
+    /// teardown can `--restore-cid` it. Written *before* the displacing rebind,
+    /// so a crash mid-attach still leaves the value for cleanup. `None` for
+    /// callers that run their own detach (they already hold the displaced cid).
+    pub restore_cid_path: Option<PathBuf>,
 }
 
 impl Default for VolteSettings {
@@ -71,6 +76,7 @@ impl Default for VolteSettings {
             cid: DEFAULT_IMS_CID,
             apn: DEFAULT_IMS_APN.to_string(),
             pcscf: None,
+            restore_cid_path: None,
         }
     }
 }
@@ -158,12 +164,58 @@ pub fn displacement_warning(current: Option<u8>, target: u8) -> Option<String> {
     }
 }
 
+/// What to do with the restore-cid record on an attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreCid {
+    /// Record this context — it is the one the attach is about to displace.
+    Record(u8),
+    /// Leave any existing record untouched.
+    Keep,
+}
+
+/// Decides how the restore-cid record should change for an attach, given the
+/// context bound *before* it (`prior_cid`) and the IMS context being bound
+/// (`ims_cid`). Pure, so the rule can be tested without a modem.
+///
+/// Records only a *genuine* displacement (a different prior context); anything
+/// else keeps the existing record. In particular **`None` (nothing bound) keeps
+/// it, never clears it**: that state occurs transiently when a renewal
+/// re-attaches after the carrier drops the PDN, and clearing there would erase
+/// the original displacement so final teardown could not restore it. A single
+/// container lifetime shares one tmpfs record, and the modem is dedicated, so a
+/// kept record always names the pre-IMS context — there is no stale value to
+/// worry about, only a valid one to protect.
+fn restore_cid_action(prior_cid: Option<u8>, ims_cid: u8) -> RestoreCid {
+    match prior_cid {
+        Some(prior) if prior != ims_cid => RestoreCid::Record(prior),
+        _ => RestoreCid::Keep,
+    }
+}
+
 /// Brings up the IMS PDN and makes it usable from the host.
 pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
     let mut at = AtCommander::open(Path::new(&settings.modem_port))?;
 
-    if let Some(warning) = displacement_warning(pdn::bound_context(&mut at)?, settings.cid) {
+    let prior_cid = pdn::bound_context(&mut at)?;
+    if let Some(warning) = displacement_warning(prior_cid, settings.cid) {
         tracing::warn!("{warning}");
+    }
+    // Record (or clear) the context to rebind on teardown, *before* `bring_up`
+    // rebinds the host data path — otherwise a crash/shutdown in the window
+    // between the rebind and this function returning would leave the teardown
+    // unable to `--restore-cid`, stranding general connectivity (found by
+    // review). The record must reflect *this* attach so a supervised restart
+    // never restores a stale context:
+    if let Some(path) = &settings.restore_cid_path {
+        match restore_cid_action(prior_cid, settings.cid) {
+            RestoreCid::Record(prior) => {
+                if let Err(e) = std::fs::write(path, prior.to_string()) {
+                    tracing::warn!(path = %path.display(), error = %e,
+                        "could not record the displaced context id; teardown will not restore it");
+                }
+            }
+            RestoreCid::Keep => {}
+        }
     }
 
     let brought_up = pdn::bring_up(&mut at, settings.cid, &settings.apn)?;
@@ -374,6 +426,28 @@ impl ImsTransport for LteImsPdnTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_cid_records_a_genuine_displacement() {
+        // Bound to the general-internet context (1) before, binding IMS (3):
+        // record 1 so teardown rebinds it.
+        assert_eq!(restore_cid_action(Some(1), 3), RestoreCid::Record(1));
+    }
+
+    #[test]
+    fn restore_cid_keeps_the_record_when_reusing_our_pdn() {
+        // A supervised restart finds the IMS context already bound (reuse). The
+        // original displacement still applies, so don't overwrite the record.
+        assert_eq!(restore_cid_action(Some(3), 3), RestoreCid::Keep);
+    }
+
+    #[test]
+    fn restore_cid_keeps_the_record_when_nothing_is_bound() {
+        // Nothing bound happens transiently when a renewal re-attaches after the
+        // carrier drops the PDN. Clearing there would erase the original
+        // displacement, so final teardown could not restore it — keep it.
+        assert_eq!(restore_cid_action(None, 3), RestoreCid::Keep);
+    }
 
     fn sample_pdn() -> pdn::ImsPdn {
         pdn::ImsPdn {

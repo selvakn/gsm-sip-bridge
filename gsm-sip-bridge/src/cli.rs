@@ -312,6 +312,12 @@ pub struct VolteRegisterArgs {
     /// Lock file preventing two concurrent VoLTE registrations on one SIM.
     #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
     pub lock_path: PathBuf,
+    /// File to record the context id the IMS PDN displaced. Relevant with
+    /// `--keep-pdn`, where this process leaves the PDN attached for an external
+    /// teardown to release: that teardown reads this to `--restore-cid` the
+    /// previous binding instead of leaving the modem data path unbound.
+    #[arg(long)]
+    pub restore_cid_path: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -432,6 +438,13 @@ pub struct VolteBridgeArgs {
     /// calls to whichever bound last, silently.
     #[arg(long)]
     pub force: bool,
+    /// File to record the context id the IMS PDN displaced, if any. The
+    /// service runs its accept loop indefinitely and never reaches its own
+    /// teardown, so the container's cleanup is what releases the PDN — and it
+    /// reads this file to `--restore-cid` the previous binding, restoring
+    /// general connectivity instead of leaving the modem data path unbound.
+    #[arg(long)]
+    pub restore_cid_path: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]

@@ -89,15 +89,36 @@ cleanup() {
         [ -n "$pid" ] && kill "$pid" 2>/dev/null
     done
     if [ -n "${VOLTE_SUPERVISOR_PID:-}" ]; then
-        kill "$VOLTE_SUPERVISOR_PID" 2>/dev/null
-        pkill -f "volte-register" 2>/dev/null
-        pkill -f "volte-bridge" 2>/dev/null
+        # SIGKILL, not SIGTERM: the child may be blocked mid-AT-transaction on
+        # the modem's serial port, and only an unblockable kill guarantees the
+        # kernel closes that fd *now* — releasing the port before we open it for
+        # `volte-pdn down`. A graceful signal could leave the child holding the
+        # port past any timeout and race the teardown (interleaved reads / open
+        # failure), leaving the displaced binding unrestored. The child has no
+        # cleanup of its own to lose — this trap owns the PDN teardown.
+        kill -KILL "$VOLTE_SUPERVISOR_PID" 2>/dev/null
+        pkill -KILL -f "volte-register" 2>/dev/null
+        pkill -KILL -f "volte-bridge" 2>/dev/null
+        # Confirm the process table (and thus the serial fd) is clear before
+        # touching the modem. Bounded so a zombie cannot hang shutdown; after
+        # SIGKILL this returns almost immediately.
+        for _ in $(seq 1 20); do
+            pgrep -f "volte-register|volte-bridge" >/dev/null 2>&1 || break
+            sleep 0.25
+        done
         # Release the IMS PDN so the modem's single host data path goes back
-        # to whatever it was bound to before (FR-005). Best-effort: a failure
-        # here must not stop the rest of cleanup.
+        # to whatever it was bound to before (FR-005). The inbound bridge
+        # recorded that context at attach; pass it as --restore-cid so tear_down
+        # rebinds it instead of leaving the data path unbound. Best-effort: a
+        # failure here must not stop the rest of cleanup.
+        volte_restore_cid=""
+        if [ -f "${VOLTE_RESTORE_CID_PATH:-}" ]; then
+            volte_restore_cid="$(cat "$VOLTE_RESTORE_CID_PATH" 2>/dev/null)"
+        fi
         "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-pdn \
             --action down --modem "${VOLTE_MODEM_PORT:-/dev/ttyUSB0}" \
             ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} --cid "${VOLTE_CID:-3}" \
+            ${volte_restore_cid:+--restore-cid "$volte_restore_cid"} \
             >/dev/null 2>&1
     fi
     [ -n "$PCSCD_LOG_TAIL_PID" ] && kill "$PCSCD_LOG_TAIL_PID" 2>/dev/null
@@ -877,6 +898,11 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
     }
     eval "$VOLTE_ENV"
 
+    # Where the inbound bridge records the context its IMS PDN displaced, so
+    # `cleanup` can `--restore-cid` it on teardown (the bridge never runs its
+    # own detach — its accept loop does not return).
+    VOLTE_RESTORE_CID_PATH="/run/volte-restore-cid"
+
     if [ "$VOWIFI_ENABLED" -eq 1 ]; then
         log "FATAL: [volte].enabled and [vowifi].enabled are both true. They register the"
         log "       same IMPU with the same instance-id, so each would tear the other's"
@@ -904,7 +930,8 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
                     --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
                     ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
                     --pcscf-port "$VOLTE_PCSCF_PORT" \
-                    --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH"
+                    --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
+                    --restore-cid-path "$VOLTE_RESTORE_CID_PATH"
             else
                 "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-register \
                     --modem "$VOLTE_MODEM_PORT" \
@@ -915,6 +942,7 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
                     --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
                     --status-path "$VOLTE_STATUS_PATH" \
                     --lock-path "$VOLTE_LOCK_PATH" \
+                    --restore-cid-path "$VOLTE_RESTORE_CID_PATH" \
                     --keep-pdn
             fi
             log "the LTE IMS service exited (status $?); restarting in 15s"
