@@ -61,6 +61,16 @@ pub enum ControlMessage {
         registered_at: Option<u64>,
         expires_at: Option<u64>,
         last_failure: Option<(u64, String)>,
+        /// Whether an inbound call could actually be answered right now
+        /// (`ims::lifecycle::ServiceHealth::can_answer`). `#[serde(default)]`
+        /// so a reply from an older peer that omits it still parses — it then
+        /// reads `false`, and `blocked_reason` below carries the "why".
+        #[serde(default)]
+        can_answer: bool,
+        /// Why the service cannot answer, when it cannot; `None` when it can or
+        /// when the peer did not report health.
+        #[serde(default)]
+        blocked_reason: Option<String>,
     },
     /// Agent B → `vowifi-status`. Recent call outcomes, newest first.
     CallHistoryReply { calls: Vec<CallRecord> },
@@ -364,6 +374,8 @@ mod tests {
             registered_at: Some(1_700_000_000),
             expires_at: Some(1_700_003_600),
             last_failure: Some((1_699_999_000, "timed out".to_string())),
+            can_answer: true,
+            blocked_reason: None,
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -375,6 +387,8 @@ mod tests {
             registered_at: None,
             expires_at: None,
             last_failure: None,
+            can_answer: false,
+            blocked_reason: Some("not registered".to_string()),
         };
         assert_eq!(roundtrip(&msg), msg);
     }

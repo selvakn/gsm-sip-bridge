@@ -87,6 +87,20 @@ pub fn split_at_fields(s: &str) -> Vec<String> {
     out.into_iter().map(|f| f.trim().to_string()).collect()
 }
 
+/// Tokenises every `+<cmd>` line in `lines`, in order, into its comma-separated
+/// fields. Centralises the `strip_prefix` + [`split_at_fields`] step that every
+/// `+CMD` parser below (and `pcscf`) otherwise repeats; the per-command field
+/// interpretation stays with each parser. `cmd` includes the colon, e.g.
+/// `"+CGPADDR:"`.
+pub fn at_fields<'a>(
+    lines: &'a [String],
+    cmd: &'static str,
+) -> impl Iterator<Item = Vec<String>> + 'a {
+    lines
+        .iter()
+        .filter_map(move |l| l.trim().strip_prefix(cmd).map(split_at_fields))
+}
+
 /// Converts the dot-decimal byte form 3GPP uses in `+CGCONTRDP` into an IPv6
 /// address. The field carries 32 bytes (address then netmask) for IPv6, or 8
 /// (address then mask) for IPv4; only the leading 16 bytes are the address.
@@ -116,11 +130,7 @@ pub struct ContextParams {
 /// The modem emits one line per address family, so the first match wins —
 /// `cid`, `bearer_id`, and `apn` are identical across them.
 pub fn parse_cgcontrdp(lines: &[String], cid: u8) -> Option<ContextParams> {
-    for line in lines {
-        let Some(payload) = line.trim().strip_prefix("+CGCONTRDP:") else {
-            continue;
-        };
-        let f = split_at_fields(payload);
+    for f in at_fields(lines, "+CGCONTRDP:") {
         if f.len() < 3 {
             continue;
         }
@@ -147,11 +157,7 @@ pub fn parse_cgcontrdp(lines: &[String], cid: u8) -> Option<ContextParams> {
 /// An all-zero IPv4 address means "not assigned" and is reported as `None` —
 /// this is the normal case on an IPv6-only IMS PDN, not an error.
 pub fn parse_cgpaddr(lines: &[String], cid: u8) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
-    for line in lines {
-        let Some(payload) = line.trim().strip_prefix("+CGPADDR:") else {
-            continue;
-        };
-        let f = split_at_fields(payload);
+    for f in at_fields(lines, "+CGPADDR:") {
         if f.len() < 2 || f[0].parse::<u8>() != Ok(cid) {
             continue;
         }
@@ -184,11 +190,7 @@ pub fn parse_cgpaddr(lines: &[String], cid: u8) -> (Option<Ipv4Addr>, Option<Ipv
 /// not registered but searching, `0` = not registered and not searching.
 /// Returns `None` if no `+CEREG` line is present or it cannot be parsed.
 pub fn parse_cereg_stat(lines: &[String]) -> Option<u8> {
-    for line in lines {
-        let Some(payload) = line.trim().strip_prefix("+CEREG:") else {
-            continue;
-        };
-        let f = split_at_fields(payload);
+    for f in at_fields(lines, "+CEREG:") {
         if f.len() < 2 {
             continue;
         }
@@ -201,11 +203,8 @@ pub fn parse_cereg_stat(lines: &[String]) -> Option<u8> {
 
 /// Parses `+CGACT: <cid>,<state>` lines into (cid, active) pairs.
 pub fn parse_cgact(lines: &[String]) -> Vec<(u8, bool)> {
-    lines
-        .iter()
-        .filter_map(|l| {
-            let payload = l.trim().strip_prefix("+CGACT:")?;
-            let f = split_at_fields(payload);
+    at_fields(lines, "+CGACT:")
+        .filter_map(|f| {
             if f.len() < 2 {
                 return None;
             }
@@ -218,11 +217,7 @@ pub fn parse_cgact(lines: &[String]) -> Vec<(u8, bool)> {
 ///
 /// Returns the bound cid, or `None` when nothing is bound (`0,0,0,0`).
 pub fn parse_qnetdevctl(lines: &[String]) -> Option<u8> {
-    for line in lines {
-        let Some(payload) = line.trim().strip_prefix("+QNETDEVCTL:") else {
-            continue;
-        };
-        let f = split_at_fields(payload);
+    for f in at_fields(lines, "+QNETDEVCTL:") {
         if f.len() < 2 {
             continue;
         }

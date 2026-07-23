@@ -7,7 +7,7 @@
 //! telephone system — which is the point: the hazards below are all things
 //! that would otherwise only show up hours into a live soak.
 
-use gsm_sip_bridge::volte::bridge::{
+use gsm_sip_bridge::ims::lifecycle::{
     Admission, BridgedCall, CallSlot, CallStage, EndedBy, Maintenance, MaintenanceDecision,
     MaintenancePolicy,
 };
@@ -226,7 +226,7 @@ fn maintenance_while_the_line_is_idle_is_never_held_back() {
 
 // ---- live status (US3, FR-014/SC-009) -------------------------------------
 
-use gsm_sip_bridge::volte::bridge::ServiceHealth;
+use gsm_sip_bridge::ims::lifecycle::ServiceHealth;
 
 fn healthy() -> ServiceHealth {
     ServiceHealth {

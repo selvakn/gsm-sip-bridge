@@ -439,6 +439,7 @@ mod tests {
             registered_at: Some(now),
             expires_at: Some(now + Duration::from_secs(3600)),
             last_failure: None,
+            ..RegistrationStatus::default()
         };
 
         let parsed = parse_status(&render_status(&original)).expect("should parse");
@@ -515,6 +516,7 @@ mod tests {
             registered_at: Some(SystemTime::now()),
             expires_at: Some(SystemTime::now() + Duration::from_secs(600)),
             last_failure: Some((SystemTime::now(), "timed out".to_string())),
+            ..RegistrationStatus::default()
         };
 
         let out = status_summary(Some(&s));

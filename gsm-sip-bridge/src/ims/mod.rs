@@ -28,6 +28,7 @@ pub mod call;
 mod digest;
 pub mod echo;
 mod gm_ipsec;
+pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
 mod rtp;
@@ -92,7 +93,7 @@ pub struct ImsRegisterConfig {
     /// `ACCESS_NETWORK_WLAN` for the ePDG/VoWiFi path — which is what every
     /// caller sent before this field existed, so it is what they still send.
     /// The LTE path supplies an E-UTRAN value instead; see
-    /// `crate::volte::access_network_info`.
+    /// `crate::volte::pani::access_network_info`.
     pub access_network_info: String,
 }
 
@@ -177,6 +178,20 @@ pub struct RegistrationStatus {
     pub registered_at: Option<std::time::SystemTime>,
     pub expires_at: Option<std::time::SystemTime>,
     pub last_failure: Option<(std::time::SystemTime, String)>,
+    // The health inputs the dispatch loop keeps current so the status listener
+    // can answer `can_answer`/`blocked_reason` (`ims::lifecycle::ServiceHealth`)
+    // without touching the modem itself. In-memory only — `render_status`
+    // persists just the four fields above, so these carry sensible defaults on
+    // a status read from disk.
+    /// Whether the network attachment underneath the registration is up. The
+    /// Wi-Fi path has no such attachment, so it is left `true` (its default)
+    /// and health then turns only on `registered`/`busy`.
+    pub attached: bool,
+    /// Whether a call is in progress.
+    pub busy: bool,
+    /// Maintenance currently held back for a call, if any — reported so a
+    /// deferral reads as deliberate rather than as a stall.
+    pub deferred_maintenance: Option<crate::ims::lifecycle::Maintenance>,
 }
 
 impl Default for RegistrationStatus {
@@ -186,6 +201,26 @@ impl Default for RegistrationStatus {
             registered_at: None,
             expires_at: None,
             last_failure: None,
+            attached: true,
+            busy: false,
+            deferred_maintenance: None,
+        }
+    }
+}
+
+impl RegistrationStatus {
+    /// The [`ServiceHealth`](crate::ims::lifecycle::ServiceHealth) this snapshot
+    /// implies — the single derivation the status listener answers a
+    /// `can_answer`/`blocked_reason` query from, so what a `volte-status` caller
+    /// reads agrees by construction with the admission the dispatch loop
+    /// applies. `registered` is *only* the `Registered` state: `Renewing` or
+    /// `Failed` cannot answer, which is the honest answer even mid-renewal.
+    pub fn health(&self) -> crate::ims::lifecycle::ServiceHealth {
+        crate::ims::lifecycle::ServiceHealth {
+            registered: self.state == RegistrationState::Registered,
+            attached: self.attached,
+            busy: self.busy,
+            deferred: self.deferred_maintenance,
         }
     }
 }
@@ -663,6 +698,48 @@ mod tests {
         let expires_at = SystemTime::now() + Duration::from_secs(3600);
         let now = SystemTime::now();
         assert!(!renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn health_is_can_answer_only_when_registered_attached_and_idle() {
+        // The status a `volte-status` query reports is derived from exactly the
+        // health this produces, so pin the mapping the dispatch loop relies on.
+        let base = RegistrationStatus {
+            state: RegistrationState::Registered,
+            ..Default::default()
+        };
+        assert!(base.health().can_answer());
+        assert_eq!(base.health().blocked_reason(), None);
+
+        // Busy: blocked, but the attachment/registration are still up.
+        let busy = RegistrationStatus {
+            busy: true,
+            ..base.clone()
+        };
+        assert!(!busy.health().can_answer());
+        assert_eq!(
+            busy.health().blocked_reason(),
+            Some("a call is already in progress")
+        );
+
+        // Attachment down outranks everything — a card on this path has no
+        // circuit-switched fallback, so it must never claim it can answer.
+        let detached = RegistrationStatus {
+            attached: false,
+            ..base.clone()
+        };
+        assert!(!detached.health().can_answer());
+        assert_eq!(
+            detached.health().blocked_reason(),
+            Some("the network attachment is down")
+        );
+
+        // Mid-renewal is not registered enough to answer.
+        let renewing = RegistrationStatus {
+            state: RegistrationState::Renewing,
+            ..base
+        };
+        assert!(!renewing.health().can_answer());
     }
 
     #[test]
