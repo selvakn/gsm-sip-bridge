@@ -189,6 +189,9 @@ pub struct RegistrationStatus {
     pub attached: bool,
     /// Whether a call is in progress.
     pub busy: bool,
+    /// Whether the telephone-side half holds the PBX registration the outbound
+    /// bridge leg needs. Left `true` on the Wi-Fi path (not tracked there).
+    pub pbx_registered: bool,
     /// Maintenance currently held back for a call, if any — reported so a
     /// deferral reads as deliberate rather than as a stall.
     pub deferred_maintenance: Option<crate::ims::lifecycle::Maintenance>,
@@ -203,6 +206,7 @@ impl Default for RegistrationStatus {
             last_failure: None,
             attached: true,
             busy: false,
+            pbx_registered: true,
             deferred_maintenance: None,
         }
     }
@@ -219,6 +223,7 @@ impl RegistrationStatus {
         crate::ims::lifecycle::ServiceHealth {
             registered: self.state == RegistrationState::Registered,
             attached: self.attached,
+            pbx_registered: self.pbx_registered,
             busy: self.busy,
             deferred: self.deferred_maintenance,
         }

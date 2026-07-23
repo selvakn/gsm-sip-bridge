@@ -30,6 +30,12 @@ struct SipBridgeConfig {
     local_port: u16,
     display_name: String,
     tls_verify: TlsVerify,
+    /// Whether this circuit-switched bridge should register the SIP trunk.
+    /// `false` when the VoLTE inbound bridge is active: it registers the *same*
+    /// trunk account for its own outbound leg, and a trunk keeps a single
+    /// binding, so two registrants of one account fight over it (and the churn
+    /// can get the account auth-denied). The VoLTE bridge owns the trunk then.
+    register_trunk: bool,
     dial_timeout_sec: u64,
     sip_destination: String,
     jb_init_ms: i32,
@@ -53,6 +59,9 @@ impl SipBridge {
             local_port: config.sip.local_port,
             display_name: config.sip.display_name.clone(),
             tls_verify: config.sip.tls_verify.clone(),
+            // Defer the trunk to the VoLTE inbound bridge when it is active, so
+            // the same account is not registered from two places at once.
+            register_trunk: !config.volte.bridge_inbound,
             dial_timeout_sec: config.bridge.sip_dial_timeout_sec,
             sip_destination: config.bridge.sip_destination.clone(),
             jb_init_ms: config.audio.settings.jb_init_ms,
@@ -75,6 +84,21 @@ impl SipBridge {
     }
 
     pub fn register(&mut self) -> Result<(), String> {
+        // When the VoLTE inbound bridge owns the trunk, this circuit-switched
+        // bridge must not also register the same account — see `register_trunk`.
+        // Skip cleanly (no endpoint/account): the caller already tolerates an
+        // unregistered bridge ("calls will not be bridged"), and this container
+        // is doing VoLTE, not circuit-switched, work.
+        if !self.config.register_trunk {
+            self.state = RegistrationState::Unregistered;
+            tracing::info!(
+                server = %self.config.server,
+                username = %self.config.username,
+                "circuit-switched SIP trunk registration skipped: the VoLTE inbound \
+                 bridge owns this trunk (avoids double-registering the same account)"
+            );
+            return Ok(());
+        }
         self.state = RegistrationState::Registering;
 
         let transport = match self.config.transport {

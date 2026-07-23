@@ -64,6 +64,18 @@ pub const AGENT_A_STATUS_PORT: u16 = 5071;
 /// `AGENT_A_STATUS_PORT`.
 pub const AGENT_B_SIP_LOCAL_PORT: u16 = 5072;
 
+/// How long to wait for the PBX to give a *final* response to the initial
+/// REGISTER before treating it as not-yet-confirmed and backing off. A SIP
+/// registration, even with an auth round-trip, settles in a second or two; this
+/// leaves generous headroom.
+const PBX_REG_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
+/// First delay after an unconfirmed/denied REGISTER before re-checking.
+const PBX_REG_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+/// Ceiling on the re-check backoff. Deliberately unhurried: PJSUA re-registers
+/// on its own timer and hammering a denial is what triggers auth lockouts in
+/// the first place, so we poll its live status rather than force REGISTERs.
+const PBX_REG_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -175,6 +187,9 @@ fn run_inner(config: &AppConfig) -> BridgeResult<()> {
         lines,
         "vowifi-sip-agent",
         crate::store::Transport::Vowifi,
+        // Wi-Fi Agent A/B are separate processes, so there is no in-process flag
+        // to share; Agent A's health does not track the PBX leg here.
+        None,
     )
 }
 
@@ -200,6 +215,11 @@ pub(crate) fn run_telephony_side(
     // recorded under — named apart from the PJSIP `transport` below, which is
     // a different thing entirely.
     record_transport: crate::store::Transport,
+    // Shared with the carrier-side half so its health/admission can tell whether
+    // the PBX leg is actually usable — set once this half confirms the PBX
+    // accepted its REGISTER, cleared while it hasn't. `None` on the Wi-Fi path,
+    // where the two halves are separate processes and cannot share it.
+    pbx_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> BridgeResult<()> {
     let transport = match config.sip.transport {
         ConfigSipTransport::Udp => TransportType::Udp,
@@ -243,12 +263,54 @@ pub(crate) fn run_telephony_side(
     };
     let account = Account::register(&endpoint, acc_config, None)
         .map_err(|e| BridgeError::Ims(format!("SIP account registration failed: {e}")))?;
-    tracing::info!(
-        server = %config.sip.server,
-        port = config.sip.port,
-        agent = agent_label,
-        "registered to PBX"
-    );
+
+    // `Account::register` only *initiates* the REGISTER — it does not mean the
+    // PBX accepted it. Confirm it did (or report the denial) before treating
+    // the outbound bridge leg as usable; assuming success is how a `403` after
+    // repeated auth attempts left the bridge "registered" while no call could
+    // be placed. On denial we degrade rather than exit (mirroring the IMS
+    // renewal loop): PJSUA keeps re-registering on its own timer, so we hold
+    // here — with the shared flag cleared so the carrier half fast-declines and
+    // status reads `can_answer=false` — and proceed the moment the PBX accepts.
+    {
+        use std::sync::atomic::Ordering;
+        let mut backoff = PBX_REG_INITIAL_BACKOFF;
+        loop {
+            match account.wait_registered(PBX_REG_CONFIRM_TIMEOUT) {
+                Ok(()) => {
+                    if let Some(flag) = &pbx_registered {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    tracing::info!(
+                        server = %config.sip.server,
+                        port = config.sip.port,
+                        agent = agent_label,
+                        "registered to PBX"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    if let Some(flag) = &pbx_registered {
+                        flag.store(false, Ordering::SeqCst);
+                    }
+                    tracing::error!(
+                        error = %e,
+                        server = %config.sip.server,
+                        agent = agent_label,
+                        retry_in_secs = backoff.as_secs(),
+                        "PBX registration not confirmed — the outbound bridge leg is \
+                         unavailable until the PBX accepts it"
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(PBX_REG_MAX_BACKOFF);
+                    // Re-send the REGISTER ourselves: PJSUA may not retry a 403
+                    // on its own, so without this the account would never
+                    // recover once the registrar starts accepting again.
+                    account.trigger_registration();
+                }
+            }
+        }
+    }
 
     // One SIP identity/registration for every line (the spec's own
     // Assumptions section) — what varies per line below is only which
