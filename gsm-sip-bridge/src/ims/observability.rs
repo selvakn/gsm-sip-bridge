@@ -27,10 +27,15 @@ pub struct AgentObservability {
     /// able to take an agent down (FR-018), so a missing store degrades to
     /// "no history for this run" rather than a startup failure.
     store: Option<StoreHandle>,
-    /// Reused for every VoWiFi call record (`[bridge].sip_destination`) —
-    /// the same destination `vowifi::mod`'s Agent B dials, since there is
-    /// exactly one PBX destination for the whole bridge.
+    /// Reused for every call record (`[bridge].sip_destination`) — the same
+    /// destination Agent B dials, since there is exactly one PBX destination
+    /// for the whole bridge.
     sip_destination: String,
+    /// Which transport this agent's call rows are filed under. Both the VoWiFi
+    /// and VoLTE paths run this same code, so it must be told which it is or
+    /// their history collapses into one — the store counterpart of the metric
+    /// `transport` label.
+    transport: Transport,
     state: Mutex<AgentState>,
 }
 
@@ -40,12 +45,14 @@ impl AgentObservability {
         module_id: String,
         store: Option<StoreHandle>,
         sip_destination: String,
+        transport: Transport,
     ) -> Self {
         Self {
             reporter,
             module_id,
             store,
             sip_destination,
+            transport,
             state: Mutex::new(AgentState::default()),
         }
     }
@@ -106,17 +113,35 @@ impl AgentObservability {
         self.insert_call_row(caller, started_at, 0.0, status);
     }
 
+    /// Reports a call that reached an answer and then ended, judged by its
+    /// media (FR-017): a call that carried audio both ways is `Answered`; one
+    /// that carried one-way or no audio is a **failure**, recorded as `Failed`
+    /// with the direction named, never as a success.
     pub fn report_call_answered_and_ended(
         &self,
         caller: &str,
         started_at: DateTime<Utc>,
         duration_seconds: f64,
+        media: super::media_stats::DirectionVerdict,
     ) {
-        self.push(vec![ObservedEvent::CallCompleted {
-            status: CallStatus::Answered,
-            duration_seconds,
-        }]);
-        self.insert_call_row(caller, started_at, duration_seconds, CallStatus::Answered);
+        if media.is_success() {
+            self.push(vec![ObservedEvent::CallCompleted {
+                status: CallStatus::Answered,
+                duration_seconds,
+            }]);
+            self.insert_call_row(caller, started_at, duration_seconds, CallStatus::Answered);
+        } else {
+            self.push(vec![
+                ObservedEvent::CallCompleted {
+                    status: CallStatus::Failed,
+                    duration_seconds,
+                },
+                ObservedEvent::BridgeFailed {
+                    reason: BridgeFailureReason::OneWayAudio,
+                },
+            ]);
+            self.insert_call_row(caller, started_at, duration_seconds, CallStatus::Failed);
+        }
     }
 
     fn insert_call_row(
@@ -136,10 +161,10 @@ impl AgentObservability {
             duration_seconds,
             status: status.as_str().to_string(),
             sip_destination: self.sip_destination.clone(),
-            transport: Transport::Vowifi,
+            transport: self.transport,
         };
         if let Err(e) = store.sender().send(StoreCommand::InsertCall(record)) {
-            tracing::error!(error = %e, "failed to send VoWiFi call record to store");
+            tracing::error!(error = %e, "failed to send call record to store");
         }
     }
 }

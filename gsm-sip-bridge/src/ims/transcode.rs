@@ -332,6 +332,7 @@ pub fn spawn_transcoding_relay(
     carrier: ChosenCodec,
     veth_codec: ChosenCodec,
     stop: Arc<AtomicBool>,
+    meter: &super::media_stats::MediaMeter,
 ) -> BridgeResult<()> {
     if carrier.codec == NegotiatedCodec::Pcmu && veth_codec.codec == NegotiatedCodec::Pcmu {
         return Err(BridgeError::Ims(
@@ -374,6 +375,11 @@ pub fn spawn_transcoding_relay(
         "starting transcoding relay"
     );
 
+    // Each direction counts what it receives from its source (FR-017): the
+    // carrier→veth thread counts downlink from the carrier, the veth→carrier
+    // thread counts uplink from the telephone leg.
+    let carrier_rx = meter.carrier_rx_counter();
+    let pbx_rx = meter.pbx_rx_counter();
     let stop_a = stop.clone();
     std::thread::spawn(move || {
         relay_direction(
@@ -385,6 +391,7 @@ pub fn spawn_transcoding_relay(
             veth_codec,
             "carrier->veth",
             stop_a,
+            carrier_rx,
         )
     });
     std::thread::spawn(move || {
@@ -397,6 +404,7 @@ pub fn spawn_transcoding_relay(
             carrier,
             "veth->carrier",
             stop,
+            pbx_rx,
         )
     });
     Ok(())
@@ -417,6 +425,7 @@ fn relay_direction(
     out: ChosenCodec,
     direction: &'static str,
     stop: Arc<AtomicBool>,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let frame_samples = out.codec.frame_samples();
     let mut sender = RtpSender::new(out.payload_type);
@@ -430,6 +439,9 @@ fn relay_direction(
         let Some(pkt) = rtp::parse_packet(&buf[..n]) else {
             continue;
         };
+        // Count the packet only once it parses as RTP — a malformed datagram is
+        // not audio that flowed, and counting it would mask a one-way call.
+        super::media_stats::bump(&counter);
         let Some(pcm) = decoder.decode(pkt.payload) else {
             continue;
         };
@@ -571,6 +583,7 @@ mod tests {
             codec(NegotiatedCodec::Pcmu, 0),
             codec(NegotiatedCodec::L16, 96),
             stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
         )
         .unwrap();
 
@@ -628,6 +641,7 @@ mod tests {
             codec(NegotiatedCodec::Pcmu, 0),
             codec(NegotiatedCodec::L16, 96),
             stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
         )
         .unwrap();
 
@@ -702,6 +716,7 @@ mod tests {
             codec(NegotiatedCodec::Pcmu, 0),
             codec(NegotiatedCodec::Pcmu, 0),
             Arc::new(AtomicBool::new(false)),
+            &crate::ims::media_stats::MediaMeter::new(),
         )
         .is_err());
     }
@@ -722,6 +737,7 @@ mod tests {
             codec(NegotiatedCodec::Pcmu, 0),
             codec(NegotiatedCodec::L16, 96),
             stop,
+            &crate::ims::media_stats::MediaMeter::new(),
         )
         .expect("8k carrier to 16k veth must resample rather than be refused");
     }

@@ -9,7 +9,69 @@
 //! without a modem, a SIM or a carrier — unusually for this project, and the
 //! reason the plan front-loads it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Counts RTP packets in each direction of a bridged call's carrier leg so a
+/// call that ended can be judged both-ways or one-way (FR-017) — the same
+/// guard `volte-call` applies to outbound calls, brought to the inbound bridge
+/// that both the VoWiFi and VoLTE paths share.
+///
+/// Cloneable and thread-safe: each of the relay's two directions holds a handle
+/// and increments its own side, while the dispatch loop keeps one to read at
+/// teardown. Counting packets (not bytes or samples) is enough — both
+/// directions run at the same ~50 packets/second frame cadence, so their counts
+/// are directly comparable against the ratio threshold.
+#[derive(Clone, Default)]
+pub struct MediaMeter {
+    /// Packets received *from the carrier* — the caller's audio (downlink).
+    carrier_rx: Arc<AtomicU64>,
+    /// Packets received *from the telephone leg* — the callee's audio, relayed
+    /// onward to the carrier (uplink).
+    pbx_rx: Arc<AtomicU64>,
+}
+
+impl MediaMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A shared handle to the downlink counter, for the carrier→telephone relay
+    /// direction to increment as packets arrive from the carrier.
+    pub fn carrier_rx_counter(&self) -> Arc<AtomicU64> {
+        self.carrier_rx.clone()
+    }
+
+    /// A shared handle to the uplink counter, for the telephone→carrier relay
+    /// direction to increment as packets arrive from the telephone leg.
+    pub fn pbx_rx_counter(&self) -> Arc<AtomicU64> {
+        self.pbx_rx.clone()
+    }
+
+    pub fn carrier_rx(&self) -> u64 {
+        self.carrier_rx.load(Ordering::Relaxed)
+    }
+
+    pub fn pbx_rx(&self) -> u64 {
+        self.pbx_rx.load(Ordering::Relaxed)
+    }
+
+    /// The FR-017 verdict for the call. Uplink (`pbx_rx`, what we relayed toward
+    /// the carrier) is the "sent" side; downlink (`carrier_rx`, what the carrier
+    /// sent us) is the "received" side — so a carrier that never sent reads as
+    /// `SendOnly`, and a telephone leg that produced nothing reads as
+    /// `ReceiveOnly`.
+    pub fn verdict(&self, threshold_percent: u8) -> DirectionVerdict {
+        verdict(self.pbx_rx(), self.carrier_rx(), threshold_percent)
+    }
+}
+
+/// Increments a packet counter by one, for a relay direction that holds a
+/// handle from [`MediaMeter`].
+pub fn bump(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Default proportion of sent audio that must come back before a direction
 /// counts as working (specs/016-volte-calls FR-016).
@@ -216,6 +278,58 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    // ---- media meter -------------------------------------------------------
+
+    #[test]
+    fn the_meter_reports_both_ways_only_when_both_directions_carried_audio() {
+        let m = MediaMeter::new();
+        for _ in 0..1000 {
+            crate::ims::media_stats::bump(&m.carrier_rx_counter());
+            crate::ims::media_stats::bump(&m.pbx_rx_counter());
+        }
+        assert_eq!(m.carrier_rx(), 1000);
+        assert_eq!(m.pbx_rx(), 1000);
+        assert_eq!(
+            m.verdict(DEFAULT_ONE_WAY_THRESHOLD_PERCENT),
+            DirectionVerdict::BothWays
+        );
+    }
+
+    #[test]
+    fn the_meter_flags_a_carrier_that_never_sent_as_one_way() {
+        // The exact R15 shape on the inbound bridge: we relayed uplink to the
+        // carrier, but the carrier sent nothing back. This must read as a
+        // failure, not the "answered" it used to.
+        let m = MediaMeter::new();
+        for _ in 0..1000 {
+            crate::ims::media_stats::bump(&m.pbx_rx_counter());
+        }
+        let v = m.verdict(DEFAULT_ONE_WAY_THRESHOLD_PERCENT);
+        assert_eq!(v, DirectionVerdict::SendOnly);
+        assert!(!v.is_success());
+    }
+
+    #[test]
+    fn the_meter_flags_a_silent_telephone_leg_as_one_way() {
+        let m = MediaMeter::new();
+        for _ in 0..1000 {
+            crate::ims::media_stats::bump(&m.carrier_rx_counter());
+        }
+        let v = m.verdict(DEFAULT_ONE_WAY_THRESHOLD_PERCENT);
+        assert_eq!(v, DirectionVerdict::ReceiveOnly);
+        assert!(!v.is_success());
+    }
+
+    #[test]
+    fn a_call_that_never_carried_media_is_not_a_success() {
+        let m = MediaMeter::new();
+        assert_eq!(
+            m.verdict(DEFAULT_ONE_WAY_THRESHOLD_PERCENT),
+            DirectionVerdict::Neither
+        );
+        assert!(!m.verdict(DEFAULT_ONE_WAY_THRESHOLD_PERCENT).is_success());
     }
 
     // ---- direction verdict -------------------------------------------------
