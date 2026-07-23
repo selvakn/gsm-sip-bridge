@@ -179,6 +179,26 @@ pub fn parse_cgpaddr(lines: &[String], cid: u8) -> (Option<Ipv4Addr>, Option<Ipv
     (None, None)
 }
 
+/// Parses the `<stat>` field of `+CEREG: <n>,<stat>[,...]` — the EPS
+/// registration state. `1` = registered home, `5` = registered roaming, `2` =
+/// not registered but searching, `0` = not registered and not searching.
+/// Returns `None` if no `+CEREG` line is present or it cannot be parsed.
+pub fn parse_cereg_stat(lines: &[String]) -> Option<u8> {
+    for line in lines {
+        let Some(payload) = line.trim().strip_prefix("+CEREG:") else {
+            continue;
+        };
+        let f = split_at_fields(payload);
+        if f.len() < 2 {
+            continue;
+        }
+        if let Ok(stat) = f[1].trim().parse::<u8>() {
+            return Some(stat);
+        }
+    }
+    None
+}
+
 /// Parses `+CGACT: <cid>,<state>` lines into (cid, active) pairs.
 pub fn parse_cgact(lines: &[String]) -> Vec<(u8, bool)> {
     lines
@@ -377,6 +397,63 @@ pub fn bring_up(at: &mut AtCommander, cid: u8, apn: &str) -> BridgeResult<PdnBri
     })
 }
 
+/// Reads the current EPS registration state (`AT+CEREG?`), returning the
+/// `<stat>` value for logging. Best-effort: a failure reads as `None` rather
+/// than aborting whatever teardown step wanted to record it.
+fn eps_registration_state(at: &mut AtCommander) -> Option<u8> {
+    match at.send_command("AT+CEREG?") {
+        Ok(AtResponse::Ok(lines)) => parse_cereg_stat(&lines),
+        _ => None,
+    }
+}
+
+/// Forces a packet-domain detach so the network releases the PDN — and with it
+/// the PCRF's IP-CAN session — instead of leaving it orphaned.
+///
+/// **Why this is not optional** (`research.md` R19 / `hardening.md` H2, the
+/// root cause of this feature's Rx 5065 block): deactivating the context with
+/// `AT+CGACT=0` returns the *host* to "no PDN" but never detaches the UE from
+/// the packet domain, so the core can keep a stale Gx session bound to the old
+/// address. A later attach then creates a *new* IP-CAN session while the old
+/// one still owns the binding, and every Rx `AAR` for media is answered
+/// `IP-CAN_SESSION_NOT_AVAILABLE` (Rx 5065). Measured directly: after a clean
+/// teardown the modem still reported `+CGATT: 1` / `+CEREG: 0,1` — attached —
+/// which is why every "restart and it was identical" test was incapable of
+/// clearing the session it was blaming.
+///
+/// `AT+CGATT=0` issues a real Detach Request: the PGW tears down every PDN
+/// connection and sends the `CCR-T` that releases the session. RF is left on,
+/// so the modem re-attaches to the packet domain on its own and the next
+/// `bring_up` activates a clean context. On an exclusively-assigned card
+/// (`research.md` R6) detaching every context is safe — nothing else is using
+/// this modem, and the default context auto-re-attaches.
+///
+/// The `CEREG` state is read before and after solely so the log distinguishes
+/// "we detached" from "we asked and the modem ignored it" after the fact.
+/// Best-effort: a refused detach is logged loudly but does not fail teardown,
+/// which is cleanup and must not get stuck.
+pub fn force_packet_domain_detach(at: &mut AtCommander) {
+    let before = eps_registration_state(at);
+    match at.send_command("AT+CGATT=0") {
+        Ok(AtResponse::Ok(_)) => {
+            let after = eps_registration_state(at);
+            tracing::info!(
+                cereg_before = ?before,
+                cereg_after = ?after,
+                "forced a packet-domain detach so the network releases the IP-CAN session"
+            );
+        }
+        other => {
+            tracing::warn!(
+                cereg_before = ?before,
+                response = ?other,
+                "AT+CGATT=0 was refused — the network may retain a stale IP-CAN \
+                 session, which can surface as Rx 5065 on the next attach"
+            );
+        }
+    }
+}
+
 /// Releases the IMS PDN and restores any previously displaced binding
 /// (FR-005). Safe when nothing is attached.
 pub fn tear_down(at: &mut AtCommander, cid: u8, restore_cid: Option<u8>) -> BridgeResult<()> {
@@ -397,6 +474,9 @@ pub fn tear_down(at: &mut AtCommander, cid: u8, restore_cid: Option<u8>) -> Brid
     if is_active(at, cid)? {
         expect_ok(at.send_command(&format!("AT+CGACT=0,{cid}"))?, "AT+CGACT=0")?;
     }
+    // Deactivating the context is not enough — the UE stays attached and the
+    // core can keep the IP-CAN session. Force a real detach so it is released.
+    force_packet_domain_detach(at);
     Ok(())
 }
 
@@ -434,6 +514,21 @@ mod tests {
         assert_eq!(parse_cgcontrdp(&l, 3).unwrap().bearer_id, 6);
         assert_eq!(parse_cgcontrdp(&l, 1).unwrap().bearer_id, 5);
         assert!(parse_cgcontrdp(&l, 7).is_none());
+    }
+
+    #[test]
+    fn parses_the_eps_registration_state() {
+        // Verbatim shapes from the live session. The stat field is what says
+        // whether a detach actually took (0/2) or the UE is still attached (1).
+        assert_eq!(parse_cereg_stat(&lines(&["+CEREG: 0,1"])), Some(1));
+        assert_eq!(parse_cereg_stat(&lines(&["+CEREG: 0,2"])), Some(2));
+        assert_eq!(parse_cereg_stat(&lines(&["+CEREG: 0,0"])), Some(0));
+        // Tolerates the longer form with location/act fields, and junk.
+        assert_eq!(
+            parse_cereg_stat(&lines(&["+CEREG: 2,1,\"1A2B\",\"00C3D4E5\",7"])),
+            Some(1)
+        );
+        assert_eq!(parse_cereg_stat(&lines(&["OK"])), None);
     }
 
     #[test]
