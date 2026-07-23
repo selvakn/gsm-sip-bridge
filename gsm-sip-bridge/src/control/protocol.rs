@@ -177,6 +177,9 @@ pub enum BridgeFailureReason {
     CallerCancelled,
     PbxDeclined,
     AgentUnreachable,
+    /// The call connected but audio did not flow both ways (FR-017) — a bridged
+    /// call that carried one-way or no audio is a failure, not a success.
+    OneWayAudio,
 }
 
 impl BridgeFailureReason {
@@ -187,6 +190,7 @@ impl BridgeFailureReason {
             BridgeFailureReason::CallerCancelled => "caller_cancelled",
             BridgeFailureReason::PbxDeclined => "pbx_declined",
             BridgeFailureReason::AgentUnreachable => "agent_unreachable",
+            BridgeFailureReason::OneWayAudio => "one_way_audio",
         }
     }
 }

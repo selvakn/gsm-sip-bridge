@@ -273,11 +273,18 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         card_id.to_string(),
         Duration::from_secs(app_config.metrics.agent_report_interval_seconds),
     );
+    // Both paths run this code; the store's call rows must carry the right
+    // transport or VoLTE and VoWiFi history collapse into one.
+    let transport = match agent_kind {
+        AgentKind::Volte | AgentKind::VolteSip => crate::store::Transport::Volte,
+        AgentKind::Ims | AgentKind::Sip => crate::store::Transport::Vowifi,
+    };
     let obs = observability::AgentObservability::new(
         reporter,
         card_id.to_string(),
         history_store,
         app_config.bridge.sip_destination.clone(),
+        transport,
     );
 
     // Under the modem lock: `register_session` reads the IMEI over the AT port
@@ -489,6 +496,9 @@ struct ActiveCall {
     caller: String,
     answered_at: chrono::DateTime<Utc>,
     answered_instant: Instant,
+    /// Per-direction packet counts on the carrier leg, read at teardown for the
+    /// FR-017 one-way-audio verdict.
+    meter: super::media_stats::MediaMeter,
 }
 
 /// The dialog state needed to send an in-dialog request (a `BYE`) on a call we
@@ -822,10 +832,29 @@ pub(crate) fn dispatch_loop(
 /// `ActiveCall` (carrier `BYE`, PBX-originated `CallEnded`, Agent B's
 /// control connection dropping mid-call).
 fn report_answered_call_ended(obs: &observability::AgentObservability, call: &ActiveCall) {
+    let verdict = call
+        .meter
+        .verdict(super::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT);
+    tracing::info!(
+        call_id = %call.call_id,
+        media = verdict.as_str(),
+        carrier_rx = call.meter.carrier_rx(),
+        pbx_rx = call.meter.pbx_rx(),
+        "call media verdict"
+    );
+    if !verdict.is_success() {
+        tracing::warn!(
+            call_id = %call.call_id,
+            media = verdict.as_str(),
+            "answered call did not carry audio both ways: {}",
+            verdict.diagnosis()
+        );
+    }
     obs.report_call_answered_and_ended(
         &call.caller,
         call.answered_at,
         call.answered_instant.elapsed().as_secs_f64(),
+        verdict,
     );
     obs.set_active_calls(0);
 }
@@ -1013,6 +1042,10 @@ fn handle_invite(
             sink.send(&build_200_ok_invite(req, &to_tag, &contact, &answer_sdp))?;
 
             let stop = Arc::new(AtomicBool::new(false));
+            // Counts audio each way so the completed call can be judged
+            // both-ways or one-way (FR-017) — the same guard the outbound path
+            // applies, here on the shared inbound bridge both transports use.
+            let meter = super::media_stats::MediaMeter::new();
             let transcoding = chosen.codec != veth.codec.codec;
             if transcoding {
                 // The two legs speak different codecs (or the same codec at
@@ -1024,10 +1057,11 @@ fn handle_invite(
                     chosen,
                     veth.codec,
                     stop.clone(),
+                    &meter,
                 )?;
             } else {
                 // Both legs speak PCMU: forward the payloads untouched.
-                spawn_relay(ims_rtp_socket, veth.rtp_socket, stop.clone());
+                spawn_relay(ims_rtp_socket, veth.rtp_socket, stop.clone(), &meter);
             }
             // Both sides of Agent A's bridge, so a one-way-audio or
             // lost-your-wideband report can be read straight off the log: what
@@ -1054,6 +1088,7 @@ fn handle_invite(
                 caller,
                 answered_at: Utc::now(),
                 answered_instant: Instant::now(),
+                meter,
             }))
         }
         ControlMessage::BridgeFailed {
@@ -1348,8 +1383,15 @@ fn accept_veth_invite(
     Ok(VethUasResult { rtp_socket, codec })
 }
 
-fn spawn_relay(a: UdpSocket, b: UdpSocket, stop: Arc<AtomicBool>) {
-    std::thread::spawn(move || relay_rtp(a, b, stop));
+fn spawn_relay(
+    carrier: UdpSocket,
+    veth: UdpSocket,
+    stop: Arc<AtomicBool>,
+    meter: &super::media_stats::MediaMeter,
+) {
+    let carrier_rx = meter.carrier_rx_counter();
+    let pbx_rx = meter.pbx_rx_counter();
+    std::thread::spawn(move || relay_rtp(carrier, veth, stop, carrier_rx, pbx_rx));
 }
 
 /// Relays raw UDP payloads bidirectionally between `a` and `b` (both
@@ -1360,28 +1402,44 @@ fn spawn_relay(a: UdpSocket, b: UdpSocket, stop: Arc<AtomicBool>) {
 /// always PCMU too — so the wire bytes (RTP header included: SSRC,
 /// sequence, timestamp all stay whatever the real source generated) are
 /// already correct for the other side without modification.
-pub fn relay_rtp(a: UdpSocket, b: UdpSocket, stop: Arc<AtomicBool>) {
-    let (a2, b2, stop2) = match (a.try_clone(), b.try_clone()) {
+pub fn relay_rtp(
+    carrier: UdpSocket,
+    veth: UdpSocket,
+    stop: Arc<AtomicBool>,
+    carrier_rx: Arc<std::sync::atomic::AtomicU64>,
+    pbx_rx: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let (carrier2, veth2, stop2) = match (carrier.try_clone(), veth.try_clone()) {
         (Ok(a2), Ok(b2)) => (a2, b2, stop.clone()),
         (Err(e), _) | (_, Err(e)) => {
             tracing::error!(error = %e, "RTP relay socket clone failed, aborting relay");
             return;
         }
     };
-    let _ = a.set_read_timeout(Some(RELAY_POLL_INTERVAL));
-    let _ = b.set_read_timeout(Some(RELAY_POLL_INTERVAL));
+    let _ = carrier.set_read_timeout(Some(RELAY_POLL_INTERVAL));
+    let _ = veth.set_read_timeout(Some(RELAY_POLL_INTERVAL));
 
-    let h1 = std::thread::spawn(move || forward(a, b2, stop));
-    let h2 = std::thread::spawn(move || forward(b, a2, stop2));
+    // Each direction counts what it *receives* at its source: the carrier→veth
+    // thread counts downlink from the carrier, the veth→carrier thread counts
+    // uplink from the telephone leg. Read together at teardown, they are the
+    // FR-017 both-ways verdict.
+    let h1 = std::thread::spawn(move || forward(carrier, veth2, stop, carrier_rx));
+    let h2 = std::thread::spawn(move || forward(veth, carrier2, stop2, pbx_rx));
     let _ = h1.join();
     let _ = h2.join();
 }
 
-fn forward(src: UdpSocket, dst: UdpSocket, stop: Arc<AtomicBool>) {
+fn forward(
+    src: UdpSocket,
+    dst: UdpSocket,
+    stop: Arc<AtomicBool>,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+) {
     let mut buf = [0u8; 2048];
     while !stop.load(Ordering::Relaxed) {
         match src.recv(&mut buf) {
             Ok(n) => {
+                super::media_stats::bump(&counter);
                 let _ = dst.send(&buf[..n]);
             }
             Err(e)
@@ -1450,7 +1508,12 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
-        let handle = std::thread::spawn(move || relay_rtp(ims_side, veth_side, stop_clone));
+        let meter = super::super::media_stats::MediaMeter::new();
+        let carrier_rx = meter.carrier_rx_counter();
+        let pbx_rx = meter.pbx_rx_counter();
+        let handle = std::thread::spawn(move || {
+            relay_rtp(ims_side, veth_side, stop_clone, carrier_rx, pbx_rx)
+        });
 
         // ims_peer -> ims_side -> (relay) -> veth_side -> veth_peer
         ims_peer.send(b"hello-from-ims").unwrap();
@@ -1471,6 +1534,15 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+
+        // Each direction counted the one packet it carried — the input to the
+        // FR-017 both-ways verdict.
+        assert_eq!(meter.carrier_rx(), 1, "downlink packet should be counted");
+        assert_eq!(meter.pbx_rx(), 1, "uplink packet should be counted");
+        assert_eq!(
+            meter.verdict(super::super::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT),
+            super::super::media_stats::DirectionVerdict::BothWays
+        );
     }
 
     #[test]

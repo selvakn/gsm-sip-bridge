@@ -56,9 +56,15 @@ async fn test_answered_and_missed_calls_are_persisted_with_vowifi_transport() {
         module_id.clone(),
         Some(store),
         "sip:100@pbx:5060".to_string(),
+        gsm_sip_bridge::store::Transport::Vowifi,
     );
 
-    obs.report_call_answered_and_ended("+15551110000", chrono::Utc::now(), 30.0);
+    obs.report_call_answered_and_ended(
+        "+15551110000",
+        chrono::Utc::now(),
+        30.0,
+        gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays,
+    );
     obs.report_call_not_answered(
         CallStatus::Missed,
         BridgeFailureReason::RingTimeout,

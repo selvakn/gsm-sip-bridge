@@ -57,6 +57,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
         module_id.clone(),
         None,
         "sip:100@pbx:5060".to_string(),
+        gsm_sip_bridge::store::Transport::Vowifi,
     );
 
     // Acceptance Scenario 1: an inbound call is answered, then ends.
@@ -74,7 +75,12 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
     )
     .await;
 
-    obs.report_call_answered_and_ended("+15551234567", chrono::Utc::now(), 42.0);
+    obs.report_call_answered_and_ended(
+        "+15551234567",
+        chrono::Utc::now(),
+        42.0,
+        gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays,
+    );
     obs.set_active_calls(0);
     wait_for(|| answered_counter.get() == 1.0, Duration::from_secs(5)).await;
     wait_for(

@@ -55,6 +55,7 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
         module_id.clone(),
         None,
         "sip:100@pbx:5060".to_string(),
+        gsm_sip_bridge::store::Transport::Vowifi,
     );
 
     // Registration success brings both gauges up.
