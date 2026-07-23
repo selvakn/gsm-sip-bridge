@@ -420,11 +420,7 @@ pub fn parse_cgcontrdp_pcscf(lines: &[String], cid: u8) -> Result<Vec<IpAddr>, S
     let mut best: Vec<IpAddr> = Vec::new();
     let mut max_fields = 0usize;
 
-    for line in lines {
-        let Some(payload) = line.trim().strip_prefix("+CGCONTRDP:") else {
-            continue;
-        };
-        let f = super::pdn::split_at_fields(payload);
+    for f in super::pdn::at_fields(lines, "+CGCONTRDP:") {
         if f.is_empty() || f[0].parse::<u8>() != Ok(cid) {
             continue;
         }

@@ -17,6 +17,9 @@
 use crate::config::VowifiConfig;
 use crate::control::protocol::{AgentKind, BridgeFailureReason, CallStatus, RegistrationStatus};
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::lifecycle::{
+    Admission, BridgedCall, CallStage, EndedBy, Maintenance, MaintenanceDecision, MaintenancePolicy,
+};
 use crate::ims::observability;
 // Extracted to `ims::session` so the host-side cellular service uses the same
 // implementation rather than a copy (FR-019, SC-008). Imported by name so the
@@ -371,6 +374,10 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         registered_at: Some(SystemTime::now()),
         expires_at: Some(SystemTime::now() + Duration::from_secs(super::DEFAULT_EXPIRES as u64)),
         last_failure: None,
+        // Health starts able-to-answer: we reach here only after a successful
+        // registration, and the attachment underneath it is up (the Wi-Fi path
+        // has none and leaves this at its default).
+        ..Default::default()
     }));
 
     {
@@ -427,6 +434,11 @@ fn run_status_listener(
         match read_msg(&mut reader) {
             Ok(ControlMessage::StatusQuery) => {
                 let snapshot = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                // One derivation of "can this line answer a call right now?",
+                // straight from the model — so the status a `volte-status`
+                // caller reads agrees by construction with the admission the
+                // dispatch loop actually applies (`ims::lifecycle`).
+                let health = snapshot.health();
                 let reply = ControlMessage::RegistrationStatusReply {
                     state: format!("{:?}", snapshot.state),
                     registered_at: snapshot.registered_at.and_then(to_unix),
@@ -434,6 +446,8 @@ fn run_status_listener(
                     last_failure: snapshot
                         .last_failure
                         .map(|(t, msg)| (to_unix(t).unwrap_or(0), msg)),
+                    can_answer: health.can_answer(),
+                    blocked_reason: health.blocked_reason().map(str::to_string),
                 };
                 let _ = write_msg(&mut stream, &reply);
             }
@@ -537,6 +551,12 @@ struct ActiveCall {
     /// Per-direction packet counts on the carrier leg, read at teardown for the
     /// FR-017 one-way-audio verdict.
     meter: super::media_stats::MediaMeter,
+    /// The transport-agnostic lifecycle record for this call (`ims::lifecycle`).
+    /// A live `ActiveCall` only exists once the call actually bridged, so this
+    /// is created already advanced to [`CallStage::Bridged`]; the dispatch loop
+    /// attributes its ending through it so end-cause and success are decided by
+    /// one model, not restated at each teardown site.
+    lifecycle: BridgedCall,
 }
 
 /// The dialog state needed to send an in-dialog request (a `BYE`) on a call we
@@ -623,9 +643,26 @@ pub(crate) fn dispatch_loop(
     // drop an otherwise-valid call within that window — found in review,
     // not live-testing).
     let mut next_renewal_attempt: Option<Instant> = None;
+    // Formalises the "maintenance must yield to a call" rule (`ims::lifecycle`):
+    // it decides whether a due renewal may run or must be held for the call in
+    // progress, and remembers that it was held so status can report the
+    // deferral as deliberate rather than as a stall (the re-attachment the
+    // renewal hook performs inherits the same deferral — see `PreRenewalHook`).
+    let mut maintenance = MaintenancePolicy::new();
     // FR-011 mid-call attachment watch, reset per call (see the INVITE branch).
     let mut watch = AttachmentWatch::default();
     loop {
+        // Keep the shared health inputs the status listener reads current — the
+        // busy flag and any deferred maintenance — so a `volte-status` query is
+        // answered from the same state the loop is acting on. Cheap: one lock
+        // per poll, and the values are eventually consistent within a poll
+        // interval regardless.
+        {
+            let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+            guard.busy = active_call.is_some();
+            guard.deferred_maintenance = maintenance.deferred();
+        }
+
         // A hangup can start on *either* side. The carrier's arrives as a BYE
         // below; the PBX's arrives here, as a `CallEnded` from Agent B — and
         // must be turned into a BYE toward the carrier, or hanging up the SIP
@@ -634,9 +671,15 @@ pub(crate) fn dispatch_loop(
         if let Some(call) = &mut active_call {
             match call.ctrl_rx.try_recv() {
                 Ok(ControlMessage::CallEnded { reason, .. }) => {
-                    let call = active_call.take().expect("just matched Some");
+                    let mut call = active_call.take().expect("just matched Some");
+                    // The telephone side hung up first (or reported its leg
+                    // failed). Attribute it before reporting; Agent B's own
+                    // reason string still drives the BYE for the finer detail.
+                    call.lifecycle.end(EndedBy::Pbx);
                     report_answered_call_ended(obs, &call);
                     hangup_carrier(session, call, &reason);
+                    // The call is over; any maintenance held for it may now run.
+                    maintenance.release();
                     continue;
                 }
                 Ok(other) => {
@@ -644,10 +687,12 @@ pub(crate) fn dispatch_loop(
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // Agent B is gone; we can't keep a half-bridged call up.
-                    let call = active_call.take().expect("just matched Some");
+                    let mut call = active_call.take().expect("just matched Some");
                     tracing::warn!(call_id = %call.call_id, "Agent B's control connection dropped mid-call");
+                    call.lifecycle.end(EndedBy::Pbx);
                     report_answered_call_ended(obs, &call);
                     hangup_carrier(session, call, reason::TRANSPORT_ERROR);
+                    maintenance.release();
                     continue;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -661,14 +706,16 @@ pub(crate) fn dispatch_loop(
         if let Some(call) = &active_call {
             if let Some(check) = attachment_check {
                 if watch.attachment_lost(call.meter.carrier_rx(), check) {
-                    let call = active_call.take().expect("just matched Some");
+                    let mut call = active_call.take().expect("just matched Some");
                     tracing::warn!(
                         call_id = %call.call_id,
                         "ending call: the network attachment was lost mid-call \
                          (not a caller hangup) — FR-011"
                     );
+                    call.lifecycle.end(EndedBy::AttachmentLost);
                     report_answered_call_ended(obs, &call);
                     end_call_attachment_lost(session, call);
+                    maintenance.release();
                     watch = AttachmentWatch::default();
                     continue;
                 }
@@ -684,7 +731,9 @@ pub(crate) fn dispatch_loop(
         };
         match inbound.rx.recv_timeout(poll) {
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {
-                if active_call.is_some() {
+                if Admission::for_current(active_call.as_ref().map(|c| &c.lifecycle))
+                    == Admission::RejectBusy
+                {
                     tracing::info!("declining inbound call: another VoWiFi call is already active");
                     let _ = sink.send(&build_486_busy_here(&req, &random_hex(4)));
                     obs.report_call_not_answered(
@@ -754,9 +803,12 @@ pub(crate) fn dispatch_loop(
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "BYE" => {
                 match active_call.take() {
-                    Some(call) => {
+                    Some(mut call) => {
+                        // The carrier's BYE is the caller hanging up.
+                        call.lifecycle.end(EndedBy::Caller);
                         report_answered_call_ended(obs, &call);
                         handle_bye(&sink, &req, call);
+                        maintenance.release();
                     }
                     None => {
                         let _ = sink.send(&build_200_ok_bye(&req, &random_hex(4)));
@@ -796,14 +848,19 @@ pub(crate) fn dispatch_loop(
                 // Never renew mid-call — that would tear down the transport
                 // a call's own signaling (e.g. the eventual BYE) still
                 // needs; renewal is deferred until the call ends.
-                if active_call.is_some() {
-                    continue;
-                }
                 let Some(expires_at) = status.lock().unwrap_or_else(|e| e.into_inner()).expires_at
                 else {
                     continue;
                 };
                 if !super::renewal_due(SystemTime::now(), expires_at, RENEWAL_HEADROOM) {
+                    continue;
+                }
+                // Renewal is genuinely due. Hold it if a call is in progress —
+                // recorded by the policy so the deferral is visible in status,
+                // and so the model, not an inline `is_some()`, owns the rule.
+                if maintenance.decide(Maintenance::Renewal, active_call.is_some())
+                    == MaintenanceDecision::Defer
+                {
                     continue;
                 }
                 // A previous attempt failed and its backoff hasn't elapsed
@@ -826,9 +883,9 @@ pub(crate) fn dispatch_loop(
                 let _modem_guard = modem_lock.map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
                 // Rebuild the layer underneath before spending a REGISTER on
                 // it. Reaching here already means no call is in progress (the
-                // `active_call` check above), which is precisely how
-                // re-attachment inherits renewal's deferral instead of
-                // needing its own — see `PreRenewalHook`.
+                // maintenance policy deferred it above otherwise), which is
+                // precisely how re-attachment inherits renewal's deferral
+                // instead of needing its own — see `PreRenewalHook`.
                 if let Some(hook) = pre_renewal {
                     if let Err(reason) = hook() {
                         tracing::warn!(
@@ -839,6 +896,9 @@ pub(crate) fn dispatch_loop(
                         let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
                         guard.state = super::RegistrationState::Failed;
                         guard.last_failure = Some((SystemTime::now(), reason));
+                        // The re-attach hook is what just failed, so the
+                        // attachment underneath is down — health must say so.
+                        guard.attached = false;
                         drop(guard);
                         obs.set_registered(false);
                         next_renewal_attempt = Some(Instant::now() + backoff);
@@ -859,6 +919,9 @@ pub(crate) fn dispatch_loop(
                         guard.expires_at = Some(
                             SystemTime::now() + Duration::from_secs(super::DEFAULT_EXPIRES as u64),
                         );
+                        // A renewal only reaches here through a successful
+                        // re-attach (the hook above), so the attachment is up.
+                        guard.attached = true;
                         drop(guard);
                         backoff = RETRY_INITIAL_BACKOFF;
                         next_renewal_attempt = None;
@@ -906,6 +969,12 @@ fn report_answered_call_ended(obs: &observability::AgentObservability, call: &Ac
         media = verdict.as_str(),
         carrier_rx = call.meter.carrier_rx(),
         pbx_rx = call.meter.pbx_rx(),
+        // The lifecycle model's own account of the call: who ended it and the
+        // status it derives from the same media verdict. Logged so the model
+        // that drives admission and teardown is auditable against the metric
+        // reported just below (`ims::lifecycle`).
+        ended_by = call.lifecycle.ended_by.map(|e| e.as_str()).unwrap_or("unknown"),
+        outcome = call.lifecycle.call_status(verdict.is_success()).as_str(),
         "call media verdict"
     );
     if !verdict.is_success() {
@@ -1144,6 +1213,16 @@ fn handle_invite(
                 "call answered and bridged"
             );
 
+            // Walk the lifecycle through the stages this call actually passed —
+            // offered, telephone-leg placed, PBX ringing, then bridged — so the
+            // record carries the real path and `reached_bridged` is set through
+            // the legal transitions rather than stamped on. Reaching here means
+            // all four happened, in this order.
+            let mut lifecycle = BridgedCall::new(call_id.clone(), caller.clone(), None);
+            lifecycle.advance_to(CallStage::Answering);
+            lifecycle.advance_to(CallStage::PbxRinging);
+            lifecycle.advance_to(CallStage::Bridged);
+
             Ok(Some(ActiveCall {
                 control,
                 ctrl_rx,
@@ -1155,6 +1234,7 @@ fn handle_invite(
                 answered_at: Utc::now(),
                 answered_instant: Instant::now(),
                 meter,
+                lifecycle,
             }))
         }
         ControlMessage::BridgeFailed {

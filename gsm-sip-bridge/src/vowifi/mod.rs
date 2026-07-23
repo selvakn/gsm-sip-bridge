@@ -953,6 +953,8 @@ pub fn print_status(config: &VowifiConfig) -> ExitCode {
                 registered_at,
                 expires_at,
                 last_failure,
+                can_answer,
+                blocked_reason,
             }) => {
                 println!("    state: {state}");
                 println!("    registered_at: {}", format_unix(registered_at));
@@ -960,6 +962,10 @@ pub fn print_status(config: &VowifiConfig) -> ExitCode {
                 match last_failure {
                     Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
                     None => println!("    last_failure: none"),
+                }
+                println!("    can_answer: {can_answer}");
+                if let Some(reason) = blocked_reason {
+                    println!("    blocked_reason: {reason}");
                 }
             }
             Ok(other) => {
