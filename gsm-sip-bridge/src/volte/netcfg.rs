@@ -13,7 +13,9 @@
 //!   1. set `addr_gen_mode=none` so the kernel stops inventing an identifier,
 //!   2. install the link-local derived from `AT+CGPADDR`,
 //!   3. enable `accept_ra=2` (the interface is not a router, but forwarding
-//!      may be on in the container, and `2` accepts RAs regardless).
+//!      may be on in the container, and `2` accepts RAs regardless), while
+//!      keeping `autoconf=0` so the accepted RA installs a route but *not* a
+//!      second, SLAAC-derived global address — see `configure_steps`.
 //!
 //! Shells out to `ip` rather than speaking netlink, consistent with
 //! `ims/gm_ipsec.rs` and this crate's zero-`unsafe` policy.
@@ -80,10 +82,21 @@ pub fn configure_steps(iface: &str, assigned: Ipv6Addr) -> Vec<NetStep> {
             knob: "accept_ra".to_string(),
             value: "2".to_string(),
         },
+        // `autoconf=0`, deliberately. `accept_ra=2` still installs the default
+        // route — which is the signal bring-up actually waits on (R10) — but
+        // the carrier's RA carries an *autonomous* prefix, so with `autoconf=1`
+        // the kernel also builds a second global address by SLAAC from the MAC
+        // (`…4b:b3ff:feb9:ebe5/64 … proto kernel_ra`), alongside the
+        // `AT+CGPADDR` address we install below. Two globals of equal scope
+        // then leave RFC 6724 to pick the source, and 3GPP expects the UE to
+        // source from the *assigned* address: if the tie-break ever lands on
+        // the SLAAC twin the PCRF has no IP-CAN session for it and the media is
+        // rejected with Rx 5065. Suppressing the twin makes the source
+        // deterministic instead of relying on selection order.
         NetStep::Sysctl {
             iface: iface.to_string(),
             knob: "autoconf".to_string(),
-            value: "1".to_string(),
+            value: "0".to_string(),
         },
         NetStep::AddGlobal {
             iface: iface.to_string(),
@@ -459,6 +472,31 @@ mod tests {
             up: false,
         };
         assert_eq!(down.argv(), vec!["ip", "link", "set", "wwan0", "down"]);
+    }
+
+    #[test]
+    fn configuration_suppresses_slaac_so_only_the_assigned_global_exists() {
+        // Two globals of equal scope would leave RFC 6724 to choose the media
+        // source address; 3GPP requires the assigned one, and a wrong choice
+        // reads as Rx 5065. `autoconf=0` alongside `accept_ra=2` keeps the RA's
+        // route without letting it mint a SLAAC twin.
+        let steps = configure_steps("wwan0", "2402:8100::1".parse().unwrap());
+
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            NetStep::Sysctl { knob, value, .. } if knob == "accept_ra" && value == "2"
+        )));
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            NetStep::Sysctl { knob, value, .. } if knob == "autoconf" && value == "0"
+        )));
+        // Exactly one global is installed — the assigned address — and it is
+        // the only source of a global on the interface once SLAAC is off.
+        let globals = steps
+            .iter()
+            .filter(|s| matches!(s, NetStep::AddGlobal { .. }))
+            .count();
+        assert_eq!(globals, 1);
     }
 
     #[test]
