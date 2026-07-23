@@ -559,6 +559,26 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
 
     let control_addr = SocketAddr::new(LOOPBACK, LOOPBACK_CONTROL_PORT);
 
+    // One lock guards every touch of the modem's AT port so two users never
+    // interleave on it (research R6): registration renewal and re-attachment on
+    // the carrier half, and the modem SMS reader spawned just below.
+    let modem_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+
+    // The circuit-switched SMS route (FR-036): the carrier may deliver a text
+    // into the modem's own storage rather than as an IMS `MESSAGE`, and with
+    // this card assigned exclusively here, nothing else reads that storage.
+    // Its own thread, serialised with renewal through the shared lock; it
+    // relays each message onto the same telephone-side recorder the IMS route
+    // uses.
+    {
+        let modem_port = service.settings.modem_port.clone();
+        let lock = modem_lock.clone();
+        std::thread::Builder::new()
+            .name("volte-sms-reader".into())
+            .spawn(move || super::sms::run_modem_reader(modem_port, control_addr, lock))
+            .map_err(|e| BridgeError::Ims(format!("failed to start the modem SMS reader: {e}")))?;
+    }
+
     // Rebuilding the attachment is what must never happen mid-call. Passing it
     // as the renewal hook is what makes that true structurally — see
     // `ims::agent::PreRenewalHook`.
@@ -578,6 +598,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         // from the same constant so they cannot drift apart again.
         veth_sip_port: LOOPBACK_SIP_PORT,
         pre_renewal: Some(&pre_renewal),
+        modem_lock: Some(modem_lock),
         app_config,
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,

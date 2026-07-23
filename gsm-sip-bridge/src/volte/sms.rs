@@ -38,7 +38,14 @@
 //!
 //! The same reasoning applies to clearing a message from the modem's storage.
 
+use crate::error::BridgeResult;
+use crate::modules::at_commander::AtCommander;
+use crate::vowifi::control::{write_msg, ControlMessage};
 use std::collections::VecDeque;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// How a message reached us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +119,7 @@ impl Dedupe {
     /// in which case the caller must still acknowledge it but must not record
     /// or forward it again.
     pub fn admit(&mut self, key: &str) -> bool {
-        if self.seen.iter().any(|k| k == key) {
+        if self.contains(key) {
             return false;
         }
         if self.seen.len() >= self.capacity {
@@ -120,6 +127,14 @@ impl Dedupe {
         }
         self.seen.push_back(key.to_string());
         true
+    }
+
+    /// Whether this key has already been handled, without recording it. Lets a
+    /// caller decide *before* it commits to an irreversible step — clearing a
+    /// message from modem storage — whether the message is a fresh one to relay
+    /// or a re-read of one already handed on.
+    pub fn contains(&self, key: &str) -> bool {
+        self.seen.iter().any(|k| k == key)
     }
 
     pub fn len(&self) -> usize {
@@ -166,6 +181,141 @@ pub fn parse_cmgl_indexes(lines: &[String]) -> Vec<u32> {
             payload.split(',').next()?.trim().parse::<u32>().ok()
         })
         .collect()
+}
+
+/// How often to check the modem's own storage for messages the carrier
+/// delivered over the circuit-switched route rather than IMS. Short enough
+/// that a text is handled promptly; the read is cheap and only runs when the
+/// modem is not mid-attach (see [`run_modem_reader`]).
+pub const MODEM_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long to wait before the first sweep, so the initial registration's own
+/// modem access (`register_session` reads the IMEI) has finished. The reader
+/// still serialises against renewal via the shared lock; this just avoids a
+/// pointless contended first attempt at startup.
+const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(12);
+
+/// How long to wait to reach and write to the telephone side's control port.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reads text messages the network left in the **modem's own storage** — the
+/// circuit-switched delivery route — and hands each to the telephone side for
+/// recording, then clears it (FR-036, US5 scenario 7).
+///
+/// # Why this is needed at all
+///
+/// Our registration advertises voice but not messaging, so the carrier may
+/// deliver a text over the modem rather than as an IMS `MESSAGE` — and it does
+/// (verified live: a text arrived in modem storage with no `MESSAGE` on the
+/// registration at all). Card assignment here is exclusive, so the
+/// circuit-switched daemon no longer reads that storage. Without this reader
+/// those texts have no reader at all and accumulate unread until storage fills.
+///
+/// # Coordinating with the registration for the one AT port
+///
+/// The registration side also drives the modem's AT port — `register_session`
+/// on renewal, `refresh_attachment` on re-attach. Two readers interleaving on
+/// one port is the documented "no status in response" hazard (research R6), so
+/// every modem touch here is taken under `modem_lock`, the same lock the
+/// renewal path holds. Renewal is already deferred while a call is up, and a
+/// call's own media rides the data bearer, not this AT port — so sweeping does
+/// not disturb a call and a call does not disturb sweeping (FR-028).
+///
+/// # Exactly-once and the order of operations
+///
+/// A message is **relayed before it is cleared**, never the reverse: clearing
+/// first would lose it outright on a crash in between. If a relay succeeds but
+/// the delete then fails, the message is re-read on the next sweep — and
+/// [`Dedupe`] recognises it, so it is cleared without being forwarded twice.
+pub fn run_modem_reader(modem_port: PathBuf, control_addr: SocketAddr, modem_lock: Arc<Mutex<()>>) {
+    std::thread::sleep(FIRST_SWEEP_DELAY);
+    let mut dedupe = Dedupe::default();
+    loop {
+        {
+            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &mut dedupe) {
+                tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
+            }
+        }
+        std::thread::sleep(MODEM_SWEEP_INTERVAL);
+    }
+}
+
+/// One pass over modem storage. Separated from the loop so a caller can drive a
+/// single sweep, and so the loop's lock discipline is visible at its call site.
+fn sweep_modem_storage(
+    modem_port: &Path,
+    control_addr: SocketAddr,
+    dedupe: &mut Dedupe,
+) -> BridgeResult<()> {
+    let mut at = AtCommander::open(modem_port)?;
+    // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
+    let _ = at.send_command("AT+CMGF=1")?;
+    let indexes = crate::sms::reader::list_sms_indexes(&mut at)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        count = indexes.len(),
+        "found messages in modem storage; relaying and clearing them"
+    );
+    for index in indexes {
+        let sms = match crate::sms::reader::read_sms(&mut at, index) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(index, error = %e, "could not read a stored message; leaving it in place");
+                continue;
+            }
+        };
+        let key = InboundMessage {
+            route: MessageRoute::ThroughModem,
+            sender: sms.sender.clone(),
+            body: sms.body.clone(),
+            modem_index: Some(index),
+        }
+        .dedupe_key();
+
+        // Already handed on this run — a previous delete must have failed.
+        // Clear it now so storage does not fill; do not forward it again.
+        if dedupe.contains(&key) {
+            let _ = crate::sms::reader::delete_sms(&mut at, index);
+            continue;
+        }
+
+        if relay_modem_message(control_addr, &sms.sender, &sms.body) {
+            dedupe.admit(&key);
+            // Relayed — now, and only now, clear it from the modem.
+            if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
+                tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
+            }
+        }
+        // On relay failure: leave it in storage, unmarked, to retry next sweep.
+    }
+    Ok(())
+}
+
+/// Hands one modem-delivered message to the telephone side over the same
+/// control channel and message shape the IMS route uses
+/// (`ims::agent::handle_message`), so both routes converge on one recorder.
+fn relay_modem_message(control_addr: SocketAddr, sender: &str, body: &str) -> bool {
+    let msg = ControlMessage::SmsReceived {
+        sender: sender.to_string(),
+        body: body.to_string(),
+        received_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT) {
+        Ok(mut control) => match write_msg(&mut control, &msg) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to relay modem SMS for recording");
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to reach the control channel to relay modem SMS");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +493,22 @@ mod tests {
     fn an_empty_message_store_recovers_nothing_rather_than_erroring() {
         assert!(parse_cmgl_indexes(&[]).is_empty());
         assert!(parse_cmgl_indexes(&["OK".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn contains_reports_prior_handling_without_recording_it() {
+        // The modem sweep clears a message from storage only after relaying it;
+        // if the clear fails the message is re-read next sweep. `contains` lets
+        // the sweep tell a fresh message (relay + clear) from a re-read (clear
+        // only, no second forward) *before* it commits to the irreversible
+        // clear — so it must answer without itself recording anything.
+        let mut d = Dedupe::default();
+        let key = msg(MessageRoute::ThroughModem, "+91123", "hello").dedupe_key();
+
+        assert!(!d.contains(&key), "unseen key must not report as handled");
+        assert!(!d.contains(&key), "checking must not record");
+        assert!(d.admit(&key));
+        assert!(d.contains(&key), "an admitted key reports as handled");
     }
 
     #[test]
