@@ -587,6 +587,80 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
 /// How long to let the telephone-side half bind before answering calls.
 const TELEPHONY_STARTUP_GRACE: Duration = Duration::from_millis(500);
 
+/// Queries the **running** service for its live state and prints it, returning
+/// `true` when the service answered (US3, FR-033).
+///
+/// This is the status source that matters while the service is up, and it must
+/// be tried before reading the modem: the service owns the modem's AT port
+/// exclusively (research R6), so a second reader probing `AT+CGACT?` on it
+/// races the service mid-transaction — the documented "no status in response"
+/// hazard. When the service answers here, the caller must **not** fall back to
+/// touching the modem.
+///
+/// Both halves run as loopback threads, so the carrier half's registration
+/// listener is on [`crate::vowifi::AGENT_A_STATUS_PORT`] and the telephone
+/// half's recent-call history is on [`LOOPBACK_CONTROL_PORT`] — the same query
+/// `vowifi-status` makes of the Wi-Fi agents, pointed at loopback.
+///
+/// Returns `false` only when the registration half is unreachable, which is
+/// what tells the caller the service is not running and a direct modem read is
+/// safe.
+pub fn print_live_status() -> bool {
+    use crate::vowifi::control::ControlMessage;
+    use crate::vowifi::{format_unix, query_status, AGENT_A_STATUS_PORT};
+
+    let reg_addr = format!("{}:{AGENT_A_STATUS_PORT}", LOOPBACK);
+    let reg = match query_status(&reg_addr) {
+        Ok(ControlMessage::RegistrationStatusReply {
+            state,
+            registered_at,
+            expires_at,
+            last_failure,
+        }) => (state, registered_at, expires_at, last_failure),
+        // Unreachable, or an unexpected reply, both mean "not the running
+        // service" — let the caller fall back to the modem.
+        _ => return false,
+    };
+
+    let (state, registered_at, expires_at, last_failure) = reg;
+    println!("Live service (querying the running bridge, not the modem):");
+    println!("  registration:");
+    println!("    state: {state}");
+    println!("    registered_at: {}", format_unix(registered_at));
+    println!("    expires_at: {}", format_unix(expires_at));
+    match last_failure {
+        Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
+        None => println!("    last_failure: none"),
+    }
+
+    println!("  recent calls:");
+    let calls_addr = format!("{}:{LOOPBACK_CONTROL_PORT}", LOOPBACK);
+    match query_status(&calls_addr) {
+        Ok(ControlMessage::CallHistoryReply { calls }) if calls.is_empty() => {
+            println!("    (none)");
+        }
+        Ok(ControlMessage::CallHistoryReply { calls }) => {
+            for c in calls {
+                println!(
+                    "    {} caller={} outcome={} started={} ended={}",
+                    c.call_id,
+                    c.caller,
+                    c.outcome,
+                    format_unix(Some(c.started_at)),
+                    format_unix(c.ended_at)
+                );
+            }
+        }
+        // The registration half answered, so the service is up; a failure here
+        // is just the telephone half briefly unreachable, reported inline
+        // rather than falling back to the modem the service still owns.
+        Ok(other) => println!("    unexpected reply: {other:?}"),
+        Err(e) => println!("    unreachable: {e}"),
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

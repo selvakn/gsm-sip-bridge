@@ -493,6 +493,15 @@ fn handle_volte_pdn_command(args: &gsm_sip_bridge::cli::VoltePdnArgs) -> ExitCod
 }
 
 fn handle_volte_status_command(args: &gsm_sip_bridge::cli::VolteStatusArgs) -> ExitCode {
+    // Ask the running service first. It owns the modem's AT port exclusively
+    // (research R6), so reading the modem directly while it runs races it
+    // mid-transaction — and the live service knows things the modem cannot,
+    // like whether a call is in progress right now (FR-033). Only when no
+    // service answers is a direct modem read both safe and necessary.
+    if gsm_sip_bridge::volte::bridge::print_live_status() {
+        return ExitCode::SUCCESS;
+    }
+
     let settings = volte_settings(&args.modem, &args.iface, args.cid, &args.apn);
     match gsm_sip_bridge::volte::status(&settings) {
         Ok(Some(report)) => {
