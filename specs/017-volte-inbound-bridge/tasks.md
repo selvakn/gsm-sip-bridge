@@ -200,7 +200,7 @@ after.
 ## Phase 8: Polish
 
 - [X] T083 [P] Document the service in `docs/operations.md`
-- [ ] T084 [P] Update `specs/017-volte-inbound-bridge/quickstart.md` with anything the live run proved wrong
+- [X] T084 [P] Update `specs/017-volte-inbound-bridge/quickstart.md` with anything the live run proved wrong — captures the Rx 5065 blocker and its detach fix (R17–R19), and that `volte-status` now queries the running service rather than the modem. Will be revisited as the remaining live gates (B1–B4 formal closure) run.
 - [X] T085 Keep `make lint` clean and the workspace suite green on every commit
 - [X] T086 [P] Verify SC-005: no failure mode exercised reports a silent call as successful
 - [X] T087 [P] Verify SC-006: every failure mode names its stage

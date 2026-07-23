@@ -49,6 +49,22 @@ Dial the SIM from the second phone. Expect:
 
 **This is Gate B1.** Both legs, audio both ways, clean teardown from either end.
 
+> **If every call bridges but is torn down ~65 ms after your 200 OK, with**
+> `Reason: SIP;cause=503;text="PT: AAA: result_code=0 exp_result_code=5065"` —
+> this was the live blocker, and it is **carrier policy state, not your
+> signalling** (research R17–R19). Rx 5065 is `IP-CAN_SESSION_NOT_AVAILABLE`:
+> the PCRF is holding a stale Gx session for this subscriber and refuses to
+> authorise media for the new one. It is caused by *churning* the PDN —
+> repeated attach/detach cycles, e.g. rapid service restarts during debugging.
+>
+> The fix is a real EPS detach, which `pdn::tear_down` now performs
+> automatically on every clean stop (`AT+CGATT=0`; hardening H2). So a normal
+> `stop → start` clears it. If you have been restarting hard and are stuck,
+> force one by hand on the service's own AT port **while the service is
+> stopped**: `AT+CGATT=0` then `AT+CFUN=4`, wait for `AT+CEREG? → 0,0`, then
+> `AT+CFUN=1`. The PDN comes back on a fresh prefix and the next call carries
+> two-way audio. Verified live: 0.6% loss, 11.1 ms jitter after a clean detach.
+
 ## Step 2 — Gate B2: is the call given voice treatment?
 
 While the call is up, on a **second** AT port (the service owns the first):
@@ -103,6 +119,13 @@ The real test of a service is time, not a first call.
 # leave it running for at least 4 hours
 gsm-sip-bridge volte-status     # periodically
 ```
+
+`volte-status` queries the **running service** over its loopback control
+channel and reports the live registration state and recent calls — it does
+**not** read the modem while the service is up, because the service owns that
+AT port exclusively and a second reader would race it (research R6). Only when
+no service is running does it fall back to reading the modem directly. So this
+is safe to run repeatedly during the soak without disturbing a call.
 
 Across that window expect several registration renewals and **at least one
 attachment teardown** — the carrier does this roughly every two hours. Then:
