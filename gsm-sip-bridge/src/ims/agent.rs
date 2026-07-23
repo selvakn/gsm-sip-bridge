@@ -232,6 +232,9 @@ fn run_inner(
         attachment_check: None,
         // No LTE modem on this path, so nothing competes for an AT port.
         modem_lock: None,
+        // Wi-Fi Agent A cannot see Agent B's PBX registration (separate
+        // processes), so it does not gate on it.
+        pbx_registered: None,
         app_config,
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
@@ -264,6 +267,11 @@ pub(crate) struct InboundParams<'a> {
     /// other user of the same port — the cellular path's modem SMS reader.
     /// `None` on the Wi-Fi path, which has no such competitor and no LTE modem.
     pub modem_lock: Option<Arc<Mutex<()>>>,
+    /// Whether the telephone-side half holds the PBX registration the outbound
+    /// bridge leg needs — shared from that half (cellular only; the two halves
+    /// are one process there). `None` on the Wi-Fi path, where health does not
+    /// track the PBX leg and so treats it as available.
+    pub pbx_registered: Option<Arc<AtomicBool>>,
     pub app_config: &'a crate::config::AppConfig,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
@@ -291,6 +299,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         pre_renewal,
         attachment_check,
         modem_lock,
+        pbx_registered,
         app_config,
         agent_label,
         agent_kind,
@@ -402,6 +411,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         pre_renewal,
         attachment_check,
         modem_lock.as_ref(),
+        pbx_registered.as_ref(),
         &obs,
     );
     session.cleanup();
@@ -630,6 +640,7 @@ pub(crate) fn dispatch_loop(
     pre_renewal: Option<&PreRenewalHook>,
     attachment_check: Option<&AttachmentHook>,
     modem_lock: Option<&Arc<Mutex<()>>>,
+    pbx_registered: Option<&Arc<AtomicBool>>,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
@@ -661,6 +672,11 @@ pub(crate) fn dispatch_loop(
             let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
             guard.busy = active_call.is_some();
             guard.deferred_maintenance = maintenance.deferred();
+            // Reflect the telephone-side half's PBX registration. Absent (Wi-Fi
+            // path), the PBX leg is not tracked here, so treat it as available
+            // rather than falsely reporting the line unable to answer.
+            guard.pbx_registered =
+                pbx_registered.is_none_or(|f| f.load(std::sync::atomic::Ordering::SeqCst));
         }
 
         // A hangup can start on *either* side. The carrier's arrives as a BYE
@@ -739,6 +755,33 @@ pub(crate) fn dispatch_loop(
                     obs.report_call_not_answered(
                         CallStatus::Failed,
                         BridgeFailureReason::BridgeSetupFailed,
+                        &extract_caller(&req),
+                        Utc::now(),
+                    );
+                    continue;
+                }
+                // If the telephone-side half has no PBX registration, the
+                // outbound leg cannot be placed — decline immediately with
+                // `480` rather than dialling into the void and making the caller
+                // wait out a ~32s transaction timeout. `480`, not `486`: the
+                // line is not busy, the bridge is temporarily unavailable.
+                if pbx_registered.is_some_and(|f| !f.load(std::sync::atomic::Ordering::SeqCst)) {
+                    tracing::warn!(
+                        caller = %extract_caller(&req),
+                        "declining inbound call: the PBX registration is down, so the \
+                         outbound bridge leg cannot be placed"
+                    );
+                    let _ = sink.send(&build_uas_response(
+                        480,
+                        "Temporarily Unavailable",
+                        &req,
+                        Some(&random_hex(4)),
+                        None,
+                        None,
+                    ));
+                    obs.report_call_not_answered(
+                        CallStatus::Failed,
+                        BridgeFailureReason::AgentUnreachable,
                         &extract_caller(&req),
                         Utc::now(),
                     );

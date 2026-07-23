@@ -232,6 +232,7 @@ fn healthy() -> ServiceHealth {
     ServiceHealth {
         registered: true,
         attached: true,
+        pbx_registered: true,
         busy: false,
         deferred: None,
     }
@@ -270,6 +271,13 @@ fn can_answer_is_false_whenever_the_service_could_not_in_fact_answer() {
             },
             "busy",
         ),
+        (
+            ServiceHealth {
+                pbx_registered: false,
+                ..healthy()
+            },
+            "pbx-unregistered",
+        ),
     ] {
         assert!(!health.can_answer(), "{what} must not report can_answer");
         assert!(
@@ -286,6 +294,7 @@ fn being_registered_does_not_by_itself_imply_being_able_to_answer() {
     let health = ServiceHealth {
         registered: true,
         attached: false,
+        pbx_registered: true,
         busy: false,
         deferred: None,
     };
@@ -294,6 +303,22 @@ fn being_registered_does_not_by_itself_imply_being_able_to_answer() {
         health.blocked_reason(),
         Some("the network attachment is down"),
         "the attachment is named, since that is what has to be fixed"
+    );
+}
+
+#[test]
+fn a_denied_pbx_registration_stops_the_service_answering() {
+    // A bridged call needs the outbound PBX leg, so however healthy the carrier
+    // side is, no call can complete without the PBX registration — and the
+    // status must say so plainly rather than claim the line is ready.
+    let health = ServiceHealth {
+        pbx_registered: false,
+        ..healthy()
+    };
+    assert!(!health.can_answer());
+    assert_eq!(
+        health.blocked_reason(),
+        Some("the PBX registration is down")
     );
 }
 

@@ -151,8 +151,14 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         control_port: LOOPBACK_CONTROL_PORT,
         sip_leg_port: LOOPBACK_SIP_PORT,
     };
+    // Whether the telephone-side half has the PBX registration the outbound
+    // bridge leg needs. Both halves are threads here, so they share it directly:
+    // the telephony half sets it, the carrier half reads it for admission and
+    // status (a call cannot be bridged if the PBX leg is unregistered).
+    let pbx_registered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let app_config = app_config.clone();
+        let pbx_registered = pbx_registered.clone();
         std::thread::Builder::new()
             .name("volte-telephony".into())
             .spawn(move || {
@@ -163,6 +169,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
                     vec![telephony_line],
                     "volte-bridge",
                     crate::store::Transport::Volte,
+                    Some(pbx_registered),
                 ) {
                     tracing::error!(error = %e, "the telephone-side half stopped");
                 }
@@ -230,6 +237,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         pre_renewal: Some(&pre_renewal),
         attachment_check: Some(&attachment_check),
         modem_lock: Some(modem_lock),
+        pbx_registered: Some(pbx_registered),
         app_config,
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,

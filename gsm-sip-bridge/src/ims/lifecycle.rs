@@ -406,6 +406,10 @@ pub struct ServiceHealth {
     /// unrouted is the failure mode specs/015 R15 spent two hours proving is
     /// real, so "attached" alone is not enough.
     pub attached: bool,
+    /// Whether the telephone-side half holds the PBX registration the outbound
+    /// bridge leg needs. A bridged call needs *both* legs, so a call cannot be
+    /// answered when this is false however healthy the carrier side is.
+    pub pbx_registered: bool,
     /// Whether a call is in progress.
     pub busy: bool,
     /// Maintenance currently being held back for a call, if any.
@@ -428,7 +432,7 @@ impl ServiceHealth {
     /// `attached`: the registration is allowed to outlive the attachment
     /// briefly, which is exactly when an optimistic answer would be wrong.
     pub fn can_answer(&self) -> bool {
-        self.registered && self.attached && !self.busy
+        self.registered && self.attached && self.pbx_registered && !self.busy
     }
 
     /// Why the service cannot answer, for an operator who needs to fix it
@@ -438,6 +442,8 @@ impl ServiceHealth {
             Some("the network attachment is down")
         } else if !self.registered {
             Some("not registered")
+        } else if !self.pbx_registered {
+            Some("the PBX registration is down")
         } else if self.busy {
             Some("a call is already in progress")
         } else {
