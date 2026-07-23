@@ -353,9 +353,19 @@ fn run_line_listener(
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
 ) {
+    // This same telephony code serves both paths, so the reporter's kind must
+    // follow the transport it is bridging: reported as `Sip` the VoLTE
+    // bridge's PBX-leg outcomes land under `transport="vowifi"`, making VoLTE
+    // and Wi-Fi calls indistinguishable in the one comparison this whole
+    // effort exists to make (the same class of bug as specs/017 R15, which
+    // fixed the gauges and `CALLS_TOTAL` but not this counter).
+    let agent_kind = match transport {
+        crate::store::Transport::Volte => AgentKind::VolteSip,
+        _ => AgentKind::Sip,
+    };
     let reporter = Reporter::spawn(
         config.control.socket_path.clone(),
-        AgentKind::Sip,
+        agent_kind,
         card_id.to_string(),
         Duration::from_secs(config.metrics.agent_report_interval_seconds),
     );
