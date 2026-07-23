@@ -691,3 +691,44 @@ bridging.
 | **H3** | **Already covered — no new code.** The re-attach back-off H3 asked for already exists: both renewal loops (`registration::run` and `ims::agent::serve_inbound`) back off exponentially, 5 s → 300 s, and `bring_up` is idempotent. The incident's churn was not a tight attach loop — it was teardown→restart *cycling*, each leaving a stale session, which H2 fixes. Adding another back-off would be redundant and would risk slowing the ~2-hourly recovery. |
 | **H4** | **Closed — not implementable, tested on the modem. Do not retry.** A real VoLTE handset marks its context with the P-CSCF-discovery and IM-CN-signalling parameters of `+CGDCONT` (TS 27.007 positions 9–10). The EC200U caps `+CGDCONT` at eight parameters: `AT+CGDCONT=?` lists `(0,1),(0,1)` ending at position 8, and setting position 9 returns `+CME ERROR: 53` while eight parameters returns `OK`. This corroborates 015 Gate G1 from the *request* side (that gate tested the read side — `CGCONTRDP`, `QPCO`, `QCFG="pcscf"`), and it eliminates the theory that our PDN could be made to look "more IMS" to the network. Configuration-as-primary (`--pcscf`) remains the only route on this hardware. |
 | **H5** | **Done.** R18's reading of `result_code=0` as "no answer from the PCRF" is corrected in R19: a Diameter answer carries either `Result-Code` or `Experimental-Result-Code`, never both, so the AAR *was* answered — with `IP-CAN_SESSION_NOT_AVAILABLE`. |
+
+## R21: Gate B1 passed — a bridged call, both ways, 99 s, verified on the instrument
+
+**Status**: ✅ **PASSED 2026-07-23, on measured media rather than "it bridged".**
+
+Gate B1 is the one the plan calls decisive: *if it fails, the feature does not
+work; everything else is moot.* It does not fail.
+
+Two live inbound calls, on the build that added the FR-017 media verdict to the
+shared bridge:
+
+```
+call 1:  22.7 s   media=both-ways   carrier_rx=911    pbx_rx=974
+call 2:  99.3 s   media=both-ways   carrier_rx=4610   pbx_rx=4566
+```
+
+The second clears B1's bar directly: answered, reached the telephone system,
+and **carried a conversation both ways for 99 seconds** — with the service
+attesting the both-ways from 4610 packets down from the carrier and 4566 up from
+the telephone leg (ratio 0.99, far above the 10% threshold), not from the human
+on the line. Both ended `caller_hangup`, both legs torn down cleanly, and both
+recorded correctly: `status=answered, transport=volte`.
+
+**Why this is a real pass and not the claim FR-017 exists to forbid.** Until
+this build the bridge reported a call answered on duration alone — a one-way or
+silent call would have been filed as success, which is exactly the failure the
+2026-07-15 one-way-audio incident and FR-017 are about. The verdict now measures
+each direction on the carrier leg and classifies the call: both-ways is
+`Answered`, one-way or silent is `Failed` with the direction named. So "B1
+passed" here means the instrument measured two-way audio, not that a human
+vouched for it. The guard rides the shared `serve_inbound`/relay path, so the
+Wi-Fi path is covered by the identical code.
+
+Also exercised end to end in the same calls: the schema-v4 fix (the row
+persisted at all) and the transport-label fix (it persisted as `volte`, not
+`vowifi`).
+
+**Still open**: B2 (whether a dedicated voice bearer appears for a
+mobile-terminating call — a measurement, absence is a valid result), B3
+(dashboards), teardown from the telephone-system side (T070; only the
+calling-side hangup has been exercised), and the mid-call cases (T073, T081/T041).

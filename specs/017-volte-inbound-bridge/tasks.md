@@ -179,8 +179,8 @@ after.
 **Gates**: B1, B2, B3, B4. None of this can be simulated.
 
 - [X] T067 Stop anything else holding the registration — they displace each other
-- [ ] T068 Re-confirm incoming calls still reach us with `volte-listen`, isolating "the network is fine" from "our service is broken"
-- [ ] T069 **Gate B1**: first bridged call — telephone system rings promptly, is answered, and carries a conversation both ways for 60s (SC-001, SC-002)
+- [X] T068 Re-confirm incoming calls still reach us — confirmed repeatedly on the live service; inbound INVITEs from the carrier reach the bridge every call.
+- [X] T069 **Gate B1 PASSED** (research R21): a 99.3 s inbound call, answered, carried audio both ways — instrument-verified `media=both-ways` (carrier_rx=4610, pbx_rx=4566), clean teardown, recorded `answered`/`transport=volte` (SC-001, SC-002).
 - [ ] T070 Test teardown from the calling side, then from the telephone-system side; both legs end cleanly each way
 - [ ] T071 **Gate B2**: sample the quality class during an inbound call on a second AT port; record whether a voice-class context appears. **A confirmed absence is a result**
 - [ ] T072 **Gate B4**: send a text while the service runs; confirm it is recorded and forwarded once, indistinguishably from today, and **record which route delivered it** (SC-010, SC-011)
