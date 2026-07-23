@@ -445,6 +445,7 @@ fn volte_settings(
         cid,
         apn: apn.to_string(),
         pcscf: None,
+        restore_cid_path: None,
     }
 }
 
@@ -559,6 +560,8 @@ fn handle_volte_listen_command(args: &gsm_sip_bridge::cli::VolteListenArgs) -> E
         cid: args.cid,
         apn: args.apn.clone(),
         pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+        // This command runs its own detach, so it never needs the recorded cid.
+        restore_cid_path: None,
     };
     let attach = match gsm_sip_bridge::volte::attach(&settings) {
         Ok(r) => r,
@@ -709,6 +712,8 @@ fn handle_volte_call_command(args: &gsm_sip_bridge::cli::VolteCallArgs) -> ExitC
         cid: args.cid,
         apn: args.apn.clone(),
         pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+        // This command runs its own detach, so it never needs the recorded cid.
+        restore_cid_path: None,
     };
 
     let attach = match gsm_sip_bridge::volte::attach(&settings) {
@@ -906,6 +911,10 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
         cid: args.cid,
         apn: args.apn.clone(),
         pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+        // With --keep-pdn this process does not detach; an external teardown
+        // does, and reads this file to restore the displaced context. Without
+        // --keep-pdn it detaches itself and the path is simply unset.
+        restore_cid_path: args.restore_cid_path.clone(),
     };
 
     // Stage 1: the network attachment. Reported separately so a failure here
@@ -1085,6 +1094,9 @@ fn handle_volte_bridge_command(
         cid: args.cid,
         apn: args.apn.clone(),
         pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
+        // Recorded before the displacing rebind so an external teardown can
+        // restore the previous context (the service never detaches itself).
+        restore_cid_path: args.restore_cid_path.clone(),
     };
 
     let card_id = args

@@ -107,6 +107,9 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
     // (FR-022).
     super::guard::check_no_vowifi_conflict(service.force).map_err(BridgeError::Ims)?;
 
+    // `attach` records the displaced context (via `settings.restore_cid_path`)
+    // *before* it rebinds, so the container's cleanup can restore it even if
+    // this service — whose accept loop never returns — is killed mid-attach.
     let attach = super::attach(&service.settings)?;
     tracing::info!(
         iface = %attach.iface,
