@@ -239,6 +239,30 @@ pub fn detach(settings: &VolteSettings, restore_cid: Option<u8>) -> BridgeResult
     Ok(())
 }
 
+/// True while the modem reports it is attached to the packet domain — `CEREG`
+/// stat 1 (registered, home) or 5 (registered, roaming). Used as the mid-call
+/// attachment check (FR-011).
+///
+/// **Deliberately biased toward "attached" on any doubt.** A false "not
+/// attached" would tear down a live call; a false "attached" only delays
+/// noticing a real loss by one probe. So a port that will not open, a `CEREG`
+/// line that will not parse, or a read error all read as attached — only a
+/// clear, parsed not-registered state (0/2/3/4) reports the attachment down.
+pub fn is_attached(modem_port: &Path) -> bool {
+    use crate::modules::at_commander::AtResponse;
+    let Ok(mut at) = AtCommander::open(modem_port) else {
+        return true;
+    };
+    match at.send_command("AT+CEREG?") {
+        Ok(AtResponse::Ok(lines)) => match pdn::parse_cereg_stat(&lines) {
+            Some(1) | Some(5) => true,
+            Some(_) => false,
+            None => true,
+        },
+        _ => true,
+    }
+}
+
 /// Current attachment state, without changing anything.
 pub fn status(settings: &VolteSettings) -> BridgeResult<Option<AttachReport>> {
     let mut at = AtCommander::open(Path::new(&settings.modem_port))?;

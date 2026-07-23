@@ -120,7 +120,7 @@ after.
 - [X] T038 [US2] Defer renewal while a call is in progress, reusing the extracted lifecycle (FR-009) in `gsm-sip-bridge/src/volte/registration.rs`
 - [X] T039 [US2] **Defer re-attachment while a call is in progress** — the genuinely new hazard; the existing deferral covers renewal only (FR-009, research R2) in `gsm-sip-bridge/src/volte/registration.rs`
 - [X] T040 [US2] Recover attachment and registration automatically when lost while idle (FR-010) in `gsm-sip-bridge/src/volte/bridge.rs`
-- [ ] T041 [US2] End a call with the attachment named as the cause when it is genuinely lost mid-call, distinct from the caller hanging up (FR-011) in `gsm-sip-bridge/src/volte/bridge.rs`
+- [X] T041 [US2] End a call attributed to attachment loss when it is genuinely lost mid-call, distinct from the caller hanging up (FR-011) — two-stage watch in the shared dispatch loop: a stalled carrier leg arms an `AT+CEREG` probe (under the modem lock, biased toward "attached" on any doubt), and only a confirmed not-attached reading ends the call with reason `attachment_lost`. Wi-Fi passes `None`. Live validation: Gate/T081 (force a mid-call detach).
 - [X] T042 [US2] Let a call outlive its registration rather than cutting it short (spec Assumptions) in `gsm-sip-bridge/src/volte/registration.rs`
 - [X] T043 [US2] Make a persistent inability to register or attach visible rather than silent (FR-013, FR-035) in `gsm-sip-bridge/src/volte/bridge.rs`
 
