@@ -194,6 +194,8 @@ fn run_inner(
         answer_preference: sdp::AnswerPreference::legacy(),
         veth_sip_port: VETH_SIP_PORT,
         pre_renewal: None,
+        // No LTE modem on this path, so nothing competes for an AT port.
+        modem_lock: None,
         app_config,
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
@@ -219,6 +221,10 @@ pub(crate) struct InboundParams<'a> {
     /// agree; see `handle_invite`.
     pub veth_sip_port: u16,
     pub pre_renewal: Option<&'a PreRenewalHook>,
+    /// Serialises this half's modem AT access (registration, renewal) with any
+    /// other user of the same port — the cellular path's modem SMS reader.
+    /// `None` on the Wi-Fi path, which has no such competitor and no LTE modem.
+    pub modem_lock: Option<Arc<Mutex<()>>>,
     pub app_config: &'a crate::config::AppConfig,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
@@ -244,6 +250,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         answer_preference,
         veth_sip_port,
         pre_renewal,
+        modem_lock,
         app_config,
         agent_label,
         agent_kind,
@@ -273,13 +280,22 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         app_config.bridge.sip_destination.clone(),
     );
 
-    let mut session = match super::register_session(reg_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            obs.report_registration_attempt(map_registration_error(&e));
-            obs.set_registered(false);
-            obs.set_tunnel_up(false);
-            return Err(e);
+    // Under the modem lock: `register_session` reads the IMEI over the AT port
+    // the cellular path's SMS reader also uses (no-op on Wi-Fi, where the lock
+    // is `None`).
+    let mut session = {
+        let _guard = modem_lock
+            .as_ref()
+            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        match super::register_session(reg_cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(_guard);
+                obs.report_registration_attempt(map_registration_error(&e));
+                obs.set_registered(false);
+                obs.set_tunnel_up(false);
+                return Err(e);
+            }
         }
     };
     if session.status != 200 {
@@ -333,6 +349,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         answer_preference,
         veth_sip_port,
         pre_renewal,
+        modem_lock.as_ref(),
         &obs,
     );
     session.cleanup();
@@ -543,6 +560,7 @@ pub(crate) fn dispatch_loop(
     answer_preference: sdp::AnswerPreference,
     veth_sip_port: u16,
     pre_renewal: Option<&PreRenewalHook>,
+    modem_lock: Option<&Arc<Mutex<()>>>,
     obs: &observability::AgentObservability,
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
@@ -723,6 +741,13 @@ pub(crate) fn dispatch_loop(
                 }
                 status.lock().unwrap_or_else(|e| e.into_inner()).state =
                     super::RegistrationState::Renewing;
+                // Hold the modem lock across the whole renewal: the hook
+                // re-attaches (drives the modem) and `attempt_renewal` re-reads
+                // the IMEI over the AT port. Serialises with the cellular SMS
+                // reader that shares that port (research R6); `None`, so a
+                // no-op, on the Wi-Fi path. Released when this arm ends or on
+                // any `continue` below.
+                let _modem_guard = modem_lock.map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
                 // Rebuild the layer underneath before spending a REGISTER on
                 // it. Reaching here already means no call is in progress (the
                 // `active_call` check above), which is precisely how
