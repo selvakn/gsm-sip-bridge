@@ -49,6 +49,55 @@ fn test_sip_bridge_unregister() {
 }
 
 #[test]
+fn test_sip_bridge_skips_trunk_when_volte_bridge_inbound_owns_it() {
+    let mut f = NamedTempFile::new().unwrap();
+    writeln!(
+        f,
+        r#"
+[sip]
+server = "127.0.0.1"
+port = 5060
+username = "test"
+password = "testpass"
+
+[volte]
+enabled = true
+bridge_inbound = true
+"#
+    )
+    .unwrap();
+
+    let config = load_config(f.path()).unwrap();
+    let mut bridge = SipBridge::new(&config);
+    bridge.register().unwrap();
+    assert_eq!(bridge.state, RegistrationState::Unregistered);
+}
+
+#[test]
+fn test_sip_bridge_skips_trunk_when_vowifi_owns_it() {
+    let mut f = NamedTempFile::new().unwrap();
+    writeln!(
+        f,
+        r#"
+[sip]
+server = "127.0.0.1"
+port = 5060
+username = "test"
+password = "testpass"
+
+[vowifi]
+enabled = true
+"#
+    )
+    .unwrap();
+
+    let config = load_config(f.path()).unwrap();
+    let mut bridge = SipBridge::new(&config);
+    bridge.register().unwrap();
+    assert_eq!(bridge.state, RegistrationState::Unregistered);
+}
+
+#[test]
 fn test_compute_destination_uri_did_passthrough() {
     let config = test_config();
     let bridge = SipBridge::new(&config);
