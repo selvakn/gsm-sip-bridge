@@ -14,6 +14,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "resilience",
     "control",
     "audio",
+    "modem_audio",
     "scheduled_restart",
     "vowifi",
     "volte",
@@ -44,13 +45,13 @@ const CONTROL_KEYS: &[&str] = &["socket_path"];
 const AUDIO_KEYS: &[&str] = &[
     "profile",
     "vad",
-    "rx_gain",
-    "tx_level",
-    "eec_mode",
     "snd_rec_latency_ms",
     "snd_play_latency_ms",
-    "rt_audio_prio",
 ];
+/// EC20 USB sound-device tuning — circuit-switched calls only (see
+/// [`ModemAudioConfig`]). Distinct from `[audio]`, which is shared by every
+/// audio path (circuit-switched and VoWiFi/VoLTE IMS).
+const MODEM_AUDIO_KEYS: &[&str] = &["rx_gain", "tx_level", "eec_mode", "rt_audio_prio"];
 const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "enabled",
     "cron",
@@ -60,27 +61,19 @@ const SCHEDULED_RESTART_KEYS: &[&str] = &[
 ];
 const LOGGING_KEYS: &[&str] = &["level"];
 const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+/// Fields global to every VoLTE line. Line-identity/PDN fields (modem
+/// matcher, cid, apn, pcscf, pcscf_port, iface, msisdn) are NOT here — they
+/// live only in `[[volte.line]]` (see [`VOLTE_LINE_KEYS`]), each with its
+/// own sane default when omitted (see `volte::discovery::resolve_one_volte_
+/// line`).
 const VOLTE_KEYS: &[&str] = &[
     "enabled",
-    "modem_port",
-    "iface",
-    "cid",
-    "apn",
-    "pcscf",
-    "pcscf_port",
     "pcscf_source_path",
-    "use_tcp",
-    "sec_agree",
     "status_path",
     "lock_path",
     "bridge_inbound",
     "max_lines",
     "line",
-    "netns",
-    "veth_carrier_iface",
-    "veth_telephony_iface",
-    "veth_carrier_addr",
-    "veth_telephony_addr",
 ];
 /// Allowed keys inside each `[[volte.line]]` entry
 /// (specs/018-volte-multi-modem — an operator override pinning a specific
@@ -97,32 +90,27 @@ const VOLTE_LINE_KEYS: &[&str] = &[
     "msisdn",
 ];
 
+/// Fields global to every VoWiFi line. Line-identity fields (mcc/mnc/modem
+/// matcher/imsi_override) and pure per-line infrastructure (netns, veth
+/// names/addresses, strongswan iface/if_id, vpcd port) are NOT here — the
+/// former live only in `[[vowifi.line]]` (see [`VOWIFI_LINE_KEYS`]), the
+/// latter are always mechanically derived from a line's index and have no
+/// config knob at all (see `vowifi::discovery::resolve_one_line`).
 const VOWIFI_KEYS: &[&str] = &[
     "enabled",
-    "mcc",
-    "mnc",
-    "modem_port",
     "use_tcp",
     "sec_agree",
     "pcscf_source_path",
-    "veth_local_addr",
-    "veth_peer_addr",
     "control_port",
     "wideband",
     "apn",
-    "netns",
     "epdg_fqdn",
     "epdg_ip",
     "src_addr",
     "keepalive_interval_sec",
-    "veth_sip_iface",
-    "veth_ims_iface",
     "tunnel_engine",
-    "strongswan_tun_iface",
-    "strongswan_if_id",
     "vpcd_host",
     "vpcd_port",
-    "imsi_override",
     "max_lines",
     "line",
 ];
@@ -253,6 +241,8 @@ impl AudioProfileSettings {
     }
 }
 
+/// Shared by every audio path — circuit-switched AND VoWiFi/VoLTE IMS calls
+/// (`vowifi::run_telephony_side`, reused by VoLTE per FR-019).
 #[derive(Clone, Debug)]
 pub struct AudioConfig {
     pub profile: AudioProfile,
@@ -260,6 +250,21 @@ pub struct AudioConfig {
     /// When `true`, PJMEDIA VAD and noise suppression are active on the capture path.
     /// Disable only for diagnostics; leave enabled in production.
     pub vad: bool,
+    /// ALSA capture (GSM→SIP) ring-buffer depth in milliseconds, passed to PJMEDIA as
+    /// `snd_rec_latency`. Larger values absorb scheduling jitter / XRUNs at the cost of
+    /// added one-way latency. Range 20–2000; default 150 (PJSUA default is 100).
+    pub snd_rec_latency_ms: u32,
+    /// ALSA playback (SIP→GSM) ring-buffer depth in milliseconds, passed to PJMEDIA as
+    /// `snd_play_latency`. Range 20–2000; default 150 (PJSUA default is 140).
+    pub snd_play_latency_ms: u32,
+}
+
+/// EC20 USB sound-device tuning. Circuit-switched calls ONLY — VoWiFi/VoLTE
+/// never touches this modem's ALSA device (`vowifi::run_telephony_side`
+/// hard-codes its own tx level and never reads `rx_gain`/`eec_mode`/
+/// `rt_audio_prio` at all).
+#[derive(Clone, Debug)]
+pub struct ModemAudioConfig {
     /// EC20 downlink digital gain sent as `AT+QRXGAIN=<val>` during module init.
     /// Controls how loud SIP audio sounds on the GSM caller's end (SIP→GSM direction).
     /// `None` (default) leaves the modem's firmware default untouched.
@@ -276,13 +281,6 @@ pub struct AudioConfig {
     /// (`pjsua_conf_adjust_tx_level`).  1.0 = unity, <1.0 attenuates, >1.0 amplifies.
     /// Range 0.0–2.0, default 1.0.
     pub tx_level: f32,
-    /// ALSA capture (GSM→SIP) ring-buffer depth in milliseconds, passed to PJMEDIA as
-    /// `snd_rec_latency`. Larger values absorb scheduling jitter / XRUNs at the cost of
-    /// added one-way latency. Range 20–2000; default 150 (PJSUA default is 100).
-    pub snd_rec_latency_ms: u32,
-    /// ALSA playback (SIP→GSM) ring-buffer depth in milliseconds, passed to PJMEDIA as
-    /// `snd_play_latency`. Range 20–2000; default 150 (PJSUA default is 140).
-    pub snd_play_latency_ms: u32,
     /// `SCHED_FIFO` priority to apply to PJMEDIA's `media` (sound-device) thread once a
     /// call's audio device is open. `0` (default) leaves it at `SCHED_OTHER`. Range 1–99;
     /// 10–30 is recommended. Requires `CAP_SYS_NICE` (privileged container); best-effort,
@@ -304,11 +302,18 @@ impl Default for AudioConfig {
             profile,
             settings,
             vad: true,
+            snd_rec_latency_ms: DEFAULT_SND_REC_LATENCY_MS,
+            snd_play_latency_ms: DEFAULT_SND_PLAY_LATENCY_MS,
+        }
+    }
+}
+
+impl Default for ModemAudioConfig {
+    fn default() -> Self {
+        Self {
             rx_gain: None,
             eec_mode: None,
             tx_level: 1.0,
-            snd_rec_latency_ms: DEFAULT_SND_REC_LATENCY_MS,
-            snd_play_latency_ms: DEFAULT_SND_PLAY_LATENCY_MS,
             rt_audio_prio: 0,
         }
     }
@@ -380,22 +385,20 @@ pub struct VowifiConfig {
     /// (see `main.rs`) when this is `false`, so an operator who hasn't
     /// provisioned VoWiFi can't accidentally bring the mode up.
     pub enabled: bool,
-    /// Mobile Country Code of the home network, e.g. `"404"`. Leave empty
-    /// (together with `mnc`) to auto-derive it from the SIM at startup —
-    /// IMSI via `AT+CIMI`, with the 2-vs-3-digit MNC ambiguity resolved via
-    /// EF_AD (`AT+CRSM`), falling back to numeric `AT+COPS`.
+    /// This line's Mobile Country Code, e.g. `"404"`. Not a `[vowifi]` TOML
+    /// key — set it on a `[[vowifi.line]]` entry instead (`line_overrides`
+    /// below); resolved here by `vowifi::discovery::resolve_one_line`. Empty
+    /// (the default) means auto-derive it from the SIM at startup — IMSI via
+    /// `AT+CIMI`, with the 2-vs-3-digit MNC ambiguity resolved via EF_AD
+    /// (`AT+CRSM`), falling back to numeric `AT+COPS`.
     pub mcc: String,
-    /// Mobile Network Code of the home network, zero-padded to 3 digits,
-    /// e.g. `"094"` (Airtel). Empty means auto-derive — see `mcc`.
+    /// This line's Mobile Network Code, zero-padded to 3 digits, e.g.
+    /// `"094"` (Airtel). Same per-line-only sourcing as `mcc`; empty means
+    /// auto-derive.
     pub mnc: String,
     /// Serial AT port for the modem whose SIM authenticates the IMS
-    /// registration (same device the existing `ims-register`/`ims-call`
-    /// CLI tools use), e.g. `/dev/ttyUSB6`. Empty (the default) means
-    /// auto-discover every VoWiFi-capable modem instead
-    /// (specs/013-multi-card-vowifi) — a non-empty value is fed to
-    /// `gsm-sip-bridge discover` as an implicit single-line override
-    /// (FR-009/FR-020: an existing single-SIM config that names a port
-    /// explicitly keeps using exactly that port, undisturbed by discovery).
+    /// registration. Resolved per line from discovery/`[[vowifi.line]]`, not
+    /// a `[vowifi]` TOML key.
     pub modem_port: String,
     /// Use TCP (not UDP) for the SIP transport to the P-CSCF. `true` is the
     /// combination that reached `200 OK` on Airtel (see `ims::mod` docs).
@@ -405,11 +408,15 @@ pub struct VowifiConfig {
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
     /// Path Agent A reads the tunnel-assigned P-CSCF address from —
-    /// `docker/entrypoint.sh` writes this once the SWu tunnel is up.
+    /// `docker/entrypoint.sh` writes this once the SWu tunnel is up. Shared
+    /// across every line (also read by `[volte].pcscf_source_path`).
     pub pcscf_source_path: String,
     /// Agent A's address on the dedicated veth link (the `ims`-netns end).
+    /// Pure per-line infrastructure, always derived from the line's index —
+    /// not a `[vowifi]` TOML key.
     pub veth_local_addr: String,
     /// Agent B's address on the dedicated veth link (the default-netns end).
+    /// Derived, not configurable — see `veth_local_addr`.
     pub veth_peer_addr: String,
     /// TCP port the Agent A↔B control channel listens on/connects to over
     /// the veth link (`contracts/agent-control-protocol.md`).
@@ -430,11 +437,13 @@ pub struct VowifiConfig {
     /// APN used by the `swu` engine's dialer (specs/011-vowifi-sip-bridge).
     pub apn: String,
     /// Network namespace the ePDG tunnel lives in — created by
-    /// `docker/entrypoint.sh`, used by both engines.
+    /// `docker/entrypoint.sh`, used by both engines. Derived per line, not a
+    /// `[vowifi]` TOML key.
     pub netns: String,
-    /// ePDG FQDN, resolved to `epdg_ip` via DNS by `docker/entrypoint.sh`.
-    /// Defaults to the 3GPP-standard derivation from `mcc`/`mnc` when not
-    /// set explicitly in `[vowifi]`.
+    /// Shared override forcing every line's ePDG FQDN, bypassing the
+    /// per-line 3GPP-standard derivation from that line's own `mcc`/`mnc`
+    /// (which `docker/entrypoint.sh` performs itself). Empty (the default)
+    /// leaves that per-line derivation alone.
     pub epdg_fqdn: String,
     /// Skip DNS resolution and dial this ePDG IP directly. `None` (the
     /// default) means resolve `epdg_fqdn` at startup.
@@ -448,9 +457,10 @@ pub struct VowifiConfig {
     /// tunnel (confirmed on Vodafone India).
     pub keepalive_interval_sec: u64,
     /// Name of the veth interface end in the container's default netns
-    /// (Agent B's side).
+    /// (Agent B's side). Derived per line, not a `[vowifi]` TOML key.
     pub veth_sip_iface: String,
     /// Name of the veth interface end inside `netns` (Agent A's side).
+    /// Derived, not configurable — see `veth_sip_iface`.
     pub veth_ims_iface: String,
     /// ePDG tunnel engine: `"strongswan"` (the default — proper IKE
     /// rekeying/re-auth/DPD/MOBIKE, netns survives reconnects) or `"swu"`
@@ -458,21 +468,26 @@ pub struct VowifiConfig {
     /// — see specs/012-strongswan-epdg).
     pub tunnel_engine: String,
     /// XFRM interface name the strongswan engine creates inside `netns`.
+    /// Derived per line, not a `[vowifi]` TOML key.
     pub strongswan_tun_iface: String,
     /// XFRM interface's `if_id`, pinned so it (and `netns`) survive
-    /// reconnects (specs/012-strongswan-epdg FR-005/FR-011).
+    /// reconnects (specs/012-strongswan-epdg FR-005/FR-011). Derived, not
+    /// configurable — see `strongswan_tun_iface`.
     pub strongswan_if_id: u32,
     /// Host running the vpcd virtual smart-card reader (pcscd's vpcd
-    /// driver) that `vowifi-usim-bridge` connects to.
+    /// driver) that `vowifi-usim-bridge` connects to. Shared across lines.
     pub vpcd_host: String,
-    /// TCP port vpcd listens on. Rendered into `/etc/reader.conf.d/vpcd`
-    /// (the driver's listener) and dialled by `vowifi-usim-bridge`, so both
-    /// ends move together. Keep it below the kernel's ephemeral range
-    /// (`net.ipv4.ip_local_port_range`) — see `vpcd_port`'s CLI docs.
+    /// Base TCP port pcscd's shared vpcd reader listens on — one reader
+    /// serves every line, at `base + index` per line (rendered into
+    /// `/etc/reader.conf.d/vpcd` and dialled by `vowifi-usim-bridge`, so
+    /// both ends move together). A genuine `[vowifi]` TOML key, unlike the
+    /// other per-line infra fields: keep it below the kernel's ephemeral
+    /// range (`net.ipv4.ip_local_port_range`) — under `network_mode: host`
+    /// an unrelated outbound connection can otherwise grab the port first.
     pub vpcd_port: u16,
-    /// Use this IMSI instead of reading it from the SIM via `vowifi-imsi`
-    /// (AT+CIMI) — a test/diagnostic escape hatch for the strongswan
-    /// engine's swanctl connection rendering.
+    /// Diagnostic escape hatch: use this IMSI instead of reading it from the
+    /// SIM via `vowifi-imsi` (`AT+CIMI`). Not a `[vowifi]` TOML key — set it
+    /// on a `[[vowifi.line]]` entry instead.
     pub imsi_override: Option<String>,
     /// Upper bound on concurrently supported VoWiFi lines
     /// (specs/013-multi-card-vowifi FR-016) — modems discovered beyond this
@@ -501,12 +516,11 @@ pub struct VowifiLineOverride {
     /// (e.g. it reports an empty `serial` sysfs attribute).
     pub modem_port: Option<String>,
     /// Fix this line's home network identity instead of auto-deriving it
-    /// from the SIM. Must be set together with `mnc`, like the top-level
-    /// `[vowifi].mcc`/`mnc` pair.
+    /// from the SIM. Must be set together with `mnc`.
     pub mcc: Option<String>,
     pub mnc: Option<String>,
-    /// Same escape hatch as the top-level `[vowifi].imsi_override`, scoped
-    /// to this one line.
+    /// Diagnostic escape hatch: use this IMSI instead of reading it from the
+    /// SIM via `vowifi-imsi` (`AT+CIMI`), scoped to this one line.
     pub imsi_override: Option<String>,
 }
 
@@ -552,22 +566,10 @@ impl Default for VowifiConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolteConfig {
     pub enabled: bool,
-    pub modem_port: String,
-    /// Host interface carrying the modem's data path. Empty means manage the
-    /// PDN only and skip host interface configuration.
-    pub iface: String,
-    pub cid: u8,
-    pub apn: String,
-    /// Explicit P-CSCF. Empty means fall back to `pcscf_source_path`, then to
-    /// discovery — which does not work on every carrier (see the feature's
-    /// research notes), hence the explicit option.
-    pub pcscf: String,
-    pub pcscf_port: u16,
     /// File the VoWiFi/ePDG path writes its discovered P-CSCF to. Reused here
     /// so a captured address is picked up automatically rather than by hand.
+    /// Shared across every line.
     pub pcscf_source_path: String,
-    pub use_tcp: bool,
-    pub sec_agree: bool,
     pub status_path: String,
     pub lock_path: String,
     /// Answer inbound calls and bridge them to the telephone system
@@ -595,26 +597,28 @@ pub struct VolteConfig {
     pub line_overrides: Vec<VolteLineOverride>,
     /// Base network namespace name for a line's carrier-facing half
     /// (specs/020-volte-line-netns). Line 0 uses this unindexed; later lines
-    /// append their index, exactly like `[vowifi].netns`. Deliberately a
-    /// distinct default from `[vowifi].netns` ("volte" vs "ims") so the two
-    /// subsystems' namespaces can never collide when both are enabled in the
-    /// same container (FR-004a) — not expected to be operator-tuned, kept
-    /// configurable only for consistency with every other per-line-derived
-    /// base in this codebase.
+    /// append their index — the LTE analogue of `[vowifi].netns`, on a
+    /// distinct default ("volte" vs "ims") so the two subsystems' namespaces
+    /// can never collide when both are enabled in the same container
+    /// (FR-004a). Pure per-line infrastructure, always derived — not a
+    /// `[volte]` TOML key, same as `[vowifi]`'s equivalent fields.
     pub netns: String,
     /// Base name for the veth end inside a line's namespace (the carrier
     /// agent's side) — the LTE analogue of `[vowifi].veth_ims_iface`.
+    /// Derived, not configurable — see `netns`.
     pub veth_carrier_iface: String,
     /// Base name for the veth end in the default namespace (the shared
     /// telephony half's side) — the LTE analogue of `[vowifi].veth_sip_iface`.
+    /// Derived, not configurable — see `netns`.
     pub veth_telephony_iface: String,
     /// Base `/30` address for the carrier-agent side of the veth link — the
-    /// LTE analogue of `[vowifi].veth_local_addr`. Distinct default block
-    /// from `[vowifi]`'s so the two subsystems' veth addressing cannot
-    /// collide either.
+    /// LTE analogue of `[vowifi].veth_local_addr`, on a distinct default
+    /// block from `[vowifi]`'s so the two subsystems' veth addressing cannot
+    /// collide either. Derived, not configurable — see `netns`.
     pub veth_carrier_addr: String,
     /// Base `/30` address for the telephony-half side of the veth link — the
-    /// LTE analogue of `[vowifi].veth_peer_addr`.
+    /// LTE analogue of `[vowifi].veth_peer_addr`. Derived, not configurable
+    /// — see `netns`.
     pub veth_telephony_addr: String,
 }
 
@@ -630,11 +634,13 @@ pub struct VolteLineOverride {
     /// Match (or pin) a modem by its AT serial device path directly — the
     /// escape hatch for a modem discovery can't identify by serial.
     pub modem_port: Option<String>,
-    /// Fix this line's PDP context id instead of taking `[volte].cid`.
+    /// This line's PDP context id. Absent means the default (3).
     pub cid: Option<u8>,
-    /// Fix this line's APN instead of taking `[volte].apn`.
+    /// This line's APN. Absent means the default (`"ims"`).
     pub apn: Option<String>,
-    /// Fix this line's P-CSCF instead of taking `[volte].pcscf`.
+    /// This line's explicit P-CSCF. Absent means fall back to
+    /// `[volte].pcscf_source_path`, then to on-modem discovery — which does
+    /// not work on every carrier (see the feature's research notes).
     pub pcscf: Option<String>,
     /// Host data interface bound to this modem's IMS PDN. Empty/absent means
     /// auto-detect from the modem's USB device (see `volte::discovery`).
@@ -647,17 +653,9 @@ impl Default for VolteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            modem_port: "/dev/ttyUSB0".to_string(),
-            iface: String::new(),
-            cid: 3,
-            apn: "ims".to_string(),
-            pcscf: String::new(),
-            pcscf_port: 5060,
             // Same default the [vowifi] section uses, so a captured address is
             // found without configuring anything.
             pcscf_source_path: "/tmp/pcscf".to_string(),
-            use_tcp: true,
-            sec_agree: true,
             status_path: "/tmp/volte-registration-status".to_string(),
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
@@ -682,6 +680,7 @@ pub struct AppConfig {
     pub resilience: ResilienceConfig,
     pub control: ControlConfig,
     pub audio: AudioConfig,
+    pub modem_audio: ModemAudioConfig,
     pub scheduled_restart: ScheduledRestartConfig,
     pub vowifi: VowifiConfig,
     pub volte: VolteConfig,
@@ -706,6 +705,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let resilience = parse_resilience(table)?;
     let control = parse_control(table)?;
     let audio = parse_audio(table)?;
+    let modem_audio = parse_modem_audio(table)?;
     let scheduled_restart = parse_scheduled_restart(table);
     let vowifi = parse_vowifi(table)?;
     let volte = parse_volte(table)?;
@@ -720,6 +720,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         resilience,
         control,
         audio,
+        modem_audio,
         scheduled_restart,
         vowifi,
         volte,
@@ -808,11 +809,6 @@ fn require_string(
 fn as_u16_port(v: &Value, key: &str) -> BridgeResult<u16> {
     let n = as_u64_range(v, key, false, 1..=65535)?;
     Ok(n as u16)
-}
-
-fn as_u32(v: &Value, key: &str) -> BridgeResult<u32> {
-    let n = as_u64_range(v, key, false, 0..=u32::MAX as u64)?;
-    Ok(n as u32)
 }
 
 /// Like `as_string`, but an absent key or an empty/blank-after-`env:`
@@ -1202,12 +1198,34 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         .transpose()?
         .unwrap_or(true);
 
+    let snd_rec_latency_ms = parse_latency_ms(t, "snd_rec_latency_ms", DEFAULT_SND_REC_LATENCY_MS)?;
+    let snd_play_latency_ms =
+        parse_latency_ms(t, "snd_play_latency_ms", DEFAULT_SND_PLAY_LATENCY_MS)?;
+
+    Ok(AudioConfig {
+        profile,
+        settings,
+        vad,
+        snd_rec_latency_ms,
+        snd_play_latency_ms,
+    })
+}
+
+fn parse_modem_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<ModemAudioConfig> {
+    let Some(val) = root.get("modem_audio") else {
+        return Ok(ModemAudioConfig::default());
+    };
+    let t = val
+        .as_table()
+        .ok_or_else(|| BridgeError::Config("[modem_audio] must be a table".into()))?;
+    warn_unknown_keys_in(t, MODEM_AUDIO_KEYS, "modem_audio");
+
     let rx_gain = match t.get("rx_gain") {
         Some(v) => {
-            let n = as_integer(v, "audio.rx_gain")?;
+            let n = as_integer(v, "modem_audio.rx_gain")?;
             if !(0..=65535).contains(&n) {
                 return Err(BridgeError::Config(format!(
-                    "audio.rx_gain must be 0–65535; got {n}"
+                    "modem_audio.rx_gain must be 0–65535; got {n}"
                 )));
             }
             Some(n as u32)
@@ -1217,10 +1235,10 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
 
     let tx_level = match t.get("tx_level") {
         Some(v) => {
-            let f = as_float(v, "audio.tx_level")?;
+            let f = as_float(v, "modem_audio.tx_level")?;
             if !(0.0..=2.0).contains(&f) {
                 return Err(BridgeError::Config(format!(
-                    "audio.tx_level must be 0.0–2.0; got {f}"
+                    "modem_audio.tx_level must be 0.0–2.0; got {f}"
                 )));
             }
             f as f32
@@ -1230,10 +1248,10 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
 
     let eec_mode = match t.get("eec_mode") {
         Some(v) => {
-            let n = as_integer(v, "audio.eec_mode")?;
+            let n = as_integer(v, "modem_audio.eec_mode")?;
             if !(0..=65535).contains(&n) {
                 return Err(BridgeError::Config(format!(
-                    "audio.eec_mode must be 0–65535; got {n}"
+                    "modem_audio.eec_mode must be 0–65535; got {n}"
                 )));
             }
             Some(n as u32)
@@ -1241,17 +1259,13 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         None => None,
     };
 
-    let snd_rec_latency_ms = parse_latency_ms(t, "snd_rec_latency_ms", DEFAULT_SND_REC_LATENCY_MS)?;
-    let snd_play_latency_ms =
-        parse_latency_ms(t, "snd_play_latency_ms", DEFAULT_SND_PLAY_LATENCY_MS)?;
-
     let rt_audio_prio = match t.get("rt_audio_prio") {
         Some(v) => {
-            let n = as_integer(v, "audio.rt_audio_prio")?;
+            let n = as_integer(v, "modem_audio.rt_audio_prio")?;
             // 0 disables; 1–99 are the valid SCHED_FIFO priorities.
             if n != 0 && !(1..=99).contains(&n) {
                 return Err(BridgeError::Config(format!(
-                    "audio.rt_audio_prio must be 0 (off) or 1–99; got {n}"
+                    "modem_audio.rt_audio_prio must be 0 (off) or 1–99; got {n}"
                 )));
             }
             n as u32
@@ -1259,15 +1273,10 @@ fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig
         None => 0,
     };
 
-    Ok(AudioConfig {
-        profile,
-        settings,
-        vad,
+    Ok(ModemAudioConfig {
         rx_gain,
         tx_level,
         eec_mode,
-        snd_rec_latency_ms,
-        snd_play_latency_ms,
         rt_audio_prio,
     })
 }
@@ -1473,59 +1482,17 @@ fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig
             .unwrap_or(default))
     };
 
-    let pcscf = str_key("pcscf", "volte.pcscf", d.pcscf)?;
-    // Fail at load time rather than at registration time, where the operator
-    // has already waited for a PDN to come up.
-    if !pcscf.is_empty() && pcscf.parse::<std::net::IpAddr>().is_err() {
-        return Err(BridgeError::Config(format!(
-            "volte.pcscf is not a valid IP address: {pcscf}"
-        )));
-    }
-
-    let cid = t
-        .get("cid")
-        .map(|v| as_integer(v, "volte.cid"))
-        .transpose()?
-        .map(|n| n as u8)
-        .unwrap_or(d.cid);
-    if cid == 0 {
-        return Err(BridgeError::Config(
-            "volte.cid must be a non-zero PDP context id".into(),
-        ));
-    }
-
     Ok(VolteConfig {
         enabled: t
             .get("enabled")
             .map(|v| as_bool(v, "volte.enabled"))
             .transpose()?
             .unwrap_or(d.enabled),
-        modem_port: str_key("modem_port", "volte.modem_port", d.modem_port)?,
-        iface: str_key("iface", "volte.iface", d.iface)?,
-        cid,
-        apn: str_key("apn", "volte.apn", d.apn)?,
-        pcscf,
-        pcscf_port: t
-            .get("pcscf_port")
-            .map(|v| as_integer(v, "volte.pcscf_port"))
-            .transpose()?
-            .map(|n| n as u16)
-            .unwrap_or(d.pcscf_port),
         pcscf_source_path: str_key(
             "pcscf_source_path",
             "volte.pcscf_source_path",
             d.pcscf_source_path,
         )?,
-        use_tcp: t
-            .get("use_tcp")
-            .map(|v| as_bool(v, "volte.use_tcp"))
-            .transpose()?
-            .unwrap_or(d.use_tcp),
-        sec_agree: t
-            .get("sec_agree")
-            .map(|v| as_bool(v, "volte.sec_agree"))
-            .transpose()?
-            .unwrap_or(d.sec_agree),
         status_path: str_key("status_path", "volte.status_path", d.status_path)?,
         lock_path: str_key("lock_path", "volte.lock_path", d.lock_path)?,
         bridge_inbound: t
@@ -1540,27 +1507,14 @@ fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig
             .map(|n| n as u32)
             .unwrap_or(d.max_lines),
         line_overrides: parse_volte_line_overrides(t)?,
-        netns: str_key("netns", "volte.netns", d.netns)?,
-        veth_carrier_iface: str_key(
-            "veth_carrier_iface",
-            "volte.veth_carrier_iface",
-            d.veth_carrier_iface,
-        )?,
-        veth_telephony_iface: str_key(
-            "veth_telephony_iface",
-            "volte.veth_telephony_iface",
-            d.veth_telephony_iface,
-        )?,
-        veth_carrier_addr: str_key(
-            "veth_carrier_addr",
-            "volte.veth_carrier_addr",
-            d.veth_carrier_addr,
-        )?,
-        veth_telephony_addr: str_key(
-            "veth_telephony_addr",
-            "volte.veth_telephony_addr",
-            d.veth_telephony_addr,
-        )?,
+        // Pure per-line infrastructure — always internally derived from a
+        // line's index, no config knob at all (see `VolteConfig`'s field
+        // docs, matching `[vowifi]`'s equivalent fields).
+        netns: d.netns,
+        veth_carrier_iface: d.veth_carrier_iface,
+        veth_telephony_iface: d.veth_telephony_iface,
+        veth_carrier_addr: d.veth_carrier_addr,
+        veth_telephony_addr: d.veth_telephony_addr,
     })
 }
 
@@ -1629,33 +1583,12 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_bool(v, "vowifi.enabled"))
         .transpose()?
         .unwrap_or(defaults.enabled);
-    let mcc = t
-        .get("mcc")
-        .map(|v| as_string(v, "vowifi.mcc", false))
-        .transpose()?
-        .unwrap_or(defaults.mcc);
-    let mnc = t
-        .get("mnc")
-        .map(|v| as_string(v, "vowifi.mnc", false))
-        .transpose()?
-        .unwrap_or(defaults.mnc);
-
-    // Both set = explicit; both unset = auto-derive from the SIM at startup
-    // (entrypoint.sh via `vowifi-plmn`, vowifi-ims-agent internally). One
-    // without the other is always a config mistake.
-    if mcc.is_empty() != mnc.is_empty() {
-        return Err(BridgeError::Config(
-            "vowifi.mcc and vowifi.mnc must be set together \
-             (or both left unset to auto-derive them from the SIM)"
-                .into(),
-        ));
-    }
-
-    let modem_port = t
-        .get("modem_port")
-        .map(|v| as_string(v, "vowifi.modem_port", false))
-        .transpose()?
-        .unwrap_or(defaults.modem_port);
+    // mcc/mnc/modem_port are per-line identity, not a global default — set
+    // them on a `[[vowifi.line]]` entry instead (see
+    // `parse_vowifi_line_overrides`, which validates mcc/mnc pairing there).
+    let mcc = defaults.mcc.clone();
+    let mnc = defaults.mnc.clone();
+    let modem_port = defaults.modem_port.clone();
     let use_tcp = t
         .get("use_tcp")
         .map(|v| as_bool(v, "vowifi.use_tcp"))
@@ -1671,16 +1604,12 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_string(v, "vowifi.pcscf_source_path", false))
         .transpose()?
         .unwrap_or(defaults.pcscf_source_path);
-    let veth_local_addr = t
-        .get("veth_local_addr")
-        .map(|v| as_string(v, "vowifi.veth_local_addr", false))
-        .transpose()?
-        .unwrap_or(defaults.veth_local_addr);
-    let veth_peer_addr = t
-        .get("veth_peer_addr")
-        .map(|v| as_string(v, "vowifi.veth_peer_addr", false))
-        .transpose()?
-        .unwrap_or(defaults.veth_peer_addr);
+    // veth addresses/names, netns, strongswan iface/if_id and the vpcd port
+    // are pure per-line infrastructure, always mechanically derived from a
+    // line's index (see `vowifi::discovery::resolve_one_line`) — there is no
+    // config knob for them at all.
+    let veth_local_addr = defaults.veth_local_addr.clone();
+    let veth_peer_addr = defaults.veth_peer_addr.clone();
     let control_port = t
         .get("control_port")
         .map(|v| as_u16_port(v, "vowifi.control_port"))
@@ -1697,25 +1626,16 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_string(v, "vowifi.apn", false))
         .transpose()?
         .unwrap_or(defaults.apn);
-    let netns = t
-        .get("netns")
-        .map(|v| as_string(v, "vowifi.netns", false))
-        .transpose()?
-        .unwrap_or(defaults.netns);
-    // Stays empty when mcc/mnc are auto-derived — entrypoint.sh applies the
-    // same 3GPP derivation itself once `vowifi-plmn` has answered.
+    let netns = defaults.netns.clone();
+    // A shared override applied to every line. Each line's real ePDG FQDN is
+    // derived per-line from that line's own mcc/mnc by `docker/entrypoint.sh`
+    // (which already re-derives it there); this is only the escape hatch for
+    // forcing a non-standard FQDN across the board.
     let epdg_fqdn = t
         .get("epdg_fqdn")
         .map(|v| as_string(v, "vowifi.epdg_fqdn", false))
         .transpose()?
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if mcc.is_empty() {
-                String::new()
-            } else {
-                format!("epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org")
-            }
-        });
+        .unwrap_or(defaults.epdg_fqdn);
     let epdg_ip = as_optional_string(t, "epdg_ip", "vowifi.epdg_ip")?;
     let src_addr = as_optional_string(t, "src_addr", "vowifi.src_addr")?;
     let keepalive_interval_sec = t
@@ -1723,16 +1643,8 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_u64_range(v, "vowifi.keepalive_interval_sec", false, 1..=3600))
         .transpose()?
         .unwrap_or(defaults.keepalive_interval_sec);
-    let veth_sip_iface = t
-        .get("veth_sip_iface")
-        .map(|v| as_string(v, "vowifi.veth_sip_iface", false))
-        .transpose()?
-        .unwrap_or(defaults.veth_sip_iface);
-    let veth_ims_iface = t
-        .get("veth_ims_iface")
-        .map(|v| as_string(v, "vowifi.veth_ims_iface", false))
-        .transpose()?
-        .unwrap_or(defaults.veth_ims_iface);
+    let veth_sip_iface = defaults.veth_sip_iface.clone();
+    let veth_ims_iface = defaults.veth_ims_iface.clone();
     let tunnel_engine = t
         .get("tunnel_engine")
         .map(|v| as_string(v, "vowifi.tunnel_engine", false))
@@ -1743,16 +1655,8 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
             "vowifi.tunnel_engine must be \"swu\" or \"strongswan\", got {tunnel_engine:?}"
         )));
     }
-    let strongswan_tun_iface = t
-        .get("strongswan_tun_iface")
-        .map(|v| as_string(v, "vowifi.strongswan_tun_iface", false))
-        .transpose()?
-        .unwrap_or(defaults.strongswan_tun_iface);
-    let strongswan_if_id = t
-        .get("strongswan_if_id")
-        .map(|v| as_u32(v, "vowifi.strongswan_if_id"))
-        .transpose()?
-        .unwrap_or(defaults.strongswan_if_id);
+    let strongswan_tun_iface = defaults.strongswan_tun_iface.clone();
+    let strongswan_if_id = defaults.strongswan_if_id;
     let vpcd_host = t
         .get("vpcd_host")
         .map(|v| as_string(v, "vowifi.vpcd_host", false))
@@ -1763,7 +1667,9 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_u16_port(v, "vowifi.vpcd_port"))
         .transpose()?
         .unwrap_or(defaults.vpcd_port);
-    let imsi_override = as_optional_string(t, "imsi_override", "vowifi.imsi_override")?;
+    // imsi_override is per-line diagnostic escape hatch — set it on a
+    // `[[vowifi.line]]` entry instead.
+    let imsi_override = defaults.imsi_override.clone();
     let max_lines = t
         .get("max_lines")
         .map(|v| as_u64_range(v, "vowifi.max_lines", false, 1..=64))
@@ -1856,6 +1762,7 @@ mod tests {
         let resilience = parse_resilience(table).unwrap();
         let control = parse_control(table).unwrap();
         let audio = parse_audio(table).unwrap();
+        let modem_audio = parse_modem_audio(table).unwrap();
         let scheduled_restart = parse_scheduled_restart(table);
         let vowifi = parse_vowifi(table).unwrap();
         let volte = parse_volte(table).unwrap();
@@ -1869,6 +1776,7 @@ mod tests {
             resilience,
             control,
             audio,
+            modem_audio,
             scheduled_restart,
             vowifi,
             volte,
@@ -1881,8 +1789,6 @@ mod tests {
         let c = parse(MINIMAL_TOML);
 
         assert!(!c.volte.enabled, "must be opt-in");
-        assert_eq!(c.volte.cid, 3);
-        assert_eq!(c.volte.apn, "ims");
         // Same default the VoWiFi path writes to, so a captured address is
         // found without configuring anything.
         assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf");
@@ -1908,7 +1814,10 @@ mod tests {
     }
 
     #[test]
-    fn volte_netns_and_veth_fields_are_parsed() {
+    fn volte_netns_and_veth_fields_are_not_settable_via_toml() {
+        // Pure per-line infrastructure — always internally derived from a
+        // line's index, no config knob at either the top level or per-line,
+        // same as [vowifi]'s equivalent fields (specs config reorg).
         let toml = format!(
             "{MINIMAL_TOML}\n[volte]\nnetns = \"volte-custom\"\n\
              veth_carrier_iface = \"veth-c\"\nveth_telephony_iface = \"veth-t\"\n\
@@ -1916,46 +1825,27 @@ mod tests {
         );
         let c = parse(&toml);
 
-        assert_eq!(c.volte.netns, "volte-custom");
-        assert_eq!(c.volte.veth_carrier_iface, "veth-c");
-        assert_eq!(c.volte.veth_telephony_iface, "veth-t");
-        assert_eq!(c.volte.veth_carrier_addr, "10.5.0.1");
-        assert_eq!(c.volte.veth_telephony_addr, "10.5.0.2");
+        assert_eq!(c.volte.netns, "volte");
+        assert_eq!(c.volte.veth_carrier_iface, "veth-volte-ims");
+        assert_eq!(c.volte.veth_telephony_iface, "veth-volte-sip");
+        assert_eq!(c.volte.veth_carrier_addr, "10.98.0.1");
+        assert_eq!(c.volte.veth_telephony_addr, "10.98.0.2");
     }
 
     #[test]
-    fn volte_section_is_parsed() {
+    fn volte_top_level_line_fields_are_no_longer_settable() {
+        // modem_port/iface/cid/apn/pcscf/pcscf_port moved to [[volte.line]]
+        // only (specs config reorg) — a stray top-level key is an
+        // unknown-key warning, not a config value.
         let toml = format!(
             "{MINIMAL_TOML}\n[volte]\nenabled = true\niface = \"wwan0\"\ncid = 4\n\
-             pcscf = \"2400:5200:a100:819::6\"\nsec_agree = false\n"
+             pcscf = \"2400:5200:a100:819::6\"\n"
         );
 
         let c = parse(&toml);
 
         assert!(c.volte.enabled);
-        assert_eq!(c.volte.iface, "wwan0");
-        assert_eq!(c.volte.cid, 4);
-        assert_eq!(c.volte.pcscf, "2400:5200:a100:819::6");
-        assert!(!c.volte.sec_agree);
-    }
-
-    #[test]
-    fn volte_rejects_a_malformed_pcscf_at_load_time() {
-        // Better here than after the operator has waited for a PDN to come up.
-        let toml = format!("{MINIMAL_TOML}\n[volte]\npcscf = \"not-an-address\"\n");
-        let root: Value = toml.parse().unwrap();
-
-        let err = parse_volte(root.as_table().unwrap()).unwrap_err();
-
-        assert!(err.to_string().contains("not a valid IP address"));
-    }
-
-    #[test]
-    fn volte_rejects_a_zero_context_id() {
-        let toml = format!("{MINIMAL_TOML}\n[volte]\ncid = 0\n");
-        let root: Value = toml.parse().unwrap();
-
-        assert!(parse_volte(root.as_table().unwrap()).is_err());
+        assert!(c.volte.line_overrides.is_empty());
     }
 
     #[test]
@@ -2229,34 +2119,29 @@ password = "pass"
     }
 
     #[test]
-    fn audio_rt_audio_prio_defaults_off() {
-        let root: toml::Value = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML)
-            .parse()
-            .unwrap();
-        let audio = parse_audio(root.as_table().unwrap()).unwrap();
-        assert_eq!(audio.rt_audio_prio, 0);
+    fn modem_audio_rt_audio_prio_defaults_off() {
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.modem_audio.rt_audio_prio, 0);
     }
 
     #[test]
-    fn audio_rt_audio_prio_valid_value_parsed() {
-        let root: toml::Value = format!("{}\n[audio]\nrt_audio_prio = 20\n", MINIMAL_TOML)
-            .parse()
-            .unwrap();
-        let audio = parse_audio(root.as_table().unwrap()).unwrap();
-        assert_eq!(audio.rt_audio_prio, 20);
+    fn modem_audio_rt_audio_prio_valid_value_parsed() {
+        let toml = format!("{}\n[modem_audio]\nrt_audio_prio = 20\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.modem_audio.rt_audio_prio, 20);
     }
 
     #[test]
-    fn audio_rt_audio_prio_out_of_range_returns_error() {
-        let root: toml::Value = format!("{}\n[audio]\nrt_audio_prio = 150\n", MINIMAL_TOML)
+    fn modem_audio_rt_audio_prio_out_of_range_returns_error() {
+        let root: toml::Value = format!("{}\n[modem_audio]\nrt_audio_prio = 150\n", MINIMAL_TOML)
             .parse()
             .unwrap();
-        let result = parse_audio(root.as_table().unwrap());
+        let result = parse_modem_audio(root.as_table().unwrap());
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("audio.rt_audio_prio must be 0 (off) or 1–99"));
+            .contains("modem_audio.rt_audio_prio must be 0 (off) or 1–99"));
     }
 
     #[test]
@@ -2322,41 +2207,31 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_enabled_without_mcc_mnc_means_auto_derive() {
+    fn vowifi_enabled_without_line_means_auto_derive() {
         let toml = format!("{}\n[vowifi]\nenabled = true\n", MINIMAL_TOML);
         let cfg = parse(&toml);
         assert!(cfg.vowifi.enabled);
         assert!(cfg.vowifi.mcc.is_empty());
         assert!(cfg.vowifi.mnc.is_empty());
-        // No PLMN yet, so no FQDN can be derived at parse time either —
-        // entrypoint.sh fills it in after `vowifi-plmn` answers.
         assert!(cfg.vowifi.epdg_fqdn.is_empty());
     }
 
     #[test]
-    fn vowifi_rejects_mcc_without_mnc() {
+    fn vowifi_top_level_mcc_mnc_are_no_longer_settable() {
+        // mcc/mnc moved to [[vowifi.line]] entries only (specs config
+        // reorg) — a stray top-level key is an unknown-key warning, not a
+        // config value, and the field stays at its auto-derive default.
         let toml = format!(
-            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\n",
+            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let result = parse_vowifi(root.as_table().unwrap());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("vowifi.mcc and vowifi.mnc must be set together"));
+        let cfg = parse(&toml);
+        assert!(cfg.vowifi.mcc.is_empty());
+        assert!(cfg.vowifi.mnc.is_empty());
     }
 
     #[test]
-    fn vowifi_rejects_mnc_without_mcc() {
-        let toml = format!("{}\n[vowifi]\nmnc = \"094\"\n", MINIMAL_TOML);
-        let root: toml::Value = toml.parse().unwrap();
-        assert!(parse_vowifi(root.as_table().unwrap()).is_err());
-    }
-
-    #[test]
-    fn vowifi_epdg_fqdn_override_respected_without_mcc_mnc() {
+    fn vowifi_epdg_fqdn_override_respected() {
         let toml = format!(
             "{}\n[vowifi]\nenabled = true\nepdg_fqdn = \"epdg.example.org\"\n",
             MINIMAL_TOML
@@ -2366,27 +2241,28 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_enabled_with_mcc_mnc_parses() {
-        let toml = format!(
-            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\n",
-            MINIMAL_TOML
-        );
-        let cfg = parse(&toml);
-        assert!(cfg.vowifi.enabled);
-        assert_eq!(cfg.vowifi.mcc, "404");
-        assert_eq!(cfg.vowifi.mnc, "094");
-    }
-
-    #[test]
-    fn vowifi_custom_veth_and_control_port() {
+    fn vowifi_veth_and_infra_fields_are_not_settable_via_toml() {
+        // Pure per-line infrastructure — always internally derived from a
+        // line's index, no config knob at either the top level or per-line.
         let toml = format!(
             "{}\n[vowifi]\nveth_local_addr = \"10.1.1.1\"\nveth_peer_addr = \"10.1.1.2\"\ncontrol_port = 9999\n",
             MINIMAL_TOML
         );
         let cfg = parse(&toml);
-        assert_eq!(cfg.vowifi.veth_local_addr, "10.1.1.1");
-        assert_eq!(cfg.vowifi.veth_peer_addr, "10.1.1.2");
+        assert_eq!(cfg.vowifi.veth_local_addr, "10.99.0.1");
+        assert_eq!(cfg.vowifi.veth_peer_addr, "10.99.0.2");
+        // control_port is the one genuinely global/shared field here.
         assert_eq!(cfg.vowifi.control_port, 9999);
+    }
+
+    #[test]
+    fn vowifi_vpcd_port_base_is_settable() {
+        // Unlike the other per-line infra fields, vpcd_port is a genuine
+        // global TOML key — the base of pcscd's shared reader range, which
+        // operators sometimes must move to avoid an ephemeral-port collision.
+        let toml = format!("{}\n[vowifi]\nvpcd_port = 20000\n", MINIMAL_TOML);
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.vpcd_port, 20000);
     }
 
     #[test]
@@ -2418,38 +2294,14 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_epdg_fqdn_derived_from_mcc_mnc_when_unset() {
-        let toml = format!(
-            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\n",
-            MINIMAL_TOML
-        );
-        let cfg = parse(&toml);
-        assert_eq!(
-            cfg.vowifi.epdg_fqdn,
-            "epdg.epc.mnc094.mcc404.pub.3gppnetwork.org"
-        );
-    }
-
-    #[test]
-    fn vowifi_epdg_fqdn_override_respected() {
-        let toml = format!(
-            "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\nepdg_fqdn = \"epdg.example.org\"\n",
-            MINIMAL_TOML
-        );
-        let cfg = parse(&toml);
-        assert_eq!(cfg.vowifi.epdg_fqdn, "epdg.example.org");
-    }
-
-    #[test]
     fn vowifi_optional_overrides_parsed() {
         let toml = format!(
-            "{}\n[vowifi]\nepdg_ip = \"1.2.3.4\"\nsrc_addr = \"9.9.9.9\"\nimsi_override = \"404940123456789\"\ntunnel_engine = \"swu\"\n",
+            "{}\n[vowifi]\nepdg_ip = \"1.2.3.4\"\nsrc_addr = \"9.9.9.9\"\ntunnel_engine = \"swu\"\n",
             MINIMAL_TOML
         );
         let cfg = parse(&toml);
         assert_eq!(cfg.vowifi.epdg_ip.as_deref(), Some("1.2.3.4"));
         assert_eq!(cfg.vowifi.src_addr.as_deref(), Some("9.9.9.9"));
-        assert_eq!(cfg.vowifi.imsi_override.as_deref(), Some("404940123456789"));
         assert_eq!(cfg.vowifi.tunnel_engine, "swu");
     }
 

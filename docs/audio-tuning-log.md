@@ -3,6 +3,12 @@
 Track changes to modem (EC20) and SIP stack audio parameters over time.
 All AT+QEEC values use the **EC20 Series index mapping** (Table 6 of AT+EEC_Manual_V1.2).
 
+Note: entries below predate the config reorg that split `[audio]` into
+`[audio]` (shared) and `[modem_audio]` (circuit-switched only, `rx_gain`/
+`eec_mode`/`tx_level`/`rt_audio_prio`) — see `docs/migrating-config-reorg.md`.
+Historical entries still say `config.toml [audio]`; read that as
+`[modem_audio]` for those four keys under the current config shape.
+
 ---
 
 ## Baseline — 2026-05-30 (v5.5.3)

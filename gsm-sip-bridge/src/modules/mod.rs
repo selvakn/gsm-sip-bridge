@@ -347,8 +347,8 @@ impl CardPool {
                     let module_clone = module.clone();
                     let evt_tx = event_tx.clone();
                     let audio_init = ModuleAudioInit {
-                        rx_gain: self.config.audio.rx_gain,
-                        eec_mode: self.config.audio.eec_mode,
+                        rx_gain: self.config.modem_audio.rx_gain,
+                        eec_mode: self.config.modem_audio.eec_mode,
                     };
                     tasks.spawn_blocking(move || {
                         let sid = slot;
@@ -515,8 +515,8 @@ impl CardPool {
                                 let module_clone = module.clone();
                                 let evt_tx = event_tx.clone();
                                 let audio_init = ModuleAudioInit {
-                                    rx_gain: self.config.audio.rx_gain,
-                                    eec_mode: self.config.audio.eec_mode,
+                                    rx_gain: self.config.modem_audio.rx_gain,
+                                    eec_mode: self.config.modem_audio.eec_mode,
                                 };
                                 tasks.spawn_blocking(move || {
                                     if let Err(e) = run_module_loop(
@@ -703,8 +703,8 @@ impl CardPool {
                     let module_clone = module.clone();
                     let evt_tx = event_tx.clone();
                     let audio_init = ModuleAudioInit {
-                        rx_gain: self.config.audio.rx_gain,
-                        eec_mode: self.config.audio.eec_mode,
+                        rx_gain: self.config.modem_audio.rx_gain,
+                        eec_mode: self.config.modem_audio.eec_mode,
                     };
                     tasks.spawn_blocking(move || {
                         if let Err(e) = run_module_loop(

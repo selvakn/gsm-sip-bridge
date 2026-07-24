@@ -354,25 +354,25 @@ fn load_vowifi_config(cli: &Cli) -> Result<gsm_sip_bridge::config::AppConfig, Ex
     Ok(config)
 }
 
-/// Without `--line`, behaves exactly as before this feature (the single
-/// `[vowifi]` config section — FR-020). With `--line N`, loads that line's
-/// fully-derived `VowifiConfig` from the `discover` subcommand's
-/// line-resolution file instead — see
+/// Loads `--line N`'s fully-derived `VowifiConfig` from the `discover`
+/// subcommand's line-resolution file — see
 /// `specs/013-multi-card-vowifi/contracts/agent-topology-contract.md`.
-/// Deliberately does NOT re-run discovery itself: doing so would re-probe
-/// modems a sibling `vowifi-usim-bridge`/other line's agent may already have
-/// open (research.md item 3).
+/// `--line` is required: every line, including a single-SIM setup, is
+/// resolved by `discover` first (`docker/entrypoint.sh` always runs it
+/// before starting this agent). Deliberately does NOT re-run discovery
+/// itself: doing so would re-probe modems a sibling
+/// `vowifi-usim-bridge`/other line's agent may already have open
+/// (research.md item 3).
 fn handle_vowifi_ims_agent_command(cli: &Cli, line: Option<u32>) -> ExitCode {
     let config = match load_vowifi_config(cli) {
         Ok(c) => c,
         Err(code) => return code,
     };
     let Some(index) = line else {
-        return gsm_sip_bridge::ims::agent::run(
-            gsm_sip_bridge::vowifi::LEGACY_LINE_CARD_ID,
-            &config.vowifi,
-            &config,
+        eprintln!(
+            "error: vowifi-ims-agent requires --line N (run `gsm-sip-bridge discover` first)"
         );
+        return ExitCode::FAILURE;
     };
     let (card_id, line_config) = match load_line_config(index) {
         Ok(c) => c,
@@ -1100,7 +1100,10 @@ fn handle_volte_bridge_command(
     // `docker/entrypoint.sh` inside that line's namespace.
     let (lines, spawn_carrier_threads) = match &args.modem {
         Some(modem) => (volte_bridge_single_line(args, modem), true),
-        None => (volte_bridge_manifest_lines(&app_config.volte), false),
+        None => (
+            volte_bridge_manifest_lines(&app_config.volte, args.pcscf_port),
+            false,
+        ),
     };
 
     let lines = match lines {
@@ -1175,6 +1178,7 @@ fn volte_bridge_single_line(
 /// `volte_bridge_single_line`/the pre-020 discovered-lines path always used.
 fn volte_bridge_manifest_lines(
     volte: &gsm_sip_bridge::config::VolteConfig,
+    pcscf_port: u16,
 ) -> Result<Vec<gsm_sip_bridge::volte::bridge::BridgeLine>, String> {
     use gsm_sip_bridge::volte::discovery;
 
@@ -1189,8 +1193,7 @@ fn volte_bridge_manifest_lines(
         } else {
             Some(entry.pcscf.clone())
         };
-        let Some(pcscf) = resolve_line_pcscf(explicit, volte.pcscf_port, &volte.pcscf_source_path)
-        else {
+        let Some(pcscf) = resolve_line_pcscf(explicit, pcscf_port, &volte.pcscf_source_path) else {
             tracing::error!(
                 card_id = %entry.card_id,
                 "no P-CSCF available for this line (none configured and none captured by the \
@@ -1387,7 +1390,7 @@ fn handle_volte_carrier_agent_command(
     };
     let Some(pcscf) = resolve_line_pcscf(
         explicit,
-        app_config.volte.pcscf_port,
+        args.pcscf_port,
         &app_config.volte.pcscf_source_path,
     ) else {
         eprintln!(
@@ -1585,18 +1588,14 @@ fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> E
                     return ExitCode::FAILURE;
                 }
             };
+            // Global-only: per-line values (modem_port/iface/cid/apn/pcscf/
+            // pcscf_port) live in `[[volte.line]]`, read directly by
+            // `volte-bridge` from config.toml — there is nothing to derive
+            // as a shell var here anymore.
             let v = &config.volte;
             let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
             println!("VOLTE_ENABLED={}", if v.enabled { 1 } else { 0 });
-            println!("VOLTE_MODEM_PORT={}", q(&v.modem_port));
-            println!("VOLTE_IFACE={}", q(&v.iface));
-            println!("VOLTE_CID={}", v.cid);
-            println!("VOLTE_APN={}", q(&v.apn));
-            println!("VOLTE_PCSCF={}", q(&v.pcscf));
-            println!("VOLTE_PCSCF_PORT={}", v.pcscf_port);
             println!("VOLTE_PCSCF_SOURCE_PATH={}", q(&v.pcscf_source_path));
-            println!("VOLTE_USE_TCP={}", if v.use_tcp { 1 } else { 0 });
-            println!("VOLTE_SEC_AGREE={}", if v.sec_agree { 1 } else { 0 });
             println!("VOLTE_STATUS_PATH={}", q(&v.status_path));
             println!("VOLTE_LOCK_PATH={}", q(&v.lock_path));
             println!(
@@ -1632,27 +1631,19 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn print_vowifi_shell_env(config: &gsm_sip_bridge::config::AppConfig) {
+    // Global-only: per-line values (mcc/mnc/modem_port/netns/veth
+    // names+addrs/strongswan iface+if_id/vpcd_port) come from
+    // `discover --shell-env` instead — see `print_discover_shell_env`.
     let v = &config.vowifi;
     let lines: Vec<(&str, String)> = vec![
-        ("MCC", v.mcc.clone()),
-        ("MNC", v.mnc.clone()),
         ("APN", v.apn.clone()),
-        ("MODEM_PORT", v.modem_port.clone()),
-        ("NETNS", v.netns.clone()),
         ("EPDG_FQDN", v.epdg_fqdn.clone()),
         ("EPDG_IP", v.epdg_ip.clone().unwrap_or_default()),
         ("SRC_ADDR", v.src_addr.clone().unwrap_or_default()),
         ("KEEPALIVE_INTERVAL", v.keepalive_interval_sec.to_string()),
-        ("VETH_SIP", v.veth_sip_iface.clone()),
-        ("VETH_IMS", v.veth_ims_iface.clone()),
-        ("VETH_IMS_ADDR", format!("{}/30", v.veth_local_addr)),
-        ("VETH_SIP_ADDR", format!("{}/30", v.veth_peer_addr)),
         ("TUNNEL_ENGINE", v.tunnel_engine.clone()),
-        ("STRONGSWAN_TUN_IFACE", v.strongswan_tun_iface.clone()),
-        ("STRONGSWAN_IF_ID", v.strongswan_if_id.to_string()),
         ("VPCD_HOST", v.vpcd_host.clone()),
         ("VPCD_PORT", v.vpcd_port.to_string()),
-        ("IMSI", v.imsi_override.clone().unwrap_or_default()),
         ("METRICS_PORT", config.metrics.port.to_string()),
     ];
     for (key, value) in lines {
@@ -1828,6 +1819,13 @@ fn print_discover_shell_env(resolution: &gsm_sip_bridge::vowifi::discovery::Line
     println!(
         "LINE_MNC={}",
         arr(resolution.lines.iter().map(|l| l.mnc.clone()))
+    );
+    println!(
+        "LINE_IMSI={}",
+        arr(resolution
+            .lines
+            .iter()
+            .map(|l| l.config.imsi_override.clone().unwrap_or_default()))
     );
     println!(
         "CS_EXCLUDED_PORTS={}",

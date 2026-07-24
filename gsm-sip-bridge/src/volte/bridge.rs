@@ -84,8 +84,7 @@ pub const LOOPBACK_CONTROL_PORT: u16 = 5075;
 /// `volte::discovery` derives the rest per line.
 pub const LOOPBACK_STATUS_PORT: u16 = 5076;
 
-/// Card label used when none is supplied — the single-line case, mirroring
-/// `vowifi::LEGACY_LINE_CARD_ID`.
+/// Card label used when none is supplied — the single-line case.
 pub const DEFAULT_CARD_ID: &str = "volte";
 
 /// Loopback — used whenever a line has no veth link (the single-`--modem`

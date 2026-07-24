@@ -135,12 +135,11 @@ const ATTACHMENT_LOSS_CONFIRMATIONS: u32 = 2;
 const ATTACHMENT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Entry point for the `vowifi-ims-agent` subcommand. `card_id` labels this
-/// line's metrics/history (specs/013-multi-card-vowifi FR-017) — pass
-/// `crate::vowifi::LEGACY_LINE_CARD_ID` for a deployment with no resolved
-/// line table (today's pre-multi-card behavior, `main.rs`). `vowifi_config`
-/// is this line's settings — `&app_config.vowifi` with no `--line`, or a
-/// line-specific override read from the `discover` resolution file
-/// otherwise; `app_config` is still needed in full alongside it because
+/// line's metrics/history (specs/013-multi-card-vowifi FR-017) — always the
+/// real card id of a resolved `discover` line (`--line N` is required; see
+/// `main.rs::handle_vowifi_ims_agent_command`). `vowifi_config` is this
+/// line's fully-derived settings, read from the `discover` resolution file;
+/// `app_config` is still needed in full alongside it because
 /// restoring observability (specs/014-vowifi-metrics-restore) needs
 /// `[control].socket_path` (where to send reports),
 /// `[metrics].agent_report_interval_seconds` (how often), `[sms].db_path`

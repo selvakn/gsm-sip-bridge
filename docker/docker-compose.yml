@@ -16,9 +16,9 @@
 #      VoWiFi included, lives in config.toml.
 #
 #   3. the host-side LTE IMS bridge (specs/015/017/018-volte-*), started when
-#      [volte].enabled + bridge_inbound = true. With modem_port left empty
-#      (auto-discovery), every SIM-ready modem becomes its own line, each in
-#      its own network namespace and veth pair (specs/020-volte-line-netns) —
+#      [volte].enabled + bridge_inbound = true. Every SIM-ready modem
+#      auto-discovered becomes its own line, each in its own network
+#      namespace and veth pair (specs/020-volte-line-netns) —
 #      the same netns/veth isolation VoWiFi's lines already get above, on a
 #      distinct namespace/veth-address base so the two subsystems never
 #      collide when both run in this one container. VoWiFi and VoLTE are

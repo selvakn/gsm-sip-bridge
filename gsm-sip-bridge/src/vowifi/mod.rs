@@ -138,34 +138,32 @@ pub(crate) struct RuntimeLine {
 }
 
 /// Reads the `discover` subcommand's line-resolution file and returns every
-/// resolved VoWiFi line. Falls back to a single legacy line built straight
-/// from `config` (today's pre-multi-card behavior, `LEGACY_LINE_CARD_ID` as
-/// its card id) when the file is missing/empty — the common case for an
-/// existing single-SIM deployment that has never run `discover` (FR-020).
-fn resolve_runtime_lines(config: &VowifiConfig) -> Vec<RuntimeLine> {
+/// resolved VoWiFi line. Every deployment — including a single-SIM one —
+/// runs `discover` first (`docker/entrypoint.sh` always does); a missing or
+/// empty line-resolution file is a real startup error, not a signal to fall
+/// back to raw `[vowifi]` config (there is no longer a raw single-line
+/// config to fall back to — see `VowifiConfig`'s per-line-only fields).
+fn resolve_runtime_lines(_config: &VowifiConfig) -> BridgeResult<Vec<RuntimeLine>> {
     let path = lines_file_path();
-    match discovery::read_line_resolution(&path) {
-        Ok(resolution) if !resolution.lines.is_empty() => resolution
-            .lines
-            .iter()
-            .map(|l| RuntimeLine {
-                index: l.index,
-                card_id: l.card_id.clone(),
-                veth_local_addr: l.veth_local_addr.clone(),
-                veth_peer_addr: l.veth_peer_addr.clone(),
-                control_port: l.control_port,
-                sip_leg_port: VETH_SIP_PORT,
-            })
-            .collect(),
-        _ => vec![RuntimeLine {
-            index: 0,
-            card_id: LEGACY_LINE_CARD_ID.to_string(),
-            veth_local_addr: config.veth_local_addr.clone(),
-            veth_peer_addr: config.veth_peer_addr.clone(),
-            control_port: config.control_port,
-            sip_leg_port: VETH_SIP_PORT,
-        }],
+    let resolution = discovery::read_line_resolution(&path).map_err(BridgeError::Config)?;
+    if resolution.lines.is_empty() {
+        return Err(BridgeError::Config(format!(
+            "no VoWiFi lines resolved in {} — run `gsm-sip-bridge discover` first",
+            path.display()
+        )));
     }
+    Ok(resolution
+        .lines
+        .iter()
+        .map(|l| RuntimeLine {
+            index: l.index,
+            card_id: l.card_id.clone(),
+            veth_local_addr: l.veth_local_addr.clone(),
+            veth_peer_addr: l.veth_peer_addr.clone(),
+            control_port: l.control_port,
+            sip_leg_port: VETH_SIP_PORT,
+        })
+        .collect())
 }
 
 pub fn run(config: &AppConfig) -> ExitCode {
@@ -179,7 +177,7 @@ pub fn run(config: &AppConfig) -> ExitCode {
 }
 
 fn run_inner(config: &AppConfig) -> BridgeResult<()> {
-    let lines = resolve_runtime_lines(&config.vowifi);
+    let lines = resolve_runtime_lines(&config.vowifi)?;
     run_telephony_side(
         config,
         AGENT_B_SIP_LOCAL_PORT,
@@ -487,14 +485,6 @@ fn run_line_listener(
         }
     }
 }
-
-/// Fallback card id used only when no `discover`-produced line resolution
-/// exists (`resolve_runtime_lines`'s legacy single-line branch, and
-/// `main.rs`'s `vowifi-ims-agent` with no `--line`) — the pre-multi-card
-/// label, kept as the default so an unresolved deployment's Discord/log/
-/// metrics attribution doesn't change (FR-020). A resolved multi-line
-/// deployment uses each line's real card id instead (FR-017).
-pub const LEGACY_LINE_CARD_ID: &str = "vowifi";
 
 /// Builds the Discord client used to forward relayed VoWiFi `MESSAGE`s,
 /// mirroring `modules::mod::CardPool::new`'s gating: only if SMS monitoring
@@ -1001,7 +991,13 @@ fn pbx_dest_uri(config: &AppConfig, caller_did: &str) -> String {
 /// (acceptance scenario 1); overall failure means *every* line's queries
 /// failed.
 pub fn print_status(config: &VowifiConfig) -> ExitCode {
-    let lines = resolve_runtime_lines(config);
+    let lines = match resolve_runtime_lines(config) {
+        Ok(lines) => lines,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut any_ok = false;
 
     for line in &lines {

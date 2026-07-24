@@ -1,8 +1,8 @@
 //! `vowifi-plmn`: prints the home network's MCC and MNC (space-separated,
 //! MNC zero-padded to 3 digits) derived from the SIM, and exits. Used by
-//! `docker/entrypoint.sh` when `vowifi.mcc`/`vowifi.mnc` are left unset in
-//! config.toml — the same "ask the binary instead of hand-parsing AT in
-//! bash" precedent as `vowifi-imsi`.
+//! `docker/entrypoint.sh` when a line's `mcc`/`mnc` (from `[[vowifi.line]]`,
+//! or auto-discovery) are left unset — the same "ask the binary instead of
+//! hand-parsing AT in bash" precedent as `vowifi-imsi`.
 //!
 //! Derivation: the MCC is always the first 3 IMSI digits (`AT+CIMI`); the
 //! MNC is the next 2 *or* 3 digits, and the IMSI alone doesn't say which.
@@ -24,8 +24,8 @@ pub struct Plmn {
     pub mcc: String,
     /// Mobile Network Code, zero-padded to 3 digits — the form every
     /// consumer needs (ePDG FQDN, EAP-AKA NAI realm, IMS realm all use
-    /// 3-digit `mnc` labels per TS 23.003, and the config's own
-    /// `vowifi.mnc` convention is the padded form, e.g. `"094"`).
+    /// 3-digit `mnc` labels per TS 23.003, and a `[[vowifi.line]].mnc`
+    /// override uses the same padded form, e.g. `"094"`).
     pub mnc: String,
 }
 
@@ -62,7 +62,7 @@ pub fn derive_plmn(at: &mut AtCommander) -> BridgeResult<Plmn> {
             let serving = at.query_cops_plmn().map_err(|cops_err| {
                 BridgeError::Discovery(format!(
                     "cannot determine MNC length: EF_AD failed ({ef_ad_err}) \
-                     and COPS failed ({cops_err}) — set vowifi.mcc/mnc explicitly"
+                     and COPS failed ({cops_err}) — set mcc/mnc explicitly on this line"
                 ))
             })?;
             // The serving PLMN's MNC length only describes the home network
@@ -72,7 +72,7 @@ pub fn derive_plmn(at: &mut AtCommander) -> BridgeResult<Plmn> {
                 tracing::warn!(
                     serving_plmn = %serving,
                     "serving PLMN doesn't match the IMSI (roaming?) — \
-                     derived MNC length may be wrong; set vowifi.mcc/mnc explicitly if so"
+                     derived MNC length may be wrong; set mcc/mnc explicitly on this line if so"
                 );
             }
             (serving.len() - 3) as u8
@@ -204,7 +204,7 @@ mod tests {
             "ERROR\r\n",                 // AT+COPS fails too
         ]);
         let err = derive_plmn(&mut at).unwrap_err().to_string();
-        assert!(err.contains("set vowifi.mcc/mnc explicitly"));
+        assert!(err.contains("set mcc/mnc explicitly on this line"));
     }
 
     #[test]

@@ -1,7 +1,10 @@
+# ============================================================================
+# Core — required for the daemon to start
+# ============================================================================
 [logging]
 # tracing filter level: trace, debug, info (default), warn, or error. Applies
-# to the daemon and both vowifi-*-agent subcommands. Overridden by the
-# RUST_LOG env var if set, or by -v/--verbose (always forces trace) on the CLI.
+# to the daemon and every subcommand. Overridden by the RUST_LOG env var if
+# set, or by -v/--verbose (always forces trace) on the CLI.
 level = "info"
 
 [sip]
@@ -18,11 +21,94 @@ tls_verify = "strict"          # strict or skip
 sip_destination = ""           # empty = DID passthrough, or fixed extension e.g. "100"
 sip_dial_timeout_sec = 30      # range: 5-120
 
+# ============================================================================
+# Optional features
+# ============================================================================
 [sms]
 enabled = true
 discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
 db_path = "/data/store.db"
 
+[scheduled_restart]
+# Preventive nightly card-restart cycle. The daemon walks every known slot in
+# ascending order and reboots each modem (AT+CFUN=1,1) with a randomized gap
+# between cards. Cards on an active call are deferred to the end of the
+# cycle. A manual `card restart` issued during a cycle takes precedence; see
+# specs/010-scheduled-card-restart/quickstart.md for full details.
+enabled = true
+# Standard 5-field cron expression in system local time. Default: 1 AM daily.
+# Examples: "0 3 * * 0" = 3 AM Sunday;  "30 2 * * 1-5" = 02:30 Mon-Fri.
+# Invalid expressions disable the scheduler without aborting the daemon.
+cron = "0 1 * * *"
+# Symmetric jitter applied to the cron-tick start time, in seconds.
+# Range 0..=86400. 0 disables jitter. Default 600 (±10 minutes).
+start_jitter_seconds = 600
+# Base wait between consecutive per-card restarts, in seconds. Range 0..=3600.
+inter_card_gap_seconds = 30
+# Symmetric jitter applied to the inter-card gap, in seconds.
+# Must be <= inter_card_gap_seconds. Range 0..=3600.
+inter_card_gap_jitter_seconds = 15
+
+# ============================================================================
+# Audio tuning
+# ============================================================================
+[audio]
+# Shared by every audio path: circuit-switched calls AND VoWiFi/VoLTE IMS
+# calls (both run through the same jitter-buffer/latency pipeline).
+#
+# Latency profile for the PJSIP jitter buffer and audio ring buffer.
+# "lan" — SIP server on the same machine or local network (default, lowest latency).
+# "wan" — Internet SIP trunk; adds headroom for packet jitter and higher RTT.
+profile = "lan"
+# Enable PJMEDIA voice activity detection and noise suppression on the
+# capture path. Set to false only for diagnostics.
+vad = true
+# ALSA/media sound-device ring-buffer depth in milliseconds.
+# snd_rec_latency_ms sizes the capture buffer (GSM/carrier → SIP);
+# snd_play_latency_ms sizes the playback buffer (SIP → GSM/carrier). Larger
+# values absorb scheduling jitter and prevent XRUNs — heard as choppy/robotic
+# audio — at the cost of added one-way latency.
+# Range 20-2000. Defaults 150 (PJSUA stock is 100/140). Raise these first if
+# the logs report "alsa_capture_overrun" / "alsa_playback_underrun" events.
+snd_rec_latency_ms = 150
+snd_play_latency_ms = 150
+
+[modem_audio]
+# EC20 USB sound-device tuning. Circuit-switched calls ONLY — has no effect
+# on VoWiFi/VoLTE, which never touch this modem's ALSA device.
+#
+# EC20 downlink digital gain applied via AT+QRXGAIN at module init.
+# Controls how loud SIP audio sounds on the GSM caller's end (SIP→GSM direction).
+# Leave unset to use the modem's firmware default (recommended).
+# Range 0-65535; default varies by audio mode (per Quectel EC20 AT manual).
+# Lower this if the GSM caller reports SIP audio is too loud.
+# rx_gain = 35000
+# EC20 echo-canceller mode word sent via AT+QEEC=2,<val> at module init.
+# Controls which EC subsystems (AEC, DENS noise suppressor, NLPP) are active.
+# Leave unset to keep the modem's firmware default (12543 = all subsystems on).
+# Set to 0 to disable all EC — recommended for USB audio bridges where there is
+# no acoustic echo path and the EC only introduces noise artefacts on the uplink.
+# Range 0-65535.
+eec_mode = 0
+# PJSUA conference-bridge software gain on the GSM→SIP capture path.
+# Applied via pjsua_conf_adjust_tx_level on every call start.
+# 1.0 = unity (no change), 0.7 ~= -3 dB, 0.5 ~= -6 dB, 2.0 = +6 dB.
+# Attenuates the GSM caller's voice as heard by SIP. Use this to reduce
+# noise or loudness on the SIP side.
+tx_level = 1.0
+# Real-time (SCHED_FIFO) priority for PJMEDIA's sound-device ("media") thread,
+# applied once a call's audio device opens. 0 = leave at normal SCHED_OTHER
+# (default). 1-99 = enable real-time scheduling so the ALSA capture buffer is
+# serviced ahead of best-effort work, preventing XRUNs / choppy audio. 20 is
+# a good starting point. Requires CAP_SYS_NICE (privileged container);
+# best-effort — if not permitted it logs a warning and the call still runs.
+# On kernels with CONFIG_RT_GROUP_SCHED you also need a non-zero
+# cpu_rt_runtime for the container.
+rt_audio_prio = 20
+
+# ============================================================================
+# Observability / operations
+# ============================================================================
 [metrics]
 port = 9091
 # How often each VoWiFi agent (vowifi-ims-agent, vowifi-sip-agent) re-reports
@@ -36,103 +122,33 @@ agent_report_interval_seconds = 10
 retry_interval_sec = 30        # range: 5-600
 max_concurrent = 8             # range: 1-8
 
-[audio]
-# Latency profile for the audio pipeline and PJSIP jitter buffer.
-# "lan" — SIP server on the same machine or local network (default, lowest latency).
-# "wan" — Internet SIP trunk; adds headroom for packet jitter and higher RTT.
-profile = "lan"
-# Enable PJMEDIA voice activity detection and noise suppression on the capture path.
-# Reduces GSM line noise heard by the SIP side. Set to false only for diagnostics.
-vad = true
-# EC20 downlink digital gain applied via AT+QRXGAIN at module init.
-# Controls how loud SIP audio sounds on the GSM caller's end (SIP→GSM direction).
-# Leave unset to use the modem's firmware default (recommended).
-# Range 0–65535; default varies by audio mode (per Quectel EC20 AT manual).
-# Lower this if the GSM caller reports SIP audio is too loud.
-# rx_gain = 35000
-# EC20 echo-canceller mode word sent via AT+QEEC=2,<val> at module init.
-# Controls which EC subsystems (AEC, DENS noise suppressor, NLPP) are active.
-# Leave unset to keep the modem's firmware default (12543 = all subsystems on).
-# Set to 0 to disable all EC — recommended for USB audio bridges where there is
-# no acoustic echo path and the EC only introduces noise artefacts on the uplink.
-# Range 0–65535.
-eec_mode = 0
-# PJSUA conference-bridge software gain on the GSM→SIP capture path.
-# Applied via pjsua_conf_adjust_tx_level on every call start.
-# 1.0 = unity (no change), 0.7 ≈ -3 dB, 0.5 ≈ -6 dB, 2.0 = +6 dB.
-# Attenuates the GSM caller's voice as heard by SIP. Use this to reduce
-# noise or loudness on the SIP side.
-tx_level = 1.0
-# ALSA sound-device ring-buffer depth in milliseconds for the EC20 USB-audio path.
-# snd_rec_latency_ms sizes the capture buffer (GSM→SIP); snd_play_latency_ms sizes
-# the playback buffer (SIP→GSM). Larger values absorb scheduling jitter and prevent
-# XRUNs — heard as choppy/robotic GSM audio — at the cost of added one-way latency.
-# Range 20–2000. Defaults 150 (PJSUA stock is 100/140). Raise these first if the logs
-# report "alsa_capture_overrun" / "alsa_playback_underrun" events.
-snd_rec_latency_ms = 150
-snd_play_latency_ms = 150
-# Real-time (SCHED_FIFO) priority for PJMEDIA's sound-device ("media") thread, applied
-# once a call's audio device opens. 0 = leave at normal SCHED_OTHER (default). 1–99 =
-# enable real-time scheduling so the ALSA capture buffer is serviced ahead of best-effort
-# work, preventing XRUNs / choppy GSM audio. 20 is a good starting point. Requires
-# CAP_SYS_NICE (privileged container); best-effort — if not permitted it logs a warning
-# and the call still runs. On kernels with CONFIG_RT_GROUP_SCHED you also need a non-zero
-# cpu_rt_runtime for the container.
-rt_audio_prio = 20
+# [resilience] and [control] are advanced, rarely-touched sections with sane
+# defaults — they're not shown here to keep this file focused. See
+# docs/configuration.md if you need to tune modem-recovery backoff or the
+# control-socket path.
 
-[scheduled_restart]
-# Preventive nightly card-restart cycle. The daemon walks every known slot in
-# ascending order and reboots each modem (AT+CFUN=1,1) with a randomized gap
-# between cards. Cards on an active call are deferred to the end of the cycle.
-# Manual `card restart` issued during a cycle takes precedence; see
-# specs/010-scheduled-card-restart/quickstart.md for full details.
-enabled = true
-# Standard 5-field cron expression in system local time.  Default: 1 AM daily.
-# Examples: "0 3 * * 0" = 3 AM Sunday;  "30 2 * * 1-5" = 02:30 Mon-Fri.
-# Invalid expressions disable the scheduler without aborting the daemon.
-cron = "0 1 * * *"
-# Symmetric jitter applied to the cron-tick start time, in seconds.
-# Range 0..=86400.  0 disables jitter.  Default 600 (±10 minutes).
-start_jitter_seconds = 600
-# Base wait between consecutive per-card restarts, in seconds. Range 0..=3600.
-inter_card_gap_seconds = 30
-# Symmetric jitter applied to the inter-card gap, in seconds.
-# Must be <= inter_card_gap_seconds.  Range 0..=3600.
-inter_card_gap_jitter_seconds = 15
-
+# ============================================================================
+# VoWiFi inbound bridge — specs/011-vowifi-sip-bridge, 012-strongswan-epdg,
+# 013-multi-card-vowifi
+# ============================================================================
 [vowifi]
-# Inbound VoWiFi-to-SIP bridge (see specs/011-vowifi-sip-bridge/) — a second,
-# independent inbound call path alongside the [sip]/[bridge] circuit-switched
-# bridge above. Only read by the `vowifi-ims-agent`/`vowifi-sip-agent`
-# subcommands (started automatically by docker/entrypoint.sh when enabled
-# here); ignored by the normal daemon path. The SIP/PBX destination for a
-# bridged VoWiFi call reuses [bridge].sip_destination above rather than a
-# separate setting.
+# Only read by the `vowifi-*-agent`/`discover` subcommands (started
+# automatically by docker/entrypoint.sh when enabled here); ignored by the
+# normal daemon path. The SIP/PBX destination for a bridged VoWiFi call
+# reuses [bridge].sip_destination above rather than a separate setting.
 enabled = false
-# Home network MCC/MNC (MNC zero-padded to 3 digits). Example: Airtel India.
-# Optional: leave both unset to auto-derive them from the SIM at startup —
-# IMSI via AT+CIMI, with the 2-vs-3-digit MNC ambiguity resolved via the
-# SIM's EF_AD file (AT+CRSM), falling back to the registered PLMN from
-# AT+COPS. Set them explicitly if the SIM predates EF_AD's MNC-length byte
-# AND the modem may be roaming (the COPS fallback reads the serving
-# network, not the home one).
-mcc = "404"
-mnc = "094"
-# Serial AT port for the modem whose SIM authenticates the IMS registration —
-# same device the ims-register/ims-call CLI tools use.
-modem_port = "/dev/ttyUSB6"
 # Use TCP (not UDP) for SIP signaling to the P-CSCF, and advertise sec-agree /
 # negotiate Gm IPsec. Both true is the combination that reached 200 OK on
 # Airtel; some networks (e.g. Vi) reject a plain UDP/no-sec-agree REGISTER.
 use_tcp = true
 sec_agree = true
 # Path Agent A reads the tunnel-assigned P-CSCF address from; written by
-# docker/entrypoint.sh once the SWu tunnel is up.
+# docker/entrypoint.sh once the SWu tunnel is up. Shared with
+# [volte].pcscf_source_path below, so a captured address is picked up there
+# automatically too.
 pcscf_source_path = "/tmp/pcscf"
-# Addresses on the dedicated veth link between Agent A (ims netns) and
-# Agent B (default netns), and the TCP port their control channel uses.
-veth_local_addr = "10.99.0.1"
-veth_peer_addr = "10.99.0.2"
+# Agent A<->B control channel TCP port — shared across every line; lines are
+# told apart by their (internally derived) veth address, not this port.
 control_port = 7050
 # Carry the carrier's wideband (16 kHz) audio all the way to the PBX instead of
 # narrowing it to 8 kHz at the first hop: Agent A prefers the carrier's AMR-WB
@@ -142,56 +158,42 @@ control_port = 7050
 # before, over a PCMU veth link. Set false to keep every leg at 8 kHz (e.g. if
 # the PBX mishandles a G.722 offer).
 wideband = true
-# --- ePDG tunnel + docker/entrypoint.sh / healthcheck.sh settings ---------
-# Everything below used to be read from env vars (MCC/MNC/APN/TUNNEL_ENGINE/
-# etc. in .env) — it now lives here instead, so .env only ever holds secrets
-# (specs/012-strongswan-epdg config consolidation). docker/entrypoint.sh
-# fetches these via `gsm-sip-bridge config vowifi-shell-env`.
-#
-# APN used by the swu engine's dialer.
+# APN used by the swu engine's dialer. Shared across every line.
 apn = "ims"
-# Network namespace the ePDG tunnel lives in.
-netns = "ims"
-# ePDG FQDN to resolve via DNS. Leave unset to derive the 3GPP-standard name
-# from mcc/mnc above (epdg.epc.mnc<mnc>.mcc<mcc>.pub.3gppnetwork.org).
-# epdg_fqdn = "epdg.epc.mnc094.mcc404.pub.3gppnetwork.org"
-# Skip DNS resolution and dial this ePDG IP directly. Leave unset to resolve
-# epdg_fqdn at startup.
-# epdg_ip = "1.2.3.4"
-# Force this as the tunnel's local source address. Leave unset to let the
-# kernel/charon pick one via routing to the ePDG.
-# src_addr = "192.0.2.10"
 # Idle-tunnel keepalive interval (seconds) — a TCP connect to the P-CSCF's
 # SIP port (operators commonly filter ICMP over the tunnel).
 keepalive_interval_sec = 20
-# veth pair names between Agent A (ims netns) and Agent B (default netns).
-veth_sip_iface = "veth-sip"
-veth_ims_iface = "veth-ims"
 # ePDG tunnel engine: "strongswan" (proper IKE rekeying/re-auth/DPD/MOBIKE,
 # netns survives reconnects — the default) or "swu" (the original SWu-IKEv2
 # Python dialer, kept as an explicit fallback until strongswan is proven
 # against every carrier — see specs/012-strongswan-epdg/tasks.md).
 tunnel_engine = "strongswan"
-# strongswan engine only: XFRM interface name/if_id created inside netns.
-strongswan_tun_iface = "tun23"
-strongswan_if_id = 23
 # strongswan engine only: pcscd's vpcd virtual smart-card reader, bridged to
-# the modem's SIM by vowifi-usim-bridge.
-vpcd_host = "127.0.0.1"
-# Must stay below the kernel's ephemeral port range
-# (net.ipv4.ip_local_port_range, 32768-60999 by default): under
+# each line's SIM by vowifi-usim-bridge. One shared reader serves every line,
+# at vpcd_port + line-index — keep the base below the kernel's ephemeral port
+# range (net.ipv4.ip_local_port_range, 32768-60999 by default): under
 # `network_mode: host` an unrelated outbound connection can otherwise grab
 # this port first, and pcscd's reader then fails to start.
+vpcd_host = "127.0.0.1"
 vpcd_port = 15963
-# strongswan engine only: use this IMSI instead of reading it from the SIM
-# via AT+CIMI. Diagnostic escape hatch — leave unset normally.
-# imsi_override = "404940123456789"
-#
-# --- Per-line overrides for multi-card VoWiFi (specs/013-multi-card-vowifi) ---
-# Pin a specific modem to VoWiFi and/or fix that line's MCC/MNC/IMSI settings
-# instead of auto-discovering them. Match a modem by its USB hardware serial
-# (preferred — survives device-path changes) or by AT port. Every field except
-# the matcher is optional. Absent = fully auto-discovered lines (the default).
+# Upper bound on auto-discovered VoWiFi lines (1-64). Modems past this count
+# are reported and skipped.
+max_lines = 8
+# --- Escape hatches (leave unset unless you have a specific reason) --------
+# Override the derived 3GPP ePDG FQDN across every line.
+# epdg_fqdn = "epdg.epc.mnc094.mcc404.pub.3gppnetwork.org"
+# Skip DNS resolution and dial this ePDG IP directly, across every line.
+# epdg_ip = "1.2.3.4"
+# Force this as every tunnel's local source address. Leave unset to let the
+# kernel/charon pick one via routing to the ePDG.
+# src_addr = "192.0.2.10"
+
+# --- Per-line configuration --------------------------------------------
+# Omit entirely for full auto-discovery: every SIM-ready modem becomes its
+# own VoWiFi line, with its network identity (mcc/mnc/IMSI) auto-derived
+# from the SIM. Add one [[vowifi.line]] block per line you want to pin to a
+# specific modem or override its network identity. Every field except the
+# matcher is optional.
 #
 # [[vowifi.line]]
 # modem_serial = "abc123def456"   # or: modem_port = "/dev/ttyUSB6"
@@ -204,9 +206,12 @@ vpcd_port = 15963
 # mcc = "404"
 # mnc = "094"
 
-# --- Host-side IMS over LTE (VoLTE) -------------------------------------
-# specs/015-volte-host-ims. The bridge runs its OWN IMS registration over an
-# LTE IMS PDN, instead of delegating to the modem's internal IMS stack.
+# ============================================================================
+# VoLTE inbound bridge — specs/015-volte-host-ims, 016-volte-calls,
+# 017-volte-inbound-bridge, 018-volte-multi-modem
+# ============================================================================
+# The bridge runs its OWN IMS registration over an LTE IMS PDN, instead of
+# delegating to the modem's internal IMS stack.
 #
 # WARNING: do not enable this alongside [vowifi] on the same SIM. Both
 # register the same IMPU with the same IMEI-derived +sip.instance, so the
@@ -216,81 +221,47 @@ vpcd_port = 15963
 [volte]
 # Off by default; the volte-* subcommands work without it as diagnostics.
 enabled = false
-# Answer incoming calls over this registration and bridge them to the PBX
-# (specs/017-volte-inbound-bridge), instead of only holding the registration
-# open.
+# Answer incoming calls over this registration and bridge them to the PBX,
+# instead of only holding the registration open.
 #
 # Off by default, which leaves everything exactly as it was: the
 # modem-internal VoLTE path stays available and this section keeps doing what
-# it did before. Turning it on makes the card EXCLUSIVE to this service — the
-# circuit-switched daemon will not drive it, so that card has no fallback and
-# takes no calls at all whenever this path is down. Watch
+# it did before. Turning it on makes every bridged card EXCLUSIVE to this
+# service — the circuit-switched daemon will not drive it, so that card has
+# no fallback and takes no calls at all whenever this path is down. Watch
 # gsm_sip_bridge_active_calls{transport="volte"} and the volte_* registration
 # gauges accordingly.
-# The modem to bridge. A named port pins exactly that one modem (single
-# line). Leave it EMPTY to auto-discover every SIM-ready modem and bridge
-# each as its own line (specs/018-volte-multi-modem) — the LTE counterpart to
-# [vowifi] multi-card. Only meaningful with bridge_inbound; a single PBX
-# registration then serves every line, exactly as the VoWiFi path does.
-modem_port = "/dev/ttyUSB0"
-# Upper bound on auto-discovered LTE lines (1–64). Modems past this count are
-# reported and skipped. Only applies when modem_port is empty.
+bridge_inbound = false
+# Upper bound on auto-discovered LTE lines (1-64). Only meaningful with
+# bridge_inbound — a single PBX registration then serves every line, exactly
+# as the VoWiFi path does.
 max_lines = 8
-# Host interface carrying the modem's data path. Leave empty to manage the
-# PDN only and skip host interface configuration. NOTE: binding the IMS PDN
-# displaces general connectivity through the modem — it exposes a single
-# host-facing data path. When auto-discovering (empty modem_port), each line's
-# interface is detected from its own modem's USB device; this value is only a
-# fallback for the single-modem case.
-iface = ""
-# PDP context id for the IMS PDN. Must not collide with the contexts the
-# modem uses for general internet access (1 and 2 on the reference hardware).
-cid = 3
-# The network resolves this to its own name (e.g. ims.mnc043.mcc404.gprs),
-# which is what gets reported back.
-apn = "ims"
-# Explicit P-CSCF. Leave empty to use the address the VoWiFi/ePDG path
-# captured (see pcscf_source_path). Automatic discovery does NOT work on
-# every carrier — on Vodafone India, DHCPv6 returns no RFC 3319 options, the
-# router advertisement carries none, and no resolver is offered. Run
-# `volte-discover` to see what your carrier does.
-pcscf = ""
-pcscf_port = 5060
 # Where the VoWiFi/ePDG path deposits the P-CSCF it learned from the IKEv2
 # config payload. Shared with [vowifi].pcscf_source_path so a captured
 # address is picked up automatically.
 pcscf_source_path = "/tmp/pcscf"
-use_tcp = true
-# Vodafone India rejects a plain digest REGISTER without sec-agree.
-sec_agree = true
 status_path = "/tmp/volte-registration-status"
 lock_path = "/tmp/volte-registration.lock"
-# Optional per-line overrides for auto-discovery (the LTE counterpart to
-# [[vowifi.line]]): pin a specific modem and/or fix that line's PDN/P-CSCF
-# settings instead of inheriting the [volte] base above. Match a modem by its
-# USB hardware serial (preferred — survives device-path changes) or by AT
-# port. Every field except the matcher is optional.
+
+# --- Per-line configuration --------------------------------------------
+# Omit entirely for full auto-discovery: every SIM-ready modem becomes its
+# own line, with sane defaults (cid 3, apn "ims", P-CSCF auto-discovered).
+# Add one [[volte.line]] block per line to pin a specific modem and/or
+# override its PDN/P-CSCF settings.
 #
 # [[volte.line]]
 # modem_serial = "abc123"        # or: modem_port = "/dev/ttyUSB2"
-# cid = 4                        # this line's PDP context id
-# apn = "ims"
-# pcscf = "2400:5200:a100:819::6"
-# iface = "wwan1"                # this modem's data interface
+# cid = 4                        # this line's PDP context id (default 3)
+# apn = "ims"                    # (default "ims")
+# pcscf = "2400:5200:a100:819::6" # (default "" = auto-discover)
+# iface = "wwan1"                # this modem's data interface (default "" = auto-detect)
 # msisdn = "919000000001"        # advertised in P-Preferred-Identity
 
-# Per-line network isolation (specs/020-volte-line-netns), only meaningful
-# with an empty modem_port (auto-discovery): each auto-discovered line's LTE
-# interface and carrier-facing traffic run inside their own network
-# namespace, so a line's traffic can never leave on another line's
-# interface — the same guarantee [vowifi]'s netns/veth_* fields above give
-# VoWiFi lines. NOT expected to be operator-tuned; exposed only for
-# consistency with every other per-line-derived base in this file. The
-# defaults are deliberately distinct from [vowifi]'s own ("volte" vs "ims",
-# a different /30 block) so the two subsystems' namespaces/veth links can
-# never collide when both are enabled in the same container.
-netns = "volte"
-veth_carrier_iface = "veth-volte-ims"
-veth_telephony_iface = "veth-volte-sip"
-veth_carrier_addr = "10.98.0.1"
-veth_telephony_addr = "10.98.0.2"
+# Per-line network isolation (specs/020-volte-line-netns): each
+# auto-discovered line's LTE interface and carrier-facing traffic run
+# inside their own network namespace/veth pair, so a line's traffic can
+# never leave on another line's interface — the same isolation VoWiFi has.
+# Like [vowifi]'s equivalent fields, this is pure internal infrastructure,
+# always derived per line (on a base distinct from [vowifi]'s own, so the
+# two subsystems' namespaces can never collide) — there is no config knob
+# for it at all.
