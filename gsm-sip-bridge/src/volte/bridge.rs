@@ -1,29 +1,39 @@
 //! Bridging inbound cellular calls over the host-side LTE registration
 //! (specs/017-volte-inbound-bridge, US1/US2).
 //!
-//! # One process, not two
+//! # One process for Agent B, one process per line for Agent A
 //!
 //! The Wi-Fi path splits into Agent A (carrier side) and Agent B (telephone
 //! side) because the ePDG tunnel puts them in different network namespaces and
-//! PJSIP cannot cross that boundary. **The LTE path has no namespace**
-//! (specs/015 research R4), so that split buys nothing here.
+//! PJSIP cannot cross that boundary. Feature 017 originally judged that this
+//! split "buys nothing" for LTE, since the LTE path had no namespace of its
+//! own (specs/015 research R4) — true only as long as there was ever one
+//! interface to bridge. specs/020-volte-line-netns revisits exactly that,
+//! once multi-line VoLTE (specs/018) made it not true any more: each line now
+//! gets its own namespace, for the same reason VoWiFi's lines do (a shared
+//! routing table cannot otherwise guarantee a line's traffic uses its own
+//! interface — see that feature's research.md).
 //!
-//! What it does *not* mean is reimplementing the call handling. `ims::agent`'s
-//! INVITE handling, ringback, RTP relay and hangup propagation are the most
-//! carefully-tuned code in the tree, and FR-019/SC-008 require one
-//! implementation serving both paths. So this service reuses that logic
-//! verbatim and drops only what the namespace forced:
+//! What stays true is the reuse: `ims::agent`'s INVITE handling, ringback,
+//! RTP relay and hangup propagation are the most carefully-tuned code in the
+//! tree, and FR-019/SC-008 require one implementation serving both paths. So
+//! this module still reuses that logic verbatim — [`super::carrier_agent`]
+//! now holds the per-line body, callable either as a thread here (this
+//! process, no namespace — the single-`--modem` diagnostic path only,
+//! research.md R7) or as its own `volte-carrier-agent` process
+//! (`docker/entrypoint.sh`, inside that line's namespace, the production
+//! path). This module (`bridge::run`) now runs only the shared telephone-side
+//! half (Agent B) for the production path — see [`ServiceConfig::spawn_carrier_threads`].
 //!
-//! | Wi-Fi path | Here |
-//! |---|---|
-//! | Two processes | Two threads |
-//! | veth pair | loopback |
-//! | Agent B's own SIP port | a **third** local port ([`SIP_LOCAL_PORT`]) |
+//! | Wi-Fi path | Diagnostic (`--modem`) | Production (auto-discovered) |
+//! |---|---|---|
+//! | Two processes | One process, two threads | Two-plus processes |
+//! | veth pair | loopback | veth pair (specs/020-volte-line-netns) |
+//! | Agent B's own SIP port | a **third** local port ([`SIP_LOCAL_PORT`]) | same |
 //!
-//! The control protocol survives the merge. Over loopback it costs one socket
-//! and saves forking the hardest code in the tree; replacing it with an
-//! in-process channel would mean a second copy of `handle_invite`, which is
-//! exactly what FR-019 exists to prevent.
+//! The control protocol is unchanged either way — only the address
+//! `run_telephony_side` reaches each line's carrier half at differs (loopback
+//! vs. a real veth address).
 //!
 //! # Why a third port
 //!
@@ -45,8 +55,6 @@
 
 use crate::config::AppConfig;
 use crate::error::{BridgeError, BridgeResult};
-use crate::ims::sdp;
-use crate::ims::ImsRegisterConfig;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -80,9 +88,12 @@ pub const LOOPBACK_STATUS_PORT: u16 = 5076;
 /// `vowifi::LEGACY_LINE_CARD_ID`.
 pub const DEFAULT_CARD_ID: &str = "volte";
 
-/// Loopback — both halves are threads in this process, so neither leg ever
-/// leaves the host.
-const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+/// Loopback — used whenever a line has no veth link (the single-`--modem`
+/// diagnostic path, research.md R7), where both halves stay threads in this
+/// one process and neither leg ever leaves the host. `pub(super)` so
+/// `carrier_agent::run` (the other caller of the same fallback) can reuse it
+/// instead of duplicating the constant.
+pub(super) const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// One host-side LTE line ready to run: a modem's attachment settings, its
 /// PBX-facing identity, and its own loopback port trio. The multi-modem unit
@@ -102,6 +113,17 @@ pub struct BridgeLine {
     pub sip_leg_port: u16,
     pub control_port: u16,
     pub status_port: u16,
+    /// This line's network namespace (specs/020-volte-line-netns). Empty for
+    /// the single-`--modem` diagnostic path (no namespace exists); informational
+    /// only here — the manifest carries it for `docker/entrypoint.sh`'s cleanup
+    /// (research.md R6), nothing in this process itself joins a namespace.
+    pub netns: String,
+    /// This line's carrier-agent-side veth address. Empty means "no netns for
+    /// this line" — [`carrier_agent::run`] then binds `LOOPBACK` instead,
+    /// exactly as before this feature (research.md R2).
+    pub veth_carrier_addr: String,
+    /// This line's telephony-half-side veth address, for the same reason.
+    pub veth_telephony_addr: String,
 }
 
 /// Everything the service needs to start.
@@ -112,6 +134,21 @@ pub struct ServiceConfig {
     /// Proceed even if the Wi-Fi path appears to hold the same subscriber's
     /// registration. An escape hatch for a stale detection, not a default.
     pub force: bool,
+    /// Whether this process should also run each line's carrier half as an
+    /// in-process thread (specs/020-volte-line-netns).
+    ///
+    /// **`true` only for the single-`--modem` diagnostic invocation** — a
+    /// manual, operator-run test with no `docker/entrypoint.sh` orchestration
+    /// and so no namespace for a line to be isolated into; this reproduces
+    /// exactly what this process did before this feature.
+    ///
+    /// **`false` for the production, auto-discovered path**: each line's
+    /// carrier half instead runs as its own `volte-carrier-agent --line N`
+    /// process, launched by `docker/entrypoint.sh` inside that line's own
+    /// namespace (research.md R3) — this process runs only the shared
+    /// telephony half (Agent B) and must not *also* run the carrier halves
+    /// in-process, which would answer every call twice.
+    pub spawn_carrier_threads: bool,
 }
 
 /// Entry point for the host-side cellular bridging service.
@@ -143,20 +180,34 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
     );
 
     // Persist the line manifest so `docker/entrypoint.sh`'s cleanup can tear
-    // down every line's PDN and `volte-status` can find every line's ports.
-    write_manifest(&lines);
+    // down every line's PDN and `volte-status` can find every line's ports —
+    // but only for the diagnostic single-`--modem` path, which owns and is
+    // the sole writer of its own manifest. The production, auto-discovered
+    // path's manifest is already there (`volte-discover-lines` wrote it
+    // before this process started, research.md R7) and MUST NOT be
+    // overwritten here: this process only resolves loopback fallbacks for
+    // veth addresses, never the P-CSCF override or restore-cid path a
+    // `volte-carrier-agent` process still needs to read correctly on its own
+    // later restarts.
+    if service.spawn_carrier_threads {
+        write_manifest(&lines);
+    }
 
     // The telephone-system half is shared across every line — one PJSIP
     // endpoint, one PBX registration, one accept-loop thread per line. This is
-    // the exact same code the Wi-Fi path runs (FR-019); only the ports and
-    // loopback addresses differ.
+    // the exact same code the Wi-Fi path runs (FR-019); only the ports (and,
+    // as of specs/020-volte-line-netns, the veth addresses replacing loopback
+    // for the netns-isolated production path) differ. An empty
+    // `veth_carrier_addr`/`veth_telephony_addr` (the diagnostic single-`--modem`
+    // path — research.md R7) falls back to `LOOPBACK`, exactly as before this
+    // feature.
     let telephony_lines: Vec<crate::vowifi::RuntimeLine> = lines
         .iter()
         .map(|l| crate::vowifi::RuntimeLine {
             index: l.settings_index(),
             card_id: l.card_id.clone(),
-            veth_local_addr: LOOPBACK.to_string(),
-            veth_peer_addr: LOOPBACK.to_string(),
+            veth_local_addr: non_empty_or_loopback(&l.veth_carrier_addr),
+            veth_peer_addr: non_empty_or_loopback(&l.veth_telephony_addr),
             control_port: l.control_port,
             sip_leg_port: l.sip_leg_port,
         })
@@ -216,27 +267,46 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         // rare, but it costs nothing to close.
         std::thread::sleep(TELEPHONY_STARTUP_GRACE);
 
-        for line in lines {
-            let pbx_registered = pbx_registered.clone();
-            std::thread::Builder::new()
-                .name(format!("volte-line-{}", line.card_id))
-                .spawn_scoped(scope, move || {
-                    run_line(&line, app_config, pbx_registered);
-                })
-                .expect("failed to start a carrier line");
+        // Production, auto-discovered lines run their carrier half as a
+        // separate, netns-isolated `volte-carrier-agent` process launched by
+        // `docker/entrypoint.sh` (research.md R3) — spawning it *again* here,
+        // in-process, would answer every call twice. Only the single-`--modem`
+        // diagnostic invocation (no entrypoint orchestration, nothing to
+        // isolate into) still runs its one line's carrier half as a thread of
+        // this process, exactly as every line did before this feature.
+        if service.spawn_carrier_threads {
+            for line in lines {
+                let pbx_registered = pbx_registered.clone();
+                std::thread::Builder::new()
+                    .name(format!("volte-line-{}", line.card_id))
+                    .spawn_scoped(scope, move || {
+                        run_line(&line, app_config, pbx_registered);
+                    })
+                    .expect("failed to start a carrier line");
+            }
         }
     });
 
     Ok(())
 }
 
+/// `LOOPBACK` when `addr` is empty (research.md R7 — the diagnostic
+/// single-`--modem` path has no veth link), else `addr` itself.
+fn non_empty_or_loopback(addr: &str) -> String {
+    if addr.is_empty() {
+        LOOPBACK.to_string()
+    } else {
+        addr.to_string()
+    }
+}
+
 /// Runs one line for the life of the process: its modem SMS reader once, then
-/// its carrier half (attach → register → answer calls) in a retry loop. The
-/// retry replaces what the single-line service got from the entrypoint
-/// restarting the whole process on failure — here one process holds every
-/// line, so a line that fails to attach or loses its registration must recover
-/// on its own without disturbing the others, exactly as the Wi-Fi path's
-/// per-line supervisor restarts each agent independently.
+/// its carrier half ([`carrier_agent::run`]) in a retry loop. **Only used for
+/// the single-`--modem` diagnostic path** (`spawn_carrier_threads`,
+/// research.md R7) — the production, auto-discovered path runs each line's
+/// carrier half as its own `volte-carrier-agent` process instead, supervised
+/// (restarted on exit) by `docker/entrypoint.sh`, mirroring how
+/// `vowifi-ims-agent` is supervised rather than retrying internally.
 fn run_line(
     line: &BridgeLine,
     app_config: &AppConfig,
@@ -267,7 +337,12 @@ fn run_line(
     }
 
     loop {
-        run_line_carrier(line, app_config, &pbx_registered, &modem_lock, control_addr);
+        super::carrier_agent::run(
+            line,
+            app_config,
+            modem_lock.clone(),
+            Some(pbx_registered.clone()),
+        );
         // The carrier half returned — a failed attach/registration or a lost
         // one. Back off before retrying, so a persistent fault (no SIM, no
         // coverage) does not spin on the modem or the registrar. `pbx_registered`
@@ -284,117 +359,6 @@ fn run_line(
             "carrier half for this line stopped; retrying"
         );
         std::thread::sleep(LINE_RETRY_BACKOFF);
-    }
-}
-
-/// One attempt at a line's carrier half: attach its PDN, register over it, and
-/// answer calls until the registration ends. Returns when the attempt is over
-/// (failure or a lost registration); `run_line` decides whether to retry.
-fn run_line_carrier(
-    line: &BridgeLine,
-    app_config: &AppConfig,
-    pbx_registered: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    modem_lock: &std::sync::Arc<std::sync::Mutex<()>>,
-    control_addr: SocketAddr,
-) {
-    // Attach and PLMN derivation both touch the AT port, so hold the modem lock
-    // across them to stay clear of the SMS reader running concurrently.
-    // `attach` records the displaced context (via `settings.restore_cid_path`)
-    // *before* it rebinds, so the container's cleanup can restore it even if
-    // this line is killed mid-attach.
-    let plmn = {
-        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let attach = match super::attach(&line.settings) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(card_id = %line.card_id, error = %e, "line failed to attach its IMS PDN");
-                return;
-            }
-        };
-        tracing::info!(
-            card_id = %line.card_id,
-            iface = %attach.iface,
-            routed = attach.routed,
-            "IMS PDN attached"
-        );
-        let mut at = match crate::modules::at_commander::AtCommander::open(
-            &line.settings.modem_port,
-        ) {
-            Ok(at) => at,
-            Err(e) => {
-                tracing::error!(card_id = %line.card_id, error = %e, "could not open the modem to derive the PLMN");
-                return;
-            }
-        };
-        match crate::vowifi::plmn::derive_plmn(&mut at) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(card_id = %line.card_id, error = %e, "could not derive the home PLMN");
-                return;
-            }
-        }
-    };
-
-    let Some(pcscf) = line.settings.pcscf else {
-        tracing::error!(card_id = %line.card_id, "no P-CSCF configured for this line");
-        return;
-    };
-
-    let reg_cfg = ImsRegisterConfig {
-        modem_port: line.settings.modem_port.clone(),
-        pcscf_addr: pcscf.ip(),
-        pcscf_port: pcscf.port(),
-        mcc: plmn.mcc,
-        mnc: plmn.mnc,
-        imsi: None,
-        imei: None,
-        use_tcp: true,
-        sec_agree: true,
-        msisdn: line.msisdn.clone(),
-        // Names the serving cell, so the network can apply the right policy
-        // and an operator can tell which radio a call actually used.
-        access_network_info: super::read_access_network_info(&line.settings.modem_port),
-    };
-
-    // Rebuilding the attachment is what must never happen mid-call. Passing it
-    // as the renewal hook is what makes that true structurally — see
-    // `ims::agent::PreRenewalHook`.
-    let settings = line.settings.clone();
-    let pre_renewal = move || super::registration::refresh_attachment(&settings);
-
-    // FR-011: if the attachment genuinely dies mid-call, this is how the call
-    // is ended with the cause stated. Reads `CEREG` under the shared modem lock
-    // — only when the carrier leg has already gone silent, so it costs nothing
-    // on a healthy call.
-    let attach_modem = line.settings.modem_port.clone();
-    let attach_lock = modem_lock.clone();
-    let attachment_check = move || {
-        let _guard = attach_lock.lock().unwrap_or_else(|e| e.into_inner());
-        super::is_attached(&attach_modem)
-    };
-
-    if let Err(e) = crate::ims::agent::serve_inbound(crate::ims::agent::InboundParams {
-        card_id: &line.card_id,
-        reg_cfg: &reg_cfg,
-        local_ip: LOOPBACK,
-        control_addr,
-        status_port: line.status_port,
-        // An inbound call is a real conversation; the whole point of this path
-        // is that it sounds better than the modem-internal one.
-        wideband: true,
-        answer_preference: sdp::AnswerPreference::cellular(),
-        // Must equal the telephony line's `sip_leg_port`. They come from this
-        // line's single derivation so they cannot drift apart.
-        veth_sip_port: line.sip_leg_port,
-        pre_renewal: Some(&pre_renewal),
-        attachment_check: Some(&attachment_check),
-        modem_lock: Some(modem_lock.clone()),
-        pbx_registered: Some(pbx_registered.clone()),
-        app_config,
-        agent_label: "volte-ims-agent",
-        agent_kind: crate::control::protocol::AgentKind::Volte,
-    }) {
-        tracing::error!(card_id = %line.card_id, error = %e, "the carrier half for this line stopped");
     }
 }
 
@@ -425,6 +389,7 @@ fn write_manifest(lines: &[BridgeLine]) {
                 card_id: l.card_id.clone(),
                 modem_port: l.settings.modem_port.to_string_lossy().to_string(),
                 cid: l.settings.cid,
+                apn: l.settings.apn.clone(),
                 iface: l.settings.iface.clone(),
                 restore_cid_path: l
                     .settings
@@ -435,6 +400,10 @@ fn write_manifest(lines: &[BridgeLine]) {
                 status_port: l.status_port,
                 control_port: l.control_port,
                 sip_leg_port: l.sip_leg_port,
+                netns: l.netns.clone(),
+                veth_carrier_addr: l.veth_carrier_addr.clone(),
+                veth_telephony_addr: l.veth_telephony_addr.clone(),
+                pcscf: l.settings.pcscf.map(|a| a.to_string()).unwrap_or_default(),
             })
             .collect(),
     };
@@ -473,26 +442,47 @@ const TELEPHONY_STARTUP_GRACE: Duration = Duration::from_millis(500);
 /// which is what tells the caller the service is not running and a direct
 /// modem read is safe.
 pub fn print_live_status() -> bool {
-    // (card_id, status_port, control_port) per line — from the manifest, or
-    // the line-0 defaults when it is absent.
-    let lines: Vec<(String, u16, u16)> =
+    // (card_id, status_port, control_port, carrier_addr, telephony_addr) per
+    // line — from the manifest, or the line-0 loopback defaults when it is
+    // absent. `carrier_addr`/`telephony_addr` empty means `LOOPBACK`
+    // (research.md R7: no netns for this line — same reachability the status
+    // query has always had). A real veth address is reachable directly from
+    // the default namespace `volte-status` itself runs in, the same way
+    // Agent B already reaches VoWiFi's Agent A across that link.
+    let lines: Vec<(String, u16, u16, String, String)> =
         match super::discovery::read_manifest(&super::discovery::manifest_path()) {
             Ok(m) if !m.lines.is_empty() => m
                 .lines
                 .iter()
-                .map(|l| (l.card_id.clone(), l.status_port, l.control_port))
+                .map(|l| {
+                    (
+                        l.card_id.clone(),
+                        l.status_port,
+                        l.control_port,
+                        l.veth_carrier_addr.clone(),
+                        l.veth_telephony_addr.clone(),
+                    )
+                })
                 .collect(),
             _ => vec![(
                 DEFAULT_CARD_ID.to_string(),
                 LOOPBACK_STATUS_PORT,
                 LOOPBACK_CONTROL_PORT,
+                String::new(),
+                String::new(),
             )],
         };
 
     println!("Live service (querying the running bridge, not the modem):");
     let mut any_reachable = false;
-    for (card_id, status_port, control_port) in &lines {
-        let reachable = print_line_live_status(card_id, *status_port, *control_port);
+    for (card_id, status_port, control_port, carrier_addr, telephony_addr) in &lines {
+        let reachable = print_line_live_status(
+            card_id,
+            &non_empty_or_loopback(carrier_addr),
+            *status_port,
+            &non_empty_or_loopback(telephony_addr),
+            *control_port,
+        );
         any_reachable = any_reachable || reachable;
     }
     any_reachable
@@ -501,12 +491,18 @@ pub fn print_live_status() -> bool {
 /// Prints one line's live status block; returns whether its registration half
 /// answered (a line whose carrier half failed to start is unreachable while
 /// its siblings still report).
-fn print_line_live_status(card_id: &str, status_port: u16, control_port: u16) -> bool {
+fn print_line_live_status(
+    card_id: &str,
+    carrier_addr: &str,
+    status_port: u16,
+    telephony_addr: &str,
+    control_port: u16,
+) -> bool {
     use crate::vowifi::control::ControlMessage;
     use crate::vowifi::{format_unix, query_status};
 
     println!("Line {card_id}:");
-    let reg_addr = format!("{LOOPBACK}:{status_port}");
+    let reg_addr = format!("{carrier_addr}:{status_port}");
     let reg = match query_status(&reg_addr) {
         Ok(ControlMessage::RegistrationStatusReply {
             state,
@@ -549,7 +545,7 @@ fn print_line_live_status(card_id: &str, status_port: u16, control_port: u16) ->
     }
 
     println!("  recent calls:");
-    let calls_addr = format!("{LOOPBACK}:{control_port}");
+    let calls_addr = format!("{telephony_addr}:{control_port}");
     match query_status(&calls_addr) {
         Ok(ControlMessage::CallHistoryReply { calls }) if calls.is_empty() => {
             println!("    (none)");

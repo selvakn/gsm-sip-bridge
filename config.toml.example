@@ -278,3 +278,19 @@ lock_path = "/tmp/volte-registration.lock"
 # pcscf = "2400:5200:a100:819::6"
 # iface = "wwan1"                # this modem's data interface
 # msisdn = "919000000001"        # advertised in P-Preferred-Identity
+
+# Per-line network isolation (specs/020-volte-line-netns), only meaningful
+# with an empty modem_port (auto-discovery): each auto-discovered line's LTE
+# interface and carrier-facing traffic run inside their own network
+# namespace, so a line's traffic can never leave on another line's
+# interface — the same guarantee [vowifi]'s netns/veth_* fields above give
+# VoWiFi lines. NOT expected to be operator-tuned; exposed only for
+# consistency with every other per-line-derived base in this file. The
+# defaults are deliberately distinct from [vowifi]'s own ("volte" vs "ims",
+# a different /30 block) so the two subsystems' namespaces/veth links can
+# never collide when both are enabled in the same container.
+netns = "volte"
+veth_carrier_iface = "veth-volte-ims"
+veth_telephony_iface = "veth-volte-sip"
+veth_carrier_addr = "10.98.0.1"
+veth_telephony_addr = "10.98.0.2"

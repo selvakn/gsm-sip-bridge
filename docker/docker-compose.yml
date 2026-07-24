@@ -1,4 +1,4 @@
-# One image, two optional subsystems (see docker/entrypoint.sh):
+# One image, up to three optional subsystems (see docker/entrypoint.sh):
 #   1. the circuit-switched GSM-to-SIP daemon — always attempted, no-ops
 #      gracefully with no supported modem attached
 #   2. the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — an
@@ -15,13 +15,24 @@
 #      holds secrets only (see .env.example) — all other configuration,
 #      VoWiFi included, lives in config.toml.
 #
+#   3. the host-side LTE IMS bridge (specs/015/017/018-volte-*), started when
+#      [volte].enabled + bridge_inbound = true. With modem_port left empty
+#      (auto-discovery), every SIM-ready modem becomes its own line, each in
+#      its own network namespace and veth pair (specs/020-volte-line-netns) —
+#      the same netns/veth isolation VoWiFi's lines already get above, on a
+#      distinct namespace/veth-address base so the two subsystems never
+#      collide when both run in this one container. VoWiFi and VoLTE are
+#      mutually exclusive on the same SIM (both would re-register the same
+#      IMPU) but not with each other otherwise.
+#
 # `privileged: true` + host networking + full /dev,/sys mounts are needed
 # for the circuit-switched daemon's arbitrary-USB-modem hot-plug discovery,
-# and happen to be a strict superset of everything the VoWiFi tunnel needs
-# too (NET_ADMIN/NET_RAW/SYS_ADMIN, /dev/net/tun, netns/veth setup for the
-# swu engine; NET_ADMIN/SYS_ADMIN, netns/XFRM-interface setup for the
-# strongswan engine) — no separate capability profile required for either
-# subsystem or engine.
+# and happen to be a strict superset of everything the VoWiFi tunnel and the
+# VoLTE bridge's per-line namespaces need too (NET_ADMIN/NET_RAW/SYS_ADMIN,
+# /dev/net/tun, netns/veth setup for the swu engine; NET_ADMIN/SYS_ADMIN,
+# netns/XFRM-interface setup for the strongswan engine; NET_ADMIN/SYS_ADMIN,
+# netns/veth setup for VoLTE lines) — no separate capability profile required
+# for any subsystem or engine.
 services:
   gsm-sip-bridge:
     build:

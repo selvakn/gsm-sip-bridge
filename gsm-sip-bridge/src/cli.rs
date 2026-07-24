@@ -87,14 +87,17 @@ pub enum Commands {
     /// PLMN from numeric `AT+COPS`. Used by `docker/entrypoint.sh` when
     /// `vowifi.mcc`/`vowifi.mnc` are left unset in config.toml.
     VowifiPlmn(VowifiPlmnArgs),
-    /// Reconciles the modem's own IMS/VoLTE stack with `[vowifi].enabled`
-    /// and exits. VoWiFi requires the modem's IMS to be OFF: a
-    /// VoLTE-registered modem registers the same IMPU with the same
-    /// IMEI-derived `+sip.instance` as the bridge, so the network treats one
-    /// as a re-registration of the other and tears our binding down (see
+    /// Reconciles the modem's own IMS/VoLTE stack with whether *this host*
+    /// is going to register this modem itself — `[vowifi].enabled` or
+    /// `[volte].enabled` (specs/020-volte-line-netns; either alone requires
+    /// the modem's IMS OFF, not just VoWiFi) — and exits. A modem left with
+    /// its own IMS on registers the same IMPU with the same IMEI-derived
+    /// `+sip.instance` as the bridge, so the network treats one as a
+    /// re-registration of the other and tears our binding down (see
     /// `vowifi::ims_mode`). Rewrites `AT+QCFG="ims"` and reboots the module
     /// only when it is in the wrong mode, so it is a no-op on a healthy boot.
-    /// Run by `docker/entrypoint.sh` before anything else opens the modem.
+    /// Run by `docker/entrypoint.sh` before anything else opens the modem,
+    /// for every line of either subsystem.
     ModemIms(ModemImsArgs),
     /// Manage the LTE IMS PDN attachment (specs/015-volte-host-ims, US1):
     /// activates a PDP context on the carrier's IMS APN and binds the modem's
@@ -165,12 +168,40 @@ pub enum Commands {
     /// renews it before expiry, and answers calls as they arrive. Renewal and
     /// re-attachment both yield to a call in progress.
     VolteBridge(VolteBridgeArgs),
-    /// Tear down every host-side LTE line the running bridge recorded in its
+    /// Resolves the auto-discovered host-side LTE line table (every SIM-ready
+    /// modem, bounded by `[volte].max_lines`, shaped by `[[volte.line]]`) and
+    /// writes it as the line manifest (specs/020-volte-line-netns) — the LTE
+    /// counterpart to `discover`. Run once, up front, by
+    /// `docker/entrypoint.sh` before any per-line namespace or process
+    /// exists: `volte-carrier-agent --line N` and `volte-bridge` (auto-
+    /// discovered mode) both read the manifest this writes rather than
+    /// re-scanning (research.md R7's "discover once" principle).
+    VolteDiscoverLines(VolteDiscoverLinesArgs),
+    /// The per-line carrier-facing half (specs/020-volte-line-netns) —
+    /// attaches this line's IMS PDN, registers over it, and answers calls
+    /// until the registration ends. The LTE counterpart to
+    /// `vowifi-ims-agent --line N`: launched by `docker/entrypoint.sh` inside
+    /// this line's own network namespace (`ip netns exec`), one process per
+    /// line, reading its settings from the manifest `volte-discover-lines`
+    /// wrote. Long-running, but does not retry internally on failure —
+    /// `docker/entrypoint.sh` restarts it, mirroring how
+    /// `vowifi-ims-agent` is supervised.
+    VolteCarrierAgent(VolteCarrierAgentArgs),
+    /// Tear down host-side LTE line(s) the running bridge recorded in its
     /// line manifest — releasing each modem's IMS PDN and restoring the data
     /// context it displaced (specs/018-volte-multi-modem). Run by
     /// `docker/entrypoint.sh`'s cleanup after the multi-modem bridge exits; a
     /// no-op when no manifest exists.
-    VolteCleanup,
+    ///
+    /// With `--line`, tears down only that one line — used by
+    /// `docker/entrypoint.sh`'s cleanup trap (specs/020-volte-line-netns
+    /// research.md R6) to run each line's teardown *inside* that line's own
+    /// namespace (`ip netns exec`) before the namespace is deleted, since a
+    /// namespace-scoped `ip`/sysctl teardown command run from the wrong
+    /// namespace silently fails to find the interface. Omitted means every
+    /// line, run from the default namespace — correct only when no line has
+    /// a namespace of its own (defensive fallback, not the production path).
+    VolteCleanup(VolteCleanupArgs),
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -455,6 +486,36 @@ pub struct VolteBridgeArgs {
     /// general connectivity instead of leaving the modem data path unbound.
     #[arg(long)]
     pub restore_cid_path: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteDiscoverLinesArgs {
+    /// Also print shell-sourceable `KEY=value`/indexed-array output to
+    /// stdout, for `docker/entrypoint.sh` to `eval` — mirrors `discover
+    /// --shell-env`.
+    #[arg(long)]
+    pub shell_env: bool,
+    /// Same meaning as `volte-bridge`'s own `--restore-cid-path`: the base
+    /// path each line's displaced-context file is derived from
+    /// (`<base>-<index>`). Recorded in the manifest so cleanup can find it.
+    #[arg(long)]
+    pub restore_cid_path: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteCarrierAgentArgs {
+    /// Which resolved VoLTE line (0-based index into the line manifest
+    /// `volte-discover-lines` wrote) to run as.
+    #[arg(long)]
+    pub line: u32,
+}
+
+#[derive(Parser, Debug)]
+pub struct VolteCleanupArgs {
+    /// Tear down only this one line (0-based index into the manifest).
+    /// Omitted means every line.
+    #[arg(long)]
+    pub line: Option<u32>,
 }
 
 #[derive(Parser, Debug)]

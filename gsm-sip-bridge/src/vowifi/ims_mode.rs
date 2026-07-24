@@ -1,20 +1,39 @@
-//! `modem-ims`: reconciles the modem's own IMS/VoLTE stack with
-//! `[vowifi].enabled`, on boot, before anything else touches the modem.
+//! `modem-ims`: reconciles the modem's own IMS/VoLTE stack with whether
+//! *this host* is going to run a registration of its own on this modem —
+//! either VoWiFi or the native-LTE VoLTE path (specs/020-volte-line-netns)
+//! — on boot, before anything else touches the modem.
 //!
-//! The two cannot coexist. Our VoWiFi `REGISTER` carries
-//! `+sip.instance="<urn:gsma:imei:$IMEI>"` (see `ims::sip_client`) — the
-//! modem's own IMEI. A VoLTE-registered modem registers the *same* IMPU with
-//! the *same* instance-id, so per RFC 5626 the network does not see two
+//! The two cannot coexist, for either host-driven path. Our own `REGISTER`
+//! carries `+sip.instance="<urn:gsma:imei:$IMEI>"` (see `ims::sip_client`) —
+//! the modem's own IMEI. A VoLTE-registered modem registers the *same* IMPU
+//! with the *same* instance-id, so per RFC 5626 the network does not see two
 //! devices: it treats whichever registration arrives second as a
 //! re-registration of the first and deactivates the older binding. Observed
-//! against Airtel: our binding was granted, then torn down ~0.7s later by a
-//! reg-event `NOTIFY` carrying `state="terminated" event="deactivated"` and
-//! `reason=noresource` for our own contact, after which the modem's VoLTE
-//! registration won and the bridge could never receive a terminating call.
+//! against Airtel on the VoWiFi path originally: our binding was granted,
+//! then torn down ~0.7s later by a reg-event `NOTIFY` carrying
+//! `state="terminated" event="deactivated"` and `reason=noresource` for our
+//! own contact, after which the modem's own VoLTE registration won and the
+//! bridge could never receive a terminating call.
 //!
-//! So VoWiFi requires `<ims_conf>=2` ("forcibly disable IMS"), and the
-//! circuit-switched-only deployment wants `1` ("forcibly enable") so VoLTE
-//! keeps working when the bridge is not running. The setting only takes
+//! **This module predates the native-LTE VoLTE path (specs/015) and was
+//! never extended to it** — a real gap, not a deliberate scoping decision:
+//! `desired_ims_conf` originally took a bare `vowifi_enabled` bool because
+//! VoWiFi was the only host-driven registration that existed. Found live
+//! (specs/020-volte-line-netns): with `[vowifi].enabled = false` and
+//! `[volte].enabled = true`, this modem's own IMS stack was left at its
+//! `[vowifi]`-only default (`IMS_ENABLED`) — enabled — and it won the same
+//! race described above against our native-LTE registration, intermittently
+//! and invisibly (both sides' REGISTERs kept succeeding; the *loser* just
+//! silently stopped being reachable), which is what a caller experiences as
+//! the line reporting itself switched off. Fixed by widening the input to
+//! "does *some* host-driven IMS registration want this modem" — true for
+//! `[vowifi].enabled` **or** `[volte].enabled` (never both — `volte::guard`
+//! already refuses that combination at the registration level).
+//!
+//! So a host-driven deployment (either path) requires `<ims_conf>=2`
+//! ("forcibly disable IMS"), and the circuit-switched-only deployment (both
+//! disabled) wants `1` ("forcibly enable") so the modem's own VoLTE keeps
+//! working when neither bridge path is running. The setting only takes
 //! effect after `AT+CFUN=1,1` and is persisted by the modem across power
 //! cycles, so a wrong value survives redeploys and must be corrected here
 //! rather than assumed.
@@ -50,9 +69,14 @@ const REBOOT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const RESET_TIMEOUT: Duration = Duration::from_secs(45);
 const RESET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The `<ims_conf>` a given `[vowifi].enabled` demands.
-pub fn desired_ims_conf(vowifi_enabled: bool) -> u8 {
-    if vowifi_enabled {
+/// The `<ims_conf>` this modem needs. `host_ims_wanted` is true when *either*
+/// host-driven registration — `[vowifi].enabled` or `[volte].enabled` — is
+/// going to register this modem's IMPU itself; the two are mutually
+/// exclusive (`volte::guard`), but either alone still needs the modem's own
+/// stack off (see module docs — this used to be `vowifi_enabled` alone,
+/// which is the bug specs/020-volte-line-netns found live).
+pub fn desired_ims_conf(host_ims_wanted: bool) -> u8 {
+    if host_ims_wanted {
         IMS_DISABLED
     } else {
         IMS_ENABLED
@@ -134,15 +158,15 @@ fn wait_for_reboot(modem_port: &Path) -> BridgeResult<AtCommander> {
     )))
 }
 
-fn run_inner(modem_port: &Path, vowifi_enabled: bool) -> BridgeResult<()> {
-    let desired = desired_ims_conf(vowifi_enabled);
+fn run_inner(modem_port: &Path, host_ims_wanted: bool) -> BridgeResult<()> {
+    let desired = desired_ims_conf(host_ims_wanted);
     let mut at = AtCommander::open(modem_port)?;
 
     match reconcile(&mut at, desired)? {
         Outcome::AlreadyCorrect(v) => {
             tracing::info!(
                 ims_conf = v,
-                vowifi_enabled,
+                host_ims_wanted,
                 "modem IMS mode already correct — no reboot needed"
             );
             Ok(())
@@ -151,7 +175,7 @@ fn run_inner(modem_port: &Path, vowifi_enabled: bool) -> BridgeResult<()> {
             tracing::warn!(
                 from,
                 to,
-                vowifi_enabled,
+                host_ims_wanted,
                 "modem IMS mode wrong for this deployment — rewrote it and rebooted the module (~30s of modem downtime)"
             );
             drop(at); // release the port before it disappears from /dev
@@ -173,8 +197,8 @@ fn run_inner(modem_port: &Path, vowifi_enabled: bool) -> BridgeResult<()> {
     }
 }
 
-pub fn run(modem_port: &Path, vowifi_enabled: bool) -> ExitCode {
-    match run_inner(modem_port, vowifi_enabled) {
+pub fn run(modem_port: &Path, host_ims_wanted: bool) -> ExitCode {
+    match run_inner(modem_port, host_ims_wanted) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
