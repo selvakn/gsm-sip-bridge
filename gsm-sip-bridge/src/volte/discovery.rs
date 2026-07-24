@@ -318,6 +318,13 @@ pub struct VolteLineManifestEntry {
     /// address wins, else the ePDG capture file), just from this field
     /// instead of re-deriving the override (research.md R7).
     pub pcscf: String,
+    /// This line's explicitly-configured MSISDN override (from
+    /// `[[volte.line]]` or `[volte].msisdn`), empty if none — used as the
+    /// IMS public identity instead of the IMSI-derived default. Must
+    /// round-trip through the manifest for the same reason `apn` does: the
+    /// split carrier-agent/bridge processes only ever see this line via the
+    /// manifest, not the original config.
+    pub msisdn: String,
 }
 
 /// Default path for the running bridge's line manifest.
@@ -366,6 +373,7 @@ pub fn write_manifest(
                 veth_carrier_addr: l.veth_carrier_addr.clone(),
                 veth_telephony_addr: l.veth_telephony_addr.clone(),
                 pcscf: l.pcscf.clone().unwrap_or_default(),
+                msisdn: l.msisdn.clone().unwrap_or_default(),
             })
             .collect(),
     };
@@ -637,6 +645,7 @@ mod tests {
                 veth_carrier_addr: "10.98.0.1".to_string(),
                 veth_telephony_addr: "10.98.0.2".to_string(),
                 pcscf: String::new(),
+                msisdn: String::new(),
             }],
         };
         let json = serde_json::to_string(&manifest).unwrap();
@@ -679,6 +688,47 @@ mod tests {
         let manifest = read_manifest(&path).expect("must read back");
 
         assert_eq!(manifest.lines[0].apn, "ims", "apn must not be dropped");
+        std::env::remove_var(MANIFEST_PATH_ENV);
+    }
+
+    /// Regression test (flagged in PR #8 review): the manifest also silently
+    /// dropped a configured `msisdn` override, so `volte-carrier-agent
+    /// --line N` and `volte-bridge` (Agent B) both reconstructed the line
+    /// with `msisdn: None` and IMS registration fell back to the
+    /// IMSI-derived public identity instead of the explicitly configured
+    /// one. Same class of bug as `apn` above — `write_manifest` must carry
+    /// a non-default `msisdn` through.
+    #[test]
+    fn write_manifest_preserves_a_configured_msisdn() {
+        let dir = tempfile_dir_for_test();
+        let path = dir.join("volte-lines-msisdn-test.json");
+        std::env::set_var(MANIFEST_PATH_ENV, &path);
+
+        let line = ResolvedVolteLine {
+            index: 0,
+            card_id: "ec20-AAAAAA".to_string(),
+            modem_port: PathBuf::from("/dev/ttyUSB0"),
+            cid: 3,
+            apn: "ims".to_string(),
+            pcscf: None,
+            iface: "wwan0".to_string(),
+            msisdn: Some("919000000001".to_string()),
+            sip_leg_port: LOOPBACK_SIP_PORT,
+            control_port: LOOPBACK_CONTROL_PORT,
+            status_port: LOOPBACK_STATUS_PORT,
+            netns: "volte".to_string(),
+            veth_carrier_iface: "veth-volte-ims".to_string(),
+            veth_telephony_iface: "veth-volte-sip".to_string(),
+            veth_carrier_addr: "10.98.0.1".to_string(),
+            veth_telephony_addr: "10.98.0.2".to_string(),
+        };
+        write_manifest(&[line], None).expect("write_manifest must succeed");
+        let manifest = read_manifest(&path).expect("must read back");
+
+        assert_eq!(
+            manifest.lines[0].msisdn, "919000000001",
+            "msisdn must not be dropped"
+        );
         std::env::remove_var(MANIFEST_PATH_ENV);
     }
 
