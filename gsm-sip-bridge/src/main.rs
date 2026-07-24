@@ -920,10 +920,16 @@ struct ResolvedVolteRegisterLine {
 
 /// Resolves a single line's settings from `--config`'s `[[volte.line]]`: the
 /// same SIM-ready-modem scan + resolution `volte-bridge`'s auto-discovery
-/// uses (`resolve_volte_lines`), keeping only the first line — these modes
-/// have no manifest/multi-line support, unlike `volte-bridge`. Requires
-/// `--config`; a config with no usable line is a clear error rather than a
-/// silent fallback to some default port.
+/// uses (`resolve_volte_lines`), then honors the first `[[volte.line]]`
+/// entry's pin if one is configured — not whichever line happened to sort
+/// first by card id, which silently ran registration against the wrong
+/// modem with default settings whenever more than one SIM-ready modem was
+/// present and the pinned one wasn't first alphabetically. Absent any
+/// override, the first (arbitrary) line is used, since there's no configured
+/// preference to respect. These modes have no manifest/multi-line support,
+/// unlike `volte-bridge` — a second `[[volte.line]]` entry is ignored.
+/// Requires `--config`; a config with no usable line is a clear error rather
+/// than a silent fallback to some default port.
 fn resolve_volte_register_line(
     config_path: Option<&std::path::Path>,
 ) -> Result<ResolvedVolteRegisterLine, String> {
@@ -953,7 +959,33 @@ fn resolve_volte_register_line(
             "VoLTE line discovery: modem not usable as a line"
         );
     }
-    let line = table.lines.into_iter().next().ok_or_else(|| {
+
+    let line = if let Some(over) = config.volte.line_overrides.first() {
+        let target = modems.iter().find(|m| {
+            over.modem_serial
+                .as_deref()
+                .is_some_and(|s| s == m.usb_serial)
+                || over.modem_port.as_deref().is_some_and(|p| {
+                    m.at_port
+                        .as_deref()
+                        .is_some_and(|port| port == std::path::Path::new(p))
+                })
+        });
+        let Some(target) = target else {
+            return Err(format!(
+                "the [[volte.line]] entry (modem_serial={:?}, modem_port={:?}) matched no \
+                 discovered modem",
+                over.modem_serial, over.modem_port
+            ));
+        };
+        table
+            .lines
+            .into_iter()
+            .find(|l| l.card_id == target.card_id)
+    } else {
+        table.lines.into_iter().next()
+    };
+    let line = line.ok_or_else(|| {
         "no usable VoLTE line found (no SIM-ready modem discovered); pass --modem explicitly \
          to bypass discovery"
             .to_string()
