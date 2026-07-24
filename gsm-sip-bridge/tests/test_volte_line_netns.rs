@@ -50,7 +50,7 @@ fn manifest_written_by_discover_lines_is_read_back_with_netns_and_veth_intact() 
             apn: "ims".to_string(),
             pcscf: Some("2400:5200:a100:819::6".to_string()),
             iface: "wwan1".to_string(),
-            msisdn: None,
+            msisdn: Some("919000000001".to_string()),
             sip_leg_port: 5078,
             control_port: 5079,
             status_port: 5080,
@@ -76,12 +76,17 @@ fn manifest_written_by_discover_lines_is_read_back_with_netns_and_veth_intact() 
     assert_eq!(l0.veth_telephony_addr, "10.98.0.2");
     assert_eq!(l0.restore_cid_path, "/run/volte-restore-cid-0");
     assert_eq!(l0.pcscf, "", "no explicit override for line 0");
+    assert_eq!(l0.msisdn, "", "no explicit override for line 0");
 
     let l1 = &manifest.lines[1];
     assert_eq!(l1.netns, "volte1");
     assert_ne!(l1.netns, l0.netns, "two lines' namespaces must not collide");
     assert_eq!(l1.restore_cid_path, "/run/volte-restore-cid-1");
     assert_eq!(l1.pcscf, "2400:5200:a100:819::6");
+    assert_eq!(
+        l1.msisdn, "919000000001",
+        "msisdn override must not be dropped"
+    );
 
     std::env::remove_var(MANIFEST_PATH_ENV);
 }

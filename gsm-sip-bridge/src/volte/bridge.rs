@@ -404,6 +404,7 @@ fn write_manifest(lines: &[BridgeLine]) {
                 veth_carrier_addr: l.veth_carrier_addr.clone(),
                 veth_telephony_addr: l.veth_telephony_addr.clone(),
                 pcscf: l.settings.pcscf.map(|a| a.to_string()).unwrap_or_default(),
+                msisdn: l.msisdn.clone().unwrap_or_default(),
             })
             .collect(),
     };

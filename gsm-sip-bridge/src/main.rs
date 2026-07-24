@@ -1213,7 +1213,11 @@ fn volte_bridge_manifest_lines(
         lines.push(gsm_sip_bridge::volte::bridge::BridgeLine {
             card_id: entry.card_id.clone(),
             settings,
-            msisdn: None,
+            msisdn: if entry.msisdn.is_empty() {
+                None
+            } else {
+                Some(entry.msisdn.clone())
+            },
             sip_leg_port: entry.sip_leg_port,
             control_port: entry.control_port,
             status_port: entry.status_port,
@@ -1409,7 +1413,11 @@ fn handle_volte_carrier_agent_command(
     let line = gsm_sip_bridge::volte::bridge::BridgeLine {
         card_id: entry.card_id.clone(),
         settings,
-        msisdn: None,
+        msisdn: if entry.msisdn.is_empty() {
+            None
+        } else {
+            Some(entry.msisdn.clone())
+        },
         sip_leg_port: entry.sip_leg_port,
         control_port: entry.control_port,
         status_port: entry.status_port,
