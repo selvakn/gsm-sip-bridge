@@ -236,9 +236,14 @@ pub enum VoltePdnAction {
 pub struct VoltePdnArgs {
     #[arg(long, value_enum)]
     pub action: VoltePdnAction,
-    /// Modem AT port.
-    #[arg(long, default_value = "/dev/ttyUSB0")]
-    pub modem: PathBuf,
+    /// Modem AT port. Omit to resolve it — along with `cid`/`apn` — from
+    /// `--config`'s `[[volte.line]]` the same way `volte-register` does;
+    /// falls back to `/dev/ttyUSB0`/the built-in cid/apn defaults when no
+    /// config is given or no line is configured. Needed on `--action down`
+    /// so a `volte-register --config ...` teardown targets the exact same
+    /// line it registered, rather than guessing the CLI default.
+    #[arg(long)]
+    pub modem: Option<PathBuf>,
     /// Host network interface carrying the modem's data path. Leave unset to
     /// manage the PDN only and skip host interface configuration.
     #[arg(long)]
@@ -300,9 +305,14 @@ pub struct VolteDiscoverArgs {
 
 #[derive(Parser, Debug)]
 pub struct VolteRegisterArgs {
-    /// Modem AT port.
-    #[arg(long, default_value = "/dev/ttyUSB0")]
-    pub modem: PathBuf,
+    /// Modem AT port. Omit to resolve it — along with `cid`/`apn` — from
+    /// `--config`'s `[[volte.line]]` (the first line a SIM-ready-modem scan
+    /// resolves); falls back to `/dev/ttyUSB0`/the built-in cid/apn defaults
+    /// when no config is given or no line is configured. Passing `--modem`
+    /// explicitly opts out of config entirely — a pure CLI-args invocation,
+    /// unchanged from before.
+    #[arg(long)]
+    pub modem: Option<PathBuf>,
     /// Host network interface carrying the IMS PDN.
     #[arg(long)]
     pub iface: Option<String>,

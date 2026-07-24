@@ -127,8 +127,10 @@ cleanup() {
         # listing every line's modem/cid/restore-cid — `volte-cleanup` tears
         # them all down from it; a no-op when no manifest exists, so running
         # it unconditionally is safe. The `volte-register` path (registration
-        # only, always the CLI's default modem/cid) writes no manifest, so it
-        # is torn down directly here instead.
+        # only) writes no manifest, so it is torn down directly here instead —
+        # omitting --modem makes volte-pdn resolve the exact same line
+        # volte-register did (same [[volte.line]]/config resolution), rather
+        # than guessing the CLI default.
         "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-cleanup \
             >/dev/null 2>&1
         if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 0 ]; then
