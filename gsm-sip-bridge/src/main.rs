@@ -1459,10 +1459,7 @@ fn handle_discover_command(args: &gsm_sip_bridge::cli::DiscoverArgs, cli: &Cli) 
                  the VoWiFi subsystem will not start this run"
             );
         }
-        gsm_sip_bridge::vowifi::discovery::LineResolution::from_result(
-            &assignment.circuit_switched,
-            &result,
-        )
+        gsm_sip_bridge::vowifi::discovery::LineResolution::from_result(&assignment.vowifi, &result)
     };
 
     if let Err(e) = write_line_resolution(&out_path, &resolution) {

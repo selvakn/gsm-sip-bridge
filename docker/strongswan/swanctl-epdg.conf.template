@@ -15,14 +15,31 @@
 #                  entirely when unset, letting charon auto-select based on
 #                  routing to @EPDG_IP@ (mirrors the legacy engine's
 #                  optional `-s`/SRC_ADDR flag)
+#   @IF_ID@      - this line's strongswan_if_id (23 + line index,
+#                  specs/013-multi-card-vowifi). MUST be substituted, not
+#                  left at a fixed value: if_id_in/if_id_out bind this
+#                  connection's CHILD_SA to a specific pre-created XFRM
+#                  interface at the KERNEL level — a hardcoded value here
+#                  means every line's CHILD_SA binds to line 0's interface
+#                  regardless of which netns/tun_iface `updown` (below)
+#                  targets (found live-testing a genuine second line for the
+#                  first time: this was hardcoded to `23` for every line
+#                  until then, silently breaking every line after the first).
+#   @UPDOWN@     - path to this line's rendered updown wrapper (sets NETNS/
+#                  STRONGSWAN_TUN_IFACE, then execs the shared ims.updown
+#                  logic). Also MUST be per-line: charon does not propagate
+#                  its own launch environment down into the updown script it
+#                  execs, so a fixed path (pointing at the shared script with
+#                  no env override) left every line's address installing on
+#                  line 0's netns/interface too (same live finding as above).
 #
 # No `secrets{}` block: authentication runs live EAP-AKA against the SIM
 # inside the modem via `vowifi-usim-bridge` (pcscd/vpcd), not a static key.
 #
-# if_id_in/if_id_out = 23 binds this connection's CHILD_SA to the
-# pre-created XFRM interface inside network namespace "ims" (research.md
-# item 3) — the piece that lets rekeys/reconnects swap SAs without ever
-# deleting the namespace or interface (FR-005).
+# if_id_in/if_id_out bind this connection's CHILD_SA to the pre-created XFRM
+# interface inside this line's own network namespace (research.md item 3) —
+# the piece that lets rekeys/reconnects swap SAs without ever deleting the
+# namespace or interface (FR-005).
 connections {
     ims {
         local_addrs  = @SRC_ADDR@
@@ -46,7 +63,7 @@ connections {
         children {
             ims {
                 remote_ts = 0.0.0.0/0, ::/0
-                updown = /etc/strongswan.d/ims.updown
+                updown = @UPDOWN@
 
                 # Same reasoning as `proposals` below, for the CHILD_SA.
                 # Carriers here are stuck on AES-CBC + HMAC-SHA1, which
@@ -58,8 +75,8 @@ connections {
                 # Vodafone selects AES_CBC_128/HMAC_SHA1_96.
                 esp_proposals = aes256gcm8-noesn, aes128-sha256-noesn, aes256-sha384-noesn, aes256-sha512-noesn, aes256-md5-noesn, aes128-sha1-noesn, aes256-sha1-noesn
 
-                if_id_in = 23
-                if_id_out = 23
+                if_id_in = @IF_ID@
+                if_id_out = @IF_ID@
             }
         }
         version = 2

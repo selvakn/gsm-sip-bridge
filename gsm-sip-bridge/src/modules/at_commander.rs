@@ -259,9 +259,20 @@ impl AtCommander {
 
     pub fn query_imei(&mut self) -> BridgeResult<String> {
         match self.send_command("AT+CGSN")? {
+            // Digit-only, like `query_imsi` below — not just "first non-empty
+            // line". A modem with command echo enabled (the power-on default
+            // on some firmware; nothing here ever sends ATE0) puts the
+            // echoed "AT+CGSN" text itself as the first response line, and a
+            // bare non-empty check happily returns that literal string as
+            // the "IMEI" — sent on to the network inside +sip.instance and
+            // silently accepted (found live: a real IMS REGISTER went out
+            // with `+sip.instance="<urn:gsma:imei:AT+CGSN>"`). GSMA IMEIs are
+            // 14-16 ASCII digits (14 + optional check digit, sometimes an SVN
+            // suffix), so requiring digits-only rejects the echo the same
+            // way `query_imsi`'s digit filter already does.
             AtResponse::Ok(lines) => lines
                 .into_iter()
-                .find(|l| !l.is_empty())
+                .find(|l| l.chars().all(|c| c.is_ascii_digit()) && l.len() >= 14 && l.len() <= 16)
                 .ok_or_else(|| BridgeError::Discovery("AT+CGSN: no IMEI in response".into())),
             AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
                 Err(BridgeError::Discovery(format!("AT+CGSN failed: {e}")))
@@ -593,6 +604,26 @@ mod tests {
     #[test]
     fn test_query_imei() {
         let mut at = make_commander("867584030123456\r\nOK\r\n");
+        assert_eq!(at.query_imei().unwrap(), "867584030123456");
+    }
+
+    #[test]
+    fn test_query_imei_skips_a_command_echo_line() {
+        // A modem with command echo enabled (no ATE0 sent anywhere in this
+        // codebase) puts the echoed "AT+CGSN" text as the first response
+        // line — found live sending a real IMS REGISTER with
+        // +sip.instance="<urn:gsma:imei:AT+CGSN>". The digit-only filter
+        // must skip that line and find the real IMEI after it.
+        let mut at = make_commander("AT+CGSN\r\n865396058758216\r\nOK\r\n");
+        assert_eq!(at.query_imei().unwrap(), "865396058758216");
+    }
+
+    #[test]
+    fn test_query_imei_rejects_a_too_short_digit_line() {
+        // Not every all-digit line is a plausible IMEI — a stray short
+        // numeric line (e.g. a status code on some other line) must not be
+        // mistaken for one.
+        let mut at = make_commander("123\r\n867584030123456\r\nOK\r\n");
         assert_eq!(at.query_imei().unwrap(), "867584030123456");
     }
 
