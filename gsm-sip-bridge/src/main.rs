@@ -72,7 +72,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(Commands::VoltePdn(args)) = &cli.command {
-        return handle_volte_pdn_command(args);
+        return handle_volte_pdn_command(args, cli.config.as_deref());
     }
 
     if let Some(Commands::VolteStatus(args)) = &cli.command {
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(Commands::VolteRegister(args)) = &cli.command {
-        return handle_volte_register_command(args);
+        return handle_volte_register_command(args, cli.config.as_deref());
     }
 
     if let Some(Commands::VolteCall(args)) = &cli.command {
@@ -354,25 +354,25 @@ fn load_vowifi_config(cli: &Cli) -> Result<gsm_sip_bridge::config::AppConfig, Ex
     Ok(config)
 }
 
-/// Without `--line`, behaves exactly as before this feature (the single
-/// `[vowifi]` config section — FR-020). With `--line N`, loads that line's
-/// fully-derived `VowifiConfig` from the `discover` subcommand's
-/// line-resolution file instead — see
+/// Loads `--line N`'s fully-derived `VowifiConfig` from the `discover`
+/// subcommand's line-resolution file — see
 /// `specs/013-multi-card-vowifi/contracts/agent-topology-contract.md`.
-/// Deliberately does NOT re-run discovery itself: doing so would re-probe
-/// modems a sibling `vowifi-usim-bridge`/other line's agent may already have
-/// open (research.md item 3).
+/// `--line` is required: every line, including a single-SIM setup, is
+/// resolved by `discover` first (`docker/entrypoint.sh` always runs it
+/// before starting this agent). Deliberately does NOT re-run discovery
+/// itself: doing so would re-probe modems a sibling
+/// `vowifi-usim-bridge`/other line's agent may already have open
+/// (research.md item 3).
 fn handle_vowifi_ims_agent_command(cli: &Cli, line: Option<u32>) -> ExitCode {
     let config = match load_vowifi_config(cli) {
         Ok(c) => c,
         Err(code) => return code,
     };
     let Some(index) = line else {
-        return gsm_sip_bridge::ims::agent::run(
-            gsm_sip_bridge::vowifi::LEGACY_LINE_CARD_ID,
-            &config.vowifi,
-            &config,
+        eprintln!(
+            "error: vowifi-ims-agent requires --line N (run `gsm-sip-bridge discover` first)"
         );
+        return ExitCode::FAILURE;
     };
     let (card_id, line_config) = match load_line_config(index) {
         Ok(c) => c,
@@ -467,9 +467,30 @@ fn volte_settings(
     }
 }
 
-fn handle_volte_pdn_command(args: &gsm_sip_bridge::cli::VoltePdnArgs) -> ExitCode {
+fn handle_volte_pdn_command(
+    args: &gsm_sip_bridge::cli::VoltePdnArgs,
+    config_path: Option<&std::path::Path>,
+) -> ExitCode {
     use gsm_sip_bridge::cli::VoltePdnAction;
-    let settings = volte_settings(&args.modem, &args.iface, args.cid, &args.apn);
+
+    let line = match &args.modem {
+        Some(modem) => ResolvedVolteRegisterLine {
+            modem: modem.clone(),
+            cid: args.cid,
+            apn: args.apn.clone(),
+            iface: args.iface.clone(),
+            pcscf: None,
+            msisdn: None,
+        },
+        None => match resolve_volte_register_line(config_path) {
+            Ok(l) => l,
+            Err(msg) => {
+                eprintln!("volte-pdn: {msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let settings = volte_settings(&line.modem, &line.iface, line.cid, &line.apn);
 
     match args.action {
         VoltePdnAction::Up => match gsm_sip_bridge::volte::attach(&settings) {
@@ -484,7 +505,7 @@ fn handle_volte_pdn_command(args: &gsm_sip_bridge::cli::VoltePdnArgs) -> ExitCod
         },
         VoltePdnAction::Down => match gsm_sip_bridge::volte::detach(&settings, args.restore_cid) {
             Ok(()) => {
-                println!("IMS PDN released (context {}).", args.cid);
+                println!("IMS PDN released (context {}).", line.cid);
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -500,7 +521,7 @@ fn handle_volte_pdn_command(args: &gsm_sip_bridge::cli::VoltePdnArgs) -> ExitCod
                 ExitCode::SUCCESS
             }
             Ok(None) => {
-                println!("No IMS PDN attached on context {}.", args.cid);
+                println!("No IMS PDN attached on context {}.", line.cid);
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -882,7 +903,108 @@ fn render_call_report(
     out
 }
 
-fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) -> ExitCode {
+/// A single line's settings for `volte-register`/`volte-pdn`'s inherently
+/// single-line invocations — either taken verbatim from CLI flags (`--modem`
+/// given), or resolved from `--config`'s `[[volte.line]]` (`--modem`
+/// omitted). `volte-pdn --action down` resolving the exact same line
+/// `volte-register` registered (rather than guessing the CLI default) is
+/// what lets `docker/entrypoint.sh`'s cleanup tear down the right modem/PDN.
+struct ResolvedVolteRegisterLine {
+    modem: std::path::PathBuf,
+    cid: u8,
+    apn: String,
+    iface: Option<String>,
+    pcscf: Option<String>,
+    msisdn: Option<String>,
+}
+
+/// Resolves a single line's settings from `--config`'s `[[volte.line]]`: the
+/// same SIM-ready-modem scan + resolution `volte-bridge`'s auto-discovery
+/// uses (`resolve_volte_lines`), then honors the first `[[volte.line]]`
+/// entry's pin if one is configured — not whichever line happened to sort
+/// first by card id, which silently ran registration against the wrong
+/// modem with default settings whenever more than one SIM-ready modem was
+/// present and the pinned one wasn't first alphabetically. Absent any
+/// override, the first (arbitrary) line is used, since there's no configured
+/// preference to respect. These modes have no manifest/multi-line support,
+/// unlike `volte-bridge` — a second `[[volte.line]]` entry is ignored.
+/// Requires `--config`; a config with no usable line is a clear error rather
+/// than a silent fallback to some default port.
+fn resolve_volte_register_line(
+    config_path: Option<&std::path::Path>,
+) -> Result<ResolvedVolteRegisterLine, String> {
+    let path = config_path.ok_or_else(|| {
+        "no --modem given and no --config to resolve one from \
+         (pass --modem explicitly, or --config a file with [volte])"
+            .to_string()
+    })?;
+    let config = load_config(path).map_err(|e| e.to_string())?;
+
+    // Probe every pinned port first on its device (a modem may answer AT on
+    // more than one ttyUSB), mirroring volte-bridge's auto-discovery.
+    let preferred: Vec<std::path::PathBuf> = config
+        .volte
+        .line_overrides
+        .iter()
+        .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
+        .collect();
+    let modems = gsm_sip_bridge::modules::discovery::scan_all_preferring(&preferred)
+        .map_err(|e| format!("modem discovery failed: {e}"))?;
+
+    let table = gsm_sip_bridge::volte::discovery::resolve_volte_lines(&modems, &config.volte);
+    for failed in &table.failed {
+        tracing::error!(
+            card_id = %failed.card_id,
+            reason = %failed.reason,
+            "VoLTE line discovery: modem not usable as a line"
+        );
+    }
+
+    let line = if let Some(over) = config.volte.line_overrides.first() {
+        let target = modems.iter().find(|m| {
+            over.modem_serial
+                .as_deref()
+                .is_some_and(|s| s == m.usb_serial)
+                || over.modem_port.as_deref().is_some_and(|p| {
+                    m.at_port
+                        .as_deref()
+                        .is_some_and(|port| port == std::path::Path::new(p))
+                })
+        });
+        let Some(target) = target else {
+            return Err(format!(
+                "the [[volte.line]] entry (modem_serial={:?}, modem_port={:?}) matched no \
+                 discovered modem",
+                over.modem_serial, over.modem_port
+            ));
+        };
+        table
+            .lines
+            .into_iter()
+            .find(|l| l.card_id == target.card_id)
+    } else {
+        table.lines.into_iter().next()
+    };
+    let line = line.ok_or_else(|| {
+        "no usable VoLTE line found (no SIM-ready modem discovered); pass --modem explicitly \
+         to bypass discovery"
+            .to_string()
+    })?;
+
+    Ok(ResolvedVolteRegisterLine {
+        modem: line.modem_port,
+        cid: line.cid,
+        apn: line.apn,
+        iface: (!line.iface.is_empty()).then_some(line.iface),
+        pcscf: line.pcscf,
+        msisdn: line.msisdn,
+    })
+}
+
+fn handle_volte_register_command(
+    args: &gsm_sip_bridge::cli::VolteRegisterArgs,
+    config_path: Option<&std::path::Path>,
+) -> ExitCode {
     use gsm_sip_bridge::ims::RegisterOutcome;
 
     // Refuse to displace a live VoWiFi registration. Checked before anything
@@ -899,12 +1021,31 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
         }
     };
 
-    // P-CSCF resolution order: explicit flag, then the address captured by the
-    // VoWiFi/ePDG path. Automatic discovery is not consulted here because it
-    // is known not to yield an address on the tested carrier and would only
-    // add latency before a failure the operator can already act on.
-    let (pcscf_addr, pcscf_source) = match args.pcscf {
-        Some(addr) => (addr, "--pcscf".to_string()),
+    let line = match &args.modem {
+        Some(modem) => ResolvedVolteRegisterLine {
+            modem: modem.clone(),
+            cid: args.cid,
+            apn: args.apn.clone(),
+            iface: args.iface.clone(),
+            pcscf: args.pcscf.map(|ip| ip.to_string()),
+            msisdn: args.msisdn.clone(),
+        },
+        None => match resolve_volte_register_line(config_path) {
+            Ok(l) => l,
+            Err(msg) => {
+                eprintln!("volte-register: {msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    // P-CSCF resolution order: explicit flag/resolved line, then the address
+    // captured by the VoWiFi/ePDG path. Automatic discovery is not consulted
+    // here because it is known not to yield an address on the tested
+    // carrier and would only add latency before a failure the operator can
+    // already act on.
+    let (pcscf_addr, pcscf_source) = match line.pcscf.as_deref().and_then(|s| s.parse().ok()) {
+        Some(addr) => (addr, "--pcscf / [[volte.line]].pcscf".to_string()),
         None => {
             let cache = std::path::PathBuf::from(&args.pcscf_source_path);
             match gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache).found() {
@@ -924,10 +1065,10 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
     tracing::info!(pcscf = %pcscf_addr, source = %pcscf_source, "resolved P-CSCF");
 
     let settings = gsm_sip_bridge::volte::VolteSettings {
-        modem_port: args.modem.clone(),
-        iface: args.iface.clone().unwrap_or_default(),
-        cid: args.cid,
-        apn: args.apn.clone(),
+        modem_port: line.modem.clone(),
+        iface: line.iface.clone().unwrap_or_default(),
+        cid: line.cid,
+        apn: line.apn.clone(),
         pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
         // With --keep-pdn this process does not detach; an external teardown
         // does, and reads this file to restore the displaced context. Without
@@ -956,7 +1097,7 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
     // The IMS realm is built from the home PLMN, so derive it from the SIM
     // exactly as the VoWiFi agent does rather than making the operator pass
     // it in.
-    let plmn = match gsm_sip_bridge::modules::at_commander::AtCommander::open(&args.modem)
+    let plmn = match gsm_sip_bridge::modules::at_commander::AtCommander::open(&line.modem)
         .and_then(|mut at| gsm_sip_bridge::vowifi::plmn::derive_plmn(&mut at))
     {
         Ok(p) => p,
@@ -971,7 +1112,7 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
 
     // Stage 2: registration, over the same shared code the VoWiFi path uses.
     let reg_cfg = gsm_sip_bridge::ims::ImsRegisterConfig {
-        modem_port: args.modem.clone(),
+        modem_port: line.modem.clone(),
         pcscf_addr,
         pcscf_port: args.pcscf_port,
         mcc: plmn.mcc.clone(),
@@ -980,8 +1121,8 @@ fn handle_volte_register_command(args: &gsm_sip_bridge::cli::VolteRegisterArgs) 
         imei: None,
         use_tcp: args.tcp,
         sec_agree: args.sec_agree,
-        msisdn: args.msisdn.clone(),
-        access_network_info: gsm_sip_bridge::volte::read_access_network_info(&args.modem),
+        msisdn: line.msisdn.clone(),
+        access_network_info: gsm_sip_bridge::volte::read_access_network_info(&line.modem),
     };
 
     // Staying up and renewing is the default; --once is the one-shot
@@ -1100,7 +1241,10 @@ fn handle_volte_bridge_command(
     // `docker/entrypoint.sh` inside that line's namespace.
     let (lines, spawn_carrier_threads) = match &args.modem {
         Some(modem) => (volte_bridge_single_line(args, modem), true),
-        None => (volte_bridge_manifest_lines(&app_config.volte), false),
+        None => (
+            volte_bridge_manifest_lines(&app_config.volte, args.pcscf_port),
+            false,
+        ),
     };
 
     let lines = match lines {
@@ -1175,6 +1319,7 @@ fn volte_bridge_single_line(
 /// `volte_bridge_single_line`/the pre-020 discovered-lines path always used.
 fn volte_bridge_manifest_lines(
     volte: &gsm_sip_bridge::config::VolteConfig,
+    pcscf_port: u16,
 ) -> Result<Vec<gsm_sip_bridge::volte::bridge::BridgeLine>, String> {
     use gsm_sip_bridge::volte::discovery;
 
@@ -1189,8 +1334,7 @@ fn volte_bridge_manifest_lines(
         } else {
             Some(entry.pcscf.clone())
         };
-        let Some(pcscf) = resolve_line_pcscf(explicit, volte.pcscf_port, &volte.pcscf_source_path)
-        else {
+        let Some(pcscf) = resolve_line_pcscf(explicit, pcscf_port, &volte.pcscf_source_path) else {
             tracing::error!(
                 card_id = %entry.card_id,
                 "no P-CSCF available for this line (none configured and none captured by the \
@@ -1387,7 +1531,7 @@ fn handle_volte_carrier_agent_command(
     };
     let Some(pcscf) = resolve_line_pcscf(
         explicit,
-        app_config.volte.pcscf_port,
+        args.pcscf_port,
         &app_config.volte.pcscf_source_path,
     ) else {
         eprintln!(
@@ -1585,18 +1729,14 @@ fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> E
                     return ExitCode::FAILURE;
                 }
             };
+            // Global-only: per-line values (modem_port/iface/cid/apn/pcscf/
+            // pcscf_port) live in `[[volte.line]]`, read directly by
+            // `volte-bridge` from config.toml — there is nothing to derive
+            // as a shell var here anymore.
             let v = &config.volte;
             let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
             println!("VOLTE_ENABLED={}", if v.enabled { 1 } else { 0 });
-            println!("VOLTE_MODEM_PORT={}", q(&v.modem_port));
-            println!("VOLTE_IFACE={}", q(&v.iface));
-            println!("VOLTE_CID={}", v.cid);
-            println!("VOLTE_APN={}", q(&v.apn));
-            println!("VOLTE_PCSCF={}", q(&v.pcscf));
-            println!("VOLTE_PCSCF_PORT={}", v.pcscf_port);
             println!("VOLTE_PCSCF_SOURCE_PATH={}", q(&v.pcscf_source_path));
-            println!("VOLTE_USE_TCP={}", if v.use_tcp { 1 } else { 0 });
-            println!("VOLTE_SEC_AGREE={}", if v.sec_agree { 1 } else { 0 });
             println!("VOLTE_STATUS_PATH={}", q(&v.status_path));
             println!("VOLTE_LOCK_PATH={}", q(&v.lock_path));
             println!(
@@ -1632,27 +1772,19 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn print_vowifi_shell_env(config: &gsm_sip_bridge::config::AppConfig) {
+    // Global-only: per-line values (mcc/mnc/modem_port/netns/veth
+    // names+addrs/strongswan iface+if_id/vpcd_port) come from
+    // `discover --shell-env` instead — see `print_discover_shell_env`.
     let v = &config.vowifi;
     let lines: Vec<(&str, String)> = vec![
-        ("MCC", v.mcc.clone()),
-        ("MNC", v.mnc.clone()),
         ("APN", v.apn.clone()),
-        ("MODEM_PORT", v.modem_port.clone()),
-        ("NETNS", v.netns.clone()),
         ("EPDG_FQDN", v.epdg_fqdn.clone()),
         ("EPDG_IP", v.epdg_ip.clone().unwrap_or_default()),
         ("SRC_ADDR", v.src_addr.clone().unwrap_or_default()),
         ("KEEPALIVE_INTERVAL", v.keepalive_interval_sec.to_string()),
-        ("VETH_SIP", v.veth_sip_iface.clone()),
-        ("VETH_IMS", v.veth_ims_iface.clone()),
-        ("VETH_IMS_ADDR", format!("{}/30", v.veth_local_addr)),
-        ("VETH_SIP_ADDR", format!("{}/30", v.veth_peer_addr)),
         ("TUNNEL_ENGINE", v.tunnel_engine.clone()),
-        ("STRONGSWAN_TUN_IFACE", v.strongswan_tun_iface.clone()),
-        ("STRONGSWAN_IF_ID", v.strongswan_if_id.to_string()),
         ("VPCD_HOST", v.vpcd_host.clone()),
         ("VPCD_PORT", v.vpcd_port.to_string()),
-        ("IMSI", v.imsi_override.clone().unwrap_or_default()),
         ("METRICS_PORT", config.metrics.port.to_string()),
     ];
     for (key, value) in lines {
@@ -1828,6 +1960,13 @@ fn print_discover_shell_env(resolution: &gsm_sip_bridge::vowifi::discovery::Line
     println!(
         "LINE_MNC={}",
         arr(resolution.lines.iter().map(|l| l.mnc.clone()))
+    );
+    println!(
+        "LINE_IMSI={}",
+        arr(resolution
+            .lines
+            .iter()
+            .map(|l| l.config.imsi_override.clone().unwrap_or_default()))
     );
     println!(
         "CS_EXCLUDED_PORTS={}",

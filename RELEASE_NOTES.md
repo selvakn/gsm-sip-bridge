@@ -1,5 +1,21 @@
 # Release Notes
 
+## Unreleased
+
+- **Breaking: config restructuring** — `[audio]` split into `[audio]` (profile/vad/
+  latency, shared by every call path) and `[modem_audio]` (rx_gain/eec_mode/
+  tx_level/rt_audio_prio, circuit-switched USB audio only — VoWiFi/VoLTE never
+  touched these). `[vowifi]`/`[volte]` top-level sections now hold only fields
+  genuinely global across every line; per-line settings (mcc/mnc/modem matcher/
+  imsi_override for VoWiFi, modem matcher/cid/apn/pcscf/iface/msisdn for VoLTE)
+  live only in `[[vowifi.line]]`/`[[volte.line]]` now, each with a sane default
+  when omitted. Pure per-line infrastructure that was always mechanically derived
+  (veth names/addresses, the ePDG netns name, the strongswan XFRM interface name/
+  id) is no longer configurable at all. `[volte].use_tcp`/`.sec_agree` are removed
+  outright — they were parsed but never actually consumed by `volte::bridge`
+  (already hard-coded to `true`). Review `config.toml.example` and
+  `docs/migrating-config-reorg.md` when upgrading.
+
 ## v6.3.0
 
 Multi-card VoWiFi, and Grafana call/SMS metrics restored on that path.

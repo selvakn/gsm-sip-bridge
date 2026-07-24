@@ -68,10 +68,10 @@ impl SipBridge {
             jb_min_pre: config.audio.settings.jb_min_pre,
             jb_max_ms: config.audio.settings.jb_max_ms,
             vad_enabled: config.audio.vad,
-            tx_level: config.audio.tx_level,
+            tx_level: config.modem_audio.tx_level,
             snd_rec_latency_ms: config.audio.snd_rec_latency_ms,
             snd_play_latency_ms: config.audio.snd_play_latency_ms,
-            rt_audio_prio: config.audio.rt_audio_prio,
+            rt_audio_prio: config.modem_audio.rt_audio_prio,
         };
 
         Self {
@@ -200,7 +200,7 @@ impl SipBridge {
 
         // Promote PJMEDIA's sound-device thread to real-time so the ALSA capture buffer is
         // serviced ahead of best-effort work (prevents XRUNs / choppy GSM audio). Opt-in
-        // via [audio] rt_audio_prio; best-effort, never fails the call path.
+        // via [modem_audio] rt_audio_prio; best-effort, never fails the call path.
         if self.config.rt_audio_prio > 0 {
             // Prefix-match the PJMEDIA audio threads: the ALSA capture/playback I/O threads
             // (`alsasound_captu`/`alsasound_playb`, 15-char-truncated comm) plus the

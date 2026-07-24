@@ -174,14 +174,6 @@ fn override_for<'a>(
     })
 }
 
-fn non_empty(s: &str) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
-    }
-}
-
 /// Adds `delta` to an IPv4 address, for deriving each line's `/30` veth
 /// block from the `[volte]` base — identical mechanism to
 /// `vowifi::discovery`'s own (private) `shift_ipv4`, not shared across
@@ -199,29 +191,25 @@ fn resolve_one_volte_line(
     base: &VolteConfig,
 ) -> ResolvedVolteLine {
     let over = override_for(modem, &base.line_overrides);
-    let cid = over.and_then(|o| o.cid).unwrap_or(base.cid);
+    let cid = over
+        .and_then(|o| o.cid)
+        .unwrap_or(crate::volte::DEFAULT_IMS_CID);
     let apn = over
         .and_then(|o| o.apn.clone())
-        .unwrap_or_else(|| base.apn.clone());
-    let pcscf = over
-        .and_then(|o| o.pcscf.clone())
-        .or_else(|| non_empty(&base.pcscf));
-    // Interface precedence: an explicit per-line override wins, then the
-    // interface auto-detected from this modem's own USB device (the multi-
-    // modem case, where each modem has its own netdev), then the `[volte]`
-    // base interface as a last resort (the single-line case).
+        .unwrap_or_else(|| crate::volte::DEFAULT_IMS_APN.to_string());
+    let pcscf = over.and_then(|o| o.pcscf.clone());
+    // Interface precedence: an explicit per-line override wins, else the
+    // interface auto-detected from this modem's own USB device.
     let iface = over
         .and_then(|o| o.iface.clone())
         .or_else(|| modem.net_device.clone())
-        .or_else(|| non_empty(&base.iface))
         .unwrap_or_default();
     let msisdn = over.and_then(|o| o.msisdn.clone());
 
     // Namespace/veth derivation (specs/020-volte-line-netns research.md R4):
-    // index 0 keeps the unindexed base — still isolated, just not suffixed —
-    // exactly the shape `vowifi::discovery::resolve_one_line` derives `netns`
-    // in (`discovery.rs:227`). Isolation is unconditional (FR-004b): there is
-    // no "no netns" branch for the single-line case.
+    // index 0 keeps the unindexed base — still isolated, just not suffixed.
+    // Isolation is unconditional (FR-004b): there is no "no netns" branch
+    // for the single-line case.
     let netns = if index == 0 {
         base.netns.clone()
     } else {
@@ -427,7 +415,7 @@ mod tests {
         assert_eq!(l.sip_leg_port, LOOPBACK_SIP_PORT);
         assert_eq!(l.control_port, LOOPBACK_CONTROL_PORT);
         assert_eq!(l.status_port, LOOPBACK_STATUS_PORT);
-        assert_eq!(l.cid, base().cid);
+        assert_eq!(l.cid, crate::volte::DEFAULT_IMS_CID);
         assert_eq!(l.modem_port, PathBuf::from("/dev/ttyUSB0"));
     }
 
