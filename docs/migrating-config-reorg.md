@@ -120,11 +120,13 @@ apn = "ims"
 
 **`docker/entrypoint.sh`'s registration-only path** (`[volte].enabled = true`,
 `bridge_inbound = false` — the legacy "just hold the registration open"
-mode) never supported multi-line and doesn't read `[[volte.line]]` at all; it
-now always uses the CLI's built-in defaults (`/dev/ttyUSB0`, cid 3, apn
-`"ims"`). If you need a non-default modem/cid/apn for that specific mode,
-invoke `gsm-sip-bridge volte-register` directly with explicit flags instead
-of relying on `config.toml`.
+mode) is still single-line only: it honors at most the *first*
+`[[volte.line]]` entry, not an arbitrary number of them. `volte-register`
+(and `volte-pdn`, for teardown) resolve that one line — modem, cid, apn,
+pcscf, iface, msisdn — from config the same way `volte-bridge`'s
+auto-discovery does, as long as `--modem` is not passed explicitly. Passing
+`--modem` on either command opts back out of config entirely, for manual
+diagnostic use.
 
 ## Roll-back
 
