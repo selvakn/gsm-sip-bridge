@@ -15,9 +15,10 @@ Docker Compose quick start, then come back here for depth.
 
 | Doc | What it covers |
 |---|---|
-| [operations.md](operations.md) | Day-2 runbook: `card` CLI, database queries/prune/backup, troubleshooting |
+| [operations.md](operations.md) | Day-2 runbook: `card` CLI, database queries/prune/backup, troubleshooting, and the [VoLTE bridge reference](operations.md#host-side-ims-over-lte-volte) |
 | [observability.md](observability.md) | Prometheus metrics reference, Grafana dashboard, database schema |
-| [ec20-volte-setup.md](ec20-volte-setup.md) | Enabling VoLTE on the EC20 (MBN profile deactivation, AT commands) |
+| [ec20-volte-setup.md](ec20-volte-setup.md) | Enabling the EC20's *own* modem-internal VoLTE (MBN profile deactivation, AT commands) — distinct from the host-side VoLTE bridge below |
+| [migrating-config-reorg.md](migrating-config-reorg.md) | Upgrading to the restructured `config.toml` (`[audio]`/`[modem_audio]` split, per-line `[[vowifi.line]]`/`[[volte.line]]`) |
 | [development.md](development.md) | Building from source, Makefile targets, pre-commit checks |
 | [migrating-from-v4.1.x.md](migrating-from-v4.1.x.md) | Upgrading from the C++ v4.1.x to the Rust v5.x |
 
@@ -25,7 +26,7 @@ Docker Compose quick start, then come back here for depth.
 
 | Doc | What it covers |
 |---|---|
-| [architecture.md](architecture.md) | Crate layout, CS and VoWiFi call flows, audio pipeline, multi-card design |
+| [architecture.md](architecture.md) | Crate layout, all three call flows (CS, VoWiFi, VoLTE), audio pipeline, multi-card/multi-line design |
 | [vowifi-bridge.md](vowifi-bridge.md) | The VoWiFi-to-SIP bridge in depth: two-agent design, codecs, control protocol |
 
 ## Design notes & engineering history
@@ -39,5 +40,8 @@ Kept for the reasoning and findings, not as how-to guides.
 | [audio-tuning-log.md](audio-tuning-log.md) | Running log of modem/SIP audio parameter changes and their outcomes |
 
 Per-feature specs, plans, and task breakdowns live under
-[`specs/`](../specs/) — most recently `011-vowifi-sip-bridge` and
-`012-strongswan-epdg` for the VoWiFi work.
+[`specs/`](../specs/) — most recently `015-volte-host-ims` through
+`020-volte-line-netns` for the host-side VoLTE bridge (registration, calls,
+inbound bridging, multi-modem, per-line network isolation), and
+`011-vowifi-sip-bridge` through `014-vowifi-metrics-restore` for the VoWiFi
+work.

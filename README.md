@@ -2,18 +2,21 @@
 
 Bridge incoming cellular calls to a SIP extension over VoIP. When someone
 dials the GSM number, the system auto-answers and routes audio
-bidirectionally to a SIP/PBX destination — whether the carrier delivers
-the call over the circuit-switched network (via Quectel EC20 modules) or
-over VoWiFi/IMS (via a built-in ePDG tunnel). Supports multiple EC20
-modules simultaneously. Incoming SMS messages are persisted to a local
-database and optionally forwarded to Discord.
+bidirectionally to a SIP/PBX destination — however the carrier delivers
+the call: over the circuit-switched network (via Quectel EC20 modules),
+over VoWiFi/IMS (via a built-in ePDG tunnel), or over VoLTE (via the
+bridge's own IMS registration on the LTE data path). VoWiFi and VoLTE
+both scale to multiple SIMs concurrently, each its own isolated line.
+Incoming SMS messages are persisted to a local database and optionally
+forwarded to Discord.
 
 **Language**: Rust | **Platform**: Linux (amd64, arm64) | **Releases**: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## Highlights
 
 - **GSM-to-SIP call bridging** — auto-answers incoming GSM calls on EC20 modules and bridges audio to a SIP extension, with comfort ringback while the extension rings.
-- **VoWiFi-to-SIP bridging** — answers calls the carrier delivers over Wi-Fi Calling: an IKEv2/IPsec ePDG tunnel (strongSwan), IMS-AKA registration with Gm IPsec, and wideband (AMR-WB → G.722) audio end-to-end. Optional; disabled by default.
+- **VoWiFi-to-SIP bridging** — answers calls the carrier delivers over Wi-Fi Calling: an IKEv2/IPsec ePDG tunnel (strongSwan), IMS-AKA registration with Gm IPsec, and wideband (AMR-WB → G.722) audio end-to-end. Auto-discovers every VoWiFi-capable SIM and runs one tunnel/registration per line concurrently. Optional; disabled by default.
+- **Host-side VoLTE-to-SIP bridging** — the bridge performs its own IMS registration and call signalling over the cellular LTE data path, instead of delegating to the modem's internal voice stack and re-bridging its already-decoded audio — bringing codec, jitter handling, and media fully under the bridge's control. Auto-discovers every VoLTE-capable modem, runs each as its own network-namespace-isolated line, and bridges answered calls to the same SIP destination as the other two paths. Optional; disabled by default.
 - **Multi-module support** — auto-detects all connected EC20s, assigns stable IMEI-keyed slots that survive restarts and re-plugs, and handles concurrent calls independently.
 - **Self-healing** — detects USB disconnects and network registration loss, recovers each card independently with exponential backoff, and runs a preventive scheduled nightly modem restart cycle.
 - **DID passthrough** — forwards the GSM caller's number as the SIP DID (`P-Asserted-Identity`, `X-GSM-Caller-ID`), so PBX inbound routes decide the destination.
@@ -39,15 +42,17 @@ flowchart LR
     Carrier <-->|"GSM voice (CS)"| EC20
     EC20 <-->|"USB<br/>(Serial + Audio)"| Server
     Carrier <-->|"VoWiFi<br/>(IKEv2/IPsec ePDG tunnel)"| Server
+    Carrier <-->|"VoLTE<br/>(IMS over the LTE data PDN)"| Server
     Server <-->|"SIP + RTP"| PBX
     PBX <-->|"SIP + RTP"| IPPhone
 ```
 
 The carrier decides how a given call is delivered: over the
-circuit-switched network to an EC20 module, or over VoWiFi through the
-ePDG tunnel. Either way it ends up as a SIP call to your PBX. See
-[docs/architecture.md](docs/architecture.md) for the crate layout, both
-call flows in detail, and the audio pipeline.
+circuit-switched network to an EC20 module, over VoWiFi through the
+ePDG tunnel, or over VoLTE through the bridge's own IMS registration on
+the LTE data path. Either way it ends up as a SIP call to your PBX. See
+[docs/architecture.md](docs/architecture.md) for the crate layout, all
+three call flows in detail, and the audio pipeline.
 
 ## Quick Start (Docker Compose)
 
@@ -102,11 +107,14 @@ discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
 
 [vowifi]
 enabled = false                  # opt-in Wi-Fi Calling bridge — see docs
+
+[volte]
+enabled = false                  # opt-in host-side VoLTE bridge — see docs
 ```
 
 Every section and key — including audio tuning (`[audio]`), card recovery
 (`[resilience]`), the scheduled restart cycle (`[scheduled_restart]`), and
-the full `[vowifi]` reference — is documented in
+the full `[vowifi]`/`[volte]` reference — is documented in
 [docs/configuration.md](docs/configuration.md).
 
 ## Documentation
@@ -115,7 +123,7 @@ the full `[vowifi]` reference — is documented in
 |---|---|
 | **Getting started** | [Hardware setup](docs/hardware-setup.md) · [Configuration reference](docs/configuration.md) |
 | **Running it** | [Operations runbook & troubleshooting](docs/operations.md) · [Metrics & dashboards](docs/observability.md) |
-| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [Host-side IMS over LTE](specs/015-volte-host-ims/quickstart.md) · [EC20 VoLTE setup (modem-internal)](docs/ec20-volte-setup.md) |
+| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [Host-side VoLTE bridge (operations)](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy path)](docs/ec20-volte-setup.md) |
 | **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |
 
 The full index, including design notes and engineering history, is at

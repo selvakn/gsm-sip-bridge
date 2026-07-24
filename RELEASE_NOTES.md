@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v7.0.0
+
+The VoLTE release. Alongside the circuit-switched GSM bridge and the VoWiFi bridge, the system now performs **its own IMS registration and call bridging over the LTE data path** — a third inbound call path, on par with VoWiFi rather than a hand-off to the modem's own (often poor-quality) internal VoLTE audio.
+
+- **Host-side VoLTE-to-SIP bridge** (`specs/015-volte-host-ims` through `017-volte-inbound-bridge`) — the bridge registers to the operator's IMS core over the modem's LTE *data* PDN using the same registration/IMS-AKA/Gm IPsec machinery the VoWiFi path already proved out (both now implement a shared `ImsTransport`), then answers and bridges inbound calls to the same SIP/PBX destination. Opt in with `[volte].enabled` + `[volte].bridge_inbound`; the modem's own internal VoLTE (`docs/ec20-volte-setup.md`) is unaffected when this is off, and `volte-discover`/`volte-register`/`volte-call`/`volte-status` remain available as standalone diagnostics without enabling call bridging at all.
+- **Multi-modem VoLTE with per-line network isolation** (`specs/018-volte-multi-modem`, `specs/020-volte-line-netns`) — auto-discovers every SIM-ready LTE modem (bounded by `[volte].max_lines`, default 8) and runs each as its own line with its own persistent registration, sharing one PBX trunk registration — the same multi-line model VoWiFi uses. Each line's carrier-facing half now runs as its own process inside its own network namespace and veth pair (`volte-carrier-agent --line N`, supervised by `docker/entrypoint.sh`), so one line's SIP/RTP can never egress on another line's LTE interface.
+- **SMS over VoLTE**, plus a store-schema fix to actually persist it — incoming SMS on a VoLTE line is read from modem storage and recorded like the other paths. Schema bumped to v4: v3's `CHECK (transport IN ('cs','vowifi'))` silently rejected every VoLTE call/SMS row; existing databases migrate automatically.
+- **New `transport="volte"`** everywhere `cs`/`vowifi` already appear (`gsm_sip_bridge_active_calls`, the `calls`/`sms` tables), plus VoLTE-specific gauges: `gsm_bridge_volte_registered`, `gsm_bridge_volte_pdn_up`, `gsm_bridge_volte_registrations_total{outcome}`.
+- **Fixed: double PBX trunk registration.** The circuit-switched daemon, VoWiFi's outbound leg, and VoLTE's inbound bridge could all try to register the same `[sip]` account when more than one path was enabled, and the loser churned the PBX with a REGISTER 408 loop forever (observed live). Registration is now confirmed against live PJSUA state instead of assumed on send, and exactly one path owns the trunk registration at a time.
+- **Fixed: multi-card VoWiFi** — five bugs latent since `specs/013-multi-card-vowifi`, found running two concurrent lines for real for the first time: a hardcoded charon pidfile guard that blocked every line but the first from starting, a hardcoded XFRM `if_id` that bound every line's CHILD_SA to line 0's interface, an updown hook that silently fell back to line 0's namespace/interface name when its per-line environment didn't propagate, incomplete circuit-switched exclusion of a role-assigned-but-unresolved modem, and an IMEI reader that could return an `AT+CGSN` command echo instead of the modem's real IMEI. Verified against two real SIMs on two carriers, concurrent registration and calls.
 - **Breaking: config restructuring** — `[audio]` split into `[audio]` (profile/vad/
   latency, shared by every call path) and `[modem_audio]` (rx_gain/eec_mode/
   tx_level/rt_audio_prio, circuit-switched USB audio only — VoWiFi/VoLTE never
@@ -15,6 +25,11 @@
   outright — they were parsed but never actually consumed by `volte::bridge`
   (already hard-coded to `true`). Review `config.toml.example` and
   `docs/migrating-config-reorg.md` when upgrading.
+- **Documentation** — README, `docs/architecture.md`, and the docs index now cover all three call flows (CS, VoWiFi, VoLTE) end-to-end, including the VoLTE call-flow diagram and the distinction from the modem-internal VoLTE setting.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:7.0.0
+```
 
 ## v6.3.0
 

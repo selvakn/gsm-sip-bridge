@@ -1,22 +1,34 @@
 # Architecture
 
-How the bridge is put together: the crate layout, the two inbound call
-paths (circuit-switched GSM and VoWiFi), and the audio pipeline.
+How the bridge is put together: the crate layout, the three inbound call
+paths (circuit-switched GSM, VoWiFi, and host-side VoLTE), and the audio
+pipeline.
 
-## The two inbound call paths
+## The three inbound call paths
 
 When someone dials the GSM number, the **carrier** decides how to deliver
-the call. The bridge accepts it either way:
+the call. The bridge accepts it any of three ways:
 
 1. **Circuit-switched (CS) path** — the call arrives on a Quectel EC20
-   module's cellular voice channel (2G/3G, or 4G with VoLTE enabled — see
-   [ec20-volte-setup.md](ec20-volte-setup.md)). The daemon auto-answers via
+   module's cellular voice channel (2G/3G, or 4G with the *modem's own*
+   VoLTE stack enabled — see [ec20-volte-setup.md](ec20-volte-setup.md), a
+   per-card modem setting, not the path below). The daemon auto-answers via
    AT commands and bridges the modem's USB audio to a SIP call.
 2. **VoWiFi path** — the call arrives over the carrier's IMS core through
    an IKEv2/IPsec ePDG tunnel (the same mechanism a phone uses for Wi-Fi
    Calling). Two agent processes answer it and bridge it to the same SIP
    destination. Disabled by default; see [vowifi-bridge.md](vowifi-bridge.md)
    for the full design.
+3. **Host-side VoLTE path** — the call arrives over the carrier's IMS core
+   through the modem's LTE *data* PDN. Instead of delegating to the modem's
+   internal voice stack (path 1's 4G option) and re-bridging its already
+   decoded audio, the bridge runs its own IMS registration and call
+   signalling — the same registration/IMS-AKA/Gm IPsec machinery the VoWiFi
+   path uses, reused over a different network attachment — so codec, jitter
+   handling and media stay under the bridge's control. Disabled by default;
+   see the [VoLTE call flow](#volte-call-flow) below and
+   [operations.md](operations.md#host-side-ims-over-lte-volte) for the
+   operational reference.
 
 ```mermaid
 flowchart LR
@@ -31,6 +43,7 @@ flowchart LR
     Carrier <-->|"GSM voice (CS)"| EC20
     EC20 <-->|"USB<br/>(Serial + Audio)"| Server
     Carrier <-->|"VoWiFi<br/>(IKEv2/IPsec ePDG tunnel)"| Server
+    Carrier <-->|"VoLTE<br/>(IMS over the LTE data PDN)"| Server
     Server <-->|"SIP + RTP"| PBX
     PBX <-->|"SIP + RTP"| IPPhone
 ```
@@ -58,9 +71,14 @@ Three-crate Cargo workspace:
 └──────────────────────────────────────────────┘
 ```
 
-The VoWiFi path adds two more top-level modules to the binary crate:
-`ims/` (Agent A — IMS registration, Gm IPsec, RTP relay) and `vowifi/`
-(Agent B — the PBX-facing PJSIP leg and the agent control channel).
+The VoWiFi and VoLTE paths add three more top-level modules to the binary
+crate: `ims/` (IMS registration, IMS-AKA, Gm IPsec, RTP relay — shared
+machinery behind an `ImsTransport` trait, so the registration/signalling
+code is written once and driven over either network attachment), `vowifi/`
+(the ePDG-tunnel transport, plus Agent B — the PBX-facing PJSIP leg and
+agent control channel), and `volte/` (the LTE-data-PDN transport, plus the
+per-line carrier agent and PBX-facing bridge — see
+[VoLTE call flow](#volte-call-flow) below).
 
 ## Circuit-switched call flow
 
@@ -157,6 +175,72 @@ call stays wideband end-to-end: AMR-WB from the carrier, uncompressed
 L16/16000 across the veth link, G.722 to the PBX. Narrowband carriers
 (PCMU/AMR-NB) are bridged at 8 kHz exactly as before.
 
+## VoLTE call flow
+
+Structurally this mirrors the [VoWiFi call flow](#vowifi-call-flow) above —
+the same registration/IMS-AKA/Gm IPsec machinery behind `ImsTransport`, and
+the same "carrier-facing half in its own namespace, PBX-facing half shared"
+split — generalized to *N* lines instead of two fixed agents. See
+[operations.md](operations.md#host-side-ims-over-lte-volte) for config, CLI
+verbs, and the standalone diagnostic subcommands (`volte-discover`,
+`volte-register`, `volte-call`, `volte-status`) that predate call bridging.
+
+**Per-line carrier agent** (`volte-carrier-agent --line N`,
+`specs/020-volte-line-netns`) runs inside that line's own network namespace
+(`volteN`), one process per LTE modem: attaches that modem's IMS PDN, holds
+the IMS-AKA registration, and answers calls on it. **Shared PBX bridge**
+(`volte-bridge`) runs once in the default namespace, holds the single SIP
+registration to the PBX, and relays each line's call over a veth pair to its
+carrier agent — reusing the exact `run_telephony_side`/`RuntimeLine` code
+path VoWiFi's Agent B uses, so a VoLTE line's traffic cannot egress via
+another line's LTE interface (closing the isolation gap the earlier
+single-namespace multi-modem design, `specs/018-volte-multi-modem`, left
+open).
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant IMS as Carrier IMS<br/>(P-CSCF, over the LTE data PDN)
+    participant CA as volte-carrier-agent --line N<br/>(volteN netns)
+    participant VB as volte-bridge<br/>(default netns)
+    participant PBX as SIP PBX
+    participant Ext as SIP Extension
+
+    Note over CA: Holds a persistent IMS-AKA registration<br/>over this line's LTE IMS PDN
+
+    Caller->>IMS: Dials the number (carrier delivers via VoLTE)
+    IMS->>CA: SIP INVITE (over the LTE data PDN)
+    CA->>VB: IncomingCall (control channel over veth)
+    VB->>PBX: INVITE (caller DID or fixed ext)
+    VB->>CA: INVITE to the carrier agent's veth-facing UAS (media leg)
+    PBX->>Ext: Routes call via inbound rule
+    Ext-->>PBX: 200 OK
+    PBX-->>VB: 200 OK
+    VB-->>CA: Media active (paired via PJSIP conference bridge)
+    CA-->>IMS: 200 OK
+
+    rect rgb(230, 245, 230)
+        Note over Caller, Ext: Bidirectional audio — the carrier agent relays RTP<br/>carrier↔veth, volte-bridge bridges veth↔PBX
+    end
+```
+
+Up to `[volte].max_lines` (default 8) LTE modems run concurrently this way,
+each with its own registration and namespace but one shared PBX registration
+— matching VoWiFi's multi-line model (`specs/013-multi-card-vowifi`).
+Incoming SMS on a VoLTE line is read from modem storage and recorded the same
+way as the CS and VoWiFi paths (`transport="volte"` in the `calls`/`sms`
+tables and on the `gsm_sip_bridge_active_calls` metric). A card bridged this
+way is exclusive to VoLTE — the circuit-switched daemon will not also drive
+it — and each line handles one call at a time, refusing a second as busy.
+
+This differs from [ec20-volte-setup.md](ec20-volte-setup.md)'s modem-internal
+VoLTE only in *whose* IMS stack does the work: that page's setting makes the
+CS path (path 1 above) carry voice over 4G through the modem's own IMS
+client. This path bypasses the modem's IMS client entirely and is a fully
+independent inbound path, on par with VoWiFi — and, like VoWiFi, the two
+cannot both register the same SIM at once; see
+[operations.md](operations.md#never-enable-vowifi-and-volte-on-the-same-sim).
+
 ## Audio pipeline (CS path)
 
 ```mermaid
@@ -239,6 +323,7 @@ gsm-sip-bridge -s /dev/ttyUSB3 -a hw:2,0 --config config.toml
 ## Further reading
 
 - [vowifi-bridge.md](vowifi-bridge.md) — the VoWiFi bridge in depth (two-agent design, codecs, control protocol)
+- [operations.md](operations.md#host-side-ims-over-lte-volte) — the VoLTE bridge in depth (config, CLI verbs, metrics, troubleshooting)
 - [vowifi-epdg-research-notes.md](vowifi-epdg-research-notes.md) — historical engineering notes: ePDG tunnel, IMS-AKA, Gm IPsec debugging, per-carrier behavior
 - [gm-ipsec-xfrm-plan.md](gm-ipsec-xfrm-plan.md) — design rationale for the kernel-XFRM Gm IPsec implementation
-- `specs/` — per-feature specs, plans, and task breakdowns
+- `specs/` — per-feature specs, plans, and task breakdowns; VoLTE spans `015-volte-host-ims` through `020-volte-line-netns`
