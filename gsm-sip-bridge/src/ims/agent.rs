@@ -221,6 +221,9 @@ fn run_inner(
         reg_cfg: &reg_cfg,
         local_ip: veth_local_ip,
         control_addr,
+        // Each Wi-Fi Agent A is alone in its own netns, so they all share the
+        // one well-known status port.
+        status_port: crate::vowifi::AGENT_A_STATUS_PORT,
         wideband: config.wideband,
         // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
         // has no attachment of its own to refresh.
@@ -254,6 +257,12 @@ pub(crate) struct InboundParams<'a> {
     pub local_ip: IpAddr,
     /// Where the telephone-side half is listening for call signalling.
     pub control_addr: SocketAddr,
+    /// Port on `local_ip` the registration-status listener binds. On Wi-Fi
+    /// each Agent A sits in its own netns so they all share
+    /// `vowifi::AGENT_A_STATUS_PORT`; the cellular path runs several carrier
+    /// halves in one namespace over loopback, so each gets its own
+    /// per-line-derived port (specs/018-volte-multi-modem).
+    pub status_port: u16,
     pub wideband: bool,
     pub answer_preference: sdp::AnswerPreference,
     /// Port the telephone-side half dials for its leg. The two halves must
@@ -293,6 +302,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         reg_cfg,
         local_ip,
         control_addr,
+        status_port,
         wideband,
         answer_preference,
         veth_sip_port,
@@ -392,7 +402,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     {
         let status_for_listener = status.clone();
         std::thread::spawn(move || {
-            if let Err(e) = run_status_listener(local_ip, status_for_listener) {
+            if let Err(e) = run_status_listener(local_ip, status_port, status_for_listener) {
                 tracing::warn!(error = %e, "registration-status listener failed");
             }
         });
@@ -418,16 +428,17 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     result
 }
 
-/// Answers `vowifi-status` queries (`ControlMessage::StatusQuery` →
-/// `RegistrationStatusReply`) on `crate::vowifi::AGENT_A_STATUS_PORT` for
-/// as long as the agent runs. A separate, always-listening connection from
-/// the main dispatch loop's own SIP transport, so a status query never
-/// competes with call signaling.
+/// Answers `vowifi-status`/`volte-status` queries (`ControlMessage::StatusQuery`
+/// → `RegistrationStatusReply`) on `status_port` for as long as the agent
+/// runs. A separate, always-listening connection from the main dispatch
+/// loop's own SIP transport, so a status query never competes with call
+/// signaling.
 fn run_status_listener(
     veth_local_ip: IpAddr,
+    status_port: u16,
     status: Arc<Mutex<super::RegistrationStatus>>,
 ) -> BridgeResult<()> {
-    let listener = std::net::TcpListener::bind((veth_local_ip, crate::vowifi::AGENT_A_STATUS_PORT))
+    let listener = std::net::TcpListener::bind((veth_local_ip, status_port))
         .map_err(|e| BridgeError::Ims(format!("status listener bind failed: {e}")))?;
     for stream in listener.incoming() {
         let mut stream = match stream {

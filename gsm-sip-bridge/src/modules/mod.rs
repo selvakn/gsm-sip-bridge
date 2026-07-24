@@ -292,9 +292,10 @@ impl CardPool {
             // A card assigned to the host-side cellular service belongs to it
             // alone (FR-034) — probing a port another subsystem is
             // mid-transaction on is the documented "claimed by both" hazard.
-            None => match discovery::scan_modules_excluding(&discovery::volte_claimed_ports(
-                &self.config.volte,
-            )) {
+            None => match discovery::scan_modules_excluding_cards(
+                &discovery::volte_claimed_ports(&self.config.volte),
+                &discovery::volte_claimed_card_ids(&self.config.volte),
+            ) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "module discovery failed");
@@ -678,7 +679,9 @@ impl CardPool {
             .collect();
 
         let volte_ports = discovery::volte_claimed_ports(&self.config.volte);
-        let new_modules = match discovery::scan_modules_excluding(&volte_ports) {
+        let volte_cards = discovery::volte_claimed_card_ids(&self.config.volte);
+        let new_modules = match discovery::scan_modules_excluding_cards(&volte_ports, &volte_cards)
+        {
             Ok(m) => m
                 .into_iter()
                 .filter(|m| !known_serials.contains(&m.serial_port))
