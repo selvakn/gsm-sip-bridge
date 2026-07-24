@@ -653,55 +653,35 @@ mod tests {
         assert_eq!(parsed, manifest);
     }
 
-    /// Regression test for a bug found live (specs/020-volte-line-netns): the
-    /// manifest silently dropped `apn`, so `volte-carrier-agent --line N`
-    /// requested an *empty* APN and the network assigned its general-purpose
-    /// bearer (`www.mnc043.mcc404.gprs`) instead of the requested dedicated
-    /// IMS one (`ims.mnc043.mcc404.gprs`) — attach still "succeeded" and the
+    /// Regression test for two bugs found live (specs/020-volte-line-netns,
+    /// the second flagged in PR #8 review): the manifest silently dropped
+    /// `apn` and `msisdn`.
+    ///
+    /// Dropping `apn` made `volte-carrier-agent --line N` request an
+    /// *empty* APN, so the network assigned its general-purpose bearer
+    /// (`www.mnc043.mcc404.gprs`) instead of the requested dedicated IMS one
+    /// (`ims.mnc043.mcc404.gprs`) — attach still "succeeded" and the
     /// interface still got configured, but the P-CSCF was unreachable from
-    /// that bearer. `write_manifest` must carry a non-default `apn` through.
+    /// that bearer.
+    ///
+    /// Dropping `msisdn` made both split processes (`volte-carrier-agent`
+    /// and `volte-bridge`, which only ever see a line via this manifest)
+    /// reconstruct it with `msisdn: None`, so IMS registration fell back to
+    /// the IMSI-derived public identity instead of the explicitly
+    /// configured one.
+    ///
+    /// Deliberately a single test: this is the only test in this module
+    /// that mutates the process-global `MANIFEST_PATH_ENV`, and Rust runs
+    /// unit tests in parallel threads by default — a second such test raced
+    /// this one under CI's higher parallelism (Rust runs unit tests in
+    /// parallel threads within one process, and `std::env::set_var` is
+    /// unsynchronized process-global state), causing an intermittent
+    /// "No such file or directory" failure. `write_manifest` must carry a
+    /// non-default `apn`/`msisdn` through.
     #[test]
-    fn write_manifest_preserves_a_non_default_apn() {
+    fn write_manifest_preserves_non_default_apn_and_msisdn() {
         let dir = tempfile_dir_for_test();
-        let path = dir.join("volte-lines-apn-test.json");
-        std::env::set_var(MANIFEST_PATH_ENV, &path);
-
-        let line = ResolvedVolteLine {
-            index: 0,
-            card_id: "ec20-AAAAAA".to_string(),
-            modem_port: PathBuf::from("/dev/ttyUSB0"),
-            cid: 3,
-            apn: "ims".to_string(),
-            pcscf: None,
-            iface: "wwan0".to_string(),
-            msisdn: None,
-            sip_leg_port: LOOPBACK_SIP_PORT,
-            control_port: LOOPBACK_CONTROL_PORT,
-            status_port: LOOPBACK_STATUS_PORT,
-            netns: "volte".to_string(),
-            veth_carrier_iface: "veth-volte-ims".to_string(),
-            veth_telephony_iface: "veth-volte-sip".to_string(),
-            veth_carrier_addr: "10.98.0.1".to_string(),
-            veth_telephony_addr: "10.98.0.2".to_string(),
-        };
-        write_manifest(&[line], None).expect("write_manifest must succeed");
-        let manifest = read_manifest(&path).expect("must read back");
-
-        assert_eq!(manifest.lines[0].apn, "ims", "apn must not be dropped");
-        std::env::remove_var(MANIFEST_PATH_ENV);
-    }
-
-    /// Regression test (flagged in PR #8 review): the manifest also silently
-    /// dropped a configured `msisdn` override, so `volte-carrier-agent
-    /// --line N` and `volte-bridge` (Agent B) both reconstructed the line
-    /// with `msisdn: None` and IMS registration fell back to the
-    /// IMSI-derived public identity instead of the explicitly configured
-    /// one. Same class of bug as `apn` above — `write_manifest` must carry
-    /// a non-default `msisdn` through.
-    #[test]
-    fn write_manifest_preserves_a_configured_msisdn() {
-        let dir = tempfile_dir_for_test();
-        let path = dir.join("volte-lines-msisdn-test.json");
+        let path = dir.join("volte-lines-apn-msisdn-test.json");
         std::env::set_var(MANIFEST_PATH_ENV, &path);
 
         let line = ResolvedVolteLine {
@@ -725,6 +705,7 @@ mod tests {
         write_manifest(&[line], None).expect("write_manifest must succeed");
         let manifest = read_manifest(&path).expect("must read back");
 
+        assert_eq!(manifest.lines[0].apn, "ims", "apn must not be dropped");
         assert_eq!(
             manifest.lines[0].msisdn, "919000000001",
             "msisdn must not be dropped"
