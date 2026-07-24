@@ -344,11 +344,9 @@ start_line_tail() {
 # to the proven single-line arrangement, just replicated N times — and a
 # crashed charon/pcscd on one line cannot touch any other line's process.
 
-# Renders a per-line strongswan.conf: its own vici socket and filelog path,
-# plus the shared ePDG plugin behavior (charon-extra.conf's
-# load_modular/retry tuning, the p-cscf/eap-* plugins under charon/*.conf) —
-# so this line's charon instance is fully independent of every other
-# line's, never sharing a vici socket or log file with them. Launched via
+# Renders a per-line strongswan.conf: its own vici socket and filelog path —
+# so this line's charon instance is fully independent of every other line's,
+# never sharing a vici socket or log file with them. Launched via
 # `STRONGSWAN_CONF="$conf" charon`/`STRONGSWAN_CONF="$conf" swanctl ...`
 # (both charon and swanctl load their settings — including the vici socket
 # — through this same file/env var; verified against the actual pinned
@@ -356,6 +354,15 @@ start_line_tail() {
 # `swanctl.socket`/`swanctl.plugins.vici.socket` from `lib->settings`
 # *before* parsing any CLI flags, which is why the `swanctl { socket = ... }`
 # block below exists — swanctl does NOT read `charon.plugins.vici.socket`).
+#
+# Deliberately does NOT set `charon.pidfile` here to get per-line pidfiles:
+# tried that first, and it does not work — the raw `charon` binary's
+# "already running" startup guard checks the unqualified `/var/run/charon.pid`
+# regardless of this directive (verified live), and there is no `--pid-file`
+# CLI flag either. `start_line_strongswan`'s `rm -f /var/run/charon.pid`
+# immediately before each launch is what actually fixes the second-line-onward
+# refusal (specs/013-multi-card-vowifi, found live-testing a genuine 2-line
+# strongswan deployment for the first time).
 render_line_strongswan_conf() {
     local idx="$1" vici_socket="$2" charon_log="$3"
     local conf="/etc/strongswan-line-$idx.conf"
@@ -406,6 +413,31 @@ render_line_swanctl_conf() {
     mkdir -p "$conf_dir"
     echo "include $conf_dir/*.conf" >"$conf"
     echo "$conf"
+}
+
+# Renders this line's updown wrapper: sets NETNS/STRONGSWAN_TUN_IFACE (which
+# the shared /etc/strongswan.d/ims.updown reads to know which netns/interface
+# to install the carrier-assigned address on — see that script's own
+# comments) to this line's own values, then execs the shared script
+# unchanged, so the verb-handling logic itself still lives in exactly one
+# place.
+#
+# A wrapper, not an env-var export on the `charon` launch line itself: tried
+# that first, and it does not work — charon does not propagate its own
+# launch environment down into the updown program it execs on CHILD_SA
+# up/down (verified live), so every line fell through to the script's
+# defaults ("ims"/"tun23", i.e. line 0's values) regardless. A script that
+# sets the vars and execs the next program *is* that program's environment,
+# no propagation required.
+render_line_updown_script() {
+    local idx="$1" netns="$2" tun_iface="$3"
+    local script="/etc/strongswan.d/ims-updown-$idx.sh"
+    cat >"$script" <<EOF
+#!/bin/sh
+NETNS="$netns" STRONGSWAN_TUN_IFACE="$tun_iface" exec /etc/strongswan.d/ims.updown "\$@"
+EOF
+    chmod +x "$script"
+    echo "$script"
 }
 
 start_line_strongswan() {
@@ -485,7 +517,15 @@ start_line_strongswan() {
         log "line $idx: read IMSI from SIM"
     fi
 
-    local sed_args=(-e "s/@IMSI@/$imsi/" -e "s/@MCC@/$mcc/" -e "s/@MNC@/$mnc/" -e "s/@EPDG_IP@/$epdg_ip/")
+    local updown_script
+    updown_script="$(render_line_updown_script "$idx" "$netns" "$tun_iface")"
+
+    # `|` delimiter for @UPDOWN@ specifically: its replacement is a filesystem
+    # path containing `/`, which would break a plain `s/.../.../ ` substitution.
+    local sed_args=(
+        -e "s/@IMSI@/$imsi/" -e "s/@MCC@/$mcc/" -e "s/@MNC@/$mnc/" -e "s/@EPDG_IP@/$epdg_ip/"
+        -e "s/@IF_ID@/$if_id/" -e "s|@UPDOWN@|$updown_script|"
+    )
     if [ -n "${SRC_ADDR:-}" ]; then
         sed_args+=(-e "s/@SRC_ADDR@/$SRC_ADDR/")
     else
@@ -511,6 +551,25 @@ start_line_strongswan() {
 
     mkdir -p /run
     : >"$charon_log"
+    # charon's own "already running" startup guard checks the unqualified
+    # /var/run/charon.pid regardless of this line's `pidfile =` setting in
+    # strongswan-line-$idx.conf (verified live: the directive is accepted but
+    # not honored by the raw charon binary, no --pid-file CLI flag exists
+    # either) — so with two or more lines, every line after the first refuses
+    # to start at all, finding the prior line's leftover pidfile. Removing it
+    # right before each launch is safe: lines start sequentially (this loop),
+    # never concurrently, and nothing reads the pidfile's *content* afterward
+    # (swanctl/vici use the per-line socket, not this file).
+    rm -f /var/run/charon.pid
+    # ims.updown (invoked by charon on CHILD_SA up/down) reads NETNS/
+    # STRONGSWAN_TUN_IFACE from ITS OWN environment, defaulting to "ims"/
+    # "tun23" when unset — exactly line 0's (unindexed) values. Without these
+    # exports every line's charon falls through to that same default,
+    # installing its carrier-assigned address on *line 0's* interface instead
+    # of its own — found live-testing a genuine second line for the first
+    # time (specs/013-multi-card-vowifi): line 1's address landed on netns
+    # "ims"/tun23, leaving its own tun23-1 with no global address and every
+    # subsequent connection attempt "Host unreachable".
     STRONGSWAN_CONF="$strongswan_conf" /usr/libexec/ipsec/charon &
     local charon_pid=$!
     CHARON_PIDS+=("$charon_pid")
@@ -574,6 +633,7 @@ start_line_strongswan() {
             if ! kill -0 "$charon_pid" 2>/dev/null; then
                 log "line $idx: charon exited after the tunnel was established; restarting charon for this line only"
                 : >"$charon_log"
+                rm -f /var/run/charon.pid
                 STRONGSWAN_CONF="$strongswan_conf" /usr/libexec/ipsec/charon &
                 charon_pid=$!
                 CHARON_PIDS+=("$charon_pid")
@@ -608,6 +668,7 @@ start_line_strongswan() {
                 log "line $idx: swanctl --list-sas failed (vici connection broken); restarting charon for this line only"
                 kill "$charon_pid" 2>/dev/null
                 : >"$charon_log"
+                rm -f /var/run/charon.pid
                 STRONGSWAN_CONF="$strongswan_conf" /usr/libexec/ipsec/charon &
                 charon_pid=$!
                 CHARON_PIDS+=("$charon_pid")

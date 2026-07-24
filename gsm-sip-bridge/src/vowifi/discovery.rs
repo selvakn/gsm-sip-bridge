@@ -311,30 +311,34 @@ impl From<&ResolvedLine> for LineResolutionEntry {
 }
 
 impl LineResolution {
-    pub fn from_result(circuit_switched: &[ProbedModem], result: &LineTableResult) -> Self {
+    pub fn from_result(vowifi: &[ProbedModem], result: &LineTableResult) -> Self {
         Self {
             circuit_switched_excluded_ports: Vec::new(),
             lines: result.lines.iter().map(LineResolutionEntry::from).collect(),
             failed: result.failed.clone(),
         }
-        .with_cs_exclusions(circuit_switched, result)
+        .with_cs_exclusions(vowifi)
     }
 
     /// `circuit_switched_excluded_ports` isn't "the CS pool" — it's every
-    /// VoWiFi line's modem port, so `modules::discovery::scan_modules` can
-    /// exclude them (FR-007) without needing to know anything about roles
-    /// itself. `circuit_switched` is accepted only to keep the constructor
-    /// symmetric with `RoleAssignment`; it plays no part in the exclusion
-    /// set.
-    fn with_cs_exclusions(
-        mut self,
-        _circuit_switched: &[ProbedModem],
-        result: &LineTableResult,
-    ) -> Self {
-        self.circuit_switched_excluded_ports = result
-            .lines
+    /// modem the role assignment gave to VoWiFi (`assignment.vowifi`), so
+    /// `modules::discovery::scan_modules` can exclude them (FR-007) without
+    /// needing to know anything about roles itself.
+    ///
+    /// Deliberately built from the *role-assigned* candidates, not
+    /// `result.lines` (only the ones that successfully became lines): a
+    /// modem an operator explicitly overrode to VoWiFi (FR-009) still
+    /// belongs to VoWiFi even when its SIM is transiently unreadable *this*
+    /// `discover` run — excluding only successes let the circuit-switched
+    /// pool claim it instead, which then held its port open indefinitely,
+    /// turning one transient read failure into a permanent one (found
+    /// live-testing a genuine 2-line deployment where this raced for the
+    /// first time).
+    fn with_cs_exclusions(mut self, vowifi: &[ProbedModem]) -> Self {
+        self.circuit_switched_excluded_ports = vowifi
             .iter()
-            .map(|l| l.modem_port.to_string_lossy().to_string())
+            .filter_map(|m| m.at_port.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
             .collect();
         self
     }
@@ -702,7 +706,7 @@ mod tests {
         let assignment = RoleAssignment::from_probed(&modems, &[]);
         let base = VowifiConfig::default();
         let result = resolve_lines(&assignment, &base);
-        let resolution = LineResolution::from_result(&assignment.circuit_switched, &result);
+        let resolution = LineResolution::from_result(&assignment.vowifi, &result);
 
         assert_eq!(resolution.lines.len(), 1);
         assert_eq!(
@@ -716,6 +720,46 @@ mod tests {
         assert_eq!(
             parsed.circuit_switched_excluded_ports,
             resolution.circuit_switched_excluded_ports
+        );
+    }
+
+    #[test]
+    fn a_modem_overridden_to_vowifi_stays_excluded_even_when_its_sim_read_fails() {
+        // An operator's [[vowifi.line]] override declares intent regardless
+        // of audio capability (FR-009) — a modem that fails its SIM read
+        // *this* discover run still belongs to VoWiFi, not the
+        // circuit-switched pool. Excluding only successfully-resolved lines
+        // let the circuit-switched daemon claim it instead, holding its port
+        // open indefinitely and turning one transient read failure into a
+        // permanent one (found live-testing a genuine 2-line deployment).
+        let modems = vec![unusable_modem(
+            "ec20-CCCCCC",
+            Some(SimStatus::Unreadable("13".to_string())),
+        )];
+        let overrides = vec![VowifiLineOverride {
+            modem_serial: Some("ec20-CCCCCC".to_string()),
+            ..Default::default()
+        }];
+        let assignment = RoleAssignment::from_probed(&modems, &overrides);
+        assert!(assignment.circuit_switched.is_empty());
+        assert_eq!(
+            assignment.vowifi.len(),
+            1,
+            "override still assigns the role"
+        );
+
+        let base = VowifiConfig::default();
+        let result = resolve_lines(&assignment, &base);
+        assert!(
+            result.lines.is_empty(),
+            "the SIM read failure blocks the line"
+        );
+
+        let resolution = LineResolution::from_result(&assignment.vowifi, &result);
+        assert_eq!(
+            resolution.circuit_switched_excluded_ports,
+            vec!["/dev/ttyUSB9".to_string()],
+            "excluded from the circuit-switched pool despite never becoming a line"
         );
     }
 }
