@@ -186,6 +186,23 @@ vpcd_port = 15963
 # strongswan engine only: use this IMSI instead of reading it from the SIM
 # via AT+CIMI. Diagnostic escape hatch — leave unset normally.
 # imsi_override = "404940123456789"
+#
+# --- Per-line overrides for multi-card VoWiFi (specs/013-multi-card-vowifi) ---
+# Pin a specific modem to VoWiFi and/or fix that line's MCC/MNC/IMSI settings
+# instead of auto-discovering them. Match a modem by its USB hardware serial
+# (preferred — survives device-path changes) or by AT port. Every field except
+# the matcher is optional. Absent = fully auto-discovered lines (the default).
+#
+# [[vowifi.line]]
+# modem_serial = "abc123def456"   # or: modem_port = "/dev/ttyUSB6"
+# mcc = "404"                      # this line's home network MCC
+# mnc = "094"                      # this line's home network MNC (zero-padded to 3 digits)
+# imsi_override = "404940123456789" # override the IMSI from the SIM for this line
+#
+# [[vowifi.line]]
+# modem_serial = "xyz789abc123"
+# mcc = "404"
+# mnc = "094"
 
 # --- Host-side IMS over LTE (VoLTE) -------------------------------------
 # specs/015-volte-host-ims. The bridge runs its OWN IMS registration over an
