@@ -99,6 +99,10 @@ fn main() -> ExitCode {
         return handle_volte_bridge_command(args, &cli);
     }
 
+    if let Some(Commands::VolteCleanup) = &cli.command {
+        return handle_volte_cleanup_command();
+    }
+
     if let Some(Commands::Config(args)) = &cli.command {
         return handle_config_command(args, &cli);
     }
@@ -1072,47 +1076,208 @@ fn handle_volte_bridge_command(
         }
     };
 
-    let pcscf_addr = match args.pcscf {
-        Some(a) => a,
-        None => {
-            let cache = std::path::PathBuf::from(&args.pcscf_source_path);
-            match gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache).found() {
-                Some(a) => a,
-                None => {
-                    eprintln!(
-                        "volte-bridge: [discovering-pcscf] no P-CSCF address available; pass --pcscf"
-                    );
-                    return ExitCode::FAILURE;
-                }
-            }
+    // An explicit `--modem` bridges exactly that one modem (the diagnostic /
+    // single-line path). Omitting it auto-discovers every SIM-ready modem and
+    // bridges each as its own line (specs/018-volte-multi-modem).
+    let lines = match &args.modem {
+        Some(modem) => volte_bridge_single_line(args, modem),
+        None => volte_bridge_discovered_lines(args, &app_config.volte),
+    };
+
+    let lines = match lines {
+        Ok(lines) if !lines.is_empty() => lines,
+        Ok(_) => {
+            eprintln!(
+                "volte-bridge: no usable LTE lines (no SIM-ready modem discovered, or none \
+                 had a P-CSCF available); nothing to bridge"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(msg) => {
+            eprintln!("volte-bridge: {msg}");
+            return ExitCode::FAILURE;
         }
     };
 
-    let settings = gsm_sip_bridge::volte::VolteSettings {
-        modem_port: args.modem.clone(),
-        iface: args.iface.clone().unwrap_or_default(),
-        cid: args.cid,
-        apn: args.apn.clone(),
-        pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
-        // Recorded before the displacing rebind so an external teardown can
-        // restore the previous context (the service never detaches itself).
-        restore_cid_path: args.restore_cid_path.clone(),
-    };
-
-    let card_id = args
-        .card_id
-        .clone()
-        .unwrap_or_else(|| gsm_sip_bridge::volte::bridge::DEFAULT_CARD_ID.to_string());
-
     gsm_sip_bridge::volte::bridge::run(
         gsm_sip_bridge::volte::bridge::ServiceConfig {
-            card_id,
-            settings,
-            msisdn: args.msisdn.clone(),
+            lines,
             force: args.force,
         },
         &app_config,
     )
+}
+
+/// The single explicit-`--modem` line (index 0, default port trio) — today's
+/// behaviour, so a diagnostic `volte-bridge --modem /dev/ttyUSBx` is unchanged.
+fn volte_bridge_single_line(
+    args: &gsm_sip_bridge::cli::VolteBridgeArgs,
+    modem: &std::path::Path,
+) -> Result<Vec<gsm_sip_bridge::volte::bridge::BridgeLine>, String> {
+    use gsm_sip_bridge::volte::discovery;
+    let explicit = args.pcscf.map(|a| a.to_string());
+    let Some(pcscf) = resolve_line_pcscf(explicit, args.pcscf_port, &args.pcscf_source_path) else {
+        return Err("[discovering-pcscf] no P-CSCF address available; pass --pcscf".to_string());
+    };
+    let card_id = args
+        .card_id
+        .clone()
+        .unwrap_or_else(|| gsm_sip_bridge::volte::bridge::DEFAULT_CARD_ID.to_string());
+    let settings = gsm_sip_bridge::volte::VolteSettings {
+        modem_port: modem.to_path_buf(),
+        iface: args.iface.clone().unwrap_or_default(),
+        cid: args.cid,
+        apn: args.apn.clone(),
+        pcscf: Some(pcscf),
+        restore_cid_path: args.restore_cid_path.clone(),
+    };
+    Ok(vec![gsm_sip_bridge::volte::bridge::BridgeLine {
+        card_id,
+        settings,
+        msisdn: args.msisdn.clone(),
+        sip_leg_port: discovery::sip_leg_port(0),
+        control_port: discovery::control_port(0),
+        status_port: discovery::status_port(0),
+    }])
+}
+
+/// Every auto-discovered LTE line. Scans the USB bus once, resolves the line
+/// table from `[volte]` (bounded by `max_lines`, shaped by `[[volte.line]]`),
+/// resolves each line's P-CSCF, and derives a per-line restore-cid file so
+/// each modem's displaced context is restored independently.
+fn volte_bridge_discovered_lines(
+    args: &gsm_sip_bridge::cli::VolteBridgeArgs,
+    volte: &gsm_sip_bridge::config::VolteConfig,
+) -> Result<Vec<gsm_sip_bridge::volte::bridge::BridgeLine>, String> {
+    use gsm_sip_bridge::volte::discovery;
+
+    // Probe every configured port first on its device (a modem may answer AT on
+    // more than one ttyUSB), mirroring the VoWiFi discover path.
+    let preferred: Vec<std::path::PathBuf> = volte
+        .line_overrides
+        .iter()
+        .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
+        .collect();
+    let modems = gsm_sip_bridge::modules::discovery::scan_all_preferring(&preferred)
+        .map_err(|e| format!("modem discovery failed: {e}"))?;
+
+    let table = discovery::resolve_volte_lines(&modems, volte);
+    for failed in &table.failed {
+        tracing::error!(
+            card_id = %failed.card_id,
+            reason = %failed.reason,
+            "VoLTE line discovery: modem not usable as a line"
+        );
+    }
+
+    let mut lines = Vec::new();
+    for resolved in &table.lines {
+        let Some(pcscf) = resolve_line_pcscf(
+            resolved.pcscf.clone(),
+            volte.pcscf_port,
+            &args.pcscf_source_path,
+        ) else {
+            tracing::error!(
+                card_id = %resolved.card_id,
+                "no P-CSCF available for this line (none configured and none captured by the \
+                 ePDG path); skipping it"
+            );
+            continue;
+        };
+        let settings = gsm_sip_bridge::volte::VolteSettings {
+            modem_port: resolved.modem_port.clone(),
+            iface: resolved.iface.clone(),
+            cid: resolved.cid,
+            apn: resolved.apn.clone(),
+            pcscf: Some(pcscf),
+            restore_cid_path: per_line_restore_cid_path(&args.restore_cid_path, resolved.index),
+        };
+        lines.push(gsm_sip_bridge::volte::bridge::BridgeLine {
+            card_id: resolved.card_id.clone(),
+            settings,
+            msisdn: resolved.msisdn.clone(),
+            sip_leg_port: resolved.sip_leg_port,
+            control_port: resolved.control_port,
+            status_port: resolved.status_port,
+        });
+    }
+    Ok(lines)
+}
+
+/// Resolves one line's P-CSCF: an explicitly-configured address wins, else the
+/// address the ePDG/VoWiFi path captured at `source_path` (so a VoWiFi run on
+/// this SIM primes the LTE path). `None` when neither is available.
+fn resolve_line_pcscf(
+    explicit: Option<String>,
+    pcscf_port: u16,
+    source_path: &str,
+) -> Option<std::net::SocketAddr> {
+    if let Some(addr) = explicit {
+        if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+            return Some(std::net::SocketAddr::new(ip, pcscf_port));
+        }
+    }
+    let cache = std::path::PathBuf::from(source_path);
+    gsm_sip_bridge::volte::pcscf::probe_epdg_cache(&cache)
+        .found()
+        .map(|ip| std::net::SocketAddr::new(ip, pcscf_port))
+}
+
+/// Per-line restore-cid file so each modem's displaced context is recorded and
+/// restored independently: `<base>-<index>`. `None` when no base was given.
+fn per_line_restore_cid_path(
+    base: &Option<std::path::PathBuf>,
+    index: u32,
+) -> Option<std::path::PathBuf> {
+    base.as_ref()
+        .map(|b| std::path::PathBuf::from(format!("{}-{index}", b.display())))
+}
+
+/// Releases every LTE line the running bridge recorded in its manifest, each
+/// with the displaced context read from that line's own restore-cid file, then
+/// removes the manifest. A no-op (success) when no manifest exists — the
+/// single-line `volte-register` path writes none and is torn down by the
+/// entrypoint's own `volte-pdn down`.
+fn handle_volte_cleanup_command() -> ExitCode {
+    use gsm_sip_bridge::volte::discovery;
+    let path = discovery::manifest_path();
+    let manifest = match discovery::read_manifest(&path) {
+        Ok(m) => m,
+        Err(_) => return ExitCode::SUCCESS,
+    };
+    let mut all_ok = true;
+    for line in &manifest.lines {
+        let restore_cid = std::fs::read_to_string(&line.restore_cid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok());
+        let settings = gsm_sip_bridge::volte::VolteSettings {
+            modem_port: std::path::PathBuf::from(&line.modem_port),
+            iface: line.iface.clone(),
+            cid: line.cid,
+            // `detach` uses only the modem port, interface, cid and restore-cid.
+            apn: String::new(),
+            pcscf: None,
+            restore_cid_path: None,
+        };
+        match gsm_sip_bridge::volte::detach(&settings, restore_cid) {
+            Ok(()) => println!(
+                "volte-cleanup: released line {} ({})",
+                line.card_id, line.modem_port
+            ),
+            Err(e) => {
+                eprintln!("volte-cleanup: line {} teardown failed: {e}", line.card_id);
+                all_ok = false;
+            }
+        }
+    }
+    // Remove the manifest so a later cleanup doesn't try to tear these down
+    // again against modems something else may have re-claimed.
+    let _ = std::fs::remove_file(&path);
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> ExitCode {
@@ -1166,6 +1331,7 @@ fn handle_config_command(args: &gsm_sip_bridge::cli::ConfigArgs, cli: &Cli) -> E
                 "VOLTE_BRIDGE_INBOUND={}",
                 if v.bridge_inbound { 1 } else { 0 }
             );
+            println!("VOLTE_MAX_LINES={}", v.max_lines);
             ExitCode::SUCCESS
         }
         ConfigSubcommand::VowifiShellEnv => {

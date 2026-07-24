@@ -165,6 +165,12 @@ pub enum Commands {
     /// renews it before expiry, and answers calls as they arrive. Renewal and
     /// re-attachment both yield to a call in progress.
     VolteBridge(VolteBridgeArgs),
+    /// Tear down every host-side LTE line the running bridge recorded in its
+    /// line manifest — releasing each modem's IMS PDN and restoring the data
+    /// context it displaced (specs/018-volte-multi-modem). Run by
+    /// `docker/entrypoint.sh`'s cleanup after the multi-modem bridge exits; a
+    /// no-op when no manifest exists.
+    VolteCleanup,
     /// Read-only config introspection, for shell scripts (entrypoint.sh)
     /// that need a single answer without hand-rolling TOML parsing in bash.
     Config(ConfigArgs),
@@ -413,8 +419,12 @@ pub struct VolteListenArgs {
 /// Options for the long-lived inbound bridging service.
 #[derive(Parser, Debug)]
 pub struct VolteBridgeArgs {
-    #[arg(long, default_value = "/dev/ttyUSB0")]
-    pub modem: PathBuf,
+    /// A single modem's AT port to bridge. Omit to auto-discover every
+    /// SIM-ready modem and bridge each as its own line (specs/018-volte-
+    /// multi-modem), bounded by `[volte].max_lines` and shaped by any
+    /// `[[volte.line]]` overrides.
+    #[arg(long)]
+    pub modem: Option<PathBuf>,
     #[arg(long)]
     pub iface: Option<String>,
     #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]

@@ -74,6 +74,22 @@ const VOLTE_KEYS: &[&str] = &[
     "status_path",
     "lock_path",
     "bridge_inbound",
+    "max_lines",
+    "line",
+];
+/// Allowed keys inside each `[[volte.line]]` entry
+/// (specs/018-volte-multi-modem — an operator override pinning a specific
+/// modem to the host-side LTE bridge and/or fixing that line's PDN/P-CSCF
+/// settings instead of taking them from the `[volte]` base). Mirrors
+/// [`VOWIFI_LINE_KEYS`], for the LTE path's per-modem fields.
+const VOLTE_LINE_KEYS: &[&str] = &[
+    "modem_serial",
+    "modem_port",
+    "cid",
+    "apn",
+    "pcscf",
+    "iface",
+    "msisdn",
 ];
 
 const VOWIFI_KEYS: &[&str] = &[
@@ -559,6 +575,44 @@ pub struct VolteConfig {
     /// what makes the feature safe to merge — an absent selection changes
     /// nothing.
     pub bridge_inbound: bool,
+    /// Upper bound on concurrently bridged LTE lines (specs/018-volte-multi-
+    /// modem) — the counterpart to `[vowifi].max_lines`. Modems discovered
+    /// beyond this count are reported and skipped rather than silently
+    /// dropped. Only meaningful with `bridge_inbound` and an empty
+    /// `modem_port` (auto-discovery); a pinned single `modem_port` is always
+    /// one line.
+    pub max_lines: u32,
+    /// Explicit per-line overrides (specs/018-volte-multi-modem), the LTE
+    /// counterpart to `[[vowifi.line]]`: pins a specific modem to the bridge
+    /// and/or fixes that line's `cid`/`apn`/`pcscf`/`iface`/`msisdn` instead
+    /// of inheriting them from the `[volte]` base. Empty (the default) means
+    /// every line is fully auto-discovered with the base settings.
+    pub line_overrides: Vec<VolteLineOverride>,
+}
+
+/// One `[[volte.line]]` entry — see `VolteConfig::line_overrides`.
+/// The LTE analogue of [`VowifiLineOverride`]: there is no netns/veth/vpcd to
+/// carry here, so the per-line fields are the modem's own PDN/P-CSCF settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VolteLineOverride {
+    /// Match a modem by its USB hardware serial (`modules::discovery`'s
+    /// `usb_serial`) — preferred over `modem_port`, since a serial survives
+    /// the device path changing across reboots/USB re-enumeration.
+    pub modem_serial: Option<String>,
+    /// Match (or pin) a modem by its AT serial device path directly — the
+    /// escape hatch for a modem discovery can't identify by serial.
+    pub modem_port: Option<String>,
+    /// Fix this line's PDP context id instead of taking `[volte].cid`.
+    pub cid: Option<u8>,
+    /// Fix this line's APN instead of taking `[volte].apn`.
+    pub apn: Option<String>,
+    /// Fix this line's P-CSCF instead of taking `[volte].pcscf`.
+    pub pcscf: Option<String>,
+    /// Host data interface bound to this modem's IMS PDN. Empty/absent means
+    /// auto-detect from the modem's USB device (see `volte::discovery`).
+    pub iface: Option<String>,
+    /// This line's own MSISDN, advertised in the P-Preferred-Identity.
+    pub msisdn: Option<String>,
 }
 
 impl Default for VolteConfig {
@@ -579,6 +633,8 @@ impl Default for VolteConfig {
             status_path: "/tmp/volte-registration-status".to_string(),
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
+            max_lines: 8,
+            line_overrides: Vec::new(),
         }
     }
 }
@@ -1444,7 +1500,63 @@ fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig
             .map(|v| as_bool(v, "volte.bridge_inbound"))
             .transpose()?
             .unwrap_or(d.bridge_inbound),
+        max_lines: t
+            .get("max_lines")
+            .map(|v| as_u64_range(v, "volte.max_lines", false, 1..=64))
+            .transpose()?
+            .map(|n| n as u32)
+            .unwrap_or(d.max_lines),
+        line_overrides: parse_volte_line_overrides(t)?,
     })
+}
+
+/// Parses the optional `[[volte.line]]` array (specs/018-volte-multi-modem).
+/// Absent = no overrides, every line auto-discovered with the `[volte]` base
+/// settings. Mirrors [`parse_vowifi_line_overrides`].
+fn parse_volte_line_overrides(
+    t: &toml::map::Map<String, Value>,
+) -> BridgeResult<Vec<VolteLineOverride>> {
+    let Some(val) = t.get("line") else {
+        return Ok(Vec::new());
+    };
+    let arr = val
+        .as_array()
+        .ok_or_else(|| BridgeError::Config("volte.line must be an array of tables".into()))?;
+    let mut overrides = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let et = entry
+            .as_table()
+            .ok_or_else(|| BridgeError::Config(format!("volte.line[{i}] must be a table")))?;
+        warn_unknown_keys_in(et, VOLTE_LINE_KEYS, "volte.line");
+        let cid = et
+            .get("cid")
+            .map(|v| as_integer(v, "volte.line.cid"))
+            .transpose()?
+            .map(|n| n as u8);
+        if cid == Some(0) {
+            return Err(BridgeError::Config(format!(
+                "volte.line[{i}].cid must be a non-zero PDP context id"
+            )));
+        }
+        let pcscf = as_optional_string(et, "pcscf", "volte.line.pcscf")?;
+        if let Some(addr) = &pcscf {
+            if addr.parse::<std::net::IpAddr>().is_err() {
+                return Err(BridgeError::Config(format!(
+                    "volte.line[{i}].pcscf is not a valid IP address: {addr}"
+                )));
+            }
+        }
+        overrides.push(VolteLineOverride {
+            modem_serial: as_optional_string(et, "modem_serial", "volte.line.modem_serial")?,
+            modem_port: as_optional_string(et, "modem_port", "volte.line.modem_port")?,
+            cid,
+            apn: as_optional_string(et, "apn", "volte.line.apn")?,
+            pcscf,
+            iface: as_optional_string(et, "iface", "volte.line.iface")?,
+            msisdn: as_optional_string(et, "msisdn", "volte.line.msisdn")?,
+        });
+    }
+    Ok(overrides)
 }
 
 fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConfig> {
@@ -1754,6 +1866,68 @@ mod tests {
         let toml = format!("{MINIMAL_TOML}\n[volte]\ncid = 0\n");
         let root: Value = toml.parse().unwrap();
 
+        assert!(parse_volte(root.as_table().unwrap()).is_err());
+    }
+
+    #[test]
+    fn volte_max_lines_defaults_to_eight() {
+        let c = parse(MINIMAL_TOML);
+        assert_eq!(c.volte.max_lines, 8);
+        assert!(c.volte.line_overrides.is_empty());
+    }
+
+    #[test]
+    fn volte_max_lines_custom_value_parses() {
+        let toml = format!("{MINIMAL_TOML}\n[volte]\nmax_lines = 4\n");
+        let c = parse(&toml);
+        assert_eq!(c.volte.max_lines, 4);
+    }
+
+    #[test]
+    fn volte_max_lines_rejects_zero() {
+        let toml = format!("{MINIMAL_TOML}\n[volte]\nmax_lines = 0\n");
+        let root: Value = toml.parse().unwrap();
+        assert!(parse_volte(root.as_table().unwrap()).is_err());
+    }
+
+    #[test]
+    fn volte_line_overrides_absent_is_empty() {
+        let c = parse(MINIMAL_TOML);
+        assert!(c.volte.line_overrides.is_empty());
+    }
+
+    #[test]
+    fn volte_line_overrides_multiple_entries_parse_in_order() {
+        let toml = format!(
+            "{MINIMAL_TOML}\n[volte]\nenabled = true\n\
+             [[volte.line]]\nmodem_port = \"/dev/ttyUSB2\"\ncid = 4\n\
+             [[volte.line]]\nmodem_serial = \"abc123\"\niface = \"wwan1\"\n\
+             pcscf = \"2400:5200:a100:819::6\"\nmsisdn = \"919000000001\"\n"
+        );
+        let c = parse(&toml);
+        assert_eq!(c.volte.line_overrides.len(), 2);
+        let l0 = &c.volte.line_overrides[0];
+        assert_eq!(l0.modem_port.as_deref(), Some("/dev/ttyUSB2"));
+        assert_eq!(l0.cid, Some(4));
+        let l1 = &c.volte.line_overrides[1];
+        assert_eq!(l1.modem_serial.as_deref(), Some("abc123"));
+        assert_eq!(l1.iface.as_deref(), Some("wwan1"));
+        assert_eq!(l1.pcscf.as_deref(), Some("2400:5200:a100:819::6"));
+        assert_eq!(l1.msisdn.as_deref(), Some("919000000001"));
+    }
+
+    #[test]
+    fn volte_line_rejects_a_malformed_pcscf() {
+        let toml = format!("{MINIMAL_TOML}\n[volte]\n[[volte.line]]\npcscf = \"not-an-address\"\n");
+        let root: Value = toml.parse().unwrap();
+        let err = parse_volte(root.as_table().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("not a valid IP address"));
+    }
+
+    #[test]
+    fn volte_line_rejects_a_zero_context_id() {
+        let toml = format!("{MINIMAL_TOML}\n[volte]\n[[volte.line]]\ncid = 0\n");
+        let root: Value = toml.parse().unwrap();
         assert!(parse_volte(root.as_table().unwrap()).is_err());
     }
 

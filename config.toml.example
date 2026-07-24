@@ -210,12 +210,21 @@ enabled = false
 # takes no calls at all whenever this path is down. Watch
 # gsm_sip_bridge_active_calls{transport="volte"} and the volte_* registration
 # gauges accordingly.
-bridge_inbound = false
+# The modem to bridge. A named port pins exactly that one modem (single
+# line). Leave it EMPTY to auto-discover every SIM-ready modem and bridge
+# each as its own line (specs/018-volte-multi-modem) — the LTE counterpart to
+# [vowifi] multi-card. Only meaningful with bridge_inbound; a single PBX
+# registration then serves every line, exactly as the VoWiFi path does.
 modem_port = "/dev/ttyUSB0"
+# Upper bound on auto-discovered LTE lines (1–64). Modems past this count are
+# reported and skipped. Only applies when modem_port is empty.
+max_lines = 8
 # Host interface carrying the modem's data path. Leave empty to manage the
 # PDN only and skip host interface configuration. NOTE: binding the IMS PDN
 # displaces general connectivity through the modem — it exposes a single
-# host-facing data path.
+# host-facing data path. When auto-discovering (empty modem_port), each line's
+# interface is detected from its own modem's USB device; this value is only a
+# fallback for the single-modem case.
 iface = ""
 # PDP context id for the IMS PDN. Must not collide with the contexts the
 # modem uses for general internet access (1 and 2 on the reference hardware).
@@ -239,3 +248,16 @@ use_tcp = true
 sec_agree = true
 status_path = "/tmp/volte-registration-status"
 lock_path = "/tmp/volte-registration.lock"
+# Optional per-line overrides for auto-discovery (the LTE counterpart to
+# [[vowifi.line]]): pin a specific modem and/or fix that line's PDN/P-CSCF
+# settings instead of inheriting the [volte] base above. Match a modem by its
+# USB hardware serial (preferred — survives device-path changes) or by AT
+# port. Every field except the matcher is optional.
+#
+# [[volte.line]]
+# modem_serial = "abc123"        # or: modem_port = "/dev/ttyUSB2"
+# cid = 4                        # this line's PDP context id
+# apn = "ims"
+# pcscf = "2400:5200:a100:819::6"
+# iface = "wwan1"                # this modem's data interface
+# msisdn = "919000000001"        # advertised in P-Preferred-Identity

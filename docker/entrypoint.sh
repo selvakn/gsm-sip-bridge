@@ -106,20 +106,31 @@ cleanup() {
             pgrep -f "volte-register|volte-bridge" >/dev/null 2>&1 || break
             sleep 0.25
         done
-        # Release the IMS PDN so the modem's single host data path goes back
+        # Release the IMS PDN(s) so each modem's single host data path goes back
         # to whatever it was bound to before (FR-005). The inbound bridge
-        # recorded that context at attach; pass it as --restore-cid so tear_down
-        # rebinds it instead of leaving the data path unbound. Best-effort: a
-        # failure here must not stop the rest of cleanup.
-        volte_restore_cid=""
-        if [ -f "${VOLTE_RESTORE_CID_PATH:-}" ]; then
-            volte_restore_cid="$(cat "$VOLTE_RESTORE_CID_PATH" 2>/dev/null)"
-        fi
-        "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-pdn \
-            --action down --modem "${VOLTE_MODEM_PORT:-/dev/ttyUSB0}" \
-            ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} --cid "${VOLTE_CID:-3}" \
-            ${volte_restore_cid:+--restore-cid "$volte_restore_cid"} \
+        # recorded each displaced context at attach; teardown passes it as
+        # --restore-cid so tear_down rebinds it instead of leaving the data path
+        # unbound. Best-effort: a failure here must not stop the rest of cleanup.
+        #
+        # A multi-modem bridge (empty modem_port) wrote a line manifest listing
+        # every line's modem/cid/restore-cid — `volte-cleanup` tears them all
+        # down from it. A single pinned modem (or the `volte-register` path,
+        # which writes no manifest) is torn down directly here. `volte-cleanup`
+        # is a no-op when no manifest exists, so running it unconditionally is
+        # safe and covers the discovery case.
+        "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-cleanup \
             >/dev/null 2>&1
+        if [ -n "$VOLTE_MODEM_PORT" ]; then
+            volte_restore_cid=""
+            if [ -f "${VOLTE_RESTORE_CID_PATH:-}" ]; then
+                volte_restore_cid="$(cat "$VOLTE_RESTORE_CID_PATH" 2>/dev/null)"
+            fi
+            "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-pdn \
+                --action down --modem "$VOLTE_MODEM_PORT" \
+                ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} --cid "${VOLTE_CID:-3}" \
+                ${volte_restore_cid:+--restore-cid "$volte_restore_cid"} \
+                >/dev/null 2>&1
+        fi
     fi
     [ -n "$PCSCD_LOG_TAIL_PID" ] && kill "$PCSCD_LOG_TAIL_PID" 2>/dev/null
     [ -n "$PCSCD_PID" ] && kill "$PCSCD_PID" 2>/dev/null
@@ -913,8 +924,17 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
     # [volte].bridge_inbound picks which of the two services runs
     # (specs/017-volte-inbound-bridge FR-023). Unset means today's behaviour:
     # hold the registration open and nothing more.
+    #
+    # A non-empty modem_port pins one modem (single-line, back-compat). An
+    # empty modem_port auto-discovers every SIM-ready modem and bridges each as
+    # its own line (specs/018-volte-multi-modem) — per-line cid/apn/pcscf/iface
+    # then come from [volte] + [[volte.line]], not these flags.
     if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
-        log "[volte].enabled + bridge_inbound — answering inbound calls over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+        if [ -n "$VOLTE_MODEM_PORT" ]; then
+            log "[volte].enabled + bridge_inbound — answering inbound calls over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+        else
+            log "[volte].enabled + bridge_inbound — answering inbound calls over LTE (auto-discovering modems, up to ${VOLTE_MAX_LINES:-8} line(s))"
+        fi
     else
         log "[volte].enabled — starting host-side IMS over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
     fi
@@ -923,12 +943,17 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
             # --pcscf is omitted deliberately: both subcommands resolve it from
             # the ePDG capture at pcscf_source_path when no address is
             # configured, so a VoWiFi run on this SIM primes the LTE path.
-            if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
+            if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ] && [ -n "$VOLTE_MODEM_PORT" ]; then
                 "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-bridge \
                     --modem "$VOLTE_MODEM_PORT" \
                     ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
                     --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
                     ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
+                    --pcscf-port "$VOLTE_PCSCF_PORT" \
+                    --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
+                    --restore-cid-path "$VOLTE_RESTORE_CID_PATH"
+            elif [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
+                "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-bridge \
                     --pcscf-port "$VOLTE_PCSCF_PORT" \
                     --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
                     --restore-cid-path "$VOLTE_RESTORE_CID_PATH"

@@ -372,6 +372,7 @@ mod tests {
             } else {
                 None
             },
+            net_device: None,
             at_port: Some(PathBuf::from(port)),
             sim_status: Some(SimStatus::Ready {
                 imsi: imsi.to_string(),
@@ -386,6 +387,7 @@ mod tests {
             usb_serial: card_id.to_string(),
             has_audio_capability: false,
             audio_device: None,
+            net_device: None,
             at_port: status.as_ref().map(|_| PathBuf::from("/dev/ttyUSB9")),
             sim_status: status,
         }

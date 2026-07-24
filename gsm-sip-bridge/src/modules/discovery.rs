@@ -84,6 +84,12 @@ pub struct ProbedModem {
     pub usb_serial: String,
     pub has_audio_capability: bool,
     pub audio_device: Option<String>,
+    /// Host network interface this modem exposes for its data path (e.g. a
+    /// QMI/ECM `wwan*`/`enx*` device), if one is enumerated. Used by the
+    /// host-side LTE bridge to bind each line's IMS PDN to its own modem's
+    /// interface (specs/018-volte-multi-modem); irrelevant to VoWiFi, which
+    /// carries its data over the ePDG tunnel, not the modem's netdev.
+    pub net_device: Option<String>,
     pub at_port: Option<PathBuf>,
     /// `None` only when `at_port` is `None` too — there was nothing to ask.
     pub sim_status: Option<SimStatus>,
@@ -180,6 +186,7 @@ fn scan_all_inner(
                 usb_serial: serial,
                 has_audio_capability: device.has_audio_capability,
                 audio_device: find_alsa_card(&dev_path),
+                net_device: find_net_iface(&dev_path),
                 at_port: None,
                 sim_status: None,
             });
@@ -187,6 +194,7 @@ fn scan_all_inner(
         }
 
         let audio_device = find_alsa_card(&dev_path);
+        let net_device = find_net_iface(&dev_path);
         let at_port = probe_at_port(&dev_path, preferred_ports);
         let sim_status = at_port.as_ref().map(|port| probe_sim_status_at(port));
 
@@ -228,6 +236,7 @@ fn scan_all_inner(
             usb_serial: serial,
             has_audio_capability: device.has_audio_capability,
             audio_device,
+            net_device,
             at_port,
             sim_status,
         });
@@ -260,20 +269,67 @@ pub fn scan_modules() -> BridgeResult<Vec<DiscoveredModule>> {
 /// on behaves exactly as it did before the feature existed (FR-021, FR-024).
 /// That default is what makes this safe to merge.
 pub fn volte_claimed_ports(config: &crate::config::VolteConfig) -> Vec<PathBuf> {
-    if !config.enabled || config.modem_port.is_empty() {
+    if !config.enabled {
         return Vec::new();
     }
-    vec![PathBuf::from(&config.modem_port)]
+    // The single pinned modem (`modem_port`), plus any AT port a
+    // `[[volte.line]]` override pins in multi-modem discovery mode
+    // (specs/018-volte-multi-modem) — all claimed so the circuit-switched pool
+    // never grabs a modem this bridge drives.
+    let mut ports = Vec::new();
+    if !config.modem_port.is_empty() {
+        ports.push(PathBuf::from(&config.modem_port));
+    }
+    for over in &config.line_overrides {
+        if let Some(p) = &over.modem_port {
+            ports.push(PathBuf::from(p));
+        }
+    }
+    ports
+}
+
+/// Card ids the host-side LTE bridge claims by SIM/hardware serial in
+/// `[[volte.line]]` overrides. Excluding by **card id** (not just port) is
+/// what makes exclusion robust when a modem answers `AT` on several `ttyUSB`
+/// interfaces — a port-only exclusion misses the modem when the scan settles
+/// on a different one of its ports than the override pinned (observed live on
+/// the EC25, specs/018-volte-multi-modem). Only serial-pinned lines can be
+/// excluded this way; a pure auto-discovery line's card id is not known until
+/// the bridge scans at runtime.
+pub fn volte_claimed_card_ids(config: &crate::config::VolteConfig) -> Vec<String> {
+    if !config.enabled {
+        return Vec::new();
+    }
+    config
+        .line_overrides
+        .iter()
+        .filter_map(|o| o.modem_serial.as_deref().map(derive_module_id))
+        .collect()
 }
 
 /// [`scan_modules`] with an explicit extra exclusion set, so the caller can
 /// state which ports another subsystem owns rather than this module guessing.
 pub fn scan_modules_excluding(also_excluded: &[PathBuf]) -> BridgeResult<Vec<DiscoveredModule>> {
+    scan_modules_excluding_cards(also_excluded, &[])
+}
+
+/// Like [`scan_modules_excluding`], but the caller can additionally name card
+/// ids to skip probing entirely (not merely filter out afterward) — the
+/// robust form of "a modem belongs to exactly one subsystem" (FR-034) for a
+/// modem that answers `AT` on several ports. Used to keep the host-side LTE
+/// bridge's serial-pinned modems out of the circuit-switched pool.
+pub fn scan_modules_excluding_cards(
+    also_excluded: &[PathBuf],
+    also_skip_cards: &[String],
+) -> BridgeResult<Vec<DiscoveredModule>> {
     let mut excluded = excluded_ports_from_lines_file();
     excluded.extend(also_excluded.iter().cloned());
-    // Skips re-probing any modem an active VoWiFi line already owns, not
-    // just filtering it out afterward — see `scan_all_inner`'s doc comment.
-    let modems = scan_all_inner(&[], &active_vowifi_card_ids())?;
+    // Skips re-probing any modem an active VoWiFi line, or a serial-pinned
+    // VoLTE line, already owns — not just filtering it out afterward (see
+    // `scan_all_inner`'s doc comment).
+    let mut skip = active_vowifi_card_ids();
+    skip.extend(also_skip_cards.iter().cloned());
+    let modems = scan_all_inner(&[], &skip)?;
     Ok(modems
         .into_iter()
         .filter(|m| m.has_audio_capability)
@@ -525,6 +581,29 @@ fn find_alsa_card(dev_path: &Path) -> Option<String> {
                 if let Some(card_num) = card_name.strip_prefix("card") {
                     return Some(format!("hw:{card_num},0"));
                 }
+            }
+        }
+    }
+    None
+}
+
+/// The host network interface a modem's data path exposes, if any — the
+/// `net/<ifname>` under one of the device's USB interface directories (a
+/// QMI/ECM `wwan*`/`usb*`/`enx*` device on the Quectel modules). Structurally
+/// the same walk as `find_alsa_card`, one subdir over (`net` instead of
+/// `sound`). Best-effort: `None` when the modem exposes no netdev this boot,
+/// in which case the LTE bridge falls back to the configured `iface`.
+fn find_net_iface(dev_path: &Path) -> Option<String> {
+    let entries = fs::read_dir(dev_path).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.contains(':') {
+            continue;
+        }
+        let net_dir = entry.path().join("net");
+        if let Ok(net_entries) = fs::read_dir(&net_dir) {
+            if let Some(net_entry) = net_entries.flatten().next() {
+                return Some(net_entry.file_name().to_string_lossy().to_string());
             }
         }
     }
@@ -828,6 +907,49 @@ mod tests {
             volte_claimed_ports(&config),
             vec![PathBuf::from("/dev/ttyUSB6")]
         );
+    }
+
+    #[test]
+    fn discovery_mode_claims_pinned_override_ports_and_serials() {
+        // Empty modem_port (auto-discovery) with pinned [[volte.line]]s: the
+        // pinned AT ports are claimed, and a serial-pinned line is excluded
+        // from the circuit-switched pool by card id (robust to a modem
+        // answering AT on several ports) — specs/018-volte-multi-modem.
+        let config = crate::config::VolteConfig {
+            enabled: true,
+            modem_port: String::new(),
+            line_overrides: vec![
+                crate::config::VolteLineOverride {
+                    modem_port: Some("/dev/ttyUSB6".to_string()),
+                    ..Default::default()
+                },
+                crate::config::VolteLineOverride {
+                    modem_serial: Some("0123456789ABCDEF".to_string()),
+                    modem_port: Some("/dev/ttyUSB9".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            volte_claimed_ports(&config),
+            vec![PathBuf::from("/dev/ttyUSB6"), PathBuf::from("/dev/ttyUSB9"),]
+        );
+        // "0123456789ABCDEF" -> last 6 alphanumerics, uppercased.
+        assert_eq!(volte_claimed_card_ids(&config), vec!["ec20-ABCDEF"]);
+    }
+
+    #[test]
+    fn a_disabled_service_claims_no_card_ids_even_with_overrides() {
+        let config = crate::config::VolteConfig {
+            enabled: false,
+            line_overrides: vec![crate::config::VolteLineOverride {
+                modem_serial: Some("0123456789ABCDEF".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(volte_claimed_card_ids(&config).is_empty());
     }
 
     #[test]
