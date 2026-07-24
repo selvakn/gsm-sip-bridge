@@ -52,23 +52,11 @@ impl RoleAssignment {
 }
 
 /// The override list `RoleAssignment::from_probed` should actually use:
-/// `config.line_overrides` as-is, unless it's empty AND `config.modem_port`
-/// names a device — in which case that's an existing pre-multi-card config
-/// (`[vowifi].modem_port` set, no `[[vowifi.line]]` array at all), and
-/// acceptance scenario 5/FR-020 requires that named port keep being used
-/// exactly as before, undisturbed by auto-discovery: synthesize a single
-/// implicit override pinning it, the same mechanism `[[vowifi.line]]` uses.
-/// Once any `[[vowifi.line]]` entry exists, `modem_port` is not consulted
-/// here at all — the array is the one source of truth from that point.
+/// `config.line_overrides`, the one source of truth for pinning a modem to
+/// VoWiFi (`[[vowifi.line]]` — there is no top-level `modem_port` fallback
+/// to synthesize an implicit override from anymore).
 pub fn effective_line_overrides(config: &VowifiConfig) -> Vec<VowifiLineOverride> {
-    if config.line_overrides.is_empty() && !config.modem_port.is_empty() {
-        vec![VowifiLineOverride {
-            modem_port: Some(config.modem_port.clone()),
-            ..Default::default()
-        }]
-    } else {
-        config.line_overrides.clone()
-    }
+    config.line_overrides.clone()
 }
 
 fn is_overridden_to_vowifi(modem: &ProbedModem, overrides: &[VowifiLineOverride]) -> bool {
@@ -112,10 +100,12 @@ pub struct FailedLine {
 /// One resolved VoWiFi line — the "Line Table" key entity
 /// (specs/013-multi-card-vowifi data-model.md). `config` is a fully
 /// per-line-derived `VowifiConfig`: every isolated resource (netns, XFRM
-/// if_id/iface, veth iface/addrs, vpcd_port, pcscf_source_path) has already
-/// been computed as a function of `index` (research.md item 5) — downstream
-/// code (`ims::agent`, `vowifi::run`) takes `&config` exactly as it does
-/// today and needs no awareness that it's one of several lines.
+/// if_id/iface, veth iface/addrs, vpcd_port) has already been computed as a
+/// function of `index` (research.md item 5), uniformly for every line
+/// including the first — downstream code (`ims::agent`, `vowifi::run`) takes
+/// `&config` exactly as it does today and needs no awareness that it's one
+/// of several lines. `pcscf_source_path` is the one exception: it's a
+/// shared, global scratch file, not per-line derived.
 #[derive(Debug, Clone)]
 pub struct ResolvedLine {
     pub index: u32,
@@ -221,24 +211,24 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     // been applied above.
     config.line_overrides = Vec::new();
 
-    // index == 0 keeps every field at its unindexed default, by construction
-    // (FR-020) — nothing below runs for the single-line case.
-    if index > 0 {
-        config.netns = format!("{}{}", base.netns, index);
-        config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
-        config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-        config.veth_sip_iface = format!("{}{}", base.veth_sip_iface, index);
-        config.veth_ims_iface = format!("{}{}", base.veth_ims_iface, index);
-        let step = 4u32 * index;
-        if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
-            config.veth_local_addr = local;
-        }
-        if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
-            config.veth_peer_addr = peer;
-        }
-        config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
-        config.pcscf_source_path = format!("{}-{}", base.pcscf_source_path, index);
+    // Pure per-line infrastructure — always mechanically derived from the
+    // line's index, uniformly for every line including the first. No config
+    // knob backs any of this (see `VowifiConfig`'s field docs).
+    config.netns = format!("{}{}", base.netns, index);
+    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
+    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
+    config.veth_sip_iface = format!("{}{}", base.veth_sip_iface, index);
+    config.veth_ims_iface = format!("{}{}", base.veth_ims_iface, index);
+    let step = 4u32 * index;
+    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
+        config.veth_local_addr = local;
     }
+    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
+        config.veth_peer_addr = peer;
+    }
+    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
+    // pcscf_source_path stays the shared, global value (also read by
+    // [volte].pcscf_source_path) — not per-line derived.
 
     ResolvedLine {
         index,
@@ -469,35 +459,27 @@ mod tests {
     }
 
     #[test]
-    fn effective_overrides_synthesizes_implicit_override_from_modem_port() {
-        let mut config = VowifiConfig::default();
-        config.modem_port = "/dev/ttyUSB6".to_string();
-        let overrides = effective_line_overrides(&config);
-        assert_eq!(overrides.len(), 1);
-        assert_eq!(overrides[0].modem_port.as_deref(), Some("/dev/ttyUSB6"));
+    fn effective_overrides_reflects_line_overrides_only() {
+        // mcc/mnc/modem_port moved to [[vowifi.line]] only — there is no
+        // top-level `modem_port` to synthesize an implicit override from
+        // anymore, so `effective_line_overrides` is just a passthrough.
+        let config = VowifiConfig::default();
+        assert!(effective_line_overrides(&config).is_empty());
     }
 
     #[test]
-    fn effective_overrides_prefers_explicit_line_array_over_modem_port() {
-        let mut config = VowifiConfig::default();
-        config.modem_port = "/dev/ttyUSB6".to_string();
-        config.line_overrides = vec![VowifiLineOverride {
-            modem_port: Some("/dev/ttyUSB10".to_string()),
+    fn explicit_line_array_pins_that_exact_modem_to_vowifi_even_with_audio() {
+        // An explicit `[[vowifi.line]]` entry naming a modem keeps using
+        // exactly that port, even if (unusually) it happens to be on an
+        // audio-capable modem that would otherwise default to the
+        // circuit-switched pool.
+        let config = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_port: Some("/dev/ttyUSB6".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
-        let overrides = effective_line_overrides(&config);
-        assert_eq!(overrides.len(), 1);
-        assert_eq!(overrides[0].modem_port.as_deref(), Some("/dev/ttyUSB10"));
-    }
-
-    #[test]
-    fn legacy_modem_port_config_pins_that_exact_modem_to_vowifi_even_with_audio() {
-        // Acceptance scenario 5 / FR-020: an existing single-SIM config that
-        // names a port explicitly keeps using exactly that port, even if
-        // (unusually) it happens to be on an audio-capable modem that would
-        // otherwise default to the circuit-switched pool.
-        let mut config = VowifiConfig::default();
-        config.modem_port = "/dev/ttyUSB6".to_string();
+        };
         let modems = vec![ready_modem(
             "ec20-AAAAAA",
             "/dev/ttyUSB6",
@@ -584,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lines_single_line_matches_unindexed_defaults() {
+    fn resolve_lines_single_line_still_goes_through_index_derivation() {
         let modems = vec![ready_modem(
             "ec20-AAAAAA",
             "/dev/ttyUSB6",
@@ -600,12 +582,20 @@ mod tests {
         assert_eq!(result.lines.len(), 1);
         let line = &result.lines[0];
         assert_eq!(line.index, 0);
-        assert_eq!(line.config.netns, base.netns);
-        assert_eq!(line.config.strongswan_tun_iface, base.strongswan_tun_iface);
+        // Index 0 goes through the exact same derivation as every other
+        // line — no more special-cased "unindexed defaults" branch. String
+        // suffixes always apply (netns "ims" -> "ims0"); the numeric
+        // shifts/offsets happen to reduce to the base value at index 0.
+        assert_eq!(line.config.netns, format!("{}0", base.netns));
+        assert_eq!(
+            line.config.strongswan_tun_iface,
+            format!("{}-0", base.strongswan_tun_iface)
+        );
         assert_eq!(line.config.strongswan_if_id, base.strongswan_if_id);
         assert_eq!(line.config.veth_local_addr, base.veth_local_addr);
         assert_eq!(line.config.veth_peer_addr, base.veth_peer_addr);
         assert_eq!(line.config.vpcd_port, base.vpcd_port);
+        // pcscf_source_path is shared/global, never per-line derived.
         assert_eq!(line.config.pcscf_source_path, base.pcscf_source_path);
         assert_eq!(line.config.control_port, base.control_port);
         // The one thing that DOES change even for a single line: the modem
@@ -636,7 +626,8 @@ mod tests {
         assert_ne!(l0.config.veth_local_addr, l1.config.veth_local_addr);
         assert_ne!(l0.config.veth_peer_addr, l1.config.veth_peer_addr);
         assert_ne!(l0.config.vpcd_port, l1.config.vpcd_port);
-        assert_ne!(l0.config.pcscf_source_path, l1.config.pcscf_source_path);
+        // pcscf_source_path is shared/global, deliberately the same on every line.
+        assert_eq!(l0.config.pcscf_source_path, l1.config.pcscf_source_path);
         // FR-011: no accidental collisions.
         assert_ne!(l0.config.veth_local_addr, l0.config.veth_peer_addr);
         assert_ne!(l1.config.veth_local_addr, l1.config.veth_peer_addr);

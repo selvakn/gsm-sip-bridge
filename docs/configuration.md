@@ -43,6 +43,7 @@ The bridge reads a single TOML configuration file specified via `--config`.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `port` | integer | 9091 | Metrics HTTP server port |
+| `agent_report_interval_seconds` | integer | 10 | How often each VoWiFi agent re-reports its call/SMS/health state over the control socket. Also sets the staleness threshold (3x this) after which an agent that stopped reporting is marked down. Ignored when `[vowifi].enabled` is false. |
 
 ### `[modules]`
 
@@ -53,20 +54,30 @@ The bridge reads a single TOML configuration file specified via `--config`.
 
 ### `[audio]`
 
-Latency and audio-quality tuning for the circuit-switched (EC20 USB audio)
-path. All keys are optional. The section is read at startup; changes
-require a process restart. See `docs/audio-tuning-log.md` for the empirical
-history behind the modem-side defaults.
+Latency and audio-quality tuning **shared by every call path** — circuit-switched
+(EC20 USB audio) AND VoWiFi/VoLTE IMS calls all run through the same jitter-buffer
+pipeline. All keys are optional. The section is read at startup; changes require a
+process restart. See `docs/audio-tuning-log.md` for the empirical history behind
+the defaults.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `profile` | enum | `lan` | Latency preset: `lan` or `wan` (see below) |
-| `vad` | boolean | `true` | PJMEDIA voice activity detection / noise suppression on the capture path (GSM → SIP). Set `false` only to diagnose audio issues (raw passthrough). |
+| `vad` | boolean | `true` | PJMEDIA voice activity detection / noise suppression on the capture path. Set `false` only to diagnose audio issues (raw passthrough). |
+| `snd_rec_latency_ms` | integer | `150` | Capture ring-buffer depth (caller → SIP), 20–2000 ms. Raise if logs report `alsa_capture_overrun`. |
+| `snd_play_latency_ms` | integer | `150` | Playback ring-buffer depth (SIP → caller), 20–2000 ms. Raise if logs report `alsa_playback_underrun`. |
+
+### `[modem_audio]`
+
+EC20 USB sound-device tuning for the circuit-switched path **only** — VoWiFi/VoLTE
+never touch this modem's ALSA device (VoWiFi/VoLTE hard-codes its own gain and
+never applies these knobs at all). All keys are optional.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
 | `rx_gain` | integer | unset (firmware default) | EC20 downlink digital gain (`AT+QRXGAIN`, 0–65535), applied at module init. Controls how loud SIP audio sounds to the GSM caller. |
 | `eec_mode` | integer | unset (firmware default, 12543) | EC20 echo-canceller mode word (`AT+QEEC=2,<val>`). `0` disables all EC — recommended for USB audio bridges, which have no acoustic echo path. |
 | `tx_level` | float | `1.0` | PJSUA conference-bridge software gain on the GSM → SIP path (`1.0` = unity, `0.5` ≈ −6 dB, `2.0` = +6 dB). |
-| `snd_rec_latency_ms` | integer | `150` | ALSA capture ring-buffer depth (GSM → SIP), 20–2000 ms. Raise if logs report `alsa_capture_overrun`. |
-| `snd_play_latency_ms` | integer | `150` | ALSA playback ring-buffer depth (SIP → GSM), 20–2000 ms. Raise if logs report `alsa_playback_underrun`. |
 | `rt_audio_prio` | integer | `0` (off) | `SCHED_FIFO` priority (1–99) for PJMEDIA's sound-device threads; prevents XRUNs/choppy audio under load. Requires `CAP_SYS_NICE`; best-effort. |
 
 #### Latency profiles
@@ -144,49 +155,92 @@ subcommands and `docker/entrypoint.sh`/`healthcheck.sh` (via
 configuration lives here — none of it is read from environment variables;
 `.env` holds secrets only (specs/012-strongswan-epdg config consolidation).
 
-**Multi-line (specs/013-multi-card-vowifi)**: as of this feature, VoWiFi
-auto-discovers *every* attached VoWiFi-capable modem — no `modem_port`
-needs to be set at all. Each discovered SIM becomes its own **line**: its
-own tunnel, IMS registration, network namespace, and inbound call path,
-running concurrently, up to `max_lines`. `[vowifi].mcc`/`mnc`/`modem_port`/
-etc. below are still honored as-is when exactly one line resolves (an
-existing single-SIM setup is unaffected, byte-for-byte — see FR-020); with
-more than one line, every per-line resource (netns, XFRM `if_id`/interface
-name, veth interface names/addresses, `vpcd_port`, `pcscf_source_path`) is
-*derived* from each line's position in the discovered line table rather
-than read from config, so there is nothing new to hand-configure per line.
+**Multi-line (specs/013-multi-card-vowifi)**: VoWiFi auto-discovers *every*
+attached VoWiFi-capable modem by default. Each discovered SIM becomes its
+own **line**: its own tunnel, IMS registration, network namespace, and
+inbound call path, running concurrently, up to `max_lines`. Every per-line
+resource (netns, XFRM `if_id`/interface name, veth interface names/
+addresses) is *derived* from each line's position in the discovered line
+table — there is no config knob for any of it. Line-specific settings
+(which modem, its home network identity) live only in `[[vowifi.line]]`
+below; everything else in this section is a genuinely global/shared value.
 Run `gsm-sip-bridge --config config.toml discover --shell-env` to see what
 gets discovered/resolved.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch |
-| `mcc` | string | `""` (auto-derive) | Home network MCC; empty means derive from the SIM (IMSI + EF_AD, `AT+COPS` fallback). Must be set together with `mnc` or not at all. Only meaningful for the single-line case — see "Multi-line" above |
-| `mnc` | string | `""` (auto-derive) | Home network MNC, zero-padded to 3 digits; empty means derive from the SIM |
-| `modem_port` | string | `""` (auto-discover) | AT port for the modem whose SIM authenticates. Empty means auto-discover every VoWiFi-capable modem instead (specs/013-multi-card-vowifi) |
 | `use_tcp` | boolean | `true` | SIP transport to the P-CSCF |
 | `sec_agree` | boolean | `true` | Advertise `Require: sec-agree` / negotiate Gm IPsec |
-| `pcscf_source_path` | string | `/tmp/pcscf` | Path Agent A reads the tunnel-assigned P-CSCF from (single-line default; per-line derived otherwise) |
-| `veth_local_addr` | string | `10.99.0.1` | Agent A's (ims-netns end) veth address (single-line default; per-line derived otherwise) |
-| `veth_peer_addr` | string | `10.99.0.2` | Agent B's (default-netns end) veth address (single-line default; per-line derived otherwise) |
-| `control_port` | integer | 7050 | Agent A↔B control channel TCP port — shared across lines; lines are told apart by `veth_peer_addr`, not this port |
+| `pcscf_source_path` | string | `/tmp/pcscf` | Path Agent A reads the tunnel-assigned P-CSCF from. Shared with `[volte].pcscf_source_path` so a captured address is picked up there automatically too |
+| `control_port` | integer | 7050 | Agent A↔B control channel TCP port — shared across every line; lines are told apart by their (internally derived) veth address, not this port |
 | `wideband` | boolean | `true` | Carry AMR-WB/G.722 end-to-end instead of narrowing to 8 kHz |
-| `apn` | string | `ims` | APN used by the `swu` engine's dialer — shared across lines |
-| `netns` | string | `ims` | Network namespace the ePDG tunnel lives in (single-line default; per-line derived otherwise) |
-| `epdg_fqdn` | string | derived from `mcc`/`mnc` (configured or SIM-derived) | ePDG FQDN to resolve via DNS |
-| `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly — shared across lines if set |
-| `src_addr` | string | unset (auto-select) | Force the tunnel's local source address — shared across lines if set |
+| `apn` | string | `ims` | APN used by the `swu` engine's dialer — shared across every line |
+| `epdg_fqdn` | string | unset (derived per line from that line's `mcc`/`mnc`) | Override the derived 3GPP ePDG FQDN — shared across every line if set |
+| `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly — shared across every line if set |
+| `src_addr` | string | unset (auto-select) | Force the tunnel's local source address — shared across every line if set |
 | `keepalive_interval_sec` | integer | 20 | Idle-tunnel TCP keepalive interval |
-| `veth_sip_iface` | string | `veth-sip` | veth end in the default netns (single-line default; per-line derived otherwise) |
-| `veth_ims_iface` | string | `veth-ims` | veth end inside `netns` (single-line default; per-line derived otherwise) |
 | `tunnel_engine` | enum | `strongswan` | `strongswan` or `swu` (specs/012-strongswan-epdg) |
-| `strongswan_tun_iface` | string | `tun23` | strongswan engine's XFRM interface name (single-line default; per-line derived otherwise) |
-| `strongswan_if_id` | integer | 23 | strongswan engine's XFRM interface `if_id` (single-line default; per-line derived otherwise) |
 | `vpcd_host` | string | `127.0.0.1` | pcscd's vpcd virtual reader host (strongswan engine) |
-| `vpcd_port` | integer | 15963 | pcscd's vpcd virtual reader port (single-line default; per-line derived otherwise — each line's slot is `base + index`, see specs/013-multi-card-vowifi). Keep the base **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
-| `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch (strongswan engine) |
+| `vpcd_port` | integer | 15963 | Base TCP port pcscd's shared vpcd reader listens on — one reader serves every line, at `base + line-index`. Unlike the other per-line fields, this **is** a genuine config key: keep the base **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
 | `max_lines` | integer | 8 | Upper bound on concurrently supported VoWiFi lines (specs/013-multi-card-vowifi FR-016); modems discovered beyond this count are reported and skipped |
-| `[[vowifi.line]]` | array of tables | none | Explicit per-line overrides (FR-009): `modem_serial` or `modem_port` pins a specific modem to VoWiFi regardless of the default audio-capability-based role assignment; optional `mcc`/`mnc`/`imsi_override` fix that one line's home network/IMSI instead of auto-deriving it |
+
+#### `[[vowifi.line]]`
+
+Optional array of tables — omit entirely for full auto-discovery (every
+SIM-ready modem becomes its own line, network identity auto-derived from the
+SIM). Add one entry per line to pin it to a specific modem and/or fix its
+network identity. Every field is optional except the matcher.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `modem_serial` | string | none | Match a modem by its USB hardware serial (preferred — survives device-path changes) |
+| `modem_port` | string | none | Match (or pin) a modem by its AT serial device path directly |
+| `mcc` | string | unset (auto-derive) | This line's home network MCC. Must be set together with `mnc` |
+| `mnc` | string | unset (auto-derive) | This line's home network MNC, zero-padded to 3 digits |
+| `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch: use this IMSI instead of reading it from the SIM |
+
+### `[volte]`
+
+Host-side IMS over LTE (specs/015-volte-host-ims) — the bridge runs its OWN IMS
+registration over an LTE IMS PDN, instead of delegating to the modem's internal
+IMS stack. **Do not enable this alongside `[vowifi]` on the same SIM** — both
+register the same IMPU with the same IMEI-derived `+sip.instance`, so the network
+tears one binding down (`volte-register` refuses to start while a VoWiFi agent is
+running unless `--force` is given).
+
+Like `[vowifi]`, auto-discovers every SIM-ready modem as its own line by default
+(specs/018-volte-multi-modem), each with sane defaults — `cid` 3, `apn` `"ims"`,
+P-CSCF auto-discovered. Line-specific settings live only in `[[volte.line]]`.
+With `bridge_inbound`, each line also runs in its own network namespace/veth
+pair (specs/020-volte-line-netns) — the same isolation `[vowifi]` lines get,
+and just as with `[vowifi]`'s equivalent fields, this is pure internal
+infrastructure with no config knob at all.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch. Off by default; the `volte-*` subcommands work without it as diagnostics |
+| `bridge_inbound` | boolean | `false` | Answer incoming calls over this registration and bridge them to the PBX (specs/017-volte-inbound-bridge), instead of only holding the registration open. Turning this on makes every bridged card EXCLUSIVE to this service — the circuit-switched daemon will not drive it |
+| `max_lines` | integer | 8 | Upper bound on auto-discovered LTE lines (specs/018-volte-multi-modem). Only meaningful with `bridge_inbound` — a single PBX registration then serves every line, exactly as the VoWiFi path does |
+| `pcscf_source_path` | string | `/tmp/pcscf` | Where the VoWiFi/ePDG path deposits the P-CSCF it learned from the IKEv2 config payload. Shared with `[vowifi].pcscf_source_path` so a captured address is picked up automatically |
+| `status_path` | string | `/tmp/volte-registration-status` | Where `volte-register` publishes registration state for `volte-status` |
+| `lock_path` | string | `/tmp/volte-registration.lock` | Lock file preventing two concurrent VoLTE registrations on one SIM |
+
+#### `[[volte.line]]`
+
+Optional array of tables — omit entirely for full auto-discovery. Add one entry
+per line to pin it to a specific modem and/or override its PDN/P-CSCF settings.
+Every field is optional except the matcher.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `modem_serial` | string | none | Match a modem by its USB hardware serial (preferred — survives device-path changes) |
+| `modem_port` | string | none | Match (or pin) a modem by its AT serial device path directly |
+| `cid` | integer | 3 | This line's PDP context id. Must not collide with the contexts the modem uses for general internet access |
+| `apn` | string | `ims` | This line's APN |
+| `pcscf` | string | unset (auto-discover) | This line's explicit P-CSCF address. Unset falls back to `pcscf_source_path`, then on-modem discovery — which does not work on every carrier |
+| `iface` | string | unset (auto-detect) | Host data interface bound to this line's IMS PDN. Unset auto-detects from the modem's own USB device |
+| `msisdn` | string | none | This line's own MSISDN, advertised in the P-Preferred-Identity |
 
 ## Examples
 

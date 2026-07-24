@@ -272,14 +272,10 @@ pub fn volte_claimed_ports(config: &crate::config::VolteConfig) -> Vec<PathBuf> 
     if !config.enabled {
         return Vec::new();
     }
-    // The single pinned modem (`modem_port`), plus any AT port a
-    // `[[volte.line]]` override pins in multi-modem discovery mode
-    // (specs/018-volte-multi-modem) — all claimed so the circuit-switched pool
-    // never grabs a modem this bridge drives.
+    // Any AT port a `[[volte.line]]` override pins in multi-modem discovery
+    // mode (specs/018-volte-multi-modem) — all claimed so the
+    // circuit-switched pool never grabs a modem this bridge drives.
     let mut ports = Vec::new();
-    if !config.modem_port.is_empty() {
-        ports.push(PathBuf::from(&config.modem_port));
-    }
     for over in &config.line_overrides {
         if let Some(p) = &over.modem_port {
             ports.push(PathBuf::from(p));
@@ -972,7 +968,10 @@ mod tests {
         // which is what makes it safe to merge.
         let config = crate::config::VolteConfig {
             enabled: false,
-            modem_port: "/dev/ttyUSB6".to_string(),
+            line_overrides: vec![crate::config::VolteLineOverride {
+                modem_port: Some("/dev/ttyUSB6".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         assert!(volte_claimed_ports(&config).is_empty());
@@ -982,7 +981,10 @@ mod tests {
     fn an_enabled_cellular_service_claims_its_card() {
         let config = crate::config::VolteConfig {
             enabled: true,
-            modem_port: "/dev/ttyUSB6".to_string(),
+            line_overrides: vec![crate::config::VolteLineOverride {
+                modem_port: Some("/dev/ttyUSB6".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         assert_eq!(
@@ -993,13 +995,12 @@ mod tests {
 
     #[test]
     fn discovery_mode_claims_pinned_override_ports_and_serials() {
-        // Empty modem_port (auto-discovery) with pinned [[volte.line]]s: the
-        // pinned AT ports are claimed, and a serial-pinned line is excluded
-        // from the circuit-switched pool by card id (robust to a modem
-        // answering AT on several ports) — specs/018-volte-multi-modem.
+        // Pinned [[volte.line]]s: the pinned AT ports are claimed, and a
+        // serial-pinned line is excluded from the circuit-switched pool by
+        // card id (robust to a modem answering AT on several ports) —
+        // specs/018-volte-multi-modem.
         let config = crate::config::VolteConfig {
             enabled: true,
-            modem_port: String::new(),
             line_overrides: vec![
                 crate::config::VolteLineOverride {
                     modem_port: Some("/dev/ttyUSB6".to_string()),
@@ -1035,12 +1036,11 @@ mod tests {
     }
 
     #[test]
-    fn an_enabled_service_with_no_port_claims_nothing_rather_than_everything() {
-        // An empty port must not be read as "claims the empty path" and then
-        // silently match nothing — or worse, be treated as a wildcard.
+    fn an_enabled_service_with_no_overrides_claims_nothing_rather_than_everything() {
+        // No [[volte.line]] pins must not be read as a wildcard claiming
+        // every modem — full auto-discovery claims nothing up front.
         let config = crate::config::VolteConfig {
             enabled: true,
-            modem_port: String::new(),
             ..Default::default()
         };
         assert!(volte_claimed_ports(&config).is_empty());
@@ -1054,7 +1054,10 @@ mod tests {
         // were interleaving AT transactions on one port.
         let config = crate::config::VolteConfig {
             enabled: true,
-            modem_port: "/dev/ttyUSB6".to_string(),
+            line_overrides: vec![crate::config::VolteLineOverride {
+                modem_port: Some("/dev/ttyUSB6".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let claimed = volte_claimed_ports(&config);

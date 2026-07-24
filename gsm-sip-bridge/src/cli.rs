@@ -84,8 +84,9 @@ pub enum Commands {
     /// zero-padded to 3 digits) derived from the SIM, and exits: MCC is the
     /// IMSI's first 3 digits, the 2-vs-3-digit MNC ambiguity is resolved
     /// via the SIM's EF_AD file (`AT+CRSM`), falling back to the registered
-    /// PLMN from numeric `AT+COPS`. Used by `docker/entrypoint.sh` when
-    /// `vowifi.mcc`/`vowifi.mnc` are left unset in config.toml.
+    /// PLMN from numeric `AT+COPS`. Used by `docker/entrypoint.sh` when a
+    /// line's `mcc`/`mnc` (from `[[vowifi.line]]`, or auto-discovery) are
+    /// left unset.
     VowifiPlmn(VowifiPlmnArgs),
     /// Reconciles the modem's own IMS/VoLTE stack with whether *this host*
     /// is going to register this modem itself — `[vowifi].enabled` or
@@ -508,6 +509,10 @@ pub struct VolteCarrierAgentArgs {
     /// `volte-discover-lines` wrote) to run as.
     #[arg(long)]
     pub line: u32,
+    /// Applied uniformly to every line, same as `volte-bridge --pcscf-port`
+    /// (the manifest carries each line's P-CSCF address but not its port).
+    #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
+    pub pcscf_port: u16,
 }
 
 #[derive(Parser, Debug)]

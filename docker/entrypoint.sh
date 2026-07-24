@@ -123,22 +123,21 @@ cleanup() {
         # --restore-cid so tear_down rebinds it instead of leaving the data path
         # unbound. Best-effort: a failure here must not stop the rest of cleanup.
         #
-        # A multi-modem bridge (empty modem_port) wrote a line manifest listing
-        # every line's modem/cid/restore-cid — `volte-cleanup` tears them all
-        # down from it. A single pinned modem (or the `volte-register` path,
-        # which writes no manifest) is torn down directly here. `volte-cleanup`
-        # is a no-op when no manifest exists, so running it unconditionally is
-        # safe and covers the discovery case.
+        # bridge_inbound (auto-discovering every modem) wrote a line manifest
+        # listing every line's modem/cid/restore-cid — `volte-cleanup` tears
+        # them all down from it; a no-op when no manifest exists, so running
+        # it unconditionally is safe. The `volte-register` path (registration
+        # only, always the CLI's default modem/cid) writes no manifest, so it
+        # is torn down directly here instead.
         "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-cleanup \
             >/dev/null 2>&1
-        if [ -n "$VOLTE_MODEM_PORT" ]; then
+        if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 0 ]; then
             volte_restore_cid=""
             if [ -f "${VOLTE_RESTORE_CID_PATH:-}" ]; then
                 volte_restore_cid="$(cat "$VOLTE_RESTORE_CID_PATH" 2>/dev/null)"
             fi
             "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-pdn \
-                --action down --modem "$VOLTE_MODEM_PORT" \
-                ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} --cid "${VOLTE_CID:-3}" \
+                --action down \
                 ${volte_restore_cid:+--restore-cid "$volte_restore_cid"} \
                 >/dev/null 2>&1
         fi
@@ -257,7 +256,7 @@ if "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" config volte-enabled;
     # own detach — its accept loop does not return).
     VOLTE_RESTORE_CID_PATH="/run/volte-restore-cid"
 
-    if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ] && [ -z "$VOLTE_MODEM_PORT" ]; then
+    if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
         DISCOVER_LINES_ENV="$("$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" \
             volte-discover-lines --shell-env --restore-cid-path "$VOLTE_RESTORE_CID_PATH")" || {
             log "FATAL: 'volte-discover-lines' failed — see error above"
@@ -553,6 +552,7 @@ start_line_strongswan() {
     local veth_peer="${LINE_VETH_PEER_ADDR[idx]}"
     local veth_sip="${LINE_VETH_SIP_IFACE[idx]}"
     local veth_ims="${LINE_VETH_IMS_IFACE[idx]}"
+    local imsi_override="${LINE_IMSI[idx]:-}"
     local charon_log="/tmp/charon-$idx.log"
     local vici_socket="/var/run/charon-$idx.vici"
     local strongswan_conf
@@ -603,9 +603,9 @@ start_line_strongswan() {
     ensure_epdg_interface "$netns" "$tun_iface" "$if_id"
     STARTED_NETNS+=("$netns")
 
-    local imsi="${IMSI:-}"
+    local imsi="$imsi_override"
     if [ -n "$imsi" ]; then
-        log "line $idx: using IMSI override from vowifi.imsi_override"
+        log "line $idx: using IMSI override from [[vowifi.line]]"
     else
         imsi="$("$GSM_SIP_BRIDGE_BIN" vowifi-imsi --modem "$modem")"
         if [ -z "$imsi" ]; then
@@ -1190,44 +1190,27 @@ VoLTE subsystem will NOT start this run."
     # (specs/017-volte-inbound-bridge FR-023). Unset means today's behaviour:
     # hold the registration open and nothing more.
     #
-    # A non-empty modem_port pins one modem (single-line, back-compat,
-    # research.md R7 — no namespace, out of scope for isolation). An empty
-    # modem_port auto-discovers every SIM-ready modem and bridges each as its
-    # own line (specs/018-volte-multi-modem), now each in its own network
-    # namespace (specs/020-volte-line-netns) — per-line cid/apn/pcscf/iface
-    # then come from [volte] + [[volte.line]], not these flags.
-    if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ] && [ -z "$VOLTE_MODEM_PORT" ]; then
+    # bridge_inbound always goes through start_volte_multiline
+    # (specs/020-volte-line-netns) — every line runs in its own namespace,
+    # unconditionally, whether one modem or several were discovered. Pin a
+    # single modem via [[volte.line]] in config.toml; there is no separate
+    # CLI-flags-driven single-line shortcut anymore (per-line cid/apn/pcscf/
+    # iface come from [[volte.line]], read directly by the binary — not from
+    # any shell var here).
+    if [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
         start_volte_multiline
-    elif [ "${VOLTE_BRIDGE_INBOUND:-0}" -eq 1 ]; then
-        log "[volte].enabled + bridge_inbound — answering inbound calls over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
-        (
-            while true; do
-                # --pcscf omitted deliberately: resolved from the ePDG capture
-                # at pcscf_source_path when no address is configured, so a
-                # VoWiFi run on this SIM primes the LTE path.
-                "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-bridge \
-                    --modem "$VOLTE_MODEM_PORT" \
-                    ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
-                    --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
-                    ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
-                    --pcscf-port "$VOLTE_PCSCF_PORT" \
-                    --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
-                    --restore-cid-path "$VOLTE_RESTORE_CID_PATH"
-                log "the LTE IMS service exited (status $?); restarting in 15s"
-                sleep 15
-            done
-        ) &
-        VOLTE_SUPERVISOR_PID=$!
     else
-        log "[volte].enabled — starting host-side IMS over LTE (modem $VOLTE_MODEM_PORT, cid $VOLTE_CID)"
+        # Registration-only (legacy, single-line): omitting --modem below
+        # makes volte-register resolve one line itself (a SIM-ready-modem
+        # scan, kept to the first line found), honoring the first
+        # [[volte.line]] entry's cid/apn/pcscf/iface if one is configured,
+        # or built-in defaults (/dev/ttyUSB0, cid 3, apn "ims") otherwise.
+        # Still single-line only — a second [[volte.line]] entry is ignored
+        # in this mode, and it runs in the default namespace, not isolated.
+        log "[volte].enabled — starting host-side IMS over LTE (resolving one line from config)"
         (
             while true; do
                 "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" volte-register \
-                    --modem "$VOLTE_MODEM_PORT" \
-                    ${VOLTE_IFACE:+--iface "$VOLTE_IFACE"} \
-                    --cid "$VOLTE_CID" --apn "$VOLTE_APN" \
-                    ${VOLTE_PCSCF:+--pcscf "$VOLTE_PCSCF"} \
-                    --pcscf-port "$VOLTE_PCSCF_PORT" \
                     --pcscf-source-path "$VOLTE_PCSCF_SOURCE_PATH" \
                     --status-path "$VOLTE_STATUS_PATH" \
                     --lock-path "$VOLTE_LOCK_PATH" \
