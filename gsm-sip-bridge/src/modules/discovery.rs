@@ -323,11 +323,28 @@ pub fn scan_modules_excluding_cards(
     also_skip_cards: &[String],
 ) -> BridgeResult<Vec<DiscoveredModule>> {
     let mut excluded = excluded_ports_from_lines_file();
+    excluded.extend(active_volte_line_ports());
     excluded.extend(also_excluded.iter().cloned());
-    // Skips re-probing any modem an active VoWiFi line, or a serial-pinned
-    // VoLTE line, already owns — not just filtering it out afterward (see
+    // Skips re-probing any modem an active VoWiFi line, an *auto-discovered*
+    // VoLTE line (specs/020-volte-line-netns — read from the manifest
+    // `volte-discover-lines` writes, the same way `active_vowifi_card_ids`
+    // reads VoWiFi's own line-resolution file), or a serial-pinned VoLTE line
+    // already owns — not just filtering it out afterward (see
     // `scan_all_inner`'s doc comment).
+    //
+    // This closes a real contention hazard found live: a serial-pinned
+    // `[[volte.line]]` override alone is not enough when a modem answers `AT`
+    // on several `ttyUSB` interfaces (the very case `volte_claimed_card_ids`'s
+    // own doc comment already warns about) — the circuit-switched daemon's
+    // periodic re-scan can settle on a *different* port than the one pinned,
+    // so a port-string exclusion misses it and both subsystems' AT traffic
+    // interleaves on the same physical SIM (observed as intermittent
+    // `AT+CIMI`/`AT+CPIN` failures on the VoLTE side). Reading the *resolved*
+    // card id back from the manifest — the identity the modem actually probed
+    // as, not the identity a config override guessed — closes that gap the
+    // same way `active_vowifi_card_ids` already closes it for VoWiFi.
     let mut skip = active_vowifi_card_ids();
+    skip.extend(active_volte_card_ids());
     skip.extend(also_skip_cards.iter().cloned());
     let modems = scan_all_inner(&[], &skip)?;
     Ok(modems
@@ -418,6 +435,71 @@ fn excluded_ports_from_lines_file() -> std::collections::HashSet<PathBuf> {
 /// `scan_all`/`scan_all_preferring`'s doc comments).
 fn active_vowifi_card_ids() -> std::collections::HashSet<String> {
     read_lines_file_excerpt()
+        .lines
+        .into_iter()
+        .map(|l| l.card_id)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Default path/env var for the VoLTE line manifest — duplicated from
+/// `volte::discovery::{DEFAULT_MANIFEST_PATH, MANIFEST_PATH_ENV}` rather than
+/// imported, for the same layering reason `DEFAULT_LINES_FILE` above lives
+/// here and not in `vowifi::discovery`: this module is the shared scan
+/// underneath both subsystems and must not depend on either of them. Keep
+/// both copies in sync if the manifest path ever changes.
+const VOLTE_MANIFEST_PATH_ENV: &str = "GSM_SIP_BRIDGE_VOLTE_LINES_FILE";
+const DEFAULT_VOLTE_MANIFEST_PATH: &str = "/run/volte-lines.json";
+
+#[derive(serde::Deserialize, Default)]
+struct VolteManifestExcerpt {
+    #[serde(default)]
+    lines: Vec<VolteLineExcerpt>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct VolteLineExcerpt {
+    #[serde(default)]
+    card_id: String,
+    #[serde(default)]
+    modem_port: String,
+}
+
+fn read_volte_manifest_excerpt() -> VolteManifestExcerpt {
+    let path = std::env::var(VOLTE_MANIFEST_PATH_ENV)
+        .unwrap_or_else(|_| DEFAULT_VOLTE_MANIFEST_PATH.to_string());
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return VolteManifestExcerpt::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_else(|e| {
+        tracing::warn!(
+            path = %path,
+            error = %e,
+            "failed to parse VoLTE line manifest; treating it as absent"
+        );
+        VolteManifestExcerpt::default()
+    })
+}
+
+/// Ports every resolved (auto-discovered or serial-pinned) VoLTE line
+/// actually settled on — read back from the manifest `volte-discover-lines`
+/// writes, so an auto-discovered line (no `[[volte.line]]` override to derive
+/// a port from) is excluded too, not only explicitly pinned ones.
+fn active_volte_line_ports() -> std::collections::HashSet<PathBuf> {
+    read_volte_manifest_excerpt()
+        .lines
+        .into_iter()
+        .map(|l| PathBuf::from(l.modem_port))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// Card ids of every currently-resolved VoLTE line — the VoLTE counterpart to
+/// `active_vowifi_card_ids`, closing the same "answers AT on several ports"
+/// gap by excluding the modem's whole USB device (by its *actually resolved*
+/// card id), not just the one port it happened to be probed on.
+fn active_volte_card_ids() -> std::collections::HashSet<String> {
+    read_volte_manifest_excerpt()
         .lines
         .into_iter()
         .map(|l| l.card_id)

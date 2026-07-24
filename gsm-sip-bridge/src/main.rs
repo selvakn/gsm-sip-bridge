@@ -99,8 +99,16 @@ fn main() -> ExitCode {
         return handle_volte_bridge_command(args, &cli);
     }
 
-    if let Some(Commands::VolteCleanup) = &cli.command {
-        return handle_volte_cleanup_command();
+    if let Some(Commands::VolteDiscoverLines(args)) = &cli.command {
+        return handle_volte_discover_lines_command(args, &cli);
+    }
+
+    if let Some(Commands::VolteCarrierAgent(args)) = &cli.command {
+        return handle_volte_carrier_agent_command(args, &cli);
+    }
+
+    if let Some(Commands::VolteCleanup(args)) = &cli.command {
+        return handle_volte_cleanup_command(args.line);
     }
 
     if let Some(Commands::Config(args)) = &cli.command {
@@ -434,7 +442,13 @@ fn handle_modem_ims_command(args: &gsm_sip_bridge::cli::ModemImsArgs, cli: &Cli)
             return ExitCode::FAILURE;
         }
     };
-    gsm_sip_bridge::vowifi::ims_mode::run(&args.modem, config.vowifi.enabled)
+    // Either host-driven path wants the modem's own IMS stack off — never
+    // both at once (`volte::guard` refuses that), but either alone still
+    // needs it (specs/020-volte-line-netns: this used to check
+    // `config.vowifi.enabled` alone, which left a VoLTE-only deployment's
+    // modem fighting our registration with its own internal one).
+    let host_ims_wanted = config.vowifi.enabled || config.volte.enabled;
+    gsm_sip_bridge::vowifi::ims_mode::run(&args.modem, host_ims_wanted)
 }
 
 fn volte_settings(
@@ -1077,19 +1091,24 @@ fn handle_volte_bridge_command(
     };
 
     // An explicit `--modem` bridges exactly that one modem (the diagnostic /
-    // single-line path). Omitting it auto-discovers every SIM-ready modem and
-    // bridges each as its own line (specs/018-volte-multi-modem).
-    let lines = match &args.modem {
-        Some(modem) => volte_bridge_single_line(args, modem),
-        None => volte_bridge_discovered_lines(args, &app_config.volte),
+    // single-line path, no namespace — research.md R7). Omitting it means the
+    // production, auto-discovered path (specs/020-volte-line-netns): the line
+    // table was already resolved and written by `volte-discover-lines`, so
+    // this reads it back rather than re-scanning (research.md R7's "discover
+    // once" principle) and runs Agent B only — each line's carrier half is
+    // its own `volte-carrier-agent` process, started separately by
+    // `docker/entrypoint.sh` inside that line's namespace.
+    let (lines, spawn_carrier_threads) = match &args.modem {
+        Some(modem) => (volte_bridge_single_line(args, modem), true),
+        None => (volte_bridge_manifest_lines(&app_config.volte), false),
     };
 
     let lines = match lines {
         Ok(lines) if !lines.is_empty() => lines,
         Ok(_) => {
             eprintln!(
-                "volte-bridge: no usable LTE lines (no SIM-ready modem discovered, or none \
-                 had a P-CSCF available); nothing to bridge"
+                "volte-bridge: no usable LTE lines in the manifest — run `volte-discover-lines` \
+                 first, or check it found a usable modem"
             );
             return ExitCode::FAILURE;
         }
@@ -1103,6 +1122,7 @@ fn handle_volte_bridge_command(
         gsm_sip_bridge::volte::bridge::ServiceConfig {
             lines,
             force: args.force,
+            spawn_carrier_threads,
         },
         &app_config,
     )
@@ -1110,6 +1130,8 @@ fn handle_volte_bridge_command(
 
 /// The single explicit-`--modem` line (index 0, default port trio) — today's
 /// behaviour, so a diagnostic `volte-bridge --modem /dev/ttyUSBx` is unchanged.
+/// No namespace, no veth (research.md R7): `netns`/`veth_*` stay empty, which
+/// is what selects `LOOPBACK` throughout.
 fn volte_bridge_single_line(
     args: &gsm_sip_bridge::cli::VolteBridgeArgs,
     modem: &std::path::Path,
@@ -1138,70 +1160,301 @@ fn volte_bridge_single_line(
         sip_leg_port: discovery::sip_leg_port(0),
         control_port: discovery::control_port(0),
         status_port: discovery::status_port(0),
+        netns: String::new(),
+        veth_carrier_addr: String::new(),
+        veth_telephony_addr: String::new(),
     }])
 }
 
-/// Every auto-discovered LTE line. Scans the USB bus once, resolves the line
-/// table from `[volte]` (bounded by `max_lines`, shaped by `[[volte.line]]`),
-/// resolves each line's P-CSCF, and derives a per-line restore-cid file so
-/// each modem's displaced context is restored independently.
-fn volte_bridge_discovered_lines(
-    args: &gsm_sip_bridge::cli::VolteBridgeArgs,
+/// Every line from the manifest `volte-discover-lines` already wrote
+/// (specs/020-volte-line-netns) — the production, auto-discovered path's
+/// `volte-bridge` (Agent B only) no longer scans or resolves lines itself.
+/// P-CSCF is still resolved fresh here (not cached in the manifest, since it
+/// can change — an ePDG capture completing after discovery ran, say) using
+/// each line's recorded override, exactly the precedence
+/// `volte_bridge_single_line`/the pre-020 discovered-lines path always used.
+fn volte_bridge_manifest_lines(
     volte: &gsm_sip_bridge::config::VolteConfig,
 ) -> Result<Vec<gsm_sip_bridge::volte::bridge::BridgeLine>, String> {
     use gsm_sip_bridge::volte::discovery;
 
-    // Probe every configured port first on its device (a modem may answer AT on
-    // more than one ttyUSB), mirroring the VoWiFi discover path.
-    let preferred: Vec<std::path::PathBuf> = volte
-        .line_overrides
-        .iter()
-        .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
-        .collect();
-    let modems = gsm_sip_bridge::modules::discovery::scan_all_preferring(&preferred)
-        .map_err(|e| format!("modem discovery failed: {e}"))?;
-
-    let table = discovery::resolve_volte_lines(&modems, volte);
-    for failed in &table.failed {
-        tracing::error!(
-            card_id = %failed.card_id,
-            reason = %failed.reason,
-            "VoLTE line discovery: modem not usable as a line"
-        );
-    }
+    let manifest = discovery::read_manifest(&discovery::manifest_path()).map_err(|e| {
+        format!("no VoLTE line manifest ({e}) — run `volte-discover-lines` before `volte-bridge`")
+    })?;
 
     let mut lines = Vec::new();
-    for resolved in &table.lines {
-        let Some(pcscf) = resolve_line_pcscf(
-            resolved.pcscf.clone(),
-            volte.pcscf_port,
-            &args.pcscf_source_path,
-        ) else {
+    for entry in &manifest.lines {
+        let explicit = if entry.pcscf.is_empty() {
+            None
+        } else {
+            Some(entry.pcscf.clone())
+        };
+        let Some(pcscf) = resolve_line_pcscf(explicit, volte.pcscf_port, &volte.pcscf_source_path)
+        else {
             tracing::error!(
-                card_id = %resolved.card_id,
+                card_id = %entry.card_id,
                 "no P-CSCF available for this line (none configured and none captured by the \
                  ePDG path); skipping it"
             );
             continue;
         };
         let settings = gsm_sip_bridge::volte::VolteSettings {
-            modem_port: resolved.modem_port.clone(),
-            iface: resolved.iface.clone(),
-            cid: resolved.cid,
-            apn: resolved.apn.clone(),
+            modem_port: std::path::PathBuf::from(&entry.modem_port),
+            iface: entry.iface.clone(),
+            cid: entry.cid,
+            apn: entry.apn.clone(),
             pcscf: Some(pcscf),
-            restore_cid_path: per_line_restore_cid_path(&args.restore_cid_path, resolved.index),
+            restore_cid_path: if entry.restore_cid_path.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&entry.restore_cid_path))
+            },
         };
         lines.push(gsm_sip_bridge::volte::bridge::BridgeLine {
-            card_id: resolved.card_id.clone(),
+            card_id: entry.card_id.clone(),
             settings,
-            msisdn: resolved.msisdn.clone(),
-            sip_leg_port: resolved.sip_leg_port,
-            control_port: resolved.control_port,
-            status_port: resolved.status_port,
+            msisdn: None,
+            sip_leg_port: entry.sip_leg_port,
+            control_port: entry.control_port,
+            status_port: entry.status_port,
+            netns: entry.netns.clone(),
+            veth_carrier_addr: entry.veth_carrier_addr.clone(),
+            veth_telephony_addr: entry.veth_telephony_addr.clone(),
         });
     }
     Ok(lines)
+}
+
+/// Resolves the auto-discovered VoLTE line table and writes it as the
+/// manifest — the LTE counterpart to `discover` (specs/020-volte-line-netns).
+/// Run once, up front, by `docker/entrypoint.sh` before any per-line
+/// namespace or process exists.
+fn handle_volte_discover_lines_command(
+    args: &gsm_sip_bridge::cli::VolteDiscoverLinesArgs,
+    cli: &gsm_sip_bridge::cli::Cli,
+) -> ExitCode {
+    use gsm_sip_bridge::volte::discovery;
+
+    let app_config = match load_config(cli.config.as_deref().unwrap_or(std::path::Path::new(""))) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("volte-discover-lines: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let volte = &app_config.volte;
+
+    let preferred: Vec<std::path::PathBuf> = volte
+        .line_overrides
+        .iter()
+        .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
+        .collect();
+    let modems = match gsm_sip_bridge::modules::discovery::scan_all_preferring(&preferred) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("volte-discover-lines: modem discovery failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let table = discovery::resolve_volte_lines(&modems, volte);
+    for failed in &table.failed {
+        eprintln!(
+            "volte-discover-lines: {} not usable as a line: {}",
+            failed.card_id, failed.reason
+        );
+    }
+
+    if let Err(e) = discovery::write_manifest(&table.lines, args.restore_cid_path.as_deref()) {
+        eprintln!("volte-discover-lines: failed to write the line manifest: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // stderr, not stdout: `docker/entrypoint.sh` captures this command's
+    // stdout wholesale into `eval` when `--shell-env` is set (mirroring
+    // `discover`'s own contract) — any other stdout output gets `eval`'d
+    // right alongside the KEY=value lines and breaks the shell (found live:
+    // this line's `(`/`)` triggered a bash syntax error the first time this
+    // ran against real hardware).
+    eprintln!(
+        "volte-discover-lines: resolved {} line(s), {} failed",
+        table.lines.len(),
+        table.failed.len()
+    );
+    if args.shell_env {
+        print_volte_discover_lines_shell_env(&table.lines);
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Bash indexed-array output for `docker/entrypoint.sh`'s VoLTE per-line
+/// loop to `eval` — mirrors `print_discover_shell_env`'s array convention
+/// exactly (`LINE_CARD_ID=(...)`, indexed by position, not per-index scalar
+/// variables) so both subsystems' entrypoint loops read the same shape.
+fn print_volte_discover_lines_shell_env(
+    lines: &[gsm_sip_bridge::volte::discovery::ResolvedVolteLine],
+) {
+    fn arr<T: ToString>(vals: impl Iterator<Item = T>) -> String {
+        format!(
+            "({})",
+            vals.map(|v| shell_quote(&v.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+
+    println!("VOLTE_LINE_COUNT={}", lines.len());
+    println!(
+        "VOLTE_LINE_CARD_ID={}",
+        arr(lines.iter().map(|l| l.card_id.clone()))
+    );
+    println!(
+        "VOLTE_LINE_MODEM_PORT={}",
+        arr(lines.iter().map(|l| l.modem_port.display().to_string()))
+    );
+    println!(
+        "VOLTE_LINE_IFACE={}",
+        arr(lines.iter().map(|l| l.iface.clone()))
+    );
+    println!(
+        "VOLTE_LINE_NETNS={}",
+        arr(lines.iter().map(|l| l.netns.clone()))
+    );
+    println!(
+        "VOLTE_LINE_VETH_CARRIER_IFACE={}",
+        arr(lines.iter().map(|l| l.veth_carrier_iface.clone()))
+    );
+    println!(
+        "VOLTE_LINE_VETH_TELEPHONY_IFACE={}",
+        arr(lines.iter().map(|l| l.veth_telephony_iface.clone()))
+    );
+    println!(
+        "VOLTE_LINE_VETH_CARRIER_ADDR={}",
+        arr(lines.iter().map(|l| l.veth_carrier_addr.clone()))
+    );
+    println!(
+        "VOLTE_LINE_VETH_TELEPHONY_ADDR={}",
+        arr(lines.iter().map(|l| l.veth_telephony_addr.clone()))
+    );
+}
+
+/// The per-line carrier-facing half (specs/020-volte-line-netns) — reads its
+/// settings from the manifest `volte-discover-lines` wrote, attaches this
+/// line's IMS PDN, registers, and answers calls until the registration ends.
+/// One-shot: does not retry internally (`docker/entrypoint.sh` restarts it on
+/// exit, mirroring `vowifi-ims-agent`'s supervision).
+fn handle_volte_carrier_agent_command(
+    args: &gsm_sip_bridge::cli::VolteCarrierAgentArgs,
+    cli: &gsm_sip_bridge::cli::Cli,
+) -> ExitCode {
+    use gsm_sip_bridge::volte::discovery;
+
+    let app_config = match load_config(cli.config.as_deref().unwrap_or(std::path::Path::new(""))) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("volte-carrier-agent: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let manifest = match discovery::read_manifest(&discovery::manifest_path()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "volte-carrier-agent: no line manifest ({e}) — run `volte-discover-lines` first"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(entry) = manifest.lines.iter().find(|l| l.index == args.line) else {
+        eprintln!(
+            "volte-carrier-agent: no line {} in the manifest ({} line(s) resolved)",
+            args.line,
+            manifest.lines.len()
+        );
+        return ExitCode::FAILURE;
+    };
+
+    let explicit = if entry.pcscf.is_empty() {
+        None
+    } else {
+        Some(entry.pcscf.clone())
+    };
+    let Some(pcscf) = resolve_line_pcscf(
+        explicit,
+        app_config.volte.pcscf_port,
+        &app_config.volte.pcscf_source_path,
+    ) else {
+        eprintln!(
+            "volte-carrier-agent: line {}: no P-CSCF available (none configured and none \
+             captured by the ePDG path)",
+            args.line
+        );
+        return ExitCode::FAILURE;
+    };
+
+    let settings = gsm_sip_bridge::volte::VolteSettings {
+        modem_port: std::path::PathBuf::from(&entry.modem_port),
+        iface: entry.iface.clone(),
+        cid: entry.cid,
+        apn: entry.apn.clone(),
+        pcscf: Some(pcscf),
+        restore_cid_path: if entry.restore_cid_path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&entry.restore_cid_path))
+        },
+    };
+    let line = gsm_sip_bridge::volte::bridge::BridgeLine {
+        card_id: entry.card_id.clone(),
+        settings,
+        msisdn: None,
+        sip_leg_port: entry.sip_leg_port,
+        control_port: entry.control_port,
+        status_port: entry.status_port,
+        netns: entry.netns.clone(),
+        veth_carrier_addr: entry.veth_carrier_addr.clone(),
+        veth_telephony_addr: entry.veth_telephony_addr.clone(),
+    };
+
+    let modem_port = line.settings.modem_port.clone();
+    let modem_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    {
+        let modem_port = modem_port.clone();
+        let lock = modem_lock.clone();
+        let control_addr = std::net::SocketAddr::new(
+            if line.veth_telephony_addr.is_empty() {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                line.veth_telephony_addr
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            },
+            line.control_port,
+        );
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("volte-sms-{}", line.card_id))
+            .spawn(move || {
+                gsm_sip_bridge::volte::sms::run_modem_reader(modem_port, control_addr, lock)
+            })
+        {
+            eprintln!(
+                "volte-carrier-agent: failed to start the modem SMS reader for this line: {e}"
+            );
+        }
+    }
+
+    // Cross-process: cannot share the telephony half's `pbx_registered` flag
+    // (see carrier_agent.rs's module docs) — the same limitation
+    // `vowifi-ims-agent` already has for the same reason.
+    gsm_sip_bridge::volte::carrier_agent::run(&line, &app_config, modem_lock, None);
+
+    eprintln!(
+        "volte-carrier-agent: line {} ({}) stopped",
+        args.line, line.card_id
+    );
+    ExitCode::FAILURE
 }
 
 /// Resolves one line's P-CSCF: an explicitly-configured address wins, else the
@@ -1225,20 +1478,22 @@ fn resolve_line_pcscf(
 
 /// Per-line restore-cid file so each modem's displaced context is recorded and
 /// restored independently: `<base>-<index>`. `None` when no base was given.
-fn per_line_restore_cid_path(
-    base: &Option<std::path::PathBuf>,
-    index: u32,
-) -> Option<std::path::PathBuf> {
-    base.as_ref()
-        .map(|b| std::path::PathBuf::from(format!("{}-{index}", b.display())))
-}
-
 /// Releases every LTE line the running bridge recorded in its manifest, each
 /// with the displaced context read from that line's own restore-cid file, then
 /// removes the manifest. A no-op (success) when no manifest exists — the
 /// single-line `volte-register` path writes none and is torn down by the
 /// entrypoint's own `volte-pdn down`.
-fn handle_volte_cleanup_command() -> ExitCode {
+/// Tears down one line (`line = Some(idx)`) or every line (`line = None`).
+///
+/// With `--line`, this is meant to be run as `ip netns exec <that line's
+/// netns> ... volte-cleanup --line <idx>` (specs/020-volte-line-netns
+/// research.md R6): `detach`'s `netcfg::teardown` issues namespace-scoped
+/// `ip`/sysctl commands that only find the interface when run inside the
+/// namespace it currently lives in — running them from the default namespace
+/// after the interface has already been moved into a per-line namespace
+/// would silently fail to restore the displaced data context, reopening the
+/// exact bug `e50ddca` fixed once already for the single-namespace case.
+fn handle_volte_cleanup_command(line: Option<u32>) -> ExitCode {
     use gsm_sip_bridge::volte::discovery;
     let path = discovery::manifest_path();
     let manifest = match discovery::read_manifest(&path) {
@@ -1246,14 +1501,18 @@ fn handle_volte_cleanup_command() -> ExitCode {
         Err(_) => return ExitCode::SUCCESS,
     };
     let mut all_ok = true;
-    for line in &manifest.lines {
-        let restore_cid = std::fs::read_to_string(&line.restore_cid_path)
+    for entry in manifest
+        .lines
+        .iter()
+        .filter(|l| line.is_none_or(|i| i == l.index))
+    {
+        let restore_cid = std::fs::read_to_string(&entry.restore_cid_path)
             .ok()
             .and_then(|s| s.trim().parse::<u8>().ok());
         let settings = gsm_sip_bridge::volte::VolteSettings {
-            modem_port: std::path::PathBuf::from(&line.modem_port),
-            iface: line.iface.clone(),
-            cid: line.cid,
+            modem_port: std::path::PathBuf::from(&entry.modem_port),
+            iface: entry.iface.clone(),
+            cid: entry.cid,
             // `detach` uses only the modem port, interface, cid and restore-cid.
             apn: String::new(),
             pcscf: None,
@@ -1262,17 +1521,22 @@ fn handle_volte_cleanup_command() -> ExitCode {
         match gsm_sip_bridge::volte::detach(&settings, restore_cid) {
             Ok(()) => println!(
                 "volte-cleanup: released line {} ({})",
-                line.card_id, line.modem_port
+                entry.card_id, entry.modem_port
             ),
             Err(e) => {
-                eprintln!("volte-cleanup: line {} teardown failed: {e}", line.card_id);
+                eprintln!("volte-cleanup: line {} teardown failed: {e}", entry.card_id);
                 all_ok = false;
             }
         }
     }
-    // Remove the manifest so a later cleanup doesn't try to tear these down
-    // again against modems something else may have re-claimed.
-    let _ = std::fs::remove_file(&path);
+    // Remove the manifest only once every line has been processed (no
+    // `--line` filter) — a per-line invocation leaves it for the remaining
+    // lines' own cleanup calls to read; the next `volte-discover-lines` run
+    // overwrites it wholesale regardless, so a stale manifest between now and
+    // then is harmless.
+    if line.is_none() {
+        let _ = std::fs::remove_file(&path);
+    }
     if all_ok {
         ExitCode::SUCCESS
     } else {

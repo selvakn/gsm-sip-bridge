@@ -1,20 +1,20 @@
-//! Multi-modem VoLTE line resolution (specs/018-volte-multi-modem): which
-//! discovered modems become host-side LTE bridge lines, and each line's
-//! per-line-derived loopback ports and PDN/P-CSCF settings. The LTE
-//! counterpart to [`crate::vowifi::discovery`], but far smaller.
-//!
-//! The LTE path has **no network namespace** (specs/015 research R4), so a
-//! line needs none of VoWiFi's netns/veth/XFRM/vpcd isolation — its two
-//! halves are threads in one process joined over loopback. The only thing
-//! that must differ per line is therefore its **loopback port trio** (the
-//! carrier half's status listener, the carrier↔telephony leg, and the
-//! control channel), which this module derives as a function of the line
-//! index, exactly the way [`crate::vowifi::discovery`] derives veth
-//! addresses and vpcd ports.
+//! Multi-modem VoLTE line resolution (specs/018-volte-multi-modem,
+//! specs/020-volte-line-netns): which discovered modems become host-side LTE
+//! bridge lines, and each line's per-line-derived ports, namespace, veth
+//! identifiers and PDN/P-CSCF settings. The LTE counterpart to
+//! [`crate::vowifi::discovery`], and now shaped much more like it: every line
+//! gets its own network namespace and veth pair, derived the same way
+//! [`crate::vowifi::discovery`] derives its own — on a distinct (`volte`-
+//! prefixed) base so the two subsystems' identifiers can never collide
+//! (specs/020-volte-line-netns FR-004a) — alongside the loopback port trio
+//! (the carrier half's status listener, the carrier↔telephony leg, and the
+//! control channel) that predates it and still applies for the single-line
+//! diagnostic path, which has no namespace (research.md R7).
 //!
 //! Resolution is a pure function over [`ProbedModem`]s (from the shared
 //! [`crate::modules::discovery`] scan) and the `[volte]` base config, so the
-//! whole role/port/settings derivation is unit-testable without a modem.
+//! whole role/port/namespace/settings derivation is unit-testable without a
+//! modem.
 
 use crate::config::{VolteConfig, VolteLineOverride};
 use crate::modules::discovery::{ProbedModem, SimStatus};
@@ -69,6 +69,21 @@ pub struct ResolvedVolteLine {
     pub sip_leg_port: u16,
     pub control_port: u16,
     pub status_port: u16,
+    /// This line's network namespace, derived from `[volte].netns`
+    /// (specs/020-volte-line-netns): index 0 keeps the unindexed base
+    /// (back-compat identity), later lines append their index — exactly the
+    /// shape `vowifi::discovery::resolve_one_line` already derives `netns`
+    /// in, on a distinct (`volte`-prefixed) base so the two subsystems'
+    /// namespaces can never collide (FR-004a).
+    pub netns: String,
+    /// Veth end inside `netns` — the carrier agent's side.
+    pub veth_carrier_iface: String,
+    /// Veth end in the default namespace — the shared telephony half's side.
+    pub veth_telephony_iface: String,
+    /// `/30` address for the carrier-agent side of the veth link.
+    pub veth_carrier_addr: String,
+    /// `/30` address for the telephony-half side of the veth link.
+    pub veth_telephony_addr: String,
 }
 
 /// The resolved LTE line table plus the modems that could not become lines,
@@ -167,6 +182,17 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+/// Adds `delta` to an IPv4 address, for deriving each line's `/30` veth
+/// block from the `[volte]` base — identical mechanism to
+/// `vowifi::discovery`'s own (private) `shift_ipv4`, not shared across
+/// modules since it is a two-line pure function used exactly once on each
+/// side (specs/020-volte-line-netns research.md R4).
+fn shift_ipv4(addr: &str, delta: u32) -> Option<String> {
+    let ip: std::net::Ipv4Addr = addr.parse().ok()?;
+    let shifted = u32::from(ip).checked_add(delta)?;
+    Some(std::net::Ipv4Addr::from(shifted).to_string())
+}
+
 fn resolve_one_volte_line(
     index: u32,
     modem: &ProbedModem,
@@ -191,6 +217,32 @@ fn resolve_one_volte_line(
         .unwrap_or_default();
     let msisdn = over.and_then(|o| o.msisdn.clone());
 
+    // Namespace/veth derivation (specs/020-volte-line-netns research.md R4):
+    // index 0 keeps the unindexed base — still isolated, just not suffixed —
+    // exactly the shape `vowifi::discovery::resolve_one_line` derives `netns`
+    // in (`discovery.rs:227`). Isolation is unconditional (FR-004b): there is
+    // no "no netns" branch for the single-line case.
+    let netns = if index == 0 {
+        base.netns.clone()
+    } else {
+        format!("{}{}", base.netns, index)
+    };
+    let veth_carrier_iface = if index == 0 {
+        base.veth_carrier_iface.clone()
+    } else {
+        format!("{}{}", base.veth_carrier_iface, index)
+    };
+    let veth_telephony_iface = if index == 0 {
+        base.veth_telephony_iface.clone()
+    } else {
+        format!("{}{}", base.veth_telephony_iface, index)
+    };
+    let step = 4u32 * index;
+    let veth_carrier_addr =
+        shift_ipv4(&base.veth_carrier_addr, step).unwrap_or_else(|| base.veth_carrier_addr.clone());
+    let veth_telephony_addr = shift_ipv4(&base.veth_telephony_addr, step)
+        .unwrap_or_else(|| base.veth_telephony_addr.clone());
+
     ResolvedVolteLine {
         index,
         card_id: modem.card_id.clone(),
@@ -206,6 +258,11 @@ fn resolve_one_volte_line(
         sip_leg_port: sip_leg_port(index),
         control_port: control_port(index),
         status_port: status_port(index),
+        netns,
+        veth_carrier_iface,
+        veth_telephony_iface,
+        veth_carrier_addr,
+        veth_telephony_addr,
     }
 }
 
@@ -227,6 +284,15 @@ pub struct VolteLineManifestEntry {
     pub card_id: String,
     pub modem_port: String,
     pub cid: u8,
+    /// This line's requested APN. Found live to matter more than it looks:
+    /// an empty APN here makes `AT+CGDCONT` request the network's *default*
+    /// bearer instead of the dedicated IMS one — the network still attaches
+    /// and assigns an address, but on the wrong APN (observed:
+    /// `www.mnc043.mcc404.gprs` instead of the requested `ims....`), and the
+    /// P-CSCF/IMS core is then unreachable from that bearer even though the
+    /// interface looks fully configured. Must round-trip through the
+    /// manifest for `volte-carrier-agent --line N` to request the right one.
+    pub apn: String,
     pub iface: String,
     /// File this line's `attach` recorded its displaced context id in, so
     /// cleanup can `volte-pdn down --restore-cid` it.
@@ -234,6 +300,24 @@ pub struct VolteLineManifestEntry {
     pub status_port: u16,
     pub control_port: u16,
     pub sip_leg_port: u16,
+    /// This line's network namespace (specs/020-volte-line-netns). Read by
+    /// `docker/entrypoint.sh`'s cleanup trap so teardown runs *inside* the
+    /// namespace before it is deleted (research.md R6), without re-deriving
+    /// it.
+    pub netns: String,
+    /// This line's carrier-agent-side veth address. Empty means "no netns for
+    /// this line" (the single-`--modem` diagnostic path, `volte::bridge`'s
+    /// in-process arrangement) — the carrier agent then binds `LOOPBACK`
+    /// instead, exactly as before this feature.
+    pub veth_carrier_addr: String,
+    /// This line's telephony-half-side veth address, for the same reason.
+    pub veth_telephony_addr: String,
+    /// This line's explicitly-configured P-CSCF (from `[[volte.line]]` or
+    /// `[volte].pcscf`), empty if none — `volte-carrier-agent --line N`
+    /// resolves it the same way `volte-bridge` always has (an explicit
+    /// address wins, else the ePDG capture file), just from this field
+    /// instead of re-deriving the override (research.md R7).
+    pub pcscf: String,
 }
 
 /// Default path for the running bridge's line manifest.
@@ -248,6 +332,45 @@ pub fn manifest_path() -> PathBuf {
     PathBuf::from(
         std::env::var(MANIFEST_PATH_ENV).unwrap_or_else(|_| DEFAULT_MANIFEST_PATH.to_string()),
     )
+}
+
+/// Builds the manifest from a resolved line table and writes it to
+/// [`manifest_path`] (specs/020-volte-line-netns). Called by
+/// `volte-discover-lines` (the production, auto-discovered path) before any
+/// per-line namespace/process is started — `volte-carrier-agent --line N`
+/// and `volte-bridge` (Agent B) both read it back rather than re-deriving
+/// (research.md R7's "discover once" principle, reused from specs/013 item
+/// 3). Best-effort: a write failure degrades cleanup/status, not the calls
+/// themselves — logged by the caller, not here.
+pub fn write_manifest(
+    lines: &[ResolvedVolteLine],
+    restore_cid_base: Option<&Path>,
+) -> Result<(), String> {
+    let manifest = VolteLineManifest {
+        lines: lines
+            .iter()
+            .map(|l| VolteLineManifestEntry {
+                index: l.index,
+                card_id: l.card_id.clone(),
+                modem_port: l.modem_port.to_string_lossy().to_string(),
+                cid: l.cid,
+                apn: l.apn.clone(),
+                iface: l.iface.clone(),
+                restore_cid_path: restore_cid_base
+                    .map(|b| format!("{}-{}", b.display(), l.index))
+                    .unwrap_or_default(),
+                status_port: l.status_port,
+                control_port: l.control_port,
+                sip_leg_port: l.sip_leg_port,
+                netns: l.netns.clone(),
+                veth_carrier_addr: l.veth_carrier_addr.clone(),
+                veth_telephony_addr: l.veth_telephony_addr.clone(),
+                pcscf: l.pcscf.clone().unwrap_or_default(),
+            })
+            .collect(),
+    };
+    let json = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+    std::fs::write(manifest_path(), json).map_err(|e| e.to_string())
 }
 
 /// Reads a [`VolteLineManifest`] back from disk (used by `volte-status`).
@@ -409,6 +532,94 @@ mod tests {
     }
 
     #[test]
+    fn index_zero_keeps_the_unindexed_netns_and_veth_defaults() {
+        let modems = vec![ready("ec20-AAAAAA", "/dev/ttyUSB0")];
+        let result = resolve_volte_lines(&modems, &base());
+        let l = &result.lines[0];
+        assert_eq!(l.netns, base().netns);
+        assert_eq!(l.veth_carrier_iface, base().veth_carrier_iface);
+        assert_eq!(l.veth_telephony_iface, base().veth_telephony_iface);
+        assert_eq!(l.veth_carrier_addr, base().veth_carrier_addr);
+        assert_eq!(l.veth_telephony_addr, base().veth_telephony_addr);
+    }
+
+    #[test]
+    fn later_lines_derive_distinct_netns_and_veth_identifiers() {
+        let modems: Vec<ProbedModem> = (0..3)
+            .map(|i| ready(&format!("ec20-{i:06}"), &format!("/dev/ttyUSB{i}")))
+            .collect();
+        let result = resolve_volte_lines(&modems, &base());
+        assert_eq!(result.lines.len(), 3);
+
+        let mut netns: Vec<&str> = result.lines.iter().map(|l| l.netns.as_str()).collect();
+        netns.sort_unstable();
+        netns.dedup();
+        assert_eq!(netns.len(), 3, "every line's netns must be distinct");
+
+        let mut carrier_addrs: Vec<&str> = result
+            .lines
+            .iter()
+            .map(|l| l.veth_carrier_addr.as_str())
+            .collect();
+        carrier_addrs.sort_unstable();
+        carrier_addrs.dedup();
+        assert_eq!(carrier_addrs.len(), 3);
+
+        assert_eq!(result.lines[1].netns, format!("{}1", base().netns));
+        assert_eq!(result.lines[2].netns, format!("{}2", base().netns));
+        // Each line's own carrier/telephony veth addresses must differ from
+        // each other too, not just across lines.
+        assert_ne!(
+            result.lines[0].veth_carrier_addr,
+            result.lines[0].veth_telephony_addr
+        );
+    }
+
+    /// specs/020-volte-line-netns FR-004a: a VoLTE line's derived namespace
+    /// must never equal a VoWiFi line's at the same index — both subsystems
+    /// can run in the same container.
+    #[test]
+    fn derived_netns_never_collides_with_vowifi_at_the_same_index() {
+        use crate::config::VowifiConfig;
+        use crate::vowifi::discovery::resolve_lines as resolve_vowifi_lines;
+
+        let volte_modems: Vec<ProbedModem> = (0..3)
+            .map(|i| ready(&format!("volte-{i:06}"), &format!("/dev/ttyUSB{i}")))
+            .collect();
+        let volte_lines = resolve_volte_lines(&volte_modems, &base()).lines;
+
+        let vowifi_modem = crate::modules::discovery::ProbedModem {
+            card_id: "vowifi-000000".to_string(),
+            model: "EC20",
+            usb_serial: "vowifi-000000".to_string(),
+            has_audio_capability: false,
+            audio_device: None,
+            net_device: None,
+            at_port: Some(PathBuf::from("/dev/ttyUSB9")),
+            sim_status: Some(SimStatus::Ready {
+                imsi: "1".to_string(),
+            }),
+        };
+        let vowifi_assignment = crate::vowifi::discovery::RoleAssignment {
+            circuit_switched: Vec::new(),
+            vowifi: vec![vowifi_modem; 3],
+        };
+        let vowifi_lines = resolve_vowifi_lines(&vowifi_assignment, &VowifiConfig::default()).lines;
+
+        for v in &volte_lines {
+            for w in &vowifi_lines {
+                if v.index == w.index {
+                    assert_ne!(
+                        v.netns, w.config.netns,
+                        "volte line {} and vowifi line {} share a namespace name",
+                        v.index, w.index
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn manifest_round_trips_through_json() {
         let manifest = VolteLineManifest {
             lines: vec![VolteLineManifestEntry {
@@ -416,15 +627,73 @@ mod tests {
                 card_id: "ec20-AAAAAA".to_string(),
                 modem_port: "/dev/ttyUSB0".to_string(),
                 cid: 3,
+                apn: "ims".to_string(),
                 iface: "wwan0".to_string(),
                 restore_cid_path: "/run/volte-restore-cid-0".to_string(),
                 status_port: LOOPBACK_STATUS_PORT,
                 control_port: LOOPBACK_CONTROL_PORT,
                 sip_leg_port: LOOPBACK_SIP_PORT,
+                netns: "volte".to_string(),
+                veth_carrier_addr: "10.98.0.1".to_string(),
+                veth_telephony_addr: "10.98.0.2".to_string(),
+                pcscf: String::new(),
             }],
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: VolteLineManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, manifest);
+    }
+
+    /// Regression test for a bug found live (specs/020-volte-line-netns): the
+    /// manifest silently dropped `apn`, so `volte-carrier-agent --line N`
+    /// requested an *empty* APN and the network assigned its general-purpose
+    /// bearer (`www.mnc043.mcc404.gprs`) instead of the requested dedicated
+    /// IMS one (`ims.mnc043.mcc404.gprs`) — attach still "succeeded" and the
+    /// interface still got configured, but the P-CSCF was unreachable from
+    /// that bearer. `write_manifest` must carry a non-default `apn` through.
+    #[test]
+    fn write_manifest_preserves_a_non_default_apn() {
+        let dir = tempfile_dir_for_test();
+        let path = dir.join("volte-lines-apn-test.json");
+        std::env::set_var(MANIFEST_PATH_ENV, &path);
+
+        let line = ResolvedVolteLine {
+            index: 0,
+            card_id: "ec20-AAAAAA".to_string(),
+            modem_port: PathBuf::from("/dev/ttyUSB0"),
+            cid: 3,
+            apn: "ims".to_string(),
+            pcscf: None,
+            iface: "wwan0".to_string(),
+            msisdn: None,
+            sip_leg_port: LOOPBACK_SIP_PORT,
+            control_port: LOOPBACK_CONTROL_PORT,
+            status_port: LOOPBACK_STATUS_PORT,
+            netns: "volte".to_string(),
+            veth_carrier_iface: "veth-volte-ims".to_string(),
+            veth_telephony_iface: "veth-volte-sip".to_string(),
+            veth_carrier_addr: "10.98.0.1".to_string(),
+            veth_telephony_addr: "10.98.0.2".to_string(),
+        };
+        write_manifest(&[line], None).expect("write_manifest must succeed");
+        let manifest = read_manifest(&path).expect("must read back");
+
+        assert_eq!(manifest.lines[0].apn, "ims", "apn must not be dropped");
+        std::env::remove_var(MANIFEST_PATH_ENV);
+    }
+
+    /// Minimal tempdir helper so this one test doesn't need the `tempfile`
+    /// dev-dependency this module (a `src/` file) doesn't otherwise pull in.
+    fn tempfile_dir_for_test() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gsm-sip-bridge-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

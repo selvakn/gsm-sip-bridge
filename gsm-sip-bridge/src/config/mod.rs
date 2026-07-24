@@ -76,6 +76,11 @@ const VOLTE_KEYS: &[&str] = &[
     "bridge_inbound",
     "max_lines",
     "line",
+    "netns",
+    "veth_carrier_iface",
+    "veth_telephony_iface",
+    "veth_carrier_addr",
+    "veth_telephony_addr",
 ];
 /// Allowed keys inside each `[[volte.line]]` entry
 /// (specs/018-volte-multi-modem — an operator override pinning a specific
@@ -588,6 +593,29 @@ pub struct VolteConfig {
     /// of inheriting them from the `[volte]` base. Empty (the default) means
     /// every line is fully auto-discovered with the base settings.
     pub line_overrides: Vec<VolteLineOverride>,
+    /// Base network namespace name for a line's carrier-facing half
+    /// (specs/020-volte-line-netns). Line 0 uses this unindexed; later lines
+    /// append their index, exactly like `[vowifi].netns`. Deliberately a
+    /// distinct default from `[vowifi].netns` ("volte" vs "ims") so the two
+    /// subsystems' namespaces can never collide when both are enabled in the
+    /// same container (FR-004a) — not expected to be operator-tuned, kept
+    /// configurable only for consistency with every other per-line-derived
+    /// base in this codebase.
+    pub netns: String,
+    /// Base name for the veth end inside a line's namespace (the carrier
+    /// agent's side) — the LTE analogue of `[vowifi].veth_ims_iface`.
+    pub veth_carrier_iface: String,
+    /// Base name for the veth end in the default namespace (the shared
+    /// telephony half's side) — the LTE analogue of `[vowifi].veth_sip_iface`.
+    pub veth_telephony_iface: String,
+    /// Base `/30` address for the carrier-agent side of the veth link — the
+    /// LTE analogue of `[vowifi].veth_local_addr`. Distinct default block
+    /// from `[vowifi]`'s so the two subsystems' veth addressing cannot
+    /// collide either.
+    pub veth_carrier_addr: String,
+    /// Base `/30` address for the telephony-half side of the veth link — the
+    /// LTE analogue of `[vowifi].veth_peer_addr`.
+    pub veth_telephony_addr: String,
 }
 
 /// One `[[volte.line]]` entry — see `VolteConfig::line_overrides`.
@@ -635,6 +663,11 @@ impl Default for VolteConfig {
             bridge_inbound: false,
             max_lines: 8,
             line_overrides: Vec::new(),
+            netns: "volte".to_string(),
+            veth_carrier_iface: "veth-volte-ims".to_string(),
+            veth_telephony_iface: "veth-volte-sip".to_string(),
+            veth_carrier_addr: "10.98.0.1".to_string(),
+            veth_telephony_addr: "10.98.0.2".to_string(),
         }
     }
 }
@@ -1507,6 +1540,27 @@ fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig
             .map(|n| n as u32)
             .unwrap_or(d.max_lines),
         line_overrides: parse_volte_line_overrides(t)?,
+        netns: str_key("netns", "volte.netns", d.netns)?,
+        veth_carrier_iface: str_key(
+            "veth_carrier_iface",
+            "volte.veth_carrier_iface",
+            d.veth_carrier_iface,
+        )?,
+        veth_telephony_iface: str_key(
+            "veth_telephony_iface",
+            "volte.veth_telephony_iface",
+            d.veth_telephony_iface,
+        )?,
+        veth_carrier_addr: str_key(
+            "veth_carrier_addr",
+            "volte.veth_carrier_addr",
+            d.veth_carrier_addr,
+        )?,
+        veth_telephony_addr: str_key(
+            "veth_telephony_addr",
+            "volte.veth_telephony_addr",
+            d.veth_telephony_addr,
+        )?,
     })
 }
 
@@ -1832,6 +1886,41 @@ mod tests {
         // Same default the VoWiFi path writes to, so a captured address is
         // found without configuring anything.
         assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf");
+        assert_eq!(c.volte.netns, "volte");
+        assert_eq!(c.volte.veth_carrier_iface, "veth-volte-ims");
+        assert_eq!(c.volte.veth_telephony_iface, "veth-volte-sip");
+        assert_eq!(c.volte.veth_carrier_addr, "10.98.0.1");
+        assert_eq!(c.volte.veth_telephony_addr, "10.98.0.2");
+    }
+
+    /// specs/020-volte-line-netns FR-004a: VoLTE's and VoWiFi's per-line
+    /// namespace/veth identifiers must never collide by default — both
+    /// subsystems can run in the same container (docker-compose.yml).
+    #[test]
+    fn volte_and_vowifi_default_netns_and_veth_identifiers_never_collide() {
+        let c = parse(MINIMAL_TOML);
+
+        assert_ne!(c.volte.netns, c.vowifi.netns);
+        assert_ne!(c.volte.veth_carrier_iface, c.vowifi.veth_ims_iface);
+        assert_ne!(c.volte.veth_telephony_iface, c.vowifi.veth_sip_iface);
+        assert_ne!(c.volte.veth_carrier_addr, c.vowifi.veth_local_addr);
+        assert_ne!(c.volte.veth_telephony_addr, c.vowifi.veth_peer_addr);
+    }
+
+    #[test]
+    fn volte_netns_and_veth_fields_are_parsed() {
+        let toml = format!(
+            "{MINIMAL_TOML}\n[volte]\nnetns = \"volte-custom\"\n\
+             veth_carrier_iface = \"veth-c\"\nveth_telephony_iface = \"veth-t\"\n\
+             veth_carrier_addr = \"10.5.0.1\"\nveth_telephony_addr = \"10.5.0.2\"\n"
+        );
+        let c = parse(&toml);
+
+        assert_eq!(c.volte.netns, "volte-custom");
+        assert_eq!(c.volte.veth_carrier_iface, "veth-c");
+        assert_eq!(c.volte.veth_telephony_iface, "veth-t");
+        assert_eq!(c.volte.veth_carrier_addr, "10.5.0.1");
+        assert_eq!(c.volte.veth_telephony_addr, "10.5.0.2");
     }
 
     #[test]

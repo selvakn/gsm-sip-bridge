@@ -20,6 +20,7 @@
 //! Until that is resolved, a P-CSCF must be supplied explicitly.
 
 pub mod bridge;
+pub mod carrier_agent;
 pub mod discovery;
 pub mod guard;
 pub mod netcfg;
