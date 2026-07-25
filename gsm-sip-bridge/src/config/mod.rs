@@ -848,6 +848,29 @@ fn as_optional_string(
         .map(|opt| opt.filter(|s| !s.is_empty()))
 }
 
+/// Validates a diagnostic identity override (`imsi_override`/`imei_override`)
+/// against the same digits-only/length constraints
+/// `AtCommander::query_imsi`/`query_imei` apply when filtering a real AT
+/// response — an override skips the modem read entirely, so nothing else
+/// would ever catch a typo'd or malformed value before it reached IMS
+/// registration/`+sip.instance` and broke authentication or terminating-call
+/// routing.
+fn validate_digit_string(
+    s: &str,
+    key: &str,
+    len: std::ops::RangeInclusive<usize>,
+) -> BridgeResult<()> {
+    if !s.chars().all(|c| c.is_ascii_digit()) || !len.contains(&s.len()) {
+        return Err(BridgeError::Config(format!(
+            "field {key} must be {}-{} ASCII digits, got {:?}",
+            len.start(),
+            len.end(),
+            s
+        )));
+    }
+    Ok(())
+}
+
 fn as_u64_range(
     v: &Value,
     key: &str,
@@ -1760,7 +1783,13 @@ fn parse_vowifi_line_overrides(
             )));
         }
         let imsi_override = as_optional_string(et, "imsi_override", "vowifi.line.imsi_override")?;
+        if let Some(imsi) = &imsi_override {
+            validate_digit_string(imsi, "vowifi.line.imsi_override", 6..=15)?;
+        }
         let imei_override = as_optional_string(et, "imei_override", "vowifi.line.imei_override")?;
+        if let Some(imei) = &imei_override {
+            validate_digit_string(imei, "vowifi.line.imei_override", 14..=16)?;
+        }
         overrides.push(VowifiLineOverride {
             modem_serial,
             modem_port,
@@ -2386,6 +2415,32 @@ password = "pass"
         let line = &cfg.vowifi.line_overrides[0];
         assert_eq!(line.imsi_override.as_deref(), Some("404400975938075"));
         assert_eq!(line.imei_override.as_deref(), Some("864650053414154"));
+    }
+
+    #[test]
+    fn vowifi_line_override_rejects_non_digit_imsi_override() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nimsi_override = \"40440097593807x\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("imsi_override"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vowifi_line_override_rejects_wrong_length_imei_override() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nimei_override = \"12345\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("imei_override"), "unexpected error: {err}");
     }
 
     #[test]
