@@ -431,6 +431,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         pbx_registered.as_ref(),
         &obs,
     );
+    session.unregister();
     session.cleanup();
     result
 }
@@ -1957,6 +1958,7 @@ pub fn probe_inbound(
     let mut session = super::register_session(cfg)?;
     if session.status != 200 {
         let (status, reason) = (session.status, session.reason.clone());
+        session.unregister();
         session.cleanup();
         return Err(BridgeError::Ims(format!(
             "registration failed, so nothing could be delivered to us: {status} {reason}"
@@ -2012,6 +2014,7 @@ pub fn probe_inbound(
     }
 
     drop(inbound);
+    session.unregister();
     session.cleanup();
     Ok(report)
 }
