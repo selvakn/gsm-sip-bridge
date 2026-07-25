@@ -177,29 +177,42 @@ device and audio access work the same in any network mode.
 ### VoWiFi: "failed to reach Agent B control channel: connection timed out"
 
 The tunnel is up, the IMS registration succeeded and the carrier's `INVITE`
-arrived — but Agent A (inside netns `ims`) cannot reach Agent B across the
-veth pair, so every inbound call fails.
+arrived — but Agent A (inside netns `ims0`, `ims1`, ... one per line) cannot
+reach Agent B across the veth pair, so every inbound call fails.
 
-Under `network_mode: host` (the shipped default) the veth's Agent B end,
-`veth-sip`, lives in the **host's** network namespace, so Agent A's traffic
-arrives as *inbound host traffic* and is filtered by the host firewall.
-A default-deny firewall (ufw, firewalld) drops it. The giveaway is that ICMP
-still works — `ip netns exec ims ping 10.99.0.2` succeeds while TCP to
-`10.99.0.2:7050` times out.
+Under `network_mode: host` (the shipped default) the veth's Agent B end —
+`veth-sip0` for line 0, `veth-sip1` for line 1, etc. (`[vowifi].veth_sip_iface`
++ line index, always suffixed, even for line 0) — lives in the **host's**
+network namespace, so Agent A's traffic arrives as *inbound host traffic* and
+is filtered by the host firewall. A default-deny firewall (ufw, firewalld)
+drops it. The giveaway is that ICMP still works —
+`ip netns exec ims0 ping 10.99.0.2` succeeds while TCP to `10.99.0.2:7050`
+times out.
 
-With ufw:
+With ufw, one rule per line's interface:
 
 ```bash
-sudo ufw allow in on veth-sip from 10.99.0.1 comment 'gsm-sip-bridge VoWiFi agents'
+sudo ufw allow in on veth-sip0 from 10.99.0.1 comment 'gsm-sip-bridge VoWiFi agents'
+```
+
+Or one rule covering every line at once with ufw's interface wildcard
+(`+` matches any suffix):
+
+```bash
+sudo ufw allow in on veth-sip+ comment 'gsm-sip-bridge VoWiFi agents, all lines'
 ```
 
 Allow the **whole interface**, not just the control port: the call's RTP
 audio crosses the same veth on PJSUA-allocated media ports (base 4000,
 incrementing per call), so a rule for TCP/7050 alone yields a connected call
-with no audio — a more confusing failure than no call at all. `veth-sip` is a
-private /30 whose only peer is the bridge's own netns. The rule keys on the
-interface name, which survives the tunnel reconnects that delete and recreate
-the pair.
+with no audio — a more confusing failure than no call at all. Each `veth-sipN`
+is a private /30 whose only peer is that line's own netns. The rule keys on
+the interface name, which survives the tunnel reconnects that delete and
+recreate the pair.
+
+VoLTE's per-line carrier-agent isolation (`specs/020-volte-line-netns`, netns
+`volte0`/`volte1`/..., veth `veth-volte-sip`+index) hits the identical class
+of failure for the identical reason — same fix, different interface prefix.
 
 Not an issue under bridge networking, where the veth's host end sits in the
 container's own namespace, out of the host firewall's reach.
