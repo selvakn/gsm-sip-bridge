@@ -42,7 +42,7 @@ jobs:
         id: pjsip-cache
         uses: actions/cache@v4
         with:
-          path: /usr/local
+          path: ~/pjsip
           key: pjsip-${{ env.PJSIP_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('docker/pjsip-config-site.h') }}
 
       - name: Build and install PJSIP
@@ -52,19 +52,19 @@ jobs:
           tar xzf ${PJSIP_VERSION}.tar.gz
           cd pjproject-${PJSIP_VERSION}
           cp ../docker/pjsip-config-site.h pjlib/include/pj/config_site.h
-          ./configure --prefix=/usr/local \
+          ./configure --prefix=$HOME/pjsip \
             --enable-shared \
             --disable-video \
             --disable-v4l2 \
             --with-external-pa=no
           make -j$(nproc) dep
           make -j$(nproc)
-          sudo make install
-          sudo ldconfig
+          make install
 
-      - name: Refresh linker cache
-        if: steps.pjsip-cache.outputs.cache-hit == 'true'
-        run: sudo ldconfig
+      - name: Export PJSIP pkg-config and linker paths
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/pjsip/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/pjsip/lib" >> "$GITHUB_ENV"
 
       - name: Build
         run: make build
