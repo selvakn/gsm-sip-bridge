@@ -201,12 +201,16 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     let imsi_override = over
         .and_then(|o| o.imsi_override.clone())
         .or_else(|| base.imsi_override.clone());
+    let imei_override = over
+        .and_then(|o| o.imei_override.clone())
+        .or_else(|| base.imei_override.clone());
 
     let mut config = base.clone();
     config.modem_port = modem_port.to_string_lossy().to_string();
     config.mcc = mcc.clone();
     config.mnc = mnc.clone();
     config.imsi_override = imsi_override.clone();
+    config.imei_override = imei_override.clone();
     // Not meaningful on a per-line derived config — overrides have already
     // been applied above.
     config.line_overrides = Vec::new();
@@ -686,6 +690,31 @@ mod tests {
         assert_eq!(result.lines[0].mnc, "094");
         assert_eq!(result.lines[0].config.mcc, "404");
         assert_eq!(result.lines[0].config.mnc, "094");
+    }
+
+    #[test]
+    fn line_override_fixes_imsi_and_imei_for_one_line() {
+        let modems = vec![ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1")];
+        let mut base = VowifiConfig::default();
+        base.line_overrides = vec![VowifiLineOverride {
+            modem_serial: Some("ec20-AAAAAA".to_string()),
+            imsi_override: Some("404400975938075".to_string()),
+            imei_override: Some("864650053414154".to_string()),
+            ..Default::default()
+        }];
+        let assignment = RoleAssignment {
+            circuit_switched: vec![],
+            vowifi: modems,
+        };
+        let result = resolve_lines(&assignment, &base);
+        assert_eq!(
+            result.lines[0].config.imsi_override.as_deref(),
+            Some("404400975938075")
+        );
+        assert_eq!(
+            result.lines[0].config.imei_override.as_deref(),
+            Some("864650053414154")
+        );
     }
 
     #[test]

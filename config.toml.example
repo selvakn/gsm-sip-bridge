@@ -200,6 +200,17 @@ max_lines = 8
 # mcc = "404"                      # this line's home network MCC
 # mnc = "094"                      # this line's home network MNC (zero-padded to 3 digits)
 # imsi_override = "404940123456789" # override the IMSI from the SIM for this line
+# imei_override = "864650053414154" # override the IMEI from the modem for this line
+#
+# Setting both imsi_override and imei_override (alongside mcc/mnc above)
+# pins this line's network identity completely, so vowifi-ims-agent never
+# has to issue AT+CIMI/AT+CGSN to the modem during registration — only
+# safe, and only useful, once you know the SIM's IMSI and the modem's IMEI
+# won't change. This matters beyond convenience: without both overrides,
+# every vowifi-ims-agent restart (e.g. on a P-CSCF change) re-reads the SIM
+# and IMEI from the modem, and if that AT channel is ever contended or
+# wedged, registration fails and retries in a tight loop that a modem
+# power cycle (AT+CFUN=1,1), not a container restart, is what clears.
 #
 # [[vowifi.line]]
 # modem_serial = "xyz789abc123"
@@ -265,3 +276,9 @@ lock_path = "/tmp/volte-registration.lock"
 # always derived per line (on a base distinct from [vowifi]'s own, so the
 # two subsystems' namespaces can never collide) — there is no config knob
 # for it at all.
+
+# [[volte.line]]
+# pcscf = "2400:5200:a100:819::6" # for vodafone india
+
+# [[volte.line]]
+# pcscf = "2401:4900:c4:40da::6" # airtel india

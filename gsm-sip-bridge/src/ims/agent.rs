@@ -199,8 +199,16 @@ fn run_inner(
         pcscf_port: transport_handle.pcscf.port(),
         mcc,
         mnc,
-        imsi: None,
-        imei: None,
+        // `config.imsi_override`/`imei_override`: when set, skip the modem
+        // reads entirely (`register_session` in ims/mod.rs falls back to
+        // AT+CIMI/AT+CGSN only when these are `None`). Both are static per
+        // SIM/modem, so pinning them removes this function's only AT-command
+        // dependency from the per-registration hot path — the path that,
+        // left unpinned, hit a wedged AT channel on every
+        // `vowifi-ims-agent` restart (e.g. after a P-CSCF change) and
+        // crash-looped for hours until the modem was power-cycled.
+        imsi: config.imsi_override.clone(),
+        imei: config.imei_override.clone(),
         use_tcp: config.use_tcp,
         sec_agree: config.sec_agree,
         msisdn: None,

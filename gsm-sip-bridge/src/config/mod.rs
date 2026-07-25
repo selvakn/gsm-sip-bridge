@@ -117,7 +117,14 @@ const VOWIFI_KEYS: &[&str] = &[
 /// Allowed keys inside each `[[vowifi.line]]` entry (specs/013-multi-card-vowifi
 /// FR-009 — an operator override that pins a specific modem to VoWiFi
 /// regardless of the default audio-capability-based role assignment).
-const VOWIFI_LINE_KEYS: &[&str] = &["modem_serial", "modem_port", "mcc", "mnc", "imsi_override"];
+const VOWIFI_LINE_KEYS: &[&str] = &[
+    "modem_serial",
+    "modem_port",
+    "mcc",
+    "mnc",
+    "imsi_override",
+    "imei_override",
+];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
@@ -489,6 +496,17 @@ pub struct VowifiConfig {
     /// SIM via `vowifi-imsi` (`AT+CIMI`). Not a `[vowifi]` TOML key — set it
     /// on a `[[vowifi.line]]` entry instead.
     pub imsi_override: Option<String>,
+    /// Diagnostic escape hatch: use this IMEI instead of reading it from the
+    /// modem via `AT+CGSN`. Not a `[vowifi]` TOML key — set it on a
+    /// `[[vowifi.line]]` entry instead. Same rationale as `imsi_override`:
+    /// both IMSI and IMEI are static for a given SIM/modem pair, so pinning
+    /// them removes `ims::agent::run_inner`'s only two AT-command
+    /// dependencies from the per-registration hot path (every
+    /// `vowifi-ims-agent` restart, e.g. on a P-CSCF change) — the path where
+    /// a modem AT channel wedged by concurrent circuit-switched/USIM traffic
+    /// has caused hours-long registration outages that only a modem power
+    /// cycle (`AT+CFUN=1,1`) could clear.
+    pub imei_override: Option<String>,
     /// Upper bound on concurrently supported VoWiFi lines
     /// (specs/013-multi-card-vowifi FR-016) — modems discovered beyond this
     /// count are reported and skipped rather than silently dropped. Same
@@ -522,6 +540,9 @@ pub struct VowifiLineOverride {
     /// Diagnostic escape hatch: use this IMSI instead of reading it from the
     /// SIM via `vowifi-imsi` (`AT+CIMI`), scoped to this one line.
     pub imsi_override: Option<String>,
+    /// Diagnostic escape hatch: use this IMEI instead of reading it from the
+    /// modem via `AT+CGSN`, scoped to this one line.
+    pub imei_override: Option<String>,
 }
 
 impl Default for VowifiConfig {
@@ -552,6 +573,7 @@ impl Default for VowifiConfig {
             vpcd_host: "127.0.0.1".to_string(),
             vpcd_port: 15963,
             imsi_override: None,
+            imei_override: None,
             max_lines: 8,
             line_overrides: Vec::new(),
         }
@@ -1667,9 +1689,10 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         .map(|v| as_u16_port(v, "vowifi.vpcd_port"))
         .transpose()?
         .unwrap_or(defaults.vpcd_port);
-    // imsi_override is per-line diagnostic escape hatch — set it on a
-    // `[[vowifi.line]]` entry instead.
+    // imsi_override/imei_override are per-line diagnostic escape hatches —
+    // set them on a `[[vowifi.line]]` entry instead.
     let imsi_override = defaults.imsi_override.clone();
+    let imei_override = defaults.imei_override.clone();
     let max_lines = t
         .get("max_lines")
         .map(|v| as_u64_range(v, "vowifi.max_lines", false, 1..=64))
@@ -1704,6 +1727,7 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         vpcd_host,
         vpcd_port,
         imsi_override,
+        imei_override,
         max_lines,
         line_overrides,
     })
@@ -1736,12 +1760,14 @@ fn parse_vowifi_line_overrides(
             )));
         }
         let imsi_override = as_optional_string(et, "imsi_override", "vowifi.line.imsi_override")?;
+        let imei_override = as_optional_string(et, "imei_override", "vowifi.line.imei_override")?;
         overrides.push(VowifiLineOverride {
             modem_serial,
             modem_port,
             mcc,
             mnc,
             imsi_override,
+            imei_override,
         });
     }
     Ok(overrides)
@@ -2279,6 +2305,7 @@ password = "pass"
         assert_eq!(cfg.vowifi.epdg_ip, None);
         assert_eq!(cfg.vowifi.src_addr, None);
         assert_eq!(cfg.vowifi.imsi_override, None);
+        assert_eq!(cfg.vowifi.imei_override, None);
     }
 
     #[test]
@@ -2346,6 +2373,19 @@ password = "pass"
         assert_eq!(line.mnc.as_deref(), Some("094"));
         assert_eq!(line.modem_port, None);
         assert_eq!(line.imsi_override, None);
+        assert_eq!(line.imei_override, None);
+    }
+
+    #[test]
+    fn vowifi_line_override_imei_override_parses_and_resolves() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nimsi_override = \"404400975938075\"\nimei_override = \"864650053414154\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        let line = &cfg.vowifi.line_overrides[0];
+        assert_eq!(line.imsi_override.as_deref(), Some("404400975938075"));
+        assert_eq!(line.imei_override.as_deref(), Some("864650053414154"));
     }
 
     #[test]
