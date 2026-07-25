@@ -133,6 +133,10 @@ pub(crate) struct RegisteredSession {
     status: u16,
     reason: String,
     headers: Vec<(String, String)>,
+    call_id: String,
+    from_tag: String,
+    pcscf_addr: SocketAddr,
+    imei: String,
 }
 
 impl RegisteredSession {
@@ -152,6 +156,59 @@ impl RegisteredSession {
     fn cleanup(&mut self) {
         if let Some((endpoints, p, theirs)) = self.gm_state.take() {
             gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, self.xfrm_proto);
+        }
+    }
+
+    /// Send an UNREGISTER to the server (a REGISTER with Expires: 0) to
+    /// clear all contacts. Best-effort only: transport/timeout errors are
+    /// logged and ignored, since a registration that cannot unregister
+    /// cleanly is better than one that litters kernel XFRM state, and a
+    /// crashed registrar has already timed out the old registration anyway.
+    ///
+    /// **Note on response validation**: UNREGISTER is sent without
+    /// re-authentication (the Digest nonce would have expired). Most SIP
+    /// registrars accept this for established registrations (matched by
+    /// Call-ID/From), but some stricter implementations may reject it. In
+    /// either case, the kernel XFRM state is torn down immediately after,
+    /// so accepting both 2xx and error responses is appropriate here.
+    ///
+    /// **Note on cleanup delay**: If the registrar is unreachable,
+    /// send_and_recv will block for ~5 seconds waiting for the timeout.
+    /// This is acceptable during shutdown but should be monitored if called
+    /// in a hot path.
+    pub(crate) fn unregister(&mut self) {
+        let via_transport = if self.use_tcp { "TCP" } else { "UDP" };
+        let request_uri = format_sip_addr(self.pcscf_addr);
+
+        self.cseq = self.cseq.wrapping_add(1);
+        let branch = format!("z9hG4bK{}", random_hex(6));
+        let unreg = build_register(&RegisterRequest {
+            registrar_uri: &request_uri,
+            public_uri: &self.public_uri,
+            local_addr: self.local_addr,
+            contact_addr: self.contact_addr,
+            call_id: &self.call_id,
+            from_tag: &self.from_tag,
+            branch: &branch,
+            cseq: self.cseq,
+            expires: 0,
+            transport: via_transport,
+            authorization: None,
+            extra_headers: &[],
+            imei: &self.imei,
+        });
+
+        match self.transport.send_and_recv(&unreg) {
+            Ok(resp) => {
+                if (200..300).contains(&resp.status) {
+                    tracing::debug!("sent UNREGISTER, server accepted");
+                } else {
+                    tracing::debug!(status = resp.status, reason = %resp.reason, "sent UNREGISTER, server rejected (registration will expire naturally)");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "UNREGISTER send failed (registration will expire naturally)");
+            }
         }
     }
 }
@@ -571,6 +628,10 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         status: resp.status,
         reason: resp.reason,
         headers: resp.headers,
+        call_id,
+        from_tag,
+        pcscf_addr: pcscf,
+        imei,
     })
 }
 
