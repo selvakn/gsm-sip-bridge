@@ -126,6 +126,7 @@ fn run_bindgen(header: &Path, pkg_cflags: &[String], out_path: &Path) -> Result<
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .merge_extern_blocks(true)
         .layout_tests(false)
+        .generate_comments(false)
         .blocklist_item("IPPORT_RESERVED")
         .blocklist_item("FP_NAN")
         .blocklist_item("FP_INFINITE")
