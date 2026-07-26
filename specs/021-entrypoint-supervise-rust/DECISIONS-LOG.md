@@ -116,4 +116,57 @@ functions inline. `make fmt && make lint && make test` all green. Committed.
 
 ---
 
+## 2026-07-26 — Phase 1 complete (Rust rendering + CommandRunner foundation)
+
+**Real bug found and fixed via direct diffing against actual `sed`**: I didn't
+just trust my hand-written Rust port of the `swanctl-epdg.conf.template`
+substitution — I ran the *actual* `sed` pipeline from `entrypoint.sh` against
+the *actual* template file in `docker/strongswan/`, and diffed its output
+byte-for-byte against my Rust `render swanctl-epdg` output. They disagreed:
+bash's `sed -e "/local_addrs.*@SRC_ADDR@/d"` is **order-sensitive** — it only
+deletes a line where `local_addrs` appears *before* `@SRC_ADDR@` — but my first
+implementation used an unordered "does this line contain both substrings"
+check. The template's own header comment happens to mention `@SRC_ADDR@`
+*before* explaining "the local_addrs line", so my version wrongly deleted
+that documentation line while bash correctly kept it. Fixed (now checks
+ordering, matching sed's `.*` semantics) and pinned with a named regression
+test. This is exactly the kind of subtlety the spec's byte-for-byte
+requirement (FR-003) exists to catch, and it would NOT have been caught by
+testing only against a simplified hand-written fixture — I verified all 5
+rendered assets against the real bash execution, not just my own test
+fixtures, before calling Phase 1 done. Diffs are all `IDENTICAL`.
+
+**`unsafe` block found and removed**: my first `CommandRunner::signal`
+implementation called raw `libc::kill(2)` inside an `unsafe` block. This
+project's `make lint` (`tools/count-unsafe.sh`) hard-fails on ANY `unsafe` in
+`gsm-sip-bridge/src` (stricter than the FFI crates, which get a 5% ratio
+allowance) — caught immediately by running the full gate, not just `cargo
+test`. Fixed by shelling out to the `kill` CLI utility instead (`Command::new
+("kill").args([flag, pid])`), which is also more faithful to the bash
+original's own `kill -TERM/-KILL/... "$pid" 2>/dev/null || true` convention,
+and adds no new dependency. Lesson for later phases: always run `make lint`
+after adding process-control code, not just `cargo test` — a green test run
+does not imply a green lint run in this repo.
+
+**What landed**: `gsm-sip-bridge/src/supervise/` module with `runner.rs`
+(`CommandRunner` trait, `RealCommandRunner`, test-only `MockCommandRunner`
+with per-use `MOCK JUSTIFICATION` comments per the constitution) and
+`render.rs` (5 pure rendering functions, 14 tests incl. `insta` snapshots).
+New `gsm-sip-bridge render <asset>` CLI subcommand. `docker/entrypoint.sh`
+now calls the Rust binary instead of the bash heredocs/`sed`; the
+superseded `render_line_*` bash functions and their bats coverage were
+deleted from `docker/lib/` (only `extract_latest_pcscf` remains there,
+pending its own Phase 3 port). `make fmt && make lint && cargo test
+--workspace` (579 tests) all green.
+
+**Not yet live-validated against the real EC20 + Airtel SIM**: I verified
+correctness by diffing Rust output against the actual bash/sed execution on
+the real template file (as strong a check as is available without deploying),
+but have not yet run the built image against the physical modem — that's
+still queued, alongside Phases 2-4, before I'd call this feature done. Noting
+this explicitly so "all green in cargo test" isn't mistaken for "verified on
+hardware."
+
+---
+
 (Further entries appended as phases proceed.)
