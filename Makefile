@@ -1,7 +1,7 @@
 CONFIG ?= config.toml
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
 
-.PHONY: build test run clean lint format dev dev-gsm dev-sip \
+.PHONY: build test test-bash run clean lint format dev dev-gsm dev-sip \
         docker-build docker-up docker-down docker-logs \
         coverage mutants mutants-full help
 
@@ -10,6 +10,14 @@ build: ## Compile all binaries (release mode)
 
 test: ## Run the full test suite
 	@cargo test --workspace
+	@$(MAKE) test-bash
+
+test-bash: ## Run bats-core tests over docker/*.sh helpers (no-ops with a warning if bats is missing)
+	@if command -v bats >/dev/null 2>&1; then \
+		bats docker/lib/*.bats; \
+	else \
+		echo "WARNING: bats not installed — skipping docker/lib/*.bats (install bats-core to run these)"; \
+	fi
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)
@@ -17,10 +25,15 @@ run: build ## Build and run the GSM-SIP bridge
 clean: ## Remove all build artifacts
 	@cargo clean
 
-lint: ## Run formatting check, clippy, cargo-deny, and unsafe audit
+lint: ## Run formatting check, clippy, cargo-deny, shellcheck, and unsafe audit
 	@cargo fmt --check
 	@cargo clippy -p gsm-sip-bridge -p pjsua-safe -- -D warnings
 	@if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; fi
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck -x docker/*.sh docker/lib/*.sh; \
+	else \
+		echo "WARNING: shellcheck not installed — skipping docker/*.sh lint"; \
+	fi
 	@bash tools/count-unsafe.sh
 
 format: ## Auto-format all Rust source files
