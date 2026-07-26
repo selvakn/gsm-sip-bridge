@@ -1,0 +1,9 @@
+---
+source: gsm-sip-bridge/src/supervise/render.rs
+assertion_line: 247
+expression: rendered
+---
+FRIENDLYNAME "Virtual PCD"
+DEVICENAME   /dev/null:0x4E20
+LIBPATH      /usr/lib/pcsc/drivers/serial/libifdvpcd.so
+CHANNELID    0x4E20

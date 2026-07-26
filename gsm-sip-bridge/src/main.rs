@@ -119,6 +119,10 @@ fn main() -> ExitCode {
         return handle_discover_command(args, &cli);
     }
 
+    if let Some(Commands::Render(args)) = &cli.command {
+        return handle_render_command(args);
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"
@@ -1873,6 +1877,55 @@ fn handle_discover_command(args: &gsm_sip_bridge::cli::DiscoverArgs, cli: &Cli) 
     if args.shell_env {
         print_discover_shell_env(&resolution);
     }
+    ExitCode::SUCCESS
+}
+
+fn handle_render_command(args: &gsm_sip_bridge::cli::RenderArgs) -> ExitCode {
+    use gsm_sip_bridge::cli::RenderAsset;
+    use gsm_sip_bridge::supervise::render;
+
+    let rendered = match &args.asset {
+        RenderAsset::StrongswanConf {
+            line,
+            vici_socket,
+            charon_log,
+        } => render::render_strongswan_conf(*line, vici_socket, charon_log),
+        RenderAsset::SwanctlTopConf { conf_dir } => render::render_swanctl_top_conf(conf_dir),
+        RenderAsset::SwanctlEpdg {
+            template_path,
+            imsi,
+            mcc,
+            mnc,
+            epdg_ip,
+            if_id,
+            updown_script,
+            src_addr,
+        } => {
+            let template = match std::fs::read_to_string(template_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: could not read {}: {e}", template_path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let params = render::SwanctlEpdgParams {
+                imsi,
+                mcc,
+                mnc,
+                epdg_ip,
+                if_id,
+                updown_script,
+                src_addr: src_addr.as_deref(),
+            };
+            render::render_swanctl_epdg(&template, &params)
+        }
+        RenderAsset::UpdownScript { netns, tun_iface } => {
+            render::render_updown_script(netns, tun_iface)
+        }
+        RenderAsset::VpcdReaderConf { port } => render::render_vpcd_reader_conf(*port),
+    };
+
+    print!("{rendered}");
     ExitCode::SUCCESS
 }
 

@@ -1,0 +1,9 @@
+---
+source: gsm-sip-bridge/src/supervise/render.rs
+assertion_line: 241
+expression: render_vpcd_reader_conf(15963)
+---
+FRIENDLYNAME "Virtual PCD"
+DEVICENAME   /dev/null:0x3E5B
+LIBPATH      /usr/lib/pcsc/drivers/serial/libifdvpcd.so
+CHANNELID    0x3E5B

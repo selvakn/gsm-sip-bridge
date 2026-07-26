@@ -1,0 +1,29 @@
+---
+source: gsm-sip-bridge/src/supervise/render.rs
+assertion_line: 147
+expression: rendered
+---
+charon {
+    plugins {
+        include /etc/strongswan.d/charon/*.conf
+        vici {
+            socket = unix:///var/run/charon-1.vici
+        }
+    }
+    filelog {
+        line1 {
+            path = /tmp/charon-1.log
+            default = 1
+            ike = 1
+            cfg = 1
+            append = no
+            flush_line = yes
+            ike_name = yes
+            time_format = %Y-%m-%d %H:%M:%S
+        }
+    }
+}
+swanctl {
+    socket = unix:///var/run/charon-1.vici
+}
+include /etc/strongswan.d/charon-extra.conf
