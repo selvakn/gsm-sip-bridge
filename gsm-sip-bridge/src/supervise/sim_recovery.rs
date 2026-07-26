@@ -180,7 +180,15 @@ pub fn reset_modem_sim(
     }
 
     if let Some(r) = reader {
+        // 1:1 port of `kill "$reader_pid" 2>/dev/null || true; wait
+        // "$reader_pid" 2>/dev/null || true` — the bash original explicitly
+        // waits for the reader after killing it, not just signals it; doing
+        // the same here also reaps the handle out of RealCommandRunner's
+        // table (a follow-up audit after the review-flagged `--initiate`
+        // leak found this is the same shape: `signal` alone never removes a
+        // tracked entry, so a handle that's signaled-and-forgotten leaks).
         runner.signal(r, Signal::Term);
+        runner.wait(r);
     }
     if let Some(h) = holder {
         runner.signal(h, Signal::Cont);
@@ -286,6 +294,29 @@ mod tests {
             reset_modem_sim(&runner, &modem, &reset_log, Some(holder));
 
             assert_eq!(runner.signals_for(holder), vec![Signal::Stop, Signal::Cont]);
+        }
+
+        #[test]
+        fn the_background_reader_is_reaped_not_just_signaled() {
+            // 1:1 port of bash's `kill "$reader_pid" ...; wait "$reader_pid"
+            // ...` — regression test for the same leak shape a Greptile
+            // review flagged elsewhere in this PR (a signaled-and-forgotten
+            // handle never gets removed from RealCommandRunner's table).
+            let runner = MockCommandRunner::new();
+            let modem = PathBuf::from("/dev/ttyUSB2");
+            let reset_log = PathBuf::from("/tmp/sim-reset-0.log");
+            runner.set_file(&reset_log, "+CPIN: READY\n");
+
+            reset_modem_sim(&runner, &modem, &reset_log, None);
+
+            // Exactly one child (the reader) is spawned with no holder;
+            // confirm it was both signaled AND waited on.
+            assert_eq!(runner.spawn_specs.lock().unwrap().len(), 1);
+            assert_eq!(
+                runner.wait_calls.lock().unwrap().len(),
+                1,
+                "the reader must be wait()-ed on after being signaled, matching bash's `kill ...; wait ...`"
+            );
         }
 
         #[test]

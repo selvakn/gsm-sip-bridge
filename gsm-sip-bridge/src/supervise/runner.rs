@@ -91,6 +91,22 @@ pub trait CommandRunner: Send + Sync {
     /// Starts a long-running child, returns a handle to it.
     fn spawn(&self, spec: ChildSpec) -> io::Result<ChildHandle>;
 
+    /// Starts a fire-and-forget child — matches the bash convention of
+    /// backgrounding a command with a trailing `&` and never referencing its
+    /// pid again (e.g. every `swanctl --initiate`, which the original script
+    /// redirects to a log file and immediately forgets about). Deliberately
+    /// returns no [`ChildHandle`]: there is no legitimate later use for one
+    /// (nothing will ever signal or query this specific process again), and
+    /// a caller holding a handle here would be tempted to track it — leading
+    /// to exactly the bug this method exists to prevent (a real review
+    /// finding: `spawn` + discard the handle still inserts a table entry
+    /// that nothing ever reaps, so repeated recovery attempts over a
+    /// long-running container's lifetime accumulate zombie processes and
+    /// leaked table entries without bound). The real implementation still
+    /// reaps the child (so it never becomes a zombie) — see
+    /// `RealCommandRunner`'s doc comment on its own impl.
+    fn spawn_detached(&self, spec: ChildSpec) -> io::Result<()>;
+
     /// Signals a previously spawned child. Best-effort, matching the current
     /// script's `kill ... 2>/dev/null || true` convention — a signal to an
     /// already-dead child is not an error.
@@ -173,6 +189,30 @@ impl CommandRunner for RealCommandRunner {
 
     fn write_file(&self, path: &Path, contents: &str) -> io::Result<()> {
         std::fs::write(path, contents)
+    }
+
+    fn spawn_detached(&self, spec: ChildSpec) -> io::Result<()> {
+        let mut cmd = Self::build_command(&spec);
+        if let Some(path) = &spec.stdout_capture_path {
+            let file = std::fs::File::create(path)?;
+            cmd.stdout(Stdio::from(file.try_clone()?));
+            cmd.stderr(Stdio::from(file));
+        }
+        let mut child = cmd.spawn()?;
+        // Never inserted into `self.children` — there is no handle for a
+        // caller to hold, so nothing could ever remove it from that table.
+        // Reaped by a dedicated thread instead (real review finding: without
+        // this, a fire-and-forget child that WAS still inserted accumulated
+        // an un-reapable table entry on every call, unboundedly, over a
+        // long-running container's lifetime). This thread's only job is to
+        // wait out the child so the kernel can release it; the exit status
+        // is intentionally discarded, matching the bash original's own
+        // `swanctl --initiate ... &` — its exit code was never checked
+        // either.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 
     fn spawn(&self, spec: ChildSpec) -> io::Result<ChildHandle> {
@@ -304,6 +344,27 @@ mod real_runner_tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!runner.is_alive(handle));
     }
+
+    #[test]
+    fn spawn_detached_never_leaves_a_table_entry_even_after_the_child_exits() {
+        // Regression test for a real review finding: `spawn` + discarding
+        // the handle still inserted an entry that nothing could ever remove
+        // (no handle survives to call is_alive/wait/signal with). Repeating
+        // this many times must never grow the table — spawn_detached must
+        // never insert into it at all.
+        let runner = RealCommandRunner::new();
+        for _ in 0..10 {
+            runner.spawn_detached(ChildSpec::new(["true"])).unwrap();
+        }
+        // Give the (near-instant) children a moment to actually exit, so
+        // this also confirms they don't linger as zombies.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            runner.children.lock().unwrap().len(),
+            0,
+            "spawn_detached must never insert a tracked table entry"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +407,12 @@ mod mock {
         /// of actually slept, so tests exercising real cadence constants stay
         /// fast while still able to assert on them.
         pub sleeps: Mutex<Vec<std::time::Duration>>,
+        /// Every handle `wait()` was called on, in call order — lets tests
+        /// assert that a signaled-and-forgotten child was actually reaped,
+        /// not just signaled (the class of bug a real review found in this
+        /// PR: a handle nothing ever waits on leaks forever in
+        /// `RealCommandRunner`'s table).
+        pub wait_calls: Mutex<Vec<ChildHandle>>,
         next_id: AtomicU64,
     }
 
@@ -462,6 +529,16 @@ mod mock {
             Ok(ChildHandle(id))
         }
 
+        fn spawn_detached(&self, spec: ChildSpec) -> io::Result<()> {
+            // Recorded in the same `spawn_specs` list as tracked spawns —
+            // tests assert "was this argv issued," not "was it tracked" —
+            // but, matching the real runner, never given a handle and never
+            // inserted into `children` (there is nothing to leak here since
+            // the mock has no OS process to reap).
+            self.spawn_specs.lock().unwrap().push(spec);
+            Ok(())
+        }
+
         fn signal(&self, handle: ChildHandle, sig: Signal) {
             if let Some(c) = self.children.lock().unwrap().get_mut(&handle.0) {
                 c.signals_received.push(sig);
@@ -481,6 +558,7 @@ mod mock {
         }
 
         fn wait(&self, handle: ChildHandle) -> Option<i32> {
+            self.wait_calls.lock().unwrap().push(handle);
             self.children
                 .lock()
                 .unwrap()

@@ -89,7 +89,14 @@ impl StrongswanEngine {
         let env = self.env_prefix();
         let mut argv = vec!["env".to_string(), env, "swanctl".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
-        let _ = runner.spawn(ChildSpec::new(argv));
+        // spawn_detached, not spawn: a real review finding caught that
+        // `spawn` + discarding the returned handle still leaves an
+        // un-reapable entry in RealCommandRunner's table forever (nothing
+        // holds the handle needed to remove it) — every repeated tunnel
+        // recovery over a long-running container's lifetime would leak one.
+        // `spawn_detached` never inserts a tracked entry at all, matching
+        // this call's true fire-and-forget nature.
+        let _ = runner.spawn_detached(ChildSpec::new(argv));
     }
 
     /// The full restart choreography, 1:1 port of both the "charon exited"
