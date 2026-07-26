@@ -229,26 +229,31 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn signal(&self, handle: ChildHandle, sig: Signal) {
-        // Checks try_wait() (and removes the entry on exit) before signaling
-        // at all — a real bug review caught: without this check, a handle
-        // whose process had already exited (reaped by an earlier is_alive/
-        // wait call, or simply exited on its own) stayed in the map with its
-        // now-stale pid, and a later signal() call would `kill` that raw pid
-        // regardless of whether the OS had since reused it for an unrelated
-        // process. Removing the entry as soon as exit is observed — here,
-        // and in is_alive/wait below — means a handle can only ever be
-        // signaled while this table still believes it's the same process.
-        let pid = {
-            let mut children = self.children.lock().unwrap();
-            let Some(child) = children.get_mut(&handle.0) else {
+        // Holds `children`'s lock for the ENTIRE check-then-signal
+        // sequence — including the external `kill` invocation itself — not
+        // just the pid lookup. A prior version released the lock as soon as
+        // the pid was read, then shelled out to `kill` afterward; a second
+        // review pass caught the resulting race: a concurrent `is_alive`/
+        // `wait` call on another thread (this runner is `Send + Sync` and
+        // genuinely used from multiple per-line supervisor threads) could
+        // reap the same child in that window, and the OS could reuse its
+        // pid, before our own `kill` call ever ran — so the signal could
+        // land on a completely unrelated process despite the try_wait()
+        // check having passed moments earlier. Holding the lock across the
+        // whole thing means no other call on this runner can reap (or be
+        // reaped as) this handle while a signal for it is in flight; the
+        // `kill` subprocess itself is near-instant, so the brief
+        // process-wide serialization this adds is an acceptable trade for
+        // actually closing the race, not just narrowing it.
+        let mut children = self.children.lock().unwrap();
+        let Some(child) = children.get_mut(&handle.0) else {
+            return;
+        };
+        let pid = match child.try_wait() {
+            Ok(None) => child.id(),
+            _ => {
+                children.remove(&handle.0);
                 return;
-            };
-            match child.try_wait() {
-                Ok(None) => child.id(),
-                _ => {
-                    children.remove(&handle.0);
-                    return;
-                }
             }
         };
         // Shells out to `kill` rather than a raw `libc::kill(2)` call: this
@@ -341,6 +346,41 @@ mod real_runner_tests {
         let handle = runner.spawn(ChildSpec::new(["sleep", "30"])).unwrap();
         assert!(runner.is_alive(handle));
         runner.signal(handle, Signal::Kill);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!runner.is_alive(handle));
+    }
+
+    #[test]
+    fn concurrent_signal_and_liveness_checks_on_the_same_handle_never_panic_or_misbehave() {
+        // Regression test for the second review finding: signal() used to
+        // release the table lock before actually shelling out to `kill`,
+        // so a concurrent wait()/is_alive() on another thread could reap
+        // the same handle (and the OS could reuse its pid) in that window.
+        // Holding the lock for the whole check-then-signal sequence
+        // serializes these instead of letting them interleave — this
+        // hammers both from separate threads concurrently and just
+        // requires it not to panic/deadlock and to end in a consistent
+        // state (the child is gone, one way or another).
+        let runner = std::sync::Arc::new(RealCommandRunner::new());
+        let handle = runner.spawn(ChildSpec::new(["sleep", "2"])).unwrap();
+
+        let r1 = std::sync::Arc::clone(&runner);
+        let liveness_checker = std::thread::spawn(move || {
+            for _ in 0..50 {
+                r1.is_alive(handle);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        let r2 = std::sync::Arc::clone(&runner);
+        let signaler = std::thread::spawn(move || {
+            r2.signal(handle, Signal::Kill);
+        });
+
+        liveness_checker
+            .join()
+            .expect("liveness checker thread must not panic");
+        signaler.join().expect("signaler thread must not panic");
+
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!runner.is_alive(handle));
     }
