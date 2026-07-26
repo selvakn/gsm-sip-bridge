@@ -245,6 +245,26 @@ impl CommandRunner for RealCommandRunner {
         // `kill` subprocess itself is near-instant, so the brief
         // process-wide serialization this adds is an acceptable trade for
         // actually closing the race, not just narrowing it.
+        //
+        // Why this closes it rather than just narrowing it: POSIX guarantees
+        // a child's pid is NOT returned to the system's free pool until it
+        // has both (a) exited and (b) been reaped by ITS OWN PARENT via
+        // wait()/waitpid() — a zombie's pid is reserved the entire time it
+        // sits unreaped, globally, not just "protected from us." The only
+        // code in this whole process that ever calls wait()/try_wait() on a
+        // handle tracked here is gated behind this same mutex (spawn_detached
+        // reaps its OWN, unrelated children on a separate thread, never
+        // touching `self.children`); this binary also registers no SIGCHLD
+        // handler anywhere (grep the codebase: the only `signal::unix::
+        // signal` call requests `SignalKind::terminate()`, and nothing uses
+        // `tokio::process`, which is the only other thing that would install
+        // one). So between this method's try_wait() and its `kill` call, the
+        // pid cannot yet be reused by anything, in this process or any
+        // other, because nothing capable of reaping it runs outside this
+        // critical section. If a future change adds a second reaper of these
+        // handles (e.g. a global SIGCHLD handler, or `tokio::process` for
+        // these specific children) outside this lock, this reasoning stops
+        // holding and the mutex alone no longer suffices.
         let mut children = self.children.lock().unwrap();
         let Some(child) = children.get_mut(&handle.0) else {
             return;
