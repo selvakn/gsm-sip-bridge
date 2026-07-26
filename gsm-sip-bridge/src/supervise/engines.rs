@@ -65,11 +65,31 @@ impl StrongswanEngine {
         format!("STRONGSWAN_CONF={}", self.strongswan_conf)
     }
 
+    /// Blocking `swanctl` invocation — matches the bash calls with no
+    /// trailing `&` (`--load-all`, `--terminate`), which the original script
+    /// runs to completion before continuing.
     fn swanctl(&self, runner: &dyn CommandRunner, args: &[&str]) {
         let env = self.env_prefix();
         let mut argv = vec!["env", env.as_str(), "swanctl"];
         argv.extend_from_slice(args);
         let _ = runner.run(&argv);
+    }
+
+    /// Backgrounded `swanctl` invocation — matches the bash calls that end
+    /// in `&` (every `--initiate`). Fire-and-forget: like the bash version,
+    /// the spawned process's handle is never tracked or waited on (the
+    /// script only ever redirects its output to a log file, `>>"...
+    /// -initiate-$idx.log" 2>&1 &`, and never references its pid again).
+    /// Not backgrounding this was a real bug caught by review: running
+    /// `--initiate` synchronously via `run()` blocks the calling supervisor
+    /// tick for as long as IKE negotiation takes, exactly the polling stall
+    /// specs/012-strongswan-epdg's own establish/steady-state loops are
+    /// designed to avoid by backgrounding it in the first place.
+    fn swanctl_background(&self, runner: &dyn CommandRunner, args: &[&str]) {
+        let env = self.env_prefix();
+        let mut argv = vec!["env".to_string(), env, "swanctl".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        let _ = runner.spawn(ChildSpec::new(argv));
     }
 
     /// The full restart choreography, 1:1 port of both the "charon exited"
@@ -86,15 +106,22 @@ impl StrongswanEngine {
         let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
 
         let env = self.env_prefix();
+        // `env` must be argv[0] here, not the `STRONGSWAN_CONF=...` string
+        // itself — a real bug review caught: RealCommandRunner passes
+        // argv[0] straight to `Command::new`, so without this prefix the
+        // spawn attempted to exec the environment assignment as a program
+        // and failed with ENOENT, silently leaving no charon running while
+        // the rest of the restart sequence (load-all, initiate) proceeded
+        // as if it had.
         if let Ok(handle) = runner.spawn(
-            ChildSpec::new([env.as_str(), "/usr/libexec/ipsec/charon"])
+            ChildSpec::new(["env", env.as_str(), "/usr/libexec/ipsec/charon"])
                 .capture_stdout_to(self.charon_log.clone()),
         ) {
             *self.charon_handle.borrow_mut() = Some(handle);
         }
 
         self.swanctl(runner, &["--load-all", "--file", &self.swanctl_top_conf]);
-        self.swanctl(runner, &["--initiate", "--child", "ims"]);
+        self.swanctl_background(runner, &["--initiate", "--child", "ims"]);
     }
 }
 
@@ -124,7 +151,7 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn reinitiate(&self, runner: &dyn CommandRunner) {
-        self.swanctl(runner, &["--initiate", "--child", "ims"]);
+        self.swanctl_background(runner, &["--initiate", "--child", "ims"]);
     }
 
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
@@ -372,6 +399,63 @@ mod tests {
                 .any(|c| c == &["rm", "-f", "/var/run/charon.pid"]));
             assert!(engine.charon_handle.borrow().is_some());
             assert_ne!(*engine.charon_handle.borrow(), Some(old));
+        }
+
+        #[test]
+        fn restart_process_spawns_charon_through_env_not_as_argv0() {
+            // Regression test (Greptile P1): a real RealCommandRunner passes
+            // argv[0] straight to `Command::new`, so the spawned command's
+            // first argument MUST be the literal program to exec ("env"),
+            // with the `STRONGSWAN_CONF=...` assignment as its own argument
+            // — not the environment-variable string itself as argv[0],
+            // which would fail with ENOENT against a real runner (a mock
+            // can't catch this since it never actually execs anything).
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.restart_process(&runner);
+            let specs = runner.spawn_specs.lock().unwrap();
+            let charon_spec = specs
+                .iter()
+                .find(|s| s.argv.iter().any(|a| a == "/usr/libexec/ipsec/charon"))
+                .expect("a charon spawn must have been issued");
+            assert_eq!(charon_spec.argv[0], "env");
+            assert!(charon_spec.argv[1].starts_with("STRONGSWAN_CONF="));
+        }
+
+        #[test]
+        fn restart_process_backgrounds_initiate_rather_than_blocking_on_it() {
+            // Regression test (Greptile P2): the bash original runs
+            // `--initiate` with a trailing `&` specifically so a slow IKE
+            // negotiation can't block the establish/steady-state poll loop;
+            // this must go through `spawn` (fire-and-forget), never a
+            // blocking `run`.
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.restart_process(&runner);
+
+            let run_calls = runner.run_calls.lock().unwrap();
+            assert!(
+                !run_calls
+                    .iter()
+                    .any(|c| c.contains(&"--initiate".to_string())),
+                "--initiate must never be issued as a blocking `run` call"
+            );
+            let spawn_specs = runner.spawn_specs.lock().unwrap();
+            assert!(spawn_specs
+                .iter()
+                .any(|s| s.argv.contains(&"--initiate".to_string())));
+        }
+
+        #[test]
+        fn reinitiate_also_backgrounds_initiate() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.reinitiate(&runner);
+            assert!(runner.run_calls.lock().unwrap().is_empty());
+            let specs = runner.spawn_specs.lock().unwrap();
+            assert!(specs
+                .iter()
+                .any(|s| s.argv.contains(&"--initiate".to_string())));
         }
 
         #[test]

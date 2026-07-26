@@ -189,12 +189,27 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn signal(&self, handle: ChildHandle, sig: Signal) {
+        // Checks try_wait() (and removes the entry on exit) before signaling
+        // at all — a real bug review caught: without this check, a handle
+        // whose process had already exited (reaped by an earlier is_alive/
+        // wait call, or simply exited on its own) stayed in the map with its
+        // now-stale pid, and a later signal() call would `kill` that raw pid
+        // regardless of whether the OS had since reused it for an unrelated
+        // process. Removing the entry as soon as exit is observed — here,
+        // and in is_alive/wait below — means a handle can only ever be
+        // signaled while this table still believes it's the same process.
         let pid = {
             let mut children = self.children.lock().unwrap();
             let Some(child) = children.get_mut(&handle.0) else {
                 return;
             };
-            child.id()
+            match child.try_wait() {
+                Ok(None) => child.id(),
+                _ => {
+                    children.remove(&handle.0);
+                    return;
+                }
+            }
         };
         // Shells out to `kill` rather than a raw `libc::kill(2)` call: this
         // crate's gsm-sip-bridge/src must contain zero `unsafe` blocks
@@ -216,17 +231,78 @@ impl CommandRunner for RealCommandRunner {
         let Some(child) = children.get_mut(&handle.0) else {
             return false;
         };
-        matches!(child.try_wait(), Ok(None))
+        match child.try_wait() {
+            Ok(None) => true,
+            _ => {
+                // Exited (or errored checking) — remove so no later signal()
+                // can reach a since-reused pid.
+                children.remove(&handle.0);
+                false
+            }
+        }
     }
 
     fn wait(&self, handle: ChildHandle) -> Option<i32> {
-        let mut children = self.children.lock().unwrap();
-        let child = children.get_mut(&handle.0)?;
+        // Removed from the table before the (potentially blocking) wait()
+        // call, both to release the lock while blocked and so the handle is
+        // already gone — and therefore un-signalable — for the whole
+        // duration of the wait, not just after it returns.
+        let mut child = {
+            let mut children = self.children.lock().unwrap();
+            children.remove(&handle.0)?
+        };
         child.wait().ok().and_then(|status| status.code())
     }
 
     fn sleep(&self, d: std::time::Duration) {
         std::thread::sleep(d);
+    }
+}
+
+#[cfg(test)]
+mod real_runner_tests {
+    // Integration-style, not mock-based (constitution Principle I): these
+    // exercise RealCommandRunner against genuinely spawned, always-available
+    // processes (`true`, `sleep`) — no hardware/charon/pcscd needed, so no
+    // mock justification applies here; this is exactly the kind of thing
+    // that must NOT be tested only against MockCommandRunner; the previous
+    // version of this file signaled a raw pid after reaping a child, which a
+    // mock (which has no concept of PID reuse at all) could never have
+    // caught.
+    use super::*;
+
+    #[test]
+    fn a_reaped_child_is_removed_so_a_later_signal_is_a_safe_no_op() {
+        let runner = RealCommandRunner::new();
+        let handle = runner.spawn(ChildSpec::new(["true"])).unwrap();
+        // Give the (near-instant) child a moment to actually exit.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!runner.is_alive(handle), "`true` should have exited by now");
+        // Must not panic/error — and, per the fix, must not attempt to
+        // signal the stale pid at all.
+        runner.signal(handle, Signal::Term);
+        assert_eq!(runner.children.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wait_removes_the_entry_so_the_handle_cannot_be_signaled_afterward() {
+        let runner = RealCommandRunner::new();
+        let handle = runner.spawn(ChildSpec::new(["true"])).unwrap();
+        let status = runner.wait(handle);
+        assert_eq!(status, Some(0));
+        assert_eq!(runner.children.lock().unwrap().len(), 0);
+        // No panic, no attempt to signal a since-possibly-reused pid.
+        runner.signal(handle, Signal::Kill);
+    }
+
+    #[test]
+    fn a_still_running_child_can_be_signaled_and_is_observed_dead_after() {
+        let runner = RealCommandRunner::new();
+        let handle = runner.spawn(ChildSpec::new(["sleep", "30"])).unwrap();
+        assert!(runner.is_alive(handle));
+        runner.signal(handle, Signal::Kill);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!runner.is_alive(handle));
     }
 }
 
