@@ -277,4 +277,12 @@ phase, so nothing needs to be invented for a follow-up.
 
 ---
 
+## 2026-07-26 — PR raised
+
+https://github.com/selvakn/gsm-sip-bridge/pull/14 — Phases 0-3, scope exactly
+as described in the two entries above. Watching for Greptile + CI now and
+will address P1 findings before notifying you.
+
+---
+
 (Further entries appended as phases proceed.)
