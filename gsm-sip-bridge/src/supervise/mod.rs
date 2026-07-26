@@ -4,6 +4,8 @@
 //! plain Rust, tested without hardware; [`runner::CommandRunner`] is the one
 //! seam through which it ever touches a real process or file.
 
+pub mod daemon_supervisor;
 pub mod render;
 pub mod runner;
 pub mod shutdown;
+pub mod sim_recovery;

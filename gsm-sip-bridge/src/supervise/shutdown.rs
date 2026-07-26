@@ -221,7 +221,7 @@ impl TeardownStep {
                     if !runner.is_alive(*handle) {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    runner.sleep(std::time::Duration::from_millis(250));
                 }
             }
             TeardownStep::RunInNetns { netns, argv } => {

@@ -101,6 +101,17 @@ pub trait CommandRunner: Send + Sync {
 
     /// Blocks until the child exits, returns its exit status if available.
     fn wait(&self, handle: ChildHandle) -> Option<i32>;
+
+    /// Blocks the calling thread for `d`. Routed through the runner (rather
+    /// than a bare `std::thread::sleep` call at each site) so decision logic
+    /// with real, load-bearing sleep durations (poll cadences, settle delays)
+    /// stays exactly as tested as everything else: `MockCommandRunner`
+    /// records the requested duration and returns immediately, so a
+    /// table-driven test exercising a 15-attempt, 1s-apart poll loop runs in
+    /// microseconds, not 15 real seconds — while still asserting the actual
+    /// requested durations, so a change to a cadence constant still fails a
+    /// test.
+    fn sleep(&self, d: std::time::Duration);
 }
 
 /// Production implementation: real `std::process::Command`/`Child`, real
@@ -213,6 +224,10 @@ impl CommandRunner for RealCommandRunner {
         let child = children.get_mut(&handle.0)?;
         child.wait().ok().and_then(|status| status.code())
     }
+
+    fn sleep(&self, d: std::time::Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +266,10 @@ mod mock {
         pub files: Mutex<Map<std::path::PathBuf, String>>,
         pub spawn_specs: Mutex<Vec<ChildSpec>>,
         pub children: Mutex<Map<u64, MockChild>>,
+        /// Every requested sleep duration, in call order — recorded instead
+        /// of actually slept, so tests exercising real cadence constants stay
+        /// fast while still able to assert on them.
+        pub sleeps: Mutex<Vec<std::time::Duration>>,
         next_id: AtomicU64,
     }
 
@@ -391,6 +410,10 @@ mod mock {
                 .unwrap()
                 .get(&handle.0)
                 .and_then(|c| c.exit_code)
+        }
+
+        fn sleep(&self, d: std::time::Duration) {
+            self.sleeps.lock().unwrap().push(d);
         }
     }
 
