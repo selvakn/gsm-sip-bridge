@@ -323,4 +323,60 @@ this up for real.
 
 ---
 
+## 2026-07-26/27 — Greptile loop, rounds 2-5: three more real concurrency/lifecycle bugs, then a deliberate stop
+
+After the first round (documented above), pushing fixes re-triggered the
+review automatically (it re-runs on every push to the PR), and it kept
+finding real things in the same area — `RealCommandRunner`'s process
+lifecycle management. In order:
+
+- **Round 2** (P1): `swanctl_background`'s fire-and-forget `spawn()` calls
+  never got their handles removed from the table (nothing held the handle to
+  remove it with) — every `--initiate` over the container's lifetime leaked
+  one table entry and one unreaped zombie, unboundedly. Fixed by adding
+  `CommandRunner::spawn_detached`, which never inserts a tracked entry at
+  all (a dedicated thread reaps it in the background instead) — matching
+  bash's own true fire-and-forget `&`. Also proactively found and fixed the
+  same shape in `sim_recovery`'s background reader while auditing for other
+  instances (bash's original explicitly `wait`s for it after killing it; the
+  port only signaled it).
+- **Round 3** (P1): `signal()` read a pid under lock, then released the lock
+  before actually shelling out to `kill` — a concurrent `wait()`/`is_alive()`
+  on another thread (this runner is genuinely used from multiple per-line
+  supervisor threads) could reap the same handle, and the OS could reuse its
+  pid, in that gap. Fixed by holding the lock across the entire
+  check-then-signal sequence, including the `kill` subprocess call itself.
+- **Round 4**: the same theme, restated — Greptile flagged what looked like
+  the identical residual race even after the round-3 fix. I stopped and
+  actually verified this one rather than reflexively iterating again: POSIX
+  guarantees a zombie's pid is reserved (not reusable by anyone) until its
+  own parent reaps it, and I grepped the whole codebase and found no
+  SIGCHLD handler and no `tokio::process` usage anywhere — meaning nothing
+  outside `signal()`'s own mutex-protected critical section can reap these
+  handles. Under that fix, the race genuinely does not exist. I documented
+  this reasoning inline in the code and replied to Greptile explaining it,
+  rather than pushing a further "fix" for a race I don't believe exists —
+  the only way to close it *further* would be pidfd-based signaling, which
+  needs a new dependency I'm not going to add unilaterally at the tail of an
+  autonomous overnight session.
+- **Round 5**: no new finding (same 6 comment IDs as round 4), but the
+  overview's confidence score still reads 3/5, restating the same point in
+  different words. **This is where I stopped the loop.** Both CI jobs are
+  green; every finding that had an actual code fix available has one; the
+  one remaining point is a documented, reasoned engineering disagreement,
+  not an unaddressed bug — continuing to push more of the same reply back
+  and forth has no further value.
+
+**Total: 5 real bugs found and fixed across the whole session** (1 from
+direct bash-diffing in Phase 1, 4 from Greptile across rounds 1-3), plus one
+point where my own technical analysis, not a code change, is the answer.
+**Recommendation for your review**: read the PR thread's reply on comment
+`3653148273` (the pid-reuse rebuttal) and this entry, and make your own call
+on whether pidfd-based signaling (via e.g. the `rustix` crate) is worth a
+follow-up — I don't think it's needed given the reasoning above, but it's
+your dependency-footprint decision to make, not mine to force through
+unasked.
+
+---
+
 (Further entries appended as phases proceed.)
