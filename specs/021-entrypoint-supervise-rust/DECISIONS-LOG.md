@@ -185,4 +185,65 @@ tick a box.
 
 ---
 
+## 2026-07-26 — Phase 3 core complete (LineSupervisor + engines + sim_recovery + daemon_supervisor)
+
+All decision logic for Phase 3 is implemented and tested: `line_supervisor.rs`
+(the state machine, 13 tests covering every transition in the spec's table),
+`engines.rs` (concrete `StrongswanEngine`/`SwuEngine`, real command wiring —
+found and fixed two more bugs via testing: `extract_swu_pcscf`'s IPv6 fallback
+matched the literal word "ADDRESS:" before the real address token, and a
+test's own mock-output key was wrong for a namespace-scoped command, which
+was actively masking a real assertion). `sim_recovery.rs` and
+`daemon_supervisor.rs` (from the previous entry) round out the four things
+Phase 3 needed to port. `CommandRunner` also gained a `sleep` method along
+the way — worth flagging on its own: my first draft of `sim_recovery`'s tests
+used real `std::thread::sleep`, and one test alone took 19.5 real seconds
+before I caught it. Routing sleep through the runner (mock records durations,
+doesn't block) dropped the whole 37-test suite to 0.02s.
+
+**631 tests total, all passing; `make lint` clean (zero unsafe, zero clippy
+findings, shellcheck clean).**
+
+## 2026-07-26 — Deliberate stop before live hardware validation
+
+I have NOT run `docker compose up` against the real EC20 + Airtel SIM, and am
+not going to without you present, for a reason worth being explicit about:
+
+This is not a sandboxed test resource — it's a live registration against a
+real carrier network, and (per my own memory of this project) this exact
+hardware has a documented history of registration instability and SIM-drop
+incidents that needed hands-on recovery (AT+CFUN power cycles, physical
+intervention). You asked me to keep going without stopping for questions, and
+I've taken that as license for every judgment call *within the code* — but
+"start a container that touches live carrier registration, unsupervised,
+overnight, with nobody able to intervene if it goes sideways" is a different
+class of action from a git commit or a design decision. The cost of being
+wrong here is a dropped/flapping registration on hardware you might need
+working in the morning; the cost of deferring it is a few hours' delay on
+one verification step. That asymmetry is why I stopped.
+
+What I did instead, to get as much real verification as I reasonably could
+without touching the modem:
+- Phase 1's rendering was verified by diffing against the *actual* `sed`/bash
+  execution on the real template file (not just my own test fixtures) — this
+  is as strong a correctness check as exists short of a live deploy, for a
+  change that's pure text transformation.
+- Phase 3's engine wiring is tested against a mock runner asserting the exact
+  command sequences (e.g. `restart_process` really does emit `rm -f
+  /var/run/charon.pid` before respawning charon), which is the correctness
+  property that matters for code review even though it can't prove the real
+  `charon`/`swanctl` binaries accept what's emitted.
+
+Docker itself IS reachable from this session (daemon-side privilege via the
+`docker` group, not my own shell's) and `docker compose build`/`up` would
+likely work mechanically — I chose not to run `up`, not because I couldn't.
+
+**Recommendation for your morning review**: run `make docker-build && make
+docker-up` yourself, watch `make docker-logs`, and work through
+`quickstart.md`'s checklist for whichever phases you want to trust before
+merging. I'd treat this as the one non-optional step between this branch and
+production, not a formality.
+
+---
+
 (Further entries appended as phases proceed.)
