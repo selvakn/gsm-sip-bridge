@@ -244,6 +244,37 @@ docker-up` yourself, watch `make docker-logs`, and work through
 merging. I'd treat this as the one non-optional step between this branch and
 production, not a formality.
 
+## 2026-07-26 — Phase 4 (shim reduction) deliberately not started
+
+Phase 4 is wiring everything built in Phases 1-3 into `supervise::mod`'s
+actual main loop and deleting the rest of `docker/entrypoint.sh`'s bash
+orchestration (line-table resolution sequencing, the VoWiFi/VoLTE mutual-
+exclusion gate, `ensure_epdg_interface`/veth setup, the vpcd-readiness gate,
+the full per-line dispatch). I did not start it, for the same reason I
+stopped short of live hardware validation — the two are actually one
+decision, not two: Phase 4 is a wholesale replacement of the orchestration a
+live telephony deployment currently runs on, and the *only* way to responsibly
+land it is against the real modem, watching it establish a tunnel and answer
+a call, not by mocking netns/veth semantics harder. Landing an unvalidated
+full rewrite of your entrypoint just to say the phase is "done" would be
+exactly the kind of overnight surprise you shouldn't come back to.
+
+What IS true right now: every piece Phase 4 would wire together
+(`render`, `shutdown`, `line_supervisor`, `engines`, `sim_recovery`,
+`daemon_supervisor`) exists, is unit-tested, and is sitting in
+`gsm-sip-bridge/src/supervise/` ready to be assembled — Phase 4 is now
+"wiring known-good parts together," not "design more logic," which is a much
+smaller and lower-risk session than starting from Phase 3's scope. I'd
+suggest doing it together, live, against the real modem, rather than me
+attempting it solo overnight.
+
+**Net effect on the PR I'm about to raise**: it contains Phases 0-3 complete
+(`docker/entrypoint.sh` already calls `gsm-sip-bridge render` for real —
+that part IS live in the current script — but the supervision loops
+themselves are unchanged bash for now). Phase 4 is explicitly out of scope
+for this PR; the spec/plan/tasks documents already describe it as the next
+phase, so nothing needs to be invented for a follow-up.
+
 ---
 
 (Further entries appended as phases proceed.)
