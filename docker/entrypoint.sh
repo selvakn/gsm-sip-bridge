@@ -37,6 +37,12 @@ set -uo pipefail
 GSM_SIP_BRIDGE_BIN="${GSM_SIP_BRIDGE_BIN:-/usr/local/bin/gsm-sip-bridge}"
 GSM_SIP_BRIDGE_CONFIG="${GSM_SIP_BRIDGE_CONFIG:-/etc/gsm-sip-bridge/config.toml}"
 
+# USIM auto-recovery (see reset_line_sim + start_line_tail): after this many
+# consecutive `AT+CSIM failed` exits from a line's vowifi-ims-agent, power-cycle
+# the SIM (AT+CFUN=0 -> 1); give up after MAX_SIM_RESETS attempts per incident.
+CSIM_FAIL_THRESHOLD="${CSIM_FAIL_THRESHOLD:-3}"
+MAX_SIM_RESETS="${MAX_SIM_RESETS:-5}"
+
 log() { echo "[entrypoint] $*"; }
 
 if [ ! -x "$GSM_SIP_BRIDGE_BIN" ]; then
@@ -394,6 +400,89 @@ ensure_epdg_interface() {
 # per-line loop below (specs/020-volte-line-netns) — see its definition
 # right after "1. Discover once, up front".
 
+# --- USIM auto-recovery (AT+CFUN power-cycle) -------------------------------
+# The vowifi-ims-agent's first *live* SIM access is AT+CSIM (IMS-AKA). With
+# imsi_override/imei_override pinned, the "read IMSI/IMEI" log lines are the
+# configured values, not live reads — so a USIM that has electrically dropped
+# off the modem bus at runtime surfaces only as `AT+CSIM failed: 0`
+# (+CME ERROR: 0) in a 5s restart loop. A soft radio cycle (AT+CFUN=0 ->
+# AT+CFUN=1) re-detects the card without re-enumerating USB or restarting the
+# container — the recipe used by hand during the sugam incident (2026-07-26).
+#
+# Whatever owns $modem for this line runs as root alongside the agent, so
+# serialport/pyserial's TIOCEXCL does not keep them apart: this container runs
+# privileged (CAP_SYS_ADMIN), and TIOCEXCL is bypassed for CAP_SYS_ADMIN — which
+# is exactly why the agent can already open the port while the holder holds it.
+# So a raw AT write here would interleave with the holder's own traffic, and its
+# reply could steal our +CPIN. Freeze the holder (SIGSTOP) for the ~20s of the
+# reset so we own the port, then resume it (SIGCONT). SIGSTOP leaves the holder's
+# fd + TIOCEXCL lock open, but that does not block our re-open for the same
+# CAP_SYS_ADMIN reason; we stop rather than kill so its supervisor does not
+# restart it mid-reset. The holder is engine-specific — the
+# strongswan engine's vowifi-usim-bridge or the swu engine's swu_emulator.py
+# dialer — so match both (only one exists per line). Each holder's supervisor
+# detects death with `kill -0`, which a stopped process still passes, so the
+# freeze does not race a restart. During a CSIM crash loop the line is already
+# broken and the holder only touches the modem on (re)auth, so pausing it is
+# safe (an swu dialer missing DPD keepalives for ~20s at worst re-establishes).
+reset_line_sim() {
+    local idx="$1" modem="$2"
+    log "line $idx: AUTO-RECOVERY: power-cycling the USIM on $modem (AT+CFUN=0->1) after $CSIM_FAIL_THRESHOLD consecutive AT+CSIM failures"
+
+    local holder_pids
+    holder_pids="$(
+        pgrep -f "vowifi-usim-bridge --modem $modem" 2>/dev/null
+        pgrep -f "swu_emulator.py -m $modem" 2>/dev/null
+    )"
+    if [ -n "$holder_pids" ]; then
+        # shellcheck disable=SC2086 # word-split intended: possibly several pids
+        kill -STOP $holder_pids 2>/dev/null || true
+        sleep 0.5 # let any in-flight serial I/O settle before we drive the port
+    fi
+
+    local reset_log="/tmp/sim-reset-$idx.log"
+    : >"$reset_log"
+    stty -F "$modem" 115200 -echo 2>/dev/null || true
+    # 30s cat budget comfortably outlasts the ~4.3s pre-roll (0.3s + CFUN=0 +
+    # 4s) plus the ~15s readiness poll below; the reader is also killed the
+    # moment we see READY, so a generous cap only removes false-failure risk on
+    # a slow modem, it never slows the success path.
+    (timeout 30 cat "$modem" >"$reset_log" 2>/dev/null) &
+    local reader_pid=$!
+    sleep 0.3
+
+    printf 'AT+CFUN=0\r' >"$modem" 2>/dev/null || true
+    sleep 4
+    printf 'AT+CFUN=1\r' >"$modem" 2>/dev/null || true
+
+    # Poll for up to ~15s. Order is send -> wait -> grep so each grep inspects
+    # the response to its *own* AT+CPIN? (including the last iteration), rather
+    # than racing the modem's reply to a request sent the same instant.
+    local ready=0 i
+    for i in $(seq 1 15); do
+        printf 'AT+CPIN?\r' >"$modem" 2>/dev/null || true
+        sleep 1
+        if grep -q '+CPIN: READY' "$reset_log" 2>/dev/null; then
+            ready=1
+            break
+        fi
+    done
+
+    kill "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid" 2>/dev/null || true
+
+    if [ -n "$holder_pids" ]; then
+        # shellcheck disable=SC2086 # word-split intended: possibly several pids
+        kill -CONT $holder_pids 2>/dev/null || true
+    fi
+
+    if [ "$ready" -eq 1 ]; then
+        log "line $idx: AUTO-RECOVERY: USIM re-detected (+CPIN: READY); ims-agent will re-register on its next attempt"
+    else
+        log "line $idx: AUTO-RECOVERY: WARNING: no +CPIN: READY within ~15s of the radio cycle (see $reset_log) — may need AT+CFUN=1,1 or a physical modem power-cycle"
+    fi
+}
+
 # Veth pair + this line's vowifi-ims-agent, supervised. Agent B
 # (vowifi-sip-agent) is started once, after every line's veth pair exists —
 # see the bottom of this script.
@@ -425,9 +514,36 @@ start_line_tail() {
 
     log "line $idx: starting vowifi-ims-agent (netns $netns), supervised..."
     (
+        # Per-incident USIM auto-recovery. We tee the agent's output to a
+        # per-line file and, after each exit, check whether this run died on
+        # AT+CSIM (the dropped-USIM signature). CSIM_FAIL_THRESHOLD consecutive
+        # such deaths trigger a SIM power-cycle (reset_line_sim); any clean run
+        # (or a non-CSIM failure) ends the incident and resets both counters.
+        agent_log="/tmp/ims-agent-$idx.out"
+        csim_fails=0
+        sim_resets=0
         while true; do
-            ip netns exec "$netns" "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-ims-agent --line "$idx"
-            log "line $idx: vowifi-ims-agent exited (status $?); restarting in 5s"
+            : >"$agent_log"
+            ip netns exec "$netns" "$GSM_SIP_BRIDGE_BIN" --config "$GSM_SIP_BRIDGE_CONFIG" vowifi-ims-agent --line "$idx" 2>&1 | tee "$agent_log"
+            log "line $idx: vowifi-ims-agent exited (status ${PIPESTATUS[0]}); restarting in 5s"
+
+            if grep -q 'AT+CSIM failed' "$agent_log" 2>/dev/null; then
+                csim_fails=$((csim_fails + 1))
+                log "line $idx: AT+CSIM failure $csim_fails/$CSIM_FAIL_THRESHOLD (dropped USIM?)"
+                if [ "$csim_fails" -ge "$CSIM_FAIL_THRESHOLD" ]; then
+                    if [ "$sim_resets" -ge "$MAX_SIM_RESETS" ]; then
+                        log "line $idx: AUTO-RECOVERY: USIM already power-cycled ${sim_resets}x this incident without recovery — NOT resetting again; leaving the loop for the healthcheck/a human"
+                    else
+                        reset_line_sim "$idx" "${LINE_MODEM_PORT[idx]}"
+                        sim_resets=$((sim_resets + 1))
+                    fi
+                    csim_fails=0
+                fi
+            else
+                csim_fails=0
+                sim_resets=0
+            fi
+
             sleep 5
         done
     ) &
