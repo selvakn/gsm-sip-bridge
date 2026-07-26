@@ -552,9 +552,12 @@ start_line_tail() {
 # to the proven single-line arrangement, just replicated N times — and a
 # crashed charon/pcscd on one line cannot touch any other line's process.
 
-# render_line_strongswan_conf, render_line_swanctl_conf, and
-# render_line_updown_script (all with their full rationale comments) now live
-# in docker/lib/render_helpers.sh, sourced above.
+# render_line_strongswan_conf, render_line_swanctl_conf, render_line_updown_script,
+# and the swanctl ePDG connection's sed substitutions all now live as pure,
+# snapshot-tested Rust in gsm-sip-bridge/src/supervise/render.rs, reached via
+# `gsm-sip-bridge render ...` (specs/021-entrypoint-supervise-rust Phase 1) —
+# verified byte-for-byte identical to this file's pre-Phase-1 heredoc/sed
+# output for the same inputs.
 
 start_line_strongswan() {
     local idx="$1"
@@ -574,11 +577,14 @@ start_line_strongswan() {
     local imsi_override="${LINE_IMSI[idx]:-}"
     local charon_log="/tmp/charon-$idx.log"
     local vici_socket="/var/run/charon-$idx.vici"
-    local strongswan_conf
-    strongswan_conf="$(render_line_strongswan_conf "$idx" "$vici_socket" "$charon_log")"
-    local swanctl_top_conf
-    swanctl_top_conf="$(render_line_swanctl_conf "$idx")"
-    local swanctl_conf="/etc/swanctl/conf.d-$idx/epdg.conf"
+    local strongswan_conf="/etc/strongswan-line-$idx.conf"
+    "$GSM_SIP_BRIDGE_BIN" render strongswan-conf --line "$idx" --vici-socket "$vici_socket" \
+        --charon-log "$charon_log" >"$strongswan_conf"
+    local swanctl_conf_dir="/etc/swanctl/conf.d-$idx"
+    mkdir -p "$swanctl_conf_dir"
+    local swanctl_top_conf="/etc/swanctl-line-$idx.conf"
+    "$GSM_SIP_BRIDGE_BIN" render swanctl-top-conf --conf-dir "$swanctl_conf_dir" >"$swanctl_top_conf"
+    local swanctl_conf="$swanctl_conf_dir/epdg.conf"
 
     log "line $idx ($card_id): modem=$modem netns=$netns mcc=$mcc mnc=$mnc"
 
@@ -634,21 +640,16 @@ start_line_strongswan() {
         log "line $idx: read IMSI from SIM"
     fi
 
-    local updown_script
-    updown_script="$(render_line_updown_script "$idx" "$netns" "$tun_iface")"
+    local updown_script="/etc/strongswan.d/ims-updown-$idx.sh"
+    "$GSM_SIP_BRIDGE_BIN" render updown-script --netns "$netns" --tun-iface "$tun_iface" >"$updown_script"
+    chmod +x "$updown_script"
 
-    # `|` delimiter for @UPDOWN@ specifically: its replacement is a filesystem
-    # path containing `/`, which would break a plain `s/.../.../ ` substitution.
-    local sed_args=(
-        -e "s/@IMSI@/$imsi/" -e "s/@MCC@/$mcc/" -e "s/@MNC@/$mnc/" -e "s/@EPDG_IP@/$epdg_ip/"
-        -e "s/@IF_ID@/$if_id/" -e "s|@UPDOWN@|$updown_script|"
-    )
-    if [ -n "${SRC_ADDR:-}" ]; then
-        sed_args+=(-e "s/@SRC_ADDR@/$SRC_ADDR/")
-    else
-        sed_args+=(-e "/local_addrs.*@SRC_ADDR@/d")
-    fi
-    sed "${sed_args[@]}" /etc/strongswan.d/swanctl-epdg.conf.template >"$swanctl_conf"
+    local src_addr_args=()
+    [ -n "${SRC_ADDR:-}" ] && src_addr_args=(--src-addr "$SRC_ADDR")
+    "$GSM_SIP_BRIDGE_BIN" render swanctl-epdg \
+        --template-path /etc/strongswan.d/swanctl-epdg.conf.template \
+        --imsi "$imsi" --mcc "$mcc" --mnc "$mnc" --epdg-ip "$epdg_ip" --if-id "$if_id" \
+        --updown-script "$updown_script" "${src_addr_args[@]}" >"$swanctl_conf"
     log "line $idx: rendered swanctl connection ($swanctl_conf) for mcc=$mcc mnc=$mnc epdg=$epdg_ip"
 
     # pcscd is the single shared instance started before this loop — this
@@ -985,13 +986,7 @@ if [ "$TUNNEL_ENGINE" = "strongswan" ]; then
     # (config vowifi-shell-env's output) — not a misspelling of the per-line
     # `local vpcd_port` used elsewhere in this script; shellcheck can't see
     # through eval and flags the name collision.
-    VPCD_PORT_HEX="$(printf '0x%04X' "$VPCD_PORT")"
-    cat >/etc/reader.conf.d/vpcd <<EOF
-FRIENDLYNAME "Virtual PCD"
-DEVICENAME   /dev/null:$VPCD_PORT_HEX
-LIBPATH      /usr/lib/pcsc/drivers/serial/libifdvpcd.so
-CHANNELID    $VPCD_PORT_HEX
-EOF
+    "$GSM_SIP_BRIDGE_BIN" render vpcd-reader-conf --port "$VPCD_PORT" >/etc/reader.conf.d/vpcd
 
     mkdir -p /run/pcscd
     (
