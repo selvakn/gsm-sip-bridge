@@ -285,4 +285,42 @@ will address P1 findings before notifying you.
 
 ---
 
+## 2026-07-26 — Greptile review: 2 P1 + 1 P2 found and fixed, now 5/5 clean
+
+First pass came back 3/5 confidence with 2 P1s and 1 P2, all genuine bugs (not
+false positives — I verified each before fixing):
+
+1. **P1**: `StrongswanEngine::restart_charon`'s charon `ChildSpec` put
+   `STRONGSWAN_CONF=...` in argv[0] instead of prefixing with `env` —
+   `RealCommandRunner` passes argv[0] straight to `Command::new`, so this
+   would fail with ENOENT against a real runner. My own mock-based tests
+   never caught it because the mock never execs anything.
+2. **P1**: `RealCommandRunner::signal` could send a signal to a stale,
+   possibly-reused pid — `is_alive`/`wait` left a reaped child's table entry
+   in place, so a later `signal()` call would `kill` a pid the OS may have
+   since handed to an unrelated process.
+3. **P2**: `swanctl --initiate` ran synchronously (`run()`, blocks until
+   exit) instead of backgrounded (`&` in the bash original) — a slow IKE
+   negotiation would have stalled the entire supervisor tick.
+
+Fixed all three in commit 8b0856c, added regression tests for each
+(including 3 new tests against `RealCommandRunner` using real spawned
+processes, not the mock — the PID-reuse bug specifically needed that, since a
+mock has no concept of PID reuse to catch it with), replied to each Greptile
+comment thread, re-triggered the review: **5/5 confidence, "appears safe to
+merge with no remaining review finding."** Both CI build-and-test jobs also
+green.
+
+**Net lesson worth remembering**: the mock-based test suite was 100% green
+the whole time these 3 bugs existed — table-driven tests against
+`MockCommandRunner` prove the *decision logic* is right, but say nothing
+about whether the *real* command/argv/env construction would actually work.
+Greptile's review caught exactly the class of bug the constitution's
+Integration-First Testing principle worries about mocks hiding. Worth a
+second look at whether `engines.rs`'s remaining `CommandRunner` call sites
+have any other argv-construction bugs of this shape before Phase 4 wires
+this up for real.
+
+---
+
 (Further entries appended as phases proceed.)
