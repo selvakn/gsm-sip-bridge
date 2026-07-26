@@ -5,6 +5,8 @@
 //! seam through which it ever touches a real process or file.
 
 pub mod daemon_supervisor;
+pub mod engines;
+pub mod line_supervisor;
 pub mod render;
 pub mod runner;
 pub mod shutdown;
