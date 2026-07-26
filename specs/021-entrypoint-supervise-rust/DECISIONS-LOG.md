@@ -169,4 +169,20 @@ hardware."
 
 ---
 
+## 2026-07-26 — Phase 2 complete (ShutdownPlan)
+
+Went smoothly — no surprises, no bugs found (10 tests passed on the first
+run). One sequencing adjustment from the original tasks.md wording: I did
+NOT yet "wire supervise's top-level signal handler" into a real running
+process (tasks.md T031) — there is no real `supervise` main loop with actual
+spawned children until Phase 3/4 exist, so there's nothing yet to gracefully
+shut down. `build_shutdown_plan`/`execute_shutdown_plan` are fully
+implemented and tested as a standalone library module; the actual
+`SIGINT`/`SIGTERM` handler registration is deferred to Phase 4, when
+`supervise::mod` has a real event loop to hook it into. This seemed like the
+more honest sequencing than wiring a signal handler to a no-op loop just to
+tick a box.
+
+---
+
 (Further entries appended as phases proceed.)
