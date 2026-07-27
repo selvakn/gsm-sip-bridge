@@ -400,4 +400,22 @@ You came back and explicitly authorized real hardware testing ("I have airtel wi
 
 ---
 
+## 2026-07-27 (later) — entrypoint.sh reduced to a thin shim (T046) + a second live-caught bug fixed
+
+Continued straight on with T046 now that `supervise` was proven live: `docker/entrypoint.sh` cut from ~1350 lines to 28 (precondition checks + `exec gsm-sip-bridge supervise`), `docker/lib/render_helpers.{sh,bats}` removed (fully superseded), `Makefile`'s `test-bash` target now a no-op, shellcheck's glob updated. Rebuilt the image against this reduced entrypoint and redeployed on the same physical EC20 + Airtel modem to test the thing that actually matters for this task — a **container warm restart** (`docker compose restart gsm-sip-bridge`) against real carrier state, since that's the scenario the old bash script's own comments specifically called out as fragile.
+
+**Found a second live-only bug, this time on the warm-restart path itself**: after restart, `tun23-0` went missing from the `ims0` netns entirely while charon still reported the CHILD_SA as ESTABLISHED/INSTALLED — the exact desync scenario specs/012-strongswan-epdg's bash comment warned about ("tun can vanish from the kernel entirely... recreate... rather than trusting the desynced SA"). `tick_steady_state`'s `TunVanished` branch correctly *detected* this but never actually recreated the interface — a gap that traces back to my own Phase 3 comment claiming interface setup was "orchestrated by the caller," which I never followed through on when I wrote Phase 4's `orchestrate.rs`. Net effect: a fresh IKE_SA negotiation succeeding every ~30s, forever, healthcheck permanently red — same *symptom* as the P-CSCF bug from the previous entry, different root cause.
+
+Fix: added `TunnelEngine::recreate_interface`, called from the `TunVanished` branch before terminate+reinitiate. `StrongswanEngine` implements it via the already-tested `ensure_epdg_interface` (idempotent); `SwuEngine` is a documented no-op (no pre-created interface concept, and its own health check never reports `TunVanished`). Added a regression test asserting the call happens (`steady_state_tun_vanished_terminates_then_reinitiates_not_a_full_restart`), plus updated the `if_id` field threading through `orchestrate.rs`'s `StrongswanEngine` construction and the two test-double/helper sites the new trait method touched.
+
+**Verified live, twice**:
+1. A real warm restart (`docker compose restart`) — transiently hit a few EAP-AKA failures (`SCardConnect: No smart card inserted`, notify error 10500) that turned out to be the modem's own SIM interface settling after restart, not a bug in this code — the establish loop's existing retry behavior handled it correctly and reached healthy on IKE_SA[6] within ~3 minutes, same as bash would have.
+2. The actual bug this fix targets, reproduced directly and deterministically: with the tunnel already up, manually ran `ip netns exec ims0 ip link del tun23-0` from inside the running container (no restart) to simulate the observed desync without waiting for it to recur naturally. The next steady-state tick (within 5s) logged the recreate, re-initiated (IKE_SA ims[7]), and the healthcheck passed again — confirming the fix closes the exact gap that caused the original failure.
+
+651 tests passing, `make lint` clean, both commits made (T046 shim reduction, then the `recreate_interface` fix on top) — not yet pushed to the PR branch.
+
+**Still remaining**: Phase 7 polish (T047-T052 — FR-009 load-bearing-comment-to-test audit, `make coverage`, final `quickstart.md` pass), VoLTE live validation (still `[volte].enabled = false` in your config, so still unexercised against real hardware), and pushing these two commits + watching for any further Greptile rounds once pushed.
+
+---
+
 (Further entries appended as phases proceed.)
