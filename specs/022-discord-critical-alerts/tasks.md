@@ -314,22 +314,22 @@ quickstart.md US5.
 
 ### Tests for User Story 5
 
-- [ ] T030 [P] [US5] End-to-end test in `tests/test_alerts_discord.rs`:
+- [X] T030 [P] [US5] End-to-end test in `tests/test_alerts_discord.rs`:
       with `[alerts.missed_call].enabled = false`, a `MissedCall` event
       results in zero HTTP calls to the wiremock server and
       `CRITICAL_ALERTS_TOTAL{category="missed_call",outcome="skipped"}`
       increments.
-- [ ] T031 [P] [US5] End-to-end test in `tests/test_alerts_discord.rs`: with
+- [X] T031 [P] [US5] End-to-end test in `tests/test_alerts_discord.rs`: with
       a category-specific `discord_webhook_url` override set, two wiremock
       servers (default + override) confirm the event lands only on the
       override.
-- [ ] T032 [P] [US5] End-to-end test confirming a fresh config with no
+- [X] T032 [P] [US5] End-to-end test confirming a fresh config with no
       `[alerts]` section at all preserves today's SMS-forwarding behavior
       unchanged (FR-001 regression guard).
 
 ### Implementation for User Story 5
 
-- [ ] T033 [US5] Fix any gaps T030–T032 surface in `alerts::dispatch`
+- [X] T033 [US5] Fix any gaps T030–T032 surface in `alerts::dispatch`
       (T008) or `parse_alerts` (T005) — by design this phase should mostly
       confirm Phase 2's work rather than add new logic; if it does surface
       a gap, this is where it's closed.
@@ -341,10 +341,10 @@ config exactly as specified.
 
 ## Phase 8: Polish & Cross-Cutting Concerns
 
-- [ ] T034 [P] Update `config.multi.toml` (or the project's documented
+- [X] T034 [P] Update `config.multi.toml` (or the project's documented
       config reference) with a `[alerts]` section example, per
       contracts/config-schema.md.
-- [ ] T035 Run `cargo fmt --all && make lint && cargo test --workspace`
+- [X] T035 Run `cargo fmt --all && make lint && cargo test --workspace`
       across the whole feature as a final gate.
 - [ ] T036 Walk through quickstart.md end-to-end against real hardware
       (`sugam-direct`) or the container, for all five user stories.
