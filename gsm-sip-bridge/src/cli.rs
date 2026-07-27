@@ -213,6 +213,81 @@ pub enum Commands {
     /// without each re-scanning independently (which would otherwise race —
     /// see `specs/013-multi-card-vowifi/research.md` item 3).
     Discover(DiscoverArgs),
+    /// Renders one config asset the strongSwan/vpcd path needs, byte-for-byte
+    /// identical to what `docker/entrypoint.sh` used to render via bash
+    /// heredoc+`sed` (specs/021-entrypoint-supervise-rust Phase 1), and prints
+    /// it to stdout. A thin CLI wrapper over `supervise::render`'s pure
+    /// functions — introduced so this phase ships independently before the
+    /// `supervise` subcommand itself exists; folded into `supervise`
+    /// in-process by Phase 4.
+    Render(RenderArgs),
+    /// Runs the full container orchestration — discover once up front, the
+    /// circuit-switched daemon, every resolved VoWiFi/VoLTE line's
+    /// supervision, and a clean shutdown on SIGINT/SIGTERM
+    /// (specs/021-entrypoint-supervise-rust Phase 4). What
+    /// `docker/entrypoint.sh` used to do itself in bash; the shim now just
+    /// checks preconditions and execs this.
+    Supervise,
+}
+
+#[derive(Parser, Debug)]
+pub struct RenderArgs {
+    #[command(subcommand)]
+    pub asset: RenderAsset,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RenderAsset {
+    /// This line's strongswan.conf (own vici socket + filelog path).
+    StrongswanConf {
+        #[arg(long)]
+        line: u32,
+        #[arg(long)]
+        vici_socket: String,
+        #[arg(long)]
+        charon_log: String,
+    },
+    /// This line's top-level swanctl.conf (`include <conf_dir>/*.conf`).
+    SwanctlTopConf {
+        #[arg(long)]
+        conf_dir: String,
+    },
+    /// This line's ePDG swanctl connection, substituted into the shared
+    /// template at `--template-path` (`docker/strongswan/swanctl-epdg.conf.template`
+    /// in the image).
+    SwanctlEpdg {
+        #[arg(long)]
+        template_path: PathBuf,
+        #[arg(long)]
+        imsi: String,
+        #[arg(long)]
+        mcc: String,
+        #[arg(long)]
+        mnc: String,
+        #[arg(long)]
+        epdg_ip: String,
+        #[arg(long)]
+        if_id: String,
+        #[arg(long)]
+        updown_script: String,
+        /// Omit to drop the `local_addrs` line entirely (no source-address
+        /// override configured).
+        #[arg(long)]
+        src_addr: Option<String>,
+    },
+    /// This line's strongSwan updown wrapper (sets NETNS/STRONGSWAN_TUN_IFACE,
+    /// execs the shared ims.updown script).
+    UpdownScript {
+        #[arg(long)]
+        netns: String,
+        #[arg(long)]
+        tun_iface: String,
+    },
+    /// The shared vpcd reader's `/etc/reader.conf.d/vpcd`.
+    VpcdReaderConf {
+        #[arg(long)]
+        port: u16,
+    },
 }
 
 #[derive(Parser, Debug)]

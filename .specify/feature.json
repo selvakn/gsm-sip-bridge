@@ -1,3 +1,1 @@
-{
-  "feature_directory": "specs/020-volte-line-netns"
-}
+{"feature_directory": "specs/021-entrypoint-supervise-rust"}

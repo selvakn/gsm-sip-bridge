@@ -10,5 +10,6 @@ pub mod runtime;
 pub mod sip;
 pub mod sms;
 pub mod store;
+pub mod supervise;
 pub mod volte;
 pub mod vowifi;

@@ -1,0 +1,22 @@
+---
+source: gsm-sip-bridge/src/supervise/render.rs
+assertion_line: 199
+expression: rendered
+---
+connections {
+    ims {
+        local_addrs = 192.168.1.50
+        remote_addrs = 10.1.2.3
+        local {
+            auth = eap-aka
+            id = 0404101234567890@realm.mnc10.mcc404.3gppnetwork.org
+        }
+        children {
+            ims {
+                if_id_in = 23
+                if_id_out = 23
+                updown = /etc/strongswan.d/ims-updown-0.sh
+            }
+        }
+    }
+}

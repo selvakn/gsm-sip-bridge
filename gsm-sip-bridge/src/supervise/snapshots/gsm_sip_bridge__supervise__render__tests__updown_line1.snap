@@ -1,0 +1,7 @@
+---
+source: gsm-sip-bridge/src/supervise/render.rs
+assertion_line: 229
+expression: line1
+---
+#!/bin/sh
+NETNS="ims1" STRONGSWAN_TUN_IFACE="tun23-1" exec /etc/strongswan.d/ims.updown "$@"

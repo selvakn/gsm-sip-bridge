@@ -24,8 +24,9 @@ The VoWiFi leg must run inside the ePDG tunnel's `ims` network namespace — tha
 the tunnel's routes and the Gm IPsec (kernel XFRM) policy negotiated during IMS registration
 actually match. The SIP/PBX leg needs ordinary LAN reachability to the PBX, which only exists in
 the container's default namespace. One process can't satisfy both constraints, so the feature is
-two processes joined by a `veth` pair that `docker/entrypoint.sh` creates automatically (only when
-`[vowifi].enabled = true` — see that script's structure):
+two processes joined by a `veth` pair that `gsm-sip-bridge supervise` creates automatically (only
+when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate.rs`;
+`docker/entrypoint.sh` is now just a thin shim that execs into it, specs/021-entrypoint-supervise-rust):
 
 ```
           netns "ims"                                    container default netns
