@@ -123,6 +123,14 @@ fn main() -> ExitCode {
         return handle_render_command(args);
     }
 
+    if let Some(Commands::Supervise) = &cli.command {
+        let Some(path) = cli.config.as_deref() else {
+            eprintln!("supervise: --config is required");
+            return ExitCode::FAILURE;
+        };
+        return gsm_sip_bridge::supervise::orchestrate::run(path);
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"

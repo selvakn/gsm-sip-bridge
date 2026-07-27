@@ -8,6 +8,8 @@ pub mod daemon_supervisor;
 pub mod engines;
 pub mod epdg_iface;
 pub mod line_supervisor;
+pub mod orchestrate;
+pub mod orchestrate_volte;
 pub mod render;
 pub mod runner;
 pub mod shutdown;

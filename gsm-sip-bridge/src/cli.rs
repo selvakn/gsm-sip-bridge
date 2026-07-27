@@ -221,6 +221,13 @@ pub enum Commands {
     /// `supervise` subcommand itself exists; folded into `supervise`
     /// in-process by Phase 4.
     Render(RenderArgs),
+    /// Runs the full container orchestration — discover once up front, the
+    /// circuit-switched daemon, every resolved VoWiFi/VoLTE line's
+    /// supervision, and a clean shutdown on SIGINT/SIGTERM
+    /// (specs/021-entrypoint-supervise-rust Phase 4). What
+    /// `docker/entrypoint.sh` used to do itself in bash; the shim now just
+    /// checks preconditions and execs this.
+    Supervise,
 }
 
 #[derive(Parser, Debug)]
