@@ -79,8 +79,8 @@ fn spawn_client_reader(
     session: &super::RegisteredSession,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
 ) -> BridgeResult<()> {
-    let mut client_reader = session.transport.try_clone_reader()?;
-    let client_sink = session.transport.sink()?;
+    let mut client_reader = session.transport()?.try_clone_reader()?;
+    let client_sink = session.transport()?.sink()?;
     std::thread::spawn(move || loop {
         match client_reader.recv_message_deadline(CLIENT_READ_POLL_INTERVAL) {
             Ok(Some(msg)) => {
@@ -282,7 +282,7 @@ pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession) {
         cseq,
         expires: super::DEFAULT_EXPIRES,
     });
-    match session.transport.send(&msg) {
+    match session.transport_mut().and_then(|t| t.send(&msg)) {
         Ok(()) => tracing::info!(impu = %impu, "sent reg-event SUBSCRIBE"),
         Err(e) => tracing::warn!(error = %e, "failed to send reg-event SUBSCRIBE"),
     }

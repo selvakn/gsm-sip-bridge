@@ -245,8 +245,10 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
     });
 
     tracing::info!(callee = %cfg.callee, "sending INVITE");
-    session.transport.send(&invite)?;
-    let resp = session.transport.recv_final_response(cfg.ring_timeout)?;
+    session.transport_mut()?.send(&invite)?;
+    let resp = session
+        .transport_mut()?
+        .recv_final_response(cfg.ring_timeout)?;
     tracing::info!(status = resp.status, reason = %resp.reason, "final INVITE response");
 
     if resp.status != 200 {
@@ -265,7 +267,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
             cseq: invite_cseq,
             branch: &branch,
         });
-        let _ = session.transport.send(&ack);
+        let _ = session.transport_mut().and_then(|t| t.send(&ack));
         session.cleanup();
         return Ok(CallOutcome::NotAnswered {
             status: resp.status,
@@ -293,7 +295,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         cseq: invite_cseq,
         branch: &ack_branch,
     });
-    session.transport.send(&ack)?;
+    session.transport_mut()?.send(&ack)?;
 
     let rtp_result = run_rtp_session(&rtp_socket, answer.remote_rtp, answer.codec, cfg)?;
 
@@ -312,10 +314,15 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
     });
     // Best-effort — the recording already happened; a BYE-send failure
     // shouldn't turn a successful call test into an error.
-    if let Err(e) = session.transport.send(&bye) {
-        tracing::warn!(error = %e, "failed to send BYE");
-    } else if let Ok(resp) = session.transport.recv_response() {
-        tracing::info!(status = resp.status, reason = %resp.reason, "BYE response");
+    match session.transport_mut() {
+        Ok(t) => {
+            if let Err(e) = t.send(&bye) {
+                tracing::warn!(error = %e, "failed to send BYE");
+            } else if let Ok(resp) = t.recv_response() {
+                tracing::info!(status = resp.status, reason = %resp.reason, "BYE response");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to send BYE"),
     }
 
     session.cleanup();

@@ -1532,7 +1532,7 @@ fn end_call_attachment_lost(session: &mut super::RegisteredSession, mut call: Ac
         cseq: d.cseq,
         branch: &format!("z9hG4bK{}", random_hex(6)),
     });
-    let _ = session.transport.send(&bye);
+    let _ = session.transport_mut().and_then(|t| t.send(&bye));
     tracing::info!(call_id = %call.call_id, reason = reason::ATTACHMENT_LOST, "call ended");
 }
 
@@ -1566,7 +1566,7 @@ fn hangup_carrier(
         cseq: d.cseq,
         branch: &format!("z9hG4bK{}", random_hex(6)),
     });
-    match session.transport.send(&bye) {
+    match session.transport_mut().and_then(|t| t.send(&bye)) {
         Ok(()) => {
             tracing::info!(call_id = %call.call_id, reason, "PBX hung up; sent BYE to the carrier");
             return;
@@ -1579,7 +1579,7 @@ fn hangup_carrier(
         tracing::warn!(call_id = %call.call_id, error = %e, "could not reconnect the carrier transport; carrier leg may be left up until the network times it out");
         return;
     }
-    match session.transport.send(&bye) {
+    match session.transport_mut().and_then(|t| t.send(&bye)) {
         Ok(()) => {
             tracing::info!(call_id = %call.call_id, reason, "PBX hung up; sent BYE to the carrier after reconnecting");
         }

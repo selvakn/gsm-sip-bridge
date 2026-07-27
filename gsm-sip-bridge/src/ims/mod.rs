@@ -114,7 +114,12 @@ pub enum RegisterOutcome {
 /// the live transport (which, once Gm IPsec is set up, is the *only* place
 /// the negotiated XFRM policy's selector matches) rather than reconnecting.
 pub(crate) struct RegisteredSession {
-    transport: SipTransport,
+    /// `None` only transiently inside `reconnect_transport` — the old
+    /// socket must be actually dropped (not just marked for an abortive
+    /// close) before the replacement can rebind its exact local port, so
+    /// there is no valid `SipTransport` to hold in between. See
+    /// `transport()`/`transport_mut()`.
+    transport: Option<SipTransport>,
     realm: String,
     public_uri: String,
     local_addr: SocketAddr,
@@ -150,6 +155,22 @@ impl RegisteredSession {
         self.gm_state.as_ref().map(|(e, _, _)| e.local_s)
     }
 
+    /// The live client transport. `Err` only if `reconnect_transport`'s own
+    /// plain-connect fallback also failed — the network attachment itself
+    /// is down, a state every caller here already treats like any other
+    /// transport failure (log and move on, or propagate via `?`).
+    pub(crate) fn transport(&self) -> BridgeResult<&SipTransport> {
+        self.transport
+            .as_ref()
+            .ok_or_else(|| BridgeError::Ims("client transport is not connected".into()))
+    }
+
+    pub(crate) fn transport_mut(&mut self) -> BridgeResult<&mut SipTransport> {
+        self.transport
+            .as_mut()
+            .ok_or_else(|| BridgeError::Ims("client transport is not connected".into()))
+    }
+
     /// Tear down any installed Gm IPsec state — a one-shot diagnostic CLI
     /// isn't a persistent registration, so kernel XFRM state would
     /// otherwise leak across repeated invocations.
@@ -157,6 +178,60 @@ impl RegisteredSession {
         if let Some((endpoints, p, theirs)) = self.gm_state.take() {
             gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, self.xfrm_proto);
         }
+    }
+
+    /// Re-establishes the client transport (the connection the initial
+    /// REGISTER went out on) after it dies mid-registration — e.g. a NAT or
+    /// the P-CSCF itself silently drops an idle TCP connection during a long
+    /// call, where no SIP traffic crosses this leg until the closing `BYE`
+    /// (media is a separate RTP path). Rebinds to the exact `port-c` local
+    /// port and reconnects to the exact Gm-protected `remote_s` peer the
+    /// original registration negotiated — the same recipe `register_session`
+    /// uses right after installing the Gm SAs — so the still-live IPsec SA
+    /// (its lifetime is independent of any one TCP connection) still applies
+    /// to the new socket.
+    ///
+    /// Drops the old socket (after an abortive `force_close`) *before*
+    /// attempting the rebind: the replacement reuses the exact same (local
+    /// port, remote peer) pair, and TCP will not let two live sockets share
+    /// one 4-tuple — `SO_REUSEADDR` only helps past `TIME_WAIT`, not a peer
+    /// that is still open. This is why `transport` is briefly `None` here,
+    /// and why the field is an `Option` at all.
+    ///
+    /// Falls back to a plain reconnect to `pcscf_addr` if there is no Gm SA
+    /// to reuse, or if the Gm-protected rebind itself fails (mirroring the
+    /// same fallback `register_session` uses) — so `transport` is left
+    /// `Some` on any partial success, and only `Err`/`None` if even that
+    /// plain reconnect fails, i.e. the network attachment itself is down.
+    ///
+    /// Does not touch `inbound`'s reader threads — the caller must restart
+    /// the client-reader half (`session::restart_client_reader`) once this
+    /// returns `Ok`; the Gm protected-server-port listener is untouched by
+    /// any of this; it is an independent socket the client transport dying
+    /// does not affect.
+    pub(crate) fn reconnect_transport(&mut self) -> BridgeResult<()> {
+        if let Some(old) = self.transport.take() {
+            old.force_close();
+        }
+        let reconnected = match self.gm_state.as_ref() {
+            Some((endpoints, _, _)) => SipTransport::connect_from(
+                endpoints.local_c.port(),
+                endpoints.remote_s,
+                self.use_tcp,
+            ),
+            None => SipTransport::connect(self.pcscf_addr, self.use_tcp),
+        };
+        let new_transport = match reconnected {
+            Ok(t) => t,
+            Err(e) if self.gm_state.is_some() => {
+                tracing::warn!(error = %e, "failed to reconnect over the negotiated Gm port; falling back to a plain connection");
+                SipTransport::connect(self.pcscf_addr, self.use_tcp)?
+            }
+            Err(e) => return Err(e),
+        };
+        self.local_addr = new_transport.local_addr()?;
+        self.transport = Some(new_transport);
+        Ok(())
     }
 
     /// Send an UNREGISTER to the server (a REGISTER with Expires: 0) to
@@ -176,36 +251,6 @@ impl RegisteredSession {
     /// send_and_recv will block for ~5 seconds waiting for the timeout.
     /// This is acceptable during shutdown but should be monitored if called
     /// in a hot path.
-    /// Re-establishes the client transport (the connection the initial
-    /// REGISTER went out on) after it dies mid-registration — e.g. a NAT or
-    /// the P-CSCF itself silently drops an idle TCP connection during a long
-    /// call, where no SIP traffic crosses this leg until the closing `BYE`
-    /// (media is a separate RTP path). Rebinds to the exact `port-c` local
-    /// port and reconnects to the exact Gm-protected `remote_s` peer the
-    /// original registration negotiated — the same recipe `register_session`
-    /// uses right after installing the Gm SAs — so the still-live IPsec SA
-    /// (its lifetime is independent of any one TCP connection) still applies
-    /// to the new socket. Without a Gm SA (`--sec-agree` off), falls back to
-    /// a plain reconnect to `pcscf_addr`.
-    ///
-    /// Does not touch `inbound`'s reader threads — the caller must restart
-    /// them (`session::start_inbound`) once this returns `Ok`, exactly as a
-    /// renewal already does after installing a fresh `RegisteredSession`.
-    pub(crate) fn reconnect_transport(&mut self) -> BridgeResult<()> {
-        self.transport.force_close();
-        let new_transport = match self.gm_state.as_ref() {
-            Some((endpoints, _, _)) => SipTransport::connect_from(
-                endpoints.local_c.port(),
-                endpoints.remote_s,
-                self.use_tcp,
-            )?,
-            None => SipTransport::connect(self.pcscf_addr, self.use_tcp)?,
-        };
-        self.local_addr = new_transport.local_addr()?;
-        self.transport = new_transport;
-        Ok(())
-    }
-
     pub(crate) fn unregister(&mut self) {
         let via_transport = if self.use_tcp { "TCP" } else { "UDP" };
         let request_uri = format_sip_addr(self.pcscf_addr);
@@ -228,7 +273,11 @@ impl RegisteredSession {
             imei: &self.imei,
         });
 
-        match self.transport.send_and_recv(&unreg) {
+        let Ok(transport) = self.transport_mut() else {
+            tracing::debug!("cannot send UNREGISTER: client transport is not connected");
+            return;
+        };
+        match transport.send_and_recv(&unreg) {
             Ok(resp) => {
                 if (200..300).contains(&resp.status) {
                     tracing::debug!("sent UNREGISTER, server accepted");
@@ -646,7 +695,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         .ok_or_else(|| BridgeError::Ims("transport unexpectedly absent after REGISTER".into()))?;
 
     Ok(RegisteredSession {
-        transport,
+        transport: Some(transport),
         realm,
         public_uri,
         local_addr,
