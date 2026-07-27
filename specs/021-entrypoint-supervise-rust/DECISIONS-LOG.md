@@ -590,4 +590,18 @@ Replaced `Arc<AtomicBool>` with `Arc<RwLock<bool>>` throughout: every supervisio
 
 ---
 
+## 2026-07-27 (later still) — a 15th bug, a fourth round on the same design gap: the initial spawn was never guarded either
+
+Re-triggered review came back 3/5, not clean: a fourth finding on the exact same shutdown-snapshot gap. This time: the `RwLock` guard from the previous fix covers every *restart/recovery* spawn site, but never the very first charon/swu-dialer spawn a line does during its own initial startup. `start_vowifi_line_strongswan`'s cold-start charon spawn and `start_vowifi_line_swu`'s initial `engine.restart_process()` call each run on their own per-line background thread, entirely outside any of the loops the last three fixes touched — so if shutdown begins while a line is still starting up for the very first time (not recovering, not yet in steady state), that spawn could register its handle after shutdown's snapshot, same escape, different call site. Verified by reading both functions directly: confirmed, no guard at all around either.
+
+Fixed by wrapping both in the identical read-guard pattern already used everywhere else: check the flag first (abandon the line's startup entirely if shutdown has already begun, rather than starting new work pointlessly), then hold the guard across the spawn and the `StartedState` registration.
+
+By this point the physical SIM had recovered on its own (back to a valid IMSI, no more CME-ERROR-10) — confirmed by redeploying and watching a full cold start establish cleanly on the first `IKE_SA` attempt, no regression to the happy path. Did **not** attempt to precisely race a SIGTERM into the narrow ~1-2 second initial-startup window itself: reliably hitting that exact timing via manual shell commands isn't practical (unlike the recovery-path race, which has a much wider, more human-timeable window), and — more importantly — this is the *identical, already-proven* guard mechanism applied to a call site that was simply missed, not a new mechanism requiring its own fresh live validation. Did run a normal (non-adversarial) shutdown timing check: 0.306s, clean exit, no regression there either.
+
+656 tests, `make lint` clean. This specific finding had no dedicated inline discussion thread (it only appeared in the review's overall summary, not an inline comment) — replied via a general PR comment instead of a threaded reply, then re-triggered. **Fifteen real bugs found and fixed across this whole feature now.**
+
+**A pattern worth naming explicitly, now that it's happened four times on one design gap**: each Greptile pass on this specific issue found a genuinely *different* call site or timing detail than the previous one, not a restatement of the same thing — round 1 (12th bug, actually a separate finding) was about reaping, round 2 (13th) was "loops don't know shutdown began," round 3 (14th) was "the flag alone isn't atomic with a multi-second recovery," round 4 (15th) was "the initial-startup spawn was never in scope at all." Every one of them was real when checked against the actual code, not a restatement dressed up as new. The lesson isn't "trust the reviewer blindly" (the earlier severity-overstatement correction in this same log shows why not) — it's "when a reviewer comes back to the same area a second, third, or fourth time, treat each pass as a fresh claim requiring its own verification, in either direction, rather than pattern-matching on 'we already covered this.'"
+
+---
+
 (Further entries appended as phases proceed.)
