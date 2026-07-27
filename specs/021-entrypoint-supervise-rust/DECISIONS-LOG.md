@@ -483,4 +483,63 @@ Restored `config.toml` to its production state afterward (`[vowifi].enabled = tr
 
 ---
 
+## 2026-07-27 (Phase 7 polish) — T047-T052
+
+You asked me to work through the remaining Phase 7 polish tasks.
+
+**T047** (`cargo fmt --all && make lint && cargo test --workspace`): all green, 653→654 tests across this session's fixes below. `make test-bash` was already a no-op with an explanatory comment (done in an earlier session this same day).
+
+**T048** (full live-validation cold-start + warm-restart cycle per quickstart.md): the bulk of this was already covered by earlier entries in this log (VoWiFi cold start/warm restart/`TunVanished` recovery/shutdown timing; VoLTE cold start/warm restart/shutdown). Ran two more of quickstart.md's specific checklist items live against the real modem while here:
+- **"kill charon mid-session"** (Phase 3 checklist item): `kill -9` on the running charon PID. This is what surfaced the FR-009 gap logged below — a real bug, not just a coverage gap.
+- **swu engine live validation**: skipped, per quickstart.md's own fallback — no second SIM/profile is available on this hardware. Noting it here as the one item that stays genuinely untested; it's a hardware-availability gap, not a scope decision.
+- **"unplug/replug the modem" / "block the ePDG IP briefly"**: not attempted — physically manipulating the SIM/USB or firewalling live traffic is a different risk class than the software-triggerable scenarios above (killing a process, restarting the container), and didn't seem like a reasonable thing to do unattended during a polish pass. Left as a manual follow-up for whoever has hands on the hardware.
+
+**A real, previously-undiscovered bug found by that "kill charon mid-session" test**: `engines.rs::restart_charon` (used by both the "charon exited" and "vici connection broken" steady-state branches) never had the bash original's `sleep 2 # let the vici socket come up before swanctl talks to it` — present at *every one* of the bash script's own charon-respawn sites, but only ported to the Rust side's *initial* cold-start call in `orchestrate.rs`, never to `restart_charon` itself. Reproduced live: killed charon, the new one respawned, but `--load-all` ran before its vici socket was listening and silently failed, so the follow-up `--initiate` failed with "CHILD_SA config 'ims' not found" — and steady-state's `ChildSaMissing` branch only ever re-initiates, never reloads, so this was a **permanent stuck state, invisible to the healthcheck** (which only checks whether `tun23-0` has an address — the stale pre-kill address was still there). Fixed by adding the missing sleep, added a regression test, re-verified live with the identical repro: clean recovery on the first try, no further errors. This is exactly the kind of gap the next task (T049) exists to catch systematically, and in fact was found by hand a few minutes before I ran that audit — the audit then confirmed no other invariant had this exact shape.
+
+**T049** (FR-009 comment-to-test audit): delegated to a research agent to systematically read the pre-refactor `docker/entrypoint.sh` (via `git show 9b251ca^:docker/entrypoint.sh`) against the current Rust port. Full findings:
+
+- **~28 load-bearing operational-invariant comments identified**, spanning rendering, pidfile/process-lifecycle handling, tunnel health/recovery, teardown ordering, and misc timing constants.
+- **~19 have clear, named test coverage.** A few original bash hazards (the `@SRC_ADDR@` sed-delimiter choice, `swanctl --list-sas | grep -q` piping into a SIGPIPE-prone pattern) are *structurally eliminated* by the Rust rewrite (no delimiter parsing; captured output before matching) and need no test at all.
+- **The `sleep 2` vici-warmup gap** (above) was one of the ~28 — now fixed and covered.
+- **One more cheap, contained gap fixed on the spot**: `epdg_iface.rs::ensure_epdg_interface` ports the `disable_policy` sysctl write (received IPsec traffic silently drops without it — osmocom wiki's Option 2) but no test asserted it was actually issued. Added `disables_ipsec_policy_on_the_interface_so_received_traffic_is_not_dropped`.
+- **Four remaining gaps, all in the same place**: `orchestrate.rs` and `orchestrate_volte.rs` carry **no `#[cfg(test)]` module at all** — confirmed independently by the coverage run below (both show *exactly* 0.00% line coverage). Every invariant that lives in the wiring itself, rather than an extracted pure decision function, is currently unguarded by any test:
+  1. **[the audit's top pick] veth half-pair rebuild** (`start_line_tail`, checks both veth ends and rebuilds when only one side survived — the swu dialer's own netns delete/recreate cycle can destroy just the ims-side end). I read the current code directly to confirm it's *actually correct*, just untested — it is: both ends are checked, the sip-side gets deleted-and-recreated only when the ims-side is the one missing. Not a live bug, a coverage gap.
+  2. Startup ordering: discover-before-daemon-start, and IMS-mode-reconcile-before-any-other-modem-read — both documented port/race-avoidance fixes with no ordering assertion.
+  3. Keepalive is TCP-connect-not-ICMP (operators filter ICMP) and re-reads the P-CSCF file every cycle (so it follows a rekey-assigned address) — no test.
+  4. VoLTE's 15s (not 5s) supervisor restart delay, to avoid hammering the modem/registrar with repeated PDN+IMS-AKA cycles — no test.
+
+  **Decision**: did not add tests for these four. Doing so properly would mean extracting each into its own pure, testable decision function first — the same pattern this whole feature is built around everywhere else (`render.rs`, `line_supervisor.rs`, `sim_recovery.rs`, ...) — which is a real, scoped refactor of currently-working, already-live-validated orchestration code, not a quick test addition. Attempting that under time pressure during a polish pass, without it being reviewed as its own change, felt like the wrong tradeoff versus documenting it clearly here as a well-defined follow-up. None of the four are live bugs (verified #1 by reading; the other three are timing/protocol choices whose current values are directly visible in the source and already exercised correctly by this session's own live testing) — they're coverage gaps against *future* regressions, not present-tense correctness problems.
+
+**T050** (docs referencing `entrypoint.sh`'s old size/structure): checked every `docs/*.md` reference (not `specs/*` — those are point-in-time historical records of past features and are correctly left alone). Found one genuinely stale pointer: `docs/vowifi-bridge.md` told readers to go look at "that script's structure" to understand the veth pair setup — misleading now that the script is a 28-line shim. Redirected to `gsm-sip-bridge/src/supervise/orchestrate.rs`. Everything else that mentions `entrypoint.sh` is still behaviorally accurate (e.g. "entrypoint.sh refuses to start if both sections are enabled") since the Rust code preserves that exact behavior — left those alone.
+
+**T051** (`make coverage`): the target itself was broken — `cargo llvm-cov report --workspace` errors, since `--workspace` belongs on the collection step, not the report step. Fixed (one-line Makefile change). `cargo-llvm-cov` wasn't installed in this environment; installed it (`cargo install cargo-llvm-cov --locked` + `rustup component add llvm-tools-preview`) to actually run it rather than skip it.
+
+`supervise` module coverage (line coverage, from the actual run):
+
+| File | Line % | Note |
+|------|-------:|------|
+| `line_supervisor.rs` | 99.73% | |
+| `sim_recovery.rs` | 99.28% | |
+| `render.rs` | 99.51% | |
+| `epdg_iface.rs` | 98.89% | after this session's added test |
+| `daemon_supervisor.rs` | 97.87% | |
+| `shutdown.rs` | 89.69% | |
+| `vpcd.rs` | 86.75% | |
+| `runner.rs` | 84.32% | |
+| `engines.rs` | 82.92% | |
+| `orchestrate.rs` | **0.00%** | no test module — see T049 above |
+| `orchestrate_volte.rs` | **0.00%** | no test module — see T049 above |
+
+The 0% files are exactly the two this session's live-hardware testing (and Greptile) found the most real bugs in — which tracks: they're also the two files with zero unit-test coverage, relying entirely on the live/manual validation this whole feature has been doing instead. This isn't a contradiction of the "pure decision functions get near-100% coverage" design — it's that pattern working as intended (the thin executor layer is supposed to rely on integration/live testing, not unit tests) — but the coverage number makes it very visible just how much weight is riding on that live testing versus a repeatable test suite, which is worth keeping in mind for anyone extending these two files without the same access to real hardware.
+
+**T052**: this entry. `quickstart.md`'s own checklist has been walked through end-to-end across this log's entries (rendering diffed against bash, shutdown timing measured live, all three degraded-state recoveries forced live, full cold-start/warm-restart/shutdown cycles for both VoWiFi and VoLTE). Completion summary:
+
+**Done**: all 5 phases of the strangler plan; `docker/entrypoint.sh` reduced to a 28-line shim; live-validated on the real EC20 + Airtel modem across cold start, warm restart, forced degraded-state recovery (TunVanished, charon killed mid-session, ViciBroken), and clean shutdown, for both VoWiFi/strongswan and VoLTE bridge_inbound; 10 real bugs found and fixed via live testing/Greptile/proactive sweep, none caught by the (now 654-test) unit suite alone; Greptile at 5/5 as of the last push; Phase 7 polish (T047-T051) done as detailed above.
+
+**Deliberately not done, and why**: swu engine live validation (no second SIM/profile available — a hardware-availability gap, not a choice); physical SIM unplug/replug and ePDG-IP-blocking tests (out of scope for an unattended polish pass — needs hands on the hardware); test coverage for the 4 remaining `orchestrate.rs`/`orchestrate_volte.rs` FR-009 gaps (would need a scoped pure-function extraction first, logged above as a well-defined follow-up rather than attempted under time pressure); a VoLTE-aware `healthcheck.sh` (pre-existing gap, predates this refactor, its own follow-up feature).
+
+**Recommendation**: PR #14 is in good shape to merge as-is. The four documented, non-blocking gaps above are reasonable candidates for a short follow-up PR whenever there's dedicated time and, ideally, someone with hands on the physical hardware for the swu/SIM-unplug scenarios.
+
+---
+
 (Further entries appended as phases proceed.)

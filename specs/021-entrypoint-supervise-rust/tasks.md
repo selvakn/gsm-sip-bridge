@@ -266,10 +266,10 @@ pre-refactor image on real hardware.
       config file present) + `exec gsm-sip-bridge --config "$GSM_SIP_BRIDGE_CONFIG"
       supervise`, matching contracts/supervise-contract.md exactly; delete
       `docker/lib/render_helpers.sh` and its `.bats` file entirely (fully superseded)
-- [ ] T047 [US4] Verify `cargo fmt --all && make lint && cargo test --workspace` pass
+- [X] T047 [US4] Verify `cargo fmt --all && make lint && cargo test --workspace` pass
       (`make test-bash` no longer applicable — remove the now-empty target or leave a
       no-op with a comment explaining Phase 0's tooling was retired here)
-- [ ] T048 [US4] Full live-validation cold-start + warm-restart cycle per quickstart.md:
+- [X] T048 [US4] Full live-validation cold-start + warm-restart cycle per quickstart.md:
       VoWiFi under both `strongswan` and `swu` engines (if a second SIM/profile is
       available; otherwise `strongswan` + a note in DECISIONS-LOG.md) plus VoLTE, against
       the real EC20 + Airtel SIM, confirming parity with the pre-refactor image; commit
@@ -282,14 +282,14 @@ heredocs, no supervision/restart loops, no global PID-array bookkeeping (SC-006)
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T049 [P] Re-read every FR-009-targeted comment in the original `entrypoint.sh` (via
+- [X] T049 [P] Re-read every FR-009-targeted comment in the original `entrypoint.sh` (via
       `git show <pre-refactor-commit>:docker/entrypoint.sh`) and confirm each has a named
       test counterpart; list any gaps in DECISIONS-LOG.md
-- [ ] T050 [P] Update `docs/` (or repo docs referencing `docker/entrypoint.sh`'s size/
+- [X] T050 [P] Update `docs/` (or repo docs referencing `docker/entrypoint.sh`'s size/
       structure) if any exist, to describe the new `supervise` module instead
-- [ ] T051 Run `make coverage` (if available) and note the `supervise` module's coverage
+- [X] T051 Run `make coverage` (if available) and note the `supervise` module's coverage
       in DECISIONS-LOG.md
-- [ ] T052 Final full `quickstart.md` pass end-to-end; update DECISIONS-LOG.md with a
+- [X] T052 Final full `quickstart.md` pass end-to-end; update DECISIONS-LOG.md with a
       completion summary and any deferred/outstanding items for review
 
 ---
