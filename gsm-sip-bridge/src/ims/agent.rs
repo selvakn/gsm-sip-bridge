@@ -27,8 +27,8 @@ use crate::ims::observability;
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{
     attempt_renewal, extract_caller, handle_notify, map_registration_error,
-    map_registration_status_code, next_backoff, respond, start_inbound, subscribe_reg_event,
-    to_unix, Inbound,
+    map_registration_status_code, next_backoff, respond, restart_client_reader, start_inbound,
+    subscribe_reg_event, to_unix, Inbound,
 };
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_200_ok_bye, build_200_ok_invite,
@@ -1549,7 +1549,7 @@ fn end_call_attachment_lost(session: &mut super::RegisteredSession, mut call: Ac
 /// carrier's own side will eventually time the call out).
 fn hangup_carrier(
     session: &mut super::RegisteredSession,
-    inbound: &mut Inbound,
+    inbound: &Inbound,
     call: ActiveCall,
     reason: &str,
 ) {
@@ -1587,11 +1587,8 @@ fn hangup_carrier(
             tracing::warn!(call_id = %call.call_id, error = %e, "failed to BYE the carrier even after reconnecting; carrier leg may be left up until the network times it out");
         }
     }
-    match start_inbound(session) {
-        Ok(new_inbound) => *inbound = new_inbound,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to restart the Gm listeners after a mid-call transport reconnect")
-        }
+    if let Err(e) = restart_client_reader(session, inbound) {
+        tracing::warn!(call_id = %call.call_id, error = %e, "failed to restart the Gm client reader after a mid-call transport reconnect");
     }
 }
 

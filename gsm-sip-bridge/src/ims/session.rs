@@ -59,30 +59,32 @@ pub(crate) fn map_registration_status_code(status: u16) -> RegistrationStatus {
 /// each paired with the sink that answers on the connection it arrived on.
 pub(crate) struct Inbound {
     pub(crate) rx: mpsc::Receiver<(SipMessage, SipSink)>,
+    /// Retained so `restart_client_reader` can feed a replacement reader
+    /// thread into the same queue after the client transport is swapped —
+    /// without this, restarting just the client half would need a new
+    /// channel, which would orphan `_server`'s already-spawned accept-loop
+    /// threads (they hold their own clone of the original sender).
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
     /// Held only for its `Drop`, which shuts the listener down. Replaced
     /// wholesale on re-registration, since a renewal negotiates a fresh SA
     /// on a fresh pair of ports.
     pub(crate) _server: Option<GmServer>,
 }
 
-/// Start reading both halves of the Gm association for `session`:
-///
-/// - the **client** connection we registered over, which carries responses
-///   to requests *we* originate (e.g. the reg-event SUBSCRIBE); and
-/// - the **protected server port** (`port-s`), which is the only place the
-///   network delivers anything it originates — including inbound `INVITE`s.
-///   Without it a registration looks healthy but is unreachable; see
-///   `sip_client::spawn_gm_server`.
-pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<Inbound> {
-    let (tx, rx) = mpsc::channel();
-
+/// Spawns the thread that reads the **client** connection we registered
+/// over — the half of a Gm association that carries responses to requests
+/// *we* originate (e.g. the reg-event SUBSCRIBE, or a BYE toward the
+/// carrier) — feeding every message it parses into `tx`.
+fn spawn_client_reader(
+    session: &super::RegisteredSession,
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
+) -> BridgeResult<()> {
     let mut client_reader = session.transport.try_clone_reader()?;
     let client_sink = session.transport.sink()?;
-    let client_tx = tx.clone();
     std::thread::spawn(move || loop {
         match client_reader.recv_message_deadline(CLIENT_READ_POLL_INTERVAL) {
             Ok(Some(msg)) => {
-                if client_tx.send((msg, client_sink.clone())).is_err() {
+                if tx.send((msg, client_sink.clone())).is_err() {
                     return;
                 }
             }
@@ -93,9 +95,24 @@ pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<
             }
         }
     });
+    Ok(())
+}
+
+/// Start reading both halves of the Gm association for `session`:
+///
+/// - the **client** connection we registered over (`spawn_client_reader`);
+///   and
+/// - the **protected server port** (`port-s`), which is the only place the
+///   network delivers anything it originates — including inbound `INVITE`s.
+///   Without it a registration looks healthy but is unreachable; see
+///   `sip_client::spawn_gm_server`.
+pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<Inbound> {
+    let (tx, rx) = mpsc::channel();
+
+    spawn_client_reader(session, tx.clone())?;
 
     let server = match session.gm_server_addr() {
-        Some(addr) => Some(spawn_gm_server(addr, session.use_tcp, tx)?),
+        Some(addr) => Some(spawn_gm_server(addr, session.use_tcp, tx.clone())?),
         None => {
             tracing::warn!(
                 "no Gm IPsec SA on this registration — there is no protected server port, so the network cannot deliver inbound calls"
@@ -106,8 +123,24 @@ pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<
 
     Ok(Inbound {
         rx,
+        tx,
         _server: server,
     })
+}
+
+/// Restarts just the client-connection reader thread, after
+/// `RegisteredSession::reconnect_transport` replaces `session.transport`
+/// mid-registration. Deliberately leaves `inbound._server` untouched: the
+/// protected-server-port listener is a fully independent socket, unaffected
+/// by the client transport's death, and still bound to the exact same
+/// `port-s` this reconnect keeps (it reuses the still-live Gm SA rather than
+/// negotiating a fresh one) — recreating it via `start_inbound` would try to
+/// rebind the port it is already listening on and fail.
+pub(crate) fn restart_client_reader(
+    session: &super::RegisteredSession,
+    inbound: &Inbound,
+) -> BridgeResult<()> {
+    spawn_client_reader(session, inbound.tx.clone())
 }
 
 pub(crate) fn to_unix(t: SystemTime) -> Option<u64> {
