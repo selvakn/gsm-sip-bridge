@@ -379,4 +379,25 @@ unasked.
 
 ---
 
+## 2026-07-27 — Phase 4 wiring complete + live-validated against the real EC20 + Airtel SIM
+
+You came back and explicitly authorized real hardware testing ("I have airtel with ec200 attached (which has been stable), use it for all real hardware testing"), which is the specific thing I was waiting on before touching Phase 4. Picked back up from where the overnight session stopped and finished the wiring:
+
+- **`ensure_epdg_interface` + the shared pcscd/vpcd readiness gate** ported to Rust (`epdg_iface.rs`, `vpcd.rs`), plus a `CommandRunner::tcp_connect_ok` primitive for the vpcd TCP-connect probe.
+- **The real `supervise` subcommand** (`orchestrate.rs` + `orchestrate_volte.rs`) — discover-once-up-front, the circuit-switched daemon, the full per-line VoWiFi flow (both engines) driving `LineSupervisor`, veth setup, the ims-agent supervision loop with `sim_recovery` wired in, the idle-tunnel keepalive, and VoLTE's two modes. `Commands::Supervise` didn't actually exist in the CLI before this — only `Render` had been wired in Phase 1.
+- Caught a real **logic bug before it ever compiled**: an early draft called `start_line_tail` (whose ims-agent supervision loop is infinite) synchronously before the steady-state loop, which would have blocked forever. Fixed by giving it — and the keepalive loop, which the same draft had simply forgotten — their own background threads via `Arc<dyn CommandRunner>`.
+
+**Then I actually deployed it against your EC20 + Airtel SIM** (built the image, ran `gsm-sip-bridge supervise` directly via `docker compose run`, entrypoint.sh untouched so this was a clean, reversible test of only the new code path):
+
+- First run: the tunnel kept re-establishing a **brand new IKE_SA every ~30 seconds, indefinitely** — never once reaching "UP." Root-caused with temporary diagnostics rather than guessing: `extract_latest_pcscf` used `str::strip_prefix`, which requires the P-CSCF marker at the *exact start* of the line — but real charon output prefixes every line with a facility tag (`[CFG] received P-CSCF server IP ...`), so it never matched. The establish loop treated every successful connection as "stuck without P-CSCF," which correctly (per its own logic) forces a terminate+reinitiate every 30s — so it was real EAP-AKA/IKE negotiations succeeding against Airtel's actual ePDG every single time, just being discarded immediately because my own code couldn't see the success. This is exactly the class of bug unit tests can't catch on their own: my test fixture used a clean, unprefixed line, which is not what charon actually emits.
+- Fixed (search for the marker anywhere in the line, matching bash's own unanchored `grep -oE`) and **redeployed against the same physical modem**: exactly one `IKE_SA` established, `tunnel UP. P-CSCF: ...` logged correctly, stable through 90 seconds and 2+ steady-state ticks with zero spurious recovery actions.
+- Tested the shutdown path live too: `docker stop` (SIGTERM) exited cleanly within the grace period both times, and `ip netns list` / process check afterward showed nothing left behind — the `ShutdownPlan` is doing its job.
+- **One minor, self-correcting behavior difference from bash, worth knowing about**: `vowifi-sip-agent`'s control-channel bind fails once (`Address not available`) before the per-line veth pair exists, because my per-line establishment now runs on its own thread in parallel with starting the shared sip-agent, whereas bash ran lines strictly sequentially before ever starting the sip-agent. It self-heals on its own 5s restart cadence (observed: exactly one failed bind, then success) and is arguably a net improvement for multi-line startup time, but it is a deliberate divergence from strict 1:1 behavior preservation. Flagging rather than quietly accepting it — your call on whether it's worth suppressing the first bind attempt's ERROR-level log noise.
+
+**651 tests, `make lint` clean.** The core, highest-value path — VoWiFi over strongSwan, the config you actually run — is now proven working end-to-end through the new Rust orchestration on real hardware, not just mocks.
+
+**Not yet done**: reducing `docker/entrypoint.sh` to the thin shim (T046) — `supervise` is proven correct but entrypoint.sh still runs the old bash orchestration; VoLTE's live validation ([volte].enabled is false in your config, so it hasn't been exercised against real hardware, only compiled and unit-tested); and the Phase 7 polish tasks (FR-009 comment audit, coverage, final quickstart.md pass).
+
+---
+
 (Further entries appended as phases proceed.)
