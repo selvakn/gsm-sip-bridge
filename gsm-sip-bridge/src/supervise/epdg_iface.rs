@@ -161,6 +161,23 @@ mod tests {
             && c == &["ip", "-6", "route", "replace", "default", "dev", "tun23-0"]));
     }
 
+    #[test]
+    fn disables_ipsec_policy_on_the_interface_so_received_traffic_is_not_dropped() {
+        // Regression test for an FR-009 gap (T049 audit): the sysctl write
+        // was ported (osmocom wiki's Option 2 walkthrough — received IPsec
+        // traffic gets dropped if IPsec policy isn't disabled on the
+        // interface itself) but nothing asserted it was actually issued.
+        let runner = MockCommandRunner::new();
+        ensure_epdg_interface(&runner, "ims0", "tun23-0", "23");
+        let netns_calls = runner.run_in_netns_calls.lock().unwrap();
+        assert!(netns_calls.iter().any(|(ns, c)| ns == "ims0"
+            && c == &[
+                "sh",
+                "-c",
+                "echo 1 > /proc/sys/net/ipv6/conf/tun23-0/disable_policy"
+            ]));
+    }
+
     fn failure_output() -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;
         std::process::Output {
