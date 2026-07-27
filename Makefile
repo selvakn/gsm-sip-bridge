@@ -12,12 +12,8 @@ test: ## Run the full test suite
 	@cargo test --workspace
 	@$(MAKE) test-bash
 
-test-bash: ## Run bats-core tests over docker/*.sh helpers (no-ops with a warning if bats is missing)
-	@if command -v bats >/dev/null 2>&1; then \
-		bats docker/lib/*.bats; \
-	else \
-		echo "WARNING: bats not installed — skipping docker/lib/*.bats (install bats-core to run these)"; \
-	fi
+test-bash: ## No-op: Phase 0's bash helpers (specs/021-entrypoint-supervise-rust) were fully ported to Rust in Phase 3/4 and removed
+	@true
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)
@@ -30,7 +26,7 @@ lint: ## Run formatting check, clippy, cargo-deny, shellcheck, and unsafe audit
 	@cargo clippy -p gsm-sip-bridge -p pjsua-safe -- -D warnings
 	@if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; fi
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck -x docker/*.sh docker/lib/*.sh; \
+		shellcheck -x docker/*.sh; \
 	else \
 		echo "WARNING: shellcheck not installed — skipping docker/*.sh lint"; \
 	fi
