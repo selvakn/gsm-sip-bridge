@@ -458,4 +458,29 @@ Fixed by splitting `runtime::wait_for_signal()` (just the SIGINT/SIGTERM wait, n
 
 ---
 
+## 2026-07-27 (even later) — VoLTE live-validated on the real EC20 + Airtel modem too
+
+You asked to close out the one remaining "not live-tested" caveat: `orchestrate_volte.rs`'s `bridge_inbound` (multiline) path, until now only unit-tested. VoLTE and VoWiFi are mutually exclusive on this single modem (same IMPU), so this meant temporarily taking VoWiFi down — confirmed with you first rather than assuming, along with which VoLTE mode to exercise (chose `bridge_inbound = true`, the multiline auto-discovery path from spec 017/018/020, over the simpler legacy single-line path, since that's the one the "VoLTE multi-modem parity" memory describes as the actually-used production design).
+
+Flipped `config.toml` (`[vowifi].enabled = false`, `[volte].enabled = true`, `bridge_inbound = true`) and redeployed. First attempt failed cleanly and informatively: `volte-discover-lines` correctly found the modem (`ec20-51212`) and wired up its netns/veth/carrier-agent/bridge processes exactly as designed, but both `volte-bridge` and `volte-carrier-agent` reported "no P-CSCF available (none configured and none captured by the ePDG path)" — expected, since `[volte].pcscf_source_path` is normally populated by a live VoWiFi/ePDG session, which was the very thing just disabled. Read `/run/volte-lines.json` inside the container to get the auto-resolved AT port (`/dev/ttyUSB0` — notably *not* `/dev/ttyUSB6`, the port `[vowifi].line.modem_port` pins; the two subsystems' own discovery independently land on different serial ports for the same physical modem) and added a `[[volte.line]]` override pinning that port with a P-CSCF address captured from one of this same session's own earlier live VoWiFi tunnels (still a valid operator IMS server address).
+
+Also hit a real, easy-to-miss gotcha along the way: after editing `config.toml`, `docker compose up -d` reported the container as already "Running" and did nothing — compose only recreates a container when the *service definition* changes, not when a bind-mounted config file's contents change on the host. Needed an explicit `docker compose restart` to actually pick up the new config; a plain `up -d` silently leaves the stale config in place. Worth remembering for any future live-testing round in this repo.
+
+**With the override in place, VoLTE registered fully and correctly on the first real attempt**: IMS PDN established over the actual LTE network (`apn_assigned=ims.mnc094.mcc404.gprs`, IPv6-only bearer), full IMS-AKA authentication, Gm IPsec SAs installed, `REGISTER` → `200 OK`, and a reg-event `NOTIFY` showing both the SIP AOR and `tel:` URI actively registered for the real MSISDN (`+919043062139`) — a real, working VoLTE registration through the new Rust `supervise` orchestration, not a mock or a partial success. One transient, self-resolving warning along the way (`modem SMS sweep failed... will retry next interval` — a one-time serial-port lock contention during startup, most likely with the IMS registration's own AT traffic; it succeeded and delivered 2 queued SMS messages 20 seconds later on its own retry cadence, exactly as designed) — not a bug.
+
+Then repeated the same rigor already given to VoWiFi:
+- **Warm restart** (`docker compose restart`): clean re-registration in ~15s, same full IMS-AKA/Gm-IPsec sequence, no errors.
+- **Shutdown timing**: `docker compose stop` completed in **0.965s**, confirming the earlier `wait()`→`is_alive()` and `wait_for_signal()` fixes (found via the VoWiFi/VoLTE-shutdown-signal bugs above) work correctly for VoLTE's own process handles too, not just VoWiFi's — `volte-carrier-agent` and `volte-bridge` are supervised by the exact same fixed loops.
+- **Host-level teardown check**: `ip netns list` empty, no leftover `charon`/`gsm-sip-bridge`/`volte` processes, exit code 0. Fully clean.
+
+**No new bugs found in this pass** — a meaningful result in its own right, given how many were found in the VoWiFi and shutdown-path rounds: it means those fixes (all in shared code — `runner.rs`, `shutdown.rs`, `runtime.rs`) generalize correctly to VoLTE's own supervision loops rather than being VoWiFi-specific patches.
+
+One pre-existing, out-of-scope observation, not a bug in this feature: `docker/healthcheck.sh` is VoWiFi-only by design (`if ! ... vowifi-enabled; then exit 0`) — a VoLTE-only container reports "healthy" the moment the circuit-switched daemon's metrics endpoint responds, regardless of whether VoLTE actually registered. This predates this refactor entirely (the same logic existed in the original bash `healthcheck.sh`) and is out of this feature's scope to change; flagging it here only because this session is the first time it's been directly observed in practice. A genuine VoLTE healthcheck would be its own follow-up feature.
+
+Restored `config.toml` to its production state afterward (`[vowifi].enabled = true`, `[volte].enabled = false`) and redeployed — confirmed VoWiFi re-established cleanly (fresh IKE_SA, `tunnel UP`, registered to PBX) before finishing. `config.toml` itself is untracked/gitignored in this worktree, so no commit was needed for the config changes themselves; this entry is the only record of what was tested and how.
+
+**This closes out the last "not live-tested" item from PR #14's description.** Both major paths this feature's `supervise` subcommand can drive — VoWiFi/strongSwan and VoLTE bridge_inbound — are now proven working end-to-end on the real EC20 + Airtel hardware, including cold start, warm restart, and clean shutdown for both. Updating the PR description to reflect this.
+
+---
+
 (Further entries appended as phases proceed.)
