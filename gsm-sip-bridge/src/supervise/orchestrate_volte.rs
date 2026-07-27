@@ -9,6 +9,7 @@
 use super::runner::{ChildSpec, CommandRunner};
 use super::shutdown::{LegacyVolteRegistration, StartedState, StartedVolteLine};
 use crate::config::AppConfig;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,11 +22,12 @@ pub fn start(
     config_path: String,
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     if config.volte.bridge_inbound {
-        start_multiline(runner, bin, config_path, config, started);
+        start_multiline(runner, bin, config_path, config, started, shutting_down);
     } else {
-        start_legacy_registration(runner, bin, config_path, config, started);
+        start_legacy_registration(runner, bin, config_path, config, started, shutting_down);
     }
 }
 
@@ -38,6 +40,7 @@ fn start_multiline(
     config_path: String,
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     println!(
         "[supervise] [volte].enabled + bridge_inbound — answering inbound calls over LTE (auto-discovering modems, up to {} line(s))",
@@ -86,6 +89,7 @@ fn start_multiline(
         let bin = bin.clone();
         let config_path = config_path.clone();
         let started = Arc::clone(&started);
+        let shutting_down = Arc::clone(&shutting_down);
         let idx = line.index;
         let card_id = line.card_id.clone();
         let modem_port = line.modem_port.clone();
@@ -161,6 +165,9 @@ fn start_multiline(
 
         println!("[supervise] volte line {idx}: starting volte-carrier-agent (netns {netns}), supervised...");
         std::thread::spawn(move || loop {
+            if shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
             match runner.spawn(ChildSpec::new([
                 "ip",
                 "netns",
@@ -211,6 +218,9 @@ fn start_multiline(
 
     println!("[supervise] starting volte-bridge (default netns, one shared process for all VoLTE lines), supervised...");
     std::thread::spawn(move || loop {
+        if shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         match runner.spawn(ChildSpec::new([
             bin.as_str(),
             "--config",
@@ -242,9 +252,13 @@ fn start_legacy_registration(
     config_path: String,
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     println!("[supervise] [volte].enabled — starting host-side IMS over LTE (resolving one line from config)");
     std::thread::spawn(move || loop {
+        if shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         match runner.spawn(ChildSpec::new([
             bin.as_str(),
             "--config",

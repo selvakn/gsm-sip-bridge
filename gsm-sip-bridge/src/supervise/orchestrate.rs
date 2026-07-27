@@ -22,6 +22,7 @@ use crate::config::AppConfig;
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +48,18 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     };
 
     let started = Arc::new(Mutex::new(StartedState::default()));
+    // Greptile P1: build_shutdown_plan snapshots StartedState exactly once,
+    // then execute_shutdown_plan signals only the handles that were in that
+    // snapshot. Every supervision loop below runs forever on its own thread
+    // and, left unchecked, would happily spawn a *replacement* process the
+    // moment it notices its current one died — including dying from the
+    // shutdown plan's own kill signal — leaving that replacement completely
+    // outside the plan, never signaled, potentially still holding the modem/
+    // netns open after the container is "done" shutting down. Every loop
+    // that can spawn a new long-lived process checks this flag immediately
+    // before doing so, and set to true right when the shutdown signal is
+    // received, before the snapshot is even taken.
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     // --- 1. Discover once, up front (specs/013-multi-card-vowifi) ---------
     // Resolved BEFORE the circuit-switched daemon supervisor starts below —
@@ -93,7 +106,11 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
         let bin = bin.clone();
         let cfg = config_path_str.clone();
         let started = Arc::clone(&started);
+        let shutting_down = Arc::clone(&shutting_down);
         std::thread::spawn(move || loop {
+            if shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
             match runner.spawn(ChildSpec::new([bin.as_str(), "--config", cfg.as_str()])) {
                 Ok(handle) => {
                     started.lock().unwrap().daemon_supervisor = Some(handle);
@@ -184,10 +201,19 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 let bin = bin.clone();
                 let cfg = config_path_str.clone();
                 let started = Arc::clone(&started);
+                let shutting_down = Arc::clone(&shutting_down);
                 let config = config.clone();
                 let line = line.clone();
                 std::thread::spawn(move || {
-                    start_vowifi_line(&runner, &bin, &cfg, &config, &line, &started);
+                    start_vowifi_line(
+                        &runner,
+                        &bin,
+                        &cfg,
+                        &config,
+                        &line,
+                        &started,
+                        &shutting_down,
+                    );
                 });
             }
 
@@ -197,7 +223,11 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 let bin = bin.clone();
                 let cfg = config_path_str.clone();
                 let started = Arc::clone(&started);
+                let shutting_down = Arc::clone(&shutting_down);
                 std::thread::spawn(move || loop {
+                    if shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
                     match runner.spawn(ChildSpec::new([
                         bin.as_str(),
                         "--config",
@@ -234,6 +264,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             config_path_str.clone(),
             config.clone(),
             Arc::clone(&started),
+            Arc::clone(&shutting_down),
         );
     } else {
         println!("[supervise] [volte].enabled is not true — VoLTE not started");
@@ -248,6 +279,12 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
         }
     };
     rt.block_on(crate::runtime::wait_for_signal());
+
+    // Set BEFORE taking the StartedState snapshot below: every supervision
+    // loop checks this flag immediately before it would spawn a new process,
+    // so once it's true, no loop still running can add anything to
+    // StartedState that the snapshot about to be taken won't already see.
+    shutting_down.store(true, Ordering::SeqCst);
 
     println!("[supervise] shutting down ...");
     let state = started.lock().unwrap();
@@ -335,6 +372,7 @@ fn resolve_epdg_ip(
 /// One VoWiFi line's full startup — 1:1 port of `start_line_strongswan`/
 /// `start_line_swu`'s shared prelude (modem presence, IMS mode reconcile,
 /// mcc/mnc derivation), then dispatches to the engine-specific rest.
+#[allow(clippy::too_many_arguments)]
 fn start_vowifi_line(
     runner: &Arc<dyn CommandRunner>,
     bin: &str,
@@ -342,6 +380,7 @@ fn start_vowifi_line(
     config: &AppConfig,
     line: &LineResolutionEntry,
     started: &Arc<Mutex<StartedState>>,
+    shutting_down: &Arc<AtomicBool>,
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
@@ -369,9 +408,29 @@ fn start_vowifi_line(
     };
 
     if config.vowifi.tunnel_engine == "strongswan" {
-        start_vowifi_line_strongswan(runner, bin, config_path, config, line, &mcc, &mnc, started);
+        start_vowifi_line_strongswan(
+            runner,
+            bin,
+            config_path,
+            config,
+            line,
+            &mcc,
+            &mnc,
+            started,
+            shutting_down,
+        );
     } else {
-        start_vowifi_line_swu(runner, bin, config_path, config, line, &mcc, &mnc, started);
+        start_vowifi_line_swu(
+            runner,
+            bin,
+            config_path,
+            config,
+            line,
+            &mcc,
+            &mnc,
+            started,
+            shutting_down,
+        );
     }
 }
 
@@ -385,6 +444,7 @@ fn start_vowifi_line_strongswan(
     mcc: &str,
     mnc: &str,
     started: &Arc<Mutex<StartedState>>,
+    shutting_down: &Arc<AtomicBool>,
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
@@ -463,7 +523,11 @@ fn start_vowifi_line_strongswan(
         let vpcd_port = line.vpcd_port;
         let usim_holder = Arc::clone(&usim_holder);
         let started = Arc::clone(started);
+        let shutting_down = Arc::clone(shutting_down);
         std::thread::spawn(move || loop {
+            if shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
             match runner.spawn(ChildSpec::new([
                 bin.as_str(),
                 "--config",
@@ -586,12 +650,23 @@ fn start_vowifi_line_strongswan(
         &usim_holder,
         started,
         pcscf.clone(),
+        shutting_down,
     );
 
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
+        if shutting_down.load(Ordering::SeqCst) {
+            // Greptile P1: tick_steady_state's Recovered outcome can itself
+            // spawn a brand new charon (engine.restart_process(), e.g. on
+            // ProcessDied/ViciBroken) — including when THIS line's charon
+            // was the one shutdown's own KillChild step just signaled.
+            // Checked here, not just inside the spawn loops above, since
+            // this path spawns via the engine directly, not a `loop { spawn
+            // }` shape of its own.
+            return;
+        }
         match line_supervisor::tick_steady_state(&engine, runner.as_ref(), &current_pcscf) {
             line_supervisor::SteadyOutcome::StillUp => {}
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
@@ -633,6 +708,7 @@ fn start_line_tail(
     usim_holder: &Arc<Mutex<Option<ChildHandle>>>,
     started: &Arc<Mutex<StartedState>>,
     initial_pcscf: String,
+    shutting_down: &Arc<AtomicBool>,
 ) {
     let veth_sip = line.config.veth_sip_iface.clone();
     let veth_ims = line.config.veth_ims_iface.clone();
@@ -678,10 +754,14 @@ fn start_line_tail(
         let modem = line.modem_port.clone();
         let usim_holder = Arc::clone(usim_holder);
         let started = Arc::clone(started);
+        let shutting_down = Arc::clone(shutting_down);
         std::thread::spawn(move || {
             let mut csim_fails = sim_recovery::IncidentCounters::default();
             let agent_log = PathBuf::from(format!("/tmp/ims-agent-{idx}.out"));
             loop {
+                if shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
                 let _ = runner.write_file(&agent_log, "");
                 let handle = runner.spawn(
                     ChildSpec::new([
@@ -782,6 +862,7 @@ fn start_vowifi_line_swu(
     mcc: &str,
     mnc: &str,
     started: &Arc<Mutex<StartedState>>,
+    shutting_down: &Arc<AtomicBool>,
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
@@ -853,11 +934,17 @@ fn start_vowifi_line_swu(
         &usim_holder,
         started,
         pcscf.clone(),
+        shutting_down,
     );
 
     let mut current_pcscf = pcscf;
     loop {
         runner.sleep(Duration::from_secs(5));
+        if shutting_down.load(Ordering::SeqCst) {
+            // See the strongswan steady-state loop's identical check: the
+            // Recovered branch below can itself respawn the swu dialer.
+            return;
+        }
         match line_supervisor::tick_steady_state(&engine, runner.as_ref(), &current_pcscf) {
             line_supervisor::SteadyOutcome::StillUp => {}
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
