@@ -25,6 +25,7 @@ pub fn charon_log_shows_established(charon_log: &str) -> bool {
 /// imported, since this crate has no shared "bash-parity log parsers" module
 /// yet — both read the identical `received P-CSCF server IP ...` marker.
 pub fn extract_latest_pcscf(charon_log: &str) -> Option<String> {
+    const MARKER: &str = "received P-CSCF server IP ";
     let is_valid_addr = |s: &str| {
         let is_v4 = s.split('.').count() == 4 && s.chars().all(|c| c.is_ascii_digit() || c == '.');
         let is_v6 = s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
@@ -32,7 +33,15 @@ pub fn extract_latest_pcscf(charon_log: &str) -> Option<String> {
     };
     charon_log
         .lines()
-        .filter_map(|l| l.strip_prefix("received P-CSCF server IP "))
+        // `grep -oE 'received P-CSCF server IP .*'` matches the marker
+        // ANYWHERE in the line, not just at its start — real charon output
+        // prefixes every line with a facility tag (`[CFG] received P-CSCF
+        // server IP ...`), which `strip_prefix` (requiring an exact line
+        // start) never matches. Caught live: this bug made the establish
+        // loop treat every successful connection as "stuck without P-CSCF"
+        // forever, so it kept terminating and re-initiating a perfectly
+        // good tunnel every ~30s instead of ever reporting success.
+        .filter_map(|l| l.find(MARKER).map(|pos| &l[pos + MARKER.len()..]))
         .map(str::trim)
         .rfind(|s| is_valid_addr(s))
         .map(str::to_string)
@@ -164,15 +173,29 @@ impl TunnelEngine for StrongswanEngine {
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
         let tun_check = runner.run_in_netns(&self.netns, &["ip", "link", "show", &self.tun_iface]);
         if tun_check.map(|o| !o.status.success()).unwrap_or(true) {
+            println!(
+                "[supervise] line {}: {} missing from netns {}; recreating and forcing reinitiate",
+                self.idx, self.tun_iface, self.netns
+            );
             return SteadyStateHealth::TunVanished;
         }
 
         let env = self.env_prefix();
         let sas_output = match runner.run(&["env", &env, "swanctl", "--list-sas"]) {
             Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-            _ => return SteadyStateHealth::ViciBroken,
+            _ => {
+                println!(
+                    "[supervise] line {}: swanctl --list-sas failed (vici connection broken); restarting charon for this line only",
+                    self.idx
+                );
+                return SteadyStateHealth::ViciBroken;
+            }
         };
         if !list_sas_has_ims_child_sa(&sas_output) {
+            println!(
+                "[supervise] line {}: ims CHILD_SA missing; re-initiating",
+                self.idx
+            );
             return SteadyStateHealth::ChildSaMissing;
         }
         SteadyStateHealth::Ok
@@ -326,6 +349,23 @@ mod tests {
     fn extract_latest_pcscf_picks_the_chronologically_last_valid_line() {
         let log = "received P-CSCF server IP 10.0.0.1\nreceived P-CSCF server IP 2001:db8::1\nreceived P-CSCF server IP 10.0.0.9\n";
         assert_eq!(extract_latest_pcscf(log), Some("10.0.0.9".to_string()));
+    }
+
+    #[test]
+    fn extract_latest_pcscf_matches_real_charons_facility_tagged_log_lines() {
+        // Regression test for a real bug found live: real charon output
+        // prefixes every line with a facility tag (`[CFG] `, `[IKE] `, ...),
+        // e.g. `[CFG] received P-CSCF server IP 2401:4900:c4:4035::8` — an
+        // earlier version used `strip_prefix`, which requires the marker at
+        // the exact start of the line and so never matched real output,
+        // silently keeping every line "stuck without P-CSCF" forever (caught
+        // by live-testing against the real EC20 + Airtel SIM: the tunnel
+        // established successfully but the establish loop never noticed).
+        let log = "[CFG] received P-CSCF server IP 2401:4900:c4:4035::8\n[CFG] received P-CSCF server IP 2401:4900:c4:4035::b\n";
+        assert_eq!(
+            extract_latest_pcscf(log),
+            Some("2401:4900:c4:4035::b".to_string())
+        );
     }
 
     #[test]
