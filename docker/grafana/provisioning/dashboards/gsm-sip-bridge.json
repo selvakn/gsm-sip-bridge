@@ -135,6 +135,30 @@
       "targets": [
         { "expr": "rate(gsm_sip_bridge_observability_events_dropped_total[5m])", "legendFormat": "{{agent}}" }
       ]
+    },
+    {
+      "title": "Critical Events Active",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 60 },
+      "targets": [
+        { "expr": "sum(gsm_sip_bridge_critical_event_active)", "legendFormat": "Active" }
+      ]
+    },
+    {
+      "title": "Critical Alerts (specs/022-discord-critical-alerts)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 60 },
+      "targets": [
+        { "expr": "rate(gsm_sip_bridge_critical_alerts_total[5m])", "legendFormat": "{{category}} {{outcome}}" }
+      ]
+    },
+    {
+      "title": "Critical Event Active by Category/Module",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
+      "targets": [
+        { "expr": "gsm_sip_bridge_critical_event_active", "legendFormat": "{{category}} {{module}}" }
+      ]
     }
   ],
   "refresh": "10s",

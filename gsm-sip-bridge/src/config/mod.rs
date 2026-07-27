@@ -1628,23 +1628,38 @@ fn parse_alerts(root: &toml::map::Map<String, Value>, sms: &SmsConfig) -> Alerts
 
     let sms_category = match t.get("sms") {
         None => legacy_sms,
-        Some(v) => parse_alert_category(v, "alerts.sms", true),
+        Some(v) => parse_alert_category(v, "alerts.sms", true, ALERTS_CATEGORY_KEYS),
     };
     let module_lifecycle = match t.get("module_lifecycle") {
         None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(v, "alerts.module_lifecycle", false),
+        Some(v) => parse_alert_category(
+            v,
+            "alerts.module_lifecycle",
+            false,
+            ALERTS_MODULE_LIFECYCLE_KEYS,
+        ),
     };
     let registration_loss = match t.get("registration_loss") {
         None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(v, "alerts.registration_loss", false),
+        Some(v) => parse_alert_category(
+            v,
+            "alerts.registration_loss",
+            false,
+            ALERTS_REGISTRATION_LOSS_KEYS,
+        ),
     };
     let tunnel_failure = match t.get("tunnel_failure") {
         None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(v, "alerts.tunnel_failure", false),
+        Some(v) => parse_alert_category(
+            v,
+            "alerts.tunnel_failure",
+            false,
+            ALERTS_TUNNEL_FAILURE_KEYS,
+        ),
     };
     let missed_call = match t.get("missed_call") {
         None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(v, "alerts.missed_call", false),
+        Some(v) => parse_alert_category(v, "alerts.missed_call", false, ALERTS_CATEGORY_KEYS),
     };
 
     let module_lifecycle_thresholds = match t.get("module_lifecycle") {
@@ -1690,7 +1705,12 @@ fn legacy_sms_alert_category(sms: &SmsConfig) -> CategoryAlertConfig {
     }
 }
 
-fn parse_alert_category(v: &Value, section: &str, default_enabled: bool) -> CategoryAlertConfig {
+fn parse_alert_category(
+    v: &Value,
+    section: &str,
+    default_enabled: bool,
+    allowed_keys: &[&str],
+) -> CategoryAlertConfig {
     let Some(t) = v.as_table() else {
         tracing::error!(
             section = section,
@@ -1698,7 +1718,7 @@ fn parse_alert_category(v: &Value, section: &str, default_enabled: bool) -> Cate
         );
         return CategoryAlertConfig::disabled();
     };
-    warn_unknown_keys_in(t, ALERTS_CATEGORY_KEYS, section);
+    warn_unknown_keys_in(t, allowed_keys, section);
 
     let enabled = match t.get("enabled") {
         None => default_enabled,

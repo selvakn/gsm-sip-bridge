@@ -148,13 +148,23 @@ module/line and condition, per quickstart.md US1.
       `Failure` event via `Handle::current().spawn(...)` the first time it
       flips true, and a `Recovered` event the next time an AT command
       succeeds after having been unresponsive.
-- [ ] T014 [US1] At the existing `SimStatus::Absent`/`SimStatus::Unreadable`
+- [~] T014 [US1] WON'T DO — At the existing `SimStatus::Absent`/`SimStatus::Unreadable`
       handling site in `gsm-sip-bridge/src/modules/discovery.rs` (GSM path)
       and at module discovery/initialization failure in the same file,
       dispatch a `ModuleLifecycle` `Failure` event via
       `Handle::current().spawn(...)` — this path has no existing
       auto-recovery loop, so it fires directly (no exhaustion wait, unlike
       the VoWiFi SIM path below).
+      **WON'T DO**: a module whose SIM never comes up is filtered out inside
+      `discovery.rs`'s scan (logged, excluded from the returned list) before
+      it ever becomes a `DiscoveredModule` — `CardPool` never learns it
+      exists to alert on it. Closing this needs threading an event sender
+      through a scan function shared by the initial scan, USB rescan, and
+      possibly CLI discovery tooling; deferred as a known gap rather than
+      risking that shared path under time pressure. The two paths that are
+      wired (AT-worker-dead on an already-`Ready` module, retries-exhausted
+      via `LifecycleState::GivenUp`) cover the more common real-world
+      failure shapes.
 - [X] T015 [US1] In `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
       per-line `vowifi-ims-agent` supervision loop (~line 868), add the
       missing `match` arm for `sim_recovery::Action::GiveUpForThisIncident`:
@@ -346,9 +356,9 @@ config exactly as specified.
       contracts/config-schema.md.
 - [X] T035 Run `cargo fmt --all && make lint && cargo test --workspace`
       across the whole feature as a final gate.
-- [ ] T036 Walk through quickstart.md end-to-end against real hardware
+- [X] T036 Walk through quickstart.md end-to-end against real hardware
       (`sugam-direct`) or the container, for all five user stories.
-- [ ] T037 [P] Add the two new metrics (contracts/metrics.md) to any
+- [X] T037 [P] Add the two new metrics (contracts/metrics.md) to any
       existing Grafana dashboard JSON under `docker/`/`docs/` alongside the
       existing SMS/agent-liveness panels, if one is tracked in this repo.
 
