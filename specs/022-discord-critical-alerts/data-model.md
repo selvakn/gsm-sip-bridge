@@ -102,31 +102,54 @@ Extends the existing per-`(AgentKind, module_id)` liveness record
 `AgentReport.state.{registered,tunnel_up}` arrives:
 
 ```rust
-struct LivenessRecord {
-    last_report: Instant,        // existing
-    state: AgentState,           // existing (latest snapshot)
-    registered_unhealthy_since: Option<Instant>,   // new
-    tunnel_unhealthy_since: Option<Instant>,       // new
+struct AgentRecord {
+    last_report: Instant,                          // existing
+    last_applied: (u64, u64),                       // existing
+    registered_unhealthy_since: Option<Instant>,    // new
+    registered_alert_phase: AlertPhase,             // new
+    tunnel_unhealthy_since: Option<Instant>,        // new
+    tunnel_alert_phase: AlertPhase,                 // new
 }
+
+enum AlertPhase { Idle, Pending, Alerted }
 ```
 
-Transition rule (applied in `apply_report`, mirroring research.md R4):
-- `registered` observed `Some(false)` and `registered_unhealthy_since` is
-  `None` → set it to `Instant::now()`.
-- `registered` observed `Some(true)` and `registered_unhealthy_since` is
-  `Some(_)` → this is the recovery point: if the elapsed time had already
-  crossed the threshold (an alert was sent), emit a `Recovered` event; clear
-  the field either way.
-- Same rule, independently, for `tunnel_up` / `tunnel_unhealthy_since`.
+**Revised post-review** (PR #16 Greptile findings, 2026-07-27): the original
+design evaluated thresholds from `metrics::server`'s `/metrics` scrape
+handler, and marked an incident "alerted" optimistically before delivery was
+confirmed. Both were bugs: a line with no Prometheus scraper (or one that
+recovered between two scrapes) could have its failure transition evaluated
+late or never at all, and a failed Discord delivery left the incident
+permanently marked "alerted" — retried never, and a later recovery fired a
+`Recovered` notice for a `Failure` the operator was never actually told
+about.
 
-A companion evaluator, `evaluate_critical_alerts(thresholds) ->
-Vec<CriticalEvent>`, mirrors `evaluate_liveness`: called on each scrape/tick,
-it reads the current records, and for any `*_unhealthy_since` whose elapsed
-time has just crossed its threshold since the last evaluation, yields one
-`Failure` event (module_lifecycle's SIM path and missed-call/AT-worker do
-not go through this evaluator — they fire directly at their own call sites,
-since they already have a precise "just now" trigger point rather than a
-polled duration).
+The fix moves evaluation into `apply_report` itself (`AlertPhase` replaces
+the earlier plain `bool`), so it runs at the real report cadence
+(`[metrics].agent_report_interval_seconds`) regardless of whether anything
+scrapes `/metrics`, and splits "is this unhealthy" from "have we told
+anyone yet":
+
+- `apply_state` still owns `*_unhealthy_since` exactly as before (set on
+  first `Some(false)`/`Some(false)` tunnel report, cleared the moment it
+  reports healthy again).
+- The pure `decide_transition(unhealthy_since, &mut phase, threshold)`,
+  called for each signal right after `apply_state` (same lock, so two
+  reports for the same key can't race into deciding the same
+  threshold-crossing twice): `Idle` → `Pending` + a `Failure` event once the
+  streak crosses threshold; `Pending` stays `Pending` while dispatch is in
+  flight (no double-send); `Alerted` + still unhealthy → `Suppressed`
+  (FR-013); `Alerted` + healthy → back to `Idle` + a `Recovered` event.
+- `record_alert_outcome`, called from the dispatch task once it resolves,
+  moves `Pending` → `Alerted` on confirmed delivery or back to `Idle` on
+  failure — so a failed send is retried on the next unhealthy report instead
+  of the incident going silently and permanently dark. `Recovered`
+  transitions commit synchronously regardless of delivery outcome (a lost
+  "all clear" is far less costly than a lost failure notice).
+
+module_lifecycle's SIM path and missed-call/AT-worker still fire directly
+at their own call sites, unaffected — they already have a precise "just
+now" trigger point, not a polled duration.
 
 ## Alert Delivery outcome (log + metric only, no DB row)
 

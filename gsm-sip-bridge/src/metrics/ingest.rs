@@ -9,7 +9,9 @@
 //! absolute value, latest-wins, with no ordering guarantee assumed between
 //! reports (contracts/observability-protocol.md).
 
-use crate::alerts::{AlertCategory, CriticalEvent, CriticalEventKind};
+use crate::alerts::discord::DiscordClient;
+use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKind};
+use crate::config::AlertsConfig;
 use crate::control::protocol::{
     AgentKind, AgentReport, AgentState, CallStatus, ObservedEvent, SmsOutcome,
 };
@@ -17,6 +19,46 @@ use crate::metrics;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// specs/022-discord-critical-alerts (Greptile P1 fix). Set once from
+/// `main.rs` via [`init_alerts`], before the control server starts
+/// accepting connections — so alert evaluation happens the moment each
+/// real `AgentReport` arrives (report cadence, `[metrics]
+/// .agent_report_interval_seconds`), not gated on an external Prometheus
+/// scrape. A line with no scraper configured, or one that flaps between
+/// two scrapes, is now evaluated exactly like one that gets scraped every
+/// second — the two used to behave differently, which is the bug.
+static ALERTS_CONFIG: OnceLock<AlertsConfig> = OnceLock::new();
+static ALERTS_CLIENT: OnceLock<DiscordClient> = OnceLock::new();
+
+/// Called once from `main.rs`. A missing call (e.g. `DiscordClient::new`
+/// failing, which in practice only happens if the HTTP client itself
+/// can't be built) leaves alert dispatch permanently skipped — reports are
+/// still ingested and gauges still update normally either way.
+pub fn init_alerts(config: AlertsConfig, client: DiscordClient) {
+    ALERTS_CONFIG.get_or_init(|| config);
+    ALERTS_CLIENT.get_or_init(|| client);
+}
+
+/// A category's alert lifecycle for one signal (registration or tunnel),
+/// independent of the raw `*_unhealthy_since` streak tracked alongside it.
+/// Splitting "is this condition currently unhealthy" from "have we told
+/// anyone about it yet" is what lets a failed Discord delivery be retried
+/// instead of silently and permanently swallowed (Greptile P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlertPhase {
+    /// Healthy, or unhealthy but not yet past threshold, or unhealthy past
+    /// threshold with the Failure delivery not yet dispatched (or dispatched
+    /// and confirmed failed — see `record_alert_outcome`).
+    Idle,
+    /// Threshold crossed; a Failure dispatch is in flight. Held here (not
+    /// jumped straight to `Alerted`) so a still-unhealthy report arriving
+    /// before the dispatch resolves doesn't fire a second, overlapping send.
+    Pending,
+    /// Failure dispatch confirmed delivered (2xx from Discord). Stays here
+    /// until a healthy report fires the `Recovered` notice.
+    Alerted,
+}
 
 const TRANSPORT_VOWIFI: &str = "vowifi";
 /// Host-side IMS over LTE. A third value on the existing `transport` label,
@@ -51,15 +93,10 @@ struct AgentRecord {
     /// `None` means "currently registered (or this agent has never
     /// reported `registered` at all)".
     registered_unhealthy_since: Option<Instant>,
-    /// Whether a `RegistrationLoss` alert has already been sent for the
-    /// *current* unhealthy streak — owned exclusively by
-    /// `evaluate_critical_alerts`, so a still-unhealthy tick never re-sends
-    /// (FR-013) and a healthy tick after having alerted sends exactly one
-    /// Recovered notice.
-    registered_alerted: bool,
+    registered_alert_phase: AlertPhase,
     /// Same pair, for `tunnel_up`.
     tunnel_unhealthy_since: Option<Instant>,
-    tunnel_alerted: bool,
+    tunnel_alert_phase: AlertPhase,
 }
 
 /// Keyed by `(agent kind, module_id)`, not just agent kind — with
@@ -87,6 +124,11 @@ fn liveness() -> &'static Mutex<HashMap<(AgentKind, String), AgentRecord>> {
 pub fn apply_report(report: &AgentReport) {
     let module_id = report.module_id.as_str();
     let key = (report.agent, module_id.to_string());
+
+    // Both the state update and the alert-transition decision happen under
+    // one lock acquisition so two reports for the same key can never race
+    // into deciding the same threshold-crossing twice (`AlertPhase::Pending`
+    // is set atomically with the rest of the record).
     let mut guard = liveness().lock().unwrap();
     let existing = guard.get(&key).copied();
 
@@ -94,15 +136,13 @@ pub fn apply_report(report: &AgentReport) {
         record.last_applied.0 == report.epoch && report.seq <= record.last_applied.1
     });
 
-    // `*_alerted` is owned exclusively by `evaluate_critical_alerts` — passed
-    // through unchanged here regardless of what `apply_state` does to
-    // `*_unhealthy_since` below, so a healthy report arriving before the
-    // evaluator's next tick doesn't erase the "a Recovered notice is owed"
-    // signal out from under it.
-    let registered_alerted = existing.is_some_and(|r| r.registered_alerted);
-    let tunnel_alerted = existing.is_some_and(|r| r.tunnel_alerted);
+    let mut registered_alert_phase =
+        existing.map_or(AlertPhase::Idle, |r| r.registered_alert_phase);
+    let mut tunnel_alert_phase = existing.map_or(AlertPhase::Idle, |r| r.tunnel_alert_phase);
     let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
     let mut tunnel_unhealthy_since = existing.and_then(|r| r.tunnel_unhealthy_since);
+    // (category, transition) pairs to dispatch once the lock is released.
+    let mut pending_transitions: Vec<(AlertCategory, CriticalEventKind)> = Vec::new();
 
     if !is_replay {
         apply_state(
@@ -122,6 +162,39 @@ pub fn apply_report(report: &AgentReport) {
                 .with_label_values(&[report.agent.as_str(), module_id])
                 .inc_by(report.dropped as f64);
         }
+
+        if let Some(cfg) = ALERTS_CONFIG.get() {
+            let registration_threshold =
+                Duration::from_secs(cfg.registration_loss_thresholds.unhealthy_sec);
+            let tunnel_threshold = Duration::from_secs(cfg.tunnel_failure_thresholds.unhealthy_sec);
+
+            match decide_transition(
+                registered_unhealthy_since,
+                &mut registered_alert_phase,
+                registration_threshold,
+            ) {
+                Transition::Event(kind) => {
+                    pending_transitions.push((AlertCategory::RegistrationLoss, kind))
+                }
+                Transition::Suppressed => {
+                    crate::alerts::record_suppressed(AlertCategory::RegistrationLoss)
+                }
+                Transition::None => {}
+            }
+            match decide_transition(
+                tunnel_unhealthy_since,
+                &mut tunnel_alert_phase,
+                tunnel_threshold,
+            ) {
+                Transition::Event(kind) => {
+                    pending_transitions.push((AlertCategory::TunnelFailure, kind))
+                }
+                Transition::Suppressed => {
+                    crate::alerts::record_suppressed(AlertCategory::TunnelFailure)
+                }
+                Transition::None => {}
+            }
+        }
     }
 
     let last_applied = if is_replay {
@@ -130,16 +203,133 @@ pub fn apply_report(report: &AgentReport) {
         (report.epoch, report.seq)
     };
     guard.insert(
-        key,
+        key.clone(),
         AgentRecord {
             last_report: Instant::now(),
             last_applied,
             registered_unhealthy_since,
-            registered_alerted,
+            registered_alert_phase,
             tunnel_unhealthy_since,
-            tunnel_alerted,
+            tunnel_alert_phase,
         },
     );
+    drop(guard);
+
+    for (category, kind) in pending_transitions {
+        dispatch_transition(key.clone(), category, kind);
+    }
+}
+
+/// The pure per-signal decision: given the current unhealthy streak and
+/// alert phase, what (if anything) should happen this report. Kept free of
+/// I/O so it's directly unit-testable with backdated `Instant`s
+/// (research.md R4) — no sleeping, no mock.
+fn decide_transition(
+    unhealthy_since: Option<Instant>,
+    phase: &mut AlertPhase,
+    threshold: Duration,
+) -> Transition {
+    match (unhealthy_since, *phase) {
+        (Some(since), AlertPhase::Idle) if since.elapsed() >= threshold => {
+            *phase = AlertPhase::Pending;
+            Transition::Event(CriticalEventKind::Failure)
+        }
+        // Already dispatching a Failure for this streak — don't fire a
+        // second, overlapping send (Greptile P1: this is also exactly what
+        // stops a burst of reports from spawning duplicate deliveries).
+        (Some(_), AlertPhase::Pending) => Transition::None,
+        (Some(_), AlertPhase::Alerted) => Transition::Suppressed,
+        (None, AlertPhase::Alerted) => {
+            *phase = AlertPhase::Idle;
+            Transition::Event(CriticalEventKind::Recovered)
+        }
+        // Recovered while a Failure dispatch was still in flight: wait for
+        // `record_alert_outcome` to resolve `Pending`, then the *next*
+        // report (now healthy) will see `(None, Alerted)` above and fire
+        // the Recovered notice — or `(None, Idle)` if delivery failed, and
+        // stay silent, matching "the failure was never actually reported."
+        _ => Transition::None,
+    }
+}
+
+enum Transition {
+    None,
+    Suppressed,
+    Event(CriticalEventKind),
+}
+
+/// Builds the event, dispatches it, and — for `Failure` events only — feeds
+/// the delivery outcome back into the stored phase so a failed send is
+/// retried on the next unhealthy report rather than silently left `Pending`
+/// forever (Greptile P1). `Recovered` events commit their phase transition
+/// synchronously in `decide_transition` regardless of delivery outcome: a
+/// lost "all clear" is far less costly than a lost failure notice, and
+/// keeping it synchronous avoids a second class of pending-state to track.
+fn dispatch_transition(key: (AgentKind, String), category: AlertCategory, kind: CriticalEventKind) {
+    let (Some(cfg), Some(client)) = (ALERTS_CONFIG.get(), ALERTS_CLIENT.get()) else {
+        return;
+    };
+    let cfg = cfg.clone();
+    let client = client.clone();
+    let description = match (category, kind) {
+        (AlertCategory::RegistrationLoss, CriticalEventKind::Failure) => format!(
+            "{} line unregistered for over {}s",
+            key.0.as_str(),
+            cfg.registration_loss_thresholds.unhealthy_sec
+        ),
+        (AlertCategory::RegistrationLoss, CriticalEventKind::Recovered) => {
+            format!("{} line re-registered", key.0.as_str())
+        }
+        (AlertCategory::TunnelFailure, CriticalEventKind::Failure) => format!(
+            "{} line's tunnel non-established for over {}s",
+            key.0.as_str(),
+            cfg.tunnel_failure_thresholds.unhealthy_sec
+        ),
+        (AlertCategory::TunnelFailure, CriticalEventKind::Recovered) => {
+            format!("{} line's tunnel re-established", key.0.as_str())
+        }
+        _ => unreachable!("only RegistrationLoss/TunnelFailure transitions are produced here"),
+    };
+    let event = CriticalEvent {
+        category,
+        unit_id: Some(key.1.clone()),
+        description,
+        at: chrono::Utc::now(),
+        kind,
+    };
+
+    tokio::spawn(async move {
+        let outcome = crate::alerts::dispatch(&client, &cfg, event).await;
+        if kind == CriticalEventKind::Failure {
+            let success = matches!(outcome, AlertOutcome::Sent(_));
+            record_alert_outcome(&key, category, success);
+        }
+    });
+}
+
+/// Resolves a `Pending` phase once its dispatch completes: `Alerted` on
+/// confirmed delivery, back to `Idle` on failure so the next unhealthy
+/// report retries instead of the incident staying silently suppressed
+/// forever (Greptile P1). A no-op if the phase has since moved on (e.g. a
+/// concurrent report already observed recovery) — this callback only ever
+/// resolves the specific `Pending` it was spawned for.
+fn record_alert_outcome(key: &(AgentKind, String), category: AlertCategory, success: bool) {
+    let mut guard = liveness().lock().unwrap();
+    let Some(record) = guard.get_mut(key) else {
+        return;
+    };
+    let phase = match category {
+        AlertCategory::RegistrationLoss => &mut record.registered_alert_phase,
+        AlertCategory::TunnelFailure => &mut record.tunnel_alert_phase,
+        _ => return,
+    };
+    if *phase == AlertPhase::Pending {
+        *phase = if success {
+            AlertPhase::Alerted
+        } else {
+            AlertPhase::Idle
+        };
+    }
 }
 
 fn apply_state(
@@ -292,91 +482,6 @@ pub fn evaluate_liveness(staleness_threshold: std::time::Duration) -> Vec<AgentL
             }
         })
         .collect()
-}
-
-/// specs/022-discord-critical-alerts FR-006/FR-005/FR-013 (US2/US3,
-/// research.md R1/R4). Evaluated on every scrape, mirroring
-/// `evaluate_liveness` — not on a separate timer, one fewer moving part.
-/// Mutates the stored `*_alerted` flags in place: a `RegistrationLoss`/
-/// `TunnelFailure` `Failure` event is returned (and the flag set) the tick a
-/// sustained-unhealthy streak first crosses its threshold; a `Recovered`
-/// event is returned (and the flag cleared) the first tick observed healthy
-/// again after having alerted. Every other tick returns nothing for that
-/// signal — a still-unhealthy-but-already-alerted tick is recorded via
-/// `alerts::record_suppressed` instead of an event.
-pub fn evaluate_critical_alerts(
-    registration_threshold: Duration,
-    tunnel_threshold: Duration,
-) -> Vec<CriticalEvent> {
-    let mut events = Vec::new();
-    let mut guard = liveness().lock().unwrap();
-    let now = Instant::now();
-
-    for ((agent, module_id), record) in guard.iter_mut() {
-        match (record.registered_unhealthy_since, record.registered_alerted) {
-            (Some(since), false) if now.duration_since(since) >= registration_threshold => {
-                record.registered_alerted = true;
-                events.push(CriticalEvent {
-                    category: AlertCategory::RegistrationLoss,
-                    unit_id: Some(module_id.clone()),
-                    description: format!(
-                        "{} line unregistered for over {}s",
-                        agent.as_str(),
-                        registration_threshold.as_secs()
-                    ),
-                    at: chrono::Utc::now(),
-                    kind: CriticalEventKind::Failure,
-                });
-            }
-            (Some(_), true) => {
-                crate::alerts::record_suppressed(AlertCategory::RegistrationLoss);
-            }
-            (None, true) => {
-                record.registered_alerted = false;
-                events.push(CriticalEvent {
-                    category: AlertCategory::RegistrationLoss,
-                    unit_id: Some(module_id.clone()),
-                    description: format!("{} line re-registered", agent.as_str()),
-                    at: chrono::Utc::now(),
-                    kind: CriticalEventKind::Recovered,
-                });
-            }
-            _ => {}
-        }
-
-        match (record.tunnel_unhealthy_since, record.tunnel_alerted) {
-            (Some(since), false) if now.duration_since(since) >= tunnel_threshold => {
-                record.tunnel_alerted = true;
-                events.push(CriticalEvent {
-                    category: AlertCategory::TunnelFailure,
-                    unit_id: Some(module_id.clone()),
-                    description: format!(
-                        "{} line's tunnel non-established for over {}s",
-                        agent.as_str(),
-                        tunnel_threshold.as_secs()
-                    ),
-                    at: chrono::Utc::now(),
-                    kind: CriticalEventKind::Failure,
-                });
-            }
-            (Some(_), true) => {
-                crate::alerts::record_suppressed(AlertCategory::TunnelFailure);
-            }
-            (None, true) => {
-                record.tunnel_alerted = false;
-                events.push(CriticalEvent {
-                    category: AlertCategory::TunnelFailure,
-                    unit_id: Some(module_id.clone()),
-                    description: format!("{} line's tunnel re-established", agent.as_str()),
-                    at: chrono::Utc::now(),
-                    kind: CriticalEventKind::Recovered,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    events
 }
 
 #[cfg(test)]
@@ -581,13 +686,18 @@ mod tests {
     // arithmetic — `registered_unhealthy_since`/`tunnel_unhealthy_since` are
     // backdated directly rather than sleeping (research.md R4).
     //
-    // `evaluate_critical_alerts` sweeps and mutates *every* entry in the
-    // shared global `liveness()` map, not just the module under test — two
-    // such tests running in parallel can otherwise steal/suppress each
-    // other's expected event. `EVALUATE_LOCK` serializes only the tests that
-    // call `evaluate_critical_alerts` against each other (a lighter-weight,
-    // dependency-free stand-in for what a `#[serial]` attribute would do).
-    static EVALUATE_LOCK: Mutex<()> = Mutex::new(());
+    // `ALERTS_CONFIG`/`ALERTS_CLIENT` are deliberately never initialized
+    // anywhere in this lib's unit-test binary: both are process-global
+    // `OnceLock`s shared by every `#[cfg(test)]` module in the crate, and
+    // once set, `apply_report` starts calling `tokio::spawn` on a
+    // threshold crossing — which panics outside a Tokio runtime, and every
+    // test here is a plain `#[test]`, not `#[tokio::test]`. The
+    // phase-transition and delivery-outcome logic below is therefore
+    // tested directly against the pure `decide_transition`/
+    // `record_alert_outcome` functions instead of through `apply_report`;
+    // the full dispatch-and-retry path is covered end-to-end by
+    // `tests/test_alerts_discord.rs` (a separate binary, free to call
+    // `init_alerts` and use `#[tokio::test]`).
 
     fn backdate_unhealthy_since(agent: AgentKind, module_id: &str, seconds_ago: u64) {
         let mut guard = liveness().lock().unwrap();
@@ -616,7 +726,7 @@ mod tests {
         let guard = liveness().lock().unwrap();
         let record = guard.get(&(AgentKind::Ims, module_id.to_string())).unwrap();
         assert!(record.registered_unhealthy_since.is_some());
-        assert!(!record.registered_alerted);
+        assert_eq!(record.registered_alert_phase, AlertPhase::Idle);
     }
 
     #[test]
@@ -665,134 +775,146 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_critical_alerts_fires_failure_once_threshold_crossed_then_suppresses() {
-        let _guard = EVALUATE_LOCK.lock().unwrap();
-        let module_id = "test-reg-loss-threshold";
-        apply_report(&AgentReport {
-            agent: AgentKind::Ims,
-            module_id: module_id.to_string(),
-            epoch: 1,
-            seq: 1,
-            state: AgentState {
-                registered: Some(false),
-                ..AgentState::default()
-            },
-            events: vec![],
-            dropped: 0,
-        });
-        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
-
-        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
-        let fired = events
-            .iter()
-            .filter(|e| e.unit_id.as_deref() == Some(module_id))
-            .count();
-        assert_eq!(fired, 1, "exactly one Failure event on first crossing");
+    fn decide_transition_fires_failure_once_threshold_crossed() {
+        let mut phase = AlertPhase::Idle;
+        let since = Instant::now() - Duration::from_secs(301);
+        let t = decide_transition(Some(since), &mut phase, Duration::from_secs(300));
+        assert!(matches!(t, Transition::Event(CriticalEventKind::Failure)));
         assert_eq!(
-            events
-                .iter()
-                .find(|e| e.unit_id.as_deref() == Some(module_id))
-                .unwrap()
-                .kind,
-            CriticalEventKind::Failure
+            phase,
+            AlertPhase::Pending,
+            "moves to Pending, not straight to Alerted — Alerted is only \
+             reached once record_alert_outcome confirms delivery (Greptile P1)"
         );
+    }
 
-        // Still unhealthy, already alerted: the next tick must not re-fire.
-        let events_again =
-            evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+    #[test]
+    fn decide_transition_does_not_refire_while_dispatch_pending() {
+        // A second unhealthy report arriving while the first Failure
+        // dispatch is still in flight must not spawn a second, overlapping
+        // send.
+        let mut phase = AlertPhase::Pending;
+        let since = Instant::now() - Duration::from_secs(301);
+        let t = decide_transition(Some(since), &mut phase, Duration::from_secs(300));
+        assert!(matches!(t, Transition::None));
+        assert_eq!(phase, AlertPhase::Pending);
+    }
+
+    #[test]
+    fn decide_transition_suppresses_while_alerted_and_still_unhealthy() {
+        let mut phase = AlertPhase::Alerted;
+        let since = Instant::now() - Duration::from_secs(301);
+        let t = decide_transition(Some(since), &mut phase, Duration::from_secs(300));
         assert!(
-            !events_again
-                .iter()
-                .any(|e| e.unit_id.as_deref() == Some(module_id)),
+            matches!(t, Transition::Suppressed),
             "must not re-alert while continuously unhealthy (FR-013)"
         );
+        assert_eq!(phase, AlertPhase::Alerted);
     }
 
     #[test]
-    fn evaluate_critical_alerts_fires_recovered_once_after_alerting() {
-        let _guard = EVALUATE_LOCK.lock().unwrap();
-        let module_id = "test-reg-loss-recovered";
-        apply_report(&AgentReport {
-            agent: AgentKind::Ims,
-            module_id: module_id.to_string(),
-            epoch: 1,
-            seq: 1,
-            state: AgentState {
-                registered: Some(false),
-                ..AgentState::default()
-            },
-            events: vec![],
-            dropped: 0,
-        });
-        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
-        evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+    fn decide_transition_fires_recovered_once_after_alerted() {
+        let mut phase = AlertPhase::Alerted;
+        let t = decide_transition(None, &mut phase, Duration::from_secs(300));
+        assert!(matches!(t, Transition::Event(CriticalEventKind::Recovered)));
+        assert_eq!(phase, AlertPhase::Idle);
 
-        // Re-registers within the same tick sequence.
-        apply_report(&AgentReport {
-            agent: AgentKind::Ims,
-            module_id: module_id.to_string(),
-            epoch: 1,
-            seq: 2,
-            state: AgentState {
-                registered: Some(true),
-                ..AgentState::default()
-            },
-            events: vec![],
-            dropped: 0,
-        });
-
-        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
-        let recovered = events
-            .iter()
-            .find(|e| e.unit_id.as_deref() == Some(module_id))
-            .expect("expected a Recovered event");
-        assert_eq!(recovered.kind, CriticalEventKind::Recovered);
-
-        // And exactly once — a further healthy tick emits nothing more.
-        let events_again =
-            evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
-        assert!(!events_again
-            .iter()
-            .any(|e| e.unit_id.as_deref() == Some(module_id)));
+        // And exactly once — a further healthy call emits nothing more.
+        let t_again = decide_transition(None, &mut phase, Duration::from_secs(300));
+        assert!(matches!(t_again, Transition::None));
     }
 
     #[test]
-    fn evaluate_critical_alerts_no_event_when_recovered_before_threshold() {
-        let _guard = EVALUATE_LOCK.lock().unwrap();
-        let module_id = "test-reg-loss-self-healed";
-        apply_report(&AgentReport {
-            agent: AgentKind::Ims,
-            module_id: module_id.to_string(),
-            epoch: 1,
-            seq: 1,
-            state: AgentState {
-                registered: Some(false),
-                ..AgentState::default()
-            },
-            events: vec![],
-            dropped: 0,
-        });
-        // Only 30s elapsed, well under a 300s threshold — a self-healed blip.
-        backdate_unhealthy_since(AgentKind::Ims, module_id, 30);
-        apply_report(&AgentReport {
-            agent: AgentKind::Ims,
-            module_id: module_id.to_string(),
-            epoch: 1,
-            seq: 2,
-            state: AgentState {
-                registered: Some(true),
-                ..AgentState::default()
-            },
-            events: vec![],
-            dropped: 0,
-        });
+    fn decide_transition_no_event_when_recovered_before_threshold() {
+        // Only 30s elapsed, well under a 300s threshold — a self-healed blip
+        // must never alert.
+        let mut phase = AlertPhase::Idle;
+        let since = Instant::now() - Duration::from_secs(30);
+        let t = decide_transition(Some(since), &mut phase, Duration::from_secs(300));
+        assert!(matches!(t, Transition::None));
+        assert_eq!(phase, AlertPhase::Idle);
+    }
 
-        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
-        assert!(
-            !events
-                .iter()
-                .any(|e| e.unit_id.as_deref() == Some(module_id)),
-            "a blip that self-heals before the threshold must never alert"
+    #[test]
+    fn decide_transition_stays_pending_when_recovered_mid_dispatch() {
+        // Health recovers while a Failure dispatch is still in flight: no
+        // event yet (the callback hasn't resolved), phase left exactly as
+        // record_alert_outcome will find it.
+        let mut phase = AlertPhase::Pending;
+        let t = decide_transition(None, &mut phase, Duration::from_secs(300));
+        assert!(matches!(t, Transition::None));
+        assert_eq!(phase, AlertPhase::Pending);
+    }
+
+    /// specs/022-discord-critical-alerts Greptile P1 ("Failed delivery
+    /// suppresses incident"): confirmed delivery moves Pending -> Alerted.
+    #[test]
+    fn record_alert_outcome_moves_pending_to_alerted_on_success() {
+        let module_id = "test-outcome-success";
+        let key = (AgentKind::Ims, module_id.to_string());
+        seed_pending_record(&key);
+
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, true);
+
+        let guard = liveness().lock().unwrap();
+        assert_eq!(
+            guard.get(&key).unwrap().registered_alert_phase,
+            AlertPhase::Alerted
+        );
+    }
+
+    /// The other half of the same fix: a failed delivery resets to `Idle`
+    /// rather than leaving the incident stuck — so the *next* unhealthy
+    /// report (`decide_transition` above) retries instead of the failure
+    /// notification being permanently lost while a later recovery still
+    /// fires a "recovered" notice for a failure nobody was ever told about.
+    #[test]
+    fn record_alert_outcome_resets_pending_to_idle_on_failure() {
+        let module_id = "test-outcome-failure";
+        let key = (AgentKind::Ims, module_id.to_string());
+        seed_pending_record(&key);
+
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, false);
+
+        let guard = liveness().lock().unwrap();
+        assert_eq!(
+            guard.get(&key).unwrap().registered_alert_phase,
+            AlertPhase::Idle,
+            "a failed delivery must be retryable, not permanently suppressed"
+        );
+    }
+
+    #[test]
+    fn record_alert_outcome_is_a_noop_if_phase_already_moved_on() {
+        // Guards against a stale callback (e.g. a slow dispatch resolving
+        // after something else already changed the phase) clobbering
+        // newer state.
+        let module_id = "test-outcome-stale-callback";
+        let key = (AgentKind::Ims, module_id.to_string());
+        seed_pending_record(&key);
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, true); // Pending -> Alerted
+
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, false); // stale, must not fire
+
+        let guard = liveness().lock().unwrap();
+        assert_eq!(
+            guard.get(&key).unwrap().registered_alert_phase,
+            AlertPhase::Alerted
+        );
+    }
+
+    fn seed_pending_record(key: &(AgentKind, String)) {
+        let mut guard = liveness().lock().unwrap();
+        guard.insert(
+            key.clone(),
+            AgentRecord {
+                last_report: Instant::now(),
+                last_applied: (0, 0),
+                registered_unhealthy_since: Some(Instant::now()),
+                registered_alert_phase: AlertPhase::Pending,
+                tunnel_unhealthy_since: None,
+                tunnel_alert_phase: AlertPhase::Idle,
+            },
         );
     }
 
@@ -819,8 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_critical_alerts_tunnel_failure_independent_of_registration() {
-        let _guard = EVALUATE_LOCK.lock().unwrap();
+    fn tunnel_unhealthy_since_tracked_independently_of_registration() {
         let module_id = "test-tunnel-independent";
         apply_report(&AgentReport {
             agent: AgentKind::Ims,
@@ -835,14 +956,16 @@ mod tests {
             events: vec![],
             dropped: 0,
         });
-        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
 
-        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
-        let fired: Vec<_> = events
-            .iter()
-            .filter(|e| e.unit_id.as_deref() == Some(module_id))
-            .collect();
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].category, AlertCategory::TunnelFailure);
+        let guard = liveness().lock().unwrap();
+        let record = guard.get(&(AgentKind::Ims, module_id.to_string())).unwrap();
+        assert!(
+            record.registered_unhealthy_since.is_none(),
+            "registered=true must not be treated as unhealthy"
+        );
+        assert!(
+            record.tunnel_unhealthy_since.is_some(),
+            "tunnel_up=false must be tracked independently"
+        );
     }
 }

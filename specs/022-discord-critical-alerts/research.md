@@ -113,9 +113,22 @@ test run.
 
 **Alternatives considered**: A background timer/ticker per line was
 rejected in favor of evaluating on each incoming `AgentReport` (registration/
-tunnel) or on each supervision-loop iteration (SIM), mirroring
-`metrics::server`'s existing "evaluated on every scrape, not on a timer"
-design for agent liveness — one fewer moving part (Constitution V).
+tunnel) or on each supervision-loop iteration (SIM) — one fewer moving part
+(Constitution V).
+
+**Revised post-review** (PR #16 Greptile, 2026-07-27): the first
+implementation evaluated registration/tunnel thresholds from
+`metrics::server`'s `/metrics` scrape handler instead — mirroring
+`evaluate_liveness`'s "evaluated on every scrape" shape, which is *correct*
+for staleness (a pull-only question: "how long since we last heard from
+this agent, as of right now") but wrong here, since a threshold-crossing is
+a specific moment that scraping can miss entirely (no scraper configured)
+or race (health recovers between two scrapes, erasing the crossing before
+it's ever evaluated). Moved to the alternative this section already
+preferred — evaluating inside `apply_report`, at real report arrival — closing
+both gaps: evaluation now runs at the report cadence regardless of whether
+anything scrapes `/metrics`, and can no longer "miss the window" between
+scrapes.
 
 ## R5: No new SQLite table for the four new categories
 
@@ -174,3 +187,39 @@ prefixed keys (`module_lifecycle_enabled`, `module_lifecycle_webhook_url`,
 ...) was rejected as harder to read/maintain than one sub-table per category,
 and inconsistent with how every other multi-attribute section in this config
 (`[scheduled_restart]`, `[resilience]`) is already structured.
+
+## R8: Delivery-outcome feedback and stale-incident recovery (PR #16 Greptile fixes)
+
+**Decision**: `AlertPhase` (`Idle`/`Pending`/`Alerted`) replaces the original
+plain `alerted: bool` for the registration/tunnel signals. Marking "alerted"
+no longer happens optimistically at the moment a threshold crosses; it
+happens only once the async dispatch task confirms delivery
+(`record_alert_outcome`, called from the `tokio::spawn`'d dispatch). A
+failed delivery resets `Pending` back to `Idle`, so the next unhealthy
+report retries it — previously, a delivery failure marked the incident
+"alerted" anyway, permanently suppressing the real failure notice and
+letting a later recovery fire a `Recovered` message for a `Failure` that
+was never actually delivered.
+
+**Alternatives considered**: Retrying inside `post_with_retry` indefinitely
+until success was rejected — that already has its own bounded retry/backoff
+(3 attempts, 30s ceiling) for transient errors; a sustained Discord outage
+should not spin an unbounded task, it should surface as "still Pending,
+retried on the next real report" the same way every other unhealthy
+condition in this feature already behaves.
+
+**Decision (module lifecycle)**: A module that reaches `LifecycleState::
+GivenUp` and is later reconnected was found to never recover in-process:
+`rescan_new_modules`'s `known_serials` set counted `GivenUp` slots as
+"already known" (so the USB rescan never even looked at that serial port
+again), and even if it had, a successful rediscovery created a brand-new
+slot at a new key rather than clearing the old one — leaving a dead slot
+sitting alongside the healthy one and `CRITICAL_EVENT_ACTIVE` stuck at 1
+forever. Fixed by (a) excluding `GivenUp` slots from `known_serials`, and
+(b) on successful rediscovery, looking up any stale `GivenUp` slot for the
+same `module.id` (`find_given_up_slot`, a pure/testable helper), removing
+it, and firing a `ModuleLifecycle` `Recovered` event.
+
+**Scope note**: this only matters *within* one process's lifetime — on a
+full daemon restart, `slots` and every Prometheus metric reset from scratch
+anyway, so there is no cross-restart "stuck gauge" to fix.

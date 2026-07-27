@@ -44,8 +44,9 @@ no new table, no migration (research.md R5).
 - Config parsing: table-driven unit tests over `parse_alerts` (new function
   in `config/mod.rs`), mirroring existing `parse_sms`/`parse_scheduled_restart`
   tests — including the `[sms]`-without-`[alerts.sms]` backward-compat case.
-- Duration-threshold logic (`metrics::ingest`'s new
-  `evaluate_critical_alerts`, and the AT-worker-unresponsive check in
+- Duration-threshold logic (`metrics::ingest`'s `decide_transition`, evaluated
+  from `apply_report` at real report-arrival time — see data-model.md's
+  "Revised post-review" note — and the AT-worker-unresponsive check in
   `modules::mod`): unit tests constructing `Instant`s in the past
   (`Instant::now() - Duration::from_secs(301)`) — real `Instant` arithmetic,
   no sleeping, no mock (Constitution I).
@@ -135,8 +136,11 @@ gsm-sip-bridge/src/
 │                                  # fields this feature reads)
 ├── metrics/
 │   ├── mod.rs                    # MODIFIED: 2 new metric families (contracts/metrics.md)
-│   └── ingest.rs                  # MODIFIED: unhealthy_since tracking +
-│                                  # evaluate_critical_alerts()
+│   ├── ingest.rs                  # MODIFIED: unhealthy_since + AlertPhase
+│                                  # tracking, evaluated from apply_report
+│                                  # (report-arrival-time, not scrape-time —
+│                                  # data-model.md's post-review note)
+│   └── server.rs                  # scrape handler unchanged by this feature
 ├── modules/
 │   └── mod.rs                     # MODIFIED: AT-worker-unresponsive timer,
 │                                  # SIM absent/unreadable + missed-call hooks

@@ -150,12 +150,15 @@ fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryA
 /// and records the outcome in `CRITICAL_ALERTS_TOTAL`/`CRITICAL_EVENT_ACTIVE`
 /// plus a structured log line. Intended to be run via
 /// `tokio::runtime::Handle::spawn`/`Runtime::spawn` (fire-and-forget, never
-/// awaited by a call/SMS/AT-command hot path — FR-011).
+/// awaited by a call/SMS/AT-command hot path — FR-011). Returns the outcome
+/// so a caller that needs to react to delivery success/failure (e.g.
+/// `metrics::ingest`'s Pending→Alerted/Idle transition, Greptile P1) can —
+/// most callers just discard it.
 pub async fn dispatch(
     client: &discord::DiscordClient,
     config: &AlertsConfig,
     event: CriticalEvent,
-) {
+) -> AlertOutcome {
     let cfg = category_config(config, event.category);
     let outcome = match precheck(cfg, &config.default_webhook_url) {
         Some(outcome) => outcome,
@@ -219,6 +222,8 @@ pub async fn dispatch(
             "critical alert delivery failed"
         ),
     }
+
+    outcome
 }
 
 /// Records a suppressed tick (FR-013: still continuously unhealthy, no

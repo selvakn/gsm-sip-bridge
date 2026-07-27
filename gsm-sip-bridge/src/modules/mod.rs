@@ -117,6 +117,19 @@ pub fn backoff_delay(attempt: u32, initial_sec: u64, max_sec: u64) -> Duration {
     Duration::from_secs(secs.min(max_sec))
 }
 
+/// specs/022-discord-critical-alerts (Greptile P1 fix): finds a stale
+/// `GivenUp` slot for `module_id`, if one exists under a *different* key —
+/// rediscovery (a USB rescan or a fresh startup scan) creates a brand new
+/// slot rather than reusing the old one, so without this the old slot would
+/// otherwise sit there forever with no recovery notification ever sent and
+/// its `CRITICAL_EVENT_ACTIVE` gauge stuck at 1.
+fn find_given_up_slot(slots: &HashMap<u32, SlotState>, module_id: &str) -> Option<u32> {
+    slots
+        .iter()
+        .find(|(_, s)| s.lifecycle == LifecycleState::GivenUp && s.module.id == module_id)
+        .map(|(k, _)| *k)
+}
+
 pub struct CardPool {
     config: AppConfig,
     store: StoreHandle,
@@ -723,8 +736,13 @@ impl CardPool {
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
         ring_capacity: usize,
     ) {
+        // specs/022-discord-critical-alerts (Greptile P1 fix): a `GivenUp`
+        // slot's serial port must NOT count as "known" — otherwise this scan
+        // treats the module as already-seen forever and never attempts it
+        // again, even if the underlying hardware issue has since cleared.
         let known_serials: std::collections::HashSet<PathBuf> = slots
             .values()
+            .filter(|s| s.lifecycle != LifecycleState::GivenUp)
             .map(|s| s.module.serial_port.clone())
             .collect();
 
@@ -747,6 +765,32 @@ impl CardPool {
             tracing::info!(module = %module.id, "new module detected, initializing");
             match self.try_init_module(&module) {
                 Ok((slot, imei, phone, net_type, net_mode)) => {
+                    // specs/022-discord-critical-alerts (Greptile P1 fix):
+                    // this module_id may already have a stale `GivenUp` slot
+                    // from an earlier incident (a different slot key — the
+                    // scan above now revisits it once it stops counting as
+                    // "known"). Rediscovering it here is exactly a recovery:
+                    // clear the stale slot and its active-incident gauge
+                    // rather than leaving a dead entry sitting alongside the
+                    // new, healthy one forever.
+                    if let Some(stale_slot) = find_given_up_slot(slots, &module.id) {
+                        slots.remove(&stale_slot);
+                        if let Some(client) = self.alerts_client.clone() {
+                            let config = self.config.alerts.clone();
+                            let event = alerts::CriticalEvent {
+                                category: alerts::AlertCategory::ModuleLifecycle,
+                                unit_id: Some(module.id.clone()),
+                                description: "module recovered after previously giving up"
+                                    .to_string(),
+                                at: Utc::now(),
+                                kind: alerts::CriticalEventKind::Recovered,
+                            };
+                            tokio::spawn(
+                                async move { alerts::dispatch(&client, &config, event).await },
+                            );
+                        }
+                    }
+
                     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ModuleCmd>();
                     let store_tx = self.store.sender();
                     let sms_enabled = self.sms_handler.is_enabled();
@@ -1952,5 +1996,57 @@ mod tests {
         record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
 
         assert!(event_rx.try_recv().is_err(), "no alert for answered calls");
+    }
+
+    // specs/022-discord-critical-alerts (Greptile P1: "GivenUp state never
+    // recovers").
+
+    fn slot_state(module_id: &str, lifecycle: LifecycleState) -> SlotState {
+        SlotState {
+            slot: 0,
+            module: DiscoveredModule {
+                id: module_id.to_string(),
+                serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
+                audio_device: String::new(),
+                usb_serial: String::new(),
+            },
+            imei: String::new(),
+            phone_number: String::new(),
+            network_type: NetworkType::Unknown,
+            network_mode: None,
+            lifecycle,
+            retry_count: 0,
+            next_retry_at: None,
+            cmd_tx: None,
+            has_active_call: false,
+        }
+    }
+
+    #[test]
+    fn find_given_up_slot_locates_stale_slot_by_module_id() {
+        let mut slots = HashMap::new();
+        slots.insert(3, slot_state("card0", LifecycleState::GivenUp));
+
+        assert_eq!(find_given_up_slot(&slots, "card0"), Some(3));
+    }
+
+    #[test]
+    fn find_given_up_slot_ignores_non_given_up_slots_for_the_same_module() {
+        let mut slots = HashMap::new();
+        slots.insert(3, slot_state("card0", LifecycleState::Ready));
+
+        assert_eq!(
+            find_given_up_slot(&slots, "card0"),
+            None,
+            "a Ready slot is not a stale incident to clear"
+        );
+    }
+
+    #[test]
+    fn find_given_up_slot_ignores_a_different_modules_given_up_slot() {
+        let mut slots = HashMap::new();
+        slots.insert(3, slot_state("card1", LifecycleState::GivenUp));
+
+        assert_eq!(find_given_up_slot(&slots, "card0"), None);
     }
 }

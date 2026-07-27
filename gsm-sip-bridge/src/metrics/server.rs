@@ -1,6 +1,3 @@
-use crate::alerts::discord::DiscordClient;
-use crate::config::secret::Secret;
-use crate::config::AlertsConfig;
 use crate::metrics::ingest;
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
 use prometheus::TextEncoder;
@@ -11,13 +8,6 @@ static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// 3x `[metrics].agent_report_interval_seconds` (research.md §R5): one
 /// missed heartbeat of tolerance before an agent is declared down.
 static AGENT_STALENESS_THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-/// specs/022-discord-critical-alerts (US2/US3): set once in `serve`, read on
-/// every scrape by `refresh_critical_alerts`. `metrics_handler` already runs
-/// inside the daemon's one tokio runtime, so — unlike
-/// `supervise::orchestrate` — no dedicated `Runtime` is needed here; alerts
-/// are fired with a plain `tokio::spawn`.
-static ALERTS_CONFIG: std::sync::OnceLock<AlertsConfig> = std::sync::OnceLock::new();
-static ALERTS_CLIENT: std::sync::OnceLock<DiscordClient> = std::sync::OnceLock::new();
 
 pub fn record_start_time() {
     START_TIME.get_or_init(Instant::now);
@@ -56,30 +46,11 @@ fn refresh_agent_liveness() {
     }
 }
 
-/// specs/022-discord-critical-alerts FR-005/FR-006 (US2/US3). Same
-/// "evaluated on every scrape, not a timer" shape as
-/// `refresh_agent_liveness` above.
-fn refresh_critical_alerts() {
-    let (Some(config), Some(client)) = (ALERTS_CONFIG.get(), ALERTS_CLIENT.get()) else {
-        return;
-    };
-    let registration_threshold =
-        Duration::from_secs(config.registration_loss_thresholds.unhealthy_sec);
-    let tunnel_threshold = Duration::from_secs(config.tunnel_failure_thresholds.unhealthy_sec);
-
-    for event in ingest::evaluate_critical_alerts(registration_threshold, tunnel_threshold) {
-        let client = client.clone();
-        let config = config.clone();
-        tokio::spawn(async move { crate::alerts::dispatch(&client, &config, event).await });
-    }
-}
-
 async fn metrics_handler() -> impl IntoResponse {
     if let Some(start) = START_TIME.get() {
         super::UPTIME_SECONDS.set(start.elapsed().as_secs_f64());
     }
     refresh_agent_liveness();
-    refresh_critical_alerts();
 
     let encoder = TextEncoder::new();
     // Both registries, not just the default one.
@@ -115,17 +86,9 @@ async fn metrics_handler() -> impl IntoResponse {
 pub async fn serve(
     port: u16,
     agent_report_interval_seconds: u64,
-    alerts_config: AlertsConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     AGENT_STALENESS_THRESHOLD
         .get_or_init(|| Duration::from_secs(3 * agent_report_interval_seconds));
-    ALERTS_CONFIG.get_or_init(|| alerts_config);
-    match DiscordClient::new(Secret::new(String::new())) {
-        Ok(client) => {
-            ALERTS_CLIENT.get_or_init(|| client);
-        }
-        Err(e) => tracing::error!(error = %e, "failed to create critical-alerts Discord client"),
-    }
 
     let app = Router::new().route("/metrics", get(metrics_handler));
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
