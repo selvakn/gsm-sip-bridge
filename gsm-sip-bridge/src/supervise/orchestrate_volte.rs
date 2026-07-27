@@ -9,8 +9,7 @@
 use super::runner::{ChildSpec, CommandRunner};
 use super::shutdown::{LegacyVolteRegistration, StartedState, StartedVolteLine};
 use crate::config::AppConfig;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 const VOLTE_RESTORE_CID_PATH: &str = "/run/volte-restore-cid";
@@ -22,7 +21,7 @@ pub fn start(
     config_path: String,
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
-    shutting_down: Arc<AtomicBool>,
+    shutting_down: Arc<RwLock<bool>>,
 ) {
     if config.volte.bridge_inbound {
         start_multiline(runner, bin, config_path, config, started, shutting_down);
@@ -40,7 +39,7 @@ fn start_multiline(
     config_path: String,
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
-    shutting_down: Arc<AtomicBool>,
+    shutting_down: Arc<RwLock<bool>>,
 ) {
     println!(
         "[supervise] [volte].enabled + bridge_inbound — answering inbound calls over LTE (auto-discovering modems, up to {} line(s))",
@@ -165,7 +164,8 @@ fn start_multiline(
 
         println!("[supervise] volte line {idx}: starting volte-carrier-agent (netns {netns}), supervised...");
         std::thread::spawn(move || loop {
-            if shutting_down.load(Ordering::SeqCst) {
+            let guard = shutting_down.read().unwrap();
+            if *guard {
                 return;
             }
             match runner.spawn(ChildSpec::new([
@@ -186,6 +186,7 @@ fn start_multiline(
                         entry.carrier_agent_handles.push(handle);
                     }
                     drop(state);
+                    drop(guard);
                     // Poll is_alive() rather than block on wait(): a real
                     // Greptile finding (mirroring the one already fixed on
                     // the vowifi-usim-bridge holder — see runner.rs) caught
@@ -200,9 +201,12 @@ fn start_multiline(
                     }
                     println!("[supervise] volte line {idx}: volte-carrier-agent exited; restarting in 15s");
                 }
-                Err(e) => eprintln!(
-                    "[supervise] volte line {idx}: failed to spawn volte-carrier-agent: {e}"
-                ),
+                Err(e) => {
+                    drop(guard);
+                    eprintln!(
+                        "[supervise] volte line {idx}: failed to spawn volte-carrier-agent: {e}"
+                    )
+                }
             }
             runner.sleep(Duration::from_secs(15));
         });
@@ -218,7 +222,8 @@ fn start_multiline(
 
     println!("[supervise] starting volte-bridge (default netns, one shared process for all VoLTE lines), supervised...");
     std::thread::spawn(move || loop {
-        if shutting_down.load(Ordering::SeqCst) {
+        let guard = shutting_down.read().unwrap();
+        if *guard {
             return;
         }
         match runner.spawn(ChildSpec::new([
@@ -229,6 +234,7 @@ fn start_multiline(
         ])) {
             Ok(handle) => {
                 started.lock().unwrap().volte_bridge_supervisor = Some(handle);
+                drop(guard);
                 // See the volte-carrier-agent loop above: poll is_alive(),
                 // don't block on wait(), so this handle (which the shutdown
                 // plan signals via `volte_bridge_supervisor`) stays
@@ -238,7 +244,10 @@ fn start_multiline(
                 }
                 println!("[supervise] volte-bridge exited; restarting in 15s");
             }
-            Err(e) => eprintln!("[supervise] failed to spawn volte-bridge: {e}"),
+            Err(e) => {
+                drop(guard);
+                eprintln!("[supervise] failed to spawn volte-bridge: {e}")
+            }
         }
         runner.sleep(Duration::from_secs(15));
     });
@@ -252,11 +261,12 @@ fn start_legacy_registration(
     config_path: String,
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
-    shutting_down: Arc<AtomicBool>,
+    shutting_down: Arc<RwLock<bool>>,
 ) {
     println!("[supervise] [volte].enabled — starting host-side IMS over LTE (resolving one line from config)");
     std::thread::spawn(move || loop {
-        if shutting_down.load(Ordering::SeqCst) {
+        let guard = shutting_down.read().unwrap();
+        if *guard {
             return;
         }
         match runner.spawn(ChildSpec::new([
@@ -282,6 +292,7 @@ fn start_legacy_registration(
                     restore_cid: std::fs::read_to_string(VOLTE_RESTORE_CID_PATH).ok(),
                 });
                 drop(state);
+                drop(guard);
                 // See the volte-carrier-agent loop above: poll is_alive(),
                 // don't block on wait(), so this handle (which the shutdown
                 // plan signals via `legacy_volte_registration.
@@ -292,7 +303,10 @@ fn start_legacy_registration(
                 }
                 println!("[supervise] the LTE IMS service exited; restarting in 15s");
             }
-            Err(e) => eprintln!("[supervise] failed to spawn volte-register: {e}"),
+            Err(e) => {
+                drop(guard);
+                eprintln!("[supervise] failed to spawn volte-register: {e}")
+            }
         }
         // Longer than the 5s used elsewhere: a restart re-runs PDN
         // attachment and a full IMS-AKA exchange, so a tight loop would
