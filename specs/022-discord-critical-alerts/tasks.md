@@ -280,18 +280,18 @@ with broken audio produces none — per quickstart.md US4.
 
 ### Tests for User Story 4
 
-- [ ] T027 [US4] Unit test for `record_call_end` in
+- [X] T027 [US4] Unit test for `record_call_end` in
       `gsm-sip-bridge/src/modules/mod.rs`'s `#[cfg(test)]` block: the
       `"missed"` status path dispatches exactly one `MissedCall` event with
       the correct caller id/module id/timestamp; the `"answered"` and
       `"failed"` paths dispatch none. **Write first.**
-- [ ] T028 [P] [US4] Integration test in `tests/test_alerts_discord.rs`: a
+- [X] T028 [P] [US4] Integration test in `tests/test_alerts_discord.rs`: a
       `MissedCall` event posts an embed with caller number, line, and
       timestamp.
 
 ### Implementation for User Story 4
 
-- [ ] T029 [US4] In `record_call_end`'s `"missed"` branch
+- [X] T029 [US4] In `record_call_end`'s `"missed"` branch
       (`gsm-sip-bridge/src/modules/mod.rs`), dispatch a `MissedCall`
       `Failure` event (one-shot, always `Failure` per data-model.md — no
       recovery notice for this category) via `Handle::current().spawn(...)`.
