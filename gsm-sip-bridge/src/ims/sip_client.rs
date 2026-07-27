@@ -1215,11 +1215,6 @@ mod tests {
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
-    /// The Contact must advertise the Gm protected *server* port, while the
-    /// Via carries the *client* port we sent from — they are different
-    /// ports, and pointing Contact at the client port makes the
-    /// registration unreachable for everything the network originates.
-    #[test]
     /// A BYE from the side that *answered* flows opposite to the INVITE: our
     /// From is the INVITE's To and vice versa, and it goes to the caller's
     /// Contact rather than the original Request-URI. Getting this backwards
@@ -1248,6 +1243,10 @@ mod tests {
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
+    /// The Contact must advertise the Gm protected *server* port, while the
+    /// Via carries the *client* port we sent from — they are different
+    /// ports, and pointing Contact at the client port makes the
+    /// registration unreachable for everything the network originates.
     #[test]
     fn build_register_advertises_the_protected_server_port_in_contact() {
         let client: SocketAddr = "[2402:8100::1]:48584".parse().unwrap();
