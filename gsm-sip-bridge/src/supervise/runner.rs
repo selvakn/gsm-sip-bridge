@@ -128,6 +128,14 @@ pub trait CommandRunner: Send + Sync {
     /// requested durations, so a change to a cadence constant still fails a
     /// test.
     fn sleep(&self, d: std::time::Duration);
+
+    /// Best-effort TCP connect probe (matches the current script's `exec
+    /// 3<>"/dev/tcp/$host/$port"` readiness/keepalive check) — `true` iff a
+    /// connection was established within a short timeout. Routed through the
+    /// runner like every other real-world effect so the vpcd-readiness gate
+    /// and tunnel keepalive decision logic stay testable without a real
+    /// socket.
+    fn tcp_connect_ok(&self, host: &str, port: u16) -> bool;
 }
 
 /// Production implementation: real `std::process::Command`/`Child`, real
@@ -322,6 +330,17 @@ impl CommandRunner for RealCommandRunner {
     fn sleep(&self, d: std::time::Duration) {
         std::thread::sleep(d);
     }
+
+    fn tcp_connect_ok(&self, host: &str, port: u16) -> bool {
+        use std::net::ToSocketAddrs;
+        let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        let Some(addr) = addrs.next() else {
+            return false;
+        };
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +492,10 @@ mod mock {
         /// PR: a handle nothing ever waits on leaks forever in
         /// `RealCommandRunner`'s table).
         pub wait_calls: Mutex<Vec<ChildHandle>>,
+        /// Overrides `tcp_connect_ok`'s return value for a given
+        /// `"host:port"` key; unseeded keys default to `false` (no
+        /// real network in tests).
+        pub tcp_connect_results: Mutex<Map<String, bool>>,
         next_id: AtomicU64,
     }
 
@@ -500,6 +523,14 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(argv_key.to_string(), output);
+        }
+
+        /// Seeds `tcp_connect_ok(host, port)`'s return value.
+        pub fn set_tcp_connect_ok(&self, host: &str, port: u16, ok: bool) {
+            self.tcp_connect_results
+                .lock()
+                .unwrap()
+                .insert(format!("{host}:{port}"), ok);
         }
 
         pub fn kill_child(&self, handle: ChildHandle, exit_code: i32) {
@@ -628,6 +659,15 @@ mod mock {
 
         fn sleep(&self, d: std::time::Duration) {
             self.sleeps.lock().unwrap().push(d);
+        }
+
+        fn tcp_connect_ok(&self, host: &str, port: u16) -> bool {
+            self.tcp_connect_results
+                .lock()
+                .unwrap()
+                .get(&format!("{host}:{port}"))
+                .copied()
+                .unwrap_or(false)
         }
     }
 
