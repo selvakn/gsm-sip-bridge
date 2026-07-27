@@ -61,6 +61,9 @@ pub struct StrongswanEngine {
     pub charon_log: PathBuf,
     pub netns: String,
     pub tun_iface: String,
+    /// This line's XFRM `if_id`, needed to recreate the interface after
+    /// `SteadyStateHealth::TunVanished` (see `recreate_interface`).
+    pub if_id: String,
     /// The currently-running charon process, if one has been spawned yet —
     /// `RefCell` because `TunnelEngine`'s methods take `&self` (the shared
     /// state-machine functions in `line_supervisor` don't need mutable
@@ -212,6 +215,10 @@ impl TunnelEngine for StrongswanEngine {
     fn reinitiate_cadence(&self) -> Option<u32> {
         Some(super::line_supervisor::STRONGSWAN_REINITIATE_EVERY)
     }
+
+    fn recreate_interface(&self, runner: &dyn CommandRunner) {
+        super::epdg_iface::ensure_epdg_interface(runner, &self.netns, &self.tun_iface, &self.if_id);
+    }
 }
 
 /// 1:1 port of `grep -q "STATE CONNECTED"`.
@@ -331,6 +338,13 @@ impl TunnelEngine for SwuEngine {
     fn reinitiate_cadence(&self) -> Option<u32> {
         None
     }
+
+    fn recreate_interface(&self, _runner: &dyn CommandRunner) {
+        // No pre-created interface concept for this engine — the dialer
+        // manages its own tun device, and `restart_process` (a full dialer
+        // respawn) is this engine's only recovery path, matching the
+        // current script's own comment on `start_line_swu`.
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +430,7 @@ mod tests {
                 charon_log: PathBuf::from("/tmp/charon-0.log"),
                 netns: "ims".to_string(),
                 tun_iface: "tun23".to_string(),
+                if_id: "23".to_string(),
                 charon_handle: RefCell::new(None),
             }
         }

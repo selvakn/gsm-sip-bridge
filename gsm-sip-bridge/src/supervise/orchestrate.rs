@@ -484,6 +484,7 @@ fn start_vowifi_line_strongswan(
         charon_log: charon_log.clone(),
         netns: netns.clone(),
         tun_iface: tun_iface.clone(),
+        if_id: if_id.clone(),
         charon_handle: RefCell::new(None),
     };
     let _ = runner.write_file(&charon_log, "");

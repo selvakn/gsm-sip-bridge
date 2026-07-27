@@ -86,6 +86,18 @@ pub trait TunnelEngine {
     fn reinitiate(&self, runner: &dyn CommandRunner);
     /// Steady-state-only health beyond process-alive/P-CSCF-change.
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth;
+    /// Recreates this line's tunnel interface after `SteadyStateHealth::
+    /// TunVanished` — 1:1 port of the current script's own comment: "tun can
+    /// vanish from the kernel entirely while swanctl still reports the
+    /// CHILD_SA ESTABLISHED/INSTALLED (observed live, specs/012-strongswan-
+    /// epdg) — recreate ... rather than trusting the desynced SA." Found
+    /// missing live: an earlier version of this port detected TunVanished
+    /// correctly but never recreated the interface before re-initiating,
+    /// so every subsequent negotiation kept succeeding at the IKE/CHILD_SA
+    /// level while silently failing to install a working data path — a
+    /// fresh IKE_SA every ~30s (one steady-state tick), forever. No-op for
+    /// swu, which has no equivalent pre-created interface concept.
+    fn recreate_interface(&self, runner: &dyn CommandRunner);
     /// Fully restarts this line's primary process from scratch (strongswan:
     /// kill, clear log, remove the stale unqualified pidfile, respawn
     /// charon, `swanctl --load-all`, `swanctl --initiate`; swu: respawn the
@@ -203,13 +215,15 @@ pub fn tick_steady_state(
             };
         }
         SteadyStateHealth::TunVanished => {
-            // The current script also recreates the XFRM interface here
-            // (`ensure_epdg_interface`) before terminate+reinitiate — that
-            // idempotent netns/interface setup is orchestrated by the
-            // caller (supervise::mod, Phase 4), which already owns
-            // `ensure_epdg_interface`'s equivalent for initial setup; this
-            // tick only issues the terminate+reinitiate strongSwan expects
-            // once the interface is back.
+            // 1:1 port of the current script's own recovery: recreate the
+            // XFRM interface (idempotent — matches `ensure_epdg_interface`)
+            // BEFORE terminate+reinitiate. Missing this call was a real bug
+            // found live: without it, every subsequent negotiation kept
+            // succeeding at the IKE/CHILD_SA level while silently failing to
+            // install a working data path onto an interface that was never
+            // actually recreated — a fresh IKE_SA every steady-state tick,
+            // forever, never actually fixing the underlying problem.
+            engine.recreate_interface(runner);
             engine.terminate(runner);
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
@@ -266,6 +280,7 @@ mod tests {
         terminate_calls: RefCell<u32>,
         reinitiate_calls: RefCell<u32>,
         restart_calls: RefCell<u32>,
+        recreate_interface_calls: RefCell<u32>,
     }
 
     impl Default for FakeEngine {
@@ -280,6 +295,7 @@ mod tests {
                 terminate_calls: RefCell::new(0),
                 reinitiate_calls: RefCell::new(0),
                 restart_calls: RefCell::new(0),
+                recreate_interface_calls: RefCell::new(0),
             }
         }
     }
@@ -305,6 +321,9 @@ mod tests {
         }
         fn restart_process(&self, _runner: &dyn CommandRunner) {
             *self.restart_calls.borrow_mut() += 1;
+        }
+        fn recreate_interface(&self, _runner: &dyn CommandRunner) {
+            *self.recreate_interface_calls.borrow_mut() += 1;
         }
         fn max_establish_attempts(&self) -> Option<u32> {
             self.max_attempts
@@ -479,6 +498,14 @@ mod tests {
             *engine.restart_calls.borrow(),
             0,
             "must not be a full process restart"
+        );
+        assert_eq!(
+            *engine.recreate_interface_calls.borrow(),
+            1,
+            "regression test: an earlier version of this port detected \
+             TunVanished but never recreated the interface, so every \
+             subsequent negotiation kept succeeding at the IKE/CHILD_SA \
+             level while silently failing to install a working data path"
         );
     }
 
