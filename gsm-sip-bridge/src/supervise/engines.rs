@@ -119,7 +119,22 @@ impl StrongswanEngine {
     /// `swanctl --initiate --child ims`.
     fn restart_charon(&self, runner: &dyn CommandRunner) {
         if let Some(old) = self.charon_handle.borrow_mut().take() {
+            // Greptile P1: signaling alone was never enough — RealCommand-
+            // Runner's tracked-children table only drops an entry once
+            // something actually reaps it (via wait()/is_alive() observing
+            // the exit). Discarding `old` here without ever waiting on it
+            // left a permanently un-reaped entry in that table every time
+            // this restart path ran (an unbounded leak over a long-running
+            // container's lifetime), and — more operationally relevant —
+            // let a slow-to-terminate old charon keep running, contending
+            // for the same vici socket/pidfile with the brand new one this
+            // function is about to spawn. `wait()` here blocks only this
+            // line's own recovery thread (each line already runs on its
+            // own, per `orchestrate.rs`), so the cost is bounded by how
+            // long a SIGTERM'd charon takes to actually exit, not anything
+            // shared across lines.
             runner.signal(old, super::runner::Signal::Term);
+            runner.wait(old);
         }
         let _ = runner.write_file(&self.charon_log, "");
         let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
@@ -341,7 +356,12 @@ impl TunnelEngine for SwuEngine {
 
     fn restart_process(&self, runner: &dyn CommandRunner) {
         if let Some(old) = self.dialer_handle.borrow_mut().take() {
+            // Same fix as StrongswanEngine::restart_charon (Greptile P1):
+            // reap the old dialer before spawning its replacement, so its
+            // table entry doesn't leak and it can't overlap/contend with
+            // the new one.
             runner.signal(old, super::runner::Signal::Term);
+            runner.wait(old);
         }
         let _ = runner.write_file(&self.log_file, "");
         *self.dialer_handle.borrow_mut() = self.spawn_dialer(runner);
@@ -477,6 +497,24 @@ mod tests {
                 .any(|c| c == &["rm", "-f", "/var/run/charon.pid"]));
             assert!(engine.charon_handle.borrow().is_some());
             assert_ne!(*engine.charon_handle.borrow(), Some(old));
+        }
+
+        #[test]
+        fn restart_process_reaps_the_old_charon_before_spawning_the_new_one() {
+            // Regression test (Greptile P1): signaling the old handle
+            // without ever waiting on it left a permanently un-reaped entry
+            // in RealCommandRunner's tracked-children table (a leak across
+            // repeated recoveries) and let a slow-to-die old charon overlap
+            // with its replacement. `wait()` must be called on the old
+            // handle before restart_process returns.
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            let old = runner.spawn(ChildSpec::new(["charon"])).unwrap();
+            *engine.charon_handle.borrow_mut() = Some(old);
+
+            engine.restart_process(&runner);
+
+            assert!(runner.wait_calls.lock().unwrap().contains(&old));
         }
 
         #[test]
@@ -622,6 +660,22 @@ mod tests {
             assert_eq!(specs.len(), 1);
             assert!(specs[0].argv.contains(&"-m".to_string()));
             assert!(specs[0].argv.contains(&"/dev/ttyUSB2".to_string()));
+        }
+
+        #[test]
+        fn swu_restart_process_reaps_the_old_dialer_before_spawning_the_new_one() {
+            // Same Greptile P1 fix as StrongswanEngine::restart_charon: the
+            // old dialer handle must actually be waited on, not just
+            // signaled, or it leaks in RealCommandRunner's tracked-children
+            // table and can overlap with its replacement.
+            let runner = MockCommandRunner::new();
+            let engine = swu_engine();
+            let old = runner.spawn(ChildSpec::new(["swu-dialer"])).unwrap();
+            *engine.dialer_handle.borrow_mut() = Some(old);
+
+            engine.restart_process(&runner);
+
+            assert!(runner.wait_calls.lock().unwrap().contains(&old));
         }
     }
 }
