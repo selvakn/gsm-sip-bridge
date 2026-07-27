@@ -542,4 +542,16 @@ The 0% files are exactly the two this session's live-hardware testing (and Grept
 
 ---
 
+## 2026-07-27 (one more) — Greptile found a 12th bug: restarted engines were never reaped
+
+Right after the Phase 7 push, Greptile posted a new P1: `StrongswanEngine::restart_charon` and `SwuEngine::restart_process` both signal the outgoing process handle (`runner.signal(old, Term)`) and discard it without ever calling `wait()` — and since `RealCommandRunner`'s tracked-children table only drops an entry once something actually reaps it, and nothing else ever touches that specific old handle again (the engine's own `charon_handle`/`dialer_handle` field is immediately replaced with the new one), every recovery cycle leaked one table entry, unbounded over a long-running container's lifetime — and worse, nothing guaranteed the old process had actually died before the new one started, so a slow-to-terminate old charon/dialer could run concurrently with its replacement, contending for the same vici socket/pidfile/tun device.
+
+Verified the claim by reading both restart paths directly — confirmed, both have the identical shape. Fixed by adding `runner.wait(old)` right after `signal()` in both, matching the exact pattern already established (and already review-approved) in `sim_recovery.rs`'s background-reader path. Added a regression test per engine asserting the old handle appears in `wait_calls`.
+
+Verified live, precisely: killed charon mid-session, watched it become a zombie (`<defunct>`) immediately after the signal, then confirmed it was fully reaped exactly once the next steady-state tick ran the restart choreography 30s later — `ps aux` showed exactly one charon process throughout the whole window, no overlap, healthcheck stayed clean, tunnel recovered normally. (One unrelated, expected wrinkle during this same test window: a transient run of `SCardConnect: No smart card inserted` / IKE notify error 10500 during re-establish — the same carrier/SIM-access flakiness observed and documented twice earlier in this log, which self-resolved via the existing retry loop within about 2 minutes, same as before. Not a regression.)
+
+656 tests, `make lint` clean. Committed (`4a9f42e`), pushed, replied to Greptile's comment, re-triggered the review. **This brings the total to twelve real bugs found and fixed across this whole feature**, none caught by the mock-based unit suite on its own.
+
+---
+
 (Further entries appended as phases proceed.)
