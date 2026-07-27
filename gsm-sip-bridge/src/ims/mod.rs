@@ -155,9 +155,10 @@ impl RegisteredSession {
         self.gm_state.as_ref().map(|(e, _, _)| e.local_s)
     }
 
-    /// The live client transport. `Err` only if `reconnect_transport`'s own
-    /// plain-connect fallback also failed — the network attachment itself
-    /// is down, a state every caller here already treats like any other
+    /// The live client transport. `Err` only in the brief window inside
+    /// `reconnect_transport`, or lastingly if a Gm-protected rebind there
+    /// failed and was left failed rather than falling back to an unprotected
+    /// connection — every caller here already treats that like any other
     /// transport failure (log and move on, or propagate via `?`).
     pub(crate) fn transport(&self) -> BridgeResult<&SipTransport> {
         self.transport
@@ -198,11 +199,18 @@ impl RegisteredSession {
     /// that is still open. This is why `transport` is briefly `None` here,
     /// and why the field is an `Option` at all.
     ///
-    /// Falls back to a plain reconnect to `pcscf_addr` if there is no Gm SA
-    /// to reuse, or if the Gm-protected rebind itself fails (mirroring the
-    /// same fallback `register_session` uses) — so `transport` is left
-    /// `Some` on any partial success, and only `Err`/`None` if even that
-    /// plain reconnect fails, i.e. the network attachment itself is down.
+    /// Connects plainly to `pcscf_addr` only if there is no Gm SA to reuse
+    /// in the first place (`--sec-agree` off). If a Gm SA *is* active and
+    /// the protected rebind itself fails, this returns `Err` rather than
+    /// falling back to a plain connection — unlike `register_session`'s
+    /// equivalent step, where that fallback is sound because the network
+    /// hasn't committed to requiring protection yet. Once a Gm SA is
+    /// active, a plain reconnect wouldn't match the installed XFRM policy's
+    /// selector, so the P-CSCF would reject or silently drop whatever went
+    /// out on it — worse than a clean, visible failure. `transport` stays
+    /// `None` in that case; every caller already treats that identically to
+    /// any other transport error, and the next scheduled renewal replaces
+    /// the whole session (and its transport) with a fresh one anyway.
     ///
     /// Does not touch `inbound`'s reader threads — the caller must restart
     /// the client-reader half (`session::restart_client_reader`) once this
@@ -213,21 +221,25 @@ impl RegisteredSession {
         if let Some(old) = self.transport.take() {
             old.force_close();
         }
-        let reconnected = match self.gm_state.as_ref() {
+        // No plain-connect fallback here if the Gm-protected rebind fails,
+        // unlike `register_session`'s equivalent step: that fallback is only
+        // sound *before* the network has committed to requiring protection
+        // for this registration. Once a Gm SA is active, the P-CSCF expects
+        // further requests protected under it — a plain reconnect to
+        // `pcscf_addr` wouldn't match the installed XFRM policy's selector,
+        // so it would either go out unprotected (a downgrade the network may
+        // reject or silently drop) or simply not be delivered as intended.
+        // Leaving `transport` `None` and propagating the error is honest:
+        // every caller already treats it exactly like any other transport
+        // failure, and the next scheduled renewal negotiates a fresh SA and
+        // replaces this session (and its transport) wholesale.
+        let new_transport = match self.gm_state.as_ref() {
             Some((endpoints, _, _)) => SipTransport::connect_from(
                 endpoints.local_c.port(),
                 endpoints.remote_s,
                 self.use_tcp,
-            ),
-            None => SipTransport::connect(self.pcscf_addr, self.use_tcp),
-        };
-        let new_transport = match reconnected {
-            Ok(t) => t,
-            Err(e) if self.gm_state.is_some() => {
-                tracing::warn!(error = %e, "failed to reconnect over the negotiated Gm port; falling back to a plain connection");
-                SipTransport::connect(self.pcscf_addr, self.use_tcp)?
-            }
-            Err(e) => return Err(e),
+            )?,
+            None => SipTransport::connect(self.pcscf_addr, self.use_tcp)?,
         };
         self.local_addr = new_transport.local_addr()?;
         self.transport = Some(new_transport);
