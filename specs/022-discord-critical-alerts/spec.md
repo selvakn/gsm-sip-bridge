@@ -16,6 +16,12 @@
 - Q5: Should the four new alert categories (module lifecycle, IMS/SIP registration loss, VoWiFi tunnel failure, missed calls) default to enabled or disabled when this feature first ships? → A: Disabled by default. An operator must explicitly enable each new category in `config.toml`; only the existing SMS-incoming alert remains enabled by default.
 - Q6: Is the "AT command worker unresponsive" threshold duration-based or consecutive-failure-count-based, and what is the default? → A: Duration-based, default 60 seconds with no successful AT command on that module's worker.
 
+### Session 2026-07-27
+
+- Q7: Given the `supervise` module (rebased in from main) already runs its own automatic recovery loops — SIM auto-reset up to a bounded retry count, and per-line tunnel establish/restart cycles — should a module-lifecycle or VoWiFi-tunnel-failure alert fire on the first detected problem, or only once that built-in recovery is exhausted or a timeout is reached? → A: Only once built-in recovery is exhausted or a fixed timeout is reached; a single self-healed blip (e.g. one SIM reset that succeeds, one tunnel restart that re-establishes) MUST NOT raise an alert.
+- Q8: The SIM recovery loop has a concrete "exhausted" signal (`GiveUpForThisIncident` after its bounded reset count), but the VoWiFi tunnel establish loop does not — strongswan retries forever by design, while swu bounds at ~180s. What duration should count as "tunnel failure" for alerting? → A: The tunnel has been continuously non-`Up` for 5 minutes (covers swu's ~180s bounded establish window plus one steady-state restart cycle before alerting).
+- Q9: The `vowifi-ims-agent` also auto-restarts on crash/registration failure with an unbounded 5-second retry loop (`daemon_supervisor::RESTART_DELAY`), the same "no natural give-up" shape as the tunnel loop. What duration should count as "registration loss" for alerting? → A: Same 5-minute threshold as VoWiFi tunnel failure — continuously unregistered for 5 minutes before alerting.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Module/Modem Lifecycle Failure Alerts (Priority: P1)
@@ -28,9 +34,10 @@ When a GSM/LTE module hits a critical failure in its lifecycle — its SIM is mi
 
 **Acceptance Scenarios**:
 
-1. **Given** the bridge is running with alerting enabled, **When** a module's SIM becomes absent or unreadable, **Then** a Discord notification is posted naming the module and the SIM condition.
-2. **Given** the bridge is running, **When** a module fails initialization/discovery at startup, **Then** a Discord notification is posted describing the failure and the module never becomes available for calls.
-3. **Given** a module's AT command worker stops responding (no successful AT command for 60 seconds, configurable), **When** that threshold is exceeded, **Then** a Discord notification is posted identifying the stalled module.
+1. **Given** the bridge is running with alerting enabled, **When** a module's SIM becomes absent or unreadable and the module's own automatic SIM recovery gives up without success, **Then** a Discord notification is posted naming the module and the SIM condition.
+2. **Given** a module's SIM becomes absent or unreadable, **When** the automatic SIM recovery power-cycle succeeds within its retry budget, **Then** no alert is sent for that incident.
+3. **Given** the bridge is running, **When** a module fails initialization/discovery at startup, **Then** a Discord notification is posted describing the failure and the module never becomes available for calls.
+4. **Given** a module's AT command worker stops responding (no successful AT command for 60 seconds, configurable), **When** that threshold is exceeded, **Then** a Discord notification is posted identifying the stalled module.
 
 ---
 
@@ -44,9 +51,10 @@ When a VoLTE or VoWiFi line unexpectedly loses its SIP registration with the PBX
 
 **Acceptance Scenarios**:
 
-1. **Given** a line is registered with the PBX, **When** the registration is lost unexpectedly (not due to a controlled bridge shutdown), **Then** a Discord notification is posted naming the line and the reason for the loss.
-2. **Given** the bridge is shutting down cleanly and deliberately unregisters its lines, **When** this occurs, **Then** no critical alert is sent for that expected unregistration.
-3. **Given** a line's registration was lost and a failure alert was sent, **When** the line successfully re-registers, **Then** a short "recovered" notification is posted naming the line, and no further failure alerts are sent while it stays registered.
+1. **Given** a line is registered with the PBX, **When** the registration is lost unexpectedly and remains lost for 5 continuous minutes (surviving the agent's own automatic crash/restart retries), **Then** a Discord notification is posted naming the line and the reason for the loss.
+2. **Given** a line's registration drops and the agent's own automatic restart re-registers it within 5 minutes, **When** this occurs, **Then** no alert is sent for that incident.
+3. **Given** the bridge is shutting down cleanly and deliberately unregisters its lines, **When** this occurs, **Then** no critical alert is sent for that expected unregistration.
+4. **Given** a line's registration was lost for over 5 minutes and a failure alert was sent, **When** the line successfully re-registers, **Then** a short "recovered" notification is posted naming the line, and no further failure alerts are sent while it stays registered.
 
 ---
 
@@ -60,9 +68,10 @@ When a VoWiFi line's IPsec tunnel to the carrier's ePDG fails to establish or dr
 
 **Acceptance Scenarios**:
 
-1. **Given** a VoWiFi line's tunnel is established, **When** the tunnel unexpectedly fails or drops, **Then** a Discord notification is posted naming the line and the tunnel failure.
-2. **Given** a tunnel failure alert was sent, **When** the tunnel is successfully re-established, **Then** a short "recovered" notification is posted naming the line.
-3. **Given** the bridge is shutting down cleanly and deliberately tears down the tunnel, **When** this occurs, **Then** no critical alert is sent for that expected teardown.
+1. **Given** a VoWiFi line's tunnel is established, **When** the tunnel unexpectedly fails or drops and remains non-established for 5 continuous minutes (surviving the supervisor's own automatic restart/reinitiate attempts), **Then** a Discord notification is posted naming the line and the tunnel failure.
+2. **Given** a VoWiFi line's tunnel drops, **When** the supervisor's own automatic restart re-establishes it within 5 minutes, **Then** no alert is sent for that incident.
+3. **Given** a tunnel failure alert was sent, **When** the tunnel is successfully re-established, **Then** a short "recovered" notification is posted naming the line.
+4. **Given** the bridge is shutting down cleanly and deliberately tears down the tunnel, **When** this occurs, **Then** no critical alert is sent for that expected teardown.
 
 ---
 
@@ -109,6 +118,7 @@ An operator configures which critical event categories raise Discord alerts, and
 - What happens when the same underlying condition would otherwise trigger two different categories at once (e.g., a module's SIM failure also causes its IMS line to deregister)? Each category alerts independently and clearly identifies its own condition; the operator can correlate them by module/line identifier and timestamp.
 - What happens during a planned maintenance restart initiated by the operator (e.g., scheduled card restart)? Expected, operator-initiated restarts must not raise the same alert as an unexpected failure.
 - How does the system behave if the alerting subsystem itself errors (e.g., malformed config)? The bridge must still start and handle calls/SMS normally; alerting configuration errors are logged, and default to alerting disabled for the affected category rather than crashing the bridge.
+- What happens when a module or line's own built-in automatic recovery (SIM power-cycle, tunnel re-establish, IMS agent restart) resolves the problem before its category's recovery-exhaustion/timeout threshold is reached? No alert is sent; a self-healed blip is routine operation, not a critical event.
 
 ## Requirements *(mandatory)*
 
@@ -117,16 +127,19 @@ An operator configures which critical event categories raise Discord alerts, and
 - **FR-001**: System MUST continue to forward incoming SMS to Discord as it does today, and MUST bring that existing behavior under the same configurable alerting mechanism defined by this feature.
 - **FR-002**: System MUST detect and alert on the following critical event categories: module/modem lifecycle failure (SIM absent/unreadable, discovery/initialization failure, unresponsive AT command worker), IMS/SIP registration loss on a VoLTE or VoWiFi line, VoWiFi ePDG/IPsec tunnel failure, and calls missed by the PBX (calls that were never bridged — no answer, declined, or cancelled — excluding calls that bridged but had broken/one-way audio, which are a separate, already-tracked outcome).
 - **FR-003**: An AT command worker MUST be considered unresponsive, and MUST raise a module lifecycle failure alert, after 60 continuous seconds with no successful AT command on that module; this duration MUST be configurable via `config.toml`.
-- **FR-004**: System MUST allow an operator to enable or disable Discord alerting independently per event category via `config.toml`. The existing SMS-incoming category MUST default to enabled (unchanged from today); the four new categories (module lifecycle failure, IMS/SIP registration loss, VoWiFi tunnel failure, missed calls) MUST default to disabled and require explicit opt-in.
-- **FR-005**: System MUST support one shared default Discord webhook URL that applies to all alert categories, and MUST allow an operator to override the webhook URL for any individual category via `config.toml`, in which case that category's alerts go to its overridden webhook instead of the default.
-- **FR-006**: Each Discord alert MUST identify: the event category, the affected module/line identifier (when applicable), a human-readable description of the condition, and a timestamp.
-- **FR-007**: System MUST distinguish deliberate/expected state changes (clean shutdown, operator-initiated restart, configuration-driven removal) from unexpected failures, and MUST NOT raise a critical alert for the former.
-- **FR-008**: System MUST NOT block or delay call handling, SMS handling, or AT command processing while sending or retrying a Discord alert.
-- **FR-009**: System MUST log every critical event and its alert outcome (sent/suppressed/skipped/failed) regardless of whether Discord delivery succeeds.
-- **FR-010**: For module lifecycle, IMS/SIP registration, and VoWiFi tunnel categories, the system MUST alert only on the healthy→unhealthy transition and MUST send a distinct "recovered" notification on the unhealthy→healthy transition; it MUST NOT re-send the failure alert while the condition remains continuously unhealthy.
-- **FR-011**: When no webhook applies to a category (no default configured and no override set), or alerting is disabled for that category, the system MUST skip the Discord call while still logging the event and updating relevant metrics.
-- **FR-012**: Critical alert delivery attempts and outcomes MUST be reflected in the existing Prometheus metrics alongside the current SMS-forwarding metrics.
-- **FR-013**: System MUST treat all alert webhook URLs (default and per-category overrides) as secrets, consistent with existing handling of the SMS Discord webhook URL.
+- **FR-004**: A SIM absent/unreadable condition MUST NOT raise a module lifecycle failure alert while the module's own automatic SIM recovery (power-cycle retries) is still in progress; the alert MUST fire only once that recovery is exhausted for the incident (i.e. it gives up without a successful recovery).
+- **FR-005**: A VoWiFi line's tunnel MUST NOT raise a tunnel-failure alert for a single establish/restart cycle; the alert MUST fire only once the tunnel has remained continuously non-established for 5 minutes, regardless of how many automatic restart attempts occurred in that window. This duration MUST be configurable via `config.toml`.
+- **FR-006**: A VoLTE or VoWiFi line MUST NOT raise an IMS/SIP registration-loss alert for a single agent crash/restart cycle; the alert MUST fire only once the line has remained continuously unregistered for 5 minutes, regardless of how many automatic restart attempts occurred in that window. This duration MUST be configurable via `config.toml`.
+- **FR-007**: System MUST allow an operator to enable or disable Discord alerting independently per event category via `config.toml`. The existing SMS-incoming category MUST default to enabled (unchanged from today); the four new categories (module lifecycle failure, IMS/SIP registration loss, VoWiFi tunnel failure, missed calls) MUST default to disabled and require explicit opt-in.
+- **FR-008**: System MUST support one shared default Discord webhook URL that applies to all alert categories, and MUST allow an operator to override the webhook URL for any individual category via `config.toml`, in which case that category's alerts go to its overridden webhook instead of the default.
+- **FR-009**: Each Discord alert MUST identify: the event category, the affected module/line identifier (when applicable), a human-readable description of the condition, and a timestamp.
+- **FR-010**: System MUST distinguish deliberate/expected state changes (clean shutdown, operator-initiated restart, configuration-driven removal) from unexpected failures, and MUST NOT raise a critical alert for the former.
+- **FR-011**: System MUST NOT block or delay call handling, SMS handling, or AT command processing while sending or retrying a Discord alert.
+- **FR-012**: System MUST log every critical event and its alert outcome (sent/suppressed/skipped/failed) regardless of whether Discord delivery succeeds.
+- **FR-013**: For module lifecycle, IMS/SIP registration, and VoWiFi tunnel categories, the system MUST alert only on the healthy→unhealthy transition (as refined by FR-004/FR-005/FR-006's recovery-exhaustion rules) and MUST send a distinct "recovered" notification on the unhealthy→healthy transition; it MUST NOT re-send the failure alert while the condition remains continuously unhealthy.
+- **FR-014**: When no webhook applies to a category (no default configured and no override set), or alerting is disabled for that category, the system MUST skip the Discord call while still logging the event and updating relevant metrics.
+- **FR-015**: Critical alert delivery attempts and outcomes MUST be reflected in the existing Prometheus metrics alongside the current SMS-forwarding metrics.
+- **FR-016**: System MUST treat all alert webhook URLs (default and per-category overrides) as secrets, consistent with existing handling of the SMS Discord webhook URL.
 
 ### Key Entities
 

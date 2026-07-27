@@ -32,4 +32,5 @@
 ## Notes
 
 - All 3 clarification questions (event category scope, config granularity/webhook routing, flood-control strategy) were resolved with the user on 2026-07-26; answers are recorded in the spec's Clarifications section.
+- After rebasing onto a much-advanced `main` (which brought in the `supervise` module and its self-healing recovery loops), 3 more clarification questions (Q7-Q9, recovery-exhaustion/timeout semantics for SIM, VoWiFi tunnel, and IMS/SIP registration categories) were resolved with the user on 2026-07-27. FR-001 through FR-016 and the affected acceptance scenarios were updated accordingly.
 - All checklist items pass.
