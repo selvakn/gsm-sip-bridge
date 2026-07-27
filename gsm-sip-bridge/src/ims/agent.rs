@@ -712,7 +712,7 @@ pub(crate) fn dispatch_loop(
                     // reason string still drives the BYE for the finer detail.
                     call.lifecycle.end(EndedBy::Pbx);
                     report_answered_call_ended(obs, &call);
-                    hangup_carrier(session, call, &reason);
+                    hangup_carrier(session, inbound, call, &reason);
                     // The call is over; any maintenance held for it may now run.
                     maintenance.release();
                     continue;
@@ -726,7 +726,7 @@ pub(crate) fn dispatch_loop(
                     tracing::warn!(call_id = %call.call_id, "Agent B's control connection dropped mid-call");
                     call.lifecycle.end(EndedBy::Pbx);
                     report_answered_call_ended(obs, &call);
-                    hangup_carrier(session, call, reason::TRANSPORT_ERROR);
+                    hangup_carrier(session, inbound, call, reason::TRANSPORT_ERROR);
                     maintenance.release();
                     continue;
                 }
@@ -1536,7 +1536,23 @@ fn end_call_attachment_lost(session: &mut super::RegisteredSession, mut call: Ac
     tracing::info!(call_id = %call.call_id, reason = reason::ATTACHMENT_LOST, "call ended");
 }
 
-fn hangup_carrier(session: &mut super::RegisteredSession, call: ActiveCall, reason: &str) {
+/// Tells the carrier the call is over after the PBX side hangs up first.
+///
+/// The client transport can die silently mid-call — a NAT or the P-CSCF
+/// itself dropping an idle TCP connection, since no SIP traffic crosses this
+/// leg for the whole call duration (media is a separate RTP path; see
+/// `RegisteredSession::reconnect_transport`) — so the first `send` failing
+/// does not mean the carrier leg is unreachable, only that this particular
+/// socket is dead. One reconnect-and-retry recovers that case; if the retry
+/// also fails, the carrier leg is left stuck up (rare: reconnect only fails
+/// if the underlying network attachment itself is down, in which case the
+/// carrier's own side will eventually time the call out).
+fn hangup_carrier(
+    session: &mut super::RegisteredSession,
+    inbound: &mut Inbound,
+    call: ActiveCall,
+    reason: &str,
+) {
     call.stop.store(true, Ordering::Relaxed);
     let d = &call.dialog;
     let bye = build_bye(&ByeRequest {
@@ -1552,10 +1568,29 @@ fn hangup_carrier(session: &mut super::RegisteredSession, call: ActiveCall, reas
     });
     match session.transport.send(&bye) {
         Ok(()) => {
-            tracing::info!(call_id = %call.call_id, reason, "PBX hung up; sent BYE to the carrier")
+            tracing::info!(call_id = %call.call_id, reason, "PBX hung up; sent BYE to the carrier");
+            return;
         }
         Err(e) => {
-            tracing::warn!(call_id = %call.call_id, error = %e, "failed to BYE the carrier after a PBX hangup")
+            tracing::warn!(call_id = %call.call_id, error = %e, "failed to BYE the carrier after a PBX hangup; reconnecting to retry");
+        }
+    }
+    if let Err(e) = session.reconnect_transport() {
+        tracing::warn!(call_id = %call.call_id, error = %e, "could not reconnect the carrier transport; carrier leg may be left up until the network times it out");
+        return;
+    }
+    match session.transport.send(&bye) {
+        Ok(()) => {
+            tracing::info!(call_id = %call.call_id, reason, "PBX hung up; sent BYE to the carrier after reconnecting");
+        }
+        Err(e) => {
+            tracing::warn!(call_id = %call.call_id, error = %e, "failed to BYE the carrier even after reconnecting; carrier leg may be left up until the network times it out");
+        }
+    }
+    match start_inbound(session) {
+        Ok(new_inbound) => *inbound = new_inbound,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to restart the Gm listeners after a mid-call transport reconnect")
         }
     }
 }

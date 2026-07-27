@@ -176,6 +176,36 @@ impl RegisteredSession {
     /// send_and_recv will block for ~5 seconds waiting for the timeout.
     /// This is acceptable during shutdown but should be monitored if called
     /// in a hot path.
+    /// Re-establishes the client transport (the connection the initial
+    /// REGISTER went out on) after it dies mid-registration — e.g. a NAT or
+    /// the P-CSCF itself silently drops an idle TCP connection during a long
+    /// call, where no SIP traffic crosses this leg until the closing `BYE`
+    /// (media is a separate RTP path). Rebinds to the exact `port-c` local
+    /// port and reconnects to the exact Gm-protected `remote_s` peer the
+    /// original registration negotiated — the same recipe `register_session`
+    /// uses right after installing the Gm SAs — so the still-live IPsec SA
+    /// (its lifetime is independent of any one TCP connection) still applies
+    /// to the new socket. Without a Gm SA (`--sec-agree` off), falls back to
+    /// a plain reconnect to `pcscf_addr`.
+    ///
+    /// Does not touch `inbound`'s reader threads — the caller must restart
+    /// them (`session::start_inbound`) once this returns `Ok`, exactly as a
+    /// renewal already does after installing a fresh `RegisteredSession`.
+    pub(crate) fn reconnect_transport(&mut self) -> BridgeResult<()> {
+        self.transport.force_close();
+        let new_transport = match self.gm_state.as_ref() {
+            Some((endpoints, _, _)) => SipTransport::connect_from(
+                endpoints.local_c.port(),
+                endpoints.remote_s,
+                self.use_tcp,
+            )?,
+            None => SipTransport::connect(self.pcscf_addr, self.use_tcp)?,
+        };
+        self.local_addr = new_transport.local_addr()?;
+        self.transport = new_transport;
+        Ok(())
+    }
+
     pub(crate) fn unregister(&mut self) {
         let via_transport = if self.use_tcp { "TCP" } else { "UDP" };
         let request_uri = format_sip_addr(self.pcscf_addr);
