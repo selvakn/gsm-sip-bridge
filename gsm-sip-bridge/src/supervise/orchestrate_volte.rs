@@ -179,8 +179,19 @@ fn start_multiline(
                         entry.carrier_agent_handles.push(handle);
                     }
                     drop(state);
-                    let status = runner.wait(handle);
-                    println!("[supervise] volte line {idx}: volte-carrier-agent exited (status {status:?}); restarting in 15s");
+                    // Poll is_alive() rather than block on wait(): a real
+                    // Greptile finding (mirroring the one already fixed on
+                    // the vowifi-usim-bridge holder — see runner.rs) caught
+                    // that RealCommandRunner::wait() removes the handle from
+                    // the tracked table BEFORE blocking, which silently
+                    // discards the shutdown plan's later `KillChild` signal
+                    // to this exact handle (stored in
+                    // `carrier_agent_handles` for that purpose) for the
+                    // process's entire lifetime.
+                    while runner.is_alive(handle) {
+                        runner.sleep(Duration::from_secs(1));
+                    }
+                    println!("[supervise] volte line {idx}: volte-carrier-agent exited; restarting in 15s");
                 }
                 Err(e) => eprintln!(
                     "[supervise] volte line {idx}: failed to spawn volte-carrier-agent: {e}"
@@ -208,8 +219,14 @@ fn start_multiline(
         ])) {
             Ok(handle) => {
                 started.lock().unwrap().volte_bridge_supervisor = Some(handle);
-                let status = runner.wait(handle);
-                println!("[supervise] volte-bridge exited (status {status:?}); restarting in 15s");
+                // See the volte-carrier-agent loop above: poll is_alive(),
+                // don't block on wait(), so this handle (which the shutdown
+                // plan signals via `volte_bridge_supervisor`) stays
+                // signalable for as long as the process is actually alive.
+                while runner.is_alive(handle) {
+                    runner.sleep(Duration::from_secs(1));
+                }
+                println!("[supervise] volte-bridge exited; restarting in 15s");
             }
             Err(e) => eprintln!("[supervise] failed to spawn volte-bridge: {e}"),
         }
@@ -251,10 +268,15 @@ fn start_legacy_registration(
                     restore_cid: std::fs::read_to_string(VOLTE_RESTORE_CID_PATH).ok(),
                 });
                 drop(state);
-                let status = runner.wait(handle);
-                println!(
-                    "[supervise] the LTE IMS service exited (status {status:?}); restarting in 15s"
-                );
+                // See the volte-carrier-agent loop above: poll is_alive(),
+                // don't block on wait(), so this handle (which the shutdown
+                // plan signals via `legacy_volte_registration.
+                // supervisor_handle`, then polls with `WaitForExit`) stays
+                // signalable for as long as the process is actually alive.
+                while runner.is_alive(handle) {
+                    runner.sleep(Duration::from_secs(1));
+                }
+                println!("[supervise] the LTE IMS service exited; restarting in 15s");
             }
             Err(e) => eprintln!("[supervise] failed to spawn volte-register: {e}"),
         }
