@@ -9,13 +9,14 @@
 //! absolute value, latest-wins, with no ordering guarantee assumed between
 //! reports (contracts/observability-protocol.md).
 
+use crate::alerts::{AlertCategory, CriticalEvent, CriticalEventKind};
 use crate::control::protocol::{
     AgentKind, AgentReport, AgentState, CallStatus, ObservedEvent, SmsOutcome,
 };
 use crate::metrics;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const TRANSPORT_VOWIFI: &str = "vowifi";
 /// Host-side IMS over LTE. A third value on the existing `transport` label,
@@ -44,6 +45,21 @@ struct AgentRecord {
     /// replay of an already-applied report (its acknowledgement was lost,
     /// so the reporter retried it) and must not be applied twice.
     last_applied: (u64, u64),
+    /// specs/022-discord-critical-alerts. Set the first time a report
+    /// observes `registered = Some(false)`, cleared the moment it observes
+    /// `Some(true)` again — `apply_state` owns this field exclusively.
+    /// `None` means "currently registered (or this agent has never
+    /// reported `registered` at all)".
+    registered_unhealthy_since: Option<Instant>,
+    /// Whether a `RegistrationLoss` alert has already been sent for the
+    /// *current* unhealthy streak — owned exclusively by
+    /// `evaluate_critical_alerts`, so a still-unhealthy tick never re-sends
+    /// (FR-013) and a healthy tick after having alerted sends exactly one
+    /// Recovered notice.
+    registered_alerted: bool,
+    /// Same pair, for `tunnel_up`.
+    tunnel_unhealthy_since: Option<Instant>,
+    tunnel_alerted: bool,
 }
 
 /// Keyed by `(agent kind, module_id)`, not just agent kind — with
@@ -72,14 +88,30 @@ pub fn apply_report(report: &AgentReport) {
     let module_id = report.module_id.as_str();
     let key = (report.agent, module_id.to_string());
     let mut guard = liveness().lock().unwrap();
-    let existing = guard.get(&key);
+    let existing = guard.get(&key).copied();
 
     let is_replay = existing.is_some_and(|record| {
         record.last_applied.0 == report.epoch && report.seq <= record.last_applied.1
     });
 
+    // `*_alerted` is owned exclusively by `evaluate_critical_alerts` — passed
+    // through unchanged here regardless of what `apply_state` does to
+    // `*_unhealthy_since` below, so a healthy report arriving before the
+    // evaluator's next tick doesn't erase the "a Recovered notice is owed"
+    // signal out from under it.
+    let registered_alerted = existing.is_some_and(|r| r.registered_alerted);
+    let tunnel_alerted = existing.is_some_and(|r| r.tunnel_alerted);
+    let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
+    let mut tunnel_unhealthy_since = existing.and_then(|r| r.tunnel_unhealthy_since);
+
     if !is_replay {
-        apply_state(report.agent, module_id, &report.state);
+        apply_state(
+            report.agent,
+            module_id,
+            &report.state,
+            &mut registered_unhealthy_since,
+            &mut tunnel_unhealthy_since,
+        );
 
         for event in &report.events {
             apply_event(report.agent, module_id, event);
@@ -102,11 +134,21 @@ pub fn apply_report(report: &AgentReport) {
         AgentRecord {
             last_report: Instant::now(),
             last_applied,
+            registered_unhealthy_since,
+            registered_alerted,
+            tunnel_unhealthy_since,
+            tunnel_alerted,
         },
     );
 }
 
-fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
+fn apply_state(
+    agent: AgentKind,
+    module_id: &str,
+    state: &AgentState,
+    registered_unhealthy_since: &mut Option<Instant>,
+    tunnel_unhealthy_since: &mut Option<Instant>,
+) {
     let transport = transport_label(agent);
     if let Some(active_calls) = state.active_calls {
         metrics::ACTIVE_CALLS
@@ -134,6 +176,15 @@ fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
             // own.
             AgentKind::VolteSip => {}
         }
+        // specs/022-discord-critical-alerts: a sustained unhealthy streak,
+        // not a raw snapshot — cleared here on every healthy report, but
+        // *when* it flips back is `evaluate_critical_alerts`'s call (it owns
+        // `registered_alerted`, not this function).
+        if registered {
+            *registered_unhealthy_since = None;
+        } else if registered_unhealthy_since.is_none() {
+            *registered_unhealthy_since = Some(Instant::now());
+        }
     }
     if let Some(tunnel_up) = state.tunnel_up {
         let up = if tunnel_up { 1.0 } else { 0.0 };
@@ -147,6 +198,11 @@ fn apply_state(agent: AgentKind, module_id: &str, state: &AgentState) {
             // The telephony half has no tunnel/PDN of its own; unreachable,
             // same as `registered` above.
             AgentKind::VolteSip => {}
+        }
+        if tunnel_up {
+            *tunnel_unhealthy_since = None;
+        } else if tunnel_unhealthy_since.is_none() {
+            *tunnel_unhealthy_since = Some(Instant::now());
         }
     }
     // pbx_registered (Agent B) has no dedicated gauge yet — sip_registered
@@ -236,6 +292,91 @@ pub fn evaluate_liveness(staleness_threshold: std::time::Duration) -> Vec<AgentL
             }
         })
         .collect()
+}
+
+/// specs/022-discord-critical-alerts FR-006/FR-005/FR-013 (US2/US3,
+/// research.md R1/R4). Evaluated on every scrape, mirroring
+/// `evaluate_liveness` — not on a separate timer, one fewer moving part.
+/// Mutates the stored `*_alerted` flags in place: a `RegistrationLoss`/
+/// `TunnelFailure` `Failure` event is returned (and the flag set) the tick a
+/// sustained-unhealthy streak first crosses its threshold; a `Recovered`
+/// event is returned (and the flag cleared) the first tick observed healthy
+/// again after having alerted. Every other tick returns nothing for that
+/// signal — a still-unhealthy-but-already-alerted tick is recorded via
+/// `alerts::record_suppressed` instead of an event.
+pub fn evaluate_critical_alerts(
+    registration_threshold: Duration,
+    tunnel_threshold: Duration,
+) -> Vec<CriticalEvent> {
+    let mut events = Vec::new();
+    let mut guard = liveness().lock().unwrap();
+    let now = Instant::now();
+
+    for ((agent, module_id), record) in guard.iter_mut() {
+        match (record.registered_unhealthy_since, record.registered_alerted) {
+            (Some(since), false) if now.duration_since(since) >= registration_threshold => {
+                record.registered_alerted = true;
+                events.push(CriticalEvent {
+                    category: AlertCategory::RegistrationLoss,
+                    unit_id: Some(module_id.clone()),
+                    description: format!(
+                        "{} line unregistered for over {}s",
+                        agent.as_str(),
+                        registration_threshold.as_secs()
+                    ),
+                    at: chrono::Utc::now(),
+                    kind: CriticalEventKind::Failure,
+                });
+            }
+            (Some(_), true) => {
+                crate::alerts::record_suppressed(AlertCategory::RegistrationLoss);
+            }
+            (None, true) => {
+                record.registered_alerted = false;
+                events.push(CriticalEvent {
+                    category: AlertCategory::RegistrationLoss,
+                    unit_id: Some(module_id.clone()),
+                    description: format!("{} line re-registered", agent.as_str()),
+                    at: chrono::Utc::now(),
+                    kind: CriticalEventKind::Recovered,
+                });
+            }
+            _ => {}
+        }
+
+        match (record.tunnel_unhealthy_since, record.tunnel_alerted) {
+            (Some(since), false) if now.duration_since(since) >= tunnel_threshold => {
+                record.tunnel_alerted = true;
+                events.push(CriticalEvent {
+                    category: AlertCategory::TunnelFailure,
+                    unit_id: Some(module_id.clone()),
+                    description: format!(
+                        "{} line's tunnel non-established for over {}s",
+                        agent.as_str(),
+                        tunnel_threshold.as_secs()
+                    ),
+                    at: chrono::Utc::now(),
+                    kind: CriticalEventKind::Failure,
+                });
+            }
+            (Some(_), true) => {
+                crate::alerts::record_suppressed(AlertCategory::TunnelFailure);
+            }
+            (None, true) => {
+                record.tunnel_alerted = false;
+                events.push(CriticalEvent {
+                    category: AlertCategory::TunnelFailure,
+                    unit_id: Some(module_id.clone()),
+                    description: format!("{} line's tunnel re-established", agent.as_str()),
+                    at: chrono::Utc::now(),
+                    kind: CriticalEventKind::Recovered,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    events
 }
 
 #[cfg(test)]
@@ -418,6 +559,8 @@ mod tests {
                 tunnel_up: Some(true),
                 ..AgentState::default()
             },
+            &mut None,
+            &mut None,
         );
 
         assert_eq!(
@@ -432,5 +575,274 @@ mod tests {
             0.0,
             "and it must not appear as a phantom VoWiFi line"
         );
+    }
+
+    // specs/022-discord-critical-alerts (T017/T023, US2/US3). Real `Instant`
+    // arithmetic — `registered_unhealthy_since`/`tunnel_unhealthy_since` are
+    // backdated directly rather than sleeping (research.md R4).
+    //
+    // `evaluate_critical_alerts` sweeps and mutates *every* entry in the
+    // shared global `liveness()` map, not just the module under test — two
+    // such tests running in parallel can otherwise steal/suppress each
+    // other's expected event. `EVALUATE_LOCK` serializes only the tests that
+    // call `evaluate_critical_alerts` against each other (a lighter-weight,
+    // dependency-free stand-in for what a `#[serial]` attribute would do).
+    static EVALUATE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn backdate_unhealthy_since(agent: AgentKind, module_id: &str, seconds_ago: u64) {
+        let mut guard = liveness().lock().unwrap();
+        let record = guard.get_mut(&(agent, module_id.to_string())).unwrap();
+        let past = Instant::now() - Duration::from_secs(seconds_ago);
+        record.registered_unhealthy_since = record.registered_unhealthy_since.map(|_| past);
+        record.tunnel_unhealthy_since = record.tunnel_unhealthy_since.map(|_| past);
+    }
+
+    #[test]
+    fn registration_loss_sets_unhealthy_since_on_first_false_report() {
+        let module_id = "test-reg-loss-first";
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                registered: Some(false),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+
+        let guard = liveness().lock().unwrap();
+        let record = guard.get(&(AgentKind::Ims, module_id.to_string())).unwrap();
+        assert!(record.registered_unhealthy_since.is_some());
+        assert!(!record.registered_alerted);
+    }
+
+    #[test]
+    fn registration_loss_does_not_reset_unhealthy_since_on_repeated_false_reports() {
+        let module_id = "test-reg-loss-repeat";
+        for seq in 1..=3 {
+            apply_report(&AgentReport {
+                agent: AgentKind::Ims,
+                module_id: module_id.to_string(),
+                epoch: 1,
+                seq,
+                state: AgentState {
+                    registered: Some(false),
+                    ..AgentState::default()
+                },
+                events: vec![],
+                dropped: 0,
+            });
+        }
+        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
+        let since_after_backdate = {
+            let guard = liveness().lock().unwrap();
+            guard
+                .get(&(AgentKind::Ims, module_id.to_string()))
+                .unwrap()
+                .registered_unhealthy_since
+        };
+
+        // A further `false` report must not push `registered_unhealthy_since`
+        // forward again — only the first-in-a-streak report may set it.
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 4,
+            state: AgentState {
+                registered: Some(false),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+        let guard = liveness().lock().unwrap();
+        let record = guard.get(&(AgentKind::Ims, module_id.to_string())).unwrap();
+        assert_eq!(record.registered_unhealthy_since, since_after_backdate);
+    }
+
+    #[test]
+    fn evaluate_critical_alerts_fires_failure_once_threshold_crossed_then_suppresses() {
+        let _guard = EVALUATE_LOCK.lock().unwrap();
+        let module_id = "test-reg-loss-threshold";
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                registered: Some(false),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
+
+        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+        let fired = events
+            .iter()
+            .filter(|e| e.unit_id.as_deref() == Some(module_id))
+            .count();
+        assert_eq!(fired, 1, "exactly one Failure event on first crossing");
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.unit_id.as_deref() == Some(module_id))
+                .unwrap()
+                .kind,
+            CriticalEventKind::Failure
+        );
+
+        // Still unhealthy, already alerted: the next tick must not re-fire.
+        let events_again =
+            evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+        assert!(
+            !events_again
+                .iter()
+                .any(|e| e.unit_id.as_deref() == Some(module_id)),
+            "must not re-alert while continuously unhealthy (FR-013)"
+        );
+    }
+
+    #[test]
+    fn evaluate_critical_alerts_fires_recovered_once_after_alerting() {
+        let _guard = EVALUATE_LOCK.lock().unwrap();
+        let module_id = "test-reg-loss-recovered";
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                registered: Some(false),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
+        evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+
+        // Re-registers within the same tick sequence.
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 2,
+            state: AgentState {
+                registered: Some(true),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+
+        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+        let recovered = events
+            .iter()
+            .find(|e| e.unit_id.as_deref() == Some(module_id))
+            .expect("expected a Recovered event");
+        assert_eq!(recovered.kind, CriticalEventKind::Recovered);
+
+        // And exactly once — a further healthy tick emits nothing more.
+        let events_again =
+            evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+        assert!(!events_again
+            .iter()
+            .any(|e| e.unit_id.as_deref() == Some(module_id)));
+    }
+
+    #[test]
+    fn evaluate_critical_alerts_no_event_when_recovered_before_threshold() {
+        let _guard = EVALUATE_LOCK.lock().unwrap();
+        let module_id = "test-reg-loss-self-healed";
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                registered: Some(false),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+        // Only 30s elapsed, well under a 300s threshold — a self-healed blip.
+        backdate_unhealthy_since(AgentKind::Ims, module_id, 30);
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 2,
+            state: AgentState {
+                registered: Some(true),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+
+        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.unit_id.as_deref() == Some(module_id)),
+            "a blip that self-heals before the threshold must never alert"
+        );
+    }
+
+    /// specs/022-discord-critical-alerts FR-009/T022: a deliberate shutdown
+    /// never sends an explicit `registered = Some(false)` report — the
+    /// agent process just stops reporting entirely (confirmed: nothing in
+    /// `ims::agent`'s dispatch loop or shutdown path constructs one). This
+    /// registration-loss mechanism only ever reacts to reports it actually
+    /// receives, so an agent that goes silent (as a clean shutdown does)
+    /// can never set `registered_unhealthy_since` — that silence is the
+    /// pre-existing, separate `AGENT_UP` staleness mechanism's concern, not
+    /// this one's. This test locks in that a record with no report at all
+    /// yields no alert-eligible state, rather than asserting behavior in
+    /// `ims::agent` this module cannot see.
+    #[test]
+    fn an_agent_that_stops_reporting_entirely_never_sets_unhealthy_since() {
+        let module_id = "test-reg-loss-silent-shutdown";
+        // No apply_report call at all — simulating a clean shutdown that
+        // simply stops sending reports.
+        let guard = liveness().lock().unwrap();
+        assert!(guard
+            .get(&(AgentKind::Ims, module_id.to_string()))
+            .is_none());
+    }
+
+    #[test]
+    fn evaluate_critical_alerts_tunnel_failure_independent_of_registration() {
+        let _guard = EVALUATE_LOCK.lock().unwrap();
+        let module_id = "test-tunnel-independent";
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                registered: Some(true),
+                tunnel_up: Some(false),
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+        backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
+
+        let events = evaluate_critical_alerts(Duration::from_secs(300), Duration::from_secs(300));
+        let fired: Vec<_> = events
+            .iter()
+            .filter(|e| e.unit_id.as_deref() == Some(module_id))
+            .collect();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].category, AlertCategory::TunnelFailure);
     }
 }

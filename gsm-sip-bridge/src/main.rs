@@ -171,9 +171,11 @@ fn main() -> ExitCode {
     rt.block_on(async {
         let metrics_port = config.metrics.port;
         let agent_report_interval_seconds = config.metrics.agent_report_interval_seconds;
+        let alerts_config = config.alerts.clone();
         let metrics_handle = tokio::spawn(async move {
             if let Err(e) =
-                metrics::server::serve(metrics_port, agent_report_interval_seconds).await
+                metrics::server::serve(metrics_port, agent_report_interval_seconds, alerts_config)
+                    .await
             {
                 tracing::error!(error = %e, "metrics server failed");
             }

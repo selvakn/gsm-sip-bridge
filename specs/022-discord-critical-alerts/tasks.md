@@ -188,7 +188,7 @@ quickstart.md US2.
 
 ### Tests for User Story 2
 
-- [ ] T017 [P] [US2] Unit tests in new
+- [X] T017 [P] [US2] Unit tests in new
       `gsm-sip-bridge/tests/test_ingest_critical_alerts.rs` (or
       `metrics::ingest`'s own `#[cfg(test)]` block) for the new
       `registered_unhealthy_since` transition logic: `AgentState.registered
@@ -197,28 +197,28 @@ quickstart.md US2.
       - Duration::from_secs(301)`) yields a `Recovered` event and clears
       the field; `Some(true)` before the threshold elapsed clears it with
       **no** event. **Write first.**
-- [ ] T018 [P] [US2] Integration test in `tests/test_alerts_discord.rs`:
+- [X] T018 [P] [US2] Integration test in `tests/test_alerts_discord.rs`:
       `evaluate_critical_alerts` output for a stale-`registered=false`
       record posts a `RegistrationLoss` embed naming the line id.
 
 ### Implementation for User Story 2
 
-- [ ] T019 [US2] Extend the per-`(AgentKind, module_id)` liveness record in
+- [X] T019 [US2] Extend the per-`(AgentKind, module_id)` liveness record in
       `gsm-sip-bridge/src/metrics/ingest.rs` with
       `registered_unhealthy_since: Option<Instant>`; update it inside
       `apply_report` per the transition rule in data-model.md.
-- [ ] T020 [US2] Implement `evaluate_critical_alerts(thresholds:
+- [X] T020 [US2] Implement `evaluate_critical_alerts(thresholds:
       &CriticalAlertThresholds) -> Vec<CriticalEvent>` in
       `gsm-sip-bridge/src/metrics/ingest.rs` (registration-loss portion for
       now), mirroring `evaluate_liveness`'s "evaluated on every scrape, not
       a timer" shape (research.md R4/R1).
-- [ ] T021 [US2] Call `evaluate_critical_alerts` from the same site
+- [X] T021 [US2] Call `evaluate_critical_alerts` from the same site
       `metrics::server::refresh_agent_liveness` already runs on each scrape
       (`gsm-sip-bridge/src/metrics/server.rs`), and dispatch each returned
       event via `Handle::current().spawn(...)` into
       `DiscordClient::send_alert` (T007) — this stays entirely in the
       existing async/tokio world, no new runtime needed.
-- [ ] T022 [US2] Verify (and adjust if needed) that a deliberate shutdown's
+- [X] T022 [US2] Verify (and adjust if needed) that a deliberate shutdown's
       `ims::unregister` path stops the agent reporting rather than reporting
       `registered = Some(false)`, so `registered_unhealthy_since` is never
       set for an expected teardown (FR-009); add a regression test in
@@ -244,19 +244,19 @@ recovery notice — per quickstart.md US3.
 
 ### Tests for User Story 3
 
-- [ ] T023 [US3] Unit tests for `tunnel_unhealthy_since` transition logic in
+- [X] T023 [US3] Unit tests for `tunnel_unhealthy_since` transition logic in
       the same test file as T017, mirroring its cases exactly but for
       `AgentState.tunnel_up`. **Write first.**
-- [ ] T024 [US3] Integration test in `tests/test_alerts_discord.rs`: a
+- [X] T024 [US3] Integration test in `tests/test_alerts_discord.rs`: a
       stale-`tunnel_up=false` record posts a `TunnelFailure` embed distinct
       from a `RegistrationLoss` one for the same line.
 
 ### Implementation for User Story 3
 
-- [ ] T025 [US3] Extend the liveness record in `metrics::ingest.rs` with
+- [X] T025 [US3] Extend the liveness record in `metrics::ingest.rs` with
       `tunnel_unhealthy_since: Option<Instant>`, same transition rule as
       T019 but keyed on `tunnel_up`.
-- [ ] T026 [US3] Extend `evaluate_critical_alerts` (T020) to also emit
+- [X] T026 [US3] Extend `evaluate_critical_alerts` (T020) to also emit
       `TunnelFailure` events; no new call site needed — T021's dispatch loop
       already consumes whatever the evaluator returns.
 
