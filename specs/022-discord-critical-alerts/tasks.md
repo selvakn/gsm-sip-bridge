@@ -35,15 +35,15 @@ Structure for the full file list. No frontend/backend split.
 **Purpose**: Scaffold the new `alerts` module and its metrics so every later
 task has somewhere to plug in.
 
-- [ ] T001 Add `pub mod alerts;` to `gsm-sip-bridge/src/lib.rs` and create
+- [X] T001 Add `pub mod alerts;` to `gsm-sip-bridge/src/lib.rs` and create
       `gsm-sip-bridge/src/alerts/mod.rs` + `gsm-sip-bridge/src/alerts/discord.rs`
       as empty modules with a module-level doc comment describing their role
       (per plan.md's Project Structure).
-- [ ] T002 [P] Add `AlertCategory` enum (`Sms`, `ModuleLifecycle`,
+- [X] T002 [P] Add `AlertCategory` enum (`Sms`, `ModuleLifecycle`,
       `RegistrationLoss`, `TunnelFailure`, `MissedCall`) with `as_str()` and
       `CriticalEvent`/`CriticalEventKind`/`AlertOutcome` types to
       `gsm-sip-bridge/src/alerts/mod.rs`, per data-model.md.
-- [ ] T003 [P] Add `CRITICAL_ALERTS_TOTAL` (`CounterVec`, labels
+- [X] T003 [P] Add `CRITICAL_ALERTS_TOTAL` (`CounterVec`, labels
       `category, outcome`) and `CRITICAL_EVENT_ACTIVE` (`GaugeVec`, labels
       `category, module`) to `gsm-sip-bridge/src/metrics/mod.rs`, following the
       existing `SMS_FORWARDED_TOTAL`/`AGENT_UP` `Lazy` construction pattern.
@@ -58,11 +58,11 @@ dispatch decision function every user story calls into.
 
 **⚠️ CRITICAL**: No user story task may start until this phase is complete.
 
-- [ ] T004 Add `AlertsConfig`, `CategoryAlertConfig`,
+- [X] T004 Add `AlertsConfig`, `CategoryAlertConfig`,
       `ModuleLifecycleThresholds`, `TunnelFailureThresholds`,
       `RegistrationLossThresholds` structs to `gsm-sip-bridge/src/config/mod.rs`,
       per data-model.md.
-- [ ] T005 Implement `parse_alerts()` in `gsm-sip-bridge/src/config/mod.rs`:
+- [X] T005 Implement `parse_alerts()` in `gsm-sip-bridge/src/config/mod.rs`:
       add `"alerts"` to `TOP_LEVEL_SECTIONS`, add `ALERTS_KEYS`/
       `ALERTS_CATEGORY_KEYS` consts, parse `[alerts]` and each
       `[alerts.<category>]` sub-table (defaults: `sms.enabled = true`, the
@@ -71,7 +71,7 @@ dispatch decision function every user story calls into.
       when `[alerts.sms]` is absent, validate threshold ranges via the
       existing `as_u64_range` helper, and call `warn_unknown_keys_in` for
       each table.
-- [ ] T006 [P] Unit tests for `parse_alerts()` in
+- [X] T006 [P] Unit tests for `parse_alerts()` in
       `gsm-sip-bridge/tests/test_config.rs`: defaults when `[alerts]` is
       absent entirely; explicit per-category enable/disable; per-category
       webhook override resolution; `[sms]`-only backward-compat seeding;
