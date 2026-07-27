@@ -97,10 +97,19 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             match runner.spawn(ChildSpec::new([bin.as_str(), "--config", cfg.as_str()])) {
                 Ok(handle) => {
                     started.lock().unwrap().daemon_supervisor = Some(handle);
-                    let status = runner.wait(handle);
-                    println!(
-                        "[supervise] gsm-sip-bridge daemon exited (status {status:?}); restarting in 5s"
-                    );
+                    // Poll is_alive() rather than block on wait(): this
+                    // handle is stored in StartedState precisely so
+                    // execute_shutdown_plan's KillChild step can signal it
+                    // later from the shutdown thread — a blocking wait()
+                    // here would (per RealCommandRunner::wait()'s own doc
+                    // comment) remove it from the tracked table for this
+                    // process's entire lifetime, silently defeating that
+                    // signal, exactly like the vowifi-usim-bridge holder and
+                    // VoLTE supervision loops fixed earlier in this feature.
+                    while runner.is_alive(handle) {
+                        runner.sleep(Duration::from_secs(1));
+                    }
+                    println!("[supervise] gsm-sip-bridge daemon exited; restarting in 5s");
                 }
                 Err(e) => eprintln!("[supervise] failed to spawn daemon: {e}"),
             }
@@ -197,10 +206,15 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     ])) {
                         Ok(handle) => {
                             started.lock().unwrap().sip_agent_supervisor = Some(handle);
-                            let status = runner.wait(handle);
-                            println!(
-                                "[supervise] vowifi-sip-agent exited (status {status:?}); restarting in 5s"
-                            );
+                            // See the daemon_supervisor loop above: poll
+                            // is_alive(), don't block on wait(), so this
+                            // handle (signaled by execute_shutdown_plan via
+                            // `sip_agent_supervisor`) stays signalable for
+                            // as long as the process is actually alive.
+                            while runner.is_alive(handle) {
+                                runner.sleep(Duration::from_secs(1));
+                            }
+                            println!("[supervise] vowifi-sip-agent exited; restarting in 5s");
                         }
                         Err(e) => eprintln!("[supervise] failed to spawn vowifi-sip-agent: {e}"),
                     }
@@ -233,8 +247,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (shutdown_tx, _rx) = crate::runtime::shutdown_channel();
-    rt.block_on(crate::runtime::wait_for_shutdown(shutdown_tx));
+    rt.block_on(crate::runtime::wait_for_signal());
 
     println!("[supervise] shutting down ...");
     let state = started.lock().unwrap();
@@ -691,8 +704,15 @@ fn start_line_tail(
                     continue;
                 };
                 started.lock().unwrap().vowifi_child_handles.push(handle);
-                let status = runner.wait(handle);
-                println!("[supervise] line {idx}: vowifi-ims-agent exited (status {status:?}); restarting in 5s");
+                // See the daemon_supervisor loop earlier in this file: poll
+                // is_alive(), don't block on wait(), so this handle
+                // (signaled by execute_shutdown_plan via
+                // `vowifi_child_handles`) stays signalable for as long as
+                // the process is actually alive.
+                while runner.is_alive(handle) {
+                    runner.sleep(Duration::from_secs(1));
+                }
+                println!("[supervise] line {idx}: vowifi-ims-agent exited; restarting in 5s");
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
                 let outcome = if sim_recovery::has_csim_failure(&log_content) {
