@@ -18,12 +18,40 @@ use super::line_supervisor::{self, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner, RealCommandRunner};
 use super::shutdown::{self, StartedState};
 use super::{daemon_supervisor, epdg_iface, sim_recovery, vpcd};
+use crate::alerts::{self, discord::DiscordClient, AlertContext};
+use crate::config::secret::Secret;
 use crate::config::AppConfig;
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+/// specs/022-discord-critical-alerts FR-004/research.md R2 (T011/T015): the
+/// pure decision of whether a `sim_recovery::Action` should raise or clear a
+/// module-lifecycle alert for this line, given whether one is already
+/// outstanding. `given_up_alerted` is updated in place; the caller only
+/// needs to act when this returns `Some`. Separate from `csim_fails`
+/// (`sim_recovery::IncidentCounters`), which resets every incident
+/// (including a give-up) — this flag alone must persist across incidents so
+/// a line stuck permanently CSIM-failing doesn't re-alert every cycle
+/// (FR-013).
+fn sim_alert_transition(
+    action: sim_recovery::Action,
+    given_up_alerted: &mut bool,
+) -> Option<alerts::CriticalEventKind> {
+    match action {
+        sim_recovery::Action::GiveUpForThisIncident if !*given_up_alerted => {
+            *given_up_alerted = true;
+            Some(alerts::CriticalEventKind::Failure)
+        }
+        sim_recovery::Action::None if *given_up_alerted => {
+            *given_up_alerted = false;
+            Some(alerts::CriticalEventKind::Recovered)
+        }
+        _ => None,
+    }
+}
 
 fn gsm_sip_bridge_bin() -> String {
     std::env::var("GSM_SIP_BRIDGE_BIN")
@@ -43,6 +71,34 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
         Err(e) => {
             eprintln!("[supervise] FATAL: {e}");
             return ExitCode::FAILURE;
+        }
+    };
+
+    // specs/022-discord-critical-alerts (research.md R3): `run` has no
+    // ambient Tokio context (invoked straight from `main.rs` as a blocking
+    // subcommand), so it builds its own small dedicated runtime once here —
+    // the same pattern `vowifi::mod`'s accept loop already establishes for
+    // firing the async `DiscordClient` from synchronous code. `run` never
+    // returns during normal operation (it supervises for the container's
+    // lifetime), so `_alerts_runtime` binding here for the rest of this
+    // function's body is equivalent to it living exactly as long as the
+    // process does — every `AlertContext::fire` spawns onto its `Handle`.
+    let _alerts_runtime = tokio::runtime::Runtime::new();
+    let alert_ctx = match &_alerts_runtime {
+        Ok(rt) => match DiscordClient::new(Secret::new(String::new())) {
+            Ok(client) => Some(AlertContext::new(
+                client,
+                config.alerts.clone(),
+                rt.handle().clone(),
+            )),
+            Err(e) => {
+                eprintln!("[supervise] failed to create critical-alerts Discord client: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("[supervise] failed to build alerts runtime: {e}");
+            None
         }
     };
 
@@ -229,6 +285,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 let shutting_down = Arc::clone(&shutting_down);
                 let config = config.clone();
                 let line = line.clone();
+                let alert_ctx = alert_ctx.clone();
                 std::thread::spawn(move || {
                     start_vowifi_line(
                         &runner,
@@ -238,6 +295,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                         &line,
                         &started,
                         &shutting_down,
+                        alert_ctx.as_ref(),
                     );
                 });
             }
@@ -414,6 +472,7 @@ fn start_vowifi_line(
     line: &LineResolutionEntry,
     started: &Arc<Mutex<StartedState>>,
     shutting_down: &Arc<RwLock<bool>>,
+    alert_ctx: Option<&AlertContext>,
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
@@ -451,6 +510,7 @@ fn start_vowifi_line(
             &mnc,
             started,
             shutting_down,
+            alert_ctx,
         );
     } else {
         start_vowifi_line_swu(
@@ -463,6 +523,7 @@ fn start_vowifi_line(
             &mnc,
             started,
             shutting_down,
+            alert_ctx,
         );
     }
 }
@@ -478,6 +539,7 @@ fn start_vowifi_line_strongswan(
     mnc: &str,
     started: &Arc<Mutex<StartedState>>,
     shutting_down: &Arc<RwLock<bool>>,
+    alert_ctx: Option<&AlertContext>,
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
@@ -702,6 +764,7 @@ fn start_vowifi_line_strongswan(
         started,
         pcscf.clone(),
         shutting_down,
+        alert_ctx,
     );
 
     // Steady-state supervision loop — runs for the container's lifetime.
@@ -771,6 +834,7 @@ fn start_line_tail(
     started: &Arc<Mutex<StartedState>>,
     initial_pcscf: String,
     shutting_down: &Arc<RwLock<bool>>,
+    alert_ctx: Option<&AlertContext>,
 ) {
     let veth_sip = line.config.veth_sip_iface.clone();
     let veth_ims = line.config.veth_ims_iface.clone();
@@ -817,8 +881,17 @@ fn start_line_tail(
         let usim_holder = Arc::clone(usim_holder);
         let started = Arc::clone(started);
         let shutting_down = Arc::clone(shutting_down);
+        let alert_ctx = alert_ctx.cloned();
+        let line_id = line.card_id.clone();
         std::thread::spawn(move || {
             let mut csim_fails = sim_recovery::IncidentCounters::default();
+            // specs/022-discord-critical-alerts FR-004 (research.md R2):
+            // `Action::GiveUpForThisIncident` already existed but was never
+            // acted on here — the loop just kept retrying forever with no
+            // observable signal. Tracked separately from `csim_fails`
+            // itself, which resets every incident (including a give-up), so
+            // this flag alone decides whether a Recovered notice is owed.
+            let mut given_up_alerted = false;
             let agent_log = PathBuf::from(format!("/tmp/ims-agent-{idx}.out"));
             loop {
                 let guard = shutting_down.read().unwrap();
@@ -865,7 +938,8 @@ fn start_line_tail(
                 } else {
                     sim_recovery::AgentExitOutcome::Other
                 };
-                if csim_fails.observe(outcome) == sim_recovery::Action::ResetSim {
+                let action = csim_fails.observe(outcome);
+                if action == sim_recovery::Action::ResetSim {
                     let holder = *usim_holder.lock().unwrap();
                     let reset_log = PathBuf::from(format!("/tmp/sim-reset-{idx}.log"));
                     sim_recovery::reset_modem_sim(
@@ -874,6 +948,30 @@ fn start_line_tail(
                         &reset_log,
                         holder,
                     );
+                }
+                if action == sim_recovery::Action::GiveUpForThisIncident {
+                    tracing::error!(
+                        line = idx,
+                        "SIM recovery exhausted (MAX_SIM_RESETS reached this incident); \
+                         giving up on this reset cycle, will keep retrying the agent"
+                    );
+                }
+                if let Some(kind) = sim_alert_transition(action, &mut given_up_alerted) {
+                    if let Some(ctx) = &alert_ctx {
+                        let description = match kind {
+                            alerts::CriticalEventKind::Failure => {
+                                "VoWiFi line's SIM recovery exhausted (max resets reached this incident)"
+                            }
+                            alerts::CriticalEventKind::Recovered => "VoWiFi line's SIM recovered",
+                        };
+                        ctx.fire(alerts::CriticalEvent {
+                            category: alerts::AlertCategory::ModuleLifecycle,
+                            unit_id: Some(line_id.clone()),
+                            description: description.to_string(),
+                            at: chrono::Utc::now(),
+                            kind,
+                        });
+                    }
                 }
 
                 runner.sleep(Duration::from_secs(5));
@@ -928,6 +1026,7 @@ fn start_vowifi_line_swu(
     mnc: &str,
     started: &Arc<Mutex<StartedState>>,
     shutting_down: &Arc<RwLock<bool>>,
+    alert_ctx: Option<&AlertContext>,
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
@@ -1009,6 +1108,7 @@ fn start_vowifi_line_swu(
         started,
         pcscf.clone(),
         shutting_down,
+        alert_ctx,
     );
 
     let mut current_pcscf = pcscf;
@@ -1040,5 +1140,55 @@ fn start_vowifi_line_swu(
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sim_alert_transition_fires_failure_once_on_give_up() {
+        let mut alerted = false;
+        assert_eq!(
+            sim_alert_transition(sim_recovery::Action::GiveUpForThisIncident, &mut alerted),
+            Some(alerts::CriticalEventKind::Failure)
+        );
+        assert!(alerted);
+    }
+
+    #[test]
+    fn sim_alert_transition_does_not_repeat_failure_while_still_given_up() {
+        let mut alerted = true;
+        assert_eq!(
+            sim_alert_transition(sim_recovery::Action::GiveUpForThisIncident, &mut alerted),
+            None,
+            "must not re-alert every incident while permanently stuck (FR-013)"
+        );
+        assert!(alerted);
+    }
+
+    #[test]
+    fn sim_alert_transition_fires_recovered_once_after_give_up() {
+        let mut alerted = true;
+        assert_eq!(
+            sim_alert_transition(sim_recovery::Action::None, &mut alerted),
+            Some(alerts::CriticalEventKind::Recovered)
+        );
+        assert!(!alerted);
+    }
+
+    #[test]
+    fn sim_alert_transition_none_when_never_alerted() {
+        let mut alerted = false;
+        assert_eq!(
+            sim_alert_transition(sim_recovery::Action::None, &mut alerted),
+            None
+        );
+        assert_eq!(
+            sim_alert_transition(sim_recovery::Action::ResetSim, &mut alerted),
+            None,
+            "a plain reset with no prior give-up is not itself a recovery notice"
+        );
     }
 }

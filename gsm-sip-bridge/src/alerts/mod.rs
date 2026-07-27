@@ -14,7 +14,7 @@
 pub mod discord;
 
 use crate::config::secret::Secret;
-use crate::config::CategoryAlertConfig;
+use crate::config::{AlertsConfig, CategoryAlertConfig};
 use chrono::{DateTime, Utc};
 
 /// Which critical-event category an alert belongs to. A closed enum, not a
@@ -133,6 +133,138 @@ pub fn precheck(
         return Some(AlertOutcome::Skipped);
     }
     None
+}
+
+fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryAlertConfig {
+    match category {
+        AlertCategory::Sms => &config.sms,
+        AlertCategory::ModuleLifecycle => &config.module_lifecycle,
+        AlertCategory::RegistrationLoss => &config.registration_loss,
+        AlertCategory::TunnelFailure => &config.tunnel_failure,
+        AlertCategory::MissedCall => &config.missed_call,
+    }
+}
+
+/// The single entry point every category's call site uses: resolves
+/// enabled/webhook (FR-007/FR-008/FR-014), sends via `client` if applicable,
+/// and records the outcome in `CRITICAL_ALERTS_TOTAL`/`CRITICAL_EVENT_ACTIVE`
+/// plus a structured log line. Intended to be run via
+/// `tokio::runtime::Handle::spawn`/`Runtime::spawn` (fire-and-forget, never
+/// awaited by a call/SMS/AT-command hot path — FR-011).
+pub async fn dispatch(
+    client: &discord::DiscordClient,
+    config: &AlertsConfig,
+    event: CriticalEvent,
+) {
+    let cfg = category_config(config, event.category);
+    let outcome = match precheck(cfg, &config.default_webhook_url) {
+        Some(outcome) => outcome,
+        None => {
+            let webhook = resolve_webhook(cfg, &config.default_webhook_url)
+                .expect("precheck already confirmed a webhook resolves")
+                .to_string();
+            match client.send_alert(&webhook, &event).await {
+                Ok(status) => AlertOutcome::Sent(status),
+                Err(e) => AlertOutcome::Failed(e),
+            }
+        }
+    };
+
+    crate::metrics::CRITICAL_ALERTS_TOTAL
+        .with_label_values(&[event.category.as_str(), outcome.as_label()])
+        .inc();
+    // Sms/MissedCall are one-shot events with no ongoing health state
+    // (data-model.md) — the active gauge only makes sense for the three
+    // categories that track a healthy/unhealthy condition over time.
+    let tracks_ongoing_health = matches!(
+        event.category,
+        AlertCategory::ModuleLifecycle
+            | AlertCategory::RegistrationLoss
+            | AlertCategory::TunnelFailure
+    );
+    if tracks_ongoing_health {
+        if let Some(unit_id) = &event.unit_id {
+            let active = match event.kind {
+                CriticalEventKind::Failure => 1.0,
+                CriticalEventKind::Recovered => 0.0,
+            };
+            crate::metrics::CRITICAL_EVENT_ACTIVE
+                .with_label_values(&[event.category.as_str(), unit_id])
+                .set(active);
+        }
+    }
+
+    match &outcome {
+        AlertOutcome::Sent(status) => tracing::info!(
+            category = event.category.as_str(),
+            unit_id = ?event.unit_id,
+            status,
+            "critical alert sent"
+        ),
+        AlertOutcome::Suppressed => tracing::debug!(
+            category = event.category.as_str(),
+            unit_id = ?event.unit_id,
+            "critical alert suppressed (still unhealthy, already alerted)"
+        ),
+        AlertOutcome::Skipped => tracing::debug!(
+            category = event.category.as_str(),
+            unit_id = ?event.unit_id,
+            description = %event.description,
+            "critical alert skipped (category disabled or no webhook configured)"
+        ),
+        AlertOutcome::Failed(e) => tracing::warn!(
+            category = event.category.as_str(),
+            unit_id = ?event.unit_id,
+            error = %e,
+            "critical alert delivery failed"
+        ),
+    }
+}
+
+/// Records a suppressed tick (FR-013: still continuously unhealthy, no
+/// re-alert) directly in the metric, without attempting delivery — used by
+/// `metrics::ingest`'s evaluator for categories it polls on each report.
+pub fn record_suppressed(category: AlertCategory) {
+    crate::metrics::CRITICAL_ALERTS_TOTAL
+        .with_label_values(&[category.as_str(), AlertOutcome::Suppressed.as_label()])
+        .inc();
+}
+
+/// A cheap, `Clone`-able handle bundling everything a *synchronous* call
+/// site (no ambient `tokio::runtime::Handle::current()`) needs to fire an
+/// alert without blocking (research.md R3) — `supervise::orchestrate`'s
+/// per-line threads build one dedicated `Runtime` at startup and pass this
+/// down instead of threading `Handle`/`DiscordClient`/`AlertsConfig`
+/// separately through every function in the call chain.
+#[derive(Clone)]
+pub struct AlertContext {
+    client: std::sync::Arc<discord::DiscordClient>,
+    config: std::sync::Arc<AlertsConfig>,
+    handle: tokio::runtime::Handle,
+}
+
+impl AlertContext {
+    pub fn new(
+        client: discord::DiscordClient,
+        config: AlertsConfig,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            client: std::sync::Arc::new(client),
+            config: std::sync::Arc::new(config),
+            handle,
+        }
+    }
+
+    /// Fire-and-forget (FR-011): spawns onto the dedicated runtime and
+    /// returns immediately, never blocking the calling thread on the
+    /// Discord round-trip.
+    pub fn fire(&self, event: CriticalEvent) {
+        let client = std::sync::Arc::clone(&self.client);
+        let config = std::sync::Arc::clone(&self.config);
+        self.handle
+            .spawn(async move { dispatch(&client, &config, event).await });
+    }
 }
 
 #[cfg(test)]

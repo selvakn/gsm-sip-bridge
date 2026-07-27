@@ -78,14 +78,14 @@ dispatch decision function every user story calls into.
       out-of-range threshold falls back to default with a warning, not a
       fatal error. **Write these first; confirm they fail before T004/T005
       land.**
-- [ ] T007 Generalize `gsm-sip-bridge/src/sms/discord.rs`'s embed-building
+- [X] T007 Generalize `gsm-sip-bridge/src/sms/discord.rs`'s embed-building
       into `gsm-sip-bridge/src/alerts/discord.rs` as a `DiscordClient::
       send_alert(&self, event: &CriticalEvent) -> Result<u16, String>`
       method (reusing the existing retry/backoff/timeout logic verbatim);
       keep `forward_sms` as a thin wrapper that builds a `CriticalEvent` for
       the `Sms` category and calls `send_alert`, so behavior is byte-for-byte
       unchanged for existing SMS forwarding (FR-001).
-- [ ] T008 Implement `alerts::dispatch::resolve(category_config: &
+- [X] T008 Implement `alerts::dispatch::resolve(category_config: &
       CategoryAlertConfig, default_webhook: &Secret<String>) -> Option<&str>`
       (webhook resolution: override wins, else default, else `None`) and
       `alerts::dispatch::decide_outcome(...)` (enabled/disabled →
@@ -93,7 +93,7 @@ dispatch decision function every user story calls into.
       `gsm-sip-bridge/src/alerts/mod.rs` — the pure decision core shared by
       every category, independent of how the actual send is invoked
       (async `Handle` vs. dedicated `Runtime`, research.md R3).
-- [ ] T009 [P] Unit tests for `alerts::dispatch::resolve`/`decide_outcome` in
+- [X] T009 [P] Unit tests for `alerts::dispatch::resolve`/`decide_outcome` in
       `gsm-sip-bridge/src/alerts/mod.rs`'s `#[cfg(test)]` block: default vs.
       override webhook resolution; disabled category; missing webhook
       entirely. **Write first.**
@@ -119,20 +119,20 @@ module/line and condition, per quickstart.md US1.
 
 ### Tests for User Story 1
 
-- [ ] T010 [P] [US1] Unit test for a new pure helper
+- [X] T010 [P] [US1] Unit test for a new pure helper
       `modules::at_worker::is_unresponsive(last_success: Instant, now:
       Instant, threshold: Duration) -> bool` in
       `gsm-sip-bridge/src/modules/mod.rs` — construct `last_success` as
       `Instant::now() - Duration::from_secs(61)` against a 60s threshold
       (no sleeping). **Write first.**
-- [ ] T011 [P] [US1] Extend `gsm-sip-bridge/src/supervise/sim_recovery.rs`'s
+- [X] T011 [P] [US1] Extend `gsm-sip-bridge/src/supervise/sim_recovery.rs`'s
       existing table-driven tests with a case asserting that observing
       `Action::GiveUpForThisIncident` is distinguishable by the caller from
       `Action::ResetSim`/no-action (the type already supports this — this
       test locks in the call site's obligation to handle it, addressing the
       research.md R2 gap). **Write first; must fail against today's
       `orchestrate.rs`, which currently drops this case silently.**
-- [ ] T012 [P] [US1] Integration test in new
+- [X] T012 [P] [US1] Integration test in new
       `gsm-sip-bridge/tests/test_alerts_discord.rs` using `wiremock` (the
       existing external-service mock convention from
       `tests/test_sms_discord.rs`): dispatching a `ModuleLifecycle`
@@ -141,7 +141,7 @@ module/line and condition, per quickstart.md US1.
 
 ### Implementation for User Story 1
 
-- [ ] T013 [US1] Add a per-module `last_at_success: Instant` field (reset on
+- [X] T013 [US1] Add a per-module `last_at_success: Instant` field (reset on
       every successful AT command) to the module/card state in
       `gsm-sip-bridge/src/modules/mod.rs`; on each poll tick, call
       `at_worker::is_unresponsive` (T010) and dispatch a `ModuleLifecycle`
@@ -155,12 +155,12 @@ module/line and condition, per quickstart.md US1.
       `Handle::current().spawn(...)` — this path has no existing
       auto-recovery loop, so it fires directly (no exhaustion wait, unlike
       the VoWiFi SIM path below).
-- [ ] T015 [US1] In `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
+- [X] T015 [US1] In `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
       per-line `vowifi-ims-agent` supervision loop (~line 868), add the
       missing `match` arm for `sim_recovery::Action::GiveUpForThisIncident`:
       log via `tracing::error!` and dispatch a `ModuleLifecycle` `Failure`
       event for that line (research.md R2).
-- [ ] T016 [US1] In `supervise::orchestrate::run` (`gsm-sip-bridge/src/
+- [X] T016 [US1] In `supervise::orchestrate::run` (`gsm-sip-bridge/src/
       supervise/orchestrate.rs`), after `config::load_config`, build one
       dedicated `tokio::runtime::Runtime` (research.md R3) and load
       `AlertsConfig`; wrap both in `Arc` and thread them into the per-line
