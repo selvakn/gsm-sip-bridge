@@ -58,7 +58,7 @@ docker-logs: ## Tail logs from all containers
 
 coverage: ## Generate code coverage report (requires cargo-llvm-cov)
 	@cargo llvm-cov --workspace --lcov --output-path lcov.info
-	@cargo llvm-cov report --workspace
+	@cargo llvm-cov report
 
 mutants: ## Mutation test core logic (store, AT parser, control protocol) — fast, no hardware needed
 	@cargo mutants \
