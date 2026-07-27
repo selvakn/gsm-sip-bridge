@@ -42,6 +42,8 @@ services:
     network_mode: host
     restart: unless-stopped
     privileged: true
+    # tini as PID 1 reaps orphaned zombie processes (supervise deliberately doesn't).
+    init: true
     volumes:
       - bridge-data:/data
       # Root-level config.toml is canonical (config.toml.example documents
