@@ -617,21 +617,36 @@ fn start_vowifi_line_strongswan(
     };
     let _ = runner.write_file(&charon_log, "");
     let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
-    match runner.spawn(
-        ChildSpec::new([
-            "env",
-            &format!("STRONGSWAN_CONF={}", engine.strongswan_conf),
-            "/usr/libexec/ipsec/charon",
-        ])
-        .capture_stdout_to(charon_log.clone()),
-    ) {
-        Ok(h) => {
-            *engine.charon_handle.borrow_mut() = Some(h);
-            started.lock().unwrap().vowifi_child_handles.push(h);
-        }
-        Err(e) => {
-            eprintln!("[supervise] line {idx}: FATAL: failed to spawn charon: {e}");
+    {
+        // Greptile P1 (round 3, same design gap): the RwLock guard added for
+        // recovery/steady-state covered restarts, but this line's very
+        // *first* charon spawn — reached via its own top-level background
+        // thread during initial startup — had no guard at all. If shutdown
+        // begins while a line is still starting up for the first time, this
+        // spawn could register its handle into StartedState after
+        // shutdown's snapshot was already taken, exactly like the recovery
+        // case, just at a different call site.
+        let guard = shutting_down.read().unwrap();
+        if *guard {
+            println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
             return;
+        }
+        match runner.spawn(
+            ChildSpec::new([
+                "env",
+                &format!("STRONGSWAN_CONF={}", engine.strongswan_conf),
+                "/usr/libexec/ipsec/charon",
+            ])
+            .capture_stdout_to(charon_log.clone()),
+        ) {
+            Ok(h) => {
+                *engine.charon_handle.borrow_mut() = Some(h);
+                started.lock().unwrap().vowifi_child_handles.push(h);
+            }
+            Err(e) => {
+                eprintln!("[supervise] line {idx}: FATAL: failed to spawn charon: {e}");
+                return;
+            }
         }
     }
 
@@ -937,10 +952,19 @@ fn start_vowifi_line_swu(
         log_file: log_file.clone(),
         dialer_handle: RefCell::new(None),
     };
+    // Same guard as strongswan's initial charon spawn above (Greptile P1,
+    // round 3): this line's very first dialer spawn had no guard at all.
+    let guard = shutting_down.read().unwrap();
+    if *guard {
+        println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
+        return;
+    }
     engine.restart_process(runner.as_ref()); // first spawn, same path as later respawns
     if let Some(h) = *engine.dialer_handle.borrow() {
         started.lock().unwrap().vowifi_child_handles.push(h);
+        drop(guard);
     } else {
+        drop(guard);
         eprintln!("[supervise] line {idx}: FATAL: failed to spawn swu dialer");
         return;
     }
