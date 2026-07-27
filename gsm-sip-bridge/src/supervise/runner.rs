@@ -380,6 +380,38 @@ mod real_runner_tests {
     }
 
     #[test]
+    fn a_handle_polled_via_is_alive_stays_signalable_the_whole_time_unlike_wait() {
+        // Regression test for a real Greptile finding on the vowifi-usim-
+        // bridge holder: its supervision loop used to block on wait(), which
+        // (per wait_removes_the_entry_so_the_handle_cannot_be_signaled_
+        // afterward above) removes the table entry before blocking — so
+        // sim_recovery::reset_modem_sim's SIGSTOP/SIGCONT calls to that same
+        // handle, issued from a different thread while the holder is still
+        // alive, silently no-opped for the holder's entire lifetime.
+        // Switching that loop to poll is_alive() instead keeps the table
+        // entry — and therefore the handle's signalability — intact for as
+        // long as the process is actually alive.
+        let runner = std::sync::Arc::new(RealCommandRunner::new());
+        let handle = runner.spawn(ChildSpec::new(["sleep", "2"])).unwrap();
+
+        let r1 = std::sync::Arc::clone(&runner);
+        let poller = std::thread::spawn(move || {
+            while r1.is_alive(handle) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        // Give the poller a moment to start, then confirm the handle is
+        // still genuinely tracked and signalable mid-flight — this is
+        // exactly the property wait() breaks.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(runner.children.lock().unwrap().contains_key(&handle.0));
+        runner.signal(handle, Signal::Kill);
+        poller.join().unwrap();
+        assert!(!runner.is_alive(handle));
+    }
+
+    #[test]
     fn a_still_running_child_can_be_signaled_and_is_observed_dead_after() {
         let runner = RealCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["sleep", "30"])).unwrap();

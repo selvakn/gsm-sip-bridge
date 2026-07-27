@@ -466,8 +466,23 @@ fn start_vowifi_line_strongswan(
                 Ok(h) => {
                     *usim_holder.lock().unwrap() = Some(h);
                     started.lock().unwrap().vowifi_child_handles.push(h);
-                    let status = runner.wait(h);
-                    println!("[supervise] line {idx}: vowifi-usim-bridge exited (status {status:?}); restarting in 5s");
+                    // Poll is_alive() rather than blocking on wait(): a real
+                    // review finding caught that RealCommandRunner::wait()
+                    // removes the handle from the tracked table BEFORE
+                    // blocking (by design, to close a PID-reuse race — see
+                    // its own doc comment), which made this handle
+                    // permanently un-signalable for the holder's entire
+                    // lifetime. sim_recovery::reset_modem_sim needs to send
+                    // it SIGSTOP/SIGCONT via this exact handle (read out of
+                    // `usim_holder` from a different thread) while it's
+                    // still running, so a blocking wait() here silently
+                    // defeated that synchronization — the mocked test never
+                    // caught it because MockCommandRunner::wait() doesn't
+                    // remove the entry the way the real one does.
+                    while runner.is_alive(h) {
+                        runner.sleep(Duration::from_secs(1));
+                    }
+                    println!("[supervise] line {idx}: vowifi-usim-bridge exited; restarting in 5s");
                 }
                 Err(e) => {
                     eprintln!("[supervise] line {idx}: failed to spawn vowifi-usim-bridge: {e}")
