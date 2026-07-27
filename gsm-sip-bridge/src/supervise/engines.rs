@@ -139,6 +139,22 @@ impl StrongswanEngine {
             *self.charon_handle.borrow_mut() = Some(handle);
         }
 
+        // 1:1 port of the current script's own `sleep 2 # let the vici
+        // socket come up before swanctl talks to it` — present at every one
+        // of its charon-respawn sites. Missing here (an FR-009 gap found
+        // live, T049): `--load-all` issued before charon's vici socket is
+        // listening silently fails (its result is deliberately ignored,
+        // matching the script's own `|| true`), then `--initiate` fails
+        // with "CHILD_SA config 'ims' not found" since nothing was ever
+        // loaded — and steady-state's ChildSaMissing branch only ever
+        // re-initiates, never reloads, so the tunnel never recovers on its
+        // own afterward. Observed live: killing charon mid-session left the
+        // line permanently stuck re-initiating against an empty vici
+        // config every 30s, while the healthcheck kept passing on the
+        // stale (pre-kill) tun23-0 address — a silently broken tunnel
+        // reporting healthy.
+        runner.sleep(std::time::Duration::from_secs(2));
+
         self.swanctl(runner, &["--load-all", "--file", &self.swanctl_top_conf]);
         self.swanctl_background(runner, &["--initiate", "--child", "ims"]);
     }
@@ -506,6 +522,36 @@ mod tests {
             assert!(spawn_specs
                 .iter()
                 .any(|s| s.argv.contains(&"--initiate".to_string())));
+        }
+
+        #[test]
+        fn restart_process_sleeps_before_load_all_to_let_the_vici_socket_come_up() {
+            // Regression test for a real bug found live (T049/FR-009 audit):
+            // the bash original has `sleep 2 # let the vici socket come up
+            // before swanctl talks to it` at every one of its charon-respawn
+            // sites, including this one — but this port's restart_charon
+            // had it only at the *initial* startup call site (orchestrate.rs),
+            // not here. Missing it here meant `--load-all` could run before
+            // the freshly respawned charon's vici socket was listening,
+            // silently failing to load anything, so the follow-up
+            // `--initiate` failed with "CHILD_SA config 'ims' not found" —
+            // and steady-state's ChildSaMissing branch only ever
+            // re-initiates, never reloads, so the tunnel never recovered on
+            // its own. Observed live: killing charon mid-session left the
+            // line permanently stuck, while the healthcheck kept passing on
+            // the stale pre-kill tun23-0 address.
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.restart_process(&runner);
+            assert!(
+                runner
+                    .sleeps
+                    .lock()
+                    .unwrap()
+                    .contains(&std::time::Duration::from_secs(2)),
+                "restart_process must sleep 2s before --load-all, matching \
+                 the bash original at every one of its charon-respawn sites"
+            );
         }
 
         #[test]
