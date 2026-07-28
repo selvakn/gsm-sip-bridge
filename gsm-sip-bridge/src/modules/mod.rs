@@ -6,6 +6,8 @@ pub mod discovery;
 pub mod scheduler;
 pub mod usim;
 
+use crate::alerts;
+use crate::config::secret::Secret;
 use crate::config::AppConfig;
 use crate::control::protocol::{ControlCmd, ControlResp, SlotInfo};
 use crate::metrics;
@@ -47,6 +49,10 @@ pub enum BridgeEvent {
     NetworkLost {
         module_id: String,
     },
+    /// specs/022-discord-critical-alerts. Sent from the blocking per-module
+    /// loop (which has no direct tokio `Handle`) so the async side can
+    /// dispatch it via `Handle::current()`, mirroring `SmsReceived`.
+    CriticalAlert(alerts::CriticalEvent),
 }
 
 pub type ControlCmdSender = mpsc::Sender<(ControlCmd, oneshot::Sender<ControlResp>)>;
@@ -111,12 +117,30 @@ pub fn backoff_delay(attempt: u32, initial_sec: u64, max_sec: u64) -> Duration {
     Duration::from_secs(secs.min(max_sec))
 }
 
+/// specs/022-discord-critical-alerts (Greptile P1 fix): finds a stale
+/// `GivenUp` slot for `module_id`, if one exists under a *different* key —
+/// rediscovery (a USB rescan or a fresh startup scan) creates a brand new
+/// slot rather than reusing the old one, so without this the old slot would
+/// otherwise sit there forever with no recovery notification ever sent and
+/// its `CRITICAL_EVENT_ACTIVE` gauge stuck at 1.
+fn find_given_up_slot(slots: &HashMap<u32, SlotState>, module_id: &str) -> Option<u32> {
+    slots
+        .iter()
+        .find(|(_, s)| s.lifecycle == LifecycleState::GivenUp && s.module.id == module_id)
+        .map(|(k, _)| *k)
+}
+
 pub struct CardPool {
     config: AppConfig,
     store: StoreHandle,
     sip_bridge: SipBridge,
     sms_handler: SmsHandler,
     discord_client: Option<DiscordClient>,
+    /// specs/022-discord-critical-alerts. Separate from `discord_client`
+    /// (SMS's own dedicated client): alert categories resolve their own
+    /// webhook per event (`alerts::dispatch`), so this client is always
+    /// constructed and never gated on any one category being enabled.
+    alerts_client: Option<DiscordClient>,
     cron_schedule: Option<cron::Schedule>,
     cycle: Option<CycleState>,
     next_scheduled_at: Option<tokio::time::Instant>,
@@ -182,6 +206,14 @@ impl CardPool {
             None
         };
 
+        let alerts_client = match DiscordClient::new(Secret::new(String::new())) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create critical-alerts Discord client");
+                None
+            }
+        };
+
         let cron_schedule = if config.scheduled_restart.enabled {
             match scheduler::parse_cron_5field(&config.scheduled_restart.cron) {
                 Ok(s) => {
@@ -215,6 +247,7 @@ impl CardPool {
             sip_bridge,
             sms_handler,
             discord_client,
+            alerts_client,
             cron_schedule,
             cycle: None,
             next_scheduled_at: None,
@@ -350,6 +383,12 @@ impl CardPool {
                         rx_gain: self.config.modem_audio.rx_gain,
                         eec_mode: self.config.modem_audio.eec_mode,
                     };
+                    let at_worker_threshold = Duration::from_secs(
+                        self.config
+                            .alerts
+                            .module_lifecycle_thresholds
+                            .at_worker_unresponsive_sec,
+                    );
                     tasks.spawn_blocking(move || {
                         let sid = slot;
                         if let Err(e) = run_module_loop(
@@ -360,6 +399,7 @@ impl CardPool {
                             cmd_rx,
                             ring_capacity,
                             audio_init,
+                            at_worker_threshold,
                         ) {
                             tracing::error!(module = %module_clone.id, error = %e, "module loop exited with error");
                         }
@@ -518,6 +558,12 @@ impl CardPool {
                                     rx_gain: self.config.modem_audio.rx_gain,
                                     eec_mode: self.config.modem_audio.eec_mode,
                                 };
+                                let at_worker_threshold = Duration::from_secs(
+                                    self.config
+                                        .alerts
+                                        .module_lifecycle_thresholds
+                                        .at_worker_unresponsive_sec,
+                                );
                                 tasks.spawn_blocking(move || {
                                     if let Err(e) = run_module_loop(
                                         module_clone.clone(),
@@ -527,6 +573,7 @@ impl CardPool {
                                         cmd_rx,
                                         ring_capacity,
                                         audio_init,
+                                        at_worker_threshold,
                                     ) {
                                         tracing::error!(module = %module_clone.id, error = %e, "module loop exited");
                                     }
@@ -543,6 +590,21 @@ impl CardPool {
                                     state.next_retry_at = None;
                                     state.cmd_tx = Some(cmd_tx);
                                 }
+
+                                // specs/022-discord-critical-alerts (Greptile
+                                // P1 follow-up: "GivenUp cleanup runs only on
+                                // immediate rescan success and is skipped
+                                // when initialization succeeds through the
+                                // retry loop"). This slot's own retry never
+                                // touches a `GivenUp` slot directly (excluded
+                                // by `should_retry` above), but a *different*
+                                // slot for the same module_id can be
+                                // `GivenUp` — e.g. a rescan's failed init
+                                // created a fresh `Initializing` slot for a
+                                // module that already had a `GivenUp` slot
+                                // from an earlier incident, and it's that
+                                // fresh slot recovering here.
+                                self.clear_stale_given_up(&mut slots, &module.id);
                             }
                             Err(e) => {
                                 tracing::debug!(module = %module.id, error = %e, "retry failed");
@@ -557,6 +619,22 @@ impl CardPool {
                                         );
                                         state.lifecycle = LifecycleState::GivenUp;
                                         state.next_retry_at = None;
+                                        if let Some(client) = self.alerts_client.clone() {
+                                            let config = self.config.alerts.clone();
+                                            let event = alerts::CriticalEvent {
+                                                category: alerts::AlertCategory::ModuleLifecycle,
+                                                unit_id: Some(module.id.clone()),
+                                                description: format!(
+                                                    "module failed to initialize after {} retries: {e}",
+                                                    state.retry_count
+                                                ),
+                                                at: Utc::now(),
+                                                kind: alerts::CriticalEventKind::Failure,
+                                            };
+                                            tokio::spawn(async move {
+                                                alerts::dispatch(&client, &config, event).await
+                                            });
+                                        }
                                     } else {
                                         let delay = backoff_delay(
                                             state.retry_count,
@@ -666,6 +744,33 @@ impl CardPool {
         }
     }
 
+    /// specs/022-discord-critical-alerts (Greptile P1 fix, and its
+    /// follow-up: the same cleanup is needed wherever a module reaches
+    /// `Ready` again — both `rescan_new_modules`'s "new module" success arm
+    /// and the retry loop's success arm call this). If `module_id` has a
+    /// stale `GivenUp` slot under a different key, remove it and fire a
+    /// `ModuleLifecycle` `Recovered` event — otherwise that slot (and its
+    /// `CRITICAL_EVENT_ACTIVE` gauge) would sit there forever, alongside the
+    /// new healthy one, with no recovery notification ever sent.
+    fn clear_stale_given_up(&self, slots: &mut HashMap<u32, SlotState>, module_id: &str) {
+        let Some(stale_slot) = find_given_up_slot(slots, module_id) else {
+            return;
+        };
+        slots.remove(&stale_slot);
+        let Some(client) = self.alerts_client.clone() else {
+            return;
+        };
+        let config = self.config.alerts.clone();
+        let event = alerts::CriticalEvent {
+            category: alerts::AlertCategory::ModuleLifecycle,
+            unit_id: Some(module_id.to_string()),
+            description: "module recovered after previously giving up".to_string(),
+            at: Utc::now(),
+            kind: alerts::CriticalEventKind::Recovered,
+        };
+        tokio::spawn(async move { alerts::dispatch(&client, &config, event).await });
+    }
+
     fn rescan_new_modules(
         &self,
         slots: &mut HashMap<u32, SlotState>,
@@ -673,8 +778,13 @@ impl CardPool {
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
         ring_capacity: usize,
     ) {
+        // specs/022-discord-critical-alerts (Greptile P1 fix): a `GivenUp`
+        // slot's serial port must NOT count as "known" — otherwise this scan
+        // treats the module as already-seen forever and never attempts it
+        // again, even if the underlying hardware issue has since cleared.
         let known_serials: std::collections::HashSet<PathBuf> = slots
             .values()
+            .filter(|s| s.lifecycle != LifecycleState::GivenUp)
             .map(|s| s.module.serial_port.clone())
             .collect();
 
@@ -697,6 +807,16 @@ impl CardPool {
             tracing::info!(module = %module.id, "new module detected, initializing");
             match self.try_init_module(&module) {
                 Ok((slot, imei, phone, net_type, net_mode)) => {
+                    // specs/022-discord-critical-alerts (Greptile P1 fix):
+                    // this module_id may already have a stale `GivenUp` slot
+                    // from an earlier incident (a different slot key — the
+                    // scan above now revisits it once it stops counting as
+                    // "known"). Rediscovering it here is exactly a recovery:
+                    // clear the stale slot and its active-incident gauge
+                    // rather than leaving a dead entry sitting alongside the
+                    // new, healthy one forever.
+                    self.clear_stale_given_up(slots, &module.id);
+
                     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ModuleCmd>();
                     let store_tx = self.store.sender();
                     let sms_enabled = self.sms_handler.is_enabled();
@@ -706,6 +826,12 @@ impl CardPool {
                         rx_gain: self.config.modem_audio.rx_gain,
                         eec_mode: self.config.modem_audio.eec_mode,
                     };
+                    let at_worker_threshold = Duration::from_secs(
+                        self.config
+                            .alerts
+                            .module_lifecycle_thresholds
+                            .at_worker_unresponsive_sec,
+                    );
                     tasks.spawn_blocking(move || {
                         if let Err(e) = run_module_loop(
                             module_clone.clone(),
@@ -715,6 +841,7 @@ impl CardPool {
                             cmd_rx,
                             ring_capacity,
                             audio_init,
+                            at_worker_threshold,
                         ) {
                             tracing::error!(module = %module_clone.id, error = %e, "module loop exited");
                         }
@@ -1297,6 +1424,13 @@ impl CardPool {
                     None,
                 );
             }
+            BridgeEvent::CriticalAlert(event) => {
+                if let Some(client) = self.alerts_client.clone() {
+                    let config = self.config.alerts.clone();
+                    tokio::runtime::Handle::current()
+                        .spawn(async move { alerts::dispatch(&client, &config, event).await });
+                }
+            }
         }
     }
 }
@@ -1312,6 +1446,25 @@ struct ModuleAudioInit {
     eec_mode: Option<u32>,
 }
 
+/// specs/022-discord-critical-alerts FR-003. Duration-based, matching the
+/// same shape `metrics::ingest`'s staleness/health checks use elsewhere in
+/// this feature (research.md R4) — real `Instant` arithmetic, no mock, so
+/// tests can construct `last_success` in the past instead of sleeping.
+fn at_worker_unresponsive(
+    last_success: std::time::Instant,
+    now: std::time::Instant,
+    threshold: Duration,
+) -> bool {
+    now.duration_since(last_success) >= threshold
+}
+
+/// How often the idle-tick liveness probe (`AT`) is sent while otherwise
+/// quiet — comfortably below any reasonable `at_worker_unresponsive_sec`
+/// threshold (default 60s) so a real stall is caught within one threshold
+/// window, not two.
+const AT_WORKER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+#[allow(clippy::too_many_arguments)]
 fn run_module_loop(
     module: DiscoveredModule,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
@@ -1320,6 +1473,7 @@ fn run_module_loop(
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
     ring_capacity: usize,
     audio_init: ModuleAudioInit,
+    at_worker_unresponsive_threshold: Duration,
 ) -> Result<(), String> {
     let mut at = AtCommander::open(&module.serial_port).map_err(|e| e.to_string())?;
 
@@ -1355,7 +1509,55 @@ fn run_module_loop(
         .with_label_values(&[&module.id, "cs"])
         .set(0.0);
 
+    // specs/022-discord-critical-alerts FR-003: last time an AT command on
+    // this module succeeded, and whether we've already alerted for it being
+    // unresponsive (so we don't re-alert every tick — FR-013).
+    let mut last_at_success = std::time::Instant::now();
+    let mut last_at_probe = std::time::Instant::now();
+    let mut at_worker_alerted = false;
+
     loop {
+        if last_at_probe.elapsed() >= AT_WORKER_PROBE_INTERVAL {
+            last_at_probe = std::time::Instant::now();
+            match at.send_command("AT") {
+                Ok(AtResponse::Ok(_)) => {
+                    last_at_success = std::time::Instant::now();
+                    if at_worker_alerted {
+                        at_worker_alerted = false;
+                        let _ = event_tx.send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
+                            category: alerts::AlertCategory::ModuleLifecycle,
+                            unit_id: Some(module.id.clone()),
+                            description: "AT command worker responsive again".to_string(),
+                            at: Utc::now(),
+                            kind: alerts::CriticalEventKind::Recovered,
+                        }));
+                    }
+                }
+                _ => {
+                    if !at_worker_alerted
+                        && at_worker_unresponsive(
+                            last_at_success,
+                            std::time::Instant::now(),
+                            at_worker_unresponsive_threshold,
+                        )
+                    {
+                        at_worker_alerted = true;
+                        tracing::error!(module = %module.id, "AT command worker unresponsive");
+                        let _ = event_tx.send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
+                            category: alerts::AlertCategory::ModuleLifecycle,
+                            unit_id: Some(module.id.clone()),
+                            description: format!(
+                                "AT command worker unresponsive for over {}s",
+                                at_worker_unresponsive_threshold.as_secs()
+                            ),
+                            at: Utc::now(),
+                            kind: alerts::CriticalEventKind::Failure,
+                        }));
+                    }
+                }
+            }
+        }
+
         // If cmd_tx side was dropped (slot restarted), try_recv will see a disconnect.
         // We check via a separate try_recv for the disconnect error.
         match cmd_rx.try_recv() {
@@ -1396,7 +1598,7 @@ fn run_module_loop(
         {
             tracing::info!(module = %module.id, "SIP peer disconnected, hanging up GSM");
             let _ = at.hangup();
-            record_call_end(&module.id, &store_tx, &mut call_ctx, "answered");
+            record_call_end(&module.id, &event_tx, &store_tx, &mut call_ctx, "answered");
             card.state = CardState::Idle;
             metrics::ACTIVE_CALLS
                 .with_label_values(&[&module.id, "cs"])
@@ -1555,15 +1757,16 @@ fn handle_hangup(
         let _ = event_tx.send(BridgeEvent::Hangup {
             module_id: module.id.clone(),
         });
-        record_call_end(&module.id, store_tx, call_ctx, "answered");
+        record_call_end(&module.id, event_tx, store_tx, call_ctx, "answered");
     } else if card.state == CardState::Ringing {
-        record_call_end(&module.id, store_tx, call_ctx, "missed");
+        record_call_end(&module.id, event_tx, store_tx, call_ctx, "missed");
     }
     card.state = CardState::Idle;
 }
 
 fn record_call_end(
     module_id: &str,
+    event_tx: &mpsc::UnboundedSender<BridgeEvent>,
     store_tx: &crossbeam_channel::Sender<StoreCommand>,
     call_ctx: &mut Option<CallContext>,
     status: &str,
@@ -1576,6 +1779,20 @@ fn record_call_end(
         metrics::CALL_DURATION_SECONDS
             .with_label_values(&[module_id, "cs"])
             .observe(duration);
+
+        // specs/022-discord-critical-alerts FR-002/Clarifications Q4: only
+        // the `CallStatus::Missed` outcome (never bridged) alerts — a call
+        // that bridged but had broken audio (`Failed`) is a distinct,
+        // already-tracked outcome and is deliberately excluded here.
+        if status == "missed" {
+            let _ = event_tx.send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
+                category: alerts::AlertCategory::MissedCall,
+                unit_id: Some(module_id.to_string()),
+                description: format!("call from {} was never answered", ctx.caller_id),
+                at: Utc::now(),
+                kind: alerts::CriticalEventKind::Failure,
+            }));
+        }
 
         let record = CallRecord {
             module_id: module_id.to_string(),
@@ -1726,5 +1943,136 @@ mod tests {
         assert_eq!(backoff_delay(5, 5, 120), Duration::from_secs(120));
         assert_eq!(backoff_delay(10, 5, 120), Duration::from_secs(120));
         assert_eq!(backoff_delay(30, 5, 120), Duration::from_secs(120));
+    }
+
+    /// specs/022-discord-critical-alerts FR-003 (T010): duration-based, no
+    /// sleeping — `last_success` is constructed in the past directly.
+    #[test]
+    fn at_worker_unresponsive_true_once_threshold_elapsed() {
+        let now = std::time::Instant::now();
+        let last_success = now - Duration::from_secs(61);
+        assert!(at_worker_unresponsive(
+            last_success,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn at_worker_unresponsive_false_within_threshold() {
+        let now = std::time::Instant::now();
+        let last_success = now - Duration::from_secs(30);
+        assert!(!at_worker_unresponsive(
+            last_success,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn at_worker_unresponsive_false_exactly_at_boundary_minus_one() {
+        let now = std::time::Instant::now();
+        let last_success = now - Duration::from_secs(59);
+        assert!(!at_worker_unresponsive(
+            last_success,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    /// specs/022-discord-critical-alerts FR-002/Clarifications Q4 (T027):
+    /// `record_call_end`'s "missed" branch dispatches exactly one
+    /// `MissedCall` `CriticalAlert`; "answered" dispatches none.
+    #[test]
+    fn record_call_end_missed_dispatches_one_missed_call_alert() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (store_tx, _store_rx) = crossbeam_channel::unbounded::<StoreCommand>();
+        let mut call_ctx = Some(CallContext {
+            caller_id: "+911234567890".to_string(),
+            sip_destination: String::new(),
+            started_at: Utc::now(),
+        });
+
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "missed");
+
+        let event = event_rx.try_recv().expect("expected one dispatched event");
+        let BridgeEvent::CriticalAlert(e) = event else {
+            panic!("expected a CriticalAlert event");
+        };
+        assert_eq!(e.category, alerts::AlertCategory::MissedCall);
+        assert_eq!(e.unit_id.as_deref(), Some("card0"));
+        assert_eq!(e.kind, alerts::CriticalEventKind::Failure);
+        assert!(e.description.contains("+911234567890"));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must dispatch exactly one event"
+        );
+    }
+
+    #[test]
+    fn record_call_end_answered_dispatches_no_alert() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (store_tx, _store_rx) = crossbeam_channel::unbounded::<StoreCommand>();
+        let mut call_ctx = Some(CallContext {
+            caller_id: "+911234567890".to_string(),
+            sip_destination: String::new(),
+            started_at: Utc::now(),
+        });
+
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+
+        assert!(event_rx.try_recv().is_err(), "no alert for answered calls");
+    }
+
+    // specs/022-discord-critical-alerts (Greptile P1: "GivenUp state never
+    // recovers").
+
+    fn slot_state(module_id: &str, lifecycle: LifecycleState) -> SlotState {
+        SlotState {
+            slot: 0,
+            module: DiscoveredModule {
+                id: module_id.to_string(),
+                serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
+                audio_device: String::new(),
+                usb_serial: String::new(),
+            },
+            imei: String::new(),
+            phone_number: String::new(),
+            network_type: NetworkType::Unknown,
+            network_mode: None,
+            lifecycle,
+            retry_count: 0,
+            next_retry_at: None,
+            cmd_tx: None,
+            has_active_call: false,
+        }
+    }
+
+    #[test]
+    fn find_given_up_slot_locates_stale_slot_by_module_id() {
+        let mut slots = HashMap::new();
+        slots.insert(3, slot_state("card0", LifecycleState::GivenUp));
+
+        assert_eq!(find_given_up_slot(&slots, "card0"), Some(3));
+    }
+
+    #[test]
+    fn find_given_up_slot_ignores_non_given_up_slots_for_the_same_module() {
+        let mut slots = HashMap::new();
+        slots.insert(3, slot_state("card0", LifecycleState::Ready));
+
+        assert_eq!(
+            find_given_up_slot(&slots, "card0"),
+            None,
+            "a Ready slot is not a stale incident to clear"
+        );
+    }
+
+    #[test]
+    fn find_given_up_slot_ignores_a_different_modules_given_up_slot() {
+        let mut slots = HashMap::new();
+        slots.insert(3, slot_state("card1", LifecycleState::GivenUp));
+
+        assert_eq!(find_given_up_slot(&slots, "card0"), None);
     }
 }

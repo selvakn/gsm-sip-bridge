@@ -1,0 +1,224 @@
+//! specs/022-discord-critical-alerts (T012/T018/T024/T028/T030-T032).
+//! `wiremock` is the external-service mock convention already declared as a
+//! dev-dependency for exactly this purpose — Discord itself is the kind of
+//! third-party service Constitution Principle I carves out as impractical to
+//! run for real in tests.
+
+use chrono::Utc;
+use gsm_sip_bridge::alerts::discord::DiscordClient;
+use gsm_sip_bridge::alerts::{dispatch, AlertCategory, CriticalEvent, CriticalEventKind};
+use gsm_sip_bridge::config::secret::Secret;
+use gsm_sip_bridge::config::{AlertsConfig, CategoryAlertConfig};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn enabled_alerts_config(default_webhook: &str) -> AlertsConfig {
+    AlertsConfig {
+        default_webhook_url: Secret::new(default_webhook.to_string()),
+        sms: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
+        module_lifecycle: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
+        registration_loss: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
+        tunnel_failure: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
+        missed_call: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
+        module_lifecycle_thresholds: Default::default(),
+        tunnel_failure_thresholds: Default::default(),
+        registration_loss_thresholds: Default::default(),
+    }
+}
+
+fn module_lifecycle_event() -> CriticalEvent {
+    CriticalEvent {
+        category: AlertCategory::ModuleLifecycle,
+        unit_id: Some("card0".to_string()),
+        description: "SIM unreadable after 5 recovery attempts".to_string(),
+        at: Utc::now(),
+        kind: CriticalEventKind::Failure,
+    }
+}
+
+/// T012 (US1): dispatching a `ModuleLifecycle` event posts an embed
+/// containing the module id and description to the resolved webhook.
+#[tokio::test]
+async fn dispatch_posts_module_lifecycle_alert_with_module_id_and_description() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
+
+    dispatch(&client, &config, module_lifecycle_event()).await;
+
+    server.verify().await;
+}
+
+/// T024 (US3): a `TunnelFailure` event is distinct from a `RegistrationLoss`
+/// one for the same line — both post, and neither is dropped.
+#[tokio::test]
+async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
+
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::TunnelFailure,
+            unit_id: Some("line0".to_string()),
+            description: "tunnel non-established for 300s".to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Failure,
+        },
+    )
+    .await;
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::RegistrationLoss,
+            unit_id: Some("line0".to_string()),
+            description: "unregistered for 300s".to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Failure,
+        },
+    )
+    .await;
+
+    server.verify().await;
+}
+
+/// T028 (US4): a `MissedCall` event posts an embed with the caller/line
+/// details baked into its description.
+#[tokio::test]
+async fn dispatch_posts_missed_call_alert() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
+
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::MissedCall,
+            unit_id: Some("card0".to_string()),
+            description: "call from +911234567890 was never answered".to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Failure,
+        },
+    )
+    .await;
+
+    server.verify().await;
+}
+
+/// T030 (US5): a disabled category makes zero HTTP calls.
+#[tokio::test]
+async fn dispatch_skips_disabled_category_without_any_http_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let mut config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
+    config.missed_call.enabled = false;
+
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::MissedCall,
+            unit_id: Some("card0".to_string()),
+            description: "call from +911234567890 was never answered".to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Failure,
+        },
+    )
+    .await;
+
+    server.verify().await;
+}
+
+/// T031 (US5): a category-specific webhook override routes only that
+/// category's alerts to the override, not the shared default.
+#[tokio::test]
+async fn dispatch_uses_category_webhook_override_not_shared_default() {
+    let default_server = MockServer::start().await;
+    let override_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/default"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&default_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/override"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&override_server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let mut config = enabled_alerts_config(&format!("{}/default", default_server.uri()));
+    config.module_lifecycle.webhook_url_override =
+        Some(Secret::new(format!("{}/override", override_server.uri())));
+
+    dispatch(&client, &config, module_lifecycle_event()).await;
+
+    default_server.verify().await;
+    override_server.verify().await;
+}
+
+/// T032 (US5)/FR-001 regression guard: with no default webhook and no
+/// override configured for a category, no Discord call is attempted.
+#[tokio::test]
+async fn dispatch_skips_when_no_webhook_resolves_at_all() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let config = enabled_alerts_config("");
+
+    dispatch(&client, &config, module_lifecycle_event()).await;
+}

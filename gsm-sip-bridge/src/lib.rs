@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod cli;
 pub mod config;
 pub mod control;

@@ -191,6 +191,34 @@ pub static SMS_DB_WRITES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// specs/022-discord-critical-alerts. `outcome` is `sent|suppressed|
+/// skipped|failed` (`alerts::AlertOutcome::as_label`); `category` is
+/// `alerts::AlertCategory::as_str` (contracts/metrics.md).
+pub static CRITICAL_ALERTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_critical_alerts_total",
+            "Critical-event Discord alert decisions"
+        ),
+        &["category", "outcome"]
+    )
+    .unwrap()
+});
+
+/// 1 while `category` is in its alerted (post-threshold) unhealthy state
+/// for `module`, 0 once recovered or never unhealthy. Mirrors `AGENT_UP`'s
+/// gauge shape (contracts/metrics.md).
+pub static CRITICAL_EVENT_ACTIVE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_critical_event_active",
+            "1 while a critical-event category is in its alerted unhealthy state for this module/line"
+        ),
+        &["category", "module"]
+    )
+    .unwrap()
+});
+
 pub static STORE_WRITES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         opts!(

@@ -19,6 +19,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "vowifi",
     "volte",
     "logging",
+    "alerts",
 ];
 const SIP_KEYS: &[&str] = &[
     "server",
@@ -32,6 +33,22 @@ const SIP_KEYS: &[&str] = &[
 ];
 const BRIDGE_KEYS: &[&str] = &["sip_destination", "sip_dial_timeout_sec"];
 const SMS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "db_path"];
+const ALERTS_KEYS: &[&str] = &[
+    "discord_webhook_url",
+    "sms",
+    "module_lifecycle",
+    "registration_loss",
+    "tunnel_failure",
+    "missed_call",
+];
+const ALERTS_CATEGORY_KEYS: &[&str] = &["enabled", "discord_webhook_url"];
+const ALERTS_MODULE_LIFECYCLE_KEYS: &[&str] = &[
+    "enabled",
+    "discord_webhook_url",
+    "at_worker_unresponsive_sec",
+];
+const ALERTS_TUNNEL_FAILURE_KEYS: &[&str] = &["enabled", "discord_webhook_url", "unhealthy_sec"];
+const ALERTS_REGISTRATION_LOSS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "unhealthy_sec"];
 const METRICS_KEYS: &[&str] = &["port", "agent_report_interval_seconds"];
 const MODULES_KEYS: &[&str] = &["retry_interval_sec", "max_concurrent"];
 const RESILIENCE_KEYS: &[&str] = &[
@@ -379,6 +396,107 @@ impl ScheduledRestartConfig {
     }
 }
 
+/// Discord alerting for critical operational events (specs/022-discord-
+/// critical-alerts) — generalizes the existing `[sms]` webhook into a
+/// shared default plus one enable/disable flag and optional webhook
+/// override per category. `sms` defaults to enabled (unchanged behavior);
+/// the four new categories default to disabled and require explicit
+/// opt-in (FR-007).
+#[derive(Clone, Debug)]
+pub struct AlertsConfig {
+    /// Shared default webhook, used by any category without its own
+    /// override. Empty means "no default" (FR-008).
+    pub default_webhook_url: Secret<String>,
+    pub sms: CategoryAlertConfig,
+    pub module_lifecycle: CategoryAlertConfig,
+    pub registration_loss: CategoryAlertConfig,
+    pub tunnel_failure: CategoryAlertConfig,
+    pub missed_call: CategoryAlertConfig,
+    pub module_lifecycle_thresholds: ModuleLifecycleThresholds,
+    pub tunnel_failure_thresholds: TunnelFailureThresholds,
+    pub registration_loss_thresholds: RegistrationLossThresholds,
+}
+
+#[derive(Clone, Debug)]
+pub struct CategoryAlertConfig {
+    pub enabled: bool,
+    /// `None` means "use `AlertsConfig::default_webhook_url`".
+    pub webhook_url_override: Option<Secret<String>>,
+}
+
+impl CategoryAlertConfig {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            webhook_url_override: None,
+        }
+    }
+}
+
+/// FR-003, default 60s: how long a module's AT command worker may go
+/// without a successful command before it is considered unresponsive.
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleLifecycleThresholds {
+    pub at_worker_unresponsive_sec: u64,
+}
+
+impl Default for ModuleLifecycleThresholds {
+    fn default() -> Self {
+        Self {
+            at_worker_unresponsive_sec: 60,
+        }
+    }
+}
+
+/// FR-005, default 300s: how long a VoWiFi line's tunnel may stay
+/// non-established before it is considered failed (spec Clarifications
+/// Q8 — covers the swu engine's own ~180s bounded establish window plus
+/// one steady-state restart cycle).
+#[derive(Clone, Copy, Debug)]
+pub struct TunnelFailureThresholds {
+    pub unhealthy_sec: u64,
+}
+
+impl Default for TunnelFailureThresholds {
+    fn default() -> Self {
+        Self { unhealthy_sec: 300 }
+    }
+}
+
+/// FR-006, default 300s: how long a line may stay unregistered before it
+/// is considered a registration-loss failure (spec Clarifications Q9 —
+/// same threshold as tunnel failure, since both sit behind an unbounded
+/// auto-restart loop with no natural "give up" signal).
+#[derive(Clone, Copy, Debug)]
+pub struct RegistrationLossThresholds {
+    pub unhealthy_sec: u64,
+}
+
+impl Default for RegistrationLossThresholds {
+    fn default() -> Self {
+        Self { unhealthy_sec: 300 }
+    }
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            default_webhook_url: Secret::new(String::new()),
+            sms: CategoryAlertConfig {
+                enabled: true,
+                webhook_url_override: None,
+            },
+            module_lifecycle: CategoryAlertConfig::disabled(),
+            registration_loss: CategoryAlertConfig::disabled(),
+            tunnel_failure: CategoryAlertConfig::disabled(),
+            missed_call: CategoryAlertConfig::disabled(),
+            module_lifecycle_thresholds: ModuleLifecycleThresholds::default(),
+            tunnel_failure_thresholds: TunnelFailureThresholds::default(),
+            registration_loss_thresholds: RegistrationLossThresholds::default(),
+        }
+    }
+}
+
 /// Configuration for the inbound VoWiFi-to-SIP bridge (feature
 /// `011-vowifi-sip-bridge`) — a second, independent inbound call path
 /// alongside the existing circuit-switched GSM-to-SIP bridge. See
@@ -707,6 +825,7 @@ pub struct AppConfig {
     pub vowifi: VowifiConfig,
     pub volte: VolteConfig,
     pub logging: LoggingConfig,
+    pub alerts: AlertsConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -732,6 +851,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let vowifi = parse_vowifi(table)?;
     let volte = parse_volte(table)?;
     let logging = parse_logging(table)?;
+    let alerts = parse_alerts(table, &sms);
 
     Ok(AppConfig {
         sip,
@@ -747,6 +867,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         vowifi,
         volte,
         logging,
+        alerts,
     })
 }
 
@@ -1467,6 +1588,238 @@ fn parse_scheduled_restart(root: &toml::map::Map<String, Value>) -> ScheduledRes
     }
 }
 
+/// specs/022-discord-critical-alerts. Never fails `load_config`: a malformed
+/// `[alerts]` table, or any single malformed `[alerts.<category>]` table,
+/// only disables *that* category for this run (logged) — consistent with
+/// the same graceful-degradation convention `parse_scheduled_restart` above
+/// already uses, and with this feature's own edge-case requirement that a
+/// bad alerts config must never keep the bridge from starting or handling
+/// calls/SMS.
+fn parse_alerts(root: &toml::map::Map<String, Value>, sms: &SmsConfig) -> AlertsConfig {
+    let legacy_sms = legacy_sms_alert_category(sms);
+
+    let Some(val) = root.get("alerts") else {
+        return AlertsConfig {
+            sms: legacy_sms,
+            ..AlertsConfig::default()
+        };
+    };
+    let Some(t) = val.as_table() else {
+        tracing::error!(
+            "[alerts] must be a table; new critical-event alert categories disabled for this run"
+        );
+        return AlertsConfig {
+            sms: legacy_sms,
+            ..AlertsConfig::default()
+        };
+    };
+    warn_unknown_keys_in(t, ALERTS_KEYS, "alerts");
+
+    let default_webhook_url = match t.get("discord_webhook_url") {
+        None => Secret::new(String::new()),
+        Some(v) => match as_string(v, "alerts.discord_webhook_url", true) {
+            Ok(s) => Secret::new(s),
+            Err(e) => {
+                tracing::error!(error = %e, "alerts.discord_webhook_url invalid; no default alert webhook configured");
+                Secret::new(String::new())
+            }
+        },
+    };
+
+    let sms_category = match t.get("sms") {
+        None => legacy_sms,
+        Some(v) => parse_alert_category(v, "alerts.sms", true, ALERTS_CATEGORY_KEYS),
+    };
+    let module_lifecycle = match t.get("module_lifecycle") {
+        None => CategoryAlertConfig::disabled(),
+        Some(v) => parse_alert_category(
+            v,
+            "alerts.module_lifecycle",
+            false,
+            ALERTS_MODULE_LIFECYCLE_KEYS,
+        ),
+    };
+    let registration_loss = match t.get("registration_loss") {
+        None => CategoryAlertConfig::disabled(),
+        Some(v) => parse_alert_category(
+            v,
+            "alerts.registration_loss",
+            false,
+            ALERTS_REGISTRATION_LOSS_KEYS,
+        ),
+    };
+    let tunnel_failure = match t.get("tunnel_failure") {
+        None => CategoryAlertConfig::disabled(),
+        Some(v) => parse_alert_category(
+            v,
+            "alerts.tunnel_failure",
+            false,
+            ALERTS_TUNNEL_FAILURE_KEYS,
+        ),
+    };
+    let missed_call = match t.get("missed_call") {
+        None => CategoryAlertConfig::disabled(),
+        Some(v) => parse_alert_category(v, "alerts.missed_call", false, ALERTS_CATEGORY_KEYS),
+    };
+
+    let module_lifecycle_thresholds = match t.get("module_lifecycle") {
+        Some(v) => parse_module_lifecycle_thresholds(v),
+        None => ModuleLifecycleThresholds::default(),
+    };
+    let tunnel_failure_thresholds = match t.get("tunnel_failure") {
+        Some(v) => parse_tunnel_failure_thresholds(v),
+        None => TunnelFailureThresholds::default(),
+    };
+    let registration_loss_thresholds = match t.get("registration_loss") {
+        Some(v) => parse_registration_loss_thresholds(v),
+        None => RegistrationLossThresholds::default(),
+    };
+
+    AlertsConfig {
+        default_webhook_url,
+        sms: sms_category,
+        module_lifecycle,
+        registration_loss,
+        tunnel_failure,
+        missed_call,
+        module_lifecycle_thresholds,
+        tunnel_failure_thresholds,
+        registration_loss_thresholds,
+    }
+}
+
+/// FR-001 backward compatibility: an operator upgrading with no `[alerts]`
+/// section (or no `[alerts.sms]` sub-table) keeps today's `[sms]`-driven
+/// behavior exactly as-is, with the legacy webhook treated as `sms`'s own
+/// override rather than shared with any other category (it was never
+/// shared before this feature).
+fn legacy_sms_alert_category(sms: &SmsConfig) -> CategoryAlertConfig {
+    let webhook = sms.discord_webhook_url.expose_secret();
+    CategoryAlertConfig {
+        enabled: sms.enabled,
+        webhook_url_override: if webhook.is_empty() {
+            None
+        } else {
+            Some(Secret::new(webhook.clone()))
+        },
+    }
+}
+
+fn parse_alert_category(
+    v: &Value,
+    section: &str,
+    default_enabled: bool,
+    allowed_keys: &[&str],
+) -> CategoryAlertConfig {
+    let Some(t) = v.as_table() else {
+        tracing::error!(
+            section = section,
+            "must be a table; this category's alerting disabled for this run"
+        );
+        return CategoryAlertConfig::disabled();
+    };
+    warn_unknown_keys_in(t, allowed_keys, section);
+
+    let enabled = match t.get("enabled") {
+        None => default_enabled,
+        Some(v) => match as_bool(v, "enabled") {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(section = section, error = %e, "enabled invalid; this category's alerting disabled for this run");
+                return CategoryAlertConfig::disabled();
+            }
+        },
+    };
+
+    let webhook_url_override = match t.get("discord_webhook_url") {
+        None => None,
+        Some(v) => match as_string(v, "discord_webhook_url", true) {
+            Ok(s) if s.is_empty() => None,
+            Ok(s) => Some(Secret::new(s)),
+            Err(e) => {
+                tracing::error!(section = section, error = %e, "discord_webhook_url invalid; falling back to the shared default webhook");
+                None
+            }
+        },
+    };
+
+    CategoryAlertConfig {
+        enabled,
+        webhook_url_override,
+    }
+}
+
+fn parse_module_lifecycle_thresholds(v: &Value) -> ModuleLifecycleThresholds {
+    let defaults = ModuleLifecycleThresholds::default();
+    let Some(t) = v.as_table() else {
+        return defaults;
+    };
+    warn_unknown_keys_in(t, ALERTS_MODULE_LIFECYCLE_KEYS, "alerts.module_lifecycle");
+    let at_worker_unresponsive_sec = match t.get("at_worker_unresponsive_sec") {
+        None => defaults.at_worker_unresponsive_sec,
+        Some(v) => {
+            match as_u64_range(
+                v,
+                "alerts.module_lifecycle.at_worker_unresponsive_sec",
+                false,
+                5..=600,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, "at_worker_unresponsive_sec invalid; using default");
+                    defaults.at_worker_unresponsive_sec
+                }
+            }
+        }
+    };
+    ModuleLifecycleThresholds {
+        at_worker_unresponsive_sec,
+    }
+}
+
+fn parse_tunnel_failure_thresholds(v: &Value) -> TunnelFailureThresholds {
+    let defaults = TunnelFailureThresholds::default();
+    let Some(t) = v.as_table() else {
+        return defaults;
+    };
+    warn_unknown_keys_in(t, ALERTS_TUNNEL_FAILURE_KEYS, "alerts.tunnel_failure");
+    let unhealthy_sec = match t.get("unhealthy_sec") {
+        None => defaults.unhealthy_sec,
+        Some(v) => match as_u64_range(v, "alerts.tunnel_failure.unhealthy_sec", false, 30..=3600) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "unhealthy_sec invalid; using default");
+                defaults.unhealthy_sec
+            }
+        },
+    };
+    TunnelFailureThresholds { unhealthy_sec }
+}
+
+fn parse_registration_loss_thresholds(v: &Value) -> RegistrationLossThresholds {
+    let defaults = RegistrationLossThresholds::default();
+    let Some(t) = v.as_table() else {
+        return defaults;
+    };
+    warn_unknown_keys_in(t, ALERTS_REGISTRATION_LOSS_KEYS, "alerts.registration_loss");
+    let unhealthy_sec = match t.get("unhealthy_sec") {
+        None => defaults.unhealthy_sec,
+        Some(v) => match as_u64_range(
+            v,
+            "alerts.registration_loss.unhealthy_sec",
+            false,
+            30..=3600,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "unhealthy_sec invalid; using default");
+                defaults.unhealthy_sec
+            }
+        },
+    };
+    RegistrationLossThresholds { unhealthy_sec }
+}
+
 fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlConfig> {
     let Some(val) = root.get("control") else {
         return Ok(ControlConfig::default());
@@ -1822,6 +2175,7 @@ mod tests {
         let vowifi = parse_vowifi(table).unwrap();
         let volte = parse_volte(table).unwrap();
         let logging = parse_logging(table).unwrap();
+        let alerts = parse_alerts(table, &sms);
         AppConfig {
             sip,
             bridge,
@@ -1836,6 +2190,7 @@ mod tests {
             vowifi,
             volte,
             logging,
+            alerts,
         }
     }
 

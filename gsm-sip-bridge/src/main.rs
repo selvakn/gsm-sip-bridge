@@ -1,5 +1,7 @@
+use gsm_sip_bridge::alerts::discord::DiscordClient;
 use gsm_sip_bridge::cli::{Cli, Commands};
 use gsm_sip_bridge::config::load_config;
+use gsm_sip_bridge::config::secret::Secret;
 use gsm_sip_bridge::control::client;
 use gsm_sip_bridge::control::protocol::{ControlCmd, ControlResp};
 use gsm_sip_bridge::control::server::start_control_server;
@@ -178,6 +180,18 @@ fn main() -> ExitCode {
                 tracing::error!(error = %e, "metrics server failed");
             }
         });
+
+        // specs/022-discord-critical-alerts (Greptile P1/P2 fix): alert
+        // evaluation lives in metrics::ingest, keyed to real AgentReport
+        // arrival rather than an external Prometheus scrape — this must be
+        // wired up before start_control_server below starts accepting the
+        // reports that trigger it.
+        match DiscordClient::new(Secret::new(String::new())) {
+            Ok(client) => metrics::ingest::init_alerts(config.alerts.clone(), client),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create critical-alerts Discord client")
+            }
+        }
 
         tracing::info!(
             sip_server = %config.sip.server,

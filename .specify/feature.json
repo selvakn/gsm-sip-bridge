@@ -1,1 +1,3 @@
-{"feature_directory": "specs/021-entrypoint-supervise-rust"}
+{
+  "feature_directory": "specs/022-discord-critical-alerts"
+}
