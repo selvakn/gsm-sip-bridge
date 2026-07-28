@@ -251,6 +251,22 @@ max_lines = 8
 # modem_serial = "xyz789abc123"
 # mcc = "404"
 # mnc = "094"
+#
+# A card-reader-backed line (specs/023-omnikey-pcsc-vowifi): the SIM lives in
+# a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem. Requires
+# tunnel_engine = "strongswan" (the default) — its eap-sim-pcsc plugin
+# auto-detects any connected PC/SC reader with no plugin-side config; the swu
+# engine has no PC/SC support and supervise refuses to start if a
+# pcsc_reader line is configured under it. mcc/mnc/imsi_override are
+# mandatory here (there's no modem to derive them from) — read the IMSI once
+# via pySim-read.py or opensc-tool against the reader. See
+# docs/omnikey-pcsc-vowifi.md.
+#
+# [[vowifi.line]]
+# pcsc_reader = true
+# imsi_override = "404940123456789"
+# mcc = "404"
+# mnc = "094"
 
 # ============================================================================
 # VoLTE inbound bridge — specs/015-volte-host-ims, 016-volte-calls,

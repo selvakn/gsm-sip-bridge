@@ -41,9 +41,11 @@ docker compose -f docker/docker-compose.yml up --build
 ## 4. Confirm pcscd sees both the real reader and any vpcd slots
 
 ```bash
-docker exec gsm-sip-bridge pcsc_scan -n
-# or: docker exec gsm-sip-bridge opensc-tool --list-readers
+docker exec gsm-sip-bridge opensc-tool --list-readers
 ```
+
+(Alpine has no `pcsc-tools`/`pcsc_scan` package — `opensc-tool` or any other
+PC/SC client works equally well.)
 
 Expect the OmniKey reader listed alongside any `Virtual PCD ...` (vpcd) slots
 used by modem-backed lines, if configured.
@@ -59,8 +61,12 @@ Cross-check against `vowifi-status` — the card-reader line must appear with
 no visible difference from a modem-backed line's entry (spec FR-010/SC-005):
 
 ```bash
-curl -s http://localhost:5076/status | jq '.lines'
+docker exec gsm-sip-bridge gsm-sip-bridge --config /etc/gsm-sip-bridge/config.toml vowifi-status
+curl -s http://localhost:9091/metrics | grep gsm_sip_bridge_vowifi
 ```
+
+The pcsc line's `card_id` (e.g. `pcsc0`) is just another `module` label value —
+no new field or label distinguishes it from a modem-backed line's entry.
 
 ## 6. Place/receive a test call
 

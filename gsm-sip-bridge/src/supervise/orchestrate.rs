@@ -231,6 +231,13 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 config.vowifi.tunnel_engine
             );
 
+            if let Err(msg) =
+                check_pcsc_engine_compatibility(&vowifi_lines, &config.vowifi.tunnel_engine)
+            {
+                eprintln!("[supervise] FATAL: {msg}");
+                return ExitCode::FAILURE;
+            }
+
             if runner
                 .run(&["ip", "netns", "add", "__probe"])
                 .map(|o| !o.status.success())
@@ -460,6 +467,30 @@ fn resolve_epdg_ip(
         .map(str::to_string)
 }
 
+/// Fail fast on an unsupported combination (specs/023-omnikey-pcsc-vowifi
+/// FR-008): the swu engine's Rust dialer only ever talks AT+CSIM to a modem
+/// — there is no code path that could serve a pcsc_reader line under it, so
+/// this is a pure config-validation concern, checked before any per-line
+/// process is spawned rather than left to fail confusingly deep in the
+/// swu-specific startup path. `Err` names the offending line's index/card_id.
+fn check_pcsc_engine_compatibility(
+    lines: &[LineResolutionEntry],
+    tunnel_engine: &str,
+) -> Result<(), String> {
+    if tunnel_engine == "strongswan" {
+        return Ok(());
+    }
+    if let Some(bad) = lines.iter().find(|l| l.pcsc_reader) {
+        return Err(format!(
+            "line {} ({}) has pcsc_reader = true, but [vowifi].tunnel_engine = {tunnel_engine:?} \
+             — a card-reader-backed line requires tunnel_engine = \"strongswan\" (the swu engine \
+             has no PC/SC support)",
+            bad.index, bad.card_id
+        ));
+    }
+    Ok(())
+}
+
 /// One VoWiFi line's full startup — 1:1 port of `start_line_strongswan`/
 /// `start_line_swu`'s shared prelude (modem presence, IMS mode reconcile,
 /// mcc/mnc derivation), then dispatches to the engine-specific rest.
@@ -476,22 +507,29 @@ fn start_vowifi_line(
 ) {
     let idx = line.index;
     let modem = line.modem_port.clone();
-    println!("[supervise] line {idx} ({}): modem={modem}", line.card_id);
-
-    if !std::path::Path::new(&modem).exists() {
-        eprintln!("[supervise] line {idx}: FATAL: modem port {modem} not present in container; skipping this line");
-        return;
-    }
-
-    if runner
-        .run(&[bin, "--config", config_path, "modem-ims", "--modem", &modem])
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
-        eprintln!(
-            "[supervise] line {idx}: FATAL: could not reconcile modem IMS mode; skipping this line"
+    if line.pcsc_reader {
+        println!(
+            "[supervise] line {idx} ({}): pcsc_reader (no modem)",
+            line.card_id
         );
-        return;
+    } else {
+        println!("[supervise] line {idx} ({}): modem={modem}", line.card_id);
+
+        if !std::path::Path::new(&modem).exists() {
+            eprintln!("[supervise] line {idx}: FATAL: modem port {modem} not present in container; skipping this line");
+            return;
+        }
+
+        if runner
+            .run(&[bin, "--config", config_path, "modem-ims", "--modem", &modem])
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "[supervise] line {idx}: FATAL: could not reconcile modem IMS mode; skipping this line"
+            );
+            return;
+        }
     }
 
     let Some((mcc, mnc)) = resolve_mcc_mnc(runner.as_ref(), bin, line) else {
@@ -607,9 +645,12 @@ fn start_vowifi_line_strongswan(
     );
 
     // vowifi-usim-bridge, supervised on its own thread (so a crash/restart
-    // never blocks this line's establish/steady-state loops below).
+    // never blocks this line's establish/steady-state loops below). Not
+    // needed for a pcsc_reader line: pcscd already reaches the physical
+    // reader directly via the ccid driver, with no modem/AT+CSIM bridge in
+    // the path at all (specs/023-omnikey-pcsc-vowifi).
     let usim_holder: Arc<Mutex<Option<ChildHandle>>> = Arc::new(Mutex::new(None));
-    {
+    if !line.pcsc_reader {
         let runner = Arc::clone(runner);
         let bin = bin.to_string();
         let config_path = config_path.to_string();
@@ -1190,5 +1231,238 @@ mod tests {
             None,
             "a plain reset with no prior give-up is not itself a recovery notice"
         );
+    }
+
+    use crate::config::VowifiConfig;
+    use crate::supervise::runner::MockCommandRunner;
+
+    fn test_config() -> AppConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sip]\nserver = \"sip.example.com\"\nusername = \"user\"\npassword = \"pass\"\n",
+        )
+        .unwrap();
+        let mut config = crate::config::load_config(&path).unwrap();
+        // Bypass live DNS resolution in every test below — irrelevant to what
+        // each test is actually checking.
+        config.vowifi.epdg_ip = Some("192.0.2.1".to_string());
+        config
+    }
+
+    fn pcsc_line(index: u32) -> LineResolutionEntry {
+        let mut config = VowifiConfig::default();
+        config.imsi_override = Some("404940123456789".to_string());
+        LineResolutionEntry {
+            index,
+            card_id: format!("pcsc{index}"),
+            modem_port: String::new(),
+            netns: format!("ims{index}"),
+            control_port: 7050,
+            veth_local_addr: "10.99.0.1".to_string(),
+            veth_peer_addr: "10.99.0.2".to_string(),
+            vpcd_port: 15963,
+            strongswan_if_id: 23,
+            strongswan_tun_iface: "tun23-0".to_string(),
+            pcscf_source_path: "/tmp/pcscf-test".to_string(),
+            mcc: "404".to_string(),
+            mnc: "043".to_string(),
+            pcsc_reader: true,
+            config,
+        }
+    }
+
+    fn modem_line(index: u32, modem_port: &str) -> LineResolutionEntry {
+        LineResolutionEntry {
+            index,
+            card_id: format!("ec20-{index}"),
+            modem_port: modem_port.to_string(),
+            netns: format!("ims{index}"),
+            control_port: 7050,
+            veth_local_addr: "10.99.0.1".to_string(),
+            veth_peer_addr: "10.99.0.2".to_string(),
+            vpcd_port: 15963,
+            strongswan_if_id: 23,
+            strongswan_tun_iface: "tun23-0".to_string(),
+            pcscf_source_path: "/tmp/pcscf-test".to_string(),
+            mcc: "404".to_string(),
+            mnc: "094".to_string(),
+            pcsc_reader: false,
+            config: VowifiConfig::default(),
+        }
+    }
+
+    /// Polls `cond` until it's true or `timeout` elapses — needed only for
+    /// effects produced by a background thread this module intentionally
+    /// never joins (e.g. the vowifi-usim-bridge supervision loop), never for
+    /// timing-sensitive production logic itself.
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if cond() {
+                return true;
+            }
+            if start.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn spawned_argv_containing(mock: &MockCommandRunner, needle: &str) -> bool {
+        mock.spawn_specs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.argv.iter().any(|a| a.contains(needle)))
+    }
+
+    fn ran_argv_containing(mock: &MockCommandRunner, needle: &str) -> bool {
+        mock.run_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|argv| argv.iter().any(|a| a.contains(needle)))
+    }
+
+    #[test]
+    fn start_vowifi_line_pcsc_reader_skips_modem_checks() {
+        // specs/023-omnikey-pcsc-vowifi US1 (T007): a pcsc_reader line never
+        // runs the modem-path-existence check or `modem-ims --modem`.
+        // charon is made to "die" immediately so tick_establishing's
+        // otherwise-infinite loop returns FatalProcessDied on its first
+        // check — the function under test then returns deterministically.
+        let mock = Arc::new(MockCommandRunner::new());
+        mock.set_born_dead_if_argv_contains("charon");
+        let runner: Arc<dyn CommandRunner> = mock.clone();
+        let config = test_config();
+        let line = pcsc_line(0);
+        let started = Arc::new(Mutex::new(StartedState::default()));
+        let shutting_down = Arc::new(RwLock::new(false));
+
+        start_vowifi_line(
+            &runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &line,
+            &started,
+            &shutting_down,
+            None,
+        );
+
+        assert!(
+            !ran_argv_containing(&mock, "modem-ims"),
+            "modem-ims reconcile must never run for a pcsc_reader line"
+        );
+        // Reaching a charon spawn attempt proves execution got past the
+        // (skipped) modem-existence check and modem-ims call rather than
+        // bailing out before either — the only other way this spawn could
+        // be reached.
+        assert!(
+            spawned_argv_containing(&mock, "charon"),
+            "expected execution to reach the strongswan engine dispatch"
+        );
+    }
+
+    #[test]
+    fn start_vowifi_line_strongswan_skips_usim_bridge_only_for_pcsc() {
+        // specs/023-omnikey-pcsc-vowifi US1 (T008): pcsc_reader never spawns
+        // vowifi-usim-bridge; an equivalent modem-backed line still does
+        // (regression).
+        let mock = Arc::new(MockCommandRunner::new());
+        mock.set_born_dead_if_argv_contains("charon");
+        let runner: Arc<dyn CommandRunner> = mock.clone();
+        let config = test_config();
+        let line = pcsc_line(0);
+        let started = Arc::new(Mutex::new(StartedState::default()));
+        let shutting_down = Arc::new(RwLock::new(false));
+
+        start_vowifi_line_strongswan(
+            &runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &line,
+            &line.mcc.clone(),
+            &line.mnc.clone(),
+            &started,
+            &shutting_down,
+            None,
+        );
+        assert!(
+            !spawned_argv_containing(&mock, "vowifi-usim-bridge"),
+            "a pcsc_reader line must never spawn vowifi-usim-bridge"
+        );
+
+        // Regression: an otherwise-equivalent modem-backed line still spawns
+        // it, on its own background thread — poll briefly for that thread to
+        // record its spawn.
+        let mock2 = Arc::new(MockCommandRunner::new());
+        mock2.set_born_dead_if_argv_contains("charon");
+        let runner2: Arc<dyn CommandRunner> = mock2.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let fake_modem = dir.path().join("ttyFAKE");
+        std::fs::write(&fake_modem, "").unwrap();
+        let modem_port = fake_modem.to_string_lossy().to_string();
+        {
+            use std::os::unix::process::ExitStatusExt;
+            mock2.set_run_output(
+                &format!("gsm-sip-bridge vowifi-imsi --modem {modem_port}"),
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"404011111111111\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+        }
+        let modem = modem_line(0, &modem_port);
+        let started2 = Arc::new(Mutex::new(StartedState::default()));
+        let shutting_down2 = Arc::new(RwLock::new(false));
+        start_vowifi_line_strongswan(
+            &runner2,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &modem,
+            &modem.mcc.clone(),
+            &modem.mnc.clone(),
+            &started2,
+            &shutting_down2,
+            None,
+        );
+        assert!(
+            wait_until(Duration::from_millis(500), || spawned_argv_containing(
+                &mock2,
+                "vowifi-usim-bridge"
+            )),
+            "a modem-backed line must still spawn vowifi-usim-bridge"
+        );
+    }
+
+    #[test]
+    fn pcsc_engine_compatibility_ok_under_strongswan() {
+        let lines = vec![pcsc_line(0)];
+        assert!(check_pcsc_engine_compatibility(&lines, "strongswan").is_ok());
+    }
+
+    #[test]
+    fn pcsc_engine_compatibility_ok_under_swu_without_pcsc_lines() {
+        let lines = vec![modem_line(0, "/dev/ttyUSB0")];
+        assert!(check_pcsc_engine_compatibility(&lines, "swu").is_ok());
+    }
+
+    #[test]
+    fn pcsc_engine_compatibility_rejects_pcsc_line_under_swu() {
+        // specs/023-omnikey-pcsc-vowifi US3 (T022): fails, naming the
+        // offending line, before any per-line process would be spawned —
+        // `run()` itself calls this check ahead of the per-line spawn loop
+        // and hardcodes `RealCommandRunner`, so this is the injectable seam
+        // that actually captures the decision logic under test.
+        let lines = vec![modem_line(0, "/dev/ttyUSB0"), pcsc_line(1)];
+        let err = check_pcsc_engine_compatibility(&lines, "swu").unwrap_err();
+        assert!(err.contains('1'), "unexpected error: {err}");
+        assert!(err.contains("pcsc1"), "unexpected error: {err}");
     }
 }

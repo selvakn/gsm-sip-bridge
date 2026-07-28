@@ -36,7 +36,7 @@ vowifi,supervise}`, `docker/`, `config.toml.example`, and `docs/`.
 **Purpose**: Confirm a clean starting point — no new project scaffolding is
 needed since this feature is additive within the existing workspace.
 
-- [ ] T001 Run `cargo fmt --all && make lint && cargo test --workspace` on this
+- [X] T001 Run `cargo fmt --all && make lint && cargo test --workspace` on this
       branch before any change, to confirm a clean, green baseline per
       CLAUDE.md's pre-commit checklist.
 
@@ -48,18 +48,18 @@ needed since this feature is additive within the existing workspace.
 branches on. **No user story task below can be implemented until this phase
 is complete.**
 
-- [ ] T002 [P] Add `pub pcsc_reader: bool` (default `false` via `#[serde(default)]`)
+- [X] T002 [P] Add `pub pcsc_reader: bool` (default `false` via `#[serde(default)]`)
       to `VowifiLineOverride` in `gsm-sip-bridge/src/config/mod.rs` (struct at
       line 644-664).
-- [ ] T003 Add validation in `load_config` (`gsm-sip-bridge/src/config/mod.rs:712`)
+- [X] T003 Add validation in `load_config` (`gsm-sip-bridge/src/config/mod.rs:712`)
       so that any `[[vowifi.line]]` entry with `pcsc_reader = true` and a
       missing/empty `imsi_override`, `mcc`, or `mnc` returns
       `BridgeError::Config` naming the entry's position and the missing
       field(s) — following the existing `Err(BridgeError::Config(format!(...)))`
       pattern already used throughout this function.
-- [ ] T004 [P] Add `pub pcsc_reader: bool` to `ResolvedLine` in
+- [X] T004 [P] Add `pub pcsc_reader: bool` to `ResolvedLine` in
       `gsm-sip-bridge/src/vowifi/discovery.rs` (struct at line 110-118).
-- [ ] T005 [P] Add `pub pcsc_reader: bool` to `LineResolutionEntry` in
+- [X] T005 [P] Add `pub pcsc_reader: bool` to `LineResolutionEntry` in
       `gsm-sip-bridge/src/vowifi/discovery.rs` (struct at line 269-284), and
       thread it through the `From<&ResolvedLine> for LineResolutionEntry`
       impl (line 286-305).
@@ -86,54 +86,54 @@ steps 1-6.
 > Write these first; confirm they fail against the Phase 2 baseline before
 > implementing.
 
-- [ ] T006 [P] [US1] Unit test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
+- [X] T006 [P] [US1] Unit test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
       test module: `resolve_lines` given only a `pcsc_reader = true` override
       (no `ProbedModem`s) produces exactly one `ResolvedLine` with
       `pcsc_reader = true`, an empty `modem_port`, and the override's
       `imsi_override`/`mcc`/`mnc` copied through.
-- [ ] T007 [P] [US1] Unit test in `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
+- [X] T007 [P] [US1] Unit test in `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
       test module: `start_vowifi_line` with a `pcsc_reader = true` line does
       NOT run the modem-path-existence check or invoke `modem-ims --modem`
       (assert via `MockCommandRunner`'s recorded command list).
-- [ ] T008 [P] [US1] Unit test in `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
+- [X] T008 [P] [US1] Unit test in `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
       test module: `start_vowifi_line_strongswan` with a `pcsc_reader = true`
       line never spawns `vowifi-usim-bridge` (assert via `MockCommandRunner`'s
       recorded spawn calls), while an equivalent modem-backed line still does
       (regression check in the same test).
-- [ ] T009 [US1] Unit test in `gsm-sip-bridge/src/config/mod.rs`'s test module:
+- [X] T009 [US1] Unit test in `gsm-sip-bridge/src/config/mod.rs`'s test module:
       `load_config` rejects a `pcsc_reader = true` entry missing
       `imsi_override` (and separately, missing `mcc`/`mnc`) with a
       `BridgeError::Config` naming the problem.
 
 ### Implementation for User Story 1
 
-- [ ] T010 [US1] Implement `resolve_one_pcsc_line(index: u32, override: &VowifiLineOverride, base: &VowifiConfig) -> ResolvedLine`
+- [X] T010 [US1] Implement `resolve_one_pcsc_line(index: u32, override: &VowifiLineOverride, base: &VowifiConfig) -> ResolvedLine`
       in `gsm-sip-bridge/src/vowifi/discovery.rs`, reusing
       `resolve_one_line`'s existing per-index infra derivation block (netns,
       veth addrs/ifaces, strongswan if_id/tun_iface, vpcd_port — lines
       218-233) and setting `modem_port = PathBuf::new()`, `pcsc_reader = true`.
-- [ ] T011 [US1] In `resolve_lines` (`gsm-sip-bridge/src/vowifi/discovery.rs:130-178`),
+- [X] T011 [US1] In `resolve_lines` (`gsm-sip-bridge/src/vowifi/discovery.rs:130-178`),
       after building `lines` from the modem-derived `ready` list, append one
       `ResolvedLine` per `base.line_overrides` entry with `pcsc_reader = true`
       via T010's helper, continuing the same index counter and subject to
       the same `max_lines` bound/overflow reporting as modem lines.
-- [ ] T012 [US1] In `start_vowifi_line` (`gsm-sip-bridge/src/supervise/orchestrate.rs:467-529`),
+- [X] T012 [US1] In `start_vowifi_line` (`gsm-sip-bridge/src/supervise/orchestrate.rs:467-529`),
       branch on `line.pcsc_reader` immediately after the existing log line to
       skip the modem-path-exists check (lines 481-484) and the
       `modem-ims --modem` reconcile call (lines 486-495).
-- [ ] T013 [US1] In `start_vowifi_line_strongswan` (`gsm-sip-bridge/src/supervise/orchestrate.rs:532-679`),
+- [X] T013 [US1] In `start_vowifi_line_strongswan` (`gsm-sip-bridge/src/supervise/orchestrate.rs:532-679`),
       skip the entire `vowifi-usim-bridge` spawn block (lines 609-668) when
       `line.pcsc_reader` is `true`.
-- [ ] T014 [US1] Add Alpine's `ccid` package to the runtime `apk add` list in
+- [X] T014 [US1] Add Alpine's `ccid` package to the runtime `apk add` list in
       `docker/Dockerfile` (around line 227-234), and update the comment block
       above it (lines 220-226) to note both drivers now coexist: `ifd-vpcd`
       (virtual, modem-bridged lines) and `ccid` (real USB PC/SC readers).
-- [ ] T015 [P] [US1] Add a `[[vowifi.line]]` example block to
+- [X] T015 [P] [US1] Add a `[[vowifi.line]]` example block to
       `config.toml.example` (near the existing per-line examples around
       line 233-254) showing `pcsc_reader = true` with mandatory
       `imsi_override`/`mcc`/`mnc`, noting it requires
       `tunnel_engine = "strongswan"`.
-- [ ] T016 [P] [US1] Write `docs/omnikey-pcsc-vowifi.md` covering: reading the
+- [X] T016 [P] [US1] Write `docs/omnikey-pcsc-vowifi.md` covering: reading the
       IMSI once via `pySim-read.py`, the config block from T015, the `ccid`
       driver requirement, and a verification checklist (mirrors
       quickstart.md); cross-link it from `docs/vowifi-bridge.md`.
@@ -157,18 +157,18 @@ per quickstart.md step 8.
 
 ### Tests for User Story 2
 
-- [ ] T017 [P] [US2] Unit test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
+- [X] T017 [P] [US2] Unit test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
       test module: `resolve_lines` given one `ProbedModem` (ready) plus one
       `pcsc_reader = true` override produces two `ResolvedLine`s with
       distinct `index`/`netns`/veth addresses, the modem line unchanged in
       shape from today, and the pcsc line's `modem_port` empty.
-- [ ] T018 [P] [US2] Unit test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
+- [X] T018 [P] [US2] Unit test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
       test module: with `max_lines` set low enough that modem lines alone
       nearly fill it, an additional `pcsc_reader` override that would exceed
       the bound is reported in `LineTableResult.failed` with reason
       `max_lines_exceeded`, identically to how an excess modem line is
       reported today.
-- [ ] T019 [US2] Regression test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
+- [X] T019 [US2] Regression test in `gsm-sip-bridge/src/vowifi/discovery.rs`'s
       test module: an existing modem-only `resolve_lines` scenario (no
       `pcsc_reader` overrides present) produces byte-identical output to
       before this feature — confirms spec FR-005/SC-004 (no behavior change
@@ -176,11 +176,11 @@ per quickstart.md step 8.
 
 ### Implementation for User Story 2
 
-- [ ] T020 [US2] Verify (and adjust if a gap is found) that T011's
+- [X] T020 [US2] Verify (and adjust if a gap is found) that T011's
       pcsc-line-appending logic in `resolve_lines` counts pcsc lines against
       `max_lines` together with modem lines (not as a separate unbounded
       pool) — satisfy T018.
-- [ ] T021 [US2] Verify (and adjust if a gap is found) that a pcsc line's
+- [X] T021 [US2] Verify (and adjust if a gap is found) that a pcsc line's
       registration failure cannot affect a modem line's thread in the
       per-line `std::thread::spawn` loop (`gsm-sip-bridge/src/supervise/orchestrate.rs:224-243`)
       — each line already runs on its own thread, so this is confirming, not
@@ -204,7 +204,7 @@ is spawned — per quickstart.md's engine-compatibility note.
 
 ### Tests for User Story 3
 
-- [ ] T022 [P] [US3] Unit test in `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
+- [X] T022 [P] [US3] Unit test in `gsm-sip-bridge/src/supervise/orchestrate.rs`'s
       test module: the supervise entrypoint, given `tunnel_engine = "swu"`
       and at least one `pcsc_reader = true` resolved line, returns a failure
       exit code with an error message naming that line's index/card_id,
@@ -213,7 +213,7 @@ is spawned — per quickstart.md's engine-compatibility note.
 
 ### Implementation for User Story 3
 
-- [ ] T023 [US3] Add the engine-compatibility check in
+- [X] T023 [US3] Add the engine-compatibility check in
       `gsm-sip-bridge/src/supervise/orchestrate.rs`, before the per-line
       spawn loop (before line 224): if `config.vowifi.tunnel_engine != "strongswan"`
       and any resolved line has `pcsc_reader = true`, print a clear error
@@ -225,12 +225,12 @@ is spawned — per quickstart.md's engine-compatibility note.
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T024 [P] Verify `vowifi-status`/Prometheus metrics output for a
+- [X] T024 [P] Verify `vowifi-status`/Prometheus metrics output for a
       `pcsc_reader` line (empty `modem_port`) renders sensibly with no
       distinguishing field — spec FR-010/SC-005; fix any awkward empty-field
       rendering found (e.g. in the status-query code path under
       `gsm-sip-bridge/src/vowifi/` or `gsm-sip-bridge/src/metrics/`).
-- [ ] T025 Run `cargo fmt --all && make lint && cargo test --workspace` full
+- [X] T025 Run `cargo fmt --all && make lint && cargo test --workspace` full
       pass (CLAUDE.md's mandatory pre-commit checklist) across every change
       above.
 - [ ] T026 Execute `specs/023-omnikey-pcsc-vowifi/quickstart.md` end-to-end
