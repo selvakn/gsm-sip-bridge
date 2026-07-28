@@ -62,7 +62,7 @@ three call flows in detail, and the audio pipeline.
 Requires Docker with the Compose plugin and one or more Quectel EC20 USB
 modems. **First time?** Each module needs one-time preparation (enable USB
 audio, disable ModemManager) — see
-[docs/hardware-setup.md](docs/hardware-setup.md).
+[docs/supported-hardware.md](docs/supported-hardware.md).
 
 ```bash
 git clone <repo-url> && cd gsm-sip-bridge/docker
@@ -124,7 +124,7 @@ the full `[vowifi]`/`[volte]` reference — is documented in
 
 | | |
 |---|---|
-| **Getting started** | [Supported hardware](docs/supported-hardware.md) · [Hardware setup](docs/hardware-setup.md) · [Configuration reference](docs/configuration.md) |
+| **Getting started** | [Supported hardware & setup](docs/supported-hardware.md) · [Configuration reference](docs/configuration.md) |
 | **Running it** | [Operations runbook & troubleshooting](docs/operations.md) · [Metrics & dashboards](docs/observability.md) |
 | **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [PC/SC card-reader VoWiFi lines (no modem)](docs/omnikey-pcsc-vowifi.md) · [Host-side VoLTE bridge (operations)](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy path)](docs/ec20-volte-setup.md) |
 | **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |

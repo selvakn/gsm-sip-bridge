@@ -8,8 +8,7 @@ Docker Compose quick start, then come back here for depth.
 | Doc | What it covers |
 |---|---|
 | [Quick Start](../README.md#quick-start-docker-compose) | Deploy the full stack with Docker Compose |
-| [supported-hardware.md](supported-hardware.md) | Which modem/reader models work, which call modes (CS/VoWiFi/VoLTE) each supports, and what's actually been live-tested vs. just architecturally possible |
-| [hardware-setup.md](hardware-setup.md) | One-time EC20 prep: enable USB audio, disable ModemManager, permissions |
+| [supported-hardware.md](supported-hardware.md) | Which modems/readers work, which call modes each supports, and one-time device setup |
 | [configuration.md](configuration.md) | Every `config.toml` key, with defaults, ranges, and example configs |
 
 ## Guides

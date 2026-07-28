@@ -9,7 +9,7 @@ For development or non-Docker deployments. Most users should prefer the
 - System packages: `build-essential`, `pkg-config`, `clang`, `libclang-dev`
 - Libraries: `libasound2-dev`, `libusb-1.0-0-dev`, `libpjproject-dev` (>= 2.14), `uuid-dev`
 - Hardware: One or more Quectel EC20 USB modems with active SIM cards
-  (see [hardware-setup.md](hardware-setup.md) for one-time module prep)
+  (see [supported-hardware.md](supported-hardware.md) for one-time module prep)
 - SIP server account (Asterisk, FreePBX, MikoPBX, etc.)
 
 Install build dependencies:

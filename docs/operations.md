@@ -80,12 +80,12 @@ sqlite3 /var/lib/gsm-sip-bridge/store.db ".backup /backup/store-$(date +%Y%m%d).
 ### No `/dev/ttyUSB*` devices
 
 Check `dmesg | grep ttyUSB`. Ensure the `option` and `qcserial` kernel
-modules are loaded, and see [hardware-setup.md](hardware-setup.md).
+modules are loaded, and see [supported-hardware.md](supported-hardware.md).
 
 ### No audio device in `arecord -l`
 
 USB Audio Class is not enabled on the module — follow the one-time UAC
-setup in [hardware-setup.md](hardware-setup.md).
+setup in [supported-hardware.md](supported-hardware.md).
 
 ### ModemManager interfering with AT sessions
 
