@@ -123,6 +123,43 @@ Two genuine defects *were* found and fixed while chasing this:
 - Documentation gap: a card-reader-only deployment was never exercised
   before this run; only mixed modem+pcsc was.
 
-Still not verified end-to-end: IMS registration and a test call on the pcsc
-line (quickstart steps 5-8). These need the line to run in the *production*
-container rather than a second one, to avoid the port contention above.
+Still not verified end-to-end (at the time of that entry): IMS registration
+and a test call on the pcsc line (quickstart steps 5-8). These needed the
+line to run in the *production* container rather than a second one, to avoid
+the port contention above. **Resolved below.**
+
+## Post-implementation follow-up (2026-07-28): IMS-AKA registration + a live call
+
+Running the pcsc line alone in the production container (Quectel modem
+physically removed) surfaced that **spec 023's PC/SC support only ever
+covered the ePDG tunnel** — `eap-sim-pcsc` talking to pcscd. IMS-AKA SIP
+registration (`vowifi-ims-agent`) is a separate SIM-access path
+(`ims::register_session`) that talked to the SIM exclusively via `AT+CSIM`,
+so it crash-looped for every pcsc line (no modem to open). Not a defect in
+the original spec's stated scope, but a real gap once "forward calls to the
+PBX" — not just "the tunnel comes up" — was the bar.
+
+Fixed by generalizing `modules::usim`'s SELECT/READ RECORD/AUTHENTICATE
+functions behind a new `ApduTransport` trait, implemented by both
+`AtCommander` (existing, AT+CSIM) and a new `modules::pcsc_card::PcscTransport`
+(direct PC/SC via the `pcsc` crate) — `register_session` picks the transport
+per line's `pcsc_reader` flag. Also auto-generates a stable, Luhn-valid IMEI
+(TS 23.003 Annex A) for the `+sip.instance` Contact parameter, since there's
+no modem to read one from via `AT+CGSN`, unless `imei_override` is set.
+
+A second genuine defect surfaced testing this against the real OmniKey AG
+3x21 + Vodafone SIM: `READ RECORD`'s `Le=00` is resolved transparently over
+`AT+CSIM`, but a real PC/SC reader answers it with `SW=6C1A` ("wrong length;
+actual length follows") and *no data* — every EF_DIR record looked empty and
+`discover_usim_aid` always failed with "no USIM application found in
+EF_DIR". Fixed by retrying with the SW2-supplied `Le`.
+
+**Live result**: with the Quectel modem physically removed (a genuinely
+card-reader-only deployment, no mixed lines), the tunnel came up, IMS-AKA
+REGISTER got `200 OK`, the network's own `NOTIFY` confirmed an active
+registration for the MSISDN (both the `sip:` and `tel:` AORs), and a real
+inbound call from a live caller arrived, was correctly signaled by Agent A,
+paired by Agent B, and dialed into the PBX as an extension — the caller hung
+up before anyone answered, which is normal call behavior, not a bug. This
+is quickstart steps 5-8, now confirmed end-to-end (with real inbound traffic
+rather than a synthetic outbound test call).

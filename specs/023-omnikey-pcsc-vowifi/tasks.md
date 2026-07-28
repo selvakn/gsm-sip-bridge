@@ -233,21 +233,28 @@ is spawned — per quickstart.md's engine-compatibility note.
 - [X] T025 Run `cargo fmt --all && make lint && cargo test --workspace` full
       pass (CLAUDE.md's mandatory pre-commit checklist) across every change
       above.
-- [ ] T026 (partial — see checklists/requirements.md) Execute
+- [X] T026 (see checklists/requirements.md) Execute
       `specs/023-omnikey-pcsc-vowifi/quickstart.md` end-to-end against the
       real OmniKey reader + Vodafone SIM (manual, hardware- and
       network-dependent — not automatable in CI, per this project's
       constitution's stated exception for hardware unavailable in CI).
       Steps 1-4 done live; reader discovery, line resolution, and
       eap-sim-pcsc's reader discrimination all confirmed correct in a real
-      mixed deployment. 2026-07-28 follow-up: the Vodafone ePDG tunnel is
-      confirmed UP (EAP-AKA succeeded, IKE_SA + CHILD_SA established,
-      verified on the wire with tcpdump) — the earlier "carrier not
-      responding" note was wrong and is retracted; the real cause was port
-      contention from running a second bridge container alongside the
-      production one under `--network host`. Remaining: steps 5-8 (IMS
-      registration + test call), which need the line to run in the
-      production container rather than a second one.
+      mixed deployment. 2026-07-28: the Vodafone ePDG tunnel is confirmed UP
+      (EAP-AKA succeeded, IKE_SA + CHILD_SA established, verified on the
+      wire with tcpdump) — the earlier "carrier not responding" note was
+      wrong and is retracted; the real cause was port contention from
+      running a second bridge container alongside the production one under
+      `--network host`. Steps 5-8 (IMS registration + test call) also now
+      confirmed, run genuinely card-reader-only (Quectel modem physically
+      removed): IMS-AKA REGISTER got 200 OK, network NOTIFY confirmed an
+      active registration, and a real inbound call was signaled and dialed
+      into the PBX. This required adding a PC/SC transport for IMS-AKA
+      registration itself (spec's original scope only covered the ePDG
+      tunnel's PC/SC path) plus an auto-generated IMEI and a READ RECORD
+      SW=6C1A retry fix — see checklists/requirements.md's
+      "Post-implementation follow-up (2026-07-28)" section for the full
+      account.
 - [X] T027 [P] Update `specs/023-omnikey-pcsc-vowifi/checklists/requirements.md`
       with any follow-up notes if implementation surfaced a spec gap.
 
