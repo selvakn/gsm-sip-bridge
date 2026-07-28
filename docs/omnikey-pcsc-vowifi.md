@@ -85,4 +85,36 @@ resolve, register, and fail independently (see
    configured, confirm it still registers independently and its
    behavior/logs are unchanged from before this feature.
 
+## Troubleshooting
+
+**Never test by starting a second bridge container alongside a running one.**
+The compose deployment uses `network_mode: host`, so a second instance shares
+the host's UDP 500/4500 (IKE), the vpcd port, the metrics port and the per-line
+SIP ports. The failures this produces look nothing like port conflicts and
+will send you chasing the carrier instead:
+
+- IKE_SA_INIT appears to go unanswered (retransmits, then silence) because the
+  ePDG's reply is delivered to the *other* container's charon, which discards
+  it as an unknown SPI. Verified on 2026-07-28: an ePDG that looked completely
+  silent answered a standalone IKEv2 probe from the same host instantly, and
+  the line established normally once run on its own.
+- `pjsua_transport_create returned 120098` — PJ's error base plus `EADDRINUSE`;
+  the SIP transport port is already taken.
+- `pcscd's vpcd reader never came up on 127.0.0.1:15963 (DriverBindFailed)`.
+
+Stop the running container first, or give the test instance its own
+`[vowifi].vpcd_port`, `[metrics].port` and SIP ports.
+
+To confirm an ePDG is reachable independently of this stack, send it a bare
+IKE_SA_INIT on UDP/500 — any reply (even `NO_PROPOSAL_CHOSEN` or
+`INVALID_KE_PAYLOAD`) proves reachability and rules out the carrier.
+
+A card-reader-only deployment (no modem-backed lines at all) needs no vpcd
+virtual reader, and `supervise` no longer provisions or waits for one — expect
+`started shared pcscd; no vpcd reader (all N line(s) are card-reader-backed)`.
+
+Note that `epdg.epc.mnc043.mcc404.pub.3gppnetwork.org` resolves to more than
+one address and DNS rotates the order; the line uses whichever `dig` returns
+first, so successive restarts may legitimately connect to different ePDG IPs.
+
 Full walkthrough: `specs/023-omnikey-pcsc-vowifi/quickstart.md`.

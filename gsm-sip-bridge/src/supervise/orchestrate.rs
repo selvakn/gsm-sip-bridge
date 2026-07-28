@@ -251,36 +251,58 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             let _ = runner.run(&["ip", "netns", "del", "__probe"]);
 
             if config.vowifi.tunnel_engine == "strongswan" {
-                vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
+                // pcscd is shared by both kinds of line: a modem-backed line
+                // reaches its SIM through the vpcd *virtual* reader that
+                // `vowifi-usim-bridge` drives, while a `pcsc_reader` line
+                // (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader
+                // pcscd picks up straight from USB. Only the former needs
+                // vpcd, so an all-pcsc deployment must not be held hostage to
+                // a virtual reader nothing will ever connect to — provisioning
+                // it anyway made a free-standing card-reader deployment die on
+                // an unrelated vpcd port bind, and left eap-sim-pcsc iterating
+                // over empty vpcd slots ("SCardConnect: No smart card
+                // inserted") before reaching the real one.
+                let needs_vpcd = needs_vpcd_reader(&vowifi_lines);
+                if needs_vpcd {
+                    vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
+                }
                 let Some(pcscd_handle) = vpcd::spawn_pcscd(runner.as_ref()) else {
                     eprintln!("[supervise] FATAL: failed to start pcscd");
                     return ExitCode::FAILURE;
                 };
                 started.lock().unwrap().pcscd = Some(pcscd_handle);
-                println!(
-                    "[supervise] started shared pcscd; one vpcd reader, slots from {}",
-                    config.vowifi.vpcd_port
-                );
 
-                match vpcd::wait_for_vpcd_ready(
-                    runner.as_ref(),
-                    pcscd_handle,
-                    &config.vowifi.vpcd_host,
-                    config.vowifi.vpcd_port,
-                ) {
-                    vpcd::ReadyOutcome::Ready => println!(
-                        "[supervise] vpcd reader ready on {}:{}",
-                        config.vowifi.vpcd_host, config.vowifi.vpcd_port
-                    ),
-                    other => {
-                        eprintln!(
-                            "[supervise] FATAL: pcscd's vpcd reader never came up on {}:{} ({other:?}). \
-                             If pcscd logged 'Address in use', another process holds that port — pick a \
-                             [vowifi].vpcd_port below the ephemeral range.",
+                if needs_vpcd {
+                    println!(
+                        "[supervise] started shared pcscd; one vpcd reader, slots from {}",
+                        config.vowifi.vpcd_port
+                    );
+                    match vpcd::wait_for_vpcd_ready(
+                        runner.as_ref(),
+                        pcscd_handle,
+                        &config.vowifi.vpcd_host,
+                        config.vowifi.vpcd_port,
+                    ) {
+                        vpcd::ReadyOutcome::Ready => println!(
+                            "[supervise] vpcd reader ready on {}:{}",
                             config.vowifi.vpcd_host, config.vowifi.vpcd_port
-                        );
-                        return ExitCode::FAILURE;
+                        ),
+                        other => {
+                            eprintln!(
+                                "[supervise] FATAL: pcscd's vpcd reader never came up on {}:{} ({other:?}). \
+                                 If pcscd logged 'Address in use', another process holds that port — pick a \
+                                 [vowifi].vpcd_port below the ephemeral range.",
+                                config.vowifi.vpcd_host, config.vowifi.vpcd_port
+                            );
+                            return ExitCode::FAILURE;
+                        }
                     }
+                } else {
+                    println!(
+                        "[supervise] started shared pcscd; no vpcd reader \
+                         (all {} line(s) are card-reader-backed)",
+                        vowifi_lines.len()
+                    );
                 }
             }
 
@@ -465,6 +487,16 @@ fn resolve_epdg_ip(
         .lines()
         .find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit() || c == '.'))
         .map(str::to_string)
+}
+
+/// Whether this line table needs pcscd's vpcd *virtual* reader provisioned.
+/// Only a modem-backed line does — it reaches its SIM through the vpcd slot
+/// that `vowifi-usim-bridge` drives over AT+CSIM. A `pcsc_reader` line
+/// (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader that pcscd picks
+/// up from USB by itself, so an all-card-reader deployment needs no vpcd at
+/// all and must not fail startup when one can't be bound.
+fn needs_vpcd_reader(lines: &[LineResolutionEntry]) -> bool {
+    lines.iter().any(|l| !l.pcsc_reader)
 }
 
 /// Fail fast on an unsupported combination (specs/023-omnikey-pcsc-vowifi
@@ -1464,5 +1496,26 @@ mod tests {
         let err = check_pcsc_engine_compatibility(&lines, "swu").unwrap_err();
         assert!(err.contains('1'), "unexpected error: {err}");
         assert!(err.contains("pcsc1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn an_all_card_reader_deployment_needs_no_vpcd_reader() {
+        // Caught live on 2026-07-28: a pcsc-only deployment died at startup
+        // with "pcscd's vpcd reader never came up" because vpcd was
+        // provisioned unconditionally under the strongswan engine, even
+        // though no line would ever connect to it.
+        assert!(!needs_vpcd_reader(&[pcsc_line(0)]));
+        assert!(!needs_vpcd_reader(&[pcsc_line(0), pcsc_line(1)]));
+    }
+
+    #[test]
+    fn any_modem_backed_line_still_needs_the_vpcd_reader() {
+        assert!(needs_vpcd_reader(&[modem_line(0, "/dev/ttyUSB0")]));
+        // Mixed deployment: the modem line's SIM still reaches charon only
+        // through vpcd, so one modem line is enough to require it.
+        assert!(needs_vpcd_reader(&[
+            modem_line(0, "/dev/ttyUSB0"),
+            pcsc_line(1)
+        ]));
     }
 }

@@ -79,9 +79,50 @@ OmniKey) simultaneously. Confirmed live and unambiguously:
 - The pcsc line's own ePDG FQDN correctly derived from its `mcc`/`mnc`
   (`epdg.epc.mnc043.mcc404.pub.3gppnetwork.org` → Vodafone's real ePDG,
   `203.88.4.88`) and IKE_SA_INIT was sent there.
-- Not achieved: a completed registration for the pcsc line — Vodafone's
-  ePDG never responded to repeated IKE_SA_INIT retransmits (silence, not a
-  rejection), most likely a carrier-side network-path/entitlement factor
-  external to this feature's code (every other stage of the pipeline this
-  feature owns was confirmed correct). Needs the operator's own real
-  deployment network path to resolve — out of scope for a sandboxed test.
+- Initially not achieved: the pcsc line's IKE_SA_INIT drew no response, and
+  this was first recorded here as a suspected carrier-side factor. **That
+  conclusion was wrong — see the follow-up below.**
+
+## T026 follow-up (2026-07-28): tunnel confirmed UP, earlier diagnosis retracted
+
+Re-ran the pcsc line in isolation with a host-side packet capture. The
+Vodafone ePDG tunnel establishes fully:
+
+```
+[IKE] EAP method EAP_AKA succeeded, MSK established
+[IKE] IKE_SA ims[2] established between 192.168.15.10
+      [0404438083996440@nai.epc.mnc043.mcc404.3gppnetwork.org]...203.88.4.88
+[IKE] CHILD_SA ims{2} established ... TS 2402:8100:6972:e043:0:18:291c:4201/128
+[IKE] installing new virtual IP 2402:8100:6972:e043:0:18:291c:4201
+```
+
+`tcpdump` confirms the full IKEv2 exchange on the wire (IKE_SA_INIT →
+IKE_AUTH ×3 over NAT-T/4500 → ESP + NAT keepalives). A standalone IKEv2
+prober also showed both `epdg.epc.mnc043.mcc404` addresses (203.88.4.88 and
+203.88.11.33) answering IKE_SA_INIT immediately. So the ePDG was never
+silent and the carrier/entitlement theory is retracted.
+
+The real cause of the original T026 silence was **test-harness contention**:
+that run started a second bridge container with `--network host` while the
+production container was already running, so both instances shared the host's
+UDP 500/4500, vpcd port, metrics port and SIP ports. Symptoms traced to this,
+not to the feature:
+
+- `pjsua_transport_create returned 120098` (PJ error base + `EADDRINUSE`) on
+  the IMS/SIP agents.
+- IKE responses landing in the wrong charon instance.
+
+Two genuine defects *were* found and fixed while chasing this:
+
+- **vpcd was provisioned unconditionally under the strongswan engine**, so an
+  all-card-reader deployment aborted at startup with "pcscd's vpcd reader
+  never came up" on a virtual reader no line would ever use, and eap-sim-pcsc
+  logged repeated `SCardConnect: No smart card inserted` walking empty vpcd
+  slots before reaching the real reader. Now gated on
+  `needs_vpcd_reader()` — provisioned only when a modem-backed line exists.
+- Documentation gap: a card-reader-only deployment was never exercised
+  before this run; only mixed modem+pcsc was.
+
+Still not verified end-to-end: IMS registration and a test call on the pcsc
+line (quickstart steps 5-8). These need the line to run in the *production*
+container rather than a second one, to avoid the port contention above.

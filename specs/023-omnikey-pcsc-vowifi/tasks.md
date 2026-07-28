@@ -240,9 +240,14 @@ is spawned — per quickstart.md's engine-compatibility note.
       constitution's stated exception for hardware unavailable in CI).
       Steps 1-4 done live; reader discovery, line resolution, and
       eap-sim-pcsc's reader discrimination all confirmed correct in a real
-      mixed deployment (steps 5-8 blocked on Vodafone's ePDG not responding
-      from this network path — carrier/entitlement-side, not this feature's
-      code).
+      mixed deployment. 2026-07-28 follow-up: the Vodafone ePDG tunnel is
+      confirmed UP (EAP-AKA succeeded, IKE_SA + CHILD_SA established,
+      verified on the wire with tcpdump) — the earlier "carrier not
+      responding" note was wrong and is retracted; the real cause was port
+      contention from running a second bridge container alongside the
+      production one under `--network host`. Remaining: steps 5-8 (IMS
+      registration + test call), which need the line to run in the
+      production container rather than a second one.
 - [X] T027 [P] Update `specs/023-omnikey-pcsc-vowifi/checklists/requirements.md`
       with any follow-up notes if implementation surfaced a spec gap.
 
