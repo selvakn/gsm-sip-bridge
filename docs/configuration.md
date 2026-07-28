@@ -228,6 +228,8 @@ network identity. Every field is optional except the matcher.
 | `mcc` | string | unset (auto-derive) | This line's home network MCC. Must be set together with `mnc` |
 | `mnc` | string | unset (auto-derive) | This line's home network MNC, zero-padded to 3 digits |
 | `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch: use this IMSI instead of reading it from the SIM |
+| `imei_override` | string | unset (read via AT+CGSN, or auto-generated for a `pcsc_reader` line) | Diagnostic escape hatch: use this IMEI instead of reading it from the modem |
+| `pcsc_reader` | bool | `false` | This line's SIM comes from a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem (specs/023-omnikey-pcsc-vowifi) — see [docs/omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md). `mcc`/`mnc`/`imsi_override` become mandatory (no modem to derive them from); `imei_override` stays optional — left unset, a stable, Luhn-valid IMEI is auto-generated from the line's IMSI. Requires `[vowifi].tunnel_engine = "strongswan"` (the default); the `swu` engine has no PC/SC support and refuses to start with this set |
 
 ### `[volte]`
 

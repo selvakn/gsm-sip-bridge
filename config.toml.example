@@ -259,14 +259,18 @@ max_lines = 8
 # engine has no PC/SC support and supervise refuses to start if a
 # pcsc_reader line is configured under it. mcc/mnc/imsi_override are
 # mandatory here (there's no modem to derive them from) — read the IMSI once
-# via pySim-read.py or opensc-tool against the reader. See
-# docs/omnikey-pcsc-vowifi.md.
+# via pySim-read.py or opensc-tool against the reader. IMS-AKA registration
+# (not just the ePDG tunnel) also needs an IMEI for the Contact header's
+# +sip.instance; with no modem to read one from via AT+CGSN, a stable,
+# Luhn-valid one is auto-generated from imsi_override unless imei_override
+# is set explicitly below. See docs/omnikey-pcsc-vowifi.md.
 #
 # [[vowifi.line]]
 # pcsc_reader = true
 # imsi_override = "404940123456789"
 # mcc = "404"
 # mnc = "094"
+# imei_override = "490154203237518"  # optional — auto-generated if unset
 
 # ============================================================================
 # VoLTE inbound bridge — specs/015-volte-host-ims, 016-volte-calls,

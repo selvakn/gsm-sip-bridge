@@ -17,7 +17,7 @@ loss, missed calls).
 ## Highlights
 
 - **GSM-to-SIP call bridging** — auto-answers incoming GSM calls on EC20 modules and bridges audio to a SIP extension, with comfort ringback while the extension rings.
-- **VoWiFi-to-SIP bridging** — answers calls the carrier delivers over Wi-Fi Calling: an IKEv2/IPsec ePDG tunnel (strongSwan), IMS-AKA registration with Gm IPsec, and wideband (AMR-WB → G.722) audio end-to-end. Auto-discovers every VoWiFi-capable SIM and runs one tunnel/registration per line concurrently. Optional; disabled by default.
+- **VoWiFi-to-SIP bridging** — answers calls the carrier delivers over Wi-Fi Calling: an IKEv2/IPsec ePDG tunnel (strongSwan), IMS-AKA registration with Gm IPsec, and wideband (AMR-WB → G.722) audio end-to-end. Auto-discovers every VoWiFi-capable SIM and runs one tunnel/registration per line concurrently. Optional; disabled by default. A line's SIM can come from a modem (the default) or directly from a physical PC/SC reader (e.g. OmniKey AG 3x21) with no modem at all — see [docs/omnikey-pcsc-vowifi.md](docs/omnikey-pcsc-vowifi.md).
 - **Host-side VoLTE-to-SIP bridging** — the bridge performs its own IMS registration and call signalling over the cellular LTE data path, instead of delegating to the modem's internal voice stack and re-bridging its already-decoded audio — bringing codec, jitter handling, and media fully under the bridge's control. Auto-discovers every VoLTE-capable modem, runs each as its own network-namespace-isolated line, and bridges answered calls to the same SIP destination as the other two paths. Optional; disabled by default.
 - **Multi-module support** — auto-detects all connected EC20s, assigns stable IMEI-keyed slots that survive restarts and re-plugs, and handles concurrent calls independently.
 - **Self-healing** — detects USB disconnects and network registration loss, recovers each card independently with exponential backoff, and runs a preventive scheduled nightly modem restart cycle.
@@ -126,7 +126,7 @@ the full `[vowifi]`/`[volte]` reference — is documented in
 |---|---|
 | **Getting started** | [Hardware setup](docs/hardware-setup.md) · [Configuration reference](docs/configuration.md) |
 | **Running it** | [Operations runbook & troubleshooting](docs/operations.md) · [Metrics & dashboards](docs/observability.md) |
-| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [Host-side VoLTE bridge (operations)](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy path)](docs/ec20-volte-setup.md) |
+| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [PC/SC card-reader VoWiFi lines (no modem)](docs/omnikey-pcsc-vowifi.md) · [Host-side VoLTE bridge (operations)](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy path)](docs/ec20-volte-setup.md) |
 | **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |
 
 The full index, including design notes and engineering history, is at
