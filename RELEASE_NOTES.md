@@ -43,6 +43,19 @@ Repository maintenance and one structural fix. CLI help text and every
   line came up with, say, an empty APN. That exact failure is documented in
   `volte::discovery` as having attached the network's default bearer instead
   of the IMS one, looking fully configured while the P-CSCF was unreachable.
+- **Breaking: the three VoLTE metrics using the pre-v5 `gsm_bridge_` prefix
+  are renamed** to `gsm_sip_bridge_volte_registered` / `_pdn_up` /
+  `_registrations_total`. Every other metric moved to `gsm_sip_bridge_` in
+  v5; these three were added later and reintroduced the old prefix, so all 31
+  metrics now share one. Update any dashboard or alert rule referencing them.
+- **An I/O failure no longer reports as a configuration error.**
+  `From<io::Error>` mapped *every* I/O error to `BridgeError::Config`, so a
+  serial port that vanished mid-call, a refused socket, and an unwritable log
+  all told the operator to check config.toml. There is now an `Io` variant
+  that retains the source, so callers can match on `ErrorKind`.
+- **Store migrations are a table** rather than a chain of near-identical
+  `if version == "N"` blocks; adding one is a single entry instead of ~10
+  lines with a hand-copied version number in the `UPDATE`.
 - **~100 stale references to `docker/entrypoint.sh`** across the source and
   docs claimed it still supervises agents, creates veth pairs, and runs
   cleanup traps. It has been a 28-line exec shim since specs/021; they now

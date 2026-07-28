@@ -352,9 +352,9 @@ previous binding, and the container does the same on shutdown.
 
 | Metric | Meaning |
 |---|---|
-| `gsm_bridge_volte_registered` | 1 when the host-side LTE registration is accepted |
-| `gsm_bridge_volte_pdn_up` | 1 when the IMS PDN is attached **and routable** |
-| `gsm_bridge_volte_registrations_total{outcome}` | `accepted` / `renewed` / `rejected` / `renewal_failed` |
+| `gsm_sip_bridge_volte_registered` | 1 when the host-side LTE registration is accepted |
+| `gsm_sip_bridge_volte_pdn_up` | 1 when the IMS PDN is attached **and routable** |
+| `gsm_sip_bridge_volte_registrations_total{outcome}` | `accepted` / `renewed` / `rejected` / `renewal_failed` |
 
 Deliberately separate from `gsm_bridge_sip_registered` (the PBX side) and from
 the VoWiFi agent's gauges — when something is down you need to know *which*
@@ -392,8 +392,8 @@ than decorative:
 
 | Watch | Because |
 |---|---|
-| `gsm_bridge_volte_registered` | 0 means calls are being missed, not merely delayed |
-| `gsm_bridge_volte_pdn_up` | attached-but-unrouted is a real, observed state |
+| `gsm_sip_bridge_volte_registered` | 0 means calls are being missed, not merely delayed |
+| `gsm_sip_bridge_volte_pdn_up` | attached-but-unrouted is a real, observed state |
 | `gsm_sip_bridge_active_calls{transport="volte"}` | this path's calls, distinct from `vowifi` and `cs` |
 
 Call and message records carry `transport="volte"`, a third value on the

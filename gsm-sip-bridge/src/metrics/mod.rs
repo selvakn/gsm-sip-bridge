@@ -78,7 +78,7 @@ pub static SIP_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
 /// is down, not an aggregate.
 pub static VOLTE_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
     let g = Gauge::new(
-        "gsm_bridge_volte_registered",
+        "gsm_sip_bridge_volte_registered",
         "1 when the host-side IMS registration over LTE is accepted, 0 otherwise",
     )
     .expect("metric");
@@ -89,7 +89,7 @@ pub static VOLTE_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
 /// 1 when the IMS PDN is attached and routable.
 pub static VOLTE_PDN_UP: Lazy<Gauge> = Lazy::new(|| {
     let g = Gauge::new(
-        "gsm_bridge_volte_pdn_up",
+        "gsm_sip_bridge_volte_pdn_up",
         "1 when the LTE IMS PDN is attached and has a default route, 0 otherwise",
     )
     .expect("metric");
@@ -102,7 +102,7 @@ pub static VOLTE_PDN_UP: Lazy<Gauge> = Lazy::new(|| {
 pub static VOLTE_REGISTRATIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let c = CounterVec::new(
         Opts::new(
-            "gsm_bridge_volte_registrations_total",
+            "gsm_sip_bridge_volte_registrations_total",
             "Host-side VoLTE IMS registration attempts by outcome",
         ),
         &["outcome"],

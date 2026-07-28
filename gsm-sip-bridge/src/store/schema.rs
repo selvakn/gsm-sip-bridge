@@ -173,6 +173,18 @@ CREATE VIEW recent_sms AS
     LIMIT 200;
 "#;
 
+/// Every migration, in order: `(from_version, to_version, sql)`.
+///
+/// To add one: append `SCHEMA_V<N+1>_SQL`, add a row here, and bump
+/// [`SCHEMA_VERSION`]. The loop in [`init_schema`] applies whichever subset an
+/// existing database needs, so a fresh database (which `SCHEMA_SQL` creates at
+/// v1) and one upgraded across several releases converge on the same shape.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("1", "2", SCHEMA_V2_SQL),
+    ("2", "3", SCHEMA_V3_SQL),
+    ("3", "4", SCHEMA_V4_SQL),
+];
+
 pub fn init_schema(conn: &Connection) -> BridgeResult<()> {
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|e| BridgeError::Store(format!("failed to initialize schema: {e}")))?;
@@ -185,40 +197,27 @@ pub fn init_schema(conn: &Connection) -> BridgeResult<()> {
         )
         .map_err(|e| BridgeError::Store(format!("failed to read schema_version: {e}")))?;
 
-    if version == "1" {
-        conn.execute_batch(SCHEMA_V2_SQL)
-            .map_err(|e| BridgeError::Store(format!("schema v1→v2 migration failed: {e}")))?;
+    // Applied in order, each stepping the recorded version by one. A table
+    // rather than a chain of near-identical `if version == "N"` blocks: the
+    // chain grew by ~10 lines per migration, and every one of those lines was
+    // an opportunity to paste the wrong version number into the `UPDATE`.
+    // Adding a migration is now one entry.
+    for (from, to, sql) in MIGRATIONS {
+        if version != *from {
+            continue;
+        }
+        conn.execute_batch(sql).map_err(|e| {
+            BridgeError::Store(format!("schema v{from}→v{to} migration failed: {e}"))
+        })?;
         conn.execute(
-            "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
-            [],
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [to],
         )
         .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
-        version = "2".to_string();
+        version = to.to_string();
     }
 
-    if version == "2" {
-        conn.execute_batch(SCHEMA_V3_SQL)
-            .map_err(|e| BridgeError::Store(format!("schema v2→v3 migration failed: {e}")))?;
-        conn.execute(
-            "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
-            [],
-        )
-        .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
-        version = "3".to_string();
-    }
-
-    if version == "3" {
-        conn.execute_batch(SCHEMA_V4_SQL)
-            .map_err(|e| BridgeError::Store(format!("schema v3→v4 migration failed: {e}")))?;
-        conn.execute(
-            "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
-            [],
-        )
-        .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
-        version = "4".to_string();
-    }
-
-    if version != "4" {
+    if version != SCHEMA_VERSION {
         return Err(BridgeError::Store(format!(
             "incompatible schema version: expected {SCHEMA_VERSION}, found {version}"
         )));

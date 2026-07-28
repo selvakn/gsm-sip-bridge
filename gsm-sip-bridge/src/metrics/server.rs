@@ -56,7 +56,7 @@ async fn metrics_handler() -> impl IntoResponse {
     // Both registries, not just the default one.
     //
     // `prometheus::gather()` collects the *default* registry. The host-side
-    // LTE gauges (`gsm_bridge_volte_*`) register into `metrics::REGISTRY`
+    // LTE gauges (`gsm_sip_bridge_volte_*`) register into `metrics::REGISTRY`
     // instead, so for as long as they have existed they have been invisible
     // to every scrape — set faithfully by the code, collected by nobody.
     // Found live (specs/017 research R16) while checking that this path's
