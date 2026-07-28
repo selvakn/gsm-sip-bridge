@@ -561,7 +561,7 @@ mod tests {
         let mut rng = seeded_rng();
         for _ in 0..1000 {
             let v = jitter_offset(&mut rng, 60);
-            assert!(v >= -60 && v <= 60, "out of range: {v}");
+            assert!((-60..=60).contains(&v), "out of range: {v}");
         }
     }
 

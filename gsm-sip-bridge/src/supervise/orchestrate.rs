@@ -1284,8 +1284,10 @@ mod tests {
     }
 
     fn pcsc_line(index: u32) -> LineResolutionEntry {
-        let mut config = VowifiConfig::default();
-        config.imsi_override = Some("404940123456789".to_string());
+        let config = VowifiConfig {
+            imsi_override: Some("404940123456789".to_string()),
+            ..Default::default()
+        };
         LineResolutionEntry {
             index,
             card_id: format!("pcsc{index}"),

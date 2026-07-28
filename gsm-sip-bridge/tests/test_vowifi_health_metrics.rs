@@ -1,5 +1,3 @@
-mod common;
-
 // User Story 4 (specs/014-vowifi-metrics-restore): registration state,
 // tunnel state, and bridge-failure reasons must be visible without reading
 // logs. Drives the real `ims::observability::AgentObservability` — the same

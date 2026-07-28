@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::config::{load_config, AppConfig};
 use gsm_sip_bridge::sip::RegistrationState;
 use gsm_sip_bridge::sip::SipBridge;

@@ -343,7 +343,7 @@ mod tests {
         let buf = EchoBuffer::new(16000);
         let mut m = EchoMixer::new(buf.clone(), 16000, 1.0, Duration::from_secs(60));
         m.next_packet(Duration::ZERO, 320, &FlatMarker(0));
-        buf.push(&vec![1000i16; 100]);
+        buf.push(&[1000i16; 100]);
 
         let (pcm, _) = m.next_packet(Duration::from_secs(2), 320, &FlatMarker(0));
 

@@ -1,11 +1,23 @@
-[advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+# cargo-deny policy (>= 0.16 schema).
+#
+# The keys this file used to carry — `[advisories] vulnerability`/`notice` and
+# `[licenses] unlicensed` — were removed upstream and now *hard-error* rather
+# than warn, so `cargo deny check` failed outright for anyone who actually had
+# cargo-deny installed. `make lint` only runs it `if command -v cargo-deny`,
+# which is why that went unnoticed; CI now installs it so the policy is
+# genuinely enforced somewhere.
+#
+# Under the current schema vulnerability / unsound / notice advisories are all
+# denied unconditionally — an individual finding is suppressed by adding its
+# RUSTSEC id to `ignore` (with a comment saying why), not by lowering a
+# severity knob.
 
+[advisories]
+yanked = "warn"
+ignore = []
+
+# All licenses are denied unless listed here; there is no implicit default.
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",

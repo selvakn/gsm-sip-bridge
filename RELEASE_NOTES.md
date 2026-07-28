@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+Repository maintenance — no runtime behaviour changes. CLI help text and
+every `*-shell-env` output were verified byte-identical before and after.
+
+- **The CLI handlers moved out of `src/main.rs` into
+  `gsm_sip_bridge::commands`** (2099 lines → 28). A binary crate's items
+  cannot be imported from `tests/`, so all 40 handlers — line resolution,
+  call reporting, and the `*-shell-env` printers whose output
+  `docker/healthcheck.sh` `eval`s — had no tests at all, for a purely
+  structural reason. `main.rs` is now argument parsing, logging setup, and a
+  dispatch call; the 24-arm `if let Some(Commands::X(..))` chain became a
+  `match`, so a new subcommand that is not wired up is a build error rather
+  than one that silently falls through and starts the daemon.
+- **The three `*-shell-env` printers now return a `String`** rather than
+  writing to stdout (`render_vowifi_shell_env`, `render_discover_shell_env`,
+  `render_volte_discover_lines_shell_env`), which is what makes them
+  assertable. Six new tests in `tests/test_shell_env_contracts.rs` pin the
+  contract: array element counts matching `LINE_COUNT` (which
+  `healthcheck.sh` indexes in a `seq` loop), every key still emitted when
+  zero lines resolve, and `shell_quote` escaping against injection.
+- **`make lint` now lints the whole workspace** (`cargo clippy --workspace
+  --all-targets -- -D warnings`). It previously covered only the
+  `gsm-sip-bridge` and `pjsua-safe` crates' default targets, so `amr-safe`,
+  `amr-sys`, `pjsua-sys`, every integration test, and every `#[cfg(test)]`
+  module were never linted — hiding ~15 warnings including genuinely dead
+  test-support code. All of them are now fixed and the gate is clean.
+- **`deny.toml` no longer hard-errors.** It used `[advisories]
+  vulnerability`/`notice` and `[licenses] unlicensed`, all removed from
+  cargo-deny and now rejected outright — so `cargo deny check` failed for
+  anyone who had the tool installed, which `make lint`'s `if command -v`
+  guard quietly hid. Rewritten against the current schema, and CI now
+  installs cargo-deny so the dependency policy is actually enforced.
+- **`make test` prefers `cargo nextest`** when installed, which applies the
+  20s per-test timeout `.config/nextest.toml` has always described but
+  nothing ever ran; falls back to `cargo test` otherwise. CI installs it.
+- **Removed dead weight**: `docker/grafana/dashboards/gsm-bridge.json` (an
+  orphaned 28-panel dashboard mounted nowhere — `docker-compose.yml` only
+  mounts `grafana/provisioning` — and querying the pre-v5 `gsm_bridge_*`
+  metric names that no longer exist), the entirely unused
+  `gsm-sip-bridge/tests/common/` harnesses (`PtyHarness`, `PbxHarness`,
+  `temp_store`, `null_alsa_device`) along with the 25 `mod common;`
+  declarations that existed only to satisfy them, and the vestigial no-op
+  `make test-bash` target.
+
 ## v8.0.0
 
 A VoWiFi line's SIM no longer needs a modem at all — it can sit directly in

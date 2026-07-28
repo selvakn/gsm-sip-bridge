@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::config::load_config;
 use std::io::Write;
 use tempfile::NamedTempFile;

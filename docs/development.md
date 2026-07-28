@@ -50,9 +50,9 @@ plans, and task breakdowns live under `specs/`.
 | Target | Description |
 |---|---|
 | `make build` | Build all crates in release mode |
-| `make test` | Run all workspace tests |
+| `make test` | Run all workspace tests (via `cargo nextest` when installed, for its per-test timeout) |
 | `make run` | Start the bridge |
-| `make lint` | Clippy + rustfmt check + cargo-deny |
+| `make lint` | rustfmt check + clippy (`--workspace --all-targets -D warnings`) + cargo-deny + shellcheck + unsafe audit |
 | `make coverage` | Generate lcov coverage report |
 | `make docker-build` | Build the Docker image |
 | `make docker-up` | Start the full Docker Compose stack |
@@ -66,6 +66,12 @@ Run, in order — all must pass:
 
 ```bash
 cargo fmt --all          # fix formatting in place
-make lint                # rustfmt check + clippy -D warnings + unsafe ratio
-cargo test --workspace   # all tests must pass
+make lint                # clippy --workspace --all-targets -D warnings, + deny/shellcheck/unsafe
+make test                # all tests must pass
 ```
+
+Two optional tools change what these actually check, so it is worth having
+them installed locally rather than discovering the difference in CI:
+`cargo-deny` (otherwise the dependency/licence policy is silently skipped) and
+`cargo-nextest` (otherwise there is no per-test timeout, and a test that hangs
+wedges the whole run).

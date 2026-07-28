@@ -1,19 +1,24 @@
 CONFIG ?= config.toml
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
 
-.PHONY: build test test-bash run clean lint format dev dev-gsm dev-sip \
+.PHONY: build test run clean lint format dev dev-gsm dev-sip \
         docker-build docker-up docker-down docker-logs \
         coverage mutants mutants-full help
 
 build: ## Compile all binaries (release mode)
 	@cargo build --workspace --release
 
+# Prefers cargo-nextest when installed: .config/nextest.toml sets a 20s
+# per-test timeout, which `cargo test` has no equivalent for and which is what
+# stops a serial-port or store-thread test that hangs from wedging the whole
+# run. Falls back to `cargo test` so a bare checkout still works.
 test: ## Run the full test suite
-	@cargo test --workspace
-	@$(MAKE) test-bash
-
-test-bash: ## No-op: Phase 0's bash helpers (specs/021-entrypoint-supervise-rust) were fully ported to Rust in Phase 3/4 and removed
-	@true
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --workspace; \
+	else \
+		echo "note: cargo-nextest not installed — falling back to cargo test (no per-test timeout)"; \
+		cargo test --workspace; \
+	fi
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)
@@ -23,7 +28,7 @@ clean: ## Remove all build artifacts
 
 lint: ## Run formatting check, clippy, cargo-deny, shellcheck, and unsafe audit
 	@cargo fmt --check
-	@cargo clippy -p gsm-sip-bridge -p pjsua-safe -- -D warnings
+	@cargo clippy --workspace --all-targets -- -D warnings
 	@if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; fi
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		shellcheck -x docker/*.sh; \

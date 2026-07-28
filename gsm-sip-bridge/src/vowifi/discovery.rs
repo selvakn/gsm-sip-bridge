@@ -679,8 +679,10 @@ mod tests {
 
     #[test]
     fn resolve_lines_bounds_at_max_lines() {
-        let mut base = VowifiConfig::default();
-        base.max_lines = 2;
+        let base = VowifiConfig {
+            max_lines: 2,
+            ..Default::default()
+        };
         let modems: Vec<ProbedModem> = (0..4)
             .map(|i| {
                 ready_modem(
@@ -787,8 +789,10 @@ mod tests {
                 )
             })
             .collect();
-        let mut base = VowifiConfig::default();
-        base.max_lines = 8;
+        let base = VowifiConfig {
+            max_lines: 8,
+            ..Default::default()
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -812,13 +816,15 @@ mod tests {
     #[test]
     fn line_override_fixes_mcc_mnc_for_one_line() {
         let modems = vec![ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1")];
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![VowifiLineOverride {
-            modem_serial: Some("ec20-AAAAAA".to_string()),
-            mcc: Some("404".to_string()),
-            mnc: Some("094".to_string()),
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some("ec20-AAAAAA".to_string()),
+                mcc: Some("404".to_string()),
+                mnc: Some("094".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -833,13 +839,15 @@ mod tests {
     #[test]
     fn line_override_fixes_imsi_and_imei_for_one_line() {
         let modems = vec![ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1")];
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![VowifiLineOverride {
-            modem_serial: Some("ec20-AAAAAA".to_string()),
-            imsi_override: Some("404400975938075".to_string()),
-            imei_override: Some("864650053414154".to_string()),
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some("ec20-AAAAAA".to_string()),
+                imsi_override: Some("404400975938075".to_string()),
+                imei_override: Some("864650053414154".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -935,8 +943,10 @@ mod tests {
     fn resolve_lines_pcsc_only_produces_one_line_with_no_modem() {
         // specs/023-omnikey-pcsc-vowifi US1 (T006): a pcsc_reader override
         // with no ProbedModems at all still produces exactly one line.
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![pcsc_override("404940123456789", "404", "043")];
+        let base = VowifiConfig {
+            line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
+            ..Default::default()
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: vec![],
@@ -965,8 +975,10 @@ mod tests {
             false,
             "404011111111111",
         )];
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![pcsc_override("404940123456789", "404", "043")];
+        let base = VowifiConfig {
+            line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
+            ..Default::default()
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -999,9 +1011,11 @@ mod tests {
     fn resolve_lines_pcsc_overflow_reported_like_excess_modem_line() {
         // specs/023-omnikey-pcsc-vowifi US2 (T018): pcsc lines share
         // max_lines with modem lines, not an unbounded separate pool.
-        let mut base = VowifiConfig::default();
-        base.max_lines = 1;
-        base.line_overrides = vec![pcsc_override("404940123456789", "404", "043")];
+        let base = VowifiConfig {
+            max_lines: 1,
+            line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
+            ..Default::default()
+        };
         let modems = vec![ready_modem(
             "ec20-AAAAAA",
             "/dev/ttyUSB0",

@@ -242,9 +242,21 @@ mod tests {
 
     #[test]
     fn proc_cmdline_splits_on_nul_and_drops_empties() {
-        let raw = b"/usr/bin/gsm-sip-bridge\0vowifi-ims-agent\0--line\00\0";
+        // NUL-*separated*, exactly as the kernel lays out /proc/<pid>/cmdline
+        // — including the trailing NUL after the final argument, which is
+        // what produces the trailing empty this test proves gets dropped.
+        // Built by joining rather than written as one literal so the
+        // `--line`/`0` boundary can't be misread as an octal escape.
+        let raw: Vec<u8> = [
+            b"/usr/bin/gsm-sip-bridge".as_slice(),
+            b"vowifi-ims-agent",
+            b"--line",
+            b"0",
+            b"",
+        ]
+        .join(&0u8);
 
-        let args = parse_proc_cmdline(raw);
+        let args = parse_proc_cmdline(&raw);
 
         assert_eq!(
             args,

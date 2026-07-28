@@ -29,6 +29,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # `make lint` runs cargo-deny only `if command -v cargo-deny`, and
+      # `make test` prefers cargo-nextest when present. Installing both here is
+      # what makes the dependency policy and the per-test timeout actually
+      # enforced somewhere rather than silently skipped on every machine.
+      - name: Install cargo-deny and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-nextest
+
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:

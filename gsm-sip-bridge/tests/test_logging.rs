@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
 
 #[derive(Clone)]
 struct CaptureWriter {

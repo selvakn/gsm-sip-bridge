@@ -1,10 +1,13 @@
-mod common;
-
 use gsm_sip_bridge::modules::at_commander::{AtCommander, AtResponse};
 use std::io::{Read, Write};
 use std::time::Duration;
 
-fn create_mock_serial() -> Option<(Box<dyn Write + Send>, Box<dyn Read + Send>, AtCommander)> {
+/// The far ("modem") end of a mocked serial link, plus the `AtCommander`
+/// speaking to it: a writer to feed it canned responses, a reader to observe
+/// the commands it sent, and the commander under test.
+type MockSerial = (Box<dyn Write + Send>, Box<dyn Read + Send>, AtCommander);
+
+fn create_mock_serial() -> Option<MockSerial> {
     let (server, client) = std::os::unix::net::UnixStream::pair().ok()?;
     server.set_nonblocking(false).ok()?;
     client.set_nonblocking(false).ok()?;
