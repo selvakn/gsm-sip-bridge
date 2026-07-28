@@ -590,6 +590,21 @@ impl CardPool {
                                     state.next_retry_at = None;
                                     state.cmd_tx = Some(cmd_tx);
                                 }
+
+                                // specs/022-discord-critical-alerts (Greptile
+                                // P1 follow-up: "GivenUp cleanup runs only on
+                                // immediate rescan success and is skipped
+                                // when initialization succeeds through the
+                                // retry loop"). This slot's own retry never
+                                // touches a `GivenUp` slot directly (excluded
+                                // by `should_retry` above), but a *different*
+                                // slot for the same module_id can be
+                                // `GivenUp` — e.g. a rescan's failed init
+                                // created a fresh `Initializing` slot for a
+                                // module that already had a `GivenUp` slot
+                                // from an earlier incident, and it's that
+                                // fresh slot recovering here.
+                                self.clear_stale_given_up(&mut slots, &module.id);
                             }
                             Err(e) => {
                                 tracing::debug!(module = %module.id, error = %e, "retry failed");
@@ -729,6 +744,33 @@ impl CardPool {
         }
     }
 
+    /// specs/022-discord-critical-alerts (Greptile P1 fix, and its
+    /// follow-up: the same cleanup is needed wherever a module reaches
+    /// `Ready` again — both `rescan_new_modules`'s "new module" success arm
+    /// and the retry loop's success arm call this). If `module_id` has a
+    /// stale `GivenUp` slot under a different key, remove it and fire a
+    /// `ModuleLifecycle` `Recovered` event — otherwise that slot (and its
+    /// `CRITICAL_EVENT_ACTIVE` gauge) would sit there forever, alongside the
+    /// new healthy one, with no recovery notification ever sent.
+    fn clear_stale_given_up(&self, slots: &mut HashMap<u32, SlotState>, module_id: &str) {
+        let Some(stale_slot) = find_given_up_slot(slots, module_id) else {
+            return;
+        };
+        slots.remove(&stale_slot);
+        let Some(client) = self.alerts_client.clone() else {
+            return;
+        };
+        let config = self.config.alerts.clone();
+        let event = alerts::CriticalEvent {
+            category: alerts::AlertCategory::ModuleLifecycle,
+            unit_id: Some(module_id.to_string()),
+            description: "module recovered after previously giving up".to_string(),
+            at: Utc::now(),
+            kind: alerts::CriticalEventKind::Recovered,
+        };
+        tokio::spawn(async move { alerts::dispatch(&client, &config, event).await });
+    }
+
     fn rescan_new_modules(
         &self,
         slots: &mut HashMap<u32, SlotState>,
@@ -773,23 +815,7 @@ impl CardPool {
                     // clear the stale slot and its active-incident gauge
                     // rather than leaving a dead entry sitting alongside the
                     // new, healthy one forever.
-                    if let Some(stale_slot) = find_given_up_slot(slots, &module.id) {
-                        slots.remove(&stale_slot);
-                        if let Some(client) = self.alerts_client.clone() {
-                            let config = self.config.alerts.clone();
-                            let event = alerts::CriticalEvent {
-                                category: alerts::AlertCategory::ModuleLifecycle,
-                                unit_id: Some(module.id.clone()),
-                                description: "module recovered after previously giving up"
-                                    .to_string(),
-                                at: Utc::now(),
-                                kind: alerts::CriticalEventKind::Recovered,
-                            };
-                            tokio::spawn(
-                                async move { alerts::dispatch(&client, &config, event).await },
-                            );
-                        }
-                    }
+                    self.clear_stale_given_up(slots, &module.id);
 
                     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ModuleCmd>();
                     let store_tx = self.store.sender();

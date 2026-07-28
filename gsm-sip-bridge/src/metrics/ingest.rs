@@ -141,8 +141,16 @@ pub fn apply_report(report: &AgentReport) {
     let mut tunnel_alert_phase = existing.map_or(AlertPhase::Idle, |r| r.tunnel_alert_phase);
     let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
     let mut tunnel_unhealthy_since = existing.and_then(|r| r.tunnel_unhealthy_since);
-    // (category, transition) pairs to dispatch once the lock is released.
-    let mut pending_transitions: Vec<(AlertCategory, CriticalEventKind)> = Vec::new();
+    // (category, transition, generation) to dispatch once the lock is
+    // released. `generation` is the `*_unhealthy_since` value this
+    // particular transition was decided against — threaded through to
+    // `record_alert_outcome` so a delivery callback that resolves after a
+    // *later* incident has already started can recognize it's stale and
+    // become a no-op instead of corrupting the new incident's phase
+    // (Greptile P1 follow-up: "delivery callbacks not scoped to an incident
+    // generation").
+    let mut pending_transitions: Vec<(AlertCategory, CriticalEventKind, Option<Instant>)> =
+        Vec::new();
 
     if !is_replay {
         apply_state(
@@ -173,9 +181,11 @@ pub fn apply_report(report: &AgentReport) {
                 &mut registered_alert_phase,
                 registration_threshold,
             ) {
-                Transition::Event(kind) => {
-                    pending_transitions.push((AlertCategory::RegistrationLoss, kind))
-                }
+                Transition::Event(kind) => pending_transitions.push((
+                    AlertCategory::RegistrationLoss,
+                    kind,
+                    registered_unhealthy_since,
+                )),
                 Transition::Suppressed => {
                     crate::alerts::record_suppressed(AlertCategory::RegistrationLoss)
                 }
@@ -186,9 +196,11 @@ pub fn apply_report(report: &AgentReport) {
                 &mut tunnel_alert_phase,
                 tunnel_threshold,
             ) {
-                Transition::Event(kind) => {
-                    pending_transitions.push((AlertCategory::TunnelFailure, kind))
-                }
+                Transition::Event(kind) => pending_transitions.push((
+                    AlertCategory::TunnelFailure,
+                    kind,
+                    tunnel_unhealthy_since,
+                )),
                 Transition::Suppressed => {
                     crate::alerts::record_suppressed(AlertCategory::TunnelFailure)
                 }
@@ -215,8 +227,8 @@ pub fn apply_report(report: &AgentReport) {
     );
     drop(guard);
 
-    for (category, kind) in pending_transitions {
-        dispatch_transition(key.clone(), category, kind);
+    for (category, kind, generation) in pending_transitions {
+        dispatch_transition(key.clone(), category, kind, generation);
     }
 }
 
@@ -265,7 +277,17 @@ enum Transition {
 /// synchronously in `decide_transition` regardless of delivery outcome: a
 /// lost "all clear" is far less costly than a lost failure notice, and
 /// keeping it synchronous avoids a second class of pending-state to track.
-fn dispatch_transition(key: (AgentKind, String), category: AlertCategory, kind: CriticalEventKind) {
+///
+/// `generation` is the `*_unhealthy_since` this `Failure` transition was
+/// decided against (`None`/unused for `Recovered`) — passed through to
+/// `record_alert_outcome` so a callback that resolves after a newer
+/// incident has already started can tell it's stale.
+fn dispatch_transition(
+    key: (AgentKind, String),
+    category: AlertCategory,
+    kind: CriticalEventKind,
+    generation: Option<Instant>,
+) {
     let (Some(cfg), Some(client)) = (ALERTS_CONFIG.get(), ALERTS_CLIENT.get()) else {
         return;
     };
@@ -302,7 +324,12 @@ fn dispatch_transition(key: (AgentKind, String), category: AlertCategory, kind: 
         let outcome = crate::alerts::dispatch(&client, &cfg, event).await;
         if kind == CriticalEventKind::Failure {
             let success = matches!(outcome, AlertOutcome::Sent(_));
-            record_alert_outcome(&key, category, success);
+            // `generation` is always `Some` here — only `Failure`
+            // transitions reach this branch, and `decide_transition` only
+            // ever produces one from `Some(since)`.
+            if let Some(generation) = generation {
+                record_alert_outcome(&key, category, generation, success);
+            }
         }
     });
 }
@@ -310,20 +337,35 @@ fn dispatch_transition(key: (AgentKind, String), category: AlertCategory, kind: 
 /// Resolves a `Pending` phase once its dispatch completes: `Alerted` on
 /// confirmed delivery, back to `Idle` on failure so the next unhealthy
 /// report retries instead of the incident staying silently suppressed
-/// forever (Greptile P1). A no-op if the phase has since moved on (e.g. a
-/// concurrent report already observed recovery) — this callback only ever
-/// resolves the specific `Pending` it was spawned for.
-fn record_alert_outcome(key: &(AgentKind, String), category: AlertCategory, success: bool) {
+/// forever (Greptile P1). A no-op if the phase has since moved on, *or* if
+/// `generation` no longer matches the record's current `*_unhealthy_since`
+/// — the latter means this callback is for an incident that has already
+/// ended (health recovered and, possibly, went unhealthy again) since the
+/// dispatch was spawned, and applying it would corrupt a newer incident's
+/// state instead of the stale one it actually belongs to (Greptile P1
+/// follow-up: "delivery callbacks not scoped to an incident generation").
+fn record_alert_outcome(
+    key: &(AgentKind, String),
+    category: AlertCategory,
+    generation: Instant,
+    success: bool,
+) {
     let mut guard = liveness().lock().unwrap();
     let Some(record) = guard.get_mut(key) else {
         return;
     };
-    let phase = match category {
-        AlertCategory::RegistrationLoss => &mut record.registered_alert_phase,
-        AlertCategory::TunnelFailure => &mut record.tunnel_alert_phase,
+    let (phase, unhealthy_since) = match category {
+        AlertCategory::RegistrationLoss => (
+            &mut record.registered_alert_phase,
+            record.registered_unhealthy_since,
+        ),
+        AlertCategory::TunnelFailure => (
+            &mut record.tunnel_alert_phase,
+            record.tunnel_unhealthy_since,
+        ),
         _ => return,
     };
-    if *phase == AlertPhase::Pending {
+    if *phase == AlertPhase::Pending && unhealthy_since == Some(generation) {
         *phase = if success {
             AlertPhase::Alerted
         } else {
@@ -852,9 +894,9 @@ mod tests {
     fn record_alert_outcome_moves_pending_to_alerted_on_success() {
         let module_id = "test-outcome-success";
         let key = (AgentKind::Ims, module_id.to_string());
-        seed_pending_record(&key);
+        let generation = seed_pending_record(&key);
 
-        record_alert_outcome(&key, AlertCategory::RegistrationLoss, true);
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, generation, true);
 
         let guard = liveness().lock().unwrap();
         assert_eq!(
@@ -872,9 +914,9 @@ mod tests {
     fn record_alert_outcome_resets_pending_to_idle_on_failure() {
         let module_id = "test-outcome-failure";
         let key = (AgentKind::Ims, module_id.to_string());
-        seed_pending_record(&key);
+        let generation = seed_pending_record(&key);
 
-        record_alert_outcome(&key, AlertCategory::RegistrationLoss, false);
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, generation, false);
 
         let guard = liveness().lock().unwrap();
         assert_eq!(
@@ -891,10 +933,10 @@ mod tests {
         // newer state.
         let module_id = "test-outcome-stale-callback";
         let key = (AgentKind::Ims, module_id.to_string());
-        seed_pending_record(&key);
-        record_alert_outcome(&key, AlertCategory::RegistrationLoss, true); // Pending -> Alerted
+        let generation = seed_pending_record(&key);
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, generation, true); // Pending -> Alerted
 
-        record_alert_outcome(&key, AlertCategory::RegistrationLoss, false); // stale, must not fire
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, generation, false); // stale, must not fire
 
         let guard = liveness().lock().unwrap();
         assert_eq!(
@@ -903,19 +945,61 @@ mod tests {
         );
     }
 
-    fn seed_pending_record(key: &(AgentKind, String)) {
+    /// specs/022-discord-critical-alerts Greptile P1 follow-up ("delivery
+    /// callbacks not scoped to an incident generation"): a callback for an
+    /// *old* incident (its `unhealthy_since` no longer matches the record's
+    /// current one — health recovered and, here, went unhealthy again in
+    /// the meantime) must not touch the phase of the new incident at all.
+    #[test]
+    fn record_alert_outcome_ignores_a_stale_generation_from_an_earlier_incident() {
+        let module_id = "test-outcome-stale-generation";
+        let key = (AgentKind::Ims, module_id.to_string());
+        let old_generation = seed_pending_record(&key); // incident A: Pending
+
+        // Incident A recovers, then a fresh incident B starts and is
+        // already Pending on its own (new) generation — exactly what
+        // `apply_report` would have produced via decide_transition.
+        let new_generation = Instant::now();
+        {
+            let mut guard = liveness().lock().unwrap();
+            let record = guard.get_mut(&key).unwrap();
+            record.registered_unhealthy_since = Some(new_generation);
+            record.registered_alert_phase = AlertPhase::Pending;
+        }
+        assert_ne!(old_generation, new_generation);
+
+        // Incident A's (stale) dispatch finally resolves.
+        record_alert_outcome(&key, AlertCategory::RegistrationLoss, old_generation, true);
+
+        // Incident B's phase must be untouched — still Pending, not
+        // wrongly marked Alerted for a Failure it never actually had sent.
+        let guard = liveness().lock().unwrap();
+        let record = guard.get(&key).unwrap();
+        assert_eq!(
+            record.registered_alert_phase,
+            AlertPhase::Pending,
+            "a stale callback for a previous incident must not resolve the current one"
+        );
+        assert_eq!(record.registered_unhealthy_since, Some(new_generation));
+    }
+
+    /// Returns the seeded `registered_unhealthy_since` — the generation a
+    /// caller must pass to `record_alert_outcome` for it to actually apply.
+    fn seed_pending_record(key: &(AgentKind, String)) -> Instant {
+        let generation = Instant::now();
         let mut guard = liveness().lock().unwrap();
         guard.insert(
             key.clone(),
             AgentRecord {
                 last_report: Instant::now(),
                 last_applied: (0, 0),
-                registered_unhealthy_since: Some(Instant::now()),
+                registered_unhealthy_since: Some(generation),
                 registered_alert_phase: AlertPhase::Pending,
                 tunnel_unhealthy_since: None,
                 tunnel_alert_phase: AlertPhase::Idle,
             },
         );
+        generation
     }
 
     /// specs/022-discord-critical-alerts FR-009/T022: a deliberate shutdown
