@@ -233,11 +233,17 @@ is spawned — per quickstart.md's engine-compatibility note.
 - [X] T025 Run `cargo fmt --all && make lint && cargo test --workspace` full
       pass (CLAUDE.md's mandatory pre-commit checklist) across every change
       above.
-- [ ] T026 Execute `specs/023-omnikey-pcsc-vowifi/quickstart.md` end-to-end
-      against the real OmniKey reader + Vodafone SIM (manual, hardware- and
+- [ ] T026 (partial — see checklists/requirements.md) Execute
+      `specs/023-omnikey-pcsc-vowifi/quickstart.md` end-to-end against the
+      real OmniKey reader + Vodafone SIM (manual, hardware- and
       network-dependent — not automatable in CI, per this project's
       constitution's stated exception for hardware unavailable in CI).
-- [ ] T027 [P] Update `specs/023-omnikey-pcsc-vowifi/checklists/requirements.md`
+      Steps 1-4 done live; reader discovery, line resolution, and
+      eap-sim-pcsc's reader discrimination all confirmed correct in a real
+      mixed deployment (steps 5-8 blocked on Vodafone's ePDG not responding
+      from this network path — carrier/entitlement-side, not this feature's
+      code).
+- [X] T027 [P] Update `specs/023-omnikey-pcsc-vowifi/checklists/requirements.md`
       with any follow-up notes if implementation surfaced a spec gap.
 
 ---
