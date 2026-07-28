@@ -181,9 +181,12 @@ fn start_multiline(
                 &idx.to_string(),
             ])) {
                 Ok(handle) => {
+                    // Shared: this loop polls liveness, the shutdown plan
+                    // signals the same child from another thread.
+                    let handle = std::sync::Arc::new(handle);
                     let mut state = started.lock().unwrap();
                     if let Some(entry) = state.volte_lines.iter_mut().find(|l| l.index == idx) {
-                        entry.carrier_agent_handles.push(handle);
+                        entry.carrier_agent_handles.push(handle.clone());
                     }
                     drop(state);
                     drop(guard);
@@ -196,7 +199,7 @@ fn start_multiline(
                     // to this exact handle (stored in
                     // `carrier_agent_handles` for that purpose) for the
                     // process's entire lifetime.
-                    while runner.is_alive(handle) {
+                    while runner.is_alive(&handle) {
                         runner.sleep(Duration::from_secs(1));
                     }
                     println!("[supervise] volte line {idx}: volte-carrier-agent exited; restarting in 15s");
@@ -233,13 +236,14 @@ fn start_multiline(
             "volte-bridge",
         ])) {
             Ok(handle) => {
-                started.lock().unwrap().volte_bridge_supervisor = Some(handle);
+                let handle = std::sync::Arc::new(handle);
+                started.lock().unwrap().volte_bridge_supervisor = Some(handle.clone());
                 drop(guard);
                 // See the volte-carrier-agent loop above: poll is_alive(),
                 // don't block on wait(), so this handle (which the shutdown
                 // plan signals via `volte_bridge_supervisor`) stays
                 // signalable for as long as the process is actually alive.
-                while runner.is_alive(handle) {
+                while runner.is_alive(&handle) {
                     runner.sleep(Duration::from_secs(1));
                 }
                 println!("[supervise] volte-bridge exited; restarting in 15s");
@@ -285,9 +289,10 @@ fn start_legacy_registration(
             "--keep-pdn",
         ])) {
             Ok(handle) => {
+                let handle = std::sync::Arc::new(handle);
                 let mut state = started.lock().unwrap();
                 state.legacy_volte_registration = Some(LegacyVolteRegistration {
-                    supervisor_handle: handle,
+                    supervisor_handle: handle.clone(),
                     bridge_inbound: false,
                     restore_cid: std::fs::read_to_string(VOLTE_RESTORE_CID_PATH).ok(),
                 });
@@ -298,7 +303,7 @@ fn start_legacy_registration(
                 // plan signals via `legacy_volte_registration.
                 // supervisor_handle`, then polls with `WaitForExit`) stays
                 // signalable for as long as the process is actually alive.
-                while runner.is_alive(handle) {
+                while runner.is_alive(&handle) {
                     runner.sleep(Duration::from_secs(1));
                 }
                 println!("[supervise] the LTE IMS service exited; restarting in 15s");

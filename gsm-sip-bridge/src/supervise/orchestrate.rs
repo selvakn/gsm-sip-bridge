@@ -190,7 +190,11 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             }
             match runner.spawn(ChildSpec::new([bin.as_str(), "--config", cfg.as_str()])) {
                 Ok(handle) => {
-                    started.lock().unwrap().daemon_supervisor = Some(handle);
+                    // Shared, not copied: this thread polls it for liveness
+                    // while the shutdown plan holds the other claim so it can
+                    // signal the same child from the shutdown thread.
+                    let handle = Arc::new(handle);
+                    started.lock().unwrap().daemon_supervisor = Some(handle.clone());
                     drop(guard);
                     // Poll is_alive() rather than block on wait(): this
                     // handle is stored in StartedState precisely so
@@ -201,7 +205,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     // process's entire lifetime, silently defeating that
                     // signal, exactly like the vowifi-usim-bridge holder and
                     // VoLTE supervision loops fixed earlier in this feature.
-                    while runner.is_alive(handle) {
+                    while runner.is_alive(&handle) {
                         runner.sleep(Duration::from_secs(1));
                     }
                     println!("[supervise] gsm-sip-bridge daemon exited; restarting in 5s");
@@ -270,7 +274,8 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     eprintln!("[supervise] FATAL: failed to start pcscd");
                     return ExitCode::FAILURE;
                 };
-                started.lock().unwrap().pcscd = Some(pcscd_handle);
+                let pcscd_handle = Arc::new(pcscd_handle);
+                started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
 
                 if needs_vpcd {
                     println!(
@@ -279,7 +284,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     );
                     match vpcd::wait_for_vpcd_ready(
                         runner.as_ref(),
-                        pcscd_handle,
+                        &pcscd_handle,
                         &config.vowifi.vpcd_host,
                         config.vowifi.vpcd_port,
                     ) {
@@ -348,14 +353,15 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                         "vowifi-sip-agent",
                     ])) {
                         Ok(handle) => {
-                            started.lock().unwrap().sip_agent_supervisor = Some(handle);
+                            let handle = Arc::new(handle);
+                            started.lock().unwrap().sip_agent_supervisor = Some(handle.clone());
                             drop(guard);
                             // See the daemon_supervisor loop above: poll
                             // is_alive(), don't block on wait(), so this
                             // handle (signaled by execute_shutdown_plan via
                             // `sip_agent_supervisor`) stays signalable for
                             // as long as the process is actually alive.
-                            while runner.is_alive(handle) {
+                            while runner.is_alive(&handle) {
                                 runner.sleep(Duration::from_secs(1));
                             }
                             println!("[supervise] vowifi-sip-agent exited; restarting in 5s");
@@ -681,7 +687,7 @@ fn start_vowifi_line_strongswan(
     // needed for a pcsc_reader line: pcscd already reaches the physical
     // reader directly via the ccid driver, with no modem/AT+CSIM bridge in
     // the path at all (specs/023-omnikey-pcsc-vowifi).
-    let usim_holder: Arc<Mutex<Option<ChildHandle>>> = Arc::new(Mutex::new(None));
+    let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
     if !line.pcsc_reader {
         let runner = Arc::clone(runner);
         let bin = bin.to_string();
@@ -710,8 +716,9 @@ fn start_vowifi_line_strongswan(
                 &vpcd_port.to_string(),
             ])) {
                 Ok(h) => {
-                    *usim_holder.lock().unwrap() = Some(h);
-                    started.lock().unwrap().vowifi_child_handles.push(h);
+                    let h = Arc::new(h);
+                    *usim_holder.lock().unwrap() = Some(h.clone());
+                    started.lock().unwrap().vowifi_child_handles.push(h.clone());
                     drop(guard);
                     // Poll is_alive() rather than blocking on wait(): a real
                     // review finding caught that RealCommandRunner::wait()
@@ -726,7 +733,7 @@ fn start_vowifi_line_strongswan(
                     // defeated that synchronization — the mocked test never
                     // caught it because MockCommandRunner::wait() doesn't
                     // remove the entry the way the real one does.
-                    while runner.is_alive(h) {
+                    while runner.is_alive(&h) {
                         runner.sleep(Duration::from_secs(1));
                     }
                     println!("[supervise] line {idx}: vowifi-usim-bridge exited; restarting in 5s");
@@ -775,7 +782,8 @@ fn start_vowifi_line_strongswan(
             .capture_stdout_to(charon_log.clone()),
         ) {
             Ok(h) => {
-                *engine.charon_handle.borrow_mut() = Some(h);
+                let h = Arc::new(h);
+                *engine.charon_handle.borrow_mut() = Some(h.clone());
                 started.lock().unwrap().vowifi_child_handles.push(h);
             }
             Err(e) => {
@@ -873,7 +881,7 @@ fn start_vowifi_line_strongswan(
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
             line_supervisor::SteadyOutcome::Recovered { reason } => {
-                if let Some(new_handle) = *engine.charon_handle.borrow() {
+                if let Some(new_handle) = engine.charon_handle.borrow().clone() {
                     started
                         .lock()
                         .unwrap()
@@ -903,7 +911,7 @@ fn start_line_tail(
     idx: u32,
     netns: &str,
     line: &LineResolutionEntry,
-    usim_holder: &Arc<Mutex<Option<ChildHandle>>>,
+    usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     started: &Arc<Mutex<StartedState>>,
     initial_pcscf: String,
     shutting_down: &Arc<RwLock<bool>>,
@@ -993,14 +1001,19 @@ fn start_line_tail(
                     runner.sleep(Duration::from_secs(5));
                     continue;
                 };
-                started.lock().unwrap().vowifi_child_handles.push(handle);
+                let handle = Arc::new(handle);
+                started
+                    .lock()
+                    .unwrap()
+                    .vowifi_child_handles
+                    .push(handle.clone());
                 drop(guard);
                 // See the daemon_supervisor loop earlier in this file: poll
                 // is_alive(), don't block on wait(), so this handle
                 // (signaled by execute_shutdown_plan via
                 // `vowifi_child_handles`) stays signalable for as long as
                 // the process is actually alive.
-                while runner.is_alive(handle) {
+                while runner.is_alive(&handle) {
                     runner.sleep(Duration::from_secs(1));
                 }
                 println!("[supervise] line {idx}: vowifi-ims-agent exited; restarting in 5s");
@@ -1013,13 +1026,13 @@ fn start_line_tail(
                 };
                 let action = csim_fails.observe(outcome);
                 if action == sim_recovery::Action::ResetSim {
-                    let holder = *usim_holder.lock().unwrap();
+                    let holder = usim_holder.lock().unwrap().clone();
                     let reset_log = PathBuf::from(format!("/tmp/sim-reset-{idx}.log"));
                     sim_recovery::reset_modem_sim(
                         runner.as_ref(),
                         Path::new(&modem),
                         &reset_log,
-                        holder,
+                        holder.as_deref(),
                     );
                 }
                 if action == sim_recovery::Action::GiveUpForThisIncident {
@@ -1132,7 +1145,7 @@ fn start_vowifi_line_swu(
         return;
     }
     engine.restart_process(runner.as_ref()); // first spawn, same path as later respawns
-    if let Some(h) = *engine.dialer_handle.borrow() {
+    if let Some(h) = engine.dialer_handle.borrow().clone() {
         started.lock().unwrap().vowifi_child_handles.push(h);
         drop(guard);
     } else {
@@ -1169,7 +1182,7 @@ fn start_vowifi_line_swu(
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
     started.lock().unwrap().started_netns.push(netns.clone());
 
-    let usim_holder: Arc<Mutex<Option<ChildHandle>>> = Arc::new(Mutex::new(None));
+    let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
     start_line_tail(
         runner,
         bin,
@@ -1206,7 +1219,7 @@ fn start_vowifi_line_swu(
                 current_pcscf = new_pcscf;
             }
             line_supervisor::SteadyOutcome::Recovered { .. } => {
-                if let Some(h) = *engine.dialer_handle.borrow() {
+                if let Some(h) = engine.dialer_handle.borrow().clone() {
                     started.lock().unwrap().vowifi_child_handles.push(h);
                 }
                 drop(guard);

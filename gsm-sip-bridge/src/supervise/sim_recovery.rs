@@ -140,7 +140,7 @@ pub fn reset_modem_sim(
     runner: &dyn CommandRunner,
     modem: &Path,
     reset_log: &Path,
-    holder: Option<ChildHandle>,
+    holder: Option<&ChildHandle>,
 ) -> bool {
     if let Some(h) = holder {
         runner.signal(h, Signal::Stop);
@@ -182,13 +182,11 @@ pub fn reset_modem_sim(
     if let Some(r) = reader {
         // 1:1 port of `kill "$reader_pid" 2>/dev/null || true; wait
         // "$reader_pid" 2>/dev/null || true` — the bash original explicitly
-        // waits for the reader after killing it, not just signals it; doing
-        // the same here also reaps the handle out of RealCommandRunner's
-        // table (a follow-up audit after the review-flagged `--initiate`
-        // leak found this is the same shape: `signal` alone never removes a
-        // tracked entry, so a handle that's signaled-and-forgotten leaks).
-        runner.signal(r, Signal::Term);
-        runner.wait(r);
+        // waits for the reader after killing it, not just signals it. This
+        // path was the one place that had it right from the start; it is now
+        // the trait's `reap`, so every other site gets it by construction
+        // rather than by remembering.
+        runner.reap(&r);
     }
     if let Some(h) = holder {
         runner.signal(h, Signal::Cont);
@@ -291,9 +289,12 @@ mod tests {
             let reset_log = PathBuf::from("/tmp/sim-reset-0.log");
             runner.set_file(&reset_log, "+CPIN: READY\n");
 
-            reset_modem_sim(&runner, &modem, &reset_log, Some(holder));
+            reset_modem_sim(&runner, &modem, &reset_log, Some(&holder));
 
-            assert_eq!(runner.signals_for(holder), vec![Signal::Stop, Signal::Cont]);
+            assert_eq!(
+                runner.signals_for(&holder),
+                vec![Signal::Stop, Signal::Cont]
+            );
         }
 
         #[test]
@@ -309,13 +310,23 @@ mod tests {
 
             reset_modem_sim(&runner, &modem, &reset_log, None);
 
-            // Exactly one child (the reader) is spawned with no holder;
-            // confirm it was both signaled AND waited on.
+            // Exactly one child (the reader) is spawned with no holder.
             assert_eq!(runner.spawn_specs.lock().unwrap().len(), 1);
+            // `reap` is signal-then-confirm-gone, not signal-then-wait: it
+            // polls `is_alive` instead, because `wait` untracks the child up
+            // front and would defeat any concurrent holder of the handle.
+            // The guarantee to assert is therefore that the reader was
+            // terminated and is actually dead by the time this returns — not
+            // that some particular syscall was issued.
+            let reader_id = *runner
+                .child_ids()
+                .first()
+                .expect("the reader child must have been spawned");
             assert_eq!(
-                runner.wait_calls.lock().unwrap().len(),
-                1,
-                "the reader must be wait()-ed on after being signaled, matching bash's `kill ...; wait ...`"
+                runner.signals_for_id(reader_id),
+                vec![Signal::Term],
+                "the reader must be terminated — and a plain SIGTERM must be \
+                 enough, i.e. reap must not need to escalate to SIGKILL"
             );
         }
 

@@ -13,22 +13,28 @@
 //! is deleted. See the ordering-invariant tests below and `data-model.md`.
 
 use super::runner::{ChildHandle, CommandRunner, Signal};
+use std::sync::Arc;
 
 /// One step of container teardown. `Run`/`RunInNetns` cover the current
 /// trap's non-signal actions (`volte-cleanup`, `volte-pdn --action down`,
 /// `ip netns del`); `KillChild`/`WaitForExit` cover its `kill`/poll-for-exit
 /// pairs.
+/// Borrows its handles from the [`StartedState`] it was built from, rather
+/// than copying them: a `KillChild` and the `WaitForExit` that confirms it
+/// both name the *same* child, which an owned, non-`Copy` [`ChildHandle`]
+/// could not express. Borrowing is also the honest description — a teardown
+/// step observes a child, it does not take ownership of one.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TeardownStep {
+pub enum TeardownStep<'a> {
     KillChild {
-        handle: ChildHandle,
+        handle: &'a ChildHandle,
         signal: Signal,
     },
     /// Poll `is_alive` up to `max_polls` times (matching the current trap's
     /// bounded `for _ in $(seq 1 20); do pgrep ... || break; sleep 0.25;
     /// done`), so a zombie cannot hang shutdown.
     WaitForExit {
-        handle: ChildHandle,
+        handle: &'a ChildHandle,
         max_polls: u32,
     },
     RunInNetns {
@@ -45,11 +51,17 @@ pub enum TeardownStep {
 
 /// One VoLTE line whose namespace/processes were actually started this run —
 /// the typed replacement for `VOLTE_STARTED_LINE_NETNS`/`VOLTE_STARTED_LINE_INDEX`.
+/// Handles are `Arc<ChildHandle>` because they are genuinely shared: the
+/// supervision loop that spawned the child polls it for liveness on its own
+/// thread, while this record exists so the shutdown plan can signal that same
+/// child from another. Sharing the claim is the honest description; what is
+/// *not* allowed is `wait()`ing on a shared claim, which the owned-only
+/// signature of [`super::runner::CommandRunner::wait`] now prevents.
 #[derive(Debug, Clone)]
 pub struct StartedVolteLine {
     pub index: u32,
     pub netns: String,
-    pub carrier_agent_handles: Vec<ChildHandle>,
+    pub carrier_agent_handles: Vec<Arc<ChildHandle>>,
 }
 
 /// Everything that actually started this run, appended-to only on success
@@ -57,13 +69,13 @@ pub struct StartedVolteLine {
 /// typed replacement for the current trap's ~15 global PID arrays.
 #[derive(Debug, Clone, Default)]
 pub struct StartedState {
-    pub daemon_supervisor: Option<ChildHandle>,
-    pub sip_agent_supervisor: Option<ChildHandle>,
-    pub pcscd: Option<ChildHandle>,
+    pub daemon_supervisor: Option<Arc<ChildHandle>>,
+    pub sip_agent_supervisor: Option<Arc<ChildHandle>>,
+    pub pcscd: Option<Arc<ChildHandle>>,
     /// Every VoWiFi/strongswan-or-swu per-line child (charon, usim-bridge,
     /// ims-agent, swu dialer, keepalive/log-tail loops, ...) that should be
     /// killed before any namespace teardown, regardless of engine.
-    pub vowifi_child_handles: Vec<ChildHandle>,
+    pub vowifi_child_handles: Vec<Arc<ChildHandle>>,
     /// Every network namespace this run created (VoWiFi lines' `ims`/`imsN`
     /// namespaces AND VoLTE lines' `volteN` namespaces) — deleted last, after
     /// every process using it is gone.
@@ -74,12 +86,12 @@ pub struct StartedState {
     pub legacy_volte_registration: Option<LegacyVolteRegistration>,
     /// Auto-discovered multi-line VoLTE lines that actually started.
     pub volte_lines: Vec<StartedVolteLine>,
-    pub volte_bridge_supervisor: Option<ChildHandle>,
+    pub volte_bridge_supervisor: Option<Arc<ChildHandle>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LegacyVolteRegistration {
-    pub supervisor_handle: ChildHandle,
+    pub supervisor_handle: Arc<ChildHandle>,
     pub bridge_inbound: bool,
     pub restore_cid: Option<String>,
 }
@@ -91,23 +103,26 @@ const KILL_CONFIRM_MAX_POLLS: u32 = 20;
 
 /// Builds the exact, ordered teardown step sequence for this run — pure,
 /// callable with zero real processes for testing (see `mod tests` below).
-pub fn build_shutdown_plan(state: &StartedState, config_path: &str) -> Vec<TeardownStep> {
+pub fn build_shutdown_plan<'a>(
+    state: &'a StartedState,
+    config_path: &str,
+) -> Vec<TeardownStep<'a>> {
     let mut steps = Vec::new();
 
     // --- VoWiFi + the two always-present supervisors, killed first --------
-    if let Some(h) = state.daemon_supervisor {
+    if let Some(h) = &state.daemon_supervisor {
         steps.push(TeardownStep::KillChild {
             handle: h,
             signal: Signal::Term,
         });
     }
-    if let Some(h) = state.sip_agent_supervisor {
+    if let Some(h) = &state.sip_agent_supervisor {
         steps.push(TeardownStep::KillChild {
             handle: h,
             signal: Signal::Term,
         });
     }
-    for &h in &state.vowifi_child_handles {
+    for h in &state.vowifi_child_handles {
         steps.push(TeardownStep::KillChild {
             handle: h,
             signal: Signal::Term,
@@ -120,11 +135,11 @@ pub fn build_shutdown_plan(state: &StartedState, config_path: &str) -> Vec<Teard
     // kernel closes that fd *now*, before `volte-pdn down` reopens the port.
     if let Some(legacy) = &state.legacy_volte_registration {
         steps.push(TeardownStep::KillChild {
-            handle: legacy.supervisor_handle,
+            handle: &legacy.supervisor_handle,
             signal: Signal::Kill,
         });
         steps.push(TeardownStep::WaitForExit {
-            handle: legacy.supervisor_handle,
+            handle: &legacy.supervisor_handle,
             max_polls: KILL_CONFIRM_MAX_POLLS,
         });
         steps.push(TeardownStep::Run {
@@ -159,14 +174,14 @@ pub fn build_shutdown_plan(state: &StartedState, config_path: &str) -> Vec<Teard
     // silently find nothing if run from the wrong namespace — before that
     // namespace is deleted.
     if !state.volte_lines.is_empty() {
-        if let Some(h) = state.volte_bridge_supervisor {
+        if let Some(h) = &state.volte_bridge_supervisor {
             steps.push(TeardownStep::KillChild {
                 handle: h,
                 signal: Signal::Kill,
             });
         }
         for line in &state.volte_lines {
-            for &h in &line.carrier_agent_handles {
+            for h in &line.carrier_agent_handles {
                 steps.push(TeardownStep::KillChild {
                     handle: h,
                     signal: Signal::Kill,
@@ -174,7 +189,7 @@ pub fn build_shutdown_plan(state: &StartedState, config_path: &str) -> Vec<Teard
             }
         }
         for line in &state.volte_lines {
-            for &h in &line.carrier_agent_handles {
+            for h in &line.carrier_agent_handles {
                 steps.push(TeardownStep::WaitForExit {
                     handle: h,
                     max_polls: KILL_CONFIRM_MAX_POLLS,
@@ -197,7 +212,7 @@ pub fn build_shutdown_plan(state: &StartedState, config_path: &str) -> Vec<Teard
     }
 
     // --- Shared pcscd, then every namespace this run created ---------------
-    if let Some(h) = state.pcscd {
+    if let Some(h) = &state.pcscd {
         steps.push(TeardownStep::KillChild {
             handle: h,
             signal: Signal::Term,
@@ -212,13 +227,13 @@ pub fn build_shutdown_plan(state: &StartedState, config_path: &str) -> Vec<Teard
     steps
 }
 
-impl TeardownStep {
+impl TeardownStep<'_> {
     fn execute(&self, runner: &dyn CommandRunner) {
         match self {
-            TeardownStep::KillChild { handle, signal } => runner.signal(*handle, *signal),
+            TeardownStep::KillChild { handle, signal } => runner.signal(handle, *signal),
             TeardownStep::WaitForExit { handle, max_polls } => {
                 for _ in 0..*max_polls {
-                    if !runner.is_alive(*handle) {
+                    if !runner.is_alive(handle) {
                         break;
                     }
                     runner.sleep(std::time::Duration::from_millis(250));
@@ -254,14 +269,14 @@ mod tests {
     use super::*;
     use crate::supervise::runner::{ChildSpec, MockCommandRunner};
 
-    fn handle(runner: &MockCommandRunner, n: u32) -> ChildHandle {
+    fn handle(runner: &MockCommandRunner, n: u32) -> Arc<ChildHandle> {
         // Each call returns a fresh handle; spawn N throwaway children to get
         // N distinct handles for a test's fixture.
         let mut h = runner.spawn(ChildSpec::new(["true"])).unwrap();
         for _ in 1..n {
             h = runner.spawn(ChildSpec::new(["true"])).unwrap();
         }
-        h
+        Arc::new(h)
     }
 
     #[test]
@@ -272,7 +287,7 @@ mod tests {
             volte_lines: vec![StartedVolteLine {
                 index: 0,
                 netns: "volte0".to_string(),
-                carrier_agent_handles: vec![carrier],
+                carrier_agent_handles: vec![carrier.clone()],
             }],
             started_netns: vec!["volte0".to_string()],
             ..Default::default()
@@ -281,7 +296,7 @@ mod tests {
 
         let kill_pos = steps
             .iter()
-            .position(|s| matches!(s, TeardownStep::KillChild { handle: h, .. } if *h == carrier))
+            .position(|s| matches!(s, TeardownStep::KillChild { handle: h, .. } if h.id() == carrier.id()))
             .expect("carrier kill step must exist");
         let cleanup_pos = steps
             .iter()
@@ -310,7 +325,7 @@ mod tests {
             volte_lines: vec![StartedVolteLine {
                 index: 2,
                 netns: "volte2".to_string(),
-                carrier_agent_handles: vec![carrier],
+                carrier_agent_handles: vec![carrier.clone()],
             }],
             started_netns: vec!["volte2".to_string()],
             ..Default::default()
@@ -349,14 +364,14 @@ mod tests {
         let carrier_handle = handle(&runner, 1);
         let state = StartedState {
             legacy_volte_registration: Some(LegacyVolteRegistration {
-                supervisor_handle: legacy_handle,
+                supervisor_handle: legacy_handle.clone(),
                 bridge_inbound: false,
                 restore_cid: None,
             }),
             volte_lines: vec![StartedVolteLine {
                 index: 0,
                 netns: "volte0".to_string(),
-                carrier_agent_handles: vec![carrier_handle],
+                carrier_agent_handles: vec![carrier_handle.clone()],
             }],
             started_netns: vec!["volte0".to_string()],
             ..Default::default()
@@ -366,7 +381,7 @@ mod tests {
         for h in [legacy_handle, carrier_handle] {
             let kill_step = steps
                 .iter()
-                .find(|s| matches!(s, TeardownStep::KillChild { handle, .. } if *handle == h))
+                .find(|s| matches!(s, TeardownStep::KillChild { handle, .. } if handle.id() == h.id()))
                 .unwrap_or_else(|| panic!("expected a kill step for {h:?}"));
             match kill_step {
                 TeardownStep::KillChild { signal, .. } => {
@@ -390,15 +405,15 @@ mod tests {
         let daemon = handle(&runner, 1);
         let sip_agent = handle(&runner, 1);
         let state = StartedState {
-            daemon_supervisor: Some(daemon),
-            sip_agent_supervisor: Some(sip_agent),
+            daemon_supervisor: Some(daemon.clone()),
+            sip_agent_supervisor: Some(sip_agent.clone()),
             ..Default::default()
         };
         let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
         for h in [daemon, sip_agent] {
             let step = steps
                 .iter()
-                .find(|s| matches!(s, TeardownStep::KillChild { handle, .. } if *handle == h))
+                .find(|s| matches!(s, TeardownStep::KillChild { handle, .. } if handle.id() == h.id()))
                 .unwrap();
             match step {
                 TeardownStep::KillChild { signal, .. } => assert_eq!(*signal, Signal::Term),
@@ -412,14 +427,14 @@ mod tests {
         let runner = MockCommandRunner::new();
         let pcscd = handle(&runner, 1);
         let state = StartedState {
-            pcscd: Some(pcscd),
+            pcscd: Some(pcscd.clone()),
             started_netns: vec!["ims0".to_string(), "ims1".to_string()],
             ..Default::default()
         };
         let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
         let pcscd_pos = steps
             .iter()
-            .position(|s| matches!(s, TeardownStep::KillChild { handle, .. } if *handle == pcscd))
+            .position(|s| matches!(s, TeardownStep::KillChild { handle, .. } if handle.id() == pcscd.id()))
             .unwrap();
         for netns in ["ims0", "ims1"] {
             let del_pos = steps
@@ -451,8 +466,8 @@ mod tests {
         // Nothing started this run (e.g. a fatal precondition failed before
         // anything spawned) -> nothing to tear down. Guards against a plan
         // builder that assumes some subsystem is always present.
-        let steps =
-            build_shutdown_plan(&StartedState::default(), "/etc/gsm-sip-bridge/config.toml");
+        let state = StartedState::default();
+        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
         assert!(steps.is_empty());
     }
 
@@ -462,7 +477,7 @@ mod tests {
         let legacy_handle = handle(&runner, 1);
         let state = StartedState {
             legacy_volte_registration: Some(LegacyVolteRegistration {
-                supervisor_handle: legacy_handle,
+                supervisor_handle: legacy_handle.clone(),
                 bridge_inbound: false,
                 restore_cid: Some("3".to_string()),
             }),
@@ -493,7 +508,7 @@ mod tests {
         let legacy_handle = handle(&runner, 1);
         let state = StartedState {
             legacy_volte_registration: Some(LegacyVolteRegistration {
-                supervisor_handle: legacy_handle,
+                supervisor_handle: legacy_handle.clone(),
                 bridge_inbound: true,
                 restore_cid: None,
             }),
@@ -510,14 +525,14 @@ mod tests {
         let runner = MockCommandRunner::new();
         let daemon = handle(&runner, 1);
         let state = StartedState {
-            daemon_supervisor: Some(daemon),
+            daemon_supervisor: Some(daemon.clone()),
             started_netns: vec!["ims0".to_string()],
             ..Default::default()
         };
         let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
         execute_shutdown_plan(&steps, &runner);
 
-        assert_eq!(runner.signals_for(daemon), vec![Signal::Term]);
+        assert_eq!(runner.signals_for(&daemon), vec![Signal::Term]);
         let netns_deletes = runner.run_calls.lock().unwrap();
         assert!(netns_deletes
             .iter()

@@ -69,7 +69,7 @@ pub struct StrongswanEngine {
     /// state-machine functions in `line_supervisor` don't need mutable
     /// access), but `restart_process` must replace this engine's own charon
     /// handle.
-    pub charon_handle: RefCell<Option<ChildHandle>>,
+    pub charon_handle: RefCell<Option<std::sync::Arc<ChildHandle>>>,
 }
 
 impl StrongswanEngine {
@@ -133,8 +133,7 @@ impl StrongswanEngine {
             // own, per `orchestrate.rs`), so the cost is bounded by how
             // long a SIGTERM'd charon takes to actually exit, not anything
             // shared across lines.
-            runner.signal(old, super::runner::Signal::Term);
-            runner.wait(old);
+            runner.reap(&old);
         }
         let _ = runner.write_file(&self.charon_log, "");
         let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
@@ -151,7 +150,7 @@ impl StrongswanEngine {
             ChildSpec::new(["env", env.as_str(), "/usr/libexec/ipsec/charon"])
                 .capture_stdout_to(self.charon_log.clone()),
         ) {
-            *self.charon_handle.borrow_mut() = Some(handle);
+            *self.charon_handle.borrow_mut() = Some(std::sync::Arc::new(handle));
         }
 
         // 1:1 port of the current script's own `sleep 2 # let the vici
@@ -193,6 +192,7 @@ impl TunnelEngine for StrongswanEngine {
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
         self.charon_handle
             .borrow()
+            .as_ref()
             .is_some_and(|h| runner.is_alive(h))
     }
 
@@ -290,7 +290,7 @@ pub struct SwuEngine {
     pub netns: String,
     pub src_addr: Option<String>,
     pub log_file: PathBuf,
-    pub dialer_handle: RefCell<Option<ChildHandle>>,
+    pub dialer_handle: RefCell<Option<std::sync::Arc<ChildHandle>>>,
 }
 
 impl SwuEngine {
@@ -338,6 +338,7 @@ impl TunnelEngine for SwuEngine {
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
         self.dialer_handle
             .borrow()
+            .as_ref()
             .is_some_and(|h| runner.is_alive(h))
     }
 
@@ -360,11 +361,10 @@ impl TunnelEngine for SwuEngine {
             // reap the old dialer before spawning its replacement, so its
             // table entry doesn't leak and it can't overlap/contend with
             // the new one.
-            runner.signal(old, super::runner::Signal::Term);
-            runner.wait(old);
+            runner.reap(&old);
         }
         let _ = runner.write_file(&self.log_file, "");
-        *self.dialer_handle.borrow_mut() = self.spawn_dialer(runner);
+        *self.dialer_handle.borrow_mut() = self.spawn_dialer(runner).map(std::sync::Arc::new);
     }
 
     fn max_establish_attempts(&self) -> Option<u32> {
@@ -487,7 +487,8 @@ mod tests {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
             let old = runner.spawn(ChildSpec::new(["charon"])).unwrap();
-            *engine.charon_handle.borrow_mut() = Some(old);
+            let old_id = old.id();
+            *engine.charon_handle.borrow_mut() = Some(std::sync::Arc::new(old));
 
             engine.restart_process(&runner);
 
@@ -495,8 +496,9 @@ mod tests {
             assert!(calls
                 .iter()
                 .any(|c| c == &["rm", "-f", "/var/run/charon.pid"]));
-            assert!(engine.charon_handle.borrow().is_some());
-            assert_ne!(*engine.charon_handle.borrow(), Some(old));
+            let new = engine.charon_handle.borrow();
+            let new = new.as_ref().expect("a replacement must have been spawned");
+            assert_ne!(new.id(), old_id, "the handle must be a new child");
         }
 
         #[test]
@@ -510,11 +512,21 @@ mod tests {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
             let old = runner.spawn(ChildSpec::new(["charon"])).unwrap();
-            *engine.charon_handle.borrow_mut() = Some(old);
+            let old_id = old.id();
+            *engine.charon_handle.borrow_mut() = Some(std::sync::Arc::new(old));
 
             engine.restart_process(&runner);
 
-            assert!(runner.wait_calls.lock().unwrap().contains(&old));
+            // `reap` = SIGTERM, then poll is_alive until it is really gone
+            // (escalating to SIGKILL). Asserting on the signals rather than
+            // on a wait() call, because reap deliberately no longer waits:
+            // waiting untracked the child up front, which is what made a
+            // concurrently-held handle silently unusable.
+            let sigs = runner.signals_for_id(old_id);
+            assert!(
+                sigs.contains(&crate::supervise::runner::Signal::Term),
+                "the replaced child must be terminated, got {sigs:?}"
+            );
         }
 
         #[test]
@@ -671,11 +683,16 @@ mod tests {
             let runner = MockCommandRunner::new();
             let engine = swu_engine();
             let old = runner.spawn(ChildSpec::new(["swu-dialer"])).unwrap();
-            *engine.dialer_handle.borrow_mut() = Some(old);
+            let old_id = old.id();
+            *engine.dialer_handle.borrow_mut() = Some(std::sync::Arc::new(old));
 
             engine.restart_process(&runner);
 
-            assert!(runner.wait_calls.lock().unwrap().contains(&old));
+            let sigs = runner.signals_for_id(old_id);
+            assert!(
+                sigs.contains(&crate::supervise::runner::Signal::Term),
+                "the replaced child must be terminated, got {sigs:?}"
+            );
         }
     }
 }

@@ -55,8 +55,53 @@ impl ChildSpec {
 /// `std::process::Child`; the mock impl maps it to a synthetic bookkeeping
 /// entry the test controls directly — callers never see a raw pid, so no test
 /// needs a real OS process to exist (research.md R2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// # Deliberately neither `Copy` nor `Clone`
+///
+/// This handle is a *claim on a live child*, and [`CommandRunner::wait`] —
+/// the one operation that ends the child's trackability for everyone —
+/// consumes it. That is not stylistic. The most expensive defect in this
+/// module's history was reaching a handle *after* something had waited on it.
+///
+/// [`RealCommandRunner::wait`] removes the table entry before blocking
+/// (closing a pid-reuse race — see its doc comment), so a waited-on handle is
+/// permanently un-signalable: a later `signal`/`is_alive` is a silent no-op
+/// and the child can never be stopped, continued, or killed again.
+/// `MockCommandRunner` did not model that, so the failure was invisible to
+/// unit tests — it shipped **seven times**, in the vowifi-usim-bridge holder,
+/// all three VoLTE supervision loops, the circuit-switched daemon loop, the
+/// shared vowifi-sip-agent loop, and the per-line vowifi-ims-agent loop, and
+/// was caught only by live hardware and code review, one site at a time.
+///
+/// Without `Copy`, `wait`'s by-value signature makes every one of those a
+/// borrow-checker error. Three shapes remain, and they are the correct ones:
+///
+/// - **Sole owner, wants the exit status** — [`CommandRunner::wait`]. Only
+///   reachable when nothing else holds the handle, which is the invariant
+///   that was being violated.
+/// - **Wants the child gone** — [`CommandRunner::reap`]. Borrows, because it
+///   signals and then polls rather than untracking up front, so it is safe
+///   even while others hold a claim.
+/// - **Shared between a supervision loop and the shutdown plan** —
+///   `Arc<ChildHandle>`. Both clones can `signal`/`is_alive`/`reap`; neither
+///   can `wait`, which is exactly right.
+///
+/// If you want to clone this bare, you want `Arc<ChildHandle>` or `is_alive`.
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ChildHandle(u64);
+
+impl ChildHandle {
+    /// The handle's opaque identity, for logging and for test assertions that
+    /// need to refer to a child *after* ownership has moved on (into an
+    /// engine's `RefCell`, into a shutdown plan, into `reap`).
+    ///
+    /// Read-only on purpose: the tuple field stays private, so an id cannot
+    /// be turned back into a `ChildHandle`. There is no way to fabricate a
+    /// claim on a child you did not spawn.
+    pub fn id(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Signals sent to a [`ChildHandle`]. `Kill` (SIGKILL) is required, not
 /// optional, for any child that may be blocked mid-AT-transaction on a serial
@@ -68,6 +113,13 @@ pub enum Signal {
     Stop,
     Cont,
 }
+
+/// Poll bound for [`CommandRunner::reap`] at each of its two stages, matching
+/// `shutdown`'s own `KILL_CONFIRM_MAX_POLLS` — a ~5s budget per stage, so a
+/// process ignoring `SIGTERM` costs 5s before escalation rather than hanging
+/// its supervision thread forever (which the `wait()` this replaced could).
+const REAP_MAX_POLLS: u32 = 20;
+const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The trait every orchestration decision is written against.
 pub trait CommandRunner: Send + Sync {
@@ -110,13 +162,64 @@ pub trait CommandRunner: Send + Sync {
     /// Signals a previously spawned child. Best-effort, matching the current
     /// script's `kill ... 2>/dev/null || true` convention — a signal to an
     /// already-dead child is not an error.
-    fn signal(&self, handle: ChildHandle, sig: Signal);
+    ///
+    /// Borrows the handle, so the caller keeps it and can signal again.
+    fn signal(&self, handle: &ChildHandle, sig: Signal);
 
-    /// `kill -0`-equivalent liveness check.
-    fn is_alive(&self, handle: ChildHandle) -> bool;
+    /// `kill -0`-equivalent liveness check. Borrows, so this is the operation
+    /// to poll in a loop when the child must stay reachable — see
+    /// [`ChildHandle`].
+    fn is_alive(&self, handle: &ChildHandle) -> bool;
 
     /// Blocks until the child exits, returns its exit status if available.
+    ///
+    /// **Consumes the handle, and is only correct for a sole owner.**
+    /// [`RealCommandRunner::wait`] untracks the child *before* blocking, so
+    /// from the moment this is called the child can never be signalled again
+    /// — by anyone. Taking the handle by value is what enforces that: a
+    /// handle shared with a supervision loop or with [`super::shutdown`] is
+    /// held as an `Arc<ChildHandle>` and simply cannot be passed here.
+    ///
+    /// If you want the child *dead* rather than its exit status, you want
+    /// [`reap`](Self::reap).
     fn wait(&self, handle: ChildHandle) -> Option<i32>;
+
+    /// Terminates a child and confirms it is really gone: `SIGTERM`, poll
+    /// until it exits, escalate to `SIGKILL` if it will not.
+    ///
+    /// This is the correct replacement for the `signal(Term); wait();` pair
+    /// that used to appear at every restart path. That pair was wrong twice
+    /// over: `signal()` alone never removes the entry from
+    /// `RealCommandRunner`'s tracked-children table (an unbounded leak across
+    /// a long-running container's restarts), and the `wait()` that was
+    /// supposed to fix that untracked the child up front — so if anything
+    /// else still held the handle, it was silently defeated from then on.
+    ///
+    /// Polling `is_alive` instead has neither problem: the entry is dropped
+    /// only once the child has *actually exited*, so a concurrent holder
+    /// keeps working right up until there is nothing left to signal. That
+    /// makes this safe to call while others still hold a claim, which is why
+    /// it borrows. It also terminates: an old charon that ignores `SIGTERM`
+    /// gets `SIGKILL` rather than blocking a supervision thread forever.
+    ///
+    /// Provided, not required — there is one correct implementation, written
+    /// in terms of the methods above, so no implementor can get it wrong.
+    fn reap(&self, handle: &ChildHandle) {
+        self.signal(handle, Signal::Term);
+        for _ in 0..REAP_MAX_POLLS {
+            if !self.is_alive(handle) {
+                return;
+            }
+            self.sleep(REAP_POLL_INTERVAL);
+        }
+        self.signal(handle, Signal::Kill);
+        for _ in 0..REAP_MAX_POLLS {
+            if !self.is_alive(handle) {
+                return;
+            }
+            self.sleep(REAP_POLL_INTERVAL);
+        }
+    }
 
     /// Blocks the calling thread for `d`. Routed through the runner (rather
     /// than a bare `std::thread::sleep` call at each site) so decision logic
@@ -236,7 +339,7 @@ impl CommandRunner for RealCommandRunner {
         Ok(ChildHandle(id))
     }
 
-    fn signal(&self, handle: ChildHandle, sig: Signal) {
+    fn signal(&self, handle: &ChildHandle, sig: Signal) {
         // Holds `children`'s lock for the ENTIRE check-then-signal
         // sequence — including the external `kill` invocation itself — not
         // just the pid lookup. A prior version released the lock as soon as
@@ -299,7 +402,7 @@ impl CommandRunner for RealCommandRunner {
         let _ = Command::new("kill").args([flag, &pid.to_string()]).status();
     }
 
-    fn is_alive(&self, handle: ChildHandle) -> bool {
+    fn is_alive(&self, handle: &ChildHandle) -> bool {
         let mut children = self.children.lock().unwrap();
         let Some(child) = children.get_mut(&handle.0) else {
             return false;
@@ -361,22 +464,37 @@ mod real_runner_tests {
         let handle = runner.spawn(ChildSpec::new(["true"])).unwrap();
         // Give the (near-instant) child a moment to actually exit.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(handle), "`true` should have exited by now");
+        assert!(
+            !runner.is_alive(&handle),
+            "`true` should have exited by now"
+        );
         // Must not panic/error — and, per the fix, must not attempt to
         // signal the stale pid at all.
-        runner.signal(handle, Signal::Term);
+        runner.signal(&handle, Signal::Term);
         assert_eq!(runner.children.lock().unwrap().len(), 0);
     }
 
+    /// `wait` untracks the child, and the type system now enforces that
+    /// nothing can name it afterwards.
+    ///
+    /// This test used to end by calling `runner.signal(handle, Signal::Kill)`
+    /// on the just-waited handle and asserting that it was harmlessly
+    /// ignored. That line no longer compiles — `wait` takes the handle by
+    /// value and `ChildHandle` is not `Copy` — which is the entire point of
+    /// the change: the silent no-op that shipped seven times is now a
+    /// borrow-checker error at the call site instead of something a test has
+    /// to remember to check for.
     #[test]
-    fn wait_removes_the_entry_so_the_handle_cannot_be_signaled_afterward() {
+    fn wait_untracks_the_child_and_consumes_the_handle() {
         let runner = RealCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["true"])).unwrap();
+
         let status = runner.wait(handle);
+
         assert_eq!(status, Some(0));
         assert_eq!(runner.children.lock().unwrap().len(), 0);
-        // No panic, no attempt to signal a since-possibly-reused pid.
-        runner.signal(handle, Signal::Kill);
+        // `runner.signal(&handle, Signal::Kill);` here would be:
+        //   error[E0382]: borrow of moved value: `handle`
     }
 
     #[test]
@@ -394,9 +512,14 @@ mod real_runner_tests {
         let runner = std::sync::Arc::new(RealCommandRunner::new());
         let handle = runner.spawn(ChildSpec::new(["sleep", "2"])).unwrap();
 
+        // Shared between the polling thread and this one — exactly the
+        // `Arc<ChildHandle>` shape production now uses for a handle that a
+        // supervision loop watches while something else must still signal it.
+        let handle = std::sync::Arc::new(handle);
         let r1 = std::sync::Arc::clone(&runner);
+        let h_poll = std::sync::Arc::clone(&handle);
         let poller = std::thread::spawn(move || {
-            while r1.is_alive(handle) {
+            while r1.is_alive(&h_poll) {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         });
@@ -406,19 +529,19 @@ mod real_runner_tests {
         // exactly the property wait() breaks.
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(runner.children.lock().unwrap().contains_key(&handle.0));
-        runner.signal(handle, Signal::Kill);
+        runner.signal(&handle, Signal::Kill);
         poller.join().unwrap();
-        assert!(!runner.is_alive(handle));
+        assert!(!runner.is_alive(&handle));
     }
 
     #[test]
     fn a_still_running_child_can_be_signaled_and_is_observed_dead_after() {
         let runner = RealCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["sleep", "30"])).unwrap();
-        assert!(runner.is_alive(handle));
-        runner.signal(handle, Signal::Kill);
+        assert!(runner.is_alive(&handle));
+        runner.signal(&handle, Signal::Kill);
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(handle));
+        assert!(!runner.is_alive(&handle));
     }
 
     #[test]
@@ -435,16 +558,19 @@ mod real_runner_tests {
         let runner = std::sync::Arc::new(RealCommandRunner::new());
         let handle = runner.spawn(ChildSpec::new(["sleep", "2"])).unwrap();
 
+        let handle = std::sync::Arc::new(handle);
         let r1 = std::sync::Arc::clone(&runner);
+        let h1 = std::sync::Arc::clone(&handle);
         let liveness_checker = std::thread::spawn(move || {
             for _ in 0..50 {
-                r1.is_alive(handle);
+                r1.is_alive(&h1);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
         let r2 = std::sync::Arc::clone(&runner);
+        let h2 = std::sync::Arc::clone(&handle);
         let signaler = std::thread::spawn(move || {
-            r2.signal(handle, Signal::Kill);
+            r2.signal(&h2, Signal::Kill);
         });
 
         liveness_checker
@@ -453,7 +579,7 @@ mod real_runner_tests {
         signaler.join().expect("signaler thread must not panic");
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!runner.is_alive(handle));
+        assert!(!runner.is_alive(&handle));
     }
 
     #[test]
@@ -475,6 +601,164 @@ mod real_runner_tests {
             0,
             "spawn_detached must never insert a tracked table entry"
         );
+    }
+}
+
+/// The handle-lifecycle contract, asserted against **both** implementations.
+///
+/// This module exists because of a specific, expensive failure mode: for the
+/// whole of specs/021, `MockCommandRunner` and `RealCommandRunner` disagreed
+/// about what `wait()` does to a handle, and every unit test in the module
+/// ran only against the mock. The same bug shipped seven times, and each one
+/// was found by live hardware or code review rather than by the 650-test
+/// suite that was supposed to cover exactly this code.
+///
+/// "Hardware" and "OS process semantics" are different axes. The mock is a
+/// legitimate stand-in for the first; it was never entitled to invent its own
+/// answers for the second. Anything asserted here runs twice — once against
+/// the mock, once against real `sleep`/`true` processes — so a future
+/// divergence fails a test in CI instead of a container in production.
+#[cfg(test)]
+mod conformance {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Lets the shared assertions below look at each implementation's own
+    /// tracked-children table, which is the thing the two disagreed about.
+    /// Test-only: production code never asks whether an id is tracked, it
+    /// holds a handle or it does not.
+    trait TracksChildren {
+        fn tracks(&self, id: u64) -> bool;
+    }
+
+    impl TracksChildren for RealCommandRunner {
+        fn tracks(&self, id: u64) -> bool {
+            self.children.lock().unwrap().contains_key(&id)
+        }
+    }
+
+    impl TracksChildren for MockCommandRunner {
+        fn tracks(&self, id: u64) -> bool {
+            self.child_ids().contains(&id)
+        }
+    }
+
+    /// Every invariant callers are entitled to rely on, written once against
+    /// the trait.
+    fn assert_runner_conformance<R: CommandRunner>(runner: R, long_lived: &[&str]) {
+        // 1. A freshly spawned child is alive.
+        let handle = runner
+            .spawn(ChildSpec::new(long_lived.iter().copied()))
+            .unwrap();
+        assert!(
+            runner.is_alive(&handle),
+            "a just-spawned long-lived child must be alive"
+        );
+
+        // 2. `is_alive` is non-consuming: polling it repeatedly, as every
+        //    supervision loop does, must leave the handle usable — this is
+        //    the property the seven-times bug destroyed.
+        for _ in 0..3 {
+            assert!(runner.is_alive(&handle), "is_alive must not consume");
+        }
+
+        // 3. A handle that has only ever been polled is still signalable.
+        //    (`Term`'s default disposition terminates.)
+        runner.signal(&handle, Signal::Term);
+
+        // 4. ...and the child actually dies as a result, within a bounded
+        //    time. `reap` is the operation that guarantees this.
+        runner.reap(&handle);
+        assert!(
+            !runner.is_alive(&handle),
+            "after reap the child must be gone"
+        );
+
+        // 5. `reap` is idempotent and safe on an already-dead child — the
+        //    shutdown plan can and does run over children a supervision loop
+        //    already replaced.
+        runner.reap(&handle);
+
+        // 6. Signalling a dead handle is a silent no-op, never a panic.
+        runner.signal(&handle, Signal::Kill);
+        assert!(!runner.is_alive(&handle));
+
+        // 7. A handle shared as `Arc<ChildHandle>` — the shape production
+        //    uses whenever a supervision loop and the shutdown plan both
+        //    hold a claim — works identically through either clone.
+        let shared = Arc::new(
+            runner
+                .spawn(ChildSpec::new(long_lived.iter().copied()))
+                .unwrap(),
+        );
+        let other_claim = Arc::clone(&shared);
+        assert!(runner.is_alive(&shared));
+        assert!(
+            runner.is_alive(&other_claim),
+            "a second claim on the same child must see the same liveness"
+        );
+        runner.reap(&other_claim);
+        assert!(
+            !runner.is_alive(&shared),
+            "reaping through one claim must be visible through the other"
+        );
+
+        // 8. `spawn` hands out distinct identities.
+        let a = runner
+            .spawn(ChildSpec::new(long_lived.iter().copied()))
+            .unwrap();
+        let b = runner
+            .spawn(ChildSpec::new(long_lived.iter().copied()))
+            .unwrap();
+        assert_ne!(a.id(), b.id(), "each spawn must be a distinct child");
+        runner.reap(&a);
+        runner.reap(&b);
+    }
+
+    #[test]
+    fn mock_runner_satisfies_the_handle_lifecycle_contract() {
+        assert_runner_conformance(MockCommandRunner::new(), &["sleep", "60"]);
+    }
+
+    /// The same assertions against real `sleep(1)` processes. Slower than the
+    /// mock but bounded, and it is the only thing that can catch the mock
+    /// drifting away from OS semantics again.
+    #[test]
+    fn real_runner_satisfies_the_handle_lifecycle_contract() {
+        assert_runner_conformance(RealCommandRunner::new(), &["sleep", "60"]);
+    }
+
+    /// The specific divergence that caused the seven bugs, pinned directly:
+    /// `wait` untracks, `is_alive` (until the child exits) does not. Asserted
+    /// on both implementations so they can never disagree about it again.
+    fn assert_wait_untracks_but_polling_does_not<R: CommandRunner + TracksChildren>(runner: R) {
+        let polled = runner.spawn(ChildSpec::new(["sleep", "60"])).unwrap();
+        assert!(runner.is_alive(&polled));
+        assert!(
+            runner.is_alive(&polled),
+            "polling must leave the child tracked and reachable"
+        );
+        runner.reap(&polled);
+
+        let waited = runner.spawn(ChildSpec::new(["true"])).unwrap();
+        let waited_id = waited.id();
+        runner.wait(waited);
+        // The handle is gone at the type level; all that is observable is
+        // that nothing is tracked under its id any more.
+        assert!(
+            !runner.tracks(waited_id),
+            "wait must untrack the child in every implementation"
+        );
+    }
+
+    #[test]
+    fn mock_wait_untracks_but_polling_does_not() {
+        assert_wait_untracks_but_polling_does_not(MockCommandRunner::new());
+    }
+
+    #[test]
+    fn real_wait_untracks_but_polling_does_not() {
+        assert_wait_untracks_but_polling_does_not(RealCommandRunner::new());
     }
 }
 
@@ -572,7 +856,7 @@ mod mock {
                 .insert(format!("{host}:{port}"), ok);
         }
 
-        pub fn kill_child(&self, handle: ChildHandle, exit_code: i32) {
+        pub fn kill_child(&self, handle: &ChildHandle, exit_code: i32) {
             if let Some(c) = self.children.lock().unwrap().get_mut(&handle.0) {
                 c.alive = false;
                 c.exit_code = Some(exit_code);
@@ -588,7 +872,38 @@ mod mock {
                 .push(needle.to_string());
         }
 
-        pub fn signals_for(&self, handle: ChildHandle) -> Vec<Signal> {
+        /// Whether `wait()` was ever called for the child with this id.
+        /// Takes an id rather than a `&ChildHandle` because the interesting
+        /// assertion is almost always about a handle that has since been
+        /// consumed by `reap`/`wait` — capture `handle.id()` before handing
+        /// ownership away.
+        pub fn waited_on(&self, id: u64) -> bool {
+            self.wait_calls.lock().unwrap().iter().any(|h| h.id() == id)
+        }
+
+        /// Ids of every child `spawn` has handed out, oldest first — for
+        /// tests asserting about a child the code under test spawned
+        /// internally, whose handle the test therefore never sees.
+        pub fn child_ids(&self) -> Vec<u64> {
+            let mut ids: Vec<u64> = self.children.lock().unwrap().keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        }
+
+        /// Signals delivered to the child with this id. The id-taking
+        /// variant of [`Self::signals_for`], for assertions about a child
+        /// whose handle has since been moved into a `RefCell`, a shutdown
+        /// plan, or `wait` — capture `handle.id()` before handing it over.
+        pub fn signals_for_id(&self, id: u64) -> Vec<Signal> {
+            self.children
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|c| c.signals_received.clone())
+                .unwrap_or_default()
+        }
+
+        pub fn signals_for(&self, handle: &ChildHandle) -> Vec<Signal> {
             self.children
                 .lock()
                 .unwrap()
@@ -684,16 +999,24 @@ mod mock {
             Ok(())
         }
 
-        fn signal(&self, handle: ChildHandle, sig: Signal) {
+        fn signal(&self, handle: &ChildHandle, sig: Signal) {
             if let Some(c) = self.children.lock().unwrap().get_mut(&handle.0) {
                 c.signals_received.push(sig);
-                if matches!(sig, Signal::Kill) {
+                // `Term` kills too, not just `Kill`: the default disposition
+                // of SIGTERM is to terminate, and every child this
+                // supervises is an ordinary process that does exactly that.
+                // Modelling `Term` as survivable made `reap` always burn
+                // through its full SIGTERM poll budget and escalate to
+                // SIGKILL in tests, which is the opposite of what happens in
+                // production and would have hidden a genuine "we never
+                // escalate" regression behind an always-escalating mock.
+                if matches!(sig, Signal::Kill | Signal::Term) {
                     c.alive = false;
                 }
             }
         }
 
-        fn is_alive(&self, handle: ChildHandle) -> bool {
+        fn is_alive(&self, handle: &ChildHandle) -> bool {
             self.children
                 .lock()
                 .unwrap()
@@ -703,11 +1026,19 @@ mod mock {
         }
 
         fn wait(&self, handle: ChildHandle) -> Option<i32> {
+            let id = handle.0;
             self.wait_calls.lock().unwrap().push(handle);
+            // Mirrors `RealCommandRunner::wait`, which removes the entry
+            // before blocking. The mock deliberately did NOT do this, and
+            // that single divergence is what hid the same handle-lifecycle
+            // bug seven separate times: a supervision loop that waited on a
+            // handle it still needed passed every mock test and silently
+            // broke against real processes. `assert_runner_conformance`
+            // below now pins the two implementations to the same semantics.
             self.children
                 .lock()
                 .unwrap()
-                .get(&handle.0)
+                .remove(&id)
                 .and_then(|c| c.exit_code)
         }
 
@@ -729,17 +1060,17 @@ mod mock {
     fn a_freshly_spawned_child_is_alive_with_no_signals_received() {
         let runner = MockCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["echo", "hi"])).unwrap();
-        assert!(runner.is_alive(handle));
-        assert!(runner.signals_for(handle).is_empty());
+        assert!(runner.is_alive(&handle));
+        assert!(runner.signals_for(&handle).is_empty());
     }
 
     #[test]
     fn killing_a_child_marks_it_dead_and_records_the_signal() {
         let runner = MockCommandRunner::new();
         let handle = runner.spawn(ChildSpec::new(["sleep", "100"])).unwrap();
-        runner.signal(handle, Signal::Kill);
-        assert!(!runner.is_alive(handle));
-        assert_eq!(runner.signals_for(handle), vec![Signal::Kill]);
+        runner.signal(&handle, Signal::Kill);
+        assert!(!runner.is_alive(&handle));
+        assert_eq!(runner.signals_for(&handle), vec![Signal::Kill]);
     }
 
     #[test]

@@ -78,7 +78,7 @@ pub fn driver_logged_bind_failure(pcscd_log: &str) -> bool {
 /// grep, then the connect probe) and its ~10s bound.
 pub fn wait_for_vpcd_ready(
     runner: &dyn CommandRunner,
-    pcscd: ChildHandle,
+    pcscd: &ChildHandle,
     vpcd_host: &str,
     vpcd_port: u16,
 ) -> ReadyOutcome {
@@ -139,7 +139,7 @@ mod tests {
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
         runner.set_tcp_connect_ok("127.0.0.1", 15963, true);
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::Ready
         );
     }
@@ -148,9 +148,9 @@ mod tests {
     fn pcscd_dying_is_reported_immediately_not_as_a_timeout() {
         let runner = MockCommandRunner::new();
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
-        runner.kill_child(pcscd, 1);
+        runner.kill_child(&pcscd, 1);
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::PcscdDied
         );
     }
@@ -161,7 +161,7 @@ mod tests {
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
         runner.set_file(std::path::Path::new(PCSCD_LOG_PATH), "Address in use\n");
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::DriverBindFailed
         );
     }
@@ -171,7 +171,7 @@ mod tests {
         let runner = MockCommandRunner::new();
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::TimedOut
         );
         assert_eq!(
