@@ -14,7 +14,7 @@ use std::time::Duration;
 const MAX_DESCRIPTION_LEN: usize = 4090;
 const MAX_RETRIES: u32 = 3;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const USER_AGENT: &str = "gsm-sip-bridge/7.1.0";
+const USER_AGENT: &str = "gsm-sip-bridge/7.2.0";
 
 #[derive(Clone)]
 pub struct DiscordClient {

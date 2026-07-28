@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## v7.2.0
+
+Discord alerts now cover every critical operational failure, not just
+inbound SMS — plus four IMS reconnect bugs and a zombie-process leak found
+while hardening the v7.1.0 supervise migration before it fully landed on
+`main`.
+
+- **Discord alerting generalized beyond SMS** (`specs/022-discord-critical-alerts`) — a new `[alerts]` config section covers five categories: SMS (existing), module/modem lifecycle failure (SIM absent/unreadable, discovery failure, AT-worker unresponsive), IMS/SIP registration loss, VoWiFi tunnel failure, and PBX missed calls. Registration-loss and tunnel-failure only alert once a condition survives a continuous 5-minute unhealthy streak (configurable), evaluated at real report-arrival time rather than at `/metrics` scrape time, and each sends a distinct recovery notice once healthy again. One shared default webhook, per-category enable/disable (SMS on by default, the four new categories off), and per-category webhook overrides. New `gsm_sip_bridge_critical_alerts_total{category,outcome}` and `gsm_sip_bridge_critical_event_active{category,module}` metrics with matching Grafana panels. Live-validated end to end against real EC20 + Airtel hardware.
+- **Fixed: a failed Discord delivery could permanently suppress an incident.** Alert state now moves `Pending` → `Alerted` only on confirmed delivery, retrying on the next unhealthy report instead of the operator never being told.
+- **Fixed: a line with no Prometheus scraper could miss its own alert transition entirely** — evaluation moved from the `/metrics` scrape handler into the report-ingestion path itself, so it runs on the real report cadence regardless of who scrapes.
+- **Fixed: recovery from a "given up" module/modem slot could require a manual restart** — the retry-loop success path now clears stale given-up state the same way the rescan path already did; previously only one of the two recovery paths did.
+- **Four IMS reconnect fixes**, found live-testing the `021-entrypoint-supervise-rust` migration after v7.1.0 was tagged: a PBX-initiated hangup whose BYE failed on a silently-dead carrier transport could leave the GSM leg connected forever (now reconnects and retries the BYE); the reconnect itself could then fail permanently by trying to rebind a port the dead socket still held open, or by rebinding the independent Gm server (now only the client-reader thread restarts), or by falling back to a plain connection that violated the already-installed IPsec policy.
+- **Fixed: helper processes' `timeout` grandchildren leaked as zombies under the new Rust `supervise` PID-1 process** (~1 every 30s, from the idle-tunnel keepalive and healthcheck probe). `tini` now sits as PID 1 ahead of it, reaping orphans without racing `supervise`'s own tracked-child `wait()`.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:7.2.0
+```
+
 ## v7.1.0
 
 The container's own supervision logic moves from bash into the Rust binary itself, as a tested `gsm-sip-bridge supervise` subcommand.

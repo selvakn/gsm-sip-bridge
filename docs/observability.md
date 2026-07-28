@@ -35,6 +35,8 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_agent_up` | Gauge | 1 if the named VoWiFi agent (`ims` or `sip`) has reported within the last 3 report intervals |
 | `gsm_sip_bridge_agent_last_report_seconds` | Gauge | Age of the named agent's most recent report |
 | `gsm_sip_bridge_observability_events_dropped_total` | Counter | Reports an agent's bounded buffer discarded on overflow |
+| `gsm_sip_bridge_critical_alerts_total` | Counter | Discord critical-alert dispatch outcomes by **category** (`sms`, `module_lifecycle`, `registration_loss`, `tunnel_failure`, `missed_call`) and **outcome** (`sent`, `suppressed`, `skipped`, `failed`) — see `[alerts]` in [configuration.md](configuration.md) |
+| `gsm_sip_bridge_critical_event_active` | Gauge | 1 while a `module_lifecycle`/`registration_loss`/`tunnel_failure` category is in an active (unresolved) incident for a given module/line, by **category** and **module** |
 
 **Transport label**: the six metrics marked **transport** above carry
 `transport="cs"` for the circuit-switched daemon and `transport="vowifi"`

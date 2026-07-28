@@ -8,7 +8,9 @@ over VoWiFi/IMS (via a built-in ePDG tunnel), or over VoLTE (via the
 bridge's own IMS registration on the LTE data path). VoWiFi and VoLTE
 both scale to multiple SIMs concurrently, each its own isolated line.
 Incoming SMS messages are persisted to a local database and optionally
-forwarded to Discord.
+forwarded to Discord, alongside configurable Discord alerts for other
+critical operational events (modem/SIM failure, registration or tunnel
+loss, missed calls).
 
 **Language**: Rust | **Platform**: Linux (amd64, arm64) | **Releases**: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
@@ -22,6 +24,7 @@ forwarded to Discord.
 - **DID passthrough** — forwards the GSM caller's number as the SIP DID (`P-Asserted-Identity`, `X-GSM-Caller-ID`), so PBX inbound routes decide the destination.
 - **CLI card management** — `card list` / `restart` / `set-mode` / `get-mode` against the running daemon over a Unix socket, with persisted per-slot network mode preferences (`2g`/`3g`/`4g`/`auto`).
 - **SMS capture** — persists all incoming SMS to SQLite and posts rich-embed notifications to a Discord webhook.
+- **Critical-event alerting** — configurable Discord alerts for modem/SIM lifecycle failure, IMS/SIP registration loss, VoWiFi tunnel failure, and missed calls, each with its own on/off switch, threshold, and webhook override; alerts once past the system's own auto-recovery, with a matching recovery notice.
 - **Call logging** — every incoming call recorded with caller ID, module, duration, and outcome.
 - **Observability** — Prometheus metrics endpoint and a pre-provisioned Grafana dashboard.
 - **Tunable audio pipeline** — `lan`/`wan` latency profiles, ALSA buffer and jitter-buffer controls, modem gain/echo-canceller settings, real-time thread scheduling.

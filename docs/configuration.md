@@ -38,6 +38,35 @@ The bridge reads a single TOML configuration file specified via `--config`.
 | `discord_webhook_url` | string | `""` | Supports `env:VAR` syntax |
 | `db_path` | string | `/var/lib/gsm-sip-bridge/store.db` | Store path |
 
+### `[alerts]`
+
+Discord alerts for critical operational events, generalizing the SMS
+forwarding above into five categories. `[sms]` continues to work unchanged
+even if this whole section is omitted — `[alerts.sms]` is seeded from
+`[sms]` above when absent. Each category alerts only once its own built-in
+recovery is exhausted, then sends a single "recovered" notice when it
+clears — never a repeating stream while a condition stays unhealthy.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `discord_webhook_url` | string | `""` | Shared default webhook for any category below with no override of its own. Supports `env:VAR` syntax |
+
+| Sub-table | Key | Type | Default | Description |
+|---|---|---|---|---|
+| `[alerts.sms]` | `enabled` | boolean | true | Matches `[sms].enabled` unless overridden |
+| | `discord_webhook_url` | string | (none) | Optional per-category override |
+| `[alerts.module_lifecycle]` | `enabled` | boolean | false | SIM absent/unreadable, discovery/init failure, or an AT command worker unresponsive |
+| | `at_worker_unresponsive_sec` | integer | 60 | Range: 5-600 |
+| `[alerts.registration_loss]` | `enabled` | boolean | false | A VoLTE/VoWiFi line's SIP registration lost continuously past `unhealthy_sec` |
+| | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
+| `[alerts.tunnel_failure]` | `enabled` | boolean | false | A VoWiFi line's ePDG/IPsec tunnel non-established continuously past `unhealthy_sec` |
+| | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
+| `[alerts.missed_call]` | `enabled` | boolean | false | An inbound call that rang out unanswered (never bridged) |
+
+Every sub-table also accepts its own `discord_webhook_url` override; a
+category without one falls back to `[alerts].discord_webhook_url`. See
+`config.toml.example` for a fully-commented sample.
+
 ### `[metrics]`
 
 | Key | Type | Default | Description |
