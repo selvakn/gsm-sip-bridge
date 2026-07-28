@@ -124,7 +124,7 @@ the full `[vowifi]`/`[volte]` reference — is documented in
 
 | | |
 |---|---|
-| **Getting started** | [Hardware setup](docs/hardware-setup.md) · [Configuration reference](docs/configuration.md) |
+| **Getting started** | [Supported hardware](docs/supported-hardware.md) · [Hardware setup](docs/hardware-setup.md) · [Configuration reference](docs/configuration.md) |
 | **Running it** | [Operations runbook & troubleshooting](docs/operations.md) · [Metrics & dashboards](docs/observability.md) |
 | **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [PC/SC card-reader VoWiFi lines (no modem)](docs/omnikey-pcsc-vowifi.md) · [Host-side VoLTE bridge (operations)](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy path)](docs/ec20-volte-setup.md) |
 | **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |

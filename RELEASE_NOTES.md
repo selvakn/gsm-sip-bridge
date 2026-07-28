@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v8.0.0
+
+A VoWiFi line's SIM no longer needs a modem at all — it can sit directly in
+a physical PC/SC smart-card reader instead.
+
+- **PC/SC card-reader-backed VoWiFi lines** (`specs/023-omnikey-pcsc-vowifi`) — validated against a real OmniKey AG 3x21 reader — cover **both** halves of a line: the ePDG tunnel (strongSwan's `eap-sim-pcsc` talking to `pcscd` directly) and, new in this release, IMS-AKA SIP registration itself. Until now only the tunnel had a PC/SC path; `ims::register_session` (used by `vowifi-ims-agent`) talked to the SIM exclusively over a modem's `AT+CSIM`, so a genuinely card-reader-only deployment's tunnel came up but the line never registered or answered a call. A new `modules::usim::ApduTransport` trait generalizes the existing SELECT/READ RECORD/AUTHENTICATE logic over either transport (`AtCommander`'s `AT+CSIM` or the new `modules::pcsc_card::PcscTransport`), so both paths share one implementation. Opt in with `[[vowifi.line]] pcsc_reader = true` plus mandatory `imsi_override`/`mcc`/`mnc` (no modem to derive them from); coexists with modem-backed lines in the same deployment, sharing `[vowifi].max_lines`. Requires `[vowifi].tunnel_engine = "strongswan"` (the default) — the `swu` engine has no PC/SC support and refuses to start with a `pcsc_reader` line configured. See [docs/omnikey-pcsc-vowifi.md](docs/omnikey-pcsc-vowifi.md).
+- **New [docs/supported-hardware.md](docs/supported-hardware.md)** — a compatibility matrix of every modem/reader model this project runs against (Quectel EC20, EC200/EC200U, and now the OmniKey AG 3x21 reader) crossed with the three call modes (circuit-switched, VoWiFi, VoLTE), distinguishing what's actually been live-tested from what the code merely doesn't prevent.
+- No modem means no `AT+CGSN` IMEI either — a stable, Luhn-valid one (TS 23.003 Annex A) is auto-generated per line from its own IMSI unless `imei_override` is set explicitly.
+- With more than one `pcsc_reader` line configured, each connects to *its own* physical reader — matched by reading each candidate reader's own `EF_IMSI` and comparing it to the line's configured IMSI (the same disambiguation `eap-sim-pcsc` already does for the tunnel side), with each candidate's probe held inside a PC/SC transaction so two lines' concurrent probes at startup can't interleave and corrupt each other's reads. Config now also rejects two `pcsc_reader` lines sharing the same `imsi_override` outright, since that would let both resolve to the same physical card while whatever SIM the other line actually meant went unused.
+- **Fixed: `pcscd`'s virtual `vpcd` reader was required even in a deployment with no modem-backed lines at all**, so a genuinely card-reader-only setup failed to start on a virtual reader nothing would ever use. Now provisioned only when at least one modem-backed line exists.
+- **Fixed: `READ RECORD` against a real PC/SC reader silently returned nothing.** `AT+CSIM` over a modem resolves a `Le=00` ("give me whatever's there") request transparently; a real PC/SC reader instead answers with `SW=6C1A` ("wrong length; here's the real one") and no data, which — undetected — made every `EF_DIR` record look empty and USIM AID discovery fail outright.
+- **Live-verified end to end** with the modem physically removed (a genuinely card-reader-only deployment, not just mixed): ePDG tunnel established, IMS-AKA `REGISTER` got `200 OK`, the network's own `NOTIFY` confirmed an active registration for the MSISDN, and a real inbound call was signaled and dialed into the PBX. Earlier, in a mixed modem + card-reader deployment, `eap-sim-pcsc`'s reader/card discrimination was proven correct in production code — it found the live card but correctly refused to use it for the modem line's own, different IMSI.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:8.0.0
+```
+
 ## v7.2.0
 
 Discord alerts now cover every critical operational failure, not just
