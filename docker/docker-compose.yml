@@ -58,7 +58,7 @@ services:
       - audio
       - dialout
     healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      test: ["CMD", "/usr/local/bin/gsm-sip-bridge", "--config", "/etc/gsm-sip-bridge/config.toml", "healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 15s

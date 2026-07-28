@@ -177,10 +177,8 @@ Configures the Unix domain socket used by `card` CLI subcommands to communicate 
 ### `[vowifi]`
 
 The inbound VoWiFi-to-SIP bridge — a second, independent inbound call path
-alongside `[sip]`/`[bridge]`. Only read by the `vowifi-*-agent`/`discover`
-subcommands and `docker/entrypoint.sh`/`healthcheck.sh` (via
-`gsm-sip-bridge config vowifi-shell-env`/`gsm-sip-bridge discover
---shell-env`), never by the normal daemon path. All ePDG-tunnel
+alongside `[sip]`/`[bridge]`. Read by the `vowifi-*-agent`/`discover`/`supervise`/`healthcheck`
+subcommands, never by the normal daemon path. All ePDG-tunnel
 configuration lives here — none of it is read from environment variables;
 `.env` holds secrets only (specs/012-strongswan-epdg config consolidation).
 

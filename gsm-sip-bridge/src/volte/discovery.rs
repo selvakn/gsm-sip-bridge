@@ -289,7 +289,7 @@ pub struct VolteLineManifestEntry {
     pub control_port: u16,
     pub sip_leg_port: u16,
     /// This line's network namespace (specs/020-volte-line-netns). Read by
-    /// `docker/entrypoint.sh`'s cleanup trap so teardown runs *inside* the
+    /// `supervise::shutdown`'s teardown plan so it runs *inside* the
     /// namespace before it is deleted (research.md R6), without re-deriving
     /// it.
     pub netns: String,

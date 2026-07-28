@@ -13,6 +13,7 @@ pub mod card;
 pub mod config;
 pub mod daemon;
 pub mod discover;
+pub mod healthcheck;
 pub mod ims;
 pub mod volte;
 pub mod vowifi;
@@ -68,5 +69,6 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
             };
             crate::supervise::orchestrate::run(path)
         }
+        Commands::Healthcheck => healthcheck::run(cli),
     }
 }

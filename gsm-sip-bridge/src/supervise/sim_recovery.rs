@@ -32,7 +32,7 @@ pub struct IncidentCounters {
 pub enum AgentExitOutcome {
     /// `grep -q 'AT+CSIM failed'` matched this run's log.
     CsimFailure,
-    /// A clean run or a non-CSIM failure — either way, the current script
+    /// A clean run or a non-CSIM failure — either way, the original script
     /// resets both counters (a non-CSIM failure is a different problem, not
     /// evidence of a dropped USIM continuing).
     Other,
@@ -92,7 +92,7 @@ pub fn is_cpin_ready(reset_log: &str) -> bool {
     reset_log.contains("+CPIN: READY")
 }
 
-/// Matches the current script's `sleep 0.5` after freezing the holder, to
+/// Matches the original script's `sleep 0.5` after freezing the holder, to
 /// let any in-flight serial I/O settle before driving the port directly.
 const HOLDER_FREEZE_SETTLE: Duration = Duration::from_millis(500);
 /// Matches `sleep 4` between `AT+CFUN=0` and `AT+CFUN=1`.
@@ -101,7 +101,7 @@ const CFUN_CYCLE_DELAY: Duration = Duration::from_secs(4);
 const CPIN_POLL_ATTEMPTS: u32 = 15;
 const CPIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Matches the current script's 30s `timeout` on the background `cat
+/// Matches the original script's 30s `timeout` on the background `cat
 /// "$modem"` reader — comfortably outlasts the ~4.3s pre-roll plus the ~15s
 /// readiness poll.
 const READER_TIMEOUT_SECS: u32 = 30;

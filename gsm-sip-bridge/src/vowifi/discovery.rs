@@ -395,7 +395,7 @@ pub struct LineResolution {
 }
 
 /// Everything a consumer needs for one line: the flat fields
-/// `docker/entrypoint.sh`'s `--shell-env` output reads directly, plus the
+/// the `--shell-env` output reads directly, plus the
 /// complete derived `VowifiConfig` so `vowifi-ims-agent --line N` (`main.rs`)
 /// can load it verbatim with no re-derivation (and, critically, no second
 /// USB/AT scan — see this module's top-level doc comment and research.md

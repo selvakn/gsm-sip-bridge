@@ -108,7 +108,7 @@ pub trait ImsTransport {
 }
 
 /// The VoWiFi transport: the ePDG tunnel, established out-of-band by
-/// `docker/entrypoint.sh` before the agent starts.
+/// `supervise::orchestrate` before the agent starts.
 ///
 /// This owns no attachment lifecycle of its own — the tunnel outlives any
 /// single registration and is supervised elsewhere — so `teardown` is a

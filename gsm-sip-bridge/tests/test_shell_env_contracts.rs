@@ -1,13 +1,20 @@
 //! Regression tests for the `*-shell-env` printers.
 //!
-//! These render the variables that `docker/healthcheck.sh` (and, before
-//! specs/021, `entrypoint.sh`) consume with `eval` — a genuine cross-process
-//! contract where a renamed variable or a lost `shell_quote` breaks a running
-//! container silently, with no compile error and no other test noticing.
+//! These render `KEY=value` lines meant to be `eval`'d by a shell. Both of
+//! their original in-tree consumers are gone — `entrypoint.sh`'s
+//! orchestration became `supervise` (specs/021) and `healthcheck.sh` became
+//! `commands::healthcheck` — so they are now an operator diagnostic ("what
+//! did this container actually resolve?") rather than an internal contract.
 //!
-//! They had no coverage at all until now for a purely structural reason: the
-//! printers lived in `src/main.rs`, and a binary crate's items cannot be
-//! imported from `tests/`. They now live in `gsm_sip_bridge::commands`.
+//! They are still worth pinning. Anything `eval`'d is a shell-injection
+//! surface, the array-length invariant below is the kind of thing that fails
+//! silently, and an operator debugging a live line at 2am should not have to
+//! wonder whether the output is trustworthy.
+//!
+//! They had no coverage at all until recently, for a purely structural
+//! reason: the printers lived in `src/main.rs`, and a binary crate's items
+//! cannot be imported from `tests/`. They now live in
+//! `gsm_sip_bridge::commands`.
 
 use gsm_sip_bridge::commands::{config as config_cmd, discover, volte};
 use gsm_sip_bridge::config::{AppConfig, VolteConfig};
@@ -66,10 +73,11 @@ fn discover_shell_env_emits_one_array_element_per_line_in_order() {
     assert_eq!(v["CS_EXCLUDED_PORTS"], "('/dev/ttyUSB9')");
 }
 
-/// `healthcheck.sh` indexes `LINE_*[i]` in a `seq 0 $((LINE_COUNT - 1))` loop,
-/// so every array must have exactly `LINE_COUNT` elements — a printer that
+/// A consumer indexes `LINE_*[i]` in a `seq 0 $((LINE_COUNT - 1))` loop, so
+/// every array must have exactly `LINE_COUNT` elements — a printer that
 /// emitted a short array for one key would silently give that line an empty
-/// netns/iface and skip its check.
+/// netns/iface. This is the invariant the old `healthcheck.sh` depended on
+/// and never checked.
 #[test]
 fn every_discover_line_array_has_exactly_line_count_elements() {
     let resolution = LineResolution {
@@ -152,12 +160,12 @@ password = "s3cret"
 }
 
 #[test]
-fn vowifi_shell_env_emits_the_globals_healthcheck_reads() {
+fn vowifi_shell_env_emits_the_globals_a_consumer_reads_by_name() {
     let config = load_minimal_config();
 
     let v = vars(&config_cmd::render_vowifi_shell_env(&config));
 
-    // `healthcheck.sh` reads METRICS_PORT and TUNNEL_ENGINE by name.
+    // METRICS_PORT and TUNNEL_ENGINE are read by name, not position.
     assert_eq!(v["METRICS_PORT"], "'9091'");
     assert_eq!(v["TUNNEL_ENGINE"], "'strongswan'");
     assert_eq!(v["APN"], "'ims'");

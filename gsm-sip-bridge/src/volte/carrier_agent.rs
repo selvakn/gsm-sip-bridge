@@ -24,7 +24,7 @@
 //!   `LOOPBACK` below.
 //!
 //! Neither caller retries on failure: the subcommand relies on
-//! `docker/entrypoint.sh`'s per-line process supervision (matching how
+//! `supervise::orchestrate_volte`'s per-line process supervision (matching how
 //! `vowifi-ims-agent` is supervised, not an internal Rust retry loop); the
 //! in-process diagnostic path keeps its own retry loop in `bridge::run_line`,
 //! calling [`run`] once per attempt exactly as it called `run_line_carrier`

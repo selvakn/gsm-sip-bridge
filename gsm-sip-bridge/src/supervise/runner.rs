@@ -1,7 +1,7 @@
 //! The injectable boundary between orchestration decision logic and the outside
 //! world (specs/021-entrypoint-supervise-rust, research.md R1/R2).
 //!
-//! Every current `docker/entrypoint.sh` shell-out — `ip`, `dig`, `swanctl`,
+//! Every `docker/entrypoint.sh` shell-out — `ip`, `dig`, `swanctl`,
 //! `stty`, raw serial AT writes, and the spawning/signalling/liveness-checking
 //! of long-running children (`charon`, `pcscd`, the vowifi/volte agents, the
 //! circuit-switched daemon, keepalive loops) — goes through [`CommandRunner`].
@@ -133,7 +133,7 @@ pub trait CommandRunner: Send + Sync {
 
     /// Reads a log/state file (charon.log, a reset log, an agent's tee'd
     /// output, a P-CSCF source-path file). Modeled separately from `run`
-    /// because the current script scrapes files that accumulate across the
+    /// because the original script scrapes files that accumulate across the
     /// container's lifetime, independent of any single command's own stdout.
     fn read_file(&self, path: &Path) -> io::Result<String>;
 
@@ -232,7 +232,7 @@ pub trait CommandRunner: Send + Sync {
     /// test.
     fn sleep(&self, d: std::time::Duration);
 
-    /// Best-effort TCP connect probe (matches the current script's `exec
+    /// Best-effort TCP connect probe (matches the original script's `exec
     /// 3<>"/dev/tcp/$host/$port"` readiness/keepalive check) — `true` iff a
     /// connection was established within a short timeout. Routed through the
     /// runner like every other real-world effect so the vpcd-readiness gate
@@ -389,7 +389,7 @@ impl CommandRunner for RealCommandRunner {
         };
         // Shells out to `kill` rather than a raw `libc::kill(2)` call: this
         // crate's gsm-sip-bridge/src must contain zero `unsafe` blocks
-        // (tools/count-unsafe.sh), and this is exactly the current script's
+        // (tools/count-unsafe.sh), and this is exactly the original script's
         // own `kill -TERM/-KILL/-STOP/-CONT "$pid" 2>/dev/null || true`
         // convention — a signal to an already-exited process is expected to
         // fail silently, not to be treated as an error.
@@ -846,6 +846,17 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(argv_key.to_string(), output);
+        }
+
+        /// Seeds the stdout a future `run_in_netns(netns, argv)` returns.
+        /// The convenience form of [`Self::set_run_output`] for the
+        /// namespace-scoped variant, whose key encoding (`netns:<ns>:<argv>`)
+        /// is an implementation detail callers should not have to spell out.
+        pub fn set_netns_output(&self, netns: &str, argv: &[&str], stdout: &str) {
+            let key = format!("netns:{netns}:{}", argv.join(" "));
+            let mut out = empty_output(0);
+            out.stdout = stdout.as_bytes().to_vec();
+            self.run_outputs.lock().unwrap().insert(key, out);
         }
 
         /// Seeds `tcp_connect_ok(host, port)`'s return value.

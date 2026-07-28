@@ -11,7 +11,7 @@
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use std::time::Duration;
 
-/// Matches the current script's `sleep 5` between a daemon exit and its
+/// Matches the original script's `sleep 5` between a daemon exit and its
 /// respawn.
 pub const RESTART_DELAY: Duration = Duration::from_secs(5);
 
@@ -26,7 +26,7 @@ pub enum Outcome {
 }
 
 /// Spawns `argv` once and waits for it to exit, returning the outcome.
-/// Blocking — matches the current script's own blocking `while true` body
+/// Blocking — matches the original script's own blocking `while true` body
 /// (the loop itself runs on its own supervisor thread, mirroring the
 /// existing `std::thread::spawn` convention used everywhere else in this
 /// codebase for equivalent long-lived supervision work).

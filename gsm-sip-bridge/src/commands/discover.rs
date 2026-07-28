@@ -13,7 +13,7 @@ use std::process::ExitCode;
 /// consumed by `main()`'s daemon-startup path via
 /// `modules::discovery::scan_modules`'s own exclusion read and by
 /// `--line`-selecting `vowifi-ims-agent`/`vowifi-status`), and optionally
-/// prints `entrypoint.sh`-`eval`-able shell output.
+/// prints `eval`-able shell output.
 pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli) -> ExitCode {
     let out_path = args
         .out
@@ -73,7 +73,7 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
         }
         if result.lines.is_empty() {
             // The spec's clarification: degrade, don't fail — the caller
-            // (entrypoint.sh) still starts the circuit-switched daemon.
+            // (`supervise::orchestrate`) still starts the circuit-switched daemon.
             tracing::error!(
                 "[vowifi].enabled is true but no usable VoWiFi line was discovered; \
                  the VoWiFi subsystem will not start this run"

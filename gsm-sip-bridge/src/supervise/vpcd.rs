@@ -9,7 +9,7 @@ use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use std::path::Path;
 use std::time::Duration;
 
-/// Matches the current script's `for _ in $(seq 1 20); do ...; sleep 0.5; done`
+/// Matches the original script's `for _ in $(seq 1 20); do ...; sleep 0.5; done`
 /// readiness poll — a ~10s bound.
 const READY_POLL_ATTEMPTS: u32 = 20;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -27,7 +27,7 @@ pub fn write_vpcd_reader_conf(runner: &dyn CommandRunner, port: u16) {
 }
 
 /// Spawns pcscd once (the caller is expected to supervise/respawn it via
-/// `daemon_supervisor`-style looping, matching the current script's own
+/// `daemon_supervisor`-style looping, matching the original script's own
 /// `while true; do pcscd --foreground ...; sleep 5; done`).
 pub fn spawn_pcscd(runner: &dyn CommandRunner) -> Option<ChildHandle> {
     let _ = runner.run(&["mkdir", "-p", "/run/pcscd"]);
@@ -39,7 +39,7 @@ pub fn spawn_pcscd(runner: &dyn CommandRunner) -> Option<ChildHandle> {
         .ok()
 }
 
-/// Outcome of the readiness gate — mirrors the current script's `VPCD_READY`
+/// Outcome of the readiness gate — mirrors the original script's `VPCD_READY`
 /// plus its two distinct FATAL causes (pcscd died vs. the driver logging a
 /// bind failure), so the caller can log the same specific guidance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub fn driver_logged_bind_failure(pcscd_log: &str) -> bool {
 
 /// Polls for the vpcd reader's readiness: pcscd still alive, no bind-failure
 /// logged, and the base slot's port actually answers a TCP connect. Matches
-/// the current script's own ordering (pcscd-alive check first, then the log
+/// the original script's own ordering (pcscd-alive check first, then the log
 /// grep, then the connect probe) and its ~10s bound.
 pub fn wait_for_vpcd_ready(
     runner: &dyn CommandRunner,

@@ -462,7 +462,7 @@ pub(crate) fn render_call_report(
 /// given), or resolved from `--config`'s `[[volte.line]]` (`--modem`
 /// omitted). `volte-pdn --action down` resolving the exact same line
 /// `volte-register` registered (rather than guessing the CLI default) is
-/// what lets `docker/entrypoint.sh`'s cleanup tear down the right modem/PDN.
+/// what lets `supervise::shutdown` tear down the right modem/PDN.
 pub(crate) struct ResolvedVolteRegisterLine {
     modem: std::path::PathBuf,
     cid: u8,
@@ -1055,7 +1055,7 @@ pub fn render_volte_discover_lines_shell_env(
 /// The per-line carrier-facing half (specs/020-volte-line-netns) — reads its
 /// settings from the manifest `volte-discover-lines` wrote, attaches this
 /// line's IMS PDN, registers, and answers calls until the registration ends.
-/// One-shot: does not retry internally (`docker/entrypoint.sh` restarts it on
+/// One-shot: does not retry internally (`supervise::orchestrate_volte` restarts it on
 /// exit, mirroring `vowifi-ims-agent`'s supervision).
 pub(crate) fn handle_volte_carrier_agent_command(
     args: &crate::cli::VolteCarrierAgentArgs,

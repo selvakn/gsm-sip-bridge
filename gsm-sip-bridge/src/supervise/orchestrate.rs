@@ -6,7 +6,7 @@
 //! of shelling out to bash functions.
 //!
 //! Threading note: functions that need to background their own supervision
-//! loop (matching the current script's `(...) &`) take `&Arc<dyn
+//! loop (matching the original script's `(...) &`) take `&Arc<dyn
 //! CommandRunner>` so they can `Arc::clone` it into a genuinely `'static`
 //! `std::thread::spawn` closure; functions that only ever run synchronously
 //! within an already-running supervisor thread (the tested Phase 1-3
@@ -135,7 +135,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
 
     // --- 1. Discover once, up front (specs/013-multi-card-vowifi) ---------
     // Resolved BEFORE the circuit-switched daemon supervisor starts below —
-    // see docker/entrypoint.sh's own extensive comment on why (both would
+    // see this function's own comment below on why (both would
     // otherwise probe the same candidate modem's serial port at once).
     let mut vowifi_lines: Vec<LineResolutionEntry> = Vec::new();
     if config.vowifi.enabled {
@@ -1076,7 +1076,7 @@ fn start_line_tail(
         let interval = Duration::from_secs(
             /* [vowifi].keepalive_interval_sec, read by the caller and
             threaded through would be cleaner, but this loop only needs a
-            reasonable default matching entrypoint.sh's own $KEEPALIVE_INTERVAL
+            reasonable default matching the original script's own $KEEPALIVE_INTERVAL
             fallback */
             30,
         );

@@ -1,5 +1,5 @@
 //! `vowifi-imsi`: prints the SIM's IMSI, read via `AT+CIMI` through the
-//! existing `AtCommander`. Used by `docker/entrypoint.sh` to render the
+//! existing `AtCommander`. Used by `supervise::orchestrate` to render the
 //! strongSwan swanctl connection's EAP identity
 //! (`0<IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`, per
 //! `swanctl-epdg.conf.template`) — the entrypoint asks the binary rather

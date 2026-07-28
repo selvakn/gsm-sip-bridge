@@ -68,7 +68,7 @@ pub struct SwanctlEpdgParams<'a> {
     pub epdg_ip: &'a str,
     pub if_id: &'a str,
     pub updown_script: &'a str,
-    /// `None` omits the `local_addrs` line entirely — the current script's
+    /// `None` omits the `local_addrs` line entirely — the original script's
     /// `sed -e "/local_addrs.*@SRC_ADDR@/d"` deletion branch (spec Acceptance
     /// Scenario 2).
     pub src_addr: Option<&'a str>,

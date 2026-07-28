@@ -153,7 +153,7 @@ impl StrongswanEngine {
             *self.charon_handle.borrow_mut() = Some(std::sync::Arc::new(handle));
         }
 
-        // 1:1 port of the current script's own `sleep 2 # let the vici
+        // 1:1 port of the original script's own `sleep 2 # let the vici
         // socket come up before swanctl talks to it` — present at every one
         // of its charon-respawn sites. Missing here (an FR-009 gap found
         // live, T049): `--load-all` issued before charon's vici socket is

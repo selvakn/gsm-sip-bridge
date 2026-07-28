@@ -2,8 +2,30 @@
 
 ## Unreleased
 
-Repository maintenance — no runtime behaviour changes. CLI help text and
-every `*-shell-env` output were verified byte-identical before and after.
+Repository maintenance and one structural fix. CLI help text and every
+`*-shell-env` output were verified byte-identical across the refactors.
+
+- **The `CommandRunner` handle-lifecycle bug class is now a compile error.**
+  The same defect shipped seven times across the supervision loops; none was
+  caught by the 650+ mock-based tests covering that code. `ChildHandle` is no
+  longer `Copy`, `wait` consumes it, a new `reap` replaces every
+  `signal(Term); wait()` pair with signal-poll-escalate, and genuinely shared
+  claims are `Arc<ChildHandle>`. A new `conformance` module asserts every
+  handle invariant against **both** the mock and real runners, so the
+  mock/real divergence that hid the bug fails in CI instead of in production.
+- **`docker/healthcheck.sh` is now `gsm-sip-bridge healthcheck`** — the last
+  orchestration left in bash after specs/021. Its per-line checks go through
+  the same tested `CommandRunner` seam as the rest of `supervise`, with nine
+  tests covering the cases the bash had none for (per-line fault reporting,
+  the engine-specific tunnel interface that once made every strongswan
+  container report unhealthy, and zero-lines degrading rather than failing).
+  The image no longer needs `bash` arrays, `/dev/tcp`, or `eval` of a
+  shell-env dump.
+- **~100 stale references to `docker/entrypoint.sh`** across the source and
+  docs claimed it still supervises agents, creates veth pairs, and runs
+  cleanup traps. It has been a 28-line exec shim since specs/021; they now
+  point at the `supervise::` module that actually does the work, and
+  `supervise/mod.rs` carries a table mapping each concern to its module.
 
 - **The CLI handlers moved out of `src/main.rs` into
   `gsm_sip_bridge::commands`** (2099 lines → 28). A binary crate's items
