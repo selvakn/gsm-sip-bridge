@@ -120,8 +120,11 @@ start_jitter_seconds = 99999999
 }
 
 #[test]
-fn scheduled_restart_unknown_key_warned_but_does_not_disable() {
-    // Unknown keys should produce a tracing::warn but the config still parses.
+fn scheduled_restart_unknown_key_is_rejected_rather_than_ignored() {
+    // This previously asserted the opposite: an unknown key warned and the
+    // config loaded anyway. That is exactly the silent-typo problem — an
+    // operator who wrote `cron_expr` instead of `cron` got a scheduler
+    // running on the default schedule and one buried WARN line.
     let f = write_config(
         r#"
 [scheduled_restart]
@@ -129,9 +132,30 @@ enabled = true
 unknown_field = "ignored"
 "#,
     );
-    let cfg = load_config(f.path()).unwrap();
+
+    let msg = load_config(f.path())
+        .expect_err("an unknown key must fail the load")
+        .to_string();
+
     assert!(
-        cfg.scheduled_restart.enabled,
-        "unknown key alone must not disable the scheduler"
+        msg.contains("scheduled_restart.unknown_field"),
+        "got: {msg}"
     );
+}
+
+/// The scheduler's real keys still load — the check must reject typos, not
+/// the section.
+#[test]
+fn scheduled_restart_real_keys_still_load() {
+    let f = write_config(
+        r#"
+[scheduled_restart]
+enabled = true
+cron = "0 4 * * *"
+start_jitter_seconds = 60
+"#,
+    );
+
+    let cfg = load_config(f.path()).expect("a valid scheduled_restart section must load");
+    assert!(cfg.scheduled_restart.enabled);
 }

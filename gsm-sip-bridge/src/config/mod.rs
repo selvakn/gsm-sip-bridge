@@ -5,7 +5,12 @@ use secret::Secret;
 use std::path::Path;
 use toml::Value;
 
-const TOP_LEVEL_SECTIONS: &[&str] = &[
+/// Every section and key list below is `pub` so `tests/test_config_docs.rs`
+/// can assert that `config.toml.example` and `docs/configuration.md` actually
+/// cover what the parser accepts. Nothing else reads them — and now that an
+/// unknown key is a hard error, an undocumented one is a key operators cannot
+/// discover except by reading this file.
+pub const TOP_LEVEL_SECTIONS: &[&str] = &[
     "sip",
     "bridge",
     "sms",
@@ -21,7 +26,7 @@ const TOP_LEVEL_SECTIONS: &[&str] = &[
     "logging",
     "alerts",
 ];
-const SIP_KEYS: &[&str] = &[
+pub const SIP_KEYS: &[&str] = &[
     "server",
     "port",
     "username",
@@ -31,9 +36,9 @@ const SIP_KEYS: &[&str] = &[
     "display_name",
     "tls_verify",
 ];
-const BRIDGE_KEYS: &[&str] = &["sip_destination", "sip_dial_timeout_sec"];
-const SMS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "db_path"];
-const ALERTS_KEYS: &[&str] = &[
+pub const BRIDGE_KEYS: &[&str] = &["sip_destination", "sip_dial_timeout_sec"];
+pub const SMS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "db_path"];
+pub const ALERTS_KEYS: &[&str] = &[
     "discord_webhook_url",
     "sms",
     "module_lifecycle",
@@ -41,25 +46,27 @@ const ALERTS_KEYS: &[&str] = &[
     "tunnel_failure",
     "missed_call",
 ];
-const ALERTS_CATEGORY_KEYS: &[&str] = &["enabled", "discord_webhook_url"];
-const ALERTS_MODULE_LIFECYCLE_KEYS: &[&str] = &[
+pub const ALERTS_CATEGORY_KEYS: &[&str] = &["enabled", "discord_webhook_url"];
+pub const ALERTS_MODULE_LIFECYCLE_KEYS: &[&str] = &[
     "enabled",
     "discord_webhook_url",
     "at_worker_unresponsive_sec",
 ];
-const ALERTS_TUNNEL_FAILURE_KEYS: &[&str] = &["enabled", "discord_webhook_url", "unhealthy_sec"];
-const ALERTS_REGISTRATION_LOSS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "unhealthy_sec"];
-const METRICS_KEYS: &[&str] = &["port", "agent_report_interval_seconds"];
-const MODULES_KEYS: &[&str] = &["retry_interval_sec", "max_concurrent"];
-const RESILIENCE_KEYS: &[&str] = &[
+pub const ALERTS_TUNNEL_FAILURE_KEYS: &[&str] =
+    &["enabled", "discord_webhook_url", "unhealthy_sec"];
+pub const ALERTS_REGISTRATION_LOSS_KEYS: &[&str] =
+    &["enabled", "discord_webhook_url", "unhealthy_sec"];
+pub const METRICS_KEYS: &[&str] = &["port", "agent_report_interval_seconds"];
+pub const MODULES_KEYS: &[&str] = &["retry_interval_sec", "max_concurrent"];
+pub const RESILIENCE_KEYS: &[&str] = &[
     "initial_backoff_sec",
     "max_backoff_sec",
     "max_retries",
     "network_loss_timeout_sec",
     "network_poll_interval_sec",
 ];
-const CONTROL_KEYS: &[&str] = &["socket_path"];
-const AUDIO_KEYS: &[&str] = &[
+pub const CONTROL_KEYS: &[&str] = &["socket_path"];
+pub const AUDIO_KEYS: &[&str] = &[
     "profile",
     "vad",
     "snd_rec_latency_ms",
@@ -68,22 +75,22 @@ const AUDIO_KEYS: &[&str] = &[
 /// EC20 USB sound-device tuning — circuit-switched calls only (see
 /// [`ModemAudioConfig`]). Distinct from `[audio]`, which is shared by every
 /// audio path (circuit-switched and VoWiFi/VoLTE IMS).
-const MODEM_AUDIO_KEYS: &[&str] = &["rx_gain", "tx_level", "eec_mode", "rt_audio_prio"];
-const SCHEDULED_RESTART_KEYS: &[&str] = &[
+pub const MODEM_AUDIO_KEYS: &[&str] = &["rx_gain", "tx_level", "eec_mode", "rt_audio_prio"];
+pub const SCHEDULED_RESTART_KEYS: &[&str] = &[
     "enabled",
     "cron",
     "start_jitter_seconds",
     "inter_card_gap_seconds",
     "inter_card_gap_jitter_seconds",
 ];
-const LOGGING_KEYS: &[&str] = &["level"];
+pub const LOGGING_KEYS: &[&str] = &["level"];
 const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 /// Fields global to every VoLTE line. Line-identity/PDN fields (modem
 /// matcher, cid, apn, pcscf, pcscf_port, iface, msisdn) are NOT here — they
 /// live only in `[[volte.line]]` (see [`VOLTE_LINE_KEYS`]), each with its
 /// own sane default when omitted (see `volte::discovery::resolve_one_volte_
 /// line`).
-const VOLTE_KEYS: &[&str] = &[
+pub const VOLTE_KEYS: &[&str] = &[
     "enabled",
     "pcscf_source_path",
     "status_path",
@@ -97,7 +104,7 @@ const VOLTE_KEYS: &[&str] = &[
 /// modem to the host-side LTE bridge and/or fixing that line's PDN/P-CSCF
 /// settings instead of taking them from the `[volte]` base). Mirrors
 /// [`VOWIFI_LINE_KEYS`], for the LTE path's per-modem fields.
-const VOLTE_LINE_KEYS: &[&str] = &[
+pub const VOLTE_LINE_KEYS: &[&str] = &[
     "modem_serial",
     "modem_port",
     "cid",
@@ -113,7 +120,7 @@ const VOLTE_LINE_KEYS: &[&str] = &[
 /// former live only in `[[vowifi.line]]` (see [`VOWIFI_LINE_KEYS`]), the
 /// latter are always mechanically derived from a line's index and have no
 /// config knob at all (see `vowifi::discovery::resolve_one_line`).
-const VOWIFI_KEYS: &[&str] = &[
+pub const VOWIFI_KEYS: &[&str] = &[
     "enabled",
     "use_tcp",
     "sec_agree",
@@ -134,7 +141,7 @@ const VOWIFI_KEYS: &[&str] = &[
 /// Allowed keys inside each `[[vowifi.line]]` entry (specs/013-multi-card-vowifi
 /// FR-009 — an operator override that pins a specific modem to VoWiFi
 /// regardless of the default audio-capability-based role assignment).
-const VOWIFI_LINE_KEYS: &[&str] = &[
+pub const VOWIFI_LINE_KEYS: &[&str] = &[
     "modem_serial",
     "modem_port",
     "mcc",
@@ -855,6 +862,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         .as_table()
         .ok_or_else(|| BridgeError::Config("config root must be a table".into()))?;
 
+    reset_unknown_keys();
     warn_unknown_keys_in(table, TOP_LEVEL_SECTIONS, "root");
     let sip = parse_sip(table)?;
     let bridge = parse_bridge(table)?;
@@ -870,6 +878,12 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let volte = parse_volte(table)?;
     let logging = parse_logging(table)?;
     let alerts = parse_alerts(table, &sms);
+
+    // After every section has been parsed, so one run reports every typo
+    // rather than only the first section's.
+    if let Some(e) = take_unknown_keys_error() {
+        return Err(e);
+    }
 
     Ok(AppConfig {
         sip,
@@ -909,12 +923,67 @@ pub fn read_log_level(path: &Path) -> String {
         .unwrap_or_else(|| LoggingConfig::default().level)
 }
 
+thread_local! {
+    /// Unknown keys seen during the current [`load_config`] call.
+    ///
+    /// A thread-local accumulator rather than a threaded-through `&mut Vec`
+    /// because several of the ~20 `parse_*` functions are deliberately
+    /// infallible (`-> ScheduledRestartConfig`, not `-> BridgeResult<_>`), and
+    /// making them fallible purely to carry this would cascade through the
+    /// module for no benefit. `load_config` clears it on entry and drains it
+    /// before returning, so the accumulation window is exactly one load.
+    static UNKNOWN_KEYS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records any key in `table` that this section does not define.
+///
+/// These used to be a `tracing::warn!` and nothing else, which meant a typo'd
+/// key silently did nothing: `max_line = 2` (missing the `s`) left
+/// `max_lines` at its default and the operator saw one WARN line — in a
+/// container whose startup logs are dominated by modem probing, and often
+/// before the configured log level had even been applied.
+///
+/// For a system where a wrong value has produced a line that attaches to the
+/// wrong bearer and looks healthy while being unreachable, a config the
+/// operator believes they wrote and the bridge silently ignored is not a
+/// warning-level event. [`load_config`] now fails on these.
 fn warn_unknown_keys_in(table: &toml::map::Map<String, Value>, allowed: &[&str], section: &str) {
     for key in table.keys() {
         if !allowed.contains(&key.as_str()) {
+            let qualified = if section == "root" {
+                key.to_string()
+            } else {
+                format!("{section}.{key}")
+            };
             tracing::warn!(section = section, key = %key, "unknown config key");
+            UNKNOWN_KEYS.with(|u| u.borrow_mut().push(qualified));
         }
     }
+}
+
+fn reset_unknown_keys() {
+    UNKNOWN_KEYS.with(|u| u.borrow_mut().clear());
+}
+
+/// Drains the accumulator into an error, if anything was collected.
+///
+/// Reports *every* unknown key at once rather than failing on the first: an
+/// operator who has mistyped three keys should learn that in one run, not
+/// three.
+fn take_unknown_keys_error() -> Option<BridgeError> {
+    let unknown = UNKNOWN_KEYS.with(|u| std::mem::take(&mut *u.borrow_mut()));
+    if unknown.is_empty() {
+        return None;
+    }
+    let plural = if unknown.len() == 1 { "key" } else { "keys" };
+    Some(BridgeError::Config(format!(
+        "unknown config {plural}: {}. Check for a typo, or a setting that was \
+         renamed or removed — see docs/configuration.md. Nothing was applied \
+         from {} line{}.",
+        unknown.join(", "),
+        if unknown.len() == 1 { "that" } else { "those" },
+        if unknown.len() == 1 { "" } else { "s" },
+    )))
 }
 
 fn resolve_env_reference(raw: &str, config_key: &str, is_secret: bool) -> BridgeResult<String> {

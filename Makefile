@@ -12,12 +12,16 @@ build: ## Compile all binaries (release mode)
 # per-test timeout, which `cargo test` has no equivalent for and which is what
 # stops a serial-port or store-thread test that hangs from wedging the whole
 # run. Falls back to `cargo test` so a bare checkout still works.
+#
+# `--no-fail-fast` because `cargo test` otherwise stops at the first failing
+# *binary*, so the summary line reports only the tests that ran before it —
+# which reads as a smaller suite passing rather than as a failure.
 test: ## Run the full test suite
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
-		cargo nextest run --workspace; \
+		cargo nextest run --workspace --no-fail-fast; \
 	else \
 		echo "note: cargo-nextest not installed — falling back to cargo test (no per-test timeout)"; \
-		cargo test --workspace; \
+		cargo test --workspace --no-fail-fast; \
 	fi
 
 run: build ## Build and run the GSM-SIP bridge

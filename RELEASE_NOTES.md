@@ -43,6 +43,21 @@ Repository maintenance and one structural fix. CLI help text and every
   line came up with, say, an empty APN. That exact failure is documented in
   `volte::discovery` as having attached the network's default bearer instead
   of the IMS one, looking fully configured while the P-CSCF was unreachable.
+- **Breaking: an unknown key in `config.toml` now fails startup** instead of
+  emitting a `tracing::warn!` and continuing. A typo silently did nothing:
+  `max_line = 2` (missing the `s`) left the real setting at its default, and
+  the one WARN was buried in a container's modem-probing startup noise —
+  often emitted before the configured log level had even been applied. In a
+  system where a wrong value has produced a line that attaches to the wrong
+  bearer and looks healthy while being unreachable, a setting the operator
+  believes they wrote and the bridge silently ignored is not a warning. Every
+  offending key is reported in one error, qualified by section, so several
+  typos are learned in one run rather than one per restart.
+- **New `tests/test_config_docs.rs`** asserts `docs/configuration.md` and
+  `config.toml.example` actually cover what the parser accepts, in both
+  directions. Now that an unknown key is fatal, an undocumented key is one an
+  operator can only find by reading the source, and a stale key in the
+  example would fail every fresh deployment on first start.
 - **Breaking: the three VoLTE metrics using the pre-v5 `gsm_bridge_` prefix
   are renamed** to `gsm_sip_bridge_volte_registered` / `_pdn_up` /
   `_registrations_total`. Every other metric moved to `gsm_sip_bridge_` in
