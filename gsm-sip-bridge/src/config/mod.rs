@@ -2200,6 +2200,34 @@ fn parse_vowifi_line_overrides(
             pcsc_reader,
         });
     }
+
+    // Two pcsc_reader lines sharing an imsi_override would both resolve to
+    // the same physical reader (modules::pcsc_card::PcscTransport::connect
+    // disambiguates by IMSI) — one SIM authenticating two conflicting
+    // registrations, while whichever SIM the other line actually meant
+    // sits unused. Caught at config time rather than left as a runtime
+    // surprise (caught in review).
+    let mut seen_pcsc_imsis: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (i, o) in overrides.iter().enumerate() {
+        if !o.pcsc_reader {
+            continue;
+        }
+        let imsi = o
+            .imsi_override
+            .as_deref()
+            .expect("pcsc_reader requires imsi_override, already validated above");
+        if let Some(&first_i) = seen_pcsc_imsis.get(imsi) {
+            return Err(BridgeError::Config(format!(
+                "vowifi.line[{first_i}] and vowifi.line[{i}] are both pcsc_reader lines with \
+                 the same imsi_override {imsi:?} — each pcsc_reader line needs its own distinct \
+                 IMSI, or both would authenticate through the same physical reader while any \
+                 other configured SIM goes unused"
+            )));
+        }
+        seen_pcsc_imsis.insert(imsi, i);
+    }
+
     Ok(overrides)
 }
 
@@ -2946,6 +2974,40 @@ password = "pass"
             .unwrap_err()
             .to_string();
         assert!(err.contains("pcsc_reader"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_rejects_duplicate_imsi_across_lines() {
+        // Caught in review: two pcsc_reader lines sharing an imsi_override
+        // would both resolve to the same physical reader (connect()
+        // disambiguates by IMSI), so one SIM would authenticate two
+        // conflicting registrations while any other configured SIM sits
+        // unused. Rejected at config time rather than left as a runtime
+        // surprise.
+        let toml = format!(
+            "{}\n[vowifi]\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("404940123456789"), "unexpected error: {err}");
+        assert!(err.contains("pcsc_reader"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_allows_distinct_imsi_across_lines() {
+        let toml = format!(
+            "{}\n[vowifi]\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404011111111111\"\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.line_overrides.len(), 2);
     }
 
     #[test]
