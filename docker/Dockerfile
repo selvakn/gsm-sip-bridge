@@ -223,6 +223,11 @@ FROM alpine:${ALPINE_VERSION}
 #   proving those stages)
 # pcsc-lite -> the pcscd daemon itself (specs/012-strongswan-epdg): bridges
 #   charon's eap-sim-pcsc plugin to the vpcd virtual reader (stage 6)
+# ccid -> generic USB CCID PC/SC driver (specs/023-omnikey-pcsc-vowifi):
+#   lets pcscd see a *real* USB smart-card reader (e.g. OmniKey AG 3x21),
+#   self-registering via USB hotplug — unlike vpcd it needs no static
+#   reader.conf.d entry. Coexists with vpcd; eap-sim-pcsc auto-detects
+#   whatever reader(s) pcscd exposes, real or virtual.
 # wget -> HEALTHCHECK's metrics-endpoint probe
 RUN apk add --no-cache \
         bash \
@@ -230,7 +235,7 @@ RUN apk add --no-cache \
         iproute2 net-tools iputils bind-tools procps \
         alsa-lib libssl3 libcrypto3 libuuid eudev-libs libgcc \
         opencore-amr vo-amrwbenc \
-        pcsc-lite-libs pcsc-lite \
+        pcsc-lite-libs pcsc-lite ccid \
         ca-certificates wget
 
 RUN addgroup -S bridge && adduser -S -G bridge -h /data bridge
