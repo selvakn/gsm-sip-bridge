@@ -443,7 +443,11 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         imei = cfg.imei.clone().ok_or_else(|| {
             BridgeError::Ims("pcsc_reader line has no imei (expected one to be auto-generated at discovery time)".into())
         })?;
-        card = Box::new(PcscTransport::connect()?);
+        // Matches against the card's own EF_IMSI rather than picking "the
+        // first reader" — with more than one pcsc_reader line configured,
+        // that would authenticate every line as whichever subscriber
+        // happened to be plugged into the first reader pcscd lists.
+        card = Box::new(PcscTransport::connect(&imsi)?);
     } else {
         let mut at = AtCommander::open(&cfg.modem_port)?;
         imsi = match &cfg.imsi {

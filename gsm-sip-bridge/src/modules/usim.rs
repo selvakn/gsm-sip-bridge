@@ -129,6 +129,70 @@ fn read_record(at: &mut dyn ApduTransport, record: u8) -> BridgeResult<Option<St
     }
 }
 
+/// READ BINARY (transparent EF, offset 0). Same SW=6CXX wrong-length retry
+/// as `read_record` — real PC/SC readers enforce `Le` exactly.
+fn read_binary(at: &mut dyn ApduTransport, le: u8) -> BridgeResult<Vec<u8>> {
+    let apdu = format!("00B00000{le:02X}");
+    let mut resp = at.transmit_apdu(&apdu)?;
+    if resp.len() >= 4 {
+        let sw = &resp[resp.len() - 4..];
+        if sw.starts_with("6C") {
+            let actual_le = &sw[2..4];
+            let retry = format!("00B00000{actual_le}");
+            resp = at.transmit_apdu(&retry)?;
+        }
+    }
+    if !resp.ends_with(SW_SUCCESS) {
+        return Err(BridgeError::Ims(format!("READ BINARY failed: SW={resp}")));
+    }
+    hex_decode(&resp[..resp.len() - 4])
+}
+
+/// Reverses the nibble order within each byte of a hex string (`"AB"` ->
+/// `"BA"`) — the BCD "swapped" representation SIM file contents (IMSI,
+/// MSISDN, ...) use throughout TS 51.011/31.102.
+fn swap_nibbles_hex(hex: &str) -> String {
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            if pair.len() == 2 {
+                format!("{}{}", pair[1] as char, pair[0] as char)
+            } else {
+                (pair[0] as char).to_string()
+            }
+        })
+        .collect()
+}
+
+/// Reads and decodes EF_IMSI (`6F07`) from the currently-selected USIM ADF
+/// (`select_usim` must run first) — TS 31.102 §4.2.2. Encoding: one length
+/// byte (of the following BCD data), then that many bytes of nibble-swapped
+/// BCD with a leading parity/oddness nibble that is **not** part of the
+/// IMSI (`docs/omnikey-pcsc-vowifi.md`'s hand-decode gotcha — this mirrors
+/// pySim's `dec_imsi`, dropping `swapped[..1]`, not `swapped[..0]`).
+pub fn read_imsi(at: &mut dyn ApduTransport) -> BridgeResult<String> {
+    select_fid(at, 0x6F07)?;
+    let raw = read_binary(at, 9)?;
+    let Some(&length_byte) = raw.first() else {
+        return Err(BridgeError::Ims("EF_IMSI response is empty".into()));
+    };
+    let digit_count = (length_byte as usize) * 2 - 1;
+    let swapped = swap_nibbles_hex(&hex_encode(&raw[1..]));
+    if swapped.len() <= digit_count {
+        return Err(BridgeError::Ims(format!(
+            "EF_IMSI too short for its own declared length: {} nibbles, need {digit_count}",
+            swapped.len()
+        )));
+    }
+    let imsi = swapped[1..=digit_count].to_string();
+    if !imsi.chars().all(|c| c.is_ascii_digit()) {
+        return Err(BridgeError::Ims(format!(
+            "EF_IMSI decoded to a non-numeric IMSI: {imsi:?}"
+        )));
+    }
+    Ok(imsi)
+}
+
 const USIM_RID: &str = "A0000000871002";
 
 /// Extract a USIM AID from one EF_DIR record's raw hex data, if present.
@@ -409,6 +473,45 @@ mod tests {
         ]));
         let aid = discover_usim_aid(&mut t).unwrap();
         assert_eq!(hex_encode(&aid), "A0000000871002FFF605FF89000001FF");
+    }
+
+    #[test]
+    fn swap_nibbles_hex_reverses_each_byte_pair() {
+        assert_eq!(swap_nibbles_hex("4940340838994604"), "9404438083996440");
+    }
+
+    #[test]
+    fn read_imsi_decodes_a_real_ef_imsi_fixture() {
+        // Reverse-derived from the real IMSI 404438083996440 read live off an
+        // OmniKey AG 3x21 (docs/omnikey-pcsc-vowifi.md): length byte 0x08 (15
+        // digits), then 8 bytes of nibble-swapped BCD with a leading
+        // parity/oddness nibble that isn't part of the IMSI.
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),                            // SELECT EF_IMSI
+            "084940340838994604".to_string() + SW_SUCCESS, // READ BINARY
+        ]));
+        assert_eq!(read_imsi(&mut t).unwrap(), "404438083996440");
+    }
+
+    #[test]
+    fn read_imsi_retries_read_binary_on_wrong_le() {
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "6C09".to_string(), // wrong Le -> retry with 9
+            "084940340838994604".to_string() + SW_SUCCESS,
+        ]));
+        assert_eq!(read_imsi(&mut t).unwrap(), "404438083996440");
+    }
+
+    #[test]
+    fn read_imsi_rejects_a_non_numeric_result() {
+        // Length byte 0x01 (1 digit) over data that swaps to a non-digit —
+        // exercises the sanity check rather than trusting the card blindly.
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "01AB".to_string() + SW_SUCCESS,
+        ]));
+        assert!(read_imsi(&mut t).is_err());
     }
 
     #[test]

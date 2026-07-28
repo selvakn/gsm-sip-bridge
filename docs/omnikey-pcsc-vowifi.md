@@ -18,6 +18,12 @@ auto-generated (deterministic per IMSI, Luhn-valid per TS 23.003 Annex A —
 not a real registered device identity) unless `imei_override` is set
 explicitly.
 
+With more than one `pcsc_reader` line (each with its own real reader),
+IMS-AKA registration picks the reader whose card's own `EF_IMSI` matches
+that line's configured `imsi_override`, the same disambiguation
+`eap-sim-pcsc` already does for the tunnel side — it does not simply grab
+"the first" reader.
+
 ## Requirements
 
 - `[vowifi].tunnel_engine = "strongswan"` (the default). The `swu` engine has
