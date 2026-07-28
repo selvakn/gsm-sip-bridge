@@ -195,6 +195,7 @@ fn run_inner(
     };
     let reg_cfg = ImsRegisterConfig {
         modem_port: PathBuf::from(&config.modem_port),
+        pcsc_reader: config.pcsc_reader,
         pcscf_addr,
         pcscf_port: transport_handle.pcscf.port(),
         mcc,

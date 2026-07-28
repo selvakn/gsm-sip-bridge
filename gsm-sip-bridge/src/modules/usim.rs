@@ -14,6 +14,22 @@ use crate::error::{BridgeError, BridgeResult};
 
 const SW_SUCCESS: &str = "9000";
 
+/// A raw APDU carrier: send a hex-encoded command APDU, get back the
+/// hex-encoded response (data + SW1SW2). Two implementations exist — a
+/// modem's `AT+CSIM` passthrough (`AtCommander`, this file's original and
+/// only transport until specs/023-omnikey-pcsc-vowifi) and a real PC/SC
+/// reader (`modules::pcsc_card::PcscTransport`) — so the SELECT/READ
+/// RECORD/AUTHENTICATE logic below runs unchanged over either one.
+pub trait ApduTransport {
+    fn transmit_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String>;
+}
+
+impl ApduTransport for AtCommander {
+    fn transmit_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String> {
+        csim(self, apdu_hex)
+    }
+}
+
 /// Outcome of a 3GPP AKA AUTHENTICATE command run against the USIM.
 #[derive(Debug, Clone)]
 pub enum AkaResult {
@@ -62,9 +78,9 @@ pub(crate) fn csim(at: &mut AtCommander, apdu_hex: &str) -> BridgeResult<String>
 }
 
 /// SELECT by file ID (MF/DF/EF), P2=0x0C (no response data requested).
-fn select_fid(at: &mut AtCommander, fid: u16) -> BridgeResult<()> {
+fn select_fid(at: &mut dyn ApduTransport, fid: u16) -> BridgeResult<()> {
     let apdu = format!("00A4000C02{fid:04X}");
-    let resp = csim(at, &apdu)?;
+    let resp = at.transmit_apdu(&apdu)?;
     if !resp.ends_with(SW_SUCCESS) {
         return Err(BridgeError::Ims(format!(
             "SELECT {fid:04X} failed: SW={resp}"
@@ -74,9 +90,9 @@ fn select_fid(at: &mut AtCommander, fid: u16) -> BridgeResult<()> {
 }
 
 /// SELECT by AID (application), P2=0x0C.
-fn select_aid(at: &mut AtCommander, aid: &[u8]) -> BridgeResult<()> {
+fn select_aid(at: &mut dyn ApduTransport, aid: &[u8]) -> BridgeResult<()> {
     let apdu = format!("00A4040C{:02X}{}", aid.len(), hex_encode(aid));
-    let resp = csim(at, &apdu)?;
+    let resp = at.transmit_apdu(&apdu)?;
     if !resp.ends_with(SW_SUCCESS) {
         return Err(BridgeError::Ims(format!(
             "SELECT AID {} failed: SW={resp}",
@@ -87,9 +103,25 @@ fn select_aid(at: &mut AtCommander, aid: &[u8]) -> BridgeResult<()> {
 }
 
 /// READ RECORD (mode: absolute, from current EF), P2=0x04.
-fn read_record(at: &mut AtCommander, record: u8) -> BridgeResult<Option<String>> {
+///
+/// `Le=00` here (asking for "whatever's there") is what `AT+CSIM` over a
+/// modem always resolved transparently, but a real PC/SC reader enforces
+/// the exact length: it replies SW=6CXX ("wrong Le; SW2 is the actual
+/// length") and returns no data, which — before this retry existed — made
+/// every record silently look empty and `discover_usim_aid` exhaust all 16
+/// records and fail (caught live against a real OmniKey AG 3x21,
+/// specs/023-omnikey-pcsc-vowifi's IMS-AKA follow-up work).
+fn read_record(at: &mut dyn ApduTransport, record: u8) -> BridgeResult<Option<String>> {
     let apdu = format!("00B2{record:02X}0400");
-    let resp = csim(at, &apdu)?;
+    let mut resp = at.transmit_apdu(&apdu)?;
+    if resp.len() >= 4 {
+        let sw = &resp[resp.len() - 4..];
+        if sw.starts_with("6C") {
+            let le = &sw[2..4];
+            let retry = format!("00B2{record:02X}04{le}");
+            resp = at.transmit_apdu(&retry)?;
+        }
+    }
     if resp.ends_with(SW_SUCCESS) && resp.len() > 4 {
         Ok(Some(resp[..resp.len() - 4].to_string()))
     } else {
@@ -129,7 +161,7 @@ fn extract_usim_aid_from_ef_dir_record(record_hex: &str) -> Option<Vec<u8>> {
 /// Discover the USIM application's AID by reading EF_DIR (2F00 under MF).
 /// EF_DIR is a linear-fixed file of ASN.1 application templates; this walks
 /// records until a USIM entry is found.
-pub fn discover_usim_aid(at: &mut AtCommander) -> BridgeResult<Vec<u8>> {
+pub fn discover_usim_aid(at: &mut dyn ApduTransport) -> BridgeResult<Vec<u8>> {
     select_fid(at, 0x3F00)?;
     select_fid(at, 0x2F00)?;
 
@@ -147,7 +179,7 @@ pub fn discover_usim_aid(at: &mut AtCommander) -> BridgeResult<Vec<u8>> {
 }
 
 /// Select the MF then the USIM ADF (by AID), ready for AUTHENTICATE.
-pub fn select_usim(at: &mut AtCommander, aid: &[u8]) -> BridgeResult<()> {
+pub fn select_usim(at: &mut dyn ApduTransport, aid: &[u8]) -> BridgeResult<()> {
     select_fid(at, 0x3F00)?;
     select_aid(at, aid)
 }
@@ -161,19 +193,19 @@ pub fn select_usim(at: &mut AtCommander, aid: &[u8]) -> BridgeResult<()> {
 /// return the full result directly with SW=9000 (observed on the Quectel
 /// EC200U).
 pub fn authenticate(
-    at: &mut AtCommander,
+    at: &mut dyn ApduTransport,
     rand: &[u8; 16],
     autn: &[u8; 16],
 ) -> BridgeResult<AkaResult> {
     let apdu = format!("008800812210{}10{}", hex_encode(rand), hex_encode(autn));
-    let mut resp = csim(at, &apdu)?;
+    let mut resp = at.transmit_apdu(&apdu)?;
 
     if resp.len() >= 4 {
         let sw = &resp[resp.len() - 4..];
         if sw.starts_with("61") {
             let le = &sw[2..4];
             let follow_up = format!("00C00000{le}");
-            resp = csim(at, &follow_up)?;
+            resp = at.transmit_apdu(&follow_up)?;
         }
     }
 
@@ -325,5 +357,85 @@ mod tests {
     fn ef_dir_record_rejects_malformed_entry() {
         assert!(extract_usim_aid_from_ef_dir_record("6981").is_none());
         assert!(extract_usim_aid_from_ef_dir_record("").is_none());
+    }
+
+    /// A scripted `ApduTransport` returning canned responses in order,
+    /// ignoring the request bytes — unlike an `AtCommander`-backed mock
+    /// (see the doc comment above `ef_dir_record_matches_usim_aid_from_real_card`),
+    /// this has no per-call `BufReader` over-read quirk, so it can actually
+    /// exercise the multi-command SELECT/READ RECORD/AUTHENTICATE flow
+    /// end-to-end (specs/023-omnikey-pcsc-vowifi's whole point in
+    /// generalizing these functions off `AtCommander`).
+    struct QueuedTransport(std::collections::VecDeque<String>);
+
+    impl ApduTransport for QueuedTransport {
+        fn transmit_apdu(&mut self, _apdu_hex: &str) -> BridgeResult<String> {
+            self.0
+                .pop_front()
+                .ok_or_else(|| BridgeError::Ims("no more scripted responses".into()))
+        }
+    }
+
+    #[test]
+    fn discover_and_select_usim_work_over_a_generic_apdu_transport() {
+        let ef_dir_record = "61184F10A0000000871002FFF605FF89000001FF50045553494D9000";
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),        // SELECT MF (discover_usim_aid)
+            "9000".to_string(),        // SELECT EF_DIR
+            ef_dir_record.to_string(), // READ RECORD 1
+            "9000".to_string(),        // SELECT MF (select_usim)
+            "9000".to_string(),        // SELECT AID
+        ]));
+        let aid = discover_usim_aid(&mut t).unwrap();
+        assert_eq!(hex_encode(&aid), "A0000000871002FFF605FF89000001FF");
+        select_usim(&mut t, &aid).unwrap();
+    }
+
+    #[test]
+    fn discover_usim_aid_retries_read_record_on_wrong_le() {
+        // Caught live on 2026-07-28 against a real OmniKey AG 3x21: unlike
+        // AT+CSIM (which resolved Le=00 transparently), a real PC/SC reader
+        // enforces the exact Le and answers READ RECORD's Le=00 with
+        // SW=6C1A ("wrong length, actual data is 26 bytes") and no data —
+        // silently starving `discover_usim_aid`'s EF_DIR walk on every
+        // record until this retry existed. Fixture is the exact byte
+        // sequence captured from the real card.
+        let ef_dir_record = "61184F10A0000000871002FFF605FF89000001FF50045553494D9000";
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),        // SELECT MF
+            "9000".to_string(),        // SELECT EF_DIR
+            "6C1A".to_string(),        // READ RECORD 1, Le=00 -> wrong length
+            ef_dir_record.to_string(), // READ RECORD 1 retried with Le=1A
+        ]));
+        let aid = discover_usim_aid(&mut t).unwrap();
+        assert_eq!(hex_encode(&aid), "A0000000871002FFF605FF89000001FF");
+    }
+
+    #[test]
+    fn authenticate_works_over_a_generic_apdu_transport() {
+        let res = [0x11u8; 8];
+        let ck = [0x22u8; 16];
+        let ik = [0x33u8; 16];
+        let mut data = vec![0xDB, res.len() as u8];
+        data.extend_from_slice(&res);
+        data.push(ck.len() as u8);
+        data.extend_from_slice(&ck);
+        data.push(ik.len() as u8);
+        data.extend_from_slice(&ik);
+        let resp_hex = format!("{}{SW_SUCCESS}", hex_encode(&data));
+
+        let mut t = QueuedTransport(std::collections::VecDeque::from([resp_hex]));
+        match authenticate(&mut t, &[0u8; 16], &[0u8; 16]).unwrap() {
+            AkaResult::Success {
+                res: r,
+                ck: c,
+                ik: i,
+            } => {
+                assert_eq!(r, res);
+                assert_eq!(c, ck);
+                assert_eq!(i, ik);
+            }
+            AkaResult::SyncFailure { .. } => panic!("expected Success"),
+        }
     }
 }

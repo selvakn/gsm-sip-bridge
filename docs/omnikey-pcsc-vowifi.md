@@ -7,6 +7,17 @@ OmniKey AG 3x21 (USB `076b:3031`) — so strongSwan's `eap-sim-pcsc` plugin
 talks to it straight through pcscd, no modem or bridge process involved at
 all. See `specs/023-omnikey-pcsc-vowifi/` for the full spec/design.
 
+This covers **both** halves of a VoWiFi line: the ePDG tunnel (strongSwan +
+`eap-sim-pcsc`, spec 023's original scope) and IMS-AKA SIP registration
+(`vowifi-ims-agent`, added 2026-07-28) — the latter needed its own PC/SC path
+(`modules::pcsc_card::PcscTransport`, implementing the same
+`modules::usim::ApduTransport` trait `AtCommander` does for a modem line)
+since `ims::register_session` talked to the SIM only via `AT+CSIM` until
+then. There is no modem to read an IMEI from either, so one is
+auto-generated (deterministic per IMSI, Luhn-valid per TS 23.003 Annex A —
+not a real registered device identity) unless `imei_override` is set
+explicitly.
+
 ## Requirements
 
 - `[vowifi].tunnel_engine = "strongswan"` (the default). The `swu` engine has
@@ -67,9 +78,14 @@ resolve, register, and fail independently (see
    `opensc-tool`, or a PC/SC client of your own) should list the OmniKey
    reader, alongside any `Virtual PCD ...` (vpcd) slots used by modem-backed
    lines.
-2. **Registration succeeds**: `docker logs <container> | grep -i "tunnel UP"`
+2. **Tunnel established**: `docker logs <container> | grep -i "tunnel UP"`
    and `/var/log/strongswan.log`'s `IKE_SA established`/`EAP_AKA succeeded`
    for this line's IMSI.
+2b. **IMS registration succeeds**: `docker logs <container> | grep -i
+   "registered, listening for inbound calls"` (from `vowifi-ims-agent`) —
+   this is a second, independent SIM access path from the tunnel (see the
+   note at the top of this doc); a tunnel UP does not by itself mean this
+   line can carry calls.
 3. **Status parity**: `vowifi-status` and `curl http://localhost:9091/metrics
    | grep gsm_sip_bridge_vowifi` — the card-reader line's `card_id` (e.g.
    `pcsc0`) is just another `module` label value; no field or label

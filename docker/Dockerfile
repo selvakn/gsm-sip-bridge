@@ -55,7 +55,7 @@ FROM rust:1-alpine${ALPINE_VERSION} AS rust-builder
 RUN apk add --no-cache \
         build-base pkgconf clang-dev \
         openssl-dev alsa-lib-dev util-linux-dev eudev-dev linux-headers \
-        opencore-amr-dev vo-amrwbenc-dev
+        opencore-amr-dev vo-amrwbenc-dev pcsc-lite-dev
 COPY --from=pjsip-builder /usr/local /usr/local
 
 WORKDIR /app

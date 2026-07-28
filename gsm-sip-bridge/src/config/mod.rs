@@ -626,6 +626,13 @@ pub struct VowifiConfig {
     /// has caused hours-long registration outages that only a modem power
     /// cycle (`AT+CFUN=1,1`) could clear.
     pub imei_override: Option<String>,
+    /// This line's SIM comes from a physical PC/SC reader, not a modem
+    /// (specs/023-omnikey-pcsc-vowifi) — threaded through from the matching
+    /// `VowifiLineOverride` by `vowifi::discovery::resolve_one_pcsc_line` so
+    /// `ims::agent::run` (which only ever sees this derived `VowifiConfig`,
+    /// not the raw override) knows to register via `PcscTransport` instead
+    /// of opening `modem_port`.
+    pub pcsc_reader: bool,
     /// Upper bound on concurrently supported VoWiFi lines
     /// (specs/013-multi-card-vowifi FR-016) — modems discovered beyond this
     /// count are reported and skipped rather than silently dropped. Same
@@ -702,6 +709,7 @@ impl Default for VowifiConfig {
             vpcd_port: 15963,
             imsi_override: None,
             imei_override: None,
+            pcsc_reader: false,
             max_lines: 8,
             line_overrides: Vec::new(),
         }
@@ -2114,6 +2122,9 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         vpcd_port,
         imsi_override,
         imei_override,
+        // Meaningful only per-line, set by `resolve_one_pcsc_line` — the
+        // base `[vowifi]` config itself is never card-reader-backed.
+        pcsc_reader: false,
         max_lines,
         line_overrides,
     })

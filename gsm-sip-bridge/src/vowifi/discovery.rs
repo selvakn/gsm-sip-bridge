@@ -277,6 +277,47 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     }
 }
 
+/// Deterministically derives a syntactically valid IMEI (TS 23.003 Annex A
+/// Luhn check digit) for a `pcsc_reader` line's `+sip.instance` Contact
+/// parameter — there's no modem to read a real one from via `AT+CGSN`.
+/// Seeded from the line's own IMSI (not randomness) so it stays stable
+/// across restarts, since a real network expects the same device identity
+/// on every registration attempt from one subscriber. This is not a real,
+/// IMEI-database-registered device identity — only a well-formed one.
+fn generate_imei(imsi: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    imsi.hash(&mut hasher);
+    "specs/023-omnikey-pcsc-vowifi generated imei".hash(&mut hasher);
+    let body = format!("{:014}", hasher.finish() % 100_000_000_000_000);
+    format!("{body}{}", luhn_check_digit(&body))
+}
+
+/// The Luhn check digit (TS 23.003 Annex A) that would append to `body` to
+/// make a full 15-digit IMEI.
+fn luhn_check_digit(body: &str) -> u8 {
+    let sum: u32 = body
+        .chars()
+        .rev()
+        .enumerate()
+        .map(|(i, c)| {
+            let d = c.to_digit(10).expect("body must be all ASCII digits");
+            if i % 2 == 0 {
+                let doubled = d * 2;
+                if doubled > 9 {
+                    doubled - 9
+                } else {
+                    doubled
+                }
+            } else {
+                d
+            }
+        })
+        .sum();
+    ((10 - (sum % 10)) % 10) as u8
+}
+
 /// The card-reader-backed counterpart to `resolve_one_line`: same per-index
 /// infrastructure derivation (netns, veth, strongswan if_id/iface, vpcd
 /// port), but the network identity comes straight from the override's
@@ -292,13 +333,25 @@ fn resolve_one_pcsc_line(
     let mcc = over.mcc.clone().unwrap_or_default();
     let mnc = over.mnc.clone().unwrap_or_default();
     let imsi_override = over.imsi_override.clone();
+    // No modem means no AT+CGSN to read a real IMEI from. Autogenerate a
+    // syntactically valid, stable one (seeded from this line's own IMSI)
+    // unless the operator pinned one explicitly — real IMS-AKA registration
+    // needs *some* device identity in the Contact header's +sip.instance
+    // (specs/023-omnikey-pcsc-vowifi's original scope only covered the ePDG
+    // tunnel; IMS registration surfaced this gap during live testing).
+    let imei_override = Some(
+        over.imei_override
+            .clone()
+            .unwrap_or_else(|| generate_imei(imsi_override.as_deref().unwrap_or(""))),
+    );
 
     let mut config = base.clone();
     config.modem_port = String::new();
     config.mcc = mcc.clone();
     config.mnc = mnc.clone();
     config.imsi_override = imsi_override.clone();
-    config.imei_override = None;
+    config.imei_override = imei_override.clone();
+    config.pcsc_reader = true;
     config.line_overrides = Vec::new();
 
     config.netns = format!("{}{}", base.netns, index);
@@ -985,5 +1038,65 @@ mod tests {
         assert_eq!(result.lines.len(), 2);
         assert!(result.failed.is_empty());
         assert!(result.lines.iter().all(|l| !l.pcsc_reader));
+    }
+
+    #[test]
+    fn luhn_check_digit_matches_known_valid_imei() {
+        // 490154203237518 is a commonly-cited Luhn-valid IMEI; the check
+        // digit (8) is verified against the 14-digit body.
+        assert_eq!(luhn_check_digit("49015420323751"), 8);
+    }
+
+    #[test]
+    fn generate_imei_is_luhn_valid_and_15_digits() {
+        let imei = generate_imei("404438083996440");
+        assert_eq!(imei.len(), 15);
+        assert!(imei.chars().all(|c| c.is_ascii_digit()));
+        let (body, check) = imei.split_at(14);
+        assert_eq!(check, luhn_check_digit(body).to_string());
+    }
+
+    #[test]
+    fn generate_imei_is_stable_for_the_same_imsi() {
+        assert_eq!(
+            generate_imei("404438083996440"),
+            generate_imei("404438083996440")
+        );
+    }
+
+    #[test]
+    fn generate_imei_differs_across_imsis() {
+        assert_ne!(
+            generate_imei("404438083996440"),
+            generate_imei("404940123456789")
+        );
+    }
+
+    #[test]
+    fn resolve_one_pcsc_line_autogenerates_imei_when_unset() {
+        // 2026-07-28 gap: IMS-AKA registration needs a device identity
+        // (+sip.instance) that spec 023's original scope never populated for
+        // a pcsc_reader line, leaving it permanently None.
+        let over = pcsc_override("404438083996440", "404", "043");
+        let base = VowifiConfig::default();
+        let line = resolve_one_pcsc_line(0, "pcsc0".to_string(), &over, &base);
+        let imei = line
+            .config
+            .imei_override
+            .expect("imei must be auto-generated");
+        assert_eq!(imei.len(), 15);
+        assert!(line.config.pcsc_reader);
+    }
+
+    #[test]
+    fn resolve_one_pcsc_line_respects_explicit_imei_override() {
+        let mut over = pcsc_override("404438083996440", "404", "043");
+        over.imei_override = Some("123456789012345".to_string());
+        let base = VowifiConfig::default();
+        let line = resolve_one_pcsc_line(0, "pcsc0".to_string(), &over, &base);
+        assert_eq!(
+            line.config.imei_override.as_deref(),
+            Some("123456789012345")
+        );
     }
 }
