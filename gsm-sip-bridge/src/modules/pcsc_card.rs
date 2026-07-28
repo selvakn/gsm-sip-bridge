@@ -18,7 +18,7 @@
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::usim::{self, ApduTransport};
-use pcsc::{Card, Context, Protocols, Scope, ShareMode, MAX_BUFFER_SIZE};
+use pcsc::{Card, Context, Disposition, Protocols, Scope, ShareMode, Transaction, MAX_BUFFER_SIZE};
 
 /// Reader names pcscd assigns its virtual vpcd slots — never a real reader
 /// we should connect to for IMS-AKA.
@@ -71,18 +71,37 @@ impl PcscTransport {
                     "reader name {reader_name:?} has an embedded NUL: {e}"
                 ))
             })?;
-            let card = match ctx.connect(&reader_cstr, ShareMode::Shared, Protocols::ANY) {
+            let mut card = match ctx.connect(&reader_cstr, ShareMode::Shared, Protocols::ANY) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(reader = %reader_name, error = %e, "PC/SC connect failed, trying next reader");
                     continue;
                 }
             };
-            let mut transport = Self { card };
-            match Self::read_card_imsi(&mut transport) {
+            // `ShareMode::Shared` lets more than one client connect to the
+            // same physical reader at once (e.g. a sibling pcsc_reader
+            // line's own `connect()` probing the same candidate list
+            // concurrently at startup) — without a PC/SC transaction, their
+            // SELECT/READ APDUs can interleave on the wire and corrupt each
+            // other's reads, causing a probe to misidentify or skip the
+            // reader that's actually its match (caught in review). Each
+            // candidate's whole discover-AID/select-ADF/read-IMSI sequence
+            // therefore runs inside one transaction, giving it exclusive
+            // access to the card for its duration.
+            let probe = match card.transaction() {
+                Ok(mut tx) => {
+                    let result = Self::read_transport_imsi(&mut tx);
+                    let _ = tx.end(Disposition::LeaveCard);
+                    result
+                }
+                Err(e) => Err(BridgeError::Ims(format!(
+                    "PC/SC transaction begin failed on reader {reader_name:?}: {e}"
+                ))),
+            };
+            match probe {
                 Ok(imsi) if imsi == target_imsi => {
                     tracing::info!(reader = %reader_name, "connected to PC/SC reader");
-                    return Ok(transport);
+                    return Ok(Self { card });
                 }
                 Ok(other_imsi) => {
                     tracing::debug!(
@@ -104,10 +123,10 @@ impl PcscTransport {
         )))
     }
 
-    fn read_card_imsi(transport: &mut Self) -> BridgeResult<String> {
-        let aid = usim::discover_usim_aid(transport)?;
-        usim::select_usim(transport, &aid)?;
-        usim::read_imsi(transport)
+    fn read_transport_imsi(t: &mut dyn ApduTransport) -> BridgeResult<String> {
+        let aid = usim::discover_usim_aid(t)?;
+        usim::select_usim(t, &aid)?;
+        usim::read_imsi(t)
     }
 }
 
@@ -117,6 +136,21 @@ impl ApduTransport for PcscTransport {
         let mut recv_buf = [0u8; MAX_BUFFER_SIZE];
         let rapdu = self
             .card
+            .transmit(&apdu, &mut recv_buf)
+            .map_err(|e| BridgeError::Ims(format!("PC/SC transmit failed: {e}")))?;
+        Ok(crate::modules::usim::hex_encode(rapdu))
+    }
+}
+
+/// Lets a probe run through the same `usim::*` SELECT/READ logic while a
+/// transaction is held, without a second copy of `ApduTransport`'s body —
+/// `Transaction` derefs to `Card`, whose `transmit` is the same primitive
+/// `PcscTransport` already wraps.
+impl ApduTransport for Transaction<'_> {
+    fn transmit_apdu(&mut self, apdu_hex: &str) -> BridgeResult<String> {
+        let apdu = crate::modules::usim::hex_decode(apdu_hex)?;
+        let mut recv_buf = [0u8; MAX_BUFFER_SIZE];
+        let rapdu = self
             .transmit(&apdu, &mut recv_buf)
             .map_err(|e| BridgeError::Ims(format!("PC/SC transmit failed: {e}")))?;
         Ok(crate::modules::usim::hex_encode(rapdu))
