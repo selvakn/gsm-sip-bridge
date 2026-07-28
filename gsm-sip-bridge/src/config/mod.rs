@@ -141,6 +141,7 @@ const VOWIFI_LINE_KEYS: &[&str] = &[
     "mnc",
     "imsi_override",
     "imei_override",
+    "pcsc_reader",
 ];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
@@ -625,6 +626,13 @@ pub struct VowifiConfig {
     /// has caused hours-long registration outages that only a modem power
     /// cycle (`AT+CFUN=1,1`) could clear.
     pub imei_override: Option<String>,
+    /// This line's SIM comes from a physical PC/SC reader, not a modem
+    /// (specs/023-omnikey-pcsc-vowifi) — threaded through from the matching
+    /// `VowifiLineOverride` by `vowifi::discovery::resolve_one_pcsc_line` so
+    /// `ims::agent::run` (which only ever sees this derived `VowifiConfig`,
+    /// not the raw override) knows to register via `PcscTransport` instead
+    /// of opening `modem_port`.
+    pub pcsc_reader: bool,
     /// Upper bound on concurrently supported VoWiFi lines
     /// (specs/013-multi-card-vowifi FR-016) — modems discovered beyond this
     /// count are reported and skipped rather than silently dropped. Same
@@ -661,6 +669,15 @@ pub struct VowifiLineOverride {
     /// Diagnostic escape hatch: use this IMEI instead of reading it from the
     /// modem via `AT+CGSN`, scoped to this one line.
     pub imei_override: Option<String>,
+    /// This line's SIM comes from a physical PC/SC reader (e.g. OmniKey
+    /// AG 3x21) rather than a modem (specs/023-omnikey-pcsc-vowifi). When
+    /// `true`, `modem_serial`/`modem_port` are not modem matchers (and must
+    /// be unset), and `mcc`/`mnc`/`imsi_override` are mandatory — there is no
+    /// modem to derive them from. Only meaningful with
+    /// `[vowifi].tunnel_engine = "strongswan"`, whose `eap-sim-pcsc` plugin
+    /// talks to `pcscd` directly; the `swu` engine has no PC/SC support and
+    /// `supervise` fails fast at startup if this is set under it.
+    pub pcsc_reader: bool,
 }
 
 impl Default for VowifiConfig {
@@ -692,6 +709,7 @@ impl Default for VowifiConfig {
             vpcd_port: 15963,
             imsi_override: None,
             imei_override: None,
+            pcsc_reader: false,
             max_lines: 8,
             line_overrides: Vec::new(),
         }
@@ -2104,6 +2122,9 @@ fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConf
         vpcd_port,
         imsi_override,
         imei_override,
+        // Meaningful only per-line, set by `resolve_one_pcsc_line` — the
+        // base `[vowifi]` config itself is never card-reader-backed.
+        pcsc_reader: false,
         max_lines,
         line_overrides,
     })
@@ -2143,6 +2164,32 @@ fn parse_vowifi_line_overrides(
         if let Some(imei) = &imei_override {
             validate_digit_string(imei, "vowifi.line.imei_override", 14..=16)?;
         }
+        let pcsc_reader = et
+            .get("pcsc_reader")
+            .map(|v| as_bool(v, "vowifi.line.pcsc_reader"))
+            .transpose()?
+            .unwrap_or(false);
+        if pcsc_reader {
+            if modem_serial.is_some() || modem_port.is_some() {
+                return Err(BridgeError::Config(format!(
+                    "vowifi.line[{i}]: pcsc_reader = true cannot be combined with \
+                     modem_serial/modem_port — a line is either modem-backed or \
+                     card-reader-backed, never both"
+                )));
+            }
+            if mcc.is_none() || mnc.is_none() {
+                return Err(BridgeError::Config(format!(
+                    "vowifi.line[{i}]: pcsc_reader = true requires mcc and mnc \
+                     (no modem to derive them from)"
+                )));
+            }
+            if imsi_override.is_none() {
+                return Err(BridgeError::Config(format!(
+                    "vowifi.line[{i}]: pcsc_reader = true requires imsi_override \
+                     (no modem to read it from)"
+                )));
+            }
+        }
         overrides.push(VowifiLineOverride {
             modem_serial,
             modem_port,
@@ -2150,8 +2197,37 @@ fn parse_vowifi_line_overrides(
             mnc,
             imsi_override,
             imei_override,
+            pcsc_reader,
         });
     }
+
+    // Two pcsc_reader lines sharing an imsi_override would both resolve to
+    // the same physical reader (modules::pcsc_card::PcscTransport::connect
+    // disambiguates by IMSI) — one SIM authenticating two conflicting
+    // registrations, while whichever SIM the other line actually meant
+    // sits unused. Caught at config time rather than left as a runtime
+    // surprise (caught in review).
+    let mut seen_pcsc_imsis: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (i, o) in overrides.iter().enumerate() {
+        if !o.pcsc_reader {
+            continue;
+        }
+        let imsi = o
+            .imsi_override
+            .as_deref()
+            .expect("pcsc_reader requires imsi_override, already validated above");
+        if let Some(&first_i) = seen_pcsc_imsis.get(imsi) {
+            return Err(BridgeError::Config(format!(
+                "vowifi.line[{first_i}] and vowifi.line[{i}] are both pcsc_reader lines with \
+                 the same imsi_override {imsi:?} — each pcsc_reader line needs its own distinct \
+                 IMSI, or both would authenticate through the same physical reader while any \
+                 other configured SIM goes unused"
+            )));
+        }
+        seen_pcsc_imsis.insert(imsi, i);
+    }
+
     Ok(overrides)
 }
 
@@ -2829,6 +2905,109 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("mcc and mnc must be set together"));
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_line_parses_with_all_mandatory_fields() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.line_overrides.len(), 1);
+        let line = &cfg.vowifi.line_overrides[0];
+        assert!(line.pcsc_reader);
+        assert_eq!(line.imsi_override.as_deref(), Some("404940123456789"));
+        assert_eq!(line.mcc.as_deref(), Some("404"));
+        assert_eq!(line.mnc.as_deref(), Some("043"));
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_defaults_to_false() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert!(!cfg.vowifi.line_overrides[0].pcsc_reader);
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_rejects_missing_imsi_override() {
+        // specs/023-omnikey-pcsc-vowifi T009: no modem to read the IMSI from,
+        // so it's mandatory when pcsc_reader = true.
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nmcc = \"404\"\nmnc = \"043\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("imsi_override"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_rejects_missing_mcc_mnc() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mcc") && err.contains("mnc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_rejects_modem_matcher_combination() {
+        let toml = format!(
+            "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nmodem_serial = \"ABC123\"\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pcsc_reader"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_rejects_duplicate_imsi_across_lines() {
+        // Caught in review: two pcsc_reader lines sharing an imsi_override
+        // would both resolve to the same physical reader (connect()
+        // disambiguates by IMSI), so one SIM would authenticate two
+        // conflicting registrations while any other configured SIM sits
+        // unused. Rejected at config time rather than left as a runtime
+        // surprise.
+        let toml = format!(
+            "{}\n[vowifi]\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let root: toml::Value = toml.parse().unwrap();
+        let err = parse_vowifi(root.as_table().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("404940123456789"), "unexpected error: {err}");
+        assert!(err.contains("pcsc_reader"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vowifi_pcsc_reader_allows_distinct_imsi_across_lines() {
+        let toml = format!(
+            "{}\n[vowifi]\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n\
+             [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404011111111111\"\nmcc = \"404\"\nmnc = \"094\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&toml);
+        assert_eq!(cfg.vowifi.line_overrides.len(), 2);
     }
 
     #[test]

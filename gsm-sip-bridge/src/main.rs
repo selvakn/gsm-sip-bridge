@@ -269,6 +269,7 @@ fn build_ims_register_config(
 ) -> gsm_sip_bridge::ims::ImsRegisterConfig {
     gsm_sip_bridge::ims::ImsRegisterConfig {
         modem_port: args.modem.clone(),
+        pcsc_reader: false,
         pcscf_addr: args.pcscf,
         pcscf_port: args.pcscf_port,
         mcc: args.mcc.clone(),
@@ -648,6 +649,7 @@ fn handle_volte_listen_command(args: &gsm_sip_bridge::cli::VolteListenArgs) -> E
 
     let reg_cfg = gsm_sip_bridge::ims::ImsRegisterConfig {
         modem_port: args.modem.clone(),
+        pcsc_reader: false,
         pcscf_addr,
         pcscf_port: args.pcscf_port,
         mcc: plmn.mcc,
@@ -806,6 +808,7 @@ fn handle_volte_call_command(args: &gsm_sip_bridge::cli::VolteCallArgs) -> ExitC
     let cfg = CallConfig {
         register: gsm_sip_bridge::ims::ImsRegisterConfig {
             modem_port: args.modem.clone(),
+            pcsc_reader: false,
             pcscf_addr,
             pcscf_port: args.pcscf_port,
             mcc: plmn.mcc.clone(),
@@ -1139,6 +1142,7 @@ fn handle_volte_register_command(
     // Stage 2: registration, over the same shared code the VoWiFi path uses.
     let reg_cfg = gsm_sip_bridge::ims::ImsRegisterConfig {
         modem_port: line.modem.clone(),
+        pcsc_reader: false,
         pcscf_addr,
         pcscf_port: args.pcscf_port,
         mcc: plmn.mcc.clone(),

@@ -28,6 +28,7 @@ Docker Compose quick start, then come back here for depth.
 |---|---|
 | [architecture.md](architecture.md) | Crate layout, all three call flows (CS, VoWiFi, VoLTE), audio pipeline, multi-card/multi-line design |
 | [vowifi-bridge.md](vowifi-bridge.md) | The VoWiFi-to-SIP bridge in depth: two-agent design, codecs, control protocol |
+| [omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md) | A VoWiFi line backed by a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem — config, IMSI/IMEI handling, verification checklist, troubleshooting |
 
 ## Design notes & engineering history
 
@@ -40,7 +41,8 @@ Kept for the reasoning and findings, not as how-to guides.
 | [audio-tuning-log.md](audio-tuning-log.md) | Running log of modem/SIP audio parameter changes and their outcomes |
 
 Per-feature specs, plans, and task breakdowns live under
-[`specs/`](../specs/) — most recently `015-volte-host-ims` through
+[`specs/`](../specs/) — most recently `023-omnikey-pcsc-vowifi` for
+PC/SC card-reader-backed VoWiFi lines, `015-volte-host-ims` through
 `020-volte-line-netns` for the host-side VoLTE bridge (registration, calls,
 inbound bridging, multi-modem, per-line network isolation), and
 `011-vowifi-sip-bridge` through `014-vowifi-metrics-restore` for the VoWiFi

@@ -40,7 +40,8 @@ pub mod transport;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::at_commander::AtCommander;
-use crate::modules::usim::{self, AkaResult};
+use crate::modules::pcsc_card::PcscTransport;
+use crate::modules::usim::{self, AkaResult, ApduTransport};
 use gm_ipsec::GmEndpoints;
 use sip_client::{
     build_register, extract_challenge, format_sip_addr, parse_digest_challenge, random_hex,
@@ -63,6 +64,12 @@ pub const ACCESS_NETWORK_WLAN: &str = "3GPP-WLAN";
 
 pub struct ImsRegisterConfig {
     pub modem_port: PathBuf,
+    /// This line's SIM comes from a physical PC/SC reader
+    /// (specs/023-omnikey-pcsc-vowifi), not the modem at `modem_port` —
+    /// `register_session` connects to it via `PcscTransport` instead of
+    /// opening `modem_port` over AT+CSIM. `imsi`/`imei` must both be `Some`
+    /// in that case; there is no modem to fall back to `AT+CIMI`/`AT+CGSN`.
+    pub pcsc_reader: bool,
     pub pcscf_addr: IpAddr,
     pub pcscf_port: u16,
     pub mcc: String,
@@ -417,22 +424,47 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
 }
 
 pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
-    let mut at = AtCommander::open(&cfg.modem_port)?;
-
-    let imsi = match &cfg.imsi {
-        Some(imsi) => imsi.clone(),
-        None => at.query_imsi()?,
-    };
+    // A pcsc_reader line's SIM sits in a real PC/SC reader, not the modem at
+    // `modem_port` (specs/023-omnikey-pcsc-vowifi). Only one `AtCommander` is
+    // ever opened on `modem_port` per call — it must serve both the
+    // AT+CIMI/AT+CGSN fallback reads below and the AUTHENTICATE/SELECT APDU
+    // traffic later, since `serialport`'s exclusive-open means a second
+    // handle on the same tty would fail outright.
+    let mut card: Box<dyn ApduTransport>;
+    let imsi: String;
+    let imei: String;
+    if cfg.pcsc_reader {
+        // Config validation guarantees both are set for a pcsc_reader
+        // line — there is no modem to fall back to AT+CIMI/AT+CGSN, and
+        // discovery auto-generates an imei when none is overridden.
+        imsi = cfg.imsi.clone().ok_or_else(|| {
+            BridgeError::Ims("pcsc_reader line has no imsi_override configured".into())
+        })?;
+        imei = cfg.imei.clone().ok_or_else(|| {
+            BridgeError::Ims("pcsc_reader line has no imei (expected one to be auto-generated at discovery time)".into())
+        })?;
+        // Matches against the card's own EF_IMSI rather than picking "the
+        // first reader" — with more than one pcsc_reader line configured,
+        // that would authenticate every line as whichever subscriber
+        // happened to be plugged into the first reader pcscd lists.
+        card = Box::new(PcscTransport::connect(&imsi)?);
+    } else {
+        let mut at = AtCommander::open(&cfg.modem_port)?;
+        imsi = match &cfg.imsi {
+            Some(imsi) => imsi.clone(),
+            None => at.query_imsi()?,
+        };
+        imei = match &cfg.imei {
+            Some(imei) => imei.clone(),
+            None => at.query_imei()?,
+        };
+        card = Box::new(at);
+    }
     tracing::info!(imsi = %imsi, "read IMSI from SIM");
-
-    let imei = match &cfg.imei {
-        Some(imei) => imei.clone(),
-        None => at.query_imei()?,
-    };
     tracing::info!(imei = %imei, "read IMEI from modem");
 
-    let aid = usim::discover_usim_aid(&mut at)?;
-    usim::select_usim(&mut at, &aid)?;
+    let aid = usim::discover_usim_aid(card.as_mut())?;
+    usim::select_usim(card.as_mut(), &aid)?;
     tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
 
     let realm = format!("ims.mnc{}.mcc{}.3gppnetwork.org", cfg.mnc, cfg.mcc);
@@ -578,7 +610,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         rand_arr.copy_from_slice(&nonce_bytes[0..16]);
         autn_arr.copy_from_slice(&nonce_bytes[16..32]);
 
-        let aka = usim::authenticate(&mut at, &rand_arr, &autn_arr)?;
+        let aka = usim::authenticate(card.as_mut(), &rand_arr, &autn_arr)?;
 
         cseq += 1;
         // RFC 2617 requires this to match the Request-URI of the message it's

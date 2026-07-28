@@ -528,6 +528,13 @@ mod mock {
         /// `"host:port"` key; unseeded keys default to `false` (no
         /// real network in tests).
         pub tcp_connect_results: Mutex<Map<String, bool>>,
+        /// Argv substrings that make a future `spawn()` create its child
+        /// already dead (`is_alive` false from the start) — lets a test
+        /// force a deterministic `EstablishOutcome::FatalProcessDied` for a
+        /// specific process (e.g. "charon") without racing a concurrently
+        /// spawned sibling (e.g. vowifi-usim-bridge, spawned on its own
+        /// thread) for handle-ID order.
+        pub born_dead_substrings: Mutex<Vec<String>>,
         next_id: AtomicU64,
     }
 
@@ -570,6 +577,15 @@ mod mock {
                 c.alive = false;
                 c.exit_code = Some(exit_code);
             }
+        }
+
+        /// A future `spawn()` whose argv contains `needle` creates a child
+        /// that is dead (`is_alive` false) from the moment it's spawned.
+        pub fn set_born_dead_if_argv_contains(&self, needle: &str) {
+            self.born_dead_substrings
+                .lock()
+                .unwrap()
+                .push(needle.to_string());
         }
 
         pub fn signals_for(&self, handle: ChildHandle) -> Vec<Signal> {
@@ -640,11 +656,17 @@ mod mock {
 
         fn spawn(&self, spec: ChildSpec) -> io::Result<ChildHandle> {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let born_dead = self
+                .born_dead_substrings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|needle| spec.argv.iter().any(|a| a.contains(needle.as_str())));
             self.children.lock().unwrap().insert(
                 id,
                 MockChild {
-                    alive: true,
-                    exit_code: None,
+                    alive: !born_dead,
+                    exit_code: if born_dead { Some(1) } else { None },
                     signals_received: Vec::new(),
                 },
             );

@@ -3,6 +3,7 @@ pub mod audio_pipeline;
 pub mod beep;
 pub mod card;
 pub mod discovery;
+pub mod pcsc_card;
 pub mod scheduler;
 pub mod usim;
 

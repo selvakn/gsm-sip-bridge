@@ -107,6 +107,8 @@ pub fn run(
 
     let reg_cfg = ImsRegisterConfig {
         modem_port: line.settings.modem_port.clone(),
+        // VoLTE lines are always modem-backed — no PC/SC path exists here.
+        pcsc_reader: false,
         pcscf_addr: pcscf.ip(),
         pcscf_port: pcscf.port(),
         mcc: plmn.mcc,

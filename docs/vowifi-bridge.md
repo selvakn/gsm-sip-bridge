@@ -118,6 +118,10 @@ the same channel, for `vowifi-status`.
 same config file; the SIP/PBX destination itself reuses the existing `[sip]`/`[bridge]` sections
 rather than duplicating them.
 
+A line's SIM normally comes from a modem, bridged into pcscd's virtual reader by
+`vowifi-usim-bridge`. It can instead come from a real PC/SC smart-card reader (e.g. OmniKey AG
+3x21) with the SIM seated directly in it — see `docs/omnikey-pcsc-vowifi.md`.
+
 ## What's verified vs. what needs real hardware
 
 Everything above is unit- and integration-tested without live hardware (175 `gsm-sip-bridge` lib
