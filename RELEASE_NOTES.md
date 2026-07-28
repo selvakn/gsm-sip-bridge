@@ -21,6 +21,28 @@ Repository maintenance and one structural fix. CLI help text and every
   container report unhealthy, and zero-lines degrading rather than failing).
   The image no longer needs `bash` arrays, `/dev/tcp`, or `eval` of a
   shell-env dump.
+- **A shared `line` module** now holds what VoWiFi and VoLTE had each
+  reinvented: candidate classification, stable card-id ordering, the
+  `max_lines` cap, per-index resource derivation, and manifest read/write.
+  `shift_ipv4` existed twice byte-identical; `volte::discovery` imported
+  `FailedLine` *from `vowifi::discovery`* (the LTE path depending on the
+  Wi-Fi path); and `modules::discovery` kept private copies of VoLTE's
+  manifest path constants with a comment saying to keep them in sync by
+  hand. All three are gone — `line` sits below both subsystems, so the
+  layering dilemma is removed rather than documented.
+- **Breaking: a VoLTE line's index-0 namespace and veth interfaces are now
+  suffixed** (`volte0`, not `volte`), matching VoWiFi. VoLTE special-cased
+  index 0 to keep the unindexed base for single-line back-compat, so the two
+  subsystems had two rules for the same derivation and line 0 was the one
+  line whose names could not be predicted from its index. Teardown reads the
+  names back out of the manifest, so a restart picks up the new ones cleanly.
+- **Line manifests carry a `schema_version` and refuse a mismatch.** They are
+  contracts between processes that may be different builds (a rolling update,
+  or a `volte-status` from another binary), and both previously used
+  `#[serde(default)]` — so a renamed field deserialised to its default and a
+  line came up with, say, an empty APN. That exact failure is documented in
+  `volte::discovery` as having attached the network's default bearer instead
+  of the IMS one, looking fully configured while the P-CSCF was unreachable.
 - **~100 stale references to `docker/entrypoint.sh`** across the source and
   docs claimed it still supervises agents, creates veth pairs, and runs
   cleanup traps. It has been a 28-line exec shim since specs/021; they now

@@ -373,17 +373,16 @@ pub fn scan_modules_excluding_cards(
 /// the `vowifi` module; `vowifi::discovery`'s writer imports this constant
 /// instead, the natural direction (a specific feature depending on shared
 /// infrastructure, not the reverse).
-pub const DEFAULT_LINES_FILE: &str = "/tmp/gsm-sip-bridge-lines.json";
-/// Env var overriding `DEFAULT_LINES_FILE`, read by both the writer
-/// (`gsm-sip-bridge discover`) and this reader.
-pub const LINES_FILE_ENV: &str = "GSM_SIP_BRIDGE_LINES_FILE";
+pub use crate::line::manifest::{
+    VOWIFI_LINES_DEFAULT_PATH as DEFAULT_LINES_FILE, VOWIFI_LINES_ENV as LINES_FILE_ENV,
+};
 
 /// Resolves the line-resolution file path every reader/writer of it
 /// (`main.rs`'s `discover`/`--line` handling, `vowifi::mod`'s Agent B
 /// listener setup, `vowifi-status`) should use: `LINES_FILE_ENV` if set,
 /// else `DEFAULT_LINES_FILE`.
 pub fn lines_file_path() -> PathBuf {
-    PathBuf::from(std::env::var(LINES_FILE_ENV).unwrap_or_else(|_| DEFAULT_LINES_FILE.to_string()))
+    crate::line::manifest::vowifi_lines_path()
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -438,15 +437,6 @@ fn active_vowifi_card_ids() -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Default path/env var for the VoLTE line manifest — duplicated from
-/// `volte::discovery::{DEFAULT_MANIFEST_PATH, MANIFEST_PATH_ENV}` rather than
-/// imported, for the same layering reason `DEFAULT_LINES_FILE` above lives
-/// here and not in `vowifi::discovery`: this module is the shared scan
-/// underneath both subsystems and must not depend on either of them. Keep
-/// both copies in sync if the manifest path ever changes.
-const VOLTE_MANIFEST_PATH_ENV: &str = "GSM_SIP_BRIDGE_VOLTE_LINES_FILE";
-const DEFAULT_VOLTE_MANIFEST_PATH: &str = "/run/volte-lines.json";
-
 #[derive(serde::Deserialize, Default)]
 struct VolteManifestExcerpt {
     #[serde(default)]
@@ -462,14 +452,13 @@ struct VolteLineExcerpt {
 }
 
 fn read_volte_manifest_excerpt() -> VolteManifestExcerpt {
-    let path = std::env::var(VOLTE_MANIFEST_PATH_ENV)
-        .unwrap_or_else(|_| DEFAULT_VOLTE_MANIFEST_PATH.to_string());
+    let path = crate::line::manifest::volte_lines_path();
     let Ok(contents) = fs::read_to_string(&path) else {
         return VolteManifestExcerpt::default();
     };
     serde_json::from_str(&contents).unwrap_or_else(|e| {
         tracing::warn!(
-            path = %path,
+            path = %path.display(),
             error = %e,
             "failed to parse VoLTE line manifest; treating it as absent"
         );

@@ -11,7 +11,8 @@
 //! `specs/013-multi-card-vowifi/contracts/discover-cli-contract.md`.
 
 use crate::config::{VowifiConfig, VowifiLineOverride};
-use crate::modules::discovery::{ProbedModem, SimStatus};
+use crate::line::resources::{self, shift_ipv4};
+use crate::modules::discovery::ProbedModem;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -91,11 +92,11 @@ fn override_for<'a>(
 }
 
 /// A modem that can't become a line, and why (FR-006/FR-016).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FailedLine {
-    pub card_id: String,
-    pub reason: String,
-}
+///
+/// Re-exported from [`crate::line`], where it lives now: VoLTE was importing
+/// this type *from the VoWiFi module*, which made the LTE path depend on the
+/// Wi-Fi path for something that belongs to neither.
+pub use crate::line::FailedLine;
 
 /// One resolved VoWiFi line — the "Line Table" key entity
 /// (specs/013-multi-card-vowifi data-model.md). `config` is a fully
@@ -133,47 +134,19 @@ pub struct LineTableResult {
 /// order (independent of USB enumeration jitter), capped at
 /// `base.max_lines` with the excess reported as failed rather than dropped.
 pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTableResult {
-    let mut failed = Vec::new();
-    let mut ready: Vec<&ProbedModem> = Vec::new();
-
-    for modem in &assignment.vowifi {
-        match &modem.sim_status {
-            Some(SimStatus::Ready { .. }) => ready.push(modem),
-            Some(SimStatus::Absent) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "sim_absent".to_string(),
-            }),
-            Some(SimStatus::Locked) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "sim_locked".to_string(),
-            }),
-            Some(SimStatus::Unreadable(msg)) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: format!("sim_unreadable: {msg}"),
-            }),
-            None => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "no_at_port".to_string(),
-            }),
-        }
-    }
-
-    ready.sort_by(|a, b| a.card_id.cmp(&b.card_id));
-
+    // Role assignment has already established each candidate's AT port, so
+    // a `Ready` SIM without one cannot occur here — hence
+    // `AlreadyEstablished` rather than VoLTE's `Required`.
+    let candidates = crate::line::select(
+        &assignment.vowifi,
+        base.max_lines,
+        crate::line::AtPortRequirement::AlreadyEstablished,
+    );
+    let mut failed = candidates.failed;
     let max_lines = base.max_lines as usize;
-    let (kept, overflow) = if ready.len() > max_lines {
-        ready.split_at(max_lines)
-    } else {
-        (&ready[..], &[][..])
-    };
-    for modem in overflow {
-        failed.push(FailedLine {
-            card_id: modem.card_id.clone(),
-            reason: "max_lines_exceeded".to_string(),
-        });
-    }
 
-    let mut lines: Vec<ResolvedLine> = kept
+    let mut lines: Vec<ResolvedLine> = candidates
+        .kept
         .iter()
         .enumerate()
         .map(|(i, modem)| resolve_one_line(i as u32, modem, base))
@@ -198,23 +171,14 @@ pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTa
             let index = lines.len() as u32;
             lines.push(resolve_one_pcsc_line(index, card_id, over, base));
         } else {
-            failed.push(FailedLine {
+            failed.push(FailedLine::new(
                 card_id,
-                reason: "max_lines_exceeded".to_string(),
-            });
+                crate::line::Rejection::MaxLinesExceeded.reason(),
+            ));
         }
     }
 
     LineTableResult { lines, failed }
-}
-
-/// One /30 veth block per line — stepping the whole dotted-quad by 4
-/// addresses (rather than assuming which octet has room) keeps the
-/// derivation correct regardless of the operator's chosen base subnet.
-fn shift_ipv4(addr: &str, delta: u32) -> Option<String> {
-    let ip: std::net::Ipv4Addr = addr.parse().ok()?;
-    let shifted = u32::from(ip).checked_add(delta)?;
-    Some(std::net::Ipv4Addr::from(shifted).to_string())
 }
 
 fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> ResolvedLine {
@@ -249,11 +213,11 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     // Pure per-line infrastructure — always mechanically derived from the
     // line's index, uniformly for every line including the first. No config
     // knob backs any of this (see `VowifiConfig`'s field docs).
-    config.netns = format!("{}{}", base.netns, index);
+    config.netns = resources::indexed(&base.netns, index);
     config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
     config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-    config.veth_sip_iface = format!("{}{}", base.veth_sip_iface, index);
-    config.veth_ims_iface = format!("{}{}", base.veth_ims_iface, index);
+    config.veth_sip_iface = resources::indexed(&base.veth_sip_iface, index);
+    config.veth_ims_iface = resources::indexed(&base.veth_ims_iface, index);
     let step = 4u32 * index;
     if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
         config.veth_local_addr = local;
@@ -354,11 +318,11 @@ fn resolve_one_pcsc_line(
     config.pcsc_reader = true;
     config.line_overrides = Vec::new();
 
-    config.netns = format!("{}{}", base.netns, index);
+    config.netns = resources::indexed(&base.netns, index);
     config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
     config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-    config.veth_sip_iface = format!("{}{}", base.veth_sip_iface, index);
-    config.veth_ims_iface = format!("{}{}", base.veth_ims_iface, index);
+    config.veth_sip_iface = resources::indexed(&base.veth_sip_iface, index);
+    config.veth_ims_iface = resources::indexed(&base.veth_ims_iface, index);
     let step = 4u32 * index;
     if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
         config.veth_local_addr = local;
@@ -495,6 +459,7 @@ pub fn read_line_resolution(path: &Path) -> Result<LineResolution, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::discovery::SimStatus;
     use std::path::PathBuf;
 
     fn ready_modem(card_id: &str, port: &str, audio: bool, imsi: &str) -> ProbedModem {
