@@ -721,7 +721,10 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BridgeError::Config(format!("config file {}: {e}", path.display())))?;
 
-    let mut root: Value = contents.parse().map_err(BridgeError::from)?;
+    // `toml::from_str`, not `str::parse` — since toml 0.9 the `FromStr` impl
+    // parses a bare *value*, so a document starting with `[sip]` is read as an
+    // array and rejected with "unexpected content, expected nothing".
+    let mut root: Value = toml::from_str(&contents).map_err(BridgeError::from)?;
     if !root.is_table() {
         return Err(BridgeError::Config("config root must be a table".into()));
     }
@@ -762,7 +765,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
 pub fn read_log_level(path: &Path) -> String {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|contents| contents.parse::<Value>().ok())
+        .and_then(|contents| toml::from_str::<Value>(&contents).ok())
         .and_then(|root| {
             root.as_table()?
                 .get("logging")?
@@ -788,7 +791,7 @@ mod tests {
     }
 
     fn try_parse(toml: &str) -> BridgeResult<AppConfig> {
-        let mut root: Value = toml.parse().unwrap();
+        let mut root: Value = toml::from_str(toml).unwrap();
         env::resolve_in_place(&mut root, "")?;
         let unknown = raw::collect_unknown_keys(&root);
         if !unknown.is_empty() {

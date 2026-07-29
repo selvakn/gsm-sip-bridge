@@ -43,6 +43,14 @@ Repository maintenance and one structural fix. CLI help text and every
   line came up with, say, an empty APN. That exact failure is documented in
   `volte::discovery` as having attached the network's default bearer instead
   of the IMS one, looking fully configured while the P-CSCF was unreachable.
+- **Dependencies refreshed**: `rand` 0.8 -> 0.9 (`thread_rng`/`gen_range`
+  renamed), `rusqlite` 0.32 -> 0.37, `toml` 0.8 -> 0.9, `cron` 0.12 -> 0.17,
+  `socket2` 0.5 -> 0.6, `base64` 0.22 -> 0.23, `md-5` 0.10 -> 0.11, plus every
+  semver-compatible update. `toml` 0.9 changed `str::parse::<Value>()` to
+  parse a bare *value* rather than a document, so the config loader now uses
+  `toml::from_str`. **`prometheus` deliberately stays on 0.13**: 0.14 changes
+  `with_label_values` to take `&[&String]`, which is 30+ call sites of churn
+  for no fix and no feature.
 - **Fixed: pjlib aborted on every container shutdown.** `Endpoint::drop`
   called `pjsua_destroy()` without registering the calling thread, unlike
   every other method on the type. `Drop` runs on whoever owns the value at the

@@ -277,7 +277,7 @@ impl CardPool {
         // Persist the natural tick immediately so the next recompute call always
         // advances past this occurrence, even if the jittered start lands earlier.
         self.last_fired_tick = Some(next_tick);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let jitter =
             scheduler::jitter_offset(&mut rng, self.config.scheduled_restart.start_jitter_seconds);
         let delta_sec = (next_tick - now_local).num_seconds() + jitter;
@@ -922,7 +922,7 @@ impl CardPool {
         }
 
         let view = PoolSlotView { slots };
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let actions = scheduler::tick_scheduler(
             cycle,
             &view,

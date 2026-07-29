@@ -105,7 +105,7 @@ mod tests {
     use super::*;
 
     fn resolve(toml_src: &str) -> BridgeResult<Value> {
-        let mut v: Value = toml_src.parse().unwrap();
+        let mut v: Value = toml::from_str(toml_src).unwrap();
         resolve_in_place(&mut v, "")?;
         Ok(v)
     }

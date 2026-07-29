@@ -110,9 +110,7 @@ fn every_top_level_section_appears_in_the_example_config() {
 /// the offending key rather than a generic parse error.
 #[test]
 fn every_key_the_example_sets_is_one_the_parser_accepts() {
-    let doc: toml::Value = EXAMPLE
-        .parse()
-        .expect("config.toml.example must be valid TOML");
+    let doc: toml::Value = toml::from_str(EXAMPLE).expect("config.toml.example must be valid TOML");
     let table = doc.as_table().expect("example root must be a table");
 
     let mut unknown = Vec::new();

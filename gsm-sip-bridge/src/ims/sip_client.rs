@@ -18,7 +18,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

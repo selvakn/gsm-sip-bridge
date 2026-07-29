@@ -83,7 +83,9 @@ mod tests {
     /// A genuine config parse failure still reports as one.
     #[test]
     fn a_toml_parse_failure_is_still_a_configuration_error() {
-        let e: BridgeError = "not = = toml".parse::<toml::Value>().unwrap_err().into();
+        let e: BridgeError = toml::from_str::<toml::Value>("not = = toml")
+            .unwrap_err()
+            .into();
         assert!(e.to_string().starts_with("configuration error:"));
     }
 }
