@@ -320,11 +320,14 @@ advertisement carries none, and no usable resolver is offered. `volte-discover`
 reports this per-method rather than failing opaquely — an empty result there is
 the expected outcome, not a fault.
 
-The working route is to let the VoWiFi/ePDG path capture one: it writes the
-address it learned from the IKEv2 config payload to `[vowifi].pcscf_source_path`
-(default `/tmp/pcscf`), and `volte-register` picks that file up automatically
-when `[volte].pcscf` is unset. So running VoWiFi once on the SIM primes the LTE
-path. `--pcscf` overrides everything.
+The working route is to let the VoWiFi/ePDG path capture one: each line writes
+the address it learned from the IKEv2 config payload to
+`[vowifi].pcscf_source_path` with its line index appended (`/tmp/pcscf-0`,
+`/tmp/pcscf-1`, ...). `volte-register` reads whichever file
+`[volte].pcscf_source_path` names — `/tmp/pcscf-0` by default, i.e. VoWiFi line
+0. So running VoWiFi once on the SIM primes the LTE path; with several VoWiFi
+lines, point it at the one whose carrier you want, since each line's P-CSCF
+comes from its own network. `--pcscf` overrides everything.
 
 ### Symptom: attached but nothing works
 

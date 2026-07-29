@@ -599,9 +599,15 @@ impl Default for VowifiConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolteConfig {
     pub enabled: bool,
-    /// File the VoWiFi/ePDG path writes its discovered P-CSCF to. Reused here
-    /// so a captured address is picked up automatically rather than by hand.
-    /// Shared across every line.
+    /// File a VoWiFi line wrote its tunnel-assigned P-CSCF to, reused here so
+    /// an LTE line can borrow it — this carrier publishes none over LTE.
+    ///
+    /// Names **one specific VoWiFi line** (`/tmp/pcscf-0` by default, i.e.
+    /// line 0). It must: each VoWiFi line's P-CSCF comes from its own carrier,
+    /// so with more than one line there is no single "the" address to pick up,
+    /// and silently taking whichever was written last is a real bug this
+    /// project has already paid for. Point it at another line's file to use
+    /// that carrier's address instead.
     pub pcscf_source_path: String,
     pub status_path: String,
     pub lock_path: String,
@@ -688,7 +694,7 @@ impl Default for VolteConfig {
             enabled: false,
             // Same default the [vowifi] section uses, so a captured address is
             // found without configuring anything.
-            pcscf_source_path: "/tmp/pcscf".to_string(),
+            pcscf_source_path: "/tmp/pcscf-0".to_string(),
             status_path: "/tmp/volte-registration-status".to_string(),
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
@@ -815,9 +821,11 @@ mod tests {
         let c = parse(MINIMAL_TOML);
 
         assert!(!c.volte.enabled, "must be opt-in");
-        // Same default the VoWiFi path writes to, so a captured address is
-        // found without configuring anything.
-        assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf");
+        // Names VoWiFi line 0's file specifically. The VoWiFi path writes
+        // `<base>-<index>`, so the pre-per-line `/tmp/pcscf` would never
+        // exist and this handoff would silently fall through to on-modem
+        // discovery, which does not work on this carrier.
+        assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf-0");
         assert_eq!(c.volte.netns, "volte");
         assert_eq!(c.volte.veth_carrier_iface, "veth-volte-ims");
         assert_eq!(c.volte.veth_telephony_iface, "veth-volte-sip");

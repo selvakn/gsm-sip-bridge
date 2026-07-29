@@ -838,7 +838,13 @@ fn volte_bridge_single_line(
     use crate::volte::discovery;
     let explicit = args.pcscf.map(|a| a.to_string());
     let Some(pcscf) = resolve_line_pcscf(explicit, args.pcscf_port, &args.pcscf_source_path) else {
-        return Err("[discovering-pcscf] no P-CSCF address available; pass --pcscf".to_string());
+        return Err(format!(
+            "[discovering-pcscf] no P-CSCF address available: none passed with --pcscf, and \
+             nothing usable in {}. The VoWiFi path writes one file per line \
+             (`<base>-<index>`, e.g. /tmp/pcscf-0), so a path with no index will never \
+             appear — point --pcscf-source-path at a specific line's file.",
+            args.pcscf_source_path
+        ));
     };
     let card_id = args
         .card_id
@@ -892,8 +898,12 @@ pub(crate) fn volte_bridge_manifest_lines(
         let Some(pcscf) = resolve_line_pcscf(explicit, pcscf_port, &volte.pcscf_source_path) else {
             tracing::error!(
                 card_id = %entry.card_id,
-                "no P-CSCF available for this line (none configured and none captured by the \
-                 ePDG path); skipping it"
+                pcscf_source_path = %volte.pcscf_source_path,
+                "no P-CSCF available for this line: none configured, and nothing usable at \
+                 pcscf_source_path. The VoWiFi path writes one file per line \
+                 (`<base>-<index>`, e.g. /tmp/pcscf-0), so a path with no index will never \
+                 appear — point [volte].pcscf_source_path at a specific line's file. \
+                 Skipping this line"
             );
             continue;
         };

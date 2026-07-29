@@ -433,7 +433,7 @@ impl Default for RawVolte {
     fn default() -> Self {
         Self {
             enabled: false,
-            pcscf_source_path: "/tmp/pcscf".to_string(),
+            pcscf_source_path: "/tmp/pcscf-0".to_string(),
             status_path: "/tmp/volte-registration-status".to_string(),
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
