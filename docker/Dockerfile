@@ -292,7 +292,19 @@ WORKDIR /opt/SWu-IKEv2
 # checks go through the same tested `supervise::runner::CommandRunner` seam as
 # the rest of orchestration (see `commands::healthcheck`). This is what
 # removed the last `eval`-a-shell-env-dump coupling from the image.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+# `start-period` is sized for how long a *carrier* takes, not how long this
+# process takes to boot. A line is only healthy once its ePDG tunnel is up and
+# has been assigned a P-CSCF, which means IKE_SA_INIT, EAP-AKA against the SIM,
+# CHILD_SA, and the address landing on the XFRM interface — all at the far end
+# of somebody else's network. Measured 2026-07-29 on two lines: tunnels up in
+# 30-60s, and one line churned (interface recreated, SA renegotiated) for
+# roughly two minutes before settling.
+#
+# At the old 15s the container went `unhealthy` after 15 + 3x30 = 105s, i.e.
+# before a perfectly normal startup had finished. Widening this costs nothing
+# when things are fine — `start-period` only defers the *unhealthy* verdict,
+# and the container still reports healthy the moment the first check passes.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
     CMD ["/usr/local/bin/gsm-sip-bridge", "--config", "/etc/gsm-sip-bridge/config.toml", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
