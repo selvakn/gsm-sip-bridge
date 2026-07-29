@@ -83,19 +83,33 @@ pub fn classify_xfrm_dump(dump: &str, ours: &BTreeSet<u32>) -> XfrmReclaim {
 /// Does nothing unless every entry is identifiably ours; see
 /// [`classify_xfrm_dump`].
 pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
-    let dump = |args: &[&str]| {
+    let dump = |args: &[&str]| -> Option<String> {
         runner
             .run(args)
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
     };
-    let combined = format!(
-        "{}\n{}",
+
+    // A query that *failed* is not a query that returned nothing. Treating it
+    // as an empty dump would let half an inventory authorize a flush of both
+    // halves: if `ip xfrm policy` failed while `ip xfrm state` happened to hold
+    // only our own if_ids, the guard below would see `AllOurs` and delete
+    // policies it had never looked at — possibly an unrelated deployment's.
+    // The flush is unfiltered, so it may only ever be authorized by a complete
+    // picture (Greptile P1).
+    let (Some(state), Some(policy)) = (
         dump(&["ip", "xfrm", "state"]),
-        dump(&["ip", "xfrm", "policy"])
-    );
+        dump(&["ip", "xfrm", "policy"]),
+    ) else {
+        eprintln!(
+            "[supervise] could not read the host's XFRM state, so it was left untouched. \
+             If a line then reports its tunnel interface cannot be created (if_id already \
+             claimed), clear the stale entries by hand — see docs/operations.md."
+        );
+        return;
+    };
+    let combined = format!("{state}\n{policy}");
 
     match classify_xfrm_dump(&combined, ours) {
         XfrmReclaim::Empty => {}
@@ -315,6 +329,31 @@ src 2402:8100::1/128 dst ::/0
             .iter()
             .any(|c| c == &["ip", "xfrm", "policy", "flush"]));
         assert!(calls.iter().any(|c| c == &["ip", "xfrm", "state", "flush"]));
+    }
+
+    /// Regression test for Greptile P1: a query that *fails* must not be read
+    /// as "nothing there". Half an inventory could otherwise authorize a flush
+    /// of both halves — the state dump holding only our if_ids while the policy
+    /// dump failed unseen, deleting policies belonging to a deployment we never
+    /// looked at. The flush is unfiltered, so only a complete picture may
+    /// authorize it.
+    #[test]
+    fn reclaim_never_flushes_on_a_half_failed_inventory() {
+        for failed in ["ip xfrm state", "ip xfrm policy"] {
+            let runner = MockCommandRunner::new();
+            // The half that succeeds looks entirely like ours — the tempting case.
+            runner.set_run_output("ip xfrm state", success_output(OURS_ONLY));
+            runner.set_run_output("ip xfrm policy", success_output(OURS_ONLY));
+            runner.set_run_output(failed, failure_output());
+
+            reclaim_stale_xfrm(&runner, &ids(&[23, 24]));
+
+            let calls = runner.run_calls.lock().unwrap();
+            assert!(
+                !calls.iter().any(|c| c.contains(&"flush".to_string())),
+                "`{failed}` failing must veto the flush, not read as an empty dump"
+            );
+        }
     }
 
     #[test]

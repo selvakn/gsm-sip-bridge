@@ -25,7 +25,10 @@ jobs:
             libpcsclite-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Same reasoning, and `stable` is a *branch* — it moves on every
+        # toolchain release. Pinning the action does not pin the toolchain:
+        # it still resolves stable Rust at run time.
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
 
@@ -34,7 +37,12 @@ jobs:
       # what makes the dependency policy and the per-test timeout actually
       # enforced somewhere rather than silently skipped on every machine.
       - name: Install cargo-deny and cargo-nextest
-        uses: taiki-e/install-action@v2
+        # Pinned to a commit, not the movable `v2` tag: this is a third-party
+        # action running with access to the checkout and to the Cargo/PJSIP
+        # caches the later steps persist, so repointing the tag would change
+        # what executes here without any change to this repository
+        # (Greptile P2). Bump deliberately.
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
         with:
           tool: cargo-deny,cargo-nextest
 
