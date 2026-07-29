@@ -364,7 +364,7 @@ RFC 5626 the network treats one registration as a re-registration of the other
 and deactivates the older binding — the same failure documented above for the
 modem's internal IMS stack. `volte-register` refuses to start while a
 `vowifi-ims-agent` is running (override with `--force` only when deliberately
-testing this), and `entrypoint.sh` refuses to start at all if both sections are
+testing this), and `supervise` refuses to start at all if both sections are
 enabled.
 
 ### The P-CSCF usually has to be captured, not discovered
@@ -430,7 +430,8 @@ enabled = true
 bridge_inbound = true
 ```
 
-`entrypoint.sh` then supervises `volte-bridge` in place of `volte-register`.
+`supervise::orchestrate_volte` then supervises `volte-bridge` in place of
+`volte-register`.
 Run it by hand the same way:
 
 ```bash

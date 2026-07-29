@@ -56,7 +56,7 @@ pub const VETH_SIP_PORT: u16 = 5070;
 pub const AGENT_A_STATUS_PORT: u16 = 5071;
 /// Agent B's own local SIP port for its PJSIP endpoint — deliberately NOT
 /// `[sip].local_port`. Both the circuit-switched daemon and Agent B share
-/// one config file and, in the merged deployment (`docker/entrypoint.sh`),
+/// one config file and, in the merged deployment (`supervise::orchestrate`),
 /// one network namespace (host networking) — reusing `[sip].local_port` for
 /// both means two independent `pjsua_create`/transport-bind calls racing for
 /// the same UDP port, which fails outright for whichever one starts second.
@@ -139,7 +139,7 @@ pub(crate) struct RuntimeLine {
 
 /// Reads the `discover` subcommand's line-resolution file and returns every
 /// resolved VoWiFi line. Every deployment — including a single-SIM one —
-/// runs `discover` first (`docker/entrypoint.sh` always does); a missing or
+/// runs `discover` first (`supervise::orchestrate` always does); a missing or
 /// empty line-resolution file is a real startup error, not a signal to fall
 /// back to raw `[vowifi]` config (there is no longer a raw single-line
 /// config to fall back to — see `VowifiConfig`'s per-line-only fields).

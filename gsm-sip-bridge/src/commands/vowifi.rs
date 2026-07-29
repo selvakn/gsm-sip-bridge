@@ -31,7 +31,7 @@ fn load_vowifi_config(cli: &Cli) -> Result<crate::config::AppConfig, ExitCode> {
 /// subcommand's line-resolution file — see
 /// `specs/013-multi-card-vowifi/contracts/agent-topology-contract.md`.
 /// `--line` is required: every line, including a single-SIM setup, is
-/// resolved by `discover` first (`docker/entrypoint.sh` always runs it
+/// resolved by `discover` first (`supervise::orchestrate` always runs it
 /// before starting this agent). Deliberately does NOT re-run discovery
 /// itself: doing so would re-probe modems a sibling
 /// `vowifi-usim-bridge`/other line's agent may already have open
@@ -95,7 +95,7 @@ pub(crate) fn handle_vowifi_status_command(cli: &Cli) -> ExitCode {
 }
 
 /// Deliberately silent (no stdout/stderr on the success path) — callers
-/// (`docker/entrypoint.sh`) only care about the exit code, e.g.
+/// (`supervise::orchestrate`) only care about the exit code, e.g.
 /// `if gsm-sip-bridge --config "$CONFIG" config vowifi-enabled; then ...`.
 /// Unlike `load_vowifi_config`, does NOT require `[vowifi].enabled = true`
 /// — that's exactly the thing being checked, not a precondition.

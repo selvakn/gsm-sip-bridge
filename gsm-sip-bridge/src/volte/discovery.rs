@@ -203,7 +203,7 @@ fn resolve_one_volte_line(
     }
 }
 
-/// The on-disk manifest the running bridge writes so `docker/entrypoint.sh`'s
+/// The on-disk manifest the running bridge writes so `supervise::shutdown`'s
 /// cleanup can tear down every line's PDN (each modem's own displaced context
 /// is restored) and `volte-status` can query every line's loopback ports —
 /// the LTE counterpart to VoWiFi's line-resolution file. Written by the
@@ -267,7 +267,7 @@ pub struct VolteLineManifestEntry {
 /// Default path for the running bridge's line manifest.
 pub use crate::line::manifest::VOLTE_LINES_DEFAULT_PATH as DEFAULT_MANIFEST_PATH;
 /// Env var overriding [`DEFAULT_MANIFEST_PATH`], read by both the writer (the
-/// bridge) and the readers (`volte-status`, `docker/entrypoint.sh`).
+/// bridge) and the readers (`volte-status`, `supervise::orchestrate_volte`).
 pub use crate::line::manifest::VOLTE_LINES_ENV as MANIFEST_PATH_ENV;
 
 /// Resolves the manifest path every reader/writer should use: `MANIFEST_PATH_ENV`

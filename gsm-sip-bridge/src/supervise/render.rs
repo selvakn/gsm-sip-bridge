@@ -128,9 +128,10 @@ pub struct SwanctlEpdgParams<'a> {
 
 /// Renders the per-line ePDG `swanctl.conf` connection block by substituting
 /// into the shared template (`docker/strongswan/swanctl-epdg.conf.template`,
-/// unchanged by this feature — still the single source of the *shape* of an
-/// "ims" connection; this function 1:1-ports the `sed` substitutions
-/// `start_line_strongswan` used to apply to it).
+/// the single source of an ePDG connection's *shape*). The connection and
+/// child are named per line via `@CONN_NAME@`; the template's
+/// `remote { id = ims }` stays literal, being a protocol identity the ePDG
+/// matches to select the IMS APN rather than a name we choose.
 pub fn render_swanctl_epdg(template: &str, params: &SwanctlEpdgParams<'_>) -> String {
     let mut rendered = template
         .replace("@CONN_NAME@", params.conn_name)
@@ -184,10 +185,9 @@ pub fn render_updown_script(netns: &str, tun_iface: &str) -> String {
 
 /// Renders `/etc/reader.conf.d/vpcd`, pcscd's driver config for the shared
 /// vpcd reader every strongswan-engine line's `vowifi-usim-bridge` connects
-/// to (one shared pcscd, N slots from `port`..`port+7` — see
-/// `docker/entrypoint.sh`'s "One shared pcscd for every strongswan-engine
-/// line" section). 1:1 port of the entrypoint's `cat >/etc/reader.conf.d/vpcd`
-/// heredoc.
+/// to: one shared pcscd, N slots from `port`..`port+7`. See
+/// `supervise::vpcd` for the startup and readiness gate around it. 1:1 port
+/// of the entrypoint's `cat >/etc/reader.conf.d/vpcd` heredoc.
 pub fn render_vpcd_reader_conf(port: u16) -> String {
     let port_hex = format!("0x{port:04X}");
     format!(

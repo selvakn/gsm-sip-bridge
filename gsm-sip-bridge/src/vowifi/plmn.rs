@@ -1,6 +1,6 @@
 //! `vowifi-plmn`: prints the home network's MCC and MNC (space-separated,
 //! MNC zero-padded to 3 digits) derived from the SIM, and exits. Used by
-//! `docker/entrypoint.sh` when a line's `mcc`/`mnc` (from `[[vowifi.line]]`,
+//! `supervise::orchestrate` when a line's `mcc`/`mnc` (from `[[vowifi.line]]`,
 //! or auto-discovery) are left unset — the same "ask the binary instead of
 //! hand-parsing AT in bash" precedent as `vowifi-imsi`.
 //!

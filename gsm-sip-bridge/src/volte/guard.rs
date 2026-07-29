@@ -15,7 +15,7 @@
 //!
 //! 1. **Cross-path**: refuse to register over LTE while a VoWiFi agent is
 //!    running. Detected by scanning `/proc` for the agent's command line —
-//!    the same signal `docker/entrypoint.sh` uses (`pkill -f
+//!    the same signal `supervise::orchestrate` uses (`pkill -f
 //!    vowifi-ims-agent`), and unlike Agent A's status port it does not depend
 //!    on veth/netns reachability.
 //! 2. **Same-path**: a lock file so two `volte-register` invocations cannot
@@ -37,7 +37,7 @@ pub const DEFAULT_LOCK_PATH: &str = "/tmp/volte-registration.lock";
 /// Matches on argv *structure*, not on the raw command line containing the
 /// name anywhere. A substring test looks equivalent and is not: a shell
 /// running a script that merely mentions `vowifi-ims-agent` — including
-/// `docker/entrypoint.sh`'s own `pkill -f vowifi-ims-agent` — matches it, and
+/// `supervise::orchestrate`'s own `pkill -f vowifi-ims-agent` — matches it, and
 /// then a perfectly legitimate VoLTE registration is refused for no reason.
 /// That false positive showed up the first time this ran against a real
 /// process list.

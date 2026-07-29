@@ -77,12 +77,14 @@ pub trait TunnelEngine {
     /// Is this line's primary process (charon / the swu dialer) still alive?
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool;
     /// Terminates the current negotiation without restarting the process
-    /// (strongswan: `swanctl --terminate --ike ims`; swu: no-op — no
-    /// in-place terminate exists for this engine).
+    /// (strongswan: `swanctl --terminate --ike <this line's connection>`;
+    /// swu: no-op — no in-place terminate exists for this engine). Scoped to
+    /// one connection: every line's connection lives in one shared charon, so
+    /// a bare `ims` would tear down every line at once.
     fn terminate(&self, runner: &dyn CommandRunner);
     /// (Re)initiates a connection attempt without restarting the process
-    /// (strongswan: `swanctl --initiate --child ims`; swu: no-op, matching
-    /// `terminate`).
+    /// (strongswan: `swanctl --initiate --child <this line's connection>`;
+    /// swu: no-op, matching `terminate`). Scoped for the same reason.
     fn reinitiate(&self, runner: &dyn CommandRunner);
     /// Steady-state-only health beyond process-alive/P-CSCF-change.
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth;

@@ -9,7 +9,7 @@
 //! [`run`] is called from two places:
 //!
 //! - **The `volte-carrier-agent --line N` subcommand** (`main.rs`) — a whole
-//!   OS process, launched by `docker/entrypoint.sh` via `ip netns exec
+//!   OS process, launched by `supervise::orchestrate_volte` via `ip netns exec
 //!   <line's netns>`. This is the production, auto-discovered, isolated
 //!   path (research.md R1/R3): the process inherits its namespace for every
 //!   socket and every `ip`/`sysctl` shell-out `volte::netcfg`/`volte::pdn`
@@ -17,7 +17,7 @@
 //! - **`volte::bridge::run_inner`'s in-process thread**, for the
 //!   single-`--modem` diagnostic invocation only (`volte-bridge --modem
 //!   /dev/ttyUSBx`, run directly by an operator rather than
-//!   `docker/entrypoint.sh`) — no namespace exists to isolate a manual
+//!   `supervise::orchestrate_volte`) — no namespace exists to isolate a manual
 //!   one-off test into, so this keeps today's loopback-joined,
 //!   same-process arrangement. `BridgeLine::veth_carrier_addr`/
 //!   `veth_telephony_addr` are empty for this path, which is what selects

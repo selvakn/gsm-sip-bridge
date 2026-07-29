@@ -1,9 +1,11 @@
 //! Shared pcscd + vpcd reader startup and readiness gate
-//! (specs/021-entrypoint-supervise-rust Phase 4) — 1:1 port of
-//! `docker/entrypoint.sh`'s "One shared pcscd for every strongswan-engine
-//! line" block. One pcscd instance serves every strongswan-engine line's
-//! SIM through one vpcd reader with N slots; each line's
-//! `vowifi-usim-bridge` connects to its own slot's port.
+//! (specs/021-entrypoint-supervise-rust Phase 4), ported from the
+//! one-shared-pcscd block the entrypoint script used to carry. One pcscd
+//! instance serves every strongswan-engine line's SIM through one vpcd reader
+//! with N slots; each line's `vowifi-usim-bridge` connects to its own slot's
+//! port. Driven from `supervise::orchestrate`, which decides whether a vpcd
+//! reader is needed at all — an all-card-reader deployment needs none, since
+//! pcscd picks a physical reader up from USB itself.
 
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use std::path::Path;

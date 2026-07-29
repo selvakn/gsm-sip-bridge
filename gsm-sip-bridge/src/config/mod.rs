@@ -374,7 +374,7 @@ impl Default for AlertsConfig {
 /// alongside the existing circuit-switched GSM-to-SIP bridge. See
 /// `specs/011-vowifi-sip-bridge/plan.md`. Disabled by default: this section
 /// only matters when running one of the `vowifi-ims-agent`/`vowifi-sip-agent`
-/// subcommands (started automatically by `docker/entrypoint.sh` when
+/// subcommands (started automatically by `supervise::orchestrate` when
 /// enabled), not for the normal daemon path.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VowifiConfig {
@@ -438,12 +438,12 @@ pub struct VowifiConfig {
     /// APN used by the `swu` engine's dialer (specs/011-vowifi-sip-bridge).
     pub apn: String,
     /// Network namespace the ePDG tunnel lives in — created by
-    /// `docker/entrypoint.sh`, used by both engines. Derived per line, not a
+    /// `supervise::epdg_iface`, used by both engines. Derived per line, not a
     /// `[vowifi]` TOML key.
     pub netns: String,
     /// Shared override forcing every line's ePDG FQDN, bypassing the
     /// per-line 3GPP-standard derivation from that line's own `mcc`/`mnc`
-    /// (which `docker/entrypoint.sh` performs itself). Empty (the default)
+    /// (which `supervise::orchestrate` performs itself). Empty (the default)
     /// leaves that per-line derivation alone.
     pub epdg_fqdn: String,
     /// Skip DNS resolution and dial this ePDG IP directly. `None` (the

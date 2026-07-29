@@ -173,7 +173,7 @@ pub enum Commands {
     /// modem, bounded by `[volte].max_lines`, shaped by `[[volte.line]]`) and
     /// writes it as the line manifest (specs/020-volte-line-netns) — the LTE
     /// counterpart to `discover`. Run once, up front, by
-    /// `docker/entrypoint.sh` before any per-line namespace or process
+    /// `supervise::orchestrate_volte` before any per-line namespace or process
     /// exists: `volte-carrier-agent --line N` and `volte-bridge` (auto-
     /// discovered mode) both read the manifest this writes rather than
     /// re-scanning (research.md R7's "discover once" principle).
@@ -181,7 +181,7 @@ pub enum Commands {
     /// The per-line carrier-facing half (specs/020-volte-line-netns) —
     /// attaches this line's IMS PDN, registers over it, and answers calls
     /// until the registration ends. The LTE counterpart to
-    /// `vowifi-ims-agent --line N`: launched by `docker/entrypoint.sh` inside
+    /// `vowifi-ims-agent --line N`: launched by `supervise::orchestrate_volte` inside
     /// this line's own network namespace (`ip netns exec`), one process per
     /// line, reading its settings from the manifest `volte-discover-lines`
     /// wrote. Long-running, but does not retry internally on failure —
@@ -209,7 +209,7 @@ pub enum Commands {
     /// Runs the shared USB modem scan once, assigns each recognized modem to
     /// the circuit-switched or VoWiFi subsystem, resolves the VoWiFi line
     /// table (specs/013-multi-card-vowifi), and writes the result so both
-    /// the circuit-switched daemon and `docker/entrypoint.sh` can act on it
+    /// the circuit-switched daemon and `supervise::orchestrate` can act on it
     /// without each re-scanning independently (which would otherwise race —
     /// see `specs/013-multi-card-vowifi/research.md` item 3).
     Discover(DiscoverArgs),
@@ -602,8 +602,10 @@ pub struct VolteBridgeArgs {
 #[derive(Parser, Debug)]
 pub struct VolteDiscoverLinesArgs {
     /// Also print shell-sourceable `KEY=value`/indexed-array output to
-    /// stdout, for `docker/entrypoint.sh` to `eval` — mirrors `discover
-    /// --shell-env`.
+    /// stdout — mirrors `discover --shell-env`. A diagnostic aid now rather
+    /// than an internal contract: the shell that used to `eval` this is gone,
+    /// since orchestration and the healthcheck are both subcommands that read
+    /// the resolved line table directly.
     #[arg(long)]
     pub shell_env: bool,
     /// Same meaning as `volte-bridge`'s own `--restore-cid-path`: the base
@@ -830,7 +832,8 @@ pub struct DiscoverArgs {
     pub out: Option<PathBuf>,
 
     /// Also print shell-sourceable `KEY=value`/indexed-array output to
-    /// stdout, for `docker/entrypoint.sh` to `eval`.
+    /// stdout. A diagnostic aid now rather than an internal contract — see
+    /// `discover --shell-env`.
     #[arg(long)]
     pub shell_env: bool,
 

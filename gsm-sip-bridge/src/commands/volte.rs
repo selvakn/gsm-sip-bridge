@@ -793,7 +793,7 @@ pub(crate) fn handle_volte_bridge_command(
     // this reads it back rather than re-scanning (research.md R7's "discover
     // once" principle) and runs Agent B only — each line's carrier half is
     // its own `volte-carrier-agent` process, started separately by
-    // `docker/entrypoint.sh` inside that line's namespace.
+    // `supervise::orchestrate_volte` inside that line's namespace.
     let (lines, spawn_carrier_threads) = match &args.modem {
         Some(modem) => (volte_bridge_single_line(args, modem), true),
         None => (
@@ -940,7 +940,7 @@ pub(crate) fn volte_bridge_manifest_lines(
 
 /// Resolves the auto-discovered VoLTE line table and writes it as the
 /// manifest — the LTE counterpart to `discover` (specs/020-volte-line-netns).
-/// Run once, up front, by `docker/entrypoint.sh` before any per-line
+/// Run once, up front, by `supervise::orchestrate_volte` before any per-line
 /// namespace or process exists.
 pub(crate) fn handle_volte_discover_lines_command(
     args: &crate::cli::VolteDiscoverLinesArgs,
@@ -983,7 +983,7 @@ pub(crate) fn handle_volte_discover_lines_command(
         return ExitCode::FAILURE;
     }
 
-    // stderr, not stdout: `docker/entrypoint.sh` captures this command's
+    // stderr, not stdout: `supervise::orchestrate_volte` captures this command's
     // stdout wholesale into `eval` when `--shell-env` is set (mirroring
     // `discover`'s own contract) — any other stdout output gets `eval`'d
     // right alongside the KEY=value lines and breaks the shell (found live:
@@ -1001,7 +1001,7 @@ pub(crate) fn handle_volte_discover_lines_command(
     ExitCode::SUCCESS
 }
 
-/// Bash indexed-array output for `docker/entrypoint.sh`'s VoLTE per-line
+/// Bash indexed-array output for `supervise::orchestrate_volte`'s VoLTE per-line
 /// loop to `eval` — mirrors `render_discover_shell_env`'s array convention
 /// exactly (`LINE_CARD_ID=(...)`, indexed by position, not per-index scalar
 /// variables) so both subsystems' entrypoint loops read the same shape.

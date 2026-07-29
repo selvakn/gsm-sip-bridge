@@ -351,7 +351,7 @@ fn resolve_one_pcsc_line(
 }
 
 /// The serialized artifact `gsm-sip-bridge discover` writes so the
-/// circuit-switched daemon and `docker/entrypoint.sh` agree on the same
+/// circuit-switched daemon and `supervise::orchestrate` agree on the same
 /// role assignment/line table without each re-scanning independently
 /// (research.md item 3, `contracts/discover-cli-contract.md`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

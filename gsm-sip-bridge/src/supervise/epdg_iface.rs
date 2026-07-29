@@ -1,7 +1,15 @@
 //! Per-line ePDG namespace/XFRM-interface setup (specs/021-entrypoint-supervise-rust
-//! Phase 4) — 1:1 port of `docker/entrypoint.sh`'s `ensure_epdg_interface`.
-//! Idempotent: safe to call again on every line-supervisor restart, exactly
-//! like the bash original.
+//! Phase 4) — originally a 1:1 port of `docker/entrypoint.sh`'s
+//! `ensure_epdg_interface`. Idempotent: safe to call again on every
+//! line-supervisor restart, exactly like the bash original.
+//!
+//! It has since grown two things the bash never had, both because a line's
+//! XFRM `if_id` can stay claimed by a *previous* container run:
+//! [`reclaim_stale_xfrm`], which releases those claims at startup when it can
+//! prove every claim is ours, and a return value from
+//! [`ensure_epdg_interface`] saying whether the interface actually ended up
+//! present — without which a recreation that could never succeed retried
+//! silently forever.
 
 use super::runner::CommandRunner;
 use std::collections::BTreeSet;
