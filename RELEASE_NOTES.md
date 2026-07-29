@@ -1,10 +1,24 @@
 # Release Notes
 
-## Unreleased
+## v8.1.0
 
 Repository maintenance, one structural fix, and a run of VoWiFi fixes found
 by getting two lines up simultaneously for the first time. CLI help text and
 every `*-shell-env` output were verified byte-identical across the refactors.
+
+### Upgrading — one config change needs action
+
+**If you set `pcscf_source_path` by hand, update it.** `[vowifi]`'s value is
+now a *base* with the line index appended, so a config still saying
+`/tmp/pcscf` produces `/tmp/pcscf-0`, `/tmp/pcscf-1`, ... and the literal
+`/tmp/pcscf` is never written again. `[volte].pcscf_source_path` must
+therefore name one specific line — it defaults to `/tmp/pcscf-0`. Both VoLTE
+failure paths now say so explicitly rather than reporting a bare "no P-CSCF
+available", so a stale setting diagnoses itself.
+
+Deployments that never set either key need no edit. Nothing else requires
+one: the per-line charon assets and the healthcheck start period below both
+change under the container, not in your config.
 
 ### Multi-line VoWiFi now actually works
 
@@ -249,6 +263,10 @@ numbers now register with their carriers and answer inbound calls.
   `temp_store`, `null_alsa_device`) along with the 25 `mod common;`
   declarations that existed only to satisfy them, and the vestigial no-op
   `make test-bash` target.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:8.1.0
+```
 
 ## v8.0.0
 
