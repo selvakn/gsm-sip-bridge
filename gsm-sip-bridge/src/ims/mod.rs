@@ -435,15 +435,31 @@ const MODEM_OPEN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// Opens the modem's serial port, waiting out a transient exclusive-open
 /// conflict with `vowifi-usim-bridge`.
 ///
-/// `serialport` opens exclusively, and the usim bridge holds this same port for
-/// as long as charon keeps the virtual card powered on — EAP-AKA at tunnel
-/// establishment, and again at every rekey. Agent A needs it for the whole IMS
-/// session. So the two genuinely contend, and which one wins is a matter of
-/// timing.
+/// `serialport` opens exclusively, so only one of the two can hold the port at
+/// a time — but neither holds it for long, which is why waiting is the whole
+/// fix and nothing more elaborate is warranted:
 ///
-/// Losing used to fail the agent outright, whereupon the supervisor restarted
-/// it five seconds later: the entire IMS session torn down and rebuilt over a
-/// conflict that clears on its own in seconds. Observed live as
+/// - the usim bridge opens it lazily on vpcd Power On and **drops it on Power
+///   Off** (`SessionState::Unpowered` owns no `AtCommander`), so charon has it
+///   only across an EAP-AKA exchange;
+/// - this transport is a local of `register_session` and is **not** stored in
+///   `RegisteredSession`, so it is dropped when the REGISTER exchange returns —
+///   seconds, once per registration refresh, not for the session's lifetime.
+///
+/// Verified on a live two-line deployment: with both lines registered and
+/// stable, nothing at all held `/dev/ttyUSB0`. So the contention is a brief,
+/// occasional overlap and a bounded wait resolves it completely.
+///
+/// This matters because it rules out the tempting redesign of routing IMS-AKA
+/// through pcscd's vpcd slot the way charon does. There is no long-lived hold
+/// to eliminate, and sharing one virtual card between charon's EAP and this
+/// registration would introduce genuinely concurrent access to card state
+/// (selected AID), requiring every SELECT+AUTHENTICATE to become transactional
+/// — real risk in the one path that must work, for no gain.
+///
+/// Losing the race used to fail the agent outright, whereupon the supervisor
+/// restarted it five seconds later: the entire IMS session torn down and
+/// rebuilt over a conflict that clears on its own in seconds. Observed live as
 /// `failed to open serial /dev/ttyUSB0: Unable to acquire exclusive lock`,
 /// crash-looping until it happened to win a race.
 ///

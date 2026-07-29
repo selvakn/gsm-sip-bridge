@@ -48,6 +48,16 @@ numbers now register with their carriers and answer inbound calls.
   nothing like its cause: charon simply omits `PCSCF4`/`PCSCF6` from its
   `CPRQ`, no carrier ever returns a P-CSCF, and every line establishes a good
   tunnel then tears it down for lacking one — about every 30s, forever.
+- **Agent A waits for a busy modem serial instead of failing.** A modem line's
+  serial has two legitimate claimants — the usim bridge (while charon has the
+  virtual card powered on for EAP-AKA) and the IMS-AKA registration — and
+  `serialport` opens exclusively. Losing the race failed the agent outright and
+  the supervisor rebuilt the whole IMS session five seconds later, over a
+  conflict that clears in seconds. Neither side holds the port for long: the
+  bridge drops it on Power Off, and the registration transport is dropped when
+  the REGISTER exchange returns, so a bounded wait resolves it. (Verified on a
+  live two-line deployment: with both lines registered, nothing held the port
+  at all.)
 - **Agent B retries a control-channel bind instead of giving up.** The veth it
   binds to only exists once that line's tunnel is up, so `EADDRNOTAVAIL` is a
   normal startup condition — but the bind was one-shot, permanently dropping
