@@ -13,7 +13,7 @@
 //! modules: `line_supervisor`, `sim_recovery`, `epdg_iface`, `vpcd`, `render`)
 //! keep taking a plain `&dyn CommandRunner`, unchanged.
 
-use super::engines::{StrongswanEngine, SwuEngine};
+use super::engines::{SharedCharon, StrongswanEngine, SwuEngine};
 use super::line_supervisor::{self, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner, RealCommandRunner};
 use super::shutdown::{self, StartedState};
@@ -58,15 +58,29 @@ fn gsm_sip_bridge_bin() -> String {
         .unwrap_or_else(|_| "/usr/local/bin/gsm-sip-bridge".to_string())
 }
 
+/// Assets of the **one** charon daemon shared by every strongswan-engine line.
+///
+/// These were per line (`/etc/strongswan-line-N.conf`, `/tmp/charon-N.log`,
+/// `/var/run/charon-N.vici`, `/etc/swanctl/conf.d-N/`) back when each line ran
+/// its own daemon — an arrangement that silently broke every line but one,
+/// because N charons in one netns all wildcard-bind UDP 500/4500 and only one
+/// of them receives. See [`SharedCharon`] for the full account.
+const SHARED_STRONGSWAN_CONF: &str = "/etc/strongswan-shared.conf";
+const SHARED_SWANCTL_CONF: &str = "/etc/swanctl/swanctl.conf";
+const SHARED_SWANCTL_CONF_DIR: &str = "/etc/swanctl/conf.d";
+const SHARED_CHARON_LOG: &str = "/tmp/charon.log";
+const SHARED_VICI_SOCKET: &str = "/var/run/charon.vici";
+
 /// The context every per-line startup step needs, threaded as one value.
 ///
-/// These seven were previously spelled out on each of the four
+/// These were previously spelled out on each of the four
 /// `start_vowifi_line*` / `start_line_tail` signatures, all of which carried
 /// `#[allow(clippy::too_many_arguments)]` to say so. Bundling them separates
 /// what is *ambient* (the runner, the binary and config paths, the shared
-/// started-state and shutdown gate, the alert sink) from what actually varies
-/// per call (which line, which PLMN, which namespace) — the latter is what a
-/// reader needs to see at a call site, and it was buried among the former.
+/// started-state and shutdown gate, the alert sink, the shared charon) from
+/// what actually varies per call (which line, which PLMN, which namespace) —
+/// the latter is what a reader needs to see at a call site, and it was buried
+/// among the former.
 struct LineStartup<'a> {
     runner: &'a Arc<dyn CommandRunner>,
     bin: &'a str,
@@ -75,6 +89,8 @@ struct LineStartup<'a> {
     started: &'a Arc<Mutex<StartedState>>,
     shutting_down: &'a Arc<RwLock<bool>>,
     alert_ctx: Option<&'a AlertContext>,
+    /// The charon daemon every strongswan-engine line shares.
+    shared_charon: &'a Arc<SharedCharon>,
 }
 
 /// Entry point for `gsm-sip-bridge supervise`.
@@ -330,6 +346,33 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 }
             }
 
+            // Render the shared charon's assets once, before any line starts.
+            // Every line then drops its own connection file into the shared
+            // conf.d and loads the union.
+            let shared_charon = Arc::new(SharedCharon::new(
+                SHARED_STRONGSWAN_CONF.to_string(),
+                SHARED_SWANCTL_CONF.to_string(),
+                PathBuf::from(SHARED_CHARON_LOG),
+            ));
+            let _ = runner.write_file(
+                Path::new(SHARED_STRONGSWAN_CONF),
+                &super::render::render_strongswan_conf(SHARED_VICI_SOCKET, SHARED_CHARON_LOG),
+            );
+            let _ = runner.run(&["mkdir", "-p", SHARED_SWANCTL_CONF_DIR]);
+            // Drop any connection file left by a previous run of this
+            // container: `docker restart` keeps the filesystem, and a stale
+            // `epdg-N.conf` for a line that no longer exists would be loaded
+            // right back in by the directory-wide `--load-all`.
+            let _ = runner.run(&[
+                "sh",
+                "-c",
+                &format!("rm -f {SHARED_SWANCTL_CONF_DIR}/*.conf"),
+            ]);
+            let _ = runner.write_file(
+                Path::new(SHARED_SWANCTL_CONF),
+                &super::render::render_swanctl_top_conf(SHARED_SWANCTL_CONF_DIR),
+            );
+
             for line in &vowifi_lines {
                 let runner = Arc::clone(&runner);
                 let bin = bin.clone();
@@ -339,6 +382,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 let config = config.clone();
                 let line = line.clone();
                 let alert_ctx = alert_ctx.clone();
+                let shared_charon = Arc::clone(&shared_charon);
                 std::thread::spawn(move || {
                     start_vowifi_line(
                         &LineStartup {
@@ -349,6 +393,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                             started: &started,
                             shutting_down: &shutting_down,
                             alert_ctx: alert_ctx.as_ref(),
+                            shared_charon: &shared_charon,
                         },
                         &line,
                     );
@@ -614,8 +659,12 @@ fn start_vowifi_line_strongswan(
     let netns = line.netns.clone();
     let tun_iface = line.strongswan_tun_iface.clone();
     let if_id = line.strongswan_if_id.to_string();
-    let charon_log = PathBuf::from(format!("/tmp/charon-{idx}.log"));
-    let vici_socket = format!("/var/run/charon-{idx}.vici");
+    // This line's swanctl connection and child name. Unique per line because
+    // every line's connection is loaded into one shared charon: a shared name
+    // would make `--initiate --child` fire every line and `--terminate --ike`
+    // tear every line down, and would make the shared log's `<name|N>` prefix
+    // impossible to attribute.
+    let conn_name = format!("ims{idx}");
 
     let Some(epdg_ip) = resolve_epdg_ip(
         runner.as_ref(),
@@ -638,18 +687,9 @@ fn start_vowifi_line_strongswan(
         return;
     };
 
-    // Render strongswan.conf / swanctl.conf(s) — 1:1 with `gsm-sip-bridge render`.
-    let strongswan_conf_path = format!("/etc/strongswan-line-{idx}.conf");
-    let strongswan_conf =
-        super::render::render_strongswan_conf(idx, &vici_socket, &charon_log.to_string_lossy());
-    let _ = runner.write_file(Path::new(&strongswan_conf_path), &strongswan_conf);
-
-    let swanctl_conf_dir = format!("/etc/swanctl/conf.d-{idx}");
-    let _ = runner.run(&["mkdir", "-p", &swanctl_conf_dir]);
-    let swanctl_top_conf_path = format!("/etc/swanctl-line-{idx}.conf");
-    let swanctl_top_conf = super::render::render_swanctl_top_conf(&swanctl_conf_dir);
-    let _ = runner.write_file(Path::new(&swanctl_top_conf_path), &swanctl_top_conf);
-
+    // No per-line strongswan.conf / swanctl top conf any more: both belong to
+    // the shared daemon and are rendered once in `run`. This line contributes
+    // only its own connection file, below.
     let updown_path = format!("/etc/strongswan.d/ims-updown-{idx}.sh");
     let updown_script = super::render::render_updown_script(&netns, &tun_iface);
     let _ = runner.write_file(Path::new(&updown_path), &updown_script);
@@ -660,6 +700,7 @@ fn start_vowifi_line_strongswan(
         .unwrap_or_default();
     let src_addr = config.vowifi.src_addr.clone();
     let params = super::render::SwanctlEpdgParams {
+        conn_name: &conn_name,
         imsi: &imsi,
         mcc,
         mnc,
@@ -670,7 +711,7 @@ fn start_vowifi_line_strongswan(
     };
     let swanctl_epdg = super::render::render_swanctl_epdg(&epdg_template, &params);
     let _ = runner.write_file(
-        Path::new(&format!("{swanctl_conf_dir}/epdg.conf")),
+        Path::new(&format!("{SHARED_SWANCTL_CONF_DIR}/epdg-{idx}.conf")),
         &swanctl_epdg,
     );
 
@@ -741,16 +782,12 @@ fn start_vowifi_line_strongswan(
 
     let engine = StrongswanEngine {
         idx,
-        strongswan_conf: strongswan_conf_path,
-        swanctl_top_conf: swanctl_top_conf_path,
-        charon_log: charon_log.clone(),
+        conn_name: conn_name.clone(),
         netns: netns.clone(),
         tun_iface: tun_iface.clone(),
         if_id: if_id.clone(),
-        charon_handle: RefCell::new(None),
+        shared: Arc::clone(ctx.shared_charon),
     };
-    let _ = runner.write_file(&charon_log, "");
-    let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
         // recovery/steady-state covered restarts, but this line's very
@@ -765,43 +802,34 @@ fn start_vowifi_line_strongswan(
             println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
             return;
         }
-        match runner.spawn(
-            ChildSpec::new([
-                "env",
-                &format!("STRONGSWAN_CONF={}", engine.strongswan_conf),
-                "/usr/libexec/ipsec/charon",
-            ])
-            .capture_stdout_to(charon_log.clone()),
-        ) {
-            Ok(h) => {
-                let h = Arc::new(h);
-                *engine.charon_handle.borrow_mut() = Some(h.clone());
-                started.lock().unwrap().vowifi_child_handles.push(h);
-            }
-            Err(e) => {
-                eprintln!("[supervise] line {idx}: FATAL: failed to spawn charon: {e}");
-                return;
-            }
+        // Idempotent across lines: whichever line reaches this first spawns
+        // the daemon and is handed the handle to register for shutdown; every
+        // other line finds it already running and gets `None` back, so the
+        // daemon is registered exactly once rather than once per line.
+        if let Some(h) = ctx.shared_charon.ensure_started(runner.as_ref()) {
+            started.lock().unwrap().vowifi_child_handles.push(h);
         }
     }
 
-    runner.sleep(Duration::from_secs(2));
-    let env = format!("STRONGSWAN_CONF={}", engine.strongswan_conf);
-    let _ = runner.run(&[
-        "env",
-        &env,
-        "swanctl",
-        "--load-all",
-        "--file",
-        &engine.swanctl_top_conf,
-    ]);
+    if !ctx.shared_charon.is_alive(runner.as_ref()) {
+        eprintln!(
+            "[supervise] line {idx}: FATAL: shared charon is not running; skipping this line"
+        );
+        return;
+    }
+
+    // Load the union of every line's connection file, then initiate only this
+    // line's child. Ordering between concurrently-starting lines is safe: each
+    // line loads *after* writing its own file, so its own connection is always
+    // present, and a directory-wide load can never evict another line's.
+    ctx.shared_charon.load_all(runner.as_ref());
     let _ = runner.spawn_detached(ChildSpec::new([
         "env",
-        &env,
+        &format!("STRONGSWAN_CONF={SHARED_STRONGSWAN_CONF}"),
         "swanctl",
         "--initiate",
         "--child",
-        "ims",
+        &conn_name,
     ]));
 
     println!("[supervise] line {idx}: waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ...");
@@ -861,12 +889,19 @@ fn start_vowifi_line_strongswan(
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
             line_supervisor::SteadyOutcome::Recovered { reason } => {
-                if let Some(new_handle) = engine.charon_handle.borrow().clone() {
-                    started
-                        .lock()
-                        .unwrap()
+                if let Some(new_handle) = engine.shared.current_handle() {
+                    let mut st = started.lock().unwrap();
+                    // Dedupe by identity: most recoveries are connection-
+                    // scoped and leave the daemon untouched, so without this
+                    // every line would re-push the same handle on every
+                    // recovery tick and grow the shutdown list forever.
+                    if !st
                         .vowifi_child_handles
-                        .push(new_handle);
+                        .iter()
+                        .any(|h| Arc::ptr_eq(h, &new_handle))
+                    {
+                        st.vowifi_child_handles.push(new_handle);
+                    }
                 }
                 drop(guard);
                 if line_supervisor::recovery_restarts_agent(reason) {
@@ -1241,6 +1276,14 @@ mod tests {
     use crate::config::VowifiConfig;
     use crate::supervise::runner::MockCommandRunner;
 
+    fn test_shared_charon() -> Arc<SharedCharon> {
+        Arc::new(SharedCharon::new(
+            SHARED_STRONGSWAN_CONF.to_string(),
+            SHARED_SWANCTL_CONF.to_string(),
+            PathBuf::from(SHARED_CHARON_LOG),
+        ))
+    }
+
     fn test_config() -> AppConfig {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1347,6 +1390,7 @@ mod tests {
         let line = pcsc_line(0);
         let started = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down = Arc::new(RwLock::new(false));
+        let shared_charon = test_shared_charon();
 
         start_vowifi_line(
             &LineStartup {
@@ -1357,6 +1401,7 @@ mod tests {
                 started: &started,
                 shutting_down: &shutting_down,
                 alert_ctx: None,
+                shared_charon: &shared_charon,
             },
             &line,
         );
@@ -1387,6 +1432,7 @@ mod tests {
         let line = pcsc_line(0);
         let started = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down = Arc::new(RwLock::new(false));
+        let shared_charon = test_shared_charon();
 
         start_vowifi_line_strongswan(
             &LineStartup {
@@ -1397,6 +1443,7 @@ mod tests {
                 started: &started,
                 shutting_down: &shutting_down,
                 alert_ctx: None,
+                shared_charon: &shared_charon,
             },
             &line,
             &line.mcc.clone(),
@@ -1431,6 +1478,7 @@ mod tests {
         let modem = modem_line(0, &modem_port);
         let started2 = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down2 = Arc::new(RwLock::new(false));
+        let shared_charon2 = test_shared_charon();
         start_vowifi_line_strongswan(
             &LineStartup {
                 runner: &runner2,
@@ -1440,6 +1488,7 @@ mod tests {
                 started: &started2,
                 shutting_down: &shutting_down2,
                 alert_ctx: None,
+                shared_charon: &shared_charon2,
             },
             &modem,
             &modem.mcc.clone(),

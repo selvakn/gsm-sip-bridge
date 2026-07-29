@@ -12,13 +12,28 @@
 //! dropped directive shows up as a failing snapshot diff in `cargo test`,
 //! before any image is built (spec FR-002/FR-003).
 
-/// Renders this line's `strongswan.conf`: its own vici socket and filelog
-/// path, so this line's charon instance never shares a vici socket or log
-/// file with any other line's. 1:1 port of
-/// `docker/lib/render_helpers.sh`'s `render_line_strongswan_conf` — see that
-/// file for the full rationale (why no `charon.pidfile` directive, why the
-/// `swanctl { socket = ... }` block is required).
-pub fn render_strongswan_conf(idx: u32, vici_socket: &str, charon_log: &str) -> String {
+/// Renders the **one shared** `strongswan.conf`: the single vici socket and
+/// filelog path used by the single charon daemon that serves every line.
+///
+/// This used to be rendered per line, each with its own vici socket and log,
+/// because each line ran its own charon process. That was the bug: charon's
+/// socket-default plugin binds the IKE ports with `SO_REUSEADDR` only (never
+/// `SO_REUSEPORT`), so N charon processes in one network namespace all
+/// wildcard-bind `0.0.0.0:500`/`0.0.0.0:4500` and exactly **one** of them
+/// receives every reply. Whichever process the kernel picked won the whole
+/// port; the others retransmitted into the void and gave up, which presented
+/// as the carrier reporting a perfectly good line as "switched off".
+///
+/// Observed live 2026-07-29: on one boot line 0 established and line 1 timed
+/// out; on the very next restart of the same image the two swapped. The
+/// coin-flip across restarts is what identified this as a local collision
+/// rather than anything carrier-side.
+///
+/// Per-line isolation does not depend on per-line *processes* — it comes from
+/// each connection's own XFRM `if_id` and its pre-created `tunN` interface
+/// inside that line's netns, both of which the kernel keys on independently of
+/// which daemon negotiated the SA. See `SharedCharon` in `supervise::engines`.
+pub fn render_strongswan_conf(vici_socket: &str, charon_log: &str) -> String {
     let lines: [String; 22] = [
         "charon {".to_string(),
         "    plugins {".to_string(),
@@ -28,7 +43,7 @@ pub fn render_strongswan_conf(idx: u32, vici_socket: &str, charon_log: &str) -> 
         "        }".to_string(),
         "    }".to_string(),
         "    filelog {".to_string(),
-        format!("        line{idx} {{"),
+        "        shared {".to_string(),
         format!("            path = {charon_log}"),
         "            default = 1".to_string(),
         "            ike = 1".to_string(),
@@ -48,12 +63,15 @@ pub fn render_strongswan_conf(idx: u32, vici_socket: &str, charon_log: &str) -> 
     rendered
 }
 
-/// Renders this line's swanctl top-level conf, pointing at this line's own
-/// `conf.d-{idx}` directory (never the shared `/etc/swanctl/conf.d/`) so
-/// `swanctl --load-all --file <this>` only ever loads this line's "ims"
-/// connection into this line's charon. 1:1 port of
-/// `render_line_swanctl_conf` minus the `mkdir -p` side effect (the caller
-/// creates `conf_dir` via `CommandRunner`, keeping this function pure).
+/// Renders the swanctl top-level conf: `include <conf_dir>/*.conf`.
+///
+/// Now points at the **shared** `/etc/swanctl/conf.d/`, into which each line
+/// writes its own `epdg-{idx}.conf`. This must stay a directory glob covering
+/// every line rather than one file per line: `swanctl --load-all` *unloads*
+/// any connection absent from what it just read, so a per-line file would make
+/// each line's load evict the previously-loaded lines. Loading the union
+/// instead is idempotent and order-independent, which matters because lines
+/// start concurrently on their own threads.
 pub fn render_swanctl_top_conf(conf_dir: &str) -> String {
     format!("include {conf_dir}/*.conf\n")
 }
@@ -62,6 +80,13 @@ pub fn render_swanctl_top_conf(conf_dir: &str) -> String {
 /// connection block. Mirrors `start_line_strongswan`'s local variables plus
 /// the `@SRC_ADDR@` sed-substitution branch.
 pub struct SwanctlEpdgParams<'a> {
+    /// This line's swanctl connection *and* child name (`ims0`, `ims1`, ...).
+    /// Must be unique per line: every line's connection is loaded into one
+    /// shared charon, so a shared name would make `--initiate --child` and
+    /// `--terminate --ike` hit every line at once and would make the shared
+    /// charon log's `<name|N>` prefix ambiguous. Distinct from the template's
+    /// literal `remote { id = ims }`, which is a protocol identity.
+    pub conn_name: &'a str,
     pub imsi: &'a str,
     pub mcc: &'a str,
     pub mnc: &'a str,
@@ -81,6 +106,7 @@ pub struct SwanctlEpdgParams<'a> {
 /// `start_line_strongswan` used to apply to it).
 pub fn render_swanctl_epdg(template: &str, params: &SwanctlEpdgParams<'_>) -> String {
     let mut rendered = template
+        .replace("@CONN_NAME@", params.conn_name)
         .replace("@IMSI@", params.imsi)
         .replace("@MCC@", params.mcc)
         .replace("@MNC@", params.mnc)
@@ -150,19 +176,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strongswan_conf_line_0() {
+    fn strongswan_conf_shared() {
         insta::assert_snapshot!(render_strongswan_conf(
-            0,
-            "/var/run/charon-0.vici",
-            "/tmp/charon-0.log"
+            "/var/run/charon.vici",
+            "/tmp/charon.log"
         ));
     }
 
     #[test]
-    fn strongswan_conf_line_1_has_its_own_socket_and_log_never_line_0s() {
-        let rendered = render_strongswan_conf(1, "/var/run/charon-1.vici", "/tmp/charon-1.log");
-        insta::assert_snapshot!(rendered);
-        assert!(!rendered.contains("charon-0"));
+    fn strongswan_conf_enables_ike_name_so_the_shared_log_can_be_attributed() {
+        // Load-bearing now that every line writes into one charon log:
+        // `ike_name = yes` is what emits the `<conn|id>` prefix that
+        // `engines::lines_for_conn` filters on to tell one line's events from
+        // another's. Drop it and every line reads every other line's
+        // establishment and P-CSCF events as its own.
+        let rendered = render_strongswan_conf("/var/run/charon.vici", "/tmp/charon.log");
+        assert!(rendered.contains("ike_name = yes"));
     }
 
     #[test]
@@ -172,26 +201,29 @@ mod tests {
         // real fix is `rm -f /var/run/charon.pid` before each launch, done
         // by the caller, not this function. Asserting its absence here
         // guards against someone "helpfully" adding it back.
-        let rendered = render_strongswan_conf(0, "/var/run/charon-0.vici", "/tmp/charon-0.log");
+        let rendered = render_strongswan_conf("/var/run/charon.vici", "/tmp/charon.log");
         assert!(!rendered.contains("pidfile"));
     }
 
     #[test]
-    fn swanctl_top_conf_points_at_this_lines_own_conf_dir() {
-        insta::assert_snapshot!(render_swanctl_top_conf("/etc/swanctl/conf.d-2"));
+    fn swanctl_top_conf_points_at_the_shared_conf_dir() {
+        insta::assert_snapshot!(render_swanctl_top_conf("/etc/swanctl/conf.d"));
     }
 
     const EPDG_TEMPLATE: &str = "\
 connections {
-    ims {
+    @CONN_NAME@ {
         local_addrs = @SRC_ADDR@
         remote_addrs = @EPDG_IP@
         local {
             auth = eap-aka
             id = 0@IMSI@@realm.mnc@MNC@.mcc@MCC@.3gppnetwork.org
         }
+        remote {
+            id = ims
+        }
         children {
-            ims {
+            @CONN_NAME@ {
                 if_id_in = @IF_ID@
                 if_id_out = @IF_ID@
                 updown = @UPDOWN@
@@ -202,8 +234,42 @@ connections {
 ";
 
     #[test]
+    fn swanctl_epdg_names_the_connection_per_line_but_leaves_the_remote_id_literal() {
+        // Two different things are spelled "ims" in this template. The
+        // connection/child name must become unique per line (one shared charon
+        // holds every line's connection), while `remote { id = ims }` is a
+        // protocol identity the ePDG matches to select the IMS APN and must
+        // stay literal — substituting it would break APN selection.
+        let params = SwanctlEpdgParams {
+            conn_name: "ims1",
+            imsi: "404101234567890",
+            mcc: "404",
+            mnc: "10",
+            epdg_ip: "10.1.2.3",
+            if_id: "24",
+            updown_script: "/etc/strongswan.d/ims-updown-1.sh",
+            src_addr: None,
+        };
+        let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
+        assert!(
+            rendered.contains("    ims1 {"),
+            "connection must be renamed"
+        );
+        assert!(
+            rendered.contains("            ims1 {"),
+            "child must be renamed too, so --initiate --child targets one line"
+        );
+        assert!(
+            rendered.contains("id = ims\n"),
+            "the remote protocol identity must stay literal `ims`"
+        );
+        assert!(!rendered.contains("@CONN_NAME@"));
+    }
+
+    #[test]
     fn swanctl_epdg_with_src_addr_keeps_the_local_addrs_line() {
         let params = SwanctlEpdgParams {
+            conn_name: "ims0",
             imsi: "404101234567890",
             mcc: "404",
             mnc: "10",
@@ -234,6 +300,7 @@ before
 after
 ";
         let params = SwanctlEpdgParams {
+            conn_name: "ims0",
             imsi: "1",
             mcc: "1",
             mnc: "1",
@@ -254,6 +321,7 @@ after
         // current script's `sed -e "/local_addrs.*@SRC_ADDR@/d"` branch —
         // not left with a dangling `@SRC_ADDR@` or an empty value.
         let params = SwanctlEpdgParams {
+            conn_name: "ims0",
             imsi: "404101234567890",
             mcc: "404",
             mnc: "10",

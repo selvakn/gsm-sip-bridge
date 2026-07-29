@@ -1,18 +1,18 @@
 ---
 source: gsm-sip-bridge/src/supervise/render.rs
-assertion_line: 147
-expression: rendered
+assertion_line: 180
+expression: "render_strongswan_conf(\"/var/run/charon.vici\", \"/tmp/charon.log\")"
 ---
 charon {
     plugins {
         include /etc/strongswan.d/charon/*.conf
         vici {
-            socket = unix:///var/run/charon-1.vici
+            socket = unix:///var/run/charon.vici
         }
     }
     filelog {
-        line1 {
-            path = /tmp/charon-1.log
+        shared {
+            path = /tmp/charon.log
             default = 1
             ike = 1
             cfg = 1
@@ -24,6 +24,6 @@ charon {
     }
 }
 swanctl {
-    socket = unix:///var/run/charon-1.vici
+    socket = unix:///var/run/charon.vici
 }
 include /etc/strongswan.d/charon-extra.conf

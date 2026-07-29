@@ -2,6 +2,16 @@
 # (specs/012-strongswan-epdg). Rendered by docker/entrypoint.sh's
 # `strongswan` branch into /etc/swanctl/conf.d/epdg.conf, substituting:
 #
+#   @CONN_NAME@  - this line's swanctl connection AND child name (`ims0`,
+#                  `ims1`, ...). MUST be unique per line: since
+#                  specs/024-shared-charon every line's connection is loaded
+#                  into ONE shared charon, so two lines both naming their
+#                  connection `ims` would collide — `--initiate --child ims`
+#                  would fire both, `--terminate --ike ims` would tear down
+#                  both, and the shared charon log's `<ims|N>` prefixes could
+#                  no longer be attributed to a line. Note this is NOT the
+#                  `remote { id = ims }` below, which is a protocol identity
+#                  the ePDG matches to select the IMS APN and stays literal.
 #   @IMSI@       - read via `gsm-sip-bridge vowifi-imsi` (or the IMSI env
 #                  override), used to build the EAP-AKA NAI identity
 #   @MCC@ @MNC@  - 3-digit-padded, from the MCC/MNC env vars — configured
@@ -41,7 +51,7 @@
 # the piece that lets rekeys/reconnects swap SAs without ever deleting the
 # namespace or interface (FR-005).
 connections {
-    ims {
+    @CONN_NAME@ {
         local_addrs  = @SRC_ADDR@
         remote_addrs = @EPDG_IP@
 
@@ -61,7 +71,7 @@ connections {
             id = ims
         }
         children {
-            ims {
+            @CONN_NAME@ {
                 remote_ts = 0.0.0.0/0, ::/0
                 updown = @UPDOWN@
 
@@ -115,5 +125,26 @@ connections {
         # Dead-peer-detection cadence (FR-004's "detect a dead peer / broken
         # path" — the reliability primitive Option 1 never had at all).
         dpd_delay = 30s
+
+        # MOBIKE off. charon defaults it on, and on a multi-homed host it
+        # promptly sends an INFORMATIONAL carrying ADD_4_ADDR/ADD_6_ADDR for
+        # every other local address. Vodafone India's ePDG advertises
+        # `N(MOBIKE_SUP)` in its IKE_AUTH response and then never answers
+        # that informational — so charon retransmits five times, concludes
+        # the peer is dead, and tears down a **completely healthy tunnel**.
+        #
+        # Observed live 2026-07-29 on the 404/043 line: IKE_SA established
+        # 03:21:55, INFORMATIONAL request 8 [N(ADD_4_ADDR) N(ADD_6_ADDR)
+        # N(ADD_4_ADDR) N(ADD_4_ADDR)] sent 03:22:00, five retransmits, then
+        # "giving up after 5 retransmits" at 03:24:45 and the virtual IP
+        # removed from the XFRM interface. The carrier reported the number
+        # as "switched off" from that moment; the re-initiate that follows
+        # gets no IKE_SA_INIT response either, so the line stays down.
+        #
+        # Nothing here needs MOBIKE: it exists so a *client* can survive its
+        # own address changing (a handset moving between networks). This is
+        # a bridge on a fixed host, so the feature is pure downside — it can
+        # only ever kill a working tunnel.
+        mobike = no
     }
 }

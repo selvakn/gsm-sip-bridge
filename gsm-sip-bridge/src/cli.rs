@@ -249,10 +249,9 @@ pub struct RenderArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RenderAsset {
-    /// This line's strongswan.conf (own vici socket + filelog path).
+    /// The shared strongswan.conf (one vici socket + filelog path for the one
+    /// charon daemon serving every line).
     StrongswanConf {
-        #[arg(long)]
-        line: u32,
         #[arg(long)]
         vici_socket: String,
         #[arg(long)]
@@ -269,6 +268,10 @@ pub enum RenderAsset {
     SwanctlEpdg {
         #[arg(long)]
         template_path: PathBuf,
+        /// This line's connection/child name (`ims0`, `ims1`, ...) — unique
+        /// per line, since every line loads into one shared charon.
+        #[arg(long)]
+        conn_name: String,
         #[arg(long)]
         imsi: String,
         #[arg(long)]

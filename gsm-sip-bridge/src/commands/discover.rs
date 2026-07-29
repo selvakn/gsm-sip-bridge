@@ -98,13 +98,13 @@ pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
 
     let rendered = match &args.asset {
         RenderAsset::StrongswanConf {
-            line,
             vici_socket,
             charon_log,
-        } => render::render_strongswan_conf(*line, vici_socket, charon_log),
+        } => render::render_strongswan_conf(vici_socket, charon_log),
         RenderAsset::SwanctlTopConf { conf_dir } => render::render_swanctl_top_conf(conf_dir),
         RenderAsset::SwanctlEpdg {
             template_path,
+            conn_name,
             imsi,
             mcc,
             mnc,
@@ -121,6 +121,7 @@ pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
                 }
             };
             let params = render::SwanctlEpdgParams {
+                conn_name,
                 imsi,
                 mcc,
                 mnc,
