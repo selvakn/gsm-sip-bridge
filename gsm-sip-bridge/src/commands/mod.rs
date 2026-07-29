@@ -70,5 +70,6 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
             crate::supervise::orchestrate::run(path)
         }
         Commands::Healthcheck => healthcheck::run(cli),
+        Commands::TcpProbe { host, port } => healthcheck::run_tcp_probe(host, *port),
     }
 }

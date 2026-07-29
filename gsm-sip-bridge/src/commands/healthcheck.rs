@@ -125,12 +125,34 @@ pub fn check_line(
     if addr.is_empty() {
         return None;
     }
-    if !runner.tcp_connect_ok(addr, PCSCF_SIP_PORT) {
+    // Probed from inside this line's namespace, never the default one. The
+    // P-CSCF sits at the far end of this line's ePDG tunnel and has no route
+    // to it outside `netns`, so a default-namespace probe reports every
+    // healthy line as unreachable — which is precisely what this container's
+    // HEALTHCHECK did, marking working deployments unhealthy while both lines
+    // were registered and carrying calls.
+    if !runner.tcp_connect_ok_in_netns(&line.netns, addr, PCSCF_SIP_PORT) {
         return Some(LineFault::PcscfUnreachable {
             addr: addr.to_string(),
         });
     }
     None
+}
+
+/// `gsm-sip-bridge tcp-probe <host> <port>` — exit 0 iff the connect succeeds.
+///
+/// Exists so [`CommandRunner::tcp_connect_ok_in_netns`] can perform a probe
+/// inside a network namespace by re-executing this binary under
+/// `ip netns exec`, rather than calling `setns` and introducing the only
+/// `unsafe` block in the application binary.
+pub fn run_tcp_probe(host: &str, port: u16) -> ExitCode {
+    let runner = RealCommandRunner::new();
+    if runner.tcp_connect_ok(host, port) {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("tcp-probe: {host}:{port} unreachable");
+        ExitCode::FAILURE
+    }
 }
 
 /// The full probe, given an already-loaded resolution.
@@ -327,7 +349,7 @@ mod tests {
         let runner = MockCommandRunner::new();
         with_addressed_iface(&runner, "ims0", "ipsec-0");
         runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok("10.11.12.13", 5060, true);
+        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
 
         let health = evaluate(
             &runner,
@@ -394,12 +416,12 @@ mod tests {
         with_addressed_iface(&runner, "ims0", "ipsec-0");
         with_addressed_iface(&runner, "ims2", "ipsec-2");
         runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok("10.11.12.13", 5060, false);
+        runner.set_tcp_connect_ok_in_netns("ims2", "10.11.12.13", 5060, false);
 
         let mut l0 = line(0);
         l0.pcscf_source_path = "/tmp/pcscf-0".to_string();
         runner.set_file(std::path::Path::new("/tmp/pcscf-0"), "10.0.0.1\n");
-        runner.set_tcp_connect_ok("10.0.0.1", 5060, true);
+        runner.set_tcp_connect_ok_in_netns("ims0", "10.0.0.1", 5060, true);
 
         let health = evaluate(
             &runner,
@@ -425,6 +447,90 @@ mod tests {
                     }
                 ),
             ])
+        );
+    }
+
+    /// Regression test for a live-found bug: the P-CSCF was probed from the
+    /// *default* namespace. It only has a route inside this line's own ePDG
+    /// tunnel namespace, so the probe could never succeed — every genuinely
+    /// healthy deployment reported unhealthy, while both lines were registered
+    /// with their carriers and able to carry calls.
+    ///
+    /// Seeding *only* the default-namespace probe must therefore leave the
+    /// line faulted: if this test passes with `Healthy`, the probe has
+    /// regressed to the wrong namespace.
+    #[test]
+    fn the_pcscf_is_probed_inside_the_lines_namespace_not_the_default_one() {
+        let runner = MockCommandRunner::new();
+        with_addressed_iface(&runner, "ims0", "ipsec-0");
+        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
+        // Reachable from the default namespace, and *only* from there.
+        runner.set_tcp_connect_ok("10.11.12.13", 5060, true);
+
+        let health = evaluate(
+            &runner,
+            true,
+            true,
+            &resolution(vec![line(0)]),
+            "strongswan",
+        );
+
+        assert_eq!(
+            health,
+            Health::LinesUnhealthy(vec![(
+                0,
+                LineFault::PcscfUnreachable {
+                    addr: "10.11.12.13".to_string()
+                }
+            )]),
+            "a default-namespace probe must not satisfy this check"
+        );
+
+        // ...and seeding it inside the line's namespace does.
+        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
+        assert_eq!(
+            evaluate(
+                &runner,
+                true,
+                true,
+                &resolution(vec![line(0)]),
+                "strongswan"
+            ),
+            Health::Healthy
+        );
+    }
+
+    /// Each line is probed in its *own* namespace: one line's reachable P-CSCF
+    /// must never vouch for another's, which sharing a namespace argument (or
+    /// dropping it) would silently allow.
+    #[test]
+    fn one_lines_reachable_pcscf_does_not_vouch_for_another_line() {
+        let runner = MockCommandRunner::new();
+        with_addressed_iface(&runner, "ims0", "ipsec-0");
+        with_addressed_iface(&runner, "ims1", "ipsec-1");
+
+        let mut l0 = line(0);
+        l0.pcscf_source_path = "/tmp/pcscf-0".to_string();
+        let mut l1 = line(1);
+        l1.pcscf_source_path = "/tmp/pcscf-1".to_string();
+        // Both lines happen to have been assigned the same P-CSCF address by
+        // their carriers — plausible, and the case where an unscoped probe is
+        // most obviously wrong.
+        runner.set_file(std::path::Path::new("/tmp/pcscf-0"), "10.11.12.13\n");
+        runner.set_file(std::path::Path::new("/tmp/pcscf-1"), "10.11.12.13\n");
+        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
+        // ims1 deliberately unseeded -> unreachable through line 1's tunnel.
+
+        let health = evaluate(&runner, true, true, &resolution(vec![l0, l1]), "strongswan");
+
+        assert_eq!(
+            health,
+            Health::LinesUnhealthy(vec![(
+                1,
+                LineFault::PcscfUnreachable {
+                    addr: "10.11.12.13".to_string()
+                }
+            )])
         );
     }
 

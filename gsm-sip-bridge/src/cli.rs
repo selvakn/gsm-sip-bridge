@@ -239,6 +239,17 @@ pub enum Commands {
     /// Replaces `docker/healthcheck.sh` — the last orchestration left in bash
     /// after specs/021 moved the rest into `supervise`.
     Healthcheck,
+
+    /// Exit 0 iff a TCP connection to `host:port` can be established.
+    ///
+    /// Internal plumbing, not meant to be run by hand: `healthcheck` probes
+    /// each line's P-CSCF, which is reachable only inside that line's ePDG
+    /// tunnel namespace, by re-executing this binary under `ip netns exec`.
+    /// Entering a namespace in-process would need `setns` — the only `unsafe`
+    /// in this binary — so it re-execs instead, the same way orchestration
+    /// already places the IMS agents in their namespaces.
+    #[command(hide = true)]
+    TcpProbe { host: String, port: u16 },
 }
 
 #[derive(Parser, Debug)]

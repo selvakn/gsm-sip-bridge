@@ -239,6 +239,15 @@ pub trait CommandRunner: Send + Sync {
     /// and tunnel keepalive decision logic stay testable without a real
     /// socket.
     fn tcp_connect_ok(&self, host: &str, port: u16) -> bool;
+
+    /// The same probe, performed **from inside `netns`**.
+    ///
+    /// A line's P-CSCF is reachable only through that line's own ePDG tunnel,
+    /// which lives in that line's network namespace. Probing it from the
+    /// default namespace therefore fails no matter how healthy the line is —
+    /// not hypothetically: it made the container's `HEALTHCHECK` report every
+    /// genuinely working deployment as unhealthy.
+    fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool;
 }
 
 /// Production implementation: real `std::process::Command`/`Child`, real
@@ -443,6 +452,22 @@ impl CommandRunner for RealCommandRunner {
             return false;
         };
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+    }
+
+    fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
+        // Entering another network namespace in-process needs `setns`, which
+        // would be the only `unsafe` in this binary (see tools/count-unsafe.sh).
+        // Re-executing this same binary under `ip netns exec` gets there with
+        // no unsafe and no extra runtime dependency — the same approach
+        // orchestration already uses to put each IMS agent in its namespace,
+        // and the reason `tcp-probe` exists as a subcommand.
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let port = port.to_string();
+        self.run_in_netns(netns, &[&exe.to_string_lossy(), "tcp-probe", host, &port])
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -867,6 +892,18 @@ mod mock {
                 .insert(format!("{host}:{port}"), ok);
         }
 
+        /// Seeds a probe made *from inside* `netns`. Deliberately a separate
+        /// key space from [`set_tcp_connect_ok`]: a test that seeds only the
+        /// default-namespace probe must not accidentally satisfy a
+        /// netns-scoped one, since confusing the two is the exact bug this
+        /// distinction exists to catch.
+        pub fn set_tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16, ok: bool) {
+            self.tcp_connect_results
+                .lock()
+                .unwrap()
+                .insert(format!("netns:{netns}:{host}:{port}"), ok);
+        }
+
         pub fn kill_child(&self, handle: &ChildHandle, exit_code: i32) {
             if let Some(c) = self.children.lock().unwrap().get_mut(&handle.0) {
                 c.alive = false;
@@ -1062,6 +1099,15 @@ mod mock {
                 .lock()
                 .unwrap()
                 .get(&format!("{host}:{port}"))
+                .copied()
+                .unwrap_or(false)
+        }
+
+        fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
+            self.tcp_connect_results
+                .lock()
+                .unwrap()
+                .get(&format!("netns:{netns}:{host}:{port}"))
                 .copied()
                 .unwrap_or(false)
         }
