@@ -58,6 +58,25 @@ fn gsm_sip_bridge_bin() -> String {
         .unwrap_or_else(|_| "/usr/local/bin/gsm-sip-bridge".to_string())
 }
 
+/// The context every per-line startup step needs, threaded as one value.
+///
+/// These seven were previously spelled out on each of the four
+/// `start_vowifi_line*` / `start_line_tail` signatures, all of which carried
+/// `#[allow(clippy::too_many_arguments)]` to say so. Bundling them separates
+/// what is *ambient* (the runner, the binary and config paths, the shared
+/// started-state and shutdown gate, the alert sink) from what actually varies
+/// per call (which line, which PLMN, which namespace) — the latter is what a
+/// reader needs to see at a call site, and it was buried among the former.
+struct LineStartup<'a> {
+    runner: &'a Arc<dyn CommandRunner>,
+    bin: &'a str,
+    config_path: &'a str,
+    config: &'a AppConfig,
+    started: &'a Arc<Mutex<StartedState>>,
+    shutting_down: &'a Arc<RwLock<bool>>,
+    alert_ctx: Option<&'a AlertContext>,
+}
+
 /// Entry point for `gsm-sip-bridge supervise`.
 pub fn run(config_path: &Path) -> std::process::ExitCode {
     use std::process::ExitCode;
@@ -322,14 +341,16 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 let alert_ctx = alert_ctx.clone();
                 std::thread::spawn(move || {
                     start_vowifi_line(
-                        &runner,
-                        &bin,
-                        &cfg,
-                        &config,
+                        &LineStartup {
+                            runner: &runner,
+                            bin: &bin,
+                            config_path: &cfg,
+                            config: &config,
+                            started: &started,
+                            shutting_down: &shutting_down,
+                            alert_ctx: alert_ctx.as_ref(),
+                        },
                         &line,
-                        &started,
-                        &shutting_down,
-                        alert_ctx.as_ref(),
                     );
                 });
             }
@@ -532,17 +553,11 @@ fn check_pcsc_engine_compatibility(
 /// One VoWiFi line's full startup — 1:1 port of `start_line_strongswan`/
 /// `start_line_swu`'s shared prelude (modem presence, IMS mode reconcile,
 /// mcc/mnc derivation), then dispatches to the engine-specific rest.
-#[allow(clippy::too_many_arguments)]
-fn start_vowifi_line(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
-    line: &LineResolutionEntry,
-    started: &Arc<Mutex<StartedState>>,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
-) {
+fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
+    let runner = ctx.runner;
+    let bin = ctx.bin;
+    let config_path = ctx.config_path;
+    let config = ctx.config;
     let idx = line.index;
     let modem = line.modem_port.clone();
     if line.pcsc_reader {
@@ -576,47 +591,24 @@ fn start_vowifi_line(
     };
 
     if config.vowifi.tunnel_engine == "strongswan" {
-        start_vowifi_line_strongswan(
-            runner,
-            bin,
-            config_path,
-            config,
-            line,
-            &mcc,
-            &mnc,
-            started,
-            shutting_down,
-            alert_ctx,
-        );
+        start_vowifi_line_strongswan(ctx, line, &mcc, &mnc);
     } else {
-        start_vowifi_line_swu(
-            runner,
-            bin,
-            config_path,
-            config,
-            line,
-            &mcc,
-            &mnc,
-            started,
-            shutting_down,
-            alert_ctx,
-        );
+        start_vowifi_line_swu(ctx, line, &mcc, &mnc);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_vowifi_line_strongswan(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
+    ctx: &LineStartup,
     line: &LineResolutionEntry,
     mcc: &str,
     mnc: &str,
-    started: &Arc<Mutex<StartedState>>,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
 ) {
+    let runner = ctx.runner;
+    let bin = ctx.bin;
+    let config_path = ctx.config_path;
+    let config = ctx.config;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
     let idx = line.index;
     let modem = line.modem_port.clone();
     let netns = line.netns.clone();
@@ -834,19 +826,7 @@ fn start_vowifi_line_strongswan(
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
-    start_line_tail(
-        runner,
-        bin,
-        config_path,
-        idx,
-        &netns,
-        line,
-        &usim_holder,
-        started,
-        pcscf.clone(),
-        shutting_down,
-        alert_ctx,
-    );
+    start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
@@ -903,20 +883,20 @@ fn start_vowifi_line_strongswan(
 /// `start_line_tail` and its keepalive sibling. Both supervision loops run
 /// on their own background threads and this function returns immediately,
 /// matching the bash original backgrounding both with `&`.
-#[allow(clippy::too_many_arguments)]
 fn start_line_tail(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
+    ctx: &LineStartup,
     idx: u32,
     netns: &str,
     line: &LineResolutionEntry,
     usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
-    started: &Arc<Mutex<StartedState>>,
     initial_pcscf: String,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
 ) {
+    let runner = ctx.runner;
+    let bin = ctx.bin;
+    let config_path = ctx.config_path;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
+    let alert_ctx = ctx.alert_ctx;
     let veth_sip = line.config.veth_sip_iface.clone();
     let veth_ims = line.config.veth_ims_iface.clone();
     let veth_sip_addr = format!("{}/30", line.veth_peer_addr);
@@ -1101,19 +1081,11 @@ fn start_line_tail(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_vowifi_line_swu(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
-    line: &LineResolutionEntry,
-    mcc: &str,
-    mnc: &str,
-    started: &Arc<Mutex<StartedState>>,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
-) {
+fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &str, mnc: &str) {
+    let runner = ctx.runner;
+    let config = ctx.config;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
     let idx = line.index;
     let modem = line.modem_port.clone();
     let netns = line.netns.clone();
@@ -1183,19 +1155,7 @@ fn start_vowifi_line_swu(
     started.lock().unwrap().started_netns.push(netns.clone());
 
     let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
-    start_line_tail(
-        runner,
-        bin,
-        config_path,
-        idx,
-        &netns,
-        line,
-        &usim_holder,
-        started,
-        pcscf.clone(),
-        shutting_down,
-        alert_ctx,
-    );
+    start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     let mut current_pcscf = pcscf;
     loop {
@@ -1389,14 +1349,16 @@ mod tests {
         let shutting_down = Arc::new(RwLock::new(false));
 
         start_vowifi_line(
-            &runner,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+            &LineStartup {
+                runner: &runner,
+                bin: "gsm-sip-bridge",
+                config_path: "/tmp/cfg.toml",
+                config: &config,
+                started: &started,
+                shutting_down: &shutting_down,
+                alert_ctx: None,
+            },
             &line,
-            &started,
-            &shutting_down,
-            None,
         );
 
         assert!(
@@ -1427,16 +1389,18 @@ mod tests {
         let shutting_down = Arc::new(RwLock::new(false));
 
         start_vowifi_line_strongswan(
-            &runner,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+            &LineStartup {
+                runner: &runner,
+                bin: "gsm-sip-bridge",
+                config_path: "/tmp/cfg.toml",
+                config: &config,
+                started: &started,
+                shutting_down: &shutting_down,
+                alert_ctx: None,
+            },
             &line,
             &line.mcc.clone(),
             &line.mnc.clone(),
-            &started,
-            &shutting_down,
-            None,
         );
         assert!(
             !spawned_argv_containing(&mock, "vowifi-usim-bridge"),
@@ -1468,16 +1432,18 @@ mod tests {
         let started2 = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down2 = Arc::new(RwLock::new(false));
         start_vowifi_line_strongswan(
-            &runner2,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+            &LineStartup {
+                runner: &runner2,
+                bin: "gsm-sip-bridge",
+                config_path: "/tmp/cfg.toml",
+                config: &config,
+                started: &started2,
+                shutting_down: &shutting_down2,
+                alert_ctx: None,
+            },
             &modem,
             &modem.mcc.clone(),
             &modem.mnc.clone(),
-            &started2,
-            &shutting_down2,
-            None,
         );
         assert!(
             wait_until(Duration::from_millis(500), || spawned_argv_containing(
