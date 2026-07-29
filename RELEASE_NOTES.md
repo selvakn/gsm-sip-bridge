@@ -2,8 +2,83 @@
 
 ## Unreleased
 
-Repository maintenance and one structural fix. CLI help text and every
-`*-shell-env` output were verified byte-identical across the refactors.
+Repository maintenance, one structural fix, and a run of VoWiFi fixes found
+by getting two lines up simultaneously for the first time. CLI help text and
+every `*-shell-env` output were verified byte-identical across the refactors.
+
+### Multi-line VoWiFi now actually works
+
+Two lines had never both established at once before, and four separate
+defects were hiding behind that. All were found on real hardware (an EC200
+with a Vodafone SIM plus an OmniKey PC/SC reader with a second), and both
+numbers now register with their carriers and answer inbound calls.
+
+- **Breaking (operational): one shared charon serves every line.** Each line
+  used to spawn its own. charon's socket-default plugin sets `SO_REUSEADDR`
+  but never `SO_REUSEPORT`, so N daemons in one network namespace all
+  wildcard-bind `0.0.0.0:500`/`:4500` and exactly **one** receives every
+  reply; the losers retransmit into the void and give up, which the carrier
+  reports to callers as the line being *"switched off"*. Demonstrated rather
+  than deduced: on one boot line 0 established and line 1 timed out, and on
+  the very next restart of the same image the two swapped.
+
+  Per-line isolation never depended on per-line processes — a CHILD_SA is
+  bound to its line by the `if_id` in its own connection block and by the
+  pre-created `tunN` XFRM interface in that line's netns, and the kernel keys
+  SA lookup on `if_id` regardless of which daemon installed it. Connections
+  are now named per line (`ims0`, `ims1`, ...); the template's
+  `remote { id = ims }` stays literal, since that is a protocol identity the
+  ePDG matches to select the IMS APN. Recovery stays scoped: the daemon is
+  restarted only when genuinely dead (atomically, so two lines noticing the
+  same death cannot restart it twice), and every other fault is repaired per
+  connection, leaving other lines' tunnels up. Rendered assets move from
+  `/etc/strongswan-line-N.conf`, `/tmp/charon-N.log`, `/var/run/charon-N.vici`
+  and `/etc/swanctl/conf.d-N/` to single shared paths plus one connection file
+  per line in `/etc/swanctl/conf.d/`.
+- **MOBIKE is off.** charon defaults it on and, on a multi-homed host,
+  promptly sends an INFORMATIONAL carrying `ADD_4_ADDR`/`ADD_6_ADDR`.
+  Vodafone India's ePDG advertises `MOBIKE_SUP` and then never answers it, so
+  charon retransmits five times, concludes the peer is dead, and tears down a
+  completely healthy tunnel (observed: established 03:21:55, gone 03:24:45).
+  MOBIKE exists so a *client* can survive its own address changing; a bridge
+  on a fixed host can only ever lose by it.
+- **The P-CSCF plugin config is generated, not shipped fixed.** The osmocom
+  fork's plugin keys its `enable` block by *connection name*, so naming
+  connections per line silently disabled it everywhere. The failure looks
+  nothing like its cause: charon simply omits `PCSCF4`/`PCSCF6` from its
+  `CPRQ`, no carrier ever returns a P-CSCF, and every line establishes a good
+  tunnel then tears it down for lacking one — about every 30s, forever.
+- **Agent B retries a control-channel bind instead of giving up.** The veth it
+  binds to only exists once that line's tunnel is up, so `EADDRNOTAVAIL` is a
+  normal startup condition — but the bind was one-shot, permanently dropping
+  whichever line was slower, with a single already-scrolled-past ERROR to say
+  so. Lines come up in whatever order their carriers answer, so which line was
+  lost varied run to run.
+- **Breaking: `[vowifi].pcscf_source_path` is a base, not a file.** The line
+  index is appended (`/tmp/pcscf-0`, `/tmp/pcscf-1`, ...). Each line's
+  supervisor writes its own tunnel-assigned P-CSCF there and each line's Agent
+  A reads it back, so one shared file had concurrently establishing lines
+  overwriting each other — the loser registered against the *other* carrier's
+  proxy, unreachable from its own netns, and crash-looped. Observed live
+  holding an address belonging to neither line.
+
+  `[volte].pcscf_source_path` consequently defaults to `/tmp/pcscf-0`, naming
+  one VoWiFi line explicitly: with several lines there is no single "the"
+  address to borrow. **If you set either key by hand, update it** — a config
+  still saying `/tmp/pcscf` will now find nothing, and both VoLTE failure
+  paths say so explicitly rather than reporting a bare "no P-CSCF available".
+- **Fixed: the container's `HEALTHCHECK` called working deployments
+  unhealthy.** A line's P-CSCF is reachable only inside that line's ePDG
+  tunnel namespace, and the probe ran in the default namespace, so it could
+  never succeed. This was a regression in the bash-to-Rust port above: the
+  original ran the probe under `ip netns exec`, and the port kept the
+  namespace for the interface-address check directly above it while dropping
+  it here. Entering a namespace in-process would need `setns` — the only
+  `unsafe` this binary would contain — so the probe re-executes the binary
+  under `ip netns exec` via a hidden `tcp-probe` subcommand, adding no
+  runtime dependency.
+
+### Maintenance
 
 - **The `CommandRunner` handle-lifecycle bug class is now a compile error.**
   The same defect shipped seven times across the supervision loops; none was
