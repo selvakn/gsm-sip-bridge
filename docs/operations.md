@@ -236,6 +236,61 @@ Since v6.2.0 the entrypoint reconciles this automatically on boot
 it was wrong. If it fails, check the modem supports `AT+QCFG="ims"` at all —
 `ims_conf=1` with `volte_cap=1` is the state that causes this.
 
+### VoWiFi: a line re-establishes its tunnel every ~30 seconds
+
+Symptom: one line never stays up. Its supervisor logs
+`tunN missing from netns imsN; recreating and forcing reinitiate` on every
+steady-state tick, `swanctl --list-sas` shows the IKE_SA repeatedly
+ESTABLISHED with a fresh CHILD_SA, and the charon log alternates
+`installing <addr> on tunN` / `removing <addr> from tunN`. The line's Agent A
+fails with `Network unreachable` reaching its P-CSCF, because the tunnel
+interface it should route over is not there.
+
+Cause: the line's XFRM `if_id` is still claimed by leftover kernel state from
+an **earlier container run**, so the interface cannot be recreated. The
+supervisor detects it missing, recreates it, fails, and tears down a
+perfectly healthy CHILD_SA to retry — forever.
+
+This is confusing to confirm because everything visible says the if_id is
+free: `/var/run/netns` is empty, no `gsm-sip-bridge`/`charon` process
+survives, and no interface of that name exists in any namespace you can
+enumerate. The kernel still refuses it:
+
+```
+$ ip link add tun23-1 type xfrm if_id 24
+RTNETLINK answers: File exists
+```
+
+Confirm by checking whether *other* if_ids are free — if a nearby unused one
+works, the name is not the problem, the if_id is:
+
+```
+$ ip link add probe type xfrm if_id 99 && ip link del probe   # succeeds
+```
+
+Then look for the leftovers, all of which outlive the container:
+
+```
+$ ip xfrm policy | grep -c '^src'      # ours carry if_id 0x17, 0x18, ...
+$ ip xfrm state  | grep -c '^src'
+$ ip link show | grep veth-sip         # leaked default-netns veth ends
+```
+
+Fix — **stop the container first**, since this removes live tunnel state:
+
+```
+$ docker stop <container>
+$ ip xfrm policy flush && ip xfrm state flush
+$ ip link del veth-sip0; ip link del veth-sip1     # any that remain
+$ docker start <container>
+```
+
+`flush` is unconditional: run it only when you know nothing else on the host
+uses IPsec. There is no way to delete selectively by if_id — iproute2 rejects
+`ip xfrm policy deleteall if_id N`. The bridge does not do this automatically
+for the same reason; it reports the failure and this remedy instead. A host
+reboot clears the state too.
+
 ### VoWiFi: "no smart card reader" / vpcd connection refused
 
 Symptom: charon logs `SCardListReaders: Cannot find a smart card reader`

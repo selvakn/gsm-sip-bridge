@@ -67,6 +67,18 @@ numbers now register with their carriers and answer inbound calls.
   address to borrow. **If you set either key by hand, update it** — a config
   still saying `/tmp/pcscf` will now find nothing, and both VoLTE failure
   paths say so explicitly rather than reporting a bare "no P-CSCF available".
+- **Fixed: a line could re-establish its tunnel every ~30s, forever.** The
+  line's XFRM `if_id` stays claimed by leftover kernel state from an earlier
+  container run — XFRM policies/states and leaked default-namespace veth ends
+  that all outlive the container — so its tunnel interface cannot be
+  recreated. The supervisor detected it missing, recreated it, failed, and
+  tore down a healthy CHILD_SA to retry. Every step of the interface setup
+  discarded its result, so nothing said why; the kernel had been answering
+  `RTNETLINK answers: File exists` for a name that existed nowhere. The
+  outcome is now checked and reported, with the remedy, and
+  `docs/operations.md` documents the cleanup. Deliberately not automatic:
+  flushing XFRM state would destroy an unrelated IPsec deployment sharing the
+  host, and iproute2 offers no way to delete selectively by if_id.
 - **Fixed: the container's `HEALTHCHECK` called working deployments
   unhealthy.** A line's P-CSCF is reachable only inside that line's ePDG
   tunnel namespace, and the probe ran in the default namespace, so it could
@@ -77,6 +89,13 @@ numbers now register with their carriers and answer inbound calls.
   `unsafe` this binary would contain — so the probe re-executes the binary
   under `ip netns exec` via a hidden `tcp-probe` subcommand, adding no
   runtime dependency.
+
+- **The healthcheck's start period is 180s, not 15s.** A line is healthy only
+  once its ePDG tunnel is up and has been assigned a P-CSCF, which is carrier
+  round-trips, not process startup: measured 30-60s to establish, with one
+  line churning ~2min before settling. The old 15s declared the container
+  unhealthy at 105s, mid-startup. This only became visible once the probe
+  above started reporting true state.
 
 ### Maintenance
 
