@@ -702,7 +702,13 @@ fn start_vowifi_line_strongswan(
         return;
     };
 
-    epdg_iface::ensure_epdg_interface(runner.as_ref(), &netns, &tun_iface, &if_id);
+    if !epdg_iface::ensure_epdg_interface(runner.as_ref(), &netns, &tun_iface, &if_id) {
+        eprintln!(
+            "[supervise] line {idx}: {tun_iface} is still absent from netns {netns} after \
+             setup; this line's tunnel cannot carry traffic and its supervisor will keep \
+             retrying (see the error above for why the interface could not be created)"
+        );
+    }
     started.lock().unwrap().started_netns.push(netns.clone());
 
     let Some(imsi) = resolve_imsi(runner.as_ref(), bin, line) else {

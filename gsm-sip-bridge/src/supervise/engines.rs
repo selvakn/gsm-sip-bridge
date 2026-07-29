@@ -395,7 +395,21 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn recreate_interface(&self, runner: &dyn CommandRunner) {
-        super::epdg_iface::ensure_epdg_interface(runner, &self.netns, &self.tun_iface, &self.if_id);
+        if !super::epdg_iface::ensure_epdg_interface(
+            runner,
+            &self.netns,
+            &self.tun_iface,
+            &self.if_id,
+        ) {
+            // Without this the loop is silent and endless: steady-state sees a
+            // missing interface every 30s, calls this, and tears down a
+            // healthy CHILD_SA to retry a recreation that cannot succeed.
+            println!(
+                "[supervise] line {}: {} could not be recreated in netns {}; this line will \
+                 keep retrying every steady-state tick until the cause above is cleared",
+                self.idx, self.tun_iface, self.netns
+            );
+        }
     }
 }
 

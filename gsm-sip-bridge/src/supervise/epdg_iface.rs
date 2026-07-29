@@ -9,12 +9,16 @@ use super::runner::CommandRunner;
 /// `tun_iface` (if_id `if_id`) exist, pinned per line since
 /// specs/013-multi-card-vowifi replicates this recipe once per line rather
 /// than sharing one namespace/interface across lines.
+/// Returns whether `tun_iface` is actually present in `netns` when this
+/// returns. Callers must report `false` rather than carrying on silently: the
+/// recovery loop's whole job is to recreate a missing interface, and a
+/// recreation that cannot succeed makes it spin forever.
 pub fn ensure_epdg_interface(
     runner: &dyn CommandRunner,
     netns: &str,
     tun_iface: &str,
     if_id: &str,
-) {
+) -> bool {
     let netns_marker = format!("/var/run/netns/{netns}");
     let netns_exists = runner
         .run(&["test", "-e", &netns_marker])
@@ -40,9 +44,31 @@ pub fn ensure_epdg_interface(
             // get moved — absorb rather than fail (idempotent startup).
             let _ = runner.run(&["ip", "link", "set", tun_iface, "netns", netns]);
         } else {
-            let _ = runner.run(&[
+            // Report this failure rather than discarding it. An `if_id` can
+            // stay claimed by leftover state from a *previous* container run —
+            // XFRM state/policy and interfaces in namespaces that outlive the
+            // container — and the kernel then answers `RTNETLINK answers: File
+            // exists` for an interface name that exists nowhere. Swallowing
+            // that left the steady-state loop detecting a missing interface,
+            // "recreating" it, finding it missing again, and tearing down a
+            // perfectly good CHILD_SA to retry — every 30s, forever, with
+            // nothing in the log saying why. Diagnosed live 2026-07-29 only by
+            // replaying this exact command by hand.
+            match runner.run(&[
                 "ip", "link", "add", tun_iface, "type", "xfrm", "if_id", if_id,
-            ]);
+            ]) {
+                Ok(out) if !out.status.success() => eprintln!(
+                    "[supervise] could not create {tun_iface} (xfrm if_id {if_id}): {}. \
+                     An if_id still claimed by a previous run does this even when no \
+                     interface of that name exists anywhere; with no tunnel running, \
+                     `ip xfrm state flush && ip xfrm policy flush` on the host releases it.",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => {
+                    eprintln!("[supervise] could not run `ip link add {tun_iface}`: {e}")
+                }
+                _ => {}
+            }
             let _ = runner.run(&["ip", "link", "set", tun_iface, "netns", netns]);
         }
     }
@@ -66,6 +92,15 @@ pub fn ensure_epdg_interface(
             &format!("echo 1 > /proc/sys/net/ipv6/conf/{tun_iface}/disable_policy"),
         ],
     );
+
+    // Confirm rather than assume. Every step above deliberately ignores its
+    // own result (they are all idempotent and individually survivable), so
+    // without a final check the one outcome that actually matters — is the
+    // interface there? — was never established.
+    runner
+        .run_in_netns(netns, &["ip", "link", "show", tun_iface])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -83,6 +118,33 @@ mod tests {
     // exercise the "absent" branch; success (the default) reads as "exists".
     fn seed_absent(runner: &MockCommandRunner, key: &str) {
         runner.set_run_output(key, failure_output());
+    }
+
+    /// Regression test for a live failure that took an hour to diagnose
+    /// because it was entirely silent: the interface could not be created (an
+    /// `if_id` left claimed by a previous container run makes the kernel
+    /// answer `File exists` for a name that exists nowhere), so steady-state
+    /// tore down a healthy CHILD_SA every 30s to retry a recreation that could
+    /// never succeed. Reporting the outcome is what makes that loop
+    /// explicable.
+    #[test]
+    fn reports_false_when_the_interface_is_still_absent_afterwards() {
+        let runner = MockCommandRunner::new();
+        // Missing from the netns before *and* after the create/move attempt.
+        seed_absent(&runner, "netns:ims1:ip link show tun23-1");
+        seed_absent(&runner, "ip link show tun23-1");
+
+        assert!(
+            !ensure_epdg_interface(&runner, "ims1", "tun23-1", "24"),
+            "an interface that never appeared must be reported, not assumed"
+        );
+    }
+
+    #[test]
+    fn reports_true_once_the_interface_is_present_in_the_netns() {
+        let runner = MockCommandRunner::new();
+        // Unseeded probes default to success, i.e. the interface is there.
+        assert!(ensure_epdg_interface(&runner, "ims0", "tun23-0", "23"));
     }
 
     #[test]
