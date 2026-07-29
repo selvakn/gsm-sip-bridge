@@ -10,39 +10,21 @@
 //! Same `include_str!`-and-assert pattern as `test_migration_guide.rs`, which
 //! already does this for metric renames.
 
-use gsm_sip_bridge::config::{
-    ALERTS_KEYS, ALERTS_MODULE_LIFECYCLE_KEYS, ALERTS_REGISTRATION_LOSS_KEYS,
-    ALERTS_TUNNEL_FAILURE_KEYS, AUDIO_KEYS, BRIDGE_KEYS, CONTROL_KEYS, LOGGING_KEYS, METRICS_KEYS,
-    MODEM_AUDIO_KEYS, MODULES_KEYS, RESILIENCE_KEYS, SCHEDULED_RESTART_KEYS, SIP_KEYS, SMS_KEYS,
-    TOP_LEVEL_SECTIONS, VOLTE_KEYS, VOLTE_LINE_KEYS, VOWIFI_KEYS, VOWIFI_LINE_KEYS,
-};
+use gsm_sip_bridge::config::raw::{section_key_lists, RawConfig};
 
 const REFERENCE: &str = include_str!("../../docs/configuration.md");
 const EXAMPLE: &str = include_str!("../../config.toml.example");
 
-/// Every section/key list the parser enforces, with the name it is known by.
+/// Every section's key list, straight from the `section!` macro that also
+/// generates the serde structs — so this test cannot drift from what the
+/// parser actually accepts, which a hand-maintained list could.
 fn all_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
-    vec![
-        ("sip", SIP_KEYS),
-        ("bridge", BRIDGE_KEYS),
-        ("sms", SMS_KEYS),
-        ("metrics", METRICS_KEYS),
-        ("modules", MODULES_KEYS),
-        ("resilience", RESILIENCE_KEYS),
-        ("control", CONTROL_KEYS),
-        ("audio", AUDIO_KEYS),
-        ("modem_audio", MODEM_AUDIO_KEYS),
-        ("scheduled_restart", SCHEDULED_RESTART_KEYS),
-        ("logging", LOGGING_KEYS),
-        ("alerts", ALERTS_KEYS),
-        ("alerts.module_lifecycle", ALERTS_MODULE_LIFECYCLE_KEYS),
-        ("alerts.tunnel_failure", ALERTS_TUNNEL_FAILURE_KEYS),
-        ("alerts.registration_loss", ALERTS_REGISTRATION_LOSS_KEYS),
-        ("vowifi", VOWIFI_KEYS),
-        ("vowifi.line", VOWIFI_LINE_KEYS),
-        ("volte", VOLTE_KEYS),
-        ("volte.line", VOLTE_LINE_KEYS),
-    ]
+    section_key_lists()
+}
+
+/// Top-level sections, likewise generated.
+fn top_level_sections() -> Vec<&'static str> {
+    RawConfig::KEYS.to_vec()
 }
 
 /// Whether `key` names a nested table rather than a settable value —
@@ -89,9 +71,8 @@ fn every_accepted_key_is_documented_in_the_configuration_reference() {
 
 #[test]
 fn every_top_level_section_is_documented() {
-    let missing: Vec<&str> = TOP_LEVEL_SECTIONS
-        .iter()
-        .copied()
+    let missing: Vec<&str> = top_level_sections()
+        .into_iter()
         .filter(|s| !REFERENCE.contains(&format!("[{s}]")))
         .collect();
 
@@ -105,9 +86,8 @@ fn every_top_level_section_is_documented() {
 /// from it is one they will not know exists.
 #[test]
 fn every_top_level_section_appears_in_the_example_config() {
-    let missing: Vec<&str> = TOP_LEVEL_SECTIONS
-        .iter()
-        .copied()
+    let missing: Vec<&str> = top_level_sections()
+        .into_iter()
         .filter(|s| {
             // Sections may be shown commented out, which still tells the
             // reader they exist.
@@ -137,7 +117,7 @@ fn every_key_the_example_sets_is_one_the_parser_accepts() {
 
     let mut unknown = Vec::new();
     for (section, value) in table {
-        if !TOP_LEVEL_SECTIONS.contains(&section.as_str()) {
+        if !top_level_sections().contains(&section.as_str()) {
             unknown.push(section.clone());
             continue;
         }

@@ -1,5 +1,10 @@
 # Configuration Reference
 
+> **An unrecognised key fails startup.** Every key below is checked against
+> what the parser accepts; a typo is reported by name rather than silently
+> ignored. Upgrading from a version that only warned? See
+> [migrating-config-to-strict-parsing.md](migrating-config-to-strict-parsing.md).
+
 The bridge reads a single TOML configuration file specified via `--config`.
 
 ## Sections
