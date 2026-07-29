@@ -76,6 +76,33 @@ pub fn render_swanctl_top_conf(conf_dir: &str) -> String {
     format!("include {conf_dir}/*.conf\n")
 }
 
+/// Renders the osmocom fork's P-CSCF plugin config, enabling the config-payload
+/// request for each line's connection **by name**.
+///
+/// This has to be generated rather than shipped static, because the plugin's
+/// `enable` block is keyed by connection name and connections are now named per
+/// line (`ims0`, `ims1`, ...). The image used to ship a fixed
+/// `enable { ims = yes }`, which stopped matching anything the moment the
+/// rename landed.
+///
+/// The failure is silent and looks nothing like its cause: charon simply omits
+/// PCSCF4/PCSCF6 from its `CPRQ`, so the carrier never sends a P-CSCF address,
+/// so every line establishes a perfectly good tunnel, fails the
+/// "established but no P-CSCF" check, tears it down and tries again — forever,
+/// about every 30s. Caught live 2026-07-29 by `CPRQ(ADDR ADDR6 DNS DNS6)`
+/// appearing where `CPRQ(ADDR ADDR6 DNS DNS6 PCSCF4 PCSCF6)` belonged.
+///
+/// Callers must pass exactly the names used for the swanctl connections; keep
+/// this in step with `orchestrate::vowifi_conn_name`.
+pub fn render_pcscf_plugin_conf(conn_names: &[String]) -> String {
+    let mut rendered = String::from("p-cscf {\n    load = yes\n\n    enable {\n");
+    for name in conn_names {
+        rendered.push_str(&format!("        {name} = yes\n"));
+    }
+    rendered.push_str("    }\n}\n");
+    rendered
+}
+
 /// Parameters for [`render_swanctl_epdg`] — the per-line ePDG `swanctl.conf`
 /// connection block. Mirrors `start_line_strongswan`'s local variables plus
 /// the `@SRC_ADDR@` sed-substitution branch.
@@ -232,6 +259,21 @@ connections {
     }
 }
 ";
+
+    #[test]
+    fn pcscf_plugin_conf_enables_every_lines_connection_by_name() {
+        let rendered = render_pcscf_plugin_conf(&["ims0".to_string(), "ims1".to_string()]);
+        assert!(rendered.contains("load = yes"));
+        assert!(rendered.contains("ims0 = yes"));
+        assert!(rendered.contains("ims1 = yes"));
+        // The name this replaced. Leaving it in would enable a connection that
+        // no longer exists while the real ones stayed disabled — which is
+        // exactly the silent failure this file is generated to avoid.
+        assert!(
+            !rendered.contains("\n        ims = yes"),
+            "the pre-rename `ims` connection must not be enabled"
+        );
+    }
 
     #[test]
     fn swanctl_epdg_names_the_connection_per_line_but_leaves_the_remote_id_literal() {

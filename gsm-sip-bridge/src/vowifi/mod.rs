@@ -398,6 +398,72 @@ pub(crate) fn run_telephony_side(
 /// only ever report on behalf of one fixed module id, so each line gets its
 /// own — cheap (a channel plus a background thread) and matches how Agent A
 /// naturally gets one per process, one per line, for free.
+/// How long to wait between attempts to bind a line's control channel.
+const CONTROL_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// How many consecutive bind failures between log lines, after the first —
+/// enough that a genuinely misconfigured address stays visible without filling
+/// the log while waiting for a slow carrier's tunnel.
+const CONTROL_BIND_LOG_EVERY: u32 = 15;
+
+/// Binds this line's control channel, retrying until it succeeds.
+///
+/// The address belongs to a veth the supervisor only creates once this line's
+/// tunnel is up, which can be minutes after Agent B starts — and lines come up
+/// in whatever order their carriers answer, which is not stable across runs.
+///
+/// A one-shot bind here meant the first line ready won and every slower line
+/// was dropped for the whole process lifetime. Observed live with two lines:
+/// both binds failed at startup with `EADDRNOTAVAIL`, a restart moments later
+/// caught `10.99.0.6`, and `10.99.0.2` stayed permanently unable to receive
+/// calls even though its veth appeared seconds afterwards — with only that one
+/// already-scrolled-past error line to say so.
+///
+/// So `EADDRNOTAVAIL` is an expected transient startup condition, not a fatal
+/// one. There is no bound on how long a carrier may take, and giving up is
+/// exactly the failure being fixed, so this retries indefinitely; the caller
+/// already blocks forever in `accept` immediately afterwards.
+///
+/// Generic over the bind and sleep so the retry policy is testable without a
+/// network or a real clock.
+fn bind_with_retry<T, E: std::fmt::Display>(
+    card_id: &str,
+    addr: &str,
+    interval: Duration,
+    mut bind: impl FnMut() -> Result<T, E>,
+    mut sleep: impl FnMut(Duration),
+) -> T {
+    let mut attempt: u32 = 0;
+    loop {
+        match bind() {
+            Ok(bound) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        card_id = %card_id,
+                        addr = %addr,
+                        attempt,
+                        "control channel bound after retrying"
+                    );
+                }
+                return bound;
+            }
+            Err(e) => {
+                if attempt.is_multiple_of(CONTROL_BIND_LOG_EVERY) {
+                    tracing::warn!(
+                        card_id = %card_id,
+                        addr = %addr,
+                        error = %e,
+                        attempt,
+                        "control channel not bindable yet (this line's veth is \
+                         probably not up); retrying"
+                    );
+                }
+                attempt = attempt.saturating_add(1);
+                sleep(interval);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_line_listener(
     listen_addr: (String, u16),
@@ -437,18 +503,14 @@ fn run_line_listener(
         Vec::new(),
     );
 
-    let listener = match TcpListener::bind((listen_addr.0.as_str(), listen_addr.1)) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(
-                card_id = %card_id,
-                addr = %format!("{}:{}", listen_addr.0, listen_addr.1),
-                error = %e,
-                "control channel listen failed for this line; it will not receive calls"
-            );
-            return;
-        }
-    };
+    let addr_str = format!("{}:{}", listen_addr.0, listen_addr.1);
+    let listener = bind_with_retry(
+        card_id,
+        &addr_str,
+        CONTROL_BIND_RETRY_INTERVAL,
+        || TcpListener::bind((listen_addr.0.as_str(), listen_addr.1)),
+        std::thread::sleep,
+    );
     tracing::info!(
         card_id = %card_id,
         addr = %listener
@@ -1137,5 +1199,46 @@ mod tests {
     fn recent_calls_empty_snapshot_when_nothing_pushed() {
         let recent = RecentCalls::new(5);
         assert!(recent.snapshot().is_empty());
+    }
+
+    #[test]
+    fn control_bind_retries_until_the_veth_appears() {
+        // Regression test for a live two-line failure: the veth an Agent B
+        // listener binds to is created only once that line's tunnel is up, so
+        // the bind legitimately fails for a while. It used to be one-shot, and
+        // the slower line was then permanently unable to receive calls.
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let bound = bind_with_retry(
+            "ec20-51212",
+            "10.99.0.2:7050",
+            Duration::from_millis(1),
+            || {
+                attempts += 1;
+                if attempts < 4 {
+                    Err("Address not available (os error 99)")
+                } else {
+                    Ok("listener")
+                }
+            },
+            |d| slept.push(d),
+        );
+        assert_eq!(bound, "listener");
+        assert_eq!(attempts, 4, "must keep retrying, not give up on the first");
+        assert_eq!(slept.len(), 3, "one sleep between each failed attempt");
+    }
+
+    #[test]
+    fn control_bind_does_not_sleep_when_the_address_is_already_available() {
+        let mut slept = Vec::new();
+        let bound = bind_with_retry(
+            "pcsc0",
+            "10.99.0.6:7050",
+            Duration::from_secs(2),
+            || Ok::<_, String>("listener"),
+            |d| slept.push(d),
+        );
+        assert_eq!(bound, "listener");
+        assert!(slept.is_empty(), "a first-try bind must not delay startup");
     }
 }

@@ -70,6 +70,23 @@ const SHARED_SWANCTL_CONF: &str = "/etc/swanctl/swanctl.conf";
 const SHARED_SWANCTL_CONF_DIR: &str = "/etc/swanctl/conf.d";
 const SHARED_CHARON_LOG: &str = "/tmp/charon.log";
 const SHARED_VICI_SOCKET: &str = "/var/run/charon.vici";
+/// Overwritten at startup from the resolved line set — the osmocom P-CSCF
+/// plugin enables its attribute request per *connection name*, so the image's
+/// static copy cannot know them. See `render::render_pcscf_plugin_conf`.
+const PCSCF_PLUGIN_CONF: &str = "/etc/strongswan.d/charon/p-cscf.conf";
+
+/// This line's swanctl connection and child name.
+///
+/// Unique per line because every line's connection lives in one shared charon:
+/// a shared name would make `--initiate --child` fire every line and
+/// `--terminate --ike` tear every line down, and would make the shared charon
+/// log's `<name|N>` prefix impossible to attribute back to a line.
+///
+/// Whatever this returns must also be what `render_pcscf_plugin_conf` enables,
+/// or the line silently never gets a P-CSCF.
+fn vowifi_conn_name(idx: u32) -> String {
+    format!("ims{idx}")
+}
 
 /// The context every per-line startup step needs, threaded as one value.
 ///
@@ -372,6 +389,17 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 Path::new(SHARED_SWANCTL_CONF),
                 &super::render::render_swanctl_top_conf(SHARED_SWANCTL_CONF_DIR),
             );
+            // Must be written before charon starts: the plugin reads this once
+            // at load time, and it enables the P-CSCF request per connection
+            // *name*, so it has to name every line the daemon will serve.
+            let conn_names: Vec<String> = vowifi_lines
+                .iter()
+                .map(|l| vowifi_conn_name(l.index))
+                .collect();
+            let _ = runner.write_file(
+                Path::new(PCSCF_PLUGIN_CONF),
+                &super::render::render_pcscf_plugin_conf(&conn_names),
+            );
 
             for line in &vowifi_lines {
                 let runner = Arc::clone(&runner);
@@ -659,12 +687,7 @@ fn start_vowifi_line_strongswan(
     let netns = line.netns.clone();
     let tun_iface = line.strongswan_tun_iface.clone();
     let if_id = line.strongswan_if_id.to_string();
-    // This line's swanctl connection and child name. Unique per line because
-    // every line's connection is loaded into one shared charon: a shared name
-    // would make `--initiate --child` fire every line and `--terminate --ike`
-    // tear every line down, and would make the shared log's `<name|N>` prefix
-    // impossible to attribute.
-    let conn_name = format!("ims{idx}");
+    let conn_name = vowifi_conn_name(idx);
 
     let Some(epdg_ip) = resolve_epdg_ip(
         runner.as_ref(),
