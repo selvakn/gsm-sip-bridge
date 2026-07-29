@@ -155,6 +155,11 @@ impl Call {
     pub fn conf_slot(&self) -> Option<SlotId> {
         #[cfg(feature = "pjsip-linked")]
         {
+            // Idempotent — `pj_thread_is_registered` short-circuits. Applied at
+            // every pjlib entry point rather than reasoning per caller about
+            // which thread it runs on; that reasoning is exactly what left
+            // `Endpoint::drop` calling pjlib from an unregistered Tokio worker.
+            crate::endpoint::ensure_pjsip_thread();
             if self.state == CallState::Confirmed {
                 unsafe // SAFETY: call_id valid when Confirmed; writable stack pjsua_call_info for out-param
                 {

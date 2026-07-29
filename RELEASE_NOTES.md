@@ -43,6 +43,16 @@ Repository maintenance and one structural fix. CLI help text and every
   line came up with, say, an empty APN. That exact failure is documented in
   `volte::discovery` as having attached the network's default bearer instead
   of the IMS one, looking fully configured while the P-CSCF was unreachable.
+- **Fixed: pjlib aborted on every container shutdown.** `Endpoint::drop`
+  called `pjsua_destroy()` without registering the calling thread, unlike
+  every other method on the type. `Drop` runs on whoever owns the value at the
+  end — a Tokio worker, once `pool_handle.abort()` tears the CardPool down —
+  and pjlib refuses to be called from a thread it has never seen. The
+  assertion fired *after* the clean-shutdown log lines and the exit code
+  stayed 0, which is why it read as cosmetic noise. Thread registration is now
+  applied at every pjlib entry point rather than reasoned about per caller.
+  Verified on hardware: the assertion is gone and shutdown ends with a proper
+  "SIP account unregistered".
 - **`config.toml` is now parsed by serde**, replacing ~1400 lines of
   hand-written `toml::Value` walking with declarative structs. The file format
   is unchanged — every key, default and range is preserved field by field —

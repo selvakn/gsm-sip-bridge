@@ -242,6 +242,10 @@ impl Endpoint {
 
     pub fn conf_slot_count(&self) -> u32 {
         #[cfg(feature = "pjsip-linked")]
+        {
+            ensure_pjsip_thread();
+        }
+        #[cfg(feature = "pjsip-linked")]
         unsafe // SAFETY: pjsua started; pjsua_conf_get_active_ports valid post-init
         {
             pjsua_sys::pjsua_conf_get_active_ports() as u32
@@ -464,7 +468,19 @@ impl Drop for Endpoint {
         if self.started {
             #[cfg(feature = "pjsip-linked")]
             {
-                unsafe // SAFETY: pjsua_destroy pairs with successful create/init when started is true
+                // Registers this thread first, exactly as every other method on
+                // this type does. `Drop` runs on whatever thread happens to own
+                // the value at the end — for the daemon that is a Tokio worker
+                // (the endpoint is dropped when `pool_handle.abort()` tears the
+                // CardPool down), and pjlib aborts with "Calling pjlib from
+                // unknown/external thread" rather than tolerating it.
+                //
+                // Observed on every container shutdown, live: the assertion
+                // fired *after* the clean-shutdown log lines and the exit code
+                // was still 0, which is why it read as cosmetic noise for so
+                // long. It was a genuine abort inside pjlib.
+                ensure_pjsip_thread();
+                unsafe // SAFETY: registered thread; pjsua_destroy pairs with successful create/init when started is true
                 {
                     pjsua_sys::pjsua_destroy();
                 }

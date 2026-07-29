@@ -41,6 +41,11 @@ impl MediaPortHandle {
     pub fn connect_to(&self, _dest_slot: SlotId) -> Result<(), PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
+            // Idempotent — `pj_thread_is_registered` short-circuits. Applied at
+            // every pjlib entry point rather than reasoning per caller about
+            // which thread it runs on; that reasoning is exactly what left
+            // `Endpoint::drop` calling pjlib from an unregistered Tokio worker.
+            crate::endpoint::ensure_pjsip_thread();
             unsafe // SAFETY: PJSIP initialized; slot IDs valid conference bridge ports for connect
             {
                 let status = pjsua_sys::pjsua_conf_connect(self.slot_id, _dest_slot);
@@ -57,6 +62,11 @@ impl MediaPortHandle {
     pub fn disconnect_from(&self, _dest_slot: SlotId) -> Result<(), PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
+            // Idempotent — `pj_thread_is_registered` short-circuits. Applied at
+            // every pjlib entry point rather than reasoning per caller about
+            // which thread it runs on; that reasoning is exactly what left
+            // `Endpoint::drop` calling pjlib from an unregistered Tokio worker.
+            crate::endpoint::ensure_pjsip_thread();
             unsafe // SAFETY: PJSIP initialized; slot IDs valid conference bridge ports for disconnect
             {
                 let status = pjsua_sys::pjsua_conf_disconnect(self.slot_id, _dest_slot);

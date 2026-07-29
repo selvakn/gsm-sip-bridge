@@ -115,6 +115,7 @@ impl Account {
     /// on denial. Reads PJSUA's live account info.
     #[cfg(feature = "pjsip-linked")]
     pub fn registration_status(&self) -> i32 {
+        crate::endpoint::ensure_pjsip_thread();
         unsafe // SAFETY: account_id valid for an added account; info is a plain C struct
         {
             let mut info: pjsua_sys::pjsua_acc_info = std::mem::zeroed();
@@ -170,6 +171,7 @@ impl Account {
     /// would never recover even once the registrar starts accepting again.
     #[cfg(feature = "pjsip-linked")]
     pub fn trigger_registration(&self) {
+        crate::endpoint::ensure_pjsip_thread();
         unsafe // SAFETY: account_id valid for an added account
         {
             pjsua_sys::pjsua_acc_set_registration(self.account_id, 1);
@@ -188,7 +190,13 @@ impl Account {
     pub fn unregister(&mut self) {
         #[cfg(feature = "pjsip-linked")]
         {
-            unsafe // SAFETY: account_id valid for an added account while unregister runs before clear
+            // Reachable from `Drop`, i.e. from whatever thread owns the account
+            // at teardown — a Tokio worker in the daemon's case, which pjlib
+            // refuses to be called from unless registered. See
+            // `Endpoint::drop` for the shutdown abort this class of omission
+            // caused.
+            crate::endpoint::ensure_pjsip_thread();
+            unsafe // SAFETY: registered thread; account_id valid for an added account while unregister runs before clear
             {
                 pjsua_sys::pjsua_acc_set_registration(self.account_id, 0);
             }
