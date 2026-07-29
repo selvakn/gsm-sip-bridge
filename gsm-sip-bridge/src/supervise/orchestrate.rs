@@ -363,6 +363,16 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 }
             }
 
+            // Before anything creates an interface or starts charon: clear
+            // XFRM state left by a previous run of this container. It outlives
+            // the container and keeps these lines' if_ids claimed, which makes
+            // their tunnel interfaces impossible to create — the line then
+            // re-establishes its tunnel every steady-state tick, forever.
+            // Guarded so a host running unrelated IPsec is never touched.
+            let our_if_ids: std::collections::BTreeSet<u32> =
+                vowifi_lines.iter().map(|l| l.strongswan_if_id).collect();
+            epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
+
             // Render the shared charon's assets once, before any line starts.
             // Every line then drops its own connection file into the shared
             // conf.d and loads the union.

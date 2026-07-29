@@ -4,6 +4,112 @@
 //! like the bash original.
 
 use super::runner::CommandRunner;
+use std::collections::BTreeSet;
+
+/// What to do about XFRM state found in the host's default namespace at
+/// startup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum XfrmReclaim {
+    /// Nothing installed — no if_id is claimed, so nothing is in our way.
+    Empty,
+    /// Every entry belongs to this deployment (its if_id is one our own lines
+    /// use), so it is leftover from a previous run of this container and safe
+    /// to clear.
+    AllOurs,
+    /// Something here is not ours: an if_id outside our lines' range, or an
+    /// entry carrying no if_id at all. Leave the host's IPsec alone.
+    ForeignPresent,
+}
+
+/// Classifies a combined `ip xfrm state` + `ip xfrm policy` dump.
+///
+/// Errs toward leaving things alone: anything not positively identifiable as
+/// ours — a foreign if_id, an entry with no if_id, a socket policy — makes the
+/// whole dump `ForeignPresent`. Deleting selectively by if_id would avoid the
+/// question entirely, but iproute2 has no such filter (`ip xfrm policy
+/// deleteall if_id N` is rejected outright), so flushing everything is the
+/// only tool available and "all ours or nothing" is the only safe rule to put
+/// around it.
+pub fn classify_xfrm_dump(dump: &str, ours: &BTreeSet<u32>) -> XfrmReclaim {
+    let mut entries = 0usize;
+    let mut ours_entries = 0usize;
+    let mut foreign = false;
+
+    for line in dump.lines() {
+        // Both dumps start each entry at column 0. `socket` policies are
+        // counted too: they carry no if_id, so they can only ever push this
+        // toward `ForeignPresent`, which is the cautious direction.
+        if line.starts_with("src ") || line.starts_with("socket ") {
+            entries += 1;
+        }
+        if let Some(rest) = line.trim().strip_prefix("if_id ") {
+            let raw = rest.split_whitespace().next().unwrap_or("");
+            let parsed = raw
+                .strip_prefix("0x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| raw.parse::<u32>().ok());
+            match parsed {
+                Some(id) if ours.contains(&id) => ours_entries += 1,
+                _ => foreign = true,
+            }
+        }
+    }
+
+    if entries == 0 {
+        return XfrmReclaim::Empty;
+    }
+    // Every entry must have accounted for itself with an if_id of ours.
+    if foreign || ours_entries < entries {
+        return XfrmReclaim::ForeignPresent;
+    }
+    XfrmReclaim::AllOurs
+}
+
+/// Clears XFRM state left behind by a previous run of this container, which
+/// would otherwise keep our lines' `if_id`s claimed and make their tunnel
+/// interfaces impossible to create.
+///
+/// Must run before charon starts, while none of our own tunnels exist — at
+/// that point anything present is by definition stale.
+///
+/// Does nothing unless every entry is identifiably ours; see
+/// [`classify_xfrm_dump`].
+pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
+    let dump = |args: &[&str]| {
+        runner
+            .run(args)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let combined = format!(
+        "{}\n{}",
+        dump(&["ip", "xfrm", "state"]),
+        dump(&["ip", "xfrm", "policy"])
+    );
+
+    match classify_xfrm_dump(&combined, ours) {
+        XfrmReclaim::Empty => {}
+        XfrmReclaim::AllOurs => {
+            println!(
+                "[supervise] clearing XFRM state left by a previous run (it keeps this \
+                 deployment's if_ids claimed, which makes the per-line tunnel interfaces \
+                 impossible to create)"
+            );
+            let _ = runner.run(&["ip", "xfrm", "policy", "flush"]);
+            let _ = runner.run(&["ip", "xfrm", "state", "flush"]);
+        }
+        XfrmReclaim::ForeignPresent => {
+            eprintln!(
+                "[supervise] found XFRM state that is not this deployment's, so it was left \
+                 untouched. If a line then reports its tunnel interface cannot be created \
+                 (if_id already claimed), clear the stale entries by hand — see \
+                 docs/operations.md."
+            );
+        }
+    }
+}
 
 /// Idempotently ensures netns `netns` and its pre-created XFRM interface
 /// `tun_iface` (if_id `if_id`) exist, pinned per line since
@@ -118,6 +224,105 @@ mod tests {
     // exercise the "absent" branch; success (the default) reads as "exists".
     fn seed_absent(runner: &MockCommandRunner, key: &str) {
         runner.set_run_output(key, failure_output());
+    }
+
+    fn ids(v: &[u32]) -> BTreeSet<u32> {
+        v.iter().copied().collect()
+    }
+
+    // Real `ip xfrm` output shapes, trimmed to the parts this parses.
+    const OURS_ONLY: &str = "\
+src 192.168.15.10 dst 203.88.11.33
+\tproto esp spi 0x57065f59 reqid 2 mode tunnel
+\tif_id 0x18
+src 2402:8100::1/128 dst ::/0 
+\tdir out priority 334463 
+\tif_id 0x17
+";
+
+    #[test]
+    fn a_dump_that_is_entirely_ours_is_safe_to_clear() {
+        assert_eq!(
+            classify_xfrm_dump(OURS_ONLY, &ids(&[23, 24])),
+            XfrmReclaim::AllOurs
+        );
+    }
+
+    #[test]
+    fn an_empty_dump_needs_no_action() {
+        assert_eq!(classify_xfrm_dump("", &ids(&[23, 24])), XfrmReclaim::Empty);
+    }
+
+    #[test]
+    fn a_foreign_if_id_protects_the_whole_dump() {
+        // Someone else s IPsec on the same host. Flushing is all-or-nothing
+        // (iproute2 cannot delete by if_id), so anything unrecognised must
+        // stop us touching any of it.
+        let dump = "src 10.0.0.1 dst 10.0.0.2\n\tif_id 0x99\n";
+        assert_eq!(
+            classify_xfrm_dump(dump, &ids(&[23, 24])),
+            XfrmReclaim::ForeignPresent
+        );
+    }
+
+    #[test]
+    fn an_entry_carrying_no_if_id_at_all_also_protects_the_dump() {
+        // Plain IPsec, unrelated to this project — it has no if_id to match,
+        // so it must never be counted as ours by omission.
+        let dump = "src 10.0.0.1 dst 10.0.0.2\n\tproto esp spi 0x1 reqid 1 mode tunnel\n";
+        assert_eq!(
+            classify_xfrm_dump(dump, &ids(&[23, 24])),
+            XfrmReclaim::ForeignPresent
+        );
+    }
+
+    #[test]
+    fn a_socket_policy_protects_the_dump() {
+        let dump = "socket in priority 0 \n\tdir in\n";
+        assert_eq!(
+            classify_xfrm_dump(dump, &ids(&[23, 24])),
+            XfrmReclaim::ForeignPresent
+        );
+    }
+
+    #[test]
+    fn our_own_if_id_from_a_different_line_count_is_still_foreign() {
+        // if_id 0x19 (25) would be line 2 — not configured in this run, so it
+        // is not ours to delete.
+        let dump = "src 10.0.0.1 dst 10.0.0.2\n\tif_id 0x19\n";
+        assert_eq!(
+            classify_xfrm_dump(dump, &ids(&[23, 24])),
+            XfrmReclaim::ForeignPresent
+        );
+    }
+
+    #[test]
+    fn reclaim_flushes_only_when_everything_is_ours() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output("ip xfrm state", success_output(OURS_ONLY));
+        runner.set_run_output("ip xfrm policy", success_output(""));
+        reclaim_stale_xfrm(&runner, &ids(&[23, 24]));
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|c| c == &["ip", "xfrm", "policy", "flush"]));
+        assert!(calls.iter().any(|c| c == &["ip", "xfrm", "state", "flush"]));
+    }
+
+    #[test]
+    fn reclaim_never_flushes_a_host_with_foreign_ipsec() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(
+            "ip xfrm state",
+            success_output("src 10.0.0.1 dst 10.0.0.2\n\tif_id 0x99\n"),
+        );
+        runner.set_run_output("ip xfrm policy", success_output(""));
+        reclaim_stale_xfrm(&runner, &ids(&[23, 24]));
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(&"flush".to_string())),
+            "someone else s IPsec must never be flushed"
+        );
     }
 
     /// Regression test for a live failure that took an hour to diagnose
@@ -245,6 +450,15 @@ mod tests {
         std::process::Output {
             status: std::process::ExitStatus::from_raw(256), // exit code 1
             stdout: vec![],
+            stderr: vec![],
+        }
+    }
+
+    fn success_output(stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
             stderr: vec![],
         }
     }
