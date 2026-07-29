@@ -58,7 +58,7 @@ pub enum Commands {
     /// from the `[vowifi]` config section (or, with `--line`, one line's
     /// resolved slice of it — specs/013-multi-card-vowifi). Long-running —
     /// intended to run inside the ePDG tunnel's `ims` network namespace,
-    /// supervised by `docker/entrypoint.sh`.
+    /// supervised by `supervise::orchestrate`.
     VowifiImsAgent(VowifiImsAgentArgs),
     /// Agent B of the inbound VoWiFi-to-SIP bridge: registers to the
     /// SIP/PBX destination (`[sip]`/`[bridge]`) and, on each call signaled
@@ -72,11 +72,11 @@ pub enum Commands {
     /// Bridges strongSwan's `eap-sim-pcsc` plugin (via pcscd's `vpcd`
     /// virtual reader) to the SIM inside the modem, forwarding APDUs over
     /// `AT+CSIM` (specs/012-strongswan-epdg). Long-running — supervised by
-    /// `docker/entrypoint.sh` alongside charon, in the container's default
+    /// `supervise::orchestrate` alongside charon, in the container's default
     /// network namespace (where the modem device and pcscd both live).
     VowifiUsimBridge(VowifiUsimBridgeArgs),
     /// Prints the SIM's IMSI (via `AT+CIMI`) and exits. Used by
-    /// `docker/entrypoint.sh` to render the strongSwan swanctl connection's
+    /// `supervise::render` to render the strongSwan swanctl connection's
     /// EAP identity without hand-parsing `AT+CIMI` in bash — the same
     /// "ask the binary" precedent as `config vowifi-enabled`.
     VowifiImsi(VowifiImsiArgs),
@@ -84,7 +84,7 @@ pub enum Commands {
     /// zero-padded to 3 digits) derived from the SIM, and exits: MCC is the
     /// IMSI's first 3 digits, the 2-vs-3-digit MNC ambiguity is resolved
     /// via the SIM's EF_AD file (`AT+CRSM`), falling back to the registered
-    /// PLMN from numeric `AT+COPS`. Used by `docker/entrypoint.sh` when a
+    /// PLMN from numeric `AT+COPS`. Used by `supervise::orchestrate` when a
     /// line's `mcc`/`mnc` (from `[[vowifi.line]]`, or auto-discovery) are
     /// left unset.
     VowifiPlmn(VowifiPlmnArgs),
@@ -97,7 +97,7 @@ pub enum Commands {
     /// re-registration of the other and tears our binding down (see
     /// `vowifi::ims_mode`). Rewrites `AT+QCFG="ims"` and reboots the module
     /// only when it is in the wrong mode, so it is a no-op on a healthy boot.
-    /// Run by `docker/entrypoint.sh` before anything else opens the modem,
+    /// Run by `supervise::orchestrate` before anything else opens the modem,
     /// for every line of either subsystem.
     ModemIms(ModemImsArgs),
     /// Manage the LTE IMS PDN attachment (specs/015-volte-host-ims, US1):
@@ -173,7 +173,7 @@ pub enum Commands {
     /// modem, bounded by `[volte].max_lines`, shaped by `[[volte.line]]`) and
     /// writes it as the line manifest (specs/020-volte-line-netns) — the LTE
     /// counterpart to `discover`. Run once, up front, by
-    /// `docker/entrypoint.sh` before any per-line namespace or process
+    /// `supervise::orchestrate_volte` before any per-line namespace or process
     /// exists: `volte-carrier-agent --line N` and `volte-bridge` (auto-
     /// discovered mode) both read the manifest this writes rather than
     /// re-scanning (research.md R7's "discover once" principle).
@@ -181,21 +181,21 @@ pub enum Commands {
     /// The per-line carrier-facing half (specs/020-volte-line-netns) —
     /// attaches this line's IMS PDN, registers over it, and answers calls
     /// until the registration ends. The LTE counterpart to
-    /// `vowifi-ims-agent --line N`: launched by `docker/entrypoint.sh` inside
+    /// `vowifi-ims-agent --line N`: launched by `supervise::orchestrate_volte` inside
     /// this line's own network namespace (`ip netns exec`), one process per
     /// line, reading its settings from the manifest `volte-discover-lines`
     /// wrote. Long-running, but does not retry internally on failure —
-    /// `docker/entrypoint.sh` restarts it, mirroring how
+    /// `supervise::orchestrate_volte` restarts it, mirroring how
     /// `vowifi-ims-agent` is supervised.
     VolteCarrierAgent(VolteCarrierAgentArgs),
     /// Tear down host-side LTE line(s) the running bridge recorded in its
     /// line manifest — releasing each modem's IMS PDN and restoring the data
     /// context it displaced (specs/018-volte-multi-modem). Run by
-    /// `docker/entrypoint.sh`'s cleanup after the multi-modem bridge exits; a
+    /// `supervise::shutdown` after the multi-modem bridge exits; a
     /// no-op when no manifest exists.
     ///
     /// With `--line`, tears down only that one line — used by
-    /// `docker/entrypoint.sh`'s cleanup trap (specs/020-volte-line-netns
+    /// `supervise::shutdown`'s teardown plan (specs/020-volte-line-netns
     /// research.md R6) to run each line's teardown *inside* that line's own
     /// namespace (`ip netns exec`) before the namespace is deleted, since a
     /// namespace-scoped `ip`/sysctl teardown command run from the wrong
@@ -209,7 +209,7 @@ pub enum Commands {
     /// Runs the shared USB modem scan once, assigns each recognized modem to
     /// the circuit-switched or VoWiFi subsystem, resolves the VoWiFi line
     /// table (specs/013-multi-card-vowifi), and writes the result so both
-    /// the circuit-switched daemon and `docker/entrypoint.sh` can act on it
+    /// the circuit-switched daemon and `supervise::orchestrate` can act on it
     /// without each re-scanning independently (which would otherwise race —
     /// see `specs/013-multi-card-vowifi/research.md` item 3).
     Discover(DiscoverArgs),
@@ -228,6 +228,28 @@ pub enum Commands {
     /// `docker/entrypoint.sh` used to do itself in bash; the shim now just
     /// checks preconditions and execs this.
     Supervise,
+    /// The container's `HEALTHCHECK` probe: exits 0 when the circuit-switched
+    /// daemon's metrics endpoint answers and — only if `[vowifi].enabled` and
+    /// at least one line resolved — every line's tunnel interface has an
+    /// address and its P-CSCF is reachable over it (specs/013-multi-card-vowifi
+    /// FR-019: every line, not just the first). Reads the line table
+    /// `supervise` resolved at startup; never re-runs USB/AT discovery, which
+    /// would race the agents already holding those serial ports open.
+    ///
+    /// Replaces `docker/healthcheck.sh` — the last orchestration left in bash
+    /// after specs/021 moved the rest into `supervise`.
+    Healthcheck,
+
+    /// Exit 0 iff a TCP connection to `host:port` can be established.
+    ///
+    /// Internal plumbing, not meant to be run by hand: `healthcheck` probes
+    /// each line's P-CSCF, which is reachable only inside that line's ePDG
+    /// tunnel namespace, by re-executing this binary under `ip netns exec`.
+    /// Entering a namespace in-process would need `setns` — the only `unsafe`
+    /// in this binary — so it re-execs instead, the same way orchestration
+    /// already places the IMS agents in their namespaces.
+    #[command(hide = true)]
+    TcpProbe { host: String, port: u16 },
 }
 
 #[derive(Parser, Debug)]
@@ -238,10 +260,9 @@ pub struct RenderArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RenderAsset {
-    /// This line's strongswan.conf (own vici socket + filelog path).
+    /// The shared strongswan.conf (one vici socket + filelog path for the one
+    /// charon daemon serving every line).
     StrongswanConf {
-        #[arg(long)]
-        line: u32,
         #[arg(long)]
         vici_socket: String,
         #[arg(long)]
@@ -258,6 +279,10 @@ pub enum RenderAsset {
     SwanctlEpdg {
         #[arg(long)]
         template_path: PathBuf,
+        /// This line's connection/child name (`ims0`, `ims1`, ...) — unique
+        /// per line, since every line loads into one shared charon.
+        #[arg(long)]
+        conn_name: String,
         #[arg(long)]
         imsi: String,
         #[arg(long)]
@@ -577,8 +602,10 @@ pub struct VolteBridgeArgs {
 #[derive(Parser, Debug)]
 pub struct VolteDiscoverLinesArgs {
     /// Also print shell-sourceable `KEY=value`/indexed-array output to
-    /// stdout, for `docker/entrypoint.sh` to `eval` — mirrors `discover
-    /// --shell-env`.
+    /// stdout — mirrors `discover --shell-env`. A diagnostic aid now rather
+    /// than an internal contract: the shell that used to `eval` this is gone,
+    /// since orchestration and the healthcheck are both subcommands that read
+    /// the resolved line table directly.
     #[arg(long)]
     pub shell_env: bool,
     /// Same meaning as `volte-bridge`'s own `--restore-cid-path`: the base
@@ -638,19 +665,24 @@ pub enum ConfigSubcommand {
     /// nothing — only the exit code is meant to be used.
     VowifiEnabled,
     /// Prints the resolved `[vowifi]` section (plus `[metrics].port`) as
-    /// `KEY=VALUE` shell-quoted lines, for `docker/entrypoint.sh` /
-    /// `docker/healthcheck.sh` to `eval`/`source` instead of hand-parsing
-    /// TOML or reading their own raw environment variables
-    /// (specs/012-strongswan-epdg config consolidation: config.toml is the
-    /// single source of truth for all non-secret configuration). Exits
-    /// non-zero and prints nothing on config-load failure.
+    /// `KEY=VALUE` shell-quoted lines, ready to `eval`/`source`.
+    ///
+    /// Now a diagnostic aid rather than an internal contract: both original
+    /// consumers (`docker/entrypoint.sh`'s orchestration and
+    /// `docker/healthcheck.sh`) are Rust subcommands and read the config
+    /// directly. It stays because "ask the binary what it resolved" is the
+    /// fastest way to answer *why is this line configured like that* on a
+    /// running container — which is what it was really for
+    /// (specs/012-strongswan-epdg: config.toml is the single source of
+    /// truth for all non-secret configuration). Exits non-zero and prints
+    /// nothing on config-load failure.
     VowifiShellEnv,
     /// Exit 0 if `[volte].enabled = true`, exit 1 otherwise (including when
     /// the file cannot be loaded). Prints nothing — only the exit code is
     /// meant to be used, matching `vowifi-enabled`.
     VolteEnabled,
     /// Prints the resolved `[volte]` section as shell-quoted `KEY=VALUE`
-    /// lines for `docker/entrypoint.sh` to `eval`, so the supervisor never
+    /// lines for the shell to `eval`, so the supervisor never
     /// hand-parses TOML (specs/015-volte-host-ims).
     VolteShellEnv,
 }
@@ -800,17 +832,18 @@ pub struct DiscoverArgs {
     pub out: Option<PathBuf>,
 
     /// Also print shell-sourceable `KEY=value`/indexed-array output to
-    /// stdout, for `docker/entrypoint.sh` to `eval`.
+    /// stdout. A diagnostic aid now rather than an internal contract — see
+    /// `discover --shell-env`.
     #[arg(long)]
     pub shell_env: bool,
 
     /// Skip the USB/AT scan entirely and just re-print the existing
     /// line-resolution file's contents (as `--shell-env`, if requested).
     /// For read-only consumers that must NOT re-probe modems the running
-    /// VoWiFi agents already hold open — `docker/healthcheck.sh`, in
-    /// particular, which polls every 30s and would otherwise both waste
-    /// time re-scanning and risk colliding with a live `vowifi-usim-bridge`
-    /// session on the same serial port.
+    /// VoWiFi agents already hold open. The `healthcheck` subcommand reads
+    /// the same file for the same reason: it runs every 30s and would
+    /// otherwise both waste time re-scanning and risk colliding with a live
+    /// `vowifi-usim-bridge` session on the same serial port.
     #[arg(long)]
     pub from_file: bool,
 }

@@ -2,7 +2,7 @@
 //! (specs/021-entrypoint-supervise-rust Phase 3) — collapses the three
 //! duplicated bash loops (strongswan establish-time, strongswan steady-state,
 //! swu establish+steady-state) into one state machine (FR-005). Every
-//! transition and its recovery action is a 1:1 port of the current script's
+//! transition and its recovery action is a 1:1 port of the original script's
 //! control flow, not a redesign: see the per-branch comments below for the
 //! exact bash this replaces.
 
@@ -43,7 +43,7 @@ pub enum DegradeReason {
 /// change pending" (checked separately) — the three strongswan-specific
 /// checks (`tun_iface` presence, `swanctl --list-sas`'s exit status, the
 /// `ims:` CHILD_SA line's presence) collapse to `Ok` for the swu engine,
-/// which the current script's own comment says has "no re-initiate-in-place
+/// which the original script's own comment says has "no re-initiate-in-place
 /// concept."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteadyStateHealth {
@@ -77,17 +77,19 @@ pub trait TunnelEngine {
     /// Is this line's primary process (charon / the swu dialer) still alive?
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool;
     /// Terminates the current negotiation without restarting the process
-    /// (strongswan: `swanctl --terminate --ike ims`; swu: no-op — no
-    /// in-place terminate exists for this engine).
+    /// (strongswan: `swanctl --terminate --ike <this line's connection>`;
+    /// swu: no-op — no in-place terminate exists for this engine). Scoped to
+    /// one connection: every line's connection lives in one shared charon, so
+    /// a bare `ims` would tear down every line at once.
     fn terminate(&self, runner: &dyn CommandRunner);
     /// (Re)initiates a connection attempt without restarting the process
-    /// (strongswan: `swanctl --initiate --child ims`; swu: no-op, matching
-    /// `terminate`).
+    /// (strongswan: `swanctl --initiate --child <this line's connection>`;
+    /// swu: no-op, matching `terminate`). Scoped for the same reason.
     fn reinitiate(&self, runner: &dyn CommandRunner);
     /// Steady-state-only health beyond process-alive/P-CSCF-change.
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth;
     /// Recreates this line's tunnel interface after `SteadyStateHealth::
-    /// TunVanished` — 1:1 port of the current script's own comment: "tun can
+    /// TunVanished` — 1:1 port of the original script's own comment: "tun can
     /// vanish from the kernel entirely while swanctl still reports the
     /// CHILD_SA ESTABLISHED/INSTALLED (observed live, specs/012-strongswan-
     /// epdg) — recreate ... rather than trusting the desynced SA." Found
@@ -122,7 +124,7 @@ pub enum EstablishOutcome {
         pcscf: String,
     },
     /// The process died before establishing — the line is skipped (matches
-    /// the current script's `return 1` from `start_line_strongswan`/
+    /// the original script's `return 1` from `start_line_strongswan`/
     /// `start_line_swu`).
     FatalProcessDied,
     /// swu only: `SWU_MAX_ESTABLISH_ATTEMPTS` reached without connecting.
@@ -215,7 +217,7 @@ pub fn tick_steady_state(
             };
         }
         SteadyStateHealth::TunVanished => {
-            // 1:1 port of the current script's own recovery: recreate the
+            // 1:1 port of the original script's own recovery: recreate the
             // XFRM interface (idempotent — matches `ensure_epdg_interface`)
             // BEFORE terminate+reinitiate. Missing this call was a real bug
             // found live: without it, every subsequent negotiation kept
@@ -231,7 +233,7 @@ pub fn tick_steady_state(
             };
         }
         SteadyStateHealth::ChildSaMissing => {
-            // Re-initiate only — the current script does NOT restart this
+            // Re-initiate only — the original script does NOT restart this
             // line's vowifi-ims-agent for this branch alone, unlike the
             // other three recovery paths.
             engine.reinitiate(runner);
@@ -252,7 +254,7 @@ pub fn tick_steady_state(
 }
 
 /// Whether a [`SteadyOutcome::Recovered`] reason also means "restart this
-/// line's vowifi-ims-agent" — matches the current script exactly: every
+/// line's vowifi-ims-agent" — matches the original script exactly: every
 /// recovery path does, EXCEPT a bare `ChildSaMissing` re-initiate.
 pub fn recovery_restarts_agent(reason: DegradeReason) -> bool {
     !matches!(reason, DegradeReason::ChildSaMissing)

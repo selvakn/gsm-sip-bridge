@@ -11,7 +11,8 @@
 //! `specs/013-multi-card-vowifi/contracts/discover-cli-contract.md`.
 
 use crate::config::{VowifiConfig, VowifiLineOverride};
-use crate::modules::discovery::{ProbedModem, SimStatus};
+use crate::line::resources::{self, shift_ipv4};
+use crate::modules::discovery::ProbedModem;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -90,12 +91,47 @@ fn override_for<'a>(
     })
 }
 
-/// A modem that can't become a line, and why (FR-006/FR-016).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FailedLine {
-    pub card_id: String,
-    pub reason: String,
+/// Derives every per-line isolated resource from the line's index, uniformly
+/// for every line including the first. No config knob backs any of these (see
+/// `VowifiConfig`'s field docs) — they exist so lines cannot collide.
+///
+/// Shared by both resolvers deliberately. This block used to be copy-pasted
+/// into the modem and the card-reader path, and the copies drifted exactly as
+/// you would expect: `pcscf_source_path` was fixed in one and silently left
+/// shared in the other, so a two-line deployment still had its card-reader line
+/// overwriting the modem line's P-CSCF. One function means a resource added
+/// here cannot be derived for only some kinds of line.
+fn derive_line_resources(config: &mut VowifiConfig, base: &VowifiConfig, index: u32) {
+    config.netns = resources::indexed(&base.netns, index);
+    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
+    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
+    config.veth_sip_iface = resources::indexed(&base.veth_sip_iface, index);
+    config.veth_ims_iface = resources::indexed(&base.veth_ims_iface, index);
+    let step = 4u32 * index;
+    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
+        config.veth_local_addr = local;
+    }
+    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
+        config.veth_peer_addr = peer;
+    }
+    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
+    // Per-line like the rest, though it was long left shared on the reasoning
+    // that it is a global scratch file. It is not: each line's tunnel is
+    // assigned its own P-CSCF by its own carrier, each line's supervisor writes
+    // it here, and each line's Agent A reads it back. With one file the loser
+    // of the race registers against the *other* carrier's proxy — unreachable
+    // from its own netns — and crash-loops. Observed live 2026-07-29 holding an
+    // address belonging to neither line (a stale one from an earlier tunnel),
+    // which is the same race one step further along.
+    config.pcscf_source_path = resources::indexed(&format!("{}-", base.pcscf_source_path), index);
 }
+
+/// A modem that can't become a line, and why (FR-006/FR-016).
+///
+/// Re-exported from [`crate::line`], where it lives now: VoLTE was importing
+/// this type *from the VoWiFi module*, which made the LTE path depend on the
+/// Wi-Fi path for something that belongs to neither.
+pub use crate::line::FailedLine;
 
 /// One resolved VoWiFi line — the "Line Table" key entity
 /// (specs/013-multi-card-vowifi data-model.md). `config` is a fully
@@ -104,8 +140,8 @@ pub struct FailedLine {
 /// function of `index` (research.md item 5), uniformly for every line
 /// including the first — downstream code (`ims::agent`, `vowifi::run`) takes
 /// `&config` exactly as it does today and needs no awareness that it's one
-/// of several lines. `pcscf_source_path` is the one exception: it's a
-/// shared, global scratch file, not per-line derived.
+/// of several lines — `pcscf_source_path` included, since two simultaneously
+/// established lines otherwise overwrite each other's P-CSCF in one file.
 #[derive(Debug, Clone)]
 pub struct ResolvedLine {
     pub index: u32,
@@ -133,47 +169,19 @@ pub struct LineTableResult {
 /// order (independent of USB enumeration jitter), capped at
 /// `base.max_lines` with the excess reported as failed rather than dropped.
 pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTableResult {
-    let mut failed = Vec::new();
-    let mut ready: Vec<&ProbedModem> = Vec::new();
-
-    for modem in &assignment.vowifi {
-        match &modem.sim_status {
-            Some(SimStatus::Ready { .. }) => ready.push(modem),
-            Some(SimStatus::Absent) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "sim_absent".to_string(),
-            }),
-            Some(SimStatus::Locked) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "sim_locked".to_string(),
-            }),
-            Some(SimStatus::Unreadable(msg)) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: format!("sim_unreadable: {msg}"),
-            }),
-            None => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "no_at_port".to_string(),
-            }),
-        }
-    }
-
-    ready.sort_by(|a, b| a.card_id.cmp(&b.card_id));
-
+    // Role assignment has already established each candidate's AT port, so
+    // a `Ready` SIM without one cannot occur here — hence
+    // `AlreadyEstablished` rather than VoLTE's `Required`.
+    let candidates = crate::line::select(
+        &assignment.vowifi,
+        base.max_lines,
+        crate::line::AtPortRequirement::AlreadyEstablished,
+    );
+    let mut failed = candidates.failed;
     let max_lines = base.max_lines as usize;
-    let (kept, overflow) = if ready.len() > max_lines {
-        ready.split_at(max_lines)
-    } else {
-        (&ready[..], &[][..])
-    };
-    for modem in overflow {
-        failed.push(FailedLine {
-            card_id: modem.card_id.clone(),
-            reason: "max_lines_exceeded".to_string(),
-        });
-    }
 
-    let mut lines: Vec<ResolvedLine> = kept
+    let mut lines: Vec<ResolvedLine> = candidates
+        .kept
         .iter()
         .enumerate()
         .map(|(i, modem)| resolve_one_line(i as u32, modem, base))
@@ -198,23 +206,14 @@ pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTa
             let index = lines.len() as u32;
             lines.push(resolve_one_pcsc_line(index, card_id, over, base));
         } else {
-            failed.push(FailedLine {
+            failed.push(FailedLine::new(
                 card_id,
-                reason: "max_lines_exceeded".to_string(),
-            });
+                crate::line::Rejection::MaxLinesExceeded.reason(),
+            ));
         }
     }
 
     LineTableResult { lines, failed }
-}
-
-/// One /30 veth block per line — stepping the whole dotted-quad by 4
-/// addresses (rather than assuming which octet has room) keeps the
-/// derivation correct regardless of the operator's chosen base subnet.
-fn shift_ipv4(addr: &str, delta: u32) -> Option<String> {
-    let ip: std::net::Ipv4Addr = addr.parse().ok()?;
-    let shifted = u32::from(ip).checked_add(delta)?;
-    Some(std::net::Ipv4Addr::from(shifted).to_string())
 }
 
 fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> ResolvedLine {
@@ -246,24 +245,7 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     // been applied above.
     config.line_overrides = Vec::new();
 
-    // Pure per-line infrastructure — always mechanically derived from the
-    // line's index, uniformly for every line including the first. No config
-    // knob backs any of this (see `VowifiConfig`'s field docs).
-    config.netns = format!("{}{}", base.netns, index);
-    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
-    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-    config.veth_sip_iface = format!("{}{}", base.veth_sip_iface, index);
-    config.veth_ims_iface = format!("{}{}", base.veth_ims_iface, index);
-    let step = 4u32 * index;
-    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
-        config.veth_local_addr = local;
-    }
-    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
-        config.veth_peer_addr = peer;
-    }
-    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
-    // pcscf_source_path stays the shared, global value (also read by
-    // [volte].pcscf_source_path) — not per-line derived.
+    derive_line_resources(&mut config, base, index);
 
     ResolvedLine {
         index,
@@ -354,19 +336,7 @@ fn resolve_one_pcsc_line(
     config.pcsc_reader = true;
     config.line_overrides = Vec::new();
 
-    config.netns = format!("{}{}", base.netns, index);
-    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
-    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-    config.veth_sip_iface = format!("{}{}", base.veth_sip_iface, index);
-    config.veth_ims_iface = format!("{}{}", base.veth_ims_iface, index);
-    let step = 4u32 * index;
-    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
-        config.veth_local_addr = local;
-    }
-    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
-        config.veth_peer_addr = peer;
-    }
-    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
+    derive_line_resources(&mut config, base, index);
 
     ResolvedLine {
         index,
@@ -381,7 +351,7 @@ fn resolve_one_pcsc_line(
 }
 
 /// The serialized artifact `gsm-sip-bridge discover` writes so the
-/// circuit-switched daemon and `docker/entrypoint.sh` agree on the same
+/// circuit-switched daemon and `supervise::orchestrate` agree on the same
 /// role assignment/line table without each re-scanning independently
 /// (research.md item 3, `contracts/discover-cli-contract.md`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -395,7 +365,7 @@ pub struct LineResolution {
 }
 
 /// Everything a consumer needs for one line: the flat fields
-/// `docker/entrypoint.sh`'s `--shell-env` output reads directly, plus the
+/// the `--shell-env` output reads directly, plus the
 /// complete derived `VowifiConfig` so `vowifi-ims-agent --line N` (`main.rs`)
 /// can load it verbatim with no re-derivation (and, critically, no second
 /// USB/AT scan — see this module's top-level doc comment and research.md
@@ -495,6 +465,7 @@ pub fn read_line_resolution(path: &Path) -> Result<LineResolution, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::discovery::SimStatus;
     use std::path::PathBuf;
 
     fn ready_modem(card_id: &str, port: &str, audio: bool, imsi: &str) -> ProbedModem {
@@ -679,8 +650,10 @@ mod tests {
 
     #[test]
     fn resolve_lines_bounds_at_max_lines() {
-        let mut base = VowifiConfig::default();
-        base.max_lines = 2;
+        let base = VowifiConfig {
+            max_lines: 2,
+            ..Default::default()
+        };
         let modems: Vec<ProbedModem> = (0..4)
             .map(|i| {
                 ready_modem(
@@ -737,8 +710,13 @@ mod tests {
         assert_eq!(line.config.veth_local_addr, base.veth_local_addr);
         assert_eq!(line.config.veth_peer_addr, base.veth_peer_addr);
         assert_eq!(line.config.vpcd_port, base.vpcd_port);
-        // pcscf_source_path is shared/global, never per-line derived.
-        assert_eq!(line.config.pcscf_source_path, base.pcscf_source_path);
+        // Suffixed even for a single line, like every other derived resource
+        // here — so line 0 keeps the same path whether or not a second line
+        // later exists.
+        assert_eq!(
+            line.config.pcscf_source_path,
+            format!("{}-0", base.pcscf_source_path)
+        );
         assert_eq!(line.config.control_port, base.control_port);
         // The one thing that DOES change even for a single line: the modem
         // port comes from discovery, not the (irrelevant) default placeholder.
@@ -768,8 +746,11 @@ mod tests {
         assert_ne!(l0.config.veth_local_addr, l1.config.veth_local_addr);
         assert_ne!(l0.config.veth_peer_addr, l1.config.veth_peer_addr);
         assert_ne!(l0.config.vpcd_port, l1.config.vpcd_port);
-        // pcscf_source_path is shared/global, deliberately the same on every line.
-        assert_eq!(l0.config.pcscf_source_path, l1.config.pcscf_source_path);
+        // Regression test for a live two-line failure: one shared file meant
+        // each line's supervisor overwrote the other's tunnel-assigned P-CSCF,
+        // so a line could register against the wrong carrier's proxy —
+        // unreachable from its own netns — and crash-loop.
+        assert_ne!(l0.config.pcscf_source_path, l1.config.pcscf_source_path);
         // FR-011: no accidental collisions.
         assert_ne!(l0.config.veth_local_addr, l0.config.veth_peer_addr);
         assert_ne!(l1.config.veth_local_addr, l1.config.veth_peer_addr);
@@ -787,8 +768,10 @@ mod tests {
                 )
             })
             .collect();
-        let mut base = VowifiConfig::default();
-        base.max_lines = 8;
+        let base = VowifiConfig {
+            max_lines: 8,
+            ..Default::default()
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -812,13 +795,15 @@ mod tests {
     #[test]
     fn line_override_fixes_mcc_mnc_for_one_line() {
         let modems = vec![ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1")];
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![VowifiLineOverride {
-            modem_serial: Some("ec20-AAAAAA".to_string()),
-            mcc: Some("404".to_string()),
-            mnc: Some("094".to_string()),
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some("ec20-AAAAAA".to_string()),
+                mcc: Some("404".to_string()),
+                mnc: Some("094".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -833,13 +818,15 @@ mod tests {
     #[test]
     fn line_override_fixes_imsi_and_imei_for_one_line() {
         let modems = vec![ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1")];
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![VowifiLineOverride {
-            modem_serial: Some("ec20-AAAAAA".to_string()),
-            imsi_override: Some("404400975938075".to_string()),
-            imei_override: Some("864650053414154".to_string()),
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some("ec20-AAAAAA".to_string()),
+                imsi_override: Some("404400975938075".to_string()),
+                imei_override: Some("864650053414154".to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -935,8 +922,10 @@ mod tests {
     fn resolve_lines_pcsc_only_produces_one_line_with_no_modem() {
         // specs/023-omnikey-pcsc-vowifi US1 (T006): a pcsc_reader override
         // with no ProbedModems at all still produces exactly one line.
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![pcsc_override("404940123456789", "404", "043")];
+        let base = VowifiConfig {
+            line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
+            ..Default::default()
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: vec![],
@@ -965,8 +954,10 @@ mod tests {
             false,
             "404011111111111",
         )];
-        let mut base = VowifiConfig::default();
-        base.line_overrides = vec![pcsc_override("404940123456789", "404", "043")];
+        let base = VowifiConfig {
+            line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
+            ..Default::default()
+        };
         let assignment = RoleAssignment {
             circuit_switched: vec![],
             vowifi: modems,
@@ -993,15 +984,34 @@ mod tests {
             modem_line.config.strongswan_if_id,
             pcsc_line.config.strongswan_if_id
         );
+        // Regression test for a live failure in exactly this configuration.
+        // The two resolvers used to derive resources through copy-pasted
+        // blocks, and they drifted: `pcscf_source_path` was made per-line on
+        // the modem path only, so the card-reader line kept the shared base and
+        // went on overwriting the modem line's tunnel-assigned P-CSCF.
+        assert_ne!(
+            modem_line.config.pcscf_source_path,
+            pcsc_line.config.pcscf_source_path
+        );
+        assert_eq!(
+            modem_line.config.pcscf_source_path,
+            format!("{}-0", base.pcscf_source_path)
+        );
+        assert_eq!(
+            pcsc_line.config.pcscf_source_path,
+            format!("{}-1", base.pcscf_source_path)
+        );
     }
 
     #[test]
     fn resolve_lines_pcsc_overflow_reported_like_excess_modem_line() {
         // specs/023-omnikey-pcsc-vowifi US2 (T018): pcsc lines share
         // max_lines with modem lines, not an unbounded separate pool.
-        let mut base = VowifiConfig::default();
-        base.max_lines = 1;
-        base.line_overrides = vec![pcsc_override("404940123456789", "404", "043")];
+        let base = VowifiConfig {
+            max_lines: 1,
+            line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
+            ..Default::default()
+        };
         let modems = vec![ready_modem(
             "ec20-AAAAAA",
             "/dev/ttyUSB0",

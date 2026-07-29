@@ -58,10 +58,16 @@ services:
       - audio
       - dialout
     healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      test: ["CMD", "/usr/local/bin/gsm-sip-bridge", "--config", "/etc/gsm-sip-bridge/config.toml", "healthcheck"]
       interval: 30s
       timeout: 5s
-      start_period: 15s
+      # Sized for how long a carrier takes, not this process — a line is only
+      # healthy once its ePDG tunnel is up and has been assigned a P-CSCF.
+      # Measured on two lines: up in 30-60s, one churning ~2min before
+      # settling, so the old 15s declared unhealthy at 105s, mid-startup.
+      # Keep in step with the Dockerfile's HEALTHCHECK, which documents this
+      # in full; whichever is more specific wins at runtime.
+      start_period: 180s
       retries: 3
 
   prometheus:

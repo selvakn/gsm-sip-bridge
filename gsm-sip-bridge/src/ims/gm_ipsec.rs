@@ -7,7 +7,7 @@
 //!
 //! Shells out to `ip xfrm` rather than speaking raw netlink, to stay
 //! consistent with this crate's zero-`unsafe` policy and the pattern
-//! `docker/entrypoint.sh` already uses for netns/route setup.
+//! `supervise::epdg_iface` already uses for netns/route setup.
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::SaProposal;

@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::config::load_config;
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -307,7 +305,12 @@ at_worker_unresponsive_sec = 99999
 }
 
 #[test]
-fn test_unknown_key_does_not_fail() {
+fn test_unknown_keys_are_rejected_and_all_are_reported_at_once() {
+    // Previously these only produced a `tracing::warn!` and startup
+    // continued. A typo'd key therefore silently did nothing: `max_line = 2`
+    // (missing the `s`) left the real setting at its default, and the single
+    // WARN was buried in a container's modem-probing startup noise — often
+    // emitted before the configured log level had even been applied.
     std::env::set_var("TEST_UNK_PASSWORD", "p");
 
     let config = r#"
@@ -322,6 +325,50 @@ x = 1
 "#;
 
     let f = write_config(config);
-    let result = load_config(f.path());
-    assert!(result.is_ok(), "unknown keys should not cause failure");
+    let err = load_config(f.path()).expect_err("an unknown key must fail the load");
+    let msg = err.to_string();
+
+    // Every offender is named in one error, so an operator with several
+    // typos learns about all of them in one run rather than one per restart.
+    assert!(msg.contains("sip.future_key"), "got: {msg}");
+    assert!(msg.contains("unknown_section"), "got: {msg}");
+    // And the message says where to look.
+    assert!(msg.contains("docs/configuration.md"), "got: {msg}");
+}
+
+/// The error names the section too, not just the bare key — `max_lines` is a
+/// real key in both `[vowifi]` and `[volte]`, so an unqualified name would
+/// not tell the operator which section to fix.
+#[test]
+fn test_an_unknown_key_is_reported_with_its_section() {
+    std::env::set_var("TEST_UNK2_PASSWORD", "p");
+
+    let f = write_config(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_UNK2_PASSWORD"
+
+[vowifi]
+max_line = 2
+"#,
+    );
+
+    let msg = load_config(f.path()).unwrap_err().to_string();
+    assert!(msg.contains("vowifi.max_line"), "got: {msg}");
+}
+
+/// A config using only real keys still loads — the check must not have become
+/// so strict that a valid deployment is rejected.
+#[test]
+fn test_the_shipped_example_config_still_loads() {
+    std::env::set_var("SIP_PASSWORD", "p");
+    std::env::set_var("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/x");
+
+    let example = include_str!("../../config.toml.example");
+    let f = write_config(example);
+
+    load_config(f.path())
+        .expect("config.toml.example must load — it is what operators copy to start from");
 }

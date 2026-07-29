@@ -21,7 +21,7 @@
 //! now holds the per-line body, callable either as a thread here (this
 //! process, no namespace — the single-`--modem` diagnostic path only,
 //! research.md R7) or as its own `volte-carrier-agent` process
-//! (`docker/entrypoint.sh`, inside that line's namespace, the production
+//! (`supervise::orchestrate_volte`, inside that line's namespace, the production
 //! path). This module (`bridge::run`) now runs only the shared telephone-side
 //! half (Agent B) for the production path — see [`ServiceConfig::spawn_carrier_threads`].
 //!
@@ -114,7 +114,7 @@ pub struct BridgeLine {
     pub status_port: u16,
     /// This line's network namespace (specs/020-volte-line-netns). Empty for
     /// the single-`--modem` diagnostic path (no namespace exists); informational
-    /// only here — the manifest carries it for `docker/entrypoint.sh`'s cleanup
+    /// only here — the manifest carries it for `supervise::shutdown`'s cleanup
     /// (research.md R6), nothing in this process itself joins a namespace.
     pub netns: String,
     /// This line's carrier-agent-side veth address. Empty means "no netns for
@@ -137,13 +137,13 @@ pub struct ServiceConfig {
     /// in-process thread (specs/020-volte-line-netns).
     ///
     /// **`true` only for the single-`--modem` diagnostic invocation** — a
-    /// manual, operator-run test with no `docker/entrypoint.sh` orchestration
+    /// manual, operator-run test with no `supervise::orchestrate_volte` orchestration
     /// and so no namespace for a line to be isolated into; this reproduces
     /// exactly what this process did before this feature.
     ///
     /// **`false` for the production, auto-discovered path**: each line's
     /// carrier half instead runs as its own `volte-carrier-agent --line N`
-    /// process, launched by `docker/entrypoint.sh` inside that line's own
+    /// process, launched by `supervise::orchestrate_volte` inside that line's own
     /// namespace (research.md R3) — this process runs only the shared
     /// telephony half (Agent B) and must not *also* run the carrier halves
     /// in-process, which would answer every call twice.
@@ -178,7 +178,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
         "resolved host-side LTE lines"
     );
 
-    // Persist the line manifest so `docker/entrypoint.sh`'s cleanup can tear
+    // Persist the line manifest so `supervise::shutdown` can tear
     // down every line's PDN and `volte-status` can find every line's ports —
     // but only for the diagnostic single-`--modem` path, which owns and is
     // the sole writer of its own manifest. The production, auto-discovered
@@ -268,7 +268,7 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
 
         // Production, auto-discovered lines run their carrier half as a
         // separate, netns-isolated `volte-carrier-agent` process launched by
-        // `docker/entrypoint.sh` (research.md R3) — spawning it *again* here,
+        // `supervise::orchestrate_volte` (research.md R3) — spawning it *again* here,
         // in-process, would answer every call twice. Only the single-`--modem`
         // diagnostic invocation (no entrypoint orchestration, nothing to
         // isolate into) still runs its one line's carrier half as a thread of
@@ -304,7 +304,7 @@ fn non_empty_or_loopback(addr: &str) -> String {
 /// the single-`--modem` diagnostic path** (`spawn_carrier_threads`,
 /// research.md R7) — the production, auto-discovered path runs each line's
 /// carrier half as its own `volte-carrier-agent` process instead, supervised
-/// (restarted on exit) by `docker/entrypoint.sh`, mirroring how
+/// (restarted on exit) by `supervise::orchestrate_volte`, mirroring how
 /// `vowifi-ims-agent` is supervised rather than retrying internally.
 fn run_line(
     line: &BridgeLine,
@@ -364,7 +364,7 @@ fn run_line(
 /// How long a line waits before retrying its carrier half after a failure.
 /// Deliberately unhurried: a retry re-runs PDN attachment and a full IMS-AKA
 /// exchange, so a tight loop would hammer both the modem and the registrar —
-/// the same reasoning as `docker/entrypoint.sh`'s 15s LTE restart backoff.
+/// the same reasoning as `supervise::orchestrate_volte`'s 15s LTE restart backoff.
 const LINE_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
 impl BridgeLine {

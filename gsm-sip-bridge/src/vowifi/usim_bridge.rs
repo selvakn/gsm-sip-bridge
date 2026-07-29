@@ -292,7 +292,7 @@ impl Session {
         // research.md's unverified assumptions hold — does the client ever
         // issue a literal GET RESPONSE, what P2 does it actually send on
         // SELECT, does it select a foreign AID. `-v` (trace level) is what
-        // docker/entrypoint.sh already passes vowifi-usim-bridge.
+        // supervise::orchestrate already passes vowifi-usim-bridge.
         tracing::trace!(apdu = %usim::hex_encode(apdu), "APDU from vpcd client");
 
         let SessionState::Powered {
@@ -412,7 +412,7 @@ where
 
 /// Entry point for the `vowifi-usim-bridge` subcommand: connects to vpcd
 /// once and serves the session until it ends. Reconnection is left to the
-/// process-level supervisor in `docker/entrypoint.sh` (restart-on-exit
+/// process-level supervisor in `supervise::orchestrate` (restart-on-exit
 /// with backoff, the same pattern already used for `vowifi-ims-agent`/
 /// `vowifi-sip-agent`) rather than duplicated here — vpcd/pcscd is a local,
 /// supervised daemon, not a flaky remote peer, so this duty cycle is

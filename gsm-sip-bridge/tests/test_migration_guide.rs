@@ -1,5 +1,3 @@
-mod common;
-
 const MIGRATION_DOC: &str = include_str!("../../docs/migrating-from-v4.1.x.md");
 
 #[test]

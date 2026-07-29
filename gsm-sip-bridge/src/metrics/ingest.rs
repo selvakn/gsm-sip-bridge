@@ -4,7 +4,7 @@
 //!
 //! Counters here only ever move forward: a report's `events` are deltas,
 //! never absolute totals, so a supervised agent restart (routine — see
-//! `docker/entrypoint.sh`'s 5s restart loop) cannot rewind a series
+//! `supervise::orchestrate`'s 5s restart loop) cannot rewind a series
 //! (FR-020). Gauges are the opposite: always applied as the report's
 //! absolute value, latest-wins, with no ordering guarantee assumed between
 //! reports (contracts/observability-protocol.md).

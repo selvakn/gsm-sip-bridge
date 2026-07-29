@@ -1,5 +1,3 @@
-mod common;
-
 // Agent liveness (specs/014-vowifi-metrics-restore, FR-021/FR-021a/FR-021b,
 // SC-009/SC-010): a report delivered over a real control socket must make
 // `metrics::ingest::evaluate_liveness` — the same function

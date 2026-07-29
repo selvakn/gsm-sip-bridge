@@ -509,15 +509,13 @@ mod tests {
     /// error or off-by-one in the filter windows shows up here immediately.
     #[test]
     fn resampling_a_constant_signal_preserves_its_level() {
-        let mut down = Downsampler::default();
-        // Prime `prev` so the very first window isn't straddling the initial
-        // zero, which legitimately ramps.
-        down.prev = 1000;
+        // `prev` is primed so the very first window isn't straddling the
+        // initial zero, which legitimately ramps.
+        let mut down = Downsampler { prev: 1000 };
         let halved = down.process(&[1000i16; 320]);
         assert!(halved.iter().all(|&s| s == 1000), "downsampled DC drifted");
 
-        let mut up = Upsampler::default();
-        up.prev = 1000;
+        let mut up = Upsampler { prev: 1000 };
         let doubled = up.process(&[1000i16; 160]);
         assert!(doubled.iter().all(|&s| s == 1000), "upsampled DC drifted");
     }

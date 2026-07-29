@@ -1,5 +1,3 @@
-mod common;
-
 // `observability::reporter::Reporter` against a real Unix socket: reports
 // made while the daemon is unreachable must survive (buffered, bounded)
 // and be delivered once the daemon comes back, with no counter reset on

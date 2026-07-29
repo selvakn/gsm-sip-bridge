@@ -1,5 +1,3 @@
-mod common;
-
 // User Story 1 (specs/014-vowifi-metrics-restore): inbound VoWiFi calls must
 // move the same call-metric panels circuit-switched calls already use. This
 // drives `ims::observability::AgentObservability` — the real component

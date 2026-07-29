@@ -1,0 +1,6 @@
+---
+source: gsm-sip-bridge/src/supervise/render.rs
+assertion_line: 210
+expression: "render_swanctl_top_conf(\"/etc/swanctl/conf.d\")"
+---
+include /etc/swanctl/conf.d/*.conf

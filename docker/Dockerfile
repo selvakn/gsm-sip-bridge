@@ -198,14 +198,14 @@ RUN make -C src/ifd-vpcd install DESTDIR=/staging
 # (spec FR-001/FR-009).
 FROM alpine:${ALPINE_VERSION}
 
-# bash: docker/entrypoint.sh and healthcheck.sh use arrays, process
-#   substitution, and /dev/tcp/* redirection — none of which busybox ash
-#   (Alpine's default /bin/sh) supports.
+# bash: docker/entrypoint.sh is now a 28-line precondition-check-and-exec
+#   shim, but the SWu-IKEv2 dialer's own scripts still expect bash.
 # python3 -> must match python-builder's python3 (same ALPINE_VERSION base)
 #   for the compiled pyscard/cryptography extensions copied in below to load.
 # iproute2 + net-tools -> the SWu dialer calls BOTH `ip` and net-tools `route`;
-#   also used directly by entrypoint.sh for the vowifi bridge's veth pair
-# iputils/bind-tools/procps -> entrypoint DNS resolve (dig) + keepalive + pgrep
+#   also shelled out to by `supervise` for the vowifi bridge's veth pair
+# iputils/bind-tools/procps -> `supervise`'s DNS resolve (dig) + keepalive +
+#   pgrep
 # alsa-lib/libssl3/libcrypto3/libuuid/eudev-libs/libgcc -> runtime shared libs
 #   for the gsm-sip-bridge binary (PJSIP itself is statically linked; these
 #   are its dynamic dependencies — eudev-libs via the `serialport` crate,
@@ -228,7 +228,6 @@ FROM alpine:${ALPINE_VERSION}
 #   self-registering via USB hotplug — unlike vpcd it needs no static
 #   reader.conf.d entry. Coexists with vpcd; eap-sim-pcsc auto-detects
 #   whatever reader(s) pcscd exposes, real or virtual.
-# wget -> HEALTHCHECK's metrics-endpoint probe
 RUN apk add --no-cache \
         bash \
         python3 \
@@ -279,8 +278,7 @@ RUN mkdir -p /data /etc/gsm-sip-bridge && chown bridge:bridge /data
 VOLUME ["/data"]
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY docker/healthcheck.sh /usr/local/bin/healthcheck.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Runs as root (not `bridge`): the VoWiFi tunnel subsystem needs
 # CAP_NET_ADMIN/CAP_SYS_ADMIN for netns/veth/tun management, granted via
@@ -290,7 +288,23 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
 # gsm-sip-bridge directly with no privilege drop).
 WORKDIR /opt/SWu-IKEv2
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD /usr/local/bin/healthcheck.sh
+# The probe is a subcommand of the binary itself, not a script: its per-line
+# checks go through the same tested `supervise::runner::CommandRunner` seam as
+# the rest of orchestration (see `commands::healthcheck`). This is what
+# removed the last `eval`-a-shell-env-dump coupling from the image.
+# `start-period` is sized for how long a *carrier* takes, not how long this
+# process takes to boot. A line is only healthy once its ePDG tunnel is up and
+# has been assigned a P-CSCF, which means IKE_SA_INIT, EAP-AKA against the SIM,
+# CHILD_SA, and the address landing on the XFRM interface — all at the far end
+# of somebody else's network. Measured 2026-07-29 on two lines: tunnels up in
+# 30-60s, and one line churned (interface recreated, SA renegotiated) for
+# roughly two minutes before settling.
+#
+# At the old 15s the container went `unhealthy` after 15 + 3x30 = 105s, i.e.
+# before a perfectly normal startup had finished. Widening this costs nothing
+# when things are fine — `start-period` only defers the *unhealthy* verdict,
+# and the container still reports healthy the moment the first check passes.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+    CMD ["/usr/local/bin/gsm-sip-bridge", "--config", "/etc/gsm-sip-bridge/config.toml", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

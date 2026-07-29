@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::modules::card::{CardInstance, CardState};
 
 const TEST_RING: usize = 4;

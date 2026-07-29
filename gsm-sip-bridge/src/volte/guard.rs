@@ -15,7 +15,7 @@
 //!
 //! 1. **Cross-path**: refuse to register over LTE while a VoWiFi agent is
 //!    running. Detected by scanning `/proc` for the agent's command line —
-//!    the same signal `docker/entrypoint.sh` uses (`pkill -f
+//!    the same signal `supervise::orchestrate` uses (`pkill -f
 //!    vowifi-ims-agent`), and unlike Agent A's status port it does not depend
 //!    on veth/netns reachability.
 //! 2. **Same-path**: a lock file so two `volte-register` invocations cannot
@@ -37,7 +37,7 @@ pub const DEFAULT_LOCK_PATH: &str = "/tmp/volte-registration.lock";
 /// Matches on argv *structure*, not on the raw command line containing the
 /// name anywhere. A substring test looks equivalent and is not: a shell
 /// running a script that merely mentions `vowifi-ims-agent` — including
-/// `docker/entrypoint.sh`'s own `pkill -f vowifi-ims-agent` — matches it, and
+/// `supervise::orchestrate`'s own `pkill -f vowifi-ims-agent` — matches it, and
 /// then a perfectly legitimate VoLTE registration is refused for no reason.
 /// That false positive showed up the first time this ran against a real
 /// process list.
@@ -242,9 +242,21 @@ mod tests {
 
     #[test]
     fn proc_cmdline_splits_on_nul_and_drops_empties() {
-        let raw = b"/usr/bin/gsm-sip-bridge\0vowifi-ims-agent\0--line\00\0";
+        // NUL-*separated*, exactly as the kernel lays out /proc/<pid>/cmdline
+        // — including the trailing NUL after the final argument, which is
+        // what produces the trailing empty this test proves gets dropped.
+        // Built by joining rather than written as one literal so the
+        // `--line`/`0` boundary can't be misread as an octal escape.
+        let raw: Vec<u8> = [
+            b"/usr/bin/gsm-sip-bridge".as_slice(),
+            b"vowifi-ims-agent",
+            b"--line",
+            b"0",
+            b"",
+        ]
+        .join(&0u8);
 
-        let args = parse_proc_cmdline(raw);
+        let args = parse_proc_cmdline(&raw);
 
         assert_eq!(
             args,

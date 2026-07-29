@@ -1,5 +1,3 @@
-mod common;
-
 // User Story 2 (specs/014-vowifi-metrics-restore): SMS received over VoWiFi
 // must be counted and forwarded-outcome-tracked on the same metrics the
 // circuit-switched path uses, and land in the shared `sms` history table.

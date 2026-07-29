@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::store::calls::{insert_call, CallRecord};
 use gsm_sip_bridge::store::schema::init_schema;
 use gsm_sip_bridge::store::sms::{insert_sms, SmsRecord};

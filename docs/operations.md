@@ -236,6 +236,61 @@ Since v6.2.0 the entrypoint reconciles this automatically on boot
 it was wrong. If it fails, check the modem supports `AT+QCFG="ims"` at all —
 `ims_conf=1` with `volte_cap=1` is the state that causes this.
 
+### VoWiFi: a line re-establishes its tunnel every ~30 seconds
+
+Symptom: one line never stays up. Its supervisor logs
+`tunN missing from netns imsN; recreating and forcing reinitiate` on every
+steady-state tick, `swanctl --list-sas` shows the IKE_SA repeatedly
+ESTABLISHED with a fresh CHILD_SA, and the charon log alternates
+`installing <addr> on tunN` / `removing <addr> from tunN`. The line's Agent A
+fails with `Network unreachable` reaching its P-CSCF, because the tunnel
+interface it should route over is not there.
+
+Cause: the line's XFRM `if_id` is still claimed by leftover kernel state from
+an **earlier container run**, so the interface cannot be recreated. The
+supervisor detects it missing, recreates it, fails, and tears down a
+perfectly healthy CHILD_SA to retry — forever.
+
+This is confusing to confirm because everything visible says the if_id is
+free: `/var/run/netns` is empty, no `gsm-sip-bridge`/`charon` process
+survives, and no interface of that name exists in any namespace you can
+enumerate. The kernel still refuses it:
+
+```
+$ ip link add tun23-1 type xfrm if_id 24
+RTNETLINK answers: File exists
+```
+
+Confirm by checking whether *other* if_ids are free — if a nearby unused one
+works, the name is not the problem, the if_id is:
+
+```
+$ ip link add probe type xfrm if_id 99 && ip link del probe   # succeeds
+```
+
+Then look for the leftovers, all of which outlive the container:
+
+```
+$ ip xfrm policy | grep -c '^src'      # ours carry if_id 0x17, 0x18, ...
+$ ip xfrm state  | grep -c '^src'
+$ ip link show | grep veth-sip         # leaked default-netns veth ends
+```
+
+Fix — **stop the container first**, since this removes live tunnel state:
+
+```
+$ docker stop <container>
+$ ip xfrm policy flush && ip xfrm state flush
+$ ip link del veth-sip0; ip link del veth-sip1     # any that remain
+$ docker start <container>
+```
+
+`flush` is unconditional: run it only when you know nothing else on the host
+uses IPsec. There is no way to delete selectively by if_id — iproute2 rejects
+`ip xfrm policy deleteall if_id N`. The bridge does not do this automatically
+for the same reason; it reports the failure and this remedy instead. A host
+reboot clears the state too.
+
 ### VoWiFi: "no smart card reader" / vpcd connection refused
 
 Symptom: charon logs `SCardListReaders: Cannot find a smart card reader`
@@ -309,7 +364,7 @@ RFC 5626 the network treats one registration as a re-registration of the other
 and deactivates the older binding — the same failure documented above for the
 modem's internal IMS stack. `volte-register` refuses to start while a
 `vowifi-ims-agent` is running (override with `--force` only when deliberately
-testing this), and `entrypoint.sh` refuses to start at all if both sections are
+testing this), and `supervise` refuses to start at all if both sections are
 enabled.
 
 ### The P-CSCF usually has to be captured, not discovered
@@ -320,11 +375,14 @@ advertisement carries none, and no usable resolver is offered. `volte-discover`
 reports this per-method rather than failing opaquely — an empty result there is
 the expected outcome, not a fault.
 
-The working route is to let the VoWiFi/ePDG path capture one: it writes the
-address it learned from the IKEv2 config payload to `[vowifi].pcscf_source_path`
-(default `/tmp/pcscf`), and `volte-register` picks that file up automatically
-when `[volte].pcscf` is unset. So running VoWiFi once on the SIM primes the LTE
-path. `--pcscf` overrides everything.
+The working route is to let the VoWiFi/ePDG path capture one: each line writes
+the address it learned from the IKEv2 config payload to
+`[vowifi].pcscf_source_path` with its line index appended (`/tmp/pcscf-0`,
+`/tmp/pcscf-1`, ...). `volte-register` reads whichever file
+`[volte].pcscf_source_path` names — `/tmp/pcscf-0` by default, i.e. VoWiFi line
+0. So running VoWiFi once on the SIM primes the LTE path; with several VoWiFi
+lines, point it at the one whose carrier you want, since each line's P-CSCF
+comes from its own network. `--pcscf` overrides everything.
 
 ### Symptom: attached but nothing works
 
@@ -352,9 +410,9 @@ previous binding, and the container does the same on shutdown.
 
 | Metric | Meaning |
 |---|---|
-| `gsm_bridge_volte_registered` | 1 when the host-side LTE registration is accepted |
-| `gsm_bridge_volte_pdn_up` | 1 when the IMS PDN is attached **and routable** |
-| `gsm_bridge_volte_registrations_total{outcome}` | `accepted` / `renewed` / `rejected` / `renewal_failed` |
+| `gsm_sip_bridge_volte_registered` | 1 when the host-side LTE registration is accepted |
+| `gsm_sip_bridge_volte_pdn_up` | 1 when the IMS PDN is attached **and routable** |
+| `gsm_sip_bridge_volte_registrations_total{outcome}` | `accepted` / `renewed` / `rejected` / `renewal_failed` |
 
 Deliberately separate from `gsm_bridge_sip_registered` (the PBX side) and from
 the VoWiFi agent's gauges — when something is down you need to know *which*
@@ -372,7 +430,8 @@ enabled = true
 bridge_inbound = true
 ```
 
-`entrypoint.sh` then supervises `volte-bridge` in place of `volte-register`.
+`supervise::orchestrate_volte` then supervises `volte-bridge` in place of
+`volte-register`.
 Run it by hand the same way:
 
 ```bash
@@ -392,8 +451,8 @@ than decorative:
 
 | Watch | Because |
 |---|---|
-| `gsm_bridge_volte_registered` | 0 means calls are being missed, not merely delayed |
-| `gsm_bridge_volte_pdn_up` | attached-but-unrouted is a real, observed state |
+| `gsm_sip_bridge_volte_registered` | 0 means calls are being missed, not merely delayed |
+| `gsm_sip_bridge_volte_pdn_up` | attached-but-unrouted is a real, observed state |
 | `gsm_sip_bridge_active_calls{transport="volte"}` | this path's calls, distinct from `vowifi` and `cs` |
 
 Call and message records carry `transport="volte"`, a third value on the

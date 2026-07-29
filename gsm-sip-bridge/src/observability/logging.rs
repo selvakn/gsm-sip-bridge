@@ -22,7 +22,7 @@ const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 ///
 /// Called unconditionally at the top of `main()` for every subcommand,
 /// including `config vowifi-shell-env` and `discover --shell-env`
-/// (specs/013-multi-card-vowifi) — both of which `docker/entrypoint.sh`
+/// (specs/013-multi-card-vowifi) — both of which `supervise::orchestrate`
 /// captures via `$(...)` and `eval`s as `KEY=value` shell assignments.
 /// `fmt::layer()` writes to stdout by default, which would otherwise
 /// interleave log lines into that captured output and get `eval`'d as

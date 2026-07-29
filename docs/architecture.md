@@ -60,7 +60,7 @@ Three-crate Cargo workspace:
 
 ```text
 ┌──────────────────────────────────────────────┐
-│                  main.rs                      │
+│      main.rs  →  commands/  (CLI + daemon)   │
 ├──────────────┬──────────┬────────────────────┤
 │  CardPool    │ SipBridge│   SmsHandler       │
 │  (modules/)  │ (sip/)   │   (sms/)           │
@@ -70,6 +70,12 @@ Three-crate Cargo workspace:
 │          pjsua-safe  ←  pjsua-sys            │
 └──────────────────────────────────────────────┘
 ```
+
+`main.rs` is deliberately thin — argument parsing, logging setup, and a
+dispatch call. Every subcommand handler lives in `commands/` (one module per
+family, plus `commands::daemon` for the no-subcommand default) *inside the
+library*, because items in a binary crate cannot be imported from `tests/`
+and so cannot be tested at all.
 
 The VoWiFi and VoLTE paths add three more top-level modules to the binary
 crate: `ims/` (IMS registration, IMS-AKA, Gm IPsec, RTP relay — shared

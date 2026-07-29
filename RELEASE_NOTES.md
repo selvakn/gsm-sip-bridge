@@ -1,6 +1,272 @@
 # Release Notes
 
-## Unreleased
+## v8.1.0
+
+Repository maintenance, one structural fix, and a run of VoWiFi fixes found
+by getting two lines up simultaneously for the first time. CLI help text and
+every `*-shell-env` output were verified byte-identical across the refactors.
+
+### Upgrading — one config change needs action
+
+**If you set `pcscf_source_path` by hand, update it.** `[vowifi]`'s value is
+now a *base* with the line index appended, so a config still saying
+`/tmp/pcscf` produces `/tmp/pcscf-0`, `/tmp/pcscf-1`, ... and the literal
+`/tmp/pcscf` is never written again. `[volte].pcscf_source_path` must
+therefore name one specific line — it defaults to `/tmp/pcscf-0`. Both VoLTE
+failure paths now say so explicitly rather than reporting a bare "no P-CSCF
+available", so a stale setting diagnoses itself.
+
+Deployments that never set either key need no edit. Nothing else requires
+one: the per-line charon assets and the healthcheck start period below both
+change under the container, not in your config.
+
+### Multi-line VoWiFi now actually works
+
+Two lines had never both established at once before, and four separate
+defects were hiding behind that. All were found on real hardware (an EC200
+with a Vodafone SIM plus an OmniKey PC/SC reader with a second), and both
+numbers now register with their carriers and answer inbound calls.
+
+- **Breaking (operational): one shared charon serves every line.** Each line
+  used to spawn its own. charon's socket-default plugin sets `SO_REUSEADDR`
+  but never `SO_REUSEPORT`, so N daemons in one network namespace all
+  wildcard-bind `0.0.0.0:500`/`:4500` and exactly **one** receives every
+  reply; the losers retransmit into the void and give up, which the carrier
+  reports to callers as the line being *"switched off"*. Demonstrated rather
+  than deduced: on one boot line 0 established and line 1 timed out, and on
+  the very next restart of the same image the two swapped.
+
+  Per-line isolation never depended on per-line processes — a CHILD_SA is
+  bound to its line by the `if_id` in its own connection block and by the
+  pre-created `tunN` XFRM interface in that line's netns, and the kernel keys
+  SA lookup on `if_id` regardless of which daemon installed it. Connections
+  are now named per line (`ims0`, `ims1`, ...); the template's
+  `remote { id = ims }` stays literal, since that is a protocol identity the
+  ePDG matches to select the IMS APN. Recovery stays scoped: the daemon is
+  restarted only when genuinely dead (atomically, so two lines noticing the
+  same death cannot restart it twice), and every other fault is repaired per
+  connection, leaving other lines' tunnels up. Rendered assets move from
+  `/etc/strongswan-line-N.conf`, `/tmp/charon-N.log`, `/var/run/charon-N.vici`
+  and `/etc/swanctl/conf.d-N/` to single shared paths plus one connection file
+  per line in `/etc/swanctl/conf.d/`.
+- **MOBIKE is off.** charon defaults it on and, on a multi-homed host,
+  promptly sends an INFORMATIONAL carrying `ADD_4_ADDR`/`ADD_6_ADDR`.
+  Vodafone India's ePDG advertises `MOBIKE_SUP` and then never answers it, so
+  charon retransmits five times, concludes the peer is dead, and tears down a
+  completely healthy tunnel (observed: established 03:21:55, gone 03:24:45).
+  MOBIKE exists so a *client* can survive its own address changing; a bridge
+  on a fixed host can only ever lose by it.
+- **The P-CSCF plugin config is generated, not shipped fixed.** The osmocom
+  fork's plugin keys its `enable` block by *connection name*, so naming
+  connections per line silently disabled it everywhere. The failure looks
+  nothing like its cause: charon simply omits `PCSCF4`/`PCSCF6` from its
+  `CPRQ`, no carrier ever returns a P-CSCF, and every line establishes a good
+  tunnel then tears it down for lacking one — about every 30s, forever.
+- **Agent A waits for a busy modem serial instead of failing.** A modem line's
+  serial has two legitimate claimants — the usim bridge (while charon has the
+  virtual card powered on for EAP-AKA) and the IMS-AKA registration — and
+  `serialport` opens exclusively. Losing the race failed the agent outright and
+  the supervisor rebuilt the whole IMS session five seconds later, over a
+  conflict that clears in seconds. Neither side holds the port for long: the
+  bridge drops it on Power Off, and the registration transport is dropped when
+  the REGISTER exchange returns, so a bounded wait resolves it. (Verified on a
+  live two-line deployment: with both lines registered, nothing held the port
+  at all.)
+- **Agent B retries a control-channel bind instead of giving up.** The veth it
+  binds to only exists once that line's tunnel is up, so `EADDRNOTAVAIL` is a
+  normal startup condition — but the bind was one-shot, permanently dropping
+  whichever line was slower, with a single already-scrolled-past ERROR to say
+  so. Lines come up in whatever order their carriers answer, so which line was
+  lost varied run to run.
+- **Breaking: `[vowifi].pcscf_source_path` is a base, not a file.** The line
+  index is appended (`/tmp/pcscf-0`, `/tmp/pcscf-1`, ...). Each line's
+  supervisor writes its own tunnel-assigned P-CSCF there and each line's Agent
+  A reads it back, so one shared file had concurrently establishing lines
+  overwriting each other — the loser registered against the *other* carrier's
+  proxy, unreachable from its own netns, and crash-looped. Observed live
+  holding an address belonging to neither line.
+
+  `[volte].pcscf_source_path` consequently defaults to `/tmp/pcscf-0`, naming
+  one VoWiFi line explicitly: with several lines there is no single "the"
+  address to borrow. **If you set either key by hand, update it** — a config
+  still saying `/tmp/pcscf` will now find nothing, and both VoLTE failure
+  paths say so explicitly rather than reporting a bare "no P-CSCF available".
+- **Fixed: a line could re-establish its tunnel every ~30s, forever.** The
+  line's XFRM `if_id` stays claimed by leftover kernel state from an earlier
+  container run — XFRM policies/states and leaked default-namespace veth ends
+  that all outlive the container — so its tunnel interface cannot be
+  recreated. The supervisor detected it missing, recreated it, failed, and
+  tore down a healthy CHILD_SA to retry. Every step of the interface setup
+  discarded its result, so nothing said why; the kernel had been answering
+  `RTNETLINK answers: File exists` for a name that existed nowhere. The
+  outcome is now checked and reported, with the remedy, and
+  `docs/operations.md` documents the cleanup. Deliberately not automatic:
+  flushing XFRM state would destroy an unrelated IPsec deployment sharing the
+  host, and iproute2 offers no way to delete selectively by if_id.
+- **Fixed: the container's `HEALTHCHECK` called working deployments
+  unhealthy.** A line's P-CSCF is reachable only inside that line's ePDG
+  tunnel namespace, and the probe ran in the default namespace, so it could
+  never succeed. This was a regression in the bash-to-Rust port above: the
+  original ran the probe under `ip netns exec`, and the port kept the
+  namespace for the interface-address check directly above it while dropping
+  it here. Entering a namespace in-process would need `setns` — the only
+  `unsafe` this binary would contain — so the probe re-executes the binary
+  under `ip netns exec` via a hidden `tcp-probe` subcommand, adding no
+  runtime dependency.
+
+- **The healthcheck's start period is 180s, not 15s.** A line is healthy only
+  once its ePDG tunnel is up and has been assigned a P-CSCF, which is carrier
+  round-trips, not process startup: measured 30-60s to establish, with one
+  line churning ~2min before settling. The old 15s declared the container
+  unhealthy at 105s, mid-startup. This only became visible once the probe
+  above started reporting true state.
+
+### Maintenance
+
+- **The `CommandRunner` handle-lifecycle bug class is now a compile error.**
+  The same defect shipped seven times across the supervision loops; none was
+  caught by the 650+ mock-based tests covering that code. `ChildHandle` is no
+  longer `Copy`, `wait` consumes it, a new `reap` replaces every
+  `signal(Term); wait()` pair with signal-poll-escalate, and genuinely shared
+  claims are `Arc<ChildHandle>`. A new `conformance` module asserts every
+  handle invariant against **both** the mock and real runners, so the
+  mock/real divergence that hid the bug fails in CI instead of in production.
+- **`docker/healthcheck.sh` is now `gsm-sip-bridge healthcheck`** — the last
+  orchestration left in bash after specs/021. Its per-line checks go through
+  the same tested `CommandRunner` seam as the rest of `supervise`, with nine
+  tests covering the cases the bash had none for (per-line fault reporting,
+  the engine-specific tunnel interface that once made every strongswan
+  container report unhealthy, and zero-lines degrading rather than failing).
+  The image no longer needs `bash` arrays, `/dev/tcp`, or `eval` of a
+  shell-env dump.
+- **A shared `line` module** now holds what VoWiFi and VoLTE had each
+  reinvented: candidate classification, stable card-id ordering, the
+  `max_lines` cap, per-index resource derivation, and manifest read/write.
+  `shift_ipv4` existed twice byte-identical; `volte::discovery` imported
+  `FailedLine` *from `vowifi::discovery`* (the LTE path depending on the
+  Wi-Fi path); and `modules::discovery` kept private copies of VoLTE's
+  manifest path constants with a comment saying to keep them in sync by
+  hand. All three are gone — `line` sits below both subsystems, so the
+  layering dilemma is removed rather than documented.
+- **Breaking: a VoLTE line's index-0 namespace and veth interfaces are now
+  suffixed** (`volte0`, not `volte`), matching VoWiFi. VoLTE special-cased
+  index 0 to keep the unindexed base for single-line back-compat, so the two
+  subsystems had two rules for the same derivation and line 0 was the one
+  line whose names could not be predicted from its index. Teardown reads the
+  names back out of the manifest, so a restart picks up the new ones cleanly.
+- **Line manifests carry a `schema_version` and refuse a mismatch.** They are
+  contracts between processes that may be different builds (a rolling update,
+  or a `volte-status` from another binary), and both previously used
+  `#[serde(default)]` — so a renamed field deserialised to its default and a
+  line came up with, say, an empty APN. That exact failure is documented in
+  `volte::discovery` as having attached the network's default bearer instead
+  of the IMS one, looking fully configured while the P-CSCF was unreachable.
+- **Dependencies refreshed**: `rand` 0.8 -> 0.9 (`thread_rng`/`gen_range`
+  renamed), `rusqlite` 0.32 -> 0.37, `toml` 0.8 -> 0.9, `cron` 0.12 -> 0.17,
+  `socket2` 0.5 -> 0.6, `base64` 0.22 -> 0.23, `md-5` 0.10 -> 0.11, plus every
+  semver-compatible update. `toml` 0.9 changed `str::parse::<Value>()` to
+  parse a bare *value* rather than a document, so the config loader now uses
+  `toml::from_str`. **`prometheus` deliberately stays on 0.13**: 0.14 changes
+  `with_label_values` to take `&[&String]`, which is 30+ call sites of churn
+  for no fix and no feature.
+- **Fixed: pjlib aborted on every container shutdown.** `Endpoint::drop`
+  called `pjsua_destroy()` without registering the calling thread, unlike
+  every other method on the type. `Drop` runs on whoever owns the value at the
+  end — a Tokio worker, once `pool_handle.abort()` tears the CardPool down —
+  and pjlib refuses to be called from a thread it has never seen. The
+  assertion fired *after* the clean-shutdown log lines and the exit code
+  stayed 0, which is why it read as cosmetic noise. Thread registration is now
+  applied at every pjlib entry point rather than reasoned about per caller.
+  Verified on hardware: the assertion is gone and shutdown ends with a proper
+  "SIP account unregistered".
+- **`config.toml` is now parsed by serde**, replacing ~1400 lines of
+  hand-written `toml::Value` walking with declarative structs. The file format
+  is unchanged — every key, default and range is preserved field by field —
+  but the parsed shape is now split from the runtime shape, which is what
+  makes `deny_unknown_fields` safe: `VowifiConfig`/`VolteConfig` carry
+  per-line *derived* fields (`netns`, `veth_*`, `strongswan_if_id`) that are
+  not settings, and deriving strictness on them directly would have started
+  *accepting* them as settable. Each section's key list is now generated by
+  the same macro that generates its struct, so the parser, the docs test and
+  serde cannot disagree. See
+  [docs/migrating-config-to-strict-parsing.md](docs/migrating-config-to-strict-parsing.md).
+- **Breaking: an unknown key in `config.toml` now fails startup** instead of
+  emitting a `tracing::warn!` and continuing. A typo silently did nothing:
+  `max_line = 2` (missing the `s`) left the real setting at its default, and
+  the one WARN was buried in a container's modem-probing startup noise —
+  often emitted before the configured log level had even been applied. In a
+  system where a wrong value has produced a line that attaches to the wrong
+  bearer and looks healthy while being unreachable, a setting the operator
+  believes they wrote and the bridge silently ignored is not a warning. Every
+  offending key is reported in one error, qualified by section, so several
+  typos are learned in one run rather than one per restart.
+- **New `tests/test_config_docs.rs`** asserts `docs/configuration.md` and
+  `config.toml.example` actually cover what the parser accepts, in both
+  directions. Now that an unknown key is fatal, an undocumented key is one an
+  operator can only find by reading the source, and a stale key in the
+  example would fail every fresh deployment on first start.
+- **Breaking: the three VoLTE metrics using the pre-v5 `gsm_bridge_` prefix
+  are renamed** to `gsm_sip_bridge_volte_registered` / `_pdn_up` /
+  `_registrations_total`. Every other metric moved to `gsm_sip_bridge_` in
+  v5; these three were added later and reintroduced the old prefix, so all 31
+  metrics now share one. Update any dashboard or alert rule referencing them.
+- **An I/O failure no longer reports as a configuration error.**
+  `From<io::Error>` mapped *every* I/O error to `BridgeError::Config`, so a
+  serial port that vanished mid-call, a refused socket, and an unwritable log
+  all told the operator to check config.toml. There is now an `Io` variant
+  that retains the source, so callers can match on `ErrorKind`.
+- **Store migrations are a table** rather than a chain of near-identical
+  `if version == "N"` blocks; adding one is a single entry instead of ~10
+  lines with a hand-copied version number in the `UPDATE`.
+- **~100 stale references to `docker/entrypoint.sh`** across the source and
+  docs claimed it still supervises agents, creates veth pairs, and runs
+  cleanup traps. It has been a 28-line exec shim since specs/021; they now
+  point at the `supervise::` module that actually does the work, and
+  `supervise/mod.rs` carries a table mapping each concern to its module.
+
+- **The CLI handlers moved out of `src/main.rs` into
+  `gsm_sip_bridge::commands`** (2099 lines → 28). A binary crate's items
+  cannot be imported from `tests/`, so all 40 handlers — line resolution,
+  call reporting, and the `*-shell-env` printers whose output
+  `docker/healthcheck.sh` `eval`s — had no tests at all, for a purely
+  structural reason. `main.rs` is now argument parsing, logging setup, and a
+  dispatch call; the 24-arm `if let Some(Commands::X(..))` chain became a
+  `match`, so a new subcommand that is not wired up is a build error rather
+  than one that silently falls through and starts the daemon.
+- **The three `*-shell-env` printers now return a `String`** rather than
+  writing to stdout (`render_vowifi_shell_env`, `render_discover_shell_env`,
+  `render_volte_discover_lines_shell_env`), which is what makes them
+  assertable. Six new tests in `tests/test_shell_env_contracts.rs` pin the
+  contract: array element counts matching `LINE_COUNT` (which
+  `healthcheck.sh` indexes in a `seq` loop), every key still emitted when
+  zero lines resolve, and `shell_quote` escaping against injection.
+- **`make lint` now lints the whole workspace** (`cargo clippy --workspace
+  --all-targets -- -D warnings`). It previously covered only the
+  `gsm-sip-bridge` and `pjsua-safe` crates' default targets, so `amr-safe`,
+  `amr-sys`, `pjsua-sys`, every integration test, and every `#[cfg(test)]`
+  module were never linted — hiding ~15 warnings including genuinely dead
+  test-support code. All of them are now fixed and the gate is clean.
+- **`deny.toml` no longer hard-errors.** It used `[advisories]
+  vulnerability`/`notice` and `[licenses] unlicensed`, all removed from
+  cargo-deny and now rejected outright — so `cargo deny check` failed for
+  anyone who had the tool installed, which `make lint`'s `if command -v`
+  guard quietly hid. Rewritten against the current schema, and CI now
+  installs cargo-deny so the dependency policy is actually enforced.
+- **`make test` prefers `cargo nextest`** when installed, which applies the
+  20s per-test timeout `.config/nextest.toml` has always described but
+  nothing ever ran; falls back to `cargo test` otherwise. CI installs it.
+- **Removed dead weight**: `docker/grafana/dashboards/gsm-bridge.json` (an
+  orphaned 28-panel dashboard mounted nowhere — `docker-compose.yml` only
+  mounts `grafana/provisioning` — and querying the pre-v5 `gsm_bridge_*`
+  metric names that no longer exist), the entirely unused
+  `gsm-sip-bridge/tests/common/` harnesses (`PtyHarness`, `PbxHarness`,
+  `temp_store`, `null_alsa_device`) along with the 25 `mod common;`
+  declarations that existed only to satisfy them, and the vestigial no-op
+  `make test-bash` target.
+
+```
+docker pull ghcr.io/selvakn/gsm-sip-bridge:8.1.0
+```
 
 ## v8.0.0
 

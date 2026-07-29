@@ -18,6 +18,7 @@ Docker Compose quick start, then come back here for depth.
 | [operations.md](operations.md) | Day-2 runbook: `card` CLI, database queries/prune/backup, troubleshooting, and the [VoLTE bridge reference](operations.md#host-side-ims-over-lte-volte) |
 | [observability.md](observability.md) | Prometheus metrics reference, Grafana dashboard, database schema |
 | [ec20-volte-setup.md](ec20-volte-setup.md) | Enabling the EC20's *own* modem-internal VoLTE (MBN profile deactivation, AT commands) — distinct from the host-side VoLTE bridge below |
+| [migrating-config-to-strict-parsing.md](migrating-config-to-strict-parsing.md) | Upgrading to strict config parsing: unknown keys now fail startup, and derived per-line fields are no longer accepted at the top level |
 | [migrating-config-reorg.md](migrating-config-reorg.md) | Upgrading to the restructured `config.toml` (`[audio]`/`[modem_audio]` split, per-line `[[vowifi.line]]`/`[[volte.line]]`) |
 | [development.md](development.md) | Building from source, Makefile targets, pre-commit checks |
 | [migrating-from-v4.1.x.md](migrating-from-v4.1.x.md) | Upgrading from the C++ v4.1.x to the Rust v5.x |

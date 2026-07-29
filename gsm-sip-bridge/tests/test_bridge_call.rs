@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::modules::audio_pipeline::AudioPipeline;
 use gsm_sip_bridge::modules::beep::BeepGenerator;
 use gsm_sip_bridge::sip::alsa_media_port::AlsaMediaPort;

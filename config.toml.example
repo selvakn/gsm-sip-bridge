@@ -177,10 +177,11 @@ enabled = false
 # Airtel; some networks (e.g. Vi) reject a plain UDP/no-sec-agree REGISTER.
 use_tcp = true
 sec_agree = true
-# Path Agent A reads the tunnel-assigned P-CSCF address from; written by
-# docker/entrypoint.sh once the SWu tunnel is up. Shared with
-# [volte].pcscf_source_path below, so a captured address is picked up there
-# automatically too.
+# BASE path Agent A reads its tunnel-assigned P-CSCF address from, written by
+# the supervisor once that line's tunnel is up. The line index is appended,
+# giving /tmp/pcscf-0, /tmp/pcscf-1, ... — each line's carrier assigns its own
+# P-CSCF, so a single shared file would have concurrently establishing lines
+# overwriting each other's address.
 pcscf_source_path = "/tmp/pcscf"
 # Agent A<->B control channel TCP port — shared across every line; lines are
 # told apart by their (internally derived) veth address, not this port.
@@ -302,10 +303,12 @@ bridge_inbound = false
 # bridge_inbound — a single PBX registration then serves every line, exactly
 # as the VoWiFi path does.
 max_lines = 8
-# Where the VoWiFi/ePDG path deposits the P-CSCF it learned from the IKEv2
-# config payload. Shared with [vowifi].pcscf_source_path so a captured
-# address is picked up automatically.
-pcscf_source_path = "/tmp/pcscf"
+# Which VoWiFi line's captured P-CSCF to borrow over LTE (this carrier
+# publishes none over LTE itself). Names ONE specific line: the VoWiFi side
+# writes <base>-<index>, and each line's address comes from its own carrier,
+# so there is no single "the" address to pick up. Change the suffix to borrow
+# a different line's.
+pcscf_source_path = "/tmp/pcscf-0"
 status_path = "/tmp/volte-registration-status"
 lock_path = "/tmp/volte-registration.lock"
 

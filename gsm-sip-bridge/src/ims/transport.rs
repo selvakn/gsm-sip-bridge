@@ -9,7 +9,7 @@
 //! above that is shared.
 //!
 //! Deliberately small. The ePDG side has no attachment work to do at all —
-//! `docker/entrypoint.sh` and the tunnel dialer establish the tunnel long
+//! `supervise::orchestrate` and the tunnel dialer establish the tunnel long
 //! before any agent starts, and the dialer drops the P-CSCF it learned from
 //! the IKEv2 config payload into a file. So `EpdgTransport::prepare` is just
 //! that file read, which is exactly what `agent.rs` did inline before this
@@ -108,7 +108,7 @@ pub trait ImsTransport {
 }
 
 /// The VoWiFi transport: the ePDG tunnel, established out-of-band by
-/// `docker/entrypoint.sh` before the agent starts.
+/// `supervise::orchestrate` before the agent starts.
 ///
 /// This owns no attachment lifecycle of its own — the tunnel outlives any
 /// single registration and is supervised elsewhere — so `teardown` is a

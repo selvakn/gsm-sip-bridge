@@ -1,5 +1,10 @@
 # Configuration Reference
 
+> **An unrecognised key fails startup.** Every key below is checked against
+> what the parser accepts; a typo is reported by name rather than silently
+> ignored. Upgrading from a version that only warned? See
+> [migrating-config-to-strict-parsing.md](migrating-config-to-strict-parsing.md).
+
 The bridge reads a single TOML configuration file specified via `--config`.
 
 ## Sections
@@ -177,10 +182,8 @@ Configures the Unix domain socket used by `card` CLI subcommands to communicate 
 ### `[vowifi]`
 
 The inbound VoWiFi-to-SIP bridge — a second, independent inbound call path
-alongside `[sip]`/`[bridge]`. Only read by the `vowifi-*-agent`/`discover`
-subcommands and `docker/entrypoint.sh`/`healthcheck.sh` (via
-`gsm-sip-bridge config vowifi-shell-env`/`gsm-sip-bridge discover
---shell-env`), never by the normal daemon path. All ePDG-tunnel
+alongside `[sip]`/`[bridge]`. Read by the `vowifi-*-agent`/`discover`/`supervise`/`healthcheck`
+subcommands, never by the normal daemon path. All ePDG-tunnel
 configuration lives here — none of it is read from environment variables;
 `.env` holds secrets only (specs/012-strongswan-epdg config consolidation).
 
@@ -201,7 +204,7 @@ gets discovered/resolved.
 | `enabled` | boolean | `false` | Master switch |
 | `use_tcp` | boolean | `true` | SIP transport to the P-CSCF |
 | `sec_agree` | boolean | `true` | Advertise `Require: sec-agree` / negotiate Gm IPsec |
-| `pcscf_source_path` | string | `/tmp/pcscf` | Path Agent A reads the tunnel-assigned P-CSCF from. Shared with `[volte].pcscf_source_path` so a captured address is picked up there automatically too |
+| `pcscf_source_path` | string | `/tmp/pcscf` | **Base** path Agent A reads its tunnel-assigned P-CSCF from; the line index is appended, so this becomes `/tmp/pcscf-0`, `/tmp/pcscf-1`, ... Each line's carrier assigns its own P-CSCF, so one shared file would have the lines overwriting each other. Point `[volte].pcscf_source_path` at a specific line's file to reuse that address over LTE |
 | `control_port` | integer | 7050 | Agent A↔B control channel TCP port — shared across every line; lines are told apart by their (internally derived) veth address, not this port |
 | `wideband` | boolean | `true` | Carry AMR-WB/G.722 end-to-end instead of narrowing to 8 kHz |
 | `apn` | string | `ims` | APN used by the `swu` engine's dialer — shared across every line |
@@ -253,7 +256,7 @@ infrastructure with no config knob at all.
 | `enabled` | boolean | `false` | Master switch. Off by default; the `volte-*` subcommands work without it as diagnostics |
 | `bridge_inbound` | boolean | `false` | Answer incoming calls over this registration and bridge them to the PBX (specs/017-volte-inbound-bridge), instead of only holding the registration open. Turning this on makes every bridged card EXCLUSIVE to this service — the circuit-switched daemon will not drive it |
 | `max_lines` | integer | 8 | Upper bound on auto-discovered LTE lines (specs/018-volte-multi-modem). Only meaningful with `bridge_inbound` — a single PBX registration then serves every line, exactly as the VoWiFi path does |
-| `pcscf_source_path` | string | `/tmp/pcscf` | Where the VoWiFi/ePDG path deposits the P-CSCF it learned from the IKEv2 config payload. Shared with `[vowifi].pcscf_source_path` so a captured address is picked up automatically |
+| `pcscf_source_path` | string | `/tmp/pcscf-0` | Which VoWiFi line's captured P-CSCF to borrow over LTE. Names **one specific line** — `[vowifi].pcscf_source_path` is a base with the line index appended, and each line's address comes from its own carrier, so there is no single "the" address to pick up. Change the suffix to use a different line |
 | `status_path` | string | `/tmp/volte-registration-status` | Where `volte-register` publishes registration state for `volte-status` |
 | `lock_path` | string | `/tmp/volte-registration.lock` | Lock file preventing two concurrent VoLTE registrations on one SIM |
 

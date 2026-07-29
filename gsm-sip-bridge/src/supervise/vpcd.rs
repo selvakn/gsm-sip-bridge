@@ -1,15 +1,17 @@
 //! Shared pcscd + vpcd reader startup and readiness gate
-//! (specs/021-entrypoint-supervise-rust Phase 4) — 1:1 port of
-//! `docker/entrypoint.sh`'s "One shared pcscd for every strongswan-engine
-//! line" block. One pcscd instance serves every strongswan-engine line's
-//! SIM through one vpcd reader with N slots; each line's
-//! `vowifi-usim-bridge` connects to its own slot's port.
+//! (specs/021-entrypoint-supervise-rust Phase 4), ported from the
+//! one-shared-pcscd block the entrypoint script used to carry. One pcscd
+//! instance serves every strongswan-engine line's SIM through one vpcd reader
+//! with N slots; each line's `vowifi-usim-bridge` connects to its own slot's
+//! port. Driven from `supervise::orchestrate`, which decides whether a vpcd
+//! reader is needed at all — an all-card-reader deployment needs none, since
+//! pcscd picks a physical reader up from USB itself.
 
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use std::path::Path;
 use std::time::Duration;
 
-/// Matches the current script's `for _ in $(seq 1 20); do ...; sleep 0.5; done`
+/// Matches the original script's `for _ in $(seq 1 20); do ...; sleep 0.5; done`
 /// readiness poll — a ~10s bound.
 const READY_POLL_ATTEMPTS: u32 = 20;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -27,7 +29,7 @@ pub fn write_vpcd_reader_conf(runner: &dyn CommandRunner, port: u16) {
 }
 
 /// Spawns pcscd once (the caller is expected to supervise/respawn it via
-/// `daemon_supervisor`-style looping, matching the current script's own
+/// `daemon_supervisor`-style looping, matching the original script's own
 /// `while true; do pcscd --foreground ...; sleep 5; done`).
 pub fn spawn_pcscd(runner: &dyn CommandRunner) -> Option<ChildHandle> {
     let _ = runner.run(&["mkdir", "-p", "/run/pcscd"]);
@@ -39,7 +41,7 @@ pub fn spawn_pcscd(runner: &dyn CommandRunner) -> Option<ChildHandle> {
         .ok()
 }
 
-/// Outcome of the readiness gate — mirrors the current script's `VPCD_READY`
+/// Outcome of the readiness gate — mirrors the original script's `VPCD_READY`
 /// plus its two distinct FATAL causes (pcscd died vs. the driver logging a
 /// bind failure), so the caller can log the same specific guidance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,11 +76,11 @@ pub fn driver_logged_bind_failure(pcscd_log: &str) -> bool {
 
 /// Polls for the vpcd reader's readiness: pcscd still alive, no bind-failure
 /// logged, and the base slot's port actually answers a TCP connect. Matches
-/// the current script's own ordering (pcscd-alive check first, then the log
+/// the original script's own ordering (pcscd-alive check first, then the log
 /// grep, then the connect probe) and its ~10s bound.
 pub fn wait_for_vpcd_ready(
     runner: &dyn CommandRunner,
-    pcscd: ChildHandle,
+    pcscd: &ChildHandle,
     vpcd_host: &str,
     vpcd_port: u16,
 ) -> ReadyOutcome {
@@ -139,7 +141,7 @@ mod tests {
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
         runner.set_tcp_connect_ok("127.0.0.1", 15963, true);
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::Ready
         );
     }
@@ -148,9 +150,9 @@ mod tests {
     fn pcscd_dying_is_reported_immediately_not_as_a_timeout() {
         let runner = MockCommandRunner::new();
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
-        runner.kill_child(pcscd, 1);
+        runner.kill_child(&pcscd, 1);
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::PcscdDied
         );
     }
@@ -161,7 +163,7 @@ mod tests {
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
         runner.set_file(std::path::Path::new(PCSCD_LOG_PATH), "Address in use\n");
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::DriverBindFailed
         );
     }
@@ -171,7 +173,7 @@ mod tests {
         let runner = MockCommandRunner::new();
         let pcscd = runner.spawn(ChildSpec::new(["pcscd"])).unwrap();
         assert_eq!(
-            wait_for_vpcd_ready(&runner, pcscd, "127.0.0.1", 15963),
+            wait_for_vpcd_ready(&runner, &pcscd, "127.0.0.1", 15963),
             ReadyOutcome::TimedOut
         );
         assert_eq!(

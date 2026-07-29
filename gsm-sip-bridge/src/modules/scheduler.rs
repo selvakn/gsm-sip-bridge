@@ -219,7 +219,7 @@ pub fn jitter_offset<R: Rng + ?Sized>(rng: &mut R, max_seconds: u64) -> i64 {
         return 0;
     }
     let max = max_seconds as i64;
-    rng.gen_range(-max..=max)
+    rng.random_range(-max..=max)
 }
 
 /// `base + uniform_random([-jitter, +jitter])`, clamped at zero.
@@ -561,7 +561,7 @@ mod tests {
         let mut rng = seeded_rng();
         for _ in 0..1000 {
             let v = jitter_offset(&mut rng, 60);
-            assert!(v >= -60 && v <= 60, "out of range: {v}");
+            assert!((-60..=60).contains(&v), "out of range: {v}");
         }
     }
 

@@ -9,10 +9,32 @@ use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-/// 1:1 port of `grep -q "CHILD_SA.*established"`.
-pub fn charon_log_shows_established(charon_log: &str) -> bool {
-    charon_log.lines().any(|l| {
+/// Keeps only the lines of the **shared** charon log that belong to
+/// `conn_name`.
+///
+/// Every line's charon used to own its whole log file, so no filtering was
+/// needed. Now one daemon serves all lines into one file, and the only thing
+/// attributing an event to a line is the `<name|uniqueid>` prefix charon emits
+/// because `strongswan.conf` sets `ike_name = yes`. That directive is
+/// therefore load-bearing: drop it and every line would read every other
+/// line's establishment and P-CSCF events as its own, so line 1 would report
+/// itself up the moment line 0 connected.
+fn lines_for_conn<'a>(
+    charon_log: &'a str,
+    conn_name: &str,
+    // `DoubleEndedIterator`, not plain `Iterator`: `extract_latest_pcscf`
+    // scans backwards for the most recent address.
+) -> impl DoubleEndedIterator<Item = &'a str> + 'a {
+    let needle = format!("<{conn_name}|");
+    charon_log.lines().filter(move |l| l.contains(&needle))
+}
+
+/// 1:1 port of `grep -q "CHILD_SA.*established"`, scoped to one connection.
+pub fn charon_log_shows_established(charon_log: &str, conn_name: &str) -> bool {
+    lines_for_conn(charon_log, conn_name).any(|l| {
         l.contains("CHILD_SA")
             && l.find("CHILD_SA")
                 .is_some_and(|pos| l[pos..].contains("established"))
@@ -24,15 +46,14 @@ pub fn charon_log_shows_established(charon_log: &str) -> bool {
 /// pending its own port); duplicated here as a pure function rather than
 /// imported, since this crate has no shared "bash-parity log parsers" module
 /// yet — both read the identical `received P-CSCF server IP ...` marker.
-pub fn extract_latest_pcscf(charon_log: &str) -> Option<String> {
+pub fn extract_latest_pcscf(charon_log: &str, conn_name: &str) -> Option<String> {
     const MARKER: &str = "received P-CSCF server IP ";
     let is_valid_addr = |s: &str| {
         let is_v4 = s.split('.').count() == 4 && s.chars().all(|c| c.is_ascii_digit() || c == '.');
         let is_v6 = s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
         is_v4 || is_v6
     };
-    charon_log
-        .lines()
+    lines_for_conn(charon_log, conn_name)
         // `grep -oE 'received P-CSCF server IP .*'` matches the marker
         // ANYWHERE in the line, not just at its start — real charon output
         // prefixes every line with a facility tag (`[CFG] received P-CSCF
@@ -47,34 +68,197 @@ pub fn extract_latest_pcscf(charon_log: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 1:1 port of `grep -q '^ims:' <<<"$sas_output"`.
-pub fn list_sas_has_ims_child_sa(sas_output: &str) -> bool {
-    sas_output.lines().any(|l| l.starts_with("ims:"))
+/// 1:1 port of `grep -q '^ims:' <<<"$sas_output"`, scoped to one connection —
+/// the shared daemon's unfiltered `--list-sas` would otherwise let one line's
+/// healthy SA mask another's missing one.
+pub fn list_sas_has_child_sa(sas_output: &str, conn_name: &str) -> bool {
+    let prefix = format!("{conn_name}:");
+    sas_output.lines().any(|l| l.starts_with(&prefix))
 }
 
-/// One line's strongSwan engine state — the rendered per-line conf paths and
-/// identifiers `start_line_strongswan` computed once at startup.
-pub struct StrongswanEngine {
-    pub idx: u32,
+/// The single charon daemon shared by every strongswan-engine line.
+///
+/// One charon *per line* was the original design, and it was wrong for a
+/// reason that only appears once a second line exists: charon's socket-default
+/// plugin sets `SO_REUSEADDR` but never `SO_REUSEPORT`, so N charon processes
+/// in one network namespace all wildcard-bind `0.0.0.0:500`/`0.0.0.0:4500` and
+/// exactly **one** of them is delivered every inbound IKE packet. The losers
+/// retransmit into the void and give up, which the carrier surfaces to callers
+/// as the line being "switched off".
+///
+/// Observed live 2026-07-29: on one boot line 0 established and line 1 timed
+/// out; on the very next restart of the same image the two swapped. That
+/// coin-flip is what identified it as a local port collision rather than
+/// anything carrier-side.
+///
+/// Sharing the daemon costs nothing in isolation. A CHILD_SA is bound to its
+/// line by the `if_id` in its own connection block and by the pre-created
+/// `tunN` XFRM interface sitting in that line's netns; the kernel keys its
+/// SA/policy lookup on `if_id` regardless of which daemon installed the state.
+/// This is exactly the arrangement strongSwan expects of a gateway terminating
+/// many independent tunnels.
+///
+/// What sharing *does* cost is recovery blast radius, so the daemon is only
+/// ever restarted when it is genuinely dead ([`SharedCharon::restart_if_dead`]).
+/// Every other fault — a stale SA, a vanished interface, a missing CHILD_SA —
+/// is recovered per connection through `--terminate --ike <conn>` /
+/// `--initiate --child <conn>`, leaving other lines' tunnels untouched.
+pub struct SharedCharon {
     pub strongswan_conf: String,
     pub swanctl_top_conf: String,
     pub charon_log: PathBuf,
+    /// `Mutex`, not the `RefCell` the per-line engines use: this is reached
+    /// concurrently from every line's supervisor thread, and holding the lock
+    /// across the check-and-spawn is what makes "restart it only if nobody
+    /// else already has" atomic.
+    handle: Mutex<Option<Arc<ChildHandle>>>,
+}
+
+impl SharedCharon {
+    pub fn new(strongswan_conf: String, swanctl_top_conf: String, charon_log: PathBuf) -> Self {
+        Self {
+            strongswan_conf,
+            swanctl_top_conf,
+            charon_log,
+            handle: Mutex::new(None),
+        }
+    }
+
+    fn env_prefix(&self) -> String {
+        format!("STRONGSWAN_CONF={}", self.strongswan_conf)
+    }
+
+    /// Spawns the daemon unless it is already running. Idempotent and safe to
+    /// call concurrently from every line's startup thread — lines start on
+    /// their own threads, and whichever arrives first wins.
+    ///
+    /// Returns the handle **only to the caller that actually spawned it**, so
+    /// the daemon gets registered into `StartedState` exactly once instead of
+    /// once per line.
+    pub fn ensure_started(&self, runner: &dyn CommandRunner) -> Option<Arc<ChildHandle>> {
+        let mut guard = self.handle.lock().unwrap();
+        if guard.as_ref().is_some_and(|h| runner.is_alive(h)) {
+            return None;
+        }
+        self.spawn_locked(runner, &mut guard)
+    }
+
+    /// Restarts the daemon **only if it is actually dead**, reporting whether
+    /// it did.
+    ///
+    /// Both halves of that condition matter. A line whose vici calls fail
+    /// while the daemon is alive must not take every other line's tunnel down
+    /// with it; and a second line noticing the same death a moment later must
+    /// not kill the replacement the first line just spawned.
+    pub fn restart_if_dead(&self, runner: &dyn CommandRunner) -> bool {
+        let mut guard = self.handle.lock().unwrap();
+        if guard.as_ref().is_some_and(|h| runner.is_alive(h)) {
+            return false;
+        }
+        self.spawn_locked(runner, &mut guard).is_some()
+    }
+
+    fn spawn_locked(
+        &self,
+        runner: &dyn CommandRunner,
+        guard: &mut Option<Arc<ChildHandle>>,
+    ) -> Option<Arc<ChildHandle>> {
+        if let Some(old) = guard.take() {
+            // Signalling alone was never enough (Greptile P1 on the per-line
+            // version this replaces): RealCommandRunner's tracked-children
+            // table only drops an entry once something reaps it, so a bare
+            // signal leaked an entry on every restart — and let a
+            // slow-to-terminate charon keep contending for the vici socket
+            // and pidfile with the replacement about to be spawned.
+            runner.reap(&old);
+        }
+        let _ = runner.write_file(&self.charon_log, "");
+        let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
+
+        let env = self.env_prefix();
+        // `env` must be argv[0], not the `STRONGSWAN_CONF=...` string itself:
+        // RealCommandRunner passes argv[0] straight to `Command::new`, so
+        // without it the spawn tries to exec the environment assignment as a
+        // program, fails with ENOENT, and leaves no daemon running while the
+        // rest of the sequence proceeds as though one were.
+        let spawned = runner
+            .spawn(
+                ChildSpec::new(["env", env.as_str(), "/usr/libexec/ipsec/charon"])
+                    .capture_stdout_to(self.charon_log.clone()),
+            )
+            .ok()
+            .map(Arc::new);
+        if spawned.is_some() {
+            // Let the vici socket come up before any swanctl call. A
+            // `--load-all` issued too early fails silently (its result is
+            // deliberately ignored), and the `--initiate` that follows then
+            // fails with "CHILD_SA config not found" — leaving the line
+            // re-initiating against an empty config forever, since
+            // steady-state's ChildSaMissing branch only re-initiates and
+            // never reloads.
+            runner.sleep(Duration::from_secs(2));
+        }
+        guard.clone_from(&spawned);
+        spawned
+    }
+
+    pub fn is_alive(&self, runner: &dyn CommandRunner) -> bool {
+        self.handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| runner.is_alive(h))
+    }
+
+    /// The daemon's current handle, so a caller that has just driven a
+    /// recovery can make sure the (possibly replaced) process is registered
+    /// for shutdown.
+    pub fn current_handle(&self) -> Option<Arc<ChildHandle>> {
+        self.handle.lock().unwrap().clone()
+    }
+
+    /// `swanctl --load-all` over the shared `conf.d`, loading the union of
+    /// every line's connection file.
+    ///
+    /// It must stay a whole-directory load: `--load-all` *unloads* any
+    /// connection missing from what it just read, so loading one line's file
+    /// alone would evict the other lines' connections. Loading the union is
+    /// idempotent and order-independent, which is what makes it safe for
+    /// concurrently-starting lines to each call it.
+    pub fn load_all(&self, runner: &dyn CommandRunner) {
+        let env = self.env_prefix();
+        let _ = runner.run(&[
+            "env",
+            env.as_str(),
+            "swanctl",
+            "--load-all",
+            "--file",
+            &self.swanctl_top_conf,
+        ]);
+    }
+}
+
+/// One line's strongSwan engine state — this line's own identifiers, plus a
+/// handle on the daemon every line shares. Anything not per line (the daemon,
+/// its log, its vici socket, its config paths) lives in [`SharedCharon`].
+pub struct StrongswanEngine {
+    pub idx: u32,
+    /// This line's swanctl connection *and* child name (`ims0`, `ims1`, ...).
+    /// Unique per line so that `--initiate`/`--terminate` address exactly one
+    /// line, and so the shared charon log's `<name|N>` prefixes can be
+    /// attributed back to one line.
+    pub conn_name: String,
     pub netns: String,
     pub tun_iface: String,
     /// This line's XFRM `if_id`, needed to recreate the interface after
     /// `SteadyStateHealth::TunVanished` (see `recreate_interface`).
     pub if_id: String,
-    /// The currently-running charon process, if one has been spawned yet —
-    /// `RefCell` because `TunnelEngine`'s methods take `&self` (the shared
-    /// state-machine functions in `line_supervisor` don't need mutable
-    /// access), but `restart_process` must replace this engine's own charon
-    /// handle.
-    pub charon_handle: RefCell<Option<ChildHandle>>,
+    pub shared: Arc<SharedCharon>,
 }
 
 impl StrongswanEngine {
     fn env_prefix(&self) -> String {
-        format!("STRONGSWAN_CONF={}", self.strongswan_conf)
+        self.shared.env_prefix()
     }
 
     /// Blocking `swanctl` invocation — matches the bash calls with no
@@ -110,98 +294,33 @@ impl StrongswanEngine {
         // this call's true fire-and-forget nature.
         let _ = runner.spawn_detached(ChildSpec::new(argv));
     }
-
-    /// The full restart choreography, 1:1 port of both the "charon exited"
-    /// and "vici connection broken" steady-state branches (identical body):
-    /// clear the log, remove the stale unqualified pidfile (charon's own
-    /// "already running" guard checks it regardless of this line's own
-    /// `pidfile =` directive), respawn charon, `swanctl --load-all`, then
-    /// `swanctl --initiate --child ims`.
-    fn restart_charon(&self, runner: &dyn CommandRunner) {
-        if let Some(old) = self.charon_handle.borrow_mut().take() {
-            // Greptile P1: signaling alone was never enough — RealCommand-
-            // Runner's tracked-children table only drops an entry once
-            // something actually reaps it (via wait()/is_alive() observing
-            // the exit). Discarding `old` here without ever waiting on it
-            // left a permanently un-reaped entry in that table every time
-            // this restart path ran (an unbounded leak over a long-running
-            // container's lifetime), and — more operationally relevant —
-            // let a slow-to-terminate old charon keep running, contending
-            // for the same vici socket/pidfile with the brand new one this
-            // function is about to spawn. `wait()` here blocks only this
-            // line's own recovery thread (each line already runs on its
-            // own, per `orchestrate.rs`), so the cost is bounded by how
-            // long a SIGTERM'd charon takes to actually exit, not anything
-            // shared across lines.
-            runner.signal(old, super::runner::Signal::Term);
-            runner.wait(old);
-        }
-        let _ = runner.write_file(&self.charon_log, "");
-        let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
-
-        let env = self.env_prefix();
-        // `env` must be argv[0] here, not the `STRONGSWAN_CONF=...` string
-        // itself — a real bug review caught: RealCommandRunner passes
-        // argv[0] straight to `Command::new`, so without this prefix the
-        // spawn attempted to exec the environment assignment as a program
-        // and failed with ENOENT, silently leaving no charon running while
-        // the rest of the restart sequence (load-all, initiate) proceeded
-        // as if it had.
-        if let Ok(handle) = runner.spawn(
-            ChildSpec::new(["env", env.as_str(), "/usr/libexec/ipsec/charon"])
-                .capture_stdout_to(self.charon_log.clone()),
-        ) {
-            *self.charon_handle.borrow_mut() = Some(handle);
-        }
-
-        // 1:1 port of the current script's own `sleep 2 # let the vici
-        // socket come up before swanctl talks to it` — present at every one
-        // of its charon-respawn sites. Missing here (an FR-009 gap found
-        // live, T049): `--load-all` issued before charon's vici socket is
-        // listening silently fails (its result is deliberately ignored,
-        // matching the script's own `|| true`), then `--initiate` fails
-        // with "CHILD_SA config 'ims' not found" since nothing was ever
-        // loaded — and steady-state's ChildSaMissing branch only ever
-        // re-initiates, never reloads, so the tunnel never recovers on its
-        // own afterward. Observed live: killing charon mid-session left the
-        // line permanently stuck re-initiating against an empty vici
-        // config every 30s, while the healthcheck kept passing on the
-        // stale (pre-kill) tun23-0 address — a silently broken tunnel
-        // reporting healthy.
-        runner.sleep(std::time::Duration::from_secs(2));
-
-        self.swanctl(runner, &["--load-all", "--file", &self.swanctl_top_conf]);
-        self.swanctl_background(runner, &["--initiate", "--child", "ims"]);
-    }
 }
 
 impl TunnelEngine for StrongswanEngine {
     fn is_tunnel_established(&self, runner: &dyn CommandRunner) -> bool {
         runner
-            .read_file(&self.charon_log)
-            .map(|c| charon_log_shows_established(&c))
+            .read_file(&self.shared.charon_log)
+            .map(|c| charon_log_shows_established(&c, &self.conn_name))
             .unwrap_or(false)
     }
 
     fn latest_pcscf(&self, runner: &dyn CommandRunner) -> Option<String> {
         runner
-            .read_file(&self.charon_log)
+            .read_file(&self.shared.charon_log)
             .ok()
-            .and_then(|c| extract_latest_pcscf(&c))
+            .and_then(|c| extract_latest_pcscf(&c, &self.conn_name))
     }
 
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
-        self.charon_handle
-            .borrow()
-            .is_some_and(|h| runner.is_alive(h))
+        self.shared.is_alive(runner)
     }
 
     fn terminate(&self, runner: &dyn CommandRunner) {
-        self.swanctl(runner, &["--terminate", "--ike", "ims"]);
+        self.swanctl(runner, &["--terminate", "--ike", &self.conn_name]);
     }
 
     fn reinitiate(&self, runner: &dyn CommandRunner) {
-        self.swanctl_background(runner, &["--initiate", "--child", "ims"]);
+        self.swanctl_background(runner, &["--initiate", "--child", &self.conn_name]);
     }
 
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
@@ -215,28 +334,56 @@ impl TunnelEngine for StrongswanEngine {
         }
 
         let env = self.env_prefix();
-        let sas_output = match runner.run(&["env", &env, "swanctl", "--list-sas"]) {
+        // `--ike <conn>` scopes the query to this line. Without it the shared
+        // daemon reports every line's SAs, and another line's healthy
+        // CHILD_SA would mask this line's missing one.
+        let sas_output = match runner.run(&[
+            "env",
+            &env,
+            "swanctl",
+            "--list-sas",
+            "--ike",
+            &self.conn_name,
+        ]) {
             Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
             _ => {
                 println!(
-                    "[supervise] line {}: swanctl --list-sas failed (vici connection broken); restarting charon for this line only",
+                    "[supervise] line {}: swanctl --list-sas failed (vici connection broken)",
                     self.idx
                 );
                 return SteadyStateHealth::ViciBroken;
             }
         };
-        if !list_sas_has_ims_child_sa(&sas_output) {
+        if !list_sas_has_child_sa(&sas_output, &self.conn_name) {
             println!(
-                "[supervise] line {}: ims CHILD_SA missing; re-initiating",
-                self.idx
+                "[supervise] line {}: {} CHILD_SA missing; re-initiating",
+                self.idx, self.conn_name
             );
             return SteadyStateHealth::ChildSaMissing;
         }
         SteadyStateHealth::Ok
     }
 
+    /// Recovery for "the process died" and "vici is unreachable".
+    ///
+    /// Restarting the daemon is the one genuinely *global* action here, so it
+    /// happens only when the daemon is actually dead — and `restart_if_dead`
+    /// makes that check-and-respawn atomic, so two lines noticing the same
+    /// death don't restart it twice or kill each other's replacement. While
+    /// the daemon is alive, this line's trouble is its own, and recovery stays
+    /// scoped to its connection so other lines' tunnels keep running.
     fn restart_process(&self, runner: &dyn CommandRunner) {
-        self.restart_charon(runner);
+        let respawned = self.shared.restart_if_dead(runner);
+        // Safe either way: loading the union of conf.d cannot evict anything.
+        // Required after a respawn (a fresh daemon has nothing loaded), and a
+        // harmless no-op otherwise.
+        self.shared.load_all(runner);
+        if !respawned {
+            // Only meaningful against a daemon still holding a stale SA for
+            // this connection; a freshly spawned one has nothing to terminate.
+            self.terminate(runner);
+        }
+        self.reinitiate(runner);
     }
 
     fn max_establish_attempts(&self) -> Option<u32> {
@@ -248,7 +395,21 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn recreate_interface(&self, runner: &dyn CommandRunner) {
-        super::epdg_iface::ensure_epdg_interface(runner, &self.netns, &self.tun_iface, &self.if_id);
+        if !super::epdg_iface::ensure_epdg_interface(
+            runner,
+            &self.netns,
+            &self.tun_iface,
+            &self.if_id,
+        ) {
+            // Without this the loop is silent and endless: steady-state sees a
+            // missing interface every 30s, calls this, and tears down a
+            // healthy CHILD_SA to retry a recreation that cannot succeed.
+            println!(
+                "[supervise] line {}: {} could not be recreated in netns {}; this line will \
+                 keep retrying every steady-state tick until the cause above is cleared",
+                self.idx, self.tun_iface, self.netns
+            );
+        }
     }
 }
 
@@ -290,7 +451,7 @@ pub struct SwuEngine {
     pub netns: String,
     pub src_addr: Option<String>,
     pub log_file: PathBuf,
-    pub dialer_handle: RefCell<Option<ChildHandle>>,
+    pub dialer_handle: RefCell<Option<std::sync::Arc<ChildHandle>>>,
 }
 
 impl SwuEngine {
@@ -338,6 +499,7 @@ impl TunnelEngine for SwuEngine {
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
         self.dialer_handle
             .borrow()
+            .as_ref()
             .is_some_and(|h| runner.is_alive(h))
     }
 
@@ -360,11 +522,10 @@ impl TunnelEngine for SwuEngine {
             // reap the old dialer before spawning its replacement, so its
             // table entry doesn't leak and it can't overlap/contend with
             // the new one.
-            runner.signal(old, super::runner::Signal::Term);
-            runner.wait(old);
+            runner.reap(&old);
         }
         let _ = runner.write_file(&self.log_file, "");
-        *self.dialer_handle.borrow_mut() = self.spawn_dialer(runner);
+        *self.dialer_handle.borrow_mut() = self.spawn_dialer(runner).map(std::sync::Arc::new);
     }
 
     fn max_establish_attempts(&self) -> Option<u32> {
@@ -390,15 +551,50 @@ mod tests {
     #[test]
     fn charon_log_established_matches_the_grep_pattern() {
         assert!(charon_log_shows_established(
-            "12[IKE] CHILD_SA ims{1} established with SPIs..."
+            "12[IKE] <ims0|1> CHILD_SA ims0{1} established with SPIs...",
+            "ims0"
         ));
-        assert!(!charon_log_shows_established("nothing relevant"));
+        assert!(!charon_log_shows_established("nothing relevant", "ims0"));
+    }
+
+    #[test]
+    fn one_lines_established_tunnel_is_not_read_as_another_lines() {
+        // The invariant that makes a shared charon log safe. Both lines write
+        // into one file now, so without `<conn|` scoping line 1 would report
+        // itself up the instant line 0 connected — and then sit waiting for a
+        // P-CSCF that belongs to someone else.
+        let log = "12[IKE] <ims0|1> CHILD_SA ims0{1} established with SPIs...\n";
+        assert!(charon_log_shows_established(log, "ims0"));
+        assert!(
+            !charon_log_shows_established(log, "ims1"),
+            "line 1 must not see line 0's CHILD_SA as its own"
+        );
     }
 
     #[test]
     fn extract_latest_pcscf_picks_the_chronologically_last_valid_line() {
-        let log = "received P-CSCF server IP 10.0.0.1\nreceived P-CSCF server IP 2001:db8::1\nreceived P-CSCF server IP 10.0.0.9\n";
-        assert_eq!(extract_latest_pcscf(log), Some("10.0.0.9".to_string()));
+        let log = "<ims0|1> received P-CSCF server IP 10.0.0.1\n<ims0|1> received P-CSCF server IP 2001:db8::1\n<ims0|1> received P-CSCF server IP 10.0.0.9\n";
+        assert_eq!(
+            extract_latest_pcscf(log, "ims0"),
+            Some("10.0.0.9".to_string())
+        );
+    }
+
+    #[test]
+    fn each_line_extracts_only_its_own_pcscf_from_the_shared_log() {
+        // Two lines interleaved in one file, line 1's address written last.
+        // Each must still read its own — handing line 0 line 1's P-CSCF would
+        // point its IMS agent at the wrong carrier's proxy.
+        let log = "<ims0|1> received P-CSCF server IP 10.0.0.1\n\
+                   <ims1|2> received P-CSCF server IP 10.9.9.9\n";
+        assert_eq!(
+            extract_latest_pcscf(log, "ims0"),
+            Some("10.0.0.1".to_string())
+        );
+        assert_eq!(
+            extract_latest_pcscf(log, "ims1"),
+            Some("10.9.9.9".to_string())
+        );
     }
 
     #[test]
@@ -411,19 +607,22 @@ mod tests {
         // silently keeping every line "stuck without P-CSCF" forever (caught
         // by live-testing against the real EC20 + Airtel SIM: the tunnel
         // established successfully but the establish loop never noticed).
-        let log = "[CFG] received P-CSCF server IP 2401:4900:c4:4035::8\n[CFG] received P-CSCF server IP 2401:4900:c4:4035::b\n";
+        let log = "[CFG] <ims0|1> received P-CSCF server IP 2401:4900:c4:4035::8\n[CFG] <ims0|1> received P-CSCF server IP 2401:4900:c4:4035::b\n";
         assert_eq!(
-            extract_latest_pcscf(log),
+            extract_latest_pcscf(log, "ims0"),
             Some("2401:4900:c4:4035::b".to_string())
         );
     }
 
     #[test]
-    fn list_sas_ims_detection_matches_the_grep_pattern() {
-        assert!(list_sas_has_ims_child_sa(
-            "ims: #1, ESTABLISHED\n  local ..."
+    fn list_sas_detection_matches_the_grep_pattern() {
+        assert!(list_sas_has_child_sa(
+            "ims0: #1, ESTABLISHED\n  local ...",
+            "ims0"
         ));
-        assert!(!list_sas_has_ims_child_sa("other: #1, ESTABLISHED\n"));
+        assert!(!list_sas_has_child_sa("other: #1, ESTABLISHED\n", "ims0"));
+        // A sibling line's SA must not count as this line's.
+        assert!(!list_sas_has_child_sa("ims1: #1, ESTABLISHED\n", "ims0"));
     }
 
     #[test]
@@ -458,36 +657,105 @@ mod tests {
         // CI. The wiring under test (which commands get issued, in what
         // order, on what engine method) is real production code.
 
+        fn shared_charon() -> Arc<SharedCharon> {
+            Arc::new(SharedCharon::new(
+                "/etc/strongswan-shared.conf".to_string(),
+                "/etc/swanctl/swanctl.conf".to_string(),
+                PathBuf::from("/tmp/charon.log"),
+            ))
+        }
+
         fn strongswan_engine() -> StrongswanEngine {
             StrongswanEngine {
                 idx: 0,
-                strongswan_conf: "/etc/strongswan-line-0.conf".to_string(),
-                swanctl_top_conf: "/etc/swanctl-line-0.conf".to_string(),
-                charon_log: PathBuf::from("/tmp/charon-0.log"),
+                conn_name: "ims0".to_string(),
                 netns: "ims".to_string(),
                 tun_iface: "tun23".to_string(),
                 if_id: "23".to_string(),
-                charon_handle: RefCell::new(None),
+                shared: shared_charon(),
             }
         }
 
         #[test]
-        fn terminate_issues_swanctl_terminate_ike_ims() {
+        fn the_daemon_is_spawned_once_no_matter_how_many_lines_share_it() {
+            // This is the fix itself. N lines used to mean N charon
+            // processes, all wildcard-bound to UDP 500/4500 in one netns,
+            // where only one of them ever received a reply.
+            let runner = MockCommandRunner::new();
+            let shared = shared_charon();
+
+            let first = shared.ensure_started(&runner);
+            let second = shared.ensure_started(&runner);
+
+            assert!(
+                first.is_some(),
+                "the first caller spawns it and is handed the handle to register"
+            );
+            assert!(
+                second.is_none(),
+                "a later line must find it already running, not spawn a second"
+            );
+            let charon_spawns = runner
+                .spawn_specs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.argv.iter().any(|a| a == "/usr/libexec/ipsec/charon"))
+                .count();
+            assert_eq!(charon_spawns, 1);
+        }
+
+        #[test]
+        fn restart_process_leaves_a_live_shared_daemon_alone() {
+            // The property that makes sharing safe: one line's vici trouble
+            // must not restart the daemon out from under every other line.
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.shared.ensure_started(&runner);
+            let id = engine.shared.current_handle().unwrap().id();
+
+            engine.restart_process(&runner);
+
+            assert_eq!(
+                engine.shared.current_handle().unwrap().id(),
+                id,
+                "a live shared daemon must survive one line's recovery"
+            );
+            let specs = runner.spawn_specs.lock().unwrap();
+            assert!(
+                specs
+                    .iter()
+                    .any(|s| s.argv.contains(&"--initiate".to_string())
+                        && s.argv.contains(&"ims0".to_string())),
+                "recovery must still re-initiate, scoped to this line's connection"
+            );
+        }
+
+        #[test]
+        fn terminate_is_scoped_to_this_lines_connection() {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
             engine.terminate(&runner);
             let calls = runner.run_calls.lock().unwrap();
-            assert!(calls
-                .iter()
-                .any(|c| c.contains(&"--terminate".to_string()) && c.contains(&"ims".to_string())));
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.contains(&"--terminate".to_string())
+                        && c.contains(&"ims0".to_string()))
+            );
+            assert!(
+                !calls.iter().any(|c| c.contains(&"ims".to_string())),
+                "the bare `ims` name would terminate every line's IKE_SA at once"
+            );
         }
 
         #[test]
-        fn restart_process_clears_the_log_removes_the_pidfile_and_respawns_charon() {
+        fn restart_process_clears_the_log_removes_the_pidfile_and_respawns_a_dead_charon() {
             let runner = MockCommandRunner::new();
+            runner.set_born_dead_if_argv_contains("charon");
             let engine = strongswan_engine();
-            let old = runner.spawn(ChildSpec::new(["charon"])).unwrap();
-            *engine.charon_handle.borrow_mut() = Some(old);
+            engine.shared.ensure_started(&runner);
+            let old_id = engine.shared.current_handle().unwrap().id();
 
             engine.restart_process(&runner);
 
@@ -495,8 +763,11 @@ mod tests {
             assert!(calls
                 .iter()
                 .any(|c| c == &["rm", "-f", "/var/run/charon.pid"]));
-            assert!(engine.charon_handle.borrow().is_some());
-            assert_ne!(*engine.charon_handle.borrow(), Some(old));
+            let new = engine
+                .shared
+                .current_handle()
+                .expect("a replacement must have been spawned");
+            assert_ne!(new.id(), old_id, "the handle must be a new child");
         }
 
         #[test]
@@ -508,13 +779,23 @@ mod tests {
             // with its replacement. `wait()` must be called on the old
             // handle before restart_process returns.
             let runner = MockCommandRunner::new();
+            runner.set_born_dead_if_argv_contains("charon");
             let engine = strongswan_engine();
-            let old = runner.spawn(ChildSpec::new(["charon"])).unwrap();
-            *engine.charon_handle.borrow_mut() = Some(old);
+            engine.shared.ensure_started(&runner);
+            let old_id = engine.shared.current_handle().unwrap().id();
 
             engine.restart_process(&runner);
 
-            assert!(runner.wait_calls.lock().unwrap().contains(&old));
+            // `reap` = SIGTERM, then poll is_alive until it is really gone
+            // (escalating to SIGKILL). Asserting on the signals rather than
+            // on a wait() call, because reap deliberately no longer waits:
+            // waiting untracked the child up front, which is what made a
+            // concurrently-held handle silently unusable.
+            let sigs = runner.signals_for_id(old_id);
+            assert!(
+                sigs.contains(&crate::supervise::runner::Signal::Term),
+                "the replaced child must be terminated, got {sigs:?}"
+            );
         }
 
         #[test]
@@ -527,6 +808,7 @@ mod tests {
             // which would fail with ENOENT against a real runner (a mock
             // can't catch this since it never actually execs anything).
             let runner = MockCommandRunner::new();
+            runner.set_born_dead_if_argv_contains("charon");
             let engine = strongswan_engine();
             engine.restart_process(&runner);
             let specs = runner.spawn_specs.lock().unwrap();
@@ -579,6 +861,7 @@ mod tests {
             // line permanently stuck, while the healthcheck kept passing on
             // the stale pre-kill tun23-0 address.
             let runner = MockCommandRunner::new();
+            runner.set_born_dead_if_argv_contains("charon");
             let engine = strongswan_engine();
             engine.restart_process(&runner);
             assert!(
@@ -587,7 +870,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .contains(&std::time::Duration::from_secs(2)),
-                "restart_process must sleep 2s before --load-all, matching \
+                "a respawn must sleep 2s before --load-all, matching \
                  the bash original at every one of its charon-respawn sites"
             );
         }
@@ -671,11 +954,16 @@ mod tests {
             let runner = MockCommandRunner::new();
             let engine = swu_engine();
             let old = runner.spawn(ChildSpec::new(["swu-dialer"])).unwrap();
-            *engine.dialer_handle.borrow_mut() = Some(old);
+            let old_id = old.id();
+            *engine.dialer_handle.borrow_mut() = Some(std::sync::Arc::new(old));
 
             engine.restart_process(&runner);
 
-            assert!(runner.wait_calls.lock().unwrap().contains(&old));
+            let sigs = runner.signals_for_id(old_id);
+            assert!(
+                sigs.contains(&crate::supervise::runner::Signal::Term),
+                "the replaced child must be terminated, got {sigs:?}"
+            );
         }
     }
 }

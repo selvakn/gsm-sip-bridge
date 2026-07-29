@@ -1,9 +1,11 @@
 pub mod alerts;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod control;
 pub mod error;
 pub mod ims;
+pub mod line;
 pub mod metrics;
 pub mod modules;
 pub mod observability;

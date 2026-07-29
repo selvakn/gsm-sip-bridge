@@ -6,14 +6,14 @@
 //! of shelling out to bash functions.
 //!
 //! Threading note: functions that need to background their own supervision
-//! loop (matching the current script's `(...) &`) take `&Arc<dyn
+//! loop (matching the original script's `(...) &`) take `&Arc<dyn
 //! CommandRunner>` so they can `Arc::clone` it into a genuinely `'static`
 //! `std::thread::spawn` closure; functions that only ever run synchronously
 //! within an already-running supervisor thread (the tested Phase 1-3
 //! modules: `line_supervisor`, `sim_recovery`, `epdg_iface`, `vpcd`, `render`)
 //! keep taking a plain `&dyn CommandRunner`, unchanged.
 
-use super::engines::{StrongswanEngine, SwuEngine};
+use super::engines::{SharedCharon, StrongswanEngine, SwuEngine};
 use super::line_supervisor::{self, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner, RealCommandRunner};
 use super::shutdown::{self, StartedState};
@@ -56,6 +56,58 @@ fn sim_alert_transition(
 fn gsm_sip_bridge_bin() -> String {
     std::env::var("GSM_SIP_BRIDGE_BIN")
         .unwrap_or_else(|_| "/usr/local/bin/gsm-sip-bridge".to_string())
+}
+
+/// Assets of the **one** charon daemon shared by every strongswan-engine line.
+///
+/// These were per line (`/etc/strongswan-line-N.conf`, `/tmp/charon-N.log`,
+/// `/var/run/charon-N.vici`, `/etc/swanctl/conf.d-N/`) back when each line ran
+/// its own daemon — an arrangement that silently broke every line but one,
+/// because N charons in one netns all wildcard-bind UDP 500/4500 and only one
+/// of them receives. See [`SharedCharon`] for the full account.
+const SHARED_STRONGSWAN_CONF: &str = "/etc/strongswan-shared.conf";
+const SHARED_SWANCTL_CONF: &str = "/etc/swanctl/swanctl.conf";
+const SHARED_SWANCTL_CONF_DIR: &str = "/etc/swanctl/conf.d";
+const SHARED_CHARON_LOG: &str = "/tmp/charon.log";
+const SHARED_VICI_SOCKET: &str = "/var/run/charon.vici";
+/// Overwritten at startup from the resolved line set — the osmocom P-CSCF
+/// plugin enables its attribute request per *connection name*, so the image's
+/// static copy cannot know them. See `render::render_pcscf_plugin_conf`.
+const PCSCF_PLUGIN_CONF: &str = "/etc/strongswan.d/charon/p-cscf.conf";
+
+/// This line's swanctl connection and child name.
+///
+/// Unique per line because every line's connection lives in one shared charon:
+/// a shared name would make `--initiate --child` fire every line and
+/// `--terminate --ike` tear every line down, and would make the shared charon
+/// log's `<name|N>` prefix impossible to attribute back to a line.
+///
+/// Whatever this returns must also be what `render_pcscf_plugin_conf` enables,
+/// or the line silently never gets a P-CSCF.
+fn vowifi_conn_name(idx: u32) -> String {
+    format!("ims{idx}")
+}
+
+/// The context every per-line startup step needs, threaded as one value.
+///
+/// These were previously spelled out on each of the four
+/// `start_vowifi_line*` / `start_line_tail` signatures, all of which carried
+/// `#[allow(clippy::too_many_arguments)]` to say so. Bundling them separates
+/// what is *ambient* (the runner, the binary and config paths, the shared
+/// started-state and shutdown gate, the alert sink, the shared charon) from
+/// what actually varies per call (which line, which PLMN, which namespace) —
+/// the latter is what a reader needs to see at a call site, and it was buried
+/// among the former.
+struct LineStartup<'a> {
+    runner: &'a Arc<dyn CommandRunner>,
+    bin: &'a str,
+    config_path: &'a str,
+    config: &'a AppConfig,
+    started: &'a Arc<Mutex<StartedState>>,
+    shutting_down: &'a Arc<RwLock<bool>>,
+    alert_ctx: Option<&'a AlertContext>,
+    /// The charon daemon every strongswan-engine line shares.
+    shared_charon: &'a Arc<SharedCharon>,
 }
 
 /// Entry point for `gsm-sip-bridge supervise`.
@@ -135,7 +187,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
 
     // --- 1. Discover once, up front (specs/013-multi-card-vowifi) ---------
     // Resolved BEFORE the circuit-switched daemon supervisor starts below —
-    // see docker/entrypoint.sh's own extensive comment on why (both would
+    // see this function's own comment below on why (both would
     // otherwise probe the same candidate modem's serial port at once).
     let mut vowifi_lines: Vec<LineResolutionEntry> = Vec::new();
     if config.vowifi.enabled {
@@ -190,7 +242,11 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             }
             match runner.spawn(ChildSpec::new([bin.as_str(), "--config", cfg.as_str()])) {
                 Ok(handle) => {
-                    started.lock().unwrap().daemon_supervisor = Some(handle);
+                    // Shared, not copied: this thread polls it for liveness
+                    // while the shutdown plan holds the other claim so it can
+                    // signal the same child from the shutdown thread.
+                    let handle = Arc::new(handle);
+                    started.lock().unwrap().daemon_supervisor = Some(handle.clone());
                     drop(guard);
                     // Poll is_alive() rather than block on wait(): this
                     // handle is stored in StartedState precisely so
@@ -201,7 +257,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     // process's entire lifetime, silently defeating that
                     // signal, exactly like the vowifi-usim-bridge holder and
                     // VoLTE supervision loops fixed earlier in this feature.
-                    while runner.is_alive(handle) {
+                    while runner.is_alive(&handle) {
                         runner.sleep(Duration::from_secs(1));
                     }
                     println!("[supervise] gsm-sip-bridge daemon exited; restarting in 5s");
@@ -270,7 +326,8 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     eprintln!("[supervise] FATAL: failed to start pcscd");
                     return ExitCode::FAILURE;
                 };
-                started.lock().unwrap().pcscd = Some(pcscd_handle);
+                let pcscd_handle = Arc::new(pcscd_handle);
+                started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
 
                 if needs_vpcd {
                     println!(
@@ -279,7 +336,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                     );
                     match vpcd::wait_for_vpcd_ready(
                         runner.as_ref(),
-                        pcscd_handle,
+                        &pcscd_handle,
                         &config.vowifi.vpcd_host,
                         config.vowifi.vpcd_port,
                     ) {
@@ -306,6 +363,54 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 }
             }
 
+            // Before anything creates an interface or starts charon: clear
+            // XFRM state left by a previous run of this container. It outlives
+            // the container and keeps these lines' if_ids claimed, which makes
+            // their tunnel interfaces impossible to create — the line then
+            // re-establishes its tunnel every steady-state tick, forever.
+            // Guarded so a host running unrelated IPsec is never touched.
+            let our_if_ids: std::collections::BTreeSet<u32> =
+                vowifi_lines.iter().map(|l| l.strongswan_if_id).collect();
+            epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
+
+            // Render the shared charon's assets once, before any line starts.
+            // Every line then drops its own connection file into the shared
+            // conf.d and loads the union.
+            let shared_charon = Arc::new(SharedCharon::new(
+                SHARED_STRONGSWAN_CONF.to_string(),
+                SHARED_SWANCTL_CONF.to_string(),
+                PathBuf::from(SHARED_CHARON_LOG),
+            ));
+            let _ = runner.write_file(
+                Path::new(SHARED_STRONGSWAN_CONF),
+                &super::render::render_strongswan_conf(SHARED_VICI_SOCKET, SHARED_CHARON_LOG),
+            );
+            let _ = runner.run(&["mkdir", "-p", SHARED_SWANCTL_CONF_DIR]);
+            // Drop any connection file left by a previous run of this
+            // container: `docker restart` keeps the filesystem, and a stale
+            // `epdg-N.conf` for a line that no longer exists would be loaded
+            // right back in by the directory-wide `--load-all`.
+            let _ = runner.run(&[
+                "sh",
+                "-c",
+                &format!("rm -f {SHARED_SWANCTL_CONF_DIR}/*.conf"),
+            ]);
+            let _ = runner.write_file(
+                Path::new(SHARED_SWANCTL_CONF),
+                &super::render::render_swanctl_top_conf(SHARED_SWANCTL_CONF_DIR),
+            );
+            // Must be written before charon starts: the plugin reads this once
+            // at load time, and it enables the P-CSCF request per connection
+            // *name*, so it has to name every line the daemon will serve.
+            let conn_names: Vec<String> = vowifi_lines
+                .iter()
+                .map(|l| vowifi_conn_name(l.index))
+                .collect();
+            let _ = runner.write_file(
+                Path::new(PCSCF_PLUGIN_CONF),
+                &super::render::render_pcscf_plugin_conf(&conn_names),
+            );
+
             for line in &vowifi_lines {
                 let runner = Arc::clone(&runner);
                 let bin = bin.clone();
@@ -315,16 +420,20 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                 let config = config.clone();
                 let line = line.clone();
                 let alert_ctx = alert_ctx.clone();
+                let shared_charon = Arc::clone(&shared_charon);
                 std::thread::spawn(move || {
                     start_vowifi_line(
-                        &runner,
-                        &bin,
-                        &cfg,
-                        &config,
+                        &LineStartup {
+                            runner: &runner,
+                            bin: &bin,
+                            config_path: &cfg,
+                            config: &config,
+                            started: &started,
+                            shutting_down: &shutting_down,
+                            alert_ctx: alert_ctx.as_ref(),
+                            shared_charon: &shared_charon,
+                        },
                         &line,
-                        &started,
-                        &shutting_down,
-                        alert_ctx.as_ref(),
                     );
                 });
             }
@@ -348,14 +457,15 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                         "vowifi-sip-agent",
                     ])) {
                         Ok(handle) => {
-                            started.lock().unwrap().sip_agent_supervisor = Some(handle);
+                            let handle = Arc::new(handle);
+                            started.lock().unwrap().sip_agent_supervisor = Some(handle.clone());
                             drop(guard);
                             // See the daemon_supervisor loop above: poll
                             // is_alive(), don't block on wait(), so this
                             // handle (signaled by execute_shutdown_plan via
                             // `sip_agent_supervisor`) stays signalable for
                             // as long as the process is actually alive.
-                            while runner.is_alive(handle) {
+                            while runner.is_alive(&handle) {
                                 runner.sleep(Duration::from_secs(1));
                             }
                             println!("[supervise] vowifi-sip-agent exited; restarting in 5s");
@@ -526,17 +636,11 @@ fn check_pcsc_engine_compatibility(
 /// One VoWiFi line's full startup — 1:1 port of `start_line_strongswan`/
 /// `start_line_swu`'s shared prelude (modem presence, IMS mode reconcile,
 /// mcc/mnc derivation), then dispatches to the engine-specific rest.
-#[allow(clippy::too_many_arguments)]
-fn start_vowifi_line(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
-    line: &LineResolutionEntry,
-    started: &Arc<Mutex<StartedState>>,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
-) {
+fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
+    let runner = ctx.runner;
+    let bin = ctx.bin;
+    let config_path = ctx.config_path;
+    let config = ctx.config;
     let idx = line.index;
     let modem = line.modem_port.clone();
     if line.pcsc_reader {
@@ -570,54 +674,30 @@ fn start_vowifi_line(
     };
 
     if config.vowifi.tunnel_engine == "strongswan" {
-        start_vowifi_line_strongswan(
-            runner,
-            bin,
-            config_path,
-            config,
-            line,
-            &mcc,
-            &mnc,
-            started,
-            shutting_down,
-            alert_ctx,
-        );
+        start_vowifi_line_strongswan(ctx, line, &mcc, &mnc);
     } else {
-        start_vowifi_line_swu(
-            runner,
-            bin,
-            config_path,
-            config,
-            line,
-            &mcc,
-            &mnc,
-            started,
-            shutting_down,
-            alert_ctx,
-        );
+        start_vowifi_line_swu(ctx, line, &mcc, &mnc);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_vowifi_line_strongswan(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
+    ctx: &LineStartup,
     line: &LineResolutionEntry,
     mcc: &str,
     mnc: &str,
-    started: &Arc<Mutex<StartedState>>,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
 ) {
+    let runner = ctx.runner;
+    let bin = ctx.bin;
+    let config_path = ctx.config_path;
+    let config = ctx.config;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
     let idx = line.index;
     let modem = line.modem_port.clone();
     let netns = line.netns.clone();
     let tun_iface = line.strongswan_tun_iface.clone();
     let if_id = line.strongswan_if_id.to_string();
-    let charon_log = PathBuf::from(format!("/tmp/charon-{idx}.log"));
-    let vici_socket = format!("/var/run/charon-{idx}.vici");
+    let conn_name = vowifi_conn_name(idx);
 
     let Some(epdg_ip) = resolve_epdg_ip(
         runner.as_ref(),
@@ -632,7 +712,13 @@ fn start_vowifi_line_strongswan(
         return;
     };
 
-    epdg_iface::ensure_epdg_interface(runner.as_ref(), &netns, &tun_iface, &if_id);
+    if !epdg_iface::ensure_epdg_interface(runner.as_ref(), &netns, &tun_iface, &if_id) {
+        eprintln!(
+            "[supervise] line {idx}: {tun_iface} is still absent from netns {netns} after \
+             setup; this line's tunnel cannot carry traffic and its supervisor will keep \
+             retrying (see the error above for why the interface could not be created)"
+        );
+    }
     started.lock().unwrap().started_netns.push(netns.clone());
 
     let Some(imsi) = resolve_imsi(runner.as_ref(), bin, line) else {
@@ -640,18 +726,9 @@ fn start_vowifi_line_strongswan(
         return;
     };
 
-    // Render strongswan.conf / swanctl.conf(s) — 1:1 with `gsm-sip-bridge render`.
-    let strongswan_conf_path = format!("/etc/strongswan-line-{idx}.conf");
-    let strongswan_conf =
-        super::render::render_strongswan_conf(idx, &vici_socket, &charon_log.to_string_lossy());
-    let _ = runner.write_file(Path::new(&strongswan_conf_path), &strongswan_conf);
-
-    let swanctl_conf_dir = format!("/etc/swanctl/conf.d-{idx}");
-    let _ = runner.run(&["mkdir", "-p", &swanctl_conf_dir]);
-    let swanctl_top_conf_path = format!("/etc/swanctl-line-{idx}.conf");
-    let swanctl_top_conf = super::render::render_swanctl_top_conf(&swanctl_conf_dir);
-    let _ = runner.write_file(Path::new(&swanctl_top_conf_path), &swanctl_top_conf);
-
+    // No per-line strongswan.conf / swanctl top conf any more: both belong to
+    // the shared daemon and are rendered once in `run`. This line contributes
+    // only its own connection file, below.
     let updown_path = format!("/etc/strongswan.d/ims-updown-{idx}.sh");
     let updown_script = super::render::render_updown_script(&netns, &tun_iface);
     let _ = runner.write_file(Path::new(&updown_path), &updown_script);
@@ -662,6 +739,7 @@ fn start_vowifi_line_strongswan(
         .unwrap_or_default();
     let src_addr = config.vowifi.src_addr.clone();
     let params = super::render::SwanctlEpdgParams {
+        conn_name: &conn_name,
         imsi: &imsi,
         mcc,
         mnc,
@@ -672,7 +750,7 @@ fn start_vowifi_line_strongswan(
     };
     let swanctl_epdg = super::render::render_swanctl_epdg(&epdg_template, &params);
     let _ = runner.write_file(
-        Path::new(&format!("{swanctl_conf_dir}/epdg.conf")),
+        Path::new(&format!("{SHARED_SWANCTL_CONF_DIR}/epdg-{idx}.conf")),
         &swanctl_epdg,
     );
 
@@ -681,7 +759,7 @@ fn start_vowifi_line_strongswan(
     // needed for a pcsc_reader line: pcscd already reaches the physical
     // reader directly via the ccid driver, with no modem/AT+CSIM bridge in
     // the path at all (specs/023-omnikey-pcsc-vowifi).
-    let usim_holder: Arc<Mutex<Option<ChildHandle>>> = Arc::new(Mutex::new(None));
+    let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
     if !line.pcsc_reader {
         let runner = Arc::clone(runner);
         let bin = bin.to_string();
@@ -710,8 +788,9 @@ fn start_vowifi_line_strongswan(
                 &vpcd_port.to_string(),
             ])) {
                 Ok(h) => {
-                    *usim_holder.lock().unwrap() = Some(h);
-                    started.lock().unwrap().vowifi_child_handles.push(h);
+                    let h = Arc::new(h);
+                    *usim_holder.lock().unwrap() = Some(h.clone());
+                    started.lock().unwrap().vowifi_child_handles.push(h.clone());
                     drop(guard);
                     // Poll is_alive() rather than blocking on wait(): a real
                     // review finding caught that RealCommandRunner::wait()
@@ -726,7 +805,7 @@ fn start_vowifi_line_strongswan(
                     // defeated that synchronization — the mocked test never
                     // caught it because MockCommandRunner::wait() doesn't
                     // remove the entry the way the real one does.
-                    while runner.is_alive(h) {
+                    while runner.is_alive(&h) {
                         runner.sleep(Duration::from_secs(1));
                     }
                     println!("[supervise] line {idx}: vowifi-usim-bridge exited; restarting in 5s");
@@ -742,16 +821,12 @@ fn start_vowifi_line_strongswan(
 
     let engine = StrongswanEngine {
         idx,
-        strongswan_conf: strongswan_conf_path,
-        swanctl_top_conf: swanctl_top_conf_path,
-        charon_log: charon_log.clone(),
+        conn_name: conn_name.clone(),
         netns: netns.clone(),
         tun_iface: tun_iface.clone(),
         if_id: if_id.clone(),
-        charon_handle: RefCell::new(None),
+        shared: Arc::clone(ctx.shared_charon),
     };
-    let _ = runner.write_file(&charon_log, "");
-    let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
         // recovery/steady-state covered restarts, but this line's very
@@ -766,42 +841,34 @@ fn start_vowifi_line_strongswan(
             println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
             return;
         }
-        match runner.spawn(
-            ChildSpec::new([
-                "env",
-                &format!("STRONGSWAN_CONF={}", engine.strongswan_conf),
-                "/usr/libexec/ipsec/charon",
-            ])
-            .capture_stdout_to(charon_log.clone()),
-        ) {
-            Ok(h) => {
-                *engine.charon_handle.borrow_mut() = Some(h);
-                started.lock().unwrap().vowifi_child_handles.push(h);
-            }
-            Err(e) => {
-                eprintln!("[supervise] line {idx}: FATAL: failed to spawn charon: {e}");
-                return;
-            }
+        // Idempotent across lines: whichever line reaches this first spawns
+        // the daemon and is handed the handle to register for shutdown; every
+        // other line finds it already running and gets `None` back, so the
+        // daemon is registered exactly once rather than once per line.
+        if let Some(h) = ctx.shared_charon.ensure_started(runner.as_ref()) {
+            started.lock().unwrap().vowifi_child_handles.push(h);
         }
     }
 
-    runner.sleep(Duration::from_secs(2));
-    let env = format!("STRONGSWAN_CONF={}", engine.strongswan_conf);
-    let _ = runner.run(&[
-        "env",
-        &env,
-        "swanctl",
-        "--load-all",
-        "--file",
-        &engine.swanctl_top_conf,
-    ]);
+    if !ctx.shared_charon.is_alive(runner.as_ref()) {
+        eprintln!(
+            "[supervise] line {idx}: FATAL: shared charon is not running; skipping this line"
+        );
+        return;
+    }
+
+    // Load the union of every line's connection file, then initiate only this
+    // line's child. Ordering between concurrently-starting lines is safe: each
+    // line loads *after* writing its own file, so its own connection is always
+    // present, and a directory-wide load can never evict another line's.
+    ctx.shared_charon.load_all(runner.as_ref());
     let _ = runner.spawn_detached(ChildSpec::new([
         "env",
-        &env,
+        &format!("STRONGSWAN_CONF={SHARED_STRONGSWAN_CONF}"),
         "swanctl",
         "--initiate",
         "--child",
-        "ims",
+        &conn_name,
     ]));
 
     println!("[supervise] line {idx}: waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ...");
@@ -826,19 +893,7 @@ fn start_vowifi_line_strongswan(
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
-    start_line_tail(
-        runner,
-        bin,
-        config_path,
-        idx,
-        &netns,
-        line,
-        &usim_holder,
-        started,
-        pcscf.clone(),
-        shutting_down,
-        alert_ctx,
-    );
+    start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
@@ -873,12 +928,19 @@ fn start_vowifi_line_strongswan(
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
             line_supervisor::SteadyOutcome::Recovered { reason } => {
-                if let Some(new_handle) = *engine.charon_handle.borrow() {
-                    started
-                        .lock()
-                        .unwrap()
+                if let Some(new_handle) = engine.shared.current_handle() {
+                    let mut st = started.lock().unwrap();
+                    // Dedupe by identity: most recoveries are connection-
+                    // scoped and leave the daemon untouched, so without this
+                    // every line would re-push the same handle on every
+                    // recovery tick and grow the shutdown list forever.
+                    if !st
                         .vowifi_child_handles
-                        .push(new_handle);
+                        .iter()
+                        .any(|h| Arc::ptr_eq(h, &new_handle))
+                    {
+                        st.vowifi_child_handles.push(new_handle);
+                    }
                 }
                 drop(guard);
                 if line_supervisor::recovery_restarts_agent(reason) {
@@ -895,20 +957,20 @@ fn start_vowifi_line_strongswan(
 /// `start_line_tail` and its keepalive sibling. Both supervision loops run
 /// on their own background threads and this function returns immediately,
 /// matching the bash original backgrounding both with `&`.
-#[allow(clippy::too_many_arguments)]
 fn start_line_tail(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
+    ctx: &LineStartup,
     idx: u32,
     netns: &str,
     line: &LineResolutionEntry,
-    usim_holder: &Arc<Mutex<Option<ChildHandle>>>,
-    started: &Arc<Mutex<StartedState>>,
+    usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     initial_pcscf: String,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
 ) {
+    let runner = ctx.runner;
+    let bin = ctx.bin;
+    let config_path = ctx.config_path;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
+    let alert_ctx = ctx.alert_ctx;
     let veth_sip = line.config.veth_sip_iface.clone();
     let veth_ims = line.config.veth_ims_iface.clone();
     let veth_sip_addr = format!("{}/30", line.veth_peer_addr);
@@ -993,14 +1055,19 @@ fn start_line_tail(
                     runner.sleep(Duration::from_secs(5));
                     continue;
                 };
-                started.lock().unwrap().vowifi_child_handles.push(handle);
+                let handle = Arc::new(handle);
+                started
+                    .lock()
+                    .unwrap()
+                    .vowifi_child_handles
+                    .push(handle.clone());
                 drop(guard);
                 // See the daemon_supervisor loop earlier in this file: poll
                 // is_alive(), don't block on wait(), so this handle
                 // (signaled by execute_shutdown_plan via
                 // `vowifi_child_handles`) stays signalable for as long as
                 // the process is actually alive.
-                while runner.is_alive(handle) {
+                while runner.is_alive(&handle) {
                     runner.sleep(Duration::from_secs(1));
                 }
                 println!("[supervise] line {idx}: vowifi-ims-agent exited; restarting in 5s");
@@ -1013,13 +1080,13 @@ fn start_line_tail(
                 };
                 let action = csim_fails.observe(outcome);
                 if action == sim_recovery::Action::ResetSim {
-                    let holder = *usim_holder.lock().unwrap();
+                    let holder = usim_holder.lock().unwrap().clone();
                     let reset_log = PathBuf::from(format!("/tmp/sim-reset-{idx}.log"));
                     sim_recovery::reset_modem_sim(
                         runner.as_ref(),
                         Path::new(&modem),
                         &reset_log,
-                        holder,
+                        holder.as_deref(),
                     );
                 }
                 if action == sim_recovery::Action::GiveUpForThisIncident {
@@ -1063,7 +1130,7 @@ fn start_line_tail(
         let interval = Duration::from_secs(
             /* [vowifi].keepalive_interval_sec, read by the caller and
             threaded through would be cleaner, but this loop only needs a
-            reasonable default matching entrypoint.sh's own $KEEPALIVE_INTERVAL
+            reasonable default matching the original script's own $KEEPALIVE_INTERVAL
             fallback */
             30,
         );
@@ -1088,19 +1155,11 @@ fn start_line_tail(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_vowifi_line_swu(
-    runner: &Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
-    line: &LineResolutionEntry,
-    mcc: &str,
-    mnc: &str,
-    started: &Arc<Mutex<StartedState>>,
-    shutting_down: &Arc<RwLock<bool>>,
-    alert_ctx: Option<&AlertContext>,
-) {
+fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &str, mnc: &str) {
+    let runner = ctx.runner;
+    let config = ctx.config;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
     let idx = line.index;
     let modem = line.modem_port.clone();
     let netns = line.netns.clone();
@@ -1132,7 +1191,7 @@ fn start_vowifi_line_swu(
         return;
     }
     engine.restart_process(runner.as_ref()); // first spawn, same path as later respawns
-    if let Some(h) = *engine.dialer_handle.borrow() {
+    if let Some(h) = engine.dialer_handle.borrow().clone() {
         started.lock().unwrap().vowifi_child_handles.push(h);
         drop(guard);
     } else {
@@ -1169,20 +1228,8 @@ fn start_vowifi_line_swu(
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
     started.lock().unwrap().started_netns.push(netns.clone());
 
-    let usim_holder: Arc<Mutex<Option<ChildHandle>>> = Arc::new(Mutex::new(None));
-    start_line_tail(
-        runner,
-        bin,
-        config_path,
-        idx,
-        &netns,
-        line,
-        &usim_holder,
-        started,
-        pcscf.clone(),
-        shutting_down,
-        alert_ctx,
-    );
+    let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
+    start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     let mut current_pcscf = pcscf;
     loop {
@@ -1206,7 +1253,7 @@ fn start_vowifi_line_swu(
                 current_pcscf = new_pcscf;
             }
             line_supervisor::SteadyOutcome::Recovered { .. } => {
-                if let Some(h) = *engine.dialer_handle.borrow() {
+                if let Some(h) = engine.dialer_handle.borrow().clone() {
                     started.lock().unwrap().vowifi_child_handles.push(h);
                 }
                 drop(guard);
@@ -1268,6 +1315,14 @@ mod tests {
     use crate::config::VowifiConfig;
     use crate::supervise::runner::MockCommandRunner;
 
+    fn test_shared_charon() -> Arc<SharedCharon> {
+        Arc::new(SharedCharon::new(
+            SHARED_STRONGSWAN_CONF.to_string(),
+            SHARED_SWANCTL_CONF.to_string(),
+            PathBuf::from(SHARED_CHARON_LOG),
+        ))
+    }
+
     fn test_config() -> AppConfig {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1284,8 +1339,10 @@ mod tests {
     }
 
     fn pcsc_line(index: u32) -> LineResolutionEntry {
-        let mut config = VowifiConfig::default();
-        config.imsi_override = Some("404940123456789".to_string());
+        let config = VowifiConfig {
+            imsi_override: Some("404940123456789".to_string()),
+            ..Default::default()
+        };
         LineResolutionEntry {
             index,
             card_id: format!("pcsc{index}"),
@@ -1372,16 +1429,20 @@ mod tests {
         let line = pcsc_line(0);
         let started = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down = Arc::new(RwLock::new(false));
+        let shared_charon = test_shared_charon();
 
         start_vowifi_line(
-            &runner,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+            &LineStartup {
+                runner: &runner,
+                bin: "gsm-sip-bridge",
+                config_path: "/tmp/cfg.toml",
+                config: &config,
+                started: &started,
+                shutting_down: &shutting_down,
+                alert_ctx: None,
+                shared_charon: &shared_charon,
+            },
             &line,
-            &started,
-            &shutting_down,
-            None,
         );
 
         assert!(
@@ -1410,18 +1471,22 @@ mod tests {
         let line = pcsc_line(0);
         let started = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down = Arc::new(RwLock::new(false));
+        let shared_charon = test_shared_charon();
 
         start_vowifi_line_strongswan(
-            &runner,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+            &LineStartup {
+                runner: &runner,
+                bin: "gsm-sip-bridge",
+                config_path: "/tmp/cfg.toml",
+                config: &config,
+                started: &started,
+                shutting_down: &shutting_down,
+                alert_ctx: None,
+                shared_charon: &shared_charon,
+            },
             &line,
             &line.mcc.clone(),
             &line.mnc.clone(),
-            &started,
-            &shutting_down,
-            None,
         );
         assert!(
             !spawned_argv_containing(&mock, "vowifi-usim-bridge"),
@@ -1452,17 +1517,21 @@ mod tests {
         let modem = modem_line(0, &modem_port);
         let started2 = Arc::new(Mutex::new(StartedState::default()));
         let shutting_down2 = Arc::new(RwLock::new(false));
+        let shared_charon2 = test_shared_charon();
         start_vowifi_line_strongswan(
-            &runner2,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+            &LineStartup {
+                runner: &runner2,
+                bin: "gsm-sip-bridge",
+                config_path: "/tmp/cfg.toml",
+                config: &config,
+                started: &started2,
+                shutting_down: &shutting_down2,
+                alert_ctx: None,
+                shared_charon: &shared_charon2,
+            },
             &modem,
             &modem.mcc.clone(),
             &modem.mnc.clone(),
-            &started2,
-            &shutting_down2,
-            None,
         );
         assert!(
             wait_until(Duration::from_millis(500), || spawned_argv_containing(

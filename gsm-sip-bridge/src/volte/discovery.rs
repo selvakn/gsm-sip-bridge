@@ -17,9 +17,10 @@
 //! modem.
 
 use crate::config::{VolteConfig, VolteLineOverride};
-use crate::modules::discovery::{ProbedModem, SimStatus};
+use crate::line::resources::{self, shift_ipv4};
+use crate::line::FailedLine;
+use crate::modules::discovery::ProbedModem;
 use crate::volte::bridge::{LOOPBACK_CONTROL_PORT, LOOPBACK_SIP_PORT, LOOPBACK_STATUS_PORT};
-use crate::vowifi::discovery::FailedLine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -30,22 +31,22 @@ use std::path::{Path, PathBuf};
 /// later without re-spacing everything.
 pub const LINE_PORT_STRIDE: u16 = 4;
 
-/// Loopback SIP-leg port for line `index` — line 0 keeps today's
-/// [`LOOPBACK_SIP_PORT`], later lines step by [`LINE_PORT_STRIDE`].
+/// Loopback SIP-leg port for line `index` — line 0 is [`LOOPBACK_SIP_PORT`],
+/// later lines step by [`LINE_PORT_STRIDE`].
 pub fn sip_leg_port(index: u32) -> u16 {
-    LOOPBACK_SIP_PORT + (index as u16) * LINE_PORT_STRIDE
+    resources::strided_port(LOOPBACK_SIP_PORT, index, LINE_PORT_STRIDE)
 }
 
-/// Loopback control port for line `index` — line 0 keeps today's
+/// Loopback control port for line `index` — line 0 is
 /// [`LOOPBACK_CONTROL_PORT`].
 pub fn control_port(index: u32) -> u16 {
-    LOOPBACK_CONTROL_PORT + (index as u16) * LINE_PORT_STRIDE
+    resources::strided_port(LOOPBACK_CONTROL_PORT, index, LINE_PORT_STRIDE)
 }
 
 /// Loopback registration-status port for line `index` — line 0 is
 /// [`LOOPBACK_STATUS_PORT`].
 pub fn status_port(index: u32) -> u16 {
-    LOOPBACK_STATUS_PORT + (index as u16) * LINE_PORT_STRIDE
+    resources::strided_port(LOOPBACK_STATUS_PORT, index, LINE_PORT_STRIDE)
 }
 
 /// One resolved host-side LTE line — the LTE analogue of
@@ -69,12 +70,11 @@ pub struct ResolvedVolteLine {
     pub sip_leg_port: u16,
     pub control_port: u16,
     pub status_port: u16,
-    /// This line's network namespace, derived from `[volte].netns`
-    /// (specs/020-volte-line-netns): index 0 keeps the unindexed base
-    /// (back-compat identity), later lines append their index — exactly the
-    /// shape `vowifi::discovery::resolve_one_line` already derives `netns`
-    /// in, on a distinct (`volte`-prefixed) base so the two subsystems'
-    /// namespaces can never collide (FR-004a).
+    /// This line's network namespace, derived from `[volte].netns` by
+    /// [`crate::line::resources::indexed`] — *every* line appends its index,
+    /// including line 0, which is the same rule `vowifi::discovery` uses, on
+    /// a distinct (`volte`-prefixed) base so the two subsystems' namespaces
+    /// can never collide (specs/020-volte-line-netns FR-004a).
     pub netns: String,
     /// Veth end inside `netns` — the carrier agent's side.
     pub veth_carrier_iface: String,
@@ -104,51 +104,17 @@ pub struct VolteLineTableResult {
 /// than silently dropped, and each kept modem's per-line settings are derived
 /// from the `[volte]` base with any matching `[[volte.line]]` override applied.
 pub fn resolve_volte_lines(modems: &[ProbedModem], base: &VolteConfig) -> VolteLineTableResult {
-    let mut failed = Vec::new();
-    let mut ready: Vec<&ProbedModem> = Vec::new();
+    // Unlike VoWiFi, there is no prior role assignment here, so a `Ready`
+    // SIM whose modem exposes no AT port has to be rejected explicitly.
+    let candidates = crate::line::select(
+        modems,
+        base.max_lines,
+        crate::line::AtPortRequirement::Required,
+    );
+    let failed = candidates.failed;
 
-    for modem in modems {
-        match (&modem.sim_status, &modem.at_port) {
-            (Some(SimStatus::Ready { .. }), Some(_)) => ready.push(modem),
-            (Some(SimStatus::Ready { .. }), None) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "no_at_port".to_string(),
-            }),
-            (Some(SimStatus::Absent), _) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "sim_absent".to_string(),
-            }),
-            (Some(SimStatus::Locked), _) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "sim_locked".to_string(),
-            }),
-            (Some(SimStatus::Unreadable(msg)), _) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: format!("sim_unreadable: {msg}"),
-            }),
-            (None, _) => failed.push(FailedLine {
-                card_id: modem.card_id.clone(),
-                reason: "no_at_port".to_string(),
-            }),
-        }
-    }
-
-    ready.sort_by(|a, b| a.card_id.cmp(&b.card_id));
-
-    let max_lines = base.max_lines as usize;
-    let (kept, overflow) = if ready.len() > max_lines {
-        ready.split_at(max_lines)
-    } else {
-        (&ready[..], &[][..])
-    };
-    for modem in overflow {
-        failed.push(FailedLine {
-            card_id: modem.card_id.clone(),
-            reason: "max_lines_exceeded".to_string(),
-        });
-    }
-
-    let lines = kept
+    let lines = candidates
+        .kept
         .iter()
         .enumerate()
         .map(|(i, modem)| resolve_one_volte_line(i as u32, modem, base))
@@ -174,17 +140,6 @@ fn override_for<'a>(
     })
 }
 
-/// Adds `delta` to an IPv4 address, for deriving each line's `/30` veth
-/// block from the `[volte]` base — identical mechanism to
-/// `vowifi::discovery`'s own (private) `shift_ipv4`, not shared across
-/// modules since it is a two-line pure function used exactly once on each
-/// side (specs/020-volte-line-netns research.md R4).
-fn shift_ipv4(addr: &str, delta: u32) -> Option<String> {
-    let ip: std::net::Ipv4Addr = addr.parse().ok()?;
-    let shifted = u32::from(ip).checked_add(delta)?;
-    Some(std::net::Ipv4Addr::from(shifted).to_string())
-}
-
 fn resolve_one_volte_line(
     index: u32,
     modem: &ProbedModem,
@@ -206,26 +161,20 @@ fn resolve_one_volte_line(
         .unwrap_or_default();
     let msisdn = over.and_then(|o| o.msisdn.clone());
 
-    // Namespace/veth derivation (specs/020-volte-line-netns research.md R4):
-    // index 0 keeps the unindexed base — still isolated, just not suffixed.
-    // Isolation is unconditional (FR-004b): there is no "no netns" branch
-    // for the single-line case.
-    let netns = if index == 0 {
-        base.netns.clone()
-    } else {
-        format!("{}{}", base.netns, index)
-    };
-    let veth_carrier_iface = if index == 0 {
-        base.veth_carrier_iface.clone()
-    } else {
-        format!("{}{}", base.veth_carrier_iface, index)
-    };
-    let veth_telephony_iface = if index == 0 {
-        base.veth_telephony_iface.clone()
-    } else {
-        format!("{}{}", base.veth_telephony_iface, index)
-    };
-    let step = 4u32 * index;
+    // Namespace/veth derivation (specs/020-volte-line-netns research.md R4).
+    // Isolation is unconditional (FR-004b): there is no "no netns" branch for
+    // the single-line case.
+    //
+    // Index 0 used to keep the *unindexed* base here (`volte`, not `volte0`)
+    // for back-compat with the single-line deployments that predated
+    // multi-line support, while VoWiFi always suffixed. Two subsystems with
+    // two rules for the same derivation, and line 0 — the line most likely to
+    // exist — was the one whose names could not be predicted from its index.
+    // Now uniform on both sides via `line::resources::indexed`.
+    let netns = resources::indexed(&base.netns, index);
+    let veth_carrier_iface = resources::indexed(&base.veth_carrier_iface, index);
+    let veth_telephony_iface = resources::indexed(&base.veth_telephony_iface, index);
+    let step = resources::veth_offset(index);
     let veth_carrier_addr =
         shift_ipv4(&base.veth_carrier_addr, step).unwrap_or_else(|| base.veth_carrier_addr.clone());
     let veth_telephony_addr = shift_ipv4(&base.veth_telephony_addr, step)
@@ -254,7 +203,7 @@ fn resolve_one_volte_line(
     }
 }
 
-/// The on-disk manifest the running bridge writes so `docker/entrypoint.sh`'s
+/// The on-disk manifest the running bridge writes so `supervise::shutdown`'s
 /// cleanup can tear down every line's PDN (each modem's own displaced context
 /// is restored) and `volte-status` can query every line's loopback ports —
 /// the LTE counterpart to VoWiFi's line-resolution file. Written by the
@@ -289,7 +238,7 @@ pub struct VolteLineManifestEntry {
     pub control_port: u16,
     pub sip_leg_port: u16,
     /// This line's network namespace (specs/020-volte-line-netns). Read by
-    /// `docker/entrypoint.sh`'s cleanup trap so teardown runs *inside* the
+    /// `supervise::shutdown`'s teardown plan so it runs *inside* the
     /// namespace before it is deleted (research.md R6), without re-deriving
     /// it.
     pub netns: String,
@@ -316,17 +265,15 @@ pub struct VolteLineManifestEntry {
 }
 
 /// Default path for the running bridge's line manifest.
-pub const DEFAULT_MANIFEST_PATH: &str = "/run/volte-lines.json";
+pub use crate::line::manifest::VOLTE_LINES_DEFAULT_PATH as DEFAULT_MANIFEST_PATH;
 /// Env var overriding [`DEFAULT_MANIFEST_PATH`], read by both the writer (the
-/// bridge) and the readers (`volte-status`, `docker/entrypoint.sh`).
-pub const MANIFEST_PATH_ENV: &str = "GSM_SIP_BRIDGE_VOLTE_LINES_FILE";
+/// bridge) and the readers (`volte-status`, `supervise::orchestrate_volte`).
+pub use crate::line::manifest::VOLTE_LINES_ENV as MANIFEST_PATH_ENV;
 
 /// Resolves the manifest path every reader/writer should use: `MANIFEST_PATH_ENV`
 /// if set, else [`DEFAULT_MANIFEST_PATH`].
 pub fn manifest_path() -> PathBuf {
-    PathBuf::from(
-        std::env::var(MANIFEST_PATH_ENV).unwrap_or_else(|_| DEFAULT_MANIFEST_PATH.to_string()),
-    )
+    crate::line::manifest::volte_lines_path()
 }
 
 /// Builds the manifest from a resolved line table and writes it to
@@ -379,6 +326,7 @@ pub fn read_manifest(path: &Path) -> Result<VolteLineManifest, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::discovery::SimStatus;
 
     fn modem(card_id: &str, port: &str, sim: Option<SimStatus>) -> ProbedModem {
         ProbedModem {
@@ -527,16 +475,53 @@ mod tests {
         assert_eq!(result.lines[0].iface, "wwan0");
     }
 
+    /// Line 0's names are derived from its index exactly like every other
+    /// line's.
+    ///
+    /// This deliberately inverts the previous behaviour, which kept the
+    /// *unindexed* base for index 0 (`volte`, not `volte0`) as back-compat
+    /// for the single-line deployments that predated multi-line support.
+    /// VoWiFi never had that carve-out, so the two subsystems had two rules
+    /// for the same derivation, and line 0 — the line most likely to exist —
+    /// was the one whose namespace could not be predicted from its index.
+    ///
+    /// Operationally this renames one namespace and two interfaces on an
+    /// existing single-line VoLTE deployment; teardown reads the names back
+    /// out of the manifest, so a restart picks up the new ones cleanly.
     #[test]
-    fn index_zero_keeps_the_unindexed_netns_and_veth_defaults() {
+    fn index_zero_is_suffixed_like_every_other_line() {
         let modems = vec![ready("ec20-AAAAAA", "/dev/ttyUSB0")];
         let result = resolve_volte_lines(&modems, &base());
         let l = &result.lines[0];
-        assert_eq!(l.netns, base().netns);
-        assert_eq!(l.veth_carrier_iface, base().veth_carrier_iface);
-        assert_eq!(l.veth_telephony_iface, base().veth_telephony_iface);
+
+        assert_eq!(l.netns, format!("{}0", base().netns));
+        assert_eq!(
+            l.veth_carrier_iface,
+            format!("{}0", base().veth_carrier_iface)
+        );
+        assert_eq!(
+            l.veth_telephony_iface,
+            format!("{}0", base().veth_telephony_iface)
+        );
+        // Addresses are offset by index, so line 0 does keep the base block.
         assert_eq!(l.veth_carrier_addr, base().veth_carrier_addr);
         assert_eq!(l.veth_telephony_addr, base().veth_telephony_addr);
+    }
+
+    /// The same rule now holds on both sides, which is the point of moving
+    /// the derivation into `line::resources`.
+    #[test]
+    fn volte_and_vowifi_derive_index_zero_names_by_the_same_rule() {
+        use crate::line::resources::indexed;
+        let modems = vec![ready("ec20-AAAAAA", "/dev/ttyUSB0")];
+        let volte0 = &resolve_volte_lines(&modems, &base()).lines[0];
+
+        assert_eq!(volte0.netns, indexed(&base().netns, 0));
+        assert_eq!(
+            crate::config::VowifiConfig::default().netns,
+            "ims",
+            "the vowifi base is unsuffixed; the *derived* name is not"
+        );
     }
 
     #[test]

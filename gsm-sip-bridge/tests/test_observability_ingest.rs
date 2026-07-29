@@ -1,5 +1,3 @@
-mod common;
-
 // End-to-end check of the observability wire protocol
 // (specs/014-vowifi-metrics-restore, contracts/observability-protocol.md):
 // a real `Observe` command over a real Unix control socket, applied to the

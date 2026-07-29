@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::config::secret::Secret;
 use gsm_sip_bridge::sms::discord::DiscordClient;
 
@@ -25,6 +23,6 @@ async fn test_discord_truncation_long_body() {
 #[tokio::test]
 async fn test_discord_emoji_body() {
     let body = "Hello 👋 from GSM! 🎉";
-    assert!(body.is_ascii() == false);
+    assert!(!body.is_ascii());
     assert!(body.len() < 4090);
 }

@@ -1,5 +1,3 @@
-mod common;
-
 use gsm_sip_bridge::metrics;
 
 fn init_metrics() {

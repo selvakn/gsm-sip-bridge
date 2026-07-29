@@ -1,5 +1,3 @@
-mod common;
-
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 

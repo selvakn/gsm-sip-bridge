@@ -1,3 +1,6 @@
+pub mod build;
+pub mod env;
+pub mod raw;
 pub mod secret;
 
 use crate::error::{BridgeError, BridgeResult};
@@ -5,144 +8,12 @@ use secret::Secret;
 use std::path::Path;
 use toml::Value;
 
-const TOP_LEVEL_SECTIONS: &[&str] = &[
-    "sip",
-    "bridge",
-    "sms",
-    "metrics",
-    "modules",
-    "resilience",
-    "control",
-    "audio",
-    "modem_audio",
-    "scheduled_restart",
-    "vowifi",
-    "volte",
-    "logging",
-    "alerts",
-];
-const SIP_KEYS: &[&str] = &[
-    "server",
-    "port",
-    "username",
-    "password",
-    "transport",
-    "local_port",
-    "display_name",
-    "tls_verify",
-];
-const BRIDGE_KEYS: &[&str] = &["sip_destination", "sip_dial_timeout_sec"];
-const SMS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "db_path"];
-const ALERTS_KEYS: &[&str] = &[
-    "discord_webhook_url",
-    "sms",
-    "module_lifecycle",
-    "registration_loss",
-    "tunnel_failure",
-    "missed_call",
-];
-const ALERTS_CATEGORY_KEYS: &[&str] = &["enabled", "discord_webhook_url"];
-const ALERTS_MODULE_LIFECYCLE_KEYS: &[&str] = &[
-    "enabled",
-    "discord_webhook_url",
-    "at_worker_unresponsive_sec",
-];
-const ALERTS_TUNNEL_FAILURE_KEYS: &[&str] = &["enabled", "discord_webhook_url", "unhealthy_sec"];
-const ALERTS_REGISTRATION_LOSS_KEYS: &[&str] = &["enabled", "discord_webhook_url", "unhealthy_sec"];
-const METRICS_KEYS: &[&str] = &["port", "agent_report_interval_seconds"];
-const MODULES_KEYS: &[&str] = &["retry_interval_sec", "max_concurrent"];
-const RESILIENCE_KEYS: &[&str] = &[
-    "initial_backoff_sec",
-    "max_backoff_sec",
-    "max_retries",
-    "network_loss_timeout_sec",
-    "network_poll_interval_sec",
-];
-const CONTROL_KEYS: &[&str] = &["socket_path"];
-const AUDIO_KEYS: &[&str] = &[
-    "profile",
-    "vad",
-    "snd_rec_latency_ms",
-    "snd_play_latency_ms",
-];
-/// EC20 USB sound-device tuning — circuit-switched calls only (see
-/// [`ModemAudioConfig`]). Distinct from `[audio]`, which is shared by every
-/// audio path (circuit-switched and VoWiFi/VoLTE IMS).
-const MODEM_AUDIO_KEYS: &[&str] = &["rx_gain", "tx_level", "eec_mode", "rt_audio_prio"];
-const SCHEDULED_RESTART_KEYS: &[&str] = &[
-    "enabled",
-    "cron",
-    "start_jitter_seconds",
-    "inter_card_gap_seconds",
-    "inter_card_gap_jitter_seconds",
-];
-const LOGGING_KEYS: &[&str] = &["level"];
+pub const ALERTS_TUNNEL_FAILURE_KEYS: &[&str] =
+    &["enabled", "discord_webhook_url", "unhealthy_sec"];
+pub const ALERTS_REGISTRATION_LOSS_KEYS: &[&str] =
+    &["enabled", "discord_webhook_url", "unhealthy_sec"];
 const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
-/// Fields global to every VoLTE line. Line-identity/PDN fields (modem
-/// matcher, cid, apn, pcscf, pcscf_port, iface, msisdn) are NOT here — they
-/// live only in `[[volte.line]]` (see [`VOLTE_LINE_KEYS`]), each with its
-/// own sane default when omitted (see `volte::discovery::resolve_one_volte_
-/// line`).
-const VOLTE_KEYS: &[&str] = &[
-    "enabled",
-    "pcscf_source_path",
-    "status_path",
-    "lock_path",
-    "bridge_inbound",
-    "max_lines",
-    "line",
-];
-/// Allowed keys inside each `[[volte.line]]` entry
-/// (specs/018-volte-multi-modem — an operator override pinning a specific
-/// modem to the host-side LTE bridge and/or fixing that line's PDN/P-CSCF
-/// settings instead of taking them from the `[volte]` base). Mirrors
-/// [`VOWIFI_LINE_KEYS`], for the LTE path's per-modem fields.
-const VOLTE_LINE_KEYS: &[&str] = &[
-    "modem_serial",
-    "modem_port",
-    "cid",
-    "apn",
-    "pcscf",
-    "iface",
-    "msisdn",
-];
 
-/// Fields global to every VoWiFi line. Line-identity fields (mcc/mnc/modem
-/// matcher/imsi_override) and pure per-line infrastructure (netns, veth
-/// names/addresses, strongswan iface/if_id, vpcd port) are NOT here — the
-/// former live only in `[[vowifi.line]]` (see [`VOWIFI_LINE_KEYS`]), the
-/// latter are always mechanically derived from a line's index and have no
-/// config knob at all (see `vowifi::discovery::resolve_one_line`).
-const VOWIFI_KEYS: &[&str] = &[
-    "enabled",
-    "use_tcp",
-    "sec_agree",
-    "pcscf_source_path",
-    "control_port",
-    "wideband",
-    "apn",
-    "epdg_fqdn",
-    "epdg_ip",
-    "src_addr",
-    "keepalive_interval_sec",
-    "tunnel_engine",
-    "vpcd_host",
-    "vpcd_port",
-    "max_lines",
-    "line",
-];
-/// Allowed keys inside each `[[vowifi.line]]` entry (specs/013-multi-card-vowifi
-/// FR-009 — an operator override that pins a specific modem to VoWiFi
-/// regardless of the default audio-capability-based role assignment).
-const VOWIFI_LINE_KEYS: &[&str] = &[
-    "modem_serial",
-    "modem_port",
-    "mcc",
-    "mnc",
-    "imsi_override",
-    "imei_override",
-    "pcsc_reader",
-];
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 
@@ -503,7 +374,7 @@ impl Default for AlertsConfig {
 /// alongside the existing circuit-switched GSM-to-SIP bridge. See
 /// `specs/011-vowifi-sip-bridge/plan.md`. Disabled by default: this section
 /// only matters when running one of the `vowifi-ims-agent`/`vowifi-sip-agent`
-/// subcommands (started automatically by `docker/entrypoint.sh` when
+/// subcommands (started automatically by `supervise::orchestrate` when
 /// enabled), not for the normal daemon path.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VowifiConfig {
@@ -533,9 +404,13 @@ pub struct VowifiConfig {
     /// IPsec. Required by networks (e.g. Vi) that reject a plain REGISTER;
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
-    /// Path Agent A reads the tunnel-assigned P-CSCF address from —
-    /// `docker/entrypoint.sh` writes this once the SWu tunnel is up. Shared
-    /// across every line (also read by `[volte].pcscf_source_path`).
+    /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
+    /// by `supervise::orchestrate` once this line's tunnel is up.
+    ///
+    /// This is a *base*: per-line resolution appends `-{index}`, so the
+    /// configured `/tmp/pcscf` becomes `/tmp/pcscf-0`, `/tmp/pcscf-1`, ... Each
+    /// line's tunnel is assigned its own P-CSCF by its own carrier, so a single
+    /// shared file makes concurrently-establishing lines overwrite each other.
     pub pcscf_source_path: String,
     /// Agent A's address on the dedicated veth link (the `ims`-netns end).
     /// Pure per-line infrastructure, always derived from the line's index —
@@ -563,12 +438,12 @@ pub struct VowifiConfig {
     /// APN used by the `swu` engine's dialer (specs/011-vowifi-sip-bridge).
     pub apn: String,
     /// Network namespace the ePDG tunnel lives in — created by
-    /// `docker/entrypoint.sh`, used by both engines. Derived per line, not a
+    /// `supervise::epdg_iface`, used by both engines. Derived per line, not a
     /// `[vowifi]` TOML key.
     pub netns: String,
     /// Shared override forcing every line's ePDG FQDN, bypassing the
     /// per-line 3GPP-standard derivation from that line's own `mcc`/`mnc`
-    /// (which `docker/entrypoint.sh` performs itself). Empty (the default)
+    /// (which `supervise::orchestrate` performs itself). Empty (the default)
     /// leaves that per-line derivation alone.
     pub epdg_fqdn: String,
     /// Skip DNS resolution and dial this ePDG IP directly. `None` (the
@@ -724,9 +599,15 @@ impl Default for VowifiConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolteConfig {
     pub enabled: bool,
-    /// File the VoWiFi/ePDG path writes its discovered P-CSCF to. Reused here
-    /// so a captured address is picked up automatically rather than by hand.
-    /// Shared across every line.
+    /// File a VoWiFi line wrote its tunnel-assigned P-CSCF to, reused here so
+    /// an LTE line can borrow it — this carrier publishes none over LTE.
+    ///
+    /// Names **one specific VoWiFi line** (`/tmp/pcscf-0` by default, i.e.
+    /// line 0). It must: each VoWiFi line's P-CSCF comes from its own carrier,
+    /// so with more than one line there is no single "the" address to pick up,
+    /// and silently taking whichever was written last is a real bug this
+    /// project has already paid for. Point it at another line's file to use
+    /// that carrier's address instead.
     pub pcscf_source_path: String,
     pub status_path: String,
     pub lock_path: String,
@@ -813,7 +694,7 @@ impl Default for VolteConfig {
             enabled: false,
             // Same default the [vowifi] section uses, so a captured address is
             // found without configuring anything.
-            pcscf_source_path: "/tmp/pcscf".to_string(),
+            pcscf_source_path: "/tmp/pcscf-0".to_string(),
             status_path: "/tmp/volte-registration-status".to_string(),
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
@@ -850,43 +731,40 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BridgeError::Config(format!("config file {}: {e}", path.display())))?;
 
-    let root: Value = contents.parse().map_err(BridgeError::from)?;
-    let table = root
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("config root must be a table".into()))?;
+    // `toml::from_str`, not `str::parse` — since toml 0.9 the `FromStr` impl
+    // parses a bare *value*, so a document starting with `[sip]` is read as an
+    // array and rejected with "unexpected content, expected nothing".
+    let mut root: Value = toml::from_str(&contents).map_err(BridgeError::from)?;
+    if !root.is_table() {
+        return Err(BridgeError::Config("config root must be a table".into()));
+    }
 
-    warn_unknown_keys_in(table, TOP_LEVEL_SECTIONS, "root");
-    let sip = parse_sip(table)?;
-    let bridge = parse_bridge(table)?;
-    let sms = parse_sms(table)?;
-    let metrics = parse_metrics(table)?;
-    let modules = parse_modules(table)?;
-    let resilience = parse_resilience(table)?;
-    let control = parse_control(table)?;
-    let audio = parse_audio(table)?;
-    let modem_audio = parse_modem_audio(table)?;
-    let scheduled_restart = parse_scheduled_restart(table);
-    let vowifi = parse_vowifi(table)?;
-    let volte = parse_volte(table)?;
-    let logging = parse_logging(table)?;
-    let alerts = parse_alerts(table, &sms);
+    // `env:VAR` indirection is resolved over the whole document before serde
+    // sees it, so it applies uniformly to every string field rather than
+    // needing a wrapper type on each — see `config::env`.
+    env::resolve_in_place(&mut root, "")?;
 
-    Ok(AppConfig {
-        sip,
-        bridge,
-        sms,
-        metrics,
-        modules,
-        resilience,
-        control,
-        audio,
-        modem_audio,
-        scheduled_restart,
-        vowifi,
-        volte,
-        logging,
-        alerts,
-    })
+    // A typo'd key is an error, not a warning nobody reads. This walk runs
+    // first purely for the message: serde's `deny_unknown_fields` enforces
+    // the same rule a line below, but reports only the first offender and
+    // names neither the section nor the file.
+    let unknown = raw::collect_unknown_keys(&root);
+    if !unknown.is_empty() {
+        return Err(BridgeError::Config(format!(
+            "unknown config {} in {}: {}. Check for a typo, or a setting that \
+             was renamed or removed — see docs/configuration.md. Nothing is \
+             applied from an unrecognised line.",
+            if unknown.len() == 1 { "key" } else { "keys" },
+            path.display(),
+            unknown.join(", "),
+        )));
+    }
+
+    let raw: raw::RawConfig = root
+        .try_into()
+        .map_err(|e: toml::de::Error| BridgeError::Config(e.to_string()))?;
+
+    build::build(raw)
 }
 
 /// Best-effort read of `[logging].level`, used to pick the tracing filter
@@ -897,7 +775,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
 pub fn read_log_level(path: &Path) -> String {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|contents| contents.parse::<Value>().ok())
+        .and_then(|contents| toml::from_str::<Value>(&contents).ok())
         .and_then(|root| {
             root.as_table()?
                 .get("logging")?
@@ -909,1365 +787,33 @@ pub fn read_log_level(path: &Path) -> String {
         .unwrap_or_else(|| LoggingConfig::default().level)
 }
 
-fn warn_unknown_keys_in(table: &toml::map::Map<String, Value>, allowed: &[&str], section: &str) {
-    for key in table.keys() {
-        if !allowed.contains(&key.as_str()) {
-            tracing::warn!(section = section, key = %key, "unknown config key");
-        }
-    }
-}
-
-fn resolve_env_reference(raw: &str, config_key: &str, is_secret: bool) -> BridgeResult<String> {
-    if let Some(var_name) = raw.strip_prefix("env:") {
-        if var_name.is_empty() {
-            return Err(BridgeError::Config(format!(
-                "{config_key}: env: reference is missing variable name"
-            )));
-        }
-        match std::env::var(var_name) {
-            Ok(value) if !value.is_empty() => Ok(value),
-            _ => {
-                let label = if is_secret {
-                    "secret variable"
-                } else {
-                    "environment variable"
-                };
-                Err(BridgeError::Config(format!(
-                    "{label} {var_name} is unset or empty (referenced from {config_key})"
-                )))
-            }
-        }
-    } else {
-        Ok(raw.to_string())
-    }
-}
-
-fn as_string(v: &Value, key: &str, secret: bool) -> BridgeResult<String> {
-    match v {
-        Value::String(s) => resolve_env_reference(s, key, secret),
-        _ => Err(BridgeError::Config(format!("field {key} must be a string"))),
-    }
-}
-
-fn require_string(
-    table: &toml::map::Map<String, Value>,
-    field: &str,
-    key: &str,
-    secret: bool,
-) -> BridgeResult<String> {
-    let v = table
-        .get(field)
-        .ok_or_else(|| BridgeError::Config(format!("required field {key} is missing")))?;
-    let s = as_string(v, key, secret)?;
-    if s.is_empty() {
-        return Err(BridgeError::Config(format!(
-            "required field {key} is empty"
-        )));
-    }
-    Ok(s)
-}
-
-fn as_u16_port(v: &Value, key: &str) -> BridgeResult<u16> {
-    let n = as_u64_range(v, key, false, 1..=65535)?;
-    Ok(n as u16)
-}
-
-/// Like `as_string`, but an absent key or an empty/blank-after-`env:`
-/// resolution value both mean "unset" (`None`) rather than an empty string —
-/// used for `[vowifi]` fields whose absence means "auto-detect"
-/// (`epdg_ip`, `src_addr`, `imsi_override`).
-fn as_optional_string(
-    t: &toml::map::Map<String, Value>,
-    field: &str,
-    key: &str,
-) -> BridgeResult<Option<String>> {
-    t.get(field)
-        .map(|v| as_string(v, key, false))
-        .transpose()
-        .map(|opt| opt.filter(|s| !s.is_empty()))
-}
-
-/// Validates a diagnostic identity override (`imsi_override`/`imei_override`)
-/// against the same digits-only/length constraints
-/// `AtCommander::query_imsi`/`query_imei` apply when filtering a real AT
-/// response — an override skips the modem read entirely, so nothing else
-/// would ever catch a typo'd or malformed value before it reached IMS
-/// registration/`+sip.instance` and broke authentication or terminating-call
-/// routing.
-fn validate_digit_string(
-    s: &str,
-    key: &str,
-    len: std::ops::RangeInclusive<usize>,
-) -> BridgeResult<()> {
-    if !s.chars().all(|c| c.is_ascii_digit()) || !len.contains(&s.len()) {
-        return Err(BridgeError::Config(format!(
-            "field {key} must be {}-{} ASCII digits, got {:?}",
-            len.start(),
-            len.end(),
-            s
-        )));
-    }
-    Ok(())
-}
-
-fn as_u64_range(
-    v: &Value,
-    key: &str,
-    secret: bool,
-    range: std::ops::RangeInclusive<u64>,
-) -> BridgeResult<u64> {
-    let n = match v {
-        Value::Integer(i) => {
-            if *i < 0 {
-                return Err(BridgeError::Config(format!(
-                    "field {key} must not be negative"
-                )));
-            }
-            *i as u64
-        }
-        Value::String(s) => {
-            let resolved = resolve_env_reference(s, key, secret)?;
-            resolved.parse::<u64>().map_err(|_| {
-                BridgeError::Config(format!(
-                    "field {key} must be an integer in {}..={}",
-                    range.start(),
-                    range.end()
-                ))
-            })?
-        }
-        _ => {
-            return Err(BridgeError::Config(format!(
-                "field {key} must be an integer"
-            )))
-        }
-    };
-    if !range.contains(&n) {
-        return Err(BridgeError::Config(format!(
-            "field {key} must be in {}..={}",
-            range.start(),
-            range.end()
-        )));
-    }
-    Ok(n)
-}
-
-fn as_bool(v: &Value, key: &str) -> BridgeResult<bool> {
-    match v {
-        Value::Boolean(b) => Ok(*b),
-        Value::String(s) => {
-            let resolved = resolve_env_reference(s, key, false)?;
-            match resolved.to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => Ok(true),
-                "false" | "0" | "no" => Ok(false),
-                _ => Err(BridgeError::Config(format!(
-                    "field {key} must be a boolean"
-                ))),
-            }
-        }
-        _ => Err(BridgeError::Config(format!(
-            "field {key} must be a boolean"
-        ))),
-    }
-}
-
-fn as_integer(v: &Value, key: &str) -> BridgeResult<i64> {
-    match v {
-        Value::Integer(n) => Ok(*n),
-        Value::String(s) => {
-            let resolved = resolve_env_reference(s, key, false)?;
-            resolved
-                .parse::<i64>()
-                .map_err(|_| BridgeError::Config(format!("field {key} must be an integer")))
-        }
-        _ => Err(BridgeError::Config(format!(
-            "field {key} must be an integer"
-        ))),
-    }
-}
-
-fn as_float(v: &Value, key: &str) -> BridgeResult<f64> {
-    match v {
-        Value::Float(f) => Ok(*f),
-        Value::Integer(n) => Ok(*n as f64),
-        Value::String(s) => {
-            let resolved = resolve_env_reference(s, key, false)?;
-            resolved
-                .parse::<f64>()
-                .map_err(|_| BridgeError::Config(format!("field {key} must be a number")))
-        }
-        _ => Err(BridgeError::Config(format!("field {key} must be a number"))),
-    }
-}
-
-fn parse_sip(root: &toml::map::Map<String, Value>) -> BridgeResult<SipConfig> {
-    let sip = root
-        .get("sip")
-        .ok_or_else(|| BridgeError::Config("required section [sip] is missing".into()))?
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[sip] must be a table".into()))?;
-
-    warn_unknown_keys_in(sip, SIP_KEYS, "sip");
-
-    let server = require_string(sip, "server", "sip.server", false)?;
-    let username = require_string(sip, "username", "sip.username", false)?;
-    let password = Secret::new(require_string(sip, "password", "sip.password", true)?);
-
-    let port = sip
-        .get("port")
-        .map(|v| as_u16_port(v, "sip.port"))
-        .transpose()?
-        .unwrap_or(5060);
-    let local_port = sip
-        .get("local_port")
-        .map(|v| as_u16_port(v, "sip.local_port"))
-        .transpose()?
-        .unwrap_or(5060);
-
-    let transport = match sip.get("transport") {
-        Some(v) => match as_string(v, "sip.transport", false)?
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "udp" => SipTransport::Udp,
-            "tcp" => SipTransport::Tcp,
-            "tls" => SipTransport::Tls,
-            other => {
-                return Err(BridgeError::Config(format!(
-                    "sip.transport must be udp, tcp, or tls; got {other}"
-                )))
-            }
-        },
-        None => SipTransport::Udp,
-    };
-
-    let (tls_verify, had_key) = match sip.get("tls_verify") {
-        Some(v) => {
-            let s = as_string(v, "sip.tls_verify", false)?;
-            let tv = match s.to_ascii_lowercase().as_str() {
-                "strict" => TlsVerify::Strict,
-                "skip" => TlsVerify::Skip,
-                other => {
-                    return Err(BridgeError::Config(format!(
-                        "sip.tls_verify must be strict or skip; got {other}"
-                    )))
-                }
-            };
-            (tv, true)
-        }
-        None => (TlsVerify::Strict, false),
-    };
-
-    if transport != SipTransport::Tls && had_key && tls_verify == TlsVerify::Skip {
-        tracing::warn!("sip.tls_verify=skip has no effect when sip.transport is not tls");
-    }
-
-    let display_name = match sip.get("display_name") {
-        Some(v) => {
-            let s = as_string(v, "sip.display_name", false)?;
-            if s.is_empty() {
-                username.clone()
-            } else {
-                s
-            }
-        }
-        None => username.clone(),
-    };
-
-    Ok(SipConfig {
-        server,
-        port,
-        username,
-        password,
-        transport,
-        local_port,
-        display_name,
-        tls_verify,
-    })
-}
-
-fn parse_bridge(root: &toml::map::Map<String, Value>) -> BridgeResult<BridgeSection> {
-    let Some(val) = root.get("bridge") else {
-        return Ok(BridgeSection {
-            sip_destination: String::new(),
-            sip_dial_timeout_sec: 30,
-        });
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[bridge] must be a table".into()))?;
-    warn_unknown_keys_in(t, BRIDGE_KEYS, "bridge");
-
-    let sip_destination = t
-        .get("sip_destination")
-        .map(|v| as_string(v, "bridge.sip_destination", false))
-        .transpose()?
-        .unwrap_or_default();
-    let sip_dial_timeout_sec = t
-        .get("sip_dial_timeout_sec")
-        .map(|v| as_u64_range(v, "bridge.sip_dial_timeout_sec", false, 5..=120))
-        .transpose()?
-        .unwrap_or(30);
-
-    Ok(BridgeSection {
-        sip_destination,
-        sip_dial_timeout_sec,
-    })
-}
-
-fn parse_sms(root: &toml::map::Map<String, Value>) -> BridgeResult<SmsConfig> {
-    let Some(val) = root.get("sms") else {
-        return Ok(SmsConfig {
-            enabled: true,
-            discord_webhook_url: Secret::new(String::new()),
-            db_path: DEFAULT_SMS_DB_PATH.into(),
-        });
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[sms] must be a table".into()))?;
-    warn_unknown_keys_in(t, SMS_KEYS, "sms");
-
-    let enabled = t
-        .get("enabled")
-        .map(|v| as_bool(v, "sms.enabled"))
-        .transpose()?
-        .unwrap_or(true);
-    let discord_webhook_url = match t.get("discord_webhook_url") {
-        Some(v) => Secret::new(as_string(v, "sms.discord_webhook_url", true)?),
-        None => Secret::new(String::new()),
-    };
-    let db_path = match t.get("db_path") {
-        Some(v) => {
-            let s = as_string(v, "sms.db_path", false)?;
-            if s.is_empty() {
-                DEFAULT_SMS_DB_PATH.into()
-            } else {
-                s
-            }
-        }
-        None => DEFAULT_SMS_DB_PATH.into(),
-    };
-
-    Ok(SmsConfig {
-        enabled,
-        discord_webhook_url,
-        db_path,
-    })
-}
-
-fn parse_metrics(root: &toml::map::Map<String, Value>) -> BridgeResult<MetricsConfig> {
-    let mut port = 9091u16;
-    let mut agent_report_interval_seconds = 10u64;
-    if let Some(val) = root.get("metrics") {
-        let t = val
-            .as_table()
-            .ok_or_else(|| BridgeError::Config("[metrics] must be a table".into()))?;
-        warn_unknown_keys_in(t, METRICS_KEYS, "metrics");
-        if let Some(v) = t.get("port") {
-            port = as_u16_port(v, "metrics.port")?;
-        }
-        if let Some(v) = t.get("agent_report_interval_seconds") {
-            agent_report_interval_seconds =
-                as_u64_range(v, "metrics.agent_report_interval_seconds", false, 1..=3600)?;
-        }
-    }
-    Ok(MetricsConfig {
-        port,
-        agent_report_interval_seconds,
-    })
-}
-
-fn parse_modules(root: &toml::map::Map<String, Value>) -> BridgeResult<ModulesConfig> {
-    let Some(val) = root.get("modules") else {
-        return Ok(ModulesConfig {
-            retry_interval_sec: 30,
-            max_concurrent: 8,
-        });
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[modules] must be a table".into()))?;
-    warn_unknown_keys_in(t, MODULES_KEYS, "modules");
-
-    let retry_interval_sec = t
-        .get("retry_interval_sec")
-        .map(|v| as_u64_range(v, "modules.retry_interval_sec", false, 5..=600))
-        .transpose()?
-        .unwrap_or(30);
-    let max_concurrent = t
-        .get("max_concurrent")
-        .map(|v| as_u64_range(v, "modules.max_concurrent", false, 1..=8))
-        .transpose()?
-        .unwrap_or(8) as u32;
-
-    Ok(ModulesConfig {
-        retry_interval_sec,
-        max_concurrent,
-    })
-}
-
-fn parse_resilience(root: &toml::map::Map<String, Value>) -> BridgeResult<ResilienceConfig> {
-    let Some(val) = root.get("resilience") else {
-        return Ok(ResilienceConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[resilience] must be a table".into()))?;
-    warn_unknown_keys_in(t, RESILIENCE_KEYS, "resilience");
-
-    let initial_backoff_sec = t
-        .get("initial_backoff_sec")
-        .map(|v| as_u64_range(v, "resilience.initial_backoff_sec", false, 1..=600))
-        .transpose()?
-        .unwrap_or(5);
-    let max_backoff_sec = t
-        .get("max_backoff_sec")
-        .map(|v| as_u64_range(v, "resilience.max_backoff_sec", false, 1..=3600))
-        .transpose()?
-        .unwrap_or(120);
-    let max_retries = t
-        .get("max_retries")
-        .map(|v| as_u64_range(v, "resilience.max_retries", false, 1..=1000))
-        .transpose()?
-        .unwrap_or(10) as u32;
-    let network_loss_timeout_sec = t
-        .get("network_loss_timeout_sec")
-        .map(|v| as_u64_range(v, "resilience.network_loss_timeout_sec", false, 10..=600))
-        .transpose()?
-        .unwrap_or(60);
-    let network_poll_interval_sec = t
-        .get("network_poll_interval_sec")
-        .map(|v| as_u64_range(v, "resilience.network_poll_interval_sec", false, 5..=300))
-        .transpose()?
-        .unwrap_or(30);
-
-    Ok(ResilienceConfig {
-        initial_backoff_sec,
-        max_backoff_sec,
-        max_retries,
-        network_loss_timeout_sec,
-        network_poll_interval_sec,
-    })
-}
-
-fn parse_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<AudioConfig> {
-    let Some(val) = root.get("audio") else {
-        return Ok(AudioConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[audio] must be a table".into()))?;
-    warn_unknown_keys_in(t, AUDIO_KEYS, "audio");
-
-    let profile = match t.get("profile") {
-        Some(v) => match as_string(v, "audio.profile", false)?
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "lan" => AudioProfile::Lan,
-            "wan" => AudioProfile::Wan,
-            other => {
-                return Err(BridgeError::Config(format!(
-                    "audio.profile must be \"lan\" or \"wan\"; got \"{other}\""
-                )))
-            }
-        },
-        None => AudioProfile::Lan,
-    };
-
-    let settings = AudioProfileSettings::for_profile(&profile);
-    let vad = t
-        .get("vad")
-        .map(|v| as_bool(v, "audio.vad"))
-        .transpose()?
-        .unwrap_or(true);
-
-    let snd_rec_latency_ms = parse_latency_ms(t, "snd_rec_latency_ms", DEFAULT_SND_REC_LATENCY_MS)?;
-    let snd_play_latency_ms =
-        parse_latency_ms(t, "snd_play_latency_ms", DEFAULT_SND_PLAY_LATENCY_MS)?;
-
-    Ok(AudioConfig {
-        profile,
-        settings,
-        vad,
-        snd_rec_latency_ms,
-        snd_play_latency_ms,
-    })
-}
-
-fn parse_modem_audio(root: &toml::map::Map<String, Value>) -> BridgeResult<ModemAudioConfig> {
-    let Some(val) = root.get("modem_audio") else {
-        return Ok(ModemAudioConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[modem_audio] must be a table".into()))?;
-    warn_unknown_keys_in(t, MODEM_AUDIO_KEYS, "modem_audio");
-
-    let rx_gain = match t.get("rx_gain") {
-        Some(v) => {
-            let n = as_integer(v, "modem_audio.rx_gain")?;
-            if !(0..=65535).contains(&n) {
-                return Err(BridgeError::Config(format!(
-                    "modem_audio.rx_gain must be 0–65535; got {n}"
-                )));
-            }
-            Some(n as u32)
-        }
-        None => None,
-    };
-
-    let tx_level = match t.get("tx_level") {
-        Some(v) => {
-            let f = as_float(v, "modem_audio.tx_level")?;
-            if !(0.0..=2.0).contains(&f) {
-                return Err(BridgeError::Config(format!(
-                    "modem_audio.tx_level must be 0.0–2.0; got {f}"
-                )));
-            }
-            f as f32
-        }
-        None => 1.0,
-    };
-
-    let eec_mode = match t.get("eec_mode") {
-        Some(v) => {
-            let n = as_integer(v, "modem_audio.eec_mode")?;
-            if !(0..=65535).contains(&n) {
-                return Err(BridgeError::Config(format!(
-                    "modem_audio.eec_mode must be 0–65535; got {n}"
-                )));
-            }
-            Some(n as u32)
-        }
-        None => None,
-    };
-
-    let rt_audio_prio = match t.get("rt_audio_prio") {
-        Some(v) => {
-            let n = as_integer(v, "modem_audio.rt_audio_prio")?;
-            // 0 disables; 1–99 are the valid SCHED_FIFO priorities.
-            if n != 0 && !(1..=99).contains(&n) {
-                return Err(BridgeError::Config(format!(
-                    "modem_audio.rt_audio_prio must be 0 (off) or 1–99; got {n}"
-                )));
-            }
-            n as u32
-        }
-        None => 0,
-    };
-
-    Ok(ModemAudioConfig {
-        rx_gain,
-        tx_level,
-        eec_mode,
-        rt_audio_prio,
-    })
-}
-
-/// Parse an ALSA latency knob (milliseconds) from the `[audio]` table, validating the
-/// 20–2000 ms range and falling back to `default` when the key is absent.
-fn parse_latency_ms(
-    t: &toml::map::Map<String, Value>,
-    key: &str,
-    default: u32,
-) -> BridgeResult<u32> {
-    match t.get(key) {
-        Some(v) => {
-            let n = as_integer(v, &format!("audio.{key}"))?;
-            if !(20..=2000).contains(&n) {
-                return Err(BridgeError::Config(format!(
-                    "audio.{key} must be 20–2000 (ms); got {n}"
-                )));
-            }
-            Ok(n as u32)
-        }
-        None => Ok(default),
-    }
-}
-
-fn parse_scheduled_restart(root: &toml::map::Map<String, Value>) -> ScheduledRestartConfig {
-    let defaults = ScheduledRestartConfig::default();
-
-    let Some(val) = root.get("scheduled_restart") else {
-        return defaults;
-    };
-    let Some(t) = val.as_table() else {
-        tracing::error!(
-            "[scheduled_restart] must be a table; scheduled restart disabled for this run"
-        );
-        return ScheduledRestartConfig::disabled();
-    };
-    warn_unknown_keys_in(t, SCHEDULED_RESTART_KEYS, "scheduled_restart");
-
-    let enabled = match t.get("enabled") {
-        None => defaults.enabled,
-        Some(v) => match as_bool(v, "scheduled_restart.enabled") {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(error = %e, "scheduled restart disabled");
-                return ScheduledRestartConfig::disabled();
-            }
-        },
-    };
-
-    let cron = match t.get("cron") {
-        None => defaults.cron.clone(),
-        Some(v) => match as_string(v, "scheduled_restart.cron", false) {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => {
-                tracing::error!(
-                    "scheduled_restart.cron is empty; scheduled restart disabled for this run"
-                );
-                return ScheduledRestartConfig::disabled();
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "scheduled restart disabled");
-                return ScheduledRestartConfig::disabled();
-            }
-        },
-    };
-
-    let start_jitter_seconds = match t.get("start_jitter_seconds") {
-        None => defaults.start_jitter_seconds,
-        Some(v) => match as_u64_range(
-            v,
-            "scheduled_restart.start_jitter_seconds",
-            false,
-            0..=86400,
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "scheduled restart disabled");
-                return ScheduledRestartConfig::disabled();
-            }
-        },
-    };
-
-    let inter_card_gap_seconds = match t.get("inter_card_gap_seconds") {
-        None => defaults.inter_card_gap_seconds,
-        Some(v) => match as_u64_range(
-            v,
-            "scheduled_restart.inter_card_gap_seconds",
-            false,
-            0..=3600,
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "scheduled restart disabled");
-                return ScheduledRestartConfig::disabled();
-            }
-        },
-    };
-
-    let inter_card_gap_jitter_seconds = match t.get("inter_card_gap_jitter_seconds") {
-        None => defaults.inter_card_gap_jitter_seconds,
-        Some(v) => match as_u64_range(
-            v,
-            "scheduled_restart.inter_card_gap_jitter_seconds",
-            false,
-            0..=3600,
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "scheduled restart disabled");
-                return ScheduledRestartConfig::disabled();
-            }
-        },
-    };
-
-    if inter_card_gap_jitter_seconds > inter_card_gap_seconds {
-        tracing::error!(
-            jitter = inter_card_gap_jitter_seconds,
-            gap = inter_card_gap_seconds,
-            "scheduled_restart.inter_card_gap_jitter_seconds must be <= inter_card_gap_seconds; scheduled restart disabled for this run"
-        );
-        return ScheduledRestartConfig::disabled();
-    }
-
-    // Validate cron expression: we use the cron crate's 7-field syntax; map our
-    // 5-field input by prepending "0 " (seconds) and appending " *" (year).
-    let translated = format!("0 {cron} *");
-    if let Err(e) = translated.parse::<cron::Schedule>() {
-        tracing::error!(
-            cron = %cron,
-            error = %e,
-            "scheduled_restart.cron is not a valid 5-field cron expression; scheduled restart disabled for this run"
-        );
-        return ScheduledRestartConfig::disabled();
-    }
-
-    ScheduledRestartConfig {
-        enabled,
-        cron,
-        start_jitter_seconds,
-        inter_card_gap_seconds,
-        inter_card_gap_jitter_seconds,
-    }
-}
-
-/// specs/022-discord-critical-alerts. Never fails `load_config`: a malformed
-/// `[alerts]` table, or any single malformed `[alerts.<category>]` table,
-/// only disables *that* category for this run (logged) — consistent with
-/// the same graceful-degradation convention `parse_scheduled_restart` above
-/// already uses, and with this feature's own edge-case requirement that a
-/// bad alerts config must never keep the bridge from starting or handling
-/// calls/SMS.
-fn parse_alerts(root: &toml::map::Map<String, Value>, sms: &SmsConfig) -> AlertsConfig {
-    let legacy_sms = legacy_sms_alert_category(sms);
-
-    let Some(val) = root.get("alerts") else {
-        return AlertsConfig {
-            sms: legacy_sms,
-            ..AlertsConfig::default()
-        };
-    };
-    let Some(t) = val.as_table() else {
-        tracing::error!(
-            "[alerts] must be a table; new critical-event alert categories disabled for this run"
-        );
-        return AlertsConfig {
-            sms: legacy_sms,
-            ..AlertsConfig::default()
-        };
-    };
-    warn_unknown_keys_in(t, ALERTS_KEYS, "alerts");
-
-    let default_webhook_url = match t.get("discord_webhook_url") {
-        None => Secret::new(String::new()),
-        Some(v) => match as_string(v, "alerts.discord_webhook_url", true) {
-            Ok(s) => Secret::new(s),
-            Err(e) => {
-                tracing::error!(error = %e, "alerts.discord_webhook_url invalid; no default alert webhook configured");
-                Secret::new(String::new())
-            }
-        },
-    };
-
-    let sms_category = match t.get("sms") {
-        None => legacy_sms,
-        Some(v) => parse_alert_category(v, "alerts.sms", true, ALERTS_CATEGORY_KEYS),
-    };
-    let module_lifecycle = match t.get("module_lifecycle") {
-        None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(
-            v,
-            "alerts.module_lifecycle",
-            false,
-            ALERTS_MODULE_LIFECYCLE_KEYS,
-        ),
-    };
-    let registration_loss = match t.get("registration_loss") {
-        None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(
-            v,
-            "alerts.registration_loss",
-            false,
-            ALERTS_REGISTRATION_LOSS_KEYS,
-        ),
-    };
-    let tunnel_failure = match t.get("tunnel_failure") {
-        None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(
-            v,
-            "alerts.tunnel_failure",
-            false,
-            ALERTS_TUNNEL_FAILURE_KEYS,
-        ),
-    };
-    let missed_call = match t.get("missed_call") {
-        None => CategoryAlertConfig::disabled(),
-        Some(v) => parse_alert_category(v, "alerts.missed_call", false, ALERTS_CATEGORY_KEYS),
-    };
-
-    let module_lifecycle_thresholds = match t.get("module_lifecycle") {
-        Some(v) => parse_module_lifecycle_thresholds(v),
-        None => ModuleLifecycleThresholds::default(),
-    };
-    let tunnel_failure_thresholds = match t.get("tunnel_failure") {
-        Some(v) => parse_tunnel_failure_thresholds(v),
-        None => TunnelFailureThresholds::default(),
-    };
-    let registration_loss_thresholds = match t.get("registration_loss") {
-        Some(v) => parse_registration_loss_thresholds(v),
-        None => RegistrationLossThresholds::default(),
-    };
-
-    AlertsConfig {
-        default_webhook_url,
-        sms: sms_category,
-        module_lifecycle,
-        registration_loss,
-        tunnel_failure,
-        missed_call,
-        module_lifecycle_thresholds,
-        tunnel_failure_thresholds,
-        registration_loss_thresholds,
-    }
-}
-
-/// FR-001 backward compatibility: an operator upgrading with no `[alerts]`
-/// section (or no `[alerts.sms]` sub-table) keeps today's `[sms]`-driven
-/// behavior exactly as-is, with the legacy webhook treated as `sms`'s own
-/// override rather than shared with any other category (it was never
-/// shared before this feature).
-fn legacy_sms_alert_category(sms: &SmsConfig) -> CategoryAlertConfig {
-    let webhook = sms.discord_webhook_url.expose_secret();
-    CategoryAlertConfig {
-        enabled: sms.enabled,
-        webhook_url_override: if webhook.is_empty() {
-            None
-        } else {
-            Some(Secret::new(webhook.clone()))
-        },
-    }
-}
-
-fn parse_alert_category(
-    v: &Value,
-    section: &str,
-    default_enabled: bool,
-    allowed_keys: &[&str],
-) -> CategoryAlertConfig {
-    let Some(t) = v.as_table() else {
-        tracing::error!(
-            section = section,
-            "must be a table; this category's alerting disabled for this run"
-        );
-        return CategoryAlertConfig::disabled();
-    };
-    warn_unknown_keys_in(t, allowed_keys, section);
-
-    let enabled = match t.get("enabled") {
-        None => default_enabled,
-        Some(v) => match as_bool(v, "enabled") {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(section = section, error = %e, "enabled invalid; this category's alerting disabled for this run");
-                return CategoryAlertConfig::disabled();
-            }
-        },
-    };
-
-    let webhook_url_override = match t.get("discord_webhook_url") {
-        None => None,
-        Some(v) => match as_string(v, "discord_webhook_url", true) {
-            Ok(s) if s.is_empty() => None,
-            Ok(s) => Some(Secret::new(s)),
-            Err(e) => {
-                tracing::error!(section = section, error = %e, "discord_webhook_url invalid; falling back to the shared default webhook");
-                None
-            }
-        },
-    };
-
-    CategoryAlertConfig {
-        enabled,
-        webhook_url_override,
-    }
-}
-
-fn parse_module_lifecycle_thresholds(v: &Value) -> ModuleLifecycleThresholds {
-    let defaults = ModuleLifecycleThresholds::default();
-    let Some(t) = v.as_table() else {
-        return defaults;
-    };
-    warn_unknown_keys_in(t, ALERTS_MODULE_LIFECYCLE_KEYS, "alerts.module_lifecycle");
-    let at_worker_unresponsive_sec = match t.get("at_worker_unresponsive_sec") {
-        None => defaults.at_worker_unresponsive_sec,
-        Some(v) => {
-            match as_u64_range(
-                v,
-                "alerts.module_lifecycle.at_worker_unresponsive_sec",
-                false,
-                5..=600,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "at_worker_unresponsive_sec invalid; using default");
-                    defaults.at_worker_unresponsive_sec
-                }
-            }
-        }
-    };
-    ModuleLifecycleThresholds {
-        at_worker_unresponsive_sec,
-    }
-}
-
-fn parse_tunnel_failure_thresholds(v: &Value) -> TunnelFailureThresholds {
-    let defaults = TunnelFailureThresholds::default();
-    let Some(t) = v.as_table() else {
-        return defaults;
-    };
-    warn_unknown_keys_in(t, ALERTS_TUNNEL_FAILURE_KEYS, "alerts.tunnel_failure");
-    let unhealthy_sec = match t.get("unhealthy_sec") {
-        None => defaults.unhealthy_sec,
-        Some(v) => match as_u64_range(v, "alerts.tunnel_failure.unhealthy_sec", false, 30..=3600) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "unhealthy_sec invalid; using default");
-                defaults.unhealthy_sec
-            }
-        },
-    };
-    TunnelFailureThresholds { unhealthy_sec }
-}
-
-fn parse_registration_loss_thresholds(v: &Value) -> RegistrationLossThresholds {
-    let defaults = RegistrationLossThresholds::default();
-    let Some(t) = v.as_table() else {
-        return defaults;
-    };
-    warn_unknown_keys_in(t, ALERTS_REGISTRATION_LOSS_KEYS, "alerts.registration_loss");
-    let unhealthy_sec = match t.get("unhealthy_sec") {
-        None => defaults.unhealthy_sec,
-        Some(v) => match as_u64_range(
-            v,
-            "alerts.registration_loss.unhealthy_sec",
-            false,
-            30..=3600,
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "unhealthy_sec invalid; using default");
-                defaults.unhealthy_sec
-            }
-        },
-    };
-    RegistrationLossThresholds { unhealthy_sec }
-}
-
-fn parse_control(root: &toml::map::Map<String, Value>) -> BridgeResult<ControlConfig> {
-    let Some(val) = root.get("control") else {
-        return Ok(ControlConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[control] must be a table".into()))?;
-    warn_unknown_keys_in(t, CONTROL_KEYS, "control");
-
-    let socket_path = t
-        .get("socket_path")
-        .map(|v| as_string(v, "control.socket_path", false))
-        .transpose()?
-        .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_string());
-
-    Ok(ControlConfig { socket_path })
-}
-
-fn parse_logging(root: &toml::map::Map<String, Value>) -> BridgeResult<LoggingConfig> {
-    let Some(val) = root.get("logging") else {
-        return Ok(LoggingConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[logging] must be a table".into()))?;
-    warn_unknown_keys_in(t, LOGGING_KEYS, "logging");
-
-    let level = match t.get("level") {
-        Some(v) => {
-            let s = as_string(v, "logging.level", false)?.to_ascii_lowercase();
-            if !LOGGING_LEVELS.contains(&s.as_str()) {
-                return Err(BridgeError::Config(format!(
-                    "logging.level must be one of {LOGGING_LEVELS:?}; got {s:?}"
-                )));
-            }
-            s
-        }
-        None => LoggingConfig::default().level,
-    };
-
-    Ok(LoggingConfig { level })
-}
-
-fn parse_volte(root: &toml::map::Map<String, Value>) -> BridgeResult<VolteConfig> {
-    let Some(val) = root.get("volte") else {
-        return Ok(VolteConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[volte] must be a table".into()))?;
-    warn_unknown_keys_in(t, VOLTE_KEYS, "volte");
-
-    let d = VolteConfig::default();
-    let str_key = |key: &str, field: &str, default: String| -> BridgeResult<String> {
-        Ok(t.get(key)
-            .map(|v| as_string(v, field, false))
-            .transpose()?
-            .unwrap_or(default))
-    };
-
-    Ok(VolteConfig {
-        enabled: t
-            .get("enabled")
-            .map(|v| as_bool(v, "volte.enabled"))
-            .transpose()?
-            .unwrap_or(d.enabled),
-        pcscf_source_path: str_key(
-            "pcscf_source_path",
-            "volte.pcscf_source_path",
-            d.pcscf_source_path,
-        )?,
-        status_path: str_key("status_path", "volte.status_path", d.status_path)?,
-        lock_path: str_key("lock_path", "volte.lock_path", d.lock_path)?,
-        bridge_inbound: t
-            .get("bridge_inbound")
-            .map(|v| as_bool(v, "volte.bridge_inbound"))
-            .transpose()?
-            .unwrap_or(d.bridge_inbound),
-        max_lines: t
-            .get("max_lines")
-            .map(|v| as_u64_range(v, "volte.max_lines", false, 1..=64))
-            .transpose()?
-            .map(|n| n as u32)
-            .unwrap_or(d.max_lines),
-        line_overrides: parse_volte_line_overrides(t)?,
-        // Pure per-line infrastructure — always internally derived from a
-        // line's index, no config knob at all (see `VolteConfig`'s field
-        // docs, matching `[vowifi]`'s equivalent fields).
-        netns: d.netns,
-        veth_carrier_iface: d.veth_carrier_iface,
-        veth_telephony_iface: d.veth_telephony_iface,
-        veth_carrier_addr: d.veth_carrier_addr,
-        veth_telephony_addr: d.veth_telephony_addr,
-    })
-}
-
-/// Parses the optional `[[volte.line]]` array (specs/018-volte-multi-modem).
-/// Absent = no overrides, every line auto-discovered with the `[volte]` base
-/// settings. Mirrors [`parse_vowifi_line_overrides`].
-fn parse_volte_line_overrides(
-    t: &toml::map::Map<String, Value>,
-) -> BridgeResult<Vec<VolteLineOverride>> {
-    let Some(val) = t.get("line") else {
-        return Ok(Vec::new());
-    };
-    let arr = val
-        .as_array()
-        .ok_or_else(|| BridgeError::Config("volte.line must be an array of tables".into()))?;
-    let mut overrides = Vec::with_capacity(arr.len());
-    for (i, entry) in arr.iter().enumerate() {
-        let et = entry
-            .as_table()
-            .ok_or_else(|| BridgeError::Config(format!("volte.line[{i}] must be a table")))?;
-        warn_unknown_keys_in(et, VOLTE_LINE_KEYS, "volte.line");
-        let cid = et
-            .get("cid")
-            .map(|v| as_integer(v, "volte.line.cid"))
-            .transpose()?
-            .map(|n| n as u8);
-        if cid == Some(0) {
-            return Err(BridgeError::Config(format!(
-                "volte.line[{i}].cid must be a non-zero PDP context id"
-            )));
-        }
-        let pcscf = as_optional_string(et, "pcscf", "volte.line.pcscf")?;
-        if let Some(addr) = &pcscf {
-            if addr.parse::<std::net::IpAddr>().is_err() {
-                return Err(BridgeError::Config(format!(
-                    "volte.line[{i}].pcscf is not a valid IP address: {addr}"
-                )));
-            }
-        }
-        overrides.push(VolteLineOverride {
-            modem_serial: as_optional_string(et, "modem_serial", "volte.line.modem_serial")?,
-            modem_port: as_optional_string(et, "modem_port", "volte.line.modem_port")?,
-            cid,
-            apn: as_optional_string(et, "apn", "volte.line.apn")?,
-            pcscf,
-            iface: as_optional_string(et, "iface", "volte.line.iface")?,
-            msisdn: as_optional_string(et, "msisdn", "volte.line.msisdn")?,
-        });
-    }
-    Ok(overrides)
-}
-
-fn parse_vowifi(root: &toml::map::Map<String, Value>) -> BridgeResult<VowifiConfig> {
-    let Some(val) = root.get("vowifi") else {
-        return Ok(VowifiConfig::default());
-    };
-    let t = val
-        .as_table()
-        .ok_or_else(|| BridgeError::Config("[vowifi] must be a table".into()))?;
-    warn_unknown_keys_in(t, VOWIFI_KEYS, "vowifi");
-
-    let defaults = VowifiConfig::default();
-
-    let enabled = t
-        .get("enabled")
-        .map(|v| as_bool(v, "vowifi.enabled"))
-        .transpose()?
-        .unwrap_or(defaults.enabled);
-    // mcc/mnc/modem_port are per-line identity, not a global default — set
-    // them on a `[[vowifi.line]]` entry instead (see
-    // `parse_vowifi_line_overrides`, which validates mcc/mnc pairing there).
-    let mcc = defaults.mcc.clone();
-    let mnc = defaults.mnc.clone();
-    let modem_port = defaults.modem_port.clone();
-    let use_tcp = t
-        .get("use_tcp")
-        .map(|v| as_bool(v, "vowifi.use_tcp"))
-        .transpose()?
-        .unwrap_or(defaults.use_tcp);
-    let sec_agree = t
-        .get("sec_agree")
-        .map(|v| as_bool(v, "vowifi.sec_agree"))
-        .transpose()?
-        .unwrap_or(defaults.sec_agree);
-    let pcscf_source_path = t
-        .get("pcscf_source_path")
-        .map(|v| as_string(v, "vowifi.pcscf_source_path", false))
-        .transpose()?
-        .unwrap_or(defaults.pcscf_source_path);
-    // veth addresses/names, netns, strongswan iface/if_id and the vpcd port
-    // are pure per-line infrastructure, always mechanically derived from a
-    // line's index (see `vowifi::discovery::resolve_one_line`) — there is no
-    // config knob for them at all.
-    let veth_local_addr = defaults.veth_local_addr.clone();
-    let veth_peer_addr = defaults.veth_peer_addr.clone();
-    let control_port = t
-        .get("control_port")
-        .map(|v| as_u16_port(v, "vowifi.control_port"))
-        .transpose()?
-        .unwrap_or(defaults.control_port);
-    let wideband = t
-        .get("wideband")
-        .map(|v| as_bool(v, "vowifi.wideband"))
-        .transpose()?
-        .unwrap_or(defaults.wideband);
-
-    let apn = t
-        .get("apn")
-        .map(|v| as_string(v, "vowifi.apn", false))
-        .transpose()?
-        .unwrap_or(defaults.apn);
-    let netns = defaults.netns.clone();
-    // A shared override applied to every line. Each line's real ePDG FQDN is
-    // derived per-line from that line's own mcc/mnc by `docker/entrypoint.sh`
-    // (which already re-derives it there); this is only the escape hatch for
-    // forcing a non-standard FQDN across the board.
-    let epdg_fqdn = t
-        .get("epdg_fqdn")
-        .map(|v| as_string(v, "vowifi.epdg_fqdn", false))
-        .transpose()?
-        .unwrap_or(defaults.epdg_fqdn);
-    let epdg_ip = as_optional_string(t, "epdg_ip", "vowifi.epdg_ip")?;
-    let src_addr = as_optional_string(t, "src_addr", "vowifi.src_addr")?;
-    let keepalive_interval_sec = t
-        .get("keepalive_interval_sec")
-        .map(|v| as_u64_range(v, "vowifi.keepalive_interval_sec", false, 1..=3600))
-        .transpose()?
-        .unwrap_or(defaults.keepalive_interval_sec);
-    let veth_sip_iface = defaults.veth_sip_iface.clone();
-    let veth_ims_iface = defaults.veth_ims_iface.clone();
-    let tunnel_engine = t
-        .get("tunnel_engine")
-        .map(|v| as_string(v, "vowifi.tunnel_engine", false))
-        .transpose()?
-        .unwrap_or(defaults.tunnel_engine);
-    if tunnel_engine != "swu" && tunnel_engine != "strongswan" {
-        return Err(BridgeError::Config(format!(
-            "vowifi.tunnel_engine must be \"swu\" or \"strongswan\", got {tunnel_engine:?}"
-        )));
-    }
-    let strongswan_tun_iface = defaults.strongswan_tun_iface.clone();
-    let strongswan_if_id = defaults.strongswan_if_id;
-    let vpcd_host = t
-        .get("vpcd_host")
-        .map(|v| as_string(v, "vowifi.vpcd_host", false))
-        .transpose()?
-        .unwrap_or(defaults.vpcd_host);
-    let vpcd_port = t
-        .get("vpcd_port")
-        .map(|v| as_u16_port(v, "vowifi.vpcd_port"))
-        .transpose()?
-        .unwrap_or(defaults.vpcd_port);
-    // imsi_override/imei_override are per-line diagnostic escape hatches —
-    // set them on a `[[vowifi.line]]` entry instead.
-    let imsi_override = defaults.imsi_override.clone();
-    let imei_override = defaults.imei_override.clone();
-    let max_lines = t
-        .get("max_lines")
-        .map(|v| as_u64_range(v, "vowifi.max_lines", false, 1..=64))
-        .transpose()?
-        .map(|n| n as u32)
-        .unwrap_or(defaults.max_lines);
-    let line_overrides = parse_vowifi_line_overrides(t)?;
-
-    Ok(VowifiConfig {
-        enabled,
-        mcc,
-        mnc,
-        modem_port,
-        use_tcp,
-        sec_agree,
-        pcscf_source_path,
-        veth_local_addr,
-        veth_peer_addr,
-        control_port,
-        wideband,
-        apn,
-        netns,
-        epdg_fqdn,
-        epdg_ip,
-        src_addr,
-        keepalive_interval_sec,
-        veth_sip_iface,
-        veth_ims_iface,
-        tunnel_engine,
-        strongswan_tun_iface,
-        strongswan_if_id,
-        vpcd_host,
-        vpcd_port,
-        imsi_override,
-        imei_override,
-        // Meaningful only per-line, set by `resolve_one_pcsc_line` — the
-        // base `[vowifi]` config itself is never card-reader-backed.
-        pcsc_reader: false,
-        max_lines,
-        line_overrides,
-    })
-}
-
-/// Parses the optional `[[vowifi.line]]` array (FR-009). Absent = no
-/// overrides, every line fully auto-discovered.
-fn parse_vowifi_line_overrides(
-    t: &toml::map::Map<String, Value>,
-) -> BridgeResult<Vec<VowifiLineOverride>> {
-    let Some(val) = t.get("line") else {
-        return Ok(Vec::new());
-    };
-    let arr = val
-        .as_array()
-        .ok_or_else(|| BridgeError::Config("vowifi.line must be an array of tables".into()))?;
-    let mut overrides = Vec::with_capacity(arr.len());
-    for (i, entry) in arr.iter().enumerate() {
-        let et = entry
-            .as_table()
-            .ok_or_else(|| BridgeError::Config(format!("vowifi.line[{i}] must be a table")))?;
-        warn_unknown_keys_in(et, VOWIFI_LINE_KEYS, "vowifi.line");
-        let modem_serial = as_optional_string(et, "modem_serial", "vowifi.line.modem_serial")?;
-        let modem_port = as_optional_string(et, "modem_port", "vowifi.line.modem_port")?;
-        let mcc = as_optional_string(et, "mcc", "vowifi.line.mcc")?;
-        let mnc = as_optional_string(et, "mnc", "vowifi.line.mnc")?;
-        if mcc.is_some() != mnc.is_some() {
-            return Err(BridgeError::Config(format!(
-                "vowifi.line[{i}]: mcc and mnc must be set together"
-            )));
-        }
-        let imsi_override = as_optional_string(et, "imsi_override", "vowifi.line.imsi_override")?;
-        if let Some(imsi) = &imsi_override {
-            validate_digit_string(imsi, "vowifi.line.imsi_override", 6..=15)?;
-        }
-        let imei_override = as_optional_string(et, "imei_override", "vowifi.line.imei_override")?;
-        if let Some(imei) = &imei_override {
-            validate_digit_string(imei, "vowifi.line.imei_override", 14..=16)?;
-        }
-        let pcsc_reader = et
-            .get("pcsc_reader")
-            .map(|v| as_bool(v, "vowifi.line.pcsc_reader"))
-            .transpose()?
-            .unwrap_or(false);
-        if pcsc_reader {
-            if modem_serial.is_some() || modem_port.is_some() {
-                return Err(BridgeError::Config(format!(
-                    "vowifi.line[{i}]: pcsc_reader = true cannot be combined with \
-                     modem_serial/modem_port — a line is either modem-backed or \
-                     card-reader-backed, never both"
-                )));
-            }
-            if mcc.is_none() || mnc.is_none() {
-                return Err(BridgeError::Config(format!(
-                    "vowifi.line[{i}]: pcsc_reader = true requires mcc and mnc \
-                     (no modem to derive them from)"
-                )));
-            }
-            if imsi_override.is_none() {
-                return Err(BridgeError::Config(format!(
-                    "vowifi.line[{i}]: pcsc_reader = true requires imsi_override \
-                     (no modem to read it from)"
-                )));
-            }
-        }
-        overrides.push(VowifiLineOverride {
-            modem_serial,
-            modem_port,
-            mcc,
-            mnc,
-            imsi_override,
-            imei_override,
-            pcsc_reader,
-        });
-    }
-
-    // Two pcsc_reader lines sharing an imsi_override would both resolve to
-    // the same physical reader (modules::pcsc_card::PcscTransport::connect
-    // disambiguates by IMSI) — one SIM authenticating two conflicting
-    // registrations, while whichever SIM the other line actually meant
-    // sits unused. Caught at config time rather than left as a runtime
-    // surprise (caught in review).
-    let mut seen_pcsc_imsis: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
-    for (i, o) in overrides.iter().enumerate() {
-        if !o.pcsc_reader {
-            continue;
-        }
-        let imsi = o
-            .imsi_override
-            .as_deref()
-            .expect("pcsc_reader requires imsi_override, already validated above");
-        if let Some(&first_i) = seen_pcsc_imsis.get(imsi) {
-            return Err(BridgeError::Config(format!(
-                "vowifi.line[{first_i}] and vowifi.line[{i}] are both pcsc_reader lines with \
-                 the same imsi_override {imsi:?} — each pcsc_reader line needs its own distinct \
-                 IMSI, or both would authenticate through the same physical reader while any \
-                 other configured SIM goes unused"
-            )));
-        }
-        seen_pcsc_imsis.insert(imsi, i);
-    }
-
-    Ok(overrides)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Parses a config fragment through the real pipeline (env resolution ->
+    /// serde -> validation), panicking on failure. The whole-document path,
+    /// not a per-section one: the old helper called each `parse_*` function
+    /// directly, which meant these tests never exercised unknown-key
+    /// rejection or cross-section seeding.
     fn parse(toml: &str) -> AppConfig {
-        let root: toml::Value = toml.parse().unwrap();
-        let table = root.as_table().unwrap();
-        let sip = parse_sip(table).unwrap();
-        let bridge = parse_bridge(table).unwrap();
-        let sms = parse_sms(table).unwrap();
-        let metrics = parse_metrics(table).unwrap();
-        let modules = parse_modules(table).unwrap();
-        let resilience = parse_resilience(table).unwrap();
-        let control = parse_control(table).unwrap();
-        let audio = parse_audio(table).unwrap();
-        let modem_audio = parse_modem_audio(table).unwrap();
-        let scheduled_restart = parse_scheduled_restart(table);
-        let vowifi = parse_vowifi(table).unwrap();
-        let volte = parse_volte(table).unwrap();
-        let logging = parse_logging(table).unwrap();
-        let alerts = parse_alerts(table, &sms);
-        AppConfig {
-            sip,
-            bridge,
-            sms,
-            metrics,
-            modules,
-            resilience,
-            control,
-            audio,
-            modem_audio,
-            scheduled_restart,
-            vowifi,
-            volte,
-            logging,
-            alerts,
+        try_parse(toml).expect("fixture must parse")
+    }
+
+    fn try_parse(toml: &str) -> BridgeResult<AppConfig> {
+        let mut root: Value = toml::from_str(toml).unwrap();
+        env::resolve_in_place(&mut root, "")?;
+        let unknown = raw::collect_unknown_keys(&root);
+        if !unknown.is_empty() {
+            return Err(BridgeError::Config(format!(
+                "unknown config keys: {}",
+                unknown.join(", ")
+            )));
         }
+        let raw: raw::RawConfig = root
+            .try_into()
+            .map_err(|e: toml::de::Error| BridgeError::Config(e.to_string()))?;
+        build::build(raw)
     }
 
     #[test]
@@ -2275,9 +821,11 @@ mod tests {
         let c = parse(MINIMAL_TOML);
 
         assert!(!c.volte.enabled, "must be opt-in");
-        // Same default the VoWiFi path writes to, so a captured address is
-        // found without configuring anything.
-        assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf");
+        // Names VoWiFi line 0's file specifically. The VoWiFi path writes
+        // `<base>-<index>`, so the pre-per-line `/tmp/pcscf` would never
+        // exist and this handoff would silently fall through to on-modem
+        // discovery, which does not work on this carrier.
+        assert_eq!(c.volte.pcscf_source_path, "/tmp/pcscf-0");
         assert_eq!(c.volte.netns, "volte");
         assert_eq!(c.volte.veth_carrier_iface, "veth-volte-ims");
         assert_eq!(c.volte.veth_telephony_iface, "veth-volte-sip");
@@ -2304,18 +852,25 @@ mod tests {
         // Pure per-line infrastructure — always internally derived from a
         // line's index, no config knob at either the top level or per-line,
         // same as [vowifi]'s equivalent fields (specs config reorg).
-        let toml = format!(
+        let src = format!(
             "{MINIMAL_TOML}\n[volte]\nnetns = \"volte-custom\"\n\
              veth_carrier_iface = \"veth-c\"\nveth_telephony_iface = \"veth-t\"\n\
              veth_carrier_addr = \"10.5.0.1\"\nveth_telephony_addr = \"10.5.0.2\"\n"
         );
-        let c = parse(&toml);
-
-        assert_eq!(c.volte.netns, "volte");
-        assert_eq!(c.volte.veth_carrier_iface, "veth-volte-ims");
-        assert_eq!(c.volte.veth_telephony_iface, "veth-volte-sip");
-        assert_eq!(c.volte.veth_carrier_addr, "10.98.0.1");
-        assert_eq!(c.volte.veth_telephony_addr, "10.98.0.2");
+        // Setting one is now refused outright rather than ignored. That
+        // matters more here than elsewhere: a hand-set netns or veth address
+        // would be silently overwritten per line, or would collide with
+        // another line's, and the operator would have no way to tell.
+        let err = try_parse(&src).unwrap_err().to_string();
+        for key in [
+            "volte.netns",
+            "volte.veth_carrier_iface",
+            "volte.veth_telephony_iface",
+            "volte.veth_carrier_addr",
+            "volte.veth_telephony_addr",
+        ] {
+            assert!(err.contains(key), "{key} missing from: {err}");
+        }
     }
 
     #[test]
@@ -2323,15 +878,15 @@ mod tests {
         // modem_port/iface/cid/apn/pcscf/pcscf_port moved to [[volte.line]]
         // only (specs config reorg) — a stray top-level key is an
         // unknown-key warning, not a config value.
-        let toml = format!(
+        let src = format!(
             "{MINIMAL_TOML}\n[volte]\nenabled = true\niface = \"wwan0\"\ncid = 4\n\
              pcscf = \"2400:5200:a100:819::6\"\n"
         );
 
-        let c = parse(&toml);
-
-        assert!(c.volte.enabled);
-        assert!(c.volte.line_overrides.is_empty());
+        let err = try_parse(&src).unwrap_err().to_string();
+        for key in ["volte.iface", "volte.cid", "volte.pcscf"] {
+            assert!(err.contains(key), "{key} missing from: {err}");
+        }
     }
 
     #[test]
@@ -2343,16 +898,15 @@ mod tests {
 
     #[test]
     fn volte_max_lines_custom_value_parses() {
-        let toml = format!("{MINIMAL_TOML}\n[volte]\nmax_lines = 4\n");
-        let c = parse(&toml);
+        let src = format!("{MINIMAL_TOML}\n[volte]\nmax_lines = 4\n");
+        let c = parse(&src);
         assert_eq!(c.volte.max_lines, 4);
     }
 
     #[test]
     fn volte_max_lines_rejects_zero() {
-        let toml = format!("{MINIMAL_TOML}\n[volte]\nmax_lines = 0\n");
-        let root: Value = toml.parse().unwrap();
-        assert!(parse_volte(root.as_table().unwrap()).is_err());
+        let src = format!("{MINIMAL_TOML}\n[volte]\nmax_lines = 0\n");
+        assert!(try_parse(&src).map(|c| c.volte).is_err());
     }
 
     #[test]
@@ -2363,13 +917,13 @@ mod tests {
 
     #[test]
     fn volte_line_overrides_multiple_entries_parse_in_order() {
-        let toml = format!(
+        let src = format!(
             "{MINIMAL_TOML}\n[volte]\nenabled = true\n\
              [[volte.line]]\nmodem_port = \"/dev/ttyUSB2\"\ncid = 4\n\
              [[volte.line]]\nmodem_serial = \"abc123\"\niface = \"wwan1\"\n\
              pcscf = \"2400:5200:a100:819::6\"\nmsisdn = \"919000000001\"\n"
         );
-        let c = parse(&toml);
+        let c = parse(&src);
         assert_eq!(c.volte.line_overrides.len(), 2);
         let l0 = &c.volte.line_overrides[0];
         assert_eq!(l0.modem_port.as_deref(), Some("/dev/ttyUSB2"));
@@ -2383,17 +937,15 @@ mod tests {
 
     #[test]
     fn volte_line_rejects_a_malformed_pcscf() {
-        let toml = format!("{MINIMAL_TOML}\n[volte]\n[[volte.line]]\npcscf = \"not-an-address\"\n");
-        let root: Value = toml.parse().unwrap();
-        let err = parse_volte(root.as_table().unwrap()).unwrap_err();
+        let src = format!("{MINIMAL_TOML}\n[volte]\n[[volte.line]]\npcscf = \"not-an-address\"\n");
+        let err = try_parse(&src).map(|c| c.volte).unwrap_err();
         assert!(err.to_string().contains("not a valid IP address"));
     }
 
     #[test]
     fn volte_line_rejects_a_zero_context_id() {
-        let toml = format!("{MINIMAL_TOML}\n[volte]\n[[volte.line]]\ncid = 0\n");
-        let root: Value = toml.parse().unwrap();
-        assert!(parse_volte(root.as_table().unwrap()).is_err());
+        let src = format!("{MINIMAL_TOML}\n[volte]\n[[volte.line]]\ncid = 0\n");
+        assert!(try_parse(&src).map(|c| c.volte).is_err());
     }
 
     const MINIMAL_TOML: &str = r#"
@@ -2415,11 +967,11 @@ password = "pass"
 
     #[test]
     fn resilience_overrides_applied() {
-        let toml = format!(
+        let src = format!(
             "{}\n[resilience]\ninitial_backoff_sec = 10\nmax_retries = 3\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.resilience.initial_backoff_sec, 10);
         assert_eq!(cfg.resilience.max_retries, 3);
         assert_eq!(cfg.resilience.max_backoff_sec, 120); // default preserved
@@ -2433,11 +985,11 @@ password = "pass"
 
     #[test]
     fn control_custom_socket_path() {
-        let toml = format!(
+        let src = format!(
             "{}\n[control]\nsocket_path = \"/run/gsm/ctrl.sock\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.control.socket_path, "/run/gsm/ctrl.sock");
     }
 
@@ -2454,30 +1006,30 @@ password = "pass"
 
     #[test]
     fn audio_vad_can_be_disabled() {
-        let toml = format!("{}\n[audio]\nvad = false\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[audio]\nvad = false\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert!(!cfg.audio.vad);
     }
 
     #[test]
     fn audio_vad_defaults_true_when_key_absent() {
-        let toml = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert!(cfg.audio.vad);
     }
 
     #[test]
     fn audio_lan_profile_explicit() {
-        let toml = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.audio.profile, AudioProfile::Lan);
         assert_eq!(cfg.audio.settings.ring_capacity, 4);
     }
 
     #[test]
     fn audio_wan_profile() {
-        let toml = format!("{}\n[audio]\nprofile = \"wan\"\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[audio]\nprofile = \"wan\"\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.audio.profile, AudioProfile::Wan);
         assert_eq!(cfg.audio.settings.ring_capacity, 16);
         assert_eq!(cfg.audio.settings.jb_init_ms, 60);
@@ -2497,18 +1049,18 @@ password = "pass"
 
     #[test]
     fn scheduled_restart_disabled_via_flag() {
-        let toml = format!("{}\n[scheduled_restart]\nenabled = false\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[scheduled_restart]\nenabled = false\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert!(!cfg.scheduled_restart.enabled);
     }
 
     #[test]
     fn scheduled_restart_custom_cron_applied() {
-        let toml = format!(
+        let src = format!(
             "{}\n[scheduled_restart]\ncron = \"30 2 * * 1-5\"\nstart_jitter_seconds = 0\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.scheduled_restart.cron, "30 2 * * 1-5");
         assert_eq!(cfg.scheduled_restart.start_jitter_seconds, 0);
         assert!(cfg.scheduled_restart.enabled);
@@ -2516,11 +1068,11 @@ password = "pass"
 
     #[test]
     fn scheduled_restart_invalid_cron_disables_feature() {
-        let toml = format!(
+        let src = format!(
             "{}\n[scheduled_restart]\ncron = \"0 25 * * *\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert!(
             !cfg.scheduled_restart.enabled,
             "invalid cron must disable the feature"
@@ -2529,38 +1081,35 @@ password = "pass"
 
     #[test]
     fn scheduled_restart_jitter_greater_than_gap_disables() {
-        let toml = format!(
+        let src = format!(
             "{}\n[scheduled_restart]\ninter_card_gap_seconds = 10\ninter_card_gap_jitter_seconds = 20\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert!(!cfg.scheduled_restart.enabled);
     }
 
     #[test]
     fn scheduled_restart_jitter_out_of_range_disables() {
-        let toml = format!(
+        let src = format!(
             "{}\n[scheduled_restart]\nstart_jitter_seconds = 999999\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert!(!cfg.scheduled_restart.enabled);
     }
 
     #[test]
     fn scheduled_restart_empty_cron_disables() {
-        let toml = format!("{}\n[scheduled_restart]\ncron = \"\"\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[scheduled_restart]\ncron = \"\"\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert!(!cfg.scheduled_restart.enabled);
     }
 
     #[test]
     fn audio_unknown_profile_returns_error() {
-        let root: toml::Value = format!("{}\n[audio]\nprofile = \"fiber\"\n", MINIMAL_TOML)
-            .parse()
-            .unwrap();
-        let table = root.as_table().unwrap();
-        let result = parse_audio(table);
+        let src = format!("{}\n[audio]\nprofile = \"fiber\"\n", MINIMAL_TOML);
+        let result = try_parse(&src).map(|c| c.audio);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2570,33 +1119,27 @@ password = "pass"
 
     #[test]
     fn audio_snd_latency_defaults_when_omitted() {
-        let root: toml::Value = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML)
-            .parse()
-            .unwrap();
-        let audio = parse_audio(root.as_table().unwrap()).unwrap();
+        let src = format!("{}\n[audio]\nprofile = \"lan\"\n", MINIMAL_TOML);
+        let audio = try_parse(&src).map(|c| c.audio).unwrap();
         assert_eq!(audio.snd_rec_latency_ms, DEFAULT_SND_REC_LATENCY_MS);
         assert_eq!(audio.snd_play_latency_ms, DEFAULT_SND_PLAY_LATENCY_MS);
     }
 
     #[test]
     fn audio_snd_latency_custom_values_parsed() {
-        let root: toml::Value = format!(
+        let src = format!(
             "{}\n[audio]\nsnd_rec_latency_ms = 300\nsnd_play_latency_ms = 250\n",
             MINIMAL_TOML
-        )
-        .parse()
-        .unwrap();
-        let audio = parse_audio(root.as_table().unwrap()).unwrap();
+        );
+        let audio = try_parse(&src).map(|c| c.audio).unwrap();
         assert_eq!(audio.snd_rec_latency_ms, 300);
         assert_eq!(audio.snd_play_latency_ms, 250);
     }
 
     #[test]
     fn audio_snd_latency_out_of_range_returns_error() {
-        let root: toml::Value = format!("{}\n[audio]\nsnd_rec_latency_ms = 5\n", MINIMAL_TOML)
-            .parse()
-            .unwrap();
-        let result = parse_audio(root.as_table().unwrap());
+        let src = format!("{}\n[audio]\nsnd_rec_latency_ms = 5\n", MINIMAL_TOML);
+        let result = try_parse(&src).map(|c| c.audio);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2612,17 +1155,15 @@ password = "pass"
 
     #[test]
     fn modem_audio_rt_audio_prio_valid_value_parsed() {
-        let toml = format!("{}\n[modem_audio]\nrt_audio_prio = 20\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[modem_audio]\nrt_audio_prio = 20\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.modem_audio.rt_audio_prio, 20);
     }
 
     #[test]
     fn modem_audio_rt_audio_prio_out_of_range_returns_error() {
-        let root: toml::Value = format!("{}\n[modem_audio]\nrt_audio_prio = 150\n", MINIMAL_TOML)
-            .parse()
-            .unwrap();
-        let result = parse_modem_audio(root.as_table().unwrap());
+        let src = format!("{}\n[modem_audio]\nrt_audio_prio = 150\n", MINIMAL_TOML);
+        let result = try_parse(&src).map(|c| c.modem_audio);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2638,23 +1179,22 @@ password = "pass"
 
     #[test]
     fn logging_level_override_applied() {
-        let toml = format!("{}\n[logging]\nlevel = \"debug\"\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[logging]\nlevel = \"debug\"\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.logging.level, "debug");
     }
 
     #[test]
     fn logging_level_is_case_insensitive() {
-        let toml = format!("{}\n[logging]\nlevel = \"WARN\"\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[logging]\nlevel = \"WARN\"\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.logging.level, "warn");
     }
 
     #[test]
     fn logging_level_rejects_unknown_value() {
-        let toml = format!("{}\n[logging]\nlevel = \"verbose\"\n", MINIMAL_TOML);
-        let root: toml::Value = toml.parse().unwrap();
-        let result = parse_logging(root.as_table().unwrap());
+        let src = format!("{}\n[logging]\nlevel = \"verbose\"\n", MINIMAL_TOML);
+        let result = try_parse(&src).map(|c| c.logging);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2694,8 +1234,8 @@ password = "pass"
 
     #[test]
     fn vowifi_enabled_without_line_means_auto_derive() {
-        let toml = format!("{}\n[vowifi]\nenabled = true\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[vowifi]\nenabled = true\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert!(cfg.vowifi.enabled);
         assert!(cfg.vowifi.mcc.is_empty());
         assert!(cfg.vowifi.mnc.is_empty());
@@ -2704,25 +1244,26 @@ password = "pass"
 
     #[test]
     fn vowifi_top_level_mcc_mnc_are_no_longer_settable() {
-        // mcc/mnc moved to [[vowifi.line]] entries only (specs config
-        // reorg) — a stray top-level key is an unknown-key warning, not a
-        // config value, and the field stays at its auto-derive default.
-        let toml = format!(
+        // mcc/mnc are per-line identity, settable only on a
+        // `[[vowifi.line]]` entry. They used to be tolerated (and silently
+        // ignored) at the top level; a key that looks like it works but does
+        // nothing is worse than one that is refused, so this now fails.
+        let src = format!(
             "{}\n[vowifi]\nenabled = true\nmcc = \"404\"\nmnc = \"094\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
-        assert!(cfg.vowifi.mcc.is_empty());
-        assert!(cfg.vowifi.mnc.is_empty());
+        let err = try_parse(&src).unwrap_err().to_string();
+        assert!(err.contains("vowifi.mcc"), "{err}");
+        assert!(err.contains("vowifi.mnc"), "{err}");
     }
 
     #[test]
     fn vowifi_epdg_fqdn_override_respected() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\nenabled = true\nepdg_fqdn = \"epdg.example.org\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.epdg_fqdn, "epdg.example.org");
     }
 
@@ -2730,15 +1271,24 @@ password = "pass"
     fn vowifi_veth_and_infra_fields_are_not_settable_via_toml() {
         // Pure per-line infrastructure — always internally derived from a
         // line's index, no config knob at either the top level or per-line.
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\nveth_local_addr = \"10.1.1.1\"\nveth_peer_addr = \"10.1.1.2\"\ncontrol_port = 9999\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
-        assert_eq!(cfg.vowifi.veth_local_addr, "10.99.0.1");
-        assert_eq!(cfg.vowifi.veth_peer_addr, "10.99.0.2");
-        // control_port is the one genuinely global/shared field here.
+        // veth addresses are derived per line and are now refused outright
+        // rather than silently ignored. `control_port` is the one genuinely
+        // global field of the three, so it remains settable.
+        let err = try_parse(&src).unwrap_err().to_string();
+        assert!(err.contains("vowifi.veth_local_addr"), "{err}");
+        assert!(err.contains("vowifi.veth_peer_addr"), "{err}");
+        assert!(
+            !err.contains("vowifi.control_port"),
+            "control_port is a real key: {err}"
+        );
+
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\ncontrol_port = 9999\n"));
         assert_eq!(cfg.vowifi.control_port, 9999);
+        assert_eq!(cfg.vowifi.veth_local_addr, "10.99.0.1");
     }
 
     #[test]
@@ -2746,8 +1296,8 @@ password = "pass"
         // Unlike the other per-line infra fields, vpcd_port is a genuine
         // global TOML key — the base of pcscd's shared reader range, which
         // operators sometimes must move to avoid an ephemeral-port collision.
-        let toml = format!("{}\n[vowifi]\nvpcd_port = 20000\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[vowifi]\nvpcd_port = 20000\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.vpcd_port, 20000);
     }
 
@@ -2770,9 +1320,8 @@ password = "pass"
 
     #[test]
     fn vowifi_tunnel_engine_rejects_unknown_value() {
-        let toml = format!("{}\n[vowifi]\ntunnel_engine = \"bogus\"\n", MINIMAL_TOML);
-        let root: toml::Value = toml.parse().unwrap();
-        let result = parse_vowifi(root.as_table().unwrap());
+        let src = format!("{}\n[vowifi]\ntunnel_engine = \"bogus\"\n", MINIMAL_TOML);
+        let result = try_parse(&src).map(|c| c.vowifi);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2782,11 +1331,11 @@ password = "pass"
 
     #[test]
     fn vowifi_optional_overrides_parsed() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\nepdg_ip = \"1.2.3.4\"\nsrc_addr = \"9.9.9.9\"\ntunnel_engine = \"swu\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.epdg_ip.as_deref(), Some("1.2.3.4"));
         assert_eq!(cfg.vowifi.src_addr.as_deref(), Some("9.9.9.9"));
         assert_eq!(cfg.vowifi.tunnel_engine, "swu");
@@ -2801,16 +1350,15 @@ password = "pass"
 
     #[test]
     fn vowifi_max_lines_custom_value_parses() {
-        let toml = format!("{}\n[vowifi]\nmax_lines = 4\n", MINIMAL_TOML);
-        let cfg = parse(&toml);
+        let src = format!("{}\n[vowifi]\nmax_lines = 4\n", MINIMAL_TOML);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.max_lines, 4);
     }
 
     #[test]
     fn vowifi_max_lines_rejects_zero() {
-        let toml = format!("{}\n[vowifi]\nmax_lines = 0\n", MINIMAL_TOML);
-        let root: toml::Value = toml.parse().unwrap();
-        assert!(parse_vowifi(root.as_table().unwrap()).is_err());
+        let src = format!("{}\n[vowifi]\nmax_lines = 0\n", MINIMAL_TOML);
+        assert!(try_parse(&src).map(|c| c.vowifi).is_err());
     }
 
     #[test]
@@ -2821,11 +1369,11 @@ password = "pass"
 
     #[test]
     fn vowifi_line_overrides_single_entry_parses() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nmcc = \"404\"\nmnc = \"094\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.line_overrides.len(), 1);
         let line = &cfg.vowifi.line_overrides[0];
         assert_eq!(line.modem_serial.as_deref(), Some("ABC123"));
@@ -2838,11 +1386,11 @@ password = "pass"
 
     #[test]
     fn vowifi_line_override_imei_override_parses_and_resolves() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nimsi_override = \"404400975938075\"\nimei_override = \"864650053414154\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         let line = &cfg.vowifi.line_overrides[0];
         assert_eq!(line.imsi_override.as_deref(), Some("404400975938075"));
         assert_eq!(line.imei_override.as_deref(), Some("864650053414154"));
@@ -2850,37 +1398,31 @@ password = "pass"
 
     #[test]
     fn vowifi_line_override_rejects_non_digit_imsi_override() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nimsi_override = \"40440097593807x\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let err = parse_vowifi(root.as_table().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
         assert!(err.contains("imsi_override"), "unexpected error: {err}");
     }
 
     #[test]
     fn vowifi_line_override_rejects_wrong_length_imei_override() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nimei_override = \"12345\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let err = parse_vowifi(root.as_table().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
         assert!(err.contains("imei_override"), "unexpected error: {err}");
     }
 
     #[test]
     fn vowifi_line_overrides_multiple_entries_parse_in_order() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB6\"\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB10\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.line_overrides.len(), 2);
         assert_eq!(
             cfg.vowifi.line_overrides[0].modem_port.as_deref(),
@@ -2894,12 +1436,11 @@ password = "pass"
 
     #[test]
     fn vowifi_line_override_rejects_mcc_without_mnc() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB6\"\nmcc = \"404\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let result = parse_vowifi(root.as_table().unwrap());
+        let result = try_parse(&src).map(|c| c.vowifi);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2909,11 +1450,11 @@ password = "pass"
 
     #[test]
     fn vowifi_pcsc_reader_line_parses_with_all_mandatory_fields() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.line_overrides.len(), 1);
         let line = &cfg.vowifi.line_overrides[0];
         assert!(line.pcsc_reader);
@@ -2924,11 +1465,11 @@ password = "pass"
 
     #[test]
     fn vowifi_pcsc_reader_defaults_to_false() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert!(!cfg.vowifi.line_overrides[0].pcsc_reader);
     }
 
@@ -2936,27 +1477,21 @@ password = "pass"
     fn vowifi_pcsc_reader_rejects_missing_imsi_override() {
         // specs/023-omnikey-pcsc-vowifi T009: no modem to read the IMSI from,
         // so it's mandatory when pcsc_reader = true.
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nmcc = \"404\"\nmnc = \"043\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let err = parse_vowifi(root.as_table().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
         assert!(err.contains("imsi_override"), "unexpected error: {err}");
     }
 
     #[test]
     fn vowifi_pcsc_reader_rejects_missing_mcc_mnc() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let err = parse_vowifi(root.as_table().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
         assert!(
             err.contains("mcc") && err.contains("mnc"),
             "unexpected error: {err}"
@@ -2965,14 +1500,11 @@ password = "pass"
 
     #[test]
     fn vowifi_pcsc_reader_rejects_modem_matcher_combination() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nmodem_serial = \"ABC123\"\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let err = parse_vowifi(root.as_table().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
         assert!(err.contains("pcsc_reader"), "unexpected error: {err}");
     }
 
@@ -2984,29 +1516,26 @@ password = "pass"
         // conflicting registrations while any other configured SIM sits
         // unused. Rejected at config time rather than left as a runtime
         // surprise.
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n\
              [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n\
              [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"094\"\n",
             MINIMAL_TOML
         );
-        let root: toml::Value = toml.parse().unwrap();
-        let err = parse_vowifi(root.as_table().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
         assert!(err.contains("404940123456789"), "unexpected error: {err}");
         assert!(err.contains("pcsc_reader"), "unexpected error: {err}");
     }
 
     #[test]
     fn vowifi_pcsc_reader_allows_distinct_imsi_across_lines() {
-        let toml = format!(
+        let src = format!(
             "{}\n[vowifi]\n\
              [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n\
              [[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404011111111111\"\nmcc = \"404\"\nmnc = \"094\"\n",
             MINIMAL_TOML
         );
-        let cfg = parse(&toml);
+        let cfg = parse(&src);
         assert_eq!(cfg.vowifi.line_overrides.len(), 2);
     }
 
@@ -3018,15 +1547,14 @@ password = "pass"
         let cfg: VolteConfig = Default::default();
         assert!(!cfg.bridge_inbound);
 
-        let parsed = parse_volte(
-            &"[volte]\nenabled = true\nmodem_port = \"/dev/ttyUSB6\"\n"
-                .parse::<Value>()
-                .unwrap()
-                .as_table()
-                .unwrap()
-                .clone(),
-        )
-        .expect("a config with no inbound selection must parse");
+        // NB: this fixture used to also set `modem_port` inside `[volte]`,
+        // which has never been a `[volte]` key — the old parser warned and
+        // carried on, so the test passed while silently exercising a config
+        // no deployment could have meant. It is now a hard error, so the
+        // stray key is gone.
+        let parsed = try_parse(&format!("{MINIMAL_TOML}\n[volte]\nenabled = true\n"))
+            .map(|c| c.volte)
+            .expect("a config with no inbound selection must parse");
         assert!(
             !parsed.bridge_inbound,
             "an unset selection must not silently enable inbound bridging"
@@ -3035,14 +1563,10 @@ password = "pass"
 
     #[test]
     fn the_inbound_selection_is_honoured_when_set() {
-        let parsed = parse_volte(
-            &"[volte]\nenabled = true\nbridge_inbound = true\n"
-                .parse::<Value>()
-                .unwrap()
-                .as_table()
-                .unwrap()
-                .clone(),
-        )
+        let parsed = try_parse(&format!(
+            "{MINIMAL_TOML}\n[volte]\nenabled = true\nbridge_inbound = true\n"
+        ))
+        .map(|c| c.volte)
         .expect("parses");
         assert!(parsed.bridge_inbound);
     }
