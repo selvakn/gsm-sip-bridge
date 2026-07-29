@@ -32,7 +32,13 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
 rusqlite = { version = "0.37", features = ["bundled"] }
-prometheus = "0.13"
+# `default-features = false` drops the protobuf encoder, and with it the
+# `protobuf 2.x` dependency carrying RUSTSEC-2024-0437 (stack overflow on
+# untrusted input). We only ever emit the text exposition format —
+# `metrics::server` uses `TextEncoder` and nothing references protobuf — so
+# the encoder was pure attack surface. This also removes the reason to chase
+# prometheus 0.14, whose only draw was a newer protobuf.
+prometheus = { version = "0.13", default-features = false }
 crossbeam-queue = "0.3"
 alsa = "0.9"
 libc = "0.2"

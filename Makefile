@@ -17,7 +17,7 @@ build: ## Compile all binaries (release mode)
 # *binary*, so the summary line reports only the tests that ran before it —
 # which reads as a smaller suite passing rather than as a failure.
 test: ## Run the full test suite
-	@if command -v cargo-nextest >/dev/null 2>&1; then \
+	@if cargo nextest --version >/dev/null 2>&1; then \
 		cargo nextest run --workspace --no-fail-fast; \
 	else \
 		echo "note: cargo-nextest not installed — falling back to cargo test (no per-test timeout)"; \
@@ -30,10 +30,24 @@ run: build ## Build and run the GSM-SIP bridge
 clean: ## Remove all build artifacts
 	@cargo clean
 
+# The cargo-* guards below ask cargo whether the *subcommand* runs, not
+# whether a `cargo-x` binary is on PATH. Cargo locates its subcommands in
+# ~/.cargo/bin itself, which is frequently not on PATH (rustup shims, distro
+# cargo). `command -v cargo-deny` therefore reported "not installed" on a
+# machine where `cargo deny check` worked perfectly — silently skipping the
+# dependency-policy gate, which is how a RUSTSEC advisory and a rejected
+# license reached CI with a clean local `make lint`.
 lint: ## Run formatting check, clippy, cargo-deny, shellcheck, and unsafe audit
 	@cargo fmt --check
 	@cargo clippy --workspace --all-targets -- -D warnings
-	@if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; fi
+	@if cargo deny --version >/dev/null 2>&1; then \
+		cargo deny check; \
+	else \
+		echo "WARNING: cargo-deny not installed — dependency advisories and"; \
+		echo "         licenses were NOT checked. CI does enforce them, so a"; \
+		echo "         clean 'make lint' here can still fail there."; \
+		echo "         Install: cargo install cargo-deny --locked"; \
+	fi
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		shellcheck -x docker/*.sh; \
 	else \
