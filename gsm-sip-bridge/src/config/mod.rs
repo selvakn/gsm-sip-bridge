@@ -404,9 +404,13 @@ pub struct VowifiConfig {
     /// IPsec. Required by networks (e.g. Vi) that reject a plain REGISTER;
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
-    /// Path Agent A reads the tunnel-assigned P-CSCF address from —
-    /// `docker/entrypoint.sh` writes this once the SWu tunnel is up. Shared
-    /// across every line (also read by `[volte].pcscf_source_path`).
+    /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
+    /// by `supervise::orchestrate` once this line's tunnel is up.
+    ///
+    /// This is a *base*: per-line resolution appends `-{index}`, so the
+    /// configured `/tmp/pcscf` becomes `/tmp/pcscf-0`, `/tmp/pcscf-1`, ... Each
+    /// line's tunnel is assigned its own P-CSCF by its own carrier, so a single
+    /// shared file makes concurrently-establishing lines overwrite each other.
     pub pcscf_source_path: String,
     /// Agent A's address on the dedicated veth link (the `ims`-netns end).
     /// Pure per-line infrastructure, always derived from the line's index —

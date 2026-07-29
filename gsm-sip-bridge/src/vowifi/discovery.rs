@@ -105,8 +105,8 @@ pub use crate::line::FailedLine;
 /// function of `index` (research.md item 5), uniformly for every line
 /// including the first — downstream code (`ims::agent`, `vowifi::run`) takes
 /// `&config` exactly as it does today and needs no awareness that it's one
-/// of several lines. `pcscf_source_path` is the one exception: it's a
-/// shared, global scratch file, not per-line derived.
+/// of several lines — `pcscf_source_path` included, since two simultaneously
+/// established lines otherwise overwrite each other's P-CSCF in one file.
 #[derive(Debug, Clone)]
 pub struct ResolvedLine {
     pub index: u32,
@@ -226,8 +226,17 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
         config.veth_peer_addr = peer;
     }
     config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
-    // pcscf_source_path stays the shared, global value (also read by
-    // [volte].pcscf_source_path) — not per-line derived.
+    // Per-line, like every other resource here. It was left shared, and with
+    // only one line ever actually establishing at a time that was invisible.
+    // The moment two lines came up together they raced over one file: each
+    // line's supervisor writes its own tunnel-assigned P-CSCF to this path and
+    // each line's Agent A reads it back, so the loser registered against the
+    // *other* carrier's proxy — unreachable from its own netns — and crash-
+    // looped. Observed live 2026-07-29 holding an address belonging to neither
+    // line (a stale one from an earlier tunnel), which is the same race one
+    // step further along.
+    config.pcscf_source_path =
+        crate::line::resources::indexed(&format!("{}-", base.pcscf_source_path), index);
 
     ResolvedLine {
         index,
@@ -704,8 +713,13 @@ mod tests {
         assert_eq!(line.config.veth_local_addr, base.veth_local_addr);
         assert_eq!(line.config.veth_peer_addr, base.veth_peer_addr);
         assert_eq!(line.config.vpcd_port, base.vpcd_port);
-        // pcscf_source_path is shared/global, never per-line derived.
-        assert_eq!(line.config.pcscf_source_path, base.pcscf_source_path);
+        // Suffixed even for a single line, like every other derived resource
+        // here — so line 0 keeps the same path whether or not a second line
+        // later exists.
+        assert_eq!(
+            line.config.pcscf_source_path,
+            format!("{}-0", base.pcscf_source_path)
+        );
         assert_eq!(line.config.control_port, base.control_port);
         // The one thing that DOES change even for a single line: the modem
         // port comes from discovery, not the (irrelevant) default placeholder.
@@ -735,8 +749,11 @@ mod tests {
         assert_ne!(l0.config.veth_local_addr, l1.config.veth_local_addr);
         assert_ne!(l0.config.veth_peer_addr, l1.config.veth_peer_addr);
         assert_ne!(l0.config.vpcd_port, l1.config.vpcd_port);
-        // pcscf_source_path is shared/global, deliberately the same on every line.
-        assert_eq!(l0.config.pcscf_source_path, l1.config.pcscf_source_path);
+        // Regression test for a live two-line failure: one shared file meant
+        // each line's supervisor overwrote the other's tunnel-assigned P-CSCF,
+        // so a line could register against the wrong carrier's proxy —
+        // unreachable from its own netns — and crash-loop.
+        assert_ne!(l0.config.pcscf_source_path, l1.config.pcscf_source_path);
         // FR-011: no accidental collisions.
         assert_ne!(l0.config.veth_local_addr, l0.config.veth_peer_addr);
         assert_ne!(l1.config.veth_local_addr, l1.config.veth_peer_addr);
