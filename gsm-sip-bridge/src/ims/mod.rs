@@ -423,6 +423,70 @@ pub fn run_register(cfg: &ImsRegisterConfig) -> BridgeResult<RegisterOutcome> {
     }
 }
 
+/// How long to wait between attempts to open a modem line's serial port.
+const MODEM_OPEN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long to keep waiting before giving up on it.
+///
+/// Bounded, unlike Agent B's control-channel bind: the conflict this waits out
+/// is one EAP-AKA exchange, which takes seconds. A genuinely wrong or missing
+/// port must still surface as an error rather than hanging the agent forever.
+const MODEM_OPEN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Opens the modem's serial port, waiting out a transient exclusive-open
+/// conflict with `vowifi-usim-bridge`.
+///
+/// `serialport` opens exclusively, and the usim bridge holds this same port for
+/// as long as charon keeps the virtual card powered on — EAP-AKA at tunnel
+/// establishment, and again at every rekey. Agent A needs it for the whole IMS
+/// session. So the two genuinely contend, and which one wins is a matter of
+/// timing.
+///
+/// Losing used to fail the agent outright, whereupon the supervisor restarted
+/// it five seconds later: the entire IMS session torn down and rebuilt over a
+/// conflict that clears on its own in seconds. Observed live as
+/// `failed to open serial /dev/ttyUSB0: Unable to acquire exclusive lock`,
+/// crash-looping until it happened to win a race.
+///
+/// Generic over open and sleep so the policy is testable without a serial port
+/// or a real clock.
+fn open_modem_waiting<T, E: std::fmt::Display>(
+    port: &str,
+    max_wait: std::time::Duration,
+    interval: std::time::Duration,
+    mut open: impl FnMut() -> Result<T, E>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<T, E> {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match open() {
+            Ok(opened) => {
+                if !waited.is_zero() {
+                    tracing::info!(
+                        port = %port,
+                        waited_secs = waited.as_secs(),
+                        "modem serial acquired after waiting out a conflicting holder"
+                    );
+                }
+                return Ok(opened);
+            }
+            Err(e) => {
+                if waited >= max_wait {
+                    return Err(e);
+                }
+                if waited.is_zero() {
+                    tracing::warn!(
+                        port = %port,
+                        error = %e,
+                        "modem serial busy (vowifi-usim-bridge is probably mid-EAP); waiting"
+                    );
+                }
+                sleep(interval);
+                waited += interval;
+            }
+        }
+    }
+}
+
 pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
     // A pcsc_reader line's SIM sits in a real PC/SC reader, not the modem at
     // `modem_port` (specs/023-omnikey-pcsc-vowifi). Only one `AtCommander` is
@@ -449,7 +513,13 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         // happened to be plugged into the first reader pcscd lists.
         card = Box::new(PcscTransport::connect(&imsi)?);
     } else {
-        let mut at = AtCommander::open(&cfg.modem_port)?;
+        let mut at = open_modem_waiting(
+            &cfg.modem_port.to_string_lossy(),
+            MODEM_OPEN_MAX_WAIT,
+            MODEM_OPEN_RETRY_INTERVAL,
+            || AtCommander::open(&cfg.modem_port),
+            std::thread::sleep,
+        )?;
         imsi = match &cfg.imsi {
             Some(imsi) => imsi.clone(),
             None => at.query_imsi()?,
@@ -1054,5 +1124,67 @@ mod tests {
         let expected_ha2 = digest::ha2("REGISTER", "sip:realm");
         let expected_response = digest::response_simple(&expected_ha1, "bm9uY2U=", &expected_ha2);
         assert!(auth.contains(&format!("response=\"{expected_response}\"")));
+    }
+
+    /// Regression test for a live crash-loop: `vowifi-usim-bridge` holds the
+    /// modem's serial for as long as charon keeps the virtual card powered on,
+    /// so Agent A losing that race is normal and transient. It used to fail the
+    /// agent outright, tearing down and rebuilding the whole IMS session over a
+    /// conflict that clears in seconds.
+    #[test]
+    fn a_busy_modem_serial_is_waited_out_rather_than_failing_the_session() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let opened = open_modem_waiting(
+            "/dev/ttyUSB0",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(2),
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err("Unable to acquire exclusive lock on serial port")
+                } else {
+                    Ok("commander")
+                }
+            },
+            |d| slept.push(d),
+        );
+        assert_eq!(opened, Ok("commander"));
+        assert_eq!(attempts, 3);
+        assert_eq!(slept.len(), 2);
+    }
+
+    /// Bounded on purpose: a genuinely wrong or missing port must still surface
+    /// as an error instead of hanging the agent forever.
+    #[test]
+    fn a_permanently_unavailable_modem_serial_still_gives_up() {
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let opened: Result<&str, &str> = open_modem_waiting(
+            "/dev/ttyUSB9",
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(2),
+            || {
+                attempts += 1;
+                Err("No such file or directory")
+            },
+            |d| slept.push(d),
+        );
+        assert_eq!(opened, Err("No such file or directory"));
+        assert_eq!(slept.len(), 3, "waits the full budget, then reports");
+    }
+
+    #[test]
+    fn an_available_modem_serial_is_opened_without_delay() {
+        let mut slept = Vec::new();
+        let opened = open_modem_waiting(
+            "/dev/ttyUSB0",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(2),
+            || Ok::<_, String>("commander"),
+            |d| slept.push(d),
+        );
+        assert_eq!(opened, Ok("commander"));
+        assert!(slept.is_empty(), "a free port must not delay registration");
     }
 }
