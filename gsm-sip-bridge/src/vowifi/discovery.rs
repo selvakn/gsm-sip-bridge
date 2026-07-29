@@ -91,6 +91,41 @@ fn override_for<'a>(
     })
 }
 
+/// Derives every per-line isolated resource from the line's index, uniformly
+/// for every line including the first. No config knob backs any of these (see
+/// `VowifiConfig`'s field docs) — they exist so lines cannot collide.
+///
+/// Shared by both resolvers deliberately. This block used to be copy-pasted
+/// into the modem and the card-reader path, and the copies drifted exactly as
+/// you would expect: `pcscf_source_path` was fixed in one and silently left
+/// shared in the other, so a two-line deployment still had its card-reader line
+/// overwriting the modem line's P-CSCF. One function means a resource added
+/// here cannot be derived for only some kinds of line.
+fn derive_line_resources(config: &mut VowifiConfig, base: &VowifiConfig, index: u32) {
+    config.netns = resources::indexed(&base.netns, index);
+    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
+    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
+    config.veth_sip_iface = resources::indexed(&base.veth_sip_iface, index);
+    config.veth_ims_iface = resources::indexed(&base.veth_ims_iface, index);
+    let step = 4u32 * index;
+    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
+        config.veth_local_addr = local;
+    }
+    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
+        config.veth_peer_addr = peer;
+    }
+    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
+    // Per-line like the rest, though it was long left shared on the reasoning
+    // that it is a global scratch file. It is not: each line's tunnel is
+    // assigned its own P-CSCF by its own carrier, each line's supervisor writes
+    // it here, and each line's Agent A reads it back. With one file the loser
+    // of the race registers against the *other* carrier's proxy — unreachable
+    // from its own netns — and crash-loops. Observed live 2026-07-29 holding an
+    // address belonging to neither line (a stale one from an earlier tunnel),
+    // which is the same race one step further along.
+    config.pcscf_source_path = resources::indexed(&format!("{}-", base.pcscf_source_path), index);
+}
+
 /// A modem that can't become a line, and why (FR-006/FR-016).
 ///
 /// Re-exported from [`crate::line`], where it lives now: VoLTE was importing
@@ -210,33 +245,7 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     // been applied above.
     config.line_overrides = Vec::new();
 
-    // Pure per-line infrastructure — always mechanically derived from the
-    // line's index, uniformly for every line including the first. No config
-    // knob backs any of this (see `VowifiConfig`'s field docs).
-    config.netns = resources::indexed(&base.netns, index);
-    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
-    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-    config.veth_sip_iface = resources::indexed(&base.veth_sip_iface, index);
-    config.veth_ims_iface = resources::indexed(&base.veth_ims_iface, index);
-    let step = 4u32 * index;
-    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
-        config.veth_local_addr = local;
-    }
-    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
-        config.veth_peer_addr = peer;
-    }
-    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
-    // Per-line, like every other resource here. It was left shared, and with
-    // only one line ever actually establishing at a time that was invisible.
-    // The moment two lines came up together they raced over one file: each
-    // line's supervisor writes its own tunnel-assigned P-CSCF to this path and
-    // each line's Agent A reads it back, so the loser registered against the
-    // *other* carrier's proxy — unreachable from its own netns — and crash-
-    // looped. Observed live 2026-07-29 holding an address belonging to neither
-    // line (a stale one from an earlier tunnel), which is the same race one
-    // step further along.
-    config.pcscf_source_path =
-        crate::line::resources::indexed(&format!("{}-", base.pcscf_source_path), index);
+    derive_line_resources(&mut config, base, index);
 
     ResolvedLine {
         index,
@@ -327,19 +336,7 @@ fn resolve_one_pcsc_line(
     config.pcsc_reader = true;
     config.line_overrides = Vec::new();
 
-    config.netns = resources::indexed(&base.netns, index);
-    config.strongswan_tun_iface = format!("{}-{}", base.strongswan_tun_iface, index);
-    config.strongswan_if_id = base.strongswan_if_id.saturating_add(index);
-    config.veth_sip_iface = resources::indexed(&base.veth_sip_iface, index);
-    config.veth_ims_iface = resources::indexed(&base.veth_ims_iface, index);
-    let step = 4u32 * index;
-    if let Some(local) = shift_ipv4(&base.veth_local_addr, step) {
-        config.veth_local_addr = local;
-    }
-    if let Some(peer) = shift_ipv4(&base.veth_peer_addr, step) {
-        config.veth_peer_addr = peer;
-    }
-    config.vpcd_port = base.vpcd_port.saturating_add(index as u16);
+    derive_line_resources(&mut config, base, index);
 
     ResolvedLine {
         index,
@@ -986,6 +983,23 @@ mod tests {
         assert_ne!(
             modem_line.config.strongswan_if_id,
             pcsc_line.config.strongswan_if_id
+        );
+        // Regression test for a live failure in exactly this configuration.
+        // The two resolvers used to derive resources through copy-pasted
+        // blocks, and they drifted: `pcscf_source_path` was made per-line on
+        // the modem path only, so the card-reader line kept the shared base and
+        // went on overwriting the modem line's tunnel-assigned P-CSCF.
+        assert_ne!(
+            modem_line.config.pcscf_source_path,
+            pcsc_line.config.pcscf_source_path
+        );
+        assert_eq!(
+            modem_line.config.pcscf_source_path,
+            format!("{}-0", base.pcscf_source_path)
+        );
+        assert_eq!(
+            pcsc_line.config.pcscf_source_path,
+            format!("{}-1", base.pcscf_source_path)
         );
     }
 
