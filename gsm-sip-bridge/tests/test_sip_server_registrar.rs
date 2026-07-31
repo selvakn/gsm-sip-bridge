@@ -359,6 +359,42 @@ fn a_replayed_nonce_count_is_refused() {
     );
 }
 
+/// §1.6, over the wire: a captured legacy header with `qop=auth` bolted on but
+/// no `nc`/`cnonce` must not register anything, however many times it is sent.
+///
+/// Regression, PR #21 review. That form used to fall through to the legacy
+/// digest, skipping the nonce-count check (never reached) and the single-use
+/// consumption (`qop` was present), so it could be replayed until the nonce
+/// expired — each replay overwriting or removing the victim's binding.
+#[test]
+fn a_forged_qop_header_never_registers_anything() {
+    let h = Harness::new();
+    let nonce = nonce_from(&h.round_trip(&register(1, "call-1", None, None)));
+    // A legitimate legacy Authorization, as a handset in the field sends it...
+    let legacy = authorization(USER, PASSWORD, &nonce, None);
+    // ...with the attacker's edit: claim qop, supply neither companion field.
+    let forged = format!("{legacy}, qop=auth");
+
+    for attempt in 0..3 {
+        let response = h.round_trip(&register(2, "call-1", Some(&forged), None));
+        assert_status(&response, 401);
+        assert!(
+            h.registrar
+                .bindings()
+                .get_live(USER, std::time::Instant::now())
+                .is_none(),
+            "attempt {attempt} must not have registered anything"
+        );
+    }
+
+    // The nonce it targeted must still be usable by the real handset, rather
+    // than burned by the forgery.
+    assert_status(
+        &h.round_trip(&register(3, "call-1", Some(&legacy), None)),
+        200,
+    );
+}
+
 /// §1.7 — algorithms we do not implement are refused rather than ignored.
 #[test]
 fn an_unsupported_algorithm_is_refused() {

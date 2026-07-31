@@ -220,8 +220,24 @@ pub fn verify(
     );
     let ha2 = digest::ha2(method, digest_uri);
 
-    let expected = match (get("qop"), get("nc"), get("cnonce")) {
-        (Some(qop), Some(nc), Some(cnonce)) => {
+    // Which form applies is decided by `qop` **alone**, and the matching replay
+    // guard is selected in the same breath.
+    //
+    // Splitting those two decisions is a replay hole: a form chosen by
+    // `(qop, nc, cnonce)` while the nonce was consumed only on `qop.is_none()`
+    // let `qop=auth` *without* `nc`/`cnonce` fall through to the legacy digest,
+    // skipping the nonce-count check (never reached) and the single-use
+    // consumption (`qop` was present). A captured legacy `Authorization` with
+    // `qop=auth` bolted on could then be replayed until the nonce expired,
+    // each time overwriting or removing the victim's binding.
+    let expected = match get("qop") {
+        Some(qop) => {
+            // Advertising `qop` means the client must supply both. Missing
+            // either is malformed, not an invitation to fall back — RFC 2617
+            // §3.2.2 requires `nc` and `cnonce` whenever `qop` is sent.
+            let (Some(nc), Some(cnonce)) = (get("nc"), get("cnonce")) else {
+                return Err(AuthFailure::Rejected);
+            };
             let parsed_nc = u32::from_str_radix(nc, 16).map_err(|_| AuthFailure::Rejected)?;
             if !nonces.accept_nc(nonce, parsed_nc) {
                 return Err(AuthFailure::Rejected);
@@ -231,7 +247,7 @@ pub fn verify(
         // The legacy RFC 2069 form. Still sent by handsets in the field, so
         // still accepted — the nonce is single-use, which is what stops replay
         // without a nonce-count to compare.
-        _ => digest::response_simple(&ha1, nonce, &ha2),
+        None => digest::response_simple(&ha1, nonce, &ha2),
     };
 
     if !constant_time_eq(expected.as_bytes(), response.as_bytes()) {
@@ -247,8 +263,9 @@ pub fn verify(
         return Err(AuthFailure::UnknownUser);
     }
 
-    // Single-use: without `qop` there is no nonce-count to advance, so the
-    // only replay defence is retiring the nonce on success.
+    // Retire the nonce for the legacy form, whose only replay defence this is.
+    // The `qop` path is guarded by the strictly-increasing `nc` recorded above,
+    // which is what lets one nonce serve a handset's whole refresh cycle.
     if get("qop").is_none() {
         nonces.consume(nonce);
     }
@@ -432,6 +449,69 @@ mod tests {
 
         assert!(check(&header, &nonces, now).is_ok());
         assert_eq!(check(&header, &nonces, now), Err(AuthFailure::StaleNonce));
+    }
+
+    /// Regression, PR #21 review: a captured legacy `Authorization` with
+    /// `qop=auth` bolted on but no `nc`/`cnonce` used to fall through to the
+    /// legacy digest — skipping the nonce-count check (never reached) and the
+    /// single-use consumption (`qop` was present). It could then be replayed
+    /// until the nonce expired, overwriting or removing the victim's binding
+    /// each time.
+    #[test]
+    fn qop_without_nc_or_cnonce_is_refused_rather_than_falling_back_to_legacy() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        // A legitimate legacy header, as a handset in the field would send it.
+        let legacy = authorization("1001", "s3cret", &nonce, None);
+        // The attacker's edit: claim qop, supply neither companion field.
+        let forged = format!("{legacy}, qop=auth");
+
+        assert_eq!(
+            check(&forged, &nonces, now),
+            Err(AuthFailure::Rejected),
+            "claiming qop without nc/cnonce must be refused, not treated as legacy"
+        );
+        // And the nonce it targeted must still be usable by the real handset,
+        // rather than burned by the forgery.
+        assert!(check(&legacy, &nonces, now).is_ok());
+    }
+
+    /// The other half of the same hole: the forged form must not be replayable
+    /// even once, let alone repeatedly.
+    #[test]
+    fn a_forged_qop_header_cannot_be_replayed() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+        let forged = format!(
+            "{}, qop=auth",
+            authorization("1001", "s3cret", &nonce, None)
+        );
+
+        for attempt in 0..3 {
+            assert_eq!(
+                check(&forged, &nonces, now),
+                Err(AuthFailure::Rejected),
+                "attempt {attempt} must be refused"
+            );
+        }
+    }
+
+    /// A nonce must survive a handset's whole refresh cycle under `qop=auth`,
+    /// which is what makes the nc guard the right defence there rather than
+    /// single-use consumption.
+    #[test]
+    fn one_nonce_serves_a_whole_refresh_cycle_under_qop() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        for nc in ["00000001", "00000002", "00000003"] {
+            let auth = authorization("1001", "s3cret", &nonce, Some((nc, "abc")));
+            assert_eq!(check(&auth, &nonces, now).unwrap(), "1001", "nc={nc}");
+        }
     }
 
     #[test]
