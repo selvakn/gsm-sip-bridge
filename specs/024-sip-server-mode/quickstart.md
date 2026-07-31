@@ -110,6 +110,36 @@ phone, no SIM, and no PJSIP.
 
 ---
 
+## What the container run verified (T071)
+
+Run against `gsm-sip-bridge:024-sip-server-test`, built from `docker/Dockerfile`
+with `pjsip-linked,amr-linked` — the only build where the pjsua side is real
+rather than stubbed:
+
+- **`Account::local` works against real PJSIP.** `pjsua_acc_add` with `reg_uri`
+  unset and `cred_count = 0` is accepted, no error and no REGISTER emitted:
+  `local SIP account created (no registration) id=sip:1001@…`.
+- **Both endpoints bind.** `/proc/net/udp` inside the container shows 5060 (the
+  Rust registrar) and 5062 (pjsua's own transport) held simultaneously — the
+  two-port design working, which is what CI structurally cannot check.
+- **`pjlib 2.16 for POSIX initialized`**, with no PJSIP-layer error or assertion
+  anywhere in the log.
+- **18 wire assertions passed** against the containerised registrar: challenge,
+  both digest forms, wrong password, unknown user, the PR #21 forged-`qop`
+  replay, a second account, the expiry floor, `OPTIONS`, `INVITE` refusal, and
+  de-registration. All seven `registrations_total{outcome}` labels were
+  exercised.
+
+**Still not verified, and it needs a SIM:** an actual inbound call ringing the
+phone — `Call::make` toward a registered `Contact`, the media bridge, and
+teardown. The modems on the test host were held by a live deployment, so this
+was not attempted. That is the remaining gap in T071.
+
+The container run did surface one real defect the stub build cannot: the calling
+identity was logged as `sip:1001@0.0.0.0:5060`, since it was built from the
+wildcard `listen_addr` default and pjsua puts `acc_cfg.id` in the `From` of
+every INVITE. Fixed — see `SipServerConfig::identity_uri`.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

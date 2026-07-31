@@ -222,7 +222,7 @@ registered, and after a refused attempt; confirm the three states differ.
 - [X] T068 [P] Add the operations runbook to `docs/operations.md`: enabling the mode, the port pair, provisioning a handset, the "accept SIP only from proxy" caveat from research.md R-002, diagnosing `no live registration for AOR`, and the new metrics
 - [X] T069 [P] Add the new doc references to the index tables in `docs/README.md`
 - [X] T070 Bump the workspace version in `Cargo.toml` from `8.2.0` to `8.3.0` and add the `RELEASE_NOTES.md` entry — additive and opt-in, so a minor bump
-- [X] T071 Run the end-to-end verification from `quickstart.md` against a real UA (`sipsak` or `linphonec`) in the Docker image with `pjsip-linked` enabled, since `Account::local` and the pjsua call path are the one surface `make test` cannot cover
+- [X] T071 Run the end-to-end verification from `quickstart.md` in the Docker image with `pjsip-linked` enabled, since `Account::local` and the pjsua call path are the one surface `make test` cannot cover — **done, partially**: the registrar, `Account::local` against real PJSIP, and both endpoints binding simultaneously are all verified (see `quickstart.md`, "What the container run verified"), and the run found the wildcard-identity defect. The call leg itself (`Call::make` toward a registered Contact, media, teardown) still needs a SIM and remains open
 - [X] T072 Run the regression check: an end-to-end call with `[sip_server].enabled = false` against the real PBX must behave exactly as before (FR-024, SC-006) — T037/T038 are the changes that make this necessary
 
 ---
