@@ -1,4 +1,5 @@
 pub mod alsa_media_port;
+pub mod server;
 
 use crate::config::{AppConfig, SipTransport, TlsVerify};
 use pjsua_safe::{Account, AccountConfig, Call, Endpoint, EndpointConfig, TransportType};
