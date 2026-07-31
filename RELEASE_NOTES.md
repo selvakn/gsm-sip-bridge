@@ -1,6 +1,20 @@
 # Release Notes
 
-## Unreleased
+## v8.2.0
+
+One correction, to a claim this project had been repeating in config
+validation, docs, and its own code comments: that a card-reader line's
+network identity cannot be read from the card. It can. Everything that
+identifies a SIM — the IMSI, and the MCC/MNC derived from it — lives on the
+card and is now read from it, leaving `imei_override` as the only identity
+field a `pcsc_reader` line genuinely cannot obtain that way, because an IMEI
+belongs to a device rather than a card.
+
+### Upgrading — no action required
+
+Nothing here needs a config edit. A `[[vowifi.line]]` that pins `mcc`/`mnc`
+keeps working exactly as before; an explicit pair still wins over the derived
+one. Removing them is now the better default, and the reason is below.
 
 - **A `pcsc_reader` line no longer needs `mcc`/`mnc` configured.** v8.1.0
   required them "because there is no modem to derive them from", which was the
