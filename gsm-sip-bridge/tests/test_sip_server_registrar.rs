@@ -395,6 +395,52 @@ fn a_forged_qop_header_never_registers_anything() {
     );
 }
 
+/// Regression, PR #21 review round 2, over the wire: an attacker who sniffs a
+/// handset's nonce must not be able to knock it off the registrar.
+///
+/// The nonce travels in cleartext over UDP on a LAN, so observing one is
+/// plausible. Replaying it with a huge `nc` and a junk digest used to record the
+/// count before the digest was checked, so the handset's next genuine REGISTER
+/// failed the strictly-increasing test — a registration outage caused by
+/// someone who never knew the password.
+#[test]
+fn a_sniffed_nonce_cannot_be_used_to_knock_a_handset_off() {
+    let h = Harness::new();
+    let nonce = nonce_from(&h.round_trip(&register(1, "victim-call", None, None)));
+
+    // The attacker knows the nonce and nothing else.
+    let forged = format!(
+        "Digest username=\"{USER}\", realm=\"{REALM}\", nonce=\"{nonce}\", uri=\"sip:bridge\", \
+         response=\"00000000000000000000000000000000\", qop=auth, nc=ffffffff, \
+         cnonce=\"attacker\", algorithm=MD5"
+    );
+    assert_status(
+        &h.round_trip(&register(2, "attacker-call", Some(&forged), None)),
+        401,
+    );
+    assert!(
+        h.registrar
+            .bindings()
+            .get_live(USER, std::time::Instant::now())
+            .is_none(),
+        "the forgery must not register anything"
+    );
+
+    // The victim, using its own nonce and its own next nc, must still get in.
+    let genuine = authorization(USER, PASSWORD, &nonce, Some("00000001"));
+    assert_status(
+        &h.round_trip(&register(2, "victim-call", Some(&genuine), None)),
+        200,
+    );
+    assert!(
+        h.registrar
+            .bindings()
+            .get_live(USER, std::time::Instant::now())
+            .is_some(),
+        "the handset must not have lost its nonce to the attacker"
+    );
+}
+
 /// §1.7 — algorithms we do not implement are refused rather than ignored.
 #[test]
 fn an_unsupported_algorithm_is_refused() {

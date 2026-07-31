@@ -230,7 +230,7 @@ pub fn verify(
     // consumption (`qop` was present). A captured legacy `Authorization` with
     // `qop=auth` bolted on could then be replayed until the nonce expired,
     // each time overwriting or removing the victim's binding.
-    let expected = match get("qop") {
+    let (expected, nonce_count) = match get("qop") {
         Some(qop) => {
             // Advertising `qop` means the client must supply both. Missing
             // either is malformed, not an invitation to fall back — RFC 2617
@@ -239,17 +239,27 @@ pub fn verify(
                 return Err(AuthFailure::Rejected);
             };
             let parsed_nc = u32::from_str_radix(nc, 16).map_err(|_| AuthFailure::Rejected)?;
-            if !nonces.accept_nc(nonce, parsed_nc) {
-                return Err(AuthFailure::Rejected);
-            }
-            digest::response_qop(&ha1, nonce, nc, cnonce, qop, &ha2)
+            (
+                digest::response_qop(&ha1, nonce, nc, cnonce, qop, &ha2),
+                Some(parsed_nc),
+            )
         }
         // The legacy RFC 2069 form. Still sent by handsets in the field, so
         // still accepted — the nonce is single-use, which is what stops replay
         // without a nonce-count to compare.
-        None => digest::response_simple(&ha1, nonce, &ha2),
+        None => (digest::response_simple(&ha1, nonce, &ha2), None),
     };
 
+    // The credential is proven **before** any nonce state moves.
+    //
+    // Recording the nonce-count first let an unauthenticated attacker poison a
+    // handset's nonce: sniff it off the wire (this is UDP on a LAN, and the
+    // challenge is cleartext), send it back with `nc=ffffffff` and a junk
+    // digest, and the count was already stored by the time the digest was
+    // rejected. The handset's next genuine REGISTER then failed the
+    // strictly-increasing check and was answered `401` *without* `stale`, which
+    // handsets read as "wrong password" rather than "retry" — a registration
+    // outage from an attacker who never knew the password.
     if !constant_time_eq(expected.as_bytes(), response.as_bytes()) {
         return Err(if password.is_none() {
             AuthFailure::UnknownUser
@@ -263,11 +273,18 @@ pub fn verify(
         return Err(AuthFailure::UnknownUser);
     }
 
-    // Retire the nonce for the legacy form, whose only replay defence this is.
-    // The `qop` path is guarded by the strictly-increasing `nc` recorded above,
-    // which is what lets one nonce serve a handset's whole refresh cycle.
-    if get("qop").is_none() {
-        nonces.consume(nonce);
+    // Genuine credential from here on, so the replay guards may now mutate.
+    match nonce_count {
+        // The strictly-increasing count is what lets one nonce serve a
+        // handset's whole refresh cycle instead of one request.
+        Some(nc) => {
+            if !nonces.accept_nc(nonce, nc) {
+                return Err(AuthFailure::Rejected);
+            }
+        }
+        // Retire the nonce for the legacy form, whose only replay defence this
+        // is — there is no count to compare.
+        None => nonces.consume(nonce),
     }
     Ok(username.to_string())
 }
@@ -497,6 +514,68 @@ mod tests {
                 "attempt {attempt} must be refused"
             );
         }
+    }
+
+    /// Regression, PR #21 review round 2: an attacker who sniffs a handset's
+    /// nonce off the wire — plausible, since this is UDP on a LAN and the
+    /// challenge is cleartext — used to be able to knock that handset off by
+    /// replaying the nonce with a huge `nc` and a junk digest. The count was
+    /// recorded before the digest was checked, so the handset's next genuine
+    /// REGISTER then failed the strictly-increasing test.
+    #[test]
+    fn an_invalid_digest_cannot_poison_the_nonce_it_targets() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        // The attacker knows only the nonce, not the password.
+        let forged = format!(
+            "Digest username=\"1001\", realm=\"{REALM}\", nonce=\"{nonce}\", uri=\"{URI}\", \
+             response=\"00000000000000000000000000000000\", qop=auth, nc=ffffffff, \
+             cnonce=\"attacker\", algorithm=MD5"
+        );
+        assert_eq!(
+            check(&forged, &nonces, now),
+            Err(AuthFailure::BadPassword),
+            "a junk digest is a credential failure, not a replay"
+        );
+
+        // The genuine handset must still be able to use its own nonce.
+        let genuine = authorization("1001", "s3cret", &nonce, Some(("00000001", "abc")));
+        assert_eq!(
+            check(&genuine, &nonces, now).unwrap(),
+            "1001",
+            "the attacker must not have consumed the handset's nc headroom"
+        );
+    }
+
+    /// The same, for a wrong *password* rather than a junk digest — the more
+    /// likely accident, and it must not cost the real handset its nonce either.
+    #[test]
+    fn a_wrong_password_does_not_consume_nonce_headroom() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        let wrong = authorization("1001", "wrong", &nonce, Some(("0000000f", "abc")));
+        assert_eq!(check(&wrong, &nonces, now), Err(AuthFailure::BadPassword));
+
+        let genuine = authorization("1001", "s3cret", &nonce, Some(("00000001", "abc")));
+        assert_eq!(check(&genuine, &nonces, now).unwrap(), "1001");
+    }
+
+    /// And an unknown account must not be able to poison a nonce either.
+    #[test]
+    fn an_unknown_user_does_not_consume_nonce_headroom() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        let unknown = authorization("9999", "any", &nonce, Some(("ffffff00", "abc")));
+        assert_eq!(check(&unknown, &nonces, now), Err(AuthFailure::UnknownUser));
+
+        let genuine = authorization("1001", "s3cret", &nonce, Some(("00000001", "abc")));
+        assert_eq!(check(&genuine, &nonces, now).unwrap(), "1001");
     }
 
     /// A nonce must survive a handset's whole refresh cycle under `qop=auth`,
