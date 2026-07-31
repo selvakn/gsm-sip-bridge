@@ -247,6 +247,26 @@ pub fn build_uas_response(
     contact: Option<&str>,
     body: Option<&str>,
 ) -> String {
+    build_uas_response_with_headers(status, reason, request, to_tag, contact, body, &[])
+}
+
+/// [`build_uas_response`] plus arbitrary `extra` headers, emitted in order
+/// after the echoed ones and before the body.
+///
+/// The registrar in `crate::sip::server` needs headers this function's caller
+/// cannot express positionally — `WWW-Authenticate` on a `401`, `Min-Expires`
+/// on a `423`, `Allow` on a `200 OK` to `OPTIONS` — and hand-rolling those
+/// responses would mean re-deriving the multi-`Via` echo and the
+/// already-tagged-`To` rule below, both of which were bug fixes (spec 024).
+pub fn build_uas_response_with_headers(
+    status: u16,
+    reason: &str,
+    request: &SipRequest,
+    to_tag: Option<&str>,
+    contact: Option<&str>,
+    body: Option<&str>,
+    extra: &[(&str, &str)],
+) -> String {
     let mut msg = format!("SIP/2.0 {status} {reason}\r\n");
     for via in request.headers_all("Via") {
         msg.push_str(&format!("Via: {via}\r\n"));
@@ -280,6 +300,9 @@ pub fn build_uas_response(
     }
     if let Some(contact) = contact {
         msg.push_str(&format!("Contact: {contact}\r\n"));
+    }
+    for (name, value) in extra {
+        msg.push_str(&format!("{name}: {value}\r\n"));
     }
     let body = body.unwrap_or("");
     if !body.is_empty() {
@@ -1412,6 +1435,55 @@ mod tests {
         assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
         assert!(resp.contains("CSeq: 2 BYE\r\n"));
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn extra_headers_appear_after_the_echoed_ones_and_before_the_body() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let resp = build_uas_response_with_headers(
+            401,
+            "Unauthorized",
+            &req,
+            Some("totag1"),
+            None,
+            None,
+            &[
+                ("WWW-Authenticate", "Digest realm=\"r\", nonce=\"n\""),
+                ("Min-Expires", "60"),
+            ],
+        );
+        assert!(resp.starts_with("SIP/2.0 401 Unauthorized\r\n"));
+        assert!(resp.contains("WWW-Authenticate: Digest realm=\"r\", nonce=\"n\"\r\n"));
+        assert!(resp.contains("Min-Expires: 60\r\n"));
+        // Order is preserved, and both land ahead of the terminating
+        // Content-Length — a header emitted after it would be part of the body.
+        let auth = resp.find("WWW-Authenticate:").unwrap();
+        let min = resp.find("Min-Expires:").unwrap();
+        let len = resp.find("Content-Length:").unwrap();
+        assert!(auth < min && min < len);
+        assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn an_empty_extra_slice_is_byte_identical_to_the_original_builder() {
+        // Pins the delegation in `build_uas_response`: the IMS path must not
+        // shift by a single byte now that it routes through the new function.
+        for req in [
+            SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap().0,
+            sample_bye(),
+        ] {
+            let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n";
+            for (tag, contact, body) in [
+                (None, None, None),
+                (Some("totag1"), None, None),
+                (Some("totag1"), Some("<sip:agent@10.0.0.9:5060>"), Some(sdp)),
+            ] {
+                let via_builder = build_uas_response(200, "OK", &req, tag, contact, body);
+                let via_extra =
+                    build_uas_response_with_headers(200, "OK", &req, tag, contact, body, &[]);
+                assert_eq!(via_builder, via_extra);
+            }
+        }
     }
 
     #[test]
