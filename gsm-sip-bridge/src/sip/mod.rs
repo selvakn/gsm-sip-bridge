@@ -241,10 +241,7 @@ impl SipBridge {
 
         // The identity the handset sees calls arrive from, so it must name the
         // bridge as the phone knows it — the registrar's own address.
-        let id_uri = format!(
-            "sip:{}@{}:{}",
-            server.ring_aor, server.listen_addr, server.listen_port
-        );
+        let id_uri = server.identity_uri();
         let account = Account::local(&endpoint, &id_uri, &self.config.display_name)
             .map_err(|e| format!("local SIP account creation failed: {e}"))?;
 

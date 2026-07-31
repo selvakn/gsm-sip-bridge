@@ -270,10 +270,7 @@ pub(crate) fn run_telephony_side(
             ))
         })?;
         let bindings = registrar.bindings();
-        let id_uri = format!(
-            "sip:{}@{}:{}",
-            server.ring_aor, server.listen_addr, server.listen_port
-        );
+        let id_uri = server.identity_uri();
         let account = Account::local(&endpoint, &id_uri, &config.sip.display_name)
             .map_err(|e| BridgeError::Ims(format!("local SIP account creation failed: {e}")))?;
         tracing::info!(

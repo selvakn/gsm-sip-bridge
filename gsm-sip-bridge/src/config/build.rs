@@ -683,6 +683,21 @@ fn build_sip_server(raw: RawSipServer) -> BridgeResult<SipServerConfig> {
     }
 
     require_non_empty(&cfg.realm, "sip_server.realm")?;
+    // The realm is quoted into `WWW-Authenticate` and, when `listen_addr` is a
+    // wildcard, becomes the host of the `From` URI (`identity_uri`). Either use
+    // turns these characters into a malformed header rather than a rejected
+    // setting, so they are refused here instead.
+    if let Some(bad) = cfg
+        .realm
+        .chars()
+        .find(|c| c.is_whitespace() || matches!(c, '"' | '\\' | '<' | '>' | '@' | ',' | ';'))
+    {
+        return Err(BridgeError::Config(format!(
+            "field sip_server.realm must not contain {bad:?} — it is quoted into the \
+             authentication challenge and can become the host of the calling identity, \
+             and that character would malform the SIP header"
+        )));
+    }
     require_non_empty(&cfg.ring_aor, "sip_server.ring_aor")?;
     in_range(cfg.listen_port, "sip_server.listen_port", 1..=65535)?;
     if cfg.listen_addr.parse::<std::net::IpAddr>().is_err() {

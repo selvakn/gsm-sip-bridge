@@ -85,6 +85,26 @@ impl SipServerConfig {
             .find(|a| a.username == username)
             .map(|a| a.password.expose_secret().as_str())
     }
+
+    /// The SIP URI inbound calls appear to come *from*, as the handset sees it.
+    ///
+    /// Not simply `ring_aor@listen_addr:listen_port`: `listen_addr` defaults to
+    /// the wildcard `0.0.0.0`, which would put a literal `sip:1001@0.0.0.0:5060`
+    /// in the `From` of every call — an unroutable address in a header the user
+    /// may well see on the handset's screen. A wildcard means "every
+    /// interface", which is not an identity, so the realm stands in: it is
+    /// already this server's authentication domain, is guaranteed non-empty, and
+    /// is guaranteed free of characters that would malform the header.
+    ///
+    /// Observed in the containerised run of spec 024 T071, which logged
+    /// `id=sip:1001@0.0.0.0:5060`.
+    pub fn identity_uri(&self) -> String {
+        let host = match self.listen_addr.parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_unspecified() => self.realm.as_str(),
+            _ => self.listen_addr.as_str(),
+        };
+        format!("sip:{}@{}:{}", self.ring_aor, host, self.listen_port)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1777,6 +1797,48 @@ password = "s3cret"
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not exceed"), "got: {err}");
+    }
+
+    /// Observed in the containerised run (spec 024 T071): the calling identity
+    /// was logged as `sip:1001@0.0.0.0:5060`, which is what the handset would
+    /// have seen in the `From` of every call.
+    #[test]
+    fn the_calling_identity_never_carries_a_wildcard_address() {
+        let c = try_parse(SERVER_MODE_TOML).expect("parses");
+        assert_eq!(
+            c.sip_server.identity_uri(),
+            "sip:1001@gsm-sip-bridge:5060",
+            "a wildcard listen_addr must not reach the From header"
+        );
+
+        // `::` is the same situation in IPv6 clothing.
+        let c = server_mode_with("listen_addr = \"::\"\n").expect("parses");
+        assert!(
+            !c.sip_server.identity_uri().contains("::"),
+            "got: {}",
+            c.sip_server.identity_uri()
+        );
+    }
+
+    /// A concrete address *is* an identity, so it is used as given.
+    #[test]
+    fn a_concrete_listen_addr_is_used_as_the_calling_identity() {
+        let c = server_mode_with("listen_addr = \"192.168.1.10\"\n").expect("parses");
+        assert_eq!(c.sip_server.identity_uri(), "sip:1001@192.168.1.10:5060");
+    }
+
+    /// The realm can become the `From` host and is quoted into the challenge,
+    /// so characters that would malform either are refused as settings.
+    #[test]
+    fn a_realm_that_would_malform_a_header_is_refused() {
+        for realm in ["my realm", "bad\"quote", "a<b", "x@y", "a,b", "a;b"] {
+            let err = server_mode_with(&format!("realm = {realm:?}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("sip_server.realm"), "{realm:?} -> {err}");
+        }
+        // A plain hostname-shaped realm remains fine.
+        assert!(server_mode_with("realm = \"pbx.example.com\"\n").is_ok());
     }
 
     #[test]
