@@ -193,6 +193,55 @@ fn server_mode_has_no_destination_until_a_phone_registers() {
     bridge.unregister();
 }
 
+/// Exactly one component may host the registrar, and it is whichever would
+/// have owned the PBX trunk. On a VoWiFi or VoLTE deployment that is the
+/// telephony agent, so the circuit-switched bridge must stand down — otherwise
+/// both processes race for the same UDP port (spec 024, research.md R-003).
+#[test]
+fn the_circuit_switched_bridge_yields_the_registrar_to_the_telephony_agent() {
+    for inbound in [
+        "[vowifi]\nenabled = true\n",
+        "[volte]\nenabled = true\nbridge_inbound = true\n",
+    ] {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[sip]
+local_port = 5062
+
+[sip_server]
+enabled = true
+listen_addr = "127.0.0.1"
+listen_port = {}
+ring_aor = "1001"
+
+[[sip_server.account]]
+username = "1001"
+password = "s3cret"
+
+{inbound}"#,
+            free_port()
+        )
+        .unwrap();
+
+        let config = load_config(f.path()).unwrap();
+        let mut bridge = SipBridge::new(&config);
+        bridge.register().unwrap();
+
+        assert_eq!(
+            bridge.state,
+            RegistrationState::Unregistered,
+            "the telephony agent owns the registrar here, so the CS bridge must not start one: \
+             {inbound}"
+        );
+        assert!(
+            bridge.compute_destination_uri("+15551234567").is_err(),
+            "and it must not claim it can route a call: {inbound}"
+        );
+    }
+}
+
 /// Two SipBridges cannot both take the port, which is what makes the
 /// config-level collision check worth having.
 #[test]

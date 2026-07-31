@@ -252,15 +252,59 @@ pub(crate) fn run_telephony_side(
         prioritize_wideband_codecs(&endpoint);
     }
 
-    let acc_config = AccountConfig {
-        sip_server: config.sip.server.clone(),
-        sip_port: config.sip.port,
-        username: config.sip.username.clone(),
-        password: config.sip.password.expose_secret().clone(),
-        display_name: config.sip.display_name.clone(),
+    // In SIP server mode this process is the one that would have owned the PBX
+    // trunk (see `crate::sip::SipBridge`'s `register_trunk`), so it is the one
+    // that hosts the registrar. Reusing that existing arbitration is what lets
+    // a single registrar serve all three call paths without IPC or a fourth
+    // supervised process (spec 024, research.md R-003).
+    //
+    // Held for the lifetime of this function: dropping it stops the thread and
+    // closes the socket, so phones would silently stop being reachable.
+    let mut _registrar = None;
+    let bindings = if config.sip_server.enabled {
+        let server = &config.sip_server;
+        let registrar = crate::sip::server::Registrar::start(server).map_err(|e| {
+            BridgeError::Ims(format!(
+                "SIP registrar could not listen on {}:{}: {e}",
+                server.listen_addr, server.listen_port
+            ))
+        })?;
+        let bindings = registrar.bindings();
+        let id_uri = format!(
+            "sip:{}@{}:{}",
+            server.ring_aor, server.listen_addr, server.listen_port
+        );
+        let account = Account::local(&endpoint, &id_uri, &config.sip.display_name)
+            .map_err(|e| BridgeError::Ims(format!("local SIP account creation failed: {e}")))?;
+        tracing::info!(
+            listen = %format!("{}:{}", server.listen_addr, server.listen_port),
+            uac_port = local_port,
+            ring_aor = %server.ring_aor,
+            agent = agent_label,
+            "SIP server mode active — IP phones register here; no PBX is used"
+        );
+        // The carrier half gates admission on this. There is no PBX to confirm
+        // acceptance with, and the registrar is listening, so the outbound leg
+        // is as available as it will ever be — whether a *phone* is registered
+        // is decided per call, when the destination is resolved.
+        if let Some(flag) = &pbx_registered {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        _registrar = Some(registrar);
+        (Some(bindings), account)
+    } else {
+        let acc_config = AccountConfig {
+            sip_server: config.sip.server.clone(),
+            sip_port: config.sip.port,
+            username: config.sip.username.clone(),
+            password: config.sip.password.expose_secret().clone(),
+            display_name: config.sip.display_name.clone(),
+        };
+        let account = Account::register(&endpoint, acc_config, None)
+            .map_err(|e| BridgeError::Ims(format!("SIP account registration failed: {e}")))?;
+        (None, account)
     };
-    let account = Account::register(&endpoint, acc_config, None)
-        .map_err(|e| BridgeError::Ims(format!("SIP account registration failed: {e}")))?;
+    let (bindings, account) = bindings;
 
     // `Account::register` only *initiates* the REGISTER — it does not mean the
     // PBX accepted it. Confirm it did (or report the denial) before treating
@@ -270,7 +314,9 @@ pub(crate) fn run_telephony_side(
     // renewal loop): PJSUA keeps re-registering on its own timer, so we hold
     // here — with the shared flag cleared so the carrier half fast-declines and
     // status reads `can_answer=false` — and proceed the moment the PBX accepts.
-    {
+    // Skipped entirely in server mode: there is no PBX whose acceptance could
+    // be confirmed, and the local account never sends a REGISTER at all.
+    if !config.sip_server.enabled {
         use std::sync::atomic::Ordering;
         let mut backoff = PBX_REG_INITIAL_BACKOFF;
         loop {
@@ -356,6 +402,7 @@ pub(crate) fn run_telephony_side(
         for line in &lines {
             let endpoint = &endpoint;
             let account = &account;
+            let bindings = bindings.as_ref();
             let recent_calls = Arc::clone(&recent_calls);
             let discord_client = &discord_client;
             let sms_runtime = &sms_runtime;
@@ -373,6 +420,7 @@ pub(crate) fn run_telephony_side(
                     record_transport,
                     endpoint,
                     account,
+                    bindings,
                     config,
                     &recent_calls,
                     discord_client,
@@ -473,6 +521,9 @@ fn run_line_listener(
     transport: crate::store::Transport,
     endpoint: &Endpoint,
     account: &Account,
+    // `Some` in SIP server mode: the phones registered to this process's own
+    // registrar, which is where the outbound leg is dialled instead of a PBX.
+    bindings: Option<&Arc<crate::sip::server::BindingStore>>,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
     discord_client: &Option<DiscordClient>,
@@ -536,6 +587,7 @@ fn run_line_listener(
             transport,
             endpoint,
             account,
+            bindings,
             config,
             recent_calls,
             discord_client,
@@ -649,6 +701,7 @@ fn handle_connection(
     transport: crate::store::Transport,
     endpoint: &Endpoint,
     account: &Account,
+    bindings: Option<&Arc<crate::sip::server::BindingStore>>,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
     discord_client: &Option<DiscordClient>,
@@ -705,7 +758,9 @@ fn handle_connection(
     tracing::info!(card_id = %card_id, call_id = %call_id, caller = %caller, "incoming VoWiFi call signaled by Agent A");
     let started_at = now_unix();
 
-    match bridge_call(endpoint, account, config, &caller, leg_addr, leg_port) {
+    match bridge_call(
+        endpoint, account, bindings, config, &caller, leg_addr, leg_port,
+    ) {
         Ok((mut pbx_call, mut veth_call)) => {
             write_msg(
                 &mut writer,
@@ -996,14 +1051,21 @@ fn spawn_control_reader(
 /// `Endpoint::pair_calls` so their media bridges together once both reach
 /// `PJSUA_CALL_MEDIA_ACTIVE` (see `pjsua-safe/src/endpoint.rs`'s
 /// `on_call_media_state_cb`).
+#[allow(clippy::too_many_arguments)]
 fn bridge_call(
     endpoint: &Endpoint,
     account: &Account,
+    bindings: Option<&Arc<crate::sip::server::BindingStore>>,
     config: &AppConfig,
     caller: &str,
     leg_addr: &str,
     leg_port: u16,
 ) -> BridgeResult<(Call, Call)> {
+    // Resolved before either leg is placed: in SIP server mode there may be no
+    // phone registered, and finding that out after answering the carrier would
+    // leave the caller connected to nothing.
+    let pbx_uri = telephony_dest_uri(config, bindings, caller)?;
+
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
     if !caller.is_empty() {
@@ -1012,7 +1074,6 @@ fn bridge_call(
         headers.push(("X-GSM-Caller-ID", caller));
     }
 
-    let pbx_uri = pbx_dest_uri(config, caller);
     let pbx_call = Call::make(account, &pbx_uri, None, &headers)
         .map_err(|e| BridgeError::Ims(format!("PBX-side call failed: {e}")))?;
 
@@ -1031,18 +1092,35 @@ fn bridge_call(
     Ok((pbx_call, veth_call))
 }
 
-/// Shares one rule with the circuit-switched bridge via
-/// `crate::sip::target::CallTarget`: empty `[bridge].sip_destination` means DID
-/// passthrough (dial the caller's own number at the PBX), otherwise dial the
-/// configured fixed extension.
-fn pbx_dest_uri(config: &AppConfig, caller_did: &str) -> String {
-    crate::sip::target::CallTarget::Pbx {
-        server: &config.sip.server,
-        port: config.sip.port,
-        sip_destination: &config.bridge.sip_destination,
-    }
-    .uri_for(caller_did, std::time::Instant::now())
-    .expect("CallTarget::Pbx is infallible")
+/// Where this call's telephony-side leg goes, sharing one rule with the
+/// circuit-switched bridge via `crate::sip::target::CallTarget`.
+///
+/// With a PBX: empty `[bridge].sip_destination` means DID passthrough (dial
+/// the caller's own number at the PBX), otherwise the configured fixed
+/// extension. In SIP server mode: the registered phone's own contact, which is
+/// the only case that can fail.
+fn telephony_dest_uri(
+    config: &AppConfig,
+    bindings: Option<&Arc<crate::sip::server::BindingStore>>,
+    caller_did: &str,
+) -> BridgeResult<String> {
+    let target = match bindings {
+        Some(bindings) => crate::sip::target::CallTarget::RegisteredPhone {
+            bindings,
+            aor: &config.sip_server.ring_aor,
+        },
+        None => crate::sip::target::CallTarget::Pbx {
+            server: &config.sip.server,
+            port: config.sip.port,
+            sip_destination: &config.bridge.sip_destination,
+        },
+    };
+    target
+        .uri_for(caller_did, std::time::Instant::now())
+        .map_err(|e| {
+            crate::metrics::SIP_SERVER_RING_TARGET_MISSING_TOTAL.inc();
+            BridgeError::Ims(e)
+        })
 }
 
 /// Entry point for the `vowifi-status` subcommand: queries every resolved

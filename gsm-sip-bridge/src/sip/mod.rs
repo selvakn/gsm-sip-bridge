@@ -40,20 +40,24 @@ struct SipBridgeConfig {
     local_port: u16,
     display_name: String,
     tls_verify: TlsVerify,
-    /// Whether this circuit-switched bridge should register the SIP trunk.
-    /// `false` when the VoLTE inbound bridge or the VoWiFi bridge is active:
-    /// either one registers the *same* trunk account for its own outbound leg,
-    /// and a trunk keeps a single binding, so two registrants of one account
-    /// fight over it (and the churn can get the account auth-denied). Whichever
-    /// bridge is active owns the trunk then.
+    /// Whether this circuit-switched bridge owns the telephony-facing SIP
+    /// identity at all.
     ///
-    /// Also `false` in SIP server mode, where there is no trunk at all — but
-    /// that case takes its own branch in `register`, because it still needs the
-    /// endpoint for the leg it dials out on (spec 024).
+    /// `false` when the VoLTE inbound bridge or the VoWiFi bridge is active:
+    /// either one drives the *same* PBX-facing leg for its own calls, from a
+    /// different process. With a PBX that matters because a trunk keeps a
+    /// single binding, so two registrants of one account fight over it (and the
+    /// churn can get the account auth-denied). In SIP server mode it matters
+    /// for the same reason in a different shape: two registrars cannot bind one
+    /// UDP port, so exactly one process may host it — and reusing this flag to
+    /// decide which is what lets one registrar serve every call path with no
+    /// IPC (spec 024, research.md R-003).
+    owns_sip_side: bool,
+    /// Whether to actually send a REGISTER. `false` in SIP server mode, where
+    /// there is no trunk to register to at all — but that case still needs the
+    /// endpoint for the leg it dials out on, so it cannot simply skip.
     register_trunk: bool,
-    /// The SIP server mode's settings, `enabled` when this process should host
-    /// the registrar. Whoever would have owned the trunk hosts it, which is
-    /// what lets one registrar serve every call path with no IPC.
+    /// The SIP server mode's settings.
     sip_server: SipServerConfig,
     dial_timeout_sec: u64,
     sip_destination: String,
@@ -81,6 +85,7 @@ impl SipBridge {
             // Defer the trunk to the VoLTE inbound bridge or the VoWiFi bridge
             // when either is active, so the same account is not registered
             // from two places at once.
+            owns_sip_side: !config.volte.bridge_inbound && !config.vowifi.enabled,
             register_trunk: !config.volte.bridge_inbound
                 && !config.vowifi.enabled
                 && !config.sip_server.enabled,
@@ -114,28 +119,34 @@ impl SipBridge {
     }
 
     pub fn register(&mut self) -> Result<(), String> {
-        // SIP server mode: no trunk to register, but we still need the endpoint
-        // for the leg we dial out on, so this cannot take the early return
-        // below. Checked first for that reason.
-        if self.config.sip_server.enabled {
-            return self.start_server_mode();
-        }
-
-        // When the VoLTE or VoWiFi bridge owns the trunk, this circuit-switched
-        // bridge must not also register the same account — see `register_trunk`.
-        // Skip cleanly (no endpoint/account): the caller already tolerates an
-        // unregistered bridge ("calls will not be bridged"), and this container
-        // is doing VoLTE/VoWiFi, not circuit-switched, work.
-        if !self.config.register_trunk {
+        // When the VoLTE or VoWiFi bridge owns the telephony-facing side, this
+        // circuit-switched bridge must stand down entirely — see
+        // `owns_sip_side`. Skip cleanly (no endpoint/account): the caller
+        // already tolerates an unregistered bridge ("calls will not be
+        // bridged"), and this container is doing VoLTE/VoWiFi, not
+        // circuit-switched, work.
+        //
+        // Checked before the server-mode branch, not after. The other way round,
+        // a VoWiFi deployment with server mode on would start a registrar here
+        // *and* one in the telephony agent, and the second to bind would fail.
+        if !self.config.owns_sip_side {
             self.state = RegistrationState::Unregistered;
             tracing::info!(
                 server = %self.config.server,
                 username = %self.config.username,
-                "circuit-switched SIP trunk registration skipped: the VoLTE/VoWiFi \
-                 bridge owns this trunk (avoids double-registering the same account)"
+                server_mode = self.config.sip_server.enabled,
+                "circuit-switched SIP side skipped: the VoLTE/VoWiFi bridge owns it \
+                 (avoids double-registering one trunk, or two registrars on one port)"
             );
             return Ok(());
         }
+
+        // SIP server mode: no trunk to register, but we still need the endpoint
+        // for the leg we dial out on, so this cannot take the skip above.
+        if self.config.sip_server.enabled {
+            return self.start_server_mode();
+        }
+
         self.state = RegistrationState::Registering;
 
         let endpoint = Endpoint::create(self.endpoint_config()).map_err(|e| {
@@ -263,6 +274,18 @@ impl SipBridge {
                 bindings,
                 aor: &self.config.sip_server.ring_aor,
             },
+            // Server mode with no binding table means this process is not the
+            // one hosting the registrar, so it has nowhere to send a call. The
+            // `[sip]` fields would be empty here (they are forbidden in this
+            // mode), and falling through to the PBX form would build a URI
+            // pointing at nothing rather than saying so.
+            None if self.config.sip_server.enabled => {
+                return Err(
+                    "SIP server mode is enabled but this process does not host the registrar \
+                     — the VoLTE/VoWiFi bridge does"
+                        .to_string(),
+                )
+            }
             None => target::CallTarget::Pbx {
                 server: &self.config.server,
                 port: self.config.port,
