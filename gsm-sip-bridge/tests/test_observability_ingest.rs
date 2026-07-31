@@ -47,6 +47,9 @@ async fn test_observe_report_lands_in_scraped_metrics() {
             registered: Some(true),
             tunnel_up: Some(true),
             pbx_registered: None,
+            // A carrier-side agent hosts no registrar (spec 024).
+            sip_server_bindings: None,
+            sip_server_ring_registered: None,
         },
         events: vec![ObservedEvent::CallCompleted {
             status: CallStatus::Answered,

@@ -44,10 +44,22 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_sip_server_ring_target_missing_total` | Counter | Inbound calls dropped because no phone was registered to ring |
 
 **SIP server mode gauges**: `sip_server_*` appear only when
-`[sip_server].enabled` (see [configuration.md](configuration.md)). They are
-deliberately separate series from `sip_registered` and `volte_registered`, for
-the same reason those two are separate from each other: an operator needs to see
-*which* registration is down, not an aggregate that hides it.
+`[sip_server].enabled` (see [configuration.md](configuration.md)).
+
+The registrar is hosted by whichever process owns the SIP side, and on the
+VoWiFi/VoLTE paths that is a telephony agent which serves no `/metrics` of its
+own. `bindings` and `ring_aor_registered` therefore reach the daemon's endpoint
+over the same agent-reporting channel the VoWiFi gauges use, so they lag by up
+to `[metrics].agent_report_interval_seconds`. The two counters
+(`registrations_total`, `requests_total`) are per-request and are **only
+exported when the circuit-switched daemon hosts the registrar** — on a
+VoWiFi/VoLTE deployment, read the refusal reasons from the agent's logs
+(`sip_server: refusing a registration`) instead.
+
+The gauges are deliberately separate series from `sip_registered` and
+`volte_registered`, for the same reason those two are separate from each other:
+an operator needs to see *which* registration is down, not an aggregate that
+hides it.
 
 `bindings` and `ring_aor_registered` answer different questions —
 `bindings` can be nonzero while the *ringing* account specifically is absent, in

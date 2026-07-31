@@ -80,15 +80,15 @@ mod tests {
     #[test]
     fn an_empty_destination_passes_the_callers_did_through() {
         assert_eq!(
-            pbx("").uri_for("919789063708", Instant::now()).unwrap(),
-            "sip:919789063708@pbx.example.com:5060"
+            pbx("").uri_for("15551234567", Instant::now()).unwrap(),
+            "sip:15551234567@pbx.example.com:5060"
         );
     }
 
     #[test]
     fn a_configured_destination_overrides_the_callers_did() {
         assert_eq!(
-            pbx("200").uri_for("919789063708", Instant::now()).unwrap(),
+            pbx("200").uri_for("15551234567", Instant::now()).unwrap(),
             "sip:200@pbx.example.com:5060"
         );
     }
@@ -98,11 +98,11 @@ mod tests {
     #[test]
     fn a_leading_plus_is_stripped_from_either_source() {
         assert_eq!(
-            pbx("").uri_for("+919789063708", Instant::now()).unwrap(),
-            "sip:919789063708@pbx.example.com:5060"
+            pbx("").uri_for("+15551234567", Instant::now()).unwrap(),
+            "sip:15551234567@pbx.example.com:5060"
         );
         assert_eq!(
-            pbx("+200").uri_for("919789063708", Instant::now()).unwrap(),
+            pbx("+200").uri_for("15551234567", Instant::now()).unwrap(),
             "sip:200@pbx.example.com:5060"
         );
     }
@@ -126,7 +126,7 @@ mod tests {
             aor: "1001",
         };
         assert_eq!(
-            target.uri_for("919789063708", now).unwrap(),
+            target.uri_for("15551234567", now).unwrap(),
             "sip:1001@192.168.1.50:5060",
             "the caller's number must not affect where a registered phone is dialled"
         );
@@ -141,7 +141,7 @@ mod tests {
             bindings: &bindings,
             aor: "1001",
         };
-        let err = target.uri_for("919789063708", Instant::now()).unwrap_err();
+        let err = target.uri_for("15551234567", Instant::now()).unwrap_err();
         assert!(err.contains("1001"), "got: {err}");
         assert!(err.contains("no live registration"), "got: {err}");
     }

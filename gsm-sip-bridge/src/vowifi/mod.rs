@@ -263,12 +263,37 @@ pub(crate) fn run_telephony_side(
     let mut _registrar = None;
     let bindings = if config.sip_server.enabled {
         let server = &config.sip_server;
-        let registrar = crate::sip::server::Registrar::start(server).map_err(|e| {
-            BridgeError::Ims(format!(
-                "SIP registrar could not listen on {}:{}: {e}",
-                server.listen_addr, server.listen_port
-            ))
-        })?;
+        // This process serves no `/metrics`, so gauges set here would never be
+        // scraped. Forward them to the daemon over the same reporting channel
+        // the VoWiFi gauges already use (spec 024, FR-022) — confirmed missing
+        // on a live container before this existed.
+        let metrics_reporter = Reporter::spawn(
+            config.control.socket_path.clone(),
+            AgentKind::Sip,
+            // The registrar is one per process, not per line, so it reports
+            // under the agent label rather than a card id — matching the
+            // unlabelled gauges it feeds.
+            "sip-server".to_string(),
+            Duration::from_secs(config.metrics.agent_report_interval_seconds),
+        );
+        let observer: crate::sip::server::RegistrarObserver =
+            Box::new(move |bindings, ring_registered| {
+                metrics_reporter.report(
+                    AgentState {
+                        sip_server_bindings: Some(bindings),
+                        sip_server_ring_registered: Some(ring_registered),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                );
+            });
+        let registrar = crate::sip::server::Registrar::start_observed(server, Some(observer))
+            .map_err(|e| {
+                BridgeError::Ims(format!(
+                    "SIP registrar could not listen on {}:{}: {e}",
+                    server.listen_addr, server.listen_port
+                ))
+            })?;
         let bindings = registrar.bindings();
         let id_uri = server.identity_uri();
         let account = Account::local(&endpoint, &id_uri, &config.sip.display_name)

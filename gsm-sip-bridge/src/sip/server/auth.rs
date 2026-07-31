@@ -58,8 +58,11 @@ impl AuthFailure {
 #[derive(Debug)]
 struct NonceEntry {
     issued_at: Instant,
-    /// Highest nonce-count seen under `qop=auth`. Replay guard.
-    last_nc: u32,
+    /// Highest nonce-count seen under `qop=auth`, **per account**. Replay
+    /// guard; see `NonceStore::accept_nc` for why the account is part of the
+    /// key. Bounded by the configured account count, which config validation
+    /// fixes at startup.
+    last_nc: HashMap<String, u32>,
 }
 
 /// Outstanding challenges.
@@ -100,7 +103,7 @@ impl NonceStore {
             nonce.clone(),
             NonceEntry {
                 issued_at: now,
-                last_nc: 0,
+                last_nc: HashMap::new(),
             },
         );
         nonce
@@ -125,15 +128,29 @@ impl NonceStore {
             .is_some_and(|e| now.duration_since(e.issued_at) < self.lifetime)
     }
 
-    /// Records `nc` against `nonce`, rejecting a value that does not advance.
-    fn accept_nc(&self, nonce: &str, nc: u32) -> bool {
+    /// Records `nc` for `(username, nonce)`, rejecting a count that does not
+    /// advance *for that account*.
+    ///
+    /// Keyed by account as well as nonce, not nonce alone. A nonce is minted by
+    /// a challenge, not owned by an account, so nothing stops account B
+    /// presenting its own perfectly valid digest against a nonce account A is
+    /// also using. Sharing one counter there lets any configured account
+    /// exhaust another's `nc` headroom and lock it out — a legitimate-credential
+    /// path to the same denial the pre-`verify` ordering allowed
+    /// (docs/greptile-review-learnings.md, "Auth & security").
+    fn accept_nc(&self, username: &str, nonce: &str, nc: u32) -> bool {
         let mut map = self.lock();
         match map.get_mut(nonce) {
-            Some(entry) if nc > entry.last_nc => {
-                entry.last_nc = nc;
-                true
+            Some(entry) => {
+                let seen = entry.last_nc.entry(username.to_string()).or_insert(0);
+                if nc > *seen {
+                    *seen = nc;
+                    true
+                } else {
+                    false
+                }
             }
-            _ => false,
+            None => false,
         }
     }
 }
@@ -278,7 +295,7 @@ pub fn verify(
         // The strictly-increasing count is what lets one nonce serve a
         // handset's whole refresh cycle instead of one request.
         Some(nc) => {
-            if !nonces.accept_nc(nonce, nc) {
+            if !nonces.accept_nc(username, nonce, nc) {
                 return Err(AuthFailure::Rejected);
             }
         }
@@ -308,6 +325,9 @@ mod tests {
     fn accounts(u: &str) -> Option<String> {
         match u {
             "1001" => Some("s3cret".to_string()),
+            // A second, equally legitimate account — the cross-account replay
+            // guard below is meaningless with only one.
+            "1002" => Some("other-secret".to_string()),
             _ => None,
         }
     }
@@ -576,6 +596,47 @@ mod tests {
 
         let genuine = authorization("1001", "s3cret", &nonce, Some(("00000001", "abc")));
         assert_eq!(check(&genuine, &nonces, now).unwrap(), "1001");
+    }
+
+    /// A nonce is minted by a challenge, not owned by an account, so two
+    /// accounts can legitimately present digests against the same one. Sharing
+    /// a single counter there let either exhaust the other's `nc` headroom and
+    /// lock it out — the same denial the pre-`verify` ordering allowed, reached
+    /// with valid credentials instead of forged ones
+    /// (docs/greptile-review-learnings.md, "Auth & security").
+    #[test]
+    fn one_account_cannot_exhaust_another_accounts_nonce_headroom() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        // 1002 runs its counter high against this nonce, entirely legitimately.
+        let high = authorization("1002", "other-secret", &nonce, Some(("ffffff00", "abc")));
+        assert_eq!(check(&high, &nonces, now).unwrap(), "1002");
+
+        // 1001 must still be able to start from its own nc=1.
+        let low = authorization("1001", "s3cret", &nonce, Some(("00000001", "abc")));
+        assert_eq!(
+            check(&low, &nonces, now).unwrap(),
+            "1001",
+            "each account's replay counter must be its own"
+        );
+    }
+
+    /// And the guard must still bite *within* one account.
+    #[test]
+    fn the_replay_guard_still_applies_per_account() {
+        let nonces = store();
+        let now = Instant::now();
+        let nonce = nonces.issue(now);
+
+        let auth = authorization("1001", "s3cret", &nonce, Some(("00000005", "abc")));
+        assert_eq!(check(&auth, &nonces, now).unwrap(), "1001");
+        assert_eq!(
+            check(&auth, &nonces, now),
+            Err(AuthFailure::Rejected),
+            "the same account replaying its own nc must still be refused"
+        );
     }
 
     /// A nonce must survive a handset's whole refresh cycle under `qop=auth`,

@@ -39,6 +39,16 @@ const MAX_DATAGRAM: usize = 8192;
 /// reads this to decide what it may send us.
 const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER";
 
+/// Called on the serve loop's idle tick with `(live_bindings,
+/// ring_aor_is_registered)`.
+///
+/// Exists because the registrar's gauges are only scrapeable when the process
+/// hosting it serves `/metrics` — true for the circuit-switched daemon, false
+/// for the VoWiFi/VoLTE telephony agent. That host passes an observer which
+/// forwards these to the daemon over the existing agent-reporting channel
+/// instead (spec 024, FR-022).
+pub type RegistrarObserver = Box<dyn Fn(u32, bool) + Send + Sync>;
+
 /// A running registrar. Dropping it stops the thread.
 pub struct Registrar {
     stop: Arc<AtomicBool>,
@@ -54,13 +64,30 @@ impl Registrar {
     /// to whoever is starting the bridge, rather than disappearing into a
     /// worker that then silently serves nothing.
     pub fn start(config: &SipServerConfig) -> std::io::Result<Self> {
+        Self::start_observed(config, None)
+    }
+
+    /// [`start`](Self::start) with an observer for hosts that cannot export the
+    /// registrar's gauges themselves — see [`RegistrarObserver`].
+    pub fn start_observed(
+        config: &SipServerConfig,
+        observer: Option<RegistrarObserver>,
+    ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind((config.listen_addr.as_str(), config.listen_port))?;
-        Self::start_on(socket, config)
+        Self::start_on_observed(socket, config, observer)
     }
 
     /// [`start`](Self::start) on an already-bound socket. Tests bind
     /// `127.0.0.1:0` and read back [`local_addr`](Self::local_addr).
     pub fn start_on(socket: UdpSocket, config: &SipServerConfig) -> std::io::Result<Self> {
+        Self::start_on_observed(socket, config, None)
+    }
+
+    fn start_on_observed(
+        socket: UdpSocket,
+        config: &SipServerConfig,
+        observer: Option<RegistrarObserver>,
+    ) -> std::io::Result<Self> {
         socket.set_read_timeout(Some(READ_TIMEOUT))?;
         let local_addr = socket.local_addr()?;
 
@@ -70,6 +97,7 @@ impl Registrar {
             config: config.clone(),
             nonces: auth::NonceStore::new(Duration::from_secs(config.nonce_lifetime_sec)),
             bindings: Arc::clone(&bindings),
+            observer,
         });
 
         tracing::info!(
@@ -125,6 +153,7 @@ struct ServerState {
     config: SipServerConfig,
     nonces: auth::NonceStore,
     bindings: Arc<BindingStore>,
+    observer: Option<RegistrarObserver>,
 }
 
 fn serve(socket: UdpSocket, state: Arc<ServerState>, stop: Arc<AtomicBool>) {
@@ -169,12 +198,19 @@ fn serve(socket: UdpSocket, state: Arc<ServerState>, stop: Arc<AtomicBool>) {
 /// protocol handling rather than bookkeeping.
 fn observe(state: &ServerState, now: Instant) {
     let live = state.bindings.live_count(now);
-    crate::metrics::SIP_SERVER_BINDINGS.set(live as f64);
     let ringable = state
         .bindings
         .get_live(&state.config.ring_aor, now)
         .is_some();
+
+    // Set locally regardless: correct and scrapeable when the host is the
+    // daemon, harmless when it is not.
+    crate::metrics::SIP_SERVER_BINDINGS.set(live as f64);
     crate::metrics::SIP_SERVER_RING_AOR_REGISTERED.set(if ringable { 1.0 } else { 0.0 });
+
+    if let Some(observer) = &state.observer {
+        observer(live as u32, ringable);
+    }
 }
 
 /// Parses one datagram and produces the response to send back, if any.
