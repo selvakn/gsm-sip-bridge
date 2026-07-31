@@ -68,6 +68,18 @@ already consumed, or was evicted by the table cap.
 Under `qop=auth`, `nc` must strictly increase per nonce. Without `qop`, the
 nonce is single-use, so a replay lands in §1.5.
 
+**Ordering guarantee: a request that fails authentication changes no nonce
+state.** The digest is compared first; the nonce-count is recorded, and the
+single-use nonce retired, only afterwards.
+
+This is load-bearing, not tidiness. Recording the count first let an attacker
+who never knew the password knock a handset off: the nonce is cleartext on a
+LAN, so replaying it with `nc=ffffffff` and a junk digest stored the count
+before the digest was rejected, and the handset's next genuine REGISTER then
+failed §1.6 and got a `401` *without* `stale` — which handsets read as "wrong
+password" rather than "retry". A wrong password and an unknown account are
+equally unable to consume a victim's `nc` headroom (PR #21 review).
+
 ### 1.7 Unsupported algorithm → `401 Unauthorized`
 
 `MD5-sess` and `SHA-256` are rejected; absent and `MD5` are accepted.
