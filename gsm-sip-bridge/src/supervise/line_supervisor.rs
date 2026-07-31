@@ -678,8 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn only_child_sa_missing_skips_the_agent_restart() {
-        assert!(!recovery_restarts_agent(DegradeReason::ChildSaMissing));
+    fn only_child_sa_missing_and_tun_unavailable_skip_the_agent_restart() {
+        for reason in [DegradeReason::ChildSaMissing, DegradeReason::TunUnavailable] {
+            assert!(
+                !recovery_restarts_agent(reason),
+                "{reason:?} should leave the agent alone"
+            );
+        }
         for reason in [
             DegradeReason::ProcessDied,
             DegradeReason::ViciBroken,
@@ -690,6 +695,28 @@ mod tests {
                 recovery_restarts_agent(reason),
                 "{reason:?} should restart the agent"
             );
+        }
+        // Both arms above list their variants literally, so a new one added to
+        // DegradeReason would be silently untested. This match has no wildcard
+        // and so fails to compile until whoever adds it decides which arm it
+        // belongs in.
+        for reason in [
+            DegradeReason::ProcessDied,
+            DegradeReason::ViciBroken,
+            DegradeReason::TunVanished,
+            DegradeReason::TunUnavailable,
+            DegradeReason::ChildSaMissing,
+            DegradeReason::PcscfChanged,
+        ] {
+            match reason {
+                DegradeReason::ProcessDied
+                | DegradeReason::ViciBroken
+                | DegradeReason::TunVanished
+                | DegradeReason::PcscfChanged => assert!(recovery_restarts_agent(reason)),
+                DegradeReason::TunUnavailable | DegradeReason::ChildSaMissing => {
+                    assert!(!recovery_restarts_agent(reason))
+                }
+            }
         }
     }
 }
