@@ -37,6 +37,32 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_observability_events_dropped_total` | Counter | Reports an agent's bounded buffer discarded on overflow |
 | `gsm_sip_bridge_critical_alerts_total` | Counter | Discord critical-alert dispatch outcomes by **category** (`sms`, `module_lifecycle`, `registration_loss`, `tunnel_failure`, `missed_call`) and **outcome** (`sent`, `suppressed`, `skipped`, `failed`) — see `[alerts]` in [configuration.md](configuration.md) |
 | `gsm_sip_bridge_critical_event_active` | Gauge | 1 while a `module_lifecycle`/`registration_loss`/`tunnel_failure` category is in an active (unresolved) incident for a given module/line, by **category** and **module** |
+| `gsm_sip_bridge_sip_server_bindings` | Gauge | IP phones currently registered to the embedded registrar (`[sip_server]` mode) |
+| `gsm_sip_bridge_sip_server_ring_aor_registered` | Gauge | 1 when `[sip_server].ring_aor` specifically has a live registration — the gauge that answers "will a call ring?" |
+| `gsm_sip_bridge_sip_server_registrations_total` | Counter | Registration attempts by **outcome** (`accepted`, `challenged`, `rejected_auth`, `rejected_unknown_user`, `rejected_stale`, `rejected_interval`, `deregistered`) |
+| `gsm_sip_bridge_sip_server_requests_total` | Counter | Every request the registrar answered, by **method** and response **status** |
+| `gsm_sip_bridge_sip_server_ring_target_missing_total` | Counter | Inbound calls dropped because no phone was registered to ring |
+
+**SIP server mode gauges**: `sip_server_*` appear only when
+`[sip_server].enabled` (see [configuration.md](configuration.md)). They are
+deliberately separate series from `sip_registered` and `volte_registered`, for
+the same reason those two are separate from each other: an operator needs to see
+*which* registration is down, not an aggregate that hides it.
+
+`bindings` and `ring_aor_registered` answer different questions —
+`bindings` can be nonzero while the *ringing* account specifically is absent, in
+which case calls do not ring. Alert on `ring_aor_registered`, not on `bindings`.
+
+One `registrations_total{outcome="challenged"}` per `accepted` is normal:
+every REGISTER is challenged once and succeeds on the retry. A rising
+`rejected_auth` means wrong credentials on a handset;
+`rejected_unknown_user` means it is claiming an account that is not
+configured. The two are answered identically on the wire, so that
+distinction exists only here.
+
+`ring_target_missing_total` is counted apart from
+`sip_calls_total{status="error"}` because the remedy differs: the bridge is
+healthy, the handset is not there.
 
 **Transport label**: the six metrics marked **transport** above carry
 `transport="cs"` for the circuit-switched daemon and `transport="vowifi"`
