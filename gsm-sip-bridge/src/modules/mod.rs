@@ -1368,7 +1368,26 @@ impl CardPool {
                     return;
                 }
 
-                let dest_uri = self.sip_bridge.compute_destination_uri(&caller_id);
+                // In SIP server mode this fails when the phone is not
+                // registered. Leaving the GSM call to ring out is the same
+                // thing that happens when `make_call` below fails, so the
+                // existing missed-call alert path still reports it.
+                let dest_uri = match self.sip_bridge.compute_destination_uri(&caller_id) {
+                    Ok(uri) => uri,
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %module_id,
+                            caller = %caller_id,
+                            error = %e,
+                            "cannot bridge call: no phone to ring"
+                        );
+                        metrics::SIP_SERVER_RING_TARGET_MISSING_TOTAL.inc();
+                        metrics::SIP_CALLS_TOTAL
+                            .with_label_values(&[&module_id, "error", "cs"])
+                            .inc();
+                        return;
+                    }
+                };
                 tracing::info!(
                     module = %module_id,
                     caller = %caller_id,
