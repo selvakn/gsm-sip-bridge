@@ -3,8 +3,8 @@ pub mod server;
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    opts, register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
-    CounterVec, Gauge, GaugeVec, HistogramVec, Opts, Registry,
+    opts, register_counter, register_counter_vec, register_gauge, register_gauge_vec,
+    register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Opts, Registry,
 };
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -68,6 +68,73 @@ pub static SIP_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
     register_gauge!(opts!(
         "gsm_sip_bridge_sip_registered",
         "1 if SIP registered, 0 otherwise"
+    ))
+    .unwrap()
+});
+
+// --------------------------------------------- embedded SIP registrar ------
+//
+// The opt-in mode where IP phones register to the bridge instead of the bridge
+// registering to a PBX (spec 024). These are separate series from
+// `SIP_REGISTERED` for the same reason `VOLTE_REGISTERED` is: an operator needs
+// to see *which* registration is down, not an aggregate that hides it.
+
+/// How many IP phones currently hold a live registration.
+pub static SIP_SERVER_BINDINGS: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(opts!(
+        "gsm_sip_bridge_sip_server_bindings",
+        "IP phones currently registered to the embedded SIP registrar"
+    ))
+    .unwrap()
+});
+
+/// 1 when the account inbound calls ring is actually reachable.
+///
+/// The one gauge that answers "will a call ring?" — `SIP_SERVER_BINDINGS` can
+/// be nonzero while the *ringing* account specifically is absent.
+pub static SIP_SERVER_RING_AOR_REGISTERED: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(opts!(
+        "gsm_sip_bridge_sip_server_ring_aor_registered",
+        "1 when [sip_server].ring_aor has a live registration, 0 otherwise"
+    ))
+    .unwrap()
+});
+
+/// Registration outcomes. `rejected_auth` and `rejected_unknown_user` are
+/// answered identically on the wire so the registrar cannot be used to
+/// enumerate account names — this is the only place the two are separable.
+pub static SIP_SERVER_REGISTRATIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_sip_server_registrations_total",
+            "Registration attempts handled by the embedded SIP registrar, by outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Every request the registrar answered. Surfaces a handset hammering
+/// `OPTIONS` or repeatedly trying to dial out.
+pub static SIP_SERVER_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_sip_server_requests_total",
+            "SIP requests handled by the embedded registrar, by method and response status"
+        ),
+        &["method", "status"]
+    )
+    .unwrap()
+});
+
+/// Calls that arrived with no phone registered to ring.
+///
+/// Counted apart from `SIP_CALLS_TOTAL{outcome="error"}` because the remedy is
+/// entirely different: the bridge is healthy, the handset is not there.
+pub static SIP_SERVER_RING_TARGET_MISSING_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(opts!(
+        "gsm_sip_bridge_sip_server_ring_target_missing_total",
+        "Inbound calls dropped because [sip_server].ring_aor had no live registration"
     ))
     .unwrap()
 });
