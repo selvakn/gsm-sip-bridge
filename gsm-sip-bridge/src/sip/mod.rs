@@ -1,5 +1,6 @@
 pub mod alsa_media_port;
 pub mod server;
+pub mod target;
 
 use crate::config::{AppConfig, SipTransport, TlsVerify};
 use pjsua_safe::{Account, AccountConfig, Call, Endpoint, EndpointConfig, TransportType};
@@ -171,13 +172,14 @@ impl SipBridge {
     }
 
     pub fn compute_destination_uri(&self, caller_did: &str) -> String {
-        let raw_dest = if self.config.sip_destination.is_empty() {
-            caller_did
-        } else {
-            &self.config.sip_destination
-        };
-        let dest = raw_dest.trim_start_matches('+');
-        format!("sip:{}@{}:{}", dest, self.config.server, self.config.port)
+        target::CallTarget::Pbx {
+            server: &self.config.server,
+            port: self.config.port,
+            sip_destination: &self.config.sip_destination,
+        }
+        .uri_for(caller_did, std::time::Instant::now())
+        // The PBX form cannot fail: a configured address is always dialable.
+        .expect("CallTarget::Pbx is infallible")
     }
 
     pub fn set_sound_device(&self, alsa_device: &str) -> Result<(), String> {

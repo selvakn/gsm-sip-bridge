@@ -1031,17 +1031,18 @@ fn bridge_call(
     Ok((pbx_call, veth_call))
 }
 
-/// Mirrors `crate::sip::SipBridge::compute_destination_uri`: empty
-/// `[bridge].sip_destination` means DID passthrough (dial the caller's own
-/// number at the PBX), otherwise dial the configured fixed extension.
+/// Shares one rule with the circuit-switched bridge via
+/// `crate::sip::target::CallTarget`: empty `[bridge].sip_destination` means DID
+/// passthrough (dial the caller's own number at the PBX), otherwise dial the
+/// configured fixed extension.
 fn pbx_dest_uri(config: &AppConfig, caller_did: &str) -> String {
-    let raw_dest = if config.bridge.sip_destination.is_empty() {
-        caller_did
-    } else {
-        &config.bridge.sip_destination
-    };
-    let dest = raw_dest.trim_start_matches('+');
-    format!("sip:{dest}@{}:{}", config.sip.server, config.sip.port)
+    crate::sip::target::CallTarget::Pbx {
+        server: &config.sip.server,
+        port: config.sip.port,
+        sip_destination: &config.bridge.sip_destination,
+    }
+    .uri_for(caller_did, std::time::Instant::now())
+    .expect("CallTarget::Pbx is infallible")
 }
 
 /// Entry point for the `vowifi-status` subcommand: queries every resolved
