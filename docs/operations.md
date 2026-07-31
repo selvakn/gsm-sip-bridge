@@ -246,10 +246,9 @@ ESTABLISHED with a fresh CHILD_SA, and the charon log alternates
 fails with `Network unreachable` reaching its P-CSCF, because the tunnel
 interface it should route over is not there.
 
-Cause: the line's XFRM `if_id` is still claimed by leftover kernel state from
-an **earlier container run**, so the interface cannot be recreated. The
-supervisor detects it missing, recreates it, fails, and tears down a
-perfectly healthy CHILD_SA to retry — forever.
+Cause: the line's XFRM `if_id` is still claimed by something, so the interface
+cannot be recreated. The supervisor detects it missing, recreates it, fails,
+and tears down a perfectly healthy CHILD_SA to retry — forever.
 
 This is confusing to confirm because everything visible says the if_id is
 free: `/var/run/netns` is empty, no `gsm-sip-bridge`/`charon` process
@@ -268,7 +267,27 @@ works, the name is not the problem, the if_id is:
 $ ip link add probe type xfrm if_id 99 && ip link del probe   # succeeds
 ```
 
-Then look for the leftovers, all of which outlive the container:
+There are two distinct causes, and they need different remedies.
+
+**Cause A — the line's own live SA holds it.** This is the common one, and
+since 2026-07-31 the supervisor recovers from it by itself: the steady-state
+`TunVanished` branch terminates the line's IKE_SA *before* recreating the
+interface, rather than after. (Recreating first cannot work here — the kernel
+refuses, the terminate releases the id a moment too late, and the reinitiate
+immediately re-claims it. That inversion was the livelock.) If you are on an
+older build, do by hand what the fixed branch now does, then leave the
+supervisor to its next tick:
+
+```
+$ docker exec <container> swanctl --terminate --ike ims1
+```
+
+An `ip link add` issued immediately after the terminate may still fail; the
+release is not synchronous. Only the named line is disturbed, so this is safe
+to run while other lines are registered.
+
+**Cause B — leftovers from an earlier container run.** XFRM state/policy and
+namespaced interfaces both outlive the container:
 
 ```
 $ ip xfrm policy | grep -c '^src'      # ours carry if_id 0x17, 0x18, ...
@@ -276,7 +295,11 @@ $ ip xfrm state  | grep -c '^src'
 $ ip link show | grep veth-sip         # leaked default-netns veth ends
 ```
 
-Fix — **stop the container first**, since this removes live tunnel state:
+`supervise` already clears this class automatically at every startup, before
+charon starts (`reclaim_stale_xfrm`) — but only when it can prove every entry
+present is this deployment's, since the flush is unfiltered and iproute2 has
+no `ip xfrm policy deleteall if_id N`. If it logged that it found foreign
+XFRM state and left it alone, that judgement is yours to make and override:
 
 ```
 $ docker stop <container>
@@ -285,11 +308,22 @@ $ ip link del veth-sip0; ip link del veth-sip1     # any that remain
 $ docker start <container>
 ```
 
-`flush` is unconditional: run it only when you know nothing else on the host
-uses IPsec. There is no way to delete selectively by if_id — iproute2 rejects
-`ip xfrm policy deleteall if_id N`. The bridge does not do this automatically
-for the same reason; it reports the failure and this remedy instead. A host
-reboot clears the state too.
+Run that only when you know nothing else on the host uses IPsec. A host
+reboot clears the same state.
+
+**If neither works**, the id is leaked at kernel level and reachable from
+nothing — observed 2026-07-30 with a flushed host, no state or policy naming
+`0x18`, and no interface holding it in `ims0`/`ims1`, the host netns, or any
+live process's netns. Two places worth checking that a process scan misses,
+since a namespace held by either keeps its interfaces (and their if_ids)
+alive with nothing in `ip netns list` to show for it:
+
+```
+$ find /proc/*/fd -lname 'net:*' 2>/dev/null    # netns held open by an fd
+$ grep -l nsfs /proc/*/mountinfo                # netns kept by a bind mount
+```
+
+Failing that, a host reboot is the reliable clear.
 
 ### VoWiFi: "no smart card reader" / vpcd connection refused
 

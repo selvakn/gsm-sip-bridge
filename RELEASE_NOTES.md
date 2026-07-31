@@ -1,5 +1,32 @@
 # Release Notes
 
+## Unreleased
+
+- **A line whose tunnel interface vanished now recovers itself when its own SA
+  is what blocks the recreation.** The steady-state `TunVanished` branch
+  recreated the line's XFRM interface and only then terminated its IKE_SA.
+  That ordering cannot win when the thing still holding the line's `if_id` is
+  the line's own live SA state: the kernel answers `RTNETLINK answers: File
+  exists`, the terminate releases the id a moment too late, the reinitiate
+  re-claims it, and the next tick fails identically — the line re-establishes
+  its tunnel every ~30s forever while its agent cannot route (diagnosed live
+  2026-07-30, recovered only by issuing that terminate by hand). The two calls
+  are now the other way round. The branch already terminated unconditionally,
+  so this costs nothing it was not paying, and a recreate that fails anyway now
+  says the `if_id` is claimed by something outside this line rather than
+  leaving the operator to guess.
+- **`ip xfrm state flush && ip xfrm policy flush` is no longer offered as the
+  remedy for a claimed `if_id`.** It was stated as fact in the interface-creation
+  failure message, and it is not one: `reclaim_stale_xfrm` already runs exactly
+  that flush at every startup, so by the time an operator reads the message the
+  program has either run it or deliberately declined to (because the host
+  carries IPsec that is not this deployment's, and the flush is unfiltered) —
+  and a leaked id survives it regardless, verified 2026-07-30 on a flushed host
+  with no state or policy naming the id and no interface holding it anywhere
+  enumerable. `docs/operations.md` now separates the self-healing case from
+  leftovers of an earlier container run, and points at the fd- and mount-held
+  namespaces a process scan misses when it is neither.
+
 ## v8.2.0
 
 One correction, to a claim this project had been repeating in config

@@ -35,6 +35,12 @@ pub enum DegradeReason {
     ProcessDied,
     ViciBroken,
     TunVanished,
+    /// The tunnel interface is missing *and* could not be recreated, so this
+    /// line has no data path and cannot be given one right now — distinct
+    /// from `TunVanished`, which is the same symptom with a recreation that
+    /// worked. Nothing downstream of the interface is worth disturbing until
+    /// it exists: see the TunVanished branch of [`tick_steady_state`].
+    TunUnavailable,
     ChildSaMissing,
     PcscfChanged,
 }
@@ -99,7 +105,14 @@ pub trait TunnelEngine {
     /// level while silently failing to install a working data path — a
     /// fresh IKE_SA every ~30s (one steady-state tick), forever. No-op for
     /// swu, which has no equivalent pre-created interface concept.
-    fn recreate_interface(&self, runner: &dyn CommandRunner);
+    ///
+    /// Returns whether the interface is present afterwards. `false` means no
+    /// data path can exist for this line right now whatever else is done to
+    /// it, so the caller skips the terminate/reinitiate that would otherwise
+    /// follow — see the TunVanished branch of [`tick_steady_state`] for why
+    /// that churn is worse than waiting. Always `true` for swu, which has no
+    /// interface to be missing.
+    fn recreate_interface(&self, runner: &dyn CommandRunner) -> bool;
     /// Fully restarts this line's primary process from scratch (strongswan:
     /// kill, clear log, remove the stale unqualified pidfile, respawn
     /// charon, `swanctl --load-all`, `swanctl --initiate`; swu: respawn the
@@ -225,7 +238,29 @@ pub fn tick_steady_state(
             // install a working data path onto an interface that was never
             // actually recreated — a fresh IKE_SA every steady-state tick,
             // forever, never actually fixing the underlying problem.
-            engine.recreate_interface(runner);
+            //
+            // The terminate+reinitiate is conditional on that recreation
+            // having actually worked. Measured live 2026-07-31: when the
+            // container is replaced, the previous run's `ims<N>` namespaces
+            // — and the `tun23-<N>` devices inside them, which register their
+            // `if_id` in the namespace they were *created* in, the host's —
+            // survive about two and a half minutes. Nothing shortens it: the
+            // shutdown plan's `ip netns del` runs, the container exits 0, and
+            // a stopped deployment still held both ids 2m29s later. Until the
+            // kernel reaps them the id is refused and no interface can exist,
+            // so terminating each tick only churned the carrier without ever
+            // getting closer to a data path: eight and six IKE_SA setups
+            // across two startups on the two lines, against two and two once
+            // this branch stopped doing it. Waiting is free by comparison: a
+            // line with no tunnel interface carries no traffic either way,
+            // and the first tick after the id frees recreates it and recovers
+            // normally — an 11s startup once the old namespaces are gone,
+            // against 163s and 195s when they are not.
+            if !engine.recreate_interface(runner) {
+                return SteadyOutcome::Recovered {
+                    reason: DegradeReason::TunUnavailable,
+                };
+            }
             engine.terminate(runner);
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
@@ -256,8 +291,25 @@ pub fn tick_steady_state(
 /// Whether a [`SteadyOutcome::Recovered`] reason also means "restart this
 /// line's vowifi-ims-agent" — matches the original script exactly: every
 /// recovery path does, EXCEPT a bare `ChildSaMissing` re-initiate.
+///
+/// `TunUnavailable` is the one addition to that rule. The agent's whole job is
+/// to route over a tunnel interface which, in that state, does not exist and
+/// cannot be made to exist yet, so killing it only guarantees it fails the same
+/// way on restart.
+///
+/// Worth knowing what this does *not* buy: measured live 2026-07-31, the agent
+/// restart count over a container replacement did not move (48 across two
+/// startups, before and after). Nearly all of those are the agent's own
+/// crash-loop — it starts, cannot reach its P-CSCF without an interface, exits,
+/// and its supervisor restarts it 5s later — which this does not touch. The
+/// tick-driven kills removed here are a handful on top of that. The change is
+/// kept because killing a process over a condition it cannot affect is wrong on
+/// its own terms, not because it measurably improved anything.
 pub fn recovery_restarts_agent(reason: DegradeReason) -> bool {
-    !matches!(reason, DegradeReason::ChildSaMissing)
+    !matches!(
+        reason,
+        DegradeReason::ChildSaMissing | DegradeReason::TunUnavailable
+    )
 }
 
 #[cfg(test)]
@@ -283,6 +335,13 @@ mod tests {
         reinitiate_calls: RefCell<u32>,
         restart_calls: RefCell<u32>,
         recreate_interface_calls: RefCell<u32>,
+        /// Whether `recreate_interface` reports the interface as present
+        /// afterwards — `false` models a line whose `if_id` is still held by
+        /// a not-yet-reaped previous run.
+        recreate_ok: bool,
+        /// Recovery calls in the order they were issued. Counts alone cannot
+        /// express the ordering the TunVanished branch depends on.
+        call_order: RefCell<Vec<&'static str>>,
     }
 
     impl Default for FakeEngine {
@@ -298,6 +357,8 @@ mod tests {
                 reinitiate_calls: RefCell::new(0),
                 restart_calls: RefCell::new(0),
                 recreate_interface_calls: RefCell::new(0),
+                recreate_ok: true,
+                call_order: RefCell::new(Vec::new()),
             }
         }
     }
@@ -314,9 +375,11 @@ mod tests {
         }
         fn terminate(&self, _runner: &dyn CommandRunner) {
             *self.terminate_calls.borrow_mut() += 1;
+            self.call_order.borrow_mut().push("terminate");
         }
         fn reinitiate(&self, _runner: &dyn CommandRunner) {
             *self.reinitiate_calls.borrow_mut() += 1;
+            self.call_order.borrow_mut().push("reinitiate");
         }
         fn steady_state_health(&self, _runner: &dyn CommandRunner) -> SteadyStateHealth {
             *self.health.borrow()
@@ -324,8 +387,10 @@ mod tests {
         fn restart_process(&self, _runner: &dyn CommandRunner) {
             *self.restart_calls.borrow_mut() += 1;
         }
-        fn recreate_interface(&self, _runner: &dyn CommandRunner) {
+        fn recreate_interface(&self, _runner: &dyn CommandRunner) -> bool {
             *self.recreate_interface_calls.borrow_mut() += 1;
+            self.call_order.borrow_mut().push("recreate_interface");
+            self.recreate_ok
         }
         fn max_establish_attempts(&self) -> Option<u32> {
             self.max_attempts
@@ -508,6 +573,57 @@ mod tests {
              TunVanished but never recreated the interface, so every \
              subsequent negotiation kept succeeding at the IKE/CHILD_SA \
              level while silently failing to install a working data path"
+        );
+    }
+
+    #[test]
+    fn steady_state_tun_vanished_recreates_before_it_terminates_and_reinitiates() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::TunVanished),
+            ..Default::default()
+        };
+        tick_steady_state(&engine, &runner, "10.0.0.1");
+        assert_eq!(
+            *engine.call_order.borrow(),
+            vec!["recreate_interface", "terminate", "reinitiate"],
+            "the original script's ordering: the interface must exist before \
+             the renegotiation that installs a data path onto it"
+        );
+    }
+
+    #[test]
+    fn steady_state_tun_vanished_leaves_the_sa_alone_when_the_interface_cannot_be_recreated() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::TunVanished),
+            recreate_ok: false,
+            ..Default::default()
+        };
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        assert_eq!(
+            outcome,
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::TunUnavailable
+            },
+            "a distinct reason, so the caller can tell 'recreated it' from \
+             'could not', and skip the agent restart for the latter"
+        );
+        assert!(!recovery_restarts_agent(DegradeReason::TunUnavailable));
+        assert_eq!(*engine.recreate_interface_calls.borrow(), 1);
+        assert_eq!(
+            (
+                *engine.terminate_calls.borrow(),
+                *engine.reinitiate_calls.borrow()
+            ),
+            (0, 0),
+            "measured live 2026-07-31: when a container is replaced, the \
+             previous run's namespaces hold this line's if_id for ~2.5min and \
+             nothing shortens that, so no interface can exist yet. Tearing the \
+             SA down every 30s through that window only churns the carrier \
+             (eight and six IKE_SA setups across two startups, against two and \
+             two after this gate) and cannot produce a data path — the tick \
+             after the id frees recovers normally"
         );
     }
 

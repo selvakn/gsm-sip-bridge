@@ -182,14 +182,24 @@ pub fn ensure_epdg_interface(
             // perfectly good CHILD_SA to retry — every 30s, forever, with
             // nothing in the log saying why. Diagnosed live 2026-07-29 only by
             // replaying this exact command by hand.
+            //
+            // This message used to name `ip xfrm state flush && ip xfrm policy
+            // flush` as the remedy. It is not one: `reclaim_stale_xfrm` above
+            // has already run exactly that at startup (or deliberately
+            // declined it, because the host carries IPsec that is not ours and
+            // the flush is unfiltered), and a leaked id survives it anyway —
+            // verified 2026-07-30 with a flushed host, no state or policy
+            // naming the id, and no interface holding it in any namespace.
             match runner.run(&[
                 "ip", "link", "add", tun_iface, "type", "xfrm", "if_id", if_id,
             ]) {
                 Ok(out) if !out.status.success() => eprintln!(
                     "[supervise] could not create {tun_iface} (xfrm if_id {if_id}): {}. \
-                     An if_id still claimed by a previous run does this even when no \
-                     interface of that name exists anywhere; with no tunnel running, \
-                     `ip xfrm state flush && ip xfrm policy flush` on the host releases it.",
+                     Something still claims that if_id, which the kernel reports this way \
+                     even when no interface of that name exists anywhere. Flushing XFRM \
+                     state/policy does not necessarily release it; terminating the owning \
+                     line's IKE_SA (`swanctl --terminate --ike ims<N>`) and letting the \
+                     supervisor retry does. See docs/operations.md.",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
                 Err(e) => {
