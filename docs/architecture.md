@@ -48,6 +48,55 @@ flowchart LR
     PBX <-->|"SIP + RTP"| IPPhone
 ```
 
+## Two SIP-side topologies
+
+The three paths above are about how a call *arrives*. Independently of that,
+there are two ways it *leaves* — and either works with any of the three.
+
+**With a PBX (the default).** The bridge registers to an external telephone
+system as a trunk and INVITEs it. Whichever component owns the carrier side
+also owns that registration: the circuit-switched daemon normally, or the
+VoWiFi/VoLTE telephony agent when one of those is enabled. A trunk keeps a
+single binding, so exactly one of them may hold it —
+`sip::SipBridge`'s `owns_sip_side` is that decision.
+
+**As the SIP server** (`[sip_server].enabled`, off by default,
+specs/024-sip-server-mode). The bridge *is* the server: IP phones REGISTER
+directly to it and inbound calls ring one configured account. No PBX exists in
+the deployment at all. Intended for small sites where standing up and
+maintaining a separate telephone system purely to receive the bridge's calls is
+the largest part of the work.
+
+```mermaid
+flowchart LR
+    Carrier["Carrier network"]
+    Server["Bridge server<br/>(gsm-sip-bridge)"]
+    IPPhone["IP Phone /<br/>Softphone"]
+
+    Carrier <-->|"CS / VoWiFi / VoLTE"| Server
+    IPPhone -->|"REGISTER :5060"| Server
+    Server -->|"INVITE + RTP<br/>from [sip].local_port"| IPPhone
+```
+
+The registrar is pure Rust on its own UDP port, hosted in-process by whichever
+component owns the SIP side — the same arbitration as the trunk case, which is
+what lets one registrar serve all three call paths with no IPC. It is
+deliberately *not* a PJSIP module sharing pjsua's transport: that would live
+behind the `pjsip-linked` feature, which CI never compiles, so an
+authentication subsystem would sit outside the test gate entirely.
+
+Consequences worth knowing before enabling it:
+
+- **Inbound only.** A phone cannot dial out through the mobile network — the
+  bridge has never had that capability, and this does not add it. The attempt is
+  refused with `403`.
+- **One phone rings.** Others may register but are never called.
+- **Two ports.** Phones register to `[sip_server].listen_port`, but INVITEs
+  are sourced from `[sip].local_port`, because two SIP endpoints cannot share
+  one UDP socket. RFC-correct — delivery uses the phone's own `Contact` — but
+  see [operations.md](operations.md#sip-server-mode) for the one handset
+  setting that interacts with it.
+
 ## Workspace layout
 
 Three-crate Cargo workspace:

@@ -18,6 +18,12 @@ VoWiFi (its SIM reaches the carrier over your host's own network
 connection, not a cellular one) — circuit-switched calls and VoLTE both
 need an actual modem.
 
+This table is about how calls *arrive*. Where they go afterwards — an
+external PBX, or an IP phone registered directly to the bridge
+(`[sip_server].enabled`) — is device-independent: every mode above works with
+either. See
+[architecture.md](architecture.md#two-sip-side-topologies).
+
 ## Quectel EC20
 
 The default choice — works for all three modes on the same device. See

@@ -57,6 +57,13 @@ the LTE data path. Either way it ends up as a SIP call to your PBX. See
 [docs/architecture.md](docs/architecture.md) for the crate layout, all
 three call flows in detail, and the audio pipeline.
 
+**No PBX?** Any of those three paths can instead ring an IP phone registered
+directly to the bridge — set `[sip_server].enabled` and the bridge becomes the
+SIP server itself, with no telephone system in the deployment. Off by default;
+inbound only. See
+[docs/architecture.md](docs/architecture.md#two-sip-side-topologies) and
+[docs/configuration.md](docs/configuration.md).
+
 ## Quick Start (Docker Compose)
 
 Requires Docker with the Compose plugin and one or more Quectel EC20 USB

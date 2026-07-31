@@ -540,3 +540,109 @@ exactly once even if both routes deliver the same message.
 Messages are acknowledged **after** being recorded, never before, so an
 ill-timed crash costs a retransmission (which is de-duplicated) rather than a
 silently lost text.
+
+## SIP server mode
+
+`specs/024-sip-server-mode`. The bridge **is** the SIP server: IP phones
+REGISTER directly to it and inbound calls (from any of the three carrier paths)
+ring one configured account. No PBX in the deployment. Opt in with
+`[sip_server].enabled`.
+
+### Enabling it
+
+```toml
+[sip]
+# The bridge's own calling port. MUST differ from listen_port below — they are
+# two separate SIP endpoints and cannot share one UDP socket. Both default to
+# 5060, so this line is not optional.
+local_port = 5062
+transport  = "udp"
+# server / username / password are NOT set: there is no PBX. Leaving them in
+# is a startup error, not a warning.
+
+[sip_server]
+enabled     = true
+listen_port = 5060          # what the phones point at
+realm       = "gsm-sip-bridge"
+ring_aor    = "1001"        # which account rings; must match an account below
+
+[[sip_server.account]]
+username = "1001"
+password = "env:PHONE_1001_PASSWORD"
+```
+
+Every mistake in that set is refused at startup with a message naming the fix —
+a missing account, a `ring_aor` matching none of them, a leftover PBX address,
+or both ports left at 5060. None of them fail silently at call time.
+
+Expected on start:
+
+```
+INFO sip_server: registrar listening addr=0.0.0.0:5060 realm=gsm-sip-bridge accounts=1 ring_aor=1001
+INFO SIP server mode active — IP phones register here; no PBX is used
+```
+
+### Provisioning a handset
+
+| Setting | Value |
+|---|---|
+| SIP server / registrar | the bridge's LAN IP |
+| Port | `[sip_server].listen_port` |
+| Username / auth ID | an `[[sip_server.account]].username` |
+| Password | that account's password |
+| Transport | UDP |
+
+Confirm it took:
+
+```bash
+curl -s localhost:9100/metrics | grep sip_server
+```
+
+`sip_server_bindings 1` and `sip_server_ring_aor_registered 1` is a working
+deployment. One `registrations_total{outcome="challenged"}` per `accepted` is
+normal — every REGISTER is challenged once and succeeds on the retry.
+
+### Troubleshooting
+
+**The phone registers but never rings.** Check the handset's "accept SIP only
+from the proxy" option — *Accept SIP Trust Server Only* on Yealink, *Accept
+Incoming SIP from Proxy Only* on Grandstream, similar on Fanvil. **Turn it
+off.** The bridge answers REGISTER on `listen_port` but dials from
+`[sip].local_port`, and although those handset options compare source *IP*
+(identical here) rather than port, this is the first thing to rule out. It is
+the one operational cost of the two-port design; see
+[architecture.md](architecture.md#two-sip-side-topologies).
+
+**`no live registration for AOR "1001"` in the log.** A call arrived with
+nothing registered under the ringing account. The carrier call is deliberately
+left to ring out rather than answered into silence, so the existing missed-call
+alert still fires. Check `sip_server_ring_aor_registered` — if it is 0, the
+handset is not registered, whatever `sip_server_bindings` says about others.
+
+**Registrations refused.** `registrations_total{outcome="rejected_auth"}` means
+wrong credentials; `rejected_unknown_user` means the handset is claiming an
+account that is not configured. The wire response is identical for both on
+purpose — so the registrar cannot be used to discover which account names
+exist — which makes these labels the only way to tell them apart.
+
+**Calls stop ringing after some minutes.** The handset's registration lapsed
+and was not refreshed. `ring_aor_registered` will read 0. Check the handset's
+registration interval against `[sip_server].min_expires`; a phone asking for
+less than the floor is told `423 Interval Too Brief` and may then give up
+rather than retry with a longer value.
+
+**`registrar could not listen on ...: Address already in use`.** Something else
+holds the port — most often a previous run still shutting down, or an
+`asterisk`/`kamailio` left on 5060.
+
+### Limitations
+
+- **Inbound only.** A phone cannot dial out through the mobile network; the
+  attempt is refused with `403` and logged. The bridge has never had outbound
+  cellular origination and this mode does not add it.
+- **One phone rings.** Others may register but are never called. Registering a
+  second device on the *same* account replaces the first, so calls go to
+  whichever registered most recently.
+- **UDP only**, and no NAT between phone and bridge — this targets a
+  single-site LAN.
+- **No message-waiting or busy-lamp** subscriptions (answered `489 Bad Event`).
