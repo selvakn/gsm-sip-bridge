@@ -25,7 +25,12 @@
 pub mod agent;
 mod amr_rtp;
 pub mod call;
-mod digest;
+/// `pub(crate)` rather than private: `sip::server`'s registrar verifies inbound
+/// REGISTER credentials with the same RFC 2617 math this module computes
+/// outbound IMS-AKA responses with. A second MD5 digest implementation in the
+/// same binary is exactly the duplication the constitution's simplicity
+/// principle targets (spec 024, research.md R-007).
+pub(crate) mod digest;
 pub mod echo;
 mod gm_ipsec;
 pub mod lifecycle;
@@ -34,7 +39,10 @@ pub mod observability;
 mod rtp;
 pub mod sdp;
 pub mod session;
-mod sip_client;
+/// `pub(crate)` rather than private: `sip::server`'s registrar reuses this
+/// module's request parser and UAS response builder to serve IP phones. See
+/// `digest` above for the same rationale (spec 024, research.md R-007).
+pub(crate) mod sip_client;
 mod transcode;
 pub mod transport;
 

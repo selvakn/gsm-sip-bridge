@@ -152,12 +152,12 @@ impl SipRequest {
     /// Same partial-read/`Content-Length`-aware framing as
     /// `SipResponse::try_parse` (see its docs), for a request's
     /// `METHOD request-uri SIP/2.0` start-line instead of a status line.
-    /// `pub(super)` (not private) so `ims::agent`'s veth-facing UAS — a
-    /// sibling module of this one, not a descendant — can parse a
+    /// `pub(crate)` (not private) so `ims::agent`'s veth-facing UAS can parse a
     /// single-datagram INVITE from Agent B directly, the same way
     /// `SipTransport::recv_message` (in this module) parses one from a
-    /// buffered stream.
-    pub(super) fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
+    /// buffered stream — and so `sip::server`'s registrar can parse a REGISTER
+    /// datagram from an IP phone (spec 024, research.md R-007).
+    pub(crate) fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
         let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
             return Ok(None);
         };
