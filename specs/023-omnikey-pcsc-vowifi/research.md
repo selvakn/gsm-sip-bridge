@@ -46,6 +46,18 @@ hardware; would be pure unnecessary complexity).
 **Decision**: Mandatory `imsi_override`/`mcc`/`mnc` in a `[[vowifi.line]]`
 entry with `pcsc_reader = true` — no live IMSI read from the card at startup.
 
+> **Superseded (post-v8.1.0) — `mcc`/`mnc` only.** The premise below (that a
+> card-reader line cannot read its identity at startup) turned out to be false
+> for the PLMN: the MCC is the first three IMSI digits and the MNC length is in
+> the card's own `EF_AD` (`6FAD`), both readable over PC/SC, and
+> `PcscTransport::connect` was already doing a live `EF_IMSI` read to pick a
+> reader. `mcc`/`mnc` are now optional and derived from the card via
+> `plmn::derive_plmn_from_card` / `vowifi-plmn --pcsc-imsi`; only the legacy
+> `AT+COPS` fallback is modem-only. `imsi_override` remains mandatory, but as
+> the reader-to-line binding key (it must be known *before* any card session
+> exists), not because the IMSI is unreadable. See the Unreleased section of
+> `RELEASE_NOTES.md`.
+
 **Rationale**: Every other line-identity field in this project already
 supports an `Option`-based override convention (`config.toml.example`'s
 "pin everything" pattern, also used operationally to sidestep a live

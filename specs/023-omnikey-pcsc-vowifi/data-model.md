@@ -44,7 +44,7 @@ each extended with one field:
 | `card_id` | `String` | Existing. For a pcsc line, a synthetic id (e.g. `pcsc0`) rather than a derived USB modem id. |
 | `modem_port` | `String` (`ResolvedLine` uses `PathBuf` today; see Design Note below) | **Empty string** for a pcsc line — no modem device. |
 | `pcsc_reader` | `bool` (**new**) | `true` for a card-reader-backed line. Drives orchestration branching (skip modem checks, skip `vowifi-usim-bridge`). |
-| `mcc` / `mnc` / `imsi_override` (on `ResolvedLine`) | `String` / `Option<String>` | Existing — always populated from the mandatory override for a pcsc line. |
+| `mcc` / `mnc` / `imsi_override` (on `ResolvedLine`) | `String` / `Option<String>` | Existing. `imsi_override` is always populated for a pcsc line (mandatory override). `mcc`/`mnc` are populated only when the override sets them; left unset they stay **empty strings** — the same "auto-derive" sentinel a modem line uses, resolved later from the card's `EF_IMSI`/`EF_AD` (see the supersession note above). |
 | everything else (netns, veth addrs, control_port, vpcd_port, strongswan_if_id/tun_iface, pcscf_source_path, `config: VowifiConfig`) | unchanged types | Existing per-index derivation (`resolve_one_line`'s pure-function-of-`index` block, `discovery.rs:218-233`) — reused as-is for pcsc lines via a sibling `resolve_one_pcsc_line`. |
 
 **Design note**: `ResolvedLine.modem_port` is typed `PathBuf` today
@@ -84,6 +84,7 @@ being unreachable surfaces as a failed EAP-AKA attempt inside the existing
 
 | Rule | Enforced where | Failure behavior |
 |---|---|---|
-| `pcsc_reader` line has `imsi_override`+`mcc`+`mnc` | Config load/validation | Startup error naming the line index/position and missing field(s) |
+| `pcsc_reader` line has `imsi_override` | Config load/validation | Startup error naming the line index/position |
+| `pcsc_reader` line's `mcc`/`mnc` — **not** required (superseded; see note above) | Derived at startup from the card's `EF_IMSI`/`EF_AD` when unset | A card whose `EF_AD` omits the MNC-length byte fails that line at startup, with an error saying to set `mcc`/`mnc` explicitly (no `AT+COPS` fallback exists for a reader) |
 | `pcsc_reader` line + `tunnel_engine = "swu"` | `supervise` startup, before any line thread spawns | Startup error naming the incompatible line; process exits non-zero |
 | Combined modem + pcsc line count vs `max_lines` | `resolve_lines` (existing overflow logic, extended) | Overflow lines reported in `LineTableResult.failed` with reason `max_lines_exceeded`, same as today |
