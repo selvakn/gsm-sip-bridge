@@ -1,5 +1,34 @@
 # Release Notes
 
+## Unreleased
+
+- **A `pcsc_reader` line no longer needs `mcc`/`mnc` configured.** v8.1.0
+  required them "because there is no modem to derive them from", which was the
+  wrong reason: both live on the card. The MCC is the first three IMSI digits,
+  and whether the MNC is 2 or 3 digits long is stated by the card's own `EF_AD`
+  (`6FAD`, TS 31.102 §4.2.18 byte 4) — the modem path had simply been reading
+  that byte via `AT+CRSM`, and the derivation was never ported to
+  `modules::usim::ApduTransport` when the rest of the SELECT/READ/AUTHENTICATE
+  logic was. It is now: `usim::read_mnc_length` and
+  `plmn::derive_plmn_from_card` work over either transport, `vowifi-plmn` takes
+  `--pcsc-imsi <IMSI>` alongside `--modem <port>`, and both consumers
+  (`supervise` for the ePDG FQDN, `vowifi-ims-agent` for the IMS realm) use the
+  card path for a card-reader line. Existing configs that set `mcc`/`mnc`
+  keep working unchanged — an explicit pair still wins — but **omitting them is
+  now preferred**, since a hand-written pair with the wrong MNC length silently
+  builds both the wrong ePDG FQDN and the wrong IMS realm. The one card that
+  still needs them pinned is one whose `EF_AD` omits the MNC-length byte (some
+  legacy 2G SIMs): the modem path falls back to the serving PLMN from
+  `AT+COPS`, but a reader has no radio, so that line fails at startup with an
+  error saying to set them explicitly.
+- `imsi_override` remains mandatory on a `pcsc_reader` line, with its rationale
+  corrected in the error message and docs: it is the reader-to-line binding key
+  (which physical card this line owns must be known before any card session
+  exists, and `eap-sim-pcsc` needs it in the rendered NAI), not a workaround
+  for an unreadable IMSI — `PcscTransport::connect` reads `EF_IMSI` off every
+  candidate reader. `imei_override` also stays optional and auto-generated; an
+  IMEI is a device identity and genuinely is not on the card.
+
 ## v8.1.0
 
 Repository maintenance, one structural fix, and a run of VoWiFi fixes found

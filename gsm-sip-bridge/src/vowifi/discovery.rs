@@ -302,10 +302,12 @@ fn luhn_check_digit(body: &str) -> u8 {
 
 /// The card-reader-backed counterpart to `resolve_one_line`: same per-index
 /// infrastructure derivation (netns, veth, strongswan if_id/iface, vpcd
-/// port), but the network identity comes straight from the override's
-/// mandatory `mcc`/`mnc`/`imsi_override` (config validation guarantees these
-/// are `Some`, per `parse_vowifi_line_overrides`) rather than from a probed
-/// modem — there is no modem to read them from.
+/// port), but the network identity comes from the override rather than from a
+/// probed modem. `imsi_override` is mandatory (config validation guarantees
+/// it is `Some`) because it names which reader's card this line owns;
+/// `mcc`/`mnc` are optional exactly as on a modem line — left unset they stay
+/// empty here and are derived later from the card's own EF_IMSI/EF_AD over
+/// PC/SC (`vowifi-plmn --pcsc-imsi`, `plmn::derive_plmn_from_card`).
 fn resolve_one_pcsc_line(
     index: u32,
     card_id: String,
@@ -941,6 +943,42 @@ mod tests {
         assert_eq!(line.mnc, "043");
         assert_eq!(line.index, 0);
         assert_eq!(line.card_id, "pcsc0");
+    }
+
+    #[test]
+    fn resolve_lines_pcsc_without_a_configured_plmn_leaves_it_to_be_derived() {
+        // mcc/mnc are optional on a pcsc line: both come from the card's own
+        // EF_IMSI/EF_AD. Empty here is the same "auto-derive" sentinel a
+        // modem line uses, which is what makes `resolve_mcc_mnc` and
+        // `ims::agent`'s startup path go read the card.
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                pcsc_reader: true,
+                imsi_override: Some("404438083996440".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let assignment = RoleAssignment {
+            circuit_switched: vec![],
+            vowifi: vec![],
+        };
+        let result = resolve_lines(&assignment, &base);
+        assert_eq!(result.lines.len(), 1);
+        let line = &result.lines[0];
+        assert!(line.pcsc_reader);
+        assert_eq!(line.mcc, "", "must not be invented at resolution time");
+        assert_eq!(line.mnc, "");
+        assert_eq!(line.config.mcc, "");
+        assert_eq!(line.config.mnc, "");
+        assert_eq!(line.imsi_override.as_deref(), Some("404438083996440"));
+        // The IMEI is still auto-generated — that one genuinely isn't on the
+        // card, so an empty mcc/mnc must not have disturbed it.
+        assert_eq!(
+            line.config.imei_override.as_deref().map(str::len),
+            Some(15),
+            "a pcsc line still needs a synthetic IMEI for +sip.instance"
+        );
     }
 
     #[test]

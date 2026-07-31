@@ -551,6 +551,12 @@ fn resolve_imsi(
 }
 
 /// Derives mcc/mnc from the SIM via `vowifi-plmn` when not already set.
+///
+/// A `pcsc_reader` line has no modem port to pass, but the two files the
+/// derivation needs (EF_IMSI, EF_AD) are on the card either way, so it goes
+/// over PC/SC instead — keyed by the line's IMSI, which is exactly how
+/// `PcscTransport::connect` already picks that line's reader. That is why
+/// `mcc`/`mnc` are optional on a card-reader line rather than mandatory.
 fn resolve_mcc_mnc(
     runner: &dyn CommandRunner,
     bin: &str,
@@ -559,9 +565,18 @@ fn resolve_mcc_mnc(
     if !line.mcc.is_empty() && !line.mnc.is_empty() {
         return Some((line.mcc.clone(), line.mnc.clone()));
     }
-    let out = runner
-        .run(&[bin, "vowifi-plmn", "--modem", &line.modem_port])
-        .ok()?;
+    let out = if line.pcsc_reader {
+        // Config validation guarantees a pcsc_reader line has an
+        // imsi_override — it is how the line names its own physical card.
+        let imsi = line.config.imsi_override.clone().unwrap_or_default();
+        runner
+            .run(&[bin, "vowifi-plmn", "--pcsc-imsi", &imsi])
+            .ok()?
+    } else {
+        runner
+            .run(&[bin, "vowifi-plmn", "--modem", &line.modem_port])
+            .ok()?
+    };
     if !out.status.success() {
         return None;
     }
@@ -1413,6 +1428,84 @@ mod tests {
             .unwrap()
             .iter()
             .any(|argv| argv.iter().any(|a| a.contains(needle)))
+    }
+
+    fn ok_stdout(stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_mcc_mnc_prefers_an_explicitly_configured_plmn() {
+        let mock = Arc::new(MockCommandRunner::new());
+        let line = pcsc_line(0); // has mcc/mnc set
+        assert_eq!(
+            resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
+            Some(("404".to_string(), "043".to_string()))
+        );
+        assert!(
+            !ran_argv_containing(&mock, "vowifi-plmn"),
+            "a pinned mcc/mnc must not trigger a card read at all"
+        );
+    }
+
+    #[test]
+    fn resolve_mcc_mnc_derives_a_pcsc_line_over_the_reader_not_a_modem() {
+        // The point of the whole change: a card-reader line with mcc/mnc left
+        // unset derives them from its own card, keyed by the IMSI that
+        // already identifies its reader. It has no modem port to pass, so the
+        // old `--modem ""` form could never have worked here.
+        let mock = Arc::new(MockCommandRunner::new());
+        mock.set_run_output(
+            "gsm-sip-bridge vowifi-plmn --pcsc-imsi 404940123456789",
+            ok_stdout("404 094\n"),
+        );
+        let mut line = pcsc_line(0);
+        line.mcc = String::new();
+        line.mnc = String::new();
+        assert_eq!(
+            resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
+            Some(("404".to_string(), "094".to_string()))
+        );
+        assert!(
+            !ran_argv_containing(&mock, "--modem"),
+            "a pcsc_reader line must never be asked to derive over a modem"
+        );
+    }
+
+    #[test]
+    fn resolve_mcc_mnc_still_derives_a_modem_line_over_the_modem() {
+        let mock = Arc::new(MockCommandRunner::new());
+        mock.set_run_output(
+            "gsm-sip-bridge vowifi-plmn --modem /dev/ttyUSB0",
+            ok_stdout("405 840\n"),
+        );
+        let mut line = modem_line(0, "/dev/ttyUSB0");
+        line.mcc = String::new();
+        line.mnc = String::new();
+        assert_eq!(
+            resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
+            Some(("405".to_string(), "840".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_mcc_mnc_reports_failure_when_the_card_cannot_be_read() {
+        // No seeded output -> the mock's default is a failing status, which
+        // is what a reader holding no matching card looks like. The caller
+        // treats None as fatal for the line rather than inventing a PLMN.
+        let mock = Arc::new(MockCommandRunner::new());
+        let mut line = pcsc_line(0);
+        line.mcc = String::new();
+        line.mnc = String::new();
+        assert_eq!(
+            resolve_mcc_mnc(mock.as_ref(), "gsm-sip-bridge", &line),
+            None
+        );
     }
 
     #[test]

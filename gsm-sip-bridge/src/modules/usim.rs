@@ -193,6 +193,35 @@ pub fn read_imsi(at: &mut dyn ApduTransport) -> BridgeResult<String> {
     Ok(imsi)
 }
 
+/// Reads the home network's MNC digit count from EF_AD (`6FAD`) on the
+/// currently-selected USIM ADF (`select_usim` must run first) — TS 31.102
+/// §4.2.18, byte 4's low nibble. The IMSI alone cannot say whether its MNC
+/// is 2 or 3 digits, and this file is the card's own authoritative answer.
+///
+/// The modem path reaches the same byte through `AT+CRSM=176,28589,0,0,4`
+/// (28589 = `0x6FAD`); running it over `ApduTransport` instead means a
+/// card-reader line derives its PLMN from the card with no modem involved.
+/// A card that leaves the nibble unprogrammed (legacy 2G SIMs may) errors
+/// here rather than guessing — `plmn::derive_plmn` decides what to fall
+/// back to, since only the modem path has a fallback available.
+pub fn read_mnc_length(at: &mut dyn ApduTransport) -> BridgeResult<u8> {
+    select_fid(at, 0x6FAD)?;
+    let raw = read_binary(at, 4)?;
+    let Some(&byte4) = raw.get(3) else {
+        return Err(BridgeError::Ims(format!(
+            "EF_AD shorter than 4 bytes (no MNC length byte): {}",
+            hex_encode(&raw)
+        )));
+    };
+    let mnc_len = byte4 & 0x0F;
+    if mnc_len != 2 && mnc_len != 3 {
+        return Err(BridgeError::Ims(format!(
+            "EF_AD MNC length not 2 or 3 (unprogrammed?): {mnc_len}"
+        )));
+    }
+    Ok(mnc_len)
+}
+
 const USIM_RID: &str = "A0000000871002";
 
 /// Extract a USIM AID from one EF_DIR record's raw hex data, if present.
@@ -512,6 +541,69 @@ mod tests {
             "01AB".to_string() + SW_SUCCESS,
         ]));
         assert!(read_imsi(&mut t).is_err());
+    }
+
+    #[test]
+    fn read_mnc_length_decodes_ef_ad_byte_four() {
+        // The same EF_AD content the modem path sees as
+        // `+CRSM: 144,0,"00000002"` — a 2-digit-MNC card (e.g. 404/094).
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),                  // SELECT EF_AD
+            "00000002".to_string() + SW_SUCCESS, // READ BINARY
+        ]));
+        assert_eq!(read_mnc_length(&mut t).unwrap(), 2);
+    }
+
+    #[test]
+    fn read_mnc_length_reads_a_three_digit_mnc_card() {
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "00000003".to_string() + SW_SUCCESS,
+        ]));
+        assert_eq!(read_mnc_length(&mut t).unwrap(), 3);
+    }
+
+    #[test]
+    fn read_mnc_length_ignores_the_high_nibble() {
+        // TS 31.102 reserves byte 4's high nibble; only the low one carries
+        // the length, and real cards do set bits up there.
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "000000F2".to_string() + SW_SUCCESS,
+        ]));
+        assert_eq!(read_mnc_length(&mut t).unwrap(), 2);
+    }
+
+    #[test]
+    fn read_mnc_length_retries_read_binary_on_wrong_le() {
+        // A real PC/SC reader enforces Le exactly, the same 6CXX path
+        // read_imsi needed against the OmniKey AG 3x21.
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "6C04".to_string(), // wrong Le -> retry with 4
+            "00000002".to_string() + SW_SUCCESS,
+        ]));
+        assert_eq!(read_mnc_length(&mut t).unwrap(), 2);
+    }
+
+    #[test]
+    fn read_mnc_length_rejects_an_unprogrammed_nibble() {
+        // Legacy SIMs may leave it 0 — better to error and let the caller
+        // fall back than to silently build the wrong realm.
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "00000000".to_string() + SW_SUCCESS,
+        ]));
+        assert!(read_mnc_length(&mut t).is_err());
+    }
+
+    #[test]
+    fn read_mnc_length_rejects_a_short_ef_ad() {
+        let mut t = QueuedTransport(std::collections::VecDeque::from([
+            "9000".to_string(),
+            "0000".to_string() + SW_SUCCESS,
+        ]));
+        assert!(read_mnc_length(&mut t).is_err());
     }
 
     #[test]

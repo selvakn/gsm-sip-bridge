@@ -5,6 +5,15 @@ description: "Task list for PC/SC Card-Reader-Backed VoWiFi Lines"
 
 # Tasks: PC/SC Card-Reader-Backed VoWiFi Lines
 
+> **Historical record.** The `[X]` items below describe the feature as
+> implemented at v8.1.0 and are left unedited. One decision has since been
+> superseded: T003/T009/T015's mandatory `mcc`/`mnc` for a `pcsc_reader` line.
+> Those are now optional and derived from the card's `EF_IMSI`/`EF_AD`
+> (`imsi_override` is still mandatory). Do not restore the `mcc`/`mnc`
+> validation or its tests from this list — see `data-model.md`'s Validation
+> Summary and the Unreleased section of `RELEASE_NOTES.md` for the current
+> contract.
+
 **Input**: Design documents from `/specs/023-omnikey-pcsc-vowifi/`
 **Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/pcsc-line-config-contract.md, quickstart.md
 
