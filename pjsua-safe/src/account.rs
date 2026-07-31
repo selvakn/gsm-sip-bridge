@@ -92,6 +92,86 @@ impl Account {
         }
     }
 
+    /// An account that never contacts a registrar.
+    ///
+    /// SIP server mode has no PBX to register to, but `Call::make` still needs
+    /// an `Account` to place calls *from*. This adds one to PJSUA with
+    /// `reg_uri` left unset and no credentials, so PJSUA never sends a
+    /// REGISTER and never expects a challenge.
+    ///
+    /// `id_uri` is the full identity (`sip:1001@192.168.1.1:5060`), not just a
+    /// user part — the handset sees it as the `From` on incoming calls, so it
+    /// should name the bridge as the phone knows it.
+    ///
+    /// Deliberately not `pjsua_acc_add_local`, which derives the identity from
+    /// a transport; we want a specific URI.
+    pub fn local(
+        _endpoint: &Endpoint,
+        id_uri: &str,
+        display_name: &str,
+    ) -> Result<Self, PjsipError> {
+        // The stub build has no `AccountConfig` to carry, so synthesise one
+        // that describes what this account is for.
+        let config = AccountConfig {
+            sip_server: String::new(),
+            sip_port: 0,
+            username: display_name.to_string(),
+            password: String::new(),
+            display_name: display_name.to_string(),
+        };
+
+        #[cfg(feature = "pjsip-linked")]
+        {
+            use std::ffi::CString;
+
+            unsafe // SAFETY: PJSIP initialized; acc_cfg and pj_str sources live until pjsua_acc_add returns
+            {
+                let mut acc_cfg: pjsua_sys::pjsua_acc_config = std::mem::zeroed();
+                pjsua_sys::pjsua_acc_config_default(&mut acc_cfg);
+
+                let id_str = format!("\"{display_name}\" <{id_uri}>");
+                let id_cstr = CString::new(id_str).unwrap();
+                acc_cfg.id = pjsua_sys::pj_str(id_cstr.as_ptr() as *mut std::os::raw::c_char);
+
+                // The whole point: no reg_uri means no REGISTER, and no
+                // credentials means nothing to answer a challenge with —
+                // neither of which this account will ever meet.
+                acc_cfg.cred_count = 0;
+
+                let mut acc_id: pjsua_sys::pjsua_acc_id = -1;
+                let status = pjsua_sys::pjsua_acc_add(&acc_cfg, 1, &mut acc_id);
+                if status != crate::error::PJ_SUCCESS {
+                    return Err(PjsipError::AccountRegister(format!(
+                        "pjsua_acc_add (local account) returned {status}"
+                    )));
+                }
+
+                tracing::info!(id = %id_uri, "local SIP account created (no registration)");
+                return Ok(Self {
+                    config,
+                    // Never registered, so `Drop` must not try to unregister
+                    // it — `pjsua_acc_set_registration(id, 0)` on an account
+                    // with no reg_uri is meaningless at best.
+                    registered: false,
+                    account_id: acc_id,
+                });
+            }
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            let _ = id_uri;
+            tracing::info!(
+                display_name,
+                "local SIP account created (stub mode - no real PJSIP linked)"
+            );
+            Ok(Self {
+                config,
+                registered: false,
+            })
+        }
+    }
+
     /// Whether the registrar currently has this account registered.
     ///
     /// Queries PJSUA's live account info rather than trusting the fire-and-forget

@@ -61,9 +61,11 @@ call at a time. ~900 lines of new Rust plus tests.
 | **V. Simplicity & Refactorability** | Two deliberate simplifications over the RFC — one binding per AOR (not a contact set), and no forking — are recorded with in-code justification comments. One new abstraction (`CallTarget`) is introduced; it is a **net removal** of existing duplication. See Complexity Tracking. | PASS with justification |
 
 **Post-Phase-1 re-check**: no new violations. The design adds exactly one
-function to `pjsua-safe` (`Account::local`, reusing the existing `unsafe` block,
-adding none) and no new crate dependencies. The feature's untestable-in-CI
-surface is a single stub returning `Ok`.
+function to `pjsua-safe` (`Account::local`, whose own `unsafe` block takes that
+crate from 28 to 29 — a 1.69% ratio against `count-unsafe.sh`'s 5% ceiling,
+with `gsm-sip-bridge/src` staying at the required zero) and no new crate
+dependencies. The feature's untestable-in-CI surface is a single stub returning
+`Ok`.
 
 ## Project Structure
 

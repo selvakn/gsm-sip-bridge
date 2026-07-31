@@ -240,10 +240,11 @@ and the only constructor is `Account::register` (`account.rs:29`), which always
 sets `acc_cfg.reg_uri` and fires a REGISTER. Server mode needs an identity to
 call *from* without registering *to* anything.
 
-The implementation is a sibling branch inside the **existing** `unsafe` block
-(`account.rs:38-78`): `pjsua_acc_config_default`, set `acc_cfg.id`, leave
-`reg_uri` zeroed and `cred_count = 0`, then `pjsua_acc_add`. **No new `unsafe`
-block is introduced**, so `count-unsafe.sh`'s ratio is essentially unchanged.
+The implementation mirrors `Account::register`: `pjsua_acc_config_default`, set
+`acc_cfg.id`, leave `reg_uri` zeroed and `cred_count = 0`, then `pjsua_acc_add`.
+Being a separate function it carries its own `unsafe` block, taking
+`pjsua-safe` from 28 to 29 — a ratio of 1.69%, well inside `count-unsafe.sh`'s
+5% threshold, and `gsm-sip-bridge/src` stays at the zero that script requires.
 
 Not `pjsua_acc_add_local`: it derives the account identity from a transport,
 whereas we want a specific `sip:{ring_aor}@{listen_addr}:{listen_port}` so the
