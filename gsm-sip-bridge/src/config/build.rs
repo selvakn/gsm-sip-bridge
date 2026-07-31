@@ -66,10 +66,63 @@ fn require_non_empty(value: &str, key: &str) -> BridgeResult<()> {
 
 // ------------------------------------------------------------------ sip ----
 
-fn build_sip(raw: RawSip) -> BridgeResult<SipConfig> {
-    require_non_empty(&raw.server, "sip.server")?;
-    require_non_empty(&raw.username, "sip.username")?;
-    require_non_empty(raw.password.expose_secret(), "sip.password")?;
+/// Rejects a key that is set but would have no effect in SIP-server mode.
+///
+/// A warning would be the softer choice, but this project already treats "a key
+/// that silently does nothing" as the failure worth being strict about — it is
+/// why `deny_unknown_fields` was adopted. An operator who leaves a PBX address
+/// in place while enabling server mode has misunderstood the mode; telling them
+/// at startup costs one restart, whereas a warning in a log nobody is watching
+/// costs a debugging session (spec 024, research.md R-010).
+fn forbid_in_server_mode(is_set: bool, key: &str, because: &str) -> BridgeResult<()> {
+    if is_set {
+        return Err(BridgeError::Config(format!(
+            "field {key} has no effect when [sip_server].enabled = true — {because}. Remove it."
+        )));
+    }
+    Ok(())
+}
+
+fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
+    if server.enabled {
+        forbid_in_server_mode(
+            !raw.server.is_empty(),
+            "sip.server",
+            "there is no PBX to register to in this mode",
+        )?;
+        forbid_in_server_mode(
+            !raw.username.is_empty(),
+            "sip.username",
+            "the bridge does not register anywhere in this mode; phone accounts \
+             live in [[sip_server.account]]",
+        )?;
+        forbid_in_server_mode(
+            !raw.password.expose_secret().is_empty(),
+            "sip.password",
+            "the bridge does not register anywhere in this mode; phone passwords \
+             live in [[sip_server.account]]",
+        )?;
+        if raw.local_port == server.listen_port {
+            return Err(BridgeError::Config(format!(
+                "[sip].local_port and [sip_server].listen_port are both {}, but they are two \
+                 separate SIP endpoints and cannot share one UDP port. \
+                 [sip_server].listen_port is what your IP phones register to — leave it and move \
+                 the bridge's own calling port instead, e.g. [sip].local_port = 5062",
+                server.listen_port
+            )));
+        }
+        if !raw.transport.eq_ignore_ascii_case("udp") {
+            return Err(BridgeError::Config(format!(
+                "field sip.transport must be \"udp\" when [sip_server].enabled = true \
+                 (the embedded registrar is UDP-only), got {:?}",
+                raw.transport
+            )));
+        }
+    } else {
+        require_non_empty(&raw.server, "sip.server")?;
+        require_non_empty(&raw.username, "sip.username")?;
+        require_non_empty(raw.password.expose_secret(), "sip.password")?;
+    }
 
     let transport = match raw.transport.to_ascii_lowercase().as_str() {
         "udp" => SipTransport::Udp,
@@ -98,12 +151,22 @@ fn build_sip(raw: RawSip) -> BridgeResult<SipConfig> {
         );
     }
 
+    // Defaulting the display name to the username keeps caller ID meaningful
+    // without making every deployment set two fields. In server mode there is
+    // no `sip.username` (it is forbidden above), so the ringing account stands
+    // in — that is the identity the phone sees calls arrive from.
+    let display_name = raw.display_name.clone().unwrap_or_else(|| {
+        if server.enabled {
+            server.ring_aor.clone()
+        } else {
+            raw.username.clone()
+        }
+    });
+
     Ok(SipConfig {
         server: raw.server,
         port: in_range(raw.port, "sip.port", 1..=65535)?,
-        // Defaulting the display name to the username keeps caller ID
-        // meaningful without making every deployment set two fields.
-        display_name: raw.display_name.unwrap_or_else(|| raw.username.clone()),
+        display_name,
         username: raw.username,
         password: raw.password,
         transport,
@@ -114,7 +177,14 @@ fn build_sip(raw: RawSip) -> BridgeResult<SipConfig> {
 
 // --------------------------------------------------------------- others ----
 
-fn build_bridge(raw: RawBridge) -> BridgeResult<BridgeSection> {
+fn build_bridge(raw: RawBridge, server: &SipServerConfig) -> BridgeResult<BridgeSection> {
+    if server.enabled {
+        forbid_in_server_mode(
+            !raw.sip_destination.is_empty(),
+            "bridge.sip_destination",
+            "the call destination in this mode is [sip_server].ring_aor",
+        )?;
+    }
     Ok(BridgeSection {
         sip_destination: raw.sip_destination,
         sip_dial_timeout_sec: in_range(
@@ -578,15 +648,122 @@ fn build_volte(raw: RawVolte) -> BridgeResult<VolteConfig> {
     })
 }
 
+// ---------------------------------------------------------- [sip_server] ---
+
+/// Validates `[sip_server]` — strict, because it is a call-path mode in the
+/// same class as `[sip]`/`[vowifi]`/`[volte]`, not a lenient side feature.
+///
+/// A disabled section is parsed but not validated, so placeholder values left
+/// behind by an operator who turned the mode off do not block startup — the
+/// same courtesy `[vowifi]` and `[volte]` extend (spec 024, FR-001/FR-004).
+fn build_sip_server(raw: RawSipServer) -> BridgeResult<SipServerConfig> {
+    let accounts: Vec<SipServerAccount> = raw
+        .account
+        .into_iter()
+        .map(|a| SipServerAccount {
+            username: a.username,
+            password: a.password,
+        })
+        .collect();
+
+    let cfg = SipServerConfig {
+        enabled: raw.enabled,
+        listen_addr: raw.listen_addr,
+        listen_port: raw.listen_port,
+        realm: raw.realm,
+        ring_aor: raw.ring_aor,
+        min_expires: raw.min_expires,
+        max_expires: raw.max_expires,
+        nonce_lifetime_sec: raw.nonce_lifetime_sec,
+        accounts,
+    };
+
+    if !cfg.enabled {
+        return Ok(cfg);
+    }
+
+    require_non_empty(&cfg.realm, "sip_server.realm")?;
+    require_non_empty(&cfg.ring_aor, "sip_server.ring_aor")?;
+    in_range(cfg.listen_port, "sip_server.listen_port", 1..=65535)?;
+    if cfg.listen_addr.parse::<std::net::IpAddr>().is_err() {
+        return Err(BridgeError::Config(format!(
+            "field sip_server.listen_addr must be an IP address, got {:?}",
+            cfg.listen_addr
+        )));
+    }
+
+    if cfg.accounts.is_empty() {
+        return Err(BridgeError::Config(
+            "sip_server: at least one [[sip_server.account]] is required when enabled = true"
+                .to_string(),
+        ));
+    }
+    for (i, account) in cfg.accounts.iter().enumerate() {
+        if account.username.is_empty() {
+            return Err(BridgeError::Config(format!(
+                "sip_server.account[{i}]: username must not be empty"
+            )));
+        }
+        if account.password.expose_secret().is_empty() {
+            return Err(BridgeError::Config(format!(
+                "sip_server.account[{i}]: password must not be empty"
+            )));
+        }
+        // Two accounts sharing a name leaves it undefined which one
+        // authenticates — the same class of error as two VoWiFi lines sharing
+        // an IMSI, and rejected the same way.
+        if let Some(j) = cfg.accounts[..i]
+            .iter()
+            .position(|p| p.username == account.username)
+        {
+            return Err(BridgeError::Config(format!(
+                "sip_server.account[{i}]: duplicate username {:?} (also used by account[{j}])",
+                account.username
+            )));
+        }
+    }
+
+    // Without this the mode starts cleanly and then silently never rings —
+    // the failure the operator would find hardest to diagnose (FR-004).
+    if !cfg.accounts.iter().any(|a| a.username == cfg.ring_aor) {
+        let available: Vec<&str> = cfg.accounts.iter().map(|a| a.username.as_str()).collect();
+        return Err(BridgeError::Config(format!(
+            "sip_server.ring_aor {:?} matches no configured account (available: {})",
+            cfg.ring_aor,
+            available.join(", ")
+        )));
+    }
+
+    in_range(cfg.min_expires, "sip_server.min_expires", 30..=86400)?;
+    in_range(cfg.max_expires, "sip_server.max_expires", 30..=86400)?;
+    if cfg.min_expires > cfg.max_expires {
+        return Err(BridgeError::Config(format!(
+            "sip_server.min_expires ({}) must not exceed sip_server.max_expires ({})",
+            cfg.min_expires, cfg.max_expires
+        )));
+    }
+    in_range(
+        cfg.nonce_lifetime_sec,
+        "sip_server.nonce_lifetime_sec",
+        10..=3600,
+    )?;
+
+    Ok(cfg)
+}
+
 // ----------------------------------------------------------------- entry ---
 
 /// Assembles the runtime config from the deserialised document.
 pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
     let sms = build_sms(raw.sms)?;
     let alerts = build_alerts(raw.alerts, &sms);
+    // Built first: `[sip_server].enabled` changes which `[sip]` and `[bridge]`
+    // keys are required versus forbidden, so those two need it in hand. Same
+    // shape as `build_alerts(raw.alerts, &sms)` above.
+    let sip_server = build_sip_server(raw.sip_server)?;
     Ok(AppConfig {
-        sip: build_sip(raw.sip)?,
-        bridge: build_bridge(raw.bridge)?,
+        sip: build_sip(raw.sip, &sip_server)?,
+        bridge: build_bridge(raw.bridge, &sip_server)?,
         sms,
         metrics: build_metrics(raw.metrics)?,
         modules: build_modules(raw.modules)?,
@@ -599,5 +776,6 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
         volte: build_volte(raw.volte)?,
         logging: build_logging(raw.logging)?,
         alerts,
+        sip_server,
     })
 }

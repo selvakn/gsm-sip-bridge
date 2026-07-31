@@ -456,6 +456,66 @@ section! {
     }
 }
 
+// --------------------------------------------------------- [sip_server] ----
+
+section! {
+    /// Exactly the `[sip_server]` keys.
+    ///
+    /// The opt-in mode in which the bridge *is* the SIP server — IP phones
+    /// REGISTER to it and it INVITEs the registered phone — instead of
+    /// registering to an external PBX (spec 024). Off by default; several
+    /// `[sip]` keys become errors when it is on, see `build::build_sip_server`.
+    pub struct RawSipServer {
+        pub enabled: bool,
+        pub listen_addr: String,
+        pub listen_port: u16,
+        pub realm: String,
+        /// Which account inbound calls ring. Exactly one; other accounts may
+        /// register but are never called.
+        pub ring_aor: String,
+        pub min_expires: u32,
+        pub max_expires: u32,
+        pub nonce_lifetime_sec: u64,
+        /// `[[sip_server.account]]` — singular because the field name *is* the
+        /// TOML key, the same reason `RawVowifi::line` is not `lines`.
+        pub account: Vec<RawSipServerAccount>,
+    }
+}
+
+impl Default for RawSipServer {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: "0.0.0.0".to_string(),
+            listen_port: 5060,
+            realm: "gsm-sip-bridge".to_string(),
+            ring_aor: String::new(),
+            min_expires: 60,
+            max_expires: 3600,
+            nonce_lifetime_sec: 120,
+            account: Vec::new(),
+        }
+    }
+}
+
+section! {
+    pub struct RawSipServerAccount {
+        pub username: String,
+        pub password: Secret<String>,
+    }
+}
+
+// Hand-written rather than derived: `Secret<String>` deliberately has no
+// `Default` impl, so an unset secret cannot be conjured silently.
+impl Default for RawSipServerAccount {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            password: Secret::new(String::new()),
+        }
+    }
+}
+
 // ------------------------------------------------- unknown-key checking ----
 
 /// Every section's accepted keys, keyed by the section's TOML path.
@@ -485,6 +545,8 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("vowifi.line", RawVowifiLine::KEYS),
         ("volte", RawVolte::KEYS),
         ("volte.line", RawVolteLine::KEYS),
+        ("sip_server", RawSipServer::KEYS),
+        ("sip_server.account", RawSipServerAccount::KEYS),
     ]
 }
 
@@ -571,5 +633,6 @@ section! {
         pub volte: RawVolte,
         pub logging: RawLogging,
         pub alerts: RawAlerts,
+        pub sip_server: RawSipServer,
     }
 }

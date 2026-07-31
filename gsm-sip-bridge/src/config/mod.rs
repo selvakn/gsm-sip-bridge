@@ -48,6 +48,45 @@ pub struct BridgeSection {
     pub sip_dial_timeout_sec: u64,
 }
 
+/// One IP phone the embedded registrar will accept (spec 024, FR-002).
+#[derive(Clone, Debug)]
+pub struct SipServerAccount {
+    pub username: String,
+    pub password: Secret<String>,
+}
+
+/// The opt-in SIP-server mode: IP phones REGISTER here instead of the bridge
+/// registering to a PBX (spec 024).
+///
+/// When `enabled`, `[sip].server`/`username`/`password` and
+/// `[bridge].sip_destination` become configuration *errors* rather than
+/// requirements — there is no PBX for them to describe. See
+/// `build::build_sip_server`.
+#[derive(Clone, Debug)]
+pub struct SipServerConfig {
+    pub enabled: bool,
+    pub listen_addr: String,
+    pub listen_port: u16,
+    pub realm: String,
+    /// The single account inbound calls ring. Others may register but are
+    /// never called — the bridge places one call at a time and does not fork.
+    pub ring_aor: String,
+    pub min_expires: u32,
+    pub max_expires: u32,
+    pub nonce_lifetime_sec: u64,
+    pub accounts: Vec<SipServerAccount>,
+}
+
+impl SipServerConfig {
+    /// The configured password for `username`, if that account exists.
+    pub fn password_for(&self, username: &str) -> Option<&str> {
+        self.accounts
+            .iter()
+            .find(|a| a.username == username)
+            .map(|a| a.password.expose_secret().as_str())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SmsConfig {
     pub enabled: bool,
@@ -725,6 +764,7 @@ pub struct AppConfig {
     pub volte: VolteConfig,
     pub logging: LoggingConfig,
     pub alerts: AlertsConfig,
+    pub sip_server: SipServerConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -1577,5 +1617,273 @@ password = "pass"
         .map(|c| c.volte)
         .expect("parses");
         assert!(parsed.bridge_inbound);
+    }
+
+    // ------------------------------------------------------- [sip_server] ---
+
+    /// A complete, valid server-mode document. Note what is *absent*: no
+    /// `[sip].server`/`username`/`password`, because in this mode they are
+    /// errors rather than requirements.
+    const SERVER_MODE_TOML: &str = r#"
+[sip]
+local_port = 5062
+
+[sip_server]
+enabled = true
+ring_aor = "1001"
+
+[[sip_server.account]]
+username = "1001"
+password = "s3cret"
+"#;
+
+    /// A valid server-mode document with `extra` spliced in *inside*
+    /// `[sip_server]` — i.e. ahead of the account table, so appended keys
+    /// belong to the section and not to the last `[[sip_server.account]]`.
+    fn server_mode_with(extra: &str) -> BridgeResult<AppConfig> {
+        try_parse(&format!(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\
+             {extra}\n[[sip_server.account]]\nusername = \"1001\"\npassword = \"s3cret\"\n"
+        ))
+    }
+
+    #[test]
+    fn sip_server_is_off_and_harmless_when_the_section_is_absent() {
+        let c = parse(MINIMAL_TOML);
+        assert!(!c.sip_server.enabled, "must be opt-in");
+        assert_eq!(c.sip_server.listen_addr, "0.0.0.0");
+        assert_eq!(c.sip_server.listen_port, 5060);
+        assert_eq!(c.sip_server.realm, "gsm-sip-bridge");
+        assert_eq!(c.sip_server.min_expires, 60);
+        assert_eq!(c.sip_server.max_expires, 3600);
+        assert_eq!(c.sip_server.nonce_lifetime_sec, 120);
+        assert!(c.sip_server.accounts.is_empty());
+    }
+
+    /// A disabled section full of nonsense must not block startup — the same
+    /// courtesy `[vowifi]` and `[volte]` extend to an operator who turned a
+    /// mode off without cleaning up after it.
+    #[test]
+    fn a_disabled_sip_server_section_is_not_validated() {
+        let c = try_parse(&format!(
+            "{MINIMAL_TOML}\n[sip_server]\nenabled = false\nring_aor = \"nobody\"\n\
+             listen_addr = \"not-an-ip\"\n"
+        ))
+        .expect("a disabled section must not be validated");
+        assert!(!c.sip_server.enabled);
+    }
+
+    #[test]
+    fn a_valid_server_mode_document_parses() {
+        let c = try_parse(SERVER_MODE_TOML).expect("fixture must parse");
+        assert!(c.sip_server.enabled);
+        assert_eq!(c.sip_server.ring_aor, "1001");
+        assert_eq!(c.sip_server.accounts.len(), 1);
+        assert_eq!(c.sip_server.password_for("1001"), Some("s3cret"));
+        assert_eq!(c.sip_server.password_for("nobody"), None);
+        // The ringing account stands in for the absent `sip.username`, so the
+        // phone sees calls arrive from an identity it recognises.
+        assert_eq!(c.sip.display_name, "1001");
+    }
+
+    #[test]
+    fn server_mode_requires_a_realm_and_a_ring_aor() {
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\n\
+             [[sip_server.account]]\nusername = \"1001\"\npassword = \"p\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sip_server.ring_aor"), "got: {err}");
+
+        let err = server_mode_with("realm = \"\"\n").unwrap_err().to_string();
+        assert!(err.contains("sip_server.realm"), "got: {err}");
+    }
+
+    #[test]
+    fn server_mode_requires_at_least_one_account() {
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("at least one [[sip_server.account]]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn server_mode_rejects_an_empty_account_username_or_password() {
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\
+             [[sip_server.account]]\nusername = \"\"\npassword = \"p\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("account[0]: username"), "got: {err}");
+
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\
+             [[sip_server.account]]\nusername = \"1001\"\npassword = \"\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("account[0]: password"), "got: {err}");
+    }
+
+    /// Two accounts sharing a name leaves it undefined which one
+    /// authenticates.
+    #[test]
+    fn server_mode_rejects_duplicate_account_usernames() {
+        let err = server_mode_with(
+            "\n[[sip_server.account]]\nusername = \"1001\"\npassword = \"other\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate username"), "got: {err}");
+        assert!(
+            err.contains("account[0]"),
+            "must name the earlier entry: {err}"
+        );
+    }
+
+    /// Without this the mode starts cleanly and silently never rings — the
+    /// hardest failure for an operator to diagnose.
+    #[test]
+    fn server_mode_rejects_a_ring_aor_matching_no_account() {
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"9999\"\n\
+             [[sip_server.account]]\nusername = \"1001\"\npassword = \"p\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("matches no configured account"), "got: {err}");
+        assert!(err.contains("1001"), "must list what is available: {err}");
+    }
+
+    #[test]
+    fn server_mode_validates_expiry_bounds_and_nonce_lifetime() {
+        for (extra, needle) in [
+            ("min_expires = 10\n", "sip_server.min_expires"),
+            ("max_expires = 999999\n", "sip_server.max_expires"),
+            ("nonce_lifetime_sec = 5\n", "sip_server.nonce_lifetime_sec"),
+        ] {
+            let err = server_mode_with(extra).unwrap_err().to_string();
+            assert!(err.contains(needle), "{extra} -> {err}");
+        }
+
+        let err = server_mode_with("min_expires = 3600\nmax_expires = 120\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not exceed"), "got: {err}");
+    }
+
+    #[test]
+    fn server_mode_rejects_a_non_ip_listen_addr() {
+        let err = server_mode_with("listen_addr = \"phones.local\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip_server.listen_addr"), "got: {err}");
+    }
+
+    /// A key that silently does nothing is the failure strict parsing exists
+    /// to prevent — so a leftover PBX address is an error, not a warning.
+    #[test]
+    fn server_mode_forbids_settings_that_would_have_no_effect() {
+        const TAIL: &str = "\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\n\
+                            [[sip_server.account]]\nusername = \"1001\"\npassword = \"s3cret\"\n";
+        for (key, doc) in [
+            (
+                "sip.server",
+                format!("[sip]\nlocal_port = 5062\nserver = \"pbx.example.com\"\n{TAIL}"),
+            ),
+            (
+                "sip.username",
+                format!("[sip]\nlocal_port = 5062\nusername = \"trunk\"\n{TAIL}"),
+            ),
+            (
+                "sip.password",
+                format!("[sip]\nlocal_port = 5062\npassword = \"p\"\n{TAIL}"),
+            ),
+            (
+                "bridge.sip_destination",
+                format!("[sip]\nlocal_port = 5062\n\n[bridge]\nsip_destination = \"200\"\n{TAIL}"),
+            ),
+        ] {
+            let err = try_parse(&doc).unwrap_err().to_string();
+            assert!(err.contains(key), "{key} must be refused, got: {err}");
+            assert!(err.contains("no effect"), "{key} -> {err}");
+        }
+    }
+
+    /// Both keys default to 5060, so every operator enabling the mode meets
+    /// this once. The message must therefore carry the remedy.
+    #[test]
+    fn server_mode_rejects_a_port_collision_and_names_the_remedy() {
+        let err = try_parse(
+            "[sip_server]\nenabled = true\nring_aor = \"1001\"\n\
+             [[sip_server.account]]\nusername = \"1001\"\npassword = \"p\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cannot share one UDP port"), "got: {err}");
+        assert!(
+            err.contains("local_port = 5062"),
+            "must name the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn server_mode_requires_udp() {
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\ntransport = \"tcp\"\n\n[sip_server]\nenabled = true\n\
+             ring_aor = \"1001\"\n\n[[sip_server.account]]\n\
+             username = \"1001\"\npassword = \"p\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sip.transport"), "got: {err}");
+        assert!(err.contains("UDP-only"), "got: {err}");
+    }
+
+    /// With the mode off, `[sip]` keeps its existing requirements untouched —
+    /// the no-regression guarantee behind FR-024.
+    #[test]
+    fn disabling_server_mode_leaves_the_sip_section_requirements_intact() {
+        let err = try_parse("[sip]\nlocal_port = 5062\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip.server"), "got: {err}");
+    }
+
+    #[test]
+    fn an_account_password_resolves_from_the_environment() {
+        std::env::set_var("TEST_PHONE_PW_024", "from-env");
+        let c = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\
+             [[sip_server.account]]\nusername = \"1001\"\npassword = \"env:TEST_PHONE_PW_024\"\n",
+        )
+        .expect("parses");
+        assert_eq!(c.sip_server.password_for("1001"), Some("from-env"));
+        std::env::remove_var("TEST_PHONE_PW_024");
+    }
+
+    #[test]
+    fn an_unknown_sip_server_key_is_rejected() {
+        let err = server_mode_with("ring_all = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip_server.ring_all"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_sip_server_account_key_is_rejected() {
+        let err = server_mode_with(
+            "\n[[sip_server.account]]\nusername = \"1002\"\npassword = \"p\"\nrealm = \"x\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sip_server.account.realm"), "got: {err}");
     }
 }

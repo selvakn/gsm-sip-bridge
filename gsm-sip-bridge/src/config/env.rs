@@ -29,6 +29,9 @@ const SECRET_KEY_PATHS: &[&str] = &[
     "alerts.registration_loss.discord_webhook_url",
     "alerts.tunnel_failure.discord_webhook_url",
     "alerts.missed_call.discord_webhook_url",
+    // Array elements keep the array's own path (see `resolve_in_place`), so
+    // this single entry covers every `[[sip_server.account]]`.
+    "sip_server.account.password",
 ];
 
 fn is_secret(path: &str) -> bool {
