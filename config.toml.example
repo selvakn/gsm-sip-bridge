@@ -258,20 +258,33 @@ max_lines = 8
 # tunnel_engine = "strongswan" (the default) — its eap-sim-pcsc plugin
 # auto-detects any connected PC/SC reader with no plugin-side config; the swu
 # engine has no PC/SC support and supervise refuses to start if a
-# pcsc_reader line is configured under it. mcc/mnc/imsi_override are
-# mandatory here (there's no modem to derive them from) — read the IMSI once
-# via pySim-read.py or opensc-tool against the reader. IMS-AKA registration
-# (not just the ePDG tunnel) also needs an IMEI for the Contact header's
-# +sip.instance; with no modem to read one from via AT+CGSN, a stable,
-# Luhn-valid one is auto-generated from imsi_override unless imei_override
-# is set explicitly below. See docs/omnikey-pcsc-vowifi.md.
+# pcsc_reader line is configured under it.
+#
+# imsi_override is the only mandatory field. It is NOT there because the IMSI
+# can't be read — it can, straight off the card — but because it names which
+# reader's card this line owns: with two readers attached, the IMSI is what
+# binds each line to its own SIM, and that has to be known before any card
+# session is opened. Read it once via pySim-read.py or opensc-tool.
+#
+# mcc/mnc are optional, exactly as on a modem line: both derive from the
+# card's own files (EF_IMSI for the digits, EF_AD for whether the MNC is 2 or
+# 3 digits). Leaving them unset is preferred — a hand-written pair that gets
+# the MNC length wrong silently builds the wrong ePDG FQDN and IMS realm.
+# Pin them only if this card's EF_AD omits the MNC-length byte (some legacy
+# SIMs), which fails loudly at startup and says so.
+#
+# IMS-AKA registration (not just the ePDG tunnel) also needs an IMEI for the
+# Contact header's +sip.instance. That one genuinely isn't on the card — it's
+# a device identity — so with no modem to read via AT+CGSN, a stable,
+# Luhn-valid IMEI is auto-generated from the IMSI unless imei_override is set
+# explicitly below. See docs/omnikey-pcsc-vowifi.md.
 #
 # [[vowifi.line]]
 # pcsc_reader = true
 # imsi_override = "404940123456789"
-# mcc = "404"
-# mnc = "094"
 # imei_override = "490154203237518"  # optional — auto-generated if unset
+# mcc = "404"                        # optional — derived from EF_IMSI/EF_AD
+# mnc = "094"                        # optional — derived from EF_IMSI/EF_AD
 
 # ============================================================================
 # VoLTE inbound bridge — specs/015-volte-host-ims, 016-volte-calls,

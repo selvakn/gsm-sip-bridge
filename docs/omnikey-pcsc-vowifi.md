@@ -13,10 +13,12 @@ This covers **both** halves of a VoWiFi line: the ePDG tunnel (strongSwan +
 (`modules::pcsc_card::PcscTransport`, implementing the same
 `modules::usim::ApduTransport` trait `AtCommander` does for a modem line)
 since `ims::register_session` talked to the SIM only via `AT+CSIM` until
-then. There is no modem to read an IMEI from either, so one is
-auto-generated (deterministic per IMSI, Luhn-valid per TS 23.003 Annex A —
-not a real registered device identity) unless `imei_override` is set
-explicitly.
+then. An IMEI is a device identity rather than card data, so there is
+genuinely nothing to read one from here: one is auto-generated (deterministic
+per IMSI, Luhn-valid per TS 23.003 Annex A — not a real registered device
+identity) unless `imei_override` is set explicitly. Everything that *is* on
+the card — the IMSI, and the MCC/MNC derived from it plus `EF_AD` — is read
+from the card, so no PLMN needs configuring.
 
 With more than one `pcsc_reader` line (each with its own real reader),
 IMS-AKA registration picks the reader whose card's own `EF_IMSI` matches
@@ -39,8 +41,30 @@ that line's configured `imsi_override`, the same disambiguation
 
 ## Reading the IMSI once
 
-A card-reader line has no modem to read `mcc`/`mnc`/`imsi_override` from at
-startup, so they're mandatory config overrides instead — pin them once:
+`imsi_override` is the one identity field a card-reader line must configure.
+Not because the IMSI is unreadable — `EF_IMSI` is read straight off the card
+over PC/SC, and `PcscTransport::connect` does exactly that on every candidate
+reader — but because it is the **reader-to-line binding key**: which physical
+card a line owns has to be known before any card session is opened, and
+strongSwan's `eap-sim-pcsc` needs it in the rendered NAI at orchestration
+time for the same reason.
+
+`mcc`/`mnc`, by contrast, are optional here, exactly as on a modem line: both
+derive from the card's own files — `EF_IMSI` for the digits and `EF_AD`
+(`6FAD`, TS 31.102 §4.2.18 byte 4) for whether the MNC is 2 or 3 digits long.
+`vowifi-plmn --pcsc-imsi <IMSI>` reads both over PC/SC with no modem
+involved, and both `supervise` (for the ePDG FQDN) and `vowifi-ims-agent`
+(for the IMS realm) call that path when the line leaves them unset. Prefer
+leaving them unset: a hand-written pair that gets the MNC length wrong
+silently builds the wrong ePDG FQDN *and* the wrong IMS realm.
+
+The one case that still needs them pinned is a card whose `EF_AD` omits the
+MNC-length byte (some legacy 2G SIMs). The modem path falls back to the
+serving PLMN from `AT+COPS` there; a reader has no radio and so no serving
+network to ask, so the line fails at startup with an error saying to set
+`mcc`/`mnc` explicitly.
+
+To read the IMSI once:
 
 ```bash
 lsusb | grep -i omnikey        # confirm the reader is visible to the host
@@ -67,8 +91,15 @@ tunnel_engine = "strongswan"   # required — swu has no PC/SC support
 [[vowifi.line]]
 pcsc_reader = true
 imsi_override = "404940123456789"
-mcc = "404"
-mnc = "043"
+# mcc/mnc omitted on purpose — derived from the card's EF_IMSI + EF_AD.
+# Pin them only if this card's EF_AD has no MNC-length byte.
+```
+
+To check what the card resolves to before starting anything:
+
+```bash
+gsm-sip-bridge vowifi-plmn --pcsc-imsi 404940123456789
+# → 404 094
 ```
 
 Existing `[[vowifi.line]]` entries for modem-backed lines, if any, are left

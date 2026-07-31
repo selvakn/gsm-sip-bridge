@@ -7,12 +7,20 @@ any entry that sets it.
 
 ## Config shape
 
+> **Superseded (post-v8.1.0):** `mcc`/`mnc` are no longer mandatory here. The
+> original rationale — "no modem to derive them from" — was wrong: the MCC is
+> the first three IMSI digits and the MNC length is in the card's own `EF_AD`
+> (`6FAD`), both readable over PC/SC. Only the `AT+COPS` fallback for cards
+> whose `EF_AD` lacks the MNC-length byte is modem-only. See the Unreleased
+> section of `RELEASE_NOTES.md`. `imsi_override` remains mandatory, but as the
+> reader-to-line binding key, not because the IMSI is unreadable.
+
 ```toml
 [[vowifi.line]]
 pcsc_reader = true            # marks this entry as card-reader-backed, not a modem matcher
 imsi_override = "404940123456789"  # MANDATORY when pcsc_reader = true
-mcc = "404"                        # MANDATORY when pcsc_reader = true
-mnc = "043"                        # MANDATORY when pcsc_reader = true (zero-padded to 3 digits)
+mcc = "404"                        # optional (was mandatory) — derived from EF_IMSI/EF_AD
+mnc = "043"                        # optional (was mandatory) — zero-padded to 3 digits
 ```
 
 `modem_serial`/`modem_port` MUST NOT be set alongside `pcsc_reader = true`
@@ -22,10 +30,10 @@ a `pcsc_reader` line (no modem/IMEI concept applies).
 
 ## Obligations of config validation (startup, before line resolution)
 
-1. **Mandatory fields**: a `pcsc_reader = true` entry missing any of
-   `imsi_override` / `mcc` / `mnc` fails config load with an error naming
-   the entry's position and the missing field(s) — never a partial or
-   silently-skipped line.
+1. **Mandatory fields**: a `pcsc_reader = true` entry missing `imsi_override`
+   fails config load with an error naming the entry's position — never a
+   partial or silently-skipped line. (`mcc`/`mnc` were also required here
+   before the supersession noted above; they now auto-derive from the card.)
 2. **Engine compatibility**: if any `pcsc_reader = true` entry exists while
    `[vowifi].tunnel_engine = "swu"`, `supervise` fails at startup with an
    error naming the incompatible line and setting, before any per-line

@@ -180,14 +180,31 @@ fn run_inner(
     let pcscf_addr = transport_handle.pcscf.ip();
     // Empty mcc/mnc means auto-derive (config::VowifiConfig::mcc docs). The
     // IMS realm is built from these, so derive them from the SIM the same
-    // way entrypoint.sh's `vowifi-plmn` call does for the tunnel side —
-    // opening the modem here is nothing new, registration already uses it
-    // for AT+CIMI/AT+CSIM below.
+    // way `supervise::orchestrate`'s `vowifi-plmn` call does for the tunnel
+    // side — over whichever transport this line's SIM is actually on. For a
+    // modem line, opening the modem here is nothing new (registration
+    // already uses it for AT+CIMI/AT+CSIM below); for a `pcsc_reader` line
+    // there is no modem port to open, so EF_IMSI/EF_AD come off the reader
+    // holding this line's card, which is why mcc/mnc need not be configured.
     let (mcc, mnc) = if config.mcc.is_empty() {
-        let mut at = crate::modules::at_commander::AtCommander::open(std::path::Path::new(
-            &config.modem_port,
-        ))?;
-        let plmn = crate::vowifi::plmn::derive_plmn(&mut at)?;
+        let plmn = if config.pcsc_reader {
+            let imsi = config.imsi_override.clone().ok_or_else(|| {
+                BridgeError::Ims(
+                    "pcsc_reader line has no imsi_override configured, so its \
+                     reader cannot be identified to derive mcc/mnc"
+                        .into(),
+                )
+            })?;
+            let mut card = crate::modules::pcsc_card::PcscTransport::connect(&imsi)?;
+            // Held exclusively: charon's eap-sim-pcsc may be mid-EAP on this
+            // same card, and an interleaved SELECT would corrupt the read.
+            card.with_transaction(crate::vowifi::plmn::derive_plmn_from_card)?
+        } else {
+            let mut at = crate::modules::at_commander::AtCommander::open(std::path::Path::new(
+                &config.modem_port,
+            ))?;
+            crate::vowifi::plmn::derive_plmn(&mut at)?
+        };
         tracing::info!(mcc = %plmn.mcc, mnc = %plmn.mnc, "derived home PLMN from the SIM");
         (plmn.mcc, plmn.mnc)
     } else {

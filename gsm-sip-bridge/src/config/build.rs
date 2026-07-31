@@ -451,18 +451,24 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
                      card-reader-backed, never both"
                 )));
             }
-            // A card-reader line has no modem to read these from, so they
-            // cannot be auto-derived the way a modem line's are.
-            if l.mcc.is_none() || l.mnc.is_none() {
-                return Err(BridgeError::Config(format!(
-                    "vowifi.line[{i}]: pcsc_reader = true requires mcc and mnc \
-                     (no modem to derive them from)"
-                )));
-            }
+            // `mcc`/`mnc` are optional here, exactly as on a modem line:
+            // both derive from files on the card itself (EF_IMSI for the
+            // digits, EF_AD for the MNC length), which `vowifi-plmn
+            // --pcsc-imsi` reads over PC/SC with no modem involved. Only the
+            // legacy `AT+COPS` fallback is modem-only, so a card whose EF_AD
+            // omits the MNC-length byte is the one case that still needs
+            // them pinned — and it fails loudly at startup saying so.
+            //
+            // `imsi_override` stays mandatory, but not because the IMSI is
+            // unreadable — `PcscTransport::connect` reads EF_IMSI off every
+            // candidate reader. It is the *reader-to-line binding key*:
+            // which physical card this line owns has to be known before any
+            // card session exists, and strongSwan's `eap-sim-pcsc` needs it
+            // in the rendered NAI at orchestration time for the same reason.
             if l.imsi_override.is_none() {
                 return Err(BridgeError::Config(format!(
                     "vowifi.line[{i}]: pcsc_reader = true requires imsi_override \
-                     (no modem to read it from)"
+                     — it names which reader's card this line owns"
                 )));
             }
         }

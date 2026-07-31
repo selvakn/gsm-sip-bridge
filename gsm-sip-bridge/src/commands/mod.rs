@@ -45,7 +45,9 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
             crate::vowifi::usim_bridge::run(&args.modem, &args.vpcd_host, args.vpcd_port)
         }
         Commands::VowifiImsi(args) => crate::vowifi::imsi::run(&args.modem),
-        Commands::VowifiPlmn(args) => crate::vowifi::plmn::run(&args.modem),
+        Commands::VowifiPlmn(args) => {
+            crate::vowifi::plmn::run(args.modem.as_deref(), args.pcsc_imsi.as_deref())
+        }
         Commands::ModemIms(args) => vowifi::handle_modem_ims_command(args, cli),
         Commands::VoltePdn(args) => volte::handle_volte_pdn_command(args, cli.config.as_deref()),
         Commands::VolteStatus(args) => volte::handle_volte_status_command(args),

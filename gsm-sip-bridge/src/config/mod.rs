@@ -1449,7 +1449,7 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_pcsc_reader_line_parses_with_all_mandatory_fields() {
+    fn vowifi_pcsc_reader_line_parses_with_an_explicit_plmn() {
         let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\nmcc = \"404\"\nmnc = \"043\"\n",
             MINIMAL_TOML
@@ -1475,8 +1475,10 @@ password = "pass"
 
     #[test]
     fn vowifi_pcsc_reader_rejects_missing_imsi_override() {
-        // specs/023-omnikey-pcsc-vowifi T009: no modem to read the IMSI from,
-        // so it's mandatory when pcsc_reader = true.
+        // Mandatory not because the IMSI is unreadable (PcscTransport reads
+        // EF_IMSI off every candidate reader) but because it is the key that
+        // binds this line to one physical card, needed before any card
+        // session exists.
         let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nmcc = \"404\"\nmnc = \"043\"\n",
             MINIMAL_TOML
@@ -1486,16 +1488,22 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_pcsc_reader_rejects_missing_mcc_mnc() {
+    fn vowifi_pcsc_reader_allows_omitted_mcc_mnc() {
+        // Both derive from files on the card itself — EF_IMSI for the digits,
+        // EF_AD for the MNC length — read over PC/SC with no modem involved
+        // (`vowifi-plmn --pcsc-imsi`). Requiring them by hand was the older
+        // behavior, and a mistyped 2-vs-3-digit MNC silently produced the
+        // wrong ePDG FQDN and IMS realm, so leaving them out is now the
+        // better default.
         let src = format!(
             "{}\n[vowifi]\n[[vowifi.line]]\npcsc_reader = true\nimsi_override = \"404940123456789\"\n",
             MINIMAL_TOML
         );
-        let err = try_parse(&src).map(|c| c.vowifi).unwrap_err().to_string();
-        assert!(
-            err.contains("mcc") && err.contains("mnc"),
-            "unexpected error: {err}"
-        );
+        let cfg = parse(&src);
+        let line = &cfg.vowifi.line_overrides[0];
+        assert!(line.pcsc_reader);
+        assert_eq!(line.mcc, None);
+        assert_eq!(line.mnc, None);
     }
 
     #[test]

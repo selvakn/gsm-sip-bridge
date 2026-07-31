@@ -11,16 +11,23 @@ one field:
 |---|---|---|
 | `modem_serial` | `Option<String>` | Existing — modem matcher. Mutually exclusive with `pcsc_reader = true`. |
 | `modem_port` | `Option<String>` | Existing — modem matcher. Mutually exclusive with `pcsc_reader = true`. |
-| `mcc` | `Option<String>` | Existing. **Mandatory** (validation error if absent) when `pcsc_reader = true`. |
-| `mnc` | `Option<String>` | Existing. **Mandatory** when `pcsc_reader = true`. |
-| `imsi_override` | `Option<String>` | Existing. **Mandatory** when `pcsc_reader = true` (no modem to read it from). |
+| `mcc` | `Option<String>` | Existing. Optional — *was* mandatory when `pcsc_reader = true`; now derived from the card's `EF_IMSI` (see supersession note below). |
+| `mnc` | `Option<String>` | Existing. Optional — *was* mandatory when `pcsc_reader = true`; now derived from the card's `EF_AD` MNC-length byte. |
+| `imsi_override` | `Option<String>` | Existing. **Mandatory** when `pcsc_reader = true` — it is the reader-to-line binding key, needed before any card session exists (not because the IMSI is unreadable). |
 | `imei_override` | `Option<String>` | Existing. Not applicable to a pcsc line (no modem/IMEI) — ignored if set alongside `pcsc_reader = true`. |
 | `pcsc_reader` | `bool` (**new**) | Default `false`. When `true`, this entry describes a card-reader-backed line rather than a modem matcher. |
 
-**Validation rule** (new): if `pcsc_reader == true`, `mcc`, `mnc`, and
-`imsi_override` must all be `Some` and non-empty, or config load fails with
-an error naming the specific line and missing field(s) — no silent partial
-line.
+**Validation rule** (new): if `pcsc_reader == true`, `imsi_override` must be
+`Some` and non-empty, or config load fails with an error naming the specific
+line — no silent partial line.
+
+> **Superseded (post-v8.1.0):** this rule originally also required `mcc`/`mnc`,
+> on the mistaken grounds that there was "no modem to derive them from". Both
+> derive from files on the card (`EF_IMSI` for the digits, `EF_AD` byte 4 for
+> the MNC length) and are now read over `ApduTransport` by
+> `plmn::derive_plmn_from_card` / `vowifi-plmn --pcsc-imsi`. Only the legacy
+> `AT+COPS` fallback is modem-only. See the Unreleased section of
+> `RELEASE_NOTES.md`.
 
 **Validation rule** (new): if `pcsc_reader == true` and `[vowifi].tunnel_engine
 != "strongswan"`, `supervise` fails at startup naming the incompatible line

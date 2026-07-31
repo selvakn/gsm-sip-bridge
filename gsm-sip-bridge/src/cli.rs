@@ -82,11 +82,15 @@ pub enum Commands {
     VowifiImsi(VowifiImsiArgs),
     /// Prints the home network's MCC and MNC (space-separated, MNC
     /// zero-padded to 3 digits) derived from the SIM, and exits: MCC is the
-    /// IMSI's first 3 digits, the 2-vs-3-digit MNC ambiguity is resolved
-    /// via the SIM's EF_AD file (`AT+CRSM`), falling back to the registered
-    /// PLMN from numeric `AT+COPS`. Used by `supervise::orchestrate` when a
-    /// line's `mcc`/`mnc` (from `[[vowifi.line]]`, or auto-discovery) are
-    /// left unset.
+    /// IMSI's first 3 digits, and the 2-vs-3-digit MNC ambiguity is resolved
+    /// via the SIM's own EF_AD file. Both inputs are on the card, so either
+    /// transport works — `--modem <port>` (`AT+CIMI` + `AT+CRSM`, falling
+    /// back to the registered PLMN from numeric `AT+COPS` if EF_AD is
+    /// unreadable) or `--pcsc-imsi <IMSI>` for a `pcsc_reader` line, which
+    /// reads EF_IMSI and EF_AD off that card directly and has no `AT+COPS`
+    /// fallback (a reader has no serving network). Used by
+    /// `supervise::orchestrate` when a line's `mcc`/`mnc` (from
+    /// `[[vowifi.line]]`, or auto-discovery) are left unset.
     VowifiPlmn(VowifiPlmnArgs),
     /// Reconciles the modem's own IMS/VoLTE stack with whether *this host*
     /// is going to register this modem itself — `[vowifi].enabled` or
@@ -807,10 +811,18 @@ pub struct VowifiImsiArgs {
 }
 
 #[derive(Parser, Debug)]
+#[command(group(
+    clap::ArgGroup::new("plmn_transport").required(true).args(["modem", "pcsc_imsi"])
+))]
 pub struct VowifiPlmnArgs {
     /// Modem AT port used for AT+CIMI / AT+CRSM / AT+COPS
     #[arg(long)]
-    pub modem: PathBuf,
+    pub modem: Option<PathBuf>,
+    /// Derive from the PC/SC reader holding this IMSI's card instead of a
+    /// modem (a `pcsc_reader` line) — EF_IMSI and EF_AD are read straight
+    /// off the card. Mutually exclusive with --modem.
+    #[arg(long)]
+    pub pcsc_imsi: Option<String>,
 }
 
 #[derive(Parser, Debug)]

@@ -40,8 +40,9 @@ fn real_reader_candidates(readers: &[String]) -> Vec<&String> {
 impl PcscTransport {
     /// Connects to whichever non-vpcd PC/SC reader holds a card whose own
     /// EF_IMSI matches `target_imsi` — this line's configured IMSI
-    /// (specs/023-omnikey-pcsc-vowifi requires `imsi_override` on every
-    /// `pcsc_reader` line, so this is always known up front). Tries each
+    /// (`imsi_override` is mandatory on every `pcsc_reader` line precisely so
+    /// this binding is known before any card session exists, which is what
+    /// makes the probe below possible at all). Tries each
     /// candidate reader in turn; a reader with no card, an unreadable card,
     /// or a card for a different line is skipped rather than treated as
     /// fatal, since `pcscd` legitimately reports many candidates.
@@ -127,6 +128,30 @@ impl PcscTransport {
         let aid = usim::discover_usim_aid(t)?;
         usim::select_usim(t, &aid)?;
         usim::read_imsi(t)
+    }
+
+    /// Runs `f` with exclusive access to the card, for a multi-step
+    /// SELECT-then-READ sequence whose correctness depends on nothing else
+    /// re-selecting a file in between.
+    ///
+    /// `ShareMode::Shared` means charon's `eap-sim-pcsc` (or a sibling line)
+    /// can be mid-EAP on this same card; an interleaved SELECT landing
+    /// between our own SELECT and READ BINARY would have us read the wrong
+    /// file and believe it — the same hazard the candidate probe in
+    /// `connect` already holds a transaction for. Single-APDU work
+    /// (AUTHENTICATE during registration, which carries its own data and
+    /// depends on no prior selection surviving) does not need this.
+    pub fn with_transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn ApduTransport) -> BridgeResult<T>,
+    ) -> BridgeResult<T> {
+        let mut tx = self
+            .card
+            .transaction()
+            .map_err(|e| BridgeError::Ims(format!("PC/SC transaction begin failed: {e}")))?;
+        let result = f(&mut tx);
+        let _ = tx.end(Disposition::LeaveCard);
+        result
     }
 }
 
