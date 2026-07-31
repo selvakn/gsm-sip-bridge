@@ -1834,6 +1834,95 @@ password = "s3cret"
         );
     }
 
+    /// PR #21 review: 5072 and 5073 are the VoWiFi and VoLTE telephony sides'
+    /// own SIP ports, and both live in the host namespace alongside the
+    /// registrar. Validation compared `listen_port` only against
+    /// `[sip].local_port`, so these passed and then failed at `bind` — inside a
+    /// supervised child, which restarts while that path carries no calls.
+    #[test]
+    fn server_mode_rejects_a_listen_port_a_telephony_agent_already_claims() {
+        for (port, inbound) in [
+            (5072u16, "[vowifi]\nenabled = true\n"),
+            (5073, "[volte]\nenabled = true\nbridge_inbound = true\n"),
+        ] {
+            let err = try_parse(&format!(
+                "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\n\
+                 listen_port = {port}\nring_aor = \"1001\"\n\n[[sip_server.account]]\n\
+                 username = \"1001\"\npassword = \"p\"\n\n{inbound}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&port.to_string()),
+                "must name the port {port}: {err}"
+            );
+            assert!(
+                err.contains("sip_server.listen_port"),
+                "must name what to move: {err}"
+            );
+        }
+    }
+
+    /// The VoLTE loopback ports are strided per line, so the whole span up to
+    /// `max_lines` is claimed — not just the first three.
+    #[test]
+    fn server_mode_rejects_a_listen_port_inside_the_volte_loopback_span() {
+        // 5074 is line 0's; 5078 is line 1's, only reachable via the stride.
+        for port in [5074u16, 5078] {
+            let err = try_parse(&format!(
+                "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\n\
+                 listen_port = {port}\nring_aor = \"1001\"\n\n[[sip_server.account]]\n\
+                 username = \"1001\"\npassword = \"p\"\n\n\
+                 [volte]\nenabled = true\nbridge_inbound = true\nmax_lines = 4\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("loopback"), "port {port} -> {err}");
+        }
+    }
+
+    /// Those ports are only claimed when the subsystem that owns them is on,
+    /// so a plain deployment must still be free to use them.
+    #[test]
+    fn a_reserved_port_is_free_when_its_subsystem_is_disabled() {
+        for port in [5072u16, 5073, 5074] {
+            let c = try_parse(&format!(
+                "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\n\
+                 listen_port = {port}\nring_aor = \"1001\"\n\n[[sip_server.account]]\n\
+                 username = \"1001\"\npassword = \"p\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("port {port} must be free with no agents: {e}"));
+            assert_eq!(c.sip_server.listen_port, port);
+        }
+    }
+
+    /// PR #21 review: only one process may host the registrar, so a config in
+    /// which both telephony sides would try to is refused rather than left to
+    /// lose the race at `bind`.
+    #[test]
+    fn server_mode_refuses_two_telephony_sides_that_would_both_host_a_registrar() {
+        let err = try_parse(
+            "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\n\
+             [[sip_server.account]]\nusername = \"1001\"\npassword = \"p\"\n\n\
+             [vowifi]\nenabled = true\n\n[volte]\nenabled = true\nbridge_inbound = true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only one can bind it"), "got: {err}");
+        assert!(err.contains("exactly one"), "must say what to do: {err}");
+    }
+
+    /// The same pairing without server mode is the pre-existing arbitration's
+    /// business, not this check's — it must stay parseable (FR-024).
+    #[test]
+    fn two_inbound_paths_without_server_mode_are_left_alone() {
+        try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nenabled = true\n\n\
+             [volte]\nenabled = true\nbridge_inbound = true\n"
+        ))
+        .expect("unchanged from before this feature");
+    }
+
     #[test]
     fn server_mode_requires_udp() {
         let err = try_parse(

@@ -751,6 +751,93 @@ fn build_sip_server(raw: RawSipServer) -> BridgeResult<SipServerConfig> {
     Ok(cfg)
 }
 
+/// Rejects a registrar port that a telephony agent already claims, and a
+/// configuration in which two agents would both try to host the registrar.
+///
+/// Both failures are otherwise discovered only at `bind`, as an `EADDRINUSE`
+/// deep inside a supervised child, which then enters its restart loop while that
+/// carrier path silently carries no calls. The ports below are fixed constants
+/// rather than settings, so an operator has no way to move them — the only
+/// actionable advice is to move `listen_port`, and that is worth saying at
+/// startup (PR #21 review).
+fn check_sip_server_port_ownership(
+    sip_server: &SipServerConfig,
+    vowifi: &VowifiConfig,
+    volte: &VolteConfig,
+) -> BridgeResult<()> {
+    if !sip_server.enabled {
+        return Ok(());
+    }
+
+    // The VoLTE telephony side claims its ports only when it actually runs, and
+    // `supervise::orchestrate` starts it on `[volte].enabled` — `bridge_inbound`
+    // alone spawns nothing, so on its own it reserves nothing either.
+    let volte_telephony_runs = volte.enabled && volte.bridge_inbound;
+
+    // Only two agents would ever host the registrar, and only one may.
+    // `supervise::orchestrate` already refuses this pairing for a different
+    // reason (both would register the same IMPU), so this is defence in depth
+    // plus an earlier, more specific message — and it also covers running the
+    // agents by hand, which bypasses the supervisor entirely.
+    if vowifi.enabled && volte_telephony_runs {
+        return Err(BridgeError::Config(
+            "[vowifi].enabled and [volte].bridge_inbound are both active with \
+             [sip_server].enabled. Both telephony sides would host a registrar on \
+             sip_server.listen_port, and only one can bind it — the other's calls \
+             would go nowhere. Enable exactly one inbound path."
+                .to_string(),
+        ));
+    }
+
+    // Ports held in the *host* network namespace, where the registrar also
+    // lives. Agent A's 5070/5071 are deliberately absent: those are bound on a
+    // veth address inside each line's own `ims` namespace, so they cannot
+    // collide with a host-namespace socket.
+    let mut reserved: Vec<(u16, &str, &str)> = Vec::new();
+    if vowifi.enabled {
+        reserved.push((
+            crate::vowifi::AGENT_B_SIP_LOCAL_PORT,
+            "vowifi-sip-agent's own SIP port",
+            "[vowifi].enabled",
+        ));
+    }
+    if volte_telephony_runs {
+        reserved.push((
+            crate::volte::bridge::SIP_LOCAL_PORT,
+            "the VoLTE telephony side's SIP port",
+            "[volte].enabled with [volte].bridge_inbound",
+        ));
+        // The loopback trio is strided per line, and the line count is
+        // discovered at runtime — so the whole span up to `max_lines` is
+        // claimed, not just the first three.
+        let stride = crate::volte::discovery::LINE_PORT_STRIDE;
+        let span = stride.saturating_mul(volte.max_lines.max(1) as u16);
+        let first = crate::volte::bridge::LOOPBACK_SIP_PORT;
+        if let Some(last) = first.checked_add(span.saturating_sub(1)) {
+            if sip_server.listen_port >= first && sip_server.listen_port <= last {
+                return Err(BridgeError::Config(format!(
+                    "sip_server.listen_port {} is inside {first}..={last}, which the VoLTE \
+                     telephony side reserves for its per-line loopback ports (three per line, \
+                     strided by {stride}, up to [volte].max_lines = {}). Those are fixed \
+                     internal constants — move sip_server.listen_port instead.",
+                    sip_server.listen_port, volte.max_lines
+                )));
+            }
+        }
+    }
+
+    for (port, what, gated_by) in reserved {
+        if sip_server.listen_port == port {
+            return Err(BridgeError::Config(format!(
+                "sip_server.listen_port {port} is already {what}, claimed because {gated_by} \
+                 is set. That port is a fixed internal constant an operator cannot move, so \
+                 change sip_server.listen_port instead."
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ----------------------------------------------------------------- entry ---
 
 /// Assembles the runtime config from the deserialised document.
@@ -761,6 +848,11 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
     // keys are required versus forbidden, so those two need it in hand. Same
     // shape as `build_alerts(raw.alerts, &sms)` above.
     let sip_server = build_sip_server(raw.sip_server)?;
+    let vowifi = build_vowifi(raw.vowifi)?;
+    let volte = build_volte(raw.volte)?;
+    // Cross-section, so it runs once all three exist rather than inside any one
+    // of their builders.
+    check_sip_server_port_ownership(&sip_server, &vowifi, &volte)?;
     Ok(AppConfig {
         sip: build_sip(raw.sip, &sip_server)?,
         bridge: build_bridge(raw.bridge, &sip_server)?,
@@ -772,8 +864,8 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
         audio: build_audio(raw.audio)?,
         modem_audio: build_modem_audio(raw.modem_audio)?,
         scheduled_restart: build_scheduled_restart(raw.scheduled_restart),
-        vowifi: build_vowifi(raw.vowifi)?,
-        volte: build_volte(raw.volte)?,
+        vowifi,
+        volte,
         logging: build_logging(raw.logging)?,
         alerts,
         sip_server,

@@ -80,6 +80,23 @@ Checked in `build()` once every section exists.
 | 16 | `[bridge].sip_destination` must be empty | The destination is `sip_server.ring_aor`. |
 | 17 | `[sip].local_port != [sip_server].listen_port` | Two SIP endpoints cannot bind one UDP port. Message names the remedy. |
 | 18 | `[sip].transport == "udp"` | The registrar is UDP-only in this version. |
+| 19 | `listen_port != 5072` when `[vowifi].enabled` | 5072 is `vowifi-sip-agent`'s own SIP port, in the same (host) namespace as the registrar. A fixed constant an operator cannot move, so the message says to move `listen_port`. |
+| 20 | `listen_port != 5073` when `[volte].enabled` **and** `bridge_inbound` | Likewise the VoLTE telephony side's SIP port. |
+| 21 | `listen_port` outside `5074..=5074+4×max_lines-1` when the VoLTE telephony side runs | Its per-line loopback ports are strided by 4 and the line count is discovered at runtime, so the whole span is reserved rather than only the first three. |
+| 22 | not (`[vowifi].enabled` and VoLTE telephony running) | Both would host a registrar on one port and only one can bind it. |
+
+Rules 19–22 exist because these ports are otherwise discovered at `bind`, as an
+`EADDRINUSE` inside a supervised child that then restarts while that carrier path
+silently carries no calls (PR #21 review).
+
+**Agent A's 5070/5071 are deliberately absent** from rules 19–21: those are bound
+on a veth address inside each line's own `ims` namespace, so they cannot collide
+with the registrar's host-namespace socket.
+
+Every one of these is gated on the subsystem that owns the port actually
+*running* — `[volte].bridge_inbound` without `[volte].enabled` spawns nothing
+(`supervise::orchestrate` starts VoLTE on `enabled`), so on its own it reserves
+nothing. A deployment with no agents may use 5072 or 5073 freely.
 
 Rules 13–15 also **relax** the existing requirement that those three keys be
 present: with the mode enabled they are forbidden rather than mandatory. This is

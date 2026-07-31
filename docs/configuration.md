@@ -297,6 +297,17 @@ share one UDP port. Both default to 5060, so enabling this mode without moving
 `[sip].local_port` is a startup error naming the fix — leave `listen_port` at
 5060 for the phones and set `[sip].local_port = 5062`.
 
+`listen_port` also cannot be one the VoWiFi or VoLTE telephony side already
+holds — 5072 with `[vowifi].enabled`, or 5073 and the per-line loopback span
+`5074..5074+4×[volte].max_lines` with `[volte].enabled` + `bridge_inbound`.
+Those are fixed internal constants an operator cannot move, so the error says to
+move `listen_port` instead. They are only reserved when the subsystem that owns
+them is actually running, so a deployment with neither may use them freely.
+
+Enabling `[vowifi]` and VoLTE inbound bridging *together* with this mode is
+refused: both telephony sides would host a registrar on one port and only one
+could bind it, leaving the other's calls nowhere to go.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch. Off by default |
