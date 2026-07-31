@@ -104,8 +104,9 @@ pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
     ) else {
         eprintln!(
             "[supervise] could not read the host's XFRM state, so it was left untouched. \
-             If a line then reports its tunnel interface cannot be created (if_id already \
-             claimed), clear the stale entries by hand — see docs/operations.md."
+             Stale SAs/policies from a previous run can degrade a line's tunnel; clear \
+             them by hand if one misbehaves — see docs/operations.md. (A line reporting \
+             its if_id is already claimed is usually unrelated and self-clearing.)"
         );
         return;
     };
@@ -125,9 +126,9 @@ pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
         XfrmReclaim::ForeignPresent => {
             eprintln!(
                 "[supervise] found XFRM state that is not this deployment's, so it was left \
-                 untouched. If a line then reports its tunnel interface cannot be created \
-                 (if_id already claimed), clear the stale entries by hand — see \
-                 docs/operations.md."
+                 untouched. Clear it by hand if a line's tunnel misbehaves — see \
+                 docs/operations.md. (A line reporting its if_id is already claimed is \
+                 usually unrelated and self-clearing.)"
             );
         }
     }
@@ -182,14 +183,30 @@ pub fn ensure_epdg_interface(
             // perfectly good CHILD_SA to retry — every 30s, forever, with
             // nothing in the log saying why. Diagnosed live 2026-07-29 only by
             // replaying this exact command by hand.
+            //
+            // This message used to name `ip xfrm state flush && ip xfrm policy
+            // flush` as the remedy. It is not one, and measuring it live on
+            // 2026-07-31 showed why: an XFRM interface registers its if_id in
+            // the namespace it was *created* in (here the host's), not the one
+            // it is moved to, so the previous run's `tun23-N` sitting in an
+            // `imsN` namespace the kernel has not reaped yet holds the id with
+            // no XFRM state involved at all. Nothing flushes a netdev. That
+            // reap took ~2.5min every time, whatever the shutdown did —
+            // `reclaim_stale_xfrm` above, the shutdown plan's `ip netns del`,
+            // a clean exit 0, none of it made a difference. Waiting is the
+            // whole remedy, so the message says so rather than sending the
+            // operator after a leak that isn't there.
             match runner.run(&[
                 "ip", "link", "add", tun_iface, "type", "xfrm", "if_id", if_id,
             ]) {
                 Ok(out) if !out.status.success() => eprintln!(
                     "[supervise] could not create {tun_iface} (xfrm if_id {if_id}): {}. \
-                     An if_id still claimed by a previous run does this even when no \
-                     interface of that name exists anywhere; with no tunnel running, \
-                     `ip xfrm state flush && ip xfrm policy flush` on the host releases it.",
+                     Usually this is the previous run of this container: its namespaces \
+                     take a few minutes to be reaped and its interface holds the if_id \
+                     until they are, which the kernel reports this way even though no \
+                     interface of that name is visible anywhere. It clears itself and \
+                     the line recovers on a later tick — flushing XFRM state/policy does \
+                     not speed it up. See docs/operations.md.",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
                 Err(e) => {

@@ -1,5 +1,57 @@
 # Release Notes
 
+## Unreleased
+
+- **A line whose tunnel interface cannot be recreated no longer tears down its
+  SA — or kills its agent — every 30 seconds while it waits.** The steady-state
+  `TunVanished` branch recreated the line's XFRM interface and then terminated +
+  reinitiated its IKE_SA unconditionally, including when the recreation had just
+  failed, and the caller restarted the line's `vowifi-ims-agent` on top of that.
+  A failed recreation is now its own outcome (`DegradeReason::TunUnavailable`)
+  and does neither.
+
+  Measured live 2026-07-31, across nine container restarts on two Airtel lines:
+  when the container is replaced, the *previous* run's `ims<N>` namespaces
+  survive it, and with them the `tun23-<N>` devices holding this deployment's
+  `if_id`s — so for about two and a half minutes no tunnel interface can exist
+  at all. Both lines came up in 163–195s on immediate replacement, against 11s
+  when the same restart followed a three-minute stop, which is what identifies
+  the wait rather than the startup as the cost. Over two startups through that
+  window:
+
+  | | before | after |
+  |---|---|---|
+  | IKE_SA setups, line 0 | 8 | 2 |
+  | IKE_SA setups, line 1 | 6 | 2 |
+  | time to both lines up | 195s, 195s | 166s, 166s |
+
+  Two per line over two startups is the floor — one apiece. None of the extra
+  setups could produce a data path, and all of them were visible to the carrier
+  as connection churn. Waiting costs nothing by comparison: a line with no
+  interface carries no traffic either way, and the first tick after the id
+  frees recreates it and recovers normally.
+
+  The agent-restart half of this changed nothing measurable — 48 restarts over
+  two startups, before and after. Nearly all of them are the agent's own
+  crash-loop (it starts, cannot reach its P-CSCF without an interface, exits,
+  and is restarted 5s later), which this does not address; suppressing that
+  would mean not starting the agent until its line has an interface, which is
+  not attempted here. The tick-driven kills are gone because killing a process
+  over a condition it cannot affect is wrong on its own terms.
+- **The `if_id`-claimed diagnostics no longer send you after a leak that isn't
+  there.** The interface-creation failure message stated as fact that
+  `ip xfrm state flush && ip xfrm policy flush` releases a claimed `if_id`. It
+  does not, and the reason is now understood: an XFRM interface registers its
+  `if_id` in the namespace it was *created* in rather than the one it is moved
+  to, so `tun23-N` holds the id against the host namespace while being
+  invisible to `ip link show` there — no XFRM state is involved and nothing
+  flushes a netdev. Neither `reclaim_stale_xfrm`, nor the shutdown plan's
+  `ip netns del`, nor a clean exit 0 shortened the wait; a fully stopped
+  deployment still held both ids 2m29s later. `docs/operations.md` now leads
+  with that measurement, explains why a *healthy* deployment also refuses its
+  own ids, and keeps the unfiltered flush only for the genuinely different case
+  of foreign XFRM state that `supervise` declines to touch.
+
 ## v8.2.0
 
 One correction, to a claim this project had been repeating in config

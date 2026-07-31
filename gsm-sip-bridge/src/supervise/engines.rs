@@ -394,22 +394,29 @@ impl TunnelEngine for StrongswanEngine {
         Some(super::line_supervisor::STRONGSWAN_REINITIATE_EVERY)
     }
 
-    fn recreate_interface(&self, runner: &dyn CommandRunner) {
-        if !super::epdg_iface::ensure_epdg_interface(
+    fn recreate_interface(&self, runner: &dyn CommandRunner) -> bool {
+        if super::epdg_iface::ensure_epdg_interface(
             runner,
             &self.netns,
             &self.tun_iface,
             &self.if_id,
         ) {
-            // Without this the loop is silent and endless: steady-state sees a
-            // missing interface every 30s, calls this, and tears down a
-            // healthy CHILD_SA to retry a recreation that cannot succeed.
-            println!(
-                "[supervise] line {}: {} could not be recreated in netns {}; this line will \
-                 keep retrying every steady-state tick until the cause above is cleared",
-                self.idx, self.tun_iface, self.netns
-            );
+            return true;
         }
+        // Without this the loop is silent and endless: steady-state sees a
+        // missing interface every 30s, calls this, and finds it missing again.
+        // The usual cause is benign and self-clearing — a previous run's
+        // namespace has not been reaped yet, so its `if_id` is still spoken
+        // for — hence the wording, which used to imply an operator had to
+        // intervene when in the common case waiting is the whole remedy.
+        println!(
+            "[supervise] line {}: {} could not be recreated in netns {} (if_id {} not \
+             available yet); leaving this line's SA alone and retrying next tick — \
+             after a container replacement the previous run's namespaces take a few \
+             minutes to be reaped, and this clears itself. See docs/operations.md",
+            self.idx, self.tun_iface, self.netns, self.if_id
+        );
+        false
     }
 }
 
@@ -536,11 +543,13 @@ impl TunnelEngine for SwuEngine {
         None
     }
 
-    fn recreate_interface(&self, _runner: &dyn CommandRunner) {
+    fn recreate_interface(&self, _runner: &dyn CommandRunner) -> bool {
         // No pre-created interface concept for this engine — the dialer
         // manages its own tun device, and `restart_process` (a full dialer
         // respawn) is this engine's only recovery path, matching the
-        // current script's own comment on `start_line_swu`.
+        // current script's own comment on `start_line_swu`. `true` so this
+        // engine's recovery is never gated on an interface it does not have.
+        true
     }
 }
 

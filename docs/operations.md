@@ -246,37 +246,94 @@ ESTABLISHED with a fresh CHILD_SA, and the charon log alternates
 fails with `Network unreachable` reaching its P-CSCF, because the tunnel
 interface it should route over is not there.
 
-Cause: the line's XFRM `if_id` is still claimed by leftover kernel state from
-an **earlier container run**, so the interface cannot be recreated. The
-supervisor detects it missing, recreates it, fails, and tears down a
-perfectly healthy CHILD_SA to retry — forever.
+Cause: the line's XFRM `if_id` is still claimed, so the interface cannot be
+created. In almost every case the claim belongs to **the previous run of this
+same container**, and it expires on its own after roughly two and a half
+minutes — during which the line cannot carry traffic and there is nothing
+useful to do about it. Measured 2026-07-31 across repeated restarts:
 
-This is confusing to confirm because everything visible says the if_id is
-free: `/var/run/netns` is empty, no `gsm-sip-bridge`/`charon` process
-survives, and no interface of that name exists in any namespace you can
-enumerate. The kernel still refuses it:
+| Restart | Time until both lines were up |
+|---|---|
+| Container replaced immediately | 163s, 195s |
+| Container restarted after a 3min stop | 11s |
+
+**Do not go looking for a leak.** The confusing part is that everything
+visible says the id is free — `ip link show` in the host namespace shows no
+such interface, `ip netns list` is empty, no process survives — and the kernel
+refuses it anyway:
 
 ```
 $ ip link add tun23-1 type xfrm if_id 24
 RTNETLINK answers: File exists
 ```
 
-Confirm by checking whether *other* if_ids are free — if a nearby unused one
-works, the name is not the problem, the if_id is:
+That is expected, and the reason is worth knowing because it also explains why
+the id survives a shutdown that looks complete. An XFRM interface registers its
+`if_id` in the namespace it was **created** in, not the one it lives in.
+`supervise` creates `tun23-N` in the host namespace and then moves it into
+`imsN`, so the device holds the id against the host while being invisible to
+`ip link show` there. `ip -d link show type xfrm` run *inside* `imsN` shows it,
+with `link-netnsid 0` pointing back at the host namespace it is registered in:
 
 ```
-$ ip link add probe type xfrm if_id 99 && ip link del probe   # succeeds
+$ docker exec <container> ip netns exec ims0 ip -d link show type xfrm
+tun23-0@NONE: ... link-netnsid 0
+    xfrm if_id 0x17 ...
 ```
 
-Then look for the leftovers, all of which outlive the container:
+So a healthy, fully registered deployment refuses `if_id 23` and `24` in the
+host namespace at all times. Refusal is not evidence of a problem.
+
+When the container is replaced, the old `imsN` namespaces (and those devices)
+outlive it. Nothing shortens this: the shutdown plan issues `ip netns del` for
+every namespace it created, the container exits 0, and a stopped deployment
+still held both ids **2m29s** later. `ip xfrm state/policy flush` does not
+release them either — there is no XFRM state involved, only a netdev in a
+namespace the kernel has not reaped yet. `supervise` runs that flush itself at
+startup (`reclaim_stale_xfrm`) for the separate case of genuinely stale SAs and
+policies; it is not a remedy for this.
+
+**The correct response is to wait.** Since 2026-07-31 the supervisor does that
+deliberately: when the interface cannot be recreated it leaves the line's SA
+alone rather than terminating and reinitiating into a tunnel that has nowhere
+to land, and recovers on the first tick after the id frees. Before that it tore
+the CHILD_SA down every 30s throughout the window — 8 and 6 IKE_SA setups
+across two startups on the two lines, against 2 and 2 afterwards, all of the
+extras wasted and visible to the carrier as connection churn.
+
+Expect `vowifi-ims-agent exited; restarting in 5s` throughout the wait
+regardless, roughly a dozen times per line. That is the agent failing to reach
+its P-CSCF over an interface that does not exist yet, and it stops when the
+interface appears. It is noisy, not a second fault.
+
+To confirm you are in the ordinary case rather than something worse, watch the
+id from a throwaway privileged container that can see every namespace on the
+host (`--pid=host`, which the bridge container itself cannot do):
 
 ```
-$ ip xfrm policy | grep -c '^src'      # ours carry if_id 0x17, 0x18, ...
-$ ip xfrm state  | grep -c '^src'
-$ ip link show | grep veth-sip         # leaked default-netns veth ends
+$ docker run --rm --privileged --pid=host --net=host --entrypoint sh \
+    <bridge-image> -c 'ip link add zz type xfrm if_id 24 && ip link del zz'
 ```
 
-Fix — **stop the container first**, since this removes live tunnel state:
+Run it every few seconds. If it starts succeeding within ~3 minutes of the
+restart, everything is normal and the line will be up on the next tick. If it
+is still refused well past that, look for a namespace held open by something a
+process scan misses, which would keep its interfaces and their if_ids alive
+with nothing in `ip netns list` to show for it:
+
+```
+$ find /proc/*/fd -lname 'net:*' 2>/dev/null    # netns held open by an fd
+$ grep -l nsfs /proc/*/mountinfo                # netns kept by a bind mount
+$ dmesg | grep unregister_netdevice             # a device stuck unregistering
+```
+
+A host reboot is the reliable clear if it ever comes to that.
+
+Separately, if `supervise` logged that it found XFRM state which is *not* this
+deployment's and left it alone, that is a real (and different) condition —
+stale SAs and policies from something else on the host, which it will not flush
+because the flush is unfiltered and iproute2 has no
+`ip xfrm policy deleteall if_id N`. Overriding that judgement is yours:
 
 ```
 $ docker stop <container>
@@ -285,11 +342,7 @@ $ ip link del veth-sip0; ip link del veth-sip1     # any that remain
 $ docker start <container>
 ```
 
-`flush` is unconditional: run it only when you know nothing else on the host
-uses IPsec. There is no way to delete selectively by if_id — iproute2 rejects
-`ip xfrm policy deleteall if_id N`. The bridge does not do this automatically
-for the same reason; it reports the failure and this remedy instead. A host
-reboot clears the state too.
+Run that only when you know nothing else on the host uses IPsec.
 
 ### VoWiFi: "no smart card reader" / vpcd connection refused
 
