@@ -276,6 +276,59 @@ Every field is optional except the matcher.
 | `iface` | string | unset (auto-detect) | Host data interface bound to this line's IMS PDN. Unset auto-detects from the modem's own USB device |
 | `msisdn` | string | none | This line's own MSISDN, advertised in the P-Preferred-Identity |
 
+### `[sip_server]`
+
+The bridge acts as the SIP **server** — IP phones REGISTER directly to it and
+inbound calls ring a registered phone — instead of registering to an external
+PBX (specs/024-sip-server-mode). For small deployments with no telephone system
+to point at. Off by default.
+
+Inbound only: a phone cannot dial out through the mobile network, and such an
+attempt is refused with `403`. Exactly one account rings; others may register
+but are never called.
+
+Enabling this changes what `[sip]` means. `server`, `username` and `password`
+describe a PBX that does not exist in this mode, so they become **errors**
+rather than requirements — as does `[bridge].sip_destination`, since the
+destination is `ring_aor`. `[sip].transport` must be `udp`.
+
+`listen_port` and `[sip].local_port` are two separate SIP endpoints and cannot
+share one UDP port. Both default to 5060, so enabling this mode without moving
+`[sip].local_port` is a startup error naming the fix — leave `listen_port` at
+5060 for the phones and set `[sip].local_port = 5062`.
+
+`listen_port` also cannot be one the VoWiFi or VoLTE telephony side already
+holds — 5072 with `[vowifi].enabled`, or 5073 and the per-line loopback span
+`5074..5074+4×[volte].max_lines` with `[volte].enabled` + `bridge_inbound`.
+Those are fixed internal constants an operator cannot move, so the error says to
+move `listen_port` instead. They are only reserved when the subsystem that owns
+them is actually running, so a deployment with neither may use them freely.
+
+Enabling `[vowifi]` and VoLTE inbound bridging *together* with this mode is
+refused: both telephony sides would host a registrar on one port and only one
+could bind it, leaving the other's calls nowhere to go.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch. Off by default |
+| `listen_addr` | string | `0.0.0.0` | Address the registrar binds. Must be an IP address, not a hostname |
+| `listen_port` | integer | 5060 | Port IP phones register to. Must differ from `[sip].local_port` |
+| `realm` | string | `gsm-sip-bridge` | Digest authentication realm, shown in the handset's credential prompt |
+| `ring_aor` | string | none (required) | Which account inbound calls ring. Must match one `[[sip_server.account]]` username, or startup fails — otherwise the mode would start cleanly and silently never ring |
+| `min_expires` | integer | 60 | Shortest registration lifetime granted, in seconds. A phone asking for less gets `423 Interval Too Brief` |
+| `max_expires` | integer | 3600 | Longest registration lifetime granted, in seconds. A longer request is clamped, and the granted value reported back |
+| `nonce_lifetime_sec` | integer | 120 | How long an authentication challenge stays valid. After this a phone is asked to retry, silently, without prompting a human |
+
+#### `[[sip_server.account]]`
+
+Array of tables — one per IP phone the registrar will accept. At least one entry
+is required when the mode is enabled. Usernames must be unique.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `username` | string | none (required) | The account name the phone authenticates as |
+| `password` | string | none (required) | The account's password. Supports `env:VAR` indirection and is redacted from logs |
+
 ## Examples
 
 ### Single-card development

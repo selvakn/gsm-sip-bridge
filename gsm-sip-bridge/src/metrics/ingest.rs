@@ -441,6 +441,22 @@ fn apply_state(
     // remains the daemon's own PBX registration (metrics-inventory.md
     // "Unchanged" note); tracked here only so liveness has somewhere to
     // record Agent B reported it, for future use.
+
+    // SIP-server mode: the registrar is hosted by whichever process owns the
+    // SIP side, and on the VoWiFi/VoLTE paths that is a telephony agent with no
+    // `/metrics` of its own. Only this ingest path can put those numbers on the
+    // daemon's endpoint, which is what FR-022 actually requires — verified
+    // missing on a live container before this existed (spec 024).
+    //
+    // Unlabelled on purpose: there is exactly one registrar per deployment, so a
+    // per-line label would report the same value N times and invite an operator
+    // to sum it.
+    if let Some(bindings) = state.sip_server_bindings {
+        metrics::SIP_SERVER_BINDINGS.set(f64::from(bindings));
+    }
+    if let Some(ring_registered) = state.sip_server_ring_registered {
+        metrics::SIP_SERVER_RING_AOR_REGISTERED.set(if ring_registered { 1.0 } else { 0.0 });
+    }
 }
 
 fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
@@ -530,6 +546,75 @@ pub fn evaluate_liveness(staleness_threshold: std::time::Duration) -> Vec<AgentL
 mod tests {
     use super::*;
     use crate::control::protocol::{AgentReport, AgentState};
+
+    /// FR-022 across a process boundary. The registrar is hosted by whichever
+    /// process owns the SIP side, and on the VoWiFi/VoLTE paths that is a
+    /// telephony agent with no `/metrics` — so gauges set in that process are
+    /// never scraped. A live container showed exactly that: a registered phone,
+    /// and zero `sip_server` series on the daemon's endpoint. This ingest path is
+    /// the only thing that puts them there.
+    #[test]
+    fn a_hosted_registrars_state_reaches_the_daemons_gauges() {
+        apply_report(&AgentReport {
+            agent: AgentKind::Sip,
+            module_id: "sip-server".to_string(),
+            epoch: 9101,
+            seq: 1,
+            state: AgentState {
+                sip_server_bindings: Some(3),
+                sip_server_ring_registered: Some(true),
+                ..Default::default()
+            },
+            events: Vec::new(),
+            dropped: 0,
+        });
+
+        assert_eq!(metrics::SIP_SERVER_BINDINGS.get(), 3.0);
+        assert_eq!(metrics::SIP_SERVER_RING_AOR_REGISTERED.get(), 1.0);
+
+        // And the "phone went away" direction, which is the one an operator
+        // alerts on.
+        apply_report(&AgentReport {
+            agent: AgentKind::Sip,
+            module_id: "sip-server".to_string(),
+            epoch: 9101,
+            seq: 2,
+            state: AgentState {
+                sip_server_bindings: Some(0),
+                sip_server_ring_registered: Some(false),
+                ..Default::default()
+            },
+            events: Vec::new(),
+            dropped: 0,
+        });
+
+        assert_eq!(metrics::SIP_SERVER_BINDINGS.get(), 0.0);
+        assert_eq!(metrics::SIP_SERVER_RING_AOR_REGISTERED.get(), 0.0);
+
+        // And an agent that hosts no registrar must leave these alone rather
+        // than reporting a default and zeroing a healthy deployment.
+        //
+        // Asserted in this same test on purpose: unlike every other gauge here
+        // these two are unlabelled singletons, so two tests touching them would
+        // race under a parallel runner — which is exactly what happened when
+        // this was written as a second `#[test]`.
+        metrics::SIP_SERVER_BINDINGS.set(7.0);
+        metrics::SIP_SERVER_RING_AOR_REGISTERED.set(1.0);
+        apply_report(&AgentReport {
+            agent: AgentKind::Ims,
+            module_id: "test-ingest-no-registrar".to_string(),
+            epoch: 9102,
+            seq: 1,
+            state: AgentState {
+                registered: Some(true),
+                ..Default::default()
+            },
+            events: Vec::new(),
+            dropped: 0,
+        });
+        assert_eq!(metrics::SIP_SERVER_BINDINGS.get(), 7.0);
+        assert_eq!(metrics::SIP_SERVER_RING_AOR_REGISTERED.get(), 1.0);
+    }
 
     #[test]
     fn test_apply_report_increments_call_metrics() {

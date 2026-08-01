@@ -353,3 +353,41 @@ lock_path = "/tmp/volte-registration.lock"
 
 # [[volte.line]]
 # pcscf = "2401:4900:c4:40da::6" # airtel india
+# ---------------------------------------------------------------------------
+# SIP server mode (specs/024-sip-server-mode) — the bridge IS the SIP server
+# ---------------------------------------------------------------------------
+# For small deployments with no PBX. IP phones REGISTER directly to the bridge
+# and inbound mobile calls ring a registered phone, instead of the bridge
+# registering to an external telephone system.
+#
+# What turning this on costs you:
+#   - [sip].server, [sip].username and [sip].password describe a PBX that does
+#     not exist in this mode, so they become ERRORS rather than requirements.
+#     So does [bridge].sip_destination — the destination is ring_aor below.
+#   - [sip].transport must be "udp"; the registrar is UDP-only.
+#   - listen_port and [sip].local_port are two separate SIP endpoints and
+#     cannot share one UDP port. Both default to 5060, so you must move
+#     [sip].local_port (e.g. to 5062) and leave 5060 for the phones.
+#   - Inbound only. A phone cannot dial out through the mobile network; the
+#     attempt is refused with 403.
+#   - Exactly ONE account rings. Others may register but are never called.
+#   - No NAT between phone and bridge — this targets a single-site LAN.
+
+# [sip_server]
+# enabled = true
+# listen_addr = "0.0.0.0"        # must be an IP address, not a hostname
+# listen_port = 5060             # what you point the phones at
+# realm = "gsm-sip-bridge"       # shown in the handset's credential prompt
+# ring_aor = "1001"              # must match an account username below
+# min_expires = 60               # shorter requests get 423 Interval Too Brief
+# max_expires = 3600             # longer requests are clamped to this
+# nonce_lifetime_sec = 120       # how long an auth challenge stays valid
+
+# One entry per IP phone. At least one is required when enabled.
+# [[sip_server.account]]
+# username = "1001"
+# password = "env:PHONE_1001_PASSWORD"
+
+# [[sip_server.account]]
+# username = "1002"
+# password = "env:PHONE_1002_PASSWORD"

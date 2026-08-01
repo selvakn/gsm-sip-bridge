@@ -111,6 +111,20 @@ pub struct AgentState {
     pub tunnel_up: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pbx_registered: Option<bool>,
+    /// SIP-server mode only: how many IP phones the registrar this agent hosts
+    /// currently holds bindings for.
+    ///
+    /// Reported rather than exported directly because the registrar is hosted by
+    /// whichever process owns the SIP side, and on the VoWiFi/VoLTE paths that is
+    /// this agent — which serves no `/metrics`. Gauges registered here would
+    /// never be scraped (spec 024; docs/greptile-review-learnings.md, "Metrics &
+    /// observability").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sip_server_bindings: Option<u32>,
+    /// SIP-server mode only: whether `[sip_server].ring_aor` specifically has a
+    /// live binding — the gauge that answers "will a call ring?".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sip_server_ring_registered: Option<bool>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is

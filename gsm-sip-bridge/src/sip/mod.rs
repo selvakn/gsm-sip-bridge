@@ -1,7 +1,13 @@
 pub mod alsa_media_port;
+pub mod server;
+pub mod target;
 
-use crate::config::{AppConfig, SipTransport, TlsVerify};
+use std::sync::Arc;
+
+use crate::config::{AppConfig, SipServerConfig, SipTransport, TlsVerify};
 use pjsua_safe::{Account, AccountConfig, Call, Endpoint, EndpointConfig, TransportType};
+
+use server::{BindingStore, Registrar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationState {
@@ -17,6 +23,10 @@ pub struct SipBridge {
     endpoint: Option<Endpoint>,
     account: Option<Account>,
     active_call: Option<Call>,
+    /// Present only in SIP server mode: the registrar this process hosts, and
+    /// the table of phones it has accepted.
+    registrar: Option<Registrar>,
+    bindings: Option<Arc<BindingStore>>,
 }
 
 #[derive(Clone)]
@@ -30,13 +40,25 @@ struct SipBridgeConfig {
     local_port: u16,
     display_name: String,
     tls_verify: TlsVerify,
-    /// Whether this circuit-switched bridge should register the SIP trunk.
+    /// Whether this circuit-switched bridge owns the telephony-facing SIP
+    /// identity at all.
+    ///
     /// `false` when the VoLTE inbound bridge or the VoWiFi bridge is active:
-    /// either one registers the *same* trunk account for its own outbound leg,
-    /// and a trunk keeps a single binding, so two registrants of one account
-    /// fight over it (and the churn can get the account auth-denied). Whichever
-    /// bridge is active owns the trunk then.
+    /// either one drives the *same* PBX-facing leg for its own calls, from a
+    /// different process. With a PBX that matters because a trunk keeps a
+    /// single binding, so two registrants of one account fight over it (and the
+    /// churn can get the account auth-denied). In SIP server mode it matters
+    /// for the same reason in a different shape: two registrars cannot bind one
+    /// UDP port, so exactly one process may host it — and reusing this flag to
+    /// decide which is what lets one registrar serve every call path with no
+    /// IPC (spec 024, research.md R-003).
+    owns_sip_side: bool,
+    /// Whether to actually send a REGISTER. `false` in SIP server mode, where
+    /// there is no trunk to register to at all — but that case still needs the
+    /// endpoint for the leg it dials out on, so it cannot simply skip.
     register_trunk: bool,
+    /// The SIP server mode's settings.
+    sip_server: SipServerConfig,
     dial_timeout_sec: u64,
     sip_destination: String,
     jb_init_ms: i32,
@@ -63,7 +85,11 @@ impl SipBridge {
             // Defer the trunk to the VoLTE inbound bridge or the VoWiFi bridge
             // when either is active, so the same account is not registered
             // from two places at once.
-            register_trunk: !config.volte.bridge_inbound && !config.vowifi.enabled,
+            owns_sip_side: !config.volte.bridge_inbound && !config.vowifi.enabled,
+            register_trunk: !config.volte.bridge_inbound
+                && !config.vowifi.enabled
+                && !config.sip_server.enabled,
+            sip_server: config.sip_server.clone(),
             dial_timeout_sec: config.bridge.sip_dial_timeout_sec,
             sip_destination: config.bridge.sip_destination.clone(),
             jb_init_ms: config.audio.settings.jb_init_ms,
@@ -82,52 +108,48 @@ impl SipBridge {
             endpoint: None,
             account: None,
             active_call: None,
+            registrar: None,
+            bindings: None,
         }
     }
 
+    /// Whether this bridge is serving IP phones rather than calling a PBX.
+    pub fn is_server_mode(&self) -> bool {
+        self.config.sip_server.enabled
+    }
+
     pub fn register(&mut self) -> Result<(), String> {
-        // When the VoLTE or VoWiFi bridge owns the trunk, this circuit-switched
-        // bridge must not also register the same account — see `register_trunk`.
-        // Skip cleanly (no endpoint/account): the caller already tolerates an
-        // unregistered bridge ("calls will not be bridged"), and this container
-        // is doing VoLTE/VoWiFi, not circuit-switched, work.
-        if !self.config.register_trunk {
+        // When the VoLTE or VoWiFi bridge owns the telephony-facing side, this
+        // circuit-switched bridge must stand down entirely — see
+        // `owns_sip_side`. Skip cleanly (no endpoint/account): the caller
+        // already tolerates an unregistered bridge ("calls will not be
+        // bridged"), and this container is doing VoLTE/VoWiFi, not
+        // circuit-switched, work.
+        //
+        // Checked before the server-mode branch, not after. The other way round,
+        // a VoWiFi deployment with server mode on would start a registrar here
+        // *and* one in the telephony agent, and the second to bind would fail.
+        if !self.config.owns_sip_side {
             self.state = RegistrationState::Unregistered;
             tracing::info!(
                 server = %self.config.server,
                 username = %self.config.username,
-                "circuit-switched SIP trunk registration skipped: the VoLTE/VoWiFi \
-                 bridge owns this trunk (avoids double-registering the same account)"
+                server_mode = self.config.sip_server.enabled,
+                "circuit-switched SIP side skipped: the VoLTE/VoWiFi bridge owns it \
+                 (avoids double-registering one trunk, or two registrars on one port)"
             );
             return Ok(());
         }
+
+        // SIP server mode: no trunk to register, but we still need the endpoint
+        // for the leg we dial out on, so this cannot take the skip above.
+        if self.config.sip_server.enabled {
+            return self.start_server_mode();
+        }
+
         self.state = RegistrationState::Registering;
 
-        let transport = match self.config.transport {
-            SipTransport::Udp => TransportType::Udp,
-            SipTransport::Tcp => TransportType::Tcp,
-            SipTransport::Tls => TransportType::Tls,
-        };
-
-        let ep_config = EndpointConfig {
-            transport,
-            local_port: self.config.local_port,
-            tls_verify: self.config.tls_verify == TlsVerify::Strict,
-            // The circuit-switched bridge's audio comes off the modem's 8 kHz
-            // USB sound device, so there is no wideband to preserve and no
-            // reason to run the conference bridge any faster. (The VoWiFi
-            // bridge's Agent B does run at 16 kHz — see `crate::vowifi`.)
-            clock_rate: 8000,
-            jb_init_ms: self.config.jb_init_ms,
-            jb_min_pre: self.config.jb_min_pre,
-            jb_max_ms: self.config.jb_max_ms,
-            vad_enabled: self.config.vad_enabled,
-            tx_level: self.config.tx_level,
-            snd_rec_latency_ms: self.config.snd_rec_latency_ms,
-            snd_play_latency_ms: self.config.snd_play_latency_ms,
-        };
-
-        let endpoint = Endpoint::create(ep_config).map_err(|e| {
+        let endpoint = Endpoint::create(self.endpoint_config()).map_err(|e| {
             self.state = RegistrationState::Failed;
             crate::metrics::SIP_REGISTRATIONS_TOTAL
                 .with_label_values(&["failure"])
@@ -169,14 +191,105 @@ impl SipBridge {
         Ok(())
     }
 
-    pub fn compute_destination_uri(&self, caller_did: &str) -> String {
-        let raw_dest = if self.config.sip_destination.is_empty() {
-            caller_did
-        } else {
-            &self.config.sip_destination
+    /// The pjsua endpoint settings, shared by both modes — server mode differs
+    /// only in what it registers, not in how the media stack is configured.
+    fn endpoint_config(&self) -> EndpointConfig {
+        let transport = match self.config.transport {
+            SipTransport::Udp => TransportType::Udp,
+            SipTransport::Tcp => TransportType::Tcp,
+            SipTransport::Tls => TransportType::Tls,
         };
-        let dest = raw_dest.trim_start_matches('+');
-        format!("sip:{}@{}:{}", dest, self.config.server, self.config.port)
+        EndpointConfig {
+            transport,
+            local_port: self.config.local_port,
+            tls_verify: self.config.tls_verify == TlsVerify::Strict,
+            // The circuit-switched bridge's audio comes off the modem's 8 kHz
+            // USB sound device, so there is no wideband to preserve and no
+            // reason to run the conference bridge any faster. (The VoWiFi
+            // bridge's Agent B does run at 16 kHz — see `crate::vowifi`.)
+            clock_rate: 8000,
+            jb_init_ms: self.config.jb_init_ms,
+            jb_min_pre: self.config.jb_min_pre,
+            jb_max_ms: self.config.jb_max_ms,
+            vad_enabled: self.config.vad_enabled,
+            tx_level: self.config.tx_level,
+            snd_rec_latency_ms: self.config.snd_rec_latency_ms,
+            snd_play_latency_ms: self.config.snd_play_latency_ms,
+        }
+    }
+
+    /// Builds the endpoint, starts the registrar, and creates the
+    /// non-registering account calls are placed from.
+    fn start_server_mode(&mut self) -> Result<(), String> {
+        self.state = RegistrationState::Registering;
+        let server = self.config.sip_server.clone();
+
+        let endpoint = Endpoint::create(self.endpoint_config()).map_err(|e| {
+            self.state = RegistrationState::Failed;
+            format!("PJSIP endpoint creation failed: {e}")
+        })?;
+
+        // Bind before anything else can fail: a port clash here is the most
+        // likely startup problem, and the operator needs it named plainly.
+        let registrar = Registrar::start(&server).map_err(|e| {
+            self.state = RegistrationState::Failed;
+            format!(
+                "SIP registrar could not listen on {}:{}: {e}",
+                server.listen_addr, server.listen_port
+            )
+        })?;
+
+        // The identity the handset sees calls arrive from, so it must name the
+        // bridge as the phone knows it — the registrar's own address.
+        let id_uri = server.identity_uri();
+        let account = Account::local(&endpoint, &id_uri, &self.config.display_name)
+            .map_err(|e| format!("local SIP account creation failed: {e}"))?;
+
+        tracing::info!(
+            listen = %format!("{}:{}", server.listen_addr, server.listen_port),
+            uac_port = self.config.local_port,
+            ring_aor = %server.ring_aor,
+            accounts = server.accounts.len(),
+            "SIP server mode active — IP phones register here; no PBX is used"
+        );
+
+        self.bindings = Some(registrar.bindings());
+        self.registrar = Some(registrar);
+        self.endpoint = Some(endpoint);
+        self.account = Some(account);
+        self.state = RegistrationState::Registered;
+        Ok(())
+    }
+
+    /// Where a call from `caller_did` should go.
+    ///
+    /// Fallible because in server mode the phone may not be registered — the
+    /// PBX case still cannot fail.
+    pub fn compute_destination_uri(&self, caller_did: &str) -> Result<String, String> {
+        let target = match &self.bindings {
+            Some(bindings) => target::CallTarget::RegisteredPhone {
+                bindings,
+                aor: &self.config.sip_server.ring_aor,
+            },
+            // Server mode with no binding table means this process is not the
+            // one hosting the registrar, so it has nowhere to send a call. The
+            // `[sip]` fields would be empty here (they are forbidden in this
+            // mode), and falling through to the PBX form would build a URI
+            // pointing at nothing rather than saying so.
+            None if self.config.sip_server.enabled => {
+                return Err(
+                    "SIP server mode is enabled but this process does not host the registrar \
+                     — the VoLTE/VoWiFi bridge does"
+                        .to_string(),
+                )
+            }
+            None => target::CallTarget::Pbx {
+                server: &self.config.server,
+                port: self.config.port,
+                sip_destination: &self.config.sip_destination,
+            },
+        };
+        target.uri_for(caller_did, std::time::Instant::now())
     }
 
     pub fn set_sound_device(&self, alsa_device: &str) -> Result<(), String> {
@@ -257,6 +370,14 @@ impl SipBridge {
 
     pub fn unregister(&mut self) {
         self.hangup_active_call();
+        // Stop serving phones before dropping the endpoint: the registrar owns
+        // its own socket and thread, and joining it here keeps shutdown
+        // deterministic rather than leaving it to drop order.
+        if let Some(ref mut registrar) = self.registrar {
+            registrar.stop();
+        }
+        self.registrar = None;
+        self.bindings = None;
         if let Some(ref mut account) = self.account {
             account.unregister();
         }
@@ -264,6 +385,8 @@ impl SipBridge {
         self.endpoint = None;
         self.state = RegistrationState::Unregistered;
         crate::metrics::SIP_REGISTERED.set(0.0);
+        crate::metrics::SIP_SERVER_BINDINGS.set(0.0);
+        crate::metrics::SIP_SERVER_RING_AOR_REGISTERED.set(0.0);
         tracing::info!("SIP unregistered");
     }
 }

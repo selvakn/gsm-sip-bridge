@@ -1,6 +1,38 @@
 # Release Notes
 
-## Unreleased
+## v8.3.0
+
+- **The bridge can now be the SIP server itself, so a small deployment needs no
+  PBX at all.** Set `[sip_server].enabled` and IP phones REGISTER directly to
+  the bridge; inbound calls from any of the three carrier paths — circuit-
+  switched, VoWiFi, VoLTE — ring one configured account. Off by default, and a
+  deployment that does not enable it is byte-for-byte unaffected.
+
+  Previously a PBX was a hard dependency however small the site: the bridge
+  could only deliver a call by registering to a telephone system as a trunk and
+  INVITEing it. For one SIM and one desk phone, standing up and maintaining
+  that PBX was the larger half of the work.
+
+  Phones authenticate with digest credentials from
+  `[[sip_server.account]]`, and the registrar handles the full registration
+  lifecycle: challenge, refresh, expiry negotiation, explicit
+  un-registration, replay rejection, and a handset that moves to a new
+  address. Inbound only — a phone cannot dial out over the mobile network,
+  which the bridge has never been able to do, and the attempt is refused
+  explicitly rather than left to time out.
+
+  **Enabling it requires moving one port.** `[sip_server].listen_port` and
+  `[sip].local_port` are two separate SIP endpoints and cannot share one UDP
+  socket, and both default to 5060 — so leave 5060 for the phones and set
+  `[sip].local_port = 5062`. The mismatch is refused at startup with the fix in
+  the message, as is a leftover `[sip].server`, a `ring_aor` matching no
+  configured account, and duplicate account names. None of those fail silently
+  at call time.
+
+  Five `gsm_sip_bridge_sip_server_*` metrics; see
+  `docs/operations.md#sip-server-mode` for the runbook, including the one
+  handset setting ("accept SIP only from proxy") that interacts with the
+  two-port design.
 
 - **A line whose tunnel interface cannot be recreated no longer tears down its
   SA — or kills its agent — every 30 seconds while it waits.** The steady-state
