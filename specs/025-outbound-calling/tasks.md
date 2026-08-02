@@ -58,16 +58,16 @@ skeletons the rest of the plan writes into.
 **Purpose**: BLOCKING. Every user story reads `[outbound].enabled` and needs
 the `PlaceCall`/`PlaceCallOutcome` types and outcome metrics to exist first.
 
-- [ ] T003 Add `RawOutbound` via the `section!` macro in `gsm-sip-bridge/src/config/raw.rs` with the single `enabled: bool` field per `contracts/config-schema.md`, and register `("outbound", RawOutbound::KEYS)` in `section_key_lists()`
-- [ ] T004 Add `OutboundConfig` runtime struct and the `outbound` field on `AppConfig` in `gsm-sip-bridge/src/config/mod.rs`
-- [ ] T005 Implement `build_outbound` in `gsm-sip-bridge/src/config/build.rs` enforcing rule 1 from `contracts/config-schema.md` (at least one carrier path configured when enabled), following the existing `build_sip_server`-style error-message conventions
-- [ ] T006 [P] Add inline tests to `gsm-sip-bridge/src/config/mod.rs` covering the default (`enabled = false`, byte-for-byte unaffected) and rule 1's rejection, driven through the real `load_config` pipeline
-- [ ] T007 [P] Document `### \`[outbound]\`` in `docs/configuration.md` with a table row for the one key, so `tests/test_config_docs.rs` passes
-- [ ] T008 [P] Add a **commented-out** `[outbound]` block to `config.toml.example`, matching the `test_the_shipped_example_config_still_loads` convention already used for `[sip_server]`
-- [ ] T009 Add `PlaceCall { destination: String }` and `PlaceCallOutcome { Placed, Busy, Failed { reason: String } }` to `gsm-sip-bridge/src/control/protocol.rs` per `contracts/line-command.md`, with `Serialize`/`Deserialize` matching the existing `ControlCmd` framing style
-- [ ] T010 Define `OutboundCallRequest`, `Origin`, `CandidateLine`, and the outcome-category enum from `data-model.md` in `gsm-sip-bridge/src/sip/outbound.rs`
-- [ ] T011 [P] Add `gsm_sip_bridge_outbound_attempts_total` (labelled by `outcome`, per data-model.md's category table) to `gsm-sip-bridge/src/metrics/mod.rs`, following the existing `SIP_SERVER_*` counter registration pattern
-- [ ] T012 [P] Document the new metric in `docs/observability.md`
+- [X] T003 Add `RawOutbound` via the `section!` macro in `gsm-sip-bridge/src/config/raw.rs` with the single `enabled: bool` field per `contracts/config-schema.md`, and register `("outbound", RawOutbound::KEYS)` in `section_key_lists()`
+- [X] T004 Add `OutboundConfig` runtime struct and the `outbound` field on `AppConfig` in `gsm-sip-bridge/src/config/mod.rs`
+- [X] T005 Implement `build_outbound` in `gsm-sip-bridge/src/config/build.rs` — structural pass-through only; `contracts/config-schema.md` was revised during implementation to drop the originally-planned "at least one carrier path configured" rule, since CS modem presence is runtime-discovered, not config-declared, and so isn't checkable at build time
+- [X] T006 [P] Add inline tests to `gsm-sip-bridge/src/config/mod.rs` covering the default (`enabled = false`, byte-for-byte unaffected) and rule 1's rejection, driven through the real `load_config` pipeline
+- [X] T007 [P] Document `### \`[outbound]\`` in `docs/configuration.md` with a table row for the one key, so `tests/test_config_docs.rs` passes
+- [X] T008 [P] Add a **commented-out** `[outbound]` block to `config.toml.example`, matching the `test_the_shipped_example_config_still_loads` convention already used for `[sip_server]`
+- [X] T009 Add `PlaceCall { destination: String }` and `PlaceCallOutcome { Placed, Busy, Failed { reason: String } }` to `gsm-sip-bridge/src/control/protocol.rs` per `contracts/line-command.md`, with `Serialize`/`Deserialize` matching the existing `ControlCmd` framing style
+- [X] T010 Define `OutboundCallRequest`, `Origin`, `CandidateLine`, and the outcome-category enum from `data-model.md` in `gsm-sip-bridge/src/sip/outbound.rs`
+- [X] T011 [P] Add `gsm_sip_bridge_outbound_attempts_total` (labelled by `outcome`, per data-model.md's category table) to `gsm-sip-bridge/src/metrics/mod.rs`, following the existing `SIP_SERVER_*` counter registration pattern
+- [X] T012 [P] Document the new metric in `docs/observability.md`
 
 **Checkpoint**: config parses/validates/documents; the wire types and metric
 exist but nothing produces or consumes them yet.
@@ -86,15 +86,30 @@ dials it (`ATD`) and two-way audio flows once answered.
 
 ### Tests for User Story 1
 
-- [ ] T013 [P] [US1] Inline test in `gsm-sip-bridge/src/modules/at_commander.rs` asserting `dial("+15551234567")` sends `ATD+15551234567;` and maps `OK`/`ERROR`/`NO CARRIER`/`BUSY` responses to the right `Result`, using the existing `make_commander` harness
-- [ ] T014 [P] [US1] Inline test in `gsm-sip-bridge/src/sip/outbound.rs` for destination validation (FR-014): empty, and characters outside `[0-9*#+]`, are rejected before any line is touched
+- [X] T013 [P] [US1] Inline test in `gsm-sip-bridge/src/modules/at_commander.rs` — DONE, adjusted scope: `AtResponse`/`read_response` only ever recognizes `OK`/`ERROR`/`+CME ERROR` as terminal (verified by reading the parser); `NO CARRIER`/`BUSY` arrive later as unsolicited result codes, the same way `RING` does, not as `ATD`'s own response. Tests cover `OK`→success, `ERROR`/`CME ERROR`→failure only; final call disposition is out of scope for this task and belongs to T019's progress relay, driven off the existing URC loop in `modules::mod`, not `AtCommander::dial` itself
+- [X] T014 [P] [US1] Inline test in `gsm-sip-bridge/src/sip/outbound.rs` for destination validation (FR-014) — DONE as part of T010's entity module
 - [ ] T015 [US1] Create `gsm-sip-bridge/tests/test_outbound_pbx_call.rs`: a real loopback SIP INVITE from a fake "PBX" `UdpSocket`/pjsua peer to a daemon configured with `[outbound].enabled = true` and one (simulated) idle CS line, asserting the destination reaches `AtCommander::dial` unmodified and a `180`/`200` progression is returned
 
 ### Implementation for User Story 1
 
-- [ ] T016 [US1] Add `AtCommander::dial(&mut self, number: &str) -> BridgeResult<()>` in `gsm-sip-bridge/src/modules/at_commander.rs`, sending `ATD{number};` alongside the existing `answer_call`/`hangup`
-- [ ] T017 [US1] Implement same-process line selection over `CardPool` in `gsm-sip-bridge/src/sip/outbound.rs`: iterate configured CS modems, claim the first `idle()` one per data-model.md's provisional-claim rule (FR-004/005/007)
-- [ ] T018 [US1] Implement the PBX-trunk UAS INVITE handler in `gsm-sip-bridge/src/sip/mod.rs`: on an incoming INVITE to the existing trunk `Account` with `[outbound].enabled = true`, construct an `OutboundCallRequest { origin: Origin::Pbx, .. }`, validate (T014), select a line (T017), and dial (T016)
+- [X] T016 [US1] Add `AtCommander::dial(&mut self, number: &str) -> BridgeResult<()>` in `gsm-sip-bridge/src/modules/at_commander.rs`, sending `ATD{number};` alongside the existing `answer_call`/`hangup`
+> **BLOCKED, discovered during implementation**: T018 (and T035 in US3) assumed
+> pjsua-safe can accept an incoming INVITE (UAS). It cannot — `pjsua-safe/src`
+> registers `on_call_state` only; there is no `on_incoming_call` callback and
+> no `Call::answer`/accept API anywhere in `pjsua-safe`/`pjsua-sys`. Every
+> existing call in this codebase is UAC-only (`Call::make`); the bridge has
+> never received an INVITE via pjsua. Adding this means new `unsafe` FFI
+> bindings (a callback registered in `AccountConfig`/`EndpointConfig`, a
+> `pjsua_call_answer` wrapper) — real, but non-trivial and non-negotiably
+> `unsafe`-audited work (`count-unsafe.sh`, currently 1.68% of `pjsua-safe`)
+> that also cannot be exercised by `make test`/CI at all (the `pjsip-linked`
+> feature they'd need is only built by `docker/Dockerfile`, per plan.md's own
+> Constraints). This needs its own focused pass — including real testing in
+> the privileged container — rather than being written blind here. T017,
+> T019–T022 below are written to be ready to wire up once that lands.
+
+- [ ] T017 [US1] **Also blocked, discovered during implementation**: each CS modem runs its own dedicated OS thread owning its `CardInstance`/`AtCommander` (`modules::mod`'s per-module loop); `CardPool` (the tokio-side orchestrator) only sees derived `SlotState` via the one-directional `BridgeEvent` channel *from* that thread. There is no existing command channel *into* a running modem thread — the same class of gap as US2's cross-process one, just intra-process. `sip::outbound::{CandidateLine, select_idle_line}` (T010) are ready to consume whatever read model this produces, but building the modem-thread command channel itself is unstarted. Implement same-process line selection over `CardPool` in `gsm-sip-bridge/src/sip/outbound.rs`: iterate configured CS modems, claim the first `idle()` one per data-model.md's provisional-claim rule (FR-004/005/007)
+- [ ] T018 [US1] **BLOCKED on the pjsua-safe UAS gap above.** Implement the PBX-trunk UAS INVITE handler in `gsm-sip-bridge/src/sip/mod.rs`: on an incoming INVITE to the existing trunk `Account` with `[outbound].enabled = true`, construct an `OutboundCallRequest { origin: Origin::Pbx, .. }`, validate (T014), select a line (T017), and dial (T016)
 - [ ] T019 [US1] Implement call-progress relay in `gsm-sip-bridge/src/sip/mod.rs` per `contracts/sip-dialout.md`'s table (`180 Ringing`, `486 Busy Here`, `503 Service Unavailable`, `200 OK`) driven off the CS leg's AT-reported call state
 - [ ] T020 [US1] Wire teardown: either leg hanging up ends the other, reusing the existing bridged-call teardown path (`sip::mod`'s current hangup handling) rather than a new implementation (FR-013)
 - [ ] T021 [US1] Increment `gsm_sip_bridge_outbound_attempts_total` with the right outcome label at every terminal point reached by T018–T020

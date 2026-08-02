@@ -248,6 +248,22 @@ impl AtCommander {
         }
     }
 
+    /// Places an outbound voice call (spec 025). `ATD{number};` — the
+    /// trailing `;` is what keeps this a voice call rather than a data call
+    /// (3GPP TS 27.007). Symmetric with `answer_call`/`ATA`: `OK` means the
+    /// modem accepted the dial attempt and started it, not that it was
+    /// answered — final call disposition (busy, no answer, rejected,
+    /// answered) arrives later as unsolicited result codes, the same way
+    /// `RING` does for an inbound call, not as this command's own response.
+    pub fn dial(&mut self, number: &str) -> BridgeResult<()> {
+        match self.send_command(&format!("ATD{number};"))? {
+            AtResponse::Ok(_) => Ok(()),
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+                Err(BridgeError::Discovery(format!("ATD failed: {e}")))
+            }
+        }
+    }
+
     pub fn hangup(&mut self) -> BridgeResult<()> {
         match self.send_command("AT+CHUP")? {
             AtResponse::Ok(_) => Ok(()),
@@ -599,6 +615,24 @@ mod tests {
 
     fn make_commander(response: &str) -> AtCommander {
         AtCommander::from_stream(MockStream::new(response), Duration::from_secs(1))
+    }
+
+    #[test]
+    fn dial_maps_ok_to_success() {
+        let mut at = make_commander("OK\r\n");
+        assert!(at.dial("+15551234567").is_ok());
+    }
+
+    #[test]
+    fn dial_maps_error_to_failure() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(at.dial("15551234567").is_err());
+    }
+
+    #[test]
+    fn dial_maps_cme_error_to_failure() {
+        let mut at = make_commander("+CME ERROR: 30\r\n");
+        assert!(at.dial("15551234567").is_err());
     }
 
     #[test]
