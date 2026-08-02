@@ -22,6 +22,7 @@ loss, missed calls).
 - **Multi-module support** — auto-detects all connected EC20s, assigns stable IMEI-keyed slots that survive restarts and re-plugs, and handles concurrent calls independently.
 - **Self-healing** — detects USB disconnects and network registration loss, recovers each card independently with exponential backoff, and runs a preventive scheduled nightly modem restart cycle.
 - **DID passthrough** — forwards the GSM caller's number as the SIP DID (`P-Asserted-Identity`, `X-GSM-Caller-ID`), so PBX inbound routes decide the destination.
+- **Optional built-in SIP server** — `[sip_server].enabled` turns the bridge itself into the SIP server for small sites with no PBX: IP phones REGISTER directly to it, and any of the three inbound call paths rings the registered phone. Inbound only; off by default. See [docs/architecture.md](docs/architecture.md#two-sip-side-topologies).
 - **CLI card management** — `card list` / `restart` / `set-mode` / `get-mode` against the running daemon over a Unix socket, with persisted per-slot network mode preferences (`2g`/`3g`/`4g`/`auto`).
 - **SMS capture** — persists all incoming SMS to SQLite and posts rich-embed notifications to a Discord webhook.
 - **Critical-event alerting** — configurable Discord alerts for modem/SIM lifecycle failure, IMS/SIP registration loss, VoWiFi tunnel failure, and missed calls, each with its own on/off switch, threshold, and webhook override; alerts once past the system's own auto-recovery, with a matching recovery notice.

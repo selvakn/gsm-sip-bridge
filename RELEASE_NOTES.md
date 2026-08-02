@@ -26,13 +26,28 @@
   socket, and both default to 5060 — so leave 5060 for the phones and set
   `[sip].local_port = 5062`. The mismatch is refused at startup with the fix in
   the message, as is a leftover `[sip].server`, a `ring_aor` matching no
-  configured account, and duplicate account names. None of those fail silently
-  at call time.
+  configured account, and duplicate account names, a `listen_port` colliding
+  with a running VoWiFi/VoLTE telephony agent's fixed internal ports or
+  per-line loopback span, and `[vowifi].enabled` alongside a running VoLTE
+  telephony side (both would try to host the registrar). None of those fail
+  silently at call time.
+
+  Digest authentication is replay-safe: a nonce-count is only accepted after
+  the credential that goes with it is verified, so a captured or guessed
+  request can no longer advance — and thereby lock out — another account's
+  counter, and a legacy request that claims `qop=auth` without the `nc`/
+  `cnonce` RFC 2617 requires it to carry can no longer skip the replay check
+  meant for it. The wildcard `listen_addr` (the default) no longer appears
+  verbatim as the calling identity in a handset's From header; the realm
+  stands in for it instead.
 
   Five `gsm_sip_bridge_sip_server_*` metrics; see
   `docs/operations.md#sip-server-mode` for the runbook, including the one
   handset setting ("accept SIP only from proxy") that interacts with the
-  two-port design.
+  two-port design. On the VoWiFi/VoLTE paths the registrar is hosted by the
+  telephony agent, which serves no `/metrics` of its own — those gauges are
+  now reported over the agent's existing control channel and exported by the
+  daemon that actually serves `/metrics`, rather than silently reading zero.
 
 - **A line whose tunnel interface cannot be recreated no longer tears down its
   SA — or kills its agent — every 30 seconds while it waits.** The steady-state
