@@ -329,6 +329,25 @@ is required when the mode is enabled. Usernames must be unique.
 | `username` | string | none (required) | The account name the phone authenticates as |
 | `password` | string | none (required) | The account's password. Supports `env:VAR` indirection and is redacted from logs |
 
+### `[outbound]`
+
+Lets a call originating on the SIP side — a PBX-sent `INVITE`, or a phone
+registered in `[sip_server]` mode — be placed out over the mobile network on
+whichever configured SIM is idle (specs/025-outbound-calling). Off by
+default. Reverses `[sip_server]`'s inbound-only restriction: with this
+enabled, any currently registered phone may also dial out, not only
+`ring_aor`.
+
+The destination number is dialed exactly as given, on any idle line
+(circuit-switched, VoWiFi, or VoLTE), with no preference between them and no
+allow-list — restricting who may reach the bridge and what they may dial is
+left entirely to the PBX's dial plan, network access controls, and
+`[sip_server]` account credentials.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch. Off by default |
+
 ## Examples
 
 ### Single-card development

@@ -1,4 +1,5 @@
 pub mod alsa_media_port;
+pub mod outbound;
 pub mod server;
 pub mod target;
 

@@ -245,6 +245,82 @@ pub struct SlotInfo {
     pub network: String,
 }
 
+// ------------------------------------------------- line-command protocol ---
+//
+// A distinct, synchronous request/response protocol carried over its own
+// per-line socket (`control::line_server`/`line_client`), not this file's
+// `ControlCmd`/`ControlResp` — that channel is one-directional
+// (agent -> daemon, via `Observe`) and, on `agent_report_interval_seconds`
+// (default 10s), far too slow to carry a call-placement command a caller is
+// actively waiting on. See specs/025-outbound-calling/contracts/line-command.md
+// and research.md R-003.
+
+/// Sent by the process that owns the SIP side to the process hosting the
+/// line it selected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaceCall {
+    /// Verbatim from the originating INVITE's Request-URI user part — not
+    /// validated or transformed further here (spec 025 FR-010); FR-014
+    /// validation already happened before line selection.
+    pub destination: String,
+}
+
+/// What the line-owning process reports back. Exactly one of these three —
+/// never a partial or ambiguous outcome, so the caller always has a
+/// definite next step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PlaceCallOutcome {
+    /// The dial-out leg was established (ATD accepted / IMS INVITE sent and
+    /// progressing). Media bridging proceeds on the existing per-call path.
+    Placed,
+    /// This line was not actually idle when the command arrived — it lost a
+    /// local race, or its state changed since the last `AgentReport`. The
+    /// caller MUST NOT try a different line automatically (FR-008/FR-009a);
+    /// the whole outbound request is refused, identically to no line having
+    /// been idle at all.
+    Busy,
+    /// The line was idle but the dial attempt itself failed (no network
+    /// registration, modem error, IMS rejection before the call reached the
+    /// network). No automatic retry on a different line (FR-009a).
+    Failed { reason: String },
+}
+
+pub fn read_place_call<R: BufRead>(reader: &mut R) -> Result<PlaceCall, String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read error: {e}"))?;
+    serde_json::from_str(line.trim()).map_err(|e| format!("parse error: {e}"))
+}
+
+pub fn write_place_call<W: Write>(writer: &mut W, cmd: &PlaceCall) -> Result<(), String> {
+    let mut json = serde_json::to_string(cmd).map_err(|e| format!("serialize error: {e}"))?;
+    json.push('\n');
+    writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("write error: {e}"))
+}
+
+pub fn read_place_call_outcome<R: BufRead>(reader: &mut R) -> Result<PlaceCallOutcome, String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read error: {e}"))?;
+    serde_json::from_str(line.trim()).map_err(|e| format!("parse error: {e}"))
+}
+
+pub fn write_place_call_outcome<W: Write>(
+    writer: &mut W,
+    outcome: &PlaceCallOutcome,
+) -> Result<(), String> {
+    let mut json = serde_json::to_string(outcome).map_err(|e| format!("serialize error: {e}"))?;
+    json.push('\n');
+    writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("write error: {e}"))
+}
+
 pub fn read_cmd<R: BufRead>(reader: &mut R) -> Result<ControlCmd, String> {
     let mut line = String::new();
     reader

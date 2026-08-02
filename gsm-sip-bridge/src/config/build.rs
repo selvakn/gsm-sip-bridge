@@ -853,6 +853,16 @@ fn check_sip_server_port_ownership(
     Ok(())
 }
 
+/// No validation beyond structural parsing — see
+/// `specs/025-outbound-calling/contracts/config-schema.md`: unlike
+/// `[sip_server]`, there is no cross-section fact `config::build` can check
+/// (circuit-switched modems are discovered at runtime, not declared here).
+fn build_outbound(raw: RawOutbound) -> BridgeResult<OutboundConfig> {
+    Ok(OutboundConfig {
+        enabled: raw.enabled,
+    })
+}
+
 // ----------------------------------------------------------------- entry ---
 
 /// Assembles the runtime config from the deserialised document.
@@ -884,5 +894,6 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
         logging: build_logging(raw.logging)?,
         alerts,
         sip_server,
+        outbound: build_outbound(raw.outbound)?,
     })
 }
