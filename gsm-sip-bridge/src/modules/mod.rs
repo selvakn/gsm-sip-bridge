@@ -1500,20 +1500,29 @@ impl CardPool {
                 if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
                     state.has_active_call = true;
                 }
-                // Every early return below must clear this back to `false`
-                // for `module_id`'s own slot — found in review, the exact
-                // "latching state" shape this repo has hit before
-                // (docs/greptile-review-learnings.md): `has_active_call` was
-                // only ever cleared by a successful bridge or a later
-                // `Hangup`, so any failure here (including the new "another
-                // call is already active" case `make_call`'s own busy check
-                // now returns) permanently deferred this slot from ever
-                // being selected again, with no GSM call actually running
-                // on it to eventually clear it via `Hangup`.
-                macro_rules! clear_has_active_call {
+                // `handle_ring` (the per-module worker) already sent `ATA`
+                // and answered the call on real hardware *before* this event
+                // ever arrives — every early return below is therefore a
+                // real, live, connected GSM call with no SIP bridge for it,
+                // not just an aborted attempt. Found in review (Greptile,
+                // PR #22): a plain "clear the flag and give up" here left
+                // that call connected to dead air indefinitely, while
+                // `has_active_call = false` made the slot look idle and
+                // eligible for a *second* dial while the modem was still
+                // genuinely busy with the first. `hang_up_unbridged_call!`
+                // sends the same `ModuleCmd::Hangup` the outbound-dial path
+                // already uses for the equivalent "answered but couldn't
+                // bridge" case — it hangs up the real call, sets
+                // `card.state = Idle`, and closes out `call_ctx` via
+                // `record_call_end("failed")` — genuinely freeing the slot,
+                // not just pretending to.
+                macro_rules! hang_up_unbridged_call {
                     () => {
                         if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
                             state.has_active_call = false;
+                            if let Some(cmd_tx) = &state.cmd_tx {
+                                let _ = cmd_tx.send(ModuleCmd::Hangup);
+                            }
                         }
                     };
                 }
@@ -1522,14 +1531,12 @@ impl CardPool {
                         module = %module_id,
                         "SIP not registered, cannot bridge call"
                     );
-                    clear_has_active_call!();
+                    hang_up_unbridged_call!();
                     return;
                 }
 
                 // In SIP server mode this fails when the phone is not
-                // registered. Leaving the GSM call to ring out is the same
-                // thing that happens when `make_call` below fails, so the
-                // existing missed-call alert path still reports it.
+                // registered.
                 let dest_uri = match self.sip_bridge.compute_destination_uri(&caller_id) {
                     Ok(uri) => uri,
                     Err(e) => {
@@ -1543,7 +1550,7 @@ impl CardPool {
                         metrics::SIP_CALLS_TOTAL
                             .with_label_values(&[&module_id, "error", "cs"])
                             .inc();
-                        clear_has_active_call!();
+                        hang_up_unbridged_call!();
                         return;
                     }
                 };
@@ -1560,7 +1567,7 @@ impl CardPool {
                     metrics::AUDIO_ERRORS_TOTAL
                         .with_label_values(&[&module_id, "sound_device"])
                         .inc();
-                    clear_has_active_call!();
+                    hang_up_unbridged_call!();
                     return;
                 }
 
@@ -1573,7 +1580,7 @@ impl CardPool {
                     metrics::SIP_CALLS_TOTAL
                         .with_label_values(&[&module_id, "error", "cs"])
                         .inc();
-                    clear_has_active_call!();
+                    hang_up_unbridged_call!();
                 } else {
                     metrics::SIP_CALLS_TOTAL
                         .with_label_values(&[&module_id, "initiated", "cs"])
