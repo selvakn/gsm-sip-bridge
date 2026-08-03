@@ -21,51 +21,53 @@ enum Origin {
 }
 ```
 
-### `CandidateLine`
+### Line selection (FR-004, FR-007, FR-008, FR-009) — as actually implemented
 
-The SIP-owning process's view of one configured line, built from the
-existing `AgentReport` liveness/state stream (no new state source — this is
-a read model over data already reported).
+**2026-08-03 revision**: the generic `CandidateLine`/`select_idle_line`
+abstraction originally described here was never wired in and has been
+deleted (`sip/outbound.rs` now only holds `OutboundOutcome` and
+`validate_destination`). The two real paths each grew their own selection
+logic against their own state representation instead:
 
-| Field | Type | Notes |
-|---|---|---|
-| `id` | `LineId` | Existing per-line identity (modem slot, or agent `(kind, module_id)`) |
-| `path` | `CarrierPath` | `CircuitSwitched` \| `VoWifi` \| `Volte` |
-| `registered` | `bool` | From existing liveness tracking |
-| `busy` | `bool` | Existing inbound-call busy state, now also set by an in-flight outbound attempt on the same line |
-| `recovering` | `bool` | Existing self-healing/backoff state |
+- **Circuit-switched** (`modules::mod::handle_outbound_request`): iterates
+  the daemon's in-process `SlotState`s in whatever order they're held, and
+  claims the first slot whose `CardState == Idle`. No priority ordering, no
+  path preference (FR-007) — same "first idle wins" rule as originally
+  specified, just against `SlotState` rather than a shared `CandidateLine`
+  read model.
+- **VoWiFi/VoLTE** (`vowifi::mod::run_outbound_listener`): iterates its own
+  `RuntimeLine`s the same way, claiming the first one that's registered and
+  not already busy.
 
-`idle(&self) -> bool { self.registered && !self.busy && !self.recovering }`
-— this is the sole definition of "idle" (FR-005); no additional outbound-
-specific eligibility rule exists.
+In both cases, "claim" is still provisional-and-self-correcting: a failed or
+lost dial attempt leaves the line's next liveness/state report to reset it,
+so nothing can wedge a line non-idle forever — same guarantee as originally
+designed, just enforced locally in each path rather than via a shared
+`idle()` method.
 
-### Line selection (FR-004, FR-007, FR-008, FR-009)
+### Dispatching a claimed line (control protocol) — as actually implemented
 
-No priority ordering, no path preference (FR-007, resolved by
-clarification): iterate `CandidateLine`s in whatever order the SIP-owning
-process already holds them (a `Vec`/map populated by existing discovery), and
-claim the first `idle()` one. "Claim" means: atomically mark it non-idle in
-the SIP-owning process's own view *before* issuing `PlaceCall` (R-003 race
-handling) — this local mark is provisional and is corrected by the line's
-next `AgentReport` regardless of outcome, so a crashed or lost `PlaceCall`
-cannot wedge a line non-idle forever.
+**2026-08-03 revision**: the `PlaceCall`/`PlaceCallOutcome` wire structs and
+the `control::line_server`/`line_client` synchronous per-agent listener
+described here were never wired in either and have been deleted
+(`control/protocol.rs`, `control/line_client.rs`, `control/line_server.rs`
+no longer exist). The two real paths use different, already-existing
+mechanisms instead, both same-process:
 
-### `PlaceCall` command / `PlaceCallOutcome` (control protocol)
-
-Sent over the new synchronous per-agent listener (`control::line_server`,
-research.md R-003), not the existing `AgentReport` channel.
-
-```rust
-struct PlaceCall {
-    destination: String,
-}
-
-enum PlaceCallOutcome {
-    Placed,                 // dial-out leg established; media bridging proceeds
-    Busy,                   // line was not actually idle (lost the local race)
-    Failed { reason: String },
-}
-```
+- **Circuit-switched**: `ControlCmd::Dial { slot, destination }` →
+  `ModuleCmd::Dial` → the modem's own command loop, replying via a
+  `oneshot::Sender<Result<(), String>>` — the exact same pattern already
+  used for `SetMode`/`Reboot`. No cross-process hop exists between the SIP
+  side and `CardPool`; both live in the same daemon binary.
+- **VoWiFi/VoLTE**: `vowifi::control::ControlMessage::PlaceCall` (JSON over
+  the existing Agent A ↔ Agent B TCP control channel — see
+  `contracts/agent-outbound-protocol.md`), answered by `CallPlaced` /
+  `CallRinging` (non-terminal) / `CallFailed`, mapped locally in
+  `try_place_on_line`'s `PlaceCallOutcome` (`Placed` / `Unavailable` /
+  `Committed` — note this is a same-named but distinct, VoWiFi-local enum
+  from the deleted wire-protocol type above) to decide whether a
+  network-failure is cheap to retry on another line or must abort per
+  FR-009a.
 
 ### Outbound outcome categories (FR-015)
 
@@ -89,31 +91,31 @@ INVITE accepted (PBX UAS, or phone via 302 redirect)
 validate destination (FR-014) ──fail──▶ refused_invalid_destination
         │ ok
         ▼
-select CandidateLine (FR-004/007) ──none idle──▶ refused_no_idle_line
+select a line (FR-004/007, per-path logic above) ──none idle──▶ refused_no_idle_line
         │ found, claimed locally (provisional)
         ▼
-PlaceCall → line_server (same process or cross-process)
+dispatch (ControlCmd::Dial, or ControlMessage::PlaceCall — per-path, see above)
         │
-        ├─ Busy ─────────────────────────▶ refused_no_idle_line (FR-008)
-        ├─ Failed ───────────────────────▶ refused_network_failure (no retry, FR-009a)
+        ├─ line lost the race / not actually idle ──▶ refused_no_idle_line (FR-008)
+        ├─ failed before carrier placement (Unavailable) ─▶ refused_network_failure, retry next line
+        ├─ failed after carrier placement (Committed) ────▶ refused_network_failure or unanswered
+        │                                                    (no retry, FR-009a)
         └─ Placed
               │
               ▼
-        mobile network progress relayed (FR-012) ── busy/rejected/unreachable ─▶ refused_network_failure
+        carrier progress relayed (FR-012, `CallRinging`) ── busy/rejected/unreachable ─▶ refused_network_failure
               │ answered
               ▼
         two-way audio, existing bridging/teardown (FR-013) ─▶ placed
 ```
 
-**Naming note (revision 4)**: the `PlaceCall`/`line_server` step above
-describes the original, since-superseded cross-process design
-(`contracts/line-command.md`, likely unneeded — `ControlCmd::Dial` already
-covers the cross-process CS case). The unrelated, actually-implemented
-`ControlMessage::PlaceCall` (`contracts/agent-outbound-protocol.md`) is the
-VoWiFi/VoLTE dispatch path, Agent B → Agent A — see that contract for its
-own state transitions, which mirror the shape above with `Placed`/`Failed`
-replaced by `CallPlaced`/`CallFailed` and no `Busy` case (a line already
-selected via `select_idle_line` before either dispatch path is chosen).
+**Naming note (revision 5, 2026-08-03)**: revision 4's cross-process
+`PlaceCall`/`line_server` design (`contracts/line-command.md`) has now been
+deleted outright rather than left unwired — see "Dispatching a claimed
+line" above. The diagram now reflects the two real dispatch paths directly.
+The VoWiFi/VoLTE `PlaceCallOutcome` used to decide the middle three branches
+is a local, same-named-but-unrelated enum in `vowifi::mod`, not the deleted
+wire-protocol struct.
 
 ## Validation rules
 

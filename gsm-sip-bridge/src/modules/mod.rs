@@ -1398,11 +1398,12 @@ impl CardPool {
             ControlCmd::Dial { slot, destination } => {
                 let resolved_slot = match slot {
                     Some(s) => Some(s),
-                    // "Whichever line is idle" — same selection rule as
-                    // `sip::outbound::select_idle_line`, applied here so a
-                    // cross-process caller (e.g. `vowifi::mod`) needs no
-                    // separate `ListSlots` round trip (which would race
-                    // another caller's selection).
+                    // "Whichever line is idle" — first `Ready` slot with
+                    // no active call, applied here (rather than requiring
+                    // the caller to pick one) so a cross-process caller
+                    // (e.g. `vowifi::mod`) needs no separate `ListSlots`
+                    // round trip, which would race another caller's
+                    // selection.
                     None => slots
                         .iter()
                         .find(|(_, s)| s.lifecycle == LifecycleState::Ready && !s.has_active_call)
@@ -1840,7 +1841,11 @@ fn run_module_loop(
                         return Ok(());
                     }
                     ModuleCmd::Dial(number, resp_tx) => {
-                        let _ = resp_tx.send(apply_dial_cmd(&mut at, &mut card, &number));
+                        let result = apply_dial_cmd(&mut at, &mut card, &number);
+                        if result.is_ok() {
+                            record_call_start_outbound(&module.id, &number, &mut call_ctx);
+                        }
+                        let _ = resp_tx.send(result);
                     }
                     ModuleCmd::Hangup => {
                         tracing::info!(module = %module.id, "outbound: hanging up after SIP-side accept failed post-dial");
@@ -2064,6 +2069,34 @@ fn handle_hangup(
         record_call_end(&module.id, event_tx, store_tx, call_ctx, "missed");
     }
     card.state = CardState::Idle;
+}
+
+/// The outbound mirror of `handle_ring`'s own call-start bookkeeping —
+/// called once `apply_dial_cmd` confirms `ATD` was accepted. Without this,
+/// an outbound call was invisible in call history (`call_ctx` stayed
+/// `None`, so `record_call_end`'s `if let Some(ctx) = call_ctx.take()`
+/// silently did nothing on teardown) while `ACTIVE_CALLS` never got set to
+/// `1.0` in the first place, only spuriously reset to `0.0` later
+/// (specs/025-outbound-calling review). `caller_id` holds the dialed
+/// destination here rather than an inbound caller's number — the same
+/// field, repurposed for the direction it wasn't originally written for,
+/// rather than widening `CallContext`'s shape for one new caller.
+fn record_call_start_outbound(
+    module_id: &str,
+    destination: &str,
+    call_ctx: &mut Option<CallContext>,
+) {
+    *call_ctx = Some(CallContext {
+        caller_id: destination.to_string(),
+        sip_destination: String::new(),
+        started_at: Utc::now(),
+    });
+    metrics::ACTIVE_CALLS
+        .with_label_values(&[module_id, "cs"])
+        .set(1.0);
+    metrics::CALLS_TOTAL
+        .with_label_values(&[module_id, "outgoing", "cs"])
+        .inc();
 }
 
 fn record_call_end(
@@ -2394,6 +2427,43 @@ mod tests {
         record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
 
         assert!(event_rx.try_recv().is_err(), "no alert for answered calls");
+    }
+
+    /// specs/025-outbound-calling review: an outbound call used to be
+    /// invisible in call history because nothing ever populated
+    /// `call_ctx` for it, so `record_call_end`'s `if let Some(ctx) =
+    /// call_ctx.take()` silently did nothing on teardown regardless of
+    /// what status it was called with. Exercises the full
+    /// start-then-end lifecycle and checks a real `InsertCall` record
+    /// comes out the other end.
+    #[test]
+    fn an_outbound_call_produces_a_real_call_history_record() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (store_tx, store_rx) = crossbeam_channel::unbounded::<StoreCommand>();
+        let mut call_ctx: Option<CallContext> = None;
+        assert!(call_ctx.is_none(), "no call in progress yet");
+
+        record_call_start_outbound("card0", "+15551234567", &mut call_ctx);
+        assert!(
+            call_ctx.is_some(),
+            "call_ctx must be populated once ATD is accepted"
+        );
+
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+        assert!(
+            call_ctx.is_none(),
+            "record_call_end must take the context, same as the inbound path"
+        );
+
+        let StoreCommand::InsertCall(record) = store_rx
+            .try_recv()
+            .expect("a call record must have been sent to the store")
+        else {
+            panic!("expected InsertCall");
+        };
+        assert_eq!(record.caller_id, "+15551234567");
+        assert_eq!(record.status, "answered");
+        assert_eq!(record.module_id, "card0");
     }
 
     // specs/022-discord-critical-alerts (Greptile P1: "GivenUp state never

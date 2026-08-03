@@ -686,14 +686,6 @@ fn run_outbound_listener(
     }
 }
 
-/// Connects to `line`'s Agent A (`veth_local_addr:AGENT_A_STATUS_PORT` —
-/// the same listener `run_status_listener` extended to also accept
-/// `PlaceCall`, specs/025-outbound-calling) and asks it to originate a call.
-/// `Ok(())` only once Agent A replies `CallPlaced` — meaning its carrier
-/// leg is up and its veth listener is waiting for us. Any other outcome
-/// (connect failure, timeout, `CallFailed`) is `Err`, cheap to try the next
-/// line for, since `dispatch_loop` answers a busy line before ever
-/// touching the carrier transport.
 /// Reports one outbound attempt outcome over the agent-reporting channel —
 /// this process serves no `/metrics` of its own (specs/025-outbound-calling
 /// T071; found live: the counter was registering in the wrong process's

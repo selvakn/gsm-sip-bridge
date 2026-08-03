@@ -252,19 +252,44 @@ this pass's fixes have been exercised against real hardware yet.
 `a_message_split_across_a_read_timeout_is_not_lost`) and the
 `pjsip-linked` build are all clean.
 
+### Fourth code review, 2026-08-03 (dead code and a missing call-history record)
+
+- **`sip/outbound.rs` was largely dead code documenting behavior the code doesn't have**: `Origin`, `OutboundCallRequest`, `CarrierPath`, and `CandidateLine` (plus `select_idle_line`) had zero callers — both real paths (`modules::mod::handle_outbound_request` for CS, `vowifi::mod::run_outbound_listener` for VoWiFi/VoLTE) had already grown their own line-selection logic against their own state (`SlotState`, `RuntimeLine`) well before this module was ever wired up. Worse, `CandidateLine::idle`'s own doc comment claimed to be "the sole definition of 'idle' (FR-005)" — false, since nothing called it. **Fixed**: deleted the dead types/function and their tests; kept `OutboundOutcome`/`validate_destination` (genuinely used by both paths); added a module doc comment explaining the deletion and pointing to `data-model.md` for where the conceptual model still lives.
+- **`control/line_client.rs`/`control/line_server.rs` were doc-comment-only stubs, and `control/protocol.rs` carried an entirely unused `PlaceCall`/`PlaceCallOutcome` wire protocol** — confusable with the real, live `vowifi::control::ControlMessage::PlaceCall` it shares a name with, but a completely separate, never-implemented cross-process design (`contracts/line-command.md`). **Fixed**: deleted both stub files, their `pub mod` declarations in `control/mod.rs`, and the dead protocol section in `control/protocol.rs` (confirmed zero callers before deleting). Added a "SUPERSEDED" banner to `contracts/line-command.md` and rewrote `data-model.md`'s "Line selection"/"PlaceCall command" sections to describe the two real dispatch paths instead of the deleted abstraction. Marked Phase 8 (T042–T046) below as superseded rather than leaving it looking like outstanding work.
+- **`try_place_on_line`'s doc comment was misattached to `report_outbound`**: a stale paragraph describing `try_place_on_line`'s old `Result<(), String>`-shaped API (superseded by the `PlaceCallOutcome` three-way split from the second review) sat directly above the unrelated `report_outbound` function, while `try_place_on_line`'s own doc comment further down (already correct/up to date) duplicated the real description. **Fixed**: deleted the misplaced stale paragraph.
+- **Real bug, fixed — outbound CS calls produced no call-store record and never set `ACTIVE_CALLS`**: inbound calls get their call-history bookkeeping from `handle_ring` (`modules/mod.rs`), but outbound calls never called anything equivalent — `call_ctx` stayed `None` for the whole call, so `record_call_end` had nothing to record and the call was invisible in call history, even though `ACTIVE_CALLS.set(0.0)` still fired on teardown (misleadingly implying a call had been tracked). **Fixed**: added `record_call_start_outbound(module_id, destination, call_ctx)`, mirroring `handle_ring`'s bookkeeping (`CallContext` with `caller_id` set to the dialed destination, `ACTIVE_CALLS` set to 1.0, `CALLS_TOTAL` incremented with the `"outgoing"` label), wired into `ModuleCmd::Dial`'s handling right after a successful `apply_dial_cmd`. New test `an_outbound_call_produces_a_real_call_history_record` verifies the full start→end lifecycle produces a real `StoreCommand::InsertCall` with the right `caller_id`/`status`/`module_id`.
+  - **Related, investigated and ruled out**: checked whether `handle_hangup`'s NO-CARRIER path could misclassify an answered outbound call as "missed," since outbound calls never reach `CardState::Bridged` (only `handle_ring`, inbound-only, sets it — outbound calls stay in `CardState::Answering` for their whole duration). Traced the actual condition and confirmed it already checks `Bridged || Answering`, so this is not a bug; no additional fix made.
+
+`make format`/`lint`/`test` (909 tests: 911 − 3 removed `sip::outbound` line-selection
+tests + 1 new `an_outbound_call_produces_a_real_call_history_record`) and the
+`pjsip-linked` build are all clean. Not yet re-verified live — none of this
+pass's changes have been exercised against real hardware yet.
+
 ---
 
-## Phase 8: Cross-process line-command channel (was Phase 2 of US2 in the original plan)
+## Phase 8: Cross-process line-command channel (was Phase 2 of US2 in the original plan) — SUPERSEDED
 
 **Purpose**: needed only once a deployment mixes CS with VoWiFi/VoLTE, or the
 SIP side is hosted by an agent process that needs to reach a *different*
 agent's line. Deferred until Phases 4–7 are solid, per plan.md Step 4.
 
-- [ ] T042 [US2] Implement `control::line_server` in `gsm-sip-bridge/src/control/line_server.rs` (per `contracts/line-command.md`, rescoped) started from the VoWiFi/VoLTE agent processes (`gsm-sip-bridge/src/ims/agent.rs`/`gsm-sip-bridge/src/vowifi/mod.rs` startup) only
-- [ ] T043 [US2] Implement `control::line_client::place_call` in `gsm-sip-bridge/src/control/line_client.rs`
-- [ ] T044 [US2] Extend `gsm-sip-bridge/src/sip/outbound.rs`'s line selection to include cross-process `CandidateLine`s, routing through T043 when the target line is remote
-- [ ] T045 [US2] Implement the provisional-claim-then-command sequence in `gsm-sip-bridge/src/sip/outbound.rs` for the cross-process case (data-model.md's race handling — still needed here, unlike the same-process case)
-- [ ] T046 [P] [US2] Create `gsm-sip-bridge/tests/test_outbound_line_command.rs`: real cross-process socket round-trip, no mocks
+**Superseded, 2026-08-03 (fourth code review)**: this whole phase never
+started, and the cross-process case it was scoped for is already met by a
+different, already-implemented mechanism —
+`vowifi::control::ControlMessage::PlaceCall` over Agent A/B's existing TCP
+control channel (`contracts/agent-outbound-protocol.md`), live-verified on
+real hardware. The `control::line_server`/`line_client` module stubs and the
+`control::protocol::PlaceCall`/`PlaceCallOutcome` wire types T042–T045 would
+have built on are deleted (dead code with zero callers — see the fourth
+review batch below and `contracts/line-command.md`'s superseded banner).
+T042–T046 are left unchecked below as a record of the original design, not
+as outstanding work; do not implement them.
+
+- [ ] ~~T042 [US2] Implement `control::line_server`...~~ — superseded, see above
+- [ ] ~~T043 [US2] Implement `control::line_client::place_call`...~~ — superseded, see above
+- [ ] ~~T044 [US2] Extend `sip/outbound.rs`'s line selection to include cross-process `CandidateLine`s...~~ — superseded, `sip/outbound.rs` no longer has a `CandidateLine` type
+- [ ] ~~T045 [US2] Implement the provisional-claim-then-command sequence for the cross-process case...~~ — superseded, see above
+- [ ] ~~T046 [P] [US2] Create `test_outbound_line_command.rs`...~~ — superseded, no protocol left to test
 
 ---
 

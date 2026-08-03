@@ -1,5 +1,14 @@
 # Contract: the cross-process line-command protocol
 
+> **SUPERSEDED, 2026-08-03**: this protocol was never implemented and the
+> code it describes (`control::line_client`, `control::line_server`,
+> `control::protocol::PlaceCall`/`PlaceCallOutcome`) has been deleted — see
+> the fourth code-review batch in `tasks.md` and `data-model.md`'s "revision
+> 5" note. VoWiFi/VoLTE dispatch (the only genuinely cross-process case) is
+> handled instead by the real, live `vowifi::control::ControlMessage::PlaceCall`
+> documented in `contracts/agent-outbound-protocol.md`. This file is kept
+> for historical record of the original design; do not implement against it.
+
 **Feature**: 025-outbound-calling
 **Rescoped 2026-08-03** (research.md R-003, revised): this channel is
 needed **only** for the genuinely cross-process case — reaching a
