@@ -105,6 +105,16 @@ PlaceCall → line_server (same process or cross-process)
         two-way audio, existing bridging/teardown (FR-013) ─▶ placed
 ```
 
+**Naming note (revision 4)**: the `PlaceCall`/`line_server` step above
+describes the original, since-superseded cross-process design
+(`contracts/line-command.md`, likely unneeded — `ControlCmd::Dial` already
+covers the cross-process CS case). The unrelated, actually-implemented
+`ControlMessage::PlaceCall` (`contracts/agent-outbound-protocol.md`) is the
+VoWiFi/VoLTE dispatch path, Agent B → Agent A — see that contract for its
+own state transitions, which mirror the shape above with `Placed`/`Failed`
+replaced by `CallPlaced`/`CallFailed` and no `Busy` case (a line already
+selected via `select_idle_line` before either dispatch path is chosen).
+
 ## Validation rules
 
 - **FR-014**: `destination` MUST be non-empty and contain only characters

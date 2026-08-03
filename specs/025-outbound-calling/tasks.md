@@ -15,6 +15,23 @@ Phase 4 were already implemented, tested, and committed in the first pass
 and are carried forward as done. New tasks (T051+) cover the pjsua-safe UAS
 addition, which nothing in US1/US3 can proceed without.
 
+**Session note (2026-08-03, implementation pass 3)**: found mid-implementation
+that this specific host's actual deployment (`config.toml`) runs SIP server
+mode hosted by `vowifi::mod` (Agent B), not the plain daemon — so T018 alone
+(implemented against `SipBridge`/the daemon) could never receive a real
+phone's INVITE without T034's registrar redirect *and* the equivalent
+poll/dial/accept pipeline in `vowifi::mod` too. Both were added in the same
+pass (see T018/T035's entries below) once this was discovered, rather than
+declaring T018 "done" against a topology this host doesn't run. Also found
+`ControlCmd`/`control::client::send_cmd` already work cross-process today
+(proven by `SetMode`/`Reboot`/`CardRestart` from the CLI) — so `ControlCmd::Dial`
+with `slot: None` reaches the daemon's CS lines from `vowifi::mod` with no
+new socket, and Phase 8's originally-planned `line_server`/`line_client`
+protocol is very likely unnecessary in its entirety, not just for the
+same-process case as the previous revision concluded. Left as unimplemented
+stubs; revisit only if a real deployment is found that `ControlCmd` truly
+cannot reach.
+
 **Tests**: INCLUDED (constitution Principle I, NON-NEGOTIABLE). The pjsua
 UAS additions are verified against the real, already-`pjsip-linked`-built
 container and the physically attached EC200 modems
@@ -113,12 +130,12 @@ confirm `ATD` reaches the modem and two-way audio flows once answered.
 
 ### PBX INVITE → outbound call (uses Phase 3's UAS support)
 
-- [ ] T018 [US1] Implement the PBX-trunk UAS INVITE handler in `gsm-sip-bridge/src/sip/mod.rs`: on `on_incoming_call` (T053/T054) with `[outbound].enabled = true`, build `OutboundCallRequest { origin: Origin::Pbx, .. }` (`gsm-sip-bridge/src/sip/outbound.rs`), validate (`validate_destination`), select a line (`select_idle_line` over CS `SlotState`s), dispatch via `ControlCmd::Dial` (T017a–d) through the daemon's own `control_tx` — no socket, direct in-process send since `CardPool` always lives in the same process as the trunk `Account`
-- [ ] T019 [US1] Implement call-progress relay in `gsm-sip-bridge/src/sip/mod.rs` per `contracts/sip-dialout.md`'s table (`180 Ringing`, `486 Busy Here`, `503 Service Unavailable`, `200 OK`), driven off the CS leg's AT-reported call state and `Call::answer` (T052)
-- [ ] T020 [US1] Wire teardown in `gsm-sip-bridge/src/sip/mod.rs`: either leg hanging up ends the other, reusing the existing bridged-call teardown path
-- [ ] T021 [US1] Increment `OUTBOUND_ATTEMPTS_TOTAL` (`gsm-sip-bridge/src/metrics/mod.rs`) with the right outcome label at every terminal point reached by T018–T020, called from `gsm-sip-bridge/src/sip/mod.rs`
-- [ ] T022 [US1] Add an inline test in `gsm-sip-bridge/src/sip/mod.rs` (or extend T015-equivalent) confirming `[outbound].enabled = false` (default) leaves the INVITE handling byte-for-byte as before (FR-017); confirm `make test` stays green
-- [ ] T023 [US1] **Hardware verification, end to end** (no source file): with `[outbound].enabled = true`, a real EC20 attached and registered, and a test SIP UAC standing in for the PBX, place a real outbound call and confirm: `180`/`200` progression, `ATD` reaches the modem, the call connects on the real mobile network, audio flows, and either side hanging up tears down the other
+- [X] T018 [US1] Implement the PBX-trunk (and, once discovered necessary, SIP-server-mode) UAS INVITE handler — DONE, different shape than planned: a 200ms poll of `SipBridge::poll_outbound_request` (new, wraps `Endpoint::poll_incoming_call` + `Call::request_destination`) added as its own `tokio::select!` arm in `CardPool::run` (`modules/mod.rs`), independent of the far-future retry/rescan wakeups already computed there — those are too infrequent for a caller waiting on a response. Dispatches via `ControlCmd::Dial` (not a direct in-process shortcut — see T024's note, this turned out to already need to work cross-process too)
+- [X] T019 [US1] Call-progress relay — SCOPE ADJUSTED: full `180`/`486` mid-dial progress needs AT+CLCC-based call-state polling that does not exist in this codebase yet (`ATD`'s own response only confirms the attempt started — see `AtCommander::dial`'s doc comment). Implemented the two endpoints that don't need it: refusal (`400` no destination, `484` invalid, `503` no line/network failure) and acceptance (`200` once the dial is confirmed *accepted*, not once actually answered). True ringing-to-answered progress is a follow-up, tracked nowhere yet — flagging here rather than silently shipping it as if done
+- [X] T020 [US1] Teardown — DONE, and turned out to need **no new code**: `ModuleCmd::Dial` already sets `card.state = Answering` on success, which is exactly the state the existing SIP-peer-disconnect check in `run_module_loop` and `BridgeEvent::Hangup`'s `self.sip_bridge.hangup_active_call()` (both written for the inbound direction) already watch — reused unmodified
+- [X] T021 [US1] `OUTBOUND_ATTEMPTS_TOTAL` incremented at every terminal point in `CardPool::handle_outbound_request` (`modules/mod.rs`)
+- [X] T022 [US1] Compatibility — DONE: the `outbound_poll.tick()` `select!` arm carries `if self.config.outbound.enabled`, so disabled means the poll (and everything downstream of it) never runs at all; `make test` green throughout including the full pre-existing suite
+- [~] T023 [US1] **Hardware verification, end to end** — see the session-level note below (this deployment's actual topology needed T032–T036 too, not just T018–T022, before an end-to-end call was even reachable)
 
 **Checkpoint**: PBX-originated outbound calling works end-to-end on real
 circuit-switched hardware. This is the MVP.
@@ -143,11 +160,11 @@ this host. Cross-process multi-path selection is Phase 8.
 
 **Goal**: unchanged from the original plan; now unblocked by Phase 3.
 
-- [ ] T032 [P] [US3] Extend `gsm-sip-bridge/tests/test_sip_server_registrar.rs`: a registered phone's INVITE receives `302 Moved Temporarily` (per `contracts/sip-dialout.md`) when `[outbound].enabled = true`, still `403` otherwise
-- [ ] T034 [US3] Change the `"INVITE"` branch in `gsm-sip-bridge/src/sip/server/mod.rs::handle_datagram` per T032
-- [ ] T035 [US3] Implement the UAS INVITE handler on `Account::local` in `gsm-sip-bridge/src/sip/mod.rs` using Phase 3's `on_incoming_call`/`Call::answer`, constructing `OutboundCallRequest { origin: Origin::SipServerPhone { aor }, .. }`, reusing T018's validate → select → dial pipeline
-- [ ] T036 [US3] Add an inline test in `gsm-sip-bridge/src/sip/mod.rs` confirming eligibility is any currently-registered account, not only `ring_aor` (FR-003)
-- [ ] T033 [US3] **Hardware verification** (no source file): a real SIP phone (or softphone) registers to SIP server mode, dials a number, and the call is placed on a real EC20 exactly as T023 verified for the PBX path
+- [X] T032 [P] [US3] `gsm-sip-bridge/tests/test_sip_server_registrar.rs`: added `a_registered_phones_call_is_redirected_when_outbound_is_enabled` (302, Contact on the pjsua UAC port) and `an_unregistered_peers_call_is_still_refused_when_outbound_is_enabled` (still 403) — 24/24 tests pass including the unmodified original `a_call_from_a_phone_is_explicitly_refused`
+- [X] T034 [US3] Changed the `"INVITE"` branch in `handle_datagram` (`sip/server/mod.rs`): `state.outbound_local_port: Option<u16>` (new field, threaded through `Registrar::start_observed`) gates a 302 redirect via `BindingStore::find_by_source` (new — matches the INVITE's peer address against a live binding's registered source, i.e. "already proved its password at REGISTER time," rather than a second digest exchange on the INVITE itself)
+- [X] T035 [US3] `Account::local`'s incoming calls are covered by the same `SipBridge::poll_outbound_request`/`accept_outbound`/`refuse_outbound` T018 already added — `Endpoint::poll_incoming_call` is endpoint-wide, not account-specific, so no separate handler was needed once T034 made the registrar actually route a phone's INVITE to that account at all. **Also extended beyond the original plan**: this real deployment hosts SIP server mode in `vowifi::mod` (its own separate `Endpoint`/`Account`, not `SipBridge` — see that file's module doc), so the identical poll/validate/dial/accept pipeline was added there too (`run_outbound_listener`), dispatching to the daemon's CS lines over the existing control socket
+- [X] T036 [US3] Eligibility is any registered account — `find_by_source` checks the binding table generically, with no `ring_aor` filter; covered by T032's redirect test using account `1001` (this deployment's only configured account, incidentally also `ring_aor` — a distinct-non-ring_aor-account test would strengthen this, not yet added)
+- [ ] T033 [US3] **Hardware verification** (no source file): see the session-level note below
 
 ---
 
@@ -158,11 +175,43 @@ this host. Cross-process multi-path selection is Phase 8.
 SDP/RTP/signalling code. **This phase does not depend on Phase 3 at all** —
 the carrier-facing leg never touches pjsua.
 
-- [ ] T037 [P] [US4] Generalize/export `ims::call`'s UAC builders (`build_invite`/`build_ack`/`build_bye`/`InviteParts`, `gsm-sip-bridge/src/ims/call.rs:653-745`) for reuse outside the CLI diagnostic tool — e.g. lift beside `gsm-sip-bridge/src/ims/sip_client.rs`'s existing builders, or make the relevant `ims::call` items `pub(crate)`
-- [ ] T038 [US4] Add an origination trigger to `gsm-sip-bridge/src/ims/agent.rs`'s session state (its `ActiveCall`, `agent.rs:610-628`, today only populated `from_invite`) so a `PlaceCall`-equivalent request can start a UAC dialog using T037's builders and the existing `sdp::build_offer`/`parse_answer` (`gsm-sip-bridge/src/ims/sdp.rs`) and RTP-relay code the inbound path already uses
-- [ ] T039 [US4] Wire the dial-target dispatch in `gsm-sip-bridge/src/ims/agent.rs`: reached by whichever cross-process mechanism (Phase 8) or, if the agent process itself owns the SIP side, a direct in-process call
-- [ ] T040 [P] [US4] Add a test in `gsm-sip-bridge/tests/` confirming PC/SC-sourced VoWiFi lines (`gsm-sip-bridge/src/modules/pcsc_card.rs`) are dialed identically to modem-sourced ones (no separate code path — per research.md, this needs no new code, just a test/assertion)
-- [ ] T041 [US4] **Hardware verification, if a VoWiFi/VoLTE-capable SIM and P-CSCF reachability are available on this host** (no source file): place a real outbound call over VoWiFi or VoLTE and confirm the originated INVITE reaches the carrier and the call connects. If no such SIM is available in this environment, this task falls back to the container-based verification spec 015–017 already established for inbound IMS calls.
+**Revised 2026-08-03 (plan revision 4)**: the live test against this host's
+real deployment showed T037–T041 as originally written undersold the work —
+Agent A/B are separate processes, and nothing let Agent B tell Agent A to
+originate a call at all. Replaced with the real breakdown below, per
+`contracts/agent-outbound-protocol.md` and `research.md` R-009/R-010/R-011.
+
+### Control protocol extension (Agent B → Agent A)
+
+- [ ] T060 [P] [US4] Add `ControlMessage::PlaceCall { call_id, destination }`, `CallPlaced { call_id, veth_rtp_port }`, `CallFailed { call_id, reason }` in `gsm-sip-bridge/src/vowifi/control.rs`, mirroring the existing `IncomingCall`/`BridgeReady`/`BridgeFailed` variants' doc-comment style and direction
+- [ ] T061 [P] [US4] Create `gsm-sip-bridge/tests/test_agent_outbound_protocol.rs`: real `TcpStream`/`read_msg`/`write_msg` round trip for the new triad, mirroring however the existing inbound triad is tested (no mocks)
+
+### `ims::call` builder generalization (no behavior change)
+
+- [ ] T062 [US4] Widen `InviteParts`/`build_invite`/`AckParts`/`build_ack`/`build_bye` (`gsm-sip-bridge/src/ims/call.rs:653-745`) from private to `pub(crate)`
+- [ ] T063 [US4] Confirm `ims::call`'s own existing tests (`build_invite_includes_sdp_body_and_content_length`, `build_invite_advertises_the_protected_server_port_in_contact`, `build_invite_includes_route_headers_in_order`, `build_bye_reuses_to_header_verbatim`, `call.rs:811-900`) still pass unmodified — this task is a visibility change only, these tests are what prove it
+
+### Agent A: UAC origination over the live session
+
+- [ ] T064 [US4] Add a UAC-role `DialogInfo`-equivalent constructor in `gsm-sip-bridge/src/ims/agent.rs`, next to the existing UAS-role `from_invite` (`agent.rs:628`), built from the currently-registered `RegisteredSession` — never a fresh `register_session` call (research.md R-010's hard constraint: a second IMS-AKA registration for the same IMSI tears the live one down)
+- [ ] T065 [US4] Handle `ControlMessage::PlaceCall` in `ims/agent.rs`'s control-message dispatch loop (alongside the existing `CallEnded`/`BridgeReady` handling around `agent.rs:1173-1330`): build and send the INVITE via T062's builders and T064's dialog, using `sdp::build_offer` for the offer (the existing inbound path uses `parse_offer`/`build_answer` — this is the UAC-side counterpart, `sdp.rs`)
+- [ ] T066 [US4] Handle the carrier's response in `ims/agent.rs`: on a final 2xx, send `CallPlaced { call_id, veth_rtp_port }` back to Agent B and proceed to RTP relay setup (reusing the inbound path's relay/transcode code, `agent.rs`'s `spawn_relay`/`transcode`); on a non-2xx final response or timeout, send `CallFailed { call_id, reason }`
+- [ ] T067 [P] [US4] Add inline tests in `gsm-sip-bridge/src/ims/agent.rs` for the UAC `DialogInfo` construction (pure — given a `RegisteredSession`-shaped fixture, asserts the right route/contact/tags), mirroring how `DialogInfo::from_invite` would be tested if it had tests today
+
+### Agent B: dispatch selection and bridging
+
+- [ ] T068 [US4] Extend `run_outbound_listener` (`gsm-sip-bridge/src/vowifi/mod.rs`, shipped in pass 3) to send `ControlMessage::PlaceCall` to this line's own Agent A instead of `ControlCmd::Dial` to the daemon, when the selected idle line's path is VoWiFi/VoLTE rather than circuit-switched (`sip::outbound::CandidateLine.path`, already modeled)
+- [ ] T069 [US4] Handle `CallPlaced`/`CallFailed` in Agent B's control-message receive loop: on `CallPlaced`, conference-bridge the already-accepted phone/PBX leg to `veth_rtp_port` via `pjsua_safe::Endpoint::pair_calls` — the same primitive `bridge_call` (`vowifi/mod.rs:1077`) already uses for inbound, called here with the leg roles reversed; on `CallFailed`, answer the phone/PBX leg per `contracts/sip-dialout.md`'s outcome table (`486`/`503`) and increment `OUTBOUND_ATTEMPTS_TOTAL` with the right label — reusing the same metric already wired in pass 3, not a new one
+- [ ] T070 [P] [US4] Confirm PC/SC-sourced VoWiFi lines (`[[vowifi.line]] pcsc_reader = true`) are dispatched identically to modem-sourced ones — per research.md, SIM source never touches call-origination code, so this is a test/assertion, not new code
+
+### Observability (cross-process metrics gap found in pass 3's live test)
+
+- [ ] T071 [US4] Fix `OUTBOUND_ATTEMPTS_TOTAL` never appearing on `/metrics`: `vowifi-sip-agent` is a separate process from the one serving `/metrics` (found live in pass 3 — the counter registers in the wrong process's local `REGISTRY`). Report it over the existing agent-reporting channel the same way `sip_server_bindings`/`sip_server_ring_aor_registered` already solve this (spec 024's fix, `2396800`) — extend `AgentState`/`ObservedEvent` (`control/protocol.rs`) with outbound-outcome fields/events, forward from `run_outbound_listener` and T069's `CallFailed` handling
+
+### Verification
+
+- [ ] T072 [US4] **Hardware verification** (no source file): with the user's involvement (per the caution already established this session — this touches the live VoWiFi tunnel registration), place a real outbound call over the VoWiFi line and confirm the originated INVITE reaches the carrier, the call connects, and audio bridges. Same live-test discipline as pass 3: confirm before disrupting anything, keep the blast radius minimal, revert any temporary config after
+- [ ] T073 [P] [US4] Same verification over the PC/SC-sourced line, confirming T070's "no separate code path" claim holds for a real call, not just discovery/config
 
 ---
 

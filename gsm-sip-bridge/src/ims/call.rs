@@ -650,26 +650,30 @@ fn run_rtp_session(
     })
 }
 
-struct InviteParts<'a> {
-    request_uri: &'a str,
-    route_headers: &'a [String],
-    via_transport: &'a str,
+/// `pub(crate)`: reused by `ims::agent`'s outbound-origination path
+/// (specs/025-outbound-calling, research.md R-010) — every field is an
+/// explicit parameter, no session/global state, so widening visibility is
+/// the entire change; the SIP-message-building logic below is unmodified.
+pub(crate) struct InviteParts<'a> {
+    pub(crate) request_uri: &'a str,
+    pub(crate) route_headers: &'a [String],
+    pub(crate) via_transport: &'a str,
     /// Sent from (Via) — the Gm protected client port.
-    local_addr: std::net::SocketAddr,
+    pub(crate) local_addr: std::net::SocketAddr,
     /// Reached at (Contact) — the Gm protected server port, where the far
     /// end's in-dialog requests (its BYE) are delivered. See
     /// `super::RegisteredSession::contact_addr`.
-    contact_addr: std::net::SocketAddr,
-    public_uri: &'a str,
-    callee_uri: &'a str,
-    call_id: &'a str,
-    from_tag: &'a str,
-    cseq: u32,
-    branch: &'a str,
-    body: &'a str,
+    pub(crate) contact_addr: std::net::SocketAddr,
+    pub(crate) public_uri: &'a str,
+    pub(crate) callee_uri: &'a str,
+    pub(crate) call_id: &'a str,
+    pub(crate) from_tag: &'a str,
+    pub(crate) cseq: u32,
+    pub(crate) branch: &'a str,
+    pub(crate) body: &'a str,
 }
 
-fn build_invite(p: &InviteParts) -> String {
+pub(crate) fn build_invite(p: &InviteParts) -> String {
     let via_addr = format_sip_addr(p.local_addr);
     let contact_addr = format_sip_addr(p.contact_addr);
     let public_user = p.public_uri.split('@').next().unwrap_or(p.public_uri);
@@ -712,24 +716,24 @@ fn build_invite(p: &InviteParts) -> String {
     msg
 }
 
-struct AckParts<'a> {
-    request_uri: &'a str,
-    route_headers: &'a [String],
-    via_transport: &'a str,
-    local_addr: std::net::SocketAddr,
-    public_uri: &'a str,
-    to_header: &'a str,
-    call_id: &'a str,
-    from_tag: &'a str,
-    cseq: u32,
-    branch: &'a str,
+pub(crate) struct AckParts<'a> {
+    pub(crate) request_uri: &'a str,
+    pub(crate) route_headers: &'a [String],
+    pub(crate) via_transport: &'a str,
+    pub(crate) local_addr: std::net::SocketAddr,
+    pub(crate) public_uri: &'a str,
+    pub(crate) to_header: &'a str,
+    pub(crate) call_id: &'a str,
+    pub(crate) from_tag: &'a str,
+    pub(crate) cseq: u32,
+    pub(crate) branch: &'a str,
 }
 
-fn build_ack(p: &AckParts) -> String {
+pub(crate) fn build_ack(p: &AckParts) -> String {
     build_in_dialog_request("ACK", p)
 }
 
-fn build_bye(p: &AckParts) -> String {
+pub(crate) fn build_bye(p: &AckParts) -> String {
     build_in_dialog_request("BYE", p)
 }
 

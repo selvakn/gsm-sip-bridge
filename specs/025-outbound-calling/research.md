@@ -192,6 +192,85 @@ carrier leg.
 duplicates registration and media logic that must otherwise be kept in sync
 with the inbound path across every future IMS fix.
 
+## R-009: Agent A/B are separate processes — the control protocol must carry origination too (REVISES R-005/R-008)
+
+**Finding**: R-005/R-008 described VoWiFi/VoLTE origination as "`ims::agent`
+gains an outbound path," which reads as a change confined to one file. It
+isn't. Agent A (`ims::agent`, carrier-facing, runs in the IMS network
+namespace) and Agent B (`vowifi::mod`, phone/PBX-facing, default namespace)
+are **separate OS processes**, connected only by a veth link and
+`vowifi::control::ControlMessage` — a small, explicitly event-driven
+protocol, today shaped entirely for the inbound direction: Agent A pushes
+`IncomingCall`, Agent B replies `BridgeReady`/`CallAnswered`/`BridgeFailed`.
+Agent B already accepts an outbound-triggering INVITE (US1/US3, shipped) but
+has no way to tell Agent A "originate a call" — that message doesn't exist.
+
+**Decision**: extend `ControlMessage` with the mirrored triad
+`PlaceCall { call_id, destination }` (B→A), `CallPlaced { call_id,
+veth_rtp_port }` (A→B, once the carrier leg is up enough to bridge —
+structurally identical to `BridgeReady`, direction reversed), and
+`CallFailed { call_id, reason }` (A→B, network busy/rejected/unreachable).
+Existing `CallEnded`/`HangupAck` are already bidirectional per their doc
+comments and are reused unmodified for teardown.
+
+**Rationale**: mirroring the existing inbound shape means the same person
+who already understands `IncomingCall`/`BridgeReady`/`BridgeFailed`
+understands this triad immediately — it is the same protocol pattern, not a
+new one, and costs three enum variants plus the send/receive plumbing
+`read_msg`/`write_msg` already provide generically.
+
+**Alternatives considered**:
+- *Have Agent B originate the carrier call itself*: rejected outright — Agent
+  B has no IMS registration at all; that lives entirely in Agent A's network
+  namespace (tunnel-only reachability to the P-CSCF), which is the whole
+  reason the two are separate processes (spec 011).
+- *A generic "RPC" message wrapping arbitrary requests*: rejected — the
+  existing protocol is intentionally a closed, typed set of lifecycle events,
+  not a request/response RPC layer; adding a generic escape hatch would
+  undermine that for every future extension, not just this one.
+
+## R-010: Reusing `ims::call`'s UAC builders without a second registration
+
+**Decision**: `ims::call::run_call`'s `InviteParts`/`build_invite`/
+`AckParts`/`build_ack`/BYE-building (`ims/call.rs:653-745`) become
+`pub(crate)` — no logic changes, they already take every value they need as
+explicit parameters (route headers, addresses, URIs, call-id, tags, cseq),
+not global/session state, so widening visibility is the entire change.
+`ims::agent` gets a new UAC-role `DialogInfo` constructor (next to the
+existing UAS-role `from_invite`, see plan.md Complexity Tracking) built from
+the **already-registered** `RegisteredSession` Agent A maintains
+continuously — never a fresh `register_session` call, which is what
+`run_call` does and which would tear down the live registration (a second
+IMS-AKA registration for the same IMSI displaces the first — established
+behavior elsewhere in this codebase).
+
+**Rationale**: avoids a second, parallel INVITE-building implementation
+while respecting the one hard constraint (`run_call`'s standalone-diagnostic
+shape cannot be reused verbatim, only its message-building pieces can).
+
+**Alternatives considered**: teaching `run_call` itself to accept an
+existing session instead of registering — rejected; it would turn a
+deliberately minimal CLI diagnostic tool (see its own doc comment: "not a
+general SIP dialog implementation") into something with two very different
+callers and lifecycles, the opposite of the simplicity that tool exists for.
+
+## R-011: Bridging the phone leg to the new carrier leg
+
+**Decision**: once Agent A's originated call reaches an audio-capable state
+and reports `CallPlaced`, Agent B conference-bridges its already-accepted
+phone/PBX leg to the veth leg toward Agent A — the exact mechanism
+`bridge_call` already uses for inbound calls (two PJSIP `Call`s,
+`pjsua_safe::Endpoint::pair_calls`), just with the roles of "which leg
+arrived first" reversed.
+
+**Rationale**: the bridging primitive doesn't care which leg was UAC vs.
+UAS — it only needs two established `Call`s to pair. Reusing it here is
+the same non-duplication argument as R-005 originally made, now pointed at
+the actual bridging code instead of hand-waved.
+
+**Alternatives considered**: none meaningfully different — `pair_calls` is
+already the only conference-bridging primitive `pjsua-safe` exposes.
+
 ## R-006: Destination pass-through
 
 **Decision**: Whatever appears in the SIP Request-URI user part of the
