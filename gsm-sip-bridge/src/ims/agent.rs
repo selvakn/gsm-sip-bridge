@@ -1465,6 +1465,10 @@ pub(crate) fn dispatch_loop(
         // to try a different line rather than giving up outright.
         if let Ok(mut pending) = place_call_rx.try_recv() {
             if active_call.is_some() {
+                tracing::debug!(
+                    call_id = %pending.call_id,
+                    "outbound: busy with another call, refusing"
+                );
                 let _ = write_msg(
                     &mut pending.control,
                     &ControlMessage::CallFailed {

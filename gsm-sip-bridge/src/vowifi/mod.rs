@@ -593,6 +593,7 @@ fn run_outbound_listener(
             if let Some((_, stale_call_id)) = endpoint.poll_incoming_call() {
                 let mut stale = Call::from_id(stale_call_id, CallState::Incoming);
                 let _ = stale.answer(503);
+                report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
             }
             continue;
         }
@@ -608,6 +609,7 @@ fn run_outbound_listener(
                 "outbound: could not determine a destination for this call, refusing"
             );
             let _ = call.answer(400);
+            report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
             continue;
         };
 

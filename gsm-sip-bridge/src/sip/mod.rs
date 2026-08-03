@@ -411,6 +411,13 @@ impl SipBridge {
             // and the same fix).
             tracing::warn!(call_id, "outbound: busy with another call, refusing");
             let _ = call.answer(503);
+            // This terminal point never reaches `handle_outbound_request`
+            // (there is no `(Call, String)` pair to hand it), so it's the
+            // only place this outcome can be counted (specs/025-outbound-calling
+            // review, T048).
+            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_no_idle_line"])
+                .inc();
             return None;
         }
         match call.request_destination() {
@@ -421,6 +428,14 @@ impl SipBridge {
                     "outbound: could not determine a destination for this call, refusing"
                 );
                 let _ = call.answer(400);
+                // `handle_outbound_request` never runs for this case (there
+                // is no `(Call, String)` pair to hand it) — the CS path's
+                // own terminal-point increment site — so this is the only
+                // place this outcome can be counted at all (specs/025-outbound-calling
+                // review, T048).
+                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_invalid_destination"])
+                    .inc();
                 None
             }
         }

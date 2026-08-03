@@ -153,15 +153,22 @@ circuit-switched hardware. This is the MVP.
 
 ## Phase 5: User Story 2 — Dial out on whichever SIM is free, same-process (Priority: P1)
 
-**Goal**: unchanged in principle from the original tasks.md, but now split
-by what actually needs the cross-process channel.
+**Goal**: unchanged in principle from the original tasks.md. **Rescoped
+2026-08-03**: the original T024-T026 text described mechanisms
+(`sip::outbound::select_idle_line`, `ControlCmd::Dial`, a Phase 8
+cross-process channel) that have since been deleted or superseded as dead
+code (fourth/fifth code reviews) — rewritten below to match what the code
+actually does now (`CardPool::handle_outbound_request` in `modules/mod.rs`,
+dispatching `ModuleCmd::Dial` directly).
 
-- [ ] T024 [US2] Extend `gsm-sip-bridge/src/sip/outbound.rs`'s line-selection call site in `gsm-sip-bridge/src/sip/mod.rs` (T018) to iterate **all** CS modems' `SlotState`s (not just the first), confirming `select_idle_line`'s no-path-preference behavior holds across multiple real EC20s if more than one is attached
-- [ ] T025 [US2] Add a contention test in `gsm-sip-bridge/tests/test_outbound_control_cmd_dial.rs` (T017e): two near-simultaneous `ControlCmd::Dial` requests for the same last-idle CS slot — confirm exactly one succeeds via the existing single-threaded-per-modem serialization (research.md R-003 revised: no separate provisional-claim step needed for the same-process case, since the modem thread only processes one `ModuleCmd` at a time)
-- [ ] T026 [US2] Document in `specs/025-outbound-calling/tasks.md` (this file, Phase 8) that multi-path selection (CS **and** a cross-process VoWiFi/VoLTE line) is deferred, since it depends on the cross-process channel — no code task here
+- [X] T024 [US2] Multi-SIM selection already covers every attached CS modem, not just the first — `CardPool::handle_outbound_request` (`modules/mod.rs`) selects via `slots.iter().find(|(_, s)| s.lifecycle == LifecycleState::Ready && !s.has_active_call)`, which iterates the full `slots: &mut HashMap<u32, SlotState>` map (populated by discovery for every attached modem), not a single line. No path preference beyond "first idle wins" — matches FR-007 as originally specified. No code change needed; the remaining gap is exercising this against **two or more** real EC20s attached simultaneously (folded into the T023/T033 hardware-verification gap below — this repo's live testing so far has only ever had one CS modem attached at a time).
+- [X] T025 [US2] **Implemented, DONE — SCOPE ADJUSTED same as T017e**: genuine concurrency between two `handle_outbound_request` calls turns out to be structurally impossible, not just unlikely — `CardPool::run`'s `tokio::select!` loop `.await`s `handle_outbound_request` to completion inside its own branch before the loop can process anything else, including a second `outbound_poll.tick()` (the same single-threaded-select! invariant already used to rule out the second review's finding #10). So "two near-simultaneous requests" as originally worded can't literally race; what the claim discipline actually protects against is **sequential** double-booking — a second request arriving (the very next tick) while the first's slot is still legitimately busy from an ongoing call. Extracted the select-and-claim logic into a new, pure, synchronous `claim_idle_cs_slot(&mut HashMap<u32, SlotState>) -> Option<(u32, String, Sender<ModuleCmd>)>` (`modules/mod.rs`, called from `handle_outbound_request`) — directly unit-testable with no `SipBridge`/`CardPool` harness needed (a full `CardPool` needs heavy real-modem-shaped construction, same reason T017e scoped its own tests down). New tests: `claim_idle_cs_slot_does_not_double_book_the_last_idle_slot` (one idle slot: first claim succeeds and immediately marks it busy; a second claim attempt on the same map finds nothing) and `claim_idle_cs_slot_picks_among_every_attached_modem` (three slots, one busy: every non-busy one is eventually claimable, the busy one never is — doubles as T024's multi-modem coverage).
+- [X] T026 [US2] Multi-path selection across CS **and** VoWiFi/VoLTE in the same attempt was never a single arbitration point, and isn't "deferred pending a cross-process channel" — that channel (Phase 8) is now marked SUPERSEDED and will not be built. This is the settled architecture instead: `CardPool` (CS) and `vowifi::mod` (VoWiFi/VoLTE) each own an independent line pool in their own process, dispatching only within it; whichever process's `Account`/trunk actually received the INVITE is the only one that gets a shot at placing the call, with no fallback to the other path if its own lines are all busy (see `data-model.md`'s "Line selection" section, and `vowifi::mod::run_outbound_listener`'s doc comment explaining why it refuses rather than falling back to CS). Documented here; no code task.
 
 **Checkpoint**: multi-SIM selection works for every CS modem attached to
-this host. Cross-process multi-path selection is Phase 8.
+this host, and the claim discipline preventing sequential double-booking is
+directly unit-tested. Multi-path (CS + VoWiFi/VoLTE) arbitration is out of
+scope by design, not deferred.
 
 ---
 
@@ -318,17 +325,17 @@ as outstanding work; do not implement them.
 
 ## Phase 9: User Story 5 — Diagnostics (Priority: P3) — unchanged
 
-- [ ] T047 [P] [US5] Add log lines at every refusal/failure point in `gsm-sip-bridge/src/sip/mod.rs` and `gsm-sip-bridge/src/ims/agent.rs`
-- [ ] T048 [P] [US5] Audit `gsm-sip-bridge/src/sip/mod.rs`, `gsm-sip-bridge/src/modules/mod.rs`, and `gsm-sip-bridge/src/ims/agent.rs` to confirm `OUTBOUND_ATTEMPTS_TOTAL` is incremented correctly at every terminal point across all phases
-- [ ] T049 [US5] Create `gsm-sip-bridge/tests/test_outbound_diagnostics.rs` testing the three distinguishable outcomes (no idle line, network refused, unanswered) end to end
+- [X] T047 [P] [US5] Audited every refusal/failure point in `gsm-sip-bridge/src/sip/mod.rs` and `gsm-sip-bridge/src/ims/agent.rs` — found two genuinely silent ones and fixed both: (1) `CardPool::handle_outbound_request`'s `cmd_tx.send(...).is_err()` branch (`modules/mod.rs` — the module command channel closed) refused with `503` and no log at all, unlike every sibling branch in the same function; added a `tracing::warn!`. (2) `ims::agent::dispatch_loop`'s "busy" `CallFailed` branch (a `PlaceCall` arriving while `active_call.is_some()`) wrote the wire message with no log, unlike `fail()` (used everywhere else in `originate_and_bridge`, which already logs internally) and `try_place_on_line`'s equivalent "line unavailable" debug log on the Agent B side; added a matching `tracing::debug!`. Everything else already logs: `sip/mod.rs`'s two `poll_outbound_request` refusals, `refuse_outbound` itself (warns if the SIP answer fails), and every `hangup_answered_carrier_leg`/`fail()` call site in `ims/agent.rs`.
+- [X] T048 [P] [US5] Audited `sip/mod.rs`, `modules/mod.rs`, `vowifi/mod.rs`, and `ims/agent.rs` (`ims/agent.rs` reports via `CallPlaced`/`CallFailed` to Agent B, which does the actual `OUTBOUND_ATTEMPTS_TOTAL` increments — no direct metric touches expected there, and none found missing) — found and fixed two symmetric gaps present in **both** the CS and VoWiFi/VoLTE paths: (1) "could not determine a destination" (`Call::request_destination` returning `None`) refused the call but never counted it — this path never reaches the function that does the counting (`handle_outbound_request` for CS, since `poll_outbound_request` returns `None` before it's ever called; equivalently `run_outbound_listener` itself for VoWiFi/VoLTE, since the `continue` skipped the report). Added a direct `OUTBOUND_ATTEMPTS_TOTAL.with_label_values(&["refused_invalid_destination"])` increment in `sip/mod.rs`'s `poll_outbound_request`, and a `report_outbound(..., RefusedInvalidDestination)` call in `vowifi/mod.rs`'s equivalent branch. (2) The "busy — refuse rather than queue" branches (an outbound request arriving while a call is already active) had the same gap for the same structural reason; added the matching `refused_no_idle_line` increment/`report_outbound` call to both. `metrics::ingest.rs`'s `ObservedEvent::OutboundAttempt` handler itself is generic over every `OutboundAttemptOutcome` variant via `outcome.as_str()` — no gap there.
+- [X] T049 [US5] Created `gsm-sip-bridge/tests/test_outbound_diagnostics.rs` — **SCOPE ADJUSTED, same reasoning as T017e/T025**: a real end-to-end call needs real hardware (pjsua + a modem or a live VoWiFi/VoLTE line) this test suite doesn't have. Instead, mirrors `test_observability_ingest.rs`'s own no-mocks approach one layer down: a real `Observe` command over a real Unix control socket for each of the three outcomes (`RefusedNoIdleLine`/`RefusedNetworkFailure`/`Unanswered`), applied to the real Prometheus registry, verified both via direct counter access and the real scrape-encoding path — confirming SC-005's actual promise (these are distinguishable *from metrics alone*) holds for the real wire types, not a reimplementation. The logic that decides which outcome a given failure maps to is unit-tested separately, close to the code that makes the decision (`committed_failure_outcome_distinguishes_unanswered_from_refused` and friends, `vowifi/mod.rs`).
 
 ---
 
 ## Phase 10: Polish
 
-- [ ] T050a [P] Add outbound-calling bullet to `README.md` Highlights
-- [ ] T050b [P] Add "Outbound calling" section to `docs/architecture.md`
-- [ ] T050c [P] Add an entry to `RELEASE_NOTES.md`
+- [X] T050a [P] Added an outbound-calling bullet to `README.md` Highlights; also corrected the SIP-server bullet just above it, which still claimed "Inbound only" — now stale since a registered phone can dial out with `[outbound].enabled`
+- [X] T050b [P] Added an "## Outbound calling" section to `docs/architecture.md` (sequence diagram, trigger paths, per-process line-pool selection rule, known limitations), cross-linked from the top-of-file summary and from "Two SIP-side topologies"; also corrected that section's own stale "Inbound only. A phone cannot dial out... the bridge has never had that capability" bullet, which this feature makes untrue
+- [X] T050c [P] Added an `## Unreleased` entry to `RELEASE_NOTES.md` (this feature hasn't shipped in a tagged release yet — v8.3.0's own entry predates it and is left as the historical record it is, not edited retroactively)
 - [ ] T050d Run `specs/025-outbound-calling/quickstart.md` end to end against real hardware
 - [ ] T050e Mark the outbound-calling item complete in `docs/todo.md`
 
