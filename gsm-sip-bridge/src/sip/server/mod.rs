@@ -64,28 +64,45 @@ impl Registrar {
     /// to whoever is starting the bridge, rather than disappearing into a
     /// worker that then silently serves nothing.
     pub fn start(config: &SipServerConfig) -> std::io::Result<Self> {
-        Self::start_observed(config, None)
+        Self::start_observed(config, None, None)
     }
 
     /// [`start`](Self::start) with an observer for hosts that cannot export the
     /// registrar's gauges themselves — see [`RegistrarObserver`].
+    ///
+    /// `outbound_local_port`: `Some(port)` when `[outbound].enabled` — a
+    /// registered phone's INVITE is redirected to
+    /// `sip:{aor}@{listen_addr}:{port}` (spec 025) instead of refused with
+    /// `403`. `None` reproduces spec 024's behaviour exactly (FR-017).
     pub fn start_observed(
         config: &SipServerConfig,
+        outbound_local_port: Option<u16>,
         observer: Option<RegistrarObserver>,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind((config.listen_addr.as_str(), config.listen_port))?;
-        Self::start_on_observed(socket, config, observer)
+        Self::start_on_observed(socket, config, outbound_local_port, observer)
     }
 
     /// [`start`](Self::start) on an already-bound socket. Tests bind
     /// `127.0.0.1:0` and read back [`local_addr`](Self::local_addr).
     pub fn start_on(socket: UdpSocket, config: &SipServerConfig) -> std::io::Result<Self> {
-        Self::start_on_observed(socket, config, None)
+        Self::start_on_observed(socket, config, None, None)
+    }
+
+    /// [`start_on`](Self::start_on) with outbound calling enabled — see
+    /// [`start_observed`](Self::start_observed)'s `outbound_local_port`.
+    pub fn start_on_with_outbound(
+        socket: UdpSocket,
+        config: &SipServerConfig,
+        outbound_local_port: u16,
+    ) -> std::io::Result<Self> {
+        Self::start_on_observed(socket, config, Some(outbound_local_port), None)
     }
 
     fn start_on_observed(
         socket: UdpSocket,
         config: &SipServerConfig,
+        outbound_local_port: Option<u16>,
         observer: Option<RegistrarObserver>,
     ) -> std::io::Result<Self> {
         socket.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -97,6 +114,7 @@ impl Registrar {
             config: config.clone(),
             nonces: auth::NonceStore::new(Duration::from_secs(config.nonce_lifetime_sec)),
             bindings: Arc::clone(&bindings),
+            outbound_local_port,
             observer,
         });
 
@@ -153,6 +171,8 @@ struct ServerState {
     config: SipServerConfig,
     nonces: auth::NonceStore,
     bindings: Arc<BindingStore>,
+    /// `Some(port)` when `[outbound].enabled` — see `start_observed`.
+    outbound_local_port: Option<u16>,
     observer: Option<RegistrarObserver>,
 }
 
@@ -241,17 +261,50 @@ fn handle_datagram(
         // A handset keepalive. Left unanswered, Yealink and Grandstream mark
         // the server dead and drop their binding.
         "OPTIONS" => Response::new(200, "OK").with_header("Allow", ALLOW),
-        // Phone-originated dialling is out of scope (FR-020). An explicit
-        // refusal beats a 32-second retransmit and a timeout on the screen.
-        "INVITE" => {
-            tracing::warn!(
-                %peer,
-                from = request.header("From").unwrap_or("<none>"),
-                "sip_server: refusing a call from a phone — this mode bridges \
-                 inbound mobile calls only, it cannot dial out"
-            );
-            Response::new(403, "Forbidden")
-        }
+        // Phone-originated dialling is out of scope by default (spec 024
+        // FR-020) — an explicit refusal beats a 32-second retransmit and a
+        // timeout on the screen. Superseded when `[outbound].enabled`
+        // (spec 025 FR-003): any *already-registered* phone (identified by
+        // its REGISTERed source address, not a fresh digest exchange on
+        // the INVITE itself) is redirected to the pjsua-hosted account
+        // that can actually accept the call and place the mobile leg —
+        // never any phone regardless of registration, which would let an
+        // unauthenticated peer probe for a dial-out primitive.
+        "INVITE" => match state.outbound_local_port {
+            Some(local_port) => match state.bindings.find_by_source(peer, now) {
+                Some(binding) => {
+                    // A wildcard `listen_addr` (the default) means "every
+                    // interface", not a routable host — same substitution
+                    // `SipServerConfig::identity_uri` already applies to the
+                    // ring target's own identity, reused here for the same
+                    // reason (spec 024).
+                    let host = match state.config.listen_addr.parse::<std::net::IpAddr>() {
+                        Ok(ip) if ip.is_unspecified() => state.config.realm.as_str(),
+                        _ => state.config.listen_addr.as_str(),
+                    };
+                    let contact = format!("sip:{}@{host}:{local_port}", binding.aor);
+                    tracing::info!(%peer, aor = %binding.aor, %contact, "sip_server: redirecting a registered phone's dial-out attempt");
+                    Response::new(302, "Moved Temporarily").with_contact(contact)
+                }
+                None => {
+                    tracing::warn!(
+                        %peer,
+                        from = request.header("From").unwrap_or("<none>"),
+                        "sip_server: refusing a call from an unregistered peer"
+                    );
+                    Response::new(403, "Forbidden")
+                }
+            },
+            None => {
+                tracing::warn!(
+                    %peer,
+                    from = request.header("From").unwrap_or("<none>"),
+                    "sip_server: refusing a call from a phone — outbound calling is \
+                     not enabled on this deployment"
+                );
+                Response::new(403, "Forbidden")
+            }
+        },
         "SUBSCRIBE" => Response::new(489, "Bad Event"),
         // ACK is hop-by-hop for a 4xx we sent; it is never answered.
         "ACK" => return None,

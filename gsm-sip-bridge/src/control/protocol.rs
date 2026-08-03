@@ -16,12 +16,20 @@ pub enum ControlCmd {
         slot: u32,
     },
     ListSlots,
-    /// Place an outbound call on a specific circuit-switched line
+    /// Place an outbound call on a circuit-switched line
     /// (specs/025-outbound-calling, `contracts/control-cmd-dial.md`).
     /// `destination` is verbatim from the originating INVITE's Request-URI
-    /// user part — not validated or transformed further here.
+    /// user part — not validated or transformed further here. `slot: None`
+    /// means "whichever line is idle" — the caller does not need to know
+    /// slot numbers, and does not need a separate `ListSlots` round trip
+    /// first (which would race another caller's selection). This is also
+    /// how a process other than the daemon itself (e.g. `vowifi::mod`
+    /// hosting SIP server mode) reaches a circuit-switched line: over this
+    /// same control socket, exactly as `SetMode`/`Reboot`/`CardRestart`
+    /// already work cross-process from the CLI today — no separate
+    /// cross-process channel is needed.
     Dial {
-        slot: u32,
+        slot: Option<u32>,
         destination: String,
     },
     /// A VoWiFi agent (`ims::agent` or `vowifi::mod`) reporting call/SMS

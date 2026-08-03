@@ -26,6 +26,7 @@ use crate::sms::SmsHandler;
 use crate::store::calls::CallRecord;
 use crate::store::{StoreCommand, StoreHandle};
 use chrono::Utc;
+use pjsua_safe::Call;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -477,6 +478,15 @@ impl CardPool {
         // USB rescan for hotplug reconnect (every 60 s — hot-plug is rare)
         let mut rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
+        // Outbound calling (specs/025-outbound-calling): a short, dedicated
+        // poll for `Endpoint::poll_incoming_call`, independent of the
+        // retry/rescan wakeup computation above — those deadlines can be an
+        // hour or more away, far too infrequent for a caller waiting on a
+        // SIP response. The `if` guard on its `select!` arm means this does
+        // nothing at all when the feature is disabled (FR-017).
+        let mut outbound_poll = tokio::time::interval(Duration::from_millis(200));
+        outbound_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         self.recompute_next_scheduled_at();
 
         loop {
@@ -526,7 +536,12 @@ impl CardPool {
                     }
                 }
                 Some((cmd, reply)) = control_rx.recv() => {
-                    self.handle_control_cmd(cmd, reply, &mut slots, &resilience);
+                    self.handle_control_cmd(cmd, reply, &mut slots, &resilience).await;
+                }
+                _ = outbound_poll.tick(), if self.config.outbound.enabled => {
+                    if let Some((call, destination)) = self.sip_bridge.poll_outbound_request() {
+                        self.handle_outbound_request(call, destination, &mut slots).await;
+                    }
                 }
                 _ = tokio::time::sleep_until(earliest_wakeup) => {
                     let now = tokio::time::Instant::now();
@@ -1164,7 +1179,110 @@ impl CardPool {
         self.recompute_next_scheduled_at();
     }
 
-    fn handle_control_cmd(
+    /// Handles one `SipBridge::poll_outbound_request` result: validate,
+    /// select an idle CS line, dial it, and accept or refuse the SIP call
+    /// accordingly (specs/025-outbound-calling, US1).
+    ///
+    /// Teardown needs no new code here: `ModuleCmd::Dial`
+    /// (`apply_dial_cmd`) already sets `card.state = Answering` on success,
+    /// which is exactly the state the existing SIP-peer-disconnect check in
+    /// `run_module_loop` and the existing `BridgeEvent::Hangup` handling
+    /// (both written for the inbound-call direction) already watch —
+    /// reused here unmodified in the other direction.
+    async fn handle_outbound_request(
+        &mut self,
+        call: Call,
+        destination: String,
+        slots: &mut HashMap<u32, SlotState>,
+    ) {
+        if crate::sip::outbound::validate_destination(&destination).is_err() {
+            tracing::warn!(destination = %destination, "outbound: invalid destination, refusing");
+            self.sip_bridge.refuse_outbound(call, 484);
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_invalid_destination"])
+                .inc();
+            return;
+        }
+
+        let idle = slots
+            .iter()
+            .find(|(_, s)| s.lifecycle == LifecycleState::Ready && !s.has_active_call)
+            .map(|(slot, s)| (*slot, s.module.audio_device.clone(), s.cmd_tx.clone()));
+
+        let Some((slot, audio_device, Some(cmd_tx))) = idle else {
+            tracing::warn!(destination = %destination, "outbound: no idle line, refusing");
+            self.sip_bridge.refuse_outbound(call, 503);
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_no_idle_line"])
+                .inc();
+            return;
+        };
+
+        // Claim it before dispatching — mirrors `ControlCmd::Dial`'s own
+        // guard, and prevents a concurrent inbound GSM call or a second
+        // outbound request from racing this same slot while the
+        // `ModuleCmd` round-trip is in flight (FR-008/FR-009a).
+        if let Some(state) = slots.get_mut(&slot) {
+            state.has_active_call = true;
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if cmd_tx
+            .send(ModuleCmd::Dial(destination.clone(), resp_tx))
+            .is_err()
+        {
+            if let Some(state) = slots.get_mut(&slot) {
+                state.has_active_call = false;
+            }
+            self.sip_bridge.refuse_outbound(call, 503);
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_no_idle_line"])
+                .inc();
+            return;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+            Ok(Ok(Ok(()))) => match self.sip_bridge.accept_outbound(call, &audio_device) {
+                Ok(()) => {
+                    tracing::info!(slot, destination = %destination, "outbound call placed");
+                    metrics::OUTBOUND_ATTEMPTS_TOTAL
+                        .with_label_values(&["placed"])
+                        .inc();
+                }
+                Err(e) => {
+                    tracing::error!(slot, error = %e, "outbound: failed to accept SIP leg after dial succeeded");
+                    if let Some(state) = slots.get_mut(&slot) {
+                        state.has_active_call = false;
+                    }
+                    metrics::OUTBOUND_ATTEMPTS_TOTAL
+                        .with_label_values(&["refused_network_failure"])
+                        .inc();
+                }
+            },
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(slot, error = %e, "outbound: dial failed");
+                if let Some(state) = slots.get_mut(&slot) {
+                    state.has_active_call = false;
+                }
+                self.sip_bridge.refuse_outbound(call, 503);
+                metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_network_failure"])
+                    .inc();
+            }
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(slot, "outbound: module did not respond in time");
+                if let Some(state) = slots.get_mut(&slot) {
+                    state.has_active_call = false;
+                }
+                self.sip_bridge.refuse_outbound(call, 503);
+                metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_network_failure"])
+                    .inc();
+            }
+        }
+    }
+
+    async fn handle_control_cmd(
         &mut self,
         cmd: ControlCmd,
         reply: oneshot::Sender<ControlResp>,
@@ -1265,6 +1383,24 @@ impl CardPool {
             }
 
             ControlCmd::Dial { slot, destination } => {
+                let resolved_slot = match slot {
+                    Some(s) => Some(s),
+                    // "Whichever line is idle" — same selection rule as
+                    // `sip::outbound::select_idle_line`, applied here so a
+                    // cross-process caller (e.g. `vowifi::mod`) needs no
+                    // separate `ListSlots` round trip (which would race
+                    // another caller's selection).
+                    None => slots
+                        .iter()
+                        .find(|(_, s)| s.lifecycle == LifecycleState::Ready && !s.has_active_call)
+                        .map(|(slot, _)| *slot),
+                };
+
+                let Some(slot) = resolved_slot else {
+                    let _ = reply.send(ControlResp::err("no idle line available"));
+                    return;
+                };
+
                 let state = match slots.get(&slot) {
                     Some(s) => s,
                     None => {
@@ -1288,34 +1424,58 @@ impl CardPool {
                     return;
                 }
 
-                if let Some(cmd_tx) = state.cmd_tx.clone() {
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    if cmd_tx.send(ModuleCmd::Dial(destination, resp_tx)).is_err() {
-                        let _ = reply.send(ControlResp::err("module command channel closed"));
-                        return;
-                    }
-                    // Shorter than SetMode's 30s: this only confirms ATD was
-                    // accepted, well inside a SIP INVITE's own retransmit
-                    // timers (contracts/control-cmd-dial.md's Timeouts).
-                    tokio::spawn(async move {
-                        match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
-                            Ok(Ok(Ok(()))) => {
-                                let _ = reply.send(ControlResp::ok());
-                            }
-                            Ok(Ok(Err(e))) => {
-                                let _ = reply.send(ControlResp::err(e));
-                            }
-                            Ok(Err(_)) => {
-                                let _ = reply.send(ControlResp::err("module did not respond"));
-                            }
-                            Err(_) => {
-                                let _ = reply
-                                    .send(ControlResp::err("AT command timeout while dialing"));
-                            }
-                        }
-                    });
-                } else {
+                let Some(cmd_tx) = state.cmd_tx.clone() else {
                     let _ = reply.send(ControlResp::err("module command channel not available"));
+                    return;
+                };
+
+                // Claimed before dispatch, cleared on any failure path below;
+                // left `true` on success for the existing NO CARRIER/hangup
+                // machinery to clear when the call actually ends — the same
+                // claim discipline `CardPool::handle_outbound_request` uses
+                // for the same-process case (FR-008/FR-009a).
+                if let Some(s) = slots.get_mut(&slot) {
+                    s.has_active_call = true;
+                }
+
+                let (resp_tx, resp_rx) = oneshot::channel();
+                if cmd_tx.send(ModuleCmd::Dial(destination, resp_tx)).is_err() {
+                    if let Some(s) = slots.get_mut(&slot) {
+                        s.has_active_call = false;
+                    }
+                    let _ = reply.send(ControlResp::err("module command channel closed"));
+                    return;
+                }
+                // Awaited inline (unlike SetMode's detached task) so
+                // `has_active_call` can be reliably cleared on every failure
+                // path — `slots` cannot be reached from a detached task,
+                // and a stuck `true` would wedge this line for outbound
+                // calling until the next unrelated event happened to clear
+                // it. Blocks this select! branch for up to 5s on a dial
+                // attempt; acceptable for a human-paced action, and shorter
+                // than SetMode's own 30s round trip.
+                match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+                    Ok(Ok(Ok(()))) => {
+                        let _ = reply.send(ControlResp::ok());
+                    }
+                    Ok(Ok(Err(e))) => {
+                        if let Some(s) = slots.get_mut(&slot) {
+                            s.has_active_call = false;
+                        }
+                        let _ = reply.send(ControlResp::err(e));
+                    }
+                    Ok(Err(_)) => {
+                        if let Some(s) = slots.get_mut(&slot) {
+                            s.has_active_call = false;
+                        }
+                        let _ = reply.send(ControlResp::err("module did not respond"));
+                    }
+                    Err(_) => {
+                        if let Some(s) = slots.get_mut(&slot) {
+                            s.has_active_call = false;
+                        }
+                        let _ = reply.send(ControlResp::err("AT command timeout while dialing"));
+                    }
                 }
             }
 

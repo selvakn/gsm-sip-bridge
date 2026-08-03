@@ -287,13 +287,18 @@ pub(crate) fn run_telephony_side(
                     Vec::new(),
                 );
             });
-        let registrar = crate::sip::server::Registrar::start_observed(server, Some(observer))
-            .map_err(|e| {
-                BridgeError::Ims(format!(
-                    "SIP registrar could not listen on {}:{}: {e}",
-                    server.listen_addr, server.listen_port
-                ))
-            })?;
+        let outbound_local_port = config.outbound.enabled.then_some(local_port);
+        let registrar = crate::sip::server::Registrar::start_observed(
+            server,
+            outbound_local_port,
+            Some(observer),
+        )
+        .map_err(|e| {
+            BridgeError::Ims(format!(
+                "SIP registrar could not listen on {}:{}: {e}",
+                server.listen_addr, server.listen_port
+            ))
+        })?;
         let bindings = registrar.bindings();
         let id_uri = server.identity_uri();
         let account = Account::local(&endpoint, &id_uri, &config.sip.display_name)
@@ -421,6 +426,18 @@ pub(crate) fn run_telephony_side(
     // like the pre-multi-card single loop did), so this call never returns
     // in normal operation, matching today's behavior for the N=1 case.
     std::thread::scope(|scope| {
+        // Outbound calling (specs/025-outbound-calling): this process's
+        // `account` (`Account::local` in SIP server mode, or the classic
+        // PBX-trunk registration otherwise) is the one that would receive
+        // an outbound-triggering INVITE when this half owns the SIP side —
+        // exactly the arbitration the registrar already uses (spec 024,
+        // research.md R-003). One thread for the whole process, not per
+        // line: the account/endpoint are shared, same as the registrar.
+        if config.outbound.enabled {
+            let endpoint = &endpoint;
+            scope.spawn(move || run_outbound_listener(endpoint, config));
+        }
+
         for line in &lines {
             let endpoint = &endpoint;
             let account = &account;
@@ -453,6 +470,100 @@ pub(crate) fn run_telephony_side(
         }
     });
     Ok(())
+}
+
+/// How often to poll for an inbound INVITE this process's account accepted.
+/// Independent of any of `run_line_listener`'s per-line cadences — this is
+/// process-wide, matching the shared `endpoint`/`account` it polls.
+const OUTBOUND_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Polls for an inbound INVITE this process's account (`Account::local` in
+/// SIP server mode, or the classic PBX-trunk registration otherwise)
+/// accepted, and dials it out on whichever circuit-switched line the main
+/// daemon reports idle — over the existing control socket, exactly as
+/// `card restart`/`set-mode` already reach the daemon from a different
+/// process (specs/025-outbound-calling; `ControlCmd::Dial`'s `slot: None`
+/// form needs no new cross-process channel, per research.md R-003 revised).
+///
+/// Runs forever on its own thread (see `run_telephony_side`); never returns
+/// in normal operation.
+fn run_outbound_listener(endpoint: &Endpoint, config: &AppConfig) {
+    let socket_path = config.control.socket_path.clone();
+    loop {
+        std::thread::sleep(OUTBOUND_POLL_INTERVAL);
+
+        let Some((_, call_id)) = endpoint.poll_incoming_call() else {
+            continue;
+        };
+        let mut call = Call::from_id(call_id, CallState::Incoming);
+
+        let Some(destination) = call.request_destination() else {
+            tracing::warn!(
+                call_id,
+                "outbound: could not determine a destination for this call, refusing"
+            );
+            let _ = call.answer(400);
+            continue;
+        };
+
+        if crate::sip::outbound::validate_destination(&destination).is_err() {
+            tracing::warn!(destination = %destination, "outbound: invalid destination, refusing");
+            let _ = call.answer(484);
+            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_invalid_destination"])
+                .inc();
+            continue;
+        }
+
+        let cmd = crate::control::protocol::ControlCmd::Dial {
+            slot: None,
+            destination: destination.clone(),
+        };
+        // Blocking call on a dedicated `std::thread` (not a tokio task), so
+        // there is no executor to stall — mirrors how the rest of this
+        // process's line listeners are themselves plain blocking loops.
+        match crate::control::client::send_cmd(&socket_path, &cmd) {
+            Ok(crate::control::protocol::ControlResp::Ok) => match call.answer(200) {
+                Ok(()) => {
+                    tracing::info!(destination = %destination, "outbound call placed");
+                    crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                        .with_label_values(&["placed"])
+                        .inc();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "outbound: failed to accept SIP leg after dial succeeded");
+                    crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                        .with_label_values(&["refused_network_failure"])
+                        .inc();
+                }
+            },
+            Ok(crate::control::protocol::ControlResp::Err { error }) => {
+                tracing::warn!(error = %error, destination = %destination, "outbound: dial refused");
+                let _ = call.answer(503);
+                let outcome = if error.contains("no idle line available") {
+                    "refused_no_idle_line"
+                } else {
+                    "refused_network_failure"
+                };
+                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&[outcome])
+                    .inc();
+            }
+            Ok(_) => {
+                let _ = call.answer(503);
+                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_network_failure"])
+                    .inc();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "outbound: control socket unreachable");
+                let _ = call.answer(503);
+                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_network_failure"])
+                    .inc();
+            }
+        }
+    }
 }
 
 /// One line's whole accept loop — binds `listen_addr` and handles every

@@ -6,7 +6,9 @@ pub mod target;
 use std::sync::Arc;
 
 use crate::config::{AppConfig, SipServerConfig, SipTransport, TlsVerify};
-use pjsua_safe::{Account, AccountConfig, Call, Endpoint, EndpointConfig, TransportType};
+use pjsua_safe::{
+    Account, AccountConfig, Call, CallState, Endpoint, EndpointConfig, TransportType,
+};
 
 use server::{BindingStore, Registrar};
 
@@ -70,6 +72,9 @@ struct SipBridgeConfig {
     snd_rec_latency_ms: u32,
     snd_play_latency_ms: u32,
     rt_audio_prio: u32,
+    /// `[outbound].enabled` (spec 025) — passed to the registrar so a
+    /// registered phone's INVITE is redirected instead of refused.
+    outbound_enabled: bool,
 }
 
 impl SipBridge {
@@ -101,6 +106,7 @@ impl SipBridge {
             snd_rec_latency_ms: config.audio.snd_rec_latency_ms,
             snd_play_latency_ms: config.audio.snd_play_latency_ms,
             rt_audio_prio: config.modem_audio.rt_audio_prio,
+            outbound_enabled: config.outbound.enabled,
         };
 
         Self {
@@ -232,13 +238,18 @@ impl SipBridge {
 
         // Bind before anything else can fail: a port clash here is the most
         // likely startup problem, and the operator needs it named plainly.
-        let registrar = Registrar::start(&server).map_err(|e| {
-            self.state = RegistrationState::Failed;
-            format!(
-                "SIP registrar could not listen on {}:{}: {e}",
-                server.listen_addr, server.listen_port
-            )
-        })?;
+        let outbound_local_port = self
+            .config
+            .outbound_enabled
+            .then_some(self.config.local_port);
+        let registrar =
+            Registrar::start_observed(&server, outbound_local_port, None).map_err(|e| {
+                self.state = RegistrationState::Failed;
+                format!(
+                    "SIP registrar could not listen on {}:{}: {e}",
+                    server.listen_addr, server.listen_port
+                )
+            })?;
 
         // The identity the handset sees calls arrive from, so it must name the
         // bridge as the phone knows it — the registrar's own address.
@@ -358,6 +369,56 @@ impl SipBridge {
         );
         self.active_call = Some(call);
         Ok(())
+    }
+
+    /// Pops one not-yet-claimed inbound INVITE, if any, and extracts its
+    /// destination (spec 025, `sip::outbound`). Only meaningful when this
+    /// process owns the SIP side and `[outbound]` is enabled — callers are
+    /// expected to check `[outbound].enabled` themselves before polling, the
+    /// same way `[sip_server].enabled` gates the registrar.
+    ///
+    /// A call whose destination cannot be extracted (see
+    /// `Call::request_destination`'s caveats) is refused here with `400`
+    /// and never handed to the caller — there is nothing useful the rest of
+    /// the outbound pipeline could do with it.
+    pub fn poll_outbound_request(&self) -> Option<(Call, String)> {
+        let endpoint = self.endpoint.as_ref()?;
+        let (_, call_id) = endpoint.poll_incoming_call()?;
+        let mut call = Call::from_id(call_id, CallState::Incoming);
+        match call.request_destination() {
+            Some(destination) => Some((call, destination)),
+            None => {
+                tracing::warn!(
+                    call_id,
+                    "outbound: could not determine a destination for this call, refusing"
+                );
+                let _ = call.answer(400);
+                None
+            }
+        }
+    }
+
+    /// Accepts a call `poll_outbound_request` returned, bridging its audio
+    /// to `alsa_device` the same way `set_sound_device` already does for
+    /// the inbound-mobile-call direction, and stores it as the (sole)
+    /// active call so the existing SIP-peer-disconnected/hangup plumbing
+    /// (`pjsua_safe::is_sip_peer_disconnected`, `hangup_active_call`) covers
+    /// it with no new teardown path.
+    pub fn accept_outbound(&mut self, mut call: Call, alsa_device: &str) -> Result<(), String> {
+        self.set_sound_device(alsa_device)?;
+        call.answer(200).map_err(|e| format!("{e}"))?;
+        tracing::info!(call_id = call.call_id(), "outbound call accepted");
+        self.active_call = Some(call);
+        Ok(())
+    }
+
+    /// Refuses a call `poll_outbound_request` returned — no idle line, or an
+    /// invalid destination (FR-009/FR-014). `code` names the SIP status;
+    /// `contracts/sip-dialout.md` uses `503` for "no line was idle".
+    pub fn refuse_outbound(&self, mut call: Call, code: u32) {
+        if let Err(e) = call.answer(code) {
+            tracing::warn!(error = %e, code, "failed to send outbound refusal");
+        }
     }
 
     pub fn hangup_active_call(&mut self) {
