@@ -1276,6 +1276,19 @@ impl CardPool {
             }
             Ok(Err(_)) | Err(_) => {
                 tracing::warn!(slot, "outbound: module did not respond in time");
+                // The 5s timeout only bounds how long *we* wait — it says
+                // nothing about the modem. If `apply_dial_cmd` is still
+                // in flight and later succeeds, the call would otherwise
+                // be a real, connected phone call nothing in this process
+                // ever tracks or hangs up (same class of leak the
+                // accept_outbound failure just above already guards
+                // against). Best-effort: `run_module_loop` processes one
+                // `ModuleCmd` at a time, so this queues behind whatever
+                // dial is still running and hangs it up the moment it
+                // finishes either way; harmless if the worker already
+                // died (`cmd_tx.send` just fails silently) or if the dial
+                // genuinely never reached the modem.
+                let _ = cmd_tx.send(ModuleCmd::Hangup);
                 if let Some(state) = slots.get_mut(&slot) {
                     state.has_active_call = false;
                 }

@@ -224,6 +224,13 @@ impl Call {
                 {
                     return None;
                 }
+                // `slice::from_raw_parts` requires a non-null, aligned
+                // pointer even for a zero-length slice — an empty
+                // `local_info` is a plausible `pj_str_t { ptr: null, slen: 0 }`
+                // this crate cannot rule out from the FFI signature alone.
+                if info.local_info.ptr.is_null() {
+                    return None;
+                }
                 let bytes = std::slice::from_raw_parts(
                     info.local_info.ptr as *const u8,
                     info.local_info.slen.max(0) as usize,

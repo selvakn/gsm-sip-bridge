@@ -314,6 +314,26 @@ pass's changes have been exercised against real hardware yet.
 `a_hung_up_outbound_attempt_produces_a_failed_call_history_record`) and the
 `pjsip-linked` build are all clean. Not yet re-verified live.
 
+### Sixth code review, 2026-08-03 (pre-PR overall review — two more orphaned-call leaks)
+
+A holistic re-read of the whole branch (not a triage of externally-reported
+findings this time) before opening the PR, focused specifically on whether
+every post-answer failure path in `originate_and_bridge` and
+`handle_outbound_request` actually tears the real carrier/modem call down —
+the exact category the fifth review's `bridge_outbound_leg` fix closed for
+the VoWiFi/VoLTE side. Found two more instances of the same shape, both on
+the paths the fifth review didn't touch:
+
+- **Real bug, fixed — `originate_and_bridge`'s `spawn_veth_uas_listener` failure leaked the carrier leg**: by the time this call runs, the carrier INVITE has already been ACKed (`dialog` is built from that same response just above) — but its `Err` branch called `fail()`, which only sends `CallFailed` to Agent B and never sends a BYE to the carrier. Every sibling failure branch right after this one (codec mismatch, relay-spawn failure, `control.try_clone()` failure) already calls `hangup_answered_carrier_leg`; this one, and the one below, were the only two that didn't. **Fixed**: now calls `hangup_answered_carrier_leg(..., reason::VETH_LEG_FAILED)`, matching the veth-timeout branch immediately below it.
+- **Real bug, fixed — `originate_and_bridge`'s `write_msg(CallPlaced)` failure leaked the carrier leg too, and worse**: same already-ACKed situation, but this branch didn't even call `fail()` — just logged a warning and returned, with no attempt to hang up the real, live carrier call at all. **Fixed**: now calls `hangup_answered_carrier_leg(..., reason::TRANSPORT_ERROR)` — best-effort even though the very `control` write that just failed is also what `hangup_answered_carrier_leg` uses for its own (secondary) `CallEnded` notice, since the BYE it sends goes out over `session`'s own transport, unrelated to `control`.
+- **Real bug, fixed — the CS side had the same class of gap**: `handle_outbound_request`'s `Ok(Err(_)) | Err(_)` branch (the module didn't reply within 5s, or the worker died) never sent `ModuleCmd::Hangup`. The 5s timeout only bounds how long the SIP side waits — if `apply_dial_cmd` is still in flight on the modem and later succeeds, nothing in the process would ever know or hang it up. **Fixed**: added a best-effort `let _ = cmd_tx.send(ModuleCmd::Hangup);`, mirroring the `accept_outbound`-failure branch just above it; harmless if the worker already died or the dial never reached the modem, since `run_module_loop` processes one `ModuleCmd` at a time and this just queues behind whatever `Dial` is still running.
+- **Stale doc, fixed — `Registrar::start_observed`'s doc comment still said the redirect Contact carries `{aor}`**: the second code review fixed this to carry the real `{destination}` instead (a phone-dependent-assumption bug), and the fix's own inline comment at the actual construction site is accurate — but this higher-level doc comment was never updated to match and still described the old, wrong behavior.
+- **Hardening, applied — `Call::request_destination`'s FFI read could be UB on a null `local_info.ptr`**: `slice::from_raw_parts` requires a non-null, aligned pointer even for a zero-length slice; the existing code clamped `slen` defensively but not `ptr`, and PJSIP's `pj_str_t { ptr: null, slen: 0 }` for an empty string is a plausible representation this crate's FFI signature alone can't rule out. **Fixed**: added a `ptr.is_null()` check before the `from_raw_parts` call, returning `None` (same outcome an empty/unparseable string already produces).
+
+No new tests added for the three leak fixes — each is a narrow error branch (a TCP write failing, a listener bind failing, a channel timeout) that would need mocking failure injection more invasive than the existing integration-style test suite uses elsewhere for this code; the fix itself is a one-line call to an already-tested helper (`hangup_answered_carrier_leg`/`ModuleCmd::Hangup`), not new logic.
+
+`make format`/`lint`/`test` (913 tests — unchanged, no new tests this pass) and the `pjsip-linked` build are all clean.
+
 ---
 
 ## Phase 8: Cross-process line-command channel (was Phase 2 of US2 in the original plan) — SUPERSEDED

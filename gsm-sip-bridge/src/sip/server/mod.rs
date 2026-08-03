@@ -72,7 +72,9 @@ impl Registrar {
     ///
     /// `outbound_local_port`: `Some(port)` when `[outbound].enabled` — a
     /// registered phone's INVITE is redirected to
-    /// `sip:{aor}@{listen_addr}:{port}` (spec 025) instead of refused with
+    /// `sip:{destination}@{listen_addr}:{port}` (spec 025; the *dialed*
+    /// destination, not the phone's own AOR — see the `"INVITE"` branch's
+    /// own comment in `handle_datagram` for why) instead of refused with
     /// `403`. `None` reproduces spec 024's behaviour exactly (FR-017).
     pub fn start_observed(
         config: &SipServerConfig,

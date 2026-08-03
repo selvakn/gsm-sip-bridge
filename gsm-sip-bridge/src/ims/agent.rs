@@ -1176,7 +1176,22 @@ fn originate_and_bridge(
     let veth_rx = match spawn_veth_uas_listener(veth_local_ip, veth_sip_port, wideband) {
         Ok(rx) => rx,
         Err(e) => {
-            fail(&mut control, call_id, &format!("veth listener failed: {e}"));
+            // The carrier leg is already ACKed and up at this point (the
+            // `dialog` built just above proves it) — `fail()` alone only
+            // tells Agent B, it doesn't hang up the real carrier call.
+            // Found in review: this and the `write_msg` failure just below
+            // were the only two post-ACK failure paths in this function
+            // that didn't call `hangup_answered_carrier_leg`, unlike the
+            // veth-timeout/codec-mismatch/relay-failure/control-clone-failure
+            // paths right after this one.
+            tracing::warn!(call_id, error = %e, "outbound: veth listener failed");
+            hangup_answered_carrier_leg(
+                session,
+                &mut control,
+                &dialog,
+                &call_id,
+                reason::VETH_LEG_FAILED,
+            );
             return None;
         }
     };
@@ -1187,7 +1202,20 @@ fn originate_and_bridge(
             call_id: call_id.clone(),
         },
     ) {
+        // Same leak as above: the carrier leg is already up. Best-effort
+        // even though this very write just failed — `hangup_answered_carrier_leg`
+        // still sends a real BYE over `session`'s own transport (unrelated
+        // to `control`), which is the load-bearing half of this call; the
+        // `CallEnded` notice to Agent B over the same broken `control`
+        // connection will likely fail too, but costs nothing to attempt.
         tracing::warn!(call_id, error = %e, "outbound: failed to notify Agent B the carrier leg is up");
+        hangup_answered_carrier_leg(
+            session,
+            &mut control,
+            &dialog,
+            &call_id,
+            reason::TRANSPORT_ERROR,
+        );
         return None;
     }
 
