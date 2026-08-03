@@ -206,7 +206,7 @@ originate a call at all. Replaced with the real breakdown below, per
 
 ### Observability (cross-process metrics gap found in pass 3's live test)
 
-- [ ] T071 [US4] Fix `OUTBOUND_ATTEMPTS_TOTAL` never appearing on `/metrics`: `vowifi-sip-agent` is a separate process from the one serving `/metrics` (found live in pass 3 — the counter registers in the wrong process's local `REGISTRY`). Report it over the existing agent-reporting channel the same way `sip_server_bindings`/`sip_server_ring_aor_registered` already solve this (spec 024's fix, `2396800`) — extend `AgentState`/`ObservedEvent` (`control/protocol.rs`) with outbound-outcome fields/events, forward from `run_outbound_listener` and T069's `CallFailed` handling
+- [X] T071 [US4] Fixed: `ObservedEvent::OutboundAttempt { outcome: OutboundAttemptOutcome }` added (`control/protocol.rs`), applied in `metrics/ingest.rs::apply_event`. `run_telephony_side` spawns a dedicated `Reporter` (mirroring the existing `Sip`/`VolteSip` transport-label mapping already used for the SMS reporter) and passes it into `run_outbound_listener`, which now reports every outcome via `report_outbound()` instead of incrementing `OUTBOUND_ATTEMPTS_TOTAL` directly — that direct form stays correct and unchanged in `modules::mod` (same process as `/metrics`)
 
 ### Verification
 

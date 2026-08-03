@@ -25,7 +25,9 @@ pub mod plmn;
 pub mod usim_bridge;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
-use crate::control::protocol::{AgentKind, AgentState, ObservedEvent, SmsOutcome};
+use crate::control::protocol::{
+    AgentKind, AgentState, ObservedEvent, OutboundAttemptOutcome, SmsOutcome,
+};
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::discovery::lines_file_path;
 use crate::observability::reporter::Reporter;
@@ -437,7 +439,24 @@ pub(crate) fn run_telephony_side(
             let endpoint = &endpoint;
             let account = &account;
             let lines_ref = &lines;
-            scope.spawn(move || run_outbound_listener(endpoint, account, config, lines_ref));
+            // This process serves no `/metrics` of its own — same reason
+            // the SIP-server-mode gauges above are reported rather than
+            // exported directly (spec 024). `record_transport`'s existing
+            // Sip/VolteSip mapping (see the SMS reporter below) keeps
+            // VoLTE's outbound attempts distinguishable from Wi-Fi's.
+            let outbound_agent_kind = match record_transport {
+                crate::store::Transport::Volte => AgentKind::VolteSip,
+                _ => AgentKind::Sip,
+            };
+            let outbound_reporter = Reporter::spawn(
+                config.control.socket_path.clone(),
+                outbound_agent_kind,
+                "outbound".to_string(),
+                Duration::from_secs(config.metrics.agent_report_interval_seconds),
+            );
+            scope.spawn(move || {
+                run_outbound_listener(endpoint, account, config, lines_ref, &outbound_reporter)
+            });
         }
 
         for line in &lines {
@@ -512,6 +531,7 @@ fn run_outbound_listener(
     account: &Account,
     config: &AppConfig,
     lines: &[RuntimeLine],
+    reporter: &Reporter,
 ) {
     let socket_path = config.control.socket_path.clone();
     loop {
@@ -534,9 +554,7 @@ fn run_outbound_listener(
         if crate::sip::outbound::validate_destination(&destination).is_err() {
             tracing::warn!(destination = %destination, "outbound: invalid destination, refusing");
             let _ = call.answer(484);
-            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                .with_label_values(&["refused_invalid_destination"])
-                .inc();
+            report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
             continue;
         }
 
@@ -548,15 +566,14 @@ fn run_outbound_listener(
                     match bridge_outbound_leg(endpoint, account, &mut call, line) {
                         Ok(()) => {
                             tracing::info!(destination = %destination, card_id = %line.card_id, "outbound call placed over VoWiFi/VoLTE");
-                            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                                .with_label_values(&["placed"])
-                                .inc();
+                            report_outbound(reporter, OutboundAttemptOutcome::Placed);
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "outbound: failed to bridge the veth leg after the carrier leg was placed");
-                            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                                .with_label_values(&["refused_network_failure"])
-                                .inc();
+                            report_outbound(
+                                reporter,
+                                OutboundAttemptOutcome::RefusedNetworkFailure,
+                            );
                         }
                     }
                     placed_on_line = true;
@@ -582,41 +599,31 @@ fn run_outbound_listener(
             Ok(crate::control::protocol::ControlResp::Ok) => match call.answer(200) {
                 Ok(()) => {
                     tracing::info!(destination = %destination, "outbound call placed over circuit-switched");
-                    crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                        .with_label_values(&["placed"])
-                        .inc();
+                    report_outbound(reporter, OutboundAttemptOutcome::Placed);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "outbound: failed to accept SIP leg after dial succeeded");
-                    crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                        .with_label_values(&["refused_network_failure"])
-                        .inc();
+                    report_outbound(reporter, OutboundAttemptOutcome::RefusedNetworkFailure);
                 }
             },
             Ok(crate::control::protocol::ControlResp::Err { error }) => {
                 tracing::warn!(error = %error, destination = %destination, "outbound: dial refused");
                 let _ = call.answer(503);
                 let outcome = if error.contains("no idle line available") {
-                    "refused_no_idle_line"
+                    OutboundAttemptOutcome::RefusedNoIdleLine
                 } else {
-                    "refused_network_failure"
+                    OutboundAttemptOutcome::RefusedNetworkFailure
                 };
-                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                    .with_label_values(&[outcome])
-                    .inc();
+                report_outbound(reporter, outcome);
             }
             Ok(_) => {
                 let _ = call.answer(503);
-                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                    .with_label_values(&["refused_network_failure"])
-                    .inc();
+                report_outbound(reporter, OutboundAttemptOutcome::RefusedNetworkFailure);
             }
             Err(e) => {
                 tracing::error!(error = %e, "outbound: control socket and every VoWiFi/VoLTE line unavailable");
                 let _ = call.answer(503);
-                crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                    .with_label_values(&["refused_no_idle_line"])
-                    .inc();
+                report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
             }
         }
     }
@@ -630,6 +637,18 @@ fn run_outbound_listener(
 /// (connect failure, timeout, `CallFailed`) is `Err`, cheap to try the next
 /// line for, since `dispatch_loop` answers a busy line before ever
 /// touching the carrier transport.
+/// Reports one outbound attempt outcome over the agent-reporting channel —
+/// this process serves no `/metrics` of its own (specs/025-outbound-calling
+/// T071; found live: the counter was registering in the wrong process's
+/// `REGISTRY` and never appearing on the daemon's endpoint, the same class
+/// of bug spec 024's `sip_server_bindings` fix already addressed).
+fn report_outbound(reporter: &Reporter, outcome: OutboundAttemptOutcome) {
+    reporter.report(
+        AgentState::default(),
+        vec![ObservedEvent::OutboundAttempt { outcome }],
+    );
+}
+
 fn try_place_on_line(line: &RuntimeLine, call_id: &str, destination: &str) -> Result<(), String> {
     let addr = format!("{}:{}", line.veth_local_addr, AGENT_A_STATUS_PORT);
     let mut stream = TcpStream::connect_timeout(

@@ -167,6 +167,42 @@ pub enum ObservedEvent {
     RegistrationAttempt {
         status: RegistrationStatus,
     },
+    /// specs/025-outbound-calling. `vowifi-sip-agent`/the VoLTE telephony
+    /// half serve no `/metrics` of their own (same reason
+    /// `AgentState::sip_server_bindings` is reported rather than exported
+    /// directly), so `OUTBOUND_ATTEMPTS_TOTAL` reaches the daemon's endpoint
+    /// through this channel for outbound attempts placed over VoWiFi/VoLTE.
+    /// CS-path attempts (`modules::mod`, same process as `/metrics`)
+    /// increment it directly and never send this.
+    OutboundAttempt {
+        outcome: OutboundAttemptOutcome,
+    },
+}
+
+/// Mirrors `sip::outbound::OutboundOutcome`'s label set exactly
+/// (`gsm-sip-bridge/src/sip/outbound.rs`) without depending on it — this
+/// module stays a plain wire-protocol type, the same layering
+/// `CallStatus`/`SmsOutcome` already keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundAttemptOutcome {
+    Placed,
+    RefusedNoIdleLine,
+    RefusedInvalidDestination,
+    RefusedNetworkFailure,
+    Unanswered,
+}
+
+impl OutboundAttemptOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutboundAttemptOutcome::Placed => "placed",
+            OutboundAttemptOutcome::RefusedNoIdleLine => "refused_no_idle_line",
+            OutboundAttemptOutcome::RefusedInvalidDestination => "refused_invalid_destination",
+            OutboundAttemptOutcome::RefusedNetworkFailure => "refused_network_failure",
+            OutboundAttemptOutcome::Unanswered => "unanswered",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
