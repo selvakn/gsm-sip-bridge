@@ -48,4 +48,9 @@ Observed pending items
       host-level change, not something in this codebase to fix. A
       permanent fix would be host/environment work: a udev rule
       blocklisting the bad port, or root-causing why the `option` driver
-      wedges on it.
+      wedges on it. Per the user, this port is the GNSS/NMEA interface —
+      plausibly explains the hang (an out-of-spec write to a port that
+      doesn't expect AT-style command framing), though not confirmed. The
+      unbind does not survive an unplug/replug or full reboot of the host,
+      so this will need to be reapplied (or fixed permanently) if the unit
+      is disconnected and reattached.
