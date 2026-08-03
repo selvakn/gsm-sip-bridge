@@ -33,6 +33,17 @@ enum ControlMessage {
     /// ringing calls the carrier went on to answer.
     CallAttempting { call_id: String },
 
+    /// Agent A → Agent B. The carrier sent `180 Ringing` for the
+    /// originated INVITE. Non-terminal — sent at most once per call
+    /// regardless of retransmission, zero or more of these arrive before
+    /// the real `CallPlaced`/`CallFailed`. Agent B relays it as
+    /// `call.answer(180)` on the phone/PBX leg (FR-012's progress table,
+    /// `contracts/sip-dialout.md`). Added 2026-08-03 (review): without
+    /// this, the caller heard nothing at all for up to
+    /// `OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT` (75s) and then a
+    /// sudden answer.
+    CallRinging { call_id: String },
+
     /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
     /// and Agent A's veth-facing UAS listener (`spawn_veth_uas_listener`,
     /// already used unmodified for inbound) is up and waiting — mirrors
@@ -47,9 +58,14 @@ enum ControlMessage {
 
     /// Agent A → Agent B. The carrier declined, was unreachable, or the
     /// line was otherwise unable to place the call (busy, network refused,
-    /// no P-CSCF reachability). Agent B answers the phone/PBX leg
-    /// accordingly (`486`/`503`, matching `contracts/sip-dialout.md`'s
-    /// table) and tears down the accepted leg.
+    /// no P-CSCF reachability, or genuinely never answered within the ring
+    /// window — the last one marked with `reason::CARRIER_TIMEOUT` so
+    /// Agent B can report `Unanswered` rather than a generic refusal,
+    /// SC-005). Agent B answers the phone/PBX leg accordingly (the
+    /// carrier's own status code when the reason carries one, else `503`
+    /// — `contracts/sip-dialout.md`'s table, `vowifi::mod`'s
+    /// `carrier_status_from_reason`/`outbound_outcome_for_committed_failure`)
+    /// and tears down the accepted leg.
     CallFailed { call_id: String, reason: String },
 }
 ```
@@ -75,7 +91,10 @@ Agent B                                  Agent A
    │                                        │  register_session call
    │                                        │
    │                                        │  ── INVITE ──▶ carrier
-   │                                        │  ◀── 180/200 ──
+   │                                        │  ◀── 180 ──
+   │ ◀── CallRinging{call_id} ────────────  │  (relayed as call.answer(180)
+   │                                        │   on the phone/PBX leg)
+   │                                        │  ◀── 200 ──
    │                                        │
    │ ◀── CallPlaced{call_id} ─────────────  │  (2xx + ACK done, veth
    │                                        │   listener up and waiting)
@@ -93,7 +112,13 @@ Agent B                                  Agent A
 On `CallFailed` instead of `CallPlaced`: Agent B answers the phone/PBX leg
 per `contracts/sip-dialout.md`'s outcome table and does not attempt
 `pair_calls` — no different from the CS path's `refused_network_failure`
-outcome, just carried over this channel instead of `ControlCmd`.
+outcome, just carried over this channel instead of `ControlCmd`. FR-009a:
+this also ends the whole request — `run_outbound_listener`'s line loop
+does *not* try another line after a post-`CallAttempting` `CallFailed`
+(`PlaceCallOutcome::Committed`, distinct from the pre-commitment
+`Unavailable` that *does* try the next line) — the carrier already
+answered for this destination, so retrying elsewhere would just ring it
+again for a call it just refused.
 
 ## Timeouts (two phases, not one — on both sides)
 

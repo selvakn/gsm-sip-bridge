@@ -67,6 +67,13 @@ enum ModuleCmd {
     /// `Ok(())` means the modem accepted `ATD`, not that the call was
     /// answered — see `AtCommander::dial`'s own doc comment.
     Dial(String, oneshot::Sender<Result<(), String>>),
+    /// Hang up a call this line just dialed, fire-and-forget (matches
+    /// `Reboot`'s no-response shape). Exists for the narrow case where
+    /// `ATD` already succeeded but accepting the SIP-side leg failed
+    /// afterward (specs/025-outbound-calling review) — without this, the
+    /// modem stays on a real, live call while `SlotState` reports it idle
+    /// and eligible for a second dial.
+    Hangup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1251,6 +1258,12 @@ impl CardPool {
                 }
                 Err(e) => {
                     tracing::error!(slot, error = %e, "outbound: failed to accept SIP leg after dial succeeded");
+                    // ATD already succeeded — the modem is on a real,
+                    // live call. Hang it up before freeing the slot, or
+                    // it stays connected indefinitely while `SlotState`
+                    // reports it idle and eligible for a second dial
+                    // (specs/025-outbound-calling review).
+                    let _ = cmd_tx.send(ModuleCmd::Hangup);
                     if let Some(state) = slots.get_mut(&slot) {
                         state.has_active_call = false;
                     }
@@ -1453,7 +1466,17 @@ impl CardPool {
                 // calling until the next unrelated event happened to clear
                 // it. Blocks this select! branch for up to 5s on a dial
                 // attempt; acceptable for a human-paced action, and shorter
-                // than SetMode's own 30s round trip.
+                // than SetMode's own 30s round trip. KNOWN LIMITATION
+                // (specs/025-outbound-calling review): this blocks the
+                // *whole* `CardPool::run` select! loop for that window, not
+                // just this one line — hotplug rescan, retry scheduling,
+                // and every other slot's `BridgeEvent` handling all stall
+                // too, since they're all branches of the same loop. 5s is
+                // short enough that this is judged an acceptable trade-off
+                // rather than fixed outright (unlike the VoWiFi/VoLTE
+                // side's much longer, ~80s equivalent — see
+                // `ims::agent::dispatch_loop`'s call to
+                // `originate_and_bridge`).
                 match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
                     Ok(Ok(Ok(()))) => {
                         let _ = reply.send(ControlResp::ok());
@@ -1818,6 +1841,14 @@ fn run_module_loop(
                     }
                     ModuleCmd::Dial(number, resp_tx) => {
                         let _ = resp_tx.send(apply_dial_cmd(&mut at, &mut card, &number));
+                    }
+                    ModuleCmd::Hangup => {
+                        tracing::info!(module = %module.id, "outbound: hanging up after SIP-side accept failed post-dial");
+                        let _ = at.hangup();
+                        card.state = CardState::Idle;
+                        metrics::ACTIVE_CALLS
+                            .with_label_values(&[&module.id, "cs"])
+                            .set(0.0);
                     }
                 }
             }

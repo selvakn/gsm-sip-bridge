@@ -163,6 +163,11 @@ impl SipBridge {
                 .inc();
             format!("PJSIP endpoint creation failed: {e}")
         })?;
+        // Without this, an unsolicited INVITE to the trunk account queues
+        // forever with no response when outbound dialing is off — nothing
+        // in this process ever calls `poll_outbound_request` to drain it
+        // (specs/025-outbound-calling review).
+        endpoint.set_accept_incoming_calls(self.config.outbound_enabled);
 
         let acc_config = AccountConfig {
             sip_server: self.config.server.clone(),
@@ -235,6 +240,9 @@ impl SipBridge {
             self.state = RegistrationState::Failed;
             format!("PJSIP endpoint creation failed: {e}")
         })?;
+        // See the same call in `start` above — SIP-server mode reaches
+        // `poll_outbound_request` through this same account too.
+        endpoint.set_accept_incoming_calls(self.config.outbound_enabled);
 
         // Bind before anything else can fail: a port clash here is the most
         // likely startup problem, and the operator needs it named plainly.
@@ -385,6 +393,26 @@ impl SipBridge {
         let endpoint = self.endpoint.as_ref()?;
         let (_, call_id) = endpoint.poll_incoming_call()?;
         let mut call = Call::from_id(call_id, CallState::Incoming);
+        if self.active_call.is_some() {
+            // Refuse rather than queue: this is polled every tick
+            // regardless of whether a previous call is still being
+            // handled. Leaving it queued would mean dialing it — possibly
+            // minutes later, for a caller who's since given up — once the
+            // current call ends; accepting it right away would silently
+            // clobber `active_call` (a single field, not one per line),
+            // losing the current call's own SIP-side handle
+            // (specs/025-outbound-calling review). `active_call` is shared
+            // with the *inbound* direction too (`make_call`, an ongoing
+            // GSM-to-PBX call on some other, otherwise-idle modem slot) —
+            // this same check is what stops `handle_outbound_request`'s
+            // purely-per-slot `has_active_call` selection from ever
+            // reaching `accept_outbound` and clobbering it (a second,
+            // independently-found review issue with the same root cause
+            // and the same fix).
+            tracing::warn!(call_id, "outbound: busy with another call, refusing");
+            let _ = call.answer(503);
+            return None;
+        }
         match call.request_destination() {
             Some(destination) => Some((call, destination)),
             None => {

@@ -272,20 +272,47 @@ fn handle_datagram(
         // unauthenticated peer probe for a dial-out primitive.
         "INVITE" => match state.outbound_local_port {
             Some(local_port) => match state.bindings.find_by_source(peer, now) {
-                Some(binding) => {
-                    // A wildcard `listen_addr` (the default) means "every
-                    // interface", not a routable host — same substitution
-                    // `SipServerConfig::identity_uri` already applies to the
-                    // ring target's own identity, reused here for the same
-                    // reason (spec 024).
-                    let host = match state.config.listen_addr.parse::<std::net::IpAddr>() {
-                        Ok(ip) if ip.is_unspecified() => state.config.realm.as_str(),
-                        _ => state.config.listen_addr.as_str(),
-                    };
-                    let contact = format!("sip:{}@{host}:{local_port}", binding.aor);
-                    tracing::info!(%peer, aor = %binding.aor, %contact, "sip_server: redirecting a registered phone's dial-out attempt");
-                    Response::new(302, "Moved Temporarily").with_contact(contact)
-                }
+                Some(binding) => match uri_user(&request.request_uri) {
+                    // Carries the *destination*, not the phone's own AOR
+                    // (specs/025-outbound-calling review). The second
+                    // INVITE this redirect provokes lands on a different
+                    // account entirely, which extracts its destination
+                    // from that request's own To header
+                    // (`Call::request_destination`) — RFC 3261 only says a
+                    // UAC *MAY* copy a 3xx's Contact into its retry's
+                    // Request-URI, and does not require it to preserve the
+                    // original To across the retry at all. Putting the AOR
+                    // here worked only because the destination happened to
+                    // be echoed back some other way (in this project's own
+                    // test client, deliberately) — a real handset that
+                    // just follows the redirect as specified would send
+                    // the phone's own extension as the destination.
+                    // Putting the real destination directly in the
+                    // Contact makes this work regardless of what the
+                    // retry's To header ends up being.
+                    Some(destination) => {
+                        // A wildcard `listen_addr` (the default) means "every
+                        // interface", not a routable host — same substitution
+                        // `SipServerConfig::identity_uri` already applies to the
+                        // ring target's own identity, reused here for the same
+                        // reason (spec 024).
+                        let host = match state.config.listen_addr.parse::<std::net::IpAddr>() {
+                            Ok(ip) if ip.is_unspecified() => state.config.realm.as_str(),
+                            _ => state.config.listen_addr.as_str(),
+                        };
+                        let contact = format!("sip:{destination}@{host}:{local_port}");
+                        tracing::info!(%peer, aor = %binding.aor, %destination, %contact, "sip_server: redirecting a registered phone's dial-out attempt");
+                        Response::new(302, "Moved Temporarily").with_contact(contact)
+                    }
+                    None => {
+                        tracing::warn!(
+                            %peer,
+                            request_uri = %request.request_uri,
+                            "sip_server: dial-out INVITE's Request-URI has no user part, refusing"
+                        );
+                        Response::new(400, "Bad Request")
+                    }
+                },
                 None => {
                     tracing::warn!(
                         %peer,
@@ -590,6 +617,17 @@ fn parse_contact_uri(contact: &str) -> Option<String> {
     Some(uri.to_string())
 }
 
+/// The user part out of a SIP URI (`sip:{user}@host[:port][;params]`) —
+/// the dialed destination out of a dial-out INVITE's own Request-URI
+/// (specs/025-outbound-calling review). URI parameters are grammatically
+/// only valid after the hostport per RFC 3261, never inside userinfo, so
+/// splitting on the first `@` after the scheme is sufficient.
+fn uri_user(uri: &str) -> Option<&str> {
+    let after_scheme = uri.split_once(':')?.1;
+    let (user, _) = after_scheme.split_once('@')?;
+    (!user.is_empty()).then_some(user)
+}
+
 /// The host out of a SIP URI, for the source-address comparison.
 fn uri_host(uri: &str) -> Option<&str> {
     let after_scheme = uri.split_once(':')?.1;
@@ -647,6 +685,20 @@ mod tests {
             ("sip:1001@[2001:db8::1]:5060", "2001:db8::1"),
         ] {
             assert_eq!(uri_host(uri), Some(want), "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_uri_user_is_extracted_as_the_dial_out_destination() {
+        for (uri, want) in [
+            ("sip:+919789063708@bridge", Some("+919789063708")),
+            ("sip:1001@192.168.1.50:5060", Some("1001")),
+            ("sips:alice@host;transport=udp", Some("alice")),
+            // No userinfo at all — nothing to extract.
+            ("sip:bridge", None),
+            ("sip:192.168.1.50:5060", None),
+        ] {
+            assert_eq!(uri_user(uri), want, "{uri}");
         }
     }
 

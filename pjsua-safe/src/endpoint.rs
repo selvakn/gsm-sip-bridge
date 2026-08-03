@@ -37,6 +37,18 @@ static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
 static INCOMING_CALLS: LazyLock<Mutex<std::collections::VecDeque<(i32, i32)>>> =
     LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
 
+/// Whether `on_incoming_call_cb` should queue what it receives at all.
+/// Defaults to `true` — unchanged behavior for any caller that never
+/// touches `Endpoint::set_accept_incoming_calls`. Found live
+/// (specs/025-outbound-calling review): `on_incoming_call` is registered
+/// unconditionally at `Endpoint::create`, so a deployment with
+/// `[outbound].enabled = false` (nothing ever calls `poll_incoming_call`)
+/// still queued every unsolicited INVITE this account received forever,
+/// answering none of them — an unbounded leak and a caller left hanging
+/// with no response at all. Set to `false` for exactly that case; the
+/// callback then rejects immediately with `503` instead of queuing.
+static INCOMING_CALLS_ACCEPTED: AtomicBool = AtomicBool::new(true);
+
 // Audio level monitor — populated by a per-call sampling thread (slot 0 = sound device).
 // tx_level from slot 0 = ALSA capture → bridge = GSM→SIP
 // rx_level from slot 0 = bridge → ALSA playback = SIP→GSM
@@ -269,6 +281,17 @@ impl Endpoint {
         {
             None
         }
+    }
+
+    /// Whether `on_incoming_call_cb` should queue calls at all — set this
+    /// to `false` when nothing in this process ever calls
+    /// `poll_incoming_call` (e.g. `[outbound].enabled = false`), so an
+    /// unsolicited INVITE gets an immediate `503` instead of queuing
+    /// forever with no response (specs/025-outbound-calling review).
+    /// Process-global, matching `INCOMING_CALLS` itself — call this once
+    /// during setup, before this account can receive real traffic.
+    pub fn set_accept_incoming_calls(&self, enabled: bool) {
+        INCOMING_CALLS_ACCEPTED.store(enabled, Ordering::Release);
     }
 
     pub fn ensure_thread_registered(&self) {
@@ -727,6 +750,11 @@ unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid ac
     call_id: pjsua_sys::pjsua_call_id,
     _rdata: *mut pjsua_sys::pjsip_rx_data,
 ) {
+    if !INCOMING_CALLS_ACCEPTED.load(Ordering::Acquire) {
+        tracing::info!(acc_id, call_id, "incoming SIP call refused (not accepting incoming calls)");
+        pjsua_sys::pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+        return;
+    }
     tracing::info!(acc_id, call_id, "incoming SIP call");
     INCOMING_CALLS
         .lock()

@@ -111,6 +111,17 @@ pub enum ControlMessage {
     /// ringing, and the carrier went on to answer a call nobody was
     /// listening for.
     CallAttempting { call_id: String },
+    /// Agent A → Agent B. The carrier sent `180 Ringing` for an originated
+    /// INVITE. Non-terminal — zero or more of these can arrive (sent at
+    /// most once per call regardless of retransmission) before the real
+    /// `CallPlaced`/`CallFailed`; Agent B answers the phone/PBX leg with
+    /// `180` in response so the caller hears ringback instead of silence
+    /// while the carrier call is still being set up (FR-012's progress
+    /// table, `contracts/sip-dialout.md`). Found live
+    /// (specs/025-outbound-calling review): without this, a caller heard
+    /// nothing at all for up to `OUTBOUND_INVITE_TIMEOUT +
+    /// OUTBOUND_RING_TIMEOUT` (75s) and then a sudden answer.
+    CallRinging { call_id: String },
     /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
     /// and Agent A's veth-facing UAS listener is up and waiting — the
     /// outbound mirror of `IncomingCall`, direction reversed. No port is
@@ -142,6 +153,7 @@ impl ControlMessage {
             | ControlMessage::HangupAck { call_id, .. }
             | ControlMessage::PlaceCall { call_id, .. }
             | ControlMessage::CallAttempting { call_id, .. }
+            | ControlMessage::CallRinging { call_id, .. }
             | ControlMessage::CallPlaced { call_id, .. }
             | ControlMessage::CallFailed { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
@@ -285,6 +297,14 @@ mod tests {
     }
 
     #[test]
+    fn call_ringing_roundtrips() {
+        let msg = ControlMessage::CallRinging {
+            call_id: "out1".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
     fn call_placed_roundtrips() {
         let msg = ControlMessage::CallPlaced {
             call_id: "out1".to_string(),
@@ -313,6 +333,13 @@ mod tests {
         );
         assert_eq!(
             ControlMessage::CallAttempting {
+                call_id: "x".to_string(),
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallRinging {
                 call_id: "x".to_string(),
             }
             .call_id(),

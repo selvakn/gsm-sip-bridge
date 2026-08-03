@@ -789,6 +789,114 @@ pub(crate) const OUTBOUND_INVITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// transaction had already been given up on).
 pub(crate) const OUTBOUND_RING_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long to wait for a final response to our own CANCEL of an
+/// abandoned INVITE — normally a prompt `487 Request Terminated`, plus the
+/// (legitimate, RFC 3261 §9.1) chance of a `200 OK` racing in from before
+/// the CANCEL arrived at the carrier. Short: a carrier that hasn't reacted
+/// to a CANCEL within a few seconds isn't going to.
+const CANCEL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sends CANCEL for a pending outbound INVITE we're giving up on before a
+/// final response ever arrived (RFC 3261 §9.1) — reusing the original
+/// INVITE's own branch/CSeq number, since this targets that same
+/// transaction rather than starting a new one. Found live
+/// (specs/025-outbound-calling review): abandoning the transaction without
+/// this left the carrier free to keep ringing the destination for as long
+/// as *it* was willing to wait, regardless of how long we'd already given
+/// up — exactly the "the carrier went on to answer a call nobody was
+/// listening for" symptom T072 pass 3 first described (that pass lengthened
+/// the timeout, which reduces how often this is hit but never closes the
+/// gap itself).
+///
+/// Gives the carrier a short, bounded window afterward for the resulting
+/// final response to the *original* INVITE: normally nothing further is
+/// needed once `487` arrives, but a `200 OK` can still legitimately race in
+/// (the carrier answered right as we gave up) — that case is ACKed and
+/// immediately BYE'd, or the carrier leg would stay up with nothing on our
+/// end tracking it.
+///
+/// KNOWN LIMITATION, only reachable *from our own side*: only reaches this
+/// function when *we* give up on a timeout. A caller hanging up mid-ring
+/// (while `dispatch_loop` is still blocked inside `originate_and_bridge`,
+/// see that call site's own doc comment) has no way to trigger this at
+/// all — `dispatch_loop` cannot observe the phone/PBX control connection
+/// during that whole window, so it never learns the caller gave up until
+/// its own timeout eventually elapses regardless. Fixing that needs an
+/// interruptible wait, not just this function.
+#[allow(clippy::too_many_arguments)]
+fn cancel_pending_invite(
+    session: &mut super::RegisteredSession,
+    callee_uri: &str,
+    route_headers: &[String],
+    via_transport: &str,
+    call_id: &str,
+    from_tag: &str,
+    invite_cseq: u32,
+    invite_branch: &str,
+) {
+    let cancel = super::call::build_cancel(&super::call::CancelParts {
+        request_uri: callee_uri,
+        route_headers,
+        via_transport,
+        local_addr: session.local_addr,
+        public_uri: &session.public_uri,
+        callee_uri,
+        call_id,
+        from_tag,
+        cseq: invite_cseq,
+        branch: invite_branch,
+    });
+    let Ok(transport) = session.transport_mut() else {
+        return;
+    };
+    if transport.send(&cancel).is_err() {
+        return;
+    }
+    tracing::info!(call_id, "outbound: sent CANCEL for an abandoned INVITE");
+
+    let Ok(resp) = transport.recv_final_response_for_origination(
+        CANCEL_RESPONSE_TIMEOUT,
+        CANCEL_RESPONSE_TIMEOUT,
+        |_| {},
+    ) else {
+        return;
+    };
+    if resp.status != 200 {
+        return;
+    }
+    tracing::warn!(
+        call_id,
+        "outbound: carrier answered despite CANCEL; sending ACK then BYE to hang up"
+    );
+    let to_header = resp.header("To").unwrap_or(callee_uri).to_string();
+    let ack = super::call::build_ack(&super::call::AckParts {
+        request_uri: callee_uri,
+        route_headers,
+        via_transport,
+        local_addr: session.local_addr,
+        public_uri: &session.public_uri,
+        to_header: &to_header,
+        call_id,
+        from_tag,
+        cseq: invite_cseq,
+        branch: invite_branch,
+    });
+    let _ = session.transport_mut().and_then(|t| t.send(&ack));
+    let bye = super::call::build_bye(&super::call::AckParts {
+        request_uri: callee_uri,
+        route_headers,
+        via_transport,
+        local_addr: session.local_addr,
+        public_uri: &session.public_uri,
+        to_header: &to_header,
+        call_id,
+        from_tag,
+        cseq: invite_cseq + 1,
+        branch: &format!("z9hG4bK{}", random_hex(6)),
+    });
+    let _ = session.transport_mut().and_then(|t| t.send(&bye));
+}
+
 /// Originates a call to `destination` over the already-registered carrier
 /// session, waits for Agent B's veth call, and bridges the two legs — the
 /// outbound mirror of `handle_invite`'s inbound answer path
@@ -798,6 +906,46 @@ pub(crate) const OUTBOUND_RING_TIMEOUT: Duration = Duration::from_secs(60);
 /// before returning, so the caller only needs to fold the result into
 /// `active_call`.
 ///
+/// Hangs up a carrier leg that was answered (200 OK + ACK already
+/// exchanged) but can't be usably bridged for some reason discovered
+/// afterward — sends a BYE to the carrier (reusing `dialog`, built right
+/// after ACK) and `CallEnded` to Agent B over `control`. Found live
+/// (specs/025-outbound-calling review): by the time any of these failures
+/// are discovered, Agent B has very likely *already* answered its own
+/// phone/PBX leg (`Call::make` dispatches the veth INVITE and returns
+/// immediately; `bridge_outbound_leg` answers the phone leg right after,
+/// without waiting for it to connect) — leaving Agent B silent here would
+/// strand a caller who thinks they're connected, on top of leaking the
+/// carrier leg itself. Best-effort on both: there is nothing further to
+/// retry from this point.
+fn hangup_answered_carrier_leg(
+    session: &mut super::RegisteredSession,
+    control: &mut TcpStream,
+    dialog: &DialogInfo,
+    call_id: &str,
+    reason: &str,
+) {
+    let bye = build_bye(&ByeRequest {
+        request_uri: &dialog.remote_target,
+        route_headers: &dialog.route_headers,
+        via_transport: if dialog.use_tcp { "TCP" } else { "UDP" },
+        local_addr: dialog.local_addr,
+        from: &dialog.from,
+        to: &dialog.to,
+        call_id,
+        cseq: dialog.cseq,
+        branch: &format!("z9hG4bK{}", random_hex(6)),
+    });
+    let _ = session.transport_mut().and_then(|t| t.send(&bye));
+    let _ = write_msg(
+        control,
+        &ControlMessage::CallEnded {
+            call_id: call_id.to_string(),
+            reason: reason.to_string(),
+        },
+    );
+}
+
 /// Never re-registers (`super::register_session`) — a second registration
 /// for the same IMSI would tear down the live one (research.md R-010's hard
 /// constraint). Everything here reuses `session`, exactly like every other
@@ -907,15 +1055,50 @@ fn originate_and_bridge(
         fail(&mut control, call_id, &format!("INVITE send failed: {e}"));
         return None;
     }
-    let resp = match transport
-        .recv_final_response_for_origination(OUTBOUND_INVITE_TIMEOUT, OUTBOUND_RING_TIMEOUT)
-    {
+    // Sent at most once regardless of how many `180`s (retransmissions
+    // included) the carrier sends — Agent B only needs to know "start
+    // playing ringback," not track every repeat.
+    let mut ringing_relayed = false;
+    let resp = match transport.recv_final_response_for_origination(
+        OUTBOUND_INVITE_TIMEOUT,
+        OUTBOUND_RING_TIMEOUT,
+        |provisional| {
+            if provisional.status == 180 && !ringing_relayed {
+                ringing_relayed = true;
+                let _ = write_msg(
+                    &mut control,
+                    &ControlMessage::CallRinging {
+                        call_id: call_id.clone(),
+                    },
+                );
+            }
+        },
+    ) {
         Ok(r) => r,
         Err(e) => {
+            cancel_pending_invite(
+                session,
+                &callee_uri,
+                &route_headers,
+                via_transport,
+                &call_id,
+                &from_tag,
+                invite_cseq,
+                &branch,
+            );
+            // Marked with `reason::CARRIER_TIMEOUT` so Agent B can tell
+            // "genuinely rang out, nobody ever answered or declined" apart
+            // from other post-commitment failures (SC-005,
+            // specs/025-outbound-calling review: `OutboundAttemptOutcome::
+            // Unanswered` existed on the wire but nothing ever reported
+            // it) — the detailed error stays after the marker for logging.
             fail(
                 &mut control,
                 call_id,
-                &format!("no final response from carrier: {e}"),
+                &format!(
+                    "{}: no final response from carrier: {e}",
+                    reason::CARRIER_TIMEOUT
+                ),
             );
             return None;
         }
@@ -1017,19 +1200,19 @@ fn originate_and_bridge(
         Err(e) => {
             tracing::warn!(call_id, error = %e, "outbound: Agent B's veth call never arrived");
             // The carrier leg is already up — hang it up rather than leaving
-            // it connected with no media path.
-            let bye = build_bye(&ByeRequest {
-                request_uri: &dialog.remote_target,
-                route_headers: &dialog.route_headers,
-                via_transport: if dialog.use_tcp { "TCP" } else { "UDP" },
-                local_addr: dialog.local_addr,
-                from: &dialog.from,
-                to: &dialog.to,
-                call_id: &call_id,
-                cseq: dialog.cseq,
-                branch: &format!("z9hG4bK{}", random_hex(6)),
-            });
-            let _ = session.transport_mut().and_then(|t| t.send(&bye));
+            // it connected with no media path. Agent B's own phone/PBX leg
+            // is very likely already answered too by this point (`Call::make`
+            // dispatches the veth INVITE and returns immediately;
+            // `bridge_outbound_leg` answers the phone leg right after,
+            // without waiting for it to connect) — tell it to hang up rather
+            // than leave a caller thinking they're connected to dead air.
+            hangup_answered_carrier_leg(
+                session,
+                &mut control,
+                &dialog,
+                &call_id,
+                reason::VETH_LEG_FAILED,
+            );
             return None;
         }
     };
@@ -1055,10 +1238,21 @@ fn originate_and_bridge(
         other => {
             // Never offered — `sdp::build_offer` only ever lists PCMU/AMR-WB
             // for an outbound offer (CodecOffer has no AMR-NB/L16 variant).
+            // Agent B's phone/PBX leg is already answered by this point
+            // (see the veth-timeout branch above) — leaving it stranded on
+            // dead air on top of leaking the carrier leg would compound the
+            // failure, not just fail to bridge it.
             tracing::error!(
                 call_id,
                 codec = other.name(),
                 "outbound: carrier answered with a codec we never offered"
+            );
+            hangup_answered_carrier_leg(
+                session,
+                &mut control,
+                &dialog,
+                &call_id,
+                reason::TRANSPORT_ERROR,
             );
             return None;
         }
@@ -1081,7 +1275,19 @@ fn originate_and_bridge(
         Ok(())
     };
     if let Err(e) = relay_result {
+        // `spawn_transcoding_relay` only reaches its two `std::thread::spawn`
+        // calls after every decoder/encoder/resampler construction (each
+        // fallible) has already succeeded — an `Err` here means neither
+        // relay thread was actually started, so there is nothing to signal
+        // `stop` for, unlike the `try_clone` failure below.
         tracing::error!(call_id, error = %e, "outbound: failed to start media relay");
+        hangup_answered_carrier_leg(
+            session,
+            &mut control,
+            &dialog,
+            &call_id,
+            reason::TRANSPORT_ERROR,
+        );
         return None;
     }
 
@@ -1096,7 +1302,18 @@ fn originate_and_bridge(
     let ctrl_rx = match control.try_clone() {
         Ok(s) => spawn_control_reader(s),
         Err(e) => {
+            // Unlike the two failures above, the relay is already running
+            // at this point — ask it to stop, or it leaks as an orphaned
+            // background thread with nothing left to ever signal it.
+            stop.store(true, Ordering::Release);
             tracing::warn!(call_id, error = %e, "outbound: control connection clone failed");
+            hangup_answered_carrier_leg(
+                session,
+                &mut control,
+                &dialog,
+                &call_id,
+                reason::TRANSPORT_ERROR,
+            );
             return None;
         }
     };
@@ -1269,6 +1486,29 @@ pub(crate) fn dispatch_loop(
                         call_id: pending.call_id.clone(),
                     },
                 );
+                // KNOWN LIMITATION (specs/025-outbound-calling review):
+                // `originate_and_bridge` blocks this whole loop for up to
+                // `OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT +
+                // VETH_INVITE_TIMEOUT` (~80s) — nothing else this loop is
+                // responsible for runs during that window: no inbound
+                // carrier INVITE is answered, no hangup on an *existing*
+                // call is processed (there can't be one — `active_call`
+                // is `None` here, or we'd have taken the `busy` branch
+                // above — but a *new* inbound call arriving during this
+                // window is effectively dropped from the caller's
+                // perspective even though its bytes are only queued, not
+                // lost: `inbound.rx` is fed by independent reader threads
+                // and does keep it, but by the time this loop gets back
+                // around to it the caller's own SIP Timer B (32s) will
+                // very likely have already given up), and this call's own
+                // mid-ring CANCEL can't be triggered by anything on the
+                // phone/PBX side either (see `cancel_pending_invite`'s doc
+                // comment for that half of the same gap). Registration
+                // renewal is unaffected (300s headroom). Properly bounding
+                // this needs an interruptible wait on both this loop and
+                // `vowifi::mod`'s `run_outbound_listener` — a materially
+                // bigger change than this pass makes; documenting the gap
+                // rather than leaving it silent.
                 active_call = originate_and_bridge(
                     session,
                     pending.control,

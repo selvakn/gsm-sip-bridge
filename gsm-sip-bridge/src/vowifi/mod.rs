@@ -251,6 +251,11 @@ pub(crate) fn run_telephony_side(
     endpoint
         .set_null_sound_device()
         .map_err(|e| BridgeError::Ims(format!("null sound device setup failed: {e}")))?;
+    // Without this, an unsolicited INVITE to this account queues forever
+    // with no response when outbound dialing is off — nothing in this
+    // process ever calls `poll_incoming_call` to drain it otherwise
+    // (specs/025-outbound-calling review).
+    endpoint.set_accept_incoming_calls(config.outbound.enabled);
     if wideband {
         prioritize_wideband_codecs(&endpoint);
     }
@@ -456,7 +461,7 @@ pub(crate) fn run_telephony_side(
                 Duration::from_secs(config.metrics.agent_report_interval_seconds),
             );
             scope.spawn(move || {
-                run_outbound_listener(endpoint, account, config, lines_ref, &outbound_reporter)
+                run_outbound_listener(endpoint, account, lines_ref, &outbound_reporter)
             });
         }
 
@@ -563,11 +568,9 @@ const CALL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
 fn run_outbound_listener(
     endpoint: &Endpoint,
     account: &Account,
-    config: &AppConfig,
     lines: &[RuntimeLine],
     reporter: &Reporter,
 ) {
-    let socket_path = config.control.socket_path.clone();
     let mut active: Option<ActiveOutboundCall> = None;
     'outer: loop {
         std::thread::sleep(OUTBOUND_POLL_INTERVAL);
@@ -578,6 +581,14 @@ fn run_outbound_listener(
                 endpoint.unpair_call(ac.call.call_id());
                 let _ = ac.call.hangup();
                 let _ = ac.veth_call.hangup();
+            }
+            // Refuse (don't queue) anything that arrives while busy —
+            // otherwise it sits in PJSUA's incoming-call queue until this
+            // call ends, then gets dialed for a caller who may have given
+            // up minutes ago (specs/025-outbound-calling review).
+            if let Some((_, stale_call_id)) = endpoint.poll_incoming_call() {
+                let mut stale = Call::from_id(stale_call_id, CallState::Incoming);
+                let _ = stale.answer(503);
             }
             continue;
         }
@@ -605,8 +616,8 @@ fn run_outbound_listener(
 
         let wire_call_id = format!("out-{call_id}");
         for line in lines {
-            match try_place_on_line(line, &wire_call_id, &destination) {
-                Ok(control) => {
+            match try_place_on_line(line, &wire_call_id, &destination, &mut call) {
+                PlaceCallOutcome::Placed(control) => {
                     match bridge_outbound_leg(endpoint, account, &mut call, line) {
                         Ok(veth_call) => {
                             tracing::info!(destination = %destination, card_id = %line.card_id, "outbound call placed over VoWiFi/VoLTE");
@@ -616,6 +627,7 @@ fn run_outbound_listener(
                                 veth_call,
                                 call_id: wire_call_id.clone(),
                                 control,
+                                pending_line: String::new(),
                             });
                         }
                         Err(e) => {
@@ -627,60 +639,50 @@ fn run_outbound_listener(
                         }
                     }
                     // Either way this line was tried and the attempt is
-                    // over — don't fall through to the CS path below, and
-                    // (the `Ok(veth_call)` case) don't let the borrow
-                    // checker see a possible later use of the just-moved
-                    // `call` on the CS path's `call.answer(200)`, which a
-                    // plain `break` + flag check can't prove never happens
-                    // (the move is inside this `for` loop; a labeled
-                    // `continue` on the outer loop is a real, not just
-                    // provable, guarantee).
+                    // over — don't fall through to the refusal below, and
+                    // don't let the borrow checker see a possible later
+                    // use of the just-moved `call`, which a plain `break`
+                    // + flag check can't prove never happens (the move is
+                    // inside this `for` loop; a labeled `continue` on the
+                    // outer loop is a real, not just provable, guarantee).
                     continue 'outer;
                 }
-                Err(e) => {
+                PlaceCallOutcome::Unavailable(e) => {
                     tracing::debug!(card_id = %line.card_id, error = %e, "outbound: line unavailable, trying next");
+                }
+                PlaceCallOutcome::Committed(reason) => {
+                    // FR-009a: the carrier already answered for this
+                    // destination — trying another line would ring it
+                    // again for a call it just refused. Stop here with
+                    // the carrier's own status code when we have one
+                    // (FR-012's progress table) and a properly
+                    // distinguished outcome (SC-005), rather than a
+                    // blanket 503/`RefusedNetworkFailure` for every
+                    // post-commitment failure regardless of cause.
+                    let (code, outcome) = outbound_outcome_for_committed_failure(&reason);
+                    tracing::warn!(destination = %destination, card_id = %line.card_id, reason = %reason, code, "outbound: carrier rejected the call; not trying another line (FR-009a)");
+                    let _ = call.answer(code);
+                    report_outbound(reporter, outcome);
+                    continue 'outer;
                 }
             }
         }
 
-        let cmd = crate::control::protocol::ControlCmd::Dial {
-            slot: None,
-            destination: destination.clone(),
-        };
-        // Blocking call on a dedicated `std::thread` (not a tokio task), so
-        // there is no executor to stall — mirrors how the rest of this
-        // process's line listeners are themselves plain blocking loops.
-        match crate::control::client::send_cmd(&socket_path, &cmd) {
-            Ok(crate::control::protocol::ControlResp::Ok) => match call.answer(200) {
-                Ok(()) => {
-                    tracing::info!(destination = %destination, "outbound call placed over circuit-switched");
-                    report_outbound(reporter, OutboundAttemptOutcome::Placed);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "outbound: failed to accept SIP leg after dial succeeded");
-                    report_outbound(reporter, OutboundAttemptOutcome::RefusedNetworkFailure);
-                }
-            },
-            Ok(crate::control::protocol::ControlResp::Err { error }) => {
-                tracing::warn!(error = %error, destination = %destination, "outbound: dial refused");
-                let _ = call.answer(503);
-                let outcome = if error.contains("no idle line available") {
-                    OutboundAttemptOutcome::RefusedNoIdleLine
-                } else {
-                    OutboundAttemptOutcome::RefusedNetworkFailure
-                };
-                report_outbound(reporter, outcome);
-            }
-            Ok(_) => {
-                let _ = call.answer(503);
-                report_outbound(reporter, OutboundAttemptOutcome::RefusedNetworkFailure);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "outbound: control socket and every VoWiFi/VoLTE line unavailable");
-                let _ = call.answer(503);
-                report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
-            }
-        }
+        // No circuit-switched fallback here (specs/025-outbound-calling
+        // review): the CS modem lives in the daemon's own process, in its
+        // own `SipBridge`/ALSA-device audio path, entirely separate from
+        // this process's PJSUA `Endpoint`. Dispatching `ControlCmd::Dial`
+        // to the daemon used to place a real ATD and answer `call` with
+        // `200 OK` regardless — but nothing ever connected the two
+        // processes' audio: the caller got a connected call and dead air,
+        // while metrics recorded it as `placed`. Refusing outright is
+        // honest about what this process can actually deliver; a real
+        // fix needs a cross-process media bridge as substantial as the
+        // Agent A/B veth link this feature already relies on for
+        // VoWiFi/VoLTE, not a shortcut through the control socket.
+        tracing::warn!(destination = %destination, "outbound: no VoWiFi/VoLTE line available, refusing (no cross-process CS audio bridge exists)");
+        let _ = call.answer(503);
+        report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
     }
 }
 
@@ -704,6 +706,30 @@ fn report_outbound(reporter: &Reporter, outcome: OutboundAttemptOutcome) {
     );
 }
 
+/// What happened trying to place a call on one line.
+enum PlaceCallOutcome {
+    /// Committed and the carrier accepted it — the call is up. Carries the
+    /// still-open connection to Agent A (see `try_place_on_line`'s doc).
+    Placed(std::io::BufReader<TcpStream>),
+    /// Never reached the carrier at all — busy, unreachable, or a
+    /// malformed reply. Cheap to have tried; the caller should move on to
+    /// the next line.
+    Unavailable(String),
+    /// Reached the carrier, which answered — a rejection, or (rarely) a
+    /// purely local failure discovered after the carrier already accepted
+    /// the call. Either way, FR-009a: this is the *destination's* answer
+    /// (or an already-committed carrier leg), not a reason to keep hunting
+    /// for a working line — trying the next line would ring the same
+    /// destination again for a call it just refused, or leave a second,
+    /// truly-answered carrier leg orphaned. Found live
+    /// (specs/025-outbound-calling review): the two cases used to be the
+    /// same `Err(String)`, so a rejected destination got redialed once per
+    /// remaining line before finally being refused. The caller must stop
+    /// and refuse the whole request with this reason, never try another
+    /// line.
+    Committed(String),
+}
+
 /// On success, returns the still-open connection to Agent A — it must stay
 /// open for the whole call (Agent A expects to send `CallEnded` on it when
 /// the carrier hangs up, and we need it to tell Agent A when the phone leg
@@ -718,27 +744,31 @@ fn try_place_on_line(
     line: &RuntimeLine,
     call_id: &str,
     destination: &str,
-) -> Result<std::io::BufReader<TcpStream>, String> {
-    let addr = format!("{}:{}", line.veth_local_addr, AGENT_A_STATUS_PORT);
-    let mut stream = TcpStream::connect_timeout(
-        &addr.parse().map_err(|e| format!("invalid address: {e}"))?,
-        PLACE_CALL_TIMEOUT,
-    )
-    .map_err(|e| format!("connect failed: {e}"))?;
-    stream
-        .set_read_timeout(Some(PLACE_CALL_TIMEOUT))
-        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
-
-    write_msg(
+    call: &mut Call,
+) -> PlaceCallOutcome {
+    let addr = match format!("{}:{}", line.veth_local_addr, AGENT_A_STATUS_PORT).parse() {
+        Ok(a) => a,
+        Err(e) => return PlaceCallOutcome::Unavailable(format!("invalid address: {e}")),
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, PLACE_CALL_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => return PlaceCallOutcome::Unavailable(format!("connect failed: {e}")),
+    };
+    if let Err(e) = stream.set_read_timeout(Some(PLACE_CALL_TIMEOUT)) {
+        return PlaceCallOutcome::Unavailable(format!("set_read_timeout failed: {e}"));
+    }
+    if let Err(e) = write_msg(
         &mut stream,
         &ControlMessage::PlaceCall {
             call_id: call_id.to_string(),
             destination: destination.to_string(),
         },
-    )?;
+    ) {
+        return PlaceCallOutcome::Unavailable(e);
+    }
 
     let mut reader = std::io::BufReader::new(stream);
-    match read_msg(&mut reader)? {
+    match read_msg(&mut reader) {
         // Committed: Agent A is not busy and is about to touch the carrier
         // transport for real. From here on a reply can legitimately take as
         // long as Agent A's own carrier-INVITE wait, so switch to the much
@@ -747,29 +777,89 @@ fn try_place_on_line(
         // T072: with one short timeout for both phases, this line gave up
         // and moved on while the carrier was still ringing, and the carrier
         // went on to answer a call nobody was listening for).
-        ControlMessage::CallAttempting { .. } => {}
-        ControlMessage::CallFailed { reason, .. } => return Err(reason),
-        other => return Err(format!("unexpected reply: {other:?}")),
+        Ok(ControlMessage::CallAttempting { .. }) => {}
+        Ok(ControlMessage::CallFailed { reason, .. }) => {
+            return PlaceCallOutcome::Unavailable(reason)
+        }
+        Ok(other) => return PlaceCallOutcome::Unavailable(format!("unexpected reply: {other:?}")),
+        Err(e) => return PlaceCallOutcome::Unavailable(e),
     }
-    reader
+    if let Err(e) = reader
         .get_ref()
         .set_read_timeout(Some(CALL_ATTEMPT_TIMEOUT))
-        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
+    {
+        return PlaceCallOutcome::Unavailable(format!("set_read_timeout failed: {e}"));
+    }
 
-    match read_msg(&mut reader)? {
-        ControlMessage::CallPlaced { .. } => {
-            // Short from here on: this same connection is now polled once
-            // per `OUTBOUND_POLL_INTERVAL` tick for the rest of the call
-            // (`service_active_outbound_call`), not waited on for a single
-            // long reply.
-            reader
-                .get_ref()
-                .set_read_timeout(Some(OUTBOUND_POLL_INTERVAL))
-                .map_err(|e| format!("set_read_timeout failed: {e}"))?;
-            Ok(reader)
+    // `CallRinging` is non-terminal — Agent A's own deadline
+    // (`OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT`, comfortably under
+    // `CALL_ATTEMPT_TIMEOUT`'s per-read timeout below) covers everything
+    // between here and the real `CallPlaced`/`CallFailed` regardless of how
+    // many reads that takes, so looping past it doesn't risk waiting
+    // longer overall than `CALL_ATTEMPT_TIMEOUT` already accounts for.
+    loop {
+        match read_msg(&mut reader) {
+            Ok(ControlMessage::CallRinging { .. }) => {
+                let _ = call.answer(180);
+            }
+            Ok(ControlMessage::CallPlaced { .. }) => {
+                // Short from here on: this same connection is now polled
+                // once per `OUTBOUND_POLL_INTERVAL` tick for the rest of
+                // the call (`service_active_outbound_call`), not waited on
+                // for a single long reply.
+                if let Err(e) = reader
+                    .get_ref()
+                    .set_read_timeout(Some(OUTBOUND_POLL_INTERVAL))
+                {
+                    return PlaceCallOutcome::Committed(format!("set_read_timeout failed: {e}"));
+                }
+                return PlaceCallOutcome::Placed(reader);
+            }
+            Ok(ControlMessage::CallFailed { reason, .. }) => {
+                return PlaceCallOutcome::Committed(reason)
+            }
+            Ok(other) => {
+                return PlaceCallOutcome::Committed(format!("unexpected reply: {other:?}"))
+            }
+            Err(e) => return PlaceCallOutcome::Committed(e),
         }
-        ControlMessage::CallFailed { reason, .. } => Err(reason),
-        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+/// Pulls a leading 3-digit SIP status code off a `CallFailed`/`Committed`
+/// reason string, when there is one — `ims::agent::fail`'s non-2xx-final-
+/// response call site formats its reason as `"{status} {resp.reason}"`
+/// (e.g. `"486 Busy Here"`), the one point in the whole outbound path with
+/// a real carrier status to report; every other failure reason is free
+/// text with no such prefix (a bind failure, a timeout, ...), which this
+/// correctly reads as "no carrier status available." Used to answer the
+/// phone/PBX leg with the carrier's own code instead of a blanket `503`
+/// (specs/025-outbound-calling review, FR-012's progress table).
+fn carrier_status_from_reason(reason: &str) -> Option<u32> {
+    let code = reason.split(' ').next()?;
+    if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) {
+        code.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// What to answer the phone/PBX leg with, and which outcome to report, for
+/// a `PlaceCallOutcome::Committed` failure. Distinguishes "genuinely rang
+/// out, nobody ever answered or declined" (`ims::agent`'s
+/// `reason::CARRIER_TIMEOUT` marker, or an explicit carrier `480
+/// Temporarily Unavailable`) from every other post-commitment failure —
+/// SC-005 wants these distinguishable from logs and metrics alone, but
+/// `OutboundAttemptOutcome::Unanswered` existed on the wire with nothing
+/// ever reporting it (specs/025-outbound-calling review).
+fn outbound_outcome_for_committed_failure(reason: &str) -> (u32, OutboundAttemptOutcome) {
+    if reason.starts_with(control::reason::CARRIER_TIMEOUT) {
+        return (480, OutboundAttemptOutcome::Unanswered);
+    }
+    match carrier_status_from_reason(reason) {
+        Some(480) => (480, OutboundAttemptOutcome::Unanswered),
+        Some(code) => (code, OutboundAttemptOutcome::RefusedNetworkFailure),
+        None => (503, OutboundAttemptOutcome::RefusedNetworkFailure),
     }
 }
 
@@ -823,6 +913,15 @@ struct ActiveOutboundCall {
     veth_call: Call,
     call_id: String,
     control: std::io::BufReader<TcpStream>,
+    /// Carries a message across ticks when `read_line` times out mid-line
+    /// (specs/025-outbound-calling review): `read_line` documents that any
+    /// bytes it already appended stay in the buffer even when it returns
+    /// an error, but a fresh `String::new()` per call throws that partial
+    /// data away — and the remainder that arrives on a later tick becomes
+    /// an orphaned, unparseable fragment on its own. Reused (not cleared)
+    /// across timeouts; only cleared once a complete line has actually
+    /// been consumed.
+    pending_line: String,
 }
 
 /// One non-blocking check of `ac.control` (`OUTBOUND_POLL_INTERVAL` read
@@ -837,26 +936,32 @@ struct ActiveOutboundCall {
 ///   to BYE the carrier — the mirror of `handle_connection`'s inbound
 ///   teardown loop (`vowifi/mod.rs`), which this deliberately matches.
 fn service_active_outbound_call(ac: &mut ActiveOutboundCall) -> bool {
-    let mut line = String::new();
-    match ac.control.read_line(&mut line) {
+    match ac.control.read_line(&mut ac.pending_line) {
         Ok(0) => {
             tracing::warn!(call_id = %ac.call_id, "outbound: control connection to Agent A lost mid-call");
             true
         }
-        Ok(_) => match serde_json::from_str::<ControlMessage>(line.trim()) {
-            Ok(ControlMessage::CallEnded { reason, .. }) => {
-                tracing::info!(call_id = %ac.call_id, reason = %reason, "outbound: carrier leg ended, tearing down the phone leg");
-                true
-            }
-            Ok(other) => {
-                tracing::warn!(call_id = %ac.call_id, message = ?other, "outbound: unexpected message during an active call");
-                false
-            }
-            Err(e) => {
-                tracing::warn!(call_id = %ac.call_id, error = %e, "outbound: malformed message on the control connection");
-                false
-            }
-        },
+        Ok(_) => {
+            let result = match serde_json::from_str::<ControlMessage>(ac.pending_line.trim()) {
+                Ok(ControlMessage::CallEnded { reason, .. }) => {
+                    tracing::info!(call_id = %ac.call_id, reason = %reason, "outbound: carrier leg ended, tearing down the phone leg");
+                    true
+                }
+                Ok(other) => {
+                    tracing::warn!(call_id = %ac.call_id, message = ?other, "outbound: unexpected message during an active call");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(call_id = %ac.call_id, error = %e, "outbound: malformed message on the control connection");
+                    false
+                }
+            };
+            // A full line was consumed either way (parse failure is not a
+            // reason to keep it around) — clear it so the next `read_line`
+            // starts a fresh message rather than appending onto this one.
+            ac.pending_line.clear();
+            result
+        }
         Err(e)
             if matches!(
                 e.kind(),
@@ -1688,6 +1793,67 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// `read_line` documents that any bytes it already appended stay in
+    /// the buffer even when it returns an error — but a fresh
+    /// `String::new()` per `service_active_outbound_call` call used to
+    /// throw that partial data away regardless, silently corrupting any
+    /// message that happened to straddle a 200ms read-timeout boundary
+    /// (specs/025-outbound-calling review). `pending_line` fixes this by
+    /// persisting across calls; this proves the fix by forcing exactly
+    /// that split.
+    #[test]
+    fn a_message_split_across_a_read_timeout_is_not_lost() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut sender = TcpStream::connect(addr).expect("connect");
+        let (receiver, _) = listener.accept().expect("accept");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set_read_timeout");
+
+        let mut ac = ActiveOutboundCall {
+            call: Call::from_id(0, CallState::Confirmed),
+            veth_call: Call::from_id(1, CallState::Confirmed),
+            call_id: "out-test".to_string(),
+            control: std::io::BufReader::new(receiver),
+            pending_line: String::new(),
+        };
+
+        let full = serde_json::to_string(&ControlMessage::CallEnded {
+            call_id: "out-test".to_string(),
+            reason: "caller_hangup".to_string(),
+        })
+        .expect("serialize")
+            + "\n";
+        let full_bytes = full.as_bytes();
+        let split_at = full_bytes.len() / 2;
+        sender
+            .write_all(&full_bytes[..split_at])
+            .expect("write first half");
+
+        // Only half the message has arrived: `read_line` must time out
+        // mid-line. `call` is `Confirmed`, not `Disconnected`, so this
+        // must not be mistaken for the phone leg hanging up either.
+        assert!(
+            !service_active_outbound_call(&mut ac),
+            "must not end the call on a mid-message timeout"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        sender
+            .write_all(&full_bytes[split_at..])
+            .expect("write second half");
+
+        // The rest arrives: if the first half had been discarded, this
+        // would parse as a malformed fragment (or the wrong message) and
+        // return `false` instead of correctly recognizing `CallEnded`.
+        assert!(
+            service_active_outbound_call(&mut ac),
+            "the reassembled message must parse as CallEnded"
+        );
+    }
 
     fn record(id: &str) -> CallRecord {
         CallRecord {
@@ -1696,6 +1862,56 @@ mod tests {
             outcome: "answered:caller_hangup".to_string(),
             started_at: 1_700_000_000,
             ended_at: Some(1_700_000_300),
+        }
+    }
+
+    #[test]
+    fn carrier_status_from_reason_reads_the_leading_sip_code() {
+        for (reason, want) in [
+            ("486 Busy Here", Some(486)),
+            ("480 Temporarily Unavailable", Some(480)),
+            ("503 Service Unavailable", Some(503)),
+            ("no final response from carrier: timed out", None),
+            ("bad SDP answer: parse error", None),
+            ("", None),
+            // Not exactly 3 digits — not a plausible SIP status.
+            ("42 not a status", None),
+            ("4860 also not a status", None),
+        ] {
+            assert_eq!(carrier_status_from_reason(reason), want, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn committed_failure_outcome_distinguishes_unanswered_from_refused() {
+        for (reason, want_code, want_outcome) in [
+            (
+                format!(
+                    "{}: no final response from carrier: timed out",
+                    control::reason::CARRIER_TIMEOUT
+                ),
+                480,
+                OutboundAttemptOutcome::Unanswered,
+            ),
+            (
+                "480 Temporarily Unavailable".to_string(),
+                480,
+                OutboundAttemptOutcome::Unanswered,
+            ),
+            (
+                "486 Busy Here".to_string(),
+                486,
+                OutboundAttemptOutcome::RefusedNetworkFailure,
+            ),
+            (
+                "bad SDP answer: parse error".to_string(),
+                503,
+                OutboundAttemptOutcome::RefusedNetworkFailure,
+            ),
+        ] {
+            let (code, outcome) = outbound_outcome_for_committed_failure(&reason);
+            assert_eq!(code, want_code, "{reason:?}");
+            assert_eq!(outcome, want_outcome, "{reason:?}");
         }
     }
 

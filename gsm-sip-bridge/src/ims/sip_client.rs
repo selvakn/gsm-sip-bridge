@@ -756,10 +756,16 @@ impl SipTransport {
     /// routing/signaling rather than the callee's own ring time — and the
     /// real, eventual `200 OK` arrived after the transaction had already
     /// been abandoned.
+    /// `on_provisional` is called once for every 1xx seen, in case the
+    /// caller wants to relay progress somewhere (Agent A relays a `180` to
+    /// Agent B as `CallRinging`, `contracts/sip-dialout.md`'s progress
+    /// table — pass a no-op closure to just log, matching the original
+    /// behavior before that relay existed).
     pub fn recv_final_response_for_origination(
         &mut self,
         initial_timeout: Duration,
         ring_timeout: Duration,
+        mut on_provisional: impl FnMut(&SipResponse),
     ) -> BridgeResult<SipResponse> {
         let mut deadline = std::time::Instant::now() + initial_timeout;
         let mut any_response_seen = false;
@@ -770,6 +776,7 @@ impl SipTransport {
                     return Ok(resp);
                 }
                 tracing::info!(status = resp.status, reason = %resp.reason, "provisional response");
+                on_provisional(&resp);
                 if !any_response_seen {
                     any_response_seen = true;
                     deadline = std::time::Instant::now() + ring_timeout;
