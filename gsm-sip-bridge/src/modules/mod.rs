@@ -1500,11 +1500,29 @@ impl CardPool {
                 if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
                     state.has_active_call = true;
                 }
+                // Every early return below must clear this back to `false`
+                // for `module_id`'s own slot — found in review, the exact
+                // "latching state" shape this repo has hit before
+                // (docs/greptile-review-learnings.md): `has_active_call` was
+                // only ever cleared by a successful bridge or a later
+                // `Hangup`, so any failure here (including the new "another
+                // call is already active" case `make_call`'s own busy check
+                // now returns) permanently deferred this slot from ever
+                // being selected again, with no GSM call actually running
+                // on it to eventually clear it via `Hangup`.
+                macro_rules! clear_has_active_call {
+                    () => {
+                        if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
+                            state.has_active_call = false;
+                        }
+                    };
+                }
                 if self.sip_bridge.state != crate::sip::RegistrationState::Registered {
                     tracing::warn!(
                         module = %module_id,
                         "SIP not registered, cannot bridge call"
                     );
+                    clear_has_active_call!();
                     return;
                 }
 
@@ -1525,6 +1543,7 @@ impl CardPool {
                         metrics::SIP_CALLS_TOTAL
                             .with_label_values(&[&module_id, "error", "cs"])
                             .inc();
+                        clear_has_active_call!();
                         return;
                     }
                 };
@@ -1541,6 +1560,7 @@ impl CardPool {
                     metrics::AUDIO_ERRORS_TOTAL
                         .with_label_values(&[&module_id, "sound_device"])
                         .inc();
+                    clear_has_active_call!();
                     return;
                 }
 
@@ -1553,6 +1573,7 @@ impl CardPool {
                     metrics::SIP_CALLS_TOTAL
                         .with_label_values(&[&module_id, "error", "cs"])
                         .inc();
+                    clear_has_active_call!();
                 } else {
                     metrics::SIP_CALLS_TOTAL
                         .with_label_values(&[&module_id, "initiated", "cs"])

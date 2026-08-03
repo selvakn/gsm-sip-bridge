@@ -341,6 +341,30 @@ pub(crate) fn run_telephony_side(
     };
     let (bindings, account) = bindings;
 
+    // Trunk mode's analog of `bindings`' source-of-truth for "who may reach
+    // the dial-out account" — see `sip::SipBridge::trunk_source_ips`'s own
+    // doc comment for the full reasoning (spec 025 review: nothing verified
+    // an outbound-triggering request's real sender before this existed).
+    // Resolved once, here, not per-request. Only meaningful in trunk mode
+    // (`bindings.is_none()`) with outbound enabled; empty otherwise.
+    let trunk_source_ips: Vec<std::net::IpAddr> = if bindings.is_none() && config.outbound.enabled {
+        use std::net::ToSocketAddrs;
+        match (config.sip.server.as_str(), config.sip.port).to_socket_addrs() {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    server = %config.sip.server,
+                    error = %e,
+                    "outbound: could not resolve the trunk server's address; \
+                     dial-out requests will be refused until this succeeds"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // `Account::register` only *initiates* the REGISTER — it does not mean the
     // PBX accepted it. Confirm it did (or report the denial) before treating
     // the outbound bridge leg as usable; assuming success is how a `403` after
@@ -445,6 +469,8 @@ pub(crate) fn run_telephony_side(
             let endpoint = &endpoint;
             let account = &account;
             let lines_ref = &lines;
+            let bindings_ref = bindings.as_ref();
+            let trunk_source_ips_ref = &trunk_source_ips;
             // This process serves no `/metrics` of its own — same reason
             // the SIP-server-mode gauges above are reported rather than
             // exported directly (spec 024). `record_transport`'s existing
@@ -461,7 +487,14 @@ pub(crate) fn run_telephony_side(
                 Duration::from_secs(config.metrics.agent_report_interval_seconds),
             );
             scope.spawn(move || {
-                run_outbound_listener(endpoint, account, lines_ref, &outbound_reporter)
+                run_outbound_listener(
+                    endpoint,
+                    account,
+                    lines_ref,
+                    bindings_ref,
+                    trunk_source_ips_ref,
+                    &outbound_reporter,
+                )
             });
         }
 
@@ -573,6 +606,15 @@ fn run_outbound_listener(
     endpoint: &Endpoint,
     account: &Account,
     lines: &[RuntimeLine],
+    // `Some` in SIP server mode: verify a dial-out request's real source
+    // against the phones currently registered here — the same check the
+    // registrar's own redirect decision makes (`find_by_source`). `None` in
+    // trunk mode, where `trunk_source_ips` is the check instead. Exactly one
+    // of the two is ever non-empty/`Some` (spec 025 review: nothing verified
+    // an outbound-triggering request's real sender at all before this
+    // existed — this account's port listens on every interface).
+    bindings: Option<&Arc<crate::sip::server::BindingStore>>,
+    trunk_source_ips: &[std::net::IpAddr],
     reporter: &Reporter,
 ) {
     let mut active: Option<ActiveOutboundCall> = None;
@@ -590,7 +632,7 @@ fn run_outbound_listener(
             // otherwise it sits in PJSUA's incoming-call queue until this
             // call ends, then gets dialed for a caller who may have given
             // up minutes ago (specs/025-outbound-calling review).
-            if let Some((_, stale_call_id)) = endpoint.poll_incoming_call() {
+            if let Some((_, stale_call_id, _)) = endpoint.poll_incoming_call() {
                 let mut stale = Call::from_id(stale_call_id, CallState::Incoming);
                 let _ = stale.answer(503);
                 report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
@@ -598,10 +640,28 @@ fn run_outbound_listener(
             continue;
         }
 
-        let Some((_, call_id)) = endpoint.poll_incoming_call() else {
+        let Some((_, call_id, source_addr)) = endpoint.poll_incoming_call() else {
             continue;
         };
         let mut call = Call::from_id(call_id, CallState::Incoming);
+
+        // This account's port listens on every interface, and nothing
+        // upstream has checked who actually sent this INVITE — verify the
+        // real transport-level source before it can reach a real carrier
+        // call at all (found in review; see this function's own doc
+        // comment on `bindings`/`trunk_source_ips`).
+        let trusted = match bindings {
+            Some(bindings) => bindings
+                .find_by_source(source_addr, std::time::Instant::now())
+                .is_some(),
+            None => trunk_source_ips.contains(&source_addr.ip()),
+        };
+        if !trusted {
+            tracing::warn!(call_id, %source_addr, "outbound: refusing a dial-out request from an untrusted source");
+            let _ = call.answer(403);
+            report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
+            continue;
+        }
 
         let Some(destination) = call.request_destination() else {
             tracing::warn!(

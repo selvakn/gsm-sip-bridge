@@ -30,6 +30,16 @@ pub struct SipBridge {
     /// the table of phones it has accepted.
     registrar: Option<Registrar>,
     bindings: Option<Arc<BindingStore>>,
+    /// Present only in PBX-trunk mode (`bindings.is_none()`): the configured
+    /// trunk server's own resolved IP address(es), checked against a
+    /// dial-out request's real source in `poll_outbound_request` — the
+    /// trunk-mode analog of `bindings`' `find_by_source` (spec 025 review:
+    /// nothing verified the sender of a request to this account's port at
+    /// all before this field existed). Resolved once at registration time,
+    /// not per-request — `ToSocketAddrs` can do a real (blocking) DNS
+    /// lookup, and this is checked from the same async loop that must keep
+    /// serving everything else.
+    trunk_source_ips: Vec<std::net::IpAddr>,
 }
 
 #[derive(Clone)]
@@ -117,6 +127,7 @@ impl SipBridge {
             active_call: None,
             registrar: None,
             bindings: None,
+            trunk_source_ips: Vec::new(),
         }
     }
 
@@ -168,6 +179,27 @@ impl SipBridge {
         // in this process ever calls `poll_outbound_request` to drain it
         // (specs/025-outbound-calling review).
         endpoint.set_accept_incoming_calls(self.config.outbound_enabled);
+
+        // Resolved once, here, not per-request — see `trunk_source_ips`'s
+        // own doc comment. A literal IP resolves locally with no network
+        // call; a hostname does a real (one-time) DNS lookup. Failure
+        // leaves this empty, which fails closed: `poll_outbound_request`
+        // trusts nothing until a restart re-resolves successfully, rather
+        // than silently trusting every sender.
+        if self.config.outbound_enabled {
+            use std::net::ToSocketAddrs;
+            match (self.config.server.as_str(), self.config.port).to_socket_addrs() {
+                Ok(addrs) => self.trunk_source_ips = addrs.map(|a| a.ip()).collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        server = %self.config.server,
+                        error = %e,
+                        "outbound: could not resolve the trunk server's address; \
+                         dial-out requests will be refused until this succeeds"
+                    );
+                }
+            }
+        }
 
         let acc_config = AccountConfig {
             sip_server: self.config.server.clone(),
@@ -355,6 +387,19 @@ impl SipBridge {
     }
 
     pub fn make_call(&mut self, dest_uri: &str, gsm_caller_id: &str) -> Result<(), String> {
+        // `active_call` is one field for the whole bridge, not one per
+        // modem — a pre-existing simplification (predates spec 025) that a
+        // true multi-modem-concurrent-call design would need to revisit on
+        // its own. Spec 025 adds a *new* way to hit it though: without this
+        // check, a modem answering a call while an outbound call is already
+        // active here would silently overwrite `active_call`, losing that
+        // outbound call's own SIP-side handle while its real carrier leg
+        // stays up with nothing left tracking it (found in review — the
+        // same root cause `poll_outbound_request`'s own busy check already
+        // guards against in the other direction).
+        if self.active_call.is_some() {
+            return Err("a call is already active on this SIP bridge".to_string());
+        }
         let account = self
             .account
             .as_ref()
@@ -391,8 +436,35 @@ impl SipBridge {
     /// the outbound pipeline could do with it.
     pub fn poll_outbound_request(&self) -> Option<(Call, String)> {
         let endpoint = self.endpoint.as_ref()?;
-        let (_, call_id) = endpoint.poll_incoming_call()?;
+        let (_, call_id, source_addr) = endpoint.poll_incoming_call()?;
         let mut call = Call::from_id(call_id, CallState::Incoming);
+        // This account's port listens on every interface (real phones and
+        // PBXes reach it directly, not just loopback), and nothing upstream
+        // has checked who actually sent this INVITE — a bare SIP header is
+        // caller-chosen text, not proof of anything. Verify the real
+        // transport-level source before this request can reach a real
+        // carrier call at all (found in review): in SIP server mode, it
+        // must be a currently-registered phone (the same check the
+        // registrar's own redirect decision makes); in trunk mode, it must
+        // be the configured PBX itself.
+        let trusted = match &self.bindings {
+            Some(bindings) => bindings
+                .find_by_source(source_addr, std::time::Instant::now())
+                .is_some(),
+            None => self.trunk_source_ips.contains(&source_addr.ip()),
+        };
+        if !trusted {
+            tracing::warn!(call_id, %source_addr, "outbound: refusing a dial-out request from an untrusted source");
+            let _ = call.answer(403);
+            // No dedicated outcome exists for "untrusted source" — this
+            // path should never be hit by a legitimate caller, so reusing
+            // the closest existing label (a refused, never-placed attempt)
+            // rather than widening the wire protocol for it.
+            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_invalid_destination"])
+                .inc();
+            return None;
+        }
         if self.active_call.is_some() {
             // Refuse rather than queue: this is polled every tick
             // regardless of whether a previous call is still being
@@ -551,5 +623,41 @@ fn verify_native_rate(device: &str, expected_rate: u32) {
                 "native-rate check: device did not report a rate range"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> crate::config::AppConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sip]\nserver = \"sip.example.com\"\nusername = \"user\"\npassword = \"pass\"\n",
+        )
+        .unwrap();
+        crate::config::load_config(&path).unwrap()
+    }
+
+    /// specs/025-outbound-calling review: `make_call` (inbound GSM→SIP
+    /// bridging) used to overwrite `active_call` unconditionally — a call
+    /// already occupying it (from another modem, or an outbound call this
+    /// feature adds) would be silently destroyed, orphaning its real
+    /// carrier/modem leg with nothing left tracking it. `make_call` must
+    /// refuse instead of clobbering.
+    #[test]
+    fn make_call_refuses_when_a_call_is_already_active() {
+        let config = test_config();
+        let mut bridge = SipBridge::new(&config);
+        bridge.active_call = Some(Call::from_id(1, CallState::Confirmed));
+
+        let result = bridge.make_call("sip:1234@example.com", "+15551234567");
+
+        assert_eq!(
+            result,
+            Err("a call is already active on this SIP bridge".to_string())
+        );
     }
 }

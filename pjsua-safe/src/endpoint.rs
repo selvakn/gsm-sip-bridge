@@ -33,9 +33,17 @@ static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
 /// larger change. Pushed in FIFO order in `on_incoming_call_cb`; popped by
 /// whichever component owns UAS handling for that account (the daemon's
 /// trunk account, or `Account::local` in SIP server mode).
+///
+/// Carries the request's real transport-level source address (from
+/// `pjsip_rx_data::pkt_info`, not any SIP header — headers are caller-chosen
+/// text, not proof of anything) so a caller can verify this INVITE actually
+/// came from a peer it trusts before acting on it (found in review: the
+/// dial-out local port listens on every interface, same as the trunk
+/// account's own port, and nothing checked the sender at all before this).
 #[cfg(feature = "pjsip-linked")]
-static INCOMING_CALLS: LazyLock<Mutex<std::collections::VecDeque<(i32, i32)>>> =
-    LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+static INCOMING_CALLS: LazyLock<
+    Mutex<std::collections::VecDeque<(i32, i32, std::net::SocketAddr)>>,
+> = LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
 
 /// Whether `on_incoming_call_cb` should queue what it receives at all.
 /// Defaults to `true` — unchanged behavior for any caller that never
@@ -262,14 +270,17 @@ impl Endpoint {
     }
 
     /// Pops the oldest not-yet-claimed incoming call, if any, as
-    /// `(account_id, call_id)`. `Call::from_id` turns the `call_id` into a
-    /// `Call` the caller can `answer`/`hangup`/`poll_state` (spec 025,
-    /// research.md R-007).
+    /// `(account_id, call_id, source_addr)`. `Call::from_id` turns the
+    /// `call_id` into a `Call` the caller can `answer`/`hangup`/`poll_state`
+    /// (spec 025, research.md R-007). `source_addr` is the request's real
+    /// transport-level source — verify it against whatever this account
+    /// considers a trusted peer before dispatching anything the caller
+    /// requested (e.g. a dial-out); nothing upstream of this has checked it.
     ///
     /// Stub builds never produce an incoming call — there is no real
     /// `on_incoming_call` to fire — so this always returns `None` there;
     /// unit tests exercise the UAS pipeline via `Call::from_id` directly.
-    pub fn poll_incoming_call(&self) -> Option<(i32, i32)> {
+    pub fn poll_incoming_call(&self) -> Option<(i32, i32, std::net::SocketAddr)> {
         #[cfg(feature = "pjsip-linked")]
         {
             INCOMING_CALLS
@@ -745,21 +756,47 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
 /// answering synchronously inside this callback.
 #[cfg(feature = "pjsip-linked")]
 #[rustfmt::skip]
-unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid acc_id/call_id after init; rdata is library-owned and not dereferenced here
+unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid acc_id/call_id after init; rdata is library-owned, read-only, valid for the callback's duration
     acc_id: pjsua_sys::pjsua_acc_id,
     call_id: pjsua_sys::pjsua_call_id,
-    _rdata: *mut pjsua_sys::pjsip_rx_data,
+    rdata: *mut pjsua_sys::pjsip_rx_data,
 ) {
     if !INCOMING_CALLS_ACCEPTED.load(Ordering::Acquire) {
         tracing::info!(acc_id, call_id, "incoming SIP call refused (not accepting incoming calls)");
         pjsua_sys::pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
         return;
     }
-    tracing::info!(acc_id, call_id, "incoming SIP call");
+    // The request's real transport-level source (`pkt_info`, filled in by
+    // PJSIP's own transport layer from the actual socket the packet arrived
+    // on) — not a SIP header, which is caller-chosen text and proves
+    // nothing. Callers of `poll_incoming_call` rely on this to verify a
+    // dial-out request actually came from a trusted peer (found in review:
+    // this account's port listens on every interface, and nothing checked
+    // the sender before this existed). `src_name` is PJSIP's own
+    // null-terminated, human-readable rendering of the address — safe to
+    // read directly, no `pj_sockaddr` union to decode.
+    let source_addr = if rdata.is_null() {
+        None
+    } else {
+        let pkt = &(*rdata).pkt_info;
+        std::ffi::CStr::from_ptr(pkt.src_name.as_ptr())
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .map(|ip| std::net::SocketAddr::new(ip, pkt.src_port as u16))
+    };
+    let Some(source_addr) = source_addr else {
+        // Fail closed: a source we cannot verify is not a source we let
+        // through, regardless of what `INCOMING_CALLS_ACCEPTED` says.
+        tracing::warn!(acc_id, call_id, "incoming SIP call refused (source address unavailable)");
+        pjsua_sys::pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+        return;
+    };
+    tracing::info!(acc_id, call_id, %source_addr, "incoming SIP call");
     INCOMING_CALLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push_back((acc_id, call_id));
+        .push_back((acc_id, call_id, source_addr));
 }
 
 #[cfg(feature = "pjsip-linked")]
