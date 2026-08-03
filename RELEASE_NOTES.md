@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v8.4.0
 
 - **Outbound calling.** `[outbound].enabled` lets the PBX — or, in SIP server
   mode, a registered phone — dial out through the mobile network, on
