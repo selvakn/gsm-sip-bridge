@@ -435,7 +435,9 @@ pub(crate) fn run_telephony_side(
         // line: the account/endpoint are shared, same as the registrar.
         if config.outbound.enabled {
             let endpoint = &endpoint;
-            scope.spawn(move || run_outbound_listener(endpoint, config));
+            let account = &account;
+            let lines_ref = &lines;
+            scope.spawn(move || run_outbound_listener(endpoint, account, config, lines_ref));
         }
 
         for line in &lines {
@@ -477,17 +479,40 @@ pub(crate) fn run_telephony_side(
 /// process-wide, matching the shared `endpoint`/`account` it polls.
 const OUTBOUND_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How long to wait to connect to a line's Agent A and get a
+/// `CallPlaced`/`CallFailed` reply before treating it as unavailable and
+/// trying the next line. Short — this is only meant to catch "busy" (an
+/// immediate reply, no carrier round trip) and "process unreachable"
+/// quickly; a genuinely placed call's own carrier round trip happens after
+/// this, inside `dispatch_loop`'s `OUTBOUND_INVITE_TIMEOUT`.
+const PLACE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Polls for an inbound INVITE this process's account (`Account::local` in
 /// SIP server mode, or the classic PBX-trunk registration otherwise)
-/// accepted, and dials it out on whichever circuit-switched line the main
-/// daemon reports idle — over the existing control socket, exactly as
-/// `card restart`/`set-mode` already reach the daemon from a different
-/// process (specs/025-outbound-calling; `ControlCmd::Dial`'s `slot: None`
-/// form needs no new cross-process channel, per research.md R-003 revised).
+/// accepted, and places it on whichever line is idle.
+///
+/// Tries this process's own configured VoWiFi/VoLTE `lines` first, each
+/// over `contracts/agent-outbound-protocol.md`'s `PlaceCall`/`CallPlaced`/
+/// `CallFailed` triad — a "busy" reply costs no carrier round trip (Agent
+/// A's `dispatch_loop` answers it before ever touching the carrier
+/// transport), so trying several lines in sequence is cheap. Falls back to
+/// the circuit-switched daemon via `ControlCmd::Dial` (cross-process,
+/// `slot: None`, exactly as `card restart`/`set-mode` already reach the
+/// daemon from the CLI — no separate channel needed, research.md R-003
+/// revised). **Simplification, not strict FR-007 no-preference**: lines are
+/// tried in the order `lines` lists them, then CS — a real (if arbitrary)
+/// ordering, not the "no preference across every process simultaneously"
+/// FR-007 describes; true unordered arbitration across processes would need
+/// a bigger mechanism than this pass builds.
 ///
 /// Runs forever on its own thread (see `run_telephony_side`); never returns
 /// in normal operation.
-fn run_outbound_listener(endpoint: &Endpoint, config: &AppConfig) {
+fn run_outbound_listener(
+    endpoint: &Endpoint,
+    account: &Account,
+    config: &AppConfig,
+    lines: &[RuntimeLine],
+) {
     let socket_path = config.control.socket_path.clone();
     loop {
         std::thread::sleep(OUTBOUND_POLL_INTERVAL);
@@ -515,6 +540,37 @@ fn run_outbound_listener(endpoint: &Endpoint, config: &AppConfig) {
             continue;
         }
 
+        let wire_call_id = format!("out-{call_id}");
+        let mut placed_on_line = false;
+        for line in lines {
+            match try_place_on_line(line, &wire_call_id, &destination) {
+                Ok(()) => {
+                    match bridge_outbound_leg(endpoint, account, &mut call, line) {
+                        Ok(()) => {
+                            tracing::info!(destination = %destination, card_id = %line.card_id, "outbound call placed over VoWiFi/VoLTE");
+                            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                                .with_label_values(&["placed"])
+                                .inc();
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "outbound: failed to bridge the veth leg after the carrier leg was placed");
+                            crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
+                                .with_label_values(&["refused_network_failure"])
+                                .inc();
+                        }
+                    }
+                    placed_on_line = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(card_id = %line.card_id, error = %e, "outbound: line unavailable, trying next");
+                }
+            }
+        }
+        if placed_on_line {
+            continue;
+        }
+
         let cmd = crate::control::protocol::ControlCmd::Dial {
             slot: None,
             destination: destination.clone(),
@@ -525,7 +581,7 @@ fn run_outbound_listener(endpoint: &Endpoint, config: &AppConfig) {
         match crate::control::client::send_cmd(&socket_path, &cmd) {
             Ok(crate::control::protocol::ControlResp::Ok) => match call.answer(200) {
                 Ok(()) => {
-                    tracing::info!(destination = %destination, "outbound call placed");
+                    tracing::info!(destination = %destination, "outbound call placed over circuit-switched");
                     crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
                         .with_label_values(&["placed"])
                         .inc();
@@ -556,14 +612,77 @@ fn run_outbound_listener(endpoint: &Endpoint, config: &AppConfig) {
                     .inc();
             }
             Err(e) => {
-                tracing::error!(error = %e, "outbound: control socket unreachable");
+                tracing::error!(error = %e, "outbound: control socket and every VoWiFi/VoLTE line unavailable");
                 let _ = call.answer(503);
                 crate::metrics::OUTBOUND_ATTEMPTS_TOTAL
-                    .with_label_values(&["refused_network_failure"])
+                    .with_label_values(&["refused_no_idle_line"])
                     .inc();
             }
         }
     }
+}
+
+/// Connects to `line`'s Agent A (`veth_local_addr:AGENT_A_STATUS_PORT` —
+/// the same listener `run_status_listener` extended to also accept
+/// `PlaceCall`, specs/025-outbound-calling) and asks it to originate a call.
+/// `Ok(())` only once Agent A replies `CallPlaced` — meaning its carrier
+/// leg is up and its veth listener is waiting for us. Any other outcome
+/// (connect failure, timeout, `CallFailed`) is `Err`, cheap to try the next
+/// line for, since `dispatch_loop` answers a busy line before ever
+/// touching the carrier transport.
+fn try_place_on_line(line: &RuntimeLine, call_id: &str, destination: &str) -> Result<(), String> {
+    let addr = format!("{}:{}", line.veth_local_addr, AGENT_A_STATUS_PORT);
+    let mut stream = TcpStream::connect_timeout(
+        &addr.parse().map_err(|e| format!("invalid address: {e}"))?,
+        PLACE_CALL_TIMEOUT,
+    )
+    .map_err(|e| format!("connect failed: {e}"))?;
+    stream
+        .set_read_timeout(Some(PLACE_CALL_TIMEOUT))
+        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
+
+    write_msg(
+        &mut stream,
+        &ControlMessage::PlaceCall {
+            call_id: call_id.to_string(),
+            destination: destination.to_string(),
+        },
+    )?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    match read_msg(&mut reader)? {
+        ControlMessage::CallPlaced { .. } => Ok(()),
+        ControlMessage::CallFailed { reason, .. } => Err(reason),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+/// Places this line's veth-side `Call::make` toward Agent A's now-waiting
+/// veth listener and conference-bridges it to the already-accepted
+/// phone/PBX leg — the same `pjsua_safe::Endpoint::pair_calls` primitive
+/// `bridge_call` already uses for inbound (`vowifi/mod.rs`), called here
+/// with the leg roles reversed: `call` was accepted first, the veth leg is
+/// placed second.
+fn bridge_outbound_leg(
+    endpoint: &Endpoint,
+    account: &Account,
+    call: &mut Call,
+    line: &RuntimeLine,
+) -> BridgeResult<()> {
+    let veth_uri = format!("sip:agent-a@{}:{}", line.veth_local_addr, line.sip_leg_port);
+    let veth_call = Call::make(account, &veth_uri, None, &[])
+        .map_err(|e| BridgeError::Ims(format!("veth-side call failed: {e}")))?;
+
+    call.answer(200)
+        .map_err(|e| BridgeError::Ims(format!("{e}")))?;
+    endpoint.pair_calls(call.call_id(), veth_call.call_id());
+    tracing::info!(
+        phone_call_id = call.call_id(),
+        veth_call_id = veth_call.call_id(),
+        card_id = %line.card_id,
+        "outbound: placed and paired both legs"
+    );
+    Ok(())
 }
 
 /// One line's whole accept loop — binds `listen_addr` and handles every

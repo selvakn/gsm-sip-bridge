@@ -94,13 +94,20 @@ pub enum ControlMessage {
     /// idle VoWiFi/VoLTE candidate. `destination` is verbatim from the
     /// originating request — no transformation (FR-010), same discipline as
     /// the circuit-switched path (`ControlCmd::Dial`).
-    PlaceCall { call_id: String, destination: String },
-    /// Agent A → Agent B. The carrier leg is up enough to bridge — the
-    /// outbound mirror of `BridgeReady`, direction reversed. Agent B
-    /// conference-bridges its already-accepted phone/PBX leg to
-    /// `veth_rtp_port` via the same `pjsua_safe::Endpoint::pair_calls`
-    /// `bridge_call` already uses for inbound.
-    CallPlaced { call_id: String, veth_rtp_port: u16 },
+    PlaceCall {
+        call_id: String,
+        destination: String,
+    },
+    /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
+    /// and Agent A's veth-facing UAS listener is up and waiting — the
+    /// outbound mirror of `IncomingCall`, direction reversed. No port is
+    /// carried: exactly like the inbound direction, Agent B places a real
+    /// `Call::make` toward Agent A's veth SIP listener (the same mechanism
+    /// `bridge_call` already uses, `vowifi/mod.rs:1213`) and RTP addressing
+    /// is negotiated through that real SIP/SDP exchange, not this message.
+    /// Agent B conference-bridges the resulting veth call to its
+    /// already-accepted phone/PBX leg via `pjsua_safe::Endpoint::pair_calls`.
+    CallPlaced { call_id: String },
     /// Agent A → Agent B. The carrier declined, was unreachable, or the
     /// line could not otherwise place the call. Agent B answers the
     /// phone/PBX leg accordingly (`486`/`503`,
@@ -259,7 +266,6 @@ mod tests {
     fn call_placed_roundtrips() {
         let msg = ControlMessage::CallPlaced {
             call_id: "out1".to_string(),
-            veth_rtp_port: 40200,
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -286,7 +292,6 @@ mod tests {
         assert_eq!(
             ControlMessage::CallPlaced {
                 call_id: "x".to_string(),
-                veth_rtp_port: 1
             }
             .call_id(),
             Some("x")

@@ -424,10 +424,13 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         ..Default::default()
     }));
 
+    let (place_call_tx, place_call_rx) = mpsc::channel();
     {
         let status_for_listener = status.clone();
         std::thread::spawn(move || {
-            if let Err(e) = run_status_listener(local_ip, status_port, status_for_listener) {
+            if let Err(e) =
+                run_status_listener(local_ip, status_port, status_for_listener, place_call_tx)
+            {
                 tracing::warn!(error = %e, "registration-status listener failed");
             }
         });
@@ -448,10 +451,21 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         modem_lock.as_ref(),
         pbx_registered.as_ref(),
         &obs,
+        place_call_rx,
     );
     session.unregister();
     session.cleanup();
     result
+}
+
+/// A `PlaceCall` (specs/025-outbound-calling) handed off by
+/// `run_status_listener` to `dispatch_loop`: the still-open connection back
+/// to Agent B (reused for `CallPlaced`/`CallFailed` and, on success, the
+/// rest of the call), plus what it asked for.
+pub(crate) struct PendingPlaceCall {
+    control: TcpStream,
+    call_id: String,
+    destination: String,
 }
 
 /// Answers `vowifi-status`/`volte-status` queries (`ControlMessage::StatusQuery`
@@ -459,10 +473,19 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
 /// runs. A separate, always-listening connection from the main dispatch
 /// loop's own SIP transport, so a status query never competes with call
 /// signaling.
+///
+/// Also the listener Agent B connects to for `PlaceCall`
+/// (specs/025-outbound-calling) — a genuinely different shape (the
+/// connection must stay open for the whole call, not close after one
+/// reply), so a `PlaceCall` connection is handed off whole to
+/// `place_call_tx` rather than answered inline here. `dispatch_loop` does
+/// the actual work single-threadedly, since it is the sole owner of
+/// `session` — this thread's only job is accepting and routing.
 fn run_status_listener(
     veth_local_ip: IpAddr,
     status_port: u16,
     status: Arc<Mutex<super::RegistrationStatus>>,
+    place_call_tx: mpsc::Sender<PendingPlaceCall>,
 ) -> BridgeResult<()> {
     let listener = std::net::TcpListener::bind((veth_local_ip, status_port))
         .map_err(|e| BridgeError::Ims(format!("status listener bind failed: {e}")))?;
@@ -479,6 +502,21 @@ fn run_status_listener(
             Err(_) => continue,
         };
         match read_msg(&mut reader) {
+            Ok(ControlMessage::PlaceCall {
+                call_id,
+                destination,
+            }) => {
+                if place_call_tx
+                    .send(PendingPlaceCall {
+                        control: stream,
+                        call_id,
+                        destination,
+                    })
+                    .is_err()
+                {
+                    tracing::warn!("dispatch loop gone, dropping outbound call request");
+                }
+            }
             Ok(ControlMessage::StatusQuery) => {
                 let snapshot = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 // One derivation of "can this line answer a call right now?",
@@ -661,6 +699,391 @@ impl DialogInfo {
             cseq: 1,
         }
     }
+
+    /// The UAC-role counterpart to [`from_invite`](Self::from_invite) —
+    /// specs/025-outbound-calling, research.md R-010: we *sent* the INVITE
+    /// this dialog started from, so unlike `from_invite`, `from`/`to` come
+    /// from what we sent/received rather than the reverse, and `route_headers`
+    /// reuses the same Service-Route set the INVITE itself was routed with
+    /// (the same simplification `ims::call::run_call` already makes for its
+    /// own BYE, rather than recomputing a dialog route set from
+    /// `Record-Route` — `SipResponse` does not even expose repeated headers
+    /// the way `SipRequest::headers_all` does, since nothing needed it before
+    /// this).
+    fn from_uac_response(
+        resp: &crate::ims::sip_client::SipResponse,
+        route_headers: Vec<String>,
+        callee_uri: &str,
+        public_uri: &str,
+        from_tag: &str,
+        next_cseq: u32,
+        session: &super::RegisteredSession,
+    ) -> Self {
+        // The far end's Contact is where in-dialog requests belong (RFC 3261
+        // §12.1.2); no Contact on the 200 OK is malformed but not fatal — the
+        // original callee URI is still a request the network already proved
+        // it could route once.
+        let remote_target = resp
+            .header("Contact")
+            .and_then(|c| {
+                let start = c.find('<')? + 1;
+                let end = c[start..].find('>')? + start;
+                Some(c[start..end].to_string())
+            })
+            .unwrap_or_else(|| callee_uri.to_string());
+
+        let to = resp
+            .header("To")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<sip:{callee_uri}>"));
+        let from = format!("<sip:{public_uri}>;tag={from_tag}");
+
+        Self {
+            remote_target,
+            route_headers,
+            from,
+            to,
+            local_addr: session.local_addr,
+            use_tcp: session.use_tcp,
+            cseq: next_cseq,
+        }
+    }
+}
+
+/// How long to wait for a final response to an originated INVITE. Well
+/// under RFC 3261 Timer B (32s) but generous for a real carrier round trip.
+const OUTBOUND_INVITE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Originates a call to `destination` over the already-registered carrier
+/// session, waits for Agent B's veth call, and bridges the two legs — the
+/// outbound mirror of `handle_invite`'s inbound answer path
+/// (specs/025-outbound-calling, research.md R-009/R-010/R-011). Sends
+/// `CallPlaced`/`CallFailed` on `control` itself before returning, so the
+/// caller (`dispatch_loop`) only needs to fold the result into
+/// `active_call`.
+///
+/// Never re-registers (`super::register_session`) — a second registration
+/// for the same IMSI would tear down the live one (research.md R-010's hard
+/// constraint). Everything here reuses `session`, exactly like every other
+/// request this agent sends.
+#[allow(clippy::too_many_arguments)]
+fn originate_and_bridge(
+    session: &mut super::RegisteredSession,
+    mut control: TcpStream,
+    call_id: String,
+    destination: &str,
+    veth_local_ip: IpAddr,
+    veth_sip_port: u16,
+    wideband: bool,
+) -> Option<ActiveCall> {
+    let fail = |control: &mut TcpStream, call_id: String, reason: &str| {
+        tracing::warn!(call_id, reason, "outbound: could not place carrier call");
+        let _ = write_msg(
+            control,
+            &ControlMessage::CallFailed {
+                call_id,
+                reason: reason.to_string(),
+            },
+        );
+    };
+
+    // RFC 3608, same simplification `ims::call::run_call` already makes:
+    // subsequent requests in this dialog route via the Service-Route the
+    // registrar returned, computed once here and reused for the INVITE and
+    // (via `DialogInfo::from_uac_response`) the eventual BYE.
+    let route_headers: Vec<String> = session
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("Service-Route"))
+        .map(|(_, v)| format!("Route: {v}"))
+        .collect();
+
+    let rtp_socket = match UdpSocket::bind((session.local_addr.ip(), 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(
+                &mut control,
+                call_id,
+                &format!("RTP socket bind failed: {e}"),
+            );
+            return None;
+        }
+    };
+    let rtp_port = match rtp_socket.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => {
+            fail(
+                &mut control,
+                call_id,
+                &format!("RTP local_addr failed: {e}"),
+            );
+            return None;
+        }
+    };
+
+    let session_id: u64 = rand::random::<u32>() as u64;
+    // Offering, not answering — "prefer wideband when available" for both
+    // carrier paths, rather than reusing `AnswerPreference`'s legacy/cellular
+    // split, which is about the *answer* fallback order (AMR-NB vs. PCMU)
+    // when the far end's own offer lacks AMR-WB — not applicable to what we
+    // ourselves offer here.
+    let offer = sdp::build_offer(
+        session.local_addr.ip(),
+        rtp_port,
+        session_id,
+        sdp::CodecOffer::preferring_wideband(wideband && amr_safe::is_available()),
+    );
+
+    // `;user=phone` (RFC 3261 §19.1.1 / TS 24.229): tells the network this is
+    // a PSTN/mobile number, not a resolvable SIP address — the same header
+    // `ims::call::run_call` adds after finding a bare `sip:` URI reached a
+    // terminating application server that never rang the callee.
+    let callee_uri = format!("{destination}@{};user=phone", session.realm);
+    let from_tag = random_hex(4);
+    let invite_cseq = session.cseq;
+    let via_transport = if session.use_tcp { "TCP" } else { "UDP" };
+    let branch = format!("z9hG4bK{}", random_hex(6));
+
+    let invite = super::call::build_invite(&super::call::InviteParts {
+        request_uri: &callee_uri,
+        route_headers: &route_headers,
+        via_transport,
+        local_addr: session.local_addr,
+        contact_addr: session.contact_addr,
+        public_uri: &session.public_uri,
+        callee_uri: &callee_uri,
+        call_id: &call_id,
+        from_tag: &from_tag,
+        cseq: invite_cseq,
+        branch: &branch,
+        body: &offer,
+    });
+
+    tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
+    let transport = match session.transport_mut() {
+        Ok(t) => t,
+        Err(e) => {
+            fail(&mut control, call_id, &format!("no carrier transport: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = transport.send(&invite) {
+        fail(&mut control, call_id, &format!("INVITE send failed: {e}"));
+        return None;
+    }
+    let resp = match transport.recv_final_response(OUTBOUND_INVITE_TIMEOUT) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(
+                &mut control,
+                call_id,
+                &format!("no final response from carrier: {e}"),
+            );
+            return None;
+        }
+    };
+    tracing::info!(call_id, status = resp.status, reason = %resp.reason, "outbound: final INVITE response");
+
+    if resp.status != 200 {
+        // Non-2xx final response: ACK reuses the INVITE's own branch/CSeq
+        // (RFC 3261 §17.1.1.3), best-effort.
+        let ack = super::call::build_ack(&super::call::AckParts {
+            request_uri: &callee_uri,
+            route_headers: &route_headers,
+            via_transport,
+            local_addr: session.local_addr,
+            public_uri: &session.public_uri,
+            to_header: resp.header("To").unwrap_or(&callee_uri),
+            call_id: &call_id,
+            from_tag: &from_tag,
+            cseq: invite_cseq,
+            branch: &branch,
+        });
+        let _ = session.transport_mut().and_then(|t| t.send(&ack));
+        fail(
+            &mut control,
+            call_id,
+            &format!("{} {}", resp.status, resp.reason),
+        );
+        return None;
+    }
+
+    let answer = match sdp::parse_answer(&resp.body) {
+        Ok(a) => a,
+        Err(e) => {
+            fail(&mut control, call_id, &format!("bad SDP answer: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = rtp_socket.connect(answer.remote_rtp) {
+        fail(&mut control, call_id, &format!("RTP connect failed: {e}"));
+        return None;
+    }
+
+    let ack_branch = format!("z9hG4bK{}", random_hex(6));
+    let ack = super::call::build_ack(&super::call::AckParts {
+        request_uri: &callee_uri,
+        route_headers: &route_headers,
+        via_transport,
+        local_addr: session.local_addr,
+        public_uri: &session.public_uri,
+        to_header: resp.header("To").unwrap_or(&callee_uri),
+        call_id: &call_id,
+        from_tag: &from_tag,
+        cseq: invite_cseq,
+        branch: &ack_branch,
+    });
+    if let Err(e) = session.transport_mut().and_then(|t| t.send(&ack)) {
+        fail(&mut control, call_id, &format!("ACK send failed: {e}"));
+        return None;
+    }
+    session.cseq = invite_cseq + 1;
+
+    let dialog = DialogInfo::from_uac_response(
+        &resp,
+        route_headers,
+        &callee_uri,
+        &session.public_uri,
+        &from_tag,
+        session.cseq,
+        session,
+    );
+
+    // Spawn the veth listener *before* telling Agent B to call in — same
+    // ordering `handle_invite` uses for the inbound direction, so the
+    // listener is guaranteed up by the time Agent B's `Call::make` reaches it.
+    let veth_rx = match spawn_veth_uas_listener(veth_local_ip, veth_sip_port, wideband) {
+        Ok(rx) => rx,
+        Err(e) => {
+            fail(&mut control, call_id, &format!("veth listener failed: {e}"));
+            return None;
+        }
+    };
+
+    if let Err(e) = write_msg(
+        &mut control,
+        &ControlMessage::CallPlaced {
+            call_id: call_id.clone(),
+        },
+    ) {
+        tracing::warn!(call_id, error = %e, "outbound: failed to notify Agent B the carrier leg is up");
+        return None;
+    }
+
+    let veth = match veth_rx
+        .recv_timeout(VETH_INVITE_TIMEOUT)
+        .map_err(|_| "timed out waiting for Agent B's veth call".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(call_id, error = %e, "outbound: Agent B's veth call never arrived");
+            // The carrier leg is already up — hang it up rather than leaving
+            // it connected with no media path.
+            let bye = build_bye(&ByeRequest {
+                request_uri: &dialog.remote_target,
+                route_headers: &dialog.route_headers,
+                via_transport: if dialog.use_tcp { "TCP" } else { "UDP" },
+                local_addr: dialog.local_addr,
+                from: &dialog.from,
+                to: &dialog.to,
+                call_id: &call_id,
+                cseq: dialog.cseq,
+                branch: &format!("z9hG4bK{}", random_hex(6)),
+            });
+            let _ = session.transport_mut().and_then(|t| t.send(&bye));
+            return None;
+        }
+    };
+
+    // `parse_answer` only returns which codec the answer picked
+    // (`NegotiatedCodec`), not a payload type — by RFC 3264, a re-used
+    // dynamic payload type on the answer must mean what *our own offer*
+    // said it meant, so there is nothing to re-parse. Reconstructs the rest
+    // from what `sdp::build_offer` is known to always send, the same
+    // necessary duplication `ims::call`'s `AMR_WB_RTP_PAYLOAD_TYPE` already
+    // accepts.
+    let chosen = match answer.codec {
+        NegotiatedCodec::Pcmu => sdp::ChosenCodec {
+            codec: NegotiatedCodec::Pcmu,
+            payload_type: 0,
+            octet_aligned: false,
+        },
+        NegotiatedCodec::AmrWb => sdp::ChosenCodec {
+            codec: NegotiatedCodec::AmrWb,
+            payload_type: 96,
+            octet_aligned: true,
+        },
+        other => {
+            // Never offered — `sdp::build_offer` only ever lists PCMU/AMR-WB
+            // for an outbound offer (CodecOffer has no AMR-NB/L16 variant).
+            tracing::error!(
+                call_id,
+                codec = other.name(),
+                "outbound: carrier answered with a codec we never offered"
+            );
+            return None;
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let meter = super::media_stats::MediaMeter::new();
+    let transcoding = chosen.codec != veth.codec.codec;
+    let relay_result = if transcoding {
+        super::transcode::spawn_transcoding_relay(
+            rtp_socket,
+            veth.rtp_socket,
+            chosen,
+            veth.codec,
+            stop.clone(),
+            &meter,
+        )
+    } else {
+        spawn_relay(rtp_socket, veth.rtp_socket, stop.clone(), &meter);
+        Ok(())
+    };
+    if let Err(e) = relay_result {
+        tracing::error!(call_id, error = %e, "outbound: failed to start media relay");
+        return None;
+    }
+
+    tracing::info!(
+        call_id,
+        destination,
+        carrier_codec = chosen.codec.name(),
+        transcoding,
+        "outbound: call placed and bridged"
+    );
+
+    let ctrl_rx = match control.try_clone() {
+        Ok(s) => spawn_control_reader(s),
+        Err(e) => {
+            tracing::warn!(call_id, error = %e, "outbound: control connection clone failed");
+            return None;
+        }
+    };
+
+    let mut lifecycle = BridgedCall::new(call_id.clone(), destination.to_string(), None);
+    lifecycle.advance_to(CallStage::Answering);
+    lifecycle.advance_to(CallStage::Bridged);
+
+    Some(ActiveCall {
+        control,
+        ctrl_rx,
+        stop,
+        // Our own from_tag doubles as `to_tag`: `handle_bye`'s
+        // `build_200_ok_bye` only falls back to it when the incoming
+        // request's own To header lacks a tag, which a real in-dialog BYE
+        // never does — see `DialogInfo::from_uac_response`'s doc comment.
+        to_tag: from_tag,
+        dialog,
+        call_id,
+        caller: destination.to_string(),
+        answered_at: Utc::now(),
+        answered_instant: Instant::now(),
+        meter,
+        lifecycle,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,6 +1102,7 @@ pub(crate) fn dispatch_loop(
     modem_lock: Option<&Arc<Mutex<()>>>,
     pbx_registered: Option<&Arc<AtomicBool>>,
     obs: &observability::AgentObservability,
+    place_call_rx: mpsc::Receiver<PendingPlaceCall>,
 ) -> BridgeResult<()> {
     let mut active_call: Option<ActiveCall> = None;
     let mut backoff = RETRY_INITIAL_BACKOFF;
@@ -773,6 +1197,38 @@ pub(crate) fn dispatch_loop(
                     continue;
                 }
             }
+        }
+
+        // Outbound calling (specs/025-outbound-calling) — the same
+        // one-call-at-a-time rule `Admission::RejectBusy` already applies to
+        // a *carrier*-originated INVITE, for the other direction. A request
+        // arriving while `active_call.is_some()` gets an immediate `busy`
+        // `CallFailed` — never left queued in the channel for whenever the
+        // current call happens to end, which could be a long, silent wait
+        // from Agent B's side. `contains("busy")` is what
+        // `run_outbound_listener` (`vowifi/mod.rs`) checks to decide whether
+        // to try a different line rather than giving up outright.
+        if let Ok(mut pending) = place_call_rx.try_recv() {
+            if active_call.is_some() {
+                let _ = write_msg(
+                    &mut pending.control,
+                    &ControlMessage::CallFailed {
+                        call_id: pending.call_id,
+                        reason: "busy".to_string(),
+                    },
+                );
+            } else {
+                active_call = originate_and_bridge(
+                    session,
+                    pending.control,
+                    pending.call_id,
+                    &pending.destination,
+                    veth_local_ip,
+                    veth_sip_port,
+                    wideband,
+                );
+            }
+            continue;
         }
 
         // Poll fast enough to notice a PBX-side hangup promptly while a call is

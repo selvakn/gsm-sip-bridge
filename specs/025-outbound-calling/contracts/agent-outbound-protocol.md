@@ -23,12 +23,17 @@ enum ControlMessage {
     /// transformation (FR-010), same discipline as the CS path.
     PlaceCall { call_id: String, destination: String },
 
-    /// Agent A → Agent B. The carrier leg is up enough to bridge — mirrors
-    /// `BridgeReady`'s shape and meaning, direction reversed. Agent B
-    /// conference-bridges its already-accepted phone/PBX leg to
-    /// `veth_rtp_port`, the same primitive `bridge_call` already uses for
-    /// inbound (`pjsua_safe::Endpoint::pair_calls`).
-    CallPlaced { call_id: String, veth_rtp_port: u16 },
+    /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
+    /// and Agent A's veth-facing UAS listener (`spawn_veth_uas_listener`,
+    /// already used unmodified for inbound) is up and waiting — mirrors
+    /// `IncomingCall`'s role, direction reversed. No port travels on this
+    /// message: exactly like inbound, Agent B places a real `Call::make`
+    /// toward Agent A's veth listener and RTP addressing is negotiated
+    /// through that SIP/SDP exchange, not this JSON. Agent B
+    /// conference-bridges the resulting veth call to its already-accepted
+    /// phone/PBX leg via `pjsua_safe::Endpoint::pair_calls` — the same
+    /// primitive `bridge_call` already uses for inbound.
+    CallPlaced { call_id: String },
 
     /// Agent A → Agent B. The carrier declined, was unreachable, or the
     /// line was otherwise unable to place the call (busy, network refused,
@@ -58,7 +63,12 @@ Agent B                                  Agent A
    │                                        │  ── INVITE ──▶ carrier
    │                                        │  ◀── 180/200 ──
    │                                        │
-   │ ◀── CallPlaced{call_id, port} ───────  │  (once audio-capable)
+   │ ◀── CallPlaced{call_id} ─────────────  │  (2xx + ACK done, veth
+   │                                        │   listener up and waiting)
+   │  places a veth Call::make toward       │
+   │  Agent A's veth SIP listener ────────▶ │  spawn_veth_uas_listener
+   │                                        │  (unmodified, already used
+   │                                        │  for inbound) answers it
    │                                        │
    │  pair_calls(phone_leg, veth_leg)       │
    │  (R-011, mirrors bridge_call)          │
