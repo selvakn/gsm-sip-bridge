@@ -88,6 +88,56 @@ pub enum ControlMessage {
         body: String,
         received_at: String,
     },
+    /// Agent B → Agent A (specs/025-outbound-calling). Sent once Agent B has
+    /// accepted an outbound-triggering INVITE (a PBX call or a registered
+    /// phone dialling out, spec 025 US1/US3) and picked this line as an
+    /// idle VoWiFi/VoLTE candidate. `destination` is verbatim from the
+    /// originating request — no transformation (FR-010), same discipline as
+    /// the circuit-switched path (`modules::ModuleCmd::Dial`).
+    PlaceCall {
+        call_id: String,
+        destination: String,
+    },
+    /// Agent A → Agent B. Sent immediately once Agent A decides to attempt
+    /// `PlaceCall` (i.e. it was not busy) — *before* touching the carrier
+    /// transport at all. Lets Agent B tell "busy, try the next line" (an
+    /// immediate `CallFailed`, no carrier round trip) apart from "committed,
+    /// now placing the call for real", which can legitimately take as long
+    /// as Agent A's own carrier-INVITE wait
+    /// (`ims::agent::OUTBOUND_INVITE_TIMEOUT`). Found live
+    /// (specs/025-outbound-calling T072): without this ack, Agent B had no
+    /// way to distinguish the two cases and used one short timeout for both
+    /// — it gave up and moved to the next line while the carrier was still
+    /// ringing, and the carrier went on to answer a call nobody was
+    /// listening for.
+    CallAttempting { call_id: String },
+    /// Agent A → Agent B. The carrier sent `180 Ringing` for an originated
+    /// INVITE. Non-terminal — zero or more of these can arrive (sent at
+    /// most once per call regardless of retransmission) before the real
+    /// `CallPlaced`/`CallFailed`; Agent B answers the phone/PBX leg with
+    /// `180` in response so the caller hears ringback instead of silence
+    /// while the carrier call is still being set up (FR-012's progress
+    /// table, `contracts/sip-dialout.md`). Found live
+    /// (specs/025-outbound-calling review): without this, a caller heard
+    /// nothing at all for up to `OUTBOUND_INVITE_TIMEOUT +
+    /// OUTBOUND_RING_TIMEOUT` (75s) and then a sudden answer.
+    CallRinging { call_id: String },
+    /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
+    /// and Agent A's veth-facing UAS listener is up and waiting — the
+    /// outbound mirror of `IncomingCall`, direction reversed. No port is
+    /// carried: exactly like the inbound direction, Agent B places a real
+    /// `Call::make` toward Agent A's veth SIP listener (the same mechanism
+    /// `bridge_call` already uses, `vowifi/mod.rs:1213`) and RTP addressing
+    /// is negotiated through that real SIP/SDP exchange, not this message.
+    /// Agent B conference-bridges the resulting veth call to its
+    /// already-accepted phone/PBX leg via `pjsua_safe::Endpoint::pair_calls`.
+    CallPlaced { call_id: String },
+    /// Agent A → Agent B. The carrier declined, was unreachable, or the
+    /// line could not otherwise place the call. Agent B answers the
+    /// phone/PBX leg accordingly (`486`/`503`,
+    /// `specs/025-outbound-calling/contracts/sip-dialout.md`) and does not
+    /// attempt to bridge.
+    CallFailed { call_id: String, reason: String },
 }
 
 impl ControlMessage {
@@ -100,7 +150,12 @@ impl ControlMessage {
             | ControlMessage::BridgeReady { call_id, .. }
             | ControlMessage::CallAnswered { call_id, .. }
             | ControlMessage::BridgeFailed { call_id, .. }
-            | ControlMessage::HangupAck { call_id, .. } => Some(call_id),
+            | ControlMessage::HangupAck { call_id, .. }
+            | ControlMessage::PlaceCall { call_id, .. }
+            | ControlMessage::CallAttempting { call_id, .. }
+            | ControlMessage::CallRinging { call_id, .. }
+            | ControlMessage::CallPlaced { call_id, .. }
+            | ControlMessage::CallFailed { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
             | ControlMessage::RegistrationStatusReply { .. }
             | ControlMessage::CallHistoryReply { .. }
@@ -145,6 +200,11 @@ pub mod reason {
     /// — distinct from the caller hanging up, because the two demand opposite
     /// responses (FR-011). LTE-only: the Wi-Fi path has no such attachment.
     pub const ATTACHMENT_LOST: &str = "attachment_lost";
+    /// `CallFailed` (specs/025-outbound-calling): the carrier rejected,
+    /// declined, or was unreachable for an outbound origination attempt.
+    pub const CARRIER_REJECTED: &str = "carrier_rejected";
+    /// `CallFailed`: no final response before giving up.
+    pub const CARRIER_TIMEOUT: &str = "carrier_timeout";
 }
 
 /// Read one newline-terminated JSON `ControlMessage` from `reader`, blocking
@@ -217,6 +277,89 @@ mod tests {
             call_id: "a1b2c3".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn place_call_roundtrips() {
+        let msg = ControlMessage::PlaceCall {
+            call_id: "out1".to_string(),
+            destination: "+919789063708".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn call_attempting_roundtrips() {
+        let msg = ControlMessage::CallAttempting {
+            call_id: "out1".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn call_ringing_roundtrips() {
+        let msg = ControlMessage::CallRinging {
+            call_id: "out1".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn call_placed_roundtrips() {
+        let msg = ControlMessage::CallPlaced {
+            call_id: "out1".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn call_failed_roundtrips() {
+        let msg = ControlMessage::CallFailed {
+            call_id: "out1".to_string(),
+            reason: reason::CARRIER_REJECTED.to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn outbound_triad_call_ids_are_reachable_via_call_id() {
+        assert_eq!(
+            ControlMessage::PlaceCall {
+                call_id: "x".to_string(),
+                destination: "1".to_string()
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallAttempting {
+                call_id: "x".to_string(),
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallRinging {
+                call_id: "x".to_string(),
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallPlaced {
+                call_id: "x".to_string(),
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallFailed {
+                call_id: "x".to_string(),
+                reason: "r".to_string()
+            }
+            .call_id(),
+            Some("x")
+        );
     }
 
     /// `BridgeReady` and `CallAnswered` are distinct events and must stay

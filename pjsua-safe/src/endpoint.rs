@@ -25,6 +25,38 @@ static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
+/// caller has claimed yet (spec 025, research.md R-007). `Endpoint` exposes
+/// this as a polling API (`poll_incoming_call`), the same idiom `Call`
+/// already uses for state (`poll_state`) rather than a callback trait — this
+/// crate has none, and adding one just for this single event would be the
+/// larger change. Pushed in FIFO order in `on_incoming_call_cb`; popped by
+/// whichever component owns UAS handling for that account (the daemon's
+/// trunk account, or `Account::local` in SIP server mode).
+///
+/// Carries the request's real transport-level source address (from
+/// `pjsip_rx_data::pkt_info`, not any SIP header — headers are caller-chosen
+/// text, not proof of anything) so a caller can verify this INVITE actually
+/// came from a peer it trusts before acting on it (found in review: the
+/// dial-out local port listens on every interface, same as the trunk
+/// account's own port, and nothing checked the sender at all before this).
+#[cfg(feature = "pjsip-linked")]
+static INCOMING_CALLS: LazyLock<
+    Mutex<std::collections::VecDeque<(i32, i32, std::net::SocketAddr)>>,
+> = LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+
+/// Whether `on_incoming_call_cb` should queue what it receives at all.
+/// Defaults to `true` — unchanged behavior for any caller that never
+/// touches `Endpoint::set_accept_incoming_calls`. Found live
+/// (specs/025-outbound-calling review): `on_incoming_call` is registered
+/// unconditionally at `Endpoint::create`, so a deployment with
+/// `[outbound].enabled = false` (nothing ever calls `poll_incoming_call`)
+/// still queued every unsolicited INVITE this account received forever,
+/// answering none of them — an unbounded leak and a caller left hanging
+/// with no response at all. Set to `false` for exactly that case; the
+/// callback then rejects immediately with `503` instead of queuing.
+static INCOMING_CALLS_ACCEPTED: AtomicBool = AtomicBool::new(true);
+
 // Audio level monitor — populated by a per-call sampling thread (slot 0 = sound device).
 // tx_level from slot 0 = ALSA capture → bridge = GSM→SIP
 // rx_level from slot 0 = bridge → ALSA playback = SIP→GSM
@@ -144,6 +176,7 @@ impl Endpoint {
                 pjsua_sys::pjsua_config_default(&mut cfg);
                 cfg.cb.on_call_media_state = Some(on_call_media_state_cb);
                 cfg.cb.on_call_state = Some(on_call_state_cb);
+                cfg.cb.on_incoming_call = Some(on_incoming_call_cb);
 
                 let mut log_cfg: pjsua_sys::pjsua_logging_config = std::mem::zeroed();
                 pjsua_sys::pjsua_logging_config_default(&mut log_cfg);
@@ -234,6 +267,42 @@ impl Endpoint {
 
     pub fn is_started(&self) -> bool {
         self.started
+    }
+
+    /// Pops the oldest not-yet-claimed incoming call, if any, as
+    /// `(account_id, call_id, source_addr)`. `Call::from_id` turns the
+    /// `call_id` into a `Call` the caller can `answer`/`hangup`/`poll_state`
+    /// (spec 025, research.md R-007). `source_addr` is the request's real
+    /// transport-level source — verify it against whatever this account
+    /// considers a trusted peer before dispatching anything the caller
+    /// requested (e.g. a dial-out); nothing upstream of this has checked it.
+    ///
+    /// Stub builds never produce an incoming call — there is no real
+    /// `on_incoming_call` to fire — so this always returns `None` there;
+    /// unit tests exercise the UAS pipeline via `Call::from_id` directly.
+    pub fn poll_incoming_call(&self) -> Option<(i32, i32, std::net::SocketAddr)> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            INCOMING_CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+        }
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            None
+        }
+    }
+
+    /// Whether `on_incoming_call_cb` should queue calls at all — set this
+    /// to `false` when nothing in this process ever calls
+    /// `poll_incoming_call` (e.g. `[outbound].enabled = false`), so an
+    /// unsolicited INVITE gets an immediate `503` instead of queuing
+    /// forever with no response (specs/025-outbound-calling review).
+    /// Process-global, matching `INCOMING_CALLS` itself — call this once
+    /// during setup, before this account can receive real traffic.
+    pub fn set_accept_incoming_calls(&self, enabled: bool) {
+        INCOMING_CALLS_ACCEPTED.store(enabled, Ordering::Release);
     }
 
     pub fn ensure_thread_registered(&self) {
@@ -596,10 +665,12 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
             // and audio-level monitor below, both of which are specific to
             // the single-call, real-sound-device GSM bridge.
             let mut peer_info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
-            if pjsua_sys::pjsua_call_get_info(peer_id, &mut peer_info) == PJ_SUCCESS
+            let got_peer_info = pjsua_sys::pjsua_call_get_info(peer_id, &mut peer_info) == PJ_SUCCESS;
+            let peer_slot = peer_info.conf_slot as i32;
+            if got_peer_info
                 && peer_info.media_status == pjsua_sys::pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE
+                && peer_slot >= 0
             {
-                let peer_slot = peer_info.conf_slot as i32;
                 pjsua_sys::pjsua_conf_connect(call_slot, peer_slot);
                 pjsua_sys::pjsua_conf_connect(peer_slot, call_slot);
                 tracing::info!(
@@ -610,13 +681,21 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
                     "paired calls' media active, conference-connected to each other"
                 );
             } else {
-                // Peer isn't active yet — its own media-active callback will
-                // find this call already active (via the same BRIDGE_PAIRS
-                // lookup) and complete the connection symmetrically then.
+                // Peer isn't active yet, or is active but PJSIP hasn't
+                // finished assigning it a conference slot (found live,
+                // specs/025-outbound-calling T072 pass 5: `media_status`
+                // can read ACTIVE with `conf_slot` still -1 in a narrow
+                // window, and calling `pjsua_conf_connect` with a negative
+                // slot hits a fatal assertion in PJSIP itself, killing the
+                // whole process). Either way, the peer's own media-active
+                // callback will find this call already active (via the
+                // same `BRIDGE_PAIRS` lookup) and complete the connection
+                // symmetrically once its slot is genuinely valid.
                 tracing::debug!(
                     call_id,
                     peer_id,
-                    "call media active, awaiting paired peer's media to become active"
+                    peer_slot,
+                    "call media active, awaiting paired peer's media (and valid conference slot) to become active"
                 );
             }
             return;
@@ -665,6 +744,59 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
             }
         });
     }
+}
+
+/// PJSIP invokes this for every INVITE that arrives on an account this
+/// endpoint owns — the PBX-facing trunk account and (SIP server mode)
+/// `Account::local`, once either accepts `[outbound].enabled`. Records the
+/// call for a Rust-side poller rather than answering here: deciding whether
+/// to accept, and with what SDP/media, is call-flow logic (`sip::outbound`),
+/// not something this crate should encode. PJSIP's invite session sends its
+/// own `100 Trying` automatically on receipt, so no response is lost by not
+/// answering synchronously inside this callback.
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid acc_id/call_id after init; rdata is library-owned, read-only, valid for the callback's duration
+    acc_id: pjsua_sys::pjsua_acc_id,
+    call_id: pjsua_sys::pjsua_call_id,
+    rdata: *mut pjsua_sys::pjsip_rx_data,
+) {
+    if !INCOMING_CALLS_ACCEPTED.load(Ordering::Acquire) {
+        tracing::info!(acc_id, call_id, "incoming SIP call refused (not accepting incoming calls)");
+        pjsua_sys::pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+        return;
+    }
+    // The request's real transport-level source (`pkt_info`, filled in by
+    // PJSIP's own transport layer from the actual socket the packet arrived
+    // on) — not a SIP header, which is caller-chosen text and proves
+    // nothing. Callers of `poll_incoming_call` rely on this to verify a
+    // dial-out request actually came from a trusted peer (found in review:
+    // this account's port listens on every interface, and nothing checked
+    // the sender before this existed). `src_name` is PJSIP's own
+    // null-terminated, human-readable rendering of the address — safe to
+    // read directly, no `pj_sockaddr` union to decode.
+    let source_addr = if rdata.is_null() {
+        None
+    } else {
+        let pkt = &(*rdata).pkt_info;
+        std::ffi::CStr::from_ptr(pkt.src_name.as_ptr())
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .map(|ip| std::net::SocketAddr::new(ip, pkt.src_port as u16))
+    };
+    let Some(source_addr) = source_addr else {
+        // Fail closed: a source we cannot verify is not a source we let
+        // through, regardless of what `INCOMING_CALLS_ACCEPTED` says.
+        tracing::warn!(acc_id, call_id, "incoming SIP call refused (source address unavailable)");
+        pjsua_sys::pjsua_call_hangup(call_id, 503, std::ptr::null(), std::ptr::null());
+        return;
+    };
+    tracing::info!(acc_id, call_id, %source_addr, "incoming SIP call");
+    INCOMING_CALLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((acc_id, call_id, source_addr));
 }
 
 #[cfg(feature = "pjsip-linked")]

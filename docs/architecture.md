@@ -1,8 +1,8 @@
 # Architecture
 
 How the bridge is put together: the crate layout, the three inbound call
-paths (circuit-switched GSM, VoWiFi, and host-side VoLTE), and the audio
-pipeline.
+paths (circuit-switched GSM, VoWiFi, and host-side VoLTE), optional
+[outbound calling](#outbound-calling), and the audio pipeline.
 
 ## The three inbound call paths
 
@@ -87,15 +87,77 @@ authentication subsystem would sit outside the test gate entirely.
 
 Consequences worth knowing before enabling it:
 
-- **Inbound only.** A phone cannot dial out through the mobile network — the
-  bridge has never had that capability, and this does not add it. The attempt is
-  refused with `403`.
-- **One phone rings.** Others may register but are never called.
+- **Inbound only, unless outbound calling is enabled.** By default a phone
+  cannot dial out through the mobile network — the attempt is refused with
+  `403`. With `[outbound].enabled = true` (specs/025-outbound-calling), a
+  registered phone's own INVITE is 302-redirected back to the bridge's own
+  dial-out port instead — see [Outbound calling](#outbound-calling) below.
+- **One phone rings** (inbound). Others may register but are never called.
 - **Two ports.** Phones register to `[sip_server].listen_port`, but INVITEs
   are sourced from `[sip].local_port`, because two SIP endpoints cannot share
   one UDP socket. RFC-correct — delivery uses the phone's own `Contact` — but
   see [operations.md](operations.md#sip-server-mode) for the one handset
   setting that interacts with it.
+
+## Outbound calling
+
+`[outbound].enabled` (off by default, specs/025-outbound-calling) lets the
+bridge dial the mobile network on request, instead of only ever answering
+it. Two things can trigger a dial-out:
+
+- **A PBX INVITE** to the bridge's trunk account — the normal case with a
+  PBX in front.
+- **A registered phone's own INVITE**, in SIP server mode — the registrar
+  302-redirects it back to the bridge's dial-out port (see
+  [Two SIP-side topologies](#two-sip-side-topologies) above) rather than
+  refusing it with `403`.
+
+Either way, the destination is the Request-URI's user part, dialed
+verbatim — no allow-list, no rewriting.
+
+```mermaid
+sequenceDiagram
+    participant Caller as PBX or<br/>registered phone
+    participant Server as Bridge server
+    participant Line as CS modem, or<br/>VoWiFi/VoLTE agent
+
+    Caller->>Server: INVITE (destination)
+    Server->>Server: Validate destination,<br/>pick the first idle line
+    alt no idle line
+        Server-->>Caller: 503
+    else destination invalid
+        Server-->>Caller: 484
+    else a line is idle
+        Server->>Line: Dial (ModuleCmd::Dial, or<br/>ControlMessage::PlaceCall)
+        Line-->>Server: Ringing / answered / rejected
+        Server-->>Caller: 180 / 200 / carrier's own status
+    end
+```
+
+**Line selection**: whichever line is idle, first-idle-wins, no path
+preference — the circuit-switched daemon (`CardPool`) and the VoWiFi/VoLTE
+process (`vowifi::mod`) each own an independent pool of lines in their own
+process and only ever select from it. There is no cross-process fallback:
+whichever process actually received the INVITE is the only one that gets a
+shot at placing the call — if every line in *its* pool is busy, the call is
+refused even if the other process has an idle line. (An earlier design
+explored a cross-process line-selection channel for this; it was dropped —
+no cross-process audio bridge exists for the circuit-switched case, and
+building one was judged out of proportion to the gap it would close. See
+`specs/025-outbound-calling/data-model.md` and
+`contracts/line-command.md`'s superseded banner for the full reasoning.)
+
+**Known limitations**: call progress for the circuit-switched path is
+coarse — `ATD`'s own response only confirms the attempt started, not
+whether the destination actually answered, so a CS-originated call is
+accepted (`200`) once dialing is confirmed, not once truly answered. The
+VoWiFi/VoLTE path relays real carrier progress (`180 Ringing`, and the
+carrier's own rejection code on failure), but blocks its own dispatch loop
+for up to ~80 seconds while a call is in flight, during which a caller
+hanging up mid-ring can't trigger a CANCEL and an unrelated inbound call is
+effectively dropped. See `docs/todo.md` for both, and
+`specs/025-outbound-calling/tasks.md`'s code-review sections for the full
+history.
 
 ## Workspace layout
 

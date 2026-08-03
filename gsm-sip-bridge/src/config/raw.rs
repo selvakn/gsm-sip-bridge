@@ -516,6 +516,22 @@ impl Default for RawSipServerAccount {
     }
 }
 
+// ---------------------------------------------------------- [outbound] -----
+
+section! {
+    /// Exactly the `[outbound]` keys.
+    ///
+    /// The opt-in capability to place a call out over the mobile network from
+    /// the SIP side — a PBX-originated INVITE, or (once accepted) a phone
+    /// registered in `[sip_server]` mode (spec 025). Off by default. No
+    /// allow-list, no path preference, no per-line configuration: enabling it
+    /// is the only operator-visible decision (spec 025 Clarifications).
+    #[derive(Default)]
+    pub struct RawOutbound {
+        pub enabled: bool,
+    }
+}
+
 // ------------------------------------------------- unknown-key checking ----
 
 /// Every section's accepted keys, keyed by the section's TOML path.
@@ -547,6 +563,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("volte.line", RawVolteLine::KEYS),
         ("sip_server", RawSipServer::KEYS),
         ("sip_server.account", RawSipServerAccount::KEYS),
+        ("outbound", RawOutbound::KEYS),
     ]
 }
 
@@ -634,5 +651,6 @@ section! {
         pub logging: RawLogging,
         pub alerts: RawAlerts,
         pub sip_server: RawSipServer,
+        pub outbound: RawOutbound,
     }
 }

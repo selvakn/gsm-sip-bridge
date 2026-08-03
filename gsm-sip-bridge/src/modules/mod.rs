@@ -26,6 +26,7 @@ use crate::sms::SmsHandler;
 use crate::store::calls::CallRecord;
 use crate::store::{StoreCommand, StoreHandle};
 use chrono::Utc;
+use pjsua_safe::Call;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -62,6 +63,17 @@ pub type ControlCmdReceiver = mpsc::Receiver<(ControlCmd, oneshot::Sender<Contro
 enum ModuleCmd {
     SetMode(NetworkMode, oneshot::Sender<Result<NetworkMode, String>>),
     Reboot,
+    /// Dial an outbound call on this line (specs/025-outbound-calling).
+    /// `Ok(())` means the modem accepted `ATD`, not that the call was
+    /// answered — see `AtCommander::dial`'s own doc comment.
+    Dial(String, oneshot::Sender<Result<(), String>>),
+    /// Hang up a call this line just dialed, fire-and-forget (matches
+    /// `Reboot`'s no-response shape). Exists for the narrow case where
+    /// `ATD` already succeeded but accepting the SIP-side leg failed
+    /// afterward (specs/025-outbound-calling review) — without this, the
+    /// modem stays on a real, live call while `SlotState` reports it idle
+    /// and eligible for a second dial.
+    Hangup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +485,15 @@ impl CardPool {
         // USB rescan for hotplug reconnect (every 60 s — hot-plug is rare)
         let mut rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
+        // Outbound calling (specs/025-outbound-calling): a short, dedicated
+        // poll for `Endpoint::poll_incoming_call`, independent of the
+        // retry/rescan wakeup computation above — those deadlines can be an
+        // hour or more away, far too infrequent for a caller waiting on a
+        // SIP response. The `if` guard on its `select!` arm means this does
+        // nothing at all when the feature is disabled (FR-017).
+        let mut outbound_poll = tokio::time::interval(Duration::from_millis(200));
+        outbound_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         self.recompute_next_scheduled_at();
 
         loop {
@@ -522,7 +543,12 @@ impl CardPool {
                     }
                 }
                 Some((cmd, reply)) = control_rx.recv() => {
-                    self.handle_control_cmd(cmd, reply, &mut slots, &resilience);
+                    self.handle_control_cmd(cmd, reply, &mut slots, &resilience).await;
+                }
+                _ = outbound_poll.tick(), if self.config.outbound.enabled => {
+                    if let Some((call, destination)) = self.sip_bridge.poll_outbound_request() {
+                        self.handle_outbound_request(call, destination, &mut slots).await;
+                    }
                 }
                 _ = tokio::time::sleep_until(earliest_wakeup) => {
                     let now = tokio::time::Instant::now();
@@ -1160,7 +1186,121 @@ impl CardPool {
         self.recompute_next_scheduled_at();
     }
 
-    fn handle_control_cmd(
+    /// Handles one `SipBridge::poll_outbound_request` result: validate,
+    /// select an idle CS line, dial it, and accept or refuse the SIP call
+    /// accordingly (specs/025-outbound-calling, US1).
+    ///
+    /// Teardown needs no new code here: `ModuleCmd::Dial`
+    /// (`apply_dial_cmd`) already sets `card.state = Answering` on success,
+    /// which is exactly the state the existing SIP-peer-disconnect check in
+    /// `run_module_loop` and the existing `BridgeEvent::Hangup` handling
+    /// (both written for the inbound-call direction) already watch —
+    /// reused here unmodified in the other direction.
+    async fn handle_outbound_request(
+        &mut self,
+        call: Call,
+        destination: String,
+        slots: &mut HashMap<u32, SlotState>,
+    ) {
+        if crate::sip::outbound::validate_destination(&destination).is_err() {
+            tracing::warn!(destination = %destination, "outbound: invalid destination, refusing");
+            self.sip_bridge.refuse_outbound(call, 484);
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_invalid_destination"])
+                .inc();
+            return;
+        }
+
+        let Some((slot, audio_device, cmd_tx)) = claim_idle_cs_slot(slots) else {
+            tracing::warn!(destination = %destination, "outbound: no idle line, refusing");
+            self.sip_bridge.refuse_outbound(call, 503);
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_no_idle_line"])
+                .inc();
+            return;
+        };
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if cmd_tx
+            .send(ModuleCmd::Dial(destination.clone(), resp_tx))
+            .is_err()
+        {
+            tracing::warn!(
+                slot,
+                destination = %destination,
+                "outbound: module command channel closed, refusing"
+            );
+            if let Some(state) = slots.get_mut(&slot) {
+                state.has_active_call = false;
+            }
+            self.sip_bridge.refuse_outbound(call, 503);
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&["refused_no_idle_line"])
+                .inc();
+            return;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+            Ok(Ok(Ok(()))) => match self.sip_bridge.accept_outbound(call, &audio_device) {
+                Ok(()) => {
+                    tracing::info!(slot, destination = %destination, "outbound call placed");
+                    metrics::OUTBOUND_ATTEMPTS_TOTAL
+                        .with_label_values(&["placed"])
+                        .inc();
+                }
+                Err(e) => {
+                    tracing::error!(slot, error = %e, "outbound: failed to accept SIP leg after dial succeeded");
+                    // ATD already succeeded — the modem is on a real,
+                    // live call. Hang it up before freeing the slot, or
+                    // it stays connected indefinitely while `SlotState`
+                    // reports it idle and eligible for a second dial
+                    // (specs/025-outbound-calling review).
+                    let _ = cmd_tx.send(ModuleCmd::Hangup);
+                    if let Some(state) = slots.get_mut(&slot) {
+                        state.has_active_call = false;
+                    }
+                    metrics::OUTBOUND_ATTEMPTS_TOTAL
+                        .with_label_values(&["refused_network_failure"])
+                        .inc();
+                }
+            },
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(slot, error = %e, "outbound: dial failed");
+                if let Some(state) = slots.get_mut(&slot) {
+                    state.has_active_call = false;
+                }
+                self.sip_bridge.refuse_outbound(call, 503);
+                metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_network_failure"])
+                    .inc();
+            }
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(slot, "outbound: module did not respond in time");
+                // The 5s timeout only bounds how long *we* wait — it says
+                // nothing about the modem. If `apply_dial_cmd` is still
+                // in flight and later succeeds, the call would otherwise
+                // be a real, connected phone call nothing in this process
+                // ever tracks or hangs up (same class of leak the
+                // accept_outbound failure just above already guards
+                // against). Best-effort: `run_module_loop` processes one
+                // `ModuleCmd` at a time, so this queues behind whatever
+                // dial is still running and hangs it up the moment it
+                // finishes either way; harmless if the worker already
+                // died (`cmd_tx.send` just fails silently) or if the dial
+                // genuinely never reached the modem.
+                let _ = cmd_tx.send(ModuleCmd::Hangup);
+                if let Some(state) = slots.get_mut(&slot) {
+                    state.has_active_call = false;
+                }
+                self.sip_bridge.refuse_outbound(call, 503);
+                metrics::OUTBOUND_ATTEMPTS_TOTAL
+                    .with_label_values(&["refused_network_failure"])
+                    .inc();
+            }
+        }
+    }
+
+    async fn handle_control_cmd(
         &mut self,
         cmd: ControlCmd,
         reply: oneshot::Sender<ControlResp>,
@@ -1360,18 +1500,43 @@ impl CardPool {
                 if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
                     state.has_active_call = true;
                 }
+                // `handle_ring` (the per-module worker) already sent `ATA`
+                // and answered the call on real hardware *before* this event
+                // ever arrives — every early return below is therefore a
+                // real, live, connected GSM call with no SIP bridge for it,
+                // not just an aborted attempt. Found in review (Greptile,
+                // PR #22): a plain "clear the flag and give up" here left
+                // that call connected to dead air indefinitely, while
+                // `has_active_call = false` made the slot look idle and
+                // eligible for a *second* dial while the modem was still
+                // genuinely busy with the first. `hang_up_unbridged_call!`
+                // sends the same `ModuleCmd::Hangup` the outbound-dial path
+                // already uses for the equivalent "answered but couldn't
+                // bridge" case — it hangs up the real call, sets
+                // `card.state = Idle`, and closes out `call_ctx` via
+                // `record_call_end("failed")` — genuinely freeing the slot,
+                // not just pretending to.
+                macro_rules! hang_up_unbridged_call {
+                    () => {
+                        if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
+                            state.has_active_call = false;
+                            if let Some(cmd_tx) = &state.cmd_tx {
+                                let _ = cmd_tx.send(ModuleCmd::Hangup);
+                            }
+                        }
+                    };
+                }
                 if self.sip_bridge.state != crate::sip::RegistrationState::Registered {
                     tracing::warn!(
                         module = %module_id,
                         "SIP not registered, cannot bridge call"
                     );
+                    hang_up_unbridged_call!();
                     return;
                 }
 
                 // In SIP server mode this fails when the phone is not
-                // registered. Leaving the GSM call to ring out is the same
-                // thing that happens when `make_call` below fails, so the
-                // existing missed-call alert path still reports it.
+                // registered.
                 let dest_uri = match self.sip_bridge.compute_destination_uri(&caller_id) {
                     Ok(uri) => uri,
                     Err(e) => {
@@ -1385,6 +1550,7 @@ impl CardPool {
                         metrics::SIP_CALLS_TOTAL
                             .with_label_values(&[&module_id, "error", "cs"])
                             .inc();
+                        hang_up_unbridged_call!();
                         return;
                     }
                 };
@@ -1401,6 +1567,7 @@ impl CardPool {
                     metrics::AUDIO_ERRORS_TOTAL
                         .with_label_values(&[&module_id, "sound_device"])
                         .inc();
+                    hang_up_unbridged_call!();
                     return;
                 }
 
@@ -1413,6 +1580,7 @@ impl CardPool {
                     metrics::SIP_CALLS_TOTAL
                         .with_label_values(&[&module_id, "error", "cs"])
                         .inc();
+                    hang_up_unbridged_call!();
                 } else {
                     metrics::SIP_CALLS_TOTAL
                         .with_label_values(&[&module_id, "initiated", "cs"])
@@ -1453,6 +1621,35 @@ impl CardPool {
             }
         }
     }
+}
+
+/// Selects the first `Ready`, non-busy CS slot and claims it
+/// (`has_active_call = true`) in the same pass, before the caller ever
+/// dispatches a `ModuleCmd::Dial` — pulled out of `handle_outbound_request`
+/// so the claim discipline itself (not the SIP-side accept/refuse plumbing
+/// around it, which needs a real `SipBridge`) is directly unit-testable
+/// (specs/025-outbound-calling, T025). No path preference beyond "first
+/// idle wins" (FR-007) — iterates every slot in `slots`, not just one line,
+/// so this covers every CS modem attached to the host.
+///
+/// Calling this twice in a row with the same `slots` map and only one
+/// idle slot returns `Some` then `None` — the whole point: a second
+/// outbound request (or a concurrent inbound GSM call reusing the same
+/// slot-claim convention) sees the slot as busy the instant this returns,
+/// not only once the `ModuleCmd::Dial` round trip finishes.
+fn claim_idle_cs_slot(
+    slots: &mut HashMap<u32, SlotState>,
+) -> Option<(u32, String, crossbeam_channel::Sender<ModuleCmd>)> {
+    let (slot, audio_device, cmd_tx) = slots
+        .iter()
+        .find(|(_, s)| s.lifecycle == LifecycleState::Ready && !s.has_active_call)
+        .map(|(slot, s)| (*slot, s.module.audio_device.clone(), s.cmd_tx.clone()))?;
+    let cmd_tx = cmd_tx?;
+
+    if let Some(state) = slots.get_mut(&slot) {
+        state.has_active_call = true;
+    }
+    Some((slot, audio_device, cmd_tx))
 }
 
 struct CallContext {
@@ -1597,6 +1794,22 @@ fn run_module_loop(
                         at.reboot();
                         return Ok(());
                     }
+                    ModuleCmd::Dial(number, resp_tx) => {
+                        let result = apply_dial_cmd(&mut at, &mut card, &number);
+                        if result.is_ok() {
+                            record_call_start_outbound(&module.id, &number, &mut call_ctx);
+                        }
+                        let _ = resp_tx.send(result);
+                    }
+                    ModuleCmd::Hangup => {
+                        tracing::info!(module = %module.id, "outbound: hanging up after SIP-side accept failed post-dial");
+                        let _ = at.hangup();
+                        card.state = CardState::Idle;
+                        metrics::ACTIVE_CALLS
+                            .with_label_values(&[&module.id, "cs"])
+                            .set(0.0);
+                        record_call_end(&module.id, &event_tx, &store_tx, &mut call_ctx, "failed");
+                    }
                 }
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -1642,6 +1855,35 @@ fn run_module_loop(
             handle_creg_urc(&module, trimmed, &event_tx);
         }
     }
+}
+
+/// The body of `ModuleCmd::Dial` handling, pulled out of `run_module_loop`'s
+/// match arm so it's unit-testable against a mocked `AtCommander` the same
+/// way `at_commander`'s own tests mock the serial stream
+/// (specs/025-outbound-calling, contracts/control-cmd-dial.md).
+///
+/// Same-thread serialization is the race guard: `run_module_loop` only ever
+/// processes one `ModuleCmd` at a time, so this check and the dial that
+/// follows cannot race against another `Dial` for this line
+/// (research.md R-003) — no separate provisional-claim step is needed here,
+/// unlike the cross-process case.
+fn apply_dial_cmd(
+    at: &mut AtCommander,
+    card: &mut CardInstance,
+    number: &str,
+) -> Result<(), String> {
+    if card.state != CardState::Idle {
+        return Err("line busy".to_string());
+    }
+    let result = at.dial(number).map_err(|e| e.to_string());
+    if result.is_ok() {
+        // Reuses `Answering` as "call setup in progress, not yet Bridged"
+        // rather than adding a new state — the full outbound state machine
+        // (progress relay, teardown) is specs/025-outbound-calling
+        // T019/T020, not yet wired to this loop.
+        card.state = CardState::Answering;
+    }
+    result
 }
 
 fn handle_creg_urc(
@@ -1782,6 +2024,34 @@ fn handle_hangup(
         record_call_end(&module.id, event_tx, store_tx, call_ctx, "missed");
     }
     card.state = CardState::Idle;
+}
+
+/// The outbound mirror of `handle_ring`'s own call-start bookkeeping —
+/// called once `apply_dial_cmd` confirms `ATD` was accepted. Without this,
+/// an outbound call was invisible in call history (`call_ctx` stayed
+/// `None`, so `record_call_end`'s `if let Some(ctx) = call_ctx.take()`
+/// silently did nothing on teardown) while `ACTIVE_CALLS` never got set to
+/// `1.0` in the first place, only spuriously reset to `0.0` later
+/// (specs/025-outbound-calling review). `caller_id` holds the dialed
+/// destination here rather than an inbound caller's number — the same
+/// field, repurposed for the direction it wasn't originally written for,
+/// rather than widening `CallContext`'s shape for one new caller.
+fn record_call_start_outbound(
+    module_id: &str,
+    destination: &str,
+    call_ctx: &mut Option<CallContext>,
+) {
+    *call_ctx = Some(CallContext {
+        caller_id: destination.to_string(),
+        sip_destination: String::new(),
+        started_at: Utc::now(),
+    });
+    metrics::ACTIVE_CALLS
+        .with_label_values(&[module_id, "cs"])
+        .set(1.0);
+    metrics::CALLS_TOTAL
+        .with_label_values(&[module_id, "outgoing", "cs"])
+        .inc();
 }
 
 fn record_call_end(
@@ -1944,6 +2214,76 @@ fn parse_sms_response(lines: &[String]) -> (String, String) {
 mod tests {
     use super::*;
 
+    /// Mock stream for `AtCommander`, mirroring `at_commander`'s own private
+    /// `MockStream`: reads from a fixed byte buffer, discards writes.
+    struct MockAtStream {
+        reader: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl MockAtStream {
+        fn new(response: &str) -> Self {
+            Self {
+                reader: std::io::Cursor::new(response.as_bytes().to_vec()),
+            }
+        }
+    }
+
+    impl std::io::Read for MockAtStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.reader, buf)
+        }
+    }
+
+    impl std::io::Write for MockAtStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_at(response: &str) -> AtCommander {
+        AtCommander::from_stream(MockAtStream::new(response), Duration::from_secs(1))
+    }
+
+    fn mock_card(state: CardState) -> CardInstance {
+        let mut card = CardInstance::new(
+            "card0".to_string(),
+            std::path::PathBuf::from("/dev/null"),
+            "hw:0,0".to_string(),
+            8,
+        );
+        card.state = state;
+        card
+    }
+
+    #[test]
+    fn apply_dial_cmd_dials_when_idle() {
+        let mut at = mock_at("OK\r\n");
+        let mut card = mock_card(CardState::Idle);
+        assert!(apply_dial_cmd(&mut at, &mut card, "+15551234567").is_ok());
+        assert_eq!(card.state, CardState::Answering);
+    }
+
+    #[test]
+    fn apply_dial_cmd_refuses_when_not_idle() {
+        let mut at = mock_at("OK\r\n");
+        let mut card = mock_card(CardState::Bridged);
+        let result = apply_dial_cmd(&mut at, &mut card, "+15551234567");
+        assert_eq!(result, Err("line busy".to_string()));
+        // State must not be perturbed by a refused attempt.
+        assert_eq!(card.state, CardState::Bridged);
+    }
+
+    #[test]
+    fn apply_dial_cmd_reports_at_failure_and_leaves_state_idle() {
+        let mut at = mock_at("ERROR\r\n");
+        let mut card = mock_card(CardState::Idle);
+        assert!(apply_dial_cmd(&mut at, &mut card, "+15551234567").is_err());
+        assert_eq!(card.state, CardState::Idle);
+    }
+
     #[test]
     fn test_backoff_delay_initial() {
         let d = backoff_delay(0, 5, 120);
@@ -2044,6 +2384,79 @@ mod tests {
         assert!(event_rx.try_recv().is_err(), "no alert for answered calls");
     }
 
+    /// specs/025-outbound-calling review: an outbound call used to be
+    /// invisible in call history because nothing ever populated
+    /// `call_ctx` for it, so `record_call_end`'s `if let Some(ctx) =
+    /// call_ctx.take()` silently did nothing on teardown regardless of
+    /// what status it was called with. Exercises the full
+    /// start-then-end lifecycle and checks a real `InsertCall` record
+    /// comes out the other end.
+    #[test]
+    fn an_outbound_call_produces_a_real_call_history_record() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (store_tx, store_rx) = crossbeam_channel::unbounded::<StoreCommand>();
+        let mut call_ctx: Option<CallContext> = None;
+        assert!(call_ctx.is_none(), "no call in progress yet");
+
+        record_call_start_outbound("card0", "+15551234567", &mut call_ctx);
+        assert!(
+            call_ctx.is_some(),
+            "call_ctx must be populated once ATD is accepted"
+        );
+
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+        assert!(
+            call_ctx.is_none(),
+            "record_call_end must take the context, same as the inbound path"
+        );
+
+        let StoreCommand::InsertCall(record) = store_rx
+            .try_recv()
+            .expect("a call record must have been sent to the store")
+        else {
+            panic!("expected InsertCall");
+        };
+        assert_eq!(record.caller_id, "+15551234567");
+        assert_eq!(record.status, "answered");
+        assert_eq!(record.module_id, "card0");
+    }
+
+    /// specs/025-outbound-calling review: `ModuleCmd::Hangup` (sent when the
+    /// SIP side rejects a call right after `ATD` was accepted) used to skip
+    /// `record_call_end` entirely — the attempt vanished from history and
+    /// `call_ctx` stayed `Some` with a stale context until the next
+    /// `handle_ring` silently overwrote it. `ModuleCmd::Hangup`'s handler
+    /// now calls `record_call_end(..., "failed")`, the same helper this
+    /// records exercises directly.
+    #[test]
+    fn a_hung_up_outbound_attempt_produces_a_failed_call_history_record() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (store_tx, store_rx) = crossbeam_channel::unbounded::<StoreCommand>();
+        let mut call_ctx: Option<CallContext> = None;
+
+        record_call_start_outbound("card0", "+15551234567", &mut call_ctx);
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "failed");
+
+        assert!(
+            call_ctx.is_none(),
+            "the stale context must not survive to the next call"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a failed (not missed) outbound attempt must not alert"
+        );
+
+        let StoreCommand::InsertCall(record) = store_rx
+            .try_recv()
+            .expect("a call record must have been sent to the store")
+        else {
+            panic!("expected InsertCall");
+        };
+        assert_eq!(record.caller_id, "+15551234567");
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.module_id, "card0");
+    }
+
     // specs/022-discord-critical-alerts (Greptile P1: "GivenUp state never
     // recovers").
 
@@ -2085,6 +2498,65 @@ mod tests {
             find_given_up_slot(&slots, "card0"),
             None,
             "a Ready slot is not a stale incident to clear"
+        );
+    }
+
+    fn slot_state_with_cmd_tx(module_id: &str) -> SlotState {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        SlotState {
+            cmd_tx: Some(cmd_tx),
+            ..slot_state(module_id, LifecycleState::Ready)
+        }
+    }
+
+    /// specs/025-outbound-calling T025 (fifth code review's rewrite of
+    /// T024-T026 — the original `ControlCmd::Dial` contention test's premise
+    /// no longer exists, that variant was deleted): the whole point of
+    /// claiming a slot in the same pass as selecting it is that a *second*
+    /// selection against the same map sees the claim immediately, not only
+    /// once the dial round trip completes. With a single idle slot, the
+    /// first call must succeed and the second must find nothing idle.
+    #[test]
+    fn claim_idle_cs_slot_does_not_double_book_the_last_idle_slot() {
+        let mut slots = HashMap::new();
+        slots.insert(0, slot_state_with_cmd_tx("card0"));
+
+        let first = claim_idle_cs_slot(&mut slots);
+        assert!(first.is_some(), "the only idle slot must be claimable");
+        assert_eq!(first.unwrap().0, 0);
+        assert!(
+            slots[&0].has_active_call,
+            "claiming must mark the slot busy before any dial round trip runs"
+        );
+
+        let second = claim_idle_cs_slot(&mut slots);
+        assert!(
+            second.is_none(),
+            "a second request must not double-book the slot the first one just claimed"
+        );
+    }
+
+    #[test]
+    fn claim_idle_cs_slot_picks_among_every_attached_modem() {
+        let mut slots = HashMap::new();
+        slots.insert(0, slot_state_with_cmd_tx("card0"));
+        // Busy: must be skipped even though it comes first in iteration for
+        // some hash orderings.
+        let mut busy = slot_state_with_cmd_tx("card1");
+        busy.has_active_call = true;
+        slots.insert(1, busy);
+        slots.insert(2, slot_state_with_cmd_tx("card2"));
+
+        let mut claimed = Vec::new();
+        while let Some((slot, _, _)) = claim_idle_cs_slot(&mut slots) {
+            claimed.push(slot);
+        }
+
+        claimed.sort_unstable();
+        assert_eq!(
+            claimed,
+            vec![0, 2],
+            "every Ready, non-busy modem must eventually be claimable, and the busy one never"
         );
     }
 

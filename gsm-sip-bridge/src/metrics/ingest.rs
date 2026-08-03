@@ -508,6 +508,11 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
                 .with_label_values(&[module_id, status.as_str()])
                 .inc();
         }
+        ObservedEvent::OutboundAttempt { outcome } => {
+            metrics::OUTBOUND_ATTEMPTS_TOTAL
+                .with_label_values(&[outcome.as_str()])
+                .inc();
+        }
     }
 }
 

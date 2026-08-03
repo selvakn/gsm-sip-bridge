@@ -25,7 +25,9 @@ pub mod plmn;
 pub mod usim_bridge;
 
 use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
-use crate::control::protocol::{AgentKind, AgentState, ObservedEvent, SmsOutcome};
+use crate::control::protocol::{
+    AgentKind, AgentState, ObservedEvent, OutboundAttemptOutcome, SmsOutcome,
+};
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::discovery::lines_file_path;
 use crate::observability::reporter::Reporter;
@@ -37,6 +39,7 @@ use pjsua_safe::{
     Account, AccountConfig, Call, CallState, Endpoint, EndpointConfig, TransportType,
 };
 use std::collections::{HashMap, VecDeque};
+use std::io::BufRead;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::ExitCode;
@@ -248,6 +251,11 @@ pub(crate) fn run_telephony_side(
     endpoint
         .set_null_sound_device()
         .map_err(|e| BridgeError::Ims(format!("null sound device setup failed: {e}")))?;
+    // Without this, an unsolicited INVITE to this account queues forever
+    // with no response when outbound dialing is off — nothing in this
+    // process ever calls `poll_incoming_call` to drain it otherwise
+    // (specs/025-outbound-calling review).
+    endpoint.set_accept_incoming_calls(config.outbound.enabled);
     if wideband {
         prioritize_wideband_codecs(&endpoint);
     }
@@ -287,13 +295,18 @@ pub(crate) fn run_telephony_side(
                     Vec::new(),
                 );
             });
-        let registrar = crate::sip::server::Registrar::start_observed(server, Some(observer))
-            .map_err(|e| {
-                BridgeError::Ims(format!(
-                    "SIP registrar could not listen on {}:{}: {e}",
-                    server.listen_addr, server.listen_port
-                ))
-            })?;
+        let outbound_local_port = config.outbound.enabled.then_some(local_port);
+        let registrar = crate::sip::server::Registrar::start_observed(
+            server,
+            outbound_local_port,
+            Some(observer),
+        )
+        .map_err(|e| {
+            BridgeError::Ims(format!(
+                "SIP registrar could not listen on {}:{}: {e}",
+                server.listen_addr, server.listen_port
+            ))
+        })?;
         let bindings = registrar.bindings();
         let id_uri = server.identity_uri();
         let account = Account::local(&endpoint, &id_uri, &config.sip.display_name)
@@ -327,6 +340,30 @@ pub(crate) fn run_telephony_side(
         (None, account)
     };
     let (bindings, account) = bindings;
+
+    // Trunk mode's analog of `bindings`' source-of-truth for "who may reach
+    // the dial-out account" — see `sip::SipBridge::trunk_source_ips`'s own
+    // doc comment for the full reasoning (spec 025 review: nothing verified
+    // an outbound-triggering request's real sender before this existed).
+    // Resolved once, here, not per-request. Only meaningful in trunk mode
+    // (`bindings.is_none()`) with outbound enabled; empty otherwise.
+    let trunk_source_ips: Vec<std::net::IpAddr> = if bindings.is_none() && config.outbound.enabled {
+        use std::net::ToSocketAddrs;
+        match (config.sip.server.as_str(), config.sip.port).to_socket_addrs() {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    server = %config.sip.server,
+                    error = %e,
+                    "outbound: could not resolve the trunk server's address; \
+                     dial-out requests will be refused until this succeeds"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     // `Account::register` only *initiates* the REGISTER — it does not mean the
     // PBX accepted it. Confirm it did (or report the denial) before treating
@@ -421,6 +458,46 @@ pub(crate) fn run_telephony_side(
     // like the pre-multi-card single loop did), so this call never returns
     // in normal operation, matching today's behavior for the N=1 case.
     std::thread::scope(|scope| {
+        // Outbound calling (specs/025-outbound-calling): this process's
+        // `account` (`Account::local` in SIP server mode, or the classic
+        // PBX-trunk registration otherwise) is the one that would receive
+        // an outbound-triggering INVITE when this half owns the SIP side —
+        // exactly the arbitration the registrar already uses (spec 024,
+        // research.md R-003). One thread for the whole process, not per
+        // line: the account/endpoint are shared, same as the registrar.
+        if config.outbound.enabled {
+            let endpoint = &endpoint;
+            let account = &account;
+            let lines_ref = &lines;
+            let bindings_ref = bindings.as_ref();
+            let trunk_source_ips_ref = &trunk_source_ips;
+            // This process serves no `/metrics` of its own — same reason
+            // the SIP-server-mode gauges above are reported rather than
+            // exported directly (spec 024). `record_transport`'s existing
+            // Sip/VolteSip mapping (see the SMS reporter below) keeps
+            // VoLTE's outbound attempts distinguishable from Wi-Fi's.
+            let outbound_agent_kind = match record_transport {
+                crate::store::Transport::Volte => AgentKind::VolteSip,
+                _ => AgentKind::Sip,
+            };
+            let outbound_reporter = Reporter::spawn(
+                config.control.socket_path.clone(),
+                outbound_agent_kind,
+                "outbound".to_string(),
+                Duration::from_secs(config.metrics.agent_report_interval_seconds),
+            );
+            scope.spawn(move || {
+                run_outbound_listener(
+                    endpoint,
+                    account,
+                    lines_ref,
+                    bindings_ref,
+                    trunk_source_ips_ref,
+                    &outbound_reporter,
+                )
+            });
+        }
+
         for line in &lines {
             let endpoint = &endpoint;
             let account = &account;
@@ -453,6 +530,543 @@ pub(crate) fn run_telephony_side(
         }
     });
     Ok(())
+}
+
+/// How often to poll for an inbound INVITE this process's account accepted.
+/// Independent of any of `run_line_listener`'s per-line cadences — this is
+/// process-wide, matching the shared `endpoint`/`account` it polls.
+const OUTBOUND_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How long to wait to connect to a line's Agent A and get its first reply
+/// — either `CallFailed` ("busy", no carrier round trip) or `CallAttempting`
+/// (committed; a real `CallPlaced`/`CallFailed` follows, waited for
+/// separately via `CALL_ATTEMPT_TIMEOUT`). Short by design: this phase only
+/// covers "is the process even reachable and idle," never a carrier round
+/// trip. Must comfortably exceed Agent A's own `ims::agent::IDLE_POLL_INTERVAL`
+/// (1s) — that bounds how long a `PlaceCall` can sit in Agent A's channel
+/// before its dispatch loop notices it and replies at all (found live,
+/// specs/025-outbound-calling T072, back when that interval was 30s: this
+/// timeout gave up before Agent A ever got around to acking). Checked
+/// directly in `place_call_timeout_exceeds_agent_as_idle_poll` below, same
+/// cross-process reasoning as `CALL_ATTEMPT_TIMEOUT`.
+const PLACE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long to wait for the definitive `CallPlaced`/`CallFailed` once a line
+/// has acked an attempt with `CallAttempting`. Must comfortably exceed
+/// Agent A's own `ims::agent::OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT`
+/// (15s + 60s) — a real carrier call can legitimately take that whole
+/// window to ring and answer, plus a little more for the veth handoff
+/// right after. Checked against those constants directly in
+/// `call_attempt_timeout_exceeds_agent_as_invite_wait` below rather than
+/// computed from them, since Agent A runs as a separate OS process (a
+/// `vowifi-ims-agent` subprocess in its own netns) even though it's the
+/// same compiled binary.
+const CALL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Polls for an inbound INVITE this process's account (`Account::local` in
+/// SIP server mode, or the classic PBX-trunk registration otherwise)
+/// accepted, and places it on whichever line is idle.
+///
+/// Tries this process's own configured VoWiFi/VoLTE `lines`, each over
+/// `contracts/agent-outbound-protocol.md`'s `PlaceCall`/`CallAttempting`/
+/// `CallPlaced`/`CallFailed` sequence — a "busy" reply costs no carrier
+/// round trip (Agent A's `dispatch_loop` answers it before ever touching
+/// the carrier transport), so trying several lines in sequence is cheap;
+/// once a line acks with `CallAttempting` it has committed to a real
+/// carrier attempt, so `try_place_on_line` stops treating replies as
+/// quick and switches to a much longer wait (`CALL_ATTEMPT_TIMEOUT`).
+///
+/// **No circuit-switched fallback** (specs/025-outbound-calling review):
+/// this process's `Endpoint`/ALSA audio path is entirely separate from the
+/// daemon's own CS/modem audio path, and no cross-process media bridge
+/// connects them — dispatching a CS dial from here used to answer the
+/// caller `200 OK` while producing dead air, metrics claiming `placed`. A
+/// call refused here because every VoWiFi/VoLTE line is busy/unregistered
+/// is refused outright (`503`, `RefusedNoIdleLine`), not retried elsewhere.
+/// **Simplification, not strict FR-007 no-preference**: lines are tried in
+/// the order `lines` lists them — a real (if arbitrary) ordering, not the
+/// "no preference across every process simultaneously" FR-007 describes;
+/// true unordered arbitration across processes would need a bigger
+/// mechanism than this pass builds.
+///
+/// Handles at most one VoWiFi/VoLTE-originated call at a time: once one is
+/// placed, this loop stops polling for new ones and instead services the
+/// active call's control connection (`service_active_outbound_call`) each
+/// tick, until it ends — the same single-call-at-a-time model
+/// `ims::agent::dispatch_loop` already uses on Agent A's side, chosen for
+/// the same reason rather than adding real concurrency here (`pjsua_safe`'s
+/// `Endpoint`/`Account` don't implement `Clone` — they're thin handles onto
+/// a process-global PJSUA singleton with their own `Drop` teardown — so a
+/// second, independently-scheduled call would need actual shared ownership,
+/// not just a second thread).
+///
+/// Runs forever on its own thread (see `run_telephony_side`); never returns
+/// in normal operation.
+fn run_outbound_listener(
+    endpoint: &Endpoint,
+    account: &Account,
+    lines: &[RuntimeLine],
+    // `Some` in SIP server mode: verify a dial-out request's real source
+    // against the phones currently registered here — the same check the
+    // registrar's own redirect decision makes (`find_by_source`). `None` in
+    // trunk mode, where `trunk_source_ips` is the check instead. Exactly one
+    // of the two is ever non-empty/`Some` (spec 025 review: nothing verified
+    // an outbound-triggering request's real sender at all before this
+    // existed — this account's port listens on every interface).
+    bindings: Option<&Arc<crate::sip::server::BindingStore>>,
+    trunk_source_ips: &[std::net::IpAddr],
+    reporter: &Reporter,
+) {
+    let mut active: Option<ActiveOutboundCall> = None;
+    'outer: loop {
+        std::thread::sleep(OUTBOUND_POLL_INTERVAL);
+
+        if let Some(ac) = active.as_mut() {
+            if service_active_outbound_call(ac) {
+                let mut ac = active.take().expect("just matched Some");
+                endpoint.unpair_call(ac.call.call_id());
+                let _ = ac.call.hangup();
+                let _ = ac.veth_call.hangup();
+            }
+            // Refuse (don't queue) anything that arrives while busy —
+            // otherwise it sits in PJSUA's incoming-call queue until this
+            // call ends, then gets dialed for a caller who may have given
+            // up minutes ago (specs/025-outbound-calling review).
+            if let Some((_, stale_call_id, _)) = endpoint.poll_incoming_call() {
+                let mut stale = Call::from_id(stale_call_id, CallState::Incoming);
+                let _ = stale.answer(503);
+                report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
+            }
+            continue;
+        }
+
+        let Some((_, call_id, source_addr)) = endpoint.poll_incoming_call() else {
+            continue;
+        };
+        let mut call = Call::from_id(call_id, CallState::Incoming);
+
+        // This account's port listens on every interface, and nothing
+        // upstream has checked who actually sent this INVITE — verify the
+        // real transport-level source before it can reach a real carrier
+        // call at all (found in review; see this function's own doc
+        // comment on `bindings`/`trunk_source_ips`).
+        let trusted = match bindings {
+            Some(bindings) => bindings
+                .find_by_source(source_addr, std::time::Instant::now())
+                .is_some(),
+            None => trunk_source_ips.contains(&source_addr.ip()),
+        };
+        if !trusted {
+            tracing::warn!(call_id, %source_addr, "outbound: refusing a dial-out request from an untrusted source");
+            let _ = call.answer(403);
+            report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
+            continue;
+        }
+
+        let Some(destination) = call.request_destination() else {
+            tracing::warn!(
+                call_id,
+                "outbound: could not determine a destination for this call, refusing"
+            );
+            let _ = call.answer(400);
+            report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
+            continue;
+        };
+
+        if crate::sip::outbound::validate_destination(&destination).is_err() {
+            tracing::warn!(destination = %destination, "outbound: invalid destination, refusing");
+            let _ = call.answer(484);
+            report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
+            continue;
+        }
+
+        let wire_call_id = format!("out-{call_id}");
+        for line in lines {
+            match try_place_on_line(line, &wire_call_id, &destination, &mut call) {
+                PlaceCallOutcome::Placed(control) => {
+                    match bridge_outbound_leg(endpoint, account, &mut call, line) {
+                        Ok(veth_call) => {
+                            tracing::info!(destination = %destination, card_id = %line.card_id, "outbound call placed over VoWiFi/VoLTE");
+                            report_outbound(reporter, OutboundAttemptOutcome::Placed);
+                            active = Some(ActiveOutboundCall {
+                                call,
+                                veth_call,
+                                call_id: wire_call_id.clone(),
+                                control,
+                                pending_line: String::new(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "outbound: failed to bridge the veth leg after the carrier leg was placed");
+                            // Every other terminal path in this loop
+                            // answers the phone/PBX leg with a status
+                            // code; this one must too, or it's left
+                            // ringing until its own timeout.
+                            let _ = call.answer(503);
+                            report_outbound(
+                                reporter,
+                                OutboundAttemptOutcome::RefusedNetworkFailure,
+                            );
+                        }
+                    }
+                    // Either way this line was tried and the attempt is
+                    // over — don't fall through to the refusal below, and
+                    // don't let the borrow checker see a possible later
+                    // use of the just-moved `call`, which a plain `break`
+                    // + flag check can't prove never happens (the move is
+                    // inside this `for` loop; a labeled `continue` on the
+                    // outer loop is a real, not just provable, guarantee).
+                    continue 'outer;
+                }
+                PlaceCallOutcome::Unavailable(e) => {
+                    tracing::debug!(card_id = %line.card_id, error = %e, "outbound: line unavailable, trying next");
+                }
+                PlaceCallOutcome::Committed(reason) => {
+                    // FR-009a: the carrier already answered for this
+                    // destination — trying another line would ring it
+                    // again for a call it just refused. Stop here with
+                    // the carrier's own status code when we have one
+                    // (FR-012's progress table) and a properly
+                    // distinguished outcome (SC-005), rather than a
+                    // blanket 503/`RefusedNetworkFailure` for every
+                    // post-commitment failure regardless of cause.
+                    let (code, outcome) = outbound_outcome_for_committed_failure(&reason);
+                    tracing::warn!(destination = %destination, card_id = %line.card_id, reason = %reason, code, "outbound: carrier rejected the call; not trying another line (FR-009a)");
+                    let _ = call.answer(code);
+                    report_outbound(reporter, outcome);
+                    continue 'outer;
+                }
+            }
+        }
+
+        // No circuit-switched fallback here (specs/025-outbound-calling
+        // review): the CS modem lives in the daemon's own process, in its
+        // own `SipBridge`/ALSA-device audio path, entirely separate from
+        // this process's PJSUA `Endpoint`. Dispatching `ControlCmd::Dial`
+        // to the daemon used to place a real ATD and answer `call` with
+        // `200 OK` regardless — but nothing ever connected the two
+        // processes' audio: the caller got a connected call and dead air,
+        // while metrics recorded it as `placed`. Refusing outright is
+        // honest about what this process can actually deliver; a real
+        // fix needs a cross-process media bridge as substantial as the
+        // Agent A/B veth link this feature already relies on for
+        // VoWiFi/VoLTE, not a shortcut through the control socket.
+        tracing::warn!(destination = %destination, "outbound: no VoWiFi/VoLTE line available, refusing (no cross-process CS audio bridge exists)");
+        let _ = call.answer(503);
+        report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
+    }
+}
+
+/// Reports one outbound attempt outcome over the agent-reporting channel —
+/// this process serves no `/metrics` of its own (specs/025-outbound-calling
+/// T071; found live: the counter was registering in the wrong process's
+/// `REGISTRY` and never appearing on the daemon's endpoint, the same class
+/// of bug spec 024's `sip_server_bindings` fix already addressed).
+fn report_outbound(reporter: &Reporter, outcome: OutboundAttemptOutcome) {
+    reporter.report(
+        AgentState::default(),
+        vec![ObservedEvent::OutboundAttempt { outcome }],
+    );
+}
+
+/// What happened trying to place a call on one line.
+enum PlaceCallOutcome {
+    /// Committed and the carrier accepted it — the call is up. Carries the
+    /// still-open connection to Agent A (see `try_place_on_line`'s doc).
+    Placed(std::io::BufReader<TcpStream>),
+    /// Never reached the carrier at all — busy, unreachable, or a
+    /// malformed reply. Cheap to have tried; the caller should move on to
+    /// the next line.
+    Unavailable(String),
+    /// Reached the carrier, which answered — a rejection, or (rarely) a
+    /// purely local failure discovered after the carrier already accepted
+    /// the call. Either way, FR-009a: this is the *destination's* answer
+    /// (or an already-committed carrier leg), not a reason to keep hunting
+    /// for a working line — trying the next line would ring the same
+    /// destination again for a call it just refused, or leave a second,
+    /// truly-answered carrier leg orphaned. Found live
+    /// (specs/025-outbound-calling review): the two cases used to be the
+    /// same `Err(String)`, so a rejected destination got redialed once per
+    /// remaining line before finally being refused. The caller must stop
+    /// and refuse the whole request with this reason, never try another
+    /// line.
+    Committed(String),
+}
+
+/// On success, returns the still-open connection to Agent A — it must stay
+/// open for the whole call (Agent A expects to send `CallEnded` on it when
+/// the carrier hangs up, and we need it to tell Agent A when the phone leg
+/// hangs up first). Found live (specs/025-outbound-calling T072 pass 7):
+/// the original version dropped the connection the moment it got
+/// `CallPlaced` — Agent A's next read on its end saw an immediate EOF,
+/// treated it as "Agent B's control connection dropped mid-call", and tore
+/// the just-bridged call down again within microseconds. The conference
+/// bridge was wired correctly and the relay was running; there was simply
+/// nothing left alive downstream by the time either had anything to carry.
+fn try_place_on_line(
+    line: &RuntimeLine,
+    call_id: &str,
+    destination: &str,
+    call: &mut Call,
+) -> PlaceCallOutcome {
+    let addr = match format!("{}:{}", line.veth_local_addr, AGENT_A_STATUS_PORT).parse() {
+        Ok(a) => a,
+        Err(e) => return PlaceCallOutcome::Unavailable(format!("invalid address: {e}")),
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, PLACE_CALL_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => return PlaceCallOutcome::Unavailable(format!("connect failed: {e}")),
+    };
+    if let Err(e) = stream.set_read_timeout(Some(PLACE_CALL_TIMEOUT)) {
+        return PlaceCallOutcome::Unavailable(format!("set_read_timeout failed: {e}"));
+    }
+    if let Err(e) = write_msg(
+        &mut stream,
+        &ControlMessage::PlaceCall {
+            call_id: call_id.to_string(),
+            destination: destination.to_string(),
+        },
+    ) {
+        return PlaceCallOutcome::Unavailable(e);
+    }
+
+    let mut reader = std::io::BufReader::new(stream);
+    match read_msg(&mut reader) {
+        // Committed: Agent A is not busy and is about to touch the carrier
+        // transport for real. From here on a reply can legitimately take as
+        // long as Agent A's own carrier-INVITE wait, so switch to the much
+        // longer `CALL_ATTEMPT_TIMEOUT` rather than keep using
+        // `PLACE_CALL_TIMEOUT` (found live, specs/025-outbound-calling
+        // T072: with one short timeout for both phases, this line gave up
+        // and moved on while the carrier was still ringing, and the carrier
+        // went on to answer a call nobody was listening for).
+        Ok(ControlMessage::CallAttempting { .. }) => {}
+        Ok(ControlMessage::CallFailed { reason, .. }) => {
+            return PlaceCallOutcome::Unavailable(reason)
+        }
+        Ok(other) => return PlaceCallOutcome::Unavailable(format!("unexpected reply: {other:?}")),
+        Err(e) => return PlaceCallOutcome::Unavailable(e),
+    }
+    if let Err(e) = reader
+        .get_ref()
+        .set_read_timeout(Some(CALL_ATTEMPT_TIMEOUT))
+    {
+        return PlaceCallOutcome::Unavailable(format!("set_read_timeout failed: {e}"));
+    }
+
+    // `CallRinging` is non-terminal — Agent A's own deadline
+    // (`OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT`, comfortably under
+    // `CALL_ATTEMPT_TIMEOUT`'s per-read timeout below) covers everything
+    // between here and the real `CallPlaced`/`CallFailed` regardless of how
+    // many reads that takes, so looping past it doesn't risk waiting
+    // longer overall than `CALL_ATTEMPT_TIMEOUT` already accounts for.
+    loop {
+        match read_msg(&mut reader) {
+            Ok(ControlMessage::CallRinging { .. }) => {
+                let _ = call.answer(180);
+            }
+            Ok(ControlMessage::CallPlaced { .. }) => {
+                // Short from here on: this same connection is now polled
+                // once per `OUTBOUND_POLL_INTERVAL` tick for the rest of
+                // the call (`service_active_outbound_call`), not waited on
+                // for a single long reply.
+                if let Err(e) = reader
+                    .get_ref()
+                    .set_read_timeout(Some(OUTBOUND_POLL_INTERVAL))
+                {
+                    return PlaceCallOutcome::Committed(format!("set_read_timeout failed: {e}"));
+                }
+                return PlaceCallOutcome::Placed(reader);
+            }
+            Ok(ControlMessage::CallFailed { reason, .. }) => {
+                return PlaceCallOutcome::Committed(reason)
+            }
+            Ok(other) => {
+                return PlaceCallOutcome::Committed(format!("unexpected reply: {other:?}"))
+            }
+            Err(e) => return PlaceCallOutcome::Committed(e),
+        }
+    }
+}
+
+/// Pulls a leading 3-digit SIP status code off a `CallFailed`/`Committed`
+/// reason string, when there is one — `ims::agent::fail`'s non-2xx-final-
+/// response call site formats its reason as `"{status} {resp.reason}"`
+/// (e.g. `"486 Busy Here"`), the one point in the whole outbound path with
+/// a real carrier status to report; every other failure reason is free
+/// text with no such prefix (a bind failure, a timeout, ...), which this
+/// correctly reads as "no carrier status available." Used to answer the
+/// phone/PBX leg with the carrier's own code instead of a blanket `503`
+/// (specs/025-outbound-calling review, FR-012's progress table).
+fn carrier_status_from_reason(reason: &str) -> Option<u32> {
+    let code = reason.split(' ').next()?;
+    if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) {
+        code.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// What to answer the phone/PBX leg with, and which outcome to report, for
+/// a `PlaceCallOutcome::Committed` failure. Distinguishes "genuinely rang
+/// out, nobody ever answered or declined" (`ims::agent`'s
+/// `reason::CARRIER_TIMEOUT` marker, or an explicit carrier `480
+/// Temporarily Unavailable`) from every other post-commitment failure —
+/// SC-005 wants these distinguishable from logs and metrics alone, but
+/// `OutboundAttemptOutcome::Unanswered` existed on the wire with nothing
+/// ever reporting it (specs/025-outbound-calling review).
+fn outbound_outcome_for_committed_failure(reason: &str) -> (u32, OutboundAttemptOutcome) {
+    if reason.starts_with(control::reason::CARRIER_TIMEOUT) {
+        return (480, OutboundAttemptOutcome::Unanswered);
+    }
+    match carrier_status_from_reason(reason) {
+        Some(480) => (480, OutboundAttemptOutcome::Unanswered),
+        // Only a genuine failure code (4xx/5xx/6xx) is safe to hand
+        // straight to `Call::answer`. This is a *failure* path — a carrier
+        // `202`/`183` reaching here (an unexpected non-final or 2xx status
+        // landing in `CallFailed.reason`) is not something a 2xx answer
+        // should ever announce, and a `3xx` needs a `Contact` header this
+        // call site has no way to supply, so `Call::answer(302)` would send
+        // a broken redirect. Fall back to a plain `503` rather than pass
+        // either through (specs/025-outbound-calling review).
+        Some(code) if (400..700).contains(&code) => {
+            (code, OutboundAttemptOutcome::RefusedNetworkFailure)
+        }
+        Some(_) | None => (503, OutboundAttemptOutcome::RefusedNetworkFailure),
+    }
+}
+
+/// Places this line's veth-side `Call::make` toward Agent A's now-waiting
+/// veth listener and conference-bridges it to the already-accepted
+/// phone/PBX leg — the same `pjsua_safe::Endpoint::pair_calls` primitive
+/// `bridge_call` already uses for inbound (`vowifi/mod.rs`), called here
+/// with the leg roles reversed: `call` was accepted first, the veth leg is
+/// placed second. Returns the veth `Call` on success — the caller must hang
+/// it up (and unpair) once the bridged call ends, same as it must for
+/// `call`.
+fn bridge_outbound_leg(
+    endpoint: &Endpoint,
+    account: &Account,
+    call: &mut Call,
+    line: &RuntimeLine,
+) -> BridgeResult<Call> {
+    let veth_uri = format!("sip:agent-a@{}:{}", line.veth_local_addr, line.sip_leg_port);
+    let mut veth_call = Call::make(account, &veth_uri, None, &[])
+        .map_err(|e| BridgeError::Ims(format!("veth-side call failed: {e}")))?;
+
+    // Pair *before* answering: `answer(200)` can complete the INVITE
+    // transaction and fire this call's media-active callback on a PJSIP
+    // worker thread almost immediately (sub-millisecond, found live —
+    // specs/025-outbound-calling T072 pass 4). `pair_calls` is documented
+    // as safe to call before either call's media is active precisely for
+    // this reason; calling it after left a real window where the phone
+    // leg's media-active callback ran before `BRIDGE_PAIRS` had this
+    // pairing, so it fell through to the sound-device branch instead of
+    // the peer-call branch — audio silently went nowhere, no error on
+    // either side.
+    endpoint.pair_calls(call.call_id(), veth_call.call_id());
+    if let Err(e) = call.answer(200) {
+        // The pairing just made above and the veth call `Call::make` just
+        // placed would otherwise leak: `Call` has no `Drop`, and a stale
+        // `BRIDGE_PAIRS` entry could pair a *future* unrelated call to this
+        // dead `veth_call.call_id()`.
+        endpoint.unpair_call(call.call_id());
+        let _ = veth_call.hangup();
+        return Err(BridgeError::Ims(format!("{e}")));
+    }
+    tracing::info!(
+        phone_call_id = call.call_id(),
+        veth_call_id = veth_call.call_id(),
+        card_id = %line.card_id,
+        "outbound: placed and paired both legs"
+    );
+    Ok(veth_call)
+}
+
+/// An outbound call in progress: both legs, plus the still-open connection
+/// to the Agent A that placed it. Held by `run_outbound_listener` between
+/// polling ticks (specs/025-outbound-calling T072 pass 7) — `control` must
+/// stay open for the call's whole lifetime, unlike the brief request/reply
+/// use `try_place_on_line` makes of it before this point.
+struct ActiveOutboundCall {
+    call: Call,
+    veth_call: Call,
+    call_id: String,
+    control: std::io::BufReader<TcpStream>,
+    /// Carries a message across ticks when `read_line` times out mid-line
+    /// (specs/025-outbound-calling review): `read_line` documents that any
+    /// bytes it already appended stay in the buffer even when it returns
+    /// an error, but a fresh `String::new()` per call throws that partial
+    /// data away — and the remainder that arrives on a later tick becomes
+    /// an orphaned, unparseable fragment on its own. Reused (not cleared)
+    /// across timeouts; only cleared once a complete line has actually
+    /// been consumed.
+    pending_line: String,
+}
+
+/// One non-blocking check of `ac.control` (`OUTBOUND_POLL_INTERVAL` read
+/// timeout, set by `try_place_on_line`) plus `ac.call`'s own state.
+/// Returns `true` once the call has ended — either side may end it first:
+///
+/// - Agent A sends `CallEnded` when the carrier hangs up; this just
+///   observes it (the caller does the actual `Call::hangup`/`unpair_call`
+///   teardown, uniformly for both directions).
+/// - `ac.call` reaching `Disconnected` means the phone/PBX leg hung up
+///   first; Agent A doesn't know yet, so this sends `CallEnded` to tell it
+///   to BYE the carrier — the mirror of `handle_connection`'s inbound
+///   teardown loop (`vowifi/mod.rs`), which this deliberately matches.
+fn service_active_outbound_call(ac: &mut ActiveOutboundCall) -> bool {
+    match ac.control.read_line(&mut ac.pending_line) {
+        Ok(0) => {
+            tracing::warn!(call_id = %ac.call_id, "outbound: control connection to Agent A lost mid-call");
+            true
+        }
+        Ok(_) => {
+            let result = match serde_json::from_str::<ControlMessage>(ac.pending_line.trim()) {
+                Ok(ControlMessage::CallEnded { reason, .. }) => {
+                    tracing::info!(call_id = %ac.call_id, reason = %reason, "outbound: carrier leg ended, tearing down the phone leg");
+                    true
+                }
+                Ok(other) => {
+                    tracing::warn!(call_id = %ac.call_id, message = ?other, "outbound: unexpected message during an active call");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(call_id = %ac.call_id, error = %e, "outbound: malformed message on the control connection");
+                    false
+                }
+            };
+            // A full line was consumed either way (parse failure is not a
+            // reason to keep it around) — clear it so the next `read_line`
+            // starts a fresh message rather than appending onto this one.
+            ac.pending_line.clear();
+            result
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            if ac.call.poll_state() == CallState::Disconnected {
+                tracing::info!(call_id = %ac.call_id, "outbound: phone leg hung up; telling Agent A to end the carrier leg");
+                let _ = write_msg(
+                    ac.control.get_mut(),
+                    &ControlMessage::CallEnded {
+                        call_id: ac.call_id.clone(),
+                        reason: control::reason::PBX_HANGUP.to_string(),
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        }
+        Err(e) => {
+            tracing::warn!(call_id = %ac.call_id, error = %e, "outbound: control connection read failed");
+            true
+        }
+    }
 }
 
 /// One line's whole accept loop — binds `listen_addr` and handles every
@@ -1259,6 +1873,67 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// `read_line` documents that any bytes it already appended stay in
+    /// the buffer even when it returns an error — but a fresh
+    /// `String::new()` per `service_active_outbound_call` call used to
+    /// throw that partial data away regardless, silently corrupting any
+    /// message that happened to straddle a 200ms read-timeout boundary
+    /// (specs/025-outbound-calling review). `pending_line` fixes this by
+    /// persisting across calls; this proves the fix by forcing exactly
+    /// that split.
+    #[test]
+    fn a_message_split_across_a_read_timeout_is_not_lost() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut sender = TcpStream::connect(addr).expect("connect");
+        let (receiver, _) = listener.accept().expect("accept");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set_read_timeout");
+
+        let mut ac = ActiveOutboundCall {
+            call: Call::from_id(0, CallState::Confirmed),
+            veth_call: Call::from_id(1, CallState::Confirmed),
+            call_id: "out-test".to_string(),
+            control: std::io::BufReader::new(receiver),
+            pending_line: String::new(),
+        };
+
+        let full = serde_json::to_string(&ControlMessage::CallEnded {
+            call_id: "out-test".to_string(),
+            reason: "caller_hangup".to_string(),
+        })
+        .expect("serialize")
+            + "\n";
+        let full_bytes = full.as_bytes();
+        let split_at = full_bytes.len() / 2;
+        sender
+            .write_all(&full_bytes[..split_at])
+            .expect("write first half");
+
+        // Only half the message has arrived: `read_line` must time out
+        // mid-line. `call` is `Confirmed`, not `Disconnected`, so this
+        // must not be mistaken for the phone leg hanging up either.
+        assert!(
+            !service_active_outbound_call(&mut ac),
+            "must not end the call on a mid-message timeout"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        sender
+            .write_all(&full_bytes[split_at..])
+            .expect("write second half");
+
+        // The rest arrives: if the first half had been discarded, this
+        // would parse as a malformed fragment (or the wrong message) and
+        // return `false` instead of correctly recognizing `CallEnded`.
+        assert!(
+            service_active_outbound_call(&mut ac),
+            "the reassembled message must parse as CallEnded"
+        );
+    }
 
     fn record(id: &str) -> CallRecord {
         CallRecord {
@@ -1267,6 +1942,78 @@ mod tests {
             outcome: "answered:caller_hangup".to_string(),
             started_at: 1_700_000_000,
             ended_at: Some(1_700_000_300),
+        }
+    }
+
+    #[test]
+    fn carrier_status_from_reason_reads_the_leading_sip_code() {
+        for (reason, want) in [
+            ("486 Busy Here", Some(486)),
+            ("480 Temporarily Unavailable", Some(480)),
+            ("503 Service Unavailable", Some(503)),
+            ("no final response from carrier: timed out", None),
+            ("bad SDP answer: parse error", None),
+            ("", None),
+            // Not exactly 3 digits — not a plausible SIP status.
+            ("42 not a status", None),
+            ("4860 also not a status", None),
+        ] {
+            assert_eq!(carrier_status_from_reason(reason), want, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn committed_failure_outcome_distinguishes_unanswered_from_refused() {
+        for (reason, want_code, want_outcome) in [
+            (
+                format!(
+                    "{}: no final response from carrier: timed out",
+                    control::reason::CARRIER_TIMEOUT
+                ),
+                480,
+                OutboundAttemptOutcome::Unanswered,
+            ),
+            (
+                "480 Temporarily Unavailable".to_string(),
+                480,
+                OutboundAttemptOutcome::Unanswered,
+            ),
+            (
+                "486 Busy Here".to_string(),
+                486,
+                OutboundAttemptOutcome::RefusedNetworkFailure,
+            ),
+            (
+                "bad SDP answer: parse error".to_string(),
+                503,
+                OutboundAttemptOutcome::RefusedNetworkFailure,
+            ),
+        ] {
+            let (code, outcome) = outbound_outcome_for_committed_failure(&reason);
+            assert_eq!(code, want_code, "{reason:?}");
+            assert_eq!(outcome, want_outcome, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn committed_failure_outcome_clamps_non_failure_codes_to_503() {
+        for reason in [
+            // A redirect: answering with it verbatim would need a Contact
+            // header this call site can't supply.
+            "302 Moved Temporarily",
+            // A 2xx landing in a *failure* reason string is not something
+            // `Call::answer` should ever pass through as-is.
+            "202 Accepted",
+            // A 1xx provisional has no business here either.
+            "183 Session Progress",
+        ] {
+            let (code, outcome) = outbound_outcome_for_committed_failure(reason);
+            assert_eq!(code, 503, "{reason:?}");
+            assert_eq!(
+                outcome,
+                OutboundAttemptOutcome::RefusedNetworkFailure,
+                "{reason:?}"
+            );
         }
     }
 
@@ -1341,5 +2088,47 @@ mod tests {
         );
         assert_eq!(bound, "listener");
         assert!(slept.is_empty(), "a first-try bind must not delay startup");
+    }
+
+    /// Found live (specs/025-outbound-calling T072): with `CALL_ATTEMPT_TIMEOUT`
+    /// no longer than Agent A's own carrier-INVITE wait, a real, ringing
+    /// call gets abandoned mid-flight — Agent B moves on to the next line
+    /// (or gives up) while the carrier is still working on the current one,
+    /// and the carrier can go on to answer a call nobody is listening for.
+    /// This can't check the two constants are literally equal-or-related at
+    /// compile time (Agent A runs as a separate OS process, even though
+    /// it's the same compiled binary), so it asserts the relationship here
+    /// instead, with room for the veth handoff on top of Agent A's own wait.
+    #[test]
+    fn call_attempt_timeout_exceeds_agent_as_invite_wait() {
+        let agent_a_max_wait =
+            crate::ims::agent::OUTBOUND_INVITE_TIMEOUT + crate::ims::agent::OUTBOUND_RING_TIMEOUT;
+        assert!(
+            CALL_ATTEMPT_TIMEOUT > agent_a_max_wait,
+            "CALL_ATTEMPT_TIMEOUT ({CALL_ATTEMPT_TIMEOUT:?}) must exceed \
+             ims::agent::OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT \
+             ({agent_a_max_wait:?}) with margin for the veth handoff, or a \
+             real carrier call can outlive Agent B's patience",
+        );
+    }
+
+    /// Found live (specs/025-outbound-calling T072): Agent A's dispatch loop
+    /// only re-checks its `place_call_rx` channel once per iteration, and
+    /// its one blocking wait is bounded by `IDLE_POLL_INTERVAL` — so a
+    /// `PlaceCall` can sit unnoticed for up to that long before Agent A
+    /// even sends `CallAttempting`. `PLACE_CALL_TIMEOUT` must stay bigger,
+    /// with real margin for the connect/write/read round trip on top, or
+    /// this line gets marked unavailable before Agent A ever gets a chance
+    /// to answer.
+    #[test]
+    fn place_call_timeout_exceeds_agent_as_idle_poll() {
+        assert!(
+            PLACE_CALL_TIMEOUT > crate::ims::agent::IDLE_POLL_INTERVAL * 2,
+            "PLACE_CALL_TIMEOUT ({PLACE_CALL_TIMEOUT:?}) must clear \
+             ims::agent::IDLE_POLL_INTERVAL ({:?}) with real margin, or a \
+             PlaceCall can time out before Agent A's dispatch loop even \
+             notices it",
+            crate::ims::agent::IDLE_POLL_INTERVAL,
+        );
     }
 }

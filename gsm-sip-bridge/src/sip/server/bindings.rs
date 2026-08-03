@@ -101,6 +101,19 @@ impl BindingStore {
         self.lock().values().find(|b| b.call_id == call_id).cloned()
     }
 
+    /// The live binding whose REGISTER came from `addr`, if any.
+    ///
+    /// Used to recognise an INVITE as coming from an already-authenticated
+    /// phone (spec 025 FR-003): the phone proved its password at REGISTER
+    /// time, and this checks the INVITE arrived from that same source
+    /// address, without requiring a second digest exchange on every call.
+    pub fn find_by_source(&self, addr: std::net::SocketAddr, now: Instant) -> Option<Binding> {
+        self.lock()
+            .values()
+            .find(|b| b.source == addr && b.is_live(now))
+            .cloned()
+    }
+
     /// Drops expired entries and returns how many remain live.
     ///
     /// Only exists so the gauges and logs report the truth — correctness does

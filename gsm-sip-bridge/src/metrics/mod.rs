@@ -139,6 +139,21 @@ pub static SIP_SERVER_RING_TARGET_MISSING_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Outbound call attempts (spec 025), by outcome: `placed`,
+/// `refused_no_idle_line`, `refused_invalid_destination`,
+/// `refused_network_failure`, `unanswered` — the granularity data-model.md
+/// defines, matching what inbound calls already report.
+pub static OUTBOUND_ATTEMPTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_outbound_attempts_total",
+            "Outbound call attempts placed from the SIP side, by outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
 /// 1 when the host-side VoLTE registration is currently accepted.
 /// Deliberately separate from `SIP_REGISTERED` (the PBX-side registration) and
 /// from the VoWiFi agent's gauge — an operator needs to see which of the three

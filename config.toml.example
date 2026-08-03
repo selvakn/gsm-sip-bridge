@@ -391,3 +391,11 @@ lock_path = "/tmp/volte-registration.lock"
 # [[sip_server.account]]
 # username = "1002"
 # password = "env:PHONE_1002_PASSWORD"
+
+# Outbound calling (specs/025-outbound-calling): place a call out over the
+# mobile network from the SIP side — a PBX-sent call, or (with [sip_server]
+# also enabled) a phone dialing directly. Off by default. No allow-list, no
+# path preference: the destination is dialed exactly as given, on whichever
+# configured line is idle.
+# [outbound]
+# enabled = true

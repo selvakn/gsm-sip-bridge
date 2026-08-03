@@ -1,5 +1,35 @@
 # Release Notes
 
+## v8.4.0
+
+- **Outbound calling.** `[outbound].enabled` lets the PBX — or, in SIP server
+  mode, a registered phone — dial out through the mobile network, on
+  whichever line (circuit-switched, VoWiFi, or VoLTE) is idle. Off by
+  default, and a deployment that does not enable it is unaffected.
+
+  A PBX INVITE to the bridge's trunk account, or a registered phone's own
+  INVITE (302-redirected back to the bridge's dial-out port instead of the
+  `403` it always got before), picks the first idle line with no path
+  preference and dials it. The destination is the Request-URI's user part,
+  dialed verbatim — no allow-list. Refused with `503` if every line is busy,
+  `484` for an invalid destination; a carrier rejection is relayed with its
+  own status where the path can determine it, distinguishing "unanswered"
+  from "refused" in both logs and the `gsm_sip_bridge_outbound_attempts_total`
+  metric.
+
+  Circuit-switched and VoWiFi/VoLTE lines each live in their own process
+  with their own line pool — there is no cross-process fallback between
+  them, and no cross-process audio bridge exists for the circuit-switched
+  case, so a line pool with nothing idle refuses outright rather than
+  reaching into the other process's lines.
+
+  Two known limitations, tracked in `docs/todo.md`: circuit-switched call
+  progress is coarse (accepted once dialing is confirmed, not once
+  genuinely answered — the modem's `ATD` response doesn't distinguish the
+  two), and the VoWiFi/VoLTE dispatch loop blocks for up to ~80 seconds
+  while a call is in flight, during which a caller hanging up mid-ring can't
+  trigger a CANCEL and an unrelated inbound call is dropped.
+
 ## v8.3.0
 
 - **The bridge can now be the SIP server itself, so a small deployment needs no

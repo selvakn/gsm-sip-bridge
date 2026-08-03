@@ -52,7 +52,19 @@ impl Harness {
     fn with_config(config: SipServerConfig) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
         let registrar = Registrar::start_on(socket, &config).expect("start registrar");
+        Self::finish(registrar)
+    }
 
+    /// A registrar with `[outbound].enabled` (spec 025) — a registered
+    /// phone's INVITE is redirected rather than refused.
+    fn with_outbound() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
+        let registrar =
+            Registrar::start_on_with_outbound(socket, &config(), 5062).expect("start registrar");
+        Self::finish(registrar)
+    }
+
+    fn finish(registrar: Registrar) -> Self {
         let phone = UdpSocket::bind("127.0.0.1:0").expect("bind phone");
         phone
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -175,7 +187,7 @@ fn authorization(user: &str, password: &str, nonce: &str, nc: Option<&str>) -> S
 
 fn non_register(method: &str) -> String {
     format!(
-        "{method} sip:bridge SIP/2.0\r\n\
+        "{method} sip:+919789063708@bridge SIP/2.0\r\n\
          Via: SIP/2.0/UDP 192.168.1.50:5060;branch=z9hG4bKx\r\n\
          From: <sip:{USER}@bridge>;tag=phone-tag\r\n\
          To: <sip:someone@bridge>\r\n\
@@ -627,11 +639,45 @@ fn options_is_answered_so_keepalives_do_not_drop_the_registration() {
     assert!(allow.contains("INVITE"), "got: {allow}");
 }
 
-/// §2 — phone-originated dialling is out of scope, and an explicit refusal
-/// beats a 32-second retransmit and a timeout on the handset's screen.
+/// §2 — phone-originated dialling is out of scope by default, and an
+/// explicit refusal beats a 32-second retransmit and a timeout on the
+/// handset's screen.
 #[test]
 fn a_call_from_a_phone_is_explicitly_refused() {
     let h = Harness::new();
+    assert_status(&h.round_trip(&non_register("INVITE")), 403);
+}
+
+/// specs/025-outbound-calling FR-003: with `[outbound].enabled`, a
+/// *registered* phone's INVITE is redirected instead of refused — and to
+/// the pjsua UAC port passed to the registrar, not the registrar's own
+/// listen port (they are deliberately different endpoints, spec 024).
+///
+/// The Contact's user part carries the *dialed destination*
+/// (`non_register`'s Request-URI, `+919789063708`), not the phone's own
+/// AOR (`USER`) — a real handset isn't guaranteed to preserve the original
+/// destination through the redirect any other way (specs/025-outbound-calling
+/// review; see `uri_user`'s doc comment).
+#[test]
+fn a_registered_phones_call_is_redirected_when_outbound_is_enabled() {
+    let h = Harness::with_outbound();
+    h.register_ok(1, "call-1");
+
+    let response = h.round_trip(&non_register("INVITE"));
+
+    assert_status(&response, 302);
+    let contact = header_of(&response, "Contact").expect("Contact");
+    assert!(contact.contains("sip:+919789063708@"), "got: {contact}");
+    assert!(!contact.contains(&format!("sip:{USER}@")), "got: {contact}");
+    assert!(contact.contains(":5062"), "got: {contact}");
+}
+
+/// An unregistered peer gets no redirect even with `[outbound].enabled` —
+/// the mode must not become a way to discover the dial-out primitive
+/// without first proving a password (contracts/sip-dialout.md).
+#[test]
+fn an_unregistered_peers_call_is_still_refused_when_outbound_is_enabled() {
+    let h = Harness::with_outbound();
     assert_status(&h.round_trip(&non_register("INVITE")), 403);
 }
 

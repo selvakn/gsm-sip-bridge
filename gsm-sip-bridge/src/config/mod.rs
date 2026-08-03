@@ -107,6 +107,15 @@ impl SipServerConfig {
     }
 }
 
+/// The opt-in capability to place a call out over the mobile network from
+/// the SIP side (spec 025). Off by default; deliberately minimal — no
+/// allow-list, no path preference, no per-line knob (see spec.md
+/// Clarifications).
+#[derive(Clone, Debug, Default)]
+pub struct OutboundConfig {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SmsConfig {
     pub enabled: bool,
@@ -785,6 +794,7 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     pub alerts: AlertsConfig,
     pub sip_server: SipServerConfig,
+    pub outbound: OutboundConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -874,6 +884,18 @@ mod tests {
             .try_into()
             .map_err(|e: toml::de::Error| BridgeError::Config(e.to_string()))?;
         build::build(raw)
+    }
+
+    #[test]
+    fn outbound_disabled_by_default() {
+        let c = parse(MINIMAL_TOML);
+        assert!(!c.outbound.enabled, "must be opt-in (FR-001)");
+    }
+
+    #[test]
+    fn outbound_can_be_enabled() {
+        let c = parse(&format!("{MINIMAL_TOML}\n[outbound]\nenabled = true\n"));
+        assert!(c.outbound.enabled);
     }
 
     #[test]

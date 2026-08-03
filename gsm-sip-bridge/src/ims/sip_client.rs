@@ -733,6 +733,65 @@ impl SipTransport {
         }
     }
 
+    /// Like `recv_final_response`, but distinguishes "the network never
+    /// even acknowledged the request" from "the call is genuinely ringing,
+    /// just slowly" — needed for an originated (UAC) INVITE, where the
+    /// caller has no operator watching and must decide for itself how long
+    /// "still ringing" is allowed to mean.
+    ///
+    /// `initial_timeout` bounds how long we wait for *any* response at all,
+    /// even a bare `100 Trying` — if nothing arrives in that window,
+    /// something transport-level is actually wrong, not just "the phone
+    /// hasn't picked up yet". Once any response (including a provisional)
+    /// has arrived, this switches to a single, longer `ring_timeout`
+    /// window for the rest of the wait — generous enough to cover a real
+    /// human noticing and answering a ringing phone, and *not* reset by
+    /// every subsequent provisional (an unbounded flood of retransmitted
+    /// `180 Ringing`s must not wedge this open forever).
+    ///
+    /// Found live (specs/025-outbound-calling T072 pass 3): a flat, short
+    /// timeout for the *whole* transaction gave up while the carrier was
+    /// still setting up the call — including an 18s gap between `100
+    /// Trying` and the next provisional response, apparently carrier-side
+    /// routing/signaling rather than the callee's own ring time — and the
+    /// real, eventual `200 OK` arrived after the transaction had already
+    /// been abandoned.
+    /// `on_provisional` is called once for every 1xx seen, in case the
+    /// caller wants to relay progress somewhere (Agent A relays a `180` to
+    /// Agent B as `CallRinging`, `contracts/sip-dialout.md`'s progress
+    /// table — pass a no-op closure to just log, matching the original
+    /// behavior before that relay existed).
+    pub fn recv_final_response_for_origination(
+        &mut self,
+        initial_timeout: Duration,
+        ring_timeout: Duration,
+        mut on_provisional: impl FnMut(&SipResponse),
+    ) -> BridgeResult<SipResponse> {
+        let mut deadline = std::time::Instant::now() + initial_timeout;
+        let mut any_response_seen = false;
+        loop {
+            if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
+                self.buf.drain(..consumed);
+                if resp.status >= 200 {
+                    return Ok(resp);
+                }
+                tracing::info!(status = resp.status, reason = %resp.reason, "provisional response");
+                on_provisional(&resp);
+                if !any_response_seen {
+                    any_response_seen = true;
+                    deadline = std::time::Instant::now() + ring_timeout;
+                }
+                continue;
+            }
+            self.read_more()?;
+            if std::time::Instant::now() >= deadline {
+                return Err(BridgeError::Ims(
+                    "timed out waiting for a final response".into(),
+                ));
+            }
+        }
+    }
+
     /// Block until the next complete SIP message — request or response —
     /// arrives, or `timeout` elapses with none available (`Ok(None)`).
     /// Unlike every other `recv_*` method above (each a single bounded

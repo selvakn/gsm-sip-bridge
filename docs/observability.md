@@ -42,6 +42,7 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_sip_server_registrations_total` | Counter | Registration attempts by **outcome** (`accepted`, `challenged`, `rejected_auth`, `rejected_unknown_user`, `rejected_stale`, `rejected_interval`, `deregistered`) |
 | `gsm_sip_bridge_sip_server_requests_total` | Counter | Every request the registrar answered, by **method** and response **status** |
 | `gsm_sip_bridge_sip_server_ring_target_missing_total` | Counter | Inbound calls dropped because no phone was registered to ring |
+| `gsm_sip_bridge_outbound_attempts_total` | Counter | Outbound call attempts (`[outbound]` mode) by **outcome** (`placed`, `refused_no_idle_line`, `refused_invalid_destination`, `refused_network_failure`, `unanswered`) |
 
 **SIP server mode gauges**: `sip_server_*` appear only when
 `[sip_server].enabled` (see [configuration.md](configuration.md)).

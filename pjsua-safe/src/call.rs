@@ -126,6 +126,52 @@ impl Call {
         }
     }
 
+    /// Wraps an already-received call (`Endpoint::poll_incoming_call`) so it
+    /// can be `answer`ed, `hangup`, or polled like any other `Call` (spec
+    /// 025, research.md R-007).
+    ///
+    /// Safe — no FFI. `Call`'s only invariant is "this `call_id` is valid in
+    /// PJSUA", which already holds: PJSIP handed us this `call_id` via
+    /// `on_incoming_call`, the same way `Call::make`'s `call_id` comes from
+    /// `pjsua_call_make_call`.
+    pub fn from_id(call_id: i32, state: CallState) -> Self {
+        Self { call_id, state }
+    }
+
+    /// Answers an incoming call with the given SIP status `code` (e.g. 180
+    /// for ringing, 200 to accept). Mirrors `hangup`'s
+    /// `#[cfg(feature = "pjsip-linked")]`/stub split.
+    pub fn answer(&mut self, code: u32) -> Result<(), PjsipError> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            ensure_pjsip_thread();
+            unsafe // SAFETY: PJSIP initialized; call_id valid for answer on this call
+            {
+                let status = pjsua_sys::pjsua_call_answer(
+                    self.call_id,
+                    code,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if status != crate::error::PJ_SUCCESS {
+                    return Err(PjsipError::CallAnswer(format!(
+                        "pjsua_call_answer({code}) returned {status}"
+                    )));
+                }
+            }
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            tracing::info!(code, "call answered (stub mode)");
+        }
+
+        if (200..300).contains(&code) {
+            self.state = CallState::Confirmed;
+        }
+        Ok(())
+    }
+
     pub fn hangup(&mut self) -> Result<(), PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
@@ -150,6 +196,54 @@ impl Call {
 
         self.state = CallState::Disconnected;
         Ok(())
+    }
+
+    /// Best-effort extraction of the destination number an incoming call
+    /// named, for outbound calling's PBX/phone entry points (spec 025).
+    ///
+    /// Reads `local_info` — PJSUA's already-rendered "Local URI" string,
+    /// derived from the request's To header per RFC 3261 §12.1.1 UAS dialog
+    /// construction — rather than the raw Request-URI: printing an
+    /// arbitrary `pjsip_uri*` requires PJSIP's `PJ_INLINE` URI-printing
+    /// functions, which have no linkable symbol without extra `bindgen`
+    /// configuration this crate does not carry. This assumes the sender
+    /// sets the To header's URI the same as the Request-URI for
+    /// trunk-style routing — standard for a PBX/gateway trunk, but not a
+    /// SIP guarantee in general.
+    ///
+    /// `None` if `local_info` doesn't parse as a `sip:`/`sips:` URI with a
+    /// user part, or in stub builds (no real call info exists there).
+    pub fn request_destination(&self) -> Option<String> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            ensure_pjsip_thread();
+            unsafe // SAFETY: PJSIP initialized; call_id valid; writable stack out-param; local_info.ptr is valid UTF-8-ish PJSIP-owned text for the info's lifetime
+            {
+                let mut info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
+                if pjsua_sys::pjsua_call_get_info(self.call_id, &mut info) != crate::error::PJ_SUCCESS
+                {
+                    return None;
+                }
+                // `slice::from_raw_parts` requires a non-null, aligned
+                // pointer even for a zero-length slice — an empty
+                // `local_info` is a plausible `pj_str_t { ptr: null, slen: 0 }`
+                // this crate cannot rule out from the FFI signature alone.
+                if info.local_info.ptr.is_null() {
+                    return None;
+                }
+                let bytes = std::slice::from_raw_parts(
+                    info.local_info.ptr as *const u8,
+                    info.local_info.slen.max(0) as usize,
+                );
+                let text = std::str::from_utf8(bytes).ok()?;
+                return parse_uri_user(text);
+            }
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            None
+        }
     }
 
     pub fn conf_slot(&self) -> Option<SlotId> {
@@ -234,5 +328,85 @@ impl Call {
 
     pub fn call_id(&self) -> i32 {
         self.call_id
+    }
+}
+
+/// Extracts the `user` part from a `sip:`/`sips:` URI, with or without a
+/// display-name/angle-bracket wrapper, ignoring URI parameters and
+/// headers. `None` for anything else (e.g. a `tel:` URI, which this
+/// project's PBX-facing routing does not use).
+///
+/// Only called from `request_destination`'s `pjsip-linked` branch — a stub
+/// build has no real call info to parse, so this is otherwise dead code
+/// there; still unit-tested unconditionally below.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+fn parse_uri_user(text: &str) -> Option<String> {
+    let scheme_at = text.find("sip:").or_else(|| text.find("sips:"))?;
+    let (_, rest) = text[scheme_at..].split_once(':')?;
+    let user = rest.split(['@', '>', ';']).next()?;
+    if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_uri_user_bare() {
+        assert_eq!(
+            parse_uri_user("sip:9789063708@192.168.1.1:5062"),
+            Some("9789063708".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_uri_user_with_display_name_and_angle_brackets() {
+        assert_eq!(
+            parse_uri_user("\"PBX\" <sip:9789063708@192.168.1.1:5062>"),
+            Some("9789063708".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_uri_user_strips_uri_parameters() {
+        assert_eq!(
+            parse_uri_user("sip:9789063708;user=phone@192.168.1.1"),
+            Some("9789063708".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_uri_user_none_for_non_sip_scheme() {
+        assert_eq!(parse_uri_user("tel:+919789063708"), None);
+    }
+
+    #[test]
+    fn parse_uri_user_none_for_empty_user() {
+        assert_eq!(parse_uri_user("sip:@192.168.1.1"), None);
+    }
+
+    #[test]
+    fn from_id_carries_the_given_id_and_state() {
+        let call = Call::from_id(42, CallState::Incoming);
+        assert_eq!(call.call_id(), 42);
+        assert_eq!(call.state(), CallState::Incoming);
+    }
+
+    #[test]
+    fn answering_with_a_2xx_code_marks_the_call_confirmed() {
+        let mut call = Call::from_id(1, CallState::Incoming);
+        call.answer(200).unwrap();
+        assert_eq!(call.state(), CallState::Confirmed);
+    }
+
+    #[test]
+    fn answering_with_a_1xx_code_leaves_state_unchanged() {
+        let mut call = Call::from_id(1, CallState::Incoming);
+        call.answer(180).unwrap();
+        assert_eq!(call.state(), CallState::Incoming);
     }
 }

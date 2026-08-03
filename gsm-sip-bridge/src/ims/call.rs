@@ -650,26 +650,30 @@ fn run_rtp_session(
     })
 }
 
-struct InviteParts<'a> {
-    request_uri: &'a str,
-    route_headers: &'a [String],
-    via_transport: &'a str,
+/// `pub(crate)`: reused by `ims::agent`'s outbound-origination path
+/// (specs/025-outbound-calling, research.md R-010) — every field is an
+/// explicit parameter, no session/global state, so widening visibility is
+/// the entire change; the SIP-message-building logic below is unmodified.
+pub(crate) struct InviteParts<'a> {
+    pub(crate) request_uri: &'a str,
+    pub(crate) route_headers: &'a [String],
+    pub(crate) via_transport: &'a str,
     /// Sent from (Via) — the Gm protected client port.
-    local_addr: std::net::SocketAddr,
+    pub(crate) local_addr: std::net::SocketAddr,
     /// Reached at (Contact) — the Gm protected server port, where the far
     /// end's in-dialog requests (its BYE) are delivered. See
     /// `super::RegisteredSession::contact_addr`.
-    contact_addr: std::net::SocketAddr,
-    public_uri: &'a str,
-    callee_uri: &'a str,
-    call_id: &'a str,
-    from_tag: &'a str,
-    cseq: u32,
-    branch: &'a str,
-    body: &'a str,
+    pub(crate) contact_addr: std::net::SocketAddr,
+    pub(crate) public_uri: &'a str,
+    pub(crate) callee_uri: &'a str,
+    pub(crate) call_id: &'a str,
+    pub(crate) from_tag: &'a str,
+    pub(crate) cseq: u32,
+    pub(crate) branch: &'a str,
+    pub(crate) body: &'a str,
 }
 
-fn build_invite(p: &InviteParts) -> String {
+pub(crate) fn build_invite(p: &InviteParts) -> String {
     let via_addr = format_sip_addr(p.local_addr);
     let contact_addr = format_sip_addr(p.contact_addr);
     let public_user = p.public_uri.split('@').next().unwrap_or(p.public_uri);
@@ -712,24 +716,76 @@ fn build_invite(p: &InviteParts) -> String {
     msg
 }
 
-struct AckParts<'a> {
-    request_uri: &'a str,
-    route_headers: &'a [String],
-    via_transport: &'a str,
-    local_addr: std::net::SocketAddr,
-    public_uri: &'a str,
-    to_header: &'a str,
-    call_id: &'a str,
-    from_tag: &'a str,
-    cseq: u32,
-    branch: &'a str,
+/// RFC 3261 §9.1: a CANCEL for a pending INVITE that hasn't yet received a
+/// final response must reuse the *original* INVITE's top Via branch, From
+/// tag, Call-ID, and CSeq number (method CANCEL, not INVITE) — it targets
+/// the same server transaction, not a new one. `To` carries no tag: no
+/// dialog was ever established (had one been, this would be a BYE, not a
+/// CANCEL).
+pub(crate) struct CancelParts<'a> {
+    pub(crate) request_uri: &'a str,
+    pub(crate) route_headers: &'a [String],
+    pub(crate) via_transport: &'a str,
+    pub(crate) local_addr: std::net::SocketAddr,
+    pub(crate) public_uri: &'a str,
+    pub(crate) callee_uri: &'a str,
+    pub(crate) call_id: &'a str,
+    pub(crate) from_tag: &'a str,
+    /// The *original* INVITE's CSeq number, unincremented.
+    pub(crate) cseq: u32,
+    /// The *original* INVITE's own branch — this is what ties the CANCEL
+    /// to the transaction it cancels.
+    pub(crate) branch: &'a str,
 }
 
-fn build_ack(p: &AckParts) -> String {
+pub(crate) fn build_cancel(p: &CancelParts) -> String {
+    let via_addr = format_sip_addr(p.local_addr);
+    let mut msg = format!(
+        "CANCEL sip:{request_uri} SIP/2.0\r\n\
+         Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n",
+        request_uri = p.request_uri,
+        transport = p.via_transport,
+        via_addr = via_addr,
+        branch = p.branch,
+    );
+    for route in p.route_headers {
+        msg.push_str(route);
+        msg.push_str("\r\n");
+    }
+    msg.push_str(&format!(
+        "From: <sip:{public_uri}>;tag={from_tag}\r\n\
+         To: <sip:{callee_uri}>\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} CANCEL\r\n\
+         Content-Length: 0\r\n\r\n",
+        public_uri = p.public_uri,
+        from_tag = p.from_tag,
+        callee_uri = p.callee_uri,
+        call_id = p.call_id,
+        cseq = p.cseq,
+    ));
+    msg
+}
+
+pub(crate) struct AckParts<'a> {
+    pub(crate) request_uri: &'a str,
+    pub(crate) route_headers: &'a [String],
+    pub(crate) via_transport: &'a str,
+    pub(crate) local_addr: std::net::SocketAddr,
+    pub(crate) public_uri: &'a str,
+    pub(crate) to_header: &'a str,
+    pub(crate) call_id: &'a str,
+    pub(crate) from_tag: &'a str,
+    pub(crate) cseq: u32,
+    pub(crate) branch: &'a str,
+}
+
+pub(crate) fn build_ack(p: &AckParts) -> String {
     build_in_dialog_request("ACK", p)
 }
 
-fn build_bye(p: &AckParts) -> String {
+pub(crate) fn build_bye(p: &AckParts) -> String {
     build_in_dialog_request("BYE", p)
 }
 
@@ -895,5 +951,66 @@ mod tests {
         assert!(msg.starts_with("BYE sip:x@realm SIP/2.0\r\n"));
         assert!(msg.contains("To: <sip:x@realm>;tag=abc123\r\n"));
         assert!(msg.contains("CSeq: 2 BYE"));
+    }
+
+    /// RFC 3261 §9.1: a CANCEL must reuse the original INVITE's own branch
+    /// and CSeq number (just the method changes), since it targets that
+    /// same pending transaction rather than starting a new one.
+    #[test]
+    fn build_cancel_reuses_the_invites_branch_and_cseq_number() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let invite = build_invite(&InviteParts {
+            request_uri: "+919789063708@realm",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            contact_addr: addr,
+            public_uri: "12345@realm",
+            callee_uri: "+919789063708@realm",
+            call_id: "callid",
+            from_tag: "tag1",
+            cseq: 7,
+            branch: "z9hG4bKinvitebranch",
+            body: "",
+        });
+        assert!(invite.contains("branch=z9hG4bKinvitebranch"));
+        assert!(invite.contains("CSeq: 7 INVITE"));
+
+        let cancel = build_cancel(&CancelParts {
+            request_uri: "+919789063708@realm",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            public_uri: "12345@realm",
+            callee_uri: "+919789063708@realm",
+            call_id: "callid",
+            from_tag: "tag1",
+            cseq: 7,
+            branch: "z9hG4bKinvitebranch",
+        });
+        assert!(cancel.starts_with("CANCEL sip:+919789063708@realm SIP/2.0\r\n"));
+        assert!(cancel.contains("branch=z9hG4bKinvitebranch"));
+        assert!(cancel.contains("CSeq: 7 CANCEL"));
+    }
+
+    /// No dialog was ever established when a CANCEL is sent (had one been,
+    /// this would be a BYE) — the To header must carry no tag.
+    #[test]
+    fn build_cancel_to_header_carries_no_tag() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let cancel = build_cancel(&CancelParts {
+            request_uri: "x@realm",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            public_uri: "u@realm",
+            callee_uri: "x@realm",
+            call_id: "c",
+            from_tag: "f",
+            cseq: 1,
+            branch: "b",
+        });
+        assert!(cancel.contains("To: <sip:x@realm>\r\n"));
+        assert!(!cancel.contains("To: <sip:x@realm>;tag"));
     }
 }
