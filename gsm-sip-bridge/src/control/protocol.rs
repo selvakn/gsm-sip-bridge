@@ -16,6 +16,14 @@ pub enum ControlCmd {
         slot: u32,
     },
     ListSlots,
+    /// Place an outbound call on a specific circuit-switched line
+    /// (specs/025-outbound-calling, `contracts/control-cmd-dial.md`).
+    /// `destination` is verbatim from the originating INVITE's Request-URI
+    /// user part — not validated or transformed further here.
+    Dial {
+        slot: u32,
+        destination: String,
+    },
     /// A VoWiFi agent (`ims::agent` or `vowifi::mod`) reporting call/SMS
     /// events and current gauge state (specs/014-vowifi-metrics-restore).
     /// Routed straight to `metrics::ingest::apply_report` by

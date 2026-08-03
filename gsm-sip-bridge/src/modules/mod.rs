@@ -62,6 +62,10 @@ pub type ControlCmdReceiver = mpsc::Receiver<(ControlCmd, oneshot::Sender<Contro
 enum ModuleCmd {
     SetMode(NetworkMode, oneshot::Sender<Result<NetworkMode, String>>),
     Reboot,
+    /// Dial an outbound call on this line (specs/025-outbound-calling).
+    /// `Ok(())` means the modem accepted `ATD`, not that the call was
+    /// answered — see `AtCommander::dial`'s own doc comment.
+    Dial(String, oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1260,6 +1264,61 @@ impl CardPool {
                 }
             }
 
+            ControlCmd::Dial { slot, destination } => {
+                let state = match slots.get(&slot) {
+                    Some(s) => s,
+                    None => {
+                        let max = slots.keys().max().copied().unwrap_or(0);
+                        let _ = reply.send(ControlResp::err(format!(
+                            "slot {slot} not found; valid slots: 0..={max}"
+                        )));
+                        return;
+                    }
+                };
+
+                if state.lifecycle != LifecycleState::Ready {
+                    let _ = reply.send(ControlResp::err(format!(
+                        "slot {slot} is not in Ready state (current: {})",
+                        state.lifecycle
+                    )));
+                    return;
+                }
+                if state.has_active_call {
+                    let _ = reply.send(ControlResp::err(format!("slot {slot} is busy")));
+                    return;
+                }
+
+                if let Some(cmd_tx) = state.cmd_tx.clone() {
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    if cmd_tx.send(ModuleCmd::Dial(destination, resp_tx)).is_err() {
+                        let _ = reply.send(ControlResp::err("module command channel closed"));
+                        return;
+                    }
+                    // Shorter than SetMode's 30s: this only confirms ATD was
+                    // accepted, well inside a SIP INVITE's own retransmit
+                    // timers (contracts/control-cmd-dial.md's Timeouts).
+                    tokio::spawn(async move {
+                        match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+                            Ok(Ok(Ok(()))) => {
+                                let _ = reply.send(ControlResp::ok());
+                            }
+                            Ok(Ok(Err(e))) => {
+                                let _ = reply.send(ControlResp::err(e));
+                            }
+                            Ok(Err(_)) => {
+                                let _ = reply.send(ControlResp::err("module did not respond"));
+                            }
+                            Err(_) => {
+                                let _ = reply
+                                    .send(ControlResp::err("AT command timeout while dialing"));
+                            }
+                        }
+                    });
+                } else {
+                    let _ = reply.send(ControlResp::err("module command channel not available"));
+                }
+            }
+
             ControlCmd::CardRestart { slot } => {
                 // FR-014a: cycle concurrency rules.
                 use scheduler::{handle_manual_restart_during_cycle, ManualRestartCycleAdvice};
@@ -1597,6 +1656,9 @@ fn run_module_loop(
                         at.reboot();
                         return Ok(());
                     }
+                    ModuleCmd::Dial(number, resp_tx) => {
+                        let _ = resp_tx.send(apply_dial_cmd(&mut at, &mut card, &number));
+                    }
                 }
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -1642,6 +1704,35 @@ fn run_module_loop(
             handle_creg_urc(&module, trimmed, &event_tx);
         }
     }
+}
+
+/// The body of `ModuleCmd::Dial` handling, pulled out of `run_module_loop`'s
+/// match arm so it's unit-testable against a mocked `AtCommander` the same
+/// way `at_commander`'s own tests mock the serial stream
+/// (specs/025-outbound-calling, contracts/control-cmd-dial.md).
+///
+/// Same-thread serialization is the race guard: `run_module_loop` only ever
+/// processes one `ModuleCmd` at a time, so this check and the dial that
+/// follows cannot race against another `Dial` for this line
+/// (research.md R-003) — no separate provisional-claim step is needed here,
+/// unlike the cross-process case.
+fn apply_dial_cmd(
+    at: &mut AtCommander,
+    card: &mut CardInstance,
+    number: &str,
+) -> Result<(), String> {
+    if card.state != CardState::Idle {
+        return Err("line busy".to_string());
+    }
+    let result = at.dial(number).map_err(|e| e.to_string());
+    if result.is_ok() {
+        // Reuses `Answering` as "call setup in progress, not yet Bridged"
+        // rather than adding a new state — the full outbound state machine
+        // (progress relay, teardown) is specs/025-outbound-calling
+        // T019/T020, not yet wired to this loop.
+        card.state = CardState::Answering;
+    }
+    result
 }
 
 fn handle_creg_urc(
@@ -1943,6 +2034,76 @@ fn parse_sms_response(lines: &[String]) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mock stream for `AtCommander`, mirroring `at_commander`'s own private
+    /// `MockStream`: reads from a fixed byte buffer, discards writes.
+    struct MockAtStream {
+        reader: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl MockAtStream {
+        fn new(response: &str) -> Self {
+            Self {
+                reader: std::io::Cursor::new(response.as_bytes().to_vec()),
+            }
+        }
+    }
+
+    impl std::io::Read for MockAtStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.reader, buf)
+        }
+    }
+
+    impl std::io::Write for MockAtStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_at(response: &str) -> AtCommander {
+        AtCommander::from_stream(MockAtStream::new(response), Duration::from_secs(1))
+    }
+
+    fn mock_card(state: CardState) -> CardInstance {
+        let mut card = CardInstance::new(
+            "card0".to_string(),
+            std::path::PathBuf::from("/dev/null"),
+            "hw:0,0".to_string(),
+            8,
+        );
+        card.state = state;
+        card
+    }
+
+    #[test]
+    fn apply_dial_cmd_dials_when_idle() {
+        let mut at = mock_at("OK\r\n");
+        let mut card = mock_card(CardState::Idle);
+        assert!(apply_dial_cmd(&mut at, &mut card, "+15551234567").is_ok());
+        assert_eq!(card.state, CardState::Answering);
+    }
+
+    #[test]
+    fn apply_dial_cmd_refuses_when_not_idle() {
+        let mut at = mock_at("OK\r\n");
+        let mut card = mock_card(CardState::Bridged);
+        let result = apply_dial_cmd(&mut at, &mut card, "+15551234567");
+        assert_eq!(result, Err("line busy".to_string()));
+        // State must not be perturbed by a refused attempt.
+        assert_eq!(card.state, CardState::Bridged);
+    }
+
+    #[test]
+    fn apply_dial_cmd_reports_at_failure_and_leaves_state_idle() {
+        let mut at = mock_at("ERROR\r\n");
+        let mut card = mock_card(CardState::Idle);
+        assert!(apply_dial_cmd(&mut at, &mut card, "+15551234567").is_err());
+        assert_eq!(card.state, CardState::Idle);
+    }
 
     #[test]
     fn test_backoff_delay_initial() {
