@@ -77,11 +77,22 @@ const ACTIVE_CALL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the RTP relay's blocking `recv` wakes up to check whether it
 /// should stop — bounds how quickly a hangup actually silences the relay.
 const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// How often the main dispatch loop wakes up (when idle) to check whether
-/// the registration needs renewing — matches the existing project's
-/// `[resilience].network_poll_interval_sec` default (feature 009) for
-/// consistency, not a hard requirement of this feature.
-const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the main dispatch loop wakes up when idle. Originally sized
+/// only for registration-renewal checks (30s, matching the existing
+/// project's `[resilience].network_poll_interval_sec` default from feature
+/// 009) — but `place_call_rx` (specs/025-outbound-calling) is also only
+/// re-checked once per loop iteration, and the loop's *only* blocking wait
+/// is `inbound.rx.recv_timeout(poll)`, so this interval is really "how long
+/// a `PlaceCall` can sit unnoticed when nothing else wakes the loop first."
+/// Found live (T072): at 30s, a `PlaceCall` could sit long enough for
+/// `vowifi::mod`'s `PLACE_CALL_TIMEOUT` (a much shorter 3s) to give up on
+/// this line before Agent A even sent `CallAttempting`. 1s keeps renewal
+/// checks plenty timely (`RENEWAL_HEADROOM` is 300s) while bounding that
+/// worst case to something `PLACE_CALL_TIMEOUT` safely covers. `pub(crate)`
+/// so `vowifi::mod`'s tests can assert `PLACE_CALL_TIMEOUT` stays larger
+/// than this, the same cross-check `CALL_ATTEMPT_TIMEOUT` does against
+/// `OUTBOUND_INVITE_TIMEOUT`.
+pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How far ahead of the registration's actual expiry Agent A starts trying
 /// to renew it — SC-003's 90s recovery budget plus margin for the
 /// renewal's own AKA-challenge round trip.
@@ -750,16 +761,41 @@ impl DialogInfo {
     }
 }
 
-/// How long to wait for a final response to an originated INVITE. Well
-/// under RFC 3261 Timer B (32s) but generous for a real carrier round trip.
-const OUTBOUND_INVITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for *any* response at all (even a bare `100 Trying`)
+/// to an originated INVITE — the first phase of
+/// `SipTransport::recv_final_response_for_origination`. If nothing arrives
+/// in this window, something transport-level is actually wrong, not just
+/// "the phone hasn't picked up yet". Well under RFC 3261 Timer B (32s).
+/// `pub(crate)`: see `OUTBOUND_RING_TIMEOUT`'s doc for why both of these
+/// need to stay visible to `vowifi::mod`.
+pub(crate) const OUTBOUND_INVITE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long to keep waiting for a final response once *any* response
+/// (including a provisional) has confirmed the call is genuinely in
+/// flight — the second phase of
+/// `SipTransport::recv_final_response_for_origination`. Generous enough to
+/// cover a real human noticing and answering a ringing phone, and any
+/// carrier-side routing/signaling gaps between provisional responses.
+/// `pub(crate)` so `vowifi::mod`'s `CALL_ATTEMPT_TIMEOUT` — how long Agent
+/// B waits for `CallPlaced`/`CallFailed` once a line has committed to an
+/// attempt — can be checked directly against
+/// `OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT` (a unit test there
+/// asserts it stays comfortably larger; found live,
+/// specs/025-outbound-calling T072 pass 3, that a single flat 15s timeout
+/// for the whole transaction abandoned a call that was still being set up
+/// — including an 18s gap between `100 Trying` and the next provisional
+/// response, apparently carrier-side routing rather than the callee's own
+/// ring time — and the real, eventual `200 OK` arrived after the
+/// transaction had already been given up on).
+pub(crate) const OUTBOUND_RING_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Originates a call to `destination` over the already-registered carrier
 /// session, waits for Agent B's veth call, and bridges the two legs — the
 /// outbound mirror of `handle_invite`'s inbound answer path
-/// (specs/025-outbound-calling, research.md R-009/R-010/R-011). Sends
-/// `CallPlaced`/`CallFailed` on `control` itself before returning, so the
-/// caller (`dispatch_loop`) only needs to fold the result into
+/// (specs/025-outbound-calling, research.md R-009/R-010/R-011). The caller
+/// (`dispatch_loop`) has already sent `CallAttempting` on `control` before
+/// calling this; from here on it sends `CallPlaced`/`CallFailed` itself
+/// before returning, so the caller only needs to fold the result into
 /// `active_call`.
 ///
 /// Never re-registers (`super::register_session`) — a second registration
@@ -871,7 +907,9 @@ fn originate_and_bridge(
         fail(&mut control, call_id, &format!("INVITE send failed: {e}"));
         return None;
     }
-    let resp = match transport.recv_final_response(OUTBOUND_INVITE_TIMEOUT) {
+    let resp = match transport
+        .recv_final_response_for_origination(OUTBOUND_INVITE_TIMEOUT, OUTBOUND_RING_TIMEOUT)
+    {
         Ok(r) => r,
         Err(e) => {
             fail(
@@ -1218,6 +1256,19 @@ pub(crate) fn dispatch_loop(
                     },
                 );
             } else {
+                // Ack receipt *before* touching the carrier transport, so
+                // Agent B can tell "committed, now genuinely placing the
+                // call" apart from "busy" and switch to a much longer wait
+                // for the real outcome (`vowifi::mod`'s `CallAttempting`
+                // handling). Best-effort like `fail()`'s writes below: a
+                // dead connection here will fail again, harmlessly, at the
+                // next write.
+                let _ = write_msg(
+                    &mut pending.control,
+                    &ControlMessage::CallAttempting {
+                        call_id: pending.call_id.clone(),
+                    },
+                );
                 active_call = originate_and_bridge(
                     session,
                     pending.control,
@@ -1236,7 +1287,7 @@ pub(crate) fn dispatch_loop(
         let poll = if active_call.is_some() {
             ACTIVE_CALL_POLL_INTERVAL
         } else {
-            REGISTRATION_POLL_INTERVAL
+            IDLE_POLL_INTERVAL
         };
         match inbound.rx.recv_timeout(poll) {
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {

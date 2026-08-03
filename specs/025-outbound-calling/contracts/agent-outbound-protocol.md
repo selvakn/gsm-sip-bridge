@@ -23,6 +23,16 @@ enum ControlMessage {
     /// transformation (FR-010), same discipline as the CS path.
     PlaceCall { call_id: String, destination: String },
 
+    /// Agent A → Agent B. Sent immediately once Agent A decides to attempt
+    /// `PlaceCall` (i.e. it was not busy) — before touching the carrier
+    /// transport at all. Added after live testing (T072) found that
+    /// without an immediate ack, Agent B could not tell "busy, try the next
+    /// line" (fast, no carrier round trip) apart from "committed, now
+    /// genuinely placing the call" (can take as long as a real carrier
+    /// ring), and used one short timeout for both — abandoning real,
+    /// ringing calls the carrier went on to answer.
+    CallAttempting { call_id: String },
+
     /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
     /// and Agent A's veth-facing UAS listener (`spawn_veth_uas_listener`,
     /// already used unmodified for inbound) is up and waiting — mirrors
@@ -55,6 +65,10 @@ Agent B                                  Agent A
    │   US1/US3 — already shipped)           │
    │                                        │
    │ ── PlaceCall{call_id, destination} ──▶ │
+   │                                        │  not busy: commit
+   │ ◀── CallAttempting{call_id} ─────────  │  (before touching the
+   │                                        │   carrier transport at all)
+   │                                        │
    │                                        │  build INVITE over the
    │                                        │  already-registered session
    │                                        │  (R-010) — never a fresh
@@ -80,6 +94,41 @@ On `CallFailed` instead of `CallPlaced`: Agent B answers the phone/PBX leg
 per `contracts/sip-dialout.md`'s outcome table and does not attempt
 `pair_calls` — no different from the CS path's `refused_network_failure`
 outcome, just carried over this channel instead of `ControlCmd`.
+
+## Timeouts (two phases, not one — on both sides)
+
+`try_place_on_line` (`vowifi/mod.rs`) waits for `CallAttempting`/`CallFailed`
+first, with a short timeout (`PLACE_CALL_TIMEOUT`, 3s) — this phase never
+involves the carrier, so a slow reply means "busy" or "unreachable," and
+Agent B moves on to the next line. Once `CallAttempting` arrives, Agent B
+switches to a much longer timeout (`CALL_ATTEMPT_TIMEOUT`, 90s, comfortably
+larger than Agent A's own `OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT`)
+before treating the line as failed — a real carrier call can legitimately
+take that whole window to ring and answer. Using one short timeout for both
+phases was the original (buggy) implementation: live testing (T072 pass 1)
+had the carrier fully answer a call (100/183/180/200 OK) after Agent B had
+already given up and moved to the next line, leaving the answered call
+unbridged until Agent A's own veth-wait timed out and it hung up on the
+carrier.
+
+`PLACE_CALL_TIMEOUT` also has to clear how long a `PlaceCall` can sit in
+Agent A's own channel before its dispatch loop even notices it —
+`ims::agent::IDLE_POLL_INTERVAL` (1s; found live, T072 pass 2, back when
+this was 30s and `PLACE_CALL_TIMEOUT` gave up before Agent A got around to
+acking at all).
+
+Agent A's own carrier wait (`SipTransport::recv_final_response_for_origination`)
+is itself two-phase: `OUTBOUND_INVITE_TIMEOUT` (15s) for *any* response at
+all (even `100 Trying`) — if nothing arrives, something transport-level is
+actually wrong — then `OUTBOUND_RING_TIMEOUT` (60s) for the real final
+response once the call is confirmed in flight, not reset per provisional.
+Found live (T072 pass 3): a single flat 15s timeout for the whole
+transaction gave up while the carrier was still setting up the call —
+including an 18s gap between `100 Trying` and the next provisional
+response, apparently carrier-side routing rather than the callee's own
+ring time — and the real, eventual `200 OK` landed as "received response
+outside an active transaction," after Agent A had already given up and
+told Agent B `CallFailed`.
 
 ## Which path Agent B chooses (CS vs. VoWiFi/VoLTE)
 

@@ -98,6 +98,19 @@ pub enum ControlMessage {
         call_id: String,
         destination: String,
     },
+    /// Agent A → Agent B. Sent immediately once Agent A decides to attempt
+    /// `PlaceCall` (i.e. it was not busy) — *before* touching the carrier
+    /// transport at all. Lets Agent B tell "busy, try the next line" (an
+    /// immediate `CallFailed`, no carrier round trip) apart from "committed,
+    /// now placing the call for real", which can legitimately take as long
+    /// as Agent A's own carrier-INVITE wait
+    /// (`ims::agent::OUTBOUND_INVITE_TIMEOUT`). Found live
+    /// (specs/025-outbound-calling T072): without this ack, Agent B had no
+    /// way to distinguish the two cases and used one short timeout for both
+    /// — it gave up and moved to the next line while the carrier was still
+    /// ringing, and the carrier went on to answer a call nobody was
+    /// listening for.
+    CallAttempting { call_id: String },
     /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
     /// and Agent A's veth-facing UAS listener is up and waiting — the
     /// outbound mirror of `IncomingCall`, direction reversed. No port is
@@ -128,6 +141,7 @@ impl ControlMessage {
             | ControlMessage::BridgeFailed { call_id, .. }
             | ControlMessage::HangupAck { call_id, .. }
             | ControlMessage::PlaceCall { call_id, .. }
+            | ControlMessage::CallAttempting { call_id, .. }
             | ControlMessage::CallPlaced { call_id, .. }
             | ControlMessage::CallFailed { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
@@ -263,6 +277,14 @@ mod tests {
     }
 
     #[test]
+    fn call_attempting_roundtrips() {
+        let msg = ControlMessage::CallAttempting {
+            call_id: "out1".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
     fn call_placed_roundtrips() {
         let msg = ControlMessage::CallPlaced {
             call_id: "out1".to_string(),
@@ -285,6 +307,13 @@ mod tests {
             ControlMessage::PlaceCall {
                 call_id: "x".to_string(),
                 destination: "1".to_string()
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallAttempting {
+                call_id: "x".to_string(),
             }
             .call_id(),
             Some("x")

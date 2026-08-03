@@ -631,10 +631,12 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
             // and audio-level monitor below, both of which are specific to
             // the single-call, real-sound-device GSM bridge.
             let mut peer_info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
-            if pjsua_sys::pjsua_call_get_info(peer_id, &mut peer_info) == PJ_SUCCESS
+            let got_peer_info = pjsua_sys::pjsua_call_get_info(peer_id, &mut peer_info) == PJ_SUCCESS;
+            let peer_slot = peer_info.conf_slot as i32;
+            if got_peer_info
                 && peer_info.media_status == pjsua_sys::pjsua_call_media_status_PJSUA_CALL_MEDIA_ACTIVE
+                && peer_slot >= 0
             {
-                let peer_slot = peer_info.conf_slot as i32;
                 pjsua_sys::pjsua_conf_connect(call_slot, peer_slot);
                 pjsua_sys::pjsua_conf_connect(peer_slot, call_slot);
                 tracing::info!(
@@ -645,13 +647,21 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
                     "paired calls' media active, conference-connected to each other"
                 );
             } else {
-                // Peer isn't active yet — its own media-active callback will
-                // find this call already active (via the same BRIDGE_PAIRS
-                // lookup) and complete the connection symmetrically then.
+                // Peer isn't active yet, or is active but PJSIP hasn't
+                // finished assigning it a conference slot (found live,
+                // specs/025-outbound-calling T072 pass 5: `media_status`
+                // can read ACTIVE with `conf_slot` still -1 in a narrow
+                // window, and calling `pjsua_conf_connect` with a negative
+                // slot hits a fatal assertion in PJSIP itself, killing the
+                // whole process). Either way, the peer's own media-active
+                // callback will find this call already active (via the
+                // same `BRIDGE_PAIRS` lookup) and complete the connection
+                // symmetrically once its slot is genuinely valid.
                 tracing::debug!(
                     call_id,
                     peer_id,
-                    "call media active, awaiting paired peer's media to become active"
+                    peer_slot,
+                    "call media active, awaiting paired peer's media (and valid conference slot) to become active"
                 );
             }
             return;
