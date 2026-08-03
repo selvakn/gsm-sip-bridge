@@ -897,15 +897,6 @@ fn cancel_pending_invite(
     let _ = session.transport_mut().and_then(|t| t.send(&bye));
 }
 
-/// Originates a call to `destination` over the already-registered carrier
-/// session, waits for Agent B's veth call, and bridges the two legs — the
-/// outbound mirror of `handle_invite`'s inbound answer path
-/// (specs/025-outbound-calling, research.md R-009/R-010/R-011). The caller
-/// (`dispatch_loop`) has already sent `CallAttempting` on `control` before
-/// calling this; from here on it sends `CallPlaced`/`CallFailed` itself
-/// before returning, so the caller only needs to fold the result into
-/// `active_call`.
-///
 /// Hangs up a carrier leg that was answered (200 OK + ACK already
 /// exchanged) but can't be usably bridged for some reason discovered
 /// afterward — sends a BYE to the carrier (reusing `dialog`, built right
@@ -946,6 +937,15 @@ fn hangup_answered_carrier_leg(
     );
 }
 
+/// Originates a call to `destination` over the already-registered carrier
+/// session, waits for Agent B's veth call, and bridges the two legs — the
+/// outbound mirror of `handle_invite`'s inbound answer path
+/// (specs/025-outbound-calling, research.md R-009/R-010/R-011). The caller
+/// (`dispatch_loop`) has already sent `CallAttempting` on `control` before
+/// calling this; from here on it sends `CallPlaced`/`CallFailed` itself
+/// before returning, so the caller only needs to fold the result into
+/// `active_call`.
+///
 /// Never re-registers (`super::register_session`) — a second registration
 /// for the same IMSI would tear down the live one (research.md R-010's hard
 /// constraint). Everything here reuses `session`, exactly like every other

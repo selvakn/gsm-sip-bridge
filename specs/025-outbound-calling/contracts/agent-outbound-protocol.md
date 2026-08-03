@@ -157,16 +157,21 @@ told Agent B `CallFailed`.
 
 ## Which path Agent B chooses (CS vs. VoWiFi/VoLTE)
 
-Agent B's `run_outbound_listener` (shipped, `vowifi/mod.rs`) already picks
-among idle lines when dispatching `ControlCmd::Dial { slot: None, .. }` to
-the daemon. This contract does not change that selection logic
-(`sip::outbound::select_idle_line`, no path preference — FR-007); it adds a
-second dispatch target for when the selected idle line's path is
-VoWiFi/VoLTE rather than circuit-switched: `PlaceCall` over this protocol to
-*this line's own* Agent A, instead of `ControlCmd::Dial` to the daemon.
-Concretely: `sip::outbound::CandidateLine.path` (already modeled,
-data-model.md) decides which dispatch mechanism a given idle line uses: `CS`
-→ `ControlCmd::Dial`; `VoWifi`/`Volte` → `PlaceCall` to that line's Agent A.
+**2026-08-03 revision**: this section originally described a single
+selector shared across CS and VoWiFi/VoLTE (`sip::outbound::CandidateLine.path`
+choosing between `ControlCmd::Dial` and `PlaceCall`). That shared selector
+was never wired in and has been deleted (see `data-model.md`'s "Line
+selection" section) — `run_outbound_listener` (`vowifi/mod.rs`) only ever
+dispatches `PlaceCall` to this process's own configured VoWiFi/VoLTE
+`lines`. It does **not** fall back to circuit-switched: an earlier review
+pass found that path answering the caller `200 OK` over dead air (no
+cross-process audio bridge exists between this process's PJSUA `Endpoint`
+and the daemon's own CS/modem audio path), so it now refuses outright
+(`503`, `RefusedNoIdleLine`) when every VoWiFi/VoLTE line is busy or
+unregistered, rather than reaching for `ControlCmd::Dial` (itself since
+deleted — see `contracts/control-cmd-dial.md`'s superseded banner). The
+genuinely same-process CS case (`CardPool::handle_outbound_request`) never
+went through this protocol or the control socket at all.
 
 ## Compatibility
 

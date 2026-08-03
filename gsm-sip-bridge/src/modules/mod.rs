@@ -1225,10 +1225,9 @@ impl CardPool {
             return;
         };
 
-        // Claim it before dispatching — mirrors `ControlCmd::Dial`'s own
-        // guard, and prevents a concurrent inbound GSM call or a second
-        // outbound request from racing this same slot while the
-        // `ModuleCmd` round-trip is in flight (FR-008/FR-009a).
+        // Claim it before dispatching — prevents a concurrent inbound GSM
+        // call or a second outbound request from racing this same slot
+        // while the `ModuleCmd` round-trip is in flight (FR-008/FR-009a).
         if let Some(state) = slots.get_mut(&slot) {
             state.has_active_call = true;
         }
@@ -1392,114 +1391,6 @@ impl CardPool {
                     });
                 } else {
                     let _ = reply.send(ControlResp::err("module command channel not available"));
-                }
-            }
-
-            ControlCmd::Dial { slot, destination } => {
-                let resolved_slot = match slot {
-                    Some(s) => Some(s),
-                    // "Whichever line is idle" — first `Ready` slot with
-                    // no active call, applied here (rather than requiring
-                    // the caller to pick one) so a cross-process caller
-                    // (e.g. `vowifi::mod`) needs no separate `ListSlots`
-                    // round trip, which would race another caller's
-                    // selection.
-                    None => slots
-                        .iter()
-                        .find(|(_, s)| s.lifecycle == LifecycleState::Ready && !s.has_active_call)
-                        .map(|(slot, _)| *slot),
-                };
-
-                let Some(slot) = resolved_slot else {
-                    let _ = reply.send(ControlResp::err("no idle line available"));
-                    return;
-                };
-
-                let state = match slots.get(&slot) {
-                    Some(s) => s,
-                    None => {
-                        let max = slots.keys().max().copied().unwrap_or(0);
-                        let _ = reply.send(ControlResp::err(format!(
-                            "slot {slot} not found; valid slots: 0..={max}"
-                        )));
-                        return;
-                    }
-                };
-
-                if state.lifecycle != LifecycleState::Ready {
-                    let _ = reply.send(ControlResp::err(format!(
-                        "slot {slot} is not in Ready state (current: {})",
-                        state.lifecycle
-                    )));
-                    return;
-                }
-                if state.has_active_call {
-                    let _ = reply.send(ControlResp::err(format!("slot {slot} is busy")));
-                    return;
-                }
-
-                let Some(cmd_tx) = state.cmd_tx.clone() else {
-                    let _ = reply.send(ControlResp::err("module command channel not available"));
-                    return;
-                };
-
-                // Claimed before dispatch, cleared on any failure path below;
-                // left `true` on success for the existing NO CARRIER/hangup
-                // machinery to clear when the call actually ends — the same
-                // claim discipline `CardPool::handle_outbound_request` uses
-                // for the same-process case (FR-008/FR-009a).
-                if let Some(s) = slots.get_mut(&slot) {
-                    s.has_active_call = true;
-                }
-
-                let (resp_tx, resp_rx) = oneshot::channel();
-                if cmd_tx.send(ModuleCmd::Dial(destination, resp_tx)).is_err() {
-                    if let Some(s) = slots.get_mut(&slot) {
-                        s.has_active_call = false;
-                    }
-                    let _ = reply.send(ControlResp::err("module command channel closed"));
-                    return;
-                }
-                // Awaited inline (unlike SetMode's detached task) so
-                // `has_active_call` can be reliably cleared on every failure
-                // path — `slots` cannot be reached from a detached task,
-                // and a stuck `true` would wedge this line for outbound
-                // calling until the next unrelated event happened to clear
-                // it. Blocks this select! branch for up to 5s on a dial
-                // attempt; acceptable for a human-paced action, and shorter
-                // than SetMode's own 30s round trip. KNOWN LIMITATION
-                // (specs/025-outbound-calling review): this blocks the
-                // *whole* `CardPool::run` select! loop for that window, not
-                // just this one line — hotplug rescan, retry scheduling,
-                // and every other slot's `BridgeEvent` handling all stall
-                // too, since they're all branches of the same loop. 5s is
-                // short enough that this is judged an acceptable trade-off
-                // rather than fixed outright (unlike the VoWiFi/VoLTE
-                // side's much longer, ~80s equivalent — see
-                // `ims::agent::dispatch_loop`'s call to
-                // `originate_and_bridge`).
-                match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
-                    Ok(Ok(Ok(()))) => {
-                        let _ = reply.send(ControlResp::ok());
-                    }
-                    Ok(Ok(Err(e))) => {
-                        if let Some(s) = slots.get_mut(&slot) {
-                            s.has_active_call = false;
-                        }
-                        let _ = reply.send(ControlResp::err(e));
-                    }
-                    Ok(Err(_)) => {
-                        if let Some(s) = slots.get_mut(&slot) {
-                            s.has_active_call = false;
-                        }
-                        let _ = reply.send(ControlResp::err("module did not respond"));
-                    }
-                    Err(_) => {
-                        if let Some(s) = slots.get_mut(&slot) {
-                            s.has_active_call = false;
-                        }
-                        let _ = reply.send(ControlResp::err("AT command timeout while dialing"));
-                    }
                 }
             }
 
@@ -1854,6 +1745,7 @@ fn run_module_loop(
                         metrics::ACTIVE_CALLS
                             .with_label_values(&[&module.id, "cs"])
                             .set(0.0);
+                        record_call_end(&module.id, &event_tx, &store_tx, &mut call_ctx, "failed");
                     }
                 }
             }
@@ -2463,6 +2355,42 @@ mod tests {
         };
         assert_eq!(record.caller_id, "+15551234567");
         assert_eq!(record.status, "answered");
+        assert_eq!(record.module_id, "card0");
+    }
+
+    /// specs/025-outbound-calling review: `ModuleCmd::Hangup` (sent when the
+    /// SIP side rejects a call right after `ATD` was accepted) used to skip
+    /// `record_call_end` entirely — the attempt vanished from history and
+    /// `call_ctx` stayed `Some` with a stale context until the next
+    /// `handle_ring` silently overwrote it. `ModuleCmd::Hangup`'s handler
+    /// now calls `record_call_end(..., "failed")`, the same helper this
+    /// records exercises directly.
+    #[test]
+    fn a_hung_up_outbound_attempt_produces_a_failed_call_history_record() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (store_tx, store_rx) = crossbeam_channel::unbounded::<StoreCommand>();
+        let mut call_ctx: Option<CallContext> = None;
+
+        record_call_start_outbound("card0", "+15551234567", &mut call_ctx);
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "failed");
+
+        assert!(
+            call_ctx.is_none(),
+            "the stale context must not survive to the next call"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a failed (not missed) outbound attempt must not alert"
+        );
+
+        let StoreCommand::InsertCall(record) = store_rx
+            .try_recv()
+            .expect("a call record must have been sent to the store")
+        else {
+            panic!("expected InsertCall");
+        };
+        assert_eq!(record.caller_id, "+15551234567");
+        assert_eq!(record.status, "failed");
         assert_eq!(record.module_id, "card0");
     }
 

@@ -93,7 +93,7 @@ pub enum ControlMessage {
     /// phone dialling out, spec 025 US1/US3) and picked this line as an
     /// idle VoWiFi/VoLTE candidate. `destination` is verbatim from the
     /// originating request — no transformation (FR-010), same discipline as
-    /// the circuit-switched path (`ControlCmd::Dial`).
+    /// the circuit-switched path (`modules::ModuleCmd::Dial`).
     PlaceCall {
         call_id: String,
         destination: String,

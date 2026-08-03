@@ -54,11 +54,18 @@ described here were never wired in either and have been deleted
 no longer exist). The two real paths use different, already-existing
 mechanisms instead, both same-process:
 
-- **Circuit-switched**: `ControlCmd::Dial { slot, destination }` →
-  `ModuleCmd::Dial` → the modem's own command loop, replying via a
-  `oneshot::Sender<Result<(), String>>` — the exact same pattern already
-  used for `SetMode`/`Reboot`. No cross-process hop exists between the SIP
-  side and `CardPool`; both live in the same daemon binary.
+- **Circuit-switched**: `CardPool::handle_outbound_request` sends
+  `ModuleCmd::Dial` straight into the selected modem's own command loop,
+  replying via a `oneshot::Sender<Result<(), String>>` — the same pattern
+  `SetMode`/`Reboot` use, but dispatched directly rather than over the
+  control socket, since the SIP side and `CardPool` always live in the same
+  daemon binary. **2026-08-03**: `ControlCmd::Dial` (the wire-visible
+  variant this section used to describe, meant for a *different* process
+  reaching a CS line over the control socket) has been deleted — its only
+  real caller was `vowifi::mod`'s cross-process CS fallback, itself removed
+  in an earlier review pass for lacking any cross-process audio bridge (see
+  `contracts/control-cmd-dial.md`'s superseded banner). `ModuleCmd::Dial`
+  itself is unaffected and still does the actual dialing.
 - **VoWiFi/VoLTE**: `vowifi::control::ControlMessage::PlaceCall` (JSON over
   the existing Agent A ↔ Agent B TCP control channel — see
   `contracts/agent-outbound-protocol.md`), answered by `CallPlaced` /
@@ -94,7 +101,7 @@ validate destination (FR-014) ──fail──▶ refused_invalid_destination
 select a line (FR-004/007, per-path logic above) ──none idle──▶ refused_no_idle_line
         │ found, claimed locally (provisional)
         ▼
-dispatch (ControlCmd::Dial, or ControlMessage::PlaceCall — per-path, see above)
+dispatch (ModuleCmd::Dial, or ControlMessage::PlaceCall — per-path, see above)
         │
         ├─ line lost the race / not actually idle ──▶ refused_no_idle_line (FR-008)
         ├─ failed before carrier placement (Unavailable) ─▶ refused_network_failure, retry next line

@@ -1,5 +1,21 @@
 # Contract: `ControlCmd::Dial` — same-process outbound dialing (CS)
 
+> **SUPERSEDED, 2026-08-03**: `ControlCmd::Dial` has been deleted
+> (`control/protocol.rs`, and its `CardPool::handle_control_cmd` arm in
+> `modules/mod.rs`). Its only real caller was `vowifi::mod`'s
+> cross-process CS fallback — dispatching a CS dial from a different
+> process than the daemon that owns the modem, for the case where
+> `vowifi::mod` hosts SIP server mode itself. That fallback was removed in
+> an earlier review pass (no cross-process audio bridge exists for CS, so
+> it answered the caller `200 OK` over dead air) — see `vowifi/mod.rs`'s
+> `run_outbound_listener` doc comment and the "No circuit-switched
+> fallback here" comment at its dispatch loop's end. That left this
+> variant with zero callers: the genuinely same-process case (`SipBridge`
+> hosting the SIP side in the daemon's own process, `CardPool::handle_outbound_request`)
+> never went through the control socket at all — it dispatches
+> `ModuleCmd::Dial` directly, despite this contract's title. Kept below
+> for historical record; do not implement against it.
+
 **Feature**: 025-outbound-calling
 **Supersedes, for the same-process case, the general line-command channel**
 described in `line-command.md` — see research.md R-003 (revised 2026-08-03).

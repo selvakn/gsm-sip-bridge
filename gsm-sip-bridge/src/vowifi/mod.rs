@@ -534,23 +534,27 @@ const CALL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
 /// SIP server mode, or the classic PBX-trunk registration otherwise)
 /// accepted, and places it on whichever line is idle.
 ///
-/// Tries this process's own configured VoWiFi/VoLTE `lines` first, each
-/// over `contracts/agent-outbound-protocol.md`'s `PlaceCall`/`CallAttempting`/
+/// Tries this process's own configured VoWiFi/VoLTE `lines`, each over
+/// `contracts/agent-outbound-protocol.md`'s `PlaceCall`/`CallAttempting`/
 /// `CallPlaced`/`CallFailed` sequence — a "busy" reply costs no carrier
 /// round trip (Agent A's `dispatch_loop` answers it before ever touching
 /// the carrier transport), so trying several lines in sequence is cheap;
 /// once a line acks with `CallAttempting` it has committed to a real
 /// carrier attempt, so `try_place_on_line` stops treating replies as
 /// quick and switches to a much longer wait (`CALL_ATTEMPT_TIMEOUT`).
-/// Falls back to
-/// the circuit-switched daemon via `ControlCmd::Dial` (cross-process,
-/// `slot: None`, exactly as `card restart`/`set-mode` already reach the
-/// daemon from the CLI — no separate channel needed, research.md R-003
-/// revised). **Simplification, not strict FR-007 no-preference**: lines are
-/// tried in the order `lines` lists them, then CS — a real (if arbitrary)
-/// ordering, not the "no preference across every process simultaneously"
-/// FR-007 describes; true unordered arbitration across processes would need
-/// a bigger mechanism than this pass builds.
+///
+/// **No circuit-switched fallback** (specs/025-outbound-calling review):
+/// this process's `Endpoint`/ALSA audio path is entirely separate from the
+/// daemon's own CS/modem audio path, and no cross-process media bridge
+/// connects them — dispatching a CS dial from here used to answer the
+/// caller `200 OK` while producing dead air, metrics claiming `placed`. A
+/// call refused here because every VoWiFi/VoLTE line is busy/unregistered
+/// is refused outright (`503`, `RefusedNoIdleLine`), not retried elsewhere.
+/// **Simplification, not strict FR-007 no-preference**: lines are tried in
+/// the order `lines` lists them — a real (if arbitrary) ordering, not the
+/// "no preference across every process simultaneously" FR-007 describes;
+/// true unordered arbitration across processes would need a bigger
+/// mechanism than this pass builds.
 ///
 /// Handles at most one VoWiFi/VoLTE-originated call at a time: once one is
 /// placed, this loop stops polling for new ones and instead services the
@@ -632,6 +636,11 @@ fn run_outbound_listener(
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "outbound: failed to bridge the veth leg after the carrier leg was placed");
+                            // Every other terminal path in this loop
+                            // answers the phone/PBX leg with a status
+                            // code; this one must too, or it's left
+                            // ringing until its own timeout.
+                            let _ = call.answer(503);
                             report_outbound(
                                 reporter,
                                 OutboundAttemptOutcome::RefusedNetworkFailure,
@@ -850,8 +859,18 @@ fn outbound_outcome_for_committed_failure(reason: &str) -> (u32, OutboundAttempt
     }
     match carrier_status_from_reason(reason) {
         Some(480) => (480, OutboundAttemptOutcome::Unanswered),
-        Some(code) => (code, OutboundAttemptOutcome::RefusedNetworkFailure),
-        None => (503, OutboundAttemptOutcome::RefusedNetworkFailure),
+        // Only a genuine failure code (4xx/5xx/6xx) is safe to hand
+        // straight to `Call::answer`. This is a *failure* path — a carrier
+        // `202`/`183` reaching here (an unexpected non-final or 2xx status
+        // landing in `CallFailed.reason`) is not something a 2xx answer
+        // should ever announce, and a `3xx` needs a `Contact` header this
+        // call site has no way to supply, so `Call::answer(302)` would send
+        // a broken redirect. Fall back to a plain `503` rather than pass
+        // either through (specs/025-outbound-calling review).
+        Some(code) if (400..700).contains(&code) => {
+            (code, OutboundAttemptOutcome::RefusedNetworkFailure)
+        }
+        Some(_) | None => (503, OutboundAttemptOutcome::RefusedNetworkFailure),
     }
 }
 
@@ -870,7 +889,7 @@ fn bridge_outbound_leg(
     line: &RuntimeLine,
 ) -> BridgeResult<Call> {
     let veth_uri = format!("sip:agent-a@{}:{}", line.veth_local_addr, line.sip_leg_port);
-    let veth_call = Call::make(account, &veth_uri, None, &[])
+    let mut veth_call = Call::make(account, &veth_uri, None, &[])
         .map_err(|e| BridgeError::Ims(format!("veth-side call failed: {e}")))?;
 
     // Pair *before* answering: `answer(200)` can complete the INVITE
@@ -884,8 +903,15 @@ fn bridge_outbound_leg(
     // the peer-call branch — audio silently went nowhere, no error on
     // either side.
     endpoint.pair_calls(call.call_id(), veth_call.call_id());
-    call.answer(200)
-        .map_err(|e| BridgeError::Ims(format!("{e}")))?;
+    if let Err(e) = call.answer(200) {
+        // The pairing just made above and the veth call `Call::make` just
+        // placed would otherwise leak: `Call` has no `Drop`, and a stale
+        // `BRIDGE_PAIRS` entry could pair a *future* unrelated call to this
+        // dead `veth_call.call_id()`.
+        endpoint.unpair_call(call.call_id());
+        let _ = veth_call.hangup();
+        return Err(BridgeError::Ims(format!("{e}")));
+    }
     tracing::info!(
         phone_call_id = call.call_id(),
         veth_call_id = veth_call.call_id(),
@@ -1904,6 +1930,28 @@ mod tests {
             let (code, outcome) = outbound_outcome_for_committed_failure(&reason);
             assert_eq!(code, want_code, "{reason:?}");
             assert_eq!(outcome, want_outcome, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn committed_failure_outcome_clamps_non_failure_codes_to_503() {
+        for reason in [
+            // A redirect: answering with it verbatim would need a Contact
+            // header this call site can't supply.
+            "302 Moved Temporarily",
+            // A 2xx landing in a *failure* reason string is not something
+            // `Call::answer` should ever pass through as-is.
+            "202 Accepted",
+            // A 1xx provisional has no business here either.
+            "183 Session Progress",
+        ] {
+            let (code, outcome) = outbound_outcome_for_committed_failure(reason);
+            assert_eq!(code, 503, "{reason:?}");
+            assert_eq!(
+                outcome,
+                OutboundAttemptOutcome::RefusedNetworkFailure,
+                "{reason:?}"
+            );
         }
     }
 
