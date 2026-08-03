@@ -2,15 +2,21 @@
 
 **Feature**: 025-outbound-calling
 
+**Note (2026-08-03)**: "that account's UAS handler" below assumes the
+pjsua-safe UAS additions in research.md R-007 (`Call::from_id`,
+`Call::answer`, `on_incoming_call`) — pjsua-safe has no such handler today.
+That work is a prerequisite for this contract to be implementable at all.
+
 ## PBX path
 
 No new listener (research.md R-002). The PBX sends an `INVITE` to the
 contact the bridge already registered via its existing trunk `Account`
 (`sip::SipBridge`). With `[outbound].enabled = true`, that account's UAS
-handler accepts it (rather than the pre-feature behavior, which never
-receives one because nothing on the PBX side has reason to send it); with
-the flag `false` the account behaves exactly as it does today — this feature
-adds a branch, it does not change what the trunk registration already means.
+handler (R-007) accepts it (rather than the pre-feature behavior, which
+never receives one because nothing on the PBX side has reason to send it);
+with the flag `false` the account behaves exactly as it does today — this
+feature adds a branch, it does not change what the trunk registration
+already means.
 
 Request-URI user part → `OutboundCallRequest.destination` verbatim (FR-010).
 

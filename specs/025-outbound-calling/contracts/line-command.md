@@ -1,21 +1,31 @@
-# Contract: the daemon↔agent line-command protocol
+# Contract: the cross-process line-command protocol
 
 **Feature**: 025-outbound-calling
+**Rescoped 2026-08-03** (research.md R-003, revised): this channel is
+needed **only** for the genuinely cross-process case — reaching a
+VoWiFi/VoLTE line's agent process from whichever process owns the SIP side.
+Circuit-switched modems never need it: they always live in the daemon's
+`CardPool`, and the daemon-internal case is instead `ControlCmd::Dial`
+(`control-cmd-dial.md`), which reuses the existing `ControlCmd`/`ModuleCmd`
+mechanism with no new socket. Deferred to plan.md Step 4, after the CS-only
+MVP (Step 3) is verified.
 
 A new, synchronous request/response channel — distinct from the existing
 `control::protocol` socket, which stays exactly as it is (agent→daemon
-`Observe` reports, CLI→daemon `ControlCmd`s). See research.md R-003 for why
-this is a separate channel rather than an extension of the existing one.
+`Observe` reports, CLI→daemon `ControlCmd`s, now including `Dial` for the
+same-process case). See research.md R-003 for why the cross-process case
+still needs its own channel rather than an extension of the existing one.
 
 ## Who listens, who connects
 
-- **Listener**: every process that can host an idle line runs
-  `control::line_server` — the daemon itself (circuit-switched modems) and
-  each VoWiFi/VoLTE line agent process (its own line).
+- **Listener**: each VoWiFi/VoLTE line agent process runs
+  `control::line_server` for its own line. (The daemon does **not** need to
+  run this listener for CS modems — see the rescoping note above.)
 - **Client**: whichever process currently owns the SIP side
   (`sip::SipBridge::owns_sip_side`, the same arbitration spec 024 reuses for
   the registrar) — the one that received the INVITE and is running
-  `sip::outbound`'s line selection.
+  `sip::outbound`'s line selection, when it needs to reach a line hosted in
+  a *different* process.
 
 Both roles can be the same process (a single-line, all-in-one-process
 deployment): the client MAY take a local fast path and call the line's dial

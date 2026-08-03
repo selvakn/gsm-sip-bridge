@@ -25,6 +25,18 @@ static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
+/// caller has claimed yet (spec 025, research.md R-007). `Endpoint` exposes
+/// this as a polling API (`poll_incoming_call`), the same idiom `Call`
+/// already uses for state (`poll_state`) rather than a callback trait — this
+/// crate has none, and adding one just for this single event would be the
+/// larger change. Pushed in FIFO order in `on_incoming_call_cb`; popped by
+/// whichever component owns UAS handling for that account (the daemon's
+/// trunk account, or `Account::local` in SIP server mode).
+#[cfg(feature = "pjsip-linked")]
+static INCOMING_CALLS: LazyLock<Mutex<std::collections::VecDeque<(i32, i32)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+
 // Audio level monitor — populated by a per-call sampling thread (slot 0 = sound device).
 // tx_level from slot 0 = ALSA capture → bridge = GSM→SIP
 // rx_level from slot 0 = bridge → ALSA playback = SIP→GSM
@@ -144,6 +156,7 @@ impl Endpoint {
                 pjsua_sys::pjsua_config_default(&mut cfg);
                 cfg.cb.on_call_media_state = Some(on_call_media_state_cb);
                 cfg.cb.on_call_state = Some(on_call_state_cb);
+                cfg.cb.on_incoming_call = Some(on_incoming_call_cb);
 
                 let mut log_cfg: pjsua_sys::pjsua_logging_config = std::mem::zeroed();
                 pjsua_sys::pjsua_logging_config_default(&mut log_cfg);
@@ -234,6 +247,28 @@ impl Endpoint {
 
     pub fn is_started(&self) -> bool {
         self.started
+    }
+
+    /// Pops the oldest not-yet-claimed incoming call, if any, as
+    /// `(account_id, call_id)`. `Call::from_id` turns the `call_id` into a
+    /// `Call` the caller can `answer`/`hangup`/`poll_state` (spec 025,
+    /// research.md R-007).
+    ///
+    /// Stub builds never produce an incoming call — there is no real
+    /// `on_incoming_call` to fire — so this always returns `None` there;
+    /// unit tests exercise the UAS pipeline via `Call::from_id` directly.
+    pub fn poll_incoming_call(&self) -> Option<(i32, i32)> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            INCOMING_CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+        }
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            None
+        }
     }
 
     pub fn ensure_thread_registered(&self) {
@@ -665,6 +700,28 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
             }
         });
     }
+}
+
+/// PJSIP invokes this for every INVITE that arrives on an account this
+/// endpoint owns — the PBX-facing trunk account and (SIP server mode)
+/// `Account::local`, once either accepts `[outbound].enabled`. Records the
+/// call for a Rust-side poller rather than answering here: deciding whether
+/// to accept, and with what SDP/media, is call-flow logic (`sip::outbound`),
+/// not something this crate should encode. PJSIP's invite session sends its
+/// own `100 Trying` automatically on receipt, so no response is lost by not
+/// answering synchronously inside this callback.
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid acc_id/call_id after init; rdata is library-owned and not dereferenced here
+    acc_id: pjsua_sys::pjsua_acc_id,
+    call_id: pjsua_sys::pjsua_call_id,
+    _rdata: *mut pjsua_sys::pjsip_rx_data,
+) {
+    tracing::info!(acc_id, call_id, "incoming SIP call");
+    INCOMING_CALLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((acc_id, call_id));
 }
 
 #[cfg(feature = "pjsip-linked")]

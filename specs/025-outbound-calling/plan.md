@@ -1,7 +1,13 @@
 # Implementation Plan: Outbound Calling
 
-**Branch**: `025-outbound-calling` | **Date**: 2026-08-02 | **Spec**: [spec.md](./spec.md)
+**Branch**: `025-outbound-calling` | **Date**: 2026-08-03 | **Spec**: [spec.md](./spec.md)
 **Input**: Feature specification from `/specs/025-outbound-calling/spec.md`
+
+**Revision note (2026-08-03)**: this plan was first written assuming two
+architectural blockers (no pjsua UAS support, no command channel into a CS
+modem thread) that turned out, on closer reading of the actual code, to be
+smaller than assumed — one of them isn't a gap at all. See research.md
+R-003/R-007/R-008 for the corrected findings this revision is based on.
 
 ## Summary
 
@@ -13,56 +19,64 @@ mode) must cause the bridge to dial the given destination number out over
 whichever SIM is idle, on any of the three carrier paths, and bridge the
 resulting audio back to the SIP-side caller unmodified.
 
-**Technical approach**: three genuinely new mechanisms, reusing everything
-else. (1) A **dial-out leg** per carrier path — a `ATD<number>;` command for
-circuit-switched (new; `answer_call`'s `ATA` is the closest existing analog),
-and an originating IMS INVITE for VoWiFi/VoLTE (new; today's `ims::agent`
-only ever answers). (2) An **inbound leg acceptance** on the SIP side — the
-PBX's INVITE lands on the trunk account pjsua already registers (no new
-listener), while a phone's INVITE lands on the lightweight hand-rolled
-registrar, which cannot itself carry media and must redirect it to the
-pjsua-hosted local account (`Account::local`, spec 024) the same way an
-inbound call already rings that phone, just reversed. (3) A **cross-process
-line-selection command channel** — the process that owns the SIP side today
-only ever *receives* state from other line agents (`AgentReport` over the
-control socket, one-directional, agent→daemon, on a 10 s heartbet cadence).
-Placing a call needs the opposite direction, synchronously, well inside SIP
-retransmit timers — a new, small per-agent command listener, documented and
-justified under Complexity Tracking below.
+**Technical approach, corrected**: three mechanisms, each smaller than first
+assumed. (1) **Dial-out leg**: `AtCommander::dial` (`ATD<number>;`, done) for
+circuit-switched; for VoWiFi/VoLTE, `ims::call` already contains working UAC
+INVITE-origination code (`build_invite`/`build_ack`/`build_bye`) — currently
+wired only to the `ims-call`/`volte-call` CLI diagnostic tool, not the live
+`ims::agent` loop, so this is a *reuse* task, not new SIP/media code
+(research.md R-008). (2) **Inbound-leg acceptance**: pjsua-safe has no
+UAS/incoming-call support at all today (only `on_call_state` is registered);
+adding `Call::from_id`, `Call::answer`, and an `on_incoming_call` callback is
+a small, well-scoped addition (~3 new `unsafe` blocks, no `pjsua-sys`
+regeneration needed — research.md R-007) that unlocks both the PBX-trunk
+account and, later, the SIP-server-mode phone path via `Account::local`.
+(3) **Line selection across processes**: turns out the daemon already has
+everything needed for the CS-only case — `ControlCmd`/`ModuleCmd` plus the
+`SetMode` round-trip pattern (`modules::mod`) is the exact shape a
+`ControlCmd::Dial` needs, since CS modems always live in the main daemon
+process regardless of which process ends up owning the SIP side. A **new**
+IPC channel is still needed, but only for the genuinely cross-process case:
+reaching a VoWiFi/VoLTE line's agent process from wherever the SIP side is
+hosted (research.md R-003, revised).
 
 ## Technical Context
 
 **Language/Version**: Rust 1.x, edition 2021 (see `rust-toolchain.toml`)
 **Primary Dependencies**: existing only — `pjsua-safe`/`pjsua-sys` (call
-placement, SDP/RTP), `tokio` (control-plane IPC), `serde`/`toml`
+placement, SDP/RTP, now also call acceptance), `tokio` (control-plane IPC,
+already has the `ControlCmd`/`ModuleCmd` pattern this reuses), `serde`/`toml`
 (configuration), the hand-rolled SIP primitives in `src/ims/sip_client.rs`
-(redirect responses). No new crate dependencies anticipated.
+and `src/ims/call.rs` (UAC INVITE origination, redirect responses). No new
+crate dependencies.
 **Storage**: in-memory only — an outbound request is a single in-flight call
 attempt, not a persisted record.
-**Testing**: `cargo nextest` via `make test`; integration tests in
-`gsm-sip-bridge/tests/`, unit tests inline, real loopback sockets for the new
-IPC surface (constitution Principle I — no mocks).
-**Target Platform**: Linux (containerised; `docker/Dockerfile`), the same
-single-board deployments this bridge already targets.
+**Testing**: `cargo nextest` via `make test` (stub `pjsua-safe` build, no
+`pjsip-linked`); real hardware verification against the attached EC200s
+(`/dev/ttyUSB0`–`ttyUSB6`) and the `pjsip-linked` Docker image for anything
+that needs the real PJSIP stack — the same two-tier verification spec 024
+used, now with actual hardware available rather than only the CI stub build.
+**Target Platform**: Linux (containerised; `docker/Dockerfile`).
 **Project Type**: Rust workspace — a daemon plus per-line agent processes.
-**Performance Goals**: call setup must complete well inside a phone's/PBX's
-INVITE retransmit timer (RFC 3261 T1 = 500 ms doubling); the existing
-10 s `agent_report_interval_seconds` heartbeat is **too slow** to carry a
-call-placement command, which is why (3) above is a distinct, synchronous
-channel rather than piggybacking on it.
+**Performance Goals**: call setup well inside a phone's/PBX's INVITE
+retransmit timer (RFC 3261 T1 = 500ms doubling). The existing
+`agent_report_interval_seconds` (default 10s) heartbeat remains too slow for
+call placement — still the reason a dedicated channel is needed for the
+cross-process case, even though the same-process (CS) case turned out not to
+need one at all.
 **Constraints**:
-- `tools/count-unsafe.sh` (via `make lint`) fails the build on any `unsafe`
-  in `gsm-sip-bridge/src`. The new dial-out and IPC code must be safe Rust,
-  as the existing registrar is.
+- `tools/count-unsafe.sh` (via `make lint`): `gsm-sip-bridge/src` must stay
+  at 0 `unsafe`; `pjsua-safe/src` is currently 29 blocks / 1.68% of a 5%
+  ceiling — the ~3 new blocks for UAS support leave ample headroom.
 - The `pjsip-linked` feature is not compiled by `make test`/`make lint`/CI —
-  only `docker/Dockerfile` builds it. The hand-rolled registrar's redirect
-  response must therefore be provable without it, exactly as spec 024's
-  REGISTER/OPTIONS handling is today.
-- One call per SIM at a time (existing design, reaffirmed by this spec's
-  Assumptions) — outbound and inbound calls contend for the same busy/idle
-  state per line.
-**Scale/Scope**: same SIM/line counts as today (1–8 CS modems, 1–8 VoWiFi/
-VoLTE lines); one outbound attempt at a time per line; no queueing.
+  only `docker/Dockerfile` builds it, and only there can the new
+  `on_incoming_call` path be exercised for real. A running,
+  already-`pjsip-linked`-built container is available on this host for that
+  purpose.
+- One call per SIM at a time (existing design) — outbound and inbound calls
+  contend for the same busy/idle state per line.
+**Scale/Scope**: same SIM/line counts as today; one outbound attempt at a
+time per line; no queueing.
 
 ## Constitution Check
 
@@ -70,17 +84,17 @@ VoLTE lines); one outbound attempt at a time per line; no queueing.
 
 | Principle | Assessment | Verdict |
 |---|---|---|
-| **I. Integration-First Testing** (NON-NEGOTIABLE) | The new command channel is exercised over a real Unix/TCP loopback socket between two real processes, matching the existing control-socket tests. The registrar's redirect is exercised the same way spec 024 tested REGISTER — real `UdpSocket` client against the real handler. The `ATD` path is exercised against the existing `AtCommander` test harness (`make_commander`), which already fakes only the serial line, not the parsing/dispatch logic. | PASS |
-| **II. Green-on-Commit** (NON-NEGOTIABLE) | Commit sequence (see tasks.md) adds each new capability behind the existing `owns_sip_side`/feature-flag gating before wiring it live, mirroring spec 024's ordering. | PASS |
-| **III. Frequent Atomic Commits** | Each of the three new mechanisms (dial-out leg, inbound-leg acceptance, cross-process command channel) is its own commit sequence; config/validation is separated from behavior, as in spec 024. | PASS |
+| **I. Integration-First Testing** (NON-NEGOTIABLE) | `ControlCmd::Dial` is exercised the same way `SetMode` already is — through the real `crossbeam_channel`/`oneshot` plumbing, no mock. `AtCommander::dial` is tested against the real response-parsing logic (`make_commander` harness, already done). The `pjsip-linked` additions are verified against real PJSIP in the container and real EC200 hardware, not stubbed — a stronger guarantee than a mock would give, and consistent with how spec 024's registrar was verified. | PASS |
+| **II. Green-on-Commit** (NON-NEGOTIABLE) | Each mechanism lands behind `[outbound].enabled` before being wired live; stub-build `make test` stays green throughout since the `pjsip-linked` additions are `#[cfg(feature = "pjsip-linked")]`-gated, mirroring every existing pjsua-safe function. | PASS |
+| **III. Frequent Atomic Commits** | pjsua-safe UAS support, `ControlCmd::Dial`, and the PBX-INVITE handler are separable commits, in that order (each buildable/testable alone). | PASS |
 | **IV. Makefile-Driven Build** | No new build operations. | PASS |
-| **V. Simplicity & Refactorability** | One new abstraction not present in the codebase today: a per-agent, synchronous, daemon→agent command listener (item 3 above). See Complexity Tracking — the existing one-directional `AgentReport` channel cannot meet the latency requirement, and piggybacking a call command on a 10 s heartbeat is not simplicity, it is a 10 s-average call-setup delay hidden in a data structure that was never meant to carry it. | PASS with justification |
+| **V. Simplicity & Refactorability** | Two things once looked like new abstractions and turned out not to be: the CS command channel is a direct reuse of the existing `ControlCmd`/`ModuleCmd` pattern (zero new abstraction), and VoWiFi/VoLTE origination reuses existing `ims::call` UAC builders (reuse, not a new SIP stack). The one genuinely new abstraction — the cross-process line-command channel — is now correctly scoped to only the case that needs it (a different OS process), not applied blanket to same-process CS dialing as the first pass assumed. See Complexity Tracking. | PASS with justification |
 
-**Post-Phase-1 re-check**: pending Phase 1 completion (data-model.md,
-contracts/). No additional violations anticipated: the redirect strategy
-reuses `Account::local` and `ims::sip_client` response-building already
-proven in spec 024; the `ATD` addition is one new `AtCommander` method
-alongside `answer_call`.
+**Post-Phase-1 re-check**: no new violations found during design. The pjsua
+UAS addition follows the existing per-function `#[cfg(feature =
+"pjsip-linked")]` stub-split convention exactly (`Call::answer`/`hangup`,
+`Call::from_id` needs no FFI at all), so it introduces no new safety pattern
+to audit beyond what `count-unsafe.sh` already gates.
 
 ## Project Structure
 
@@ -88,14 +102,15 @@ alongside `answer_call`.
 
 ```text
 specs/025-outbound-calling/
-├── plan.md              # This file
+├── plan.md              # This file (revised 2026-08-03)
 ├── spec.md              # Feature specification
-├── research.md          # Phase 0 — design decisions and rejected alternatives
-├── data-model.md        # Phase 1 — entities, state, validation rules
-├── quickstart.md        # Phase 1 — operator walkthrough
+├── research.md          # Phase 0 — revised: R-003 corrected, R-007/R-008 added
+├── data-model.md        # Phase 1 — entities, state, validation rules (unchanged)
+├── quickstart.md        # Phase 1 — operator walkthrough (unchanged)
 ├── contracts/
-│   ├── config-schema.md     # The [outbound] TOML contract
-│   ├── line-command.md      # The new daemon<->agent call-placement protocol
+│   ├── config-schema.md     # The [outbound] TOML contract (unchanged)
+│   ├── line-command.md      # Cross-process call-placement protocol — rescoped
+│   ├── control-cmd-dial.md  # NEW: same-process ControlCmd::Dial contract (CS)
 │   └── sip-dialout.md       # The on-the-wire SIP contract toward PBX/phones
 └── checklists/
     └── requirements.md      # Spec quality checklist (already passing)
@@ -105,38 +120,37 @@ specs/025-outbound-calling/
 
 ```text
 gsm-sip-bridge/
+├── pjsua-safe/src/
+│   ├── call.rs                  # NEW: Call::from_id (safe), Call::answer (pjsip-linked + stub)
+│   └── endpoint.rs               # NEW: on_incoming_call registration + callback
 ├── src/
 │   ├── modules/
-│   │   └── at_commander.rs      # MODIFIED: new dial()/ATD method alongside answer_call/ATA
-│   ├── sip/
-│   │   ├── mod.rs               # MODIFIED: accept a PBX-originated INVITE (UAS on the
-│   │   │                        #   trunk account), start an outbound attempt
-│   │   ├── server/
-│   │   │   └── mod.rs           # MODIFIED: "INVITE" branch redirects (302) to the
-│   │   │                        #   pjsua-hosted local account instead of refusing (403)
-│   │   └── outbound.rs          # NEW: OutboundCallRequest, line selection, outcome
-│   │       #                      mapping shared by both entry points above
-│   ├── ims/
-│   │   └── agent.rs             # MODIFIED: originate an INVITE toward the P-CSCF
-│   │       #                      (new) alongside the existing inbound-only handling
+│   │   ├── at_commander.rs      # DONE: dial()
+│   │   └── mod.rs               # NEW: ModuleCmd::Dial, ControlCmd::Dial handling
 │   ├── control/
-│   │   ├── protocol.rs          # MODIFIED: new PlaceCall command/response variants
-│   │   ├── line_server.rs       # NEW: the per-agent listener each line process runs
-│   │       #                      so the SIP-owning process can command it
-│   │   └── line_client.rs       # NEW: synchronous client used by sip::outbound
+│   │   ├── protocol.rs          # MODIFIED: ControlCmd::Dial (same-process, CS);
+│   │   │                        #   PlaceCall/PlaceCallOutcome kept for cross-process only
+│   │   ├── line_server.rs       # Cross-process only (VoWiFi/VoLTE agents) — deferred to Step 4
+│   │   └── line_client.rs       # Cross-process only — deferred to Step 4
+│   ├── sip/
+│   │   ├── mod.rs               # NEW: PBX-trunk UAS INVITE handler, progress relay, teardown
+│   │   └── outbound.rs          # DONE: entities/validation/selection; NEW: dial dispatch via ControlCmd::Dial
+│   ├── ims/
+│   │   ├── call.rs               # EXISTING: build_invite/build_ack/build_bye — to be
+│   │   │                         #   generalized for reuse (deferred to Step 4 / US4)
+│   │   └── agent.rs              # Deferred to Step 4 / US4: origination trigger
 │   └── metrics/
-│       └── mod.rs               # MODIFIED: gsm_sip_bridge_outbound_* counters
+│       └── mod.rs               # DONE: gsm_sip_bridge_outbound_attempts_total
 ├── tests/
-│   ├── test_outbound_line_command.rs   # NEW: real loopback socket, both processes real
-│   ├── test_sip_server_redirect.rs     # NEW: registrar 302 response, wire-level
-│   └── test_at_dial.rs                 # NEW: ATD dispatch against AtCommander harness
+│   ├── test_outbound_control_cmd_dial.rs   # NEW: real ControlCmd::Dial round-trip, no mocks
+│   └── test_outbound_pbx_call.rs           # NEW: PBX INVITE -> CS dial, stub-buildable parts only
 ```
 
-**Structure Decision**: extends the existing per-concern module layout
-(`sip/`, `ims/`, `modules/`, `control/`, `metrics/`) rather than introducing
-a new top-level crate or directory — this feature is additive glue between
-subsystems that already exist, not a new subsystem of its own, matching
-Principle V.
+**Structure Decision**: unchanged from the original — this feature is
+additive glue between subsystems that already exist. The revision doesn't
+add new top-level modules beyond what was already planned; it removes one
+(no new same-process IPC for CS) and shrinks another (pjsua UAS support is
+now a bounded, itemized addition rather than an open scope).
 
 ## Complexity Tracking
 
@@ -144,4 +158,5 @@ Principle V.
 
 | Violation | Why Needed | Simpler Alternative Rejected Because |
 |-----------|------------|---------------------------------------|
-| New daemon↔agent synchronous command channel (`control::line_server`/`line_client`) | An outbound call must be placed on a specific idle line, hosted in a different OS process (VoWiFi/VoLTE line agents run in their own network namespace), within a few hundred milliseconds of the INVITE that requested it. | Piggybacking on the existing `AgentReport` heartbeat (`agent_report_interval_seconds`, default 10 s) was rejected: it is one-directional (agent→daemon) and would make call setup wait for the next scheduled report, i.e. up to 10 s of silence on a channel a caller is actively listening to ring. A dedicated, low-latency, request/response channel is the smaller change once that latency requirement is taken as given. |
+| Cross-process line-command channel (`control::line_server`/`line_client`) — **rescoped**, deferred to Step 4 | Only needed when the process that owns the SIP side is not the process hosting the selected line — i.e. reaching a VoWiFi/VoLTE agent's line from the daemon (or another agent). The CS-only MVP (Step 3) needs no such channel: `ControlCmd`/`ModuleCmd` already lets the daemon command a CS modem in-process. | Piggybacking on `AgentReport` (10s heartbeat) is still too slow once this channel is actually built (Step 4) — same reasoning as before, just no longer applied to a case (CS) that doesn't need it. |
+| pjsua-safe UAS support (`Call::from_id`, `Call::answer`, `on_incoming_call`) | Both the PBX-trunk account and (later) `Account::local` must accept an inbound INVITE; pjsua-safe has no such capability today. | Hand-rolling SIP/media for the PBX/phone-facing leg (the way `ims::agent` does for the carrier-facing leg) was rejected: that leg already has a real, working PJSIP stack via pjsua for everything except accepting the call — duplicating it would be the actual complexity increase. |

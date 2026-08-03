@@ -6,17 +6,21 @@ description: "Task list for 025-outbound-calling"
 # Tasks: Outbound Calling
 
 **Input**: Design documents from `/specs/025-outbound-calling/`
-**Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/
+**Prerequisites**: plan.md (revised 2026-08-03), spec.md, research.md
+(revised — R-003/R-007/R-008), data-model.md, contracts/
 
-**Tests**: INCLUDED. Constitution Principle I (Integration-First Testing) is
-NON-NEGOTIABLE and the Development Workflow section makes TDD the default.
-Every test in this feature runs against real components over real sockets —
-the new daemon↔agent channel is tested with two real processes/real Unix
-sockets, never a mock, exactly as `test_sip_server_registrar.rs` (spec 024)
-tests the registrar over a real `UdpSocket`.
+**Revision note**: this list replaces the original tasks.md after three
+`Explore` agents corrected two assumed blockers. Phases 1–2 and part of
+Phase 4 were already implemented, tested, and committed in the first pass
+and are carried forward as done. New tasks (T051+) cover the pjsua-safe UAS
+addition, which nothing in US1/US3 can proceed without.
 
-**Organization**: Grouped by user story, in spec.md priority order (US1/US2
-are both P1; US3/US4 are P2; US5 is P3).
+**Tests**: INCLUDED (constitution Principle I, NON-NEGOTIABLE). The pjsua
+UAS additions are verified against the real, already-`pjsip-linked`-built
+container and the physically attached EC200 modems
+(`/dev/ttyUSB0`–`ttyUSB6`) — not mocked. Everything reachable from the stub
+build (`make test`, no `pjsip-linked`) is still exercised over real
+in-process channels, matching the rest of this codebase.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -26,290 +30,207 @@ are both P1; US3/US4 are P2; US5 is P3).
 
 ## Path Conventions
 
-Rust workspace. Crate sources at `gsm-sip-bridge/src/`; integration tests at
-`gsm-sip-bridge/tests/`. Unit tests live inline in a `#[cfg(test)] mod tests`
-at the bottom of the file they cover.
+Rust workspace. Crate sources at `gsm-sip-bridge/src/` and `pjsua-safe/src/`;
+integration tests at `gsm-sip-bridge/tests/`. Unit tests live inline.
 
 ## Pre-commit gate (applies to EVERY commit)
 
 `make format && make lint && make test` — all three, no exceptions
-(`CLAUDE.md`). `make lint` includes `tools/count-unsafe.sh`, which fails on
-any `unsafe` in `gsm-sip-bridge/src` — the new `control::line_server`/
-`line_client` and `sip::outbound` modules must be safe Rust, as the existing
-registrar is.
+(`CLAUDE.md`). `make lint` includes `tools/count-unsafe.sh`
+(`gsm-sip-bridge/src` = 0 unsafe; `pjsua-safe/src` currently 1.68%/5%).
 
 ---
 
-## Phase 1: Setup
+## Phase 1: Setup — DONE
 
-**Purpose**: No new project/crate is created (plan.md Structure Decision) —
-this feature extends existing modules. Setup is limited to the new file
-skeletons the rest of the plan writes into.
-
-- [X] T001 [P] Create empty `gsm-sip-bridge/src/sip/outbound.rs` with a module doc comment summarizing its role (data-model.md `OutboundCallRequest`/`CandidateLine`) and add `pub mod outbound;` to `gsm-sip-bridge/src/sip/mod.rs`
-- [X] T002 [P] Create empty `gsm-sip-bridge/src/control/line_server.rs` and `gsm-sip-bridge/src/control/line_client.rs` with module doc comments referencing `contracts/line-command.md`, and register both in `gsm-sip-bridge/src/control/mod.rs`
-
-**Checkpoint**: New modules exist and compile empty; nothing wired up yet.
+- [X] T001 [P] Create `gsm-sip-bridge/src/sip/outbound.rs` module and register it in `gsm-sip-bridge/src/sip/mod.rs`
+- [X] T002 [P] Create `gsm-sip-bridge/src/control/line_server.rs` and `gsm-sip-bridge/src/control/line_client.rs` module stubs, registered in `gsm-sip-bridge/src/control/mod.rs` — remain stubs; cross-process work is now Phase 8, not Phase 3
 
 ---
 
-## Phase 2: Foundational — config, protocol types, metrics
+## Phase 2: Foundational — DONE
 
-**Purpose**: BLOCKING. Every user story reads `[outbound].enabled` and needs
-the `PlaceCall`/`PlaceCallOutcome` types and outcome metrics to exist first.
+- [X] T003 Add `RawOutbound` in `gsm-sip-bridge/src/config/raw.rs`
+- [X] T004 Add `OutboundConfig` runtime struct in `gsm-sip-bridge/src/config/mod.rs`
+- [X] T005 Implement `build_outbound` in `gsm-sip-bridge/src/config/build.rs`
+- [X] T006 [P] Inline tests in `gsm-sip-bridge/src/config/mod.rs` for `[outbound]` defaults
+- [X] T007 [P] Document `[outbound]` in `docs/configuration.md`
+- [X] T008 [P] Commented-out `[outbound]` block in `config.toml.example`
+- [X] T009 Add `PlaceCall`/`PlaceCallOutcome` wire types in `gsm-sip-bridge/src/control/protocol.rs` (kept for the cross-process case, Phase 8)
+- [X] T010 Add `OutboundCallRequest`/`Origin`/`CandidateLine`/`OutboundOutcome`/`CarrierPath`/`validate_destination`/`select_idle_line` in `gsm-sip-bridge/src/sip/outbound.rs`, unit-tested
+- [X] T011 [P] Add `gsm_sip_bridge_outbound_attempts_total` metric in `gsm-sip-bridge/src/metrics/mod.rs`
+- [X] T012 [P] Document the metric in `docs/observability.md`
 
-- [X] T003 Add `RawOutbound` via the `section!` macro in `gsm-sip-bridge/src/config/raw.rs` with the single `enabled: bool` field per `contracts/config-schema.md`, and register `("outbound", RawOutbound::KEYS)` in `section_key_lists()`
-- [X] T004 Add `OutboundConfig` runtime struct and the `outbound` field on `AppConfig` in `gsm-sip-bridge/src/config/mod.rs`
-- [X] T005 Implement `build_outbound` in `gsm-sip-bridge/src/config/build.rs` — structural pass-through only; `contracts/config-schema.md` was revised during implementation to drop the originally-planned "at least one carrier path configured" rule, since CS modem presence is runtime-discovered, not config-declared, and so isn't checkable at build time
-- [X] T006 [P] Add inline tests to `gsm-sip-bridge/src/config/mod.rs` covering the default (`enabled = false`, byte-for-byte unaffected) and rule 1's rejection, driven through the real `load_config` pipeline
-- [X] T007 [P] Document `### \`[outbound]\`` in `docs/configuration.md` with a table row for the one key, so `tests/test_config_docs.rs` passes
-- [X] T008 [P] Add a **commented-out** `[outbound]` block to `config.toml.example`, matching the `test_the_shipped_example_config_still_loads` convention already used for `[sip_server]`
-- [X] T009 Add `PlaceCall { destination: String }` and `PlaceCallOutcome { Placed, Busy, Failed { reason: String } }` to `gsm-sip-bridge/src/control/protocol.rs` per `contracts/line-command.md`, with `Serialize`/`Deserialize` matching the existing `ControlCmd` framing style
-- [X] T010 Define `OutboundCallRequest`, `Origin`, `CandidateLine`, and the outcome-category enum from `data-model.md` in `gsm-sip-bridge/src/sip/outbound.rs`
-- [X] T011 [P] Add `gsm_sip_bridge_outbound_attempts_total` (labelled by `outcome`, per data-model.md's category table) to `gsm-sip-bridge/src/metrics/mod.rs`, following the existing `SIP_SERVER_*` counter registration pattern
-- [X] T012 [P] Document the new metric in `docs/observability.md`
-
-**Checkpoint**: config parses/validates/documents; the wire types and metric
-exist but nothing produces or consumes them yet.
+**Checkpoint**: unchanged from the first pass — still the correct foundation.
 
 ---
 
-## Phase 3: User Story 1 — Place an outbound call from the PBX (Priority: P1) 🎯 MVP
+## Phase 3: pjsua-safe UAS support (NEW — prerequisite for US1 and US3)
 
-**Goal**: A PBX-sent INVITE dials a number out over an idle circuit-switched
-SIM (same-process case — the daemon's own `CardPool` already tracks every
-modem's busy/idle state, so this story needs no cross-process channel).
+**Purpose**: BLOCKING for T018 and (later) T035. research.md R-007: small,
+well-scoped addition — `Call::from_id` needs no FFI at all; `Call::answer`
+and the `on_incoming_call` callback follow the exact
+`#[cfg(feature = "pjsip-linked")]`/stub-split template `hangup`/
+`on_call_state_cb` already use. No `pjsua-sys` regeneration needed
+(`pjsua_call_answer`, `on_incoming_call`, `pjsua_call_get_info` are already
+in the unfiltered bindgen output).
 
-**Independent Test**: Configure `[outbound].enabled = true` with at least one
-CS modem, send an INVITE from a PBX naming a real number, confirm the modem
-dials it (`ATD`) and two-way audio flows once answered.
+- [ ] T051 [P] Add `Call::from_id(call_id: i32, state: CallState) -> Self` in `pjsua-safe/src/call.rs` — safe, no FFI (mirrors the struct literal already used internally by `Call::make`)
+- [ ] T052 [US1] Add `Call::answer(&mut self, code: u32) -> Result<(), PjsipError>` in `pjsua-safe/src/call.rs`, wrapping `pjsua_sys::pjsua_call_answer`, `#[cfg(feature = "pjsip-linked")]`/stub split identical to `hangup` (`call.rs:129-153`)
+- [ ] T053 [US1] Add the `on_incoming_call_cb` free `unsafe extern "C" fn(acc_id, call_id, rdata)` in `pjsua-safe/src/endpoint.rs`, following `on_call_state_cb`'s template (`endpoint.rs:670-672`): SAFETY comment inline, `pjsua_call_get_info` into a zeroed stack struct, hand the accepted `call_id` to Rust-side waiting code via the same module-level state pattern `BRIDGE_PAIRS` already uses (no new mechanism)
+- [ ] T054 [US1] Register `cfg.cb.on_incoming_call = Some(on_incoming_call_cb);` in `pjsua-safe/src/endpoint.rs`'s `Endpoint::create` (`endpoint.rs:145-146` area)
+- [ ] T055 [P] Add inline tests to `pjsua-safe/src/call.rs` for `Call::from_id` and the stub-path behavior of `Call::answer` (real pjsua-linked behavior can only be verified per T056)
+- [ ] T056 [US1] **Hardware/container verification** (no source file — operational task): build the `pjsip-linked` feature (reuse the running `docker-gsm-sip-bridge-1` container or `make docker-build` if it predates this change) and confirm `on_incoming_call_cb` fires for a real inbound INVITE sent to the daemon's trunk account, and `Call::answer` accepts it — a minimal smoke test, not the full outbound flow (that's T018's job)
+- [ ] T057 Run `tools/count-unsafe.sh` (via `make lint`) and confirm `pjsua-safe/src` stays under the 5% ceiling (expect ~1.8–2%, from 1.68% baseline + ~3 blocks)
 
-### Tests for User Story 1
-
-- [X] T013 [P] [US1] Inline test in `gsm-sip-bridge/src/modules/at_commander.rs` — DONE, adjusted scope: `AtResponse`/`read_response` only ever recognizes `OK`/`ERROR`/`+CME ERROR` as terminal (verified by reading the parser); `NO CARRIER`/`BUSY` arrive later as unsolicited result codes, the same way `RING` does, not as `ATD`'s own response. Tests cover `OK`→success, `ERROR`/`CME ERROR`→failure only; final call disposition is out of scope for this task and belongs to T019's progress relay, driven off the existing URC loop in `modules::mod`, not `AtCommander::dial` itself
-- [X] T014 [P] [US1] Inline test in `gsm-sip-bridge/src/sip/outbound.rs` for destination validation (FR-014) — DONE as part of T010's entity module
-- [ ] T015 [US1] Create `gsm-sip-bridge/tests/test_outbound_pbx_call.rs`: a real loopback SIP INVITE from a fake "PBX" `UdpSocket`/pjsua peer to a daemon configured with `[outbound].enabled = true` and one (simulated) idle CS line, asserting the destination reaches `AtCommander::dial` unmodified and a `180`/`200` progression is returned
-
-### Implementation for User Story 1
-
-- [X] T016 [US1] Add `AtCommander::dial(&mut self, number: &str) -> BridgeResult<()>` in `gsm-sip-bridge/src/modules/at_commander.rs`, sending `ATD{number};` alongside the existing `answer_call`/`hangup`
-> **BLOCKED, discovered during implementation**: T018 (and T035 in US3) assumed
-> pjsua-safe can accept an incoming INVITE (UAS). It cannot — `pjsua-safe/src`
-> registers `on_call_state` only; there is no `on_incoming_call` callback and
-> no `Call::answer`/accept API anywhere in `pjsua-safe`/`pjsua-sys`. Every
-> existing call in this codebase is UAC-only (`Call::make`); the bridge has
-> never received an INVITE via pjsua. Adding this means new `unsafe` FFI
-> bindings (a callback registered in `AccountConfig`/`EndpointConfig`, a
-> `pjsua_call_answer` wrapper) — real, but non-trivial and non-negotiably
-> `unsafe`-audited work (`count-unsafe.sh`, currently 1.68% of `pjsua-safe`)
-> that also cannot be exercised by `make test`/CI at all (the `pjsip-linked`
-> feature they'd need is only built by `docker/Dockerfile`, per plan.md's own
-> Constraints). This needs its own focused pass — including real testing in
-> the privileged container — rather than being written blind here. T017,
-> T019–T022 below are written to be ready to wire up once that lands.
-
-- [ ] T017 [US1] **Also blocked, discovered during implementation**: each CS modem runs its own dedicated OS thread owning its `CardInstance`/`AtCommander` (`modules::mod`'s per-module loop); `CardPool` (the tokio-side orchestrator) only sees derived `SlotState` via the one-directional `BridgeEvent` channel *from* that thread. There is no existing command channel *into* a running modem thread — the same class of gap as US2's cross-process one, just intra-process. `sip::outbound::{CandidateLine, select_idle_line}` (T010) are ready to consume whatever read model this produces, but building the modem-thread command channel itself is unstarted. Implement same-process line selection over `CardPool` in `gsm-sip-bridge/src/sip/outbound.rs`: iterate configured CS modems, claim the first `idle()` one per data-model.md's provisional-claim rule (FR-004/005/007)
-- [ ] T018 [US1] **BLOCKED on the pjsua-safe UAS gap above.** Implement the PBX-trunk UAS INVITE handler in `gsm-sip-bridge/src/sip/mod.rs`: on an incoming INVITE to the existing trunk `Account` with `[outbound].enabled = true`, construct an `OutboundCallRequest { origin: Origin::Pbx, .. }`, validate (T014), select a line (T017), and dial (T016)
-- [ ] T019 [US1] Implement call-progress relay in `gsm-sip-bridge/src/sip/mod.rs` per `contracts/sip-dialout.md`'s table (`180 Ringing`, `486 Busy Here`, `503 Service Unavailable`, `200 OK`) driven off the CS leg's AT-reported call state
-- [ ] T020 [US1] Wire teardown: either leg hanging up ends the other, reusing the existing bridged-call teardown path (`sip::mod`'s current hangup handling) rather than a new implementation (FR-013)
-- [ ] T021 [US1] Increment `gsm_sip_bridge_outbound_attempts_total` with the right outcome label at every terminal point reached by T018–T020
-- [ ] T022 [US1] Confirm `make test` green with `[outbound].enabled = false` (default) leaving `sip::mod`'s INVITE handling byte-for-byte as before (FR-017) — add the negative-path inline test if not already covered by T015
-
-**Checkpoint**: A PBX can dial out over a single-process CS deployment. This
-is the MVP — independently demoable without US2–US5.
+**Checkpoint**: pjsua-safe can accept and answer an inbound call. Nothing
+yet triggers `OutboundCallRequest` from it — that's T018.
 
 ---
 
-## Phase 4: User Story 2 — Dial out on whichever SIM is free, across processes (Priority: P1)
+## Phase 4: User Story 1 — PBX-originated CS outbound call (Priority: P1) 🎯 MVP
 
-**Goal**: Line selection generalizes beyond the SIP-owning process's own
-modems to VoWiFi/VoLTE lines running as separate agent processes, using the
-new synchronous command channel (research.md R-003).
+**Goal**: A PBX-sent INVITE dials a number out over an idle CS modem, in the
+single main-daemon process — no cross-process IPC needed (research.md R-003,
+revised).
 
-**Independent Test**: With a CS modem busy and a VoWiFi line idle (or vice
-versa, in separate processes), an outbound request lands on the idle one;
-two concurrent requests with only one idle line total result in exactly one
-success.
+**Independent Test**: Configure `[outbound].enabled = true` with a real EC20
+attached, send an INVITE from a PBX (or a test UAC) naming a real number,
+confirm `ATD` reaches the modem and two-way audio flows once answered.
 
-### Tests for User Story 2
+- [X] T013 [P] [US1] Inline tests for `AtCommander::dial` in `gsm-sip-bridge/src/modules/at_commander.rs` — DONE
+- [X] T014 [P] [US1] Destination validation tests in `gsm-sip-bridge/src/sip/outbound.rs` — DONE (part of T010)
+- [X] T016 [US1] `AtCommander::dial` in `gsm-sip-bridge/src/modules/at_commander.rs` — DONE
 
-- [ ] T023 [P] [US2] Create `gsm-sip-bridge/tests/test_outbound_line_command.rs`: two real processes (or two real Unix-socket endpoints in-process, mirroring `test_sip_server_registrar.rs`'s realism) exchanging `PlaceCall`/`PlaceCallOutcome` per `contracts/line-command.md`, covering `Placed`, `Busy`, `Failed`, and the request timeout
-- [ ] T024 [P] [US2] Inline test in `gsm-sip-bridge/src/sip/outbound.rs` for the contention rule (FR-008): two selections racing for the same last-idle `CandidateLine` — the second sees it already claimed and is refused identically to "no line idle" (FR-009)
-- [ ] T025 [US2] Extend `test_outbound_pbx_call.rs` (T015) with a case where the CS modem is busy and a second (simulated cross-process) line is idle, asserting the call is placed on the idle one, not refused
+### `ControlCmd::Dial` (same-process line command — contracts/control-cmd-dial.md)
 
-### Implementation for User Story 2
+- [ ] T017a [US1] Add `ControlCmd::Dial { slot: u32, destination: String }` in `gsm-sip-bridge/src/control/protocol.rs`
+- [ ] T017b [US1] Add `ModuleCmd::Dial(String, oneshot::Sender<Result<(), String>>)` in `gsm-sip-bridge/src/modules/mod.rs` alongside `SetMode`/`Reboot` (`mod.rs:62-65`)
+- [ ] T017c [US1] Handle `ModuleCmd::Dial` in `gsm-sip-bridge/src/modules/mod.rs`'s `run_module_loop` `cmd_rx` match (`mod.rs:1588` area): guard `card.state == CardState::Idle`, call `AtCommander::dial`, reply via the embedded `oneshot::Sender`, matching the code sketch in `contracts/control-cmd-dial.md`
+- [ ] T017d [US1] Add the `ControlCmd::Dial` arm in `gsm-sip-bridge/src/modules/mod.rs`'s `CardPool::handle_control_cmd` (`mod.rs:1163`), mirroring `SetMode`'s round-trip (`mod.rs:1196-1261`): clone `cmd_tx`, fresh `oneshot::channel`, send, `tokio::spawn` a bounded timeout (single-digit seconds — shorter than `SetMode`'s 30s, per `control-cmd-dial.md`'s Timeouts section), forward to the control reply
+- [ ] T017e [P] [US1] Create `gsm-sip-bridge/tests/test_outbound_control_cmd_dial.rs`: real `ControlCmd::Dial` round-trip through a real `CardPool` with a simulated idle slot, over the real `crossbeam_channel`/`oneshot` plumbing (no mocks) — asserts busy slot is refused, idle slot dials
+- [ ] T017f [US1] **Hardware verification** (no source file): with a real EC20 attached and idle, send `ControlCmd::Dial` via the CLI/control socket directly (bypassing SIP for this smoke test) and confirm `ATD` is sent on the real serial port and the modem attempts the call
 
-- [ ] T026 [US2] Implement `control::line_server`: a per-line Unix socket listener (path derived from line identity, per `contracts/line-command.md`) that accepts `PlaceCall`, dispatches to the local dial function (`AtCommander::dial` for CS, or the VoWiFi/VoLTE origination point added in US4), and replies with `PlaceCallOutcome`
-- [ ] T027 [US2] Implement `control::line_client::place_call(socket_path, destination, timeout) -> PlaceCallOutcome`, applying the sub-Timer-B timeout from `contracts/line-command.md` and mapping a timed-out/unreachable socket to `Failed`
-- [ ] T028 [US2] Start a `line_server` listener per line at daemon/agent startup, gated on `[outbound].enabled`, in whichever module already owns that line's lifecycle (the daemon's `CardPool` init for CS, `ims::agent`/`vowifi::mod` startup for VoWiFi/VoLTE)
-- [ ] T029 [US2] Extend `sip::outbound`'s line selection (T017) to build its `CandidateLine` list from every configured line regardless of hosting process, using the existing `AgentReport` liveness/state stream (data-model.md) for the cross-process ones, and route the actual dial through `line_client::place_call` (T027) instead of a direct in-process call when the target line is remote
-- [ ] T030 [US2] Implement the local-claim-then-command sequence in `gsm-sip-bridge/src/sip/outbound.rs` (data-model.md's race handling): mark a `CandidateLine` provisionally non-idle before issuing `PlaceCall`, and unconditionally let the next `AgentReport` correct it regardless of outcome
-- [ ] T031 [US2] No automatic retry on `Busy`/`Failed` (FR-008/FR-009a) — confirm `sip::outbound` returns the whole request as refused rather than trying a second `CandidateLine`; extend T024 if this isn't already pinned there
+### PBX INVITE → outbound call (uses Phase 3's UAS support)
 
-**Checkpoint**: Outbound calling works across every configured line,
-regardless of which process hosts it, with correct contention handling.
+- [ ] T018 [US1] Implement the PBX-trunk UAS INVITE handler in `gsm-sip-bridge/src/sip/mod.rs`: on `on_incoming_call` (T053/T054) with `[outbound].enabled = true`, build `OutboundCallRequest { origin: Origin::Pbx, .. }` (`gsm-sip-bridge/src/sip/outbound.rs`), validate (`validate_destination`), select a line (`select_idle_line` over CS `SlotState`s), dispatch via `ControlCmd::Dial` (T017a–d) through the daemon's own `control_tx` — no socket, direct in-process send since `CardPool` always lives in the same process as the trunk `Account`
+- [ ] T019 [US1] Implement call-progress relay in `gsm-sip-bridge/src/sip/mod.rs` per `contracts/sip-dialout.md`'s table (`180 Ringing`, `486 Busy Here`, `503 Service Unavailable`, `200 OK`), driven off the CS leg's AT-reported call state and `Call::answer` (T052)
+- [ ] T020 [US1] Wire teardown in `gsm-sip-bridge/src/sip/mod.rs`: either leg hanging up ends the other, reusing the existing bridged-call teardown path
+- [ ] T021 [US1] Increment `OUTBOUND_ATTEMPTS_TOTAL` (`gsm-sip-bridge/src/metrics/mod.rs`) with the right outcome label at every terminal point reached by T018–T020, called from `gsm-sip-bridge/src/sip/mod.rs`
+- [ ] T022 [US1] Add an inline test in `gsm-sip-bridge/src/sip/mod.rs` (or extend T015-equivalent) confirming `[outbound].enabled = false` (default) leaves the INVITE handling byte-for-byte as before (FR-017); confirm `make test` stays green
+- [ ] T023 [US1] **Hardware verification, end to end** (no source file): with `[outbound].enabled = true`, a real EC20 attached and registered, and a test SIP UAC standing in for the PBX, place a real outbound call and confirm: `180`/`200` progression, `ATD` reaches the modem, the call connects on the real mobile network, audio flows, and either side hanging up tears down the other
 
----
-
-## Phase 5: User Story 3 — Dial out from a phone in SIP server mode (Priority: P2)
-
-**Goal**: A phone registered directly to the bridge's own SIP server mode
-(spec 024) can also originate an outbound call, reversing that spec's FR-020.
-
-**Independent Test**: With `[sip_server].enabled` and `[outbound].enabled`
-both true and a phone registered (not necessarily `ring_aor`), dialing a
-number from the phone places it on an idle SIM.
-
-### Tests for User Story 3
-
-- [ ] T032 [P] [US3] Extend `gsm-sip-bridge/tests/test_sip_server_registrar.rs`: a registered phone's INVITE now receives `302 Moved Temporarily` with the `Contact` from `contracts/sip-dialout.md` when `[outbound].enabled = true`, and still `403 Forbidden` when it is `false` (FR-017) or the phone has no live binding
-- [ ] T033 [US3] Create `gsm-sip-bridge/tests/test_outbound_sip_server_phone.rs`: a real phone-side `UdpSocket` registers, dials, follows the 302 to `Account::local`'s port, and the resulting call reaches `sip::outbound` with `Origin::SipServerPhone`
-
-### Implementation for User Story 3
-
-- [ ] T034 [US3] Change the `"INVITE"` branch in `gsm-sip-bridge/src/sip/server/mod.rs::handle_datagram` from unconditional `403 Forbidden` to: `403` if the peer has no live binding, else (when `[outbound].enabled`) `302 Moved Temporarily` with `Contact: sip:{aor}@{listen_addr}:{sip.local_port}` per `contracts/sip-dialout.md` — else the existing `403` (FR-017)
-- [ ] T035 [US3] Implement the UAS INVITE handler on `Account::local` in `gsm-sip-bridge/src/sip/mod.rs`, constructing `OutboundCallRequest { origin: Origin::SipServerPhone { aor }, .. }` and reusing the same validate → select → dial pipeline as US1/US2 (T014/T017/T029) — no new pipeline
-- [ ] T036 [US3] Confirm eligibility is any currently-registered account, not only `ring_aor` (spec.md FR-003) — add the case explicitly if T032/T033 don't already cover a non-`ring_aor` account
-
-**Checkpoint**: Both SIP-side topologies (PBX, SIP server mode) can
-originate outbound calls through the same underlying pipeline.
+**Checkpoint**: PBX-originated outbound calling works end-to-end on real
+circuit-switched hardware. This is the MVP.
 
 ---
 
-## Phase 6: User Story 4 — Same behavior on every carrier path (Priority: P2)
+## Phase 5: User Story 2 — Dial out on whichever SIM is free, same-process (Priority: P1)
 
-**Goal**: VoWiFi and VoLTE SIMs (including PC/SC-sourced VoWiFi lines) can
-be selected and dialed exactly like a CS modem.
+**Goal**: unchanged in principle from the original tasks.md, but now split
+by what actually needs the cross-process channel.
 
-**Independent Test**: With outbound calling enabled on a VoWiFi- or
-VoLTE-only deployment, an outbound request is placed and carries audio with
-no visible difference from the CS case.
+- [ ] T024 [US2] Extend `gsm-sip-bridge/src/sip/outbound.rs`'s line-selection call site in `gsm-sip-bridge/src/sip/mod.rs` (T018) to iterate **all** CS modems' `SlotState`s (not just the first), confirming `select_idle_line`'s no-path-preference behavior holds across multiple real EC20s if more than one is attached
+- [ ] T025 [US2] Add a contention test in `gsm-sip-bridge/tests/test_outbound_control_cmd_dial.rs` (T017e): two near-simultaneous `ControlCmd::Dial` requests for the same last-idle CS slot — confirm exactly one succeeds via the existing single-threaded-per-modem serialization (research.md R-003 revised: no separate provisional-claim step needed for the same-process case, since the modem thread only processes one `ModuleCmd` at a time)
+- [ ] T026 [US2] Document in `specs/025-outbound-calling/tasks.md` (this file, Phase 8) that multi-path selection (CS **and** a cross-process VoWiFi/VoLTE line) is deferred, since it depends on the cross-process channel — no code task here
 
-### Tests for User Story 4
-
-- [ ] T037 [P] [US4] Inline test in `gsm-sip-bridge/src/ims/agent.rs` asserting the new outbound-origination path builds an INVITE whose Request-URI user part is the given destination verbatim (FR-010), reusing the existing SDP-offer construction used for the inbound direction
-- [ ] T038 [US4] Extend `test_outbound_line_command.rs` (T023) or add `test_outbound_vowifi_call.rs`: a `PlaceCall` routed to a simulated VoWiFi/VoLTE agent results in an originated IMS INVITE, not an `ATD`
-- [ ] T039 [P] [US4] Confirm (test or explicit assertion in T038) that a PC/SC-sourced VoWiFi line is selected and dialed identically to a modem-sourced one — per research.md, this requires no new code path since PC/SC only changes SIM sourcing, not call origination, but the parity must be demonstrated, not assumed
-
-### Implementation for User Story 4
-
-- [ ] T040 [US4] Add the outbound-origination function to `gsm-sip-bridge/src/ims/agent.rs`: send an INVITE toward the P-CSCF with the destination as Request-URI user part, reusing the existing inbound call's SDP/media bridging code for everything after the initial INVITE (research.md R-005)
-- [ ] T041 [US4] Wire this function as the VoWiFi/VoLTE line's dial target for `control::line_server` (T026), so `PlaceCall` on a VoWiFi/VoLTE line reaches T040 instead of `AtCommander::dial`
-- [ ] T042 [US4] Verify `sip::outbound`'s line selection (T029) treats `CarrierPath::VoWifi`/`Volte` candidates with no preference relative to `CircuitSwitched` (FR-007) — extend T024 if not already covered
-
-**Checkpoint**: Outbound calling is fully path-agnostic.
+**Checkpoint**: multi-SIM selection works for every CS modem attached to
+this host. Cross-process multi-path selection is Phase 8.
 
 ---
 
-## Phase 7: User Story 5 — Diagnose a failed or refused outbound call (Priority: P3)
+## Phase 6: User Story 3 — Dial out from a phone in SIP server mode (Priority: P2)
 
-**Goal**: An operator can distinguish "no SIM was idle," "network refused,"
-and "unanswered" from logs and metrics alone.
+**Goal**: unchanged from the original plan; now unblocked by Phase 3.
 
-**Independent Test**: Trigger each of the three outcomes and confirm they
-are distinguishable without a packet capture.
-
-- [ ] T043 [P] [US5] Add a log line at each refusal/failure point (T018, T029, T035, T040) naming the reason and, for `refused_no_idle_line`, that no `CandidateLine` was idle at the time (FR-016)
-- [ ] T044 [P] [US5] Confirm `gsm_sip_bridge_outbound_attempts_total{outcome=...}` (T011/T021) is incremented at every terminal point across US1–US4 with the correct label from data-model.md's outcome table — add any missing increments
-- [ ] T045 [US5] Add an inline or integration test asserting the three outcomes in the Independent Test above produce distinct log fields and distinct metric label values
-
-**Checkpoint**: All five user stories are independently functional and
-diagnosable.
+- [ ] T032 [P] [US3] Extend `gsm-sip-bridge/tests/test_sip_server_registrar.rs`: a registered phone's INVITE receives `302 Moved Temporarily` (per `contracts/sip-dialout.md`) when `[outbound].enabled = true`, still `403` otherwise
+- [ ] T034 [US3] Change the `"INVITE"` branch in `gsm-sip-bridge/src/sip/server/mod.rs::handle_datagram` per T032
+- [ ] T035 [US3] Implement the UAS INVITE handler on `Account::local` in `gsm-sip-bridge/src/sip/mod.rs` using Phase 3's `on_incoming_call`/`Call::answer`, constructing `OutboundCallRequest { origin: Origin::SipServerPhone { aor }, .. }`, reusing T018's validate → select → dial pipeline
+- [ ] T036 [US3] Add an inline test in `gsm-sip-bridge/src/sip/mod.rs` confirming eligibility is any currently-registered account, not only `ring_aor` (FR-003)
+- [ ] T033 [US3] **Hardware verification** (no source file): a real SIP phone (or softphone) registers to SIP server mode, dials a number, and the call is placed on a real EC20 exactly as T023 verified for the PBX path
 
 ---
 
-## Phase 8: Polish & Cross-Cutting Concerns
+## Phase 7: User Story 4 — VoWiFi/VoLTE outbound (Priority: P2) — REVISED, no pjsua dependency
 
-- [ ] T046 [P] Update `README.md`'s Highlights with an outbound-calling bullet, mirroring the existing SIP-server-mode bullet's style
-- [ ] T047 [P] Add an "Outbound calling" section to `docs/architecture.md` describing the three new mechanisms (dial-out leg, inbound-leg acceptance, cross-process line command) and linking `contracts/line-command.md` and `contracts/sip-dialout.md`
-- [ ] T048 [P] Add an outbound-calling entry to `RELEASE_NOTES.md` following the project's dense-narrative style (see the `v8.3.0` SIP-server-mode entry for the expected shape)
-- [ ] T049 Run `specs/025-outbound-calling/quickstart.md` end to end against a real container (per the project's `run` skill / docker compose), confirming every step and the "If nothing happens" diagnostics actually match observed behavior
-- [ ] T050 Mark `docs/todo.md`'s outbound-calling item (if present) complete, referencing this feature directory
+**Goal**: reuse `ims::call`'s existing working UAC INVITE-origination code
+(research.md R-008) from the live `ims::agent` loop, instead of writing new
+SDP/RTP/signalling code. **This phase does not depend on Phase 3 at all** —
+the carrier-facing leg never touches pjsua.
+
+- [ ] T037 [P] [US4] Generalize/export `ims::call`'s UAC builders (`build_invite`/`build_ack`/`build_bye`/`InviteParts`, `gsm-sip-bridge/src/ims/call.rs:653-745`) for reuse outside the CLI diagnostic tool — e.g. lift beside `gsm-sip-bridge/src/ims/sip_client.rs`'s existing builders, or make the relevant `ims::call` items `pub(crate)`
+- [ ] T038 [US4] Add an origination trigger to `gsm-sip-bridge/src/ims/agent.rs`'s session state (its `ActiveCall`, `agent.rs:610-628`, today only populated `from_invite`) so a `PlaceCall`-equivalent request can start a UAC dialog using T037's builders and the existing `sdp::build_offer`/`parse_answer` (`gsm-sip-bridge/src/ims/sdp.rs`) and RTP-relay code the inbound path already uses
+- [ ] T039 [US4] Wire the dial-target dispatch in `gsm-sip-bridge/src/ims/agent.rs`: reached by whichever cross-process mechanism (Phase 8) or, if the agent process itself owns the SIP side, a direct in-process call
+- [ ] T040 [P] [US4] Add a test in `gsm-sip-bridge/tests/` confirming PC/SC-sourced VoWiFi lines (`gsm-sip-bridge/src/modules/pcsc_card.rs`) are dialed identically to modem-sourced ones (no separate code path — per research.md, this needs no new code, just a test/assertion)
+- [ ] T041 [US4] **Hardware verification, if a VoWiFi/VoLTE-capable SIM and P-CSCF reachability are available on this host** (no source file): place a real outbound call over VoWiFi or VoLTE and confirm the originated INVITE reaches the carrier and the call connects. If no such SIM is available in this environment, this task falls back to the container-based verification spec 015–017 already established for inbound IMS calls.
+
+---
+
+## Phase 8: Cross-process line-command channel (was Phase 2 of US2 in the original plan)
+
+**Purpose**: needed only once a deployment mixes CS with VoWiFi/VoLTE, or the
+SIP side is hosted by an agent process that needs to reach a *different*
+agent's line. Deferred until Phases 4–7 are solid, per plan.md Step 4.
+
+- [ ] T042 [US2] Implement `control::line_server` in `gsm-sip-bridge/src/control/line_server.rs` (per `contracts/line-command.md`, rescoped) started from the VoWiFi/VoLTE agent processes (`gsm-sip-bridge/src/ims/agent.rs`/`gsm-sip-bridge/src/vowifi/mod.rs` startup) only
+- [ ] T043 [US2] Implement `control::line_client::place_call` in `gsm-sip-bridge/src/control/line_client.rs`
+- [ ] T044 [US2] Extend `gsm-sip-bridge/src/sip/outbound.rs`'s line selection to include cross-process `CandidateLine`s, routing through T043 when the target line is remote
+- [ ] T045 [US2] Implement the provisional-claim-then-command sequence in `gsm-sip-bridge/src/sip/outbound.rs` for the cross-process case (data-model.md's race handling — still needed here, unlike the same-process case)
+- [ ] T046 [P] [US2] Create `gsm-sip-bridge/tests/test_outbound_line_command.rs`: real cross-process socket round-trip, no mocks
+
+---
+
+## Phase 9: User Story 5 — Diagnostics (Priority: P3) — unchanged
+
+- [ ] T047 [P] [US5] Add log lines at every refusal/failure point in `gsm-sip-bridge/src/sip/mod.rs` and `gsm-sip-bridge/src/ims/agent.rs`
+- [ ] T048 [P] [US5] Audit `gsm-sip-bridge/src/sip/mod.rs`, `gsm-sip-bridge/src/modules/mod.rs`, and `gsm-sip-bridge/src/ims/agent.rs` to confirm `OUTBOUND_ATTEMPTS_TOTAL` is incremented correctly at every terminal point across all phases
+- [ ] T049 [US5] Create `gsm-sip-bridge/tests/test_outbound_diagnostics.rs` testing the three distinguishable outcomes (no idle line, network refused, unanswered) end to end
+
+---
+
+## Phase 10: Polish
+
+- [ ] T050a [P] Add outbound-calling bullet to `README.md` Highlights
+- [ ] T050b [P] Add "Outbound calling" section to `docs/architecture.md`
+- [ ] T050c [P] Add an entry to `RELEASE_NOTES.md`
+- [ ] T050d Run `specs/025-outbound-calling/quickstart.md` end to end against real hardware
+- [ ] T050e Mark the outbound-calling item complete in `docs/todo.md`
 
 ---
 
 ## Dependencies & Execution Order
 
-### Phase Dependencies
+- **Phase 3 (pjsua UAS) blocks Phase 4 (T018+) and Phase 6 (T035)** — nothing
+  else in the original plan blocks on it. Phase 7 (US4, VoWiFi/VoLTE)
+  explicitly does **not** depend on Phase 3.
+- **Phase 4 (US1)** is the MVP: Foundational (done) → Phase 3 → `ControlCmd::Dial`
+  (T017a–f, independent of Phase 3) → T018–T023 (needs both).
+- **Phase 5 (US2, same-process)** only needs Phase 4. **Phase 8 (cross-process)**
+  is deferred and separate.
+- **Phase 6 (US3)** needs Phase 3 and reuses Phase 4's pipeline.
+- **Phase 7 (US4)** needs only Foundational — it can, in principle, be built
+  in parallel with Phases 3/4/6, since it shares no code with the pjsua UAS
+  work. Reaching it from a cross-process SIP-owning process still needs
+  Phase 8.
+- **Phase 9 (US5)** needs Phases 4/6/7 to have outcomes to diagnose.
+- **Phase 10 (Polish)** last.
 
-- **Setup (Phase 1)**: no dependencies
-- **Foundational (Phase 2)**: depends on Setup — BLOCKS all user stories
-- **US1 (Phase 3)**: depends on Foundational only — the MVP
-- **US2 (Phase 4)**: depends on Foundational; builds directly on US1's
-  `sip::outbound` pipeline (T017) but is independently testable once US1
-  exists (a single-line deployment stays on US1's fast path)
-- **US3 (Phase 5)**: depends on Foundational and reuses US1/US2's pipeline
-  (T014/T017/T029) — cannot be tested meaningfully before US1 exists, but
-  adds no new pipeline of its own
-- **US4 (Phase 6)**: depends on Foundational; reuses `control::line_server`
-  from US2 (T026) — a VoWiFi/VoLTE-only deployment needs US2's cross-process
-  channel even to exercise US1's CS-only fast path is absent, so US4
-  effectively depends on US2 being present, not just US1
-- **US5 (Phase 7)**: depends on US1–US4 existing to have outcomes to
-  diagnose; purely additive (logging/metrics), touches no new call-placement
-  logic
-- **Polish (Phase 8)**: depends on all desired user stories being complete
+### Parallel opportunities
 
-### Within Each User Story
-
-- Tests before implementation (constitution TDD default)
-- `sip::outbound` entity/validation before line selection before dial
-  before SIP-side wiring before progress/teardown
-- Story complete before moving to the next priority
-
-### Parallel Opportunities
-
-- T001/T002 (Setup) in parallel
-- T006/T007/T008 and T011/T012 (Foundational) in parallel — different files
-- T013/T014 (US1 tests) in parallel
-- T023/T024 (US2 tests) in parallel
-- T037/T039 (US4 tests) in parallel
-- T046/T047/T048 (Polish) in parallel
-
----
-
-## Parallel Example: User Story 1
-
-```bash
-# Tests first, in parallel (different files):
-Task: "Inline test for AtCommander::dial in gsm-sip-bridge/src/modules/at_commander.rs"
-Task: "Inline test for destination validation in gsm-sip-bridge/src/sip/outbound.rs"
-
-# Then sequentially, since each depends on the previous:
-Task: "Implement AtCommander::dial"
-Task: "Implement same-process line selection in sip::outbound"
-Task: "Implement the PBX-trunk UAS INVITE handler in sip::mod"
-```
-
----
+- T051/T055 (Phase 3) in parallel with T017a–e (Phase 4's `ControlCmd::Dial`,
+  independent of pjsua)
+- Phase 7 (US4) can run entirely in parallel with Phases 3/4/6, since it
+  shares no files or dependencies with the pjsua UAS work
+- T037/T040 (Phase 7 tests) in parallel
 
 ## Implementation Strategy
 
-### MVP First (User Story 1 Only)
+### MVP (unchanged goal, corrected path)
 
-1. Setup + Foundational
-2. User Story 1 — PBX-originated outbound calling on a single-process CS
-   deployment
-3. **STOP and VALIDATE**: run `quickstart.md`'s steps 1–3 against a
-   single-modem deployment
-4. Deploy/demo if ready — this alone delivers the feature's stated core
-   value for the most common (single-SIM, PBX-backed) deployment shape
-
-### Incremental Delivery
-
-1. Setup + Foundational → foundation ready
-2. US1 → validate → MVP demoable
-3. US2 → validate → multi-SIM and cross-process deployments covered
-4. US3 → validate → PBX-free (SIP server mode) deployments covered
-5. US4 → validate → VoWiFi/VoLTE/PC-SC deployments covered
-6. US5 → validate → day-two diagnosability covered
-7. Polish
-
-### Notes
-
-- [P] tasks = different files, no dependencies
-- Verify tests fail before implementing (TDD, constitution Development
-  Workflow)
-- Commit after each task or logical group (constitution Principle III)
-- `make format && make lint && make test` before every commit, no
-  exceptions (`CLAUDE.md`)
+1. Foundational (done)
+2. Phase 3 (pjsua UAS) — small, verify against real container + hardware early since everything else in US1/US3 depends on it
+3. `ControlCmd::Dial` (T017a–f) — can start immediately, doesn't wait on Phase 3
+4. T018–T023 — the actual MVP, verified against a real attached EC20
+5. **STOP and VALIDATE** on real hardware before continuing
+6. From there, US2 (same-process)/US3/US4/US5/Polish as before — US4 is now
+   independently reachable at any point since it doesn't depend on Phase 3

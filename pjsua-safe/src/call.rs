@@ -126,6 +126,52 @@ impl Call {
         }
     }
 
+    /// Wraps an already-received call (`Endpoint::poll_incoming_call`) so it
+    /// can be `answer`ed, `hangup`, or polled like any other `Call` (spec
+    /// 025, research.md R-007).
+    ///
+    /// Safe — no FFI. `Call`'s only invariant is "this `call_id` is valid in
+    /// PJSUA", which already holds: PJSIP handed us this `call_id` via
+    /// `on_incoming_call`, the same way `Call::make`'s `call_id` comes from
+    /// `pjsua_call_make_call`.
+    pub fn from_id(call_id: i32, state: CallState) -> Self {
+        Self { call_id, state }
+    }
+
+    /// Answers an incoming call with the given SIP status `code` (e.g. 180
+    /// for ringing, 200 to accept). Mirrors `hangup`'s
+    /// `#[cfg(feature = "pjsip-linked")]`/stub split.
+    pub fn answer(&mut self, code: u32) -> Result<(), PjsipError> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            ensure_pjsip_thread();
+            unsafe // SAFETY: PJSIP initialized; call_id valid for answer on this call
+            {
+                let status = pjsua_sys::pjsua_call_answer(
+                    self.call_id,
+                    code,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if status != crate::error::PJ_SUCCESS {
+                    return Err(PjsipError::CallAnswer(format!(
+                        "pjsua_call_answer({code}) returned {status}"
+                    )));
+                }
+            }
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            tracing::info!(code, "call answered (stub mode)");
+        }
+
+        if (200..300).contains(&code) {
+            self.state = CallState::Confirmed;
+        }
+        Ok(())
+    }
+
     pub fn hangup(&mut self) -> Result<(), PjsipError> {
         #[cfg(feature = "pjsip-linked")]
         {
@@ -234,5 +280,31 @@ impl Call {
 
     pub fn call_id(&self) -> i32 {
         self.call_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_id_carries_the_given_id_and_state() {
+        let call = Call::from_id(42, CallState::Incoming);
+        assert_eq!(call.call_id(), 42);
+        assert_eq!(call.state(), CallState::Incoming);
+    }
+
+    #[test]
+    fn answering_with_a_2xx_code_marks_the_call_confirmed() {
+        let mut call = Call::from_id(1, CallState::Incoming);
+        call.answer(200).unwrap();
+        assert_eq!(call.state(), CallState::Confirmed);
+    }
+
+    #[test]
+    fn answering_with_a_1xx_code_leaves_state_unchanged() {
+        let mut call = Call::from_id(1, CallState::Incoming);
+        call.answer(180).unwrap();
+        assert_eq!(call.state(), CallState::Incoming);
     }
 }

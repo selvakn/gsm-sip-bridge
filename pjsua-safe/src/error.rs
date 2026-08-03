@@ -11,6 +11,7 @@ pub enum PjsipError {
     AccountRegister(String),
     CallMake(String),
     CallHangup(String),
+    CallAnswer(String),
     MediaPort(String),
     Status(PjStatus),
 }
@@ -42,6 +43,7 @@ impl fmt::Display for PjsipError {
             PjsipError::AccountRegister(msg) => write!(f, "account registration failed: {msg}"),
             PjsipError::CallMake(msg) => write!(f, "make call failed: {msg}"),
             PjsipError::CallHangup(msg) => write!(f, "hangup failed: {msg}"),
+            PjsipError::CallAnswer(msg) => write!(f, "answer failed: {msg}"),
             PjsipError::MediaPort(msg) => write!(f, "media port error: {msg}"),
             PjsipError::Status(s) => write!(f, "PJSIP status: {s}"),
         }
