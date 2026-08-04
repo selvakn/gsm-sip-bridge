@@ -181,52 +181,118 @@ pub struct LineTableResult {
 }
 
 /// Resolves `assignment.vowifi` into an ordered, bounded `LineTable`
-/// (FR-012/FR-016): only SIM-ready candidates become lines, stable card-id
-/// order (independent of USB enumeration jitter), capped at
+/// (FR-012/FR-016): only SIM-ready candidates become lines, capped at
 /// `base.max_lines` with the excess reported as failed rather than dropped.
+///
+/// **Membership** — which candidates make the cut — is decided by three
+/// priority tiers sharing that one budget, each filled to capacity before
+/// the next gets any of what remains, so an auto-discovered candidate can
+/// never displace an operator's explicit configuration:
+///
+/// 1. A modem matched by an explicit `[[vowifi.line]]` `modem_serial`/
+///    `modem_port` override.
+/// 2. Every `pcsc_reader` line — always explicit; there is no such thing as
+///    an auto-discovered card-reader line.
+/// 3. Every other (auto-discovered, unpinned) modem.
+///
+/// Before specs/026-disable-circuit-switched, the second and third tiers
+/// were the only ones that could ever compete for a scarce slot, and a
+/// modem happened to win ties (specs/023-omnikey-pcsc-vowifi US2). That
+/// stopped being safe once `[cs].enabled = false` could substantially
+/// enlarge the auto-discovered pool with modems the circuit-switched path
+/// used to reserve for itself (greptile P1 on that PR): an auto-discovered
+/// modem must never bump an explicit pin, of either kind.
+///
+/// **Indices**, once membership is settled, are assigned independently of
+/// tier: every kept modem (pinned or not) ordered by card id, then every
+/// kept pcsc line ordered by position among the configured overrides — the
+/// same convention this function used before priority tiers existed. That
+/// split matters operationally: a line's index determines its whole network
+/// identity (namespace, veth pair, ports), so reassigning indices on every
+/// upgrade — even to deployments with no actual contention, where nothing
+/// was ever at risk of being bumped — would needlessly tear down and
+/// rebuild every tunnel on restart. Tier order only ever changes *who* is
+/// kept; a deployment where everything already fit within `max_lines` gets
+/// byte-identical indices to before this priority scheme existed.
 pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTableResult {
-    // Role assignment has already established each candidate's AT port, so
-    // a `Ready` SIM without one cannot occur here — hence
-    // `AlreadyEstablished` rather than VoLTE's `Required`.
-    let candidates = crate::line::select(
-        &assignment.vowifi,
-        base.max_lines,
-        crate::line::AtPortRequirement::AlreadyEstablished,
-    );
-    let mut failed = candidates.failed;
     let max_lines = base.max_lines as usize;
+    let mut failed = Vec::new();
 
-    let mut lines: Vec<ResolvedLine> = candidates
-        .kept
-        .iter()
-        .enumerate()
-        .map(|(i, modem)| resolve_one_line(i as u32, modem, base))
-        .collect();
+    // Role assignment has already established each candidate's AT port, so
+    // a `Ready` SIM without one cannot occur here.
+    let mut ready: Vec<&ProbedModem> = Vec::new();
+    for modem in &assignment.vowifi {
+        match crate::line::classify(modem, crate::line::AtPortRequirement::AlreadyEstablished) {
+            Ok(()) => ready.push(modem),
+            Err(r) => failed.push(FailedLine::new(modem.card_id.clone(), r.reason())),
+        }
+    }
+    // Sorted before the tier split below so each tier's slice remains
+    // card-id ordered (`partition` preserves relative order), which is what
+    // "the excluded suffix is the highest card ids" and the index-assignment
+    // pass both depend on.
+    ready.sort_by(|a, b| a.card_id.cmp(&b.card_id));
+    let (pinned_modems, unpinned_modems): (Vec<&ProbedModem>, Vec<&ProbedModem>) = ready
+        .into_iter()
+        .partition(|m| is_overridden_to_vowifi(m, &base.line_overrides));
 
-    // Card-reader-backed lines (specs/023-omnikey-pcsc-vowifi) are independent
-    // of modem scanning entirely — sourced straight from `base.line_overrides`
-    // — but continue the same index counter and share the same `max_lines`
-    // bound as modem lines combined (spec FR-006): an entry pushed past the
-    // cap is reported as failed identically to an excess modem line, using a
-    // synthetic `pcscN` card id (N = its position among pcsc overrides) since
-    // there is no USB modem identity to report instead.
     let pcsc_overrides: Vec<&VowifiLineOverride> = base
         .line_overrides
         .iter()
         .filter(|o| o.pcsc_reader)
         .collect();
-    let remaining_capacity = max_lines.saturating_sub(lines.len());
-    for (i, over) in pcsc_overrides.iter().enumerate() {
+
+    // --- Membership: tier 1 (pinned modems) → tier 2 (pcsc) → tier 3
+    // (unpinned modems), each capped by whatever budget the tiers before it
+    // left behind.
+    let pinned_kept = pinned_modems.len().min(max_lines);
+    let pcsc_kept = pcsc_overrides
+        .len()
+        .min(max_lines.saturating_sub(pinned_kept));
+    let unpinned_kept = unpinned_modems
+        .len()
+        .min(max_lines.saturating_sub(pinned_kept + pcsc_kept));
+
+    for modem in &pinned_modems[pinned_kept..] {
+        failed.push(FailedLine::new(
+            modem.card_id.clone(),
+            crate::line::Rejection::MaxLinesExceeded.reason(),
+        ));
+    }
+    // A synthetic `pcscN` card id (N = position among pcsc overrides) since
+    // there is no USB modem identity to report instead.
+    for (i, _) in pcsc_overrides.iter().enumerate().skip(pcsc_kept) {
+        failed.push(FailedLine::new(
+            format!("pcsc{i}"),
+            crate::line::Rejection::MaxLinesExceeded.reason(),
+        ));
+    }
+    for modem in &unpinned_modems[unpinned_kept..] {
+        failed.push(FailedLine::new(
+            modem.card_id.clone(),
+            crate::line::Rejection::MaxLinesExceeded.reason(),
+        ));
+    }
+
+    // --- Indices: every kept modem together, by card id, regardless of
+    // which tier kept it; then every kept pcsc line.
+    let mut kept_modems: Vec<&ProbedModem> = pinned_modems[..pinned_kept]
+        .iter()
+        .chain(unpinned_modems[..unpinned_kept].iter())
+        .copied()
+        .collect();
+    kept_modems.sort_by(|a, b| a.card_id.cmp(&b.card_id));
+
+    let mut lines: Vec<ResolvedLine> = kept_modems
+        .iter()
+        .enumerate()
+        .map(|(i, modem)| resolve_one_line(i as u32, modem, base))
+        .collect();
+
+    for (i, over) in pcsc_overrides.iter().take(pcsc_kept).enumerate() {
         let card_id = format!("pcsc{i}");
-        if i < remaining_capacity {
-            let index = lines.len() as u32;
-            lines.push(resolve_one_pcsc_line(index, card_id, over, base));
-        } else {
-            failed.push(FailedLine::new(
-                card_id,
-                crate::line::Rejection::MaxLinesExceeded.reason(),
-            ));
-        }
+        let index = lines.len() as u32;
+        lines.push(resolve_one_pcsc_line(index, card_id, over, base));
     }
 
     LineTableResult { lines, failed }
@@ -740,6 +806,79 @@ mod tests {
         );
     }
 
+    /// specs/026-disable-circuit-switched, greptile P1: an explicit
+    /// `[[vowifi.line]]` override must never be displaced by auto-discovered
+    /// modems that merely sort earlier by card id — the scenario `[cs].
+    /// enabled = false` makes newly reachable by enlarging the auto-
+    /// discovered pool with modems the circuit-switched path used to
+    /// reserve for itself.
+    #[test]
+    fn resolve_lines_never_displaces_an_explicit_override_with_auto_discovered_modems() {
+        let base = VowifiConfig {
+            max_lines: 2,
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some("ec20-ZZZZZZ".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Two unpinned candidates that sort ahead of the pinned one by card
+        // id alone, plus the pinned one itself — three candidates for two
+        // slots.
+        let modems = vec![
+            ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", true, "1"),
+            ready_modem("ec20-BBBBBB", "/dev/ttyUSB1", true, "2"),
+            ready_modem("ec20-ZZZZZZ", "/dev/ttyUSB2", true, "3"),
+        ];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+
+        let ids: Vec<&str> = result.lines.iter().map(|l| l.card_id.as_str()).collect();
+        assert!(
+            ids.contains(&"ec20-ZZZZZZ"),
+            "the explicitly pinned modem must always get a line: got {ids:?}"
+        );
+        assert_eq!(result.lines.len(), 2);
+        assert_eq!(
+            result
+                .failed
+                .iter()
+                .filter(|f| f.reason == "max_lines_exceeded")
+                .count(),
+            1
+        );
+    }
+
+    /// A `pcsc_reader` line is always explicit configuration — there is no
+    /// such thing as an auto-discovered card-reader line — so it must never
+    /// lose its capacity to auto-discovered modems either, even when they
+    /// alone would fill every available slot.
+    #[test]
+    fn resolve_lines_reserves_capacity_for_pcsc_lines_against_auto_discovered_modems() {
+        let base = VowifiConfig {
+            max_lines: 1,
+            line_overrides: vec![VowifiLineOverride {
+                pcsc_reader: true,
+                imsi_override: Some("404940123456789".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // A single auto-discovered modem candidate would, on its own,
+        // consume the entire max_lines=1 budget before the pcsc line ever
+        // gets a chance.
+        let modems = vec![ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", true, "1")];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].card_id, "pcsc0");
+        assert!(result
+            .failed
+            .iter()
+            .any(|f| f.card_id == "ec20-AAAAAA" && f.reason == "max_lines_exceeded"));
+    }
+
     #[test]
     fn resolve_lines_single_line_still_goes_through_index_derivation() {
         let modems = vec![ready_modem(
@@ -1103,6 +1242,16 @@ mod tests {
     fn resolve_lines_pcsc_overflow_reported_like_excess_modem_line() {
         // specs/023-omnikey-pcsc-vowifi US2 (T018): pcsc lines share
         // max_lines with modem lines, not an unbounded separate pool.
+        //
+        // Which one wins a contested slot changed under specs/026-disable-
+        // circuit-switched (greptile P1): a pcsc_reader entry is *always*
+        // explicit configuration — there is no such thing as an
+        // auto-discovered card-reader line — so it must never lose to a
+        // modem that only reached this candidate pool by auto-discovery
+        // (no matching [[vowifi.line]] override). The modem here has none,
+        // so the pcsc line now wins and the modem is the one reported as
+        // max_lines_exceeded — the reverse of this test's original
+        // assertion, which predates that guarantee.
         let base = VowifiConfig {
             max_lines: 1,
             line_overrides: vec![pcsc_override("404940123456789", "404", "043")],
@@ -1120,10 +1269,45 @@ mod tests {
         };
         let result = resolve_lines(&assignment, &base);
         assert_eq!(result.lines.len(), 1);
-        assert!(!result.lines[0].pcsc_reader, "the modem line wins the slot");
+        assert!(
+            result.lines[0].pcsc_reader,
+            "the pcsc line — always explicit config — wins the slot over an auto-discovered modem"
+        );
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].card_id, "ec20-AAAAAA");
+        assert_eq!(result.failed[0].reason, "max_lines_exceeded");
+    }
+
+    /// Companion to the above: an auto-discovered modem competing against a
+    /// pcsc line for the last slot loses; but the *same* modem, pinned by an
+    /// explicit [[vowifi.line]] override, wins instead — the pcsc
+    /// reservation only outranks *unpinned* modems, not explicit ones.
+    #[test]
+    fn resolve_lines_pinned_modem_still_beats_a_pcsc_line_for_a_contested_slot() {
+        let base = VowifiConfig {
+            max_lines: 1,
+            line_overrides: vec![
+                pcsc_override("404940123456789", "404", "043"),
+                VowifiLineOverride {
+                    modem_serial: Some("ec20-AAAAAA".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let modems = vec![ready_modem(
+            "ec20-AAAAAA",
+            "/dev/ttyUSB0",
+            false,
+            "404011111111111",
+        )];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, true);
+        let result = resolve_lines(&assignment, &base);
+
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].card_id, "ec20-AAAAAA");
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].card_id, "pcsc0");
-        assert_eq!(result.failed[0].reason, "max_lines_exceeded");
     }
 
     #[test]

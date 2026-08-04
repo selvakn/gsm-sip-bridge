@@ -115,10 +115,19 @@ pub struct Candidates<'a> {
 
 /// Turns a set of probed modems into an ordered, bounded candidate list.
 ///
-/// Ordering is by **card id, not USB enumeration order**: enumeration order
-/// varies between boots, and a line's index determines its namespace, veth
-/// addresses, and ports — so an unstable order would silently reassign a
-/// SIM's entire network identity across a restart.
+/// Ordering is by **card id, not USB enumeration order**, within each of two
+/// priority tiers: enumeration order varies between boots, and a line's
+/// index determines its namespace, veth addresses, and ports — so an
+/// unstable order would silently reassign a SIM's entire network identity
+/// across a restart. `is_pinned` — true for a modem an explicit
+/// `[[...line]]` override names by `modem_serial`/`modem_port` — decides the
+/// tier: every pinned candidate sorts ahead of every unpinned one,
+/// regardless of card id. Without that split, a pool enlarged by
+/// auto-discovery (e.g. specs/026-disable-circuit-switched freeing modems a
+/// disabled circuit-switched path no longer reserves) could bump an
+/// operator's explicit pin out to `max_lines_exceeded` in favor of a modem
+/// that merely sorts earlier alphabetically — passing `|_| false` when the
+/// caller has no such concept restores the plain by-card-id order.
 ///
 /// Overflow past `max_lines` is *reported* as `max_lines_exceeded` rather
 /// than silently dropped, so an operator who plugs in a fifth modem with
@@ -127,6 +136,7 @@ pub fn select<'a>(
     modems: impl IntoIterator<Item = &'a ProbedModem>,
     max_lines: u32,
     at_port: AtPortRequirement,
+    is_pinned: impl Fn(&ProbedModem) -> bool,
 ) -> Candidates<'a> {
     let mut failed = Vec::new();
     let mut ready: Vec<&ProbedModem> = Vec::new();
@@ -138,7 +148,11 @@ pub fn select<'a>(
         }
     }
 
-    ready.sort_by(|a, b| a.card_id.cmp(&b.card_id));
+    ready.sort_by(|a, b| {
+        is_pinned(b)
+            .cmp(&is_pinned(a))
+            .then_with(|| a.card_id.cmp(&b.card_id))
+    });
 
     let max_lines = max_lines as usize;
     let overflow = ready.split_off(max_lines.min(ready.len()));
@@ -192,7 +206,7 @@ mod tests {
             ready("ec20-AAAAAA"),
             ready("ec20-BBBBBB"),
         ];
-        let c = select(&m, 8, AtPortRequirement::Required);
+        let c = select(&m, 8, AtPortRequirement::Required, |_| false);
 
         let ids: Vec<&str> = c.kept.iter().map(|m| m.card_id.as_str()).collect();
         assert_eq!(ids, ["ec20-AAAAAA", "ec20-BBBBBB", "ec20-CCCCCC"]);
@@ -202,7 +216,7 @@ mod tests {
     #[test]
     fn overflow_past_max_lines_is_reported_not_silently_dropped() {
         let m = [ready("a"), ready("b"), ready("c"), ready("d")];
-        let c = select(&m, 2, AtPortRequirement::Required);
+        let c = select(&m, 2, AtPortRequirement::Required, |_| false);
 
         assert_eq!(c.kept.len(), 2);
         assert_eq!(
@@ -220,16 +234,59 @@ mod tests {
     #[test]
     fn the_cap_keeps_the_lowest_card_ids_regardless_of_probe_order() {
         let m = [ready("d"), ready("b"), ready("a"), ready("c")];
-        let c = select(&m, 2, AtPortRequirement::Required);
+        let c = select(&m, 2, AtPortRequirement::Required, |_| false);
 
         let ids: Vec<&str> = c.kept.iter().map(|m| m.card_id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
     }
 
+    /// A pinned candidate must never lose its slot to an unpinned one that
+    /// merely sorts earlier by card id — the gap specs/026-disable-
+    /// circuit-switched surfaced: freeing previously CS-reserved modems to
+    /// VoWiFi enlarges the auto-discovered pool, and without this priority
+    /// an operator's explicit override could be silently bumped out.
+    #[test]
+    fn a_pinned_candidate_is_kept_over_unpinned_ones_that_sort_earlier() {
+        let m = [
+            ready("aaa-unpinned"),
+            ready("bbb-unpinned"),
+            ready("zzz-pinned"),
+        ];
+        let c = select(&m, 2, AtPortRequirement::Required, |modem| {
+            modem.card_id == "zzz-pinned"
+        });
+
+        let ids: Vec<&str> = c.kept.iter().map(|m| m.card_id.as_str()).collect();
+        assert_eq!(ids, ["zzz-pinned", "aaa-unpinned"]);
+        assert_eq!(
+            c.failed,
+            vec![FailedLine::new("bbb-unpinned", "max_lines_exceeded")]
+        );
+    }
+
+    /// Within each tier — pinned or unpinned — ordering is still by card id,
+    /// not probe order, so a deployment with more than one pinned modem
+    /// still gets stable indices across restarts.
+    #[test]
+    fn ordering_within_each_pinned_tier_is_still_by_card_id() {
+        let m = [
+            ready("pinned-b"),
+            ready("unpinned-b"),
+            ready("pinned-a"),
+            ready("unpinned-a"),
+        ];
+        let c = select(&m, 8, AtPortRequirement::Required, |modem| {
+            modem.card_id.starts_with("pinned")
+        });
+
+        let ids: Vec<&str> = c.kept.iter().map(|m| m.card_id.as_str()).collect();
+        assert_eq!(ids, ["pinned-a", "pinned-b", "unpinned-a", "unpinned-b"]);
+    }
+
     #[test]
     fn max_lines_zero_keeps_nothing_and_reports_everything() {
         let m = [ready("a"), ready("b")];
-        let c = select(&m, 0, AtPortRequirement::Required);
+        let c = select(&m, 0, AtPortRequirement::Required, |_| false);
 
         assert!(c.kept.is_empty());
         assert_eq!(c.failed.len(), 2);
@@ -247,7 +304,7 @@ mod tests {
             ),
             modem("noprobe", None, false),
         ];
-        let c = select(&m, 8, AtPortRequirement::Required);
+        let c = select(&m, 8, AtPortRequirement::Required, |_| false);
 
         assert!(c.kept.is_empty());
         assert_eq!(
@@ -273,9 +330,14 @@ mod tests {
             false,
         )];
 
-        assert_eq!(select(&m, 8, AtPortRequirement::Required).kept.len(), 0);
         assert_eq!(
-            select(&m, 8, AtPortRequirement::AlreadyEstablished)
+            select(&m, 8, AtPortRequirement::Required, |_| false)
+                .kept
+                .len(),
+            0
+        );
+        assert_eq!(
+            select(&m, 8, AtPortRequirement::AlreadyEstablished, |_| false)
                 .kept
                 .len(),
             1

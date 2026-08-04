@@ -106,10 +106,16 @@ pub struct VolteLineTableResult {
 pub fn resolve_volte_lines(modems: &[ProbedModem], base: &VolteConfig) -> VolteLineTableResult {
     // Unlike VoWiFi, there is no prior role assignment here, so a `Ready`
     // SIM whose modem exposes no AT port has to be rejected explicitly.
+    //
+    // A modem an explicit [[volte.line]] override names by modem_serial/
+    // modem_port is pinned ahead of every auto-discovered candidate — see
+    // `line::select`'s own doc comment for why (an enlarged auto-discovered
+    // pool must never bump an operator's explicit pin).
     let candidates = crate::line::select(
         modems,
         base.max_lines,
         crate::line::AtPortRequirement::Required,
+        |modem| override_for(modem, &base.line_overrides).is_some(),
     );
     let failed = candidates.failed;
 
