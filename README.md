@@ -192,6 +192,18 @@ Common issues — no `ttyUSB` devices, missing audio device, SIP
 registration failures, choppy audio, cards stuck in recovery — are covered
 in the runbook: [docs/operations.md](docs/operations.md#troubleshooting).
 
+## Community
+
+Have a question about your setup, hit something the docs don't cover, or
+want to share how you're using the bridge? Head over to
+[GitHub Discussions](https://github.com/selvakn/gsm-sip-bridge/discussions):
+
+- **[Q&A](https://github.com/selvakn/gsm-sip-bridge/discussions/categories/q-a)** — ask about configuration, hardware, or anything that isn't quite a bug report.
+- **[Show and tell](https://github.com/selvakn/gsm-sip-bridge/discussions/categories/show-and-tell)** — share your setup, modem/SIM combos, or PBX integration.
+- **[Ideas](https://github.com/selvakn/gsm-sip-bridge/discussions/categories/ideas)** — propose features before opening a PR.
+
+Found an actual bug? Use [Issues](https://github.com/selvakn/gsm-sip-bridge/issues) instead.
+
 ## Acknowledgements
 
 The VoWiFi bridge stands on foundation work by the
