@@ -34,6 +34,16 @@ loss, missed calls).
 
 ## How it works
 
+The carrier decides how a given call is delivered: over the
+circuit-switched network to an EC20 module, over VoWiFi through the
+ePDG tunnel, or over VoLTE through the bridge's own IMS registration on
+the LTE data path. Either way it becomes a SIP call — to a PBX, or
+directly to an IP phone if there's no PBX in the deployment (below). See
+[docs/architecture.md](docs/architecture.md) for the crate layout, all
+three call flows in detail, and the audio pipeline.
+
+### With a PBX (the default)
+
 ```mermaid
 flowchart LR
     Phone["Caller"]
@@ -52,19 +62,36 @@ flowchart LR
     PBX <-->|"SIP + RTP"| IPPhone
 ```
 
-The carrier decides how a given call is delivered: over the
-circuit-switched network to an EC20 module, over VoWiFi through the
-ePDG tunnel, or over VoLTE through the bridge's own IMS registration on
-the LTE data path. Either way it ends up as a SIP call to your PBX. See
-[docs/architecture.md](docs/architecture.md) for the crate layout, all
-three call flows in detail, and the audio pipeline.
+The bridge registers to the PBX as a trunk; inbound mobile calls are
+INVITEd to it and routed by its own dial plan. With `[outbound].enabled`,
+the PBX can also place calls back out onto the mobile network through the
+bridge.
 
-**No PBX?** Any of those three paths can instead ring an IP phone registered
-directly to the bridge — set `[sip_server].enabled` and the bridge becomes the
-SIP server itself, with no telephone system in the deployment. Off by default;
-inbound only. See
-[docs/architecture.md](docs/architecture.md#two-sip-side-topologies) and
-[docs/configuration.md](docs/configuration.md).
+### Without a PBX — the bridge as the SIP server
+
+`[sip_server].enabled` turns the bridge itself into the SIP server: IP
+phones REGISTER directly to it, and any of the three carrier paths rings
+whichever account is configured — no separate telephone system anywhere
+in the deployment.
+
+```mermaid
+flowchart LR
+    Carrier["Carrier network<br/>(GSM + IMS core)"]
+    Server["Bridge server<br/>(gsm-sip-bridge)"]
+    IPPhone["IP Phone /<br/>Softphone"]
+
+    Carrier <-->|"CS / VoWiFi / VoLTE"| Server
+    IPPhone -->|"REGISTER"| Server
+    Server -->|"INVITE + RTP"| IPPhone
+    IPPhone -->|"INVITE (dial out),<br/>[outbound].enabled"| Server
+```
+
+Off by default, and inbound-only unless `[outbound].enabled` is also set. See
+[docs/architecture.md#two-sip-side-topologies](docs/architecture.md#two-sip-side-topologies)
+and [docs/architecture.md#outbound-calling](docs/architecture.md#outbound-calling)
+for the full design, and
+[docs/configuration.md](docs/configuration.md#sip_server) for the setting
+reference.
 
 ## Quick Start (Docker Compose)
 

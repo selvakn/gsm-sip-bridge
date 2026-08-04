@@ -15,7 +15,7 @@ Docker Compose quick start, then come back here for depth.
 
 | Doc | What it covers |
 |---|---|
-| [operations.md](operations.md) | Day-2 runbook: `card` CLI, database queries/prune/backup, troubleshooting, the [VoLTE bridge reference](operations.md#host-side-ims-over-lte-volte), and the [SIP server mode runbook](operations.md#sip-server-mode) |
+| [operations.md](operations.md) | Day-2 runbook: `card` CLI, database queries/prune/backup, troubleshooting, the [VoLTE bridge reference](operations.md#host-side-ims-over-lte-volte), the [SIP server mode runbook](operations.md#sip-server-mode), and the [outbound calling runbook](operations.md#outbound-calling) |
 | [observability.md](observability.md) | Prometheus metrics reference, Grafana dashboard, database schema |
 | [ec20-volte-setup.md](ec20-volte-setup.md) | Enabling the EC20's *own* modem-internal VoLTE (MBN profile deactivation, AT commands) — distinct from the host-side VoLTE bridge below |
 | [migrating-config-to-strict-parsing.md](migrating-config-to-strict-parsing.md) | Upgrading to strict config parsing: unknown keys now fail startup, and derived per-line fields are no longer accepted at the top level |
@@ -27,7 +27,7 @@ Docker Compose quick start, then come back here for depth.
 
 | Doc | What it covers |
 |---|---|
-| [architecture.md](architecture.md) | Crate layout, all three call flows (CS, VoWiFi, VoLTE), the [two SIP-side topologies](architecture.md#two-sip-side-topologies) (PBX trunk or the bridge as SIP server), audio pipeline, multi-card/multi-line design |
+| [architecture.md](architecture.md) | Crate layout, all three call flows (CS, VoWiFi, VoLTE), the [two SIP-side topologies](architecture.md#two-sip-side-topologies) (PBX trunk or the bridge as SIP server), [outbound calling](architecture.md#outbound-calling), audio pipeline, multi-card/multi-line design |
 | [vowifi-bridge.md](vowifi-bridge.md) | The VoWiFi-to-SIP bridge in depth: two-agent design, codecs, control protocol |
 | [omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md) | A VoWiFi line backed by a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem — config, IMSI/IMEI handling, verification checklist, troubleshooting |
 
@@ -42,8 +42,9 @@ Kept for the reasoning and findings, not as how-to guides.
 | [audio-tuning-log.md](audio-tuning-log.md) | Running log of modem/SIP audio parameter changes and their outcomes |
 
 Per-feature specs, plans, and task breakdowns live under
-[`specs/`](../specs/) — most recently `024-sip-server-mode` for the bridge
-acting as the SIP server itself, `023-omnikey-pcsc-vowifi` for
+[`specs/`](../specs/) — most recently `025-outbound-calling` for placing
+calls out through the mobile network on request, `024-sip-server-mode` for
+the bridge acting as the SIP server itself, `023-omnikey-pcsc-vowifi` for
 PC/SC card-reader-backed VoWiFi lines, `015-volte-host-ims` through
 `020-volte-line-netns` for the host-side VoLTE bridge (registration, calls,
 inbound bridging, multi-modem, per-line network isolation), and

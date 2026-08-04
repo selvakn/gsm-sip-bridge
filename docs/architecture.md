@@ -76,6 +76,7 @@ flowchart LR
     Carrier <-->|"CS / VoWiFi / VoLTE"| Server
     IPPhone -->|"REGISTER :5060"| Server
     Server -->|"INVITE + RTP<br/>from [sip].local_port"| IPPhone
+    IPPhone -->|"INVITE (dial out),<br/>[outbound].enabled"| Server
 ```
 
 The registrar is pure Rust on its own UDP port, hosted in-process by whichever

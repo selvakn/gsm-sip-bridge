@@ -637,12 +637,71 @@ holds the port — most often a previous run still shutting down, or an
 
 ### Limitations
 
-- **Inbound only.** A phone cannot dial out through the mobile network; the
-  attempt is refused with `403` and logged. The bridge has never had outbound
-  cellular origination and this mode does not add it.
+- **Inbound only by default.** A phone cannot dial out through the mobile
+  network unless `[outbound].enabled` is also set — without it, the attempt is
+  refused with `403` and logged. See [Outbound calling](#outbound-calling)
+  below.
 - **One phone rings.** Others may register but are never called. Registering a
   second device on the *same* account replaces the first, so calls go to
   whichever registered most recently.
 - **UDP only**, and no NAT between phone and bridge — this targets a
   single-site LAN.
 - **No message-waiting or busy-lamp** subscriptions (answered `489 Bad Event`).
+
+## Outbound calling
+
+`specs/025-outbound-calling`. Reverses the normal direction: instead of only
+answering calls the mobile network delivers, the bridge places one on
+request — a PBX-sent `INVITE` to its trunk account, or (in
+[SIP server mode](#sip-server-mode)) any currently-registered phone's own
+`INVITE`, redirected back to the bridge instead of refused. Opt in with
+`[outbound].enabled`; off by default. See
+[configuration.md](configuration.md#outbound) for the setting and
+[architecture.md](architecture.md#outbound-calling) for how a request is
+validated and routed to a line.
+
+### Enabling it
+
+```toml
+[outbound]
+enabled = true
+```
+
+Nothing else to configure — the destination is the Request-URI's user part,
+dialed verbatim on whichever line (circuit-switched, VoWiFi, or VoLTE) is
+idle, no path preference and no allow-list. Restricting who may reach the
+bridge and what they may dial is left to the PBX's dial plan and network
+access controls, or, in SIP server mode, `[[sip_server.account]]`
+credentials.
+
+### Troubleshooting
+
+**`403 Forbidden` on every dial-out attempt.** Either `[outbound].enabled` is
+still `false`, or (SIP server mode only) the phone placing the call is not
+currently registered — the registrar only redirects an INVITE from a source
+address it already holds a live binding for, never an unauthenticated one.
+
+**`503 Service Unavailable`.** No idle line in the process that received the
+INVITE. Line selection is per-process with no cross-process fallback: if the
+circuit-switched daemon owns the SIP side and every EC20 is busy, the call is
+refused even if a VoWiFi/VoLTE line happens to be idle — see
+[architecture.md#outbound-calling](architecture.md#outbound-calling).
+
+**`484 Address Incomplete`.** The Request-URI's user part failed the
+destination check (empty, or otherwise not dialable). The bridge dials it
+verbatim, so check what the PBX or phone actually put there.
+
+**Track outcomes** via `gsm_sip_bridge_outbound_attempts_total{outcome=...}`
+— `placed`, `refused_no_idle_line`, `refused_invalid_destination`,
+`refused_network_failure`, `unanswered`.
+
+### Limitations
+
+- **Coarse progress on the circuit-switched path.** `ATD`'s own response only
+  confirms dialing started, not that the destination answered, so a
+  CS-originated call is accepted (`200`) once dialing is confirmed rather
+  than once truly answered.
+- **The VoWiFi/VoLTE path blocks its own dispatch loop** for up to ~80s while
+  a call is in flight. During that window a caller hanging up mid-ring cannot
+  trigger a CANCEL, and an unrelated inbound call on that same process is
+  dropped. See `docs/todo.md`.

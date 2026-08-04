@@ -283,9 +283,10 @@ inbound calls ring a registered phone — instead of registering to an external
 PBX (specs/024-sip-server-mode). For small deployments with no telephone system
 to point at. Off by default.
 
-Inbound only: a phone cannot dial out through the mobile network, and such an
-attempt is refused with `403`. Exactly one account rings; others may register
-but are never called.
+Inbound only by default: a phone cannot dial out through the mobile network,
+and such an attempt is refused with `403`, unless `[outbound]` below is also
+enabled. Exactly one account rings inbound calls; others may register but are
+never called for those.
 
 Enabling this changes what `[sip]` means. `server`, `username` and `password`
 describe a PBX that does not exist in this mode, so they become **errors**
