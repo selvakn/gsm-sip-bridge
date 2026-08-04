@@ -172,6 +172,51 @@ impl Account {
         }
     }
 
+    /// Rewrites this account's identity (`acc_cfg.id`) in place — the `From`
+    /// PJSIP puts on every call [`Call::make`](crate::Call::make) places from
+    /// it afterwards, until the next call to this method.
+    ///
+    /// Exists because `pjsua_call_make_call` takes no per-call `From`
+    /// override, only the placing account's own fixed identity — so a
+    /// SIP-server-mode account, which lives for the whole process and rings
+    /// a different mobile caller on every call, has no other way to make the
+    /// phone's screen show the real caller instead of the bridge's own
+    /// static AOR. Safe to call between calls because SIP-server mode places
+    /// at most one call at a time (`SipBridge::make_call`'s `active_call`
+    /// check) and this account never registers anywhere, so there is no
+    /// REGISTER exchange whose identity this could disturb.
+    #[cfg(feature = "pjsip-linked")]
+    pub fn set_identity(&self, id_uri: &str, display_name: &str) -> Result<(), PjsipError> {
+        crate::endpoint::ensure_pjsip_thread();
+        use std::ffi::CString;
+
+        unsafe // SAFETY: PJSIP initialized; acc_cfg and pj_str sources live until pjsua_acc_modify returns
+        {
+            let mut acc_cfg: pjsua_sys::pjsua_acc_config = std::mem::zeroed();
+            pjsua_sys::pjsua_acc_config_default(&mut acc_cfg);
+
+            let id_str = format!("\"{display_name}\" <{id_uri}>");
+            let id_cstr = CString::new(id_str)
+                .map_err(|_| PjsipError::AccountRegister("identity contains a NUL byte".into()))?;
+            acc_cfg.id = pjsua_sys::pj_str(id_cstr.as_ptr() as *mut std::os::raw::c_char);
+            acc_cfg.cred_count = 0;
+
+            let status = pjsua_sys::pjsua_acc_modify(self.account_id, &acc_cfg);
+            if status != crate::error::PJ_SUCCESS {
+                return Err(PjsipError::AccountRegister(format!(
+                    "pjsua_acc_modify returned {status}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stub build: no live account to modify.
+    #[cfg(not(feature = "pjsip-linked"))]
+    pub fn set_identity(&self, _id_uri: &str, _display_name: &str) -> Result<(), PjsipError> {
+        Ok(())
+    }
+
     /// Whether the registrar currently has this account registered.
     ///
     /// Queries PJSUA's live account info rather than trusting the fire-and-forget

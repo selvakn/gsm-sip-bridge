@@ -405,6 +405,31 @@ impl SipBridge {
             .as_ref()
             .ok_or_else(|| "no SIP account registered".to_string())?;
 
+        // SIP server mode: the phone receives this INVITE directly, with no
+        // PBX in between to turn `P-Asserted-Identity` into a caller ID it
+        // will actually display — plain SIP handsets show the `From`, which
+        // this account otherwise leaves fixed at the bridge's own identity
+        // for every call (see `Account::set_identity`). Trunk mode leaves
+        // this alone: there, a real PBX sits between this account and the
+        // phone and already reads `P-Asserted-Identity` below, which is what
+        // FR-017 ("by the same means it already uses when calling a PBX")
+        // called for.
+        if self.bindings.is_some() {
+            let id_uri = self.config.sip_server.caller_identity_uri(gsm_caller_id);
+            let display = if gsm_caller_id.is_empty() {
+                self.config.display_name.as_str()
+            } else {
+                gsm_caller_id
+            };
+            if let Err(e) = account.set_identity(&id_uri, display) {
+                tracing::warn!(
+                    error = %e,
+                    "sip_server: failed to set this call's caller identity; \
+                     phone will show the bridge's own identity instead"
+                );
+            }
+        }
+
         let mut headers: Vec<(&str, &str)> = Vec::new();
         let pai_value;
         if !gsm_caller_id.is_empty() {
