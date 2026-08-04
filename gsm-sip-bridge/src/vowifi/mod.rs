@@ -452,6 +452,17 @@ pub(crate) fn run_telephony_side(
     let store = StoreHandle::open(Path::new(&config.sms.db_path))
         .map_err(|e| BridgeError::Ims(format!("failed to open SMS store: {e}")))?;
 
+    // Guards `Account::set_identity` + the `Call::make` that reads it back
+    // in `bridge_call`, below. Every line's thread closes over the same
+    // `&Account` (one shared identity, not one per line), and rewriting
+    // that identity then placing a call from it are two separate PJSUA
+    // calls with no atomicity between them — without this lock, two lines
+    // ringing at once can interleave: line A sets its caller's identity,
+    // line B overwrites it with its own before line A's `Call::make` runs,
+    // and line A's INVITE goes out carrying line B's caller ID (found in
+    // review — Greptile, PR #24).
+    let call_placement_lock: Mutex<()> = Mutex::new(());
+
     // One accept-loop thread per line, all sharing the one endpoint/account/
     // Discord client/store/runtime above — `std::thread::scope` blocks until
     // every thread finishes, which in practice is never (each loops forever
@@ -502,6 +513,7 @@ pub(crate) fn run_telephony_side(
             let endpoint = &endpoint;
             let account = &account;
             let bindings = bindings.as_ref();
+            let call_placement_lock = &call_placement_lock;
             let recent_calls = Arc::clone(&recent_calls);
             let discord_client = &discord_client;
             let sms_runtime = &sms_runtime;
@@ -520,6 +532,7 @@ pub(crate) fn run_telephony_side(
                     endpoint,
                     account,
                     bindings,
+                    call_placement_lock,
                     config,
                     &recent_calls,
                     discord_client,
@@ -1160,6 +1173,7 @@ fn run_line_listener(
     // `Some` in SIP server mode: the phones registered to this process's own
     // registrar, which is where the outbound leg is dialled instead of a PBX.
     bindings: Option<&Arc<crate::sip::server::BindingStore>>,
+    call_placement_lock: &Mutex<()>,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
     discord_client: &Option<DiscordClient>,
@@ -1224,6 +1238,7 @@ fn run_line_listener(
             endpoint,
             account,
             bindings,
+            call_placement_lock,
             config,
             recent_calls,
             discord_client,
@@ -1338,6 +1353,7 @@ fn handle_connection(
     endpoint: &Endpoint,
     account: &Account,
     bindings: Option<&Arc<crate::sip::server::BindingStore>>,
+    call_placement_lock: &Mutex<()>,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
     discord_client: &Option<DiscordClient>,
@@ -1395,7 +1411,14 @@ fn handle_connection(
     let started_at = now_unix();
 
     match bridge_call(
-        endpoint, account, bindings, config, &caller, leg_addr, leg_port,
+        endpoint,
+        account,
+        bindings,
+        call_placement_lock,
+        config,
+        &caller,
+        leg_addr,
+        leg_port,
     ) {
         Ok((mut pbx_call, mut veth_call)) => {
             write_msg(
@@ -1692,6 +1715,7 @@ fn bridge_call(
     endpoint: &Endpoint,
     account: &Account,
     bindings: Option<&Arc<crate::sip::server::BindingStore>>,
+    call_placement_lock: &Mutex<()>,
     config: &AppConfig,
     caller: &str,
     leg_addr: &str,
@@ -1702,26 +1726,6 @@ fn bridge_call(
     // leave the caller connected to nothing.
     let pbx_uri = telephony_dest_uri(config, bindings, caller)?;
 
-    // SIP server mode: same reasoning as `crate::sip::SipBridge::make_call`
-    // — the phone receives this INVITE directly, so it is the `From` (not
-    // `P-Asserted-Identity` below, which only a PBX in the middle would
-    // read) that must carry the real caller.
-    if bindings.is_some() {
-        let id_uri = config.sip_server.caller_identity_uri(caller);
-        let display = if caller.is_empty() {
-            config.sip.display_name.as_str()
-        } else {
-            caller
-        };
-        if let Err(e) = account.set_identity(&id_uri, display) {
-            tracing::warn!(
-                error = %e,
-                "sip_server: failed to set this call's caller identity; \
-                 phone will show the bridge's own identity instead"
-            );
-        }
-    }
-
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
     if !caller.is_empty() {
@@ -1730,8 +1734,40 @@ fn bridge_call(
         headers.push(("X-GSM-Caller-ID", caller));
     }
 
-    let pbx_call = Call::make(account, &pbx_uri, None, &headers)
-        .map_err(|e| BridgeError::Ims(format!("PBX-side call failed: {e}")))?;
+    // SIP server mode: same reasoning as `crate::sip::SipBridge::make_call`
+    // — the phone receives this INVITE directly, so it is the `From` (not
+    // `P-Asserted-Identity` above, which only a PBX in the middle would
+    // read) that must carry the real caller. `set_identity` rewrites the
+    // one `Account` every line's thread shares, and `Call::make` right
+    // below is what actually reads that identity into the INVITE it
+    // builds — the lock has to span both, or another line's thread can set
+    // its own caller in between and this call goes out under the wrong
+    // name (see `call_placement_lock`'s doc comment in `run`). Not held
+    // around the veth-side call further down: nothing reads this account's
+    // identity for that leg, and a PJSIP dialog never re-reads it once its
+    // INVITE has been sent.
+    let pbx_call = {
+        let _guard = call_placement_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if bindings.is_some() {
+            let id_uri = config.sip_server.caller_identity_uri(caller);
+            let display = if caller.is_empty() {
+                config.sip.display_name.as_str()
+            } else {
+                caller
+            };
+            if let Err(e) = account.set_identity(&id_uri, display) {
+                tracing::warn!(
+                    error = %e,
+                    "sip_server: failed to set this call's caller identity; \
+                     phone will show the bridge's own identity instead"
+                );
+            }
+        }
+        Call::make(account, &pbx_uri, None, &headers)
+            .map_err(|e| BridgeError::Ims(format!("PBX-side call failed: {e}")))?
+    };
 
     let veth_uri = format!("sip:agent-a@{leg_addr}:{leg_port}");
     let veth_call = Call::make(account, &veth_uri, None, &[])
