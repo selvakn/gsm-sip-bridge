@@ -1,13 +1,14 @@
 # Documentation
 
-Start with the [project README](../README.md) for an overview and the
-Docker Compose quick start, then come back here for depth.
+Start with the [project README](https://github.com/selvakn/gsm-sip-bridge#readme)
+for an overview and the Docker Compose quick start, then come back here for
+depth.
 
 ## Getting started
 
 | Doc | What it covers |
 |---|---|
-| [Quick Start](../README.md#quick-start-docker-compose) | Deploy the full stack with Docker Compose |
+| [Quick Start](https://github.com/selvakn/gsm-sip-bridge#quick-start-docker-compose) | Deploy the full stack with Docker Compose |
 | [supported-hardware.md](supported-hardware.md) | Which modems/readers work, which call modes each supports, and one-time device setup |
 | [configuration.md](configuration.md) | Every `config.toml` key, with defaults, ranges, and example configs |
 
