@@ -1702,6 +1702,26 @@ fn bridge_call(
     // leave the caller connected to nothing.
     let pbx_uri = telephony_dest_uri(config, bindings, caller)?;
 
+    // SIP server mode: same reasoning as `crate::sip::SipBridge::make_call`
+    // — the phone receives this INVITE directly, so it is the `From` (not
+    // `P-Asserted-Identity` below, which only a PBX in the middle would
+    // read) that must carry the real caller.
+    if bindings.is_some() {
+        let id_uri = config.sip_server.caller_identity_uri(caller);
+        let display = if caller.is_empty() {
+            config.sip.display_name.as_str()
+        } else {
+            caller
+        };
+        if let Err(e) = account.set_identity(&id_uri, display) {
+            tracing::warn!(
+                error = %e,
+                "sip_server: failed to set this call's caller identity; \
+                 phone will show the bridge's own identity instead"
+            );
+        }
+    }
+
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
     if !caller.is_empty() {

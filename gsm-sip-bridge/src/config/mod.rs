@@ -99,11 +99,44 @@ impl SipServerConfig {
     /// Observed in the containerised run of spec 024 T071, which logged
     /// `id=sip:1001@0.0.0.0:5060`.
     pub fn identity_uri(&self) -> String {
-        let host = match self.listen_addr.parse::<std::net::IpAddr>() {
+        format!(
+            "sip:{}@{}:{}",
+            self.ring_aor,
+            self.identity_host(),
+            self.listen_port
+        )
+    }
+
+    /// The `From` PJSIP should put on a call ringing the phone for a specific
+    /// mobile caller — same host substitution as [`identity_uri`], but the
+    /// caller's own number in place of `ring_aor`. Falls back to
+    /// [`identity_uri`] when the caller ID is unknown (withheld or CLIP not
+    /// provided by the network), reproducing the pre-existing behaviour for
+    /// that case exactly.
+    ///
+    /// `pjsua_call_make_call` has no per-call override of `From` — only
+    /// per-account (`acc_cfg.id`) — so the caller must rewrite the single
+    /// server-mode account's identity before each call it places (see
+    /// `pjsua_safe::Account::set_identity`).
+    pub fn caller_identity_uri(&self, caller_did: &str) -> String {
+        if caller_did.is_empty() {
+            return self.identity_uri();
+        }
+        format!(
+            "sip:{}@{}:{}",
+            caller_did,
+            self.identity_host(),
+            self.listen_port
+        )
+    }
+
+    /// Not simply `listen_addr`: see [`identity_uri`]'s doc comment for why a
+    /// wildcard address falls back to the realm.
+    fn identity_host(&self) -> &str {
+        match self.listen_addr.parse::<std::net::IpAddr>() {
             Ok(ip) if ip.is_unspecified() => self.realm.as_str(),
             _ => self.listen_addr.as_str(),
-        };
-        format!("sip:{}@{}:{}", self.ring_aor, host, self.listen_port)
+        }
     }
 }
 
@@ -1847,6 +1880,31 @@ password = "s3cret"
     fn a_concrete_listen_addr_is_used_as_the_calling_identity() {
         let c = server_mode_with("listen_addr = \"192.168.1.10\"\n").expect("parses");
         assert_eq!(c.sip_server.identity_uri(), "sip:1001@192.168.1.10:5060");
+    }
+
+    /// The whole point of `caller_identity_uri`: a phone in server mode has
+    /// no PBX to translate `P-Asserted-Identity` into a displayed caller ID,
+    /// so the mobile number must appear in what becomes the `From` itself.
+    #[test]
+    fn the_caller_identity_uri_carries_the_mobile_number_not_the_ring_aor() {
+        let c = try_parse(SERVER_MODE_TOML).expect("parses");
+        assert_eq!(
+            c.sip_server.caller_identity_uri("+15551234567"),
+            "sip:+15551234567@gsm-sip-bridge:5060"
+        );
+    }
+
+    /// An unavailable CLIP (withheld or not provided by the network) falls
+    /// back to the bridge's own identity, exactly as every call did before
+    /// per-call identities existed — no call should end up with an empty
+    /// user part in its `From`.
+    #[test]
+    fn an_empty_caller_id_falls_back_to_the_ring_aor_identity() {
+        let c = try_parse(SERVER_MODE_TOML).expect("parses");
+        assert_eq!(
+            c.sip_server.caller_identity_uri(""),
+            c.sip_server.identity_uri()
+        );
     }
 
     /// The realm can become the `From` host and is quoted into the challenge,
