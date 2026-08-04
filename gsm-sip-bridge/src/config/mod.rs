@@ -149,6 +149,14 @@ pub struct OutboundConfig {
     pub enabled: bool,
 }
 
+/// The opt-out switch for the circuit-switched call path (specs/026-
+/// disable-circuit-switched). Defaults to enabled — see `RawCs`'s own doc
+/// comment on why that default must never be derived.
+#[derive(Clone, Debug)]
+pub struct CsConfig {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SmsConfig {
     pub enabled: bool,
@@ -828,6 +836,7 @@ pub struct AppConfig {
     pub alerts: AlertsConfig,
     pub sip_server: SipServerConfig,
     pub outbound: OutboundConfig,
+    pub cs: CsConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {

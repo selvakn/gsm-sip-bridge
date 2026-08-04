@@ -62,7 +62,11 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
                 return ExitCode::FAILURE;
             }
         };
-        let assignment = crate::vowifi::discovery::RoleAssignment::from_probed(&modems, &overrides);
+        let assignment = crate::vowifi::discovery::RoleAssignment::from_probed(
+            &modems,
+            &overrides,
+            config.cs.enabled,
+        );
         let result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
         for failed in &result.failed {
             tracing::error!(

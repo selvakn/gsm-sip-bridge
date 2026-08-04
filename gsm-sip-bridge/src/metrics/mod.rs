@@ -229,6 +229,21 @@ pub static MODULES_FAILED: Lazy<Gauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// specs/026-disable-circuit-switched (FR-021b): 1 when `[cs].enabled` is
+/// true, 0 when false. Set unconditionally at startup, in **both** states —
+/// unlike `MODULES_ACTIVE`/`MODULES_FAILED`/etc, which are never registered
+/// at all when the circuit-switched path is off (they are `Lazy` and only
+/// ever dereferenced from inside `CardPool`, which does not run). This gauge
+/// exists precisely to be present when those are absent, so a consumer can
+/// tell "deliberately disabled" apart from "process down or scrape broken".
+pub static CS_ENABLED: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(opts!(
+        "gsm_sip_bridge_cs_enabled",
+        "1 when the circuit-switched call path is enabled, 0 when disabled"
+    ))
+    .unwrap()
+});
+
 pub static AUDIO_ERRORS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         opts!(

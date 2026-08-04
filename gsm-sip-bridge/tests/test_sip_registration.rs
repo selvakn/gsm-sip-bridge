@@ -95,6 +95,51 @@ enabled = true
     assert_eq!(bridge.state, RegistrationState::Unregistered);
 }
 
+/// specs/026-disable-circuit-switched FR-009a: with the circuit-switched
+/// path off and no VoWiFi/VoLTE to own the telephone-facing side instead,
+/// `register()` must establish no trunk registration and start no
+/// registrar — reusing the same skip path `owns_sip_side` already provides
+/// for the VoLTE/VoWiFi case above, not a second mechanism.
+#[test]
+fn test_sip_bridge_skips_trunk_when_cs_disabled() {
+    let mut f = NamedTempFile::new().unwrap();
+    writeln!(
+        f,
+        r#"
+[sip]
+server = "127.0.0.1"
+port = 5060
+username = "test"
+password = "testpass"
+
+[cs]
+enabled = false
+"#
+    )
+    .unwrap();
+
+    let config = load_config(f.path()).unwrap();
+    let mut bridge = SipBridge::new(&config);
+    bridge.register().unwrap();
+    assert_eq!(bridge.state, RegistrationState::Unregistered);
+}
+
+/// FR-009c: the suppression is specific to the circuit-switched host's own
+/// SIP side. It must not require VoWiFi/VoLTE to be *disabled* to prove out
+/// — with either enabled, `owns_sip_side` is already false for its own
+/// reason, so this test's point is that `cs.enabled = false` alone (with
+/// both VoWiFi and VoLTE off, so nothing else could be masking the effect)
+/// suffices, which the test above already establishes. This test instead
+/// pins the flag-on side of FR-009c: registration proceeds exactly as
+/// before when `[cs].enabled` is left at its default.
+#[test]
+fn test_sip_bridge_registers_normally_when_cs_enabled_is_left_at_default() {
+    let config = test_config();
+    let mut bridge = SipBridge::new(&config);
+    bridge.register().unwrap();
+    assert_eq!(bridge.state, RegistrationState::Registered);
+}
+
 #[test]
 fn test_compute_destination_uri_did_passthrough() {
     let config = test_config();

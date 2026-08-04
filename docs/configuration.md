@@ -79,7 +79,61 @@ category without one falls back to `[alerts].discord_webhook_url`. See
 | `port` | integer | 9091 | Metrics HTTP server port |
 | `agent_report_interval_seconds` | integer | 10 | How often each VoWiFi agent re-reports its call/SMS/health state over the control socket. Also sets the staleness threshold (3x this) after which an agent that stopped reporting is marked down. Ignored when `[vowifi].enabled` is false. |
 
+### `[cs]`
+
+The opt-out switch for the circuit-switched call path (specs/026-disable-
+circuit-switched). Circuit-switched tuning itself lives in `[modules]` below
+— this section exists solely to hold the on/off flag.
+
+Turning it off stops all circuit-switched modem discovery, the periodic
+rescan, AT traffic, and circuit-switched call handling. The metrics endpoint,
+control socket, and message store keep running unchanged, and VoWiFi/VoLTE
+are unaffected.
+
+Two consequences are not predictable from the flag's name alone:
+
+- **No telephone-facing registration of the circuit-switched host's own.**
+  With the path off there is nothing behind a trunk registration, so this
+  process establishes none, and starts no registrar of its own either. If
+  this deployment previously registered a trunk with a PBX, that
+  registration stops — the PBX will mark it down. The startup log names
+  `[cs].enabled` as the reason. This has no effect when VoWiFi or VoLTE is
+  enabled: that subsystem already owns the telephone-facing side and hosts
+  its own registration independently.
+- **Voice-capable modems become available to VoWiFi.** While the flag is
+  on, a voice-capable modem with no explicit `[[vowifi.line]]` override is
+  reserved for circuit-switched use. With the flag off nothing is reserved,
+  so VoWiFi may pick it up instead, subject to the usual SIM-readiness check
+  and `max_lines` bound.
+
+If neither VoWiFi nor VoLTE is enabled either, the process still starts —
+serving metrics and stored history only — with a startup warning that no
+call path is active.
+
+Recommended `false` on any deployment where every call is carried over
+VoWiFi or VoLTE, to stop the circuit-switched daemon probing modems in the
+background for a path that will never carry a call.
+
+**Metrics**: the endpoint always exports `gsm_sip_bridge_cs_enabled` (`1`
+enabled, `0` disabled), so a scrape can tell "deliberately disabled" apart
+from "process down or scrape broken". With the flag off,
+`gsm_sip_bridge_modules_active`, `gsm_sip_bridge_modules_failed`,
+`gsm_sip_bridge_module_init_total`, `gsm_sip_bridge_module_retries_total`,
+and `gsm_sip_bridge_scheduled_restart_total` are **absent** from the scrape
+entirely — not reported as zero — so an existing "no cards ready" style
+alert rule goes quiet instead of firing continuously against a path that
+was switched off on purpose. Review any dashboard panel or alert rule built
+on those five series before flipping the flag; every other series
+(VoWiFi/VoLTE, SMS, store, build info) is unaffected.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Master switch for the circuit-switched call path. `[modules]` below tunes it when on. |
+
 ### `[modules]`
+
+Circuit-switched card-pool tuning, gated by `[cs].enabled` above — these
+keys stay valid and simply have no effect while `[cs].enabled = false`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

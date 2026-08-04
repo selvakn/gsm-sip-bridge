@@ -1,0 +1,31 @@
+# ============================================================================
+# Sample: VoWiFi-only, circuit-switched path disabled
+# ============================================================================
+# Every call is carried over VoWiFi — no plain circuit-switched (2G/3G/4G
+# CSFB) calls at all. [cs].enabled = false stops the circuit-switched daemon
+# from probing modems in the background for a path that will never carry a
+# call: no startup scan, no periodic rescan, no AT traffic.
+#
+# See docs/configuration.md#cs (specs/026-disable-circuit-switched). Two
+# things this is not obvious from the flag's name alone:
+#   - If this deployment previously registered a trunk with a PBX, that
+#     registration stops (nothing else here does — VoWiFi hosts its own).
+#   - A voice-capable modem with no [[vowifi.line]] override, which would
+#     otherwise be reserved for circuit-switched use, becomes available to
+#     VoWiFi instead — so this sample needs no [[vowifi.line]] entries at
+#     all even on hardware VoWiFi alone would not have claimed by default.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[cs]
+enabled = false
+
+[vowifi]
+enabled = true
+
+# Omit [[vowifi.line]] entirely for full auto-discovery: with [cs] disabled,
+# every SIM-ready modem — audio-capable or not — becomes its own VoWiFi
+# line, with mcc/mnc/IMSI derived from the SIM.

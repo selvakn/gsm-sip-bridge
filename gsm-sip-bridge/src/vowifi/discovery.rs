@@ -32,14 +32,30 @@ impl RoleAssignment {
     /// → VoWiFi. An explicit `[[vowifi.line]]` override (FR-009) always
     /// wins, regardless of audio capability. A modem with no AT port at all
     /// (never probed successfully) serves neither.
-    pub fn from_probed(modems: &[ProbedModem], overrides: &[VowifiLineOverride]) -> Self {
+    ///
+    /// `cs_enabled` is `[cs].enabled` (specs/026-disable-circuit-switched,
+    /// FR-010a). With the circuit-switched path off, nothing is reserved for
+    /// it: every successfully probed modem — including one that would
+    /// otherwise be claimed by the audio-capable default above — is offered
+    /// to VoWiFi instead. `resolve_lines`'s readiness filter and `max_lines`
+    /// bound still apply afterward (FR-010b), so this only *offers*
+    /// candidates; it doesn't bypass admission. With `cs_enabled` true this
+    /// is exactly the prior behaviour (FR-010c).
+    pub fn from_probed(
+        modems: &[ProbedModem],
+        overrides: &[VowifiLineOverride],
+        cs_enabled: bool,
+    ) -> Self {
         let mut circuit_switched = Vec::new();
         let mut vowifi = Vec::new();
         for modem in modems {
             if modem.at_port.is_none() {
                 continue;
             }
-            if is_overridden_to_vowifi(modem, overrides) || !modem.has_audio_capability {
+            if !cs_enabled
+                || is_overridden_to_vowifi(modem, overrides)
+                || !modem.has_audio_capability
+            {
                 vowifi.push(modem.clone());
             } else {
                 circuit_switched.push(modem.clone());
@@ -508,7 +524,49 @@ mod tests {
             ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", true, "404011111111111"),
             ready_modem("ec20-BBBBBB", "/dev/ttyUSB1", false, "404022222222222"),
         ];
-        let assignment = RoleAssignment::from_probed(&modems, &[]);
+        let assignment = RoleAssignment::from_probed(&modems, &[], true);
+        assert_eq!(assignment.circuit_switched.len(), 1);
+        assert_eq!(assignment.circuit_switched[0].card_id, "ec20-AAAAAA");
+        assert_eq!(assignment.vowifi.len(), 1);
+        assert_eq!(assignment.vowifi[0].card_id, "ec20-BBBBBB");
+    }
+
+    /// specs/026-disable-circuit-switched FR-010a: with the circuit-switched
+    /// path off, a voice-capable modem that the default rule would otherwise
+    /// reserve for it (`role_assignment_default_splits_by_audio` above, same
+    /// fixture) is offered to VoWiFi instead — nothing is reserved for a
+    /// path that is disabled.
+    #[test]
+    fn role_assignment_offers_every_modem_to_vowifi_when_cs_is_disabled() {
+        let modems = vec![
+            ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", true, "404011111111111"),
+            ready_modem("ec20-BBBBBB", "/dev/ttyUSB1", false, "404022222222222"),
+        ];
+        let assignment = RoleAssignment::from_probed(&modems, &[], false);
+        assert!(
+            assignment.circuit_switched.is_empty(),
+            "nothing should be reserved for a disabled path"
+        );
+        assert_eq!(assignment.vowifi.len(), 2);
+        let ids: Vec<&str> = assignment
+            .vowifi
+            .iter()
+            .map(|m| m.card_id.as_str())
+            .collect();
+        assert!(ids.contains(&"ec20-AAAAAA"));
+        assert!(ids.contains(&"ec20-BBBBBB"));
+    }
+
+    /// FR-010c: the flag-on case is untouched — same fixture, same result as
+    /// `role_assignment_default_splits_by_audio`, just spelled out with the
+    /// new parameter explicit rather than relied on implicitly.
+    #[test]
+    fn role_assignment_default_splits_by_audio_when_cs_enabled() {
+        let modems = vec![
+            ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", true, "404011111111111"),
+            ready_modem("ec20-BBBBBB", "/dev/ttyUSB1", false, "404022222222222"),
+        ];
+        let assignment = RoleAssignment::from_probed(&modems, &[], true);
         assert_eq!(assignment.circuit_switched.len(), 1);
         assert_eq!(assignment.circuit_switched[0].card_id, "ec20-AAAAAA");
         assert_eq!(assignment.vowifi.len(), 1);
@@ -527,7 +585,7 @@ mod tests {
             modem_serial: Some("ec20-AAAAAA".to_string()),
             ..Default::default()
         }];
-        let assignment = RoleAssignment::from_probed(&modems, &overrides);
+        let assignment = RoleAssignment::from_probed(&modems, &overrides, true);
         assert!(assignment.circuit_switched.is_empty());
         assert_eq!(assignment.vowifi.len(), 1);
     }
@@ -542,7 +600,7 @@ mod tests {
             modem_port: Some("/dev/ttyUSB0".to_string()),
             ..Default::default()
         }];
-        let assignment = RoleAssignment::from_probed(&modems, &overrides);
+        let assignment = RoleAssignment::from_probed(&modems, &overrides, true);
         let all_ids: Vec<&str> = assignment
             .circuit_switched
             .iter()
@@ -562,7 +620,7 @@ mod tests {
     #[test]
     fn role_assignment_excludes_modems_with_no_at_port() {
         let modems = vec![unusable_modem("ec20-CCCCCC", None)];
-        let assignment = RoleAssignment::from_probed(&modems, &[]);
+        let assignment = RoleAssignment::from_probed(&modems, &[], true);
         assert!(assignment.circuit_switched.is_empty());
         assert!(assignment.vowifi.is_empty());
     }
@@ -602,7 +660,7 @@ mod tests {
             "404011111111111",
         )];
         let overrides = effective_line_overrides(&config);
-        let assignment = RoleAssignment::from_probed(&modems, &overrides);
+        let assignment = RoleAssignment::from_probed(&modems, &overrides, true);
         assert!(assignment.circuit_switched.is_empty());
         assert_eq!(assignment.vowifi.len(), 1);
     }
@@ -850,7 +908,7 @@ mod tests {
             ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1"),
             ready_modem("ec20-BBBBBB", "/dev/ttyUSB1", true, "2"),
         ];
-        let assignment = RoleAssignment::from_probed(&modems, &[]);
+        let assignment = RoleAssignment::from_probed(&modems, &[], true);
         let base = VowifiConfig::default();
         let result = resolve_lines(&assignment, &base);
         let resolution = LineResolution::from_result(&assignment.vowifi, &result);
@@ -887,7 +945,7 @@ mod tests {
             modem_serial: Some("ec20-CCCCCC".to_string()),
             ..Default::default()
         }];
-        let assignment = RoleAssignment::from_probed(&modems, &overrides);
+        let assignment = RoleAssignment::from_probed(&modems, &overrides, true);
         assert!(assignment.circuit_switched.is_empty());
         assert_eq!(
             assignment.vowifi.len(),

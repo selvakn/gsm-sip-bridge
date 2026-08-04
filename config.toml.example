@@ -153,6 +153,14 @@ port = 9091
 # it owns are zeroed. Ignored entirely when [vowifi].enabled is false.
 agent_report_interval_seconds = 10
 
+[cs]
+# Master switch for the circuit-switched call path (specs/026-disable-
+# circuit-switched). Set false on a deployment where every call is carried
+# over VoWiFi or VoLTE, to stop the circuit-switched daemon probing modems
+# in the background for a path that will never carry a call. [modules]
+# below tunes it when on and is otherwise simply inert.
+enabled = true
+
 [modules]
 retry_interval_sec = 30        # range: 5-600
 max_concurrent = 8             # range: 1-8
