@@ -1,0 +1,14 @@
+# ============================================================================
+# Sample: forward incoming SMS to Discord
+# ============================================================================
+# [sms] is on by default; the only thing actually needed to get a
+# notification per incoming SMS is a webhook to send it to. See
+# docs/configuration.md#sms.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[sms]
+discord_webhook_url = "env:DISCORD_WEBHOOK_URL"

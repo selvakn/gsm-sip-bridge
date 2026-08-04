@@ -156,6 +156,11 @@ Every section and key — including audio tuning (`[audio]`), card recovery
 the full `[vowifi]`/`[volte]` reference — is documented in
 [docs/configuration.md](docs/configuration.md).
 
+Complete, ready-to-copy configs for common deployment shapes (plain
+circuit-switched, single-line VoWiFi, host-side VoLTE, PC/SC card-reader
+VoWiFi, multi-line VoWiFi) live in
+[`sample_configs/`](sample_configs/README.md).
+
 ## Documentation
 
 | | |

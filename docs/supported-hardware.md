@@ -5,8 +5,8 @@
 | Hardware | Circuit-switched calls | VoWiFi | VoLTE |
 |---|---|---|---|
 | Quectel EC20 | ✅ | ✅ | ✅ |
-| Quectel EC200 / EC200U | ❌ (no audio output) | ✅ | ✅ |
-| PC/SC card reader (e.g. OmniKey AG 3x21) | ❌ | ✅ | ❌ |
+| Quectel [EC200 / EC200U](https://www.rhydolabz.com/EC200-4G-LTE-2G-GSM-Industrial-Grade-Modem-UART-USB-rhydoLABZ) | ❌ (no audio output) | ✅ | ✅ |
+| PC/SC card reader (e.g. [OmniKey AG 3x21](https://link.amazon/B0c8Xjqc5)) | ❌ | ✅ | ❌ |
 
 - **Circuit-switched** — classic GSM voice; the modem answers the call and
   sends audio over USB.

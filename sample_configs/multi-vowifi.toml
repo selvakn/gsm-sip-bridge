@@ -1,0 +1,29 @@
+# ============================================================================
+# Sample: multiple VoWiFi lines (mixed modem + card-reader)
+# ============================================================================
+# Several VoWiFi lines sharing one PBX registration, each isolated in its own
+# network namespace/veth pair. See docs/vowifi-bridge.md
+# (specs/013-multi-card-vowifi).
+#
+# Line indexing: modem-backed lines are indexed first, in card-id order from
+# the USB scan, and card-reader lines are appended after — regardless of the
+# order the [[vowifi.line]] blocks appear in below. So the two modems are
+# lines 0/1 and the reader is line 2.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[vowifi]
+enabled = true
+
+[[vowifi.line]]
+modem_port = "/dev/ttyUSB0"
+
+[[vowifi.line]]
+modem_port = "/dev/ttyUSB2"
+
+[[vowifi.line]]
+pcsc_reader = true
+imsi_override = "404940123456789"

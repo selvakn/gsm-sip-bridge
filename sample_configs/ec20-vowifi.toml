@@ -1,0 +1,21 @@
+# ============================================================================
+# Sample: single EC20, VoWiFi (Wi-Fi Calling) bridge
+# ============================================================================
+# One Quectel EC20 modem registering Wi-Fi Calling over an ePDG/IPsec tunnel
+# and bridging inbound IMS calls to the PBX. See docs/vowifi-bridge.md
+# (specs/011-vowifi-sip-bridge, 012-strongswan-epdg).
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[vowifi]
+enabled = true
+
+# Optional: pin to a known modem port for a deterministic line assignment.
+# Omit [[vowifi.line]] entirely for full auto-discovery — every SIM-ready,
+# audio-less modem becomes its own VoWiFi line, with mcc/mnc/IMSI derived
+# from the SIM.
+[[vowifi.line]]
+modem_port = "/dev/ttyUSB2"

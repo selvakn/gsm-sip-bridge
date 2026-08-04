@@ -1,0 +1,33 @@
+# ============================================================================
+# Sample: Discord alerts for critical operational events
+# ============================================================================
+# Four categories beyond plain SMS forwarding (specs/022-discord-critical-
+# alerts), each off by default — opt in per-category below. A category
+# alerts only once its own built-in recovery is exhausted, then sends a
+# single "recovered" notice when it clears, never a repeating stream while
+# a condition stays unhealthy. See docs/configuration.md#alerts.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[alerts]
+# Shared default webhook for any category below with no override of its own.
+discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
+
+[alerts.module_lifecycle]
+# SIM absent/unreadable, discovery/init failure, or an AT worker unresponsive.
+enabled = true
+
+[alerts.registration_loss]
+# A VoLTE/VoWiFi line's SIP registration lost continuously past unhealthy_sec.
+enabled = true
+
+[alerts.tunnel_failure]
+# A VoWiFi line's ePDG/IPsec tunnel non-established past unhealthy_sec.
+enabled = true
+
+[alerts.missed_call]
+# An inbound call that rang out unanswered (never bridged).
+enabled = true

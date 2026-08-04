@@ -1,0 +1,13 @@
+# ============================================================================
+# Sample: EC20, circuit-switched only (no VoWiFi/VoLTE)
+# ============================================================================
+# One or more Quectel EC20 USB modems, bridging plain circuit-switched calls
+# (2G/3G, or 4G with CSFB) to a SIP/PBX trunk. This is the default mode:
+# every SIM-ready modem registers on the mobile network and bridges calls
+# over its own USB audio device with no further config. See
+# docs/architecture.md.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"

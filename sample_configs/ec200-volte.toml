@@ -1,0 +1,30 @@
+# ============================================================================
+# Sample: EC200(U), host-side VoLTE bridge
+# ============================================================================
+# The bridge runs its OWN IMS registration over the EC200(U)'s LTE IMS PDN
+# and answers incoming calls directly, instead of delegating to the modem's
+# internal VoLTE stack. See docs/ec20-volte-setup.md and
+# docs/operations.md#host-side-ims-over-lte-volte (specs/015-volte-host-ims,
+# 016-volte-calls, 017-volte-inbound-bridge).
+#
+# WARNING: never enable [volte] alongside [vowifi] on the SAME SIM — both
+# register the same IMPU with the same IMEI-derived +sip.instance, so the
+# network treats the second registration as replacing the first.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[volte]
+enabled = true
+# Without this, the registration is held open but nothing answers on it —
+# the modem-internal VoLTE path stays in control of incoming calls. Setting
+# it makes this modem EXCLUSIVE to this path: the circuit-switched daemon
+# will not drive it, so it has no CS fallback whenever this path is down.
+bridge_inbound = true
+
+# Optional: pin to a known modem. Omit [[volte.line]] entirely for
+# auto-discovery (cid 3, apn "ims", P-CSCF auto-discovered).
+[[volte.line]]
+modem_port = "/dev/ttyUSB0"

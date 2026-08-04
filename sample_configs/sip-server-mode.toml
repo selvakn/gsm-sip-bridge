@@ -1,0 +1,33 @@
+# ============================================================================
+# Sample: SIP server mode (no PBX)
+# ============================================================================
+# For small deployments with no telephone system to point at: the bridge IS
+# the SIP server. IP phones REGISTER directly to it and inbound mobile calls
+# ring a registered phone. See docs/configuration.md#sip_server
+# (specs/024-sip-server-mode).
+#
+# Enabling this changes what [sip] means: server/username/password describe
+# a PBX that doesn't exist in this mode, so they become ERRORS here rather
+# than requirements. listen_port (below, default 5060) and [sip].local_port
+# are two separate SIP endpoints and can't share a port, so local_port has
+# to move — leave 5060 free for the phones.
+#
+# Inbound only: a phone can't dial out through the mobile network unless
+# [outbound] is also enabled (see multi-vowifi.toml / ec20-vowifi.toml for
+# the telephony side to pair this with).
+
+[sip]
+local_port = 5062
+
+[sip_server]
+enabled = true
+ring_aor = "1001"   # must match an account username below; the only account that rings
+
+[[sip_server.account]]
+username = "1001"
+password = "env:PHONE_1001_PASSWORD"
+
+# Additional phones may register but are never rung (ring_aor above is exclusive).
+# [[sip_server.account]]
+# username = "1002"
+# password = "env:PHONE_1002_PASSWORD"

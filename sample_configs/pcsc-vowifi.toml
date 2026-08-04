@@ -1,0 +1,22 @@
+# ============================================================================
+# Sample: PC/SC card-reader VoWiFi line (no modem)
+# ============================================================================
+# The SIM sits directly in a PC/SC reader (e.g. OmniKey AG 3x21), read by
+# pcscd's ccid driver — no modem and no vowifi-usim-bridge involved. See
+# docs/omnikey-pcsc-vowifi.md (specs/023-omnikey-pcsc-vowifi).
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[vowifi]
+enabled = true
+
+# imsi_override is mandatory here — not because the IMSI can't be read (it's
+# decoded straight off the card's EF_IMSI), but because with multiple
+# readers attached, it's what names which reader's card this line owns.
+# Read it once via pySim-read.py or opensc-tool.
+[[vowifi.line]]
+pcsc_reader = true
+imsi_override = "404940123456789"
