@@ -6,14 +6,17 @@
 # from probing modems in the background for a path that will never carry a
 # call: no startup scan, no periodic rescan, no AT traffic.
 #
+# Mixes a modem-backed line and a PC/SC card-reader line — both land in
+# VoWiFi together, live-verified against Airtel India on an EC20/EC25 plus
+# an OmniKey AG 3x21. See docs/omnikey-pcsc-vowifi.md for the reader setup.
+#
 # See docs/configuration.md#cs (specs/026-disable-circuit-switched). Two
 # things this is not obvious from the flag's name alone:
 #   - If this deployment previously registered a trunk with a PBX, that
 #     registration stops (nothing else here does — VoWiFi hosts its own).
 #   - A voice-capable modem with no [[vowifi.line]] override, which would
 #     otherwise be reserved for circuit-switched use, becomes available to
-#     VoWiFi instead — so this sample needs no [[vowifi.line]] entries at
-#     all even on hardware VoWiFi alone would not have claimed by default.
+#     VoWiFi instead — so the modem line below needs no modem_port pin.
 
 [sip]
 server = "pbx.example.com"
@@ -26,6 +29,26 @@ enabled = false
 [vowifi]
 enabled = true
 
-# Omit [[vowifi.line]] entirely for full auto-discovery: with [cs] disabled,
-# every SIM-ready modem — audio-capable or not — becomes its own VoWiFi
-# line, with mcc/mnc/IMSI derived from the SIM.
+# The modem line: no [[vowifi.line]] block at all, deliberately. With [cs]
+# disabled, every SIM-ready modem — audio-capable or not — becomes its own
+# VoWiFi line automatically, with mcc/mnc/IMSI derived from the SIM.
+#
+# Pinning modem_port to a specific ttyUSB number is tempting for a
+# "deterministic" line, but that number is assigned by USB enumeration
+# order and can silently change on a physical replug, at which point the
+# pin just stops matching anything — see
+# docs/operations.md#vowifi-modem-line-silently-drops-out-of-resolved-lines-after-a-replug
+# for what that looks like and how to recover. If you do need to pin a
+# specific physical modem (multiple modems, one deliberately excluded),
+# pin by modem_serial instead — the USB serial number, stable across
+# replugs — not modem_port:
+# [[vowifi.line]]
+# modem_serial = "abc123def456"
+
+# The PC/SC card-reader line, alongside the auto-discovered modem line
+# above. imsi_override is mandatory — with multiple readers attached it's
+# what names which reader's card this line owns. Read it once via
+# pySim-read.py or opensc-tool.
+[[vowifi.line]]
+pcsc_reader = true
+imsi_override = "404940123456789"

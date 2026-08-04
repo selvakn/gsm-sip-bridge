@@ -373,6 +373,52 @@ port instead (`net.ipv4.ip_local_reserved_ports`) also works, but it is a
 host-wide kernel setting and will not evict a connection already holding
 the port.
 
+### VoWiFi modem line silently drops out of `resolved lines` after a replug
+
+Two symptoms, usually together, after physically unplugging and
+replugging a modem used as a VoWiFi line:
+
+**The pinned `[[vowifi.line]] modem_port` stops matching anything.** A USB
+serial device's `ttyUSB*` number is assigned by enumeration order, not
+tied to the physical device — a replug can hand it a different number
+than it had before. `discover: LINE_COUNT=N` drops by one, and the
+supervise log's `line N (...)` list is missing the modem entry, with no
+error explaining why: the override just never matches a probed device.
+Fix: drop the `modem_port` pin and let full auto-discovery find the modem
+on whichever port it lands on this boot (omit `[[vowifi.line]]` for that
+modem entirely, or keep the block for other fields but remove
+`modem_port`) — see `sample_configs/vowifi-only-cs-disabled.toml`. Pinning
+a specific `ttyUSB` number is only safe on hardware that's never
+physically replugged.
+
+**The SIM reads as unusable even though the modem answers plain `AT`
+fine.** `gsm-sip-bridge discover` (or the daemon's own scan) logs
+`modem's SIM is not usable ... reason=Unreadable("13")` /
+`sim_unreadable: 13` — `CME ERROR: 13` is 3GPP's "SIM failure". Confirm
+directly against the modem's AT port with a terminal that both sends and
+reads back (`minicom -D /dev/ttyUSBn -b 115200`, `screen /dev/ttyUSBn
+115200`, or any single-command AT-probe tool you have — a plain `echo >
+device` only writes, it won't show the reply):
+
+```
+AT+CPIN?
++CME ERROR: 13
+```
+
+This is the SIM having electrically "fallen off the bus" — common right
+after a replug, before the module has fully reseated it. A radio
+power-cycle over AT, not a container or modem restart, usually clears it:
+
+```
+AT+CFUN=0    -> OK
+AT+CFUN=1    -> OK, wait ~10s
+AT+CPIN?     -> +CPIN: READY
+```
+
+Once `AT+CIMI` returns a valid IMSI again, restart the bridge (or
+`supervise`'s container) so `discover` re-resolves the line — it does not
+re-scan on its own mid-run.
+
 ### Discord forwarding failing
 
 Check:
