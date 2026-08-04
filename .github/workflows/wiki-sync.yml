@@ -1,0 +1,31 @@
+name: Sync docs to wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - .github/workflows/wiki-sync.yml
+  workflow_dispatch: {}
+
+concurrency:
+  group: wiki-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Push docs/ to wiki
+        # Pinned to a commit, not the movable v5 tag: this is a third-party
+        # action with push access to the wiki repo, so repointing the tag
+        # would change what executes here without any change to this
+        # repository. Bump deliberately.
+        uses: Andrew-Chen-Wang/github-wiki-action@1bbb4280446f9630e8e21a18012cbacf3b0f992e # v5.0.6
+        with:
+          path: docs/
