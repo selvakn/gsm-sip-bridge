@@ -4,6 +4,7 @@ pub mod beep;
 pub mod card;
 pub mod discovery;
 pub mod pcsc_card;
+pub mod pcsc_list;
 pub mod scheduler;
 pub mod usim;
 

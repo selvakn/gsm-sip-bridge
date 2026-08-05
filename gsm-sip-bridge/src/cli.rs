@@ -244,6 +244,17 @@ pub enum Commands {
     /// after specs/021 moved the rest into `supervise`.
     Healthcheck,
 
+    /// Lists every real (non-vpcd) PC/SC reader attached to the host, along
+    /// with whatever card's IMSI and home MCC/MNC/carrier it holds
+    /// (specs/023-omnikey-pcsc-vowifi) — read directly off the SIM, no
+    /// modem involved. Meant to answer "which `imsi_override` goes on which
+    /// `pcsc_reader` line" for a multi-reader deployment, without decoding
+    /// an IMSI by hand off `pySim-read.py`/`opensc-tool` output. Carrier
+    /// names come from a lookup against mcc-mnc-lookup.com; a lookup
+    /// failure (offline, unreachable) leaves that column blank rather than
+    /// failing the whole listing.
+    PcscList,
+
     /// Exit 0 iff a TCP connection to `host:port` can be established.
     ///
     /// Internal plumbing, not meant to be run by hand: `healthcheck` probes

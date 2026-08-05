@@ -1,5 +1,21 @@
 # Release Notes
 
+## v8.5.0
+
+- **`gsm-sip-bridge pcsc-list`: enumerate every PC/SC reader's card without
+  hand-decoding `EF_IMSI`.** A multi-reader `pcsc_reader` deployment
+  (specs/023-omnikey-pcsc-vowifi) needs each line's `imsi_override` to name
+  which physical reader's card it owns — previously that meant running
+  `pySim-read.py`/`opensc-tool` and decoding the SIM's BCD-encoded `EF_IMSI`
+  by hand. This lists every real (non-vpcd) reader with whatever card it
+  holds — IMSI, MCC/MNC (from the same `EF_IMSI`/`EF_AD` read `vowifi-plmn
+  --pcsc-imsi` uses), and a carrier name looked up against
+  `mcc-mnc-lookup.com` — in one table. A reader with no card, or a card whose
+  identity can't be fully read, still gets a row with a status note instead
+  of aborting the whole listing; a failed carrier lookup (offline, API
+  unreachable) just leaves that column blank. Diagnostic-only, same category
+  as `vowifi-imsi`/`vowifi-plmn` — no effect on any running line.
+
 ## v8.4.0
 
 - **Circuit-switched call handling can now be turned off entirely.**

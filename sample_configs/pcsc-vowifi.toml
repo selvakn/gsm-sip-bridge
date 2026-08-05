@@ -16,7 +16,10 @@ enabled = true
 # imsi_override is mandatory here — not because the IMSI can't be read (it's
 # decoded straight off the card's EF_IMSI), but because with multiple
 # readers attached, it's what names which reader's card this line owns.
-# Read it once via pySim-read.py or opensc-tool.
+# Read it once via `docker exec <container> gsm-sip-bridge pcsc-list`, which
+# lists every attached reader's card (IMSI, MCC/MNC, carrier) — pcscd must
+# already be reachable, which inside this project means running it in the
+# container, not on the bare host.
 [[vowifi.line]]
 pcsc_reader = true
 imsi_override = "404940123456789"
