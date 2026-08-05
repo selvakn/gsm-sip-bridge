@@ -115,19 +115,29 @@ pub struct Candidates<'a> {
 
 /// Turns a set of probed modems into an ordered, bounded candidate list.
 ///
-/// Ordering is by **card id, not USB enumeration order**, within each of two
-/// priority tiers: enumeration order varies between boots, and a line's
-/// index determines its namespace, veth addresses, and ports — so an
+/// The returned `kept` list is **always in plain card-id order, regardless
+/// of pin status** — enumeration order varies between boots, and a line's
+/// index determines its namespace, veth addresses, and ports, so an
 /// unstable order would silently reassign a SIM's entire network identity
-/// across a restart. `is_pinned` — true for a modem an explicit
-/// `[[...line]]` override names by `modem_serial`/`modem_port` — decides the
-/// tier: every pinned candidate sorts ahead of every unpinned one,
-/// regardless of card id. Without that split, a pool enlarged by
-/// auto-discovery (e.g. specs/026-disable-circuit-switched freeing modems a
-/// disabled circuit-switched path no longer reserves) could bump an
-/// operator's explicit pin out to `max_lines_exceeded` in favor of a modem
-/// that merely sorts earlier alphabetically — passing `|_| false` when the
-/// caller has no such concept restores the plain by-card-id order.
+/// across a restart (greptile P1 on specs/026-disable-circuit-switched: an
+/// earlier version of this function sorted pinned candidates ahead of
+/// unpinned ones in the *returned* order, which reassigned every kept
+/// line's index — and therefore its whole identity — the moment a pinned
+/// and an unpinned candidate's relative card-id order disagreed with their
+/// pin status, even with no actual `max_lines` contention at all).
+///
+/// `is_pinned` — true for a modem an explicit `[[...line]]` override names
+/// by `modem_serial`/`modem_port` — affects only *which* candidates survive
+/// a capacity cut, never their order: when the pool exceeds `max_lines`,
+/// pinned candidates are preferred for the remaining slots over unpinned
+/// ones, but the survivors are still returned in the same card-id order
+/// they would have been in without any pinning concept at all. Passing
+/// `|_| false` when the caller has no such concept is equivalent to that
+/// plain by-card-id behaviour throughout. Without the pin preference, a
+/// pool enlarged by auto-discovery (e.g. specs/026-disable-circuit-switched
+/// freeing modems a disabled circuit-switched path no longer reserves)
+/// could bump an operator's explicit pin out to `max_lines_exceeded` in
+/// favor of a modem that merely sorts earlier alphabetically.
 ///
 /// Overflow past `max_lines` is *reported* as `max_lines_exceeded` rather
 /// than silently dropped, so an operator who plugs in a fifth modem with
@@ -148,25 +158,40 @@ pub fn select<'a>(
         }
     }
 
-    ready.sort_by(|a, b| {
-        is_pinned(b)
-            .cmp(&is_pinned(a))
-            .then_with(|| a.card_id.cmp(&b.card_id))
-    });
+    // The order every caller actually indexes by. Established once, up
+    // front, so it's what gets returned whether or not a cut is needed.
+    ready.sort_by(|a, b| a.card_id.cmp(&b.card_id));
 
     let max_lines = max_lines as usize;
-    let overflow = ready.split_off(max_lines.min(ready.len()));
-    for modem in overflow {
-        failed.push(FailedLine::new(
-            modem.card_id.clone(),
-            Rejection::MaxLinesExceeded.reason(),
-        ));
-    }
+    let kept = if ready.len() <= max_lines {
+        ready
+    } else {
+        // Decide who survives using pin priority — a clone sorted by pin
+        // status alone; stable sort preserves the card-id order already
+        // established above within each tier. Only the *membership* of the
+        // first `max_lines` of that ranking is used; the ordering of
+        // `ready` itself, and therefore of the returned `kept`, is
+        // untouched by pin status.
+        let mut by_priority = ready.clone();
+        by_priority.sort_by_key(|m| std::cmp::Reverse(is_pinned(m)));
+        let survivor_ids: std::collections::HashSet<&str> = by_priority[..max_lines]
+            .iter()
+            .map(|m| m.card_id.as_str())
+            .collect();
 
-    Candidates {
-        kept: ready,
-        failed,
-    }
+        let (kept, overflow): (Vec<&ProbedModem>, Vec<&ProbedModem>) = ready
+            .into_iter()
+            .partition(|m| survivor_ids.contains(m.card_id.as_str()));
+        for modem in overflow {
+            failed.push(FailedLine::new(
+                modem.card_id.clone(),
+                Rejection::MaxLinesExceeded.reason(),
+            ));
+        }
+        kept
+    };
+
+    Candidates { kept, failed }
 }
 
 #[cfg(test)]
@@ -244,7 +269,9 @@ mod tests {
     /// merely sorts earlier by card id — the gap specs/026-disable-
     /// circuit-switched surfaced: freeing previously CS-reserved modems to
     /// VoWiFi enlarges the auto-discovered pool, and without this priority
-    /// an operator's explicit override could be silently bumped out.
+    /// an operator's explicit override could be silently bumped out. The
+    /// *returned* order is still plain card-id order regardless of which
+    /// tier won a candidate its slot — pin status decides membership only.
     #[test]
     fn a_pinned_candidate_is_kept_over_unpinned_ones_that_sort_earlier() {
         let m = [
@@ -257,30 +284,38 @@ mod tests {
         });
 
         let ids: Vec<&str> = c.kept.iter().map(|m| m.card_id.as_str()).collect();
-        assert_eq!(ids, ["zzz-pinned", "aaa-unpinned"]);
+        assert_eq!(
+            ids,
+            ["aaa-unpinned", "zzz-pinned"],
+            "zzz-pinned must survive the cut, but the kept list stays card-id ordered"
+        );
         assert_eq!(
             c.failed,
             vec![FailedLine::new("bbb-unpinned", "max_lines_exceeded")]
         );
     }
 
-    /// Within each tier — pinned or unpinned — ordering is still by card id,
-    /// not probe order, so a deployment with more than one pinned modem
-    /// still gets stable indices across restarts.
+    /// specs/026-disable-circuit-switched, greptile P1 (second finding): with
+    /// no actual `max_lines` contention, pin status must not reorder the
+    /// kept list at all — a pinned candidate whose card id sorts *after* an
+    /// unpinned one must not jump ahead of it, since a line's index drives
+    /// its whole network identity (namespace, veth, ports) and reassigning
+    /// it on every upgrade — even where nothing was ever at risk of being
+    /// excluded — would needlessly tear down and rebuild a working line.
     #[test]
-    fn ordering_within_each_pinned_tier_is_still_by_card_id() {
-        let m = [
-            ready("pinned-b"),
-            ready("unpinned-b"),
-            ready("pinned-a"),
-            ready("unpinned-a"),
-        ];
+    fn pin_status_never_reorders_the_kept_list_when_nothing_is_cut() {
+        let m = [ready("aaa-unpinned"), ready("zzz-pinned")];
         let c = select(&m, 8, AtPortRequirement::Required, |modem| {
-            modem.card_id.starts_with("pinned")
+            modem.card_id == "zzz-pinned"
         });
 
         let ids: Vec<&str> = c.kept.iter().map(|m| m.card_id.as_str()).collect();
-        assert_eq!(ids, ["pinned-a", "pinned-b", "unpinned-a", "unpinned-b"]);
+        assert_eq!(
+            ids,
+            ["aaa-unpinned", "zzz-pinned"],
+            "both fit under max_lines, so plain card-id order must be unchanged by pinning"
+        );
+        assert!(c.failed.is_empty());
     }
 
     #[test]
