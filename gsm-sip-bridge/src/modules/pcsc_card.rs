@@ -29,8 +29,10 @@ pub struct PcscTransport {
 }
 
 /// Every reader name that isn't a vpcd virtual slot — the candidates worth
-/// probing for a matching card.
-fn real_reader_candidates(readers: &[String]) -> Vec<&String> {
+/// probing for a matching card. `pub(crate)` so `modules::pcsc_list` (which
+/// enumerates every real reader rather than hunting for one matching IMSI)
+/// can reuse the same vpcd filter instead of re-implementing it.
+pub(crate) fn real_reader_candidates(readers: &[String]) -> Vec<&String> {
     readers
         .iter()
         .filter(|n| !n.contains(VPCD_READER_MARKER))

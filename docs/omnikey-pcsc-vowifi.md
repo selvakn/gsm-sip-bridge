@@ -64,22 +64,36 @@ serving PLMN from `AT+COPS` there; a reader has no radio and so no serving
 network to ask, so the line fails at startup with an error saying to set
 `mcc`/`mnc` explicitly.
 
-To read the IMSI once:
+To read the IMSI (and MCC/MNC/carrier) off every attached reader in one shot:
 
 ```bash
-lsusb | grep -i omnikey        # confirm the reader is visible to the host
-pySim-read.py -p 0             # per the osmocom wiki's "Getting IMSI" step
-# → IMSI: 404940123456789 (example)
+gsm-sip-bridge pcsc-list
+# reader                                   status               imsi              mcc   mnc   carrier
+# ----------------------------------------------------------------------------------------------------
+# OMNIKEY AG SmartCard Reader 3x21 00 00   ok                   404940123456789  404   094   Vodafone Idea (India)
+# OMNIKEY AG SmartCard Reader 3x21 01 00   no card              -                 -     -     -
 ```
 
-The first 5-6 digits are MCC+MNC (India: MCC is always 404/405; MNC is the
-remaining 2-3 digits — pad to 3 digits, e.g. Vodafone Idea `43` → `"043"`).
+This runs entirely on the host (no container/pcscd required, since it opens
+its own PC/SC context the same way `PcscTransport::connect` does) and needs
+no PIN or prior configuration — it's meant to be the first thing you run
+against a new reader, before writing `imsi_override` into `config.toml`. Each
+row's `mcc`/`mnc` come from the same `EF_IMSI`/`EF_AD` read `vowifi-plmn
+--pcsc-imsi` does; `carrier` is a lookup against
+`https://mcc-mnc-lookup.com`'s public API and is left blank (not fatal) if
+that lookup fails or the host has no internet access. With more than one
+reader attached, this is what tells you which reader's card is which line's
+`imsi_override` — `Virtual PCD ...` (vpcd) slots are never listed, since
+those are the modem-backed lines' virtual reader, not a card to bind to.
 
-If you're decoding `EF_IMSI` (`6F07`) by hand instead of using `pySim-read.py`,
+`pySim-read.py -p 0` (per the osmocom wiki's "Getting IMSI" step) is the
+fallback if `pcsc-list` isn't available (e.g. reading a card outside this
+project entirely). If you're decoding `EF_IMSI` (`6F07`) by hand instead,
 note the file's length byte and BCD encoding include a leading parity/oddness
 nibble that is **not** part of the IMSI — `pySim`'s `dec_imsi` drops it
-(`swapped[1:]`, not `swapped[0:]`). Dropping this step silently produces an
-IMSI with a bogus leading digit.
+(`swapped[1:]`, not `swapped[0:]`), and so does `pcsc-list`/`PcscTransport`'s
+own decoder (`modules::usim::read_imsi`). Dropping this step silently
+produces an IMSI with a bogus leading digit.
 
 ## Configuration
 
@@ -114,7 +128,9 @@ resolve, register, and fail independently (see
    --list-readers` (Alpine has no `pcsc-tools`/`pcsc_scan` package — use
    `opensc-tool`, or a PC/SC client of your own) should list the OmniKey
    reader, alongside any `Virtual PCD ...` (vpcd) slots used by modem-backed
-   lines.
+   lines. `gsm-sip-bridge pcsc-list` run on the host covers the same check
+   plus the card's IMSI/MCC/MNC in one command (vpcd slots are filtered out,
+   so it only ever lists real readers).
 2. **Tunnel established**: `docker logs <container> | grep -i "tunnel UP"`
    and `/var/log/strongswan.log`'s `IKE_SA established`/`EAP_AKA succeeded`
    for this line's IMSI.
