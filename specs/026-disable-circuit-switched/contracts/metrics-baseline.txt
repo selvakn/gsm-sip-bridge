@@ -1,0 +1,25 @@
+# Circuit-switched metric series present today ([cs].enabled has no effect yet)
+#
+# Captured by reading the Lazy<...> registrations in gsm-sip-bridge/src/metrics/mod.rs
+# rather than scraping a live daemon — no running instance was available in this
+# environment. This is the FR-021c "unchanged when enabled" comparison baseline: after
+# implementation, a scrape with the flag ON must still show exactly these names, types,
+# and label sets (values will naturally differ), plus the new gsm_sip_bridge_cs_enabled 1.
+
+# TYPE gsm_sip_bridge_modules_active gauge
+# TYPE gsm_sip_bridge_modules_failed gauge
+# TYPE gsm_sip_bridge_module_init_total counter
+#   labels: module, status, reason
+# TYPE gsm_sip_bridge_module_retries_total counter
+#   labels: module
+# TYPE gsm_sip_bridge_scheduled_restart_total counter
+#   labels: slot, outcome
+
+# Not in this list (stay registered regardless of [cs].enabled — see
+# contracts/metrics-contract.md "Series unaffected"):
+#   gsm_sip_bridge_outbound_attempts_total (also incremented by metrics::ingest
+#     from VoWiFi/VoLTE agent reports)
+#   gsm_sip_bridge_vowifi_*, gsm_sip_bridge_volte_*
+#   gsm_sip_bridge_agent_up, gsm_sip_bridge_agent_last_report_seconds
+#   gsm_sip_bridge_build_info, gsm_sip_bridge_uptime_seconds
+#   gsm_sip_bridge_sms_*, gsm_sip_bridge_store_*

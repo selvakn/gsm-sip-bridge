@@ -59,6 +59,13 @@ impl std::fmt::Display for LineFault {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     Healthy,
+    /// specs/026-disable-circuit-switched FR-018: `[cs].enabled` is false and
+    /// there was nothing else to check (no VoWiFi lines in play) — reported
+    /// distinctly from `Healthy` so an operator reading the verdict can tell
+    /// "disabled on purpose" apart from "checked and found healthy", but
+    /// exits the same way (`ExitCode::SUCCESS`): a deliberately disabled
+    /// path is never unhealthy, degraded, or failed.
+    CircuitSwitchedDisabled,
     /// The circuit-switched daemon's metrics endpoint did not respond. Fatal
     /// on its own — nothing else is checked.
     MetricsEndpointDown,
@@ -68,7 +75,7 @@ pub enum Health {
 
 impl Health {
     pub fn is_healthy(&self) -> bool {
-        matches!(self, Health::Healthy)
+        matches!(self, Health::Healthy | Health::CircuitSwitchedDisabled)
     }
 }
 
@@ -159,6 +166,7 @@ pub fn run_tcp_probe(host: &str, port: u16) -> ExitCode {
 pub fn evaluate(
     runner: &dyn CommandRunner,
     metrics_ok: bool,
+    cs_enabled: bool,
     vowifi_enabled: bool,
     resolution: &LineResolution,
     tunnel_engine: &str,
@@ -166,10 +174,16 @@ pub fn evaluate(
     if !metrics_ok {
         return Health::MetricsEndpointDown;
     }
-    // VoWiFi off, or on but with no line resolved this run: the
-    // circuit-switched side is what matters and it just answered.
+    // VoWiFi off, or on but with no line resolved this run: nothing but the
+    // circuit-switched side to report on. If that side is itself
+    // deliberately off (specs/026-disable-circuit-switched), say so
+    // distinctly rather than reporting a bare, uninformative "Healthy".
     if !vowifi_enabled || resolution.lines.is_empty() {
-        return Health::Healthy;
+        return if cs_enabled {
+            Health::Healthy
+        } else {
+            Health::CircuitSwitchedDisabled
+        };
     }
 
     let faults: Vec<(u32, LineFault)> = resolution
@@ -217,6 +231,7 @@ pub fn run(cli: &Cli) -> ExitCode {
     let health = evaluate(
         &runner,
         metrics_ok,
+        config.cs.enabled,
         config.vowifi.enabled,
         &resolution,
         &config.vowifi.tunnel_engine,
@@ -224,6 +239,7 @@ pub fn run(cli: &Cli) -> ExitCode {
 
     match &health {
         Health::Healthy => ExitCode::SUCCESS,
+        Health::CircuitSwitchedDisabled => ExitCode::SUCCESS,
         Health::MetricsEndpointDown => {
             eprintln!(
                 "metrics endpoint on port {} is not responding",
@@ -290,6 +306,7 @@ mod tests {
             &runner,
             false,
             true,
+            true,
             &resolution(vec![line(0)]),
             "strongswan",
         );
@@ -305,6 +322,7 @@ mod tests {
         let health = evaluate(
             &runner,
             true,
+            true,
             false,
             &resolution(vec![line(0)]),
             "strongswan",
@@ -317,7 +335,47 @@ mod tests {
     #[test]
     fn zero_resolved_lines_is_healthy_not_a_container_failure() {
         let runner = MockCommandRunner::new();
-        let health = evaluate(&runner, true, true, &resolution(vec![]), "strongswan");
+        let health = evaluate(&runner, true, true, true, &resolution(vec![]), "strongswan");
+        assert_eq!(health, Health::Healthy);
+    }
+
+    /// specs/026-disable-circuit-switched FR-018: [cs].enabled is false and
+    /// there is nothing else to check — reported distinctly, not as a bare
+    /// (uninformative) Healthy, and still not a container failure.
+    #[test]
+    fn cs_disabled_with_nothing_else_to_check_is_reported_distinctly() {
+        let runner = MockCommandRunner::new();
+        let health = evaluate(
+            &runner,
+            true,
+            false,
+            false,
+            &resolution(vec![]),
+            "strongswan",
+        );
+        assert_eq!(health, Health::CircuitSwitchedDisabled);
+        assert!(health.is_healthy(), "must not be unhealthy/degraded/failed");
+    }
+
+    /// FR-018: with VoWiFi actually carrying traffic, [cs].enabled being
+    /// false must not suppress the real per-line health checks — the
+    /// distinct "disabled" verdict only applies when there is nothing else
+    /// to report on.
+    #[test]
+    fn cs_disabled_does_not_suppress_real_vowifi_line_checks() {
+        let runner = MockCommandRunner::new();
+        with_addressed_iface(&runner, "ims0", "ipsec-0");
+        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
+        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
+
+        let health = evaluate(
+            &runner,
+            true,
+            false,
+            true,
+            &resolution(vec![line(0)]),
+            "strongswan",
+        );
         assert_eq!(health, Health::Healthy);
     }
 
@@ -327,6 +385,7 @@ mod tests {
         // No `ip addr show` output seeded -> no address.
         let health = evaluate(
             &runner,
+            true,
             true,
             true,
             &resolution(vec![line(0)]),
@@ -355,6 +414,7 @@ mod tests {
             &runner,
             true,
             true,
+            true,
             &resolution(vec![line(0)]),
             "strongswan",
         );
@@ -371,6 +431,7 @@ mod tests {
 
         let health = evaluate(
             &runner,
+            true,
             true,
             true,
             &resolution(vec![line(0)]),
@@ -400,6 +461,7 @@ mod tests {
             &runner,
             true,
             true,
+            true,
             &resolution(vec![line(0)]),
             "strongswan",
         );
@@ -425,6 +487,7 @@ mod tests {
 
         let health = evaluate(
             &runner,
+            true,
             true,
             true,
             &resolution(vec![l0, line(1), line(2)]),
@@ -471,6 +534,7 @@ mod tests {
             &runner,
             true,
             true,
+            true,
             &resolution(vec![line(0)]),
             "strongswan",
         );
@@ -491,6 +555,7 @@ mod tests {
         assert_eq!(
             evaluate(
                 &runner,
+                true,
                 true,
                 true,
                 &resolution(vec![line(0)]),
@@ -521,7 +586,14 @@ mod tests {
         runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
         // ims1 deliberately unseeded -> unreachable through line 1's tunnel.
 
-        let health = evaluate(&runner, true, true, &resolution(vec![l0, l1]), "strongswan");
+        let health = evaluate(
+            &runner,
+            true,
+            true,
+            true,
+            &resolution(vec![l0, l1]),
+            "strongswan",
+        );
 
         assert_eq!(
             health,

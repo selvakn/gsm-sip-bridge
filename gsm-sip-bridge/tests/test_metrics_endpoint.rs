@@ -42,6 +42,10 @@ fn init_all_metrics() {
         .with_label_values(&["success"])
         .inc();
     metrics::UPTIME_SECONDS.set(1.0);
+    // specs/026-disable-circuit-switched FR-021c: present regardless of
+    // [cs].enabled, alongside every metric CardPool itself would have
+    // touched above — proves the existing set is exported unchanged.
+    metrics::CS_ENABLED.set(1.0);
     metrics::BUILD_INFO
         .with_label_values(&["5.0.0", "test", "2.16", "1.80.0"])
         .set(1.0);
@@ -124,6 +128,7 @@ fn test_all_metrics_registered() {
         "gsm_sip_bridge_agent_up",
         "gsm_sip_bridge_agent_last_report_seconds",
         "gsm_sip_bridge_observability_events_dropped_total",
+        "gsm_sip_bridge_cs_enabled",
     ];
 
     for metric in &expected_metrics {

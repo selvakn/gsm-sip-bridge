@@ -532,6 +532,34 @@ section! {
     }
 }
 
+// -------------------------------------------------------------- [cs] -------
+
+section! {
+    /// Exactly the `[cs]` keys.
+    ///
+    /// The opt-out switch for the circuit-switched call path (specs/026-
+    /// disable-circuit-switched). Circuit-switched tuning itself lives in
+    /// `[modules]` (`retry_interval_sec`, `max_concurrent`); this section
+    /// exists solely to hold the on/off flag, kept separate so it reads next
+    /// to `[vowifi]`/`[volte]` where an operator looks for the switch.
+    pub struct RawCs {
+        pub enabled: bool,
+    }
+}
+
+// NOT #[derive(Default)]. `section!` applies `#[serde(default)]`, so an
+// absent `[cs]` section (or an absent `enabled` key within it) falls back to
+// this impl. `[cs]` is the first *opt-out* flag in this file — every other
+// `enabled` key here (`RawVowifi`, `RawVolte`, `RawOutbound`, `RawSipServer`)
+// is opt-in and correctly derives `false`. Deriving `Default` here would
+// silently disable circuit switching for every existing deployment on
+// upgrade — the exact regression this feature's spec (User Story 2) forbids.
+impl Default for RawCs {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 // ------------------------------------------------- unknown-key checking ----
 
 /// Every section's accepted keys, keyed by the section's TOML path.
@@ -564,6 +592,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("sip_server", RawSipServer::KEYS),
         ("sip_server.account", RawSipServerAccount::KEYS),
         ("outbound", RawOutbound::KEYS),
+        ("cs", RawCs::KEYS),
     ]
 }
 
@@ -652,5 +681,6 @@ section! {
         pub alerts: RawAlerts,
         pub sip_server: RawSipServer,
         pub outbound: RawOutbound,
+        pub cs: RawCs,
     }
 }

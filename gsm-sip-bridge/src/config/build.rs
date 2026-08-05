@@ -863,6 +863,14 @@ fn build_outbound(raw: RawOutbound) -> BridgeResult<OutboundConfig> {
     })
 }
 
+/// No validation beyond structural parsing — a boolean has no invalid value,
+/// and every combination with `[vowifi]`/`[volte]` is accepted (FR-003).
+fn build_cs(raw: RawCs) -> CsConfig {
+    CsConfig {
+        enabled: raw.enabled,
+    }
+}
+
 // ----------------------------------------------------------------- entry ---
 
 /// Assembles the runtime config from the deserialised document.
@@ -895,5 +903,6 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
         alerts,
         sip_server,
         outbound: build_outbound(raw.outbound)?,
+        cs: build_cs(raw.cs),
     })
 }

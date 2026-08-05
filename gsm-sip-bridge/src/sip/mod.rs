@@ -85,6 +85,12 @@ struct SipBridgeConfig {
     /// `[outbound].enabled` (spec 025) — passed to the registrar so a
     /// registered phone's INVITE is redirected instead of refused.
     outbound_enabled: bool,
+    /// `[cs].enabled` (specs/026-disable-circuit-switched) — carried
+    /// separately from `owns_sip_side` purely so `register()`'s skip log can
+    /// name the actual reason (FR-009b) instead of always blaming
+    /// VoLTE/VoWiFi, which folding this flag into `owns_sip_side` alone
+    /// would otherwise hide.
+    cs_enabled: bool,
 }
 
 impl SipBridge {
@@ -100,11 +106,25 @@ impl SipBridge {
             tls_verify: config.sip.tls_verify.clone(),
             // Defer the trunk to the VoLTE inbound bridge or the VoWiFi bridge
             // when either is active, so the same account is not registered
-            // from two places at once.
-            owns_sip_side: !config.volte.bridge_inbound && !config.vowifi.enabled,
+            // from two places at once. `config.cs.enabled` (specs/026-
+            // disable-circuit-switched, FR-009a) folds into the same
+            // condition rather than a second mechanism: with the
+            // circuit-switched path off, this side of the daemon has
+            // nothing behind it, so establishing a trunk registration or a
+            // host-side registrar would advertise capacity that does not
+            // exist. In the shipped binary `register()` is only ever called
+            // from `CardPool::run`, which the daemon's `[cs].enabled` gate
+            // already prevents from running at all when the path is off —
+            // this term makes that invariant hold for `SipBridge` itself,
+            // regardless of caller, rather than relying on that gate as the
+            // only thing enforcing it.
+            owns_sip_side: !config.volte.bridge_inbound
+                && !config.vowifi.enabled
+                && config.cs.enabled,
             register_trunk: !config.volte.bridge_inbound
                 && !config.vowifi.enabled
-                && !config.sip_server.enabled,
+                && !config.sip_server.enabled
+                && config.cs.enabled,
             sip_server: config.sip_server.clone(),
             dial_timeout_sec: config.bridge.sip_dial_timeout_sec,
             sip_destination: config.bridge.sip_destination.clone(),
@@ -117,6 +137,7 @@ impl SipBridge {
             snd_play_latency_ms: config.audio.snd_play_latency_ms,
             rt_audio_prio: config.modem_audio.rt_audio_prio,
             outbound_enabled: config.outbound.enabled,
+            cs_enabled: config.cs.enabled,
         };
 
         Self {
@@ -149,13 +170,27 @@ impl SipBridge {
         // *and* one in the telephony agent, and the second to bind would fail.
         if !self.config.owns_sip_side {
             self.state = RegistrationState::Unregistered;
-            tracing::info!(
-                server = %self.config.server,
-                username = %self.config.username,
-                server_mode = self.config.sip_server.enabled,
-                "circuit-switched SIP side skipped: the VoLTE/VoWiFi bridge owns it \
-                 (avoids double-registering one trunk, or two registrars on one port)"
-            );
+            if !self.config.cs_enabled {
+                // specs/026-disable-circuit-switched FR-009b: named
+                // separately from the VoLTE/VoWiFi case below — an operator
+                // who loses an expected registration after setting the flag
+                // must be able to tell why at a glance, not have to rule out
+                // a VoLTE/VoWiFi conflict first.
+                tracing::info!(
+                    server = %self.config.server,
+                    username = %self.config.username,
+                    "circuit-switched SIP side skipped: [cs].enabled is false \
+                     (no upstream trunk registration, no host-side registrar)"
+                );
+            } else {
+                tracing::info!(
+                    server = %self.config.server,
+                    username = %self.config.username,
+                    server_mode = self.config.sip_server.enabled,
+                    "circuit-switched SIP side skipped: the VoLTE/VoWiFi bridge owns it \
+                     (avoids double-registering one trunk, or two registrars on one port)"
+                );
+            }
             return Ok(());
         }
 

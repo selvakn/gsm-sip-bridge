@@ -2,6 +2,29 @@
 
 ## v8.4.0
 
+- **Circuit-switched call handling can now be turned off entirely.**
+  `[cs].enabled` (default `true`) stops the circuit-switched daemon's modem
+  discovery, periodic rescan, AT traffic, and call handling outright — for a
+  deployment where every call already goes over VoWiFi or VoLTE, there is no
+  more background probing of a path that will never carry a call. A
+  deployment that does not set it is byte-for-byte unaffected.
+
+  **Upgrade-visible behaviour**: if this deployment previously registered a
+  trunk with a PBX and you set `[cs].enabled = false` without also enabling
+  VoWiFi or VoLTE, that trunk registration stops — with nothing behind it,
+  keeping it up would advertise capacity that no longer exists, so the PBX
+  will mark it down. The startup log names `[cs].enabled` as the reason. If
+  VoWiFi or VoLTE is enabled, this has no effect: that subsystem already
+  owns the telephone-facing side and is untouched.
+
+  A voice-capable modem with no `[[vowifi.line]]` override, which the
+  circuit-switched path reserves for itself while enabled, becomes
+  available to VoWiFi once the flag is off — so a VoWiFi-only deployment
+  needs no `[[vowifi.line]]` entries even on hardware VoWiFi alone would not
+  have claimed by default. The metrics/control/message-store services this
+  process hosts alongside the circuit-switched path keep running unchanged.
+  See `docs/configuration.md#cs`.
+
 - **Outbound calling.** `[outbound].enabled` lets the PBX — or, in SIP server
   mode, a registered phone — dial out through the mobile network, on
   whichever line (circuit-switched, VoWiFi, or VoLTE) is idle. Off by

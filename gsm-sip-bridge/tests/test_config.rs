@@ -372,3 +372,218 @@ fn test_the_shipped_example_config_still_loads() {
     load_config(f.path())
         .expect("config.toml.example must load — it is what operators copy to start from");
 }
+
+/// specs/026-disable-circuit-switched FR-002: the single highest-risk
+/// assertion in the feature. `[cs]` is the first *opt-out* flag in the file —
+/// every other `enabled` key defaults to `false` (opt-in). If `RawCs` ever
+/// grows a derived `Default` instead of a hand-written one, this silently
+/// disables circuit switching for every existing deployment on upgrade.
+#[test]
+fn cs_defaults_to_enabled_when_section_absent() {
+    std::env::set_var("TEST_CS_ABSENT_PASSWORD", "p");
+
+    let f = write_config(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CS_ABSENT_PASSWORD"
+"#,
+    );
+
+    let cfg = load_config(f.path()).unwrap();
+    assert!(
+        cfg.cs.enabled,
+        "a config written before this feature existed must behave identically after upgrade"
+    );
+}
+
+#[test]
+fn cs_defaults_to_enabled_when_section_present_but_key_absent() {
+    std::env::set_var("TEST_CS_PRESENT_PASSWORD", "p");
+
+    let f = write_config(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CS_PRESENT_PASSWORD"
+
+[cs]
+"#,
+    );
+
+    let cfg = load_config(f.path()).unwrap();
+    assert!(cfg.cs.enabled);
+}
+
+#[test]
+fn cs_enabled_false_is_honoured() {
+    std::env::set_var("TEST_CS_FALSE_PASSWORD", "p");
+
+    let f = write_config(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CS_FALSE_PASSWORD"
+
+[cs]
+enabled = false
+"#,
+    );
+
+    let cfg = load_config(f.path()).unwrap();
+    assert!(!cfg.cs.enabled);
+}
+
+#[test]
+fn cs_unknown_key_is_rejected() {
+    std::env::set_var("TEST_CS_UNKNOWN_PASSWORD", "p");
+
+    let f = write_config(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CS_UNKNOWN_PASSWORD"
+
+[cs]
+bogus = 1
+"#,
+    );
+
+    let msg = load_config(f.path()).unwrap_err().to_string();
+    assert!(msg.contains("cs.bogus"), "got: {msg}");
+}
+
+/// FR-003: every combination of `[cs]`, `[vowifi]`, `[volte]` enable flags is
+/// valid configuration — enabling one MUST NOT implicitly change another.
+#[test]
+fn cs_vowifi_volte_every_combination_is_accepted() {
+    for (cs, vowifi, volte) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (false, true, false),
+        (true, false, true),
+        (false, false, true),
+        // Both true is rejected by supervise::orchestrate, not by config
+        // loading — load_config itself must still accept it.
+        (true, true, true),
+        (false, true, true),
+    ] {
+        std::env::set_var("TEST_CS_COMBO_PASSWORD", "p");
+        let f = write_config(&format!(
+            r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CS_COMBO_PASSWORD"
+
+[cs]
+enabled = {cs}
+
+[vowifi]
+enabled = {vowifi}
+
+[volte]
+enabled = {volte}
+"#
+        ));
+
+        let cfg = load_config(f.path())
+            .unwrap_or_else(|e| panic!("cs={cs} vowifi={vowifi} volte={volte} rejected: {e}"));
+        assert_eq!(cfg.cs.enabled, cs);
+        assert_eq!(cfg.vowifi.enabled, vowifi);
+        assert_eq!(cfg.volte.enabled, volte);
+    }
+}
+
+/// FR-025: circuit-switched-specific tuning stays valid and has no bearing on
+/// whether the config loads when the path is disabled.
+#[test]
+fn cs_disabled_leaves_related_sections_valid() {
+    std::env::set_var("TEST_CS_INERT_PASSWORD", "p");
+
+    let f = write_config(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CS_INERT_PASSWORD"
+
+[cs]
+enabled = false
+
+[modules]
+retry_interval_sec = 45
+max_concurrent = 3
+
+[resilience]
+initial_backoff_sec = 10
+max_backoff_sec = 200
+max_retries = 5
+network_loss_timeout_sec = 90
+network_poll_interval_sec = 45
+
+[scheduled_restart]
+enabled = true
+cron = "0 2 * * *"
+
+[modem_audio]
+tx_level = 0.8
+"#,
+    );
+
+    let cfg = load_config(f.path()).unwrap();
+    assert!(!cfg.cs.enabled);
+    assert_eq!(cfg.modules.retry_interval_sec, 45);
+    assert_eq!(cfg.modules.max_concurrent, 3);
+}
+
+/// specs/026-disable-circuit-switched User Story 2: every configuration that
+/// predates this feature — every shipped sample except the one this feature
+/// itself added to demonstrate `[cs]` — must keep behaving exactly as
+/// before after upgrade. Loads every real sample config in
+/// `sample_configs/` (not fabricated fixtures) and asserts each resolves
+/// `cs.enabled == true` unless it explicitly names `[cs]` itself, the
+/// load-bearing regression check for "a config with no [cs] section is
+/// unaffected".
+#[test]
+fn every_shipped_sample_config_defaults_circuit_switching_to_enabled() {
+    std::env::set_var("SIP_PASSWORD", "p");
+    std::env::set_var("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/x");
+    std::env::set_var("PHONE_1001_PASSWORD", "p");
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample_configs");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("sample_configs/ must exist") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let cfg =
+            load_config(&path).unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
+        if raw.contains("[cs]") {
+            // Explicitly opts into the new section — not a pre-existing
+            // config, so it's exempt from the "unaffected by upgrade" claim
+            // this test otherwise makes.
+            checked += 1;
+            continue;
+        }
+        assert!(
+            cfg.cs.enabled,
+            "{} has no [cs] section, so it must default to enabled — a regression here means \
+             upgrading silently disables circuit switching on this deployment shape",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "expected at least one sample config in {}",
+        dir.display()
+    );
+}

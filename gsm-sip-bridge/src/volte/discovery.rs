@@ -106,10 +106,16 @@ pub struct VolteLineTableResult {
 pub fn resolve_volte_lines(modems: &[ProbedModem], base: &VolteConfig) -> VolteLineTableResult {
     // Unlike VoWiFi, there is no prior role assignment here, so a `Ready`
     // SIM whose modem exposes no AT port has to be rejected explicitly.
+    //
+    // A modem an explicit [[volte.line]] override names by modem_serial/
+    // modem_port is pinned ahead of every auto-discovered candidate — see
+    // `line::select`'s own doc comment for why (an enlarged auto-discovered
+    // pool must never bump an operator's explicit pin).
     let candidates = crate::line::select(
         modems,
         base.max_lines,
         crate::line::AtPortRequirement::Required,
+        |modem| override_for(modem, &base.line_overrides).is_some(),
     );
     let failed = candidates.failed;
 
@@ -376,6 +382,38 @@ mod tests {
         let result = resolve_volte_lines(&modems, &base());
         assert_eq!(result.lines.len(), 2);
         assert_eq!(result.lines[0].card_id, "ec20-AAAAAA");
+        assert_eq!(result.lines[1].card_id, "ec20-ZZZZZZ");
+    }
+
+    /// specs/026-disable-circuit-switched, greptile P1 (second finding): a
+    /// modem pinned by an explicit [[volte.line]] override must win a
+    /// contested slot over an unpinned one (line::select's pin-priority
+    /// membership rule), but when both fit comfortably under max_lines —
+    /// no contention at all — pin status must not reorder them. A line's
+    /// index drives its whole network identity (namespace, veth pair,
+    /// SIP/control/status ports); reassigning it on every upgrade even
+    /// where nothing was ever at risk of being excluded would needlessly
+    /// tear down and rebuild a working line.
+    #[test]
+    fn pinned_modem_does_not_reorder_lines_when_both_fit_under_max_lines() {
+        let mut b = base();
+        // Pinned modem's card id sorts *after* the unpinned one's — under
+        // the bug, pin priority alone would have put it first anyway.
+        b.line_overrides = vec![VolteLineOverride {
+            modem_serial: Some("ec20-ZZZZZZ".to_string()),
+            ..Default::default()
+        }];
+        let modems = vec![
+            ready("ec20-ZZZZZZ", "/dev/ttyUSB1"),
+            ready("ec20-AAAAAA", "/dev/ttyUSB0"),
+        ];
+        let result = resolve_volte_lines(&modems, &b);
+
+        assert_eq!(result.lines.len(), 2);
+        assert_eq!(
+            result.lines[0].card_id, "ec20-AAAAAA",
+            "plain card-id order must be unchanged by pinning when nothing is excluded"
+        );
         assert_eq!(result.lines[1].card_id, "ec20-ZZZZZZ");
     }
 
