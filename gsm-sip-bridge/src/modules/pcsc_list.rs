@@ -48,6 +48,17 @@ struct LookupEntry {
     country: String,
 }
 
+/// Zero-pads a literal, card-read MNC (2 or 3 digits) to the project's
+/// documented 3-digit `mnc` convention (`docs/configuration.md`,
+/// `vowifi::plmn::plmn_from_imsi`'s output) for display only — the raw,
+/// un-padded value (not this) is what must go to `lookup_carrier`, since
+/// mcc-mnc-lookup.com matches the literal digit run and a padded "010"
+/// misses a real 2-digit "10" MNC entirely (verified live against Airtel
+/// 404/10).
+fn pad_mnc_for_display(mnc: &str) -> String {
+    format!("{mnc:0>3}")
+}
+
 /// Reads EF_IMSI and (best-effort) EF_AD off the currently-reachable card.
 /// Errors only when the IMSI itself can't be read — the AID discovery or
 /// EF_IMSI read failing means there's nothing useful to report at all,
@@ -183,6 +194,9 @@ pub async fn list_cards(client: &reqwest::Client) -> BridgeResult<Vec<CardRow>> 
                 mnc: None,
                 carrier: None,
             }),
+            // `mnc` here is the literal, un-padded digit run `lookup_carrier`
+            // needs (see `pad_mnc_for_display`) — only the row pushed below
+            // pads it for display.
             Ok((imsi, mcc, mnc)) => {
                 let carrier = match &mnc {
                     Some(mnc) => {
@@ -206,7 +220,7 @@ pub async fn list_cards(client: &reqwest::Client) -> BridgeResult<Vec<CardRow>> 
                     },
                     imsi: Some(imsi),
                     mcc: Some(mcc),
-                    mnc,
+                    mnc: mnc.as_deref().map(pad_mnc_for_display),
                     carrier,
                 });
             }
@@ -301,6 +315,21 @@ mod tests {
     }
 
     #[test]
+    fn pad_mnc_for_display_pads_a_two_digit_mnc() {
+        // Caught in review: the raw, un-padded value `read_card_identity`
+        // returns (correct for `lookup_carrier` — see that fn's doc comment)
+        // must not leak into the displayed row as-is, or it reads as
+        // inconsistent with the project's documented 3-digit `mnc`
+        // convention (`docs/configuration.md`, `vowifi-plmn`'s output).
+        assert_eq!(pad_mnc_for_display("43"), "043");
+    }
+
+    #[test]
+    fn pad_mnc_for_display_leaves_a_three_digit_mnc_unchanged() {
+        assert_eq!(pad_mnc_for_display("170"), "170");
+    }
+
+    #[test]
     fn read_card_identity_reads_imsi_and_plmn() {
         let mut responses = usim_selection_responses();
         responses.extend([
@@ -352,7 +381,7 @@ mod tests {
                 status: "ok".to_string(),
                 imsi: Some("404438083996440".to_string()),
                 mcc: Some("404".to_string()),
-                mnc: Some("43".to_string()),
+                mnc: Some("043".to_string()),
                 carrier: Some("Vodafone India (India)".to_string()),
             },
             CardRow {

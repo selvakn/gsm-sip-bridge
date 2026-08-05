@@ -64,27 +64,35 @@ serving PLMN from `AT+COPS` there; a reader has no radio and so no serving
 network to ask, so the line fails at startup with an error saying to set
 `mcc`/`mnc` explicitly.
 
-To read the IMSI (and MCC/MNC/carrier) off every attached reader in one shot:
+To read the IMSI (and MCC/MNC/carrier) off every attached reader in one shot,
+run `gsm-sip-bridge pcsc-list` **wherever pcscd is already running and can see
+the reader** — same requirement as the `opensc-tool --list-readers` check
+below, since `pcsc-list` opens a PC/SC context against the running pcscd
+resource manager (`SCardEstablishContext`) rather than starting one of its
+own. In this project's deployment, that's pcscd running inside the container
+(`docker/Dockerfile`'s `pcsc-lite`/`ccid` packages), so the usual invocation
+is:
 
 ```bash
-gsm-sip-bridge pcsc-list
+docker exec <container> gsm-sip-bridge pcsc-list
 # reader                                   status               imsi              mcc   mnc   carrier
 # ----------------------------------------------------------------------------------------------------
 # OMNIKEY AG SmartCard Reader 3x21 00 00   ok                   404940123456789  404   094   Vodafone Idea (India)
 # OMNIKEY AG SmartCard Reader 3x21 01 00   no card              -                 -     -     -
 ```
 
-This runs entirely on the host (no container/pcscd required, since it opens
-its own PC/SC context the same way `PcscTransport::connect` does) and needs
-no PIN or prior configuration — it's meant to be the first thing you run
-against a new reader, before writing `imsi_override` into `config.toml`. Each
-row's `mcc`/`mnc` come from the same `EF_IMSI`/`EF_AD` read `vowifi-plmn
---pcsc-imsi` does; `carrier` is a lookup against
-`https://mcc-mnc-lookup.com`'s public API and is left blank (not fatal) if
-that lookup fails or the host has no internet access. With more than one
-reader attached, this is what tells you which reader's card is which line's
-`imsi_override` — `Virtual PCD ...` (vpcd) slots are never listed, since
-those are the modem-backed lines' virtual reader, not a card to bind to.
+(Running it directly on the bare host only works if you've separately set up
+pcscd + the `ccid` driver there yourself — this project's own pcscd instance
+lives in the container.) It needs no PIN or prior configuration — it's meant
+to be the first thing you run against a new reader, before writing
+`imsi_override` into `config.toml`. Each row's `mcc`/`mnc` come from the same
+`EF_IMSI`/`EF_AD` read `vowifi-plmn --pcsc-imsi` does; `carrier` is a lookup
+against `https://mcc-mnc-lookup.com`'s public API and is left blank (not
+fatal) if that lookup fails or the container has no internet access. With
+more than one reader attached, this is what tells you which reader's card is
+which line's `imsi_override` — `Virtual PCD ...` (vpcd) slots are never
+listed, since those are the modem-backed lines' virtual reader, not a card to
+bind to.
 
 `pySim-read.py -p 0` (per the osmocom wiki's "Getting IMSI" step) is the
 fallback if `pcsc-list` isn't available (e.g. reading a card outside this
@@ -128,9 +136,9 @@ resolve, register, and fail independently (see
    --list-readers` (Alpine has no `pcsc-tools`/`pcsc_scan` package — use
    `opensc-tool`, or a PC/SC client of your own) should list the OmniKey
    reader, alongside any `Virtual PCD ...` (vpcd) slots used by modem-backed
-   lines. `gsm-sip-bridge pcsc-list` run on the host covers the same check
-   plus the card's IMSI/MCC/MNC in one command (vpcd slots are filtered out,
-   so it only ever lists real readers).
+   lines. `docker exec <container> gsm-sip-bridge pcsc-list` covers the same
+   check plus the card's IMSI/MCC/MNC in one command (vpcd slots are filtered
+   out, so it only ever lists real readers).
 2. **Tunnel established**: `docker logs <container> | grep -i "tunnel UP"`
    and `/var/log/strongswan.log`'s `IKE_SA established`/`EAP_AKA succeeded`
    for this line's IMSI.
