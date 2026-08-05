@@ -1,5 +1,16 @@
 # Release Notes
 
+## v8.5.1
+
+- **VoWiFi USIM bridge now self-heals a SIM that drops off the modem bus.**
+  A physically/electrically dropped SIM used to surface only as a repeating
+  `AT+CSIM failed` warning with no automatic recovery — the existing
+  auto-recovery (power-cycle via `AT+CFUN=0` -> `1` after 3 consecutive
+  failures) was wired to a different process than the one that now actually
+  talks to the SIM, so it never fired. The recovery is now wired into the
+  process that owns the modem connection, so a dropped SIM reconnects on its
+  own within seconds instead of requiring a manual container restart.
+
 ## v8.5.0
 
 - **`gsm-sip-bridge pcsc-list`: enumerate every PC/SC reader's card without
