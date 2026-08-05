@@ -95,11 +95,15 @@ pub fn is_cpin_ready(reset_log: &str) -> bool {
 /// Matches the original script's `sleep 0.5` after freezing the holder, to
 /// let any in-flight serial I/O settle before driving the port directly.
 const HOLDER_FREEZE_SETTLE: Duration = Duration::from_millis(500);
-/// Matches `sleep 4` between `AT+CFUN=0` and `AT+CFUN=1`.
-const CFUN_CYCLE_DELAY: Duration = Duration::from_secs(4);
+/// Matches `sleep 4` between `AT+CFUN=0` and `AT+CFUN=1`. `pub`: also the
+/// policy `vowifi::usim_bridge`'s in-process reset uses — that call site
+/// already holds the modem port itself (no separate holder to freeze/steal
+/// it from), but the AT+CFUN timing is the same modem-level recipe either
+/// way, so it reuses these constants rather than forking its own copy.
+pub const CFUN_CYCLE_DELAY: Duration = Duration::from_secs(4);
 /// Matches the `for i in $(seq 1 15)` READY poll, 1s apart.
-const CPIN_POLL_ATTEMPTS: u32 = 15;
-const CPIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+pub const CPIN_POLL_ATTEMPTS: u32 = 15;
+pub const CPIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Matches the original script's 30s `timeout` on the background `cat
 /// "$modem"` reader — comfortably outlasts the ~4.3s pre-roll plus the ~15s
