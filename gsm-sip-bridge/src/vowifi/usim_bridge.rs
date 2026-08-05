@@ -13,6 +13,7 @@
 use crate::error::{BridgeError, BridgeResult};
 use crate::modules::at_commander::AtCommander;
 use crate::modules::usim;
+use crate::supervise::sim_recovery::{self, Action, AgentExitOutcome, IncidentCounters};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -205,6 +206,47 @@ fn try_open_with_backoff(
     Err(last_err.unwrap())
 }
 
+/// Power-cycles the SIM in place (`AT+CFUN=0` -> `AT+CFUN=1`) over `at`,
+/// polling `AT+CPIN?` for `READY`, and reports whether it came back within
+/// the poll window.
+///
+/// This is the same recipe as `sim_recovery::reset_modem_sim` (the recovery
+/// added after the sugam incident, doc'd there in full) but driven directly
+/// through the `AtCommander` this session already has open, rather than
+/// shelling out via `CommandRunner` to steal the port from a separate
+/// process. That indirection existed because the *original* CSIM-failure
+/// detection lived in `supervise::orchestrate`'s vowifi-ims-agent supervisor
+/// — a different process from whichever one actually held the modem port —
+/// so it had to freeze the holder (SIGSTOP/SIGCONT) before driving raw AT
+/// writes at the device path. Here the detection and the reset both happen
+/// inside the same `Session` that already owns `serial`, so there is no
+/// other reader/writer to freeze: this function just talks to the port it's
+/// already holding.
+///
+/// Timing is a parameter (rather than reading `sim_recovery`'s constants
+/// directly) purely so tests can drive the same real AT-command sequence
+/// with near-zero delays instead of a real multi-second sleep; production
+/// always calls this through `Session`'s fields, which default to those
+/// constants (see `Session::new`).
+fn reset_sim_in_place(
+    at: &mut AtCommander,
+    cycle_delay: Duration,
+    poll_interval: Duration,
+    poll_attempts: u32,
+) -> bool {
+    let _ = at.send_command("AT+CFUN=0");
+    std::thread::sleep(cycle_delay);
+    let _ = at.send_command("AT+CFUN=1");
+
+    for _ in 0..poll_attempts {
+        std::thread::sleep(poll_interval);
+        if matches!(at.query_cpin(), Ok(status) if status.contains("READY")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// One vpcd session's state — data-model.md's
 /// `Disconnected → Connected(unpowered) → Powered → Connected(unpowered)`
 /// machine, minus `Disconnected` (that's the caller's connection-retry
@@ -224,12 +266,31 @@ enum SessionState {
 
 struct Session {
     state: SessionState,
+    /// Consecutive-`AT+CSIM failed`-count across this session's whole
+    /// lifetime (not reset by Power Off/On or Reset — those don't touch the
+    /// modem bus, so they say nothing about whether the SIM is still
+    /// electrically present). A dropped USIM (see `reset_sim_in_place`'s
+    /// doc comment) used to crash-loop a *different* process forever with
+    /// no self-recovery (the sugam incident); this is the same
+    /// three-strikes policy, applied where `AT+CSIM` failures actually
+    /// surface now.
+    csim_fails: IncidentCounters,
+    /// SIM-reset timing, threaded through to `reset_sim_in_place` — defaults
+    /// to `sim_recovery`'s real constants; overridden in tests so the reset
+    /// path can be exercised without a real multi-second sleep.
+    cfun_cycle_delay: Duration,
+    cpin_poll_interval: Duration,
+    cpin_poll_attempts: u32,
 }
 
 impl Session {
     fn new() -> Self {
         Self {
             state: SessionState::Unpowered,
+            csim_fails: IncidentCounters::default(),
+            cfun_cycle_delay: sim_recovery::CFUN_CYCLE_DELAY,
+            cpin_poll_interval: sim_recovery::CPIN_POLL_INTERVAL,
+            cpin_poll_attempts: sim_recovery::CPIN_POLL_ATTEMPTS,
         }
     }
 
@@ -349,6 +410,7 @@ impl Session {
         }
         match forward_apdu(serial, &redirected) {
             Ok(resp) => {
+                self.csim_fails.observe(AgentExitOutcome::Other);
                 *last_response = Some(resp.clone());
                 let to_send = synthesize_61xx_if_needed(&redirected, &resp);
                 if to_send != resp {
@@ -364,6 +426,43 @@ impl Session {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "APDU forwarding failed; responding SW=6F00");
+                let outcome = if sim_recovery::has_csim_failure(&e.to_string()) {
+                    AgentExitOutcome::CsimFailure
+                } else {
+                    AgentExitOutcome::Other
+                };
+                match self.csim_fails.observe(outcome) {
+                    Action::ResetSim => {
+                        tracing::warn!(
+                            "consecutive AT+CSIM failures; power-cycling the SIM (AT+CFUN=0 -> 1)"
+                        );
+                        if reset_sim_in_place(
+                            serial,
+                            self.cfun_cycle_delay,
+                            self.cpin_poll_interval,
+                            self.cpin_poll_attempts,
+                        ) {
+                            tracing::info!("SIM re-detected after power cycle (AT+CPIN? -> READY)");
+                        } else {
+                            tracing::error!(
+                                "SIM power cycle did not report READY within the poll window"
+                            );
+                        }
+                        // The reset may have landed on a different file
+                        // selection state, and any cached GET RESPONSE data
+                        // is now stale — same invalidation `reset()` does.
+                        *aid = None;
+                        *last_response = None;
+                    }
+                    Action::GiveUpForThisIncident => {
+                        tracing::error!(
+                            "SIM recovery exhausted (MAX_SIM_RESETS reached this incident); \
+                             giving up on power-cycling, will keep responding SW=6F00 until \
+                             a CSIM command succeeds on its own"
+                        );
+                    }
+                    Action::None => {}
+                }
                 sw_only(0x6F, 0x00)
             }
         }
@@ -672,6 +771,7 @@ mod tests {
                 aid: Some(vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF]),
                 last_response: Some(vec![0x11, 0x22, 0x90, 0x00]),
             },
+            ..Session::new()
         };
         let resp = session.handle_apdu(&[0x00, 0xC0, 0x00, 0x00, 0x04]);
         assert_eq!(resp, vec![0x11, 0x22, 0x90, 0x00]);
@@ -759,6 +859,7 @@ mod tests {
                 aid: None,
                 last_response: None,
             },
+            ..Session::new()
         };
         let select_ef_dir = [0x00, 0xA4, 0x08, 0x04, 0x02, 0x2F, 0x00, 0x00];
         let first = session.handle_apdu(&select_ef_dir);
@@ -866,6 +967,7 @@ mod tests {
                 aid: None,
                 last_response: None,
             },
+            ..Session::new()
         };
         let select_by_path = [0x00, 0xA4, 0x08, 0x04, 0x02, 0x2F, 0x00, 0x00];
         let resp = session.handle_apdu(&select_by_path);
@@ -898,6 +1000,7 @@ mod tests {
                 aid: None,
                 last_response: None,
             },
+            ..Session::new()
         };
         // SELECT-by-AID carrying a generic/wrong AID, same RID.
         let generic_aid = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0xFF];
@@ -963,9 +1066,145 @@ mod tests {
                 aid: Some(vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]),
                 last_response: None,
             },
+            ..Session::new()
         };
         let resp = session.handle_apdu(&[0x00, 0x20, 0x00, 0x00, 0x02, 0x11, 0x22]);
         assert_eq!(resp, vec![0x6F, 0x00]);
+    }
+
+    // --- specs/026-disable-circuit-switched follow-up: the sugam-incident
+    // SIM auto-recovery (sim_recovery::IncidentCounters/CFUN cycle) used to
+    // be wired only into the vowifi-ims-agent supervisor, which watches for
+    // an *exited* agent process. This module's own `AT+CSIM failed` errors
+    // never crash the process (`handle_apdu` just mutes with SW=6F00 and
+    // keeps serving), so that watcher never saw them and never recovered a
+    // dropped SIM. These tests cover the same policy wired directly into
+    // `handle_apdu`, where the failures actually surface. -----------------
+
+    #[test]
+    fn three_consecutive_csim_failures_trigger_an_in_place_sim_reset() {
+        let mut session = Session {
+            state: SessionState::Powered {
+                serial: AtCommander::from_stream(
+                    ScriptedModem::new(&[
+                        "+CME ERROR: 0\r\n",      // CSIM attempt 1 — dropped SIM
+                        "+CME ERROR: 0\r\n",      // CSIM attempt 2
+                        "+CME ERROR: 0\r\n",      // CSIM attempt 3 — crosses the threshold
+                        "OK\r\n",                 // AT+CFUN=0
+                        "OK\r\n",                 // AT+CFUN=1
+                        "+CPIN: READY\r\nOK\r\n", // AT+CPIN? poll, attempt 1
+                    ]),
+                    Duration::from_secs(1),
+                ),
+                aid: Some(vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]),
+                last_response: Some(vec![0x11, 0x22, 0x90, 0x00]),
+            },
+            cfun_cycle_delay: Duration::from_millis(1),
+            cpin_poll_interval: Duration::from_millis(1),
+            cpin_poll_attempts: 1,
+            ..Session::new()
+        };
+
+        let apdu = [0x00, 0x20, 0x00, 0x00, 0x02, 0x11, 0x22];
+        for _ in 0..2 {
+            let resp = session.handle_apdu(&apdu);
+            assert_eq!(resp, vec![0x6F, 0x00], "below threshold: no reset yet");
+        }
+        assert_eq!(session.csim_fails.sim_resets, 0);
+
+        let resp = session.handle_apdu(&apdu);
+        assert_eq!(resp, vec![0x6F, 0x00], "APDU itself still fails");
+        assert_eq!(
+            session.csim_fails.sim_resets, 1,
+            "the 3rd consecutive failure must have triggered the CFUN reset"
+        );
+
+        let SessionState::Powered {
+            aid, last_response, ..
+        } = &session.state
+        else {
+            panic!("expected Powered");
+        };
+        assert_eq!(*aid, None, "AID must be invalidated after a SIM reset");
+        assert_eq!(
+            *last_response, None,
+            "cached GET RESPONSE data must be invalidated after a SIM reset"
+        );
+    }
+
+    #[test]
+    fn a_successful_apdu_between_failures_resets_the_csim_failure_count() {
+        let mut session = Session {
+            state: SessionState::Powered {
+                serial: AtCommander::from_stream(
+                    ScriptedModem::new(&[
+                        "+CME ERROR: 0\r\n",           // failure 1
+                        "+CME ERROR: 0\r\n",           // failure 2
+                        "+CSIM: 4,\"9000\"\r\nOK\r\n", // a clean success in between
+                        "+CME ERROR: 0\r\n",           // failure 1 of a fresh incident
+                        "+CME ERROR: 0\r\n",           // failure 2
+                    ]),
+                    Duration::from_secs(1),
+                ),
+                aid: Some(vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]),
+                last_response: None,
+            },
+            cfun_cycle_delay: Duration::from_millis(1),
+            cpin_poll_interval: Duration::from_millis(1),
+            cpin_poll_attempts: 1,
+            ..Session::new()
+        };
+
+        let failing_apdu = [0x00, 0x20, 0x00, 0x00, 0x02, 0x11, 0x22];
+        let succeeding_apdu = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00];
+
+        session.handle_apdu(&failing_apdu);
+        session.handle_apdu(&failing_apdu);
+        session.handle_apdu(&succeeding_apdu);
+        session.handle_apdu(&failing_apdu);
+        session.handle_apdu(&failing_apdu);
+
+        assert_eq!(
+            session.csim_fails.sim_resets, 0,
+            "the intervening success must have cleared the streak — two more \
+             failures afterward should not have crossed the threshold"
+        );
+    }
+
+    #[test]
+    fn a_sim_reset_that_never_reports_ready_still_mutes_the_apdu_and_counts_as_used() {
+        let mut session = Session {
+            state: SessionState::Powered {
+                serial: AtCommander::from_stream(
+                    ScriptedModem::new(&[
+                        "+CME ERROR: 0\r\n", // failure 1
+                        "+CME ERROR: 0\r\n", // failure 2
+                        "+CME ERROR: 0\r\n", // failure 3 — triggers the reset
+                        "OK\r\n",            // AT+CFUN=0
+                        "OK\r\n",            // AT+CFUN=1
+                        "ERROR\r\n",         // AT+CPIN? poll, attempt 1 — SIM still gone
+                    ]),
+                    Duration::from_secs(1),
+                ),
+                aid: None,
+                last_response: None,
+            },
+            cfun_cycle_delay: Duration::from_millis(1),
+            cpin_poll_interval: Duration::from_millis(1),
+            cpin_poll_attempts: 1,
+            ..Session::new()
+        };
+
+        let apdu = [0x00, 0x20, 0x00, 0x00, 0x02, 0x11, 0x22];
+        session.handle_apdu(&apdu);
+        session.handle_apdu(&apdu);
+        let resp = session.handle_apdu(&apdu);
+
+        assert_eq!(resp, vec![0x6F, 0x00]);
+        assert_eq!(
+            session.csim_fails.sim_resets, 1,
+            "an unsuccessful reset attempt still counts against MAX_SIM_RESETS"
+        );
     }
 
     #[test]
