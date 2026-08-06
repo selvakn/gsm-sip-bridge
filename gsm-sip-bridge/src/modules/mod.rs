@@ -226,23 +226,48 @@ impl<'a> SlotView for PoolSlotView<'a> {
 }
 
 /// How long a restarted slot stays `Recovering` before recovery is allowed
-/// to retry it, when the restart command went to a live worker (`cmd_tx`).
-/// Just a starting estimate — the worker's eventual exit (picked up via
-/// `CardPool::run`'s `JoinSet`) recomputes `next_retry_at` for real once the
-/// restart actually finishes, so this only matters for the brief window
-/// before that.
+/// to retry it, when the restart command went to a live worker (`cmd_tx`)
+/// running `RestartMode::Full` (`AT+CFUN=1,1`, one command, ~5s worst-case
+/// AT timeout — comfortably under this). Just a starting estimate — the
+/// worker's eventual exit (picked up via `CardPool::run`'s `JoinSet`)
+/// recomputes `next_retry_at` for real once the restart actually finishes,
+/// so this only matters for the brief window before that.
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Same idea, but for `apply_send_reboot`'s no-worker fallback: that restart
-/// runs detached (`tokio::task::spawn_blocking`, fire-and-forget) with
-/// nothing to recompute `next_retry_at` once it finishes, unlike the
-/// `cmd_tx`/`JoinSet` path above. Recovery reopening the same serial port
-/// before the detached restart releases it would interleave AT commands or
-/// fail outright (Greptile review, PR #30), so this waits out the slowest
-/// case regardless of which restart mode ran: `AtCommander::open` plus
-/// `radio_restart`'s `AT+CFUN=0` (~5s worst-case AT timeout) -> `sleep(4s)`
-/// -> `AT+CFUN=1` (~5s worst-case) is ~14s; this adds real margin on top.
-const RADIO_RESTART_FALLBACK_RETRY_DELAY: Duration = Duration::from_secs(20);
+/// Same idea, but for anything driving `RestartMode::Radio`'s `AT+CFUN=0`
+/// (~5s worst-case AT timeout) -> `sleep(4s)` -> `AT+CFUN=1` (~5s
+/// worst-case) — ~14s, longer than `RECOVERY_RETRY_DELAY`. Used for two
+/// different reasons depending on the path:
+///
+/// - The no-worker fallback (`apply_send_reboot`) runs the restart detached
+///   (`tokio::task::spawn_blocking`, fire-and-forget) with nothing at all to
+///   recompute `next_retry_at` once it finishes.
+/// - The `cmd_tx`/worker path *does* eventually recompute it for real via
+///   `CardPool::run`'s `JoinSet`, but only once the worker actually exits —
+///   until then, `RECOVERY_RETRY_DELAY` would still be too short an initial
+///   estimate and a premature retry tick could race that exit event.
+///
+/// Either way, recovery reopening the same serial port before the old
+/// restart releases it would interleave AT commands, fail initialization,
+/// or leave the modem in an inconsistent radio state (Greptile review,
+/// PR #30) — so both paths use this generous margin whenever `Radio` is the
+/// selected mode.
+const RADIO_RESTART_RETRY_DELAY: Duration = Duration::from_secs(20);
+
+/// How long `apply_send_reboot` should park a slot in `Recovering` before
+/// recovery may retry it, given the selected restart mode and whether a
+/// live worker (`cmd_tx`) took the command or the no-worker fallback ran it
+/// detached. Pulled out of `apply_send_reboot` so this decision is testable
+/// without constructing a whole `CardPool` — same reasoning as
+/// `scheduled_restart_mode`. See `RECOVERY_RETRY_DELAY`/
+/// `RADIO_RESTART_RETRY_DELAY`'s doc comments for why these differ.
+fn retry_delay_for(mode: RestartMode, had_worker: bool) -> Duration {
+    if had_worker && mode == RestartMode::Full {
+        RECOVERY_RETRY_DELAY
+    } else {
+        RADIO_RESTART_RETRY_DELAY
+    }
+}
 
 impl CardPool {
     pub fn new(
@@ -1096,12 +1121,12 @@ impl CardPool {
         // every card in this cycle; manual `card restart` (below) always
         // does a full reset regardless of this setting.
         let mode = scheduled_restart_mode(&self.config.scheduled_restart);
+        let retry_delay = retry_delay_for(mode, state.cmd_tx.is_some());
 
         // Mirror the manual `card restart` code path: send Reboot via the worker
         // if present, else open the serial port directly.
-        let retry_delay = if let Some(cmd_tx) = state.cmd_tx.take() {
+        if let Some(cmd_tx) = state.cmd_tx.take() {
             let _ = cmd_tx.send(ModuleCmd::Reboot(mode));
-            RECOVERY_RETRY_DELAY
         } else {
             // No worker owns this slot right now, so there's no dedicated OS
             // thread to hand the command to — unlike the `cmd_tx` path above.
@@ -1110,7 +1135,11 @@ impl CardPool {
             // `sleep(4s)` -> `AT+CFUN=1`, up to ~14s of synchronous AT I/O
             // that would otherwise stall this CardPool's shared event loop —
             // every other card's control commands and bridge events — for
-            // the duration (Greptile review, PR #30).
+            // the duration (Greptile review, PR #30). Nothing tracks this
+            // detached task's completion the way the cmd_tx/worker path is
+            // tracked by CardPool::run's JoinSet, which is exactly why
+            // retry_delay_for gives this branch the longer delay regardless
+            // of mode — see its own doc comment.
             let serial_port = state.module.serial_port.clone();
             let module_id = state.module.id.clone();
             tokio::task::spawn_blocking(move || match AtCommander::open(&serial_port) {
@@ -1126,16 +1155,7 @@ impl CardPool {
                     );
                 }
             });
-            // Nothing tracks this detached task's completion the way the
-            // cmd_tx/worker path is tracked by CardPool::run's JoinSet (whose
-            // eventual worker-exit event recomputes next_retry_at on its
-            // own). Without a longer delay here, recovery could reopen this
-            // same serial port before the detached radio_restart releases
-            // it, interleaving AT commands or failing recovery outright
-            // (Greptile review, PR #30) — so this fallback always waits out
-            // the worst case regardless of which mode ran.
-            RADIO_RESTART_FALLBACK_RETRY_DELAY
-        };
+        }
         state.lifecycle = LifecycleState::Recovering;
         state.retry_count = 0;
         state.next_retry_at = Some(now + retry_delay);
@@ -2363,6 +2383,43 @@ mod tests {
             scheduled_restart_mode(&ScheduledRestartConfig::default()),
             RestartMode::Full,
             "the default config's restart_mode is \"full\", preserving old behavior"
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_full_mode_with_a_live_worker_uses_the_short_delay() {
+        // The only combination that's actually safe with the historical
+        // flat 10s: AT+CFUN=1,1 is one command, ~5s worst case, and the
+        // worker's own eventual exit event recomputes next_retry_at anyway.
+        assert_eq!(
+            retry_delay_for(RestartMode::Full, true),
+            RECOVERY_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_radio_mode_uses_the_long_delay_even_with_a_live_worker() {
+        // Greptile review (PR #30): radio mode's ~14s worst case can outlast
+        // RECOVERY_RETRY_DELAY even on the tracked cmd_tx/worker path, since
+        // next_retry_at is only an initial estimate until the worker's real
+        // exit event supersedes it.
+        assert_eq!(
+            retry_delay_for(RestartMode::Radio, true),
+            RADIO_RESTART_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_the_no_worker_fallback_uses_the_long_delay_regardless_of_mode() {
+        // Greptile review (PR #30): the detached fallback has nothing that
+        // recomputes next_retry_at on completion, for either mode.
+        assert_eq!(
+            retry_delay_for(RestartMode::Full, false),
+            RADIO_RESTART_RETRY_DELAY
+        );
+        assert_eq!(
+            retry_delay_for(RestartMode::Radio, false),
+            RADIO_RESTART_RETRY_DELAY
         );
     }
 
