@@ -1,5 +1,10 @@
 # Release Notes
 
+## v8.7.0
+
+- **A configured VoWiFi line that never comes up at startup is now retried, self-heals, and is reported instead of silently missing.** A `[[vowifi.line]]` pin (`modem_port`/`modem_serial`) that raced a slow-enumerating modem at boot used to just be absent from `vowifi-status` with no indication anything was wrong. `discover` now keeps retrying in the background when no VoWiFi line resolved at startup, and starts the subsystem automatically the moment the pinned line is found — no restart needed. If it's still missing, `vowifi-status` and `healthcheck` now report it explicitly (`Configured line ... NOT RUNNING`), and an opt-in Discord alert (`[alerts.line_discovery_failed]`) fires after a grace window, with a matching recovery notice if it comes up later.
+- **`discover`'s SIM probe now retries a transiently-unreadable card instead of giving up immediately.** A SIM that answers `AT+CPIN?` with an error right at boot (found live on real EC20 hardware) used to be reported as unusable for the rest of that run. `discover` now attempts one `AT+CFUN=0` -> `AT+CFUN=1` radio cycle and re-probes before giving up — scoped to the one-shot startup scan only, never the ongoing background rescan, so a modem that's already registered or mid-call is never touched.
+
 ## v8.6.0
 
 - **`[scheduled_restart].restart_mode`: choose a soft radio cycle instead of a full modem reset.**
