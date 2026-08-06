@@ -540,6 +540,131 @@ fn resolve_one_pcsc_line(
     }
 }
 
+/// Which of a modem line's identity fields are still unpinned after
+/// `resolve_one_line` — i.e. still empty/`None` because neither an
+/// override nor the base config set them, and so would otherwise be left
+/// for something later to derive from the modem itself.
+///
+/// Pure so the decision is unit-tested without touching a modem; the actual
+/// AT I/O lives in [`enrich_resolved_line_identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MissingIdentity {
+    imsi: bool,
+    imei: bool,
+    mcc_mnc: bool,
+}
+
+impl MissingIdentity {
+    fn none_missing(self) -> bool {
+        !self.imsi && !self.imei && !self.mcc_mnc
+    }
+}
+
+fn missing_identity(line: &ResolvedLine) -> MissingIdentity {
+    MissingIdentity {
+        imsi: line.imsi_override.is_none(),
+        imei: line.config.imei_override.is_none(),
+        mcc_mnc: line.mcc.is_empty() || line.mnc.is_empty(),
+    }
+}
+
+/// Fills in whatever [`missing_identity`] found missing for one modem line,
+/// over an already-open `AtCommander` — pure given that connection, so it's
+/// exercised in tests against a fake transport. The real one-shot open
+/// lives in [`enrich_resolved_line_identity`], the only caller with real
+/// hardware to open.
+fn apply_derived_identity(
+    line: &mut ResolvedLine,
+    at: &mut crate::modules::at_commander::AtCommander,
+    missing: MissingIdentity,
+) {
+    if missing.imsi {
+        match at.query_imsi() {
+            Ok(imsi) => {
+                line.imsi_override = Some(imsi.clone());
+                line.config.imsi_override = Some(imsi);
+            }
+            Err(e) => tracing::warn!(
+                card_id = %line.card_id, error = %e,
+                "could not pre-read IMSI at discover time; vowifi-ims-agent will read it itself later"
+            ),
+        }
+    }
+    if missing.imei {
+        match at.query_imei() {
+            Ok(imei) => line.config.imei_override = Some(imei),
+            Err(e) => tracing::warn!(
+                card_id = %line.card_id, error = %e,
+                "could not pre-read IMEI at discover time; vowifi-ims-agent will read it itself later"
+            ),
+        }
+    }
+    if missing.mcc_mnc {
+        match super::plmn::derive_plmn(at) {
+            Ok(plmn) => {
+                line.mcc = plmn.mcc.clone();
+                line.mnc = plmn.mnc.clone();
+                line.config.mcc = plmn.mcc;
+                line.config.mnc = plmn.mnc;
+            }
+            Err(e) => tracing::warn!(
+                card_id = %line.card_id, error = %e,
+                "could not pre-derive mcc/mnc at discover time; vowifi-ims-agent will derive it itself later"
+            ),
+        }
+    }
+}
+
+/// Closes the redundant per-line AT reads that used to happen later,
+/// inside `vowifi-ims-agent`'s own startup (`derive_plmn`'s mcc/mnc, gated
+/// on `config.mcc.is_empty()`) and every subsequent re-registration
+/// (`register_session`'s imsi/imei, gated on `imsi_override`/
+/// `imei_override` being `None`) — each of which opens its own connection
+/// to the same modem port `vowifi-usim-bridge` is, by then, already holding
+/// open indefinitely for AT+CSIM/EAP-SIM proxying. Two processes writing to
+/// the same tty concurrently interleave/garble each other's AT
+/// command-response bytes, which surfaces as a modem-reported CME error
+/// (`AT+CIMI failed: 3` observed live) — and because `vowifi-usim-bridge`
+/// never releases the port, the loser keeps failing on every 5s
+/// supervise-driven restart until it happens to land in a moment
+/// `vowifi-usim-bridge` is briefly idle between transactions. Found live: a
+/// v8.7.0 redeploy where whichever line's Agent A started second lost this
+/// race and stayed unregistered for several minutes.
+///
+/// `discover` is the one place this is safe to close for good rather than
+/// just narrow: it is the *first* thing to ever touch this modem for this
+/// deployment — `vowifi-usim-bridge`/`vowifi-ims-agent` don't exist yet, so
+/// there is nothing to race. Opens the port once per line that still has
+/// *something* unpinned, derives it, and writes it into the resolution —
+/// after this, only `vowifi-usim-bridge` ever needs the AT port again for a
+/// healthy line. An operator's explicit `mcc`/`mnc`/`imsi_override`/
+/// `imei_override` is never touched or overridden, matching
+/// `resolve_one_line`'s own precedence.
+///
+/// Deliberately not fatal to `discover` as a whole: a failure here just
+/// leaves that one field unpinned, and `supervise::orchestrate`'s
+/// `resolve_mcc_mnc`/`vowifi-ims-agent`'s own fallbacks still cover it —
+/// slower and racier, but not broken. `pcsc_reader` lines are skipped: they
+/// have no modem, and `resolve_one_pcsc_line` already derived everything
+/// they need from the override/card.
+pub fn enrich_resolved_line_identity(line: &mut ResolvedLine) {
+    if line.pcsc_reader {
+        return;
+    }
+    let missing = missing_identity(line);
+    if missing.none_missing() {
+        return;
+    }
+    match crate::modules::at_commander::AtCommander::open(&line.modem_port) {
+        Ok(mut at) => apply_derived_identity(line, &mut at, missing),
+        Err(e) => tracing::warn!(
+            card_id = %line.card_id, error = %e,
+            "could not open modem to pre-derive line identity at discover time; \
+             vowifi-ims-agent will derive whatever's missing itself later"
+        ),
+    }
+}
+
 /// The serialized artifact `gsm-sip-bridge discover` writes so the
 /// circuit-switched daemon and `supervise::orchestrate` agree on the same
 /// role assignment/line table without each re-scanning independently
@@ -683,6 +808,225 @@ mod tests {
                 imsi: imsi.to_string(),
             }),
         }
+    }
+
+    /// A queue of responses, one per `send_command` call — needed because
+    /// `AtCommander::read_response` builds a fresh `BufReader` per call,
+    /// which over-reads and drops any buffered-but-unconsumed bytes from a
+    /// single-shot `Cursor`-backed stream across more than one call (the
+    /// same pre-existing quirk documented in `modules::discovery`'s and
+    /// `usim_bridge`'s own copies of this same helper).
+    struct ScriptedModem {
+        responses: std::collections::VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+        pos: usize,
+    }
+
+    impl ScriptedModem {
+        fn new(responses: &[&str]) -> Self {
+            Self {
+                responses: responses.iter().map(|s| s.as_bytes().to_vec()).collect(),
+                current: Vec::new(),
+                pos: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for ScriptedModem {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.current.len() {
+                let Some(next) = self.responses.pop_front() else {
+                    return Ok(0);
+                };
+                self.current = next;
+                self.pos = 0;
+            }
+            let remaining = &self.current[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Write for ScriptedModem {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scripted(responses: &[&str]) -> crate::modules::at_commander::AtCommander {
+        crate::modules::at_commander::AtCommander::from_stream(
+            ScriptedModem::new(responses),
+            std::time::Duration::from_secs(1),
+        )
+    }
+
+    fn resolved_modem_line(card_id: &str, port: &str) -> ResolvedLine {
+        ResolvedLine {
+            index: 0,
+            card_id: card_id.to_string(),
+            modem_port: PathBuf::from(port),
+            mcc: String::new(),
+            mnc: String::new(),
+            imsi_override: None,
+            pcsc_reader: false,
+            configured_identifier: None,
+            config: VowifiConfig::default(),
+        }
+    }
+
+    #[test]
+    fn missing_identity_is_all_true_for_a_freshly_resolved_line() {
+        let line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        assert_eq!(
+            missing_identity(&line),
+            MissingIdentity {
+                imsi: true,
+                imei: true,
+                mcc_mnc: true
+            }
+        );
+    }
+
+    #[test]
+    fn missing_identity_respects_already_pinned_fields() {
+        let mut line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        line.mcc = "404".to_string();
+        line.mnc = "045".to_string();
+        line.imsi_override = Some("404011111111111".to_string());
+        line.config.imei_override = Some("123456789012345".to_string());
+        assert!(missing_identity(&line).none_missing());
+    }
+
+    #[test]
+    fn missing_identity_mcc_mnc_true_if_either_alone_is_empty() {
+        let mut line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        line.mcc = "404".to_string();
+        // mnc left empty
+        assert!(missing_identity(&line).mcc_mnc);
+    }
+
+    /// The exact live-hardware finding this whole function exists for:
+    /// `vowifi-ims-agent` crash-looping with `AT+CIMI failed: 3` against
+    /// `vowifi-usim-bridge` — closed by pre-deriving imsi, imei, and
+    /// mcc/mnc here, at `discover` time, before either of those processes
+    /// exists to race against.
+    #[test]
+    fn apply_derived_identity_fills_in_everything_missing() {
+        let mut line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        let mut at = scripted(&[
+            "404940123456789\r\nOK\r\n",           // AT+CIMI
+            "123\r\n867584030123456\r\nOK\r\n",    // AT+CGSN
+            "404940123456789\r\nOK\r\n",           // AT+CIMI (derive_plmn's own)
+            "+CRSM: 144,0,\"00000002\"\r\nOK\r\n", // AT+CRSM (EF_AD)
+        ]);
+        let missing = missing_identity(&line);
+        apply_derived_identity(&mut line, &mut at, missing);
+
+        assert_eq!(line.imsi_override.as_deref(), Some("404940123456789"));
+        assert_eq!(
+            line.config.imsi_override.as_deref(),
+            Some("404940123456789")
+        );
+        assert_eq!(
+            line.config.imei_override.as_deref(),
+            Some("867584030123456")
+        );
+        assert_eq!(line.mcc, "404");
+        assert_eq!(line.mnc, "094");
+        assert_eq!(line.config.mcc, "404");
+        assert_eq!(line.config.mnc, "094");
+    }
+
+    /// An operator who already pinned `mcc`/`mnc` (but not `imsi_override`)
+    /// must only see the imsi/imei reads — sending a needless AT+CRSM would
+    /// be harmless functionally, but the whole point is fewer AT
+    /// round-trips against a port something else may also want.
+    #[test]
+    fn apply_derived_identity_only_queries_what_is_actually_missing() {
+        let mut line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        line.mcc = "404".to_string();
+        line.mnc = "045".to_string();
+        // Scripted with exactly two responses: a third command (the mcc/mnc
+        // derivation) would hit an empty queue and read back `Ok(0)`/EOF,
+        // which `send_command` treats as a parse error — so this also
+        // proves no third command was sent, not just that the two expected
+        // ones succeeded.
+        let mut at = scripted(&[
+            "404940123456789\r\nOK\r\n",        // AT+CIMI
+            "123\r\n867584030123456\r\nOK\r\n", // AT+CGSN
+        ]);
+        let missing = missing_identity(&line);
+        apply_derived_identity(&mut line, &mut at, missing);
+
+        assert_eq!(line.imsi_override.as_deref(), Some("404940123456789"));
+        assert_eq!(
+            line.config.imei_override.as_deref(),
+            Some("867584030123456")
+        );
+        // Untouched — still exactly what the operator pinned.
+        assert_eq!(line.mcc, "404");
+        assert_eq!(line.mnc, "045");
+    }
+
+    /// One field failing to read must not stop the others from being
+    /// applied, and must not panic — this runs during `discover`, and the
+    /// existing per-process fallbacks (`resolve_mcc_mnc`,
+    /// `vowifi-ims-agent`'s own `derive_plmn`/`register_session`) are the
+    /// safety net for whatever is left unpinned.
+    #[test]
+    fn apply_derived_identity_tolerates_one_query_failing() {
+        let mut line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        let mut at = scripted(&[
+            "ERROR\r\n",                           // AT+CIMI fails
+            "123\r\n867584030123456\r\nOK\r\n",    // AT+CGSN still succeeds
+            "404940123456789\r\nOK\r\n",           // derive_plmn's own AT+CIMI succeeds
+            "+CRSM: 144,0,\"00000002\"\r\nOK\r\n", // AT+CRSM succeeds
+        ]);
+        let missing = missing_identity(&line);
+        apply_derived_identity(&mut line, &mut at, missing);
+
+        assert_eq!(
+            line.imsi_override, None,
+            "the failed read must leave this unset"
+        );
+        assert_eq!(
+            line.config.imei_override.as_deref(),
+            Some("867584030123456")
+        );
+        assert_eq!(line.mcc, "404");
+        assert_eq!(line.mnc, "094");
+    }
+
+    #[test]
+    fn enrich_resolved_line_identity_skips_pcsc_reader_lines() {
+        let mut line = resolved_modem_line("pcsc0", "");
+        line.pcsc_reader = true;
+        // No modem_port to open at all — if this tried, it would fail to
+        // open an empty path and warn, but every field must stay untouched
+        // either way.
+        enrich_resolved_line_identity(&mut line);
+        assert_eq!(line.imsi_override, None);
+        assert_eq!(line.mcc, "");
+    }
+
+    #[test]
+    fn enrich_resolved_line_identity_is_a_no_op_when_nothing_is_missing() {
+        let mut line = resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3");
+        line.mcc = "404".to_string();
+        line.mnc = "045".to_string();
+        line.imsi_override = Some("404011111111111".to_string());
+        line.config.imei_override = Some("123456789012345".to_string());
+        // A real modem_port that does not exist on this test host — if this
+        // attempted to open it, it would fail and log a warning, but the
+        // `missing_identity` short-circuit must skip the open entirely.
+        enrich_resolved_line_identity(&mut line);
+        assert_eq!(line.mcc, "404");
+        assert_eq!(line.imsi_override.as_deref(), Some("404011111111111"));
     }
 
     fn unusable_modem(card_id: &str, status: Option<SimStatus>) -> ProbedModem {
