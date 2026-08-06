@@ -38,6 +38,10 @@ pub enum AlertCategory {
     /// A call that was never bridged (`CallStatus::Missed` only — see spec
     /// Clarifications Q4; `CallStatus::Failed` is out of scope).
     MissedCall,
+    /// specs/027-discover-retry-health: an explicitly configured VoWiFi
+    /// line (`modem_port`/`modem_serial`) never resolved into a line at
+    /// all, even after retrying discovery for it.
+    LineDiscoveryFailed,
 }
 
 impl AlertCategory {
@@ -50,6 +54,7 @@ impl AlertCategory {
             AlertCategory::RegistrationLoss => "registration_loss",
             AlertCategory::TunnelFailure => "tunnel_failure",
             AlertCategory::MissedCall => "missed_call",
+            AlertCategory::LineDiscoveryFailed => "line_discovery_failed",
         }
     }
 }
@@ -142,6 +147,7 @@ fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryA
         AlertCategory::RegistrationLoss => &config.registration_loss,
         AlertCategory::TunnelFailure => &config.tunnel_failure,
         AlertCategory::MissedCall => &config.missed_call,
+        AlertCategory::LineDiscoveryFailed => &config.line_discovery_failed,
     }
 }
 
@@ -184,6 +190,7 @@ pub async fn dispatch(
         AlertCategory::ModuleLifecycle
             | AlertCategory::RegistrationLoss
             | AlertCategory::TunnelFailure
+            | AlertCategory::LineDiscoveryFailed
     );
     if tracks_ongoing_health {
         if let Some(unit_id) = &event.unit_id {

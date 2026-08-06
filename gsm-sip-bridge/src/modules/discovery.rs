@@ -128,7 +128,52 @@ pub fn scan_all() -> BridgeResult<Vec<ProbedModem>> {
 /// passes `vowifi::discovery::effective_line_overrides`' configured ports
 /// here; a plain `scan_all()` (no hints) behaves exactly as before.
 pub fn scan_all_preferring(preferred_ports: &[PathBuf]) -> BridgeResult<Vec<ProbedModem>> {
-    scan_all_inner(preferred_ports, &std::collections::HashSet::new())
+    scan_all_inner(
+        preferred_ports,
+        &std::collections::HashSet::new(),
+        SimRecovery::Disabled,
+    )
+}
+
+/// Whether a scan may try to *repair* a modem whose SIM does not read,
+/// rather than only observing that it doesn't.
+///
+/// This is a deliberately narrow opt-in because the repair
+/// (`AT+CFUN=0` → `AT+CFUN=1`, see `recover_and_reprobe_sim`) is not a
+/// read-only probe: it drops and re-acquires the modem's radio, and blocks
+/// the scan for the cycle delay plus the readiness poll. Both are fine
+/// exactly once, at startup, before any line is carrying traffic — which is
+/// the only place it was ever meant to run and the only place it was live-
+/// tested (specs/027-discover-retry-health).
+///
+/// They are *not* fine on [`scan_modules`]' ongoing rescans, which run for
+/// the container's whole lifetime alongside modems that are actively
+/// registered or mid-call. Those rescans reach the very same
+/// `probe_sim_status_at`, so without this switch a modem whose SIM read
+/// merely glitched — including a circuit-switched one carrying a call, which
+/// `skip_card_ids` does not cover (it only protects *VoWiFi* lines) — would
+/// have had its radio power-cycled out from under it, and every rescan would
+/// stall for the poll window per unreadable modem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimRecovery {
+    /// Observe and report `SimStatus::Unreadable`; never touch the radio.
+    Disabled,
+    /// On `Unreadable`, attempt one `AT+CFUN` cycle and re-probe.
+    CfunCycleOnUnreadable,
+}
+
+/// [`scan_all_preferring`] for the one-shot startup scan behind
+/// `gsm-sip-bridge discover`, which may additionally attempt SIM recovery —
+/// see [`SimRecovery`] for why every other caller must not.
+pub fn scan_all_preferring_with_sim_recovery(
+    preferred_ports: &[PathBuf],
+    sim_recovery: SimRecovery,
+) -> BridgeResult<Vec<ProbedModem>> {
+    scan_all_inner(
+        preferred_ports,
+        &std::collections::HashSet::new(),
+        sim_recovery,
+    )
 }
 
 /// Shared implementation. `skip_card_ids` are devices whose serial ports
@@ -143,9 +188,13 @@ pub fn scan_all_preferring(preferred_ports: &[PathBuf]) -> BridgeResult<Vec<Prob
 /// in response` on the *already-registered* line's own port) — the
 /// "modem claimed by both subsystems" hazard the spec's edge cases warn
 /// about, just manifesting after startup instead of at it.
+///
+/// `sim_recovery` gates the one effect in here that writes to a modem
+/// rather than reading from it — see [`SimRecovery`].
 fn scan_all_inner(
     preferred_ports: &[PathBuf],
     skip_card_ids: &std::collections::HashSet<String>,
+    sim_recovery: SimRecovery,
 ) -> BridgeResult<Vec<ProbedModem>> {
     let mut modems = Vec::new();
 
@@ -196,7 +245,9 @@ fn scan_all_inner(
         let audio_device = find_alsa_card(&dev_path);
         let net_device = find_net_iface(&dev_path);
         let at_port = probe_at_port(&dev_path, preferred_ports);
-        let sim_status = at_port.as_ref().map(|port| probe_sim_status_at(port));
+        let sim_status = at_port
+            .as_ref()
+            .map(|port| probe_sim_status_at(port, sim_recovery));
 
         match (&at_port, &sim_status) {
             (Some(port), Some(SimStatus::Ready { imsi })) => {
@@ -342,7 +393,9 @@ pub fn scan_modules_excluding_cards(
     let mut skip = active_vowifi_card_ids();
     skip.extend(active_volte_card_ids());
     skip.extend(also_skip_cards.iter().cloned());
-    let modems = scan_all_inner(&[], &skip)?;
+    // `SimRecovery::Disabled`: this is the ongoing-rescan path, which must
+    // stay a read-only probe — see `SimRecovery`.
+    let modems = scan_all_inner(&[], &skip, SimRecovery::Disabled)?;
     Ok(modems
         .into_iter()
         .filter(|m| m.has_audio_capability)
@@ -577,12 +630,69 @@ pub fn probe_is_at_capable(at: &mut AtCommander) -> bool {
 
 /// Opens `port` fresh and reads its SIM status — real hardware I/O, not
 /// unit-tested directly; `probe_sim_status` (below) carries the tested
-/// interpretation logic.
-fn probe_sim_status_at(port: &Path) -> SimStatus {
+/// interpretation logic. On `Unreadable`, attempts one CFUN power-cycle via
+/// `recover_and_reprobe_sim` before giving up (specs/027-discover-retry-health
+/// — see that function's doc comment for why).
+fn probe_sim_status_at(port: &Path, sim_recovery: SimRecovery) -> SimStatus {
     match AtCommander::open_with_timeout(port, PROBE_TIMEOUT) {
-        Ok(mut at) => probe_sim_status(&mut at),
+        Ok(mut at) => {
+            let status = probe_sim_status(&mut at);
+            if sim_recovery == SimRecovery::CfunCycleOnUnreadable
+                && matches!(status, SimStatus::Unreadable(_))
+            {
+                tracing::warn!(
+                    port = %port.display(),
+                    reason = ?status,
+                    "SIM unreadable on first probe; attempting a CFUN power-cycle before giving up"
+                );
+                recover_and_reprobe_sim(
+                    &mut at,
+                    crate::supervise::sim_recovery::CFUN_CYCLE_DELAY,
+                    crate::supervise::sim_recovery::CPIN_POLL_INTERVAL,
+                    crate::supervise::sim_recovery::CPIN_POLL_ATTEMPTS,
+                )
+            } else {
+                status
+            }
+        }
         Err(e) => SimStatus::Unreadable(e.to_string()),
     }
+}
+
+/// After a first-probe `Unreadable` result, power-cycles the SIM in place
+/// (`AT+CFUN=0` -> `AT+CFUN=1`) and re-probes once — the same recipe as
+/// `supervise::sim_recovery::reset_modem_sim`/`vowifi::usim_bridge`'s
+/// `reset_sim_in_place` (see either's doc comment for the sugam incident
+/// this traces back to), driven directly over the `AtCommander` this probe
+/// already has open rather than shelling out via `CommandRunner`.
+/// `discover`'s probe never has a running vowifi-usim-bridge/swu-dialer
+/// holder to freeze first, unlike those two call sites: it runs before any
+/// per-line agent starts, so nothing else is using the port yet.
+///
+/// Without this, a SIM that is transiently unreadable at boot (the sugam
+/// pattern: `+CME ERROR: 13`, cleared in practice by a soft radio cycle)
+/// stayed permanently unreadable through `discover`'s one-shot probe — live
+/// testing against real EC20 hardware (specs/027-discover-retry-health)
+/// found this reachable, not just hypothetical. Timing is a parameter
+/// (rather than reading the constants directly) purely so tests can drive
+/// the same real AT-command sequence with near-zero delays.
+fn recover_and_reprobe_sim(
+    at: &mut AtCommander,
+    cycle_delay: Duration,
+    poll_interval: Duration,
+    poll_attempts: u32,
+) -> SimStatus {
+    let _ = at.send_command("AT+CFUN=0");
+    std::thread::sleep(cycle_delay);
+    let _ = at.send_command("AT+CFUN=1");
+
+    for _ in 0..poll_attempts {
+        std::thread::sleep(poll_interval);
+        if matches!(at.query_cpin(), Ok(status) if status.contains("READY")) {
+            break;
+        }
+    }
+    probe_sim_status(at)
 }
 
 /// Interprets `AT+CPIN?` (and, if ready, `AT+CIMI`) into a `SimStatus`
@@ -900,6 +1010,147 @@ mod tests {
             probe_sim_status(&mut at),
             SimStatus::Unreadable(_)
         ));
+    }
+
+    /// A queue of responses, one per `send_command` call — unlike
+    /// `MockStream`'s single-shot `Cursor`, this survives multiple
+    /// sequential calls, needed to exercise `recover_and_reprobe_sim`'s
+    /// AT+CFUN=0/AT+CFUN=1/poll/re-probe sequence. Mirrors
+    /// `vowifi::usim_bridge`'s own `ScriptedModem` test helper (see its doc
+    /// comment for why a fresh-`BufReader`-per-call transport needs this
+    /// instead of a plain `Cursor`); duplicated locally rather than shared,
+    /// same as this module's existing `MockStream` mirrors
+    /// `at_commander.rs`'s.
+    struct ScriptedModem {
+        responses: std::collections::VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+        pos: usize,
+    }
+
+    impl ScriptedModem {
+        fn new(responses: &[&str]) -> Self {
+            Self {
+                responses: responses.iter().map(|s| s.as_bytes().to_vec()).collect(),
+                current: Vec::new(),
+                pos: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for ScriptedModem {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.current.len() {
+                let Some(next) = self.responses.pop_front() else {
+                    return Ok(0);
+                };
+                self.current = next;
+                self.pos = 0;
+            }
+            let remaining = &self.current[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Write for ScriptedModem {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_scripted_commander(responses: &[&str]) -> AtCommander {
+        AtCommander::from_stream(ScriptedModem::new(responses), Duration::from_secs(1))
+    }
+
+    /// The ongoing-rescan path must never power-cycle a radio: it runs for
+    /// the container's whole lifetime next to modems that may be registered
+    /// or mid-call, and `skip_card_ids` only shields *VoWiFi* lines, not
+    /// circuit-switched ones. Encoded as a call-site assertion because the
+    /// effect itself (`AT+CFUN`) needs real hardware to observe — what is
+    /// checkable here is that the rescan entry point still asks for
+    /// `Disabled`, which is what keeps `probe_sim_status_at` read-only.
+    #[test]
+    fn only_the_one_shot_discover_scan_opts_into_sim_recovery() {
+        // Flattened so the check survives rustfmt reflowing argument lists.
+        let src: String = include_str!("discovery.rs")
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Every `scan_all_inner(...)` call in this module — the rescan path
+        // and the `scan_all_preferring` family — must pass `Disabled`; only
+        // the caller-supplied parameter may ever carry the opt-in.
+        for call in src.split("scan_all_inner(").skip(1) {
+            let args = call.split(')').next().unwrap_or_default();
+            assert!(
+                !args.contains("CfunCycleOnUnreadable"),
+                "a scan_all_inner call site in this module hard-codes SIM \
+                 recovery; it must stay Disabled here: {args}"
+            );
+        }
+
+        let callers: Vec<&str> = include_str!("../commands/discover.rs")
+            .lines()
+            .filter(|l| l.contains("SimRecovery::"))
+            .collect();
+        assert_eq!(
+            callers.len(),
+            1,
+            "the one-shot discover scan is the single intended opt-in, got {callers:?}"
+        );
+        assert!(callers[0].contains("CfunCycleOnUnreadable"));
+    }
+
+    /// specs/027-discover-retry-health: a SIM that is unreadable on the
+    /// first probe but comes back `+CPIN: READY` after a soft radio cycle —
+    /// the exact live-hardware finding (EC20, `+CME ERROR: 13`) that
+    /// motivated `recover_and_reprobe_sim`.
+    #[test]
+    fn recover_and_reprobe_sim_returns_ready_after_a_successful_cfun_cycle() {
+        let mut at = make_scripted_commander(&[
+            "OK\r\n",                    // AT+CFUN=0
+            "OK\r\n",                    // AT+CFUN=1
+            "+CPIN: READY\r\nOK\r\n",    // poll attempt 1: AT+CPIN?
+            "+CPIN: READY\r\nOK\r\n",    // re-probe: AT+CPIN?
+            "404438083996440\r\nOK\r\n", // re-probe: AT+CIMI
+        ]);
+        let status = recover_and_reprobe_sim(
+            &mut at,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        );
+        assert_eq!(
+            status,
+            SimStatus::Ready {
+                imsi: "404438083996440".to_string()
+            }
+        );
+    }
+
+    /// If the SIM never comes back `READY` within the poll window, the
+    /// re-probe at the end still runs and (correctly) reports `Unreadable`
+    /// again rather than panicking or hanging.
+    #[test]
+    fn recover_and_reprobe_sim_stays_unreadable_if_cpin_never_becomes_ready() {
+        let mut at = make_scripted_commander(&[
+            "OK\r\n",             // AT+CFUN=0
+            "OK\r\n",             // AT+CFUN=1
+            "+CME ERROR: 13\r\n", // poll attempt 1: AT+CPIN?
+            "+CME ERROR: 13\r\n", // re-probe: AT+CPIN?
+        ]);
+        let status = recover_and_reprobe_sim(
+            &mut at,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        );
+        assert!(matches!(status, SimStatus::Unreadable(_)));
     }
 
     // A single test, not two — both set the same process-wide

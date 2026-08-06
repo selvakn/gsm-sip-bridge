@@ -69,8 +69,19 @@ pub enum Health {
     /// The circuit-switched daemon's metrics endpoint did not respond. Fatal
     /// on its own — nothing else is checked.
     MetricsEndpointDown,
-    /// One or more VoWiFi lines failed their checks, reported per line.
-    LinesUnhealthy(Vec<(u32, LineFault)>),
+    /// One or more VoWiFi lines failed their checks, reported per line, and/
+    /// or one or more explicitly configured lines never became a running
+    /// line at all — whether because no modem matched (`not_found`) or a
+    /// matched modem failed some other way (e.g. `sim_unreadable`; live
+    /// testing on real EC20 hardware, specs/027-discover-retry-health,
+    /// found this reason reachable too, not just `not_found`) — kept as a
+    /// separate list from `line_faults` since such a line has no `index`
+    /// to key a fault by; its identifier is whatever `[[vowifi.line]]` was
+    /// pinned to (`modem_port`/`modem_serial`).
+    LinesUnhealthy {
+        line_faults: Vec<(u32, LineFault)>,
+        configured_failed: Vec<String>,
+    },
 }
 
 impl Health {
@@ -174,11 +185,11 @@ pub fn evaluate(
     if !metrics_ok {
         return Health::MetricsEndpointDown;
     }
-    // VoWiFi off, or on but with no line resolved this run: nothing but the
-    // circuit-switched side to report on. If that side is itself
-    // deliberately off (specs/026-disable-circuit-switched), say so
-    // distinctly rather than reporting a bare, uninformative "Healthy".
-    if !vowifi_enabled || resolution.lines.is_empty() {
+    // VoWiFi off entirely: nothing but the circuit-switched side to report
+    // on. If that side is itself deliberately off
+    // (specs/026-disable-circuit-switched), say so distinctly rather than
+    // reporting a bare, uninformative "Healthy".
+    if !vowifi_enabled {
         return if cs_enabled {
             Health::Healthy
         } else {
@@ -186,16 +197,48 @@ pub fn evaluate(
         };
     }
 
-    let faults: Vec<(u32, LineFault)> = resolution
+    // specs/027-discover-retry-health FR-008: a configured line
+    // (`modem_port`/`modem_serial`) that never became a running line must
+    // flip this unhealthy too — checked *before* the old "no lines
+    // resolved, nothing to report" shortcut below, which used to treat
+    // that exact situation as healthy because it only ever looked at
+    // `resolution.lines`. Shares `is_configured_line_failure` with
+    // `vowifi::print_status` rather than re-deriving its own narrower
+    // `reason == "not_found"` filter: live testing against real EC20
+    // hardware found a configured line failing with `sim_unreadable`
+    // (modem present, SIM read failed) — `vowifi-status` already reported
+    // it correctly, but this check originally didn't, silently exiting
+    // healthy. `max_lines_exceeded` is still excluded: that is an unpinned
+    // auto-discovered candidate losing out on a scarce slot, not a
+    // configured line failing.
+    let configured_failed: Vec<String> = resolution
+        .failed
+        .iter()
+        .filter(|f| crate::vowifi::is_configured_line_failure(f))
+        .map(|f| f.card_id.clone())
+        .collect();
+
+    if resolution.lines.is_empty() && configured_failed.is_empty() {
+        return if cs_enabled {
+            Health::Healthy
+        } else {
+            Health::CircuitSwitchedDisabled
+        };
+    }
+
+    let line_faults: Vec<(u32, LineFault)> = resolution
         .lines
         .iter()
         .filter_map(|l| check_line(runner, l, tunnel_engine).map(|f| (l.index, f)))
         .collect();
 
-    if faults.is_empty() {
+    if line_faults.is_empty() && configured_failed.is_empty() {
         Health::Healthy
     } else {
-        Health::LinesUnhealthy(faults)
+        Health::LinesUnhealthy {
+            line_faults,
+            configured_failed,
+        }
     }
 }
 
@@ -247,9 +290,15 @@ pub fn run(cli: &Cli) -> ExitCode {
             );
             ExitCode::FAILURE
         }
-        Health::LinesUnhealthy(faults) => {
-            for (index, fault) in faults {
+        Health::LinesUnhealthy {
+            line_faults,
+            configured_failed,
+        } => {
+            for (index, fault) in line_faults {
                 eprintln!("line {index}: {fault}");
+            }
+            for identifier in configured_failed {
+                eprintln!("configured line {identifier}: not running");
             }
             ExitCode::FAILURE
         }
@@ -277,6 +326,7 @@ mod tests {
             mcc: "404".to_string(),
             mnc: "043".to_string(),
             pcsc_reader: false,
+            configured_identifier: None,
             config: Default::default(),
         }
     }
@@ -339,6 +389,90 @@ mod tests {
         assert_eq!(health, Health::Healthy);
     }
 
+    /// specs/027-discover-retry-health FR-008: this is the exact incident
+    /// the feature exists for — a configured line never resolved at all
+    /// (zero `lines`), which the old `resolution.lines.is_empty()`
+    /// shortcut reported as bare `Healthy` even though the operator's
+    /// config said a line should exist.
+    #[test]
+    fn a_configured_line_that_was_never_found_is_unhealthy_even_with_zero_resolved_lines() {
+        let runner = MockCommandRunner::new();
+        let mut r = resolution(vec![]);
+        r.failed = vec![
+            crate::vowifi::discovery::FailedLine::new("/dev/ttyUSB3", "not_found").configured(true),
+        ];
+        let health = evaluate(&runner, true, true, true, &r, "strongswan");
+        assert_eq!(
+            health,
+            Health::LinesUnhealthy {
+                line_faults: vec![],
+                configured_failed: vec!["/dev/ttyUSB3".to_string()],
+            }
+        );
+    }
+
+    /// A healthy resolved line does not mask a *sibling* configured line
+    /// that never resolved — both must be visible in the same verdict.
+    #[test]
+    fn a_configured_line_not_found_is_unhealthy_alongside_an_otherwise_healthy_resolved_line() {
+        let runner = MockCommandRunner::new();
+        with_addressed_iface(&runner, "ims0", "ipsec-0");
+        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
+        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
+
+        let mut r = resolution(vec![line(0)]);
+        r.failed = vec![
+            crate::vowifi::discovery::FailedLine::new("/dev/ttyUSB5", "not_found").configured(true),
+        ];
+        let health = evaluate(&runner, true, true, true, &r, "strongswan");
+        assert_eq!(
+            health,
+            Health::LinesUnhealthy {
+                line_faults: vec![],
+                configured_failed: vec!["/dev/ttyUSB5".to_string()],
+            }
+        );
+    }
+
+    /// Live testing against real EC20 hardware found a configured line
+    /// failing with `sim_unreadable` (modem present on the bus, SIM read
+    /// failed) rather than `not_found` (no modem matched at all) — the
+    /// check must flag it too, not just the `not_found` reason it was
+    /// originally written against.
+    #[test]
+    fn a_configured_line_failing_for_a_reason_other_than_not_found_is_still_unhealthy() {
+        let runner = MockCommandRunner::new();
+        let mut r = resolution(vec![]);
+        r.failed =
+            vec![
+                crate::vowifi::discovery::FailedLine::new("ec20-ABCDEF", "sim_unreadable: 13")
+                    .configured(true),
+            ];
+        let health = evaluate(&runner, true, true, true, &r, "strongswan");
+        assert_eq!(
+            health,
+            Health::LinesUnhealthy {
+                line_faults: vec![],
+                configured_failed: vec!["ec20-ABCDEF".to_string()],
+            }
+        );
+    }
+
+    /// `max_lines_exceeded` is a different condition (an unpinned
+    /// auto-discovered candidate losing out on a scarce slot) — must not be
+    /// reported as a configured line failing to be discovered.
+    #[test]
+    fn max_lines_exceeded_does_not_count_as_a_configured_line_not_found() {
+        let runner = MockCommandRunner::new();
+        let mut r = resolution(vec![]);
+        r.failed = vec![crate::vowifi::discovery::FailedLine::new(
+            "ec20-AAAAAA",
+            "max_lines_exceeded",
+        )];
+        let health = evaluate(&runner, true, true, true, &r, "strongswan");
+        assert_eq!(health, Health::Healthy);
+    }
+
     /// specs/026-disable-circuit-switched FR-018: [cs].enabled is false and
     /// there is nothing else to check — reported distinctly, not as a bare
     /// (uninformative) Healthy, and still not a container failure.
@@ -394,12 +528,15 @@ mod tests {
 
         assert_eq!(
             health,
-            Health::LinesUnhealthy(vec![(
-                0,
-                LineFault::TunnelInterfaceHasNoAddress {
-                    iface: "ipsec-0".to_string()
-                }
-            )])
+            Health::LinesUnhealthy {
+                line_faults: vec![(
+                    0,
+                    LineFault::TunnelInterfaceHasNoAddress {
+                        iface: "ipsec-0".to_string()
+                    }
+                )],
+                configured_failed: vec![],
+            }
         );
     }
 
@@ -440,12 +577,15 @@ mod tests {
 
         assert_eq!(
             health,
-            Health::LinesUnhealthy(vec![(
-                0,
-                LineFault::PcscfUnreachable {
-                    addr: "10.11.12.13".to_string()
-                }
-            )])
+            Health::LinesUnhealthy {
+                line_faults: vec![(
+                    0,
+                    LineFault::PcscfUnreachable {
+                        addr: "10.11.12.13".to_string()
+                    }
+                )],
+                configured_failed: vec![],
+            }
         );
     }
 
@@ -496,20 +636,23 @@ mod tests {
 
         assert_eq!(
             health,
-            Health::LinesUnhealthy(vec![
-                (
-                    1,
-                    LineFault::TunnelInterfaceHasNoAddress {
-                        iface: "ipsec-1".to_string()
-                    }
-                ),
-                (
-                    2,
-                    LineFault::PcscfUnreachable {
-                        addr: "10.11.12.13".to_string()
-                    }
-                ),
-            ])
+            Health::LinesUnhealthy {
+                line_faults: vec![
+                    (
+                        1,
+                        LineFault::TunnelInterfaceHasNoAddress {
+                            iface: "ipsec-1".to_string()
+                        }
+                    ),
+                    (
+                        2,
+                        LineFault::PcscfUnreachable {
+                            addr: "10.11.12.13".to_string()
+                        }
+                    ),
+                ],
+                configured_failed: vec![],
+            }
         );
     }
 
@@ -541,12 +684,15 @@ mod tests {
 
         assert_eq!(
             health,
-            Health::LinesUnhealthy(vec![(
-                0,
-                LineFault::PcscfUnreachable {
-                    addr: "10.11.12.13".to_string()
-                }
-            )]),
+            Health::LinesUnhealthy {
+                line_faults: vec![(
+                    0,
+                    LineFault::PcscfUnreachable {
+                        addr: "10.11.12.13".to_string()
+                    }
+                )],
+                configured_failed: vec![],
+            },
             "a default-namespace probe must not satisfy this check"
         );
 
@@ -597,12 +743,15 @@ mod tests {
 
         assert_eq!(
             health,
-            Health::LinesUnhealthy(vec![(
-                1,
-                LineFault::PcscfUnreachable {
-                    addr: "10.11.12.13".to_string()
-                }
-            )])
+            Health::LinesUnhealthy {
+                line_faults: vec![(
+                    1,
+                    LineFault::PcscfUnreachable {
+                        addr: "10.11.12.13".to_string()
+                    }
+                )],
+                configured_failed: vec![],
+            }
         );
     }
 

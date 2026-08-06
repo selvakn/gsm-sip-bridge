@@ -398,6 +398,9 @@ pub struct AlertsConfig {
     pub registration_loss: CategoryAlertConfig,
     pub tunnel_failure: CategoryAlertConfig,
     pub missed_call: CategoryAlertConfig,
+    /// specs/027-discover-retry-health. No paired `*Thresholds` struct: see
+    /// `RawAlerts::line_discovery_failed`'s doc comment for why.
+    pub line_discovery_failed: CategoryAlertConfig,
     pub module_lifecycle_thresholds: ModuleLifecycleThresholds,
     pub tunnel_failure_thresholds: TunnelFailureThresholds,
     pub registration_loss_thresholds: RegistrationLossThresholds,
@@ -476,6 +479,7 @@ impl Default for AlertsConfig {
             registration_loss: CategoryAlertConfig::disabled(),
             tunnel_failure: CategoryAlertConfig::disabled(),
             missed_call: CategoryAlertConfig::disabled(),
+            line_discovery_failed: CategoryAlertConfig::disabled(),
             module_lifecycle_thresholds: ModuleLifecycleThresholds::default(),
             tunnel_failure_thresholds: TunnelFailureThresholds::default(),
             registration_loss_thresholds: RegistrationLossThresholds::default(),

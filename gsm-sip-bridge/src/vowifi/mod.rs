@@ -155,7 +155,11 @@ fn resolve_runtime_lines(_config: &VowifiConfig) -> BridgeResult<Vec<RuntimeLine
             path.display()
         )));
     }
-    Ok(resolution
+    Ok(runtime_lines_from_resolution(&resolution))
+}
+
+fn runtime_lines_from_resolution(resolution: &discovery::LineResolution) -> Vec<RuntimeLine> {
+    resolution
         .lines
         .iter()
         .map(|l| RuntimeLine {
@@ -166,7 +170,27 @@ fn resolve_runtime_lines(_config: &VowifiConfig) -> BridgeResult<Vec<RuntimeLine
             control_port: l.control_port,
             sip_leg_port: VETH_SIP_PORT,
         })
-        .collect())
+        .collect()
+}
+
+/// specs/027-discover-retry-health FR-006/FR-007: `vowifi-status`'s
+/// "Configured line ... NOT RUNNING" section is only for a configured
+/// override (`modem_port`/`modem_serial`/`pcsc_reader`) that failed to
+/// start (see `contracts/vowifi-status-output.md`) — checked via
+/// `FailedLine::configured` rather than excluding `max_lines_exceeded` by
+/// name (an earlier version of this function did that, on the wrong
+/// assumption that `max_lines_exceeded` was the *only* reason an
+/// unpinned, auto-discovered candidate's failure could show up here:
+/// review on this PR found that every other rejection reason —
+/// `sim_unreadable`, `sim_locked`, `no_at_port` — was just as reachable
+/// for an auto-discovered modem and got mislabeled as "a configured line
+/// from config.toml", sending operators looking for a config entry that
+/// does not exist). `resolve_lines` now sets `configured` at the point
+/// each `FailedLine` is created, which is the only place true provenance
+/// is known; a `max_lines_exceeded` overflow of an *actually pinned*
+/// modem still correctly counts here, since it is `configured: true`.
+pub(crate) fn is_configured_line_failure(failed: &discovery::FailedLine) -> bool {
+    failed.configured
 }
 
 pub fn run(config: &AppConfig) -> ExitCode {
@@ -1823,14 +1847,27 @@ fn telephony_dest_uri(
 /// line is reported for that line only, not fatal to reporting the others
 /// (acceptance scenario 1); overall failure means *every* line's queries
 /// failed.
-pub fn print_status(config: &VowifiConfig) -> ExitCode {
-    let lines = match resolve_runtime_lines(config) {
-        Ok(lines) => lines,
+pub fn print_status(_config: &VowifiConfig) -> ExitCode {
+    let path = lines_file_path();
+    let resolution = match discovery::read_line_resolution(&path) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
+    // specs/027-discover-retry-health FR-006: a configured line that never
+    // resolved at all must still be reported (the section below), not just
+    // silently fail here the way it used to — only bail out this early if
+    // there is truly nothing to say about *any* line, configured or not.
+    if resolution.lines.is_empty() && resolution.failed.is_empty() {
+        eprintln!(
+            "error: no VoWiFi lines resolved in {} — run `gsm-sip-bridge discover` first",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let lines = runtime_lines_from_resolution(&resolution);
     let mut any_ok = false;
 
     for line in &lines {
@@ -1899,6 +1936,21 @@ pub fn print_status(config: &VowifiConfig) -> ExitCode {
         any_ok = any_ok || line_ok;
     }
 
+    // specs/027-discover-retry-health FR-006/FR-007: every configured
+    // override that failed to become a line, printed after the resolved
+    // ones — contracts/vowifi-status-output.md.
+    for failed in resolution
+        .failed
+        .iter()
+        .filter(|f| is_configured_line_failure(f))
+    {
+        println!(
+            "Configured line {} (from config.toml): NOT RUNNING",
+            failed.card_id
+        );
+        println!("  reason: {}", failed.reason);
+    }
+
     if any_ok {
         ExitCode::SUCCESS
     } else {
@@ -1930,6 +1982,93 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// specs/027-discover-retry-health review finding: this used to be keyed
+    /// off `reason != "max_lines_exceeded"`, on the wrong assumption that
+    /// `max_lines_exceeded` was the only reason an unpinned, auto-discovered
+    /// candidate's failure could reach here — every other reason
+    /// (`sim_unreadable`, `sim_locked`, `no_at_port`, ...) is just as
+    /// reachable for one, and got mislabeled as a configured line from
+    /// config.toml. Provenance (`FailedLine::configured`), not the reason
+    /// string, is what actually distinguishes them.
+    #[test]
+    fn is_configured_line_failure_is_false_when_not_configured_regardless_of_reason() {
+        for reason in [
+            "not_found",
+            "sim_absent",
+            "sim_locked",
+            "no_at_port",
+            "sim_unreadable: CME 13",
+            "max_lines_exceeded",
+        ] {
+            assert!(
+                !is_configured_line_failure(&discovery::FailedLine::new("ec20-AAAAAA", reason)),
+                "{reason} on an unpinned/auto-discovered candidate must not be \
+                 reported as a configured-line failure"
+            );
+        }
+    }
+
+    /// The mirror case: a `configured: true` entry is always reported here
+    /// regardless of reason — including `max_lines_exceeded`, since an
+    /// operator who pins more lines than `max_lines` allows genuinely has a
+    /// configured line that isn't running, which is exactly what this
+    /// section exists to surface.
+    #[test]
+    fn is_configured_line_failure_is_true_when_configured_regardless_of_reason() {
+        for reason in [
+            "not_found",
+            "sim_absent",
+            "sim_locked",
+            "no_at_port",
+            "sim_unreadable: CME 13",
+            "max_lines_exceeded",
+        ] {
+            assert!(
+                is_configured_line_failure(
+                    &discovery::FailedLine::new("ec20-AAAAAA", reason).configured(true)
+                ),
+                "{reason} on a configured/pinned candidate must be reported \
+                 as a configured-line failure"
+            );
+        }
+    }
+
+    // A single test, not several — every case sets the same process-wide
+    // GSM_SIP_BRIDGE_LINES_FILE env var `cargo test`'s parallel-within-
+    // binary execution would otherwise race (matches the convention
+    // `modules::discovery`'s own `excluded_ports_from_lines_file_behavior`
+    // test already establishes for this exact env var).
+    #[test]
+    fn print_status_reports_a_configured_line_failure_even_with_zero_resolved_lines() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Before: zero lines, zero failures — the pre-existing "nothing to
+        // report at all" case, unchanged.
+        let empty_path = dir.path().join("empty.json");
+        std::fs::write(&empty_path, r#"{"lines": [], "failed": []}"#).unwrap();
+        std::env::set_var(crate::line::manifest::VOWIFI_LINES_ENV, &empty_path);
+        assert_eq!(print_status(&VowifiConfig::default()), ExitCode::FAILURE);
+
+        // specs/027-discover-retry-health: zero resolved lines but a
+        // configured line failed to be discovered — must not hit the early
+        // "no VoWiFi lines resolved, run discover first" bail before ever
+        // reporting it (that used to be exactly what swallowed this case).
+        let failed_path = dir.path().join("failed.json");
+        std::fs::write(
+            &failed_path,
+            r#"{"lines": [], "failed": [{"card_id": "/dev/ttyUSB3", "reason": "not_found"}]}"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::line::manifest::VOWIFI_LINES_ENV, &failed_path);
+        // Still FAILURE overall (no line actually answered), but it must
+        // get there via the failed-line reporting path, not the early
+        // bail — the exit code alone can't distinguish the two, so this
+        // test's real value is that it doesn't panic/short-circuit before
+        // reaching the new section (verified manually in quickstart.md's
+        // "Configured line ... NOT RUNNING" output check).
+        assert_eq!(print_status(&VowifiConfig::default()), ExitCode::FAILURE);
+    }
 
     /// `read_line` documents that any bytes it already appended stay in
     /// the buffer even when it returns an error — but a fresh

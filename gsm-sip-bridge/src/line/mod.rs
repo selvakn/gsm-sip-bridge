@@ -36,6 +36,20 @@ use crate::modules::discovery::{ProbedModem, SimStatus};
 pub struct FailedLine {
     pub card_id: String,
     pub reason: String,
+    /// Whether this candidate matched an explicit `[[vowifi.line]]`
+    /// `modem_port`/`modem_serial`/`pcsc_reader` override, as opposed to an
+    /// unpinned, auto-discovered modem that merely failed classification or
+    /// lost a capacity cut (specs/027-discover-retry-health review finding:
+    /// `resolve_lines`'s classify-failure loop used to push every rejected
+    /// modem — pinned or not — with no way to tell them apart afterward,
+    /// which made `vowifi::is_configured_line_failure` mislabel an
+    /// auto-discovered modem's `sim_unreadable`/`no_at_port`/etc. as a
+    /// "configured line from config.toml", sending operators looking for a
+    /// config entry that does not exist). Defaults to `false` via `new` so
+    /// every pre-existing call site — VoLTE's `select`, and every test that
+    /// does not care about provenance — is unaffected; call sites that do
+    /// know a candidate is pinned/overridden opt in via `.configured(true)`.
+    pub configured: bool,
 }
 
 impl FailedLine {
@@ -43,7 +57,13 @@ impl FailedLine {
         Self {
             card_id: card_id.into(),
             reason: reason.into(),
+            configured: false,
         }
+    }
+
+    pub fn configured(mut self, configured: bool) -> Self {
+        self.configured = configured;
+        self
     }
 }
 
@@ -59,6 +79,12 @@ pub enum Rejection {
     SimUnreadable(String),
     NoAtPort,
     MaxLinesExceeded,
+    /// A configured override (`modem_port`/`modem_serial`/`pcsc_reader`)
+    /// matched no probed device on the most recent discovery pass —
+    /// distinct from `NoAtPort` (device found, nothing answers AT) and the
+    /// `Sim*` variants (device found, SIM problem). specs/027-discover-
+    /// retry-health.
+    NotFound,
 }
 
 impl Rejection {
@@ -69,6 +95,7 @@ impl Rejection {
             Rejection::SimUnreadable(msg) => format!("sim_unreadable: {msg}"),
             Rejection::NoAtPort => "no_at_port".to_string(),
             Rejection::MaxLinesExceeded => "max_lines_exceeded".to_string(),
+            Rejection::NotFound => "not_found".to_string(),
         }
     }
 }
@@ -351,6 +378,11 @@ mod tests {
                 FailedLine::new("noprobe", "no_at_port"),
             ]
         );
+    }
+
+    #[test]
+    fn not_found_reason_is_stable() {
+        assert_eq!(Rejection::NotFound.reason(), "not_found");
     }
 
     /// The one genuine behavioural difference between the two subsystems,
