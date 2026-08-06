@@ -225,7 +225,19 @@ pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTa
     for modem in &assignment.vowifi {
         match crate::line::classify(modem, crate::line::AtPortRequirement::AlreadyEstablished) {
             Ok(()) => ready.push(modem),
-            Err(r) => failed.push(FailedLine::new(modem.card_id.clone(), r.reason())),
+            Err(r) => {
+                // Provenance must be checked here, before the ready-only
+                // partition below ever runs: a modem that fails classify()
+                // never reaches it, so without this check every classify
+                // failure — pinned or auto-discovered alike — was
+                // indistinguishable (review finding on this PR: an
+                // auto-discovered modem's `sim_unreadable` was reported as a
+                // "configured line from config.toml").
+                let configured = is_overridden_to_vowifi(modem, &base.line_overrides);
+                failed.push(
+                    FailedLine::new(modem.card_id.clone(), r.reason()).configured(configured),
+                );
+            }
         }
     }
     // Sorted before the tier split below so each tier's slice remains
@@ -255,18 +267,24 @@ pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTa
         .min(max_lines.saturating_sub(pinned_kept + pcsc_kept));
 
     for modem in &pinned_modems[pinned_kept..] {
-        failed.push(FailedLine::new(
-            modem.card_id.clone(),
-            crate::line::Rejection::MaxLinesExceeded.reason(),
-        ));
+        failed.push(
+            FailedLine::new(
+                modem.card_id.clone(),
+                crate::line::Rejection::MaxLinesExceeded.reason(),
+            )
+            .configured(true),
+        );
     }
     // A synthetic `pcscN` card id (N = position among pcsc overrides) since
     // there is no USB modem identity to report instead.
     for (i, _) in pcsc_overrides.iter().enumerate().skip(pcsc_kept) {
-        failed.push(FailedLine::new(
-            format!("pcsc{i}"),
-            crate::line::Rejection::MaxLinesExceeded.reason(),
-        ));
+        failed.push(
+            FailedLine::new(
+                format!("pcsc{i}"),
+                crate::line::Rejection::MaxLinesExceeded.reason(),
+            )
+            .configured(true),
+        );
     }
     for modem in &unpinned_modems[unpinned_kept..] {
         failed.push(FailedLine::new(
@@ -335,7 +353,7 @@ pub fn unmatched_overrides(
         })
         .filter_map(|o| {
             let identifier = o.modem_port.clone().or_else(|| o.modem_serial.clone())?;
-            Some(FailedLine::new(identifier, Rejection::NotFound.reason()))
+            Some(FailedLine::new(identifier, Rejection::NotFound.reason()).configured(true))
         })
         .collect()
 }
@@ -780,7 +798,10 @@ mod tests {
             ..Default::default()
         }];
         let failed = unmatched_overrides(&overrides, &[]);
-        assert_eq!(failed, vec![FailedLine::new("/dev/ttyUSB3", "not_found")]);
+        assert_eq!(
+            failed,
+            vec![FailedLine::new("/dev/ttyUSB3", "not_found").configured(true)]
+        );
     }
 
     #[test]
@@ -790,7 +811,10 @@ mod tests {
             ..Default::default()
         }];
         let failed = unmatched_overrides(&overrides, &[]);
-        assert_eq!(failed, vec![FailedLine::new("ec20-AAAAAA", "not_found")]);
+        assert_eq!(
+            failed,
+            vec![FailedLine::new("ec20-AAAAAA", "not_found").configured(true)]
+        );
     }
 
     #[test]

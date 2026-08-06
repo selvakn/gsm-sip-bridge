@@ -397,10 +397,9 @@ mod tests {
     fn a_configured_line_that_was_never_found_is_unhealthy_even_with_zero_resolved_lines() {
         let runner = MockCommandRunner::new();
         let mut r = resolution(vec![]);
-        r.failed = vec![crate::vowifi::discovery::FailedLine::new(
-            "/dev/ttyUSB3",
-            "not_found",
-        )];
+        r.failed = vec![
+            crate::vowifi::discovery::FailedLine::new("/dev/ttyUSB3", "not_found").configured(true),
+        ];
         let health = evaluate(&runner, true, true, true, &r, "strongswan");
         assert_eq!(
             health,
@@ -421,10 +420,9 @@ mod tests {
         runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
 
         let mut r = resolution(vec![line(0)]);
-        r.failed = vec![crate::vowifi::discovery::FailedLine::new(
-            "/dev/ttyUSB5",
-            "not_found",
-        )];
+        r.failed = vec![
+            crate::vowifi::discovery::FailedLine::new("/dev/ttyUSB5", "not_found").configured(true),
+        ];
         let health = evaluate(&runner, true, true, true, &r, "strongswan");
         assert_eq!(
             health,
@@ -444,10 +442,11 @@ mod tests {
     fn a_configured_line_failing_for_a_reason_other_than_not_found_is_still_unhealthy() {
         let runner = MockCommandRunner::new();
         let mut r = resolution(vec![]);
-        r.failed = vec![crate::vowifi::discovery::FailedLine::new(
-            "ec20-ABCDEF",
-            "sim_unreadable: 13",
-        )];
+        r.failed =
+            vec![
+                crate::vowifi::discovery::FailedLine::new("ec20-ABCDEF", "sim_unreadable: 13")
+                    .configured(true),
+            ];
         let health = evaluate(&runner, true, true, true, &r, "strongswan");
         assert_eq!(
             health,

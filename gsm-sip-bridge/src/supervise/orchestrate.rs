@@ -367,6 +367,30 @@ fn start_vowifi_subsystem(
 ///   covered by Foundational's immediate `not_found` detection and,  if its
 ///   own alert already fired, by that alert — but not retried further.
 ///
+/// Which of `pending`'s identifiers have *not* actually become a running
+/// line in `resolution` yet. Membership in `resolution.lines` is the only
+/// correct definition of "resolved" — checking whether `resolution.failed`
+/// still reports a `not_found` entry for the id, as an earlier version of
+/// this did, is not equivalent: a pending id can go from `not_found` (no
+/// modem matched at all) to some *other* rejection on a later tick (found
+/// on real EC20 hardware while testing this PR — the modem showed up but
+/// its SIM was `sim_unreadable`), which drops it out of a reason-filtered
+/// set even though it still never made it into `resolution.lines`. Treating
+/// that as "resolved" started the subsystem on whatever (possibly empty)
+/// set of lines *did* resolve, permanently dropped the still-broken id from
+/// `pending` so it was never retried again, and could fire a false
+/// `Recovered` alert for a line that was never actually started.
+fn still_missing_from_resolution(
+    pending: &std::collections::HashMap<String, std::time::Instant>,
+    resolution: &crate::vowifi::discovery::LineResolution,
+) -> std::collections::HashSet<String> {
+    pending
+        .keys()
+        .filter(|id| !resolution.lines.iter().any(|l| &l.card_id == *id))
+        .cloned()
+        .collect()
+}
+
 /// Pure decision core of one retry tick, kept separate from
 /// `spawn_discover_retry`'s threading/file-IO so it's testable without real
 /// sleeping: given which of `pending`'s identifiers are still missing after
@@ -454,12 +478,7 @@ fn spawn_discover_retry(
             let Ok(resolution) = crate::vowifi::discovery::read_line_resolution(&lines_file) else {
                 continue;
             };
-            let still_missing: std::collections::HashSet<String> = resolution
-                .failed
-                .iter()
-                .filter(|f| f.reason == "not_found")
-                .map(|f| f.card_id.clone())
-                .collect();
+            let still_missing = still_missing_from_resolution(&pending, &resolution);
             let (resolved_now, newly_expired) = discover_retry_tick(
                 &pending,
                 &alerted,
@@ -1559,6 +1578,50 @@ mod tests {
             Some(alerts::CriticalEventKind::Recovered)
         );
         assert!(!alerted);
+    }
+
+    /// The exact review-flagged scenario: a pending id's failure reason
+    /// changes between ticks (`not_found` on the previous pass, some other
+    /// rejection now — live testing found `sim_unreadable` reachable this
+    /// way) without it ever actually becoming a resolved line. Must still
+    /// count as missing.
+    #[test]
+    fn still_missing_from_resolution_stays_missing_when_the_failure_reason_changes() {
+        let pending = std::collections::HashMap::from([(
+            "ec20-0".to_string(),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )]);
+        let resolution = crate::vowifi::discovery::LineResolution {
+            circuit_switched_excluded_ports: vec![],
+            lines: vec![],
+            failed: vec![
+                crate::vowifi::discovery::FailedLine::new("ec20-0", "sim_unreadable: 13")
+                    .configured(true),
+            ],
+        };
+        let still_missing = still_missing_from_resolution(&pending, &resolution);
+        assert!(
+            still_missing.contains("ec20-0"),
+            "a failure-reason change alone must never be treated as resolution"
+        );
+    }
+
+    #[test]
+    fn still_missing_from_resolution_clears_once_the_id_is_an_actual_resolved_line() {
+        let pending = std::collections::HashMap::from([(
+            "ec20-0".to_string(),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )]);
+        let resolution = crate::vowifi::discovery::LineResolution {
+            circuit_switched_excluded_ports: vec![],
+            lines: vec![modem_line(0, "/dev/ttyUSB3")],
+            failed: vec![],
+        };
+        let still_missing = still_missing_from_resolution(&pending, &resolution);
+        assert!(
+            still_missing.is_empty(),
+            "an id present in resolution.lines is genuinely resolved"
+        );
     }
 
     #[test]

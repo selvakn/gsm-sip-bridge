@@ -176,11 +176,21 @@ fn runtime_lines_from_resolution(resolution: &discovery::LineResolution) -> Vec<
 /// specs/027-discover-retry-health FR-006/FR-007: `vowifi-status`'s
 /// "Configured line ... NOT RUNNING" section is only for a configured
 /// override (`modem_port`/`modem_serial`/`pcsc_reader`) that failed to
-/// start — `max_lines_exceeded` is an *unpinned* auto-discovered candidate
-/// losing out on a scarce slot, a different condition entirely (see
-/// `contracts/vowifi-status-output.md`).
+/// start (see `contracts/vowifi-status-output.md`) — checked via
+/// `FailedLine::configured` rather than excluding `max_lines_exceeded` by
+/// name (an earlier version of this function did that, on the wrong
+/// assumption that `max_lines_exceeded` was the *only* reason an
+/// unpinned, auto-discovered candidate's failure could show up here:
+/// review on this PR found that every other rejection reason —
+/// `sim_unreadable`, `sim_locked`, `no_at_port` — was just as reachable
+/// for an auto-discovered modem and got mislabeled as "a configured line
+/// from config.toml", sending operators looking for a config entry that
+/// does not exist). `resolve_lines` now sets `configured` at the point
+/// each `FailedLine` is created, which is the only place true provenance
+/// is known; a `max_lines_exceeded` overflow of an *actually pinned*
+/// modem still correctly counts here, since it is `configured: true`.
 pub(crate) fn is_configured_line_failure(failed: &discovery::FailedLine) -> bool {
-    failed.reason != "max_lines_exceeded"
+    failed.configured
 }
 
 pub fn run(config: &AppConfig) -> ExitCode {
@@ -1973,26 +1983,53 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// specs/027-discover-retry-health review finding: this used to be keyed
+    /// off `reason != "max_lines_exceeded"`, on the wrong assumption that
+    /// `max_lines_exceeded` was the only reason an unpinned, auto-discovered
+    /// candidate's failure could reach here — every other reason
+    /// (`sim_unreadable`, `sim_locked`, `no_at_port`, ...) is just as
+    /// reachable for one, and got mislabeled as a configured line from
+    /// config.toml. Provenance (`FailedLine::configured`), not the reason
+    /// string, is what actually distinguishes them.
     #[test]
-    fn is_configured_line_failure_excludes_max_lines_exceeded() {
-        assert!(!is_configured_line_failure(&discovery::FailedLine::new(
-            "ec20-AAAAAA",
-            "max_lines_exceeded",
-        )));
-    }
-
-    #[test]
-    fn is_configured_line_failure_includes_every_other_reason() {
+    fn is_configured_line_failure_is_false_when_not_configured_regardless_of_reason() {
         for reason in [
             "not_found",
             "sim_absent",
             "sim_locked",
             "no_at_port",
             "sim_unreadable: CME 13",
+            "max_lines_exceeded",
         ] {
             assert!(
-                is_configured_line_failure(&discovery::FailedLine::new("ec20-AAAAAA", reason)),
-                "{reason} should be reported as a configured-line failure"
+                !is_configured_line_failure(&discovery::FailedLine::new("ec20-AAAAAA", reason)),
+                "{reason} on an unpinned/auto-discovered candidate must not be \
+                 reported as a configured-line failure"
+            );
+        }
+    }
+
+    /// The mirror case: a `configured: true` entry is always reported here
+    /// regardless of reason — including `max_lines_exceeded`, since an
+    /// operator who pins more lines than `max_lines` allows genuinely has a
+    /// configured line that isn't running, which is exactly what this
+    /// section exists to surface.
+    #[test]
+    fn is_configured_line_failure_is_true_when_configured_regardless_of_reason() {
+        for reason in [
+            "not_found",
+            "sim_absent",
+            "sim_locked",
+            "no_at_port",
+            "sim_unreadable: CME 13",
+            "max_lines_exceeded",
+        ] {
+            assert!(
+                is_configured_line_failure(
+                    &discovery::FailedLine::new("ec20-AAAAAA", reason).configured(true)
+                ),
+                "{reason} on a configured/pinned candidate must be reported \
+                 as a configured-line failure"
             );
         }
     }
