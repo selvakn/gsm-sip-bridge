@@ -75,6 +75,17 @@ const SHARED_VICI_SOCKET: &str = "/var/run/charon.vici";
 /// static copy cannot know them. See `render::render_pcscf_plugin_conf`.
 const PCSCF_PLUGIN_CONF: &str = "/etc/strongswan.d/charon/p-cscf.conf";
 
+/// specs/027-discover-retry-health: how long `spawn_discover_retry` keeps
+/// re-checking a configured line that was missing on the first `discover`
+/// pass before giving up on it for this run. Sized to absorb ordinary USB/
+/// modem enumeration delay (the observed real-world case — an EC20 modem
+/// that hadn't finished enumerating when the first pass ran), not to wait
+/// out a genuinely disconnected device indefinitely.
+const DISCOVER_RETRY_WINDOW: Duration = Duration::from_secs(180);
+/// How often `spawn_discover_retry` re-runs `discover` while a configured
+/// line is still missing.
+const DISCOVER_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
 /// This line's swanctl connection and child name.
 ///
 /// Unique per line because every line's connection lives in one shared charon:
@@ -108,6 +119,390 @@ struct LineStartup<'a> {
     alert_ctx: Option<&'a AlertContext>,
     /// The charon daemon every strongswan-engine line shares.
     shared_charon: &'a Arc<SharedCharon>,
+}
+
+/// Starts the whole inbound VoWiFi-to-SIP bridge for a non-empty, already
+/// fully-resolved line set: pcscd/vpcd, XFRM reclaim, the shared charon's
+/// rendered assets (including `PCSCF_PLUGIN_CONF`, which must list every
+/// line's connection name *before* charon starts — see that const's doc
+/// comment), every line's own supervision thread, and the shared Agent B
+/// (`vowifi-sip-agent`) process.
+///
+/// Extracted out of `run`'s section 3 (specs/027-discover-retry-health) so
+/// it can be called a second time, later, from `spawn_discover_retry`'s
+/// success path — but only when nothing has started it yet this run (see
+/// that function's doc comment for why this is never called twice).
+///
+/// Returns `Err` for the same fatal conditions section 3 used to `return
+/// ExitCode::FAILURE` for directly; the synchronous startup caller maps that
+/// straight back to a process exit, while the retry caller only has a
+/// background thread to log from and gives up on starting the subsystem
+/// this run instead.
+#[allow(clippy::too_many_arguments)]
+fn start_vowifi_subsystem(
+    vowifi_lines: &[LineResolutionEntry],
+    runner: &Arc<dyn CommandRunner>,
+    bin: &str,
+    config_path_str: &str,
+    config: &AppConfig,
+    started: &Arc<Mutex<StartedState>>,
+    shutting_down: &Arc<RwLock<bool>>,
+    alert_ctx: Option<&AlertContext>,
+) -> Result<(), String> {
+    println!(
+        "[supervise] [vowifi].enabled — starting {} VoWiFi line(s) (engine: {})",
+        vowifi_lines.len(),
+        config.vowifi.tunnel_engine
+    );
+
+    check_pcsc_engine_compatibility(vowifi_lines, &config.vowifi.tunnel_engine)?;
+
+    if runner
+        .run(&["ip", "netns", "add", "__probe"])
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        return Err(
+            "cannot create network namespaces — add cap_add: SYS_ADMIN (and NET_ADMIN)".to_string(),
+        );
+    }
+    let _ = runner.run(&["ip", "netns", "del", "__probe"]);
+
+    if config.vowifi.tunnel_engine == "strongswan" {
+        // pcscd is shared by both kinds of line: a modem-backed line
+        // reaches its SIM through the vpcd *virtual* reader that
+        // `vowifi-usim-bridge` drives, while a `pcsc_reader` line
+        // (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader
+        // pcscd picks up straight from USB. Only the former needs
+        // vpcd, so an all-pcsc deployment must not be held hostage to
+        // a virtual reader nothing will ever connect to — provisioning
+        // it anyway made a free-standing card-reader deployment die on
+        // an unrelated vpcd port bind, and left eap-sim-pcsc iterating
+        // over empty vpcd slots ("SCardConnect: No smart card
+        // inserted") before reaching the real one.
+        let needs_vpcd = needs_vpcd_reader(vowifi_lines);
+        if needs_vpcd {
+            vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
+        }
+        let Some(pcscd_handle) = vpcd::spawn_pcscd(runner.as_ref()) else {
+            return Err("failed to start pcscd".to_string());
+        };
+        let pcscd_handle = Arc::new(pcscd_handle);
+        started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
+
+        if needs_vpcd {
+            println!(
+                "[supervise] started shared pcscd; one vpcd reader, slots from {}",
+                config.vowifi.vpcd_port
+            );
+            match vpcd::wait_for_vpcd_ready(
+                runner.as_ref(),
+                &pcscd_handle,
+                &config.vowifi.vpcd_host,
+                config.vowifi.vpcd_port,
+            ) {
+                vpcd::ReadyOutcome::Ready => println!(
+                    "[supervise] vpcd reader ready on {}:{}",
+                    config.vowifi.vpcd_host, config.vowifi.vpcd_port
+                ),
+                other => {
+                    return Err(format!(
+                        "pcscd's vpcd reader never came up on {}:{} ({other:?}). \
+                         If pcscd logged 'Address in use', another process holds that port — pick a \
+                         [vowifi].vpcd_port below the ephemeral range.",
+                        config.vowifi.vpcd_host, config.vowifi.vpcd_port
+                    ));
+                }
+            }
+        } else {
+            println!(
+                "[supervise] started shared pcscd; no vpcd reader \
+                 (all {} line(s) are card-reader-backed)",
+                vowifi_lines.len()
+            );
+        }
+    }
+
+    // Before anything creates an interface or starts charon: clear
+    // XFRM state left by a previous run of this container. It outlives
+    // the container and keeps these lines' if_ids claimed, which makes
+    // their tunnel interfaces impossible to create — the line then
+    // re-establishes its tunnel every steady-state tick, forever.
+    // Guarded so a host running unrelated IPsec is never touched.
+    let our_if_ids: std::collections::BTreeSet<u32> =
+        vowifi_lines.iter().map(|l| l.strongswan_if_id).collect();
+    epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
+
+    // Render the shared charon's assets once, before any line starts.
+    // Every line then drops its own connection file into the shared
+    // conf.d and loads the union.
+    let shared_charon = Arc::new(SharedCharon::new(
+        SHARED_STRONGSWAN_CONF.to_string(),
+        SHARED_SWANCTL_CONF.to_string(),
+        PathBuf::from(SHARED_CHARON_LOG),
+    ));
+    let _ = runner.write_file(
+        Path::new(SHARED_STRONGSWAN_CONF),
+        &super::render::render_strongswan_conf(SHARED_VICI_SOCKET, SHARED_CHARON_LOG),
+    );
+    let _ = runner.run(&["mkdir", "-p", SHARED_SWANCTL_CONF_DIR]);
+    // Drop any connection file left by a previous run of this
+    // container: `docker restart` keeps the filesystem, and a stale
+    // `epdg-N.conf` for a line that no longer exists would be loaded
+    // right back in by the directory-wide `--load-all`.
+    let _ = runner.run(&[
+        "sh",
+        "-c",
+        &format!("rm -f {SHARED_SWANCTL_CONF_DIR}/*.conf"),
+    ]);
+    let _ = runner.write_file(
+        Path::new(SHARED_SWANCTL_CONF),
+        &super::render::render_swanctl_top_conf(SHARED_SWANCTL_CONF_DIR),
+    );
+    // Must be written before charon starts: the plugin reads this once
+    // at load time, and it enables the P-CSCF request per connection
+    // *name*, so it has to name every line the daemon will serve.
+    let conn_names: Vec<String> = vowifi_lines
+        .iter()
+        .map(|l| vowifi_conn_name(l.index))
+        .collect();
+    let _ = runner.write_file(
+        Path::new(PCSCF_PLUGIN_CONF),
+        &super::render::render_pcscf_plugin_conf(&conn_names),
+    );
+
+    for line in vowifi_lines {
+        let runner = Arc::clone(runner);
+        let bin = bin.to_string();
+        let cfg = config_path_str.to_string();
+        let started = Arc::clone(started);
+        let shutting_down = Arc::clone(shutting_down);
+        let config = config.clone();
+        let line = line.clone();
+        let alert_ctx = alert_ctx.cloned();
+        let shared_charon = Arc::clone(&shared_charon);
+        std::thread::spawn(move || {
+            start_vowifi_line(
+                &LineStartup {
+                    runner: &runner,
+                    bin: &bin,
+                    config_path: &cfg,
+                    config: &config,
+                    started: &started,
+                    shutting_down: &shutting_down,
+                    alert_ctx: alert_ctx.as_ref(),
+                    shared_charon: &shared_charon,
+                },
+                &line,
+            );
+        });
+    }
+
+    // Agent B: one shared process for every line's veth pair.
+    {
+        let runner = Arc::clone(runner);
+        let bin = bin.to_string();
+        let cfg = config_path_str.to_string();
+        let started = Arc::clone(started);
+        let shutting_down = Arc::clone(shutting_down);
+        std::thread::spawn(move || loop {
+            let guard = shutting_down.read().unwrap();
+            if *guard {
+                return;
+            }
+            match runner.spawn(ChildSpec::new([
+                bin.as_str(),
+                "--config",
+                cfg.as_str(),
+                "vowifi-sip-agent",
+            ])) {
+                Ok(handle) => {
+                    let handle = Arc::new(handle);
+                    started.lock().unwrap().sip_agent_supervisor = Some(handle.clone());
+                    drop(guard);
+                    // See the daemon_supervisor loop above: poll
+                    // is_alive(), don't block on wait(), so this
+                    // handle (signaled by execute_shutdown_plan via
+                    // `sip_agent_supervisor`) stays signalable for
+                    // as long as the process is actually alive.
+                    while runner.is_alive(&handle) {
+                        runner.sleep(Duration::from_secs(1));
+                    }
+                    println!("[supervise] vowifi-sip-agent exited; restarting in 5s");
+                }
+                Err(e) => {
+                    drop(guard);
+                    eprintln!("[supervise] failed to spawn vowifi-sip-agent: {e}")
+                }
+            }
+            runner.sleep(Duration::from_secs(5));
+        });
+    }
+
+    Ok(())
+}
+
+/// specs/027-discover-retry-health US1: only ever called when the first
+/// `discover` pass resolved zero VoWiFi lines (so nothing has started —
+/// `start_vowifi_subsystem` was never called this run, per `run`'s only call
+/// site for this function). Background thread that re-runs `discover` on
+/// `DISCOVER_RETRY_POLL_INTERVAL` for as long as any configured override
+/// (a `modem_port`/`modem_serial` line) is still missing, up to
+/// `DISCOVER_RETRY_WINDOW` per override:
+///
+/// - As soon as any override resolves, `start_vowifi_subsystem` runs once
+///   with whatever the resolution now contains — exactly the normal startup
+///   path, just delayed. From that point on this function stops re-running
+///   `discover` (deliberately: hot-adding a *further* late line to an
+///   already-started charon isn't safe — see `start_vowifi_subsystem`'s doc
+///   comment and R3 in research.md) but keeps tracking any override that's
+///   *still* missing purely so its own window can still elapse and alert.
+/// - An override whose window elapses without resolving is dropped from
+///   tracking; `discover` itself already wrote its terminal `not_found`
+///   entry to the resolution file on the very first pass (Foundational
+///   phase), so there's nothing further to persist here.
+///
+/// Pure decision core of one retry tick, kept separate from
+/// `spawn_discover_retry`'s threading/file-IO so it's testable without real
+/// sleeping: given which of `pending`'s identifiers are still missing after
+/// a fresh `discover` pass and the current time, returns
+/// `(newly_resolved, newly_expired)`. An identifier that resolved this tick
+/// is reported as resolved even if its deadline also happens to have passed
+/// — resolving always wins over expiring.
+fn discover_retry_tick(
+    pending: &std::collections::HashMap<String, std::time::Instant>,
+    still_missing: &std::collections::HashSet<String>,
+    now: std::time::Instant,
+) -> (Vec<String>, Vec<String>) {
+    let resolved: Vec<String> = pending
+        .keys()
+        .filter(|id| !still_missing.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let expired: Vec<String> = pending
+        .iter()
+        .filter(|(id, deadline)| !resolved.contains(id) && now >= **deadline)
+        .map(|(id, _)| id.clone())
+        .collect();
+    (resolved, expired)
+}
+
+/// A no-op if the first pass's resolution file has no `not_found` entries
+/// to retry (e.g. `[vowifi].enabled` but zero lines configured at all).
+#[allow(clippy::too_many_arguments)]
+fn spawn_discover_retry(
+    runner: &Arc<dyn CommandRunner>,
+    bin: &str,
+    config_path_str: &str,
+    config: &AppConfig,
+    started: &Arc<Mutex<StartedState>>,
+    shutting_down: &Arc<RwLock<bool>>,
+    alert_ctx: Option<&AlertContext>,
+) {
+    let lines_file = crate::modules::discovery::lines_file_path();
+    let initial_failed = crate::vowifi::discovery::read_line_resolution(&lines_file)
+        .map(|r| r.failed)
+        .unwrap_or_default();
+    let deadline = std::time::Instant::now() + DISCOVER_RETRY_WINDOW;
+    let mut pending: std::collections::HashMap<String, std::time::Instant> = initial_failed
+        .into_iter()
+        .filter(|f| f.reason == "not_found")
+        .map(|f| (f.card_id, deadline))
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+
+    let runner = Arc::clone(runner);
+    let bin = bin.to_string();
+    let config_path_str = config_path_str.to_string();
+    let config = config.clone();
+    let started = Arc::clone(started);
+    let shutting_down = Arc::clone(shutting_down);
+    let alert_ctx = alert_ctx.cloned();
+    std::thread::spawn(move || {
+        let mut subsystem_started = false;
+        while !pending.is_empty() {
+            if *shutting_down.read().unwrap() {
+                return;
+            }
+            runner.sleep(DISCOVER_RETRY_POLL_INTERVAL);
+            if *shutting_down.read().unwrap() {
+                return;
+            }
+
+            if !subsystem_started {
+                match runner.run(&[&bin, "--config", &config_path_str, "discover"]) {
+                    Ok(o) if o.status.success() => {}
+                    _ => {
+                        eprintln!(
+                            "[supervise] line discovery: retry re-run of 'discover' failed; trying again in {DISCOVER_RETRY_POLL_INTERVAL:?}"
+                        );
+                    }
+                }
+                if let Ok(resolution) = crate::vowifi::discovery::read_line_resolution(&lines_file)
+                {
+                    let still_missing: std::collections::HashSet<String> = resolution
+                        .failed
+                        .iter()
+                        .filter(|f| f.reason == "not_found")
+                        .map(|f| f.card_id.clone())
+                        .collect();
+                    let (resolved_now, expired_now) =
+                        discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+                    for id in &expired_now {
+                        pending.remove(id);
+                        println!(
+                            "[supervise] line discovery: configured line {id} still not found after {DISCOVER_RETRY_WINDOW:?} — giving up retrying it for this run"
+                        );
+                    }
+                    if !resolved_now.is_empty() {
+                        println!(
+                            "[supervise] line discovery: {} previously-missing configured line(s) now found ({}) — starting the VoWiFi subsystem",
+                            resolved_now.len(),
+                            resolved_now.join(", ")
+                        );
+                        if let Err(msg) = start_vowifi_subsystem(
+                            &resolution.lines,
+                            &runner,
+                            &bin,
+                            &config_path_str,
+                            &config,
+                            &started,
+                            &shutting_down,
+                            alert_ctx.as_ref(),
+                        ) {
+                            eprintln!(
+                                "[supervise] FATAL: retried VoWiFi line(s) found but failed to start: {msg}"
+                            );
+                        }
+                        subsystem_started = true;
+                        for id in &resolved_now {
+                            pending.remove(id);
+                        }
+                    }
+                }
+            } else {
+                // The subsystem already started with whatever resolved
+                // earlier — no more re-scanning (see this function's doc
+                // comment), just wait out whatever's left purely so its
+                // deadline can still fire the alert in
+                // `discover_retry_tick`'s caller once it passes.
+                let now = std::time::Instant::now();
+                let expired: Vec<String> = pending
+                    .iter()
+                    .filter(|(_, deadline)| now >= **deadline)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in expired {
+                    pending.remove(&id);
+                    println!(
+                        "[supervise] line discovery: configured line {id} still not found after {DISCOVER_RETRY_WINDOW:?} — giving up retrying it for this run"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Entry point for `gsm-sip-bridge supervise`.
@@ -280,204 +675,33 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
                  serving the circuit-switched bridge) — the VoWiFi subsystem will NOT start this run. \
                  The circuit-switched daemon is unaffected and keeps running."
             );
-        } else {
-            println!(
-                "[supervise] [vowifi].enabled — starting {} VoWiFi line(s) (engine: {})",
-                vowifi_lines.len(),
-                config.vowifi.tunnel_engine
+            // specs/027-discover-retry-health: nothing has started yet this
+            // run (no charon, no pcscd), so retrying the still-missing
+            // configured overrides and starting the subsystem late if one
+            // resolves is safe — see `spawn_discover_retry` and R3 in
+            // research.md for why this is deliberately *not* attempted once
+            // any line has already started.
+            spawn_discover_retry(
+                &runner,
+                &bin,
+                &config_path_str,
+                &config,
+                &started,
+                &shutting_down,
+                alert_ctx.as_ref(),
             );
-
-            if let Err(msg) =
-                check_pcsc_engine_compatibility(&vowifi_lines, &config.vowifi.tunnel_engine)
-            {
-                eprintln!("[supervise] FATAL: {msg}");
-                return ExitCode::FAILURE;
-            }
-
-            if runner
-                .run(&["ip", "netns", "add", "__probe"])
-                .map(|o| !o.status.success())
-                .unwrap_or(true)
-            {
-                eprintln!(
-                    "[supervise] FATAL: cannot create network namespaces — add cap_add: SYS_ADMIN (and NET_ADMIN)"
-                );
-                return ExitCode::FAILURE;
-            }
-            let _ = runner.run(&["ip", "netns", "del", "__probe"]);
-
-            if config.vowifi.tunnel_engine == "strongswan" {
-                // pcscd is shared by both kinds of line: a modem-backed line
-                // reaches its SIM through the vpcd *virtual* reader that
-                // `vowifi-usim-bridge` drives, while a `pcsc_reader` line
-                // (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader
-                // pcscd picks up straight from USB. Only the former needs
-                // vpcd, so an all-pcsc deployment must not be held hostage to
-                // a virtual reader nothing will ever connect to — provisioning
-                // it anyway made a free-standing card-reader deployment die on
-                // an unrelated vpcd port bind, and left eap-sim-pcsc iterating
-                // over empty vpcd slots ("SCardConnect: No smart card
-                // inserted") before reaching the real one.
-                let needs_vpcd = needs_vpcd_reader(&vowifi_lines);
-                if needs_vpcd {
-                    vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
-                }
-                let Some(pcscd_handle) = vpcd::spawn_pcscd(runner.as_ref()) else {
-                    eprintln!("[supervise] FATAL: failed to start pcscd");
-                    return ExitCode::FAILURE;
-                };
-                let pcscd_handle = Arc::new(pcscd_handle);
-                started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
-
-                if needs_vpcd {
-                    println!(
-                        "[supervise] started shared pcscd; one vpcd reader, slots from {}",
-                        config.vowifi.vpcd_port
-                    );
-                    match vpcd::wait_for_vpcd_ready(
-                        runner.as_ref(),
-                        &pcscd_handle,
-                        &config.vowifi.vpcd_host,
-                        config.vowifi.vpcd_port,
-                    ) {
-                        vpcd::ReadyOutcome::Ready => println!(
-                            "[supervise] vpcd reader ready on {}:{}",
-                            config.vowifi.vpcd_host, config.vowifi.vpcd_port
-                        ),
-                        other => {
-                            eprintln!(
-                                "[supervise] FATAL: pcscd's vpcd reader never came up on {}:{} ({other:?}). \
-                                 If pcscd logged 'Address in use', another process holds that port — pick a \
-                                 [vowifi].vpcd_port below the ephemeral range.",
-                                config.vowifi.vpcd_host, config.vowifi.vpcd_port
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                } else {
-                    println!(
-                        "[supervise] started shared pcscd; no vpcd reader \
-                         (all {} line(s) are card-reader-backed)",
-                        vowifi_lines.len()
-                    );
-                }
-            }
-
-            // Before anything creates an interface or starts charon: clear
-            // XFRM state left by a previous run of this container. It outlives
-            // the container and keeps these lines' if_ids claimed, which makes
-            // their tunnel interfaces impossible to create — the line then
-            // re-establishes its tunnel every steady-state tick, forever.
-            // Guarded so a host running unrelated IPsec is never touched.
-            let our_if_ids: std::collections::BTreeSet<u32> =
-                vowifi_lines.iter().map(|l| l.strongswan_if_id).collect();
-            epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
-
-            // Render the shared charon's assets once, before any line starts.
-            // Every line then drops its own connection file into the shared
-            // conf.d and loads the union.
-            let shared_charon = Arc::new(SharedCharon::new(
-                SHARED_STRONGSWAN_CONF.to_string(),
-                SHARED_SWANCTL_CONF.to_string(),
-                PathBuf::from(SHARED_CHARON_LOG),
-            ));
-            let _ = runner.write_file(
-                Path::new(SHARED_STRONGSWAN_CONF),
-                &super::render::render_strongswan_conf(SHARED_VICI_SOCKET, SHARED_CHARON_LOG),
-            );
-            let _ = runner.run(&["mkdir", "-p", SHARED_SWANCTL_CONF_DIR]);
-            // Drop any connection file left by a previous run of this
-            // container: `docker restart` keeps the filesystem, and a stale
-            // `epdg-N.conf` for a line that no longer exists would be loaded
-            // right back in by the directory-wide `--load-all`.
-            let _ = runner.run(&[
-                "sh",
-                "-c",
-                &format!("rm -f {SHARED_SWANCTL_CONF_DIR}/*.conf"),
-            ]);
-            let _ = runner.write_file(
-                Path::new(SHARED_SWANCTL_CONF),
-                &super::render::render_swanctl_top_conf(SHARED_SWANCTL_CONF_DIR),
-            );
-            // Must be written before charon starts: the plugin reads this once
-            // at load time, and it enables the P-CSCF request per connection
-            // *name*, so it has to name every line the daemon will serve.
-            let conn_names: Vec<String> = vowifi_lines
-                .iter()
-                .map(|l| vowifi_conn_name(l.index))
-                .collect();
-            let _ = runner.write_file(
-                Path::new(PCSCF_PLUGIN_CONF),
-                &super::render::render_pcscf_plugin_conf(&conn_names),
-            );
-
-            for line in &vowifi_lines {
-                let runner = Arc::clone(&runner);
-                let bin = bin.clone();
-                let cfg = config_path_str.clone();
-                let started = Arc::clone(&started);
-                let shutting_down = Arc::clone(&shutting_down);
-                let config = config.clone();
-                let line = line.clone();
-                let alert_ctx = alert_ctx.clone();
-                let shared_charon = Arc::clone(&shared_charon);
-                std::thread::spawn(move || {
-                    start_vowifi_line(
-                        &LineStartup {
-                            runner: &runner,
-                            bin: &bin,
-                            config_path: &cfg,
-                            config: &config,
-                            started: &started,
-                            shutting_down: &shutting_down,
-                            alert_ctx: alert_ctx.as_ref(),
-                            shared_charon: &shared_charon,
-                        },
-                        &line,
-                    );
-                });
-            }
-
-            // Agent B: one shared process for every line's veth pair.
-            {
-                let runner = Arc::clone(&runner);
-                let bin = bin.clone();
-                let cfg = config_path_str.clone();
-                let started = Arc::clone(&started);
-                let shutting_down = Arc::clone(&shutting_down);
-                std::thread::spawn(move || loop {
-                    let guard = shutting_down.read().unwrap();
-                    if *guard {
-                        return;
-                    }
-                    match runner.spawn(ChildSpec::new([
-                        bin.as_str(),
-                        "--config",
-                        cfg.as_str(),
-                        "vowifi-sip-agent",
-                    ])) {
-                        Ok(handle) => {
-                            let handle = Arc::new(handle);
-                            started.lock().unwrap().sip_agent_supervisor = Some(handle.clone());
-                            drop(guard);
-                            // See the daemon_supervisor loop above: poll
-                            // is_alive(), don't block on wait(), so this
-                            // handle (signaled by execute_shutdown_plan via
-                            // `sip_agent_supervisor`) stays signalable for
-                            // as long as the process is actually alive.
-                            while runner.is_alive(&handle) {
-                                runner.sleep(Duration::from_secs(1));
-                            }
-                            println!("[supervise] vowifi-sip-agent exited; restarting in 5s");
-                        }
-                        Err(e) => {
-                            drop(guard);
-                            eprintln!("[supervise] failed to spawn vowifi-sip-agent: {e}")
-                        }
-                    }
-                    runner.sleep(Duration::from_secs(5));
-                });
-            }
+        } else if let Err(msg) = start_vowifi_subsystem(
+            &vowifi_lines,
+            &runner,
+            &bin,
+            &config_path_str,
+            &config,
+            &started,
+            &shutting_down,
+            alert_ctx.as_ref(),
+        ) {
+            eprintln!("[supervise] FATAL: {msg}");
+            return ExitCode::FAILURE;
         }
     } else {
         println!("[supervise] [vowifi].enabled is not true — VoWiFi bridge not started");
@@ -1311,6 +1535,72 @@ mod tests {
             Some(alerts::CriticalEventKind::Recovered)
         );
         assert!(!alerted);
+    }
+
+    #[test]
+    fn discover_retry_tick_reports_an_identifier_missing_from_this_ticks_scan_as_resolved() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let still_missing = std::collections::HashSet::new();
+        let (resolved, expired) =
+            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn discover_retry_tick_reports_nothing_while_still_missing_and_within_the_window() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let still_missing = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
+        let (resolved, expired) =
+            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        assert!(resolved.is_empty());
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn discover_retry_tick_expires_an_identifier_whose_window_has_elapsed() {
+        // Deadline already in the past relative to "now" below — simulates
+        // DISCOVER_RETRY_WINDOW having elapsed without needing to actually
+        // wait for it.
+        let deadline = std::time::Instant::now() - Duration::from_secs(1);
+        let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let still_missing = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
+        let (resolved, expired) =
+            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        assert!(resolved.is_empty());
+        assert_eq!(expired, vec!["/dev/ttyUSB3".to_string()]);
+    }
+
+    #[test]
+    fn discover_retry_tick_resolving_wins_over_an_expired_deadline() {
+        // The tick that finally finds the device is allowed to arrive on
+        // the same poll as its deadline passing — it must still count as
+        // resolved, not expired.
+        let deadline = std::time::Instant::now() - Duration::from_secs(1);
+        let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let still_missing = std::collections::HashSet::new();
+        let (resolved, expired) =
+            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn discover_retry_tick_handles_two_configured_lines_independently() {
+        // spec.md User Story 1 acceptance scenario 3: one line resolves,
+        // the other is still missing and not yet expired — each identifier
+        // is judged on its own.
+        let now = std::time::Instant::now();
+        let pending = std::collections::HashMap::from([
+            ("/dev/ttyUSB3".to_string(), now + Duration::from_secs(60)),
+            ("/dev/ttyUSB5".to_string(), now + Duration::from_secs(60)),
+        ]);
+        let still_missing = std::collections::HashSet::from(["/dev/ttyUSB5".to_string()]);
+        let (resolved, expired) = discover_retry_tick(&pending, &still_missing, now);
+        assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
+        assert!(expired.is_empty());
     }
 
     #[test]
