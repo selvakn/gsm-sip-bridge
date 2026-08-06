@@ -380,13 +380,35 @@ fn start_vowifi_subsystem(
 /// set of lines *did* resolve, permanently dropped the still-broken id from
 /// `pending` so it was never retried again, and could fire a false
 /// `Recovered` alert for a line that was never actually started.
+///
+/// `pending`'s keys are *configured-override* identifiers — whatever
+/// `unmatched_overrides` used, which is the override's own `modem_port` or
+/// `modem_serial` string, never a USB-derived `card_id` (there is nothing
+/// to derive one from until a modem actually matches). A first version of
+/// this function compared those keys straight against `resolution.lines`'
+/// `card_id` (review finding on this PR: "Recovery compares incompatible
+/// identities") — the two are never the same string once a line *does*
+/// resolve, so that comparison could never succeed and a genuinely-resolved
+/// override would be reported missing forever. Matched here the same way
+/// `unmatched_overrides`/`resolve_lines` establish the pinning in the first
+/// place: a `modem_port` override's key equals `LineResolutionEntry.
+/// modem_port` verbatim once resolved (`resolve_one_line` sets it straight
+/// from the matched `ProbedModem.at_port`); a `modem_serial` override's key
+/// is the modem's raw USB serial, which becomes its `card_id` via
+/// `derive_module_id` (`scan_all_inner`) — so re-deriving that from the
+/// pending key and comparing against `card_id` covers the serial case
+/// without `LineResolutionEntry` needing to carry the raw serial at all.
 fn still_missing_from_resolution(
     pending: &std::collections::HashMap<String, std::time::Instant>,
     resolution: &crate::vowifi::discovery::LineResolution,
 ) -> std::collections::HashSet<String> {
     pending
         .keys()
-        .filter(|id| !resolution.lines.iter().any(|l| &l.card_id == *id))
+        .filter(|id| {
+            !resolution.lines.iter().any(|l| {
+                l.modem_port == **id || crate::modules::discovery::derive_module_id(id) == l.card_id
+            })
+        })
         .cloned()
         .collect()
 }
@@ -1606,10 +1628,15 @@ mod tests {
         );
     }
 
+    /// Review finding on this PR ("Recovery compares incompatible
+    /// identities"): `pending`'s key for a `modem_port` override is the
+    /// port string itself, e.g. `/dev/ttyUSB3` — never a USB-derived
+    /// `card_id` like `ec20-ABCDEF`. This must match against the resolved
+    /// line's `modem_port` field, not its `card_id`.
     #[test]
-    fn still_missing_from_resolution_clears_once_the_id_is_an_actual_resolved_line() {
+    fn still_missing_from_resolution_clears_once_a_modem_port_override_resolves() {
         let pending = std::collections::HashMap::from([(
-            "ec20-0".to_string(),
+            "/dev/ttyUSB3".to_string(),
             std::time::Instant::now() + Duration::from_secs(60),
         )]);
         let resolution = crate::vowifi::discovery::LineResolution {
@@ -1620,8 +1647,58 @@ mod tests {
         let still_missing = still_missing_from_resolution(&pending, &resolution);
         assert!(
             still_missing.is_empty(),
-            "an id present in resolution.lines is genuinely resolved"
+            "a modem_port pending key must match the resolved line's modem_port field"
         );
+    }
+
+    /// The `modem_serial` mirror case: `pending`'s key is the modem's raw
+    /// USB serial, which only ever surfaces post-resolution via
+    /// `derive_module_id(serial) == card_id` — `LineResolutionEntry` never
+    /// carries the raw serial itself.
+    #[test]
+    fn still_missing_from_resolution_clears_once_a_modem_serial_override_resolves() {
+        let serial = "0123456789ABCDEF";
+        let pending = std::collections::HashMap::from([(
+            serial.to_string(),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )]);
+        let mut line = modem_line(0, "/dev/ttyUSB3");
+        line.card_id = crate::modules::discovery::derive_module_id(serial);
+        let resolution = crate::vowifi::discovery::LineResolution {
+            circuit_switched_excluded_ports: vec![],
+            lines: vec![line],
+            failed: vec![],
+        };
+        let still_missing = still_missing_from_resolution(&pending, &resolution);
+        assert!(
+            still_missing.is_empty(),
+            "a modem_serial pending key must resolve via derive_module_id against card_id"
+        );
+    }
+
+    /// The exact bug the two tests above guard against, made explicit: a
+    /// naive `pending` key vs. `card_id` string comparison (what an earlier
+    /// version of `still_missing_from_resolution` did) never matches a
+    /// `modem_port`-pinned override, because its key is a port string, not
+    /// a card id — the line would be reported missing forever even though
+    /// it is genuinely running.
+    #[test]
+    fn still_missing_from_resolution_does_not_require_the_pending_key_to_equal_card_id() {
+        let pending = std::collections::HashMap::from([(
+            "/dev/ttyUSB3".to_string(),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )]);
+        let resolution = crate::vowifi::discovery::LineResolution {
+            circuit_switched_excluded_ports: vec![],
+            lines: vec![modem_line(0, "/dev/ttyUSB3")],
+            failed: vec![],
+        };
+        assert_ne!(
+            resolution.lines[0].card_id, "/dev/ttyUSB3",
+            "test fixture sanity: card_id must genuinely differ from the pending key"
+        );
+        let still_missing = still_missing_from_resolution(&pending, &resolution);
+        assert!(still_missing.is_empty());
     }
 
     #[test]
