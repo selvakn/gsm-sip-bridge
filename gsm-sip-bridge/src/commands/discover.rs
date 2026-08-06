@@ -76,6 +76,14 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
             config.cs.enabled,
         );
         let mut result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
+        // specs/027-discover-retry-health follow-up: pre-derive whatever
+        // identity (imsi/imei/mcc/mnc) each resolved modem line doesn't
+        // already have pinned, while this is still the only process
+        // touching the modem — see `enrich_resolved_line_identity`'s doc
+        // comment for the AT-port race this closes.
+        for line in &mut result.lines {
+            crate::vowifi::discovery::enrich_resolved_line_identity(line);
+        }
         // specs/027-discover-retry-health FR-001: a configured override
         // that matched no probed device at all (never even enumerated on
         // the USB bus) is invisible to `resolve_lines` — it only sees
