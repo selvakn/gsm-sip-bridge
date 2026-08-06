@@ -225,6 +225,25 @@ impl<'a> SlotView for PoolSlotView<'a> {
     }
 }
 
+/// How long a restarted slot stays `Recovering` before recovery is allowed
+/// to retry it, when the restart command went to a live worker (`cmd_tx`).
+/// Just a starting estimate — the worker's eventual exit (picked up via
+/// `CardPool::run`'s `JoinSet`) recomputes `next_retry_at` for real once the
+/// restart actually finishes, so this only matters for the brief window
+/// before that.
+const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Same idea, but for `apply_send_reboot`'s no-worker fallback: that restart
+/// runs detached (`tokio::task::spawn_blocking`, fire-and-forget) with
+/// nothing to recompute `next_retry_at` once it finishes, unlike the
+/// `cmd_tx`/`JoinSet` path above. Recovery reopening the same serial port
+/// before the detached restart releases it would interleave AT commands or
+/// fail outright (Greptile review, PR #30), so this waits out the slowest
+/// case regardless of which restart mode ran: `AtCommander::open` plus
+/// `radio_restart`'s `AT+CFUN=0` (~5s worst-case AT timeout) -> `sleep(4s)`
+/// -> `AT+CFUN=1` (~5s worst-case) is ~14s; this adds real margin on top.
+const RADIO_RESTART_FALLBACK_RETRY_DELAY: Duration = Duration::from_secs(20);
+
 impl CardPool {
     pub fn new(
         config: AppConfig,
@@ -1080,8 +1099,9 @@ impl CardPool {
 
         // Mirror the manual `card restart` code path: send Reboot via the worker
         // if present, else open the serial port directly.
-        if let Some(cmd_tx) = state.cmd_tx.take() {
+        let retry_delay = if let Some(cmd_tx) = state.cmd_tx.take() {
             let _ = cmd_tx.send(ModuleCmd::Reboot(mode));
+            RECOVERY_RETRY_DELAY
         } else {
             // No worker owns this slot right now, so there's no dedicated OS
             // thread to hand the command to — unlike the `cmd_tx` path above.
@@ -1106,10 +1126,19 @@ impl CardPool {
                     );
                 }
             });
-        }
+            // Nothing tracks this detached task's completion the way the
+            // cmd_tx/worker path is tracked by CardPool::run's JoinSet (whose
+            // eventual worker-exit event recomputes next_retry_at on its
+            // own). Without a longer delay here, recovery could reopen this
+            // same serial port before the detached radio_restart releases
+            // it, interleaving AT commands or failing recovery outright
+            // (Greptile review, PR #30) — so this fallback always waits out
+            // the worst case regardless of which mode ran.
+            RADIO_RESTART_FALLBACK_RETRY_DELAY
+        };
         state.lifecycle = LifecycleState::Recovering;
         state.retry_count = 0;
-        state.next_retry_at = Some(now + Duration::from_secs(10));
+        state.next_retry_at = Some(now + retry_delay);
     }
 
     fn record_outcome(&self, slot: u32, outcome: &CycleOutcome) {
