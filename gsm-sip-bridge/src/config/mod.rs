@@ -354,6 +354,10 @@ pub struct ScheduledRestartConfig {
     pub start_jitter_seconds: u64,
     pub inter_card_gap_seconds: u64,
     pub inter_card_gap_jitter_seconds: u64,
+    /// `"full"` (default) or `"radio"` — kept a plain `String` all the way
+    /// through, same as `[vowifi].tunnel_engine`, and compared with `==` at
+    /// the one call site that acts on it (`modules::CardPool::apply_send_reboot`).
+    pub restart_mode: String,
 }
 
 impl Default for ScheduledRestartConfig {
@@ -364,6 +368,7 @@ impl Default for ScheduledRestartConfig {
             start_jitter_seconds: 600,
             inter_card_gap_seconds: 30,
             inter_card_gap_jitter_seconds: 15,
+            restart_mode: "full".to_string(),
         }
     }
 }
@@ -1169,6 +1174,31 @@ password = "pass"
         assert_eq!(cfg.scheduled_restart.start_jitter_seconds, 600);
         assert_eq!(cfg.scheduled_restart.inter_card_gap_seconds, 30);
         assert_eq!(cfg.scheduled_restart.inter_card_gap_jitter_seconds, 15);
+        assert_eq!(cfg.scheduled_restart.restart_mode, "full");
+    }
+
+    #[test]
+    fn scheduled_restart_radio_mode_applied() {
+        let src = format!(
+            "{}\n[scheduled_restart]\nrestart_mode = \"radio\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&src);
+        assert_eq!(cfg.scheduled_restart.restart_mode, "radio");
+        assert!(cfg.scheduled_restart.enabled);
+    }
+
+    #[test]
+    fn scheduled_restart_invalid_restart_mode_disables_feature() {
+        let src = format!(
+            "{}\n[scheduled_restart]\nrestart_mode = \"nuke-from-orbit\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&src);
+        assert!(
+            !cfg.scheduled_restart.enabled,
+            "invalid restart_mode must disable the feature, same as an invalid cron"
+        );
     }
 
     #[test]

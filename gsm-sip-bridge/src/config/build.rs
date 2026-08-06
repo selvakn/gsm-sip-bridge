@@ -386,12 +386,22 @@ fn build_scheduled_restart(raw: RawScheduledRestart) -> ScheduledRestartConfig {
         return ScheduledRestartConfig::disabled();
     }
 
+    if raw.restart_mode != "full" && raw.restart_mode != "radio" {
+        tracing::error!(
+            restart_mode = %raw.restart_mode,
+            "scheduled_restart.restart_mode must be \"full\" or \"radio\"; \
+             scheduled restart disabled for this run"
+        );
+        return ScheduledRestartConfig::disabled();
+    }
+
     ScheduledRestartConfig {
         enabled: true,
         cron: raw.cron,
         start_jitter_seconds: start_jitter,
         inter_card_gap_seconds: gap,
         inter_card_gap_jitter_seconds: gap_jitter,
+        restart_mode: raw.restart_mode,
     }
 }
 

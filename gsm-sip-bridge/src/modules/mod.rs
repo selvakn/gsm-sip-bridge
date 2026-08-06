@@ -10,7 +10,7 @@ pub mod usim;
 
 use crate::alerts;
 use crate::config::secret::Secret;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ScheduledRestartConfig};
 use crate::control::protocol::{ControlCmd, ControlResp, SlotInfo};
 use crate::metrics;
 use crate::modules::at_commander::{AtCommander, AtResponse, NetworkMode, NetworkType};
@@ -61,9 +61,34 @@ pub enum BridgeEvent {
 pub type ControlCmdSender = mpsc::Sender<(ControlCmd, oneshot::Sender<ControlResp>)>;
 pub type ControlCmdReceiver = mpsc::Receiver<(ControlCmd, oneshot::Sender<ControlResp>)>;
 
+/// How hard to restart a card — shared by the scheduled-restart cycle
+/// (`[scheduled_restart].restart_mode`) and manual `card restart` (always
+/// `Full`, matching this crate's long-standing behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartMode {
+    /// `AT+CFUN=0` -> `AT+CFUN=1`: drops and re-acquires network
+    /// registration without power-cycling the module or re-enumerating USB.
+    Radio,
+    /// `AT+CFUN=1,1`: a full module reset. Can move the card's ttyUSB path.
+    Full,
+}
+
+/// `[scheduled_restart].restart_mode` -> `RestartMode`, pulled out of
+/// `CardPool::apply_send_reboot` so the decision is testable without
+/// constructing a whole `CardPool`. `build_scheduled_restart` (config/build.rs)
+/// already rejects anything other than `"full"`/`"radio"` at load time (the
+/// section is disabled instead), so this only ever sees one of the two.
+fn scheduled_restart_mode(config: &ScheduledRestartConfig) -> RestartMode {
+    if config.restart_mode == "radio" {
+        RestartMode::Radio
+    } else {
+        RestartMode::Full
+    }
+}
+
 enum ModuleCmd {
     SetMode(NetworkMode, oneshot::Sender<Result<NetworkMode, String>>),
-    Reboot,
+    Reboot(RestartMode),
     /// Dial an outbound call on this line (specs/025-outbound-calling).
     /// `Ok(())` means the modem accepted `ATD`, not that the call was
     /// answered — see `AtCommander::dial`'s own doc comment.
@@ -197,6 +222,64 @@ impl<'a> SlotView for PoolSlotView<'a> {
                 }
             },
         }
+    }
+}
+
+/// How long a restarted slot stays `Recovering` before recovery is allowed
+/// to retry it, when the restart command went to a live worker (`cmd_tx`)
+/// running `RestartMode::Full` (`AT+CFUN=1,1`, one command, ~5s worst-case
+/// AT timeout — comfortably under this). Just a starting estimate — the
+/// worker's eventual exit (picked up via `CardPool::run`'s `JoinSet`)
+/// recomputes `next_retry_at` for real once the restart actually finishes,
+/// so this only matters for the brief window before that.
+const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Same idea, but for anything driving `RestartMode::Radio`. Sized from two
+/// components, both worst-case:
+///
+/// - *Pickup latency* before the restart even starts: on the `cmd_tx`/worker
+///   path, `run_module_loop`'s own idle loop only checks `cmd_rx` once per
+///   iteration, and one iteration can already take ~10s (an `AT_WORKER_PROBE_INTERVAL`
+///   liveness probe, itself an AT round trip up to `AtCommander`'s ~5s read
+///   timeout, followed by `read_line_from_at` blocking up to that same ~5s
+///   timeout waiting for a URC). The no-worker fallback has no such delay
+///   itself, but shares the same uncertainty from a different source: tokio's
+///   blocking pool may not run its `spawn_blocking` closure the instant it's
+///   queued.
+/// - The restart sequence itself: `AT+CFUN=0` (~5s worst-case AT timeout) ->
+///   `sleep(4s)` -> `AT+CFUN=1` (~5s worst-case) — ~14s.
+///
+/// ~24s total, rounded up for margin. `next_retry_at` set to `now +` this is
+/// still only a *backstop*, not a guarantee: both paths' actual completion
+/// is tracked for real via `CardPool::run`'s `JoinSet` (`tasks`), whose
+/// `join_next` branch recomputes `next_retry_at` from the real exit event —
+/// that's what actually closes the race in the common case, this constant
+/// only bounds how bad the window is if it doesn't land in time. (A `JoinSet`
+/// task that panics loses its `(slot, module_id)` payload — `join_next`'s
+/// `Err` arm can't identify which slot to correct — so an unbounded wait
+/// instead of a numeric backstop isn't a safe alternative: a panicking
+/// restart would leave that slot stuck in `Recovering` forever instead of
+/// eventually retried.)
+///
+/// Either way, recovery reopening the same serial port before the old
+/// restart releases it would interleave AT commands, fail initialization,
+/// or leave the modem in an inconsistent radio state (Greptile review,
+/// PR #30) — so both paths use this generous margin whenever `Radio` is the
+/// selected mode.
+const RADIO_RESTART_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// How long `apply_send_reboot` should park a slot in `Recovering` before
+/// recovery may retry it, given the selected restart mode and whether a
+/// live worker (`cmd_tx`) took the command or the no-worker fallback ran it
+/// detached. Pulled out of `apply_send_reboot` so this decision is testable
+/// without constructing a whole `CardPool` — same reasoning as
+/// `scheduled_restart_mode`. See `RECOVERY_RETRY_DELAY`/
+/// `RADIO_RESTART_RETRY_DELAY`'s doc comments for why these differ.
+fn retry_delay_for(mode: RestartMode, had_worker: bool) -> Duration {
+    if had_worker && mode == RestartMode::Full {
+        RECOVERY_RETRY_DELAY
+    } else {
+        RADIO_RESTART_RETRY_DELAY
     }
 }
 
@@ -683,7 +766,7 @@ impl CardPool {
                     }
 
                     // Scheduled restart: start cycle if armed, or advance running cycle.
-                    self.advance_scheduler(&mut slots, now);
+                    self.advance_scheduler(&mut slots, &mut tasks, now);
 
                     metrics::MODULES_ACTIVE.set(slots.values().filter(|s| s.lifecycle == LifecycleState::Ready).count() as f64);
                     metrics::MODULES_FAILED.set(slots.values().filter(|s| s.lifecycle != LifecycleState::Ready).count() as f64);
@@ -926,6 +1009,7 @@ impl CardPool {
     fn advance_scheduler(
         &mut self,
         slots: &mut HashMap<u32, SlotState>,
+        tasks: &mut JoinSet<(u32, String)>,
         now: tokio::time::Instant,
     ) {
         // 1) If no cycle is active and the scheduled instant has arrived, start one.
@@ -963,7 +1047,7 @@ impl CardPool {
         for action in actions {
             match action {
                 SchedulerAction::SendReboot { slot } => {
-                    self.apply_send_reboot(slots, slot, now);
+                    self.apply_send_reboot(slots, tasks, slot, now);
                 }
                 SchedulerAction::RecordOutcome { slot, outcome } => {
                     self.record_outcome(slot, &outcome);
@@ -1026,6 +1110,7 @@ impl CardPool {
     fn apply_send_reboot(
         &self,
         slots: &mut HashMap<u32, SlotState>,
+        tasks: &mut JoinSet<(u32, String)>,
         slot: u32,
         now: tokio::time::Instant,
     ) {
@@ -1048,16 +1133,58 @@ impl CardPool {
             "scheduled_restart per-card-start"
         );
 
+        // `[scheduled_restart].restart_mode` picks the restart's severity for
+        // every card in this cycle; manual `card restart` (below) always
+        // does a full reset regardless of this setting.
+        let mode = scheduled_restart_mode(&self.config.scheduled_restart);
+        let retry_delay = retry_delay_for(mode, state.cmd_tx.is_some());
+
         // Mirror the manual `card restart` code path: send Reboot via the worker
         // if present, else open the serial port directly.
         if let Some(cmd_tx) = state.cmd_tx.take() {
-            let _ = cmd_tx.send(ModuleCmd::Reboot);
-        } else if let Ok(mut at) = AtCommander::open(&state.module.serial_port) {
-            at.reboot();
+            let _ = cmd_tx.send(ModuleCmd::Reboot(mode));
+        } else {
+            // No worker owns this slot right now, so there's no dedicated OS
+            // thread to hand the command to — unlike the `cmd_tx` path above.
+            // Open the port and run the restart on tokio's blocking pool
+            // rather than inline: `RestartMode::Radio` is `AT+CFUN=0` ->
+            // `sleep(4s)` -> `AT+CFUN=1`, up to ~14s of synchronous AT I/O
+            // that would otherwise stall this CardPool's shared event loop —
+            // every other card's control commands and bridge events — for
+            // the duration (Greptile review, PR #30).
+            //
+            // Spawned on `tasks` (the same JoinSet every module worker
+            // lives in), not a bare detached `tokio::task::spawn_blocking`:
+            // that JoinSet is drained by CardPool::run's `join_next` branch,
+            // which recomputes `next_retry_at` from this task's *actual*
+            // completion. A bare detached task has nothing to correct the
+            // `retry_delay` estimate below if tokio's blocking pool is busy
+            // enough to delay when this closure even starts running — Greptile
+            // review, PR #30, follow-up — so `retry_delay` here is only a
+            // defensive starting point, exactly like the `cmd_tx` path's own
+            // estimate above it (RECOVERY_RETRY_DELAY's doc comment).
+            let serial_port = state.module.serial_port.clone();
+            let module_id = state.module.id.clone();
+            tasks.spawn_blocking(move || {
+                match AtCommander::open(&serial_port) {
+                    Ok(mut at) => match mode {
+                        RestartMode::Radio => at.radio_restart(),
+                        RestartMode::Full => at.reboot(),
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %module_id,
+                            error = %e,
+                            "scheduled_restart: could not open modem port for fallback restart"
+                        );
+                    }
+                }
+                (slot, module_id)
+            });
         }
         state.lifecycle = LifecycleState::Recovering;
         state.retry_count = 0;
-        state.next_retry_at = Some(now + Duration::from_secs(10));
+        state.next_retry_at = Some(now + retry_delay);
     }
 
     fn record_outcome(&self, slot: u32, outcome: &CycleOutcome) {
@@ -1431,8 +1558,11 @@ impl CardPool {
                 if let Some(state) = slots.get_mut(&slot) {
                     tracing::info!(slot = slot, module = %state.module.id, "card restart requested");
                     if let Some(cmd_tx) = state.cmd_tx.take() {
-                        // Worker is running — ask it to send AT+CFUN=1,1 and exit
-                        let _ = cmd_tx.send(ModuleCmd::Reboot);
+                        // Worker is running — ask it to send AT+CFUN=1,1 and exit.
+                        // Manual restart is always a full reset, regardless of
+                        // [scheduled_restart].restart_mode — that setting only
+                        // governs the scheduled cycle.
+                        let _ = cmd_tx.send(ModuleCmd::Reboot(RestartMode::Full));
                     } else {
                         // Worker not running — send AT+CFUN=1,1 directly
                         tracing::info!(module = %state.module.id, "no worker running, rebooting modem directly");
@@ -1790,9 +1920,14 @@ fn run_module_loop(
                         let result = at.set_network_mode(mode).map_err(|e| e.to_string());
                         let _ = resp_tx.send(result);
                     }
-                    ModuleCmd::Reboot => {
+                    ModuleCmd::Reboot(RestartMode::Full) => {
                         tracing::info!(module = %module.id, "rebooting modem (AT+CFUN=1,1)");
                         at.reboot();
+                        return Ok(());
+                    }
+                    ModuleCmd::Reboot(RestartMode::Radio) => {
+                        tracing::info!(module = %module.id, "radio-cycling modem (AT+CFUN=0 -> 1)");
+                        at.radio_restart();
                         return Ok(());
                     }
                     ModuleCmd::Dial(number, resp_tx) => {
@@ -2257,6 +2392,61 @@ mod tests {
         );
         card.state = state;
         card
+    }
+
+    #[test]
+    fn scheduled_restart_mode_selects_radio_when_configured() {
+        let cfg = ScheduledRestartConfig {
+            restart_mode: "radio".to_string(),
+            ..ScheduledRestartConfig::default()
+        };
+        assert_eq!(scheduled_restart_mode(&cfg), RestartMode::Radio);
+    }
+
+    #[test]
+    fn scheduled_restart_mode_defaults_to_full() {
+        assert_eq!(
+            scheduled_restart_mode(&ScheduledRestartConfig::default()),
+            RestartMode::Full,
+            "the default config's restart_mode is \"full\", preserving old behavior"
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_full_mode_with_a_live_worker_uses_the_short_delay() {
+        // The only combination that's actually safe with the historical
+        // flat 10s: AT+CFUN=1,1 is one command, ~5s worst case, and the
+        // worker's own eventual exit event recomputes next_retry_at anyway.
+        assert_eq!(
+            retry_delay_for(RestartMode::Full, true),
+            RECOVERY_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_radio_mode_uses_the_long_delay_even_with_a_live_worker() {
+        // Greptile review (PR #30): radio mode's ~14s worst case can outlast
+        // RECOVERY_RETRY_DELAY even on the tracked cmd_tx/worker path, since
+        // next_retry_at is only an initial estimate until the worker's real
+        // exit event supersedes it.
+        assert_eq!(
+            retry_delay_for(RestartMode::Radio, true),
+            RADIO_RESTART_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_the_no_worker_fallback_uses_the_long_delay_regardless_of_mode() {
+        // Greptile review (PR #30): the detached fallback has nothing that
+        // recomputes next_retry_at on completion, for either mode.
+        assert_eq!(
+            retry_delay_for(RestartMode::Full, false),
+            RADIO_RESTART_RETRY_DELAY
+        );
+        assert_eq!(
+            retry_delay_for(RestartMode::Radio, false),
+            RADIO_RESTART_RETRY_DELAY
+        );
     }
 
     #[test]

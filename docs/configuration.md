@@ -200,9 +200,10 @@ depending on trunk latency.
 ### `[scheduled_restart]`
 
 Preventive nightly card-restart cycle: the daemon walks every known slot in
-ascending order and reboots each modem (`AT+CFUN=1,1`) with a randomized
-gap between cards. Cards on an active call are deferred to the end of the
-cycle; a manual `card restart` issued during a cycle takes precedence. See
+ascending order and restarts each modem with a randomized gap between
+cards. Cards on an active call are deferred to the end of the cycle; a
+manual `card restart` issued during a cycle takes precedence (and always
+does a full reset, regardless of `restart_mode`). See
 `specs/010-scheduled-card-restart/quickstart.md` for full details.
 
 | Key | Type | Default | Description |
@@ -212,6 +213,7 @@ cycle; a manual `card restart` issued during a cycle takes precedence. See
 | `start_jitter_seconds` | integer | `600` | Symmetric jitter on the cycle start time. Range 0–86400; 0 disables. |
 | `inter_card_gap_seconds` | integer | `30` | Base wait between consecutive per-card restarts. Range 0–3600. |
 | `inter_card_gap_jitter_seconds` | integer | `15` | Symmetric jitter on the inter-card gap; must be ≤ `inter_card_gap_seconds`. |
+| `restart_mode` | string | `full` | `full` sends `AT+CFUN=1,1` — a complete module reset that can move the card's ttyUSB path (the original, still-default behavior). `radio` sends `AT+CFUN=0` -> `AT+CFUN=1` instead — a soft cycle that drops and re-acquires network registration without power-cycling the module or re-enumerating USB. Any other value disables the scheduler for this run (lenient policy, like the other keys in this section). |
 
 ### `[resilience]`
 

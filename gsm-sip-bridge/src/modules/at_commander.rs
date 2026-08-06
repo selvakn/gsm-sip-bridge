@@ -8,6 +8,12 @@ use std::time::Duration;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const BAUD_RATE: u32 = 115200;
 
+/// Matches `AT+CFUN=0` -> `AT+CFUN=1`'s settle time elsewhere in this
+/// codebase (`supervise::sim_recovery::CFUN_CYCLE_DELAY`,
+/// `vowifi::usim_bridge`'s in-place SIM reset) — the same modem-level
+/// recipe, so the same wait.
+const RADIO_CYCLE_DELAY: Duration = Duration::from_secs(4);
+
 pub struct AtCommander {
     port: Box<dyn ReadWrite + Send>,
 }
@@ -138,6 +144,20 @@ impl AtCommander {
     pub fn reboot(&mut self) {
         // Fire-and-forget: modem will not send OK before it reboots
         self.send_command("AT+CFUN=1,1").ok();
+    }
+
+    /// Soft radio-cycle (`AT+CFUN=0` -> `AT+CFUN=1`): drops and re-acquires
+    /// network registration without power-cycling the module or
+    /// re-enumerating USB, unlike `reboot`'s `AT+CFUN=1,1` (which resets the
+    /// whole module and can move its ttyUSB path). Fire-and-forget like
+    /// `reboot`, for the same reason — the caller (a scheduled/manual
+    /// restart) already treats the card as `Recovering` and waits for it to
+    /// come back on its own, so there is nothing useful to do with either
+    /// command's response here.
+    pub fn radio_restart(&mut self) {
+        self.send_command("AT+CFUN=0").ok();
+        std::thread::sleep(RADIO_CYCLE_DELAY);
+        self.send_command("AT+CFUN=1").ok();
     }
 
     pub fn send_command(&mut self, cmd: &str) -> BridgeResult<AtResponse> {
