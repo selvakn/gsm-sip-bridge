@@ -51,6 +51,7 @@ The system already proactively notifies the operator (via an existing alert mech
 
 1. **Given** a configured line that fails to start even after retries, **When** the retry window elapses, **Then** an alert notification is sent through the existing alerting channel.
 2. **Given** a configured line that initially fails to be discovered but succeeds during a retry, **When** it comes up successfully, **Then** no failure alert is sent for it.
+3. **Given** a configured line that already triggered a failure alert, **When** its hardware later becomes available and the line starts successfully, **Then** a recovery notification is sent through the same alerting channel.
 
 ---
 
@@ -59,7 +60,7 @@ The system already proactively notifies the operator (via an existing alert mech
 - What happens when the configured hardware is genuinely absent (unplugged, never connected) rather than just slow to enumerate? Retries must not continue forever — the system needs to eventually settle into a persistent "not found" state that stops consuming retry effort.
 - What happens when a configured line's hardware is found and answers, but its SIM is not usable (already-detected today as a distinct condition from "not found at all")? This should also count as "not working" for status/health purposes, not just outright absence.
 - What happens when more than one configured line is missing at the same time? Status and alerting must be able to identify each one individually, not just report a single generic degraded flag.
-- What happens if the missing hardware appears *after* the system has already declared the line failed and alerted on it? The line should still be able to recover automatically and the earlier alert/degraded state should clear.
+- What happens if the missing hardware appears *after* the system has already declared the line failed and alerted on it? The line should still be able to recover automatically, its degraded state should clear, and a recovery notification should be sent (matching the existing failure/recovered alert pairing).
 - What happens to a line that was successfully running and later becomes unreachable during the container's life (for example, the modem is unplugged mid-run)? This is distinct from the startup-discovery problem this feature targets — see clarification below on whether it's in scope.
 
 ## Requirements *(mandatory)*
@@ -76,7 +77,8 @@ The system already proactively notifies the operator (via an existing alert mech
 - **FR-008**: System's container-level health check MUST report a degraded/unhealthy result when any explicitly configured line has failed to start, rather than reporting healthy on the basis of the lines it does know about.
 - **FR-009**: System MUST notify through its existing alerting mechanism when a configured line's retries are exhausted and it settles into the failed state, matching how other sustained line-health failures are already escalated today.
 - **FR-010**: System MUST NOT send a failure alert for a configured line that succeeds during its retry window — only lines that are still failed once the window elapses.
-- **FR-011**: If a previously-failed configured line later becomes available, System MUST clear its degraded status/health-check state and MUST reflect recovery consistently across status-query output and health check.
+- **FR-011**: If a previously-failed configured line later becomes available, System MUST clear its degraded status/health-check state, MUST reflect recovery consistently across status-query output and health check, and — if a failure alert was already sent for it — MUST send a matching recovery notification through the same alerting mechanism, mirroring how registration-loss and tunnel-failure alerts already pair failure and recovery notices.
+- **FR-012**: System MUST expose a configured line's failed-to-start state as a metric on the existing metrics endpoint, consistent with how other per-line health signals (registration, tunnel status) are already exposed there today.
 
 ### Key Entities
 
@@ -93,6 +95,7 @@ The system already proactively notifies the operator (via an existing alert mech
 - **SC-003**: A configured line that never becomes available is reflected as unhealthy in the container's health check within the bounded retry window, every time.
 - **SC-004**: A configured line that never becomes available triggers exactly one proactive alert notification per failure episode (not a flood of repeated alerts, and not silence).
 - **SC-005**: Lines that resolve successfully on the first discovery pass show no observable change in startup time or behavior compared to today.
+- **SC-006**: An automated monitoring system watching the existing metrics endpoint can detect 100% of configured-but-failed lines without needing to parse status-query text or wait for the Discord alert.
 
 ## Assumptions
 
@@ -107,3 +110,5 @@ The system already proactively notifies the operator (via an existing alert mech
 ### Session 2026-08-06
 
 - Q: Should the retry-and-report behavior in this feature cover only the startup window (a line missing when the system starts, which may recover shortly after), or should it also continuously watch, for the entire life of the running system, for a line that later drops out (e.g., a modem physically unplugged mid-run) or a configured line that still hasn't appeared long after startup? → A: Startup-only — bounded retry window right after startup; a line that later drops out mid-run is a separate, already-partially-covered concern (existing registration/tunnel alerts) and out of scope here.
+- Q: The system already exposes per-line health (registration, tunnel) as metrics on the existing metrics endpoint, alongside status-query output and Discord alerts. Should a configured line's failed-to-start state also be exposed as a metric there, or is status-query + health check + alert enough? → A: Yes — expose it as a metric too, consistent with every other line-health signal already surfaced that way.
+- Q: The existing alert pattern (registration-loss, tunnel-failure) always pairs a failure alert with a matching "recovered" notice once the condition clears. Should a configured line that self-heals after its failure alert fired also get an explicit recovery notification, or should its degraded state just clear silently? → A: Yes — send a recovery notification, matching the existing failure/recovered pairing used for registration and tunnel alerts.
