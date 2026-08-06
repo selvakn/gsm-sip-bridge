@@ -1,5 +1,14 @@
 # Release Notes
 
+## v8.6.0
+
+- **`[scheduled_restart].restart_mode`: choose a soft radio cycle instead of a full modem reset.**
+  The nightly preventive restart has always sent `AT+CFUN=1,1` to every card — a complete module
+  reset that can move the card's ttyUSB path. Setting `restart_mode = "radio"` sends `AT+CFUN=0` ->
+  `AT+CFUN=1` instead: it drops and re-acquires network registration without power-cycling the
+  module or re-enumerating USB. Default (`"full"`) is unchanged; manual `card restart` is
+  unaffected either way.
+
 ## v8.5.1
 
 - **VoWiFi USIM bridge now self-heals a SIM that drops off the modem bus.**
