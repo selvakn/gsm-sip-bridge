@@ -422,7 +422,51 @@ AT+CPIN?     -> +CPIN: READY
 
 Once `AT+CIMI` returns a valid IMSI again, restart the bridge (or
 `supervise`'s container) so `discover` re-resolves the line — it does not
-re-scan on its own mid-run.
+re-scan on its own mid-run, **unless** this was the *only* configured
+VoWiFi line and it was still missing when the container started — see the
+next section, which covers that case without a restart.
+
+### VoWiFi: a configured line was missing at startup ("NOT RUNNING" / `not_found`)
+
+specs/027-discover-retry-health closes the gap the previous section still
+describes for the general case: `discover`'s single startup scan can miss
+a configured `[[vowifi.line]] modem_port`/`modem_serial` line simply
+because the USB device hadn't finished enumerating yet (a real incident:
+an EC20 modem present on the bus the whole time, just not yet visible to
+`/sys/bus/usb/devices` at the exact moment `discover` ran). This used to
+be completely silent — no log line, `vowifi-status` didn't mention it,
+`healthcheck`/`docker ps` reported healthy regardless. It no longer is:
+
+- `gsm-sip-bridge vowifi-status` prints a `Configured line <id> (from
+  config.toml): NOT RUNNING` / `reason: not_found` block for it, right
+  after the lines that did resolve.
+- The container's `HEALTHCHECK` (and `docker ps`) reports unhealthy while
+  it's in that state.
+- If `[alerts.line_discovery_failed].enabled = true`, a Discord
+  notification fires once, and a paired recovery notification fires if it
+  later self-heals.
+
+**What actually happens automatically, and what still needs a restart:**
+
+- If this was the *only* configured VoWiFi line (so `discover`'s first
+  pass resolved zero lines at all), the bridge retries `discover` every
+  ~10s for up to ~3 minutes on its own — watch for `[supervise] line
+  discovery: ... previously-missing configured line(s) now found ...` in
+  the container logs, or just re-run `vowifi-status` a little later. No
+  restart needed; this is the common case for a single-modem deployment
+  and is exactly what fixes a slow-enumerating modem.
+- If *another* configured line already resolved and started (a
+  multi-line deployment where only one line was missing), this specific
+  line will **not** self-heal even after the underlying hardware becomes
+  reachable — the shared tunnel daemon's P-CSCF plugin only reads its
+  enabled-connections list once at its own process start, and restarting
+  it to pick up a late line would drop every other line's already-live
+  calls. Confirm the modem now answers plain `AT` (see the previous
+  section), then restart the bridge/container to pick it up.
+- If it's still `NOT RUNNING`/`not_found` well past ~3 minutes after
+  startup with *no* other line configured, the retry window has already
+  elapsed and given up for this run (that's the Discord alert firing) —
+  confirm the hardware, fix it, and restart.
 
 ### Discord forwarding failing
 
