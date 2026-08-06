@@ -381,34 +381,38 @@ fn start_vowifi_subsystem(
 /// `pending` so it was never retried again, and could fire a false
 /// `Recovered` alert for a line that was never actually started.
 ///
-/// `pending`'s keys are *configured-override* identifiers — whatever
-/// `unmatched_overrides` used, which is the override's own `modem_port` or
-/// `modem_serial` string, never a USB-derived `card_id` (there is nothing
-/// to derive one from until a modem actually matches). A first version of
-/// this function compared those keys straight against `resolution.lines`'
-/// `card_id` (review finding on this PR: "Recovery compares incompatible
-/// identities") — the two are never the same string once a line *does*
-/// resolve, so that comparison could never succeed and a genuinely-resolved
-/// override would be reported missing forever. Matched here the same way
-/// `unmatched_overrides`/`resolve_lines` establish the pinning in the first
-/// place: a `modem_port` override's key equals `LineResolutionEntry.
-/// modem_port` verbatim once resolved (`resolve_one_line` sets it straight
-/// from the matched `ProbedModem.at_port`); a `modem_serial` override's key
-/// is the modem's raw USB serial, which becomes its `card_id` via
-/// `derive_module_id` (`scan_all_inner`) — so re-deriving that from the
-/// pending key and comparing against `card_id` covers the serial case
-/// without `LineResolutionEntry` needing to carry the raw serial at all.
+/// `pending`'s keys are *configured-override* identifiers
+/// (`vowifi::discovery::override_identifier` — the override's own
+/// `modem_port` or `modem_serial` string), and a resolved line reports the
+/// identifier of the override that produced it in
+/// `LineResolutionEntry::configured_identifier`. Both sides come from that
+/// one shared function, so this is an exact string match with nothing
+/// reconstructed in between.
+///
+/// That property is the whole point, and it was learned the hard way — two
+/// successive P1 review findings on specs/027-discover-retry-health, both
+/// from trying to *infer* the correspondence after the fact. Comparing a
+/// pending key against `card_id` never matched at all (different identifier
+/// spaces, so a recovered line stayed "missing" forever, the subsystem
+/// never started, and a false discovery-failure alert eventually fired);
+/// bridging them through `derive_module_id` then matched too eagerly (it
+/// keeps only the last six alphanumerics, uppercased, so two distinct
+/// serials sharing that suffix collapse to one `card_id` and an unrelated
+/// modem resolving reads as the configured one recovering). Recording the
+/// match where it is actually known removes the guesswork instead of
+/// refining it.
 fn still_missing_from_resolution(
     pending: &std::collections::HashMap<String, std::time::Instant>,
     resolution: &crate::vowifi::discovery::LineResolution,
 ) -> std::collections::HashSet<String> {
+    let resolved: std::collections::HashSet<&str> = resolution
+        .lines
+        .iter()
+        .filter_map(|l| l.configured_identifier.as_deref())
+        .collect();
     pending
         .keys()
-        .filter(|id| {
-            !resolution.lines.iter().any(|l| {
-                l.modem_port == **id || crate::modules::discovery::derive_module_id(id) == l.card_id
-            })
-        })
+        .filter(|id| !resolved.contains(id.as_str()))
         .cloned()
         .collect()
 }
@@ -1628,11 +1632,20 @@ mod tests {
         );
     }
 
-    /// Review finding on this PR ("Recovery compares incompatible
-    /// identities"): `pending`'s key for a `modem_port` override is the
-    /// port string itself, e.g. `/dev/ttyUSB3` — never a USB-derived
-    /// `card_id` like `ec20-ABCDEF`. This must match against the resolved
-    /// line's `modem_port` field, not its `card_id`.
+    /// Builds a resolved line that reports itself as having come from the
+    /// configured override named `identifier` — what `resolve_one_line`
+    /// records once that override actually matches a modem.
+    fn configured_modem_line(index: u32, port: &str, identifier: &str) -> LineResolutionEntry {
+        let mut line = modem_line(index, port);
+        line.configured_identifier = Some(identifier.to_string());
+        line
+    }
+
+    /// First P1 review finding ("Recovery compares incompatible
+    /// identities"): a `modem_port` override's pending key is the port
+    /// string, never the USB-derived `card_id`, so a resolved line must be
+    /// recognised by the identifier it records — not by any resemblance
+    /// between the pending key and `card_id`.
     #[test]
     fn still_missing_from_resolution_clears_once_a_modem_port_override_resolves() {
         let pending = std::collections::HashMap::from([(
@@ -1641,20 +1654,19 @@ mod tests {
         )]);
         let resolution = crate::vowifi::discovery::LineResolution {
             circuit_switched_excluded_ports: vec![],
-            lines: vec![modem_line(0, "/dev/ttyUSB3")],
+            lines: vec![configured_modem_line(0, "/dev/ttyUSB3", "/dev/ttyUSB3")],
             failed: vec![],
         };
-        let still_missing = still_missing_from_resolution(&pending, &resolution);
-        assert!(
-            still_missing.is_empty(),
-            "a modem_port pending key must match the resolved line's modem_port field"
+        assert_ne!(
+            resolution.lines[0].card_id, "/dev/ttyUSB3",
+            "fixture sanity: card_id must genuinely differ from the pending key"
         );
+        assert!(still_missing_from_resolution(&pending, &resolution).is_empty());
     }
 
-    /// The `modem_serial` mirror case: `pending`'s key is the modem's raw
-    /// USB serial, which only ever surfaces post-resolution via
-    /// `derive_module_id(serial) == card_id` — `LineResolutionEntry` never
-    /// carries the raw serial itself.
+    /// The `modem_serial` mirror case: the pending key is the raw USB
+    /// serial the operator pinned, and the resolved line records that same
+    /// serial — `card_id` never enters the comparison.
     #[test]
     fn still_missing_from_resolution_clears_once_a_modem_serial_override_resolves() {
         let serial = "0123456789ABCDEF";
@@ -1662,28 +1674,54 @@ mod tests {
             serial.to_string(),
             std::time::Instant::now() + Duration::from_secs(60),
         )]);
-        let mut line = modem_line(0, "/dev/ttyUSB3");
-        line.card_id = crate::modules::discovery::derive_module_id(serial);
         let resolution = crate::vowifi::discovery::LineResolution {
             circuit_switched_excluded_ports: vec![],
-            lines: vec![line],
+            lines: vec![configured_modem_line(0, "/dev/ttyUSB3", serial)],
             failed: vec![],
         };
-        let still_missing = still_missing_from_resolution(&pending, &resolution);
+        assert!(still_missing_from_resolution(&pending, &resolution).is_empty());
+    }
+
+    /// Second P1 review finding ("Serial collision fakes recovery"): the
+    /// previous fix bridged the two identifier spaces through
+    /// `derive_module_id`, which keeps only the last six alphanumerics
+    /// uppercased — so a *different* modem whose serial shares that suffix
+    /// (here differing in both the prefix and the case of the suffix)
+    /// resolved into the same `card_id` and was read as the configured
+    /// modem recovering. The configured modem here is genuinely still
+    /// absent and must stay missing.
+    #[test]
+    fn still_missing_from_resolution_is_not_fooled_by_a_colliding_serial_suffix() {
+        let configured = "AAAAAAAAAAabcdef";
+        let unrelated = "BBBBBBBBBBABCDEF";
+        assert_eq!(
+            crate::modules::discovery::derive_module_id(configured),
+            crate::modules::discovery::derive_module_id(unrelated),
+            "fixture sanity: these two serials must collide under derive_module_id"
+        );
+
+        let pending = std::collections::HashMap::from([(
+            configured.to_string(),
+            std::time::Instant::now() + Duration::from_secs(60),
+        )]);
+        // The line that actually resolved is the *unrelated* modem.
+        let resolution = crate::vowifi::discovery::LineResolution {
+            circuit_switched_excluded_ports: vec![],
+            lines: vec![configured_modem_line(0, "/dev/ttyUSB9", unrelated)],
+            failed: vec![],
+        };
         assert!(
-            still_missing.is_empty(),
-            "a modem_serial pending key must resolve via derive_module_id against card_id"
+            still_missing_from_resolution(&pending, &resolution).contains(configured),
+            "a colliding serial suffix must never be read as the configured line recovering"
         );
     }
 
-    /// The exact bug the two tests above guard against, made explicit: a
-    /// naive `pending` key vs. `card_id` string comparison (what an earlier
-    /// version of `still_missing_from_resolution` did) never matches a
-    /// `modem_port`-pinned override, because its key is a port string, not
-    /// a card id — the line would be reported missing forever even though
-    /// it is genuinely running.
+    /// An auto-discovered line (no override behind it) records no
+    /// identifier at all, so it can never satisfy a pending configured
+    /// override — the subsystem starting on unrelated hardware must not
+    /// clear the line the operator is actually waiting for.
     #[test]
-    fn still_missing_from_resolution_does_not_require_the_pending_key_to_equal_card_id() {
+    fn still_missing_from_resolution_is_not_satisfied_by_an_unconfigured_line() {
         let pending = std::collections::HashMap::from([(
             "/dev/ttyUSB3".to_string(),
             std::time::Instant::now() + Duration::from_secs(60),
@@ -1693,12 +1731,10 @@ mod tests {
             lines: vec![modem_line(0, "/dev/ttyUSB3")],
             failed: vec![],
         };
-        assert_ne!(
-            resolution.lines[0].card_id, "/dev/ttyUSB3",
-            "test fixture sanity: card_id must genuinely differ from the pending key"
+        assert!(
+            still_missing_from_resolution(&pending, &resolution).contains("/dev/ttyUSB3"),
+            "a line with no configured_identifier is not the pinned line, whatever its port"
         );
-        let still_missing = still_missing_from_resolution(&pending, &resolution);
-        assert!(still_missing.is_empty());
     }
 
     #[test]
@@ -1892,6 +1928,7 @@ mod tests {
             mcc: "404".to_string(),
             mnc: "043".to_string(),
             pcsc_reader: true,
+            configured_identifier: None,
             config,
         }
     }
@@ -1912,6 +1949,7 @@ mod tests {
             mcc: "404".to_string(),
             mnc: "094".to_string(),
             pcsc_reader: false,
+            configured_identifier: None,
             config: VowifiConfig::default(),
         }
     }

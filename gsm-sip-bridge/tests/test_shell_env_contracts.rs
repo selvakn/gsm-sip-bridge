@@ -48,6 +48,7 @@ fn entry(index: u32, card_id: &str) -> LineResolutionEntry {
         mcc: "404".to_string(),
         mnc: "043".to_string(),
         pcsc_reader: false,
+        configured_identifier: None,
         config: Default::default(),
     }
 }

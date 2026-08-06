@@ -55,7 +55,15 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
             .iter()
             .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
             .collect();
-        let modems = match crate::modules::discovery::scan_all_preferring(&preferred_ports) {
+        // The one scan allowed to *repair* an unreadable SIM rather than
+        // just report it (specs/027-discover-retry-health): `discover` is
+        // one-shot and runs before any line carries traffic, so an
+        // `AT+CFUN` cycle here can't interrupt a call the way it could on
+        // `scan_modules`' ongoing rescans — see `SimRecovery`.
+        let modems = match crate::modules::discovery::scan_all_preferring_with_sim_recovery(
+            &preferred_ports,
+            crate::modules::discovery::SimRecovery::CfunCycleOnUnreadable,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("error: modem discovery failed: {e}");

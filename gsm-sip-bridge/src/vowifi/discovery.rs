@@ -172,6 +172,23 @@ pub struct ResolvedLine {
     /// path, and orchestration skips every modem-only step (existence
     /// check, `modem-ims` reconcile, `vowifi-usim-bridge` spawn) for it.
     pub pcsc_reader: bool,
+    /// Which configured `[[vowifi.line]]` override produced this line, named
+    /// by [`override_identifier`] — `None` for an auto-discovered modem that
+    /// no override pins.
+    ///
+    /// Recorded here, at the one point the override→modem match is actually
+    /// known ([`override_for`]), rather than reconstructed later by
+    /// comparing strings: `supervise`'s discovery-retry loop needs to tell
+    /// whether the line it was waiting on has now resolved, and every
+    /// attempt to answer that *after the fact* was wrong. Comparing the
+    /// override identifier to `card_id` never matched at all (they are
+    /// different identifier spaces); re-deriving one from the other via
+    /// `derive_module_id` matched too eagerly, since that transform keeps
+    /// only the last six alphanumerics uppercased, so two distinct serials
+    /// ending `…abcdef`/`…ABCDEF` collapse to the same `card_id` and one
+    /// modem resolving would have been read as the *other* one recovering.
+    /// Both were P1 review findings on specs/027-discover-retry-health.
+    pub configured_identifier: Option<String>,
     pub config: VowifiConfig,
 }
 
@@ -352,10 +369,29 @@ pub fn unmatched_overrides(
             })
         })
         .filter_map(|o| {
-            let identifier = o.modem_port.clone().or_else(|| o.modem_serial.clone())?;
+            let identifier = override_identifier(o)?;
             Some(FailedLine::new(identifier, Rejection::NotFound.reason()).configured(true))
         })
         .collect()
+}
+
+/// How a configured `[[vowifi.line]]` override names itself, in the one
+/// identifier space that both the "this override never resolved"
+/// ([`unmatched_overrides`], via `FailedLine::card_id`) and the "this
+/// override *did* resolve" ([`ResolvedLine::configured_identifier`]) sides
+/// agree on.
+///
+/// Deliberately a single shared function rather than the same
+/// `modem_port.or(modem_serial)` expression written twice. `supervise`'s
+/// discovery-retry loop keys its pending set by exactly this string and has
+/// to decide whether a given resolved line is the override it was waiting
+/// on; two independent copies of this rule that drift apart would make that
+/// comparison quietly wrong, which is the class of bug that produced two
+/// separate P1 review findings on specs/027-discover-retry-health (first
+/// comparing an override identifier against a USB-derived `card_id`, then
+/// re-deriving one from the other through the *lossy* `derive_module_id`).
+pub fn override_identifier(o: &VowifiLineOverride) -> Option<String> {
+    o.modem_port.clone().or_else(|| o.modem_serial.clone())
 }
 
 fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> ResolvedLine {
@@ -397,6 +433,10 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
         mnc,
         imsi_override,
         pcsc_reader: false,
+        // `over` is the exact override this modem matched, so this is the
+        // authoritative answer to "which configured line is this" — see the
+        // field's doc comment.
+        configured_identifier: over.and_then(override_identifier),
         config,
     }
 }
@@ -490,6 +530,12 @@ fn resolve_one_pcsc_line(
         mnc,
         imsi_override,
         pcsc_reader: true,
+        // A pcsc line is always explicitly configured; `override_identifier`
+        // still returns `None` for the usual reader override that pins
+        // neither a port nor a serial, which is correct — the retry loop
+        // excludes pcsc overrides entirely (`unmatched_overrides`), since
+        // nothing in the USB scan can confirm or deny a reader's presence.
+        configured_identifier: override_identifier(over),
         config,
     }
 }
@@ -531,6 +577,13 @@ pub struct LineResolutionEntry {
     pub mnc: String,
     #[serde(default)]
     pub pcsc_reader: bool,
+    /// See [`ResolvedLine::configured_identifier`]. `#[serde(default)]` so a
+    /// resolution file written by an older build (a `docker restart` keeps
+    /// `/tmp`) still deserializes — it reads back as `None`, i.e. "not a
+    /// configured line", which is the safe direction: the retry loop then
+    /// keeps waiting rather than falsely reporting recovery.
+    #[serde(default)]
+    pub configured_identifier: Option<String>,
     pub config: VowifiConfig,
 }
 
@@ -551,6 +604,7 @@ impl From<&ResolvedLine> for LineResolutionEntry {
             mcc: line.mcc.clone(),
             mnc: line.mnc.clone(),
             pcsc_reader: line.pcsc_reader,
+            configured_identifier: line.configured_identifier.clone(),
             config: line.config.clone(),
         }
     }
@@ -714,6 +768,110 @@ mod tests {
         let assignment = RoleAssignment::from_probed(&modems, &overrides, true);
         assert!(assignment.circuit_switched.is_empty());
         assert_eq!(assignment.vowifi.len(), 1);
+    }
+
+    /// The invariant `supervise`'s discovery-retry loop is built on: the
+    /// identifier an override is reported under while it is missing
+    /// (`unmatched_overrides` → `FailedLine::card_id`) is *the same string*
+    /// it is reported under once it resolves
+    /// (`resolve_lines` → `ResolvedLine::configured_identifier`). If these
+    /// two ever disagree, a recovered line is never recognised as the one
+    /// that was being waited for — which is exactly what the first P1
+    /// review finding on specs/027-discover-retry-health was.
+    #[test]
+    fn a_modem_port_overrides_identifier_is_the_same_missing_and_resolved() {
+        let over = VowifiLineOverride {
+            modem_port: Some("/dev/ttyUSB3".to_string()),
+            ..Default::default()
+        };
+        let base = VowifiConfig {
+            line_overrides: vec![over.clone()],
+            ..Default::default()
+        };
+
+        // Missing: nothing probed at all.
+        let missing = unmatched_overrides(&base.line_overrides, &[]);
+        assert_eq!(missing.len(), 1);
+        let while_missing = missing[0].card_id.clone();
+
+        // Resolved: the pinned port now answers.
+        let modems = vec![ready_modem(
+            "ec20-ABCDEF",
+            "/dev/ttyUSB3",
+            false,
+            "404011111111111",
+        )];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+        assert!(unmatched_overrides(&base.line_overrides, &modems).is_empty());
+        assert_eq!(result.lines.len(), 1);
+        let when_resolved = result.lines[0]
+            .configured_identifier
+            .clone()
+            .expect("a pinned line must record which override produced it");
+
+        assert_eq!(
+            while_missing, when_resolved,
+            "the identifier must survive the missing → resolved transition unchanged"
+        );
+    }
+
+    /// Same invariant for a `modem_serial` pin, where the resolved line's
+    /// `card_id` is a *lossy* derivation of the serial — so the recorded
+    /// identifier must be the serial itself, not something reconstructed
+    /// from `card_id` (the second P1 review finding: two serials sharing
+    /// their last six alphanumerics collapse to one `card_id`).
+    #[test]
+    fn a_modem_serial_overrides_identifier_is_the_raw_serial_not_the_derived_card_id() {
+        let serial = "AAAAAAAAAAabcdef";
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some(serial.to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let while_missing = unmatched_overrides(&base.line_overrides, &[])[0]
+            .card_id
+            .clone();
+        assert_eq!(while_missing, serial);
+
+        let mut modem = ready_modem("ec20-IGNORED", "/dev/ttyUSB3", false, "404011111111111");
+        modem.usb_serial = serial.to_string();
+        modem.card_id = crate::modules::discovery::derive_module_id(serial);
+        let modems = vec![modem];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+        assert_eq!(result.lines.len(), 1);
+
+        assert_eq!(
+            result.lines[0].configured_identifier.as_deref(),
+            Some(serial),
+            "the raw pinned serial must be recorded verbatim, not re-derived"
+        );
+        assert_ne!(
+            result.lines[0].configured_identifier.as_deref(),
+            Some(result.lines[0].card_id.as_str()),
+            "fixture sanity: card_id is a lossy derivation and must not be what is recorded"
+        );
+    }
+
+    /// An auto-discovered modem records no identifier, so it can never be
+    /// mistaken for someone's pinned line.
+    #[test]
+    fn an_auto_discovered_line_records_no_configured_identifier() {
+        let base = VowifiConfig::default();
+        let modems = vec![ready_modem(
+            "ec20-AAAAAA",
+            "/dev/ttyUSB0",
+            false,
+            "404011111111111",
+        )];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].configured_identifier, None);
     }
 
     #[test]
