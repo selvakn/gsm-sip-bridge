@@ -752,7 +752,7 @@ impl CardPool {
                     }
 
                     // Scheduled restart: start cycle if armed, or advance running cycle.
-                    self.advance_scheduler(&mut slots, now);
+                    self.advance_scheduler(&mut slots, &mut tasks, now);
 
                     metrics::MODULES_ACTIVE.set(slots.values().filter(|s| s.lifecycle == LifecycleState::Ready).count() as f64);
                     metrics::MODULES_FAILED.set(slots.values().filter(|s| s.lifecycle != LifecycleState::Ready).count() as f64);
@@ -995,6 +995,7 @@ impl CardPool {
     fn advance_scheduler(
         &mut self,
         slots: &mut HashMap<u32, SlotState>,
+        tasks: &mut JoinSet<(u32, String)>,
         now: tokio::time::Instant,
     ) {
         // 1) If no cycle is active and the scheduled instant has arrived, start one.
@@ -1032,7 +1033,7 @@ impl CardPool {
         for action in actions {
             match action {
                 SchedulerAction::SendReboot { slot } => {
-                    self.apply_send_reboot(slots, slot, now);
+                    self.apply_send_reboot(slots, tasks, slot, now);
                 }
                 SchedulerAction::RecordOutcome { slot, outcome } => {
                     self.record_outcome(slot, &outcome);
@@ -1095,6 +1096,7 @@ impl CardPool {
     fn apply_send_reboot(
         &self,
         slots: &mut HashMap<u32, SlotState>,
+        tasks: &mut JoinSet<(u32, String)>,
         slot: u32,
         now: tokio::time::Instant,
     ) {
@@ -1135,25 +1137,35 @@ impl CardPool {
             // `sleep(4s)` -> `AT+CFUN=1`, up to ~14s of synchronous AT I/O
             // that would otherwise stall this CardPool's shared event loop —
             // every other card's control commands and bridge events — for
-            // the duration (Greptile review, PR #30). Nothing tracks this
-            // detached task's completion the way the cmd_tx/worker path is
-            // tracked by CardPool::run's JoinSet, which is exactly why
-            // retry_delay_for gives this branch the longer delay regardless
-            // of mode — see its own doc comment.
+            // the duration (Greptile review, PR #30).
+            //
+            // Spawned on `tasks` (the same JoinSet every module worker
+            // lives in), not a bare detached `tokio::task::spawn_blocking`:
+            // that JoinSet is drained by CardPool::run's `join_next` branch,
+            // which recomputes `next_retry_at` from this task's *actual*
+            // completion. A bare detached task has nothing to correct the
+            // `retry_delay` estimate below if tokio's blocking pool is busy
+            // enough to delay when this closure even starts running — Greptile
+            // review, PR #30, follow-up — so `retry_delay` here is only a
+            // defensive starting point, exactly like the `cmd_tx` path's own
+            // estimate above it (RECOVERY_RETRY_DELAY's doc comment).
             let serial_port = state.module.serial_port.clone();
             let module_id = state.module.id.clone();
-            tokio::task::spawn_blocking(move || match AtCommander::open(&serial_port) {
-                Ok(mut at) => match mode {
-                    RestartMode::Radio => at.radio_restart(),
-                    RestartMode::Full => at.reboot(),
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        module = %module_id,
-                        error = %e,
-                        "scheduled_restart: could not open modem port for fallback restart"
-                    );
+            tasks.spawn_blocking(move || {
+                match AtCommander::open(&serial_port) {
+                    Ok(mut at) => match mode {
+                        RestartMode::Radio => at.radio_restart(),
+                        RestartMode::Full => at.reboot(),
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %module_id,
+                            error = %e,
+                            "scheduled_restart: could not open modem port for fallback restart"
+                        );
+                    }
                 }
+                (slot, module_id)
             });
         }
         state.lifecycle = LifecycleState::Recovering;
