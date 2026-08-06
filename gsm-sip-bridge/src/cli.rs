@@ -883,6 +883,13 @@ pub enum CardSubcommand {
     Restart {
         #[arg(long, short)]
         slot: u32,
+        /// "full" (default): AT+CFUN=1,1, a complete module reset that can
+        /// move the card's ttyUSB path. "radio": AT+CFUN=0 -> AT+CFUN=1
+        /// instead — drops and re-acquires network registration without
+        /// power-cycling the module or re-enumerating USB. Same two values
+        /// as [scheduled_restart].restart_mode.
+        #[arg(long, short, default_value = "full")]
+        mode: String,
     },
     /// Set the network mode for a slot (2g, 3g, 4g, auto)
     SetMode {
