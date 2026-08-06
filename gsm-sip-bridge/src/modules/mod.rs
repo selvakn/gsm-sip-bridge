@@ -1082,11 +1082,30 @@ impl CardPool {
         // if present, else open the serial port directly.
         if let Some(cmd_tx) = state.cmd_tx.take() {
             let _ = cmd_tx.send(ModuleCmd::Reboot(mode));
-        } else if let Ok(mut at) = AtCommander::open(&state.module.serial_port) {
-            match mode {
-                RestartMode::Radio => at.radio_restart(),
-                RestartMode::Full => at.reboot(),
-            }
+        } else {
+            // No worker owns this slot right now, so there's no dedicated OS
+            // thread to hand the command to — unlike the `cmd_tx` path above.
+            // Open the port and run the restart on tokio's blocking pool
+            // rather than inline: `RestartMode::Radio` is `AT+CFUN=0` ->
+            // `sleep(4s)` -> `AT+CFUN=1`, up to ~14s of synchronous AT I/O
+            // that would otherwise stall this CardPool's shared event loop —
+            // every other card's control commands and bridge events — for
+            // the duration (Greptile review, PR #30).
+            let serial_port = state.module.serial_port.clone();
+            let module_id = state.module.id.clone();
+            tokio::task::spawn_blocking(move || match AtCommander::open(&serial_port) {
+                Ok(mut at) => match mode {
+                    RestartMode::Radio => at.radio_restart(),
+                    RestartMode::Full => at.reboot(),
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        module = %module_id,
+                        error = %e,
+                        "scheduled_restart: could not open modem port for fallback restart"
+                    );
+                }
+            });
         }
         state.lifecycle = LifecycleState::Recovering;
         state.retry_count = 0;
