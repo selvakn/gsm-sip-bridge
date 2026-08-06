@@ -234,25 +234,39 @@ impl<'a> SlotView for PoolSlotView<'a> {
 /// so this only matters for the brief window before that.
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Same idea, but for anything driving `RestartMode::Radio`'s `AT+CFUN=0`
-/// (~5s worst-case AT timeout) -> `sleep(4s)` -> `AT+CFUN=1` (~5s
-/// worst-case) — ~14s, longer than `RECOVERY_RETRY_DELAY`. Used for two
-/// different reasons depending on the path:
+/// Same idea, but for anything driving `RestartMode::Radio`. Sized from two
+/// components, both worst-case:
 ///
-/// - The no-worker fallback (`apply_send_reboot`) runs the restart detached
-///   (`tokio::task::spawn_blocking`, fire-and-forget) with nothing at all to
-///   recompute `next_retry_at` once it finishes.
-/// - The `cmd_tx`/worker path *does* eventually recompute it for real via
-///   `CardPool::run`'s `JoinSet`, but only once the worker actually exits —
-///   until then, `RECOVERY_RETRY_DELAY` would still be too short an initial
-///   estimate and a premature retry tick could race that exit event.
+/// - *Pickup latency* before the restart even starts: on the `cmd_tx`/worker
+///   path, `run_module_loop`'s own idle loop only checks `cmd_rx` once per
+///   iteration, and one iteration can already take ~10s (an `AT_WORKER_PROBE_INTERVAL`
+///   liveness probe, itself an AT round trip up to `AtCommander`'s ~5s read
+///   timeout, followed by `read_line_from_at` blocking up to that same ~5s
+///   timeout waiting for a URC). The no-worker fallback has no such delay
+///   itself, but shares the same uncertainty from a different source: tokio's
+///   blocking pool may not run its `spawn_blocking` closure the instant it's
+///   queued.
+/// - The restart sequence itself: `AT+CFUN=0` (~5s worst-case AT timeout) ->
+///   `sleep(4s)` -> `AT+CFUN=1` (~5s worst-case) — ~14s.
+///
+/// ~24s total, rounded up for margin. `next_retry_at` set to `now +` this is
+/// still only a *backstop*, not a guarantee: both paths' actual completion
+/// is tracked for real via `CardPool::run`'s `JoinSet` (`tasks`), whose
+/// `join_next` branch recomputes `next_retry_at` from the real exit event —
+/// that's what actually closes the race in the common case, this constant
+/// only bounds how bad the window is if it doesn't land in time. (A `JoinSet`
+/// task that panics loses its `(slot, module_id)` payload — `join_next`'s
+/// `Err` arm can't identify which slot to correct — so an unbounded wait
+/// instead of a numeric backstop isn't a safe alternative: a panicking
+/// restart would leave that slot stuck in `Recovering` forever instead of
+/// eventually retried.)
 ///
 /// Either way, recovery reopening the same serial port before the old
 /// restart releases it would interleave AT commands, fail initialization,
 /// or leave the modem in an inconsistent radio state (Greptile review,
 /// PR #30) — so both paths use this generous margin whenever `Radio` is the
 /// selected mode.
-const RADIO_RESTART_RETRY_DELAY: Duration = Duration::from_secs(20);
+const RADIO_RESTART_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// How long `apply_send_reboot` should park a slot in `Recovering` before
 /// recovery may retry it, given the selected restart mode and whether a
