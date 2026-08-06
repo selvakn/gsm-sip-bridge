@@ -1,5 +1,9 @@
 # Release Notes
 
+## v8.7.1
+
+- **Fixed a startup/re-registration race that could leave a VoWiFi line stuck "unreachable" for minutes.** A modem line's `vowifi-ims-agent` used to independently reopen the modem's AT port at its own startup and on every re-registration to derive MCC/MNC/IMSI/IMEI whenever they weren't explicitly pinned in config — the default case. That raced `vowifi-usim-bridge`, which starts around the same moment and holds the same port open indefinitely for AT+CSIM proxying; the two processes writing to the same serial port concurrently could garble each other's AT command/response bytes (`AT+CIMI failed: 3`), and since `vowifi-usim-bridge` never releases the port, the agent kept failing every 5s restart until it happened to land in a moment usim-bridge was briefly idle. `discover` already reads the modem's IMSI once during its own probe; it now also derives whatever else is missing (IMEI, MCC/MNC) in that same one-shot pass, before any long-running process exists to race against — closing the gap instead of just narrowing it.
+
 ## v8.7.0
 
 - **A configured VoWiFi line that never comes up at startup is now retried, self-heals, and is reported instead of silently missing.** A `[[vowifi.line]]` pin (`modem_port`/`modem_serial`) that raced a slow-enumerating modem at boot used to just be absent from `vowifi-status` with no indication anything was wrong. `discover` now keeps retrying in the background when no VoWiFi line resolved at startup, and starts the subsystem automatically the moment the pinned line is found — no restart needed. If it's still missing, `vowifi-status` and `healthcheck` now report it explicitly (`Configured line ... NOT RUNNING`), and an opt-in Discord alert (`[alerts.line_discovery_failed]`) fires after a grace window, with a matching recovery notice if it comes up later.
