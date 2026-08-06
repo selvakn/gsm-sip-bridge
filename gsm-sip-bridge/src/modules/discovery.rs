@@ -577,12 +577,67 @@ pub fn probe_is_at_capable(at: &mut AtCommander) -> bool {
 
 /// Opens `port` fresh and reads its SIM status — real hardware I/O, not
 /// unit-tested directly; `probe_sim_status` (below) carries the tested
-/// interpretation logic.
+/// interpretation logic. On `Unreadable`, attempts one CFUN power-cycle via
+/// `recover_and_reprobe_sim` before giving up (specs/027-discover-retry-health
+/// — see that function's doc comment for why).
 fn probe_sim_status_at(port: &Path) -> SimStatus {
     match AtCommander::open_with_timeout(port, PROBE_TIMEOUT) {
-        Ok(mut at) => probe_sim_status(&mut at),
+        Ok(mut at) => {
+            let status = probe_sim_status(&mut at);
+            if matches!(status, SimStatus::Unreadable(_)) {
+                tracing::warn!(
+                    port = %port.display(),
+                    reason = ?status,
+                    "SIM unreadable on first probe; attempting a CFUN power-cycle before giving up"
+                );
+                recover_and_reprobe_sim(
+                    &mut at,
+                    crate::supervise::sim_recovery::CFUN_CYCLE_DELAY,
+                    crate::supervise::sim_recovery::CPIN_POLL_INTERVAL,
+                    crate::supervise::sim_recovery::CPIN_POLL_ATTEMPTS,
+                )
+            } else {
+                status
+            }
+        }
         Err(e) => SimStatus::Unreadable(e.to_string()),
     }
+}
+
+/// After a first-probe `Unreadable` result, power-cycles the SIM in place
+/// (`AT+CFUN=0` -> `AT+CFUN=1`) and re-probes once — the same recipe as
+/// `supervise::sim_recovery::reset_modem_sim`/`vowifi::usim_bridge`'s
+/// `reset_sim_in_place` (see either's doc comment for the sugam incident
+/// this traces back to), driven directly over the `AtCommander` this probe
+/// already has open rather than shelling out via `CommandRunner`.
+/// `discover`'s probe never has a running vowifi-usim-bridge/swu-dialer
+/// holder to freeze first, unlike those two call sites: it runs before any
+/// per-line agent starts, so nothing else is using the port yet.
+///
+/// Without this, a SIM that is transiently unreadable at boot (the sugam
+/// pattern: `+CME ERROR: 13`, cleared in practice by a soft radio cycle)
+/// stayed permanently unreadable through `discover`'s one-shot probe — live
+/// testing against real EC20 hardware (specs/027-discover-retry-health)
+/// found this reachable, not just hypothetical. Timing is a parameter
+/// (rather than reading the constants directly) purely so tests can drive
+/// the same real AT-command sequence with near-zero delays.
+fn recover_and_reprobe_sim(
+    at: &mut AtCommander,
+    cycle_delay: Duration,
+    poll_interval: Duration,
+    poll_attempts: u32,
+) -> SimStatus {
+    let _ = at.send_command("AT+CFUN=0");
+    std::thread::sleep(cycle_delay);
+    let _ = at.send_command("AT+CFUN=1");
+
+    for _ in 0..poll_attempts {
+        std::thread::sleep(poll_interval);
+        if matches!(at.query_cpin(), Ok(status) if status.contains("READY")) {
+            break;
+        }
+    }
+    probe_sim_status(at)
 }
 
 /// Interprets `AT+CPIN?` (and, if ready, `AT+CIMI`) into a `SimStatus`
@@ -900,6 +955,108 @@ mod tests {
             probe_sim_status(&mut at),
             SimStatus::Unreadable(_)
         ));
+    }
+
+    /// A queue of responses, one per `send_command` call — unlike
+    /// `MockStream`'s single-shot `Cursor`, this survives multiple
+    /// sequential calls, needed to exercise `recover_and_reprobe_sim`'s
+    /// AT+CFUN=0/AT+CFUN=1/poll/re-probe sequence. Mirrors
+    /// `vowifi::usim_bridge`'s own `ScriptedModem` test helper (see its doc
+    /// comment for why a fresh-`BufReader`-per-call transport needs this
+    /// instead of a plain `Cursor`); duplicated locally rather than shared,
+    /// same as this module's existing `MockStream` mirrors
+    /// `at_commander.rs`'s.
+    struct ScriptedModem {
+        responses: std::collections::VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+        pos: usize,
+    }
+
+    impl ScriptedModem {
+        fn new(responses: &[&str]) -> Self {
+            Self {
+                responses: responses.iter().map(|s| s.as_bytes().to_vec()).collect(),
+                current: Vec::new(),
+                pos: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for ScriptedModem {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.current.len() {
+                let Some(next) = self.responses.pop_front() else {
+                    return Ok(0);
+                };
+                self.current = next;
+                self.pos = 0;
+            }
+            let remaining = &self.current[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Write for ScriptedModem {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_scripted_commander(responses: &[&str]) -> AtCommander {
+        AtCommander::from_stream(ScriptedModem::new(responses), Duration::from_secs(1))
+    }
+
+    /// specs/027-discover-retry-health: a SIM that is unreadable on the
+    /// first probe but comes back `+CPIN: READY` after a soft radio cycle —
+    /// the exact live-hardware finding (EC20, `+CME ERROR: 13`) that
+    /// motivated `recover_and_reprobe_sim`.
+    #[test]
+    fn recover_and_reprobe_sim_returns_ready_after_a_successful_cfun_cycle() {
+        let mut at = make_scripted_commander(&[
+            "OK\r\n",                    // AT+CFUN=0
+            "OK\r\n",                    // AT+CFUN=1
+            "+CPIN: READY\r\nOK\r\n",    // poll attempt 1: AT+CPIN?
+            "+CPIN: READY\r\nOK\r\n",    // re-probe: AT+CPIN?
+            "404438083996440\r\nOK\r\n", // re-probe: AT+CIMI
+        ]);
+        let status = recover_and_reprobe_sim(
+            &mut at,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        );
+        assert_eq!(
+            status,
+            SimStatus::Ready {
+                imsi: "404438083996440".to_string()
+            }
+        );
+    }
+
+    /// If the SIM never comes back `READY` within the poll window, the
+    /// re-probe at the end still runs and (correctly) reports `Unreadable`
+    /// again rather than panicking or hanging.
+    #[test]
+    fn recover_and_reprobe_sim_stays_unreadable_if_cpin_never_becomes_ready() {
+        let mut at = make_scripted_commander(&[
+            "OK\r\n",             // AT+CFUN=0
+            "OK\r\n",             // AT+CFUN=1
+            "+CME ERROR: 13\r\n", // poll attempt 1: AT+CPIN?
+            "+CME ERROR: 13\r\n", // re-probe: AT+CPIN?
+        ]);
+        let status = recover_and_reprobe_sim(
+            &mut at,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        );
+        assert!(matches!(status, SimStatus::Unreadable(_)));
     }
 
     // A single test, not two — both set the same process-wide

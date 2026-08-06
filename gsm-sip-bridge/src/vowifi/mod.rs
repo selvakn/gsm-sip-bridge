@@ -179,7 +179,7 @@ fn runtime_lines_from_resolution(resolution: &discovery::LineResolution) -> Vec<
 /// start — `max_lines_exceeded` is an *unpinned* auto-discovered candidate
 /// losing out on a scarce slot, a different condition entirely (see
 /// `contracts/vowifi-status-output.md`).
-fn is_configured_line_failure(failed: &discovery::FailedLine) -> bool {
+pub(crate) fn is_configured_line_failure(failed: &discovery::FailedLine) -> bool {
     failed.reason != "max_lines_exceeded"
 }
 
