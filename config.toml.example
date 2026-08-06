@@ -66,9 +66,10 @@ enabled = false
 
 [scheduled_restart]
 # Preventive nightly card-restart cycle. The daemon walks every known slot in
-# ascending order and reboots each modem (AT+CFUN=1,1) with a randomized gap
-# between cards. Cards on an active call are deferred to the end of the
-# cycle. A manual `card restart` issued during a cycle takes precedence; see
+# ascending order and restarts each modem with a randomized gap between
+# cards. Cards on an active call are deferred to the end of the
+# cycle. A manual `card restart` issued during a cycle takes precedence (and
+# always does a full reset, regardless of restart_mode below); see
 # specs/010-scheduled-card-restart/quickstart.md for full details.
 enabled = true
 # Standard 5-field cron expression in system local time. Default: 1 AM daily.
@@ -83,6 +84,12 @@ inter_card_gap_seconds = 30
 # Symmetric jitter applied to the inter-card gap, in seconds.
 # Must be <= inter_card_gap_seconds. Range 0..=3600.
 inter_card_gap_jitter_seconds = 15
+# "full" (default) sends AT+CFUN=1,1 -- a complete module reset that can move
+# the card's ttyUSB path. "radio" sends AT+CFUN=0 -> AT+CFUN=1 instead -- a
+# soft cycle that drops and re-acquires network registration without
+# power-cycling the module or re-enumerating USB. Any other value disables
+# the scheduler for this run.
+restart_mode = "full"
 
 # ============================================================================
 # Audio tuning

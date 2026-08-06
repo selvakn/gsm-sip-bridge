@@ -287,6 +287,7 @@ section! {
         pub start_jitter_seconds: u64,
         pub inter_card_gap_seconds: u64,
         pub inter_card_gap_jitter_seconds: u64,
+        pub restart_mode: String,
     }
 }
 
@@ -298,6 +299,7 @@ impl Default for RawScheduledRestart {
             start_jitter_seconds: 600,
             inter_card_gap_seconds: 30,
             inter_card_gap_jitter_seconds: 15,
+            restart_mode: "full".to_string(),
         }
     }
 }

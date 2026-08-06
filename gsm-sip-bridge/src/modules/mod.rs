@@ -10,7 +10,7 @@ pub mod usim;
 
 use crate::alerts;
 use crate::config::secret::Secret;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ScheduledRestartConfig};
 use crate::control::protocol::{ControlCmd, ControlResp, SlotInfo};
 use crate::metrics;
 use crate::modules::at_commander::{AtCommander, AtResponse, NetworkMode, NetworkType};
@@ -61,9 +61,34 @@ pub enum BridgeEvent {
 pub type ControlCmdSender = mpsc::Sender<(ControlCmd, oneshot::Sender<ControlResp>)>;
 pub type ControlCmdReceiver = mpsc::Receiver<(ControlCmd, oneshot::Sender<ControlResp>)>;
 
+/// How hard to restart a card — shared by the scheduled-restart cycle
+/// (`[scheduled_restart].restart_mode`) and manual `card restart` (always
+/// `Full`, matching this crate's long-standing behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartMode {
+    /// `AT+CFUN=0` -> `AT+CFUN=1`: drops and re-acquires network
+    /// registration without power-cycling the module or re-enumerating USB.
+    Radio,
+    /// `AT+CFUN=1,1`: a full module reset. Can move the card's ttyUSB path.
+    Full,
+}
+
+/// `[scheduled_restart].restart_mode` -> `RestartMode`, pulled out of
+/// `CardPool::apply_send_reboot` so the decision is testable without
+/// constructing a whole `CardPool`. `build_scheduled_restart` (config/build.rs)
+/// already rejects anything other than `"full"`/`"radio"` at load time (the
+/// section is disabled instead), so this only ever sees one of the two.
+fn scheduled_restart_mode(config: &ScheduledRestartConfig) -> RestartMode {
+    if config.restart_mode == "radio" {
+        RestartMode::Radio
+    } else {
+        RestartMode::Full
+    }
+}
+
 enum ModuleCmd {
     SetMode(NetworkMode, oneshot::Sender<Result<NetworkMode, String>>),
-    Reboot,
+    Reboot(RestartMode),
     /// Dial an outbound call on this line (specs/025-outbound-calling).
     /// `Ok(())` means the modem accepted `ATD`, not that the call was
     /// answered — see `AtCommander::dial`'s own doc comment.
@@ -1048,12 +1073,20 @@ impl CardPool {
             "scheduled_restart per-card-start"
         );
 
+        // `[scheduled_restart].restart_mode` picks the restart's severity for
+        // every card in this cycle; manual `card restart` (below) always
+        // does a full reset regardless of this setting.
+        let mode = scheduled_restart_mode(&self.config.scheduled_restart);
+
         // Mirror the manual `card restart` code path: send Reboot via the worker
         // if present, else open the serial port directly.
         if let Some(cmd_tx) = state.cmd_tx.take() {
-            let _ = cmd_tx.send(ModuleCmd::Reboot);
+            let _ = cmd_tx.send(ModuleCmd::Reboot(mode));
         } else if let Ok(mut at) = AtCommander::open(&state.module.serial_port) {
-            at.reboot();
+            match mode {
+                RestartMode::Radio => at.radio_restart(),
+                RestartMode::Full => at.reboot(),
+            }
         }
         state.lifecycle = LifecycleState::Recovering;
         state.retry_count = 0;
@@ -1431,8 +1464,11 @@ impl CardPool {
                 if let Some(state) = slots.get_mut(&slot) {
                     tracing::info!(slot = slot, module = %state.module.id, "card restart requested");
                     if let Some(cmd_tx) = state.cmd_tx.take() {
-                        // Worker is running — ask it to send AT+CFUN=1,1 and exit
-                        let _ = cmd_tx.send(ModuleCmd::Reboot);
+                        // Worker is running — ask it to send AT+CFUN=1,1 and exit.
+                        // Manual restart is always a full reset, regardless of
+                        // [scheduled_restart].restart_mode — that setting only
+                        // governs the scheduled cycle.
+                        let _ = cmd_tx.send(ModuleCmd::Reboot(RestartMode::Full));
                     } else {
                         // Worker not running — send AT+CFUN=1,1 directly
                         tracing::info!(module = %state.module.id, "no worker running, rebooting modem directly");
@@ -1790,9 +1826,14 @@ fn run_module_loop(
                         let result = at.set_network_mode(mode).map_err(|e| e.to_string());
                         let _ = resp_tx.send(result);
                     }
-                    ModuleCmd::Reboot => {
+                    ModuleCmd::Reboot(RestartMode::Full) => {
                         tracing::info!(module = %module.id, "rebooting modem (AT+CFUN=1,1)");
                         at.reboot();
+                        return Ok(());
+                    }
+                    ModuleCmd::Reboot(RestartMode::Radio) => {
+                        tracing::info!(module = %module.id, "radio-cycling modem (AT+CFUN=0 -> 1)");
+                        at.radio_restart();
                         return Ok(());
                     }
                     ModuleCmd::Dial(number, resp_tx) => {
@@ -2257,6 +2298,24 @@ mod tests {
         );
         card.state = state;
         card
+    }
+
+    #[test]
+    fn scheduled_restart_mode_selects_radio_when_configured() {
+        let cfg = ScheduledRestartConfig {
+            restart_mode: "radio".to_string(),
+            ..ScheduledRestartConfig::default()
+        };
+        assert_eq!(scheduled_restart_mode(&cfg), RestartMode::Radio);
+    }
+
+    #[test]
+    fn scheduled_restart_mode_defaults_to_full() {
+        assert_eq!(
+            scheduled_restart_mode(&ScheduledRestartConfig::default()),
+            RestartMode::Full,
+            "the default config's restart_mode is \"full\", preserving old behavior"
+        );
     }
 
     #[test]

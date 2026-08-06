@@ -38,6 +38,36 @@ fn scheduled_restart_defaults_when_section_omitted() {
     assert_eq!(s.start_jitter_seconds, 600);
     assert_eq!(s.inter_card_gap_seconds, 30);
     assert_eq!(s.inter_card_gap_jitter_seconds, 15);
+    assert_eq!(s.restart_mode, "full", "default must preserve old behavior");
+}
+
+#[test]
+fn scheduled_restart_radio_mode_applied() {
+    let f = write_config(
+        r#"
+[scheduled_restart]
+restart_mode = "radio"
+"#,
+    );
+    let cfg = load_config(f.path()).unwrap();
+    assert_eq!(cfg.scheduled_restart.restart_mode, "radio");
+    assert!(cfg.scheduled_restart.enabled);
+}
+
+#[test]
+fn scheduled_restart_invalid_restart_mode_disables_feature_but_daemon_continues() {
+    let f = write_config(
+        r#"
+[scheduled_restart]
+restart_mode = "nuke-from-orbit"
+"#,
+    );
+    let cfg = load_config(f.path()).expect("daemon must continue past an invalid restart_mode");
+    assert!(
+        !cfg.scheduled_restart.enabled,
+        "invalid restart_mode must disable scheduled_restart, same as an invalid cron"
+    );
+    assert_eq!(cfg.sip.server, "sip.example.com");
 }
 
 #[test]
