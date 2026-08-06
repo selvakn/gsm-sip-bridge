@@ -36,7 +36,10 @@ pub(crate) fn handle_card_command(args: &crate::cli::CardArgs, cli: &Cli) -> Exi
 pub(crate) fn build_control_cmd(args: &crate::cli::CardArgs) -> Result<ControlCmd, String> {
     use crate::cli::CardSubcommand;
     match &args.subcommand {
-        CardSubcommand::Restart { slot } => Ok(ControlCmd::CardRestart { slot: *slot }),
+        CardSubcommand::Restart { slot, mode } => Ok(ControlCmd::CardRestart {
+            slot: *slot,
+            mode: mode.clone(),
+        }),
         CardSubcommand::SetMode { slot, mode } => Ok(ControlCmd::SetMode {
             slot: *slot,
             mode: mode.clone(),
@@ -75,5 +78,41 @@ fn print_resp(resp: ControlResp) -> ExitCode {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{CardArgs, CardSubcommand};
+
+    #[test]
+    fn restart_defaults_to_full_mode() {
+        let args = CardArgs {
+            subcommand: CardSubcommand::Restart {
+                slot: 3,
+                mode: "full".to_string(),
+            },
+        };
+        let cmd = build_control_cmd(&args).unwrap();
+        assert!(matches!(
+            cmd,
+            ControlCmd::CardRestart { slot: 3, ref mode } if mode == "full"
+        ));
+    }
+
+    #[test]
+    fn restart_passes_an_explicit_radio_mode_through() {
+        let args = CardArgs {
+            subcommand: CardSubcommand::Restart {
+                slot: 1,
+                mode: "radio".to_string(),
+            },
+        };
+        let cmd = build_control_cmd(&args).unwrap();
+        assert!(matches!(
+            cmd,
+            ControlCmd::CardRestart { slot: 1, ref mode } if mode == "radio"
+        ));
     }
 }

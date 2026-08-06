@@ -303,7 +303,10 @@ async fn disabled_responder_refuses_every_card_command_naming_the_flag() {
 
     for cmd in [
         ControlCmd::ListSlots,
-        ControlCmd::CardRestart { slot: 0 },
+        ControlCmd::CardRestart {
+            slot: 0,
+            mode: "full".to_string(),
+        },
         ControlCmd::SetMode {
             slot: 0,
             mode: "auto".to_string(),

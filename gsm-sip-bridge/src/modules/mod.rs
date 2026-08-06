@@ -30,6 +30,7 @@ use chrono::Utc;
 use pjsua_safe::Call;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -71,6 +72,24 @@ enum RestartMode {
     Radio,
     /// `AT+CFUN=1,1`: a full module reset. Can move the card's ttyUSB path.
     Full,
+}
+
+/// Parses the same two values `[scheduled_restart].restart_mode` accepts
+/// (`build_scheduled_restart`, config/build.rs), for the manual `card
+/// restart --mode` control command — mirrors `NetworkMode::from_str`'s
+/// shape (`modules::at_commander`).
+impl FromStr for RestartMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(RestartMode::Full),
+            "radio" => Ok(RestartMode::Radio),
+            _ => Err(format!(
+                "unknown restart mode: {s} (expected \"full\" or \"radio\")"
+            )),
+        }
+    }
 }
 
 /// `[scheduled_restart].restart_mode` -> `RestartMode`, pulled out of
@@ -627,7 +646,7 @@ impl CardPool {
                     }
                 }
                 Some((cmd, reply)) = control_rx.recv() => {
-                    self.handle_control_cmd(cmd, reply, &mut slots, &resilience).await;
+                    self.handle_control_cmd(cmd, reply, &mut slots, &mut tasks, &resilience).await;
                 }
                 _ = outbound_poll.tick(), if self.config.outbound.enabled => {
                     if let Some((call, destination)) = self.sip_bridge.poll_outbound_request() {
@@ -1433,6 +1452,7 @@ impl CardPool {
         cmd: ControlCmd,
         reply: oneshot::Sender<ControlResp>,
         slots: &mut HashMap<u32, SlotState>,
+        tasks: &mut JoinSet<(u32, String)>,
         _resilience: &crate::config::ResilienceConfig,
     ) {
         match cmd {
@@ -1528,7 +1548,15 @@ impl CardPool {
                 }
             }
 
-            ControlCmd::CardRestart { slot } => {
+            ControlCmd::CardRestart { slot, mode } => {
+                let mode = match mode.parse::<RestartMode>() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = reply.send(ControlResp::err(e));
+                        return;
+                    }
+                };
+
                 // FR-014a: cycle concurrency rules.
                 use scheduler::{handle_manual_restart_during_cycle, ManualRestartCycleAdvice};
                 let cycle_advice = self
@@ -1556,25 +1584,46 @@ impl CardPool {
                 }
 
                 if let Some(state) = slots.get_mut(&slot) {
-                    tracing::info!(slot = slot, module = %state.module.id, "card restart requested");
+                    tracing::info!(
+                        slot = slot,
+                        module = %state.module.id,
+                        mode = ?mode,
+                        "card restart requested"
+                    );
+                    let retry_delay = retry_delay_for(mode, state.cmd_tx.is_some());
                     if let Some(cmd_tx) = state.cmd_tx.take() {
-                        // Worker is running — ask it to send AT+CFUN=1,1 and exit.
-                        // Manual restart is always a full reset, regardless of
-                        // [scheduled_restart].restart_mode — that setting only
-                        // governs the scheduled cycle.
-                        let _ = cmd_tx.send(ModuleCmd::Reboot(RestartMode::Full));
+                        // Worker is running — ask it to run the restart and exit.
+                        let _ = cmd_tx.send(ModuleCmd::Reboot(mode));
                     } else {
-                        // Worker not running — send AT+CFUN=1,1 directly
+                        // Worker not running — same reasoning as
+                        // apply_send_reboot's identical fallback (Greptile
+                        // review, PR #30): run it on tokio's blocking pool,
+                        // tracked in the same JoinSet every module worker
+                        // lives in, rather than inline on this async
+                        // handler's own event-loop thread.
                         tracing::info!(module = %state.module.id, "no worker running, rebooting modem directly");
-                        if let Ok(mut at) = AtCommander::open(&state.module.serial_port) {
-                            at.reboot();
-                        }
+                        let serial_port = state.module.serial_port.clone();
+                        let module_id = state.module.id.clone();
+                        tasks.spawn_blocking(move || {
+                            match AtCommander::open(&serial_port) {
+                                Ok(mut at) => match mode {
+                                    RestartMode::Radio => at.radio_restart(),
+                                    RestartMode::Full => at.reboot(),
+                                },
+                                Err(e) => {
+                                    tracing::warn!(
+                                        module = %module_id,
+                                        error = %e,
+                                        "card restart: could not open modem port for fallback restart"
+                                    );
+                                }
+                            }
+                            (slot, module_id)
+                        });
                     }
                     state.lifecycle = LifecycleState::Recovering;
                     state.retry_count = 0;
-                    // Allow 10 s for the modem to reboot before re-initializing
-                    state.next_retry_at =
-                        Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                    state.next_retry_at = Some(tokio::time::Instant::now() + retry_delay);
                     let _ = reply.send(ControlResp::ok());
                 } else {
                     let max = slots.keys().max().copied().unwrap_or(0);
@@ -2392,6 +2441,22 @@ mod tests {
         );
         card.state = state;
         card
+    }
+
+    #[test]
+    fn restart_mode_from_str_parses_full_and_radio() {
+        assert_eq!("full".parse::<RestartMode>(), Ok(RestartMode::Full));
+        assert_eq!("radio".parse::<RestartMode>(), Ok(RestartMode::Radio));
+    }
+
+    #[test]
+    fn restart_mode_from_str_rejects_unknown_values() {
+        // No case-folding, matching NetworkMode::from_str's own strictness
+        // (modules::at_commander) — the CLI/config both document the exact
+        // accepted spelling, so a typo should surface as an error, not
+        // silently match something.
+        assert!("Radio".parse::<RestartMode>().is_err());
+        assert!("nuke-from-orbit".parse::<RestartMode>().is_err());
     }
 
     #[test]

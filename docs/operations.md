@@ -9,7 +9,12 @@ The `card` subcommands talk to the running daemon over its control socket (defau
 gsm-sip-bridge --config config.toml card list
 
 # Restart a slot (safe to run while other cards are active; resets give-up state)
+# --mode: "full" (default, AT+CFUN=1,1 — a complete module reset, can move
+# the card's ttyUSB path) or "radio" (AT+CFUN=0 -> AT+CFUN=1 — drops and
+# re-acquires network registration without power-cycling the module or
+# re-enumerating USB). Same two values as [scheduled_restart].restart_mode.
 gsm-sip-bridge --config config.toml card restart --slot 0
+gsm-sip-bridge --config config.toml card restart --slot 0 --mode radio
 
 # Set network preference for a slot and persist it
 # Valid modes: 2g, 3g, 4g, auto

@@ -2,11 +2,22 @@ use crate::modules::at_commander::NetworkMode;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
+fn default_restart_mode() -> String {
+    "full".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlCmd {
     CardRestart {
         slot: u32,
+        /// `"full"` (default) or `"radio"` — same two values and meaning as
+        /// `[scheduled_restart].restart_mode`; validated server-side
+        /// (`modules::CardPool::handle_control_cmd`), same pattern as
+        /// `SetMode`'s own `mode` string. Defaulted so an older client that
+        /// predates this field still round-trips.
+        #[serde(default = "default_restart_mode")]
+        mode: String,
     },
     SetMode {
         slot: u32,
@@ -358,7 +369,26 @@ mod tests {
     fn test_cmd_card_restart_roundtrip() {
         let json = r#"{"cmd":"card_restart","slot":0}"#;
         let cmd: ControlCmd = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, ControlCmd::CardRestart { slot: 0 }));
+        assert!(matches!(
+            cmd,
+            ControlCmd::CardRestart {
+                slot: 0,
+                ref mode
+            } if mode == "full"
+        ));
+    }
+
+    #[test]
+    fn test_cmd_card_restart_with_explicit_radio_mode() {
+        let json = r#"{"cmd":"card_restart","slot":2,"mode":"radio"}"#;
+        let cmd: ControlCmd = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            cmd,
+            ControlCmd::CardRestart {
+                slot: 2,
+                ref mode
+            } if mode == "radio"
+        ));
     }
 
     #[test]

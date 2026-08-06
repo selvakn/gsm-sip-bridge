@@ -62,3 +62,42 @@ fn test_unknown_flag_fails() {
     let err = result.unwrap_err();
     assert_eq!(err.exit_code(), 2);
 }
+
+#[test]
+fn test_card_restart_mode_defaults_to_full() {
+    use gsm_sip_bridge::cli::{CardSubcommand, Commands};
+
+    let args = vec!["gsm-sip-bridge", "card", "restart", "--slot", "2"];
+    let cli = Cli::try_parse_from(args).unwrap();
+    let Some(Commands::Card(card_args)) = cli.command else {
+        panic!("expected a Card subcommand");
+    };
+    let CardSubcommand::Restart { slot, mode } = card_args.subcommand else {
+        panic!("expected the Restart subcommand");
+    };
+    assert_eq!(slot, 2);
+    assert_eq!(mode, "full");
+}
+
+#[test]
+fn test_card_restart_accepts_an_explicit_radio_mode() {
+    use gsm_sip_bridge::cli::{CardSubcommand, Commands};
+
+    let args = vec![
+        "gsm-sip-bridge",
+        "card",
+        "restart",
+        "--slot",
+        "0",
+        "--mode",
+        "radio",
+    ];
+    let cli = Cli::try_parse_from(args).unwrap();
+    let Some(Commands::Card(card_args)) = cli.command else {
+        panic!("expected a Card subcommand");
+    };
+    let CardSubcommand::Restart { mode, .. } = card_args.subcommand else {
+        panic!("expected the Restart subcommand");
+    };
+    assert_eq!(mode, "radio");
+}
