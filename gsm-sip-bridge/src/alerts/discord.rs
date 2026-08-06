@@ -188,5 +188,6 @@ fn category_title(category: AlertCategory) -> &'static str {
         AlertCategory::RegistrationLoss => "IMS/SIP Registration Loss",
         AlertCategory::TunnelFailure => "VoWiFi Tunnel Failure",
         AlertCategory::MissedCall => "Missed Call",
+        AlertCategory::LineDiscoveryFailed => "VoWiFi Line Discovery Failed",
     }
 }

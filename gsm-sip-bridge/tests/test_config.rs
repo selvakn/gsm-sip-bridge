@@ -177,6 +177,7 @@ discord_webhook_url = "env:TEST_ALERTS_LEGACY_WEBHOOK"
     assert!(!cfg.alerts.registration_loss.enabled);
     assert!(!cfg.alerts.tunnel_failure.enabled);
     assert!(!cfg.alerts.missed_call.enabled);
+    assert!(!cfg.alerts.line_discovery_failed.enabled);
     assert_eq!(
         cfg.alerts
             .module_lifecycle_thresholds
@@ -263,6 +264,40 @@ unhealthy_sec = 120
     assert!(cfg.alerts.tunnel_failure.webhook_url_override.is_none());
     assert_eq!(cfg.alerts.tunnel_failure_thresholds.unhealthy_sec, 120);
     assert!(!cfg.alerts.registration_loss.enabled);
+}
+
+/// specs/027-discover-retry-health: `[alerts.line_discovery_failed]` follows
+/// the same enable + optional webhook-override shape as `module_lifecycle`,
+/// with no threshold field of its own (the retry window is a fixed constant,
+/// not user-configured — see `RawAlerts::line_discovery_failed`'s doc
+/// comment).
+#[test]
+fn test_alerts_line_discovery_failed_enable_and_webhook_override() {
+    std::env::set_var("TEST_ALERTS_LDF_PASSWORD", "p");
+
+    let config = r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_ALERTS_LDF_PASSWORD"
+
+[alerts.line_discovery_failed]
+enabled = true
+discord_webhook_url = "https://discord.com/api/webhooks/line-discovery-failed"
+"#;
+
+    let f = write_config(config);
+    let cfg = load_config(f.path()).unwrap();
+
+    assert!(cfg.alerts.line_discovery_failed.enabled);
+    assert_eq!(
+        cfg.alerts
+            .line_discovery_failed
+            .webhook_url_override
+            .as_ref()
+            .map(|s| s.expose_secret().as_str()),
+        Some("https://discord.com/api/webhooks/line-discovery-failed")
+    );
 }
 
 /// An out-of-range threshold falls back to the default rather than failing

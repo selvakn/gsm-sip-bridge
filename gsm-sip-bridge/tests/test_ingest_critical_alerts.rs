@@ -78,6 +78,10 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
                 enabled: false,
                 webhook_url_override: None,
             },
+            line_discovery_failed: CategoryAlertConfig {
+                enabled: false,
+                webhook_url_override: None,
+            },
             module_lifecycle_thresholds: ModuleLifecycleThresholds {
                 at_worker_unresponsive_sec: 60,
             },

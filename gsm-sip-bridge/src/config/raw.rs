@@ -343,6 +343,12 @@ section! {
         pub registration_loss: Option<RawUnhealthyCategory>,
         pub tunnel_failure: Option<RawUnhealthyCategory>,
         pub missed_call: Option<RawAlertCategory>,
+        /// specs/027-discover-retry-health: no threshold field — this
+        /// category's "threshold" is the retry loop's own bounded window
+        /// (`supervise::orchestrate::DISCOVER_RETRY_WINDOW`), not a
+        /// continuously-reported unhealthy-duration like
+        /// `RawUnhealthyCategory`'s `unhealthy_sec`.
+        pub line_discovery_failed: Option<RawAlertCategory>,
     }
 }
 
@@ -587,6 +593,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("alerts.module_lifecycle", RawModuleLifecycle::KEYS),
         ("alerts.registration_loss", RawUnhealthyCategory::KEYS),
         ("alerts.tunnel_failure", RawUnhealthyCategory::KEYS),
+        ("alerts.line_discovery_failed", RawAlertCategory::KEYS),
         ("vowifi", RawVowifi::KEYS),
         ("vowifi.line", RawVowifiLine::KEYS),
         ("volte", RawVolte::KEYS),

@@ -4,26 +4,29 @@ New surfaces, additive to the existing metrics scrape and Discord alert contract
 (`specs/005-observability-metrics`, `specs/022-discord-critical-alerts`) — nothing existing changes
 shape.
 
-## Metric: `gsm_sip_bridge_vowifi_line_discovery_failed`
+## Metric: `gsm_sip_bridge_critical_event_active{category="line_discovery_failed"}` (reused, not new)
+
+Implementation-time simplification: rather than a bespoke gauge, this reuses the metric
+`alerts::dispatch()` already maintains for every ongoing-health alert category:
 
 ```
-# HELP gsm_sip_bridge_vowifi_line_discovery_failed 1 if this configured VoWiFi/VoLTE line failed to be discovered after retries, 0 otherwise
-# TYPE gsm_sip_bridge_vowifi_line_discovery_failed gauge
-gsm_sip_bridge_vowifi_line_discovery_failed{module="<identifier>"} 1
+# HELP gsm_sip_bridge_critical_event_active 1 while a critical-event category is in its alerted unhealthy state for this module/line
+# TYPE gsm_sip_bridge_critical_event_active gauge
+gsm_sip_bridge_critical_event_active{category="line_discovery_failed",module="<identifier>"} 1
 ```
 
 - `module` label: same identifier as the corresponding `FailedLine.card_id` /
-  `vowifi-status` "Configured line \<identifier\>" output — the configured `modem_port` path,
-  `modem_serial`, or synthetic `pcscN` id.
-- Value `1` once the line's retry window elapses without success; reset to `0` (or the series
-  simply stops being reported as `1` — implementation detail for `/speckit-tasks`) if the line
-  later resolves within the same process lifetime (FR-011).
-- Set directly by the startup retry loop (`supervise::orchestrate`), not via the `AgentReport`
-  ingestion path other `vowifi_*` gauges use — see `research.md` R5 for why (no agent process
-  exists for a line that was never discovered).
-- Absent entirely for a line that resolved on its first discovery pass (no series with
-  `module="<that line>"` at all) — matches how `VOWIFI_REGISTERED`/`VOWIFI_TUNNEL_UP` only ever
-  have series for lines that exist.
+  `vowifi-status` "Configured line \<identifier\>" output — the configured `modem_port` path or
+  `modem_serial`.
+- Value `1` once the line's retry window elapses without success (the `Failure` event fires);
+  `0` once the line later resolves within the same process lifetime and the paired `Recovered`
+  event fires (FR-011) — this is the exact same mechanism `registration_loss`/`tunnel_failure`
+  already use, just a new `category` label value alongside theirs.
+- Set by `alerts::dispatch()` itself (via `AlertContext::fire`, called from the retry loop), not
+  via the `AgentReport` ingestion path the `vowifi_*` gauges use — see `research.md` R5 for why
+  (no agent process exists for a line that was never discovered).
+- Absent entirely for a line that resolved on its first discovery pass, or whose category is
+  disabled — no series is ever written for it.
 
 ## Discord alert: `line_discovery_failed` category
 

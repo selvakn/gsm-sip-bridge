@@ -342,35 +342,43 @@ fn start_vowifi_subsystem(
     Ok(())
 }
 
-/// specs/027-discover-retry-health US1: only ever called when the first
+/// specs/027-discover-retry-health US1/US3: only ever called when the first
 /// `discover` pass resolved zero VoWiFi lines (so nothing has started —
 /// `start_vowifi_subsystem` was never called this run, per `run`'s only call
 /// site for this function). Background thread that re-runs `discover` on
-/// `DISCOVER_RETRY_POLL_INTERVAL` for as long as any configured override
-/// (a `modem_port`/`modem_serial` line) is still missing, up to
-/// `DISCOVER_RETRY_WINDOW` per override:
+/// `DISCOVER_RETRY_POLL_INTERVAL` for as long as any configured override (a
+/// `modem_port`/`modem_serial` line) is still unresolved:
 ///
-/// - As soon as any override resolves, `start_vowifi_subsystem` runs once
-///   with whatever the resolution now contains — exactly the normal startup
-///   path, just delayed. From that point on this function stops re-running
-///   `discover` (deliberately: hot-adding a *further* late line to an
-///   already-started charon isn't safe — see `start_vowifi_subsystem`'s doc
-///   comment and R3 in research.md) but keeps tracking any override that's
-///   *still* missing purely so its own window can still elapse and alert.
-/// - An override whose window elapses without resolving is dropped from
-///   tracking; `discover` itself already wrote its terminal `not_found`
-///   entry to the resolution file on the very first pass (Foundational
-///   phase), so there's nothing further to persist here.
+/// - `DISCOVER_RETRY_WINDOW` governs only *when the one-time `Failure`
+///   alert fires* for an override, not how long this function keeps
+///   watching it — a spec edge case (spec.md) requires a line to still be
+///   able to recover, with a paired `Recovered` alert, even after it was
+///   already declared failed. Since re-scanning costs one `discover`
+///   subprocess + file read per tick, watching indefinitely is cheap; only
+///   *starting* the subsystem has a real safety window (see below).
+/// - As soon as *any* override resolves, `start_vowifi_subsystem` runs once
+///   with whatever the resolution now contains (including an override that
+///   resolved only after its own alert already fired — that gets its
+///   `Recovered` notice here) — exactly the normal startup path, just
+///   delayed. From that point on this function stops entirely: hot-adding a
+///   *further* late line to an already-started charon isn't safe (see
+///   `start_vowifi_subsystem`'s doc comment and R3 in research.md), so any
+///   override still unresolved at that instant is left exactly as it is —
+///   covered by Foundational's immediate `not_found` detection and,  if its
+///   own alert already fired, by that alert — but not retried further.
 ///
 /// Pure decision core of one retry tick, kept separate from
 /// `spawn_discover_retry`'s threading/file-IO so it's testable without real
 /// sleeping: given which of `pending`'s identifiers are still missing after
-/// a fresh `discover` pass and the current time, returns
-/// `(newly_resolved, newly_expired)`. An identifier that resolved this tick
-/// is reported as resolved even if its deadline also happens to have passed
-/// — resolving always wins over expiring.
+/// a fresh `discover` pass, which have already had a `Failure` alert fired
+/// (`alerted`), and the current time, returns `(newly_resolved,
+/// newly_expired)`. An identifier that resolved this tick is reported as
+/// resolved even if its deadline also happens to have passed — resolving
+/// always wins over expiring. An identifier already in `alerted` is never
+/// reported as newly-expired again (the alert already fired once).
 fn discover_retry_tick(
     pending: &std::collections::HashMap<String, std::time::Instant>,
+    alerted: &std::collections::HashSet<String>,
     still_missing: &std::collections::HashSet<String>,
     now: std::time::Instant,
 ) -> (Vec<String>, Vec<String>) {
@@ -381,15 +389,14 @@ fn discover_retry_tick(
         .collect();
     let expired: Vec<String> = pending
         .iter()
-        .filter(|(id, deadline)| !resolved.contains(id) && now >= **deadline)
+        .filter(|(id, deadline)| {
+            !resolved.contains(id) && now >= **deadline && !alerted.contains(id.as_str())
+        })
         .map(|(id, _)| id.clone())
         .collect();
     (resolved, expired)
 }
 
-/// A no-op if the first pass's resolution file has no `not_found` entries
-/// to retry (e.g. `[vowifi].enabled` but zero lines configured at all).
-#[allow(clippy::too_many_arguments)]
 fn spawn_discover_retry(
     runner: &Arc<dyn CommandRunner>,
     bin: &str,
@@ -421,7 +428,11 @@ fn spawn_discover_retry(
     let shutting_down = Arc::clone(shutting_down);
     let alert_ctx = alert_ctx.cloned();
     std::thread::spawn(move || {
-        let mut subsystem_started = false;
+        // Ids that already had a `Failure` alert dispatched for them — never
+        // removed from `pending` on expiry (only on resolve), so a later
+        // tick can still notice recovery and pair it with a `Recovered`
+        // alert (`alerted.remove` below).
+        let mut alerted: std::collections::HashSet<String> = std::collections::HashSet::new();
         while !pending.is_empty() {
             if *shutting_down.read().unwrap() {
                 return;
@@ -431,75 +442,88 @@ fn spawn_discover_retry(
                 return;
             }
 
-            if !subsystem_started {
-                match runner.run(&[&bin, "--config", &config_path_str, "discover"]) {
-                    Ok(o) if o.status.success() => {}
-                    _ => {
-                        eprintln!(
-                            "[supervise] line discovery: retry re-run of 'discover' failed; trying again in {DISCOVER_RETRY_POLL_INTERVAL:?}"
-                        );
-                    }
+            match runner.run(&[&bin, "--config", &config_path_str, "discover"]) {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    eprintln!(
+                        "[supervise] line discovery: retry re-run of 'discover' failed; trying again in {DISCOVER_RETRY_POLL_INTERVAL:?}"
+                    );
+                    continue;
                 }
-                if let Ok(resolution) = crate::vowifi::discovery::read_line_resolution(&lines_file)
-                {
-                    let still_missing: std::collections::HashSet<String> = resolution
-                        .failed
-                        .iter()
-                        .filter(|f| f.reason == "not_found")
-                        .map(|f| f.card_id.clone())
-                        .collect();
-                    let (resolved_now, expired_now) =
-                        discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
-                    for id in &expired_now {
-                        pending.remove(id);
-                        println!(
-                            "[supervise] line discovery: configured line {id} still not found after {DISCOVER_RETRY_WINDOW:?} — giving up retrying it for this run"
-                        );
-                    }
-                    if !resolved_now.is_empty() {
-                        println!(
-                            "[supervise] line discovery: {} previously-missing configured line(s) now found ({}) — starting the VoWiFi subsystem",
-                            resolved_now.len(),
-                            resolved_now.join(", ")
-                        );
-                        if let Err(msg) = start_vowifi_subsystem(
-                            &resolution.lines,
-                            &runner,
-                            &bin,
-                            &config_path_str,
-                            &config,
-                            &started,
-                            &shutting_down,
-                            alert_ctx.as_ref(),
-                        ) {
-                            eprintln!(
-                                "[supervise] FATAL: retried VoWiFi line(s) found but failed to start: {msg}"
-                            );
-                        }
-                        subsystem_started = true;
-                        for id in &resolved_now {
-                            pending.remove(id);
-                        }
-                    }
+            }
+            let Ok(resolution) = crate::vowifi::discovery::read_line_resolution(&lines_file) else {
+                continue;
+            };
+            let still_missing: std::collections::HashSet<String> = resolution
+                .failed
+                .iter()
+                .filter(|f| f.reason == "not_found")
+                .map(|f| f.card_id.clone())
+                .collect();
+            let (resolved_now, newly_expired) = discover_retry_tick(
+                &pending,
+                &alerted,
+                &still_missing,
+                std::time::Instant::now(),
+            );
+
+            for id in &newly_expired {
+                println!(
+                    "[supervise] line discovery: configured line {id} still not found after {DISCOVER_RETRY_WINDOW:?} — alerting (still watching in case it recovers)"
+                );
+                alerted.insert(id.clone());
+                if let Some(ctx) = &alert_ctx {
+                    ctx.fire(alerts::CriticalEvent {
+                        category: alerts::AlertCategory::LineDiscoveryFailed,
+                        unit_id: Some(id.clone()),
+                        description: format!(
+                            "configured VoWiFi line {id} was not found after {DISCOVER_RETRY_WINDOW:?} of retrying discovery"
+                        ),
+                        at: chrono::Utc::now(),
+                        kind: alerts::CriticalEventKind::Failure,
+                    });
                 }
-            } else {
-                // The subsystem already started with whatever resolved
-                // earlier — no more re-scanning (see this function's doc
-                // comment), just wait out whatever's left purely so its
-                // deadline can still fire the alert in
-                // `discover_retry_tick`'s caller once it passes.
-                let now = std::time::Instant::now();
-                let expired: Vec<String> = pending
-                    .iter()
-                    .filter(|(_, deadline)| now >= **deadline)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in expired {
-                    pending.remove(&id);
-                    println!(
-                        "[supervise] line discovery: configured line {id} still not found after {DISCOVER_RETRY_WINDOW:?} — giving up retrying it for this run"
+            }
+
+            if !resolved_now.is_empty() {
+                println!(
+                    "[supervise] line discovery: {} previously-missing configured line(s) now found ({}) — starting the VoWiFi subsystem",
+                    resolved_now.len(),
+                    resolved_now.join(", ")
+                );
+                if let Err(msg) = start_vowifi_subsystem(
+                    &resolution.lines,
+                    &runner,
+                    &bin,
+                    &config_path_str,
+                    &config,
+                    &started,
+                    &shutting_down,
+                    alert_ctx.as_ref(),
+                ) {
+                    eprintln!(
+                        "[supervise] FATAL: retried VoWiFi line(s) found but failed to start: {msg}"
                     );
                 }
+                for id in &resolved_now {
+                    pending.remove(id);
+                    if alerted.remove(id) {
+                        if let Some(ctx) = &alert_ctx {
+                            ctx.fire(alerts::CriticalEvent {
+                                category: alerts::AlertCategory::LineDiscoveryFailed,
+                                unit_id: Some(id.clone()),
+                                description: format!(
+                                    "configured VoWiFi line {id} was found and started after previously being reported as not found"
+                                ),
+                                at: chrono::Utc::now(),
+                                kind: alerts::CriticalEventKind::Recovered,
+                            });
+                        }
+                    }
+                }
+                // Whatever's still in `pending` at this point can never be
+                // hot-added (charon just started) — stop watching entirely.
+                return;
             }
         }
     });
@@ -1541,9 +1565,14 @@ mod tests {
     fn discover_retry_tick_reports_an_identifier_missing_from_this_ticks_scan_as_resolved() {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let alerted = std::collections::HashSet::new();
         let still_missing = std::collections::HashSet::new();
-        let (resolved, expired) =
-            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        let (resolved, expired) = discover_retry_tick(
+            &pending,
+            &alerted,
+            &still_missing,
+            std::time::Instant::now(),
+        );
         assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
         assert!(expired.is_empty());
     }
@@ -1552,9 +1581,14 @@ mod tests {
     fn discover_retry_tick_reports_nothing_while_still_missing_and_within_the_window() {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let alerted = std::collections::HashSet::new();
         let still_missing = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
-        let (resolved, expired) =
-            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        let (resolved, expired) = discover_retry_tick(
+            &pending,
+            &alerted,
+            &still_missing,
+            std::time::Instant::now(),
+        );
         assert!(resolved.is_empty());
         assert!(expired.is_empty());
     }
@@ -1566,9 +1600,14 @@ mod tests {
         // wait for it.
         let deadline = std::time::Instant::now() - Duration::from_secs(1);
         let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let alerted = std::collections::HashSet::new();
         let still_missing = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
-        let (resolved, expired) =
-            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        let (resolved, expired) = discover_retry_tick(
+            &pending,
+            &alerted,
+            &still_missing,
+            std::time::Instant::now(),
+        );
         assert!(resolved.is_empty());
         assert_eq!(expired, vec!["/dev/ttyUSB3".to_string()]);
     }
@@ -1580,9 +1619,14 @@ mod tests {
         // resolved, not expired.
         let deadline = std::time::Instant::now() - Duration::from_secs(1);
         let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let alerted = std::collections::HashSet::new();
         let still_missing = std::collections::HashSet::new();
-        let (resolved, expired) =
-            discover_retry_tick(&pending, &still_missing, std::time::Instant::now());
+        let (resolved, expired) = discover_retry_tick(
+            &pending,
+            &alerted,
+            &still_missing,
+            std::time::Instant::now(),
+        );
         assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
         assert!(expired.is_empty());
     }
@@ -1597,8 +1641,53 @@ mod tests {
             ("/dev/ttyUSB3".to_string(), now + Duration::from_secs(60)),
             ("/dev/ttyUSB5".to_string(), now + Duration::from_secs(60)),
         ]);
+        let alerted = std::collections::HashSet::new();
         let still_missing = std::collections::HashSet::from(["/dev/ttyUSB5".to_string()]);
-        let (resolved, expired) = discover_retry_tick(&pending, &still_missing, now);
+        let (resolved, expired) = discover_retry_tick(&pending, &alerted, &still_missing, now);
+        assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
+        assert!(expired.is_empty());
+    }
+
+    /// specs/027-discover-retry-health FR-009/SC-004: once an identifier's
+    /// `Failure` alert has fired, later ticks must not report it as
+    /// newly-expired again — that would re-fire the alert every poll while
+    /// permanently stuck, exactly the noise `sim_alert_transition`'s own
+    /// `given_up_alerted` flag exists to prevent for a different category.
+    #[test]
+    fn discover_retry_tick_does_not_re_report_an_already_alerted_identifier_as_expired() {
+        let deadline = std::time::Instant::now() - Duration::from_secs(1);
+        let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let alerted = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
+        let still_missing = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
+        let (resolved, expired) = discover_retry_tick(
+            &pending,
+            &alerted,
+            &still_missing,
+            std::time::Instant::now(),
+        );
+        assert!(resolved.is_empty());
+        assert!(
+            expired.is_empty(),
+            "already-alerted identifiers must not re-expire every tick"
+        );
+    }
+
+    /// The edge case from spec.md: a line can still recover *after* its
+    /// `Failure` alert already fired — `discover_retry_tick` itself doesn't
+    /// know about alerting, but must still report it resolved so the
+    /// caller can pair a `Recovered` notice with it.
+    #[test]
+    fn discover_retry_tick_reports_an_already_alerted_identifier_as_resolved_once_it_recovers() {
+        let deadline = std::time::Instant::now() - Duration::from_secs(1);
+        let pending = std::collections::HashMap::from([("/dev/ttyUSB3".to_string(), deadline)]);
+        let alerted = std::collections::HashSet::from(["/dev/ttyUSB3".to_string()]);
+        let still_missing = std::collections::HashSet::new();
+        let (resolved, expired) = discover_retry_tick(
+            &pending,
+            &alerted,
+            &still_missing,
+            std::time::Instant::now(),
+        );
         assert_eq!(resolved, vec!["/dev/ttyUSB3".to_string()]);
         assert!(expired.is_empty());
     }

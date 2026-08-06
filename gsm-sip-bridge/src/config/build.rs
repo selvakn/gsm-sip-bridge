@@ -487,6 +487,7 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
         registration_loss,
         tunnel_failure,
         missed_call: category(raw.missed_call, false),
+        line_discovery_failed: category(raw.line_discovery_failed, false),
         module_lifecycle_thresholds,
         tunnel_failure_thresholds,
         registration_loss_thresholds,

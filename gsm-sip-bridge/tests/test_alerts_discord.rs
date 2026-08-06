@@ -35,6 +35,10 @@ fn enabled_alerts_config(default_webhook: &str) -> AlertsConfig {
             enabled: true,
             webhook_url_override: None,
         },
+        line_discovery_failed: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
         module_lifecycle_thresholds: Default::default(),
         tunnel_failure_thresholds: Default::default(),
         registration_loss_thresholds: Default::default(),
@@ -105,6 +109,104 @@ async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
             category: AlertCategory::RegistrationLoss,
             unit_id: Some("line0".to_string()),
             description: "unregistered for 300s".to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Failure,
+        },
+    )
+    .await;
+
+    server.verify().await;
+}
+
+/// specs/027-discover-retry-health T017/T018: a `LineDiscoveryFailed`
+/// `Failure` event, followed later by its paired `Recovered` event for the
+/// same identifier, both post — mirroring the existing `TunnelFailure`/
+/// `RegistrationLoss` failure-then-recovered pairing other categories
+/// already use — and drive the same `gsm_sip_bridge_critical_event_active`
+/// gauge every ongoing-health category already reports through (FR-012/
+/// SC-006: no bespoke metric needed, see data-model.md's revision note).
+#[tokio::test]
+async fn dispatch_posts_line_discovery_failed_and_its_recovery_pair() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
+    let identifier = "/dev/ttyUSB3-recovery-pair-test";
+
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::LineDiscoveryFailed,
+            unit_id: Some(identifier.to_string()),
+            description:
+                "configured VoWiFi line /dev/ttyUSB3 was not found after 3m of retrying discovery"
+                    .to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Failure,
+        },
+    )
+    .await;
+    assert_eq!(
+        gsm_sip_bridge::metrics::CRITICAL_EVENT_ACTIVE
+            .with_label_values(&["line_discovery_failed", identifier])
+            .get(),
+        1.0,
+        "gauge must be 1 once the Failure event is dispatched"
+    );
+
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::LineDiscoveryFailed,
+            unit_id: Some(identifier.to_string()),
+            description: "configured VoWiFi line /dev/ttyUSB3 was found and started after previously being reported as not found".to_string(),
+            at: Utc::now(),
+            kind: CriticalEventKind::Recovered,
+        },
+    )
+    .await;
+    assert_eq!(
+        gsm_sip_bridge::metrics::CRITICAL_EVENT_ACTIVE
+            .with_label_values(&["line_discovery_failed", identifier])
+            .get(),
+        0.0,
+        "gauge must clear back to 0 once the Recovered event is dispatched"
+    );
+
+    server.verify().await;
+}
+
+/// specs/027-discover-retry-health FR-010/SC-004: `line_discovery_failed`
+/// disabled makes zero HTTP calls, same as every other category.
+#[tokio::test]
+async fn dispatch_skips_disabled_line_discovery_failed_without_any_http_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let mut config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
+    config.line_discovery_failed.enabled = false;
+
+    dispatch(
+        &client,
+        &config,
+        CriticalEvent {
+            category: AlertCategory::LineDiscoveryFailed,
+            unit_id: Some("/dev/ttyUSB3".to_string()),
+            description: "configured VoWiFi line /dev/ttyUSB3 was not found".to_string(),
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },

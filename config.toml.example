@@ -64,6 +64,11 @@ unhealthy_sec = 300               # range: 30-3600
 # An inbound call that rang out unanswered (never bridged).
 enabled = false
 
+[alerts.line_discovery_failed]
+# An explicitly configured VoWiFi line (modem_port/modem_serial) never
+# resolved even after retrying discovery for it.
+enabled = false
+
 [scheduled_restart]
 # Preventive nightly card-restart cycle. The daemon walks every known slot in
 # ascending order and restarts each modem with a randomized gap between

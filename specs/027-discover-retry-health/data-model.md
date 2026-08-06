@@ -43,10 +43,14 @@ A new variant alongside `RegistrationLoss`/`TunnelFailure`/`Sms`/`ModuleLifecycl
 
 A single new duration setting — where exactly it lives (a new `[vowifi]`/`[discover]` key vs. a constant, and its default value) is an implementation detail for `/speckit-tasks` to place, not fixed here; the data model only requires that *some* bounded, on-the-order-of-minutes duration exists and is readable by `supervise::orchestrate`'s retry loop (per spec Assumptions).
 
-## New: `VOWIFI_LINE_DISCOVERY_FAILED` metric (`gsm-sip-bridge/src/metrics/mod.rs`)
+## Revised (implementation-time simplification): no new metric needed
 
-A `GaugeVec` alongside `VOWIFI_REGISTERED`/`VOWIFI_TUNNEL_UP`:
-
-- Name: `gsm_sip_bridge_vowifi_line_discovery_failed`
-- Labels: `["module"]` — using the same identifier as `FailedLine.card_id` above, consistent with every other per-line gauge's `module` label.
-- Value: `1` once an override's retry window has elapsed without success (terminal `not_found`), `0` if/when it later resolves (FR-011) — set directly by the retry loop (R5 in research.md; there is no agent process to report this one via `AgentReport`/`metrics::ingest`).
+`gsm-sip-bridge/src/alerts/mod.rs`'s `dispatch()` already sets a generic
+`CRITICAL_EVENT_ACTIVE{category, module}` gauge (`gsm_sip_bridge_critical_event_active`)
+to `1`/`0` for every `AlertCategory` in its `tracks_ongoing_health` list, driven directly
+by the `Failure`/`Recovered` events `AlertContext::fire` already dispatches. Adding
+`AlertCategory::LineDiscoveryFailed` to that list gets FR-012/SC-006 for free —
+`gsm_sip_bridge_critical_event_active{category="line_discovery_failed", module="<id>"}` —
+with no bespoke gauge, no new registration, and no second code path to keep in sync
+with the alert. The originally-planned standalone `VOWIFI_LINE_DISCOVERY_FAILED`
+gauge is dropped in favor of this reuse (Constitution Principle V).
