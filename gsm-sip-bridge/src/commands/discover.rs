@@ -67,7 +67,18 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
             &overrides,
             config.cs.enabled,
         );
-        let result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
+        let mut result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
+        // specs/027-discover-retry-health FR-001: a configured override
+        // that matched no probed device at all (never even enumerated on
+        // the USB bus) is invisible to `resolve_lines` — it only sees
+        // candidates that made it into `assignment.vowifi`. Merge those in
+        // too, so every `discover` pass — not just a future retry —
+        // reports a missing configured line immediately.
+        result
+            .failed
+            .extend(crate::vowifi::discovery::unmatched_overrides(
+                &overrides, &modems,
+            ));
         for failed in &result.failed {
             tracing::error!(
                 card_id = %failed.card_id,

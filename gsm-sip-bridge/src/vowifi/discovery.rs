@@ -12,6 +12,7 @@
 
 use crate::config::{VowifiConfig, VowifiLineOverride};
 use crate::line::resources::{self, shift_ipv4};
+use crate::line::Rejection;
 use crate::modules::discovery::ProbedModem;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -296,6 +297,47 @@ pub fn resolve_lines(assignment: &RoleAssignment, base: &VowifiConfig) -> LineTa
     }
 
     LineTableResult { lines, failed }
+}
+
+/// Configured modem overrides (`modem_port`/`modem_serial`) with no
+/// matching entry in `all_probed` — specs/027-discover-retry-health FR-001.
+///
+/// `resolve_lines`'s own `failed` list only ever reports on candidates that
+/// made it into `assignment.vowifi` (i.e. were probed *and* answered AT) —
+/// an override whose modem never enumerated on the USB bus at all is
+/// invisible to it. `all_probed` must be the full pre-role-assignment scan
+/// result (`scan_all_preferring`'s return value in `discover.rs`, before
+/// `RoleAssignment::from_probed` filters it), so a device that was seen but
+/// never got a working AT port still counts as "matched" here — that case
+/// already has its own `Rejection::NoAtPort`/SIM-status reason once it
+/// reaches `resolve_lines`; this function is only for "never seen at all".
+///
+/// `pcsc_reader` overrides are deliberately excluded: `scan_all_preferring`
+/// only ever scans USB modems, so it has no way to confirm or deny a PC/SC
+/// card reader's presence — that would need a distinct probe this feature
+/// doesn't add.
+pub fn unmatched_overrides(
+    overrides: &[VowifiLineOverride],
+    all_probed: &[ProbedModem],
+) -> Vec<FailedLine> {
+    overrides
+        .iter()
+        .filter(|o| !o.pcsc_reader)
+        .filter(|o| {
+            !all_probed.iter().any(|m| {
+                o.modem_serial.as_deref().is_some_and(|s| s == m.usb_serial)
+                    || o.modem_port.as_deref().is_some_and(|p| {
+                        m.at_port
+                            .as_deref()
+                            .is_some_and(|port| port == Path::new(p))
+                    })
+            })
+        })
+        .filter_map(|o| {
+            let identifier = o.modem_port.clone().or_else(|| o.modem_serial.clone())?;
+            Some(FailedLine::new(identifier, Rejection::NotFound.reason()))
+        })
+        .collect()
 }
 
 fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> ResolvedLine {
@@ -729,6 +771,67 @@ mod tests {
         let assignment = RoleAssignment::from_probed(&modems, &overrides, true);
         assert!(assignment.circuit_switched.is_empty());
         assert_eq!(assignment.vowifi.len(), 1);
+    }
+
+    #[test]
+    fn unmatched_overrides_flags_a_modem_port_absent_from_the_probed_list() {
+        let overrides = vec![VowifiLineOverride {
+            modem_port: Some("/dev/ttyUSB3".to_string()),
+            ..Default::default()
+        }];
+        let failed = unmatched_overrides(&overrides, &[]);
+        assert_eq!(failed, vec![FailedLine::new("/dev/ttyUSB3", "not_found")]);
+    }
+
+    #[test]
+    fn unmatched_overrides_flags_a_modem_serial_absent_from_the_probed_list() {
+        let overrides = vec![VowifiLineOverride {
+            modem_serial: Some("ec20-AAAAAA".to_string()),
+            ..Default::default()
+        }];
+        let failed = unmatched_overrides(&overrides, &[]);
+        assert_eq!(failed, vec![FailedLine::new("ec20-AAAAAA", "not_found")]);
+    }
+
+    #[test]
+    fn unmatched_overrides_matches_by_serial_even_without_a_working_at_port() {
+        // A device pinned by serial is "seen" the moment it's on the USB
+        // bus at all — usb_serial comes from sysfs, independent of whether
+        // any AT-capable interface was found. Port-based matching can't
+        // make this same claim (there's no port to compare against a
+        // device that never got one), so serial is the identity that
+        // survives a device answering nothing at all.
+        let overrides = vec![VowifiLineOverride {
+            modem_serial: Some("ec20-AAAAAA".to_string()),
+            ..Default::default()
+        }];
+        let probed = vec![unusable_modem("ec20-AAAAAA", None)];
+        assert!(unmatched_overrides(&overrides, &probed).is_empty());
+    }
+
+    #[test]
+    fn unmatched_overrides_matches_by_at_port_not_by_card_id() {
+        let overrides = vec![VowifiLineOverride {
+            modem_port: Some("/dev/ttyUSB3".to_string()),
+            ..Default::default()
+        }];
+        let probed = vec![ready_modem(
+            "ec20-AAAAAA",
+            "/dev/ttyUSB3",
+            false,
+            "404011111111111",
+        )];
+        assert!(unmatched_overrides(&overrides, &probed).is_empty());
+    }
+
+    #[test]
+    fn unmatched_overrides_excludes_pcsc_reader_lines() {
+        let overrides = vec![VowifiLineOverride {
+            pcsc_reader: true,
+            imsi_override: Some("404011111111111".to_string()),
+            ..Default::default()
+        }];
+        assert!(unmatched_overrides(&overrides, &[]).is_empty());
     }
 
     #[test]

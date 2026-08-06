@@ -59,6 +59,12 @@ pub enum Rejection {
     SimUnreadable(String),
     NoAtPort,
     MaxLinesExceeded,
+    /// A configured override (`modem_port`/`modem_serial`/`pcsc_reader`)
+    /// matched no probed device on the most recent discovery pass —
+    /// distinct from `NoAtPort` (device found, nothing answers AT) and the
+    /// `Sim*` variants (device found, SIM problem). specs/027-discover-
+    /// retry-health.
+    NotFound,
 }
 
 impl Rejection {
@@ -69,6 +75,7 @@ impl Rejection {
             Rejection::SimUnreadable(msg) => format!("sim_unreadable: {msg}"),
             Rejection::NoAtPort => "no_at_port".to_string(),
             Rejection::MaxLinesExceeded => "max_lines_exceeded".to_string(),
+            Rejection::NotFound => "not_found".to_string(),
         }
     }
 }
@@ -351,6 +358,11 @@ mod tests {
                 FailedLine::new("noprobe", "no_at_port"),
             ]
         );
+    }
+
+    #[test]
+    fn not_found_reason_is_stable() {
+        assert_eq!(Rejection::NotFound.reason(), "not_found");
     }
 
     /// The one genuine behavioural difference between the two subsystems,
