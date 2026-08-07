@@ -42,6 +42,20 @@ fn refresh_agent_liveness() {
                     .with_label_values(&[&state.module_id])
                     .set(0.0);
             }
+            // specs/028: the Gm-connection gauge is reported by whichever
+            // agent runs the dispatch loop — `Ims` (VoWiFi) and `Volte` — and
+            // is shared across transports keyed by `module`. A stale line must
+            // not keep reading "connection up", the exact stale-healthy state
+            // the other gauges above are zeroed to avoid.
+            if matches!(
+                state.agent,
+                crate::control::protocol::AgentKind::Ims
+                    | crate::control::protocol::AgentKind::Volte
+            ) {
+                super::VOWIFI_GM_CONNECTION_UP
+                    .with_label_values(&[&state.module_id])
+                    .set(0.0);
+            }
         }
     }
 }
