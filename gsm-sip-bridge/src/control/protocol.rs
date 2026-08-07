@@ -192,6 +192,11 @@ pub enum OutboundAttemptOutcome {
     RefusedInvalidDestination,
     RefusedNetworkFailure,
     Unanswered,
+    /// The originating caller hung up before the call connected — distinct
+    /// from `Unanswered` ("the destination never picked up") and from
+    /// `RefusedNetworkFailure` (specs/029-interruptible-origination-wait,
+    /// FR-018). Only reachable once the origination wait is interruptible.
+    CallerAbandoned,
 }
 
 impl OutboundAttemptOutcome {
@@ -202,6 +207,7 @@ impl OutboundAttemptOutcome {
             OutboundAttemptOutcome::RefusedInvalidDestination => "refused_invalid_destination",
             OutboundAttemptOutcome::RefusedNetworkFailure => "refused_network_failure",
             OutboundAttemptOutcome::Unanswered => "unanswered",
+            OutboundAttemptOutcome::CallerAbandoned => "caller_abandoned",
         }
     }
 }
