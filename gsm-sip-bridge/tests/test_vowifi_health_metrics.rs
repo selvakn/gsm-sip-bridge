@@ -56,10 +56,12 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
         gsm_sip_bridge::store::Transport::Vowifi,
     );
 
-    // Registration success brings both gauges up.
+    // Registration success brings the gauges up, including the Gm-connection
+    // gauge (specs/028).
     obs.report_registration_attempt(RegistrationStatus::Success);
     obs.set_registered(true);
     obs.set_tunnel_up(true);
+    obs.set_gm_connection_up(true);
     wait_for(
         || {
             metrics::VOWIFI_REGISTERED
@@ -67,6 +69,10 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
                 .get()
                 == 1.0
                 && metrics::VOWIFI_TUNNEL_UP
+                    .with_label_values(&[&module_id])
+                    .get()
+                    == 1.0
+                && metrics::VOWIFI_GM_CONNECTION_UP
                     .with_label_values(&[&module_id])
                     .get()
                     == 1.0
@@ -79,10 +85,12 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
         .get();
     assert!(success_count >= 1.0);
 
-    // A registration failure brings both back down and counts the attempt.
+    // A registration failure brings the gauges back down, and a Gm-connection
+    // drop reads 0 on its own gauge while reconnecting.
     obs.report_registration_attempt(RegistrationStatus::AuthFailed);
     obs.set_registered(false);
     obs.set_tunnel_up(false);
+    obs.set_gm_connection_up(false);
     wait_for(
         || {
             metrics::VOWIFI_REGISTERED
@@ -90,6 +98,10 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
                 .get()
                 == 0.0
                 && metrics::VOWIFI_TUNNEL_UP
+                    .with_label_values(&[&module_id])
+                    .get()
+                    == 0.0
+                && metrics::VOWIFI_GM_CONNECTION_UP
                     .with_label_values(&[&module_id])
                     .get()
                     == 0.0
@@ -119,6 +131,55 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
                 .with_label_values(&[&module_id, "ring_timeout"])
                 .get()
                 == ring_timeout_before + 1.0
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    handle.abort();
+}
+
+/// specs/028: the Gm-connection gauge is shared across transports, keyed by
+/// `module`, so a VoLTE-kind agent writes the same `VOWIFI_GM_CONNECTION_UP`
+/// gauge under its own module label (the `vowifi_` prefix is retained for
+/// VoLTE by design — see the metric's doc).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gm_connection_gauge_is_written_for_a_volte_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir
+        .path()
+        .join("gm-volte-test.sock")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = start_control_server(&socket_path, cmd_tx, shutdown_rx).await;
+
+    let module_id = "test-gm-volte".to_string();
+    let reporter = Reporter::spawn(
+        socket_path.clone(),
+        AgentKind::Volte,
+        module_id.clone(),
+        Duration::from_millis(50),
+    );
+    let obs = AgentObservability::new(
+        reporter,
+        module_id.clone(),
+        None,
+        "sip:100@pbx:5060".to_string(),
+        gsm_sip_bridge::store::Transport::Volte,
+    );
+
+    obs.set_gm_connection_up(true);
+    wait_for(
+        || {
+            metrics::VOWIFI_GM_CONNECTION_UP
+                .with_label_values(&[&module_id])
+                .get()
+                == 1.0
         },
         Duration::from_secs(5),
     )

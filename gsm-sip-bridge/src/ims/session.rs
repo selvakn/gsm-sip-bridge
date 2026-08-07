@@ -143,6 +143,31 @@ pub(crate) fn restart_client_reader(
     spawn_client_reader(session, inbound.tx.clone())
 }
 
+/// Restarts just the Gm protected-server-port listener after its accept loop
+/// dies (`GmServer::is_alive` went false), mirroring `restart_client_reader`
+/// for the other half of the association. Replaces `inbound._server`
+/// wholesale, feeding the replacement into the same `tx` queue.
+///
+/// The port is free to rebind by the time this runs: the old listener's
+/// `TcpListener` was moved into its accept thread, so that thread's fatal-exit
+/// `return` dropped it. Reuses the still-live Gm SA on the same `port-s` the
+/// registration negotiated (like `restart_client_reader`, this is not a
+/// renewal — no fresh SA). Returns `Err` if there is no Gm SA at all, since
+/// then there is no server port to rebind. See specs/028-gm-tcp-reconnect R4.
+pub(crate) fn restart_gm_server(
+    session: &super::RegisteredSession,
+    inbound: &mut Inbound,
+) -> BridgeResult<()> {
+    let addr = session.gm_server_addr().ok_or_else(|| {
+        BridgeError::Ims("no Gm SA on this registration; there is no server port to restart".into())
+    })?;
+    // Drop the old server first so its `stop` flag is set and the dead accept
+    // thread is not left referenced, then bind the replacement.
+    inbound._server = None;
+    inbound._server = Some(spawn_gm_server(addr, session.use_tcp, inbound.tx.clone())?);
+    Ok(())
+}
+
 pub(crate) fn to_unix(t: SystemTime) -> Option<u64> {
     t.duration_since(std::time::UNIX_EPOCH)
         .ok()

@@ -120,6 +120,12 @@ pub struct AgentState {
     pub registered: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tunnel_up: Option<bool>,
+    /// Whether this line's Gm signaling connection is up (specs/028). `None`
+    /// means "this agent does not report the signal" — an older peer, or a
+    /// report carrying only other fields — and the ingest side leaves the
+    /// gauge unchanged rather than reading absent as down (data-model.md §1).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gm_connection_up: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pbx_registered: Option<bool>,
     /// SIP-server mode only: how many IP phones the registrar this agent hosts

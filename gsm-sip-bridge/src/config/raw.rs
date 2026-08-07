@@ -349,6 +349,10 @@ section! {
         /// continuously-reported unhealthy-duration like
         /// `RawUnhealthyCategory`'s `unhealthy_sec`.
         pub line_discovery_failed: Option<RawAlertCategory>,
+        /// specs/028-gm-tcp-reconnect: a continuously-reported
+        /// unhealthy-duration like registration/tunnel loss, so it carries an
+        /// `unhealthy_sec` threshold (`RawUnhealthyCategory`).
+        pub gm_connection_lost: Option<RawUnhealthyCategory>,
     }
 }
 
@@ -594,6 +598,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("alerts.registration_loss", RawUnhealthyCategory::KEYS),
         ("alerts.tunnel_failure", RawUnhealthyCategory::KEYS),
         ("alerts.line_discovery_failed", RawAlertCategory::KEYS),
+        ("alerts.gm_connection_lost", RawUnhealthyCategory::KEYS),
         ("vowifi", RawVowifi::KEYS),
         ("vowifi.line", RawVowifiLine::KEYS),
         ("volte", RawVolte::KEYS),

@@ -504,6 +504,52 @@ pub fn build_register(req: &RegisterRequest) -> String {
     msg
 }
 
+/// The pieces needed to build an out-of-dialog `OPTIONS` keepalive on the Gm
+/// client connection — a liveness probe the P-CSCF is obliged to answer
+/// (RFC 3261 §11). Sent fire-and-forget via `SipTransport::send`; the response
+/// is correlated back by `CSeq` at the dispatch loop's existing response arm.
+/// See specs/028-gm-tcp-reconnect.
+pub struct OptionsRequest<'a> {
+    /// Where the probe is addressed — the registration's realm/P-CSCF. This is
+    /// a keepalive, not a dialog-forming request, so it targets the registrar
+    /// rather than any peer UA.
+    pub request_uri: &'a str,
+    pub local_addr: SocketAddr,
+    /// "TCP" or "UDP".
+    pub transport: &'a str,
+    pub public_uri: &'a str,
+    pub from_tag: &'a str,
+    pub call_id: &'a str,
+    /// The correlation key: the response echoes this in its `CSeq`, which is
+    /// how the dispatch loop matches an answer to the ping it sent.
+    pub cseq: u32,
+    pub branch: &'a str,
+}
+
+/// Build an out-of-dialog `OPTIONS` request used as a Gm-connection keepalive.
+/// The `To` header carries no tag (out-of-dialog), and there is no body.
+pub fn build_options(req: &OptionsRequest) -> String {
+    let via_addr = format_sip_addr(req.local_addr);
+    format!(
+        "OPTIONS sip:{request_uri} SIP/2.0\r\n\
+         Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:{public}>;tag={from_tag}\r\n\
+         To: <sip:{public}>\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} OPTIONS\r\n\
+         Content-Length: 0\r\n\r\n",
+        request_uri = req.request_uri,
+        transport = req.transport,
+        via_addr = via_addr,
+        branch = req.branch,
+        public = req.public_uri,
+        from_tag = req.from_tag,
+        call_id = req.call_id,
+        cseq = req.cseq,
+    )
+}
+
 enum Socket {
     Udp(UdpSocket),
     Tcp(TcpStream),
@@ -936,11 +982,27 @@ impl SipTransport {
 /// loop (and, once their peers hang up, the per-connection reader threads).
 pub struct GmServer {
     stop: Arc<AtomicBool>,
+    /// Reports whether the accept loop is still running. Distinct from `stop`:
+    /// `stop` is an instruction *to* the loop (set by `Drop`), `alive` is a
+    /// report *from* it — the accept loop clears it on its own fatal-error
+    /// exit. Conflating the two would make a deliberate shutdown (which always
+    /// sets `stop`) indistinguishable from a crash, so a clean re-registration
+    /// would look like a listener death. See specs/028-gm-tcp-reconnect R4.
+    alive: Arc<AtomicBool>,
 }
 
 impl Drop for GmServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl GmServer {
+    /// Whether the accept loop is still running. `false` once it has taken its
+    /// fatal-error exit — the symptom of the Gm server port dying underneath a
+    /// registration, which is otherwise invisible to the rest of the process.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
@@ -962,13 +1024,25 @@ pub fn spawn_gm_server(
     tx: mpsc::Sender<(SipMessage, SipSink)>,
 ) -> BridgeResult<GmServer> {
     let stop = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
     if use_tcp {
-        spawn_gm_tcp_server(local, tx, stop.clone())?;
+        spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone())?;
     } else {
-        spawn_gm_udp_server(local, tx, stop.clone())?;
+        spawn_gm_udp_server(local, tx, stop.clone(), alive.clone())?;
     }
     tracing::info!(local = %local, transport = if use_tcp { "TCP" } else { "UDP" }, "listening on the Gm protected server port for network-initiated requests");
-    Ok(GmServer { stop })
+    Ok(GmServer { stop, alive })
+}
+
+/// Whether an `accept()`/`recv()` error on the Gm server socket is a routine
+/// poll-timeout (the read timeout firing so the loop can check `stop`) rather
+/// than a fatal condition. A fatal error takes the loop's exit path, which
+/// clears `GmServer::alive` — see specs/028-gm-tcp-reconnect R4.
+fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn bind_gm_socket(
@@ -1000,6 +1074,7 @@ fn spawn_gm_tcp_server(
     local: SocketAddr,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 ) -> BridgeResult<()> {
     let socket = bind_gm_socket(local, socket2::Type::STREAM, ACCEPT_POLL_INTERVAL)?;
     socket
@@ -1016,13 +1091,10 @@ fn spawn_gm_tcp_server(
                     let stop = stop.clone();
                     std::thread::spawn(move || serve_gm_connection(stream, peer, tx, stop));
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
+                Err(e) if is_transient_accept_error(e.kind()) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "Gm server accept failed; stopping");
+                    alive.store(false, Ordering::Relaxed);
                     return;
                 }
             }
@@ -1071,6 +1143,7 @@ fn spawn_gm_udp_server(
     local: SocketAddr,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 ) -> BridgeResult<()> {
     let socket = bind_gm_socket(local, socket2::Type::DGRAM, ACCEPT_POLL_INTERVAL)?;
     let socket: UdpSocket = socket.into();
@@ -1080,16 +1153,10 @@ fn spawn_gm_udp_server(
         while !stop.load(Ordering::Relaxed) {
             let (n, peer) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    continue
-                }
+                Err(e) if is_transient_accept_error(e.kind()) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "Gm server recv failed; stopping");
+                    alive.store(false, Ordering::Relaxed);
                     return;
                 }
             };
@@ -1212,6 +1279,87 @@ pub fn extract_challenge(params: &[(String, String)]) -> BridgeResult<DigestChal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gm_server_reports_alive_and_delivers_a_real_message() {
+        use std::io::Write;
+        // A real ephemeral loopback port (bind :0, read the port, release it).
+        let probe = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (tx, rx) = mpsc::channel();
+        let server = spawn_gm_server(addr, true, tx).unwrap();
+        assert!(server.is_alive(), "a freshly spawned server is alive");
+
+        // A real client connects and sends a complete SIP request.
+        let mut client = TcpStream::connect(addr).unwrap();
+        let req = "OPTIONS sip:x SIP/2.0\r\n\
+                   Via: SIP/2.0/TCP 1.2.3.4:5060\r\n\
+                   CSeq: 1 OPTIONS\r\n\
+                   Content-Length: 0\r\n\r\n";
+        client.write_all(req.as_bytes()).unwrap();
+
+        // The accept loop delivered it — proof the loop is actually running.
+        let (msg, _sink) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match msg {
+            SipMessage::Request(r) => assert_eq!(r.method, "OPTIONS"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+        // Serving a connection is normal operation, not a crash.
+        assert!(server.is_alive());
+
+        // A normal Drop stops the loop without ever reporting a crash: `alive`
+        // reflects the loop's own fatal exit, which a clean shutdown never
+        // takes (it exits via `stop`). This is the stop/alive distinction the
+        // struct doc calls out — a clean re-registration must not look like a
+        // listener death.
+        let alive_flag = server.alive.clone();
+        drop(server);
+        assert!(
+            alive_flag.load(Ordering::Relaxed),
+            "a clean shutdown must not report the loop as crashed"
+        );
+    }
+
+    #[test]
+    fn transient_accept_errors_are_only_poll_timeouts() {
+        use std::io::ErrorKind;
+        // The read-timeout firing so the loop can check `stop` — routine.
+        assert!(is_transient_accept_error(ErrorKind::WouldBlock));
+        assert!(is_transient_accept_error(ErrorKind::TimedOut));
+        // Anything else is fatal and must flip `alive` to false.
+        assert!(!is_transient_accept_error(ErrorKind::ConnectionReset));
+        assert!(!is_transient_accept_error(ErrorKind::Other));
+        assert!(!is_transient_accept_error(ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn build_options_is_out_of_dialog_and_bodyless() {
+        let addr: SocketAddr = "10.0.0.2:5060".parse().unwrap();
+        let msg = build_options(&OptionsRequest {
+            request_uri: "ims.example.org",
+            local_addr: addr,
+            transport: "TCP",
+            public_uri: "u@ims.example.org",
+            from_tag: "tag123",
+            call_id: "call-abc",
+            cseq: 5,
+            branch: "z9hG4bKdeadbeef",
+        });
+        assert!(msg.starts_with("OPTIONS sip:ims.example.org SIP/2.0\r\n"));
+        // CSeq carries the OPTIONS method token — the correlation key the
+        // dispatch loop matches on.
+        assert!(msg.contains("CSeq: 5 OPTIONS\r\n"), "{msg}");
+        // Out-of-dialog: the To header has no tag.
+        assert!(msg.contains("To: <sip:u@ims.example.org>\r\n"), "{msg}");
+        assert!(!msg.contains("To: <sip:u@ims.example.org>;tag"), "{msg}");
+        // From carries our tag.
+        assert!(msg.contains("From: <sip:u@ims.example.org>;tag=tag123\r\n"));
+        // No body.
+        assert!(msg.contains("Content-Length: 0\r\n"));
+        assert!(msg.ends_with("\r\n\r\n"));
+    }
 
     #[test]
     fn parse_status_line_and_headers() {

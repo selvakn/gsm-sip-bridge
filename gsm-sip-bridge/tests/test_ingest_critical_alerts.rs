@@ -16,8 +16,8 @@
 use gsm_sip_bridge::alerts::discord::DiscordClient;
 use gsm_sip_bridge::config::secret::Secret;
 use gsm_sip_bridge::config::{
-    AlertsConfig, CategoryAlertConfig, ModuleLifecycleThresholds, RegistrationLossThresholds,
-    TunnelFailureThresholds,
+    AlertsConfig, CategoryAlertConfig, GmConnectionLostThresholds, ModuleLifecycleThresholds,
+    RegistrationLossThresholds, TunnelFailureThresholds,
 };
 use gsm_sip_bridge::control::protocol::{AgentKind, AgentReport, AgentState};
 use gsm_sip_bridge::metrics::ingest;
@@ -40,6 +40,24 @@ fn report(module_id: &str, seq: u64, registered: bool) -> AgentReport {
         seq,
         state: AgentState {
             registered: Some(registered),
+            ..AgentState::default()
+        },
+        events: vec![],
+        dropped: 0,
+    }
+}
+
+/// A report that only carries `gm_connection_up` (specs/028), for the
+/// Gm-connection alert phases. Registration is left unreported so it never
+/// interacts with the registration-loss episode above.
+fn gm_report(module_id: &str, seq: u64, gm_connection_up: bool) -> AgentReport {
+    AgentReport {
+        agent: AgentKind::Ims,
+        module_id: module_id.to_string(),
+        epoch: 1,
+        seq,
+        state: AgentState {
+            gm_connection_up: Some(gm_connection_up),
             ..AgentState::default()
         },
         events: vec![],
@@ -82,11 +100,15 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
                 enabled: false,
                 webhook_url_override: None,
             },
+            // specs/028: enabled and threshold 0 so the gm-connection phase
+            // below fires on the first unhealthy report, same as registration.
+            gm_connection_lost: enabled(Some(&webhook)),
             module_lifecycle_thresholds: ModuleLifecycleThresholds {
                 at_worker_unresponsive_sec: 60,
             },
             tunnel_failure_thresholds: TunnelFailureThresholds { unhealthy_sec: 300 },
             registration_loss_thresholds: RegistrationLossThresholds { unhealthy_sec: 0 },
+            gm_connection_lost_thresholds: GmConnectionLostThresholds { unhealthy_sec: 0 },
         },
         DiscordClient::new(Secret::new(String::new())).unwrap(),
     );
@@ -143,6 +165,48 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
         .mount(&server)
         .await;
     ingest::apply_report(&report(module_id, 4, true));
+    settle().await;
+    server.verify().await;
+
+    // --- specs/028-gm-tcp-reconnect: the Gm-connection category pairs a
+    // failure and a recovery through the very same AlertPhase machine, on an
+    // independent module so the two episodes never overlap. ---
+    let gm_module = "test-e2e-gm";
+
+    // A down connection fires exactly one Failure alert.
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ingest::apply_report(&gm_report(gm_module, 1, false));
+    settle().await;
+    server.verify().await;
+
+    // A further still-down report must NOT fire a second alert (FR-015 —
+    // suppressed while Alerted).
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    ingest::apply_report(&gm_report(gm_module, 2, false));
+    settle().await;
+    server.verify().await;
+
+    // Recovery fires exactly one paired Recovered notice (FR-016).
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ingest::apply_report(&gm_report(gm_module, 3, true));
     settle().await;
     server.verify().await;
 }

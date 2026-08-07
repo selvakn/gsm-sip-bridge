@@ -68,6 +68,8 @@ clears — never a repeating stream while a condition stays unhealthy.
 | | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
 | `[alerts.missed_call]` | `enabled` | boolean | false | An inbound call that rang out unanswered (never bridged) |
 | `[alerts.line_discovery_failed]` | `enabled` | boolean | false | An explicitly configured VoWiFi line (`modem_port`/`modem_serial`) never resolved even after retrying discovery for it |
+| `[alerts.gm_connection_lost]` | `enabled` | boolean | **true** | A registered line's Gm signaling connection down and unrecoverable continuously past `unhealthy_sec`, despite automatic reconnects and a re-registration. Defaults enabled (an incident, not an opt-in) |
+| | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
 
 Every sub-table also accepts its own `discord_webhook_url` override; a
 category without one falls back to `[alerts].discord_webhook_url`. See

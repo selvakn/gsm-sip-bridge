@@ -69,6 +69,14 @@ enabled = false
 # resolved even after retrying discovery for it.
 enabled = false
 
+[alerts.gm_connection_lost]
+# A registered line's Gm signaling connection down and unrecoverable
+# continuously for unhealthy_sec, despite automatic reconnects and a
+# re-registration. Defaults ENABLED (an incident, not an opt-in); set
+# enabled = false to silence it.
+enabled = true
+unhealthy_sec = 300               # range: 30-3600
+
 [scheduled_restart]
 # Preventive nightly card-restart cycle. The daemon walks every known slot in
 # ascending order and restarts each modem with a randomized gap between

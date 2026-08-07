@@ -401,9 +401,14 @@ pub struct AlertsConfig {
     /// specs/027-discover-retry-health. No paired `*Thresholds` struct: see
     /// `RawAlerts::line_discovery_failed`'s doc comment for why.
     pub line_discovery_failed: CategoryAlertConfig,
+    /// specs/028-gm-tcp-reconnect. Unlike the categories above it defaults
+    /// **enabled**: a registered line whose Gm connection cannot be restored
+    /// is unambiguously an incident, not something an operator must opt into.
+    pub gm_connection_lost: CategoryAlertConfig,
     pub module_lifecycle_thresholds: ModuleLifecycleThresholds,
     pub tunnel_failure_thresholds: TunnelFailureThresholds,
     pub registration_loss_thresholds: RegistrationLossThresholds,
+    pub gm_connection_lost_thresholds: GmConnectionLostThresholds,
 }
 
 #[derive(Clone, Debug)]
@@ -467,6 +472,21 @@ impl Default for RegistrationLossThresholds {
     }
 }
 
+/// specs/028-gm-tcp-reconnect, default 300s: how long a line's Gm connection
+/// may stay down (through reconnects and a re-registration) before it is
+/// alerted on. Comfortably longer than detection (~130s) plus the reconnect
+/// attempts and the escalation, so a drop that self-heals never pages.
+#[derive(Clone, Copy, Debug)]
+pub struct GmConnectionLostThresholds {
+    pub unhealthy_sec: u64,
+}
+
+impl Default for GmConnectionLostThresholds {
+    fn default() -> Self {
+        Self { unhealthy_sec: 300 }
+    }
+}
+
 impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
@@ -480,9 +500,15 @@ impl Default for AlertsConfig {
             tunnel_failure: CategoryAlertConfig::disabled(),
             missed_call: CategoryAlertConfig::disabled(),
             line_discovery_failed: CategoryAlertConfig::disabled(),
+            // Defaults enabled — see the field doc on `AlertsConfig`.
+            gm_connection_lost: CategoryAlertConfig {
+                enabled: true,
+                webhook_url_override: None,
+            },
             module_lifecycle_thresholds: ModuleLifecycleThresholds::default(),
             tunnel_failure_thresholds: TunnelFailureThresholds::default(),
             registration_loss_thresholds: RegistrationLossThresholds::default(),
+            gm_connection_lost_thresholds: GmConnectionLostThresholds::default(),
         }
     }
 }

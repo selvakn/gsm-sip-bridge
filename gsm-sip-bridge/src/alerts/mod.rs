@@ -42,6 +42,10 @@ pub enum AlertCategory {
     /// line (`modem_port`/`modem_serial`) never resolved into a line at
     /// all, even after retrying discovery for it.
     LineDiscoveryFailed,
+    /// specs/028-gm-tcp-reconnect: a registered line's Gm signaling
+    /// connection has been down and unrecoverable for its configured
+    /// threshold, despite automatic reconnects and a re-registration.
+    GmConnectionLost,
 }
 
 impl AlertCategory {
@@ -55,6 +59,7 @@ impl AlertCategory {
             AlertCategory::TunnelFailure => "tunnel_failure",
             AlertCategory::MissedCall => "missed_call",
             AlertCategory::LineDiscoveryFailed => "line_discovery_failed",
+            AlertCategory::GmConnectionLost => "gm_connection_lost",
         }
     }
 }
@@ -148,6 +153,7 @@ fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryA
         AlertCategory::TunnelFailure => &config.tunnel_failure,
         AlertCategory::MissedCall => &config.missed_call,
         AlertCategory::LineDiscoveryFailed => &config.line_discovery_failed,
+        AlertCategory::GmConnectionLost => &config.gm_connection_lost,
     }
 }
 
@@ -191,6 +197,7 @@ pub async fn dispatch(
             | AlertCategory::RegistrationLoss
             | AlertCategory::TunnelFailure
             | AlertCategory::LineDiscoveryFailed
+            | AlertCategory::GmConnectionLost
     );
     if tracks_ongoing_health {
         if let Some(unit_id) = &event.unit_id {

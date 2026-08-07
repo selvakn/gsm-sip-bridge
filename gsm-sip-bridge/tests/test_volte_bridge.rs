@@ -233,6 +233,7 @@ fn healthy() -> ServiceHealth {
         registered: true,
         attached: true,
         pbx_registered: true,
+        gm_connection_up: true,
         busy: false,
         deferred: None,
     }
@@ -278,6 +279,13 @@ fn can_answer_is_false_whenever_the_service_could_not_in_fact_answer() {
             },
             "pbx-unregistered",
         ),
+        (
+            ServiceHealth {
+                gm_connection_up: false,
+                ..healthy()
+            },
+            "gm-connection-down",
+        ),
     ] {
         assert!(!health.can_answer(), "{what} must not report can_answer");
         assert!(
@@ -295,6 +303,7 @@ fn being_registered_does_not_by_itself_imply_being_able_to_answer() {
         registered: true,
         attached: false,
         pbx_registered: true,
+        gm_connection_up: true,
         busy: false,
         deferred: None,
     };
@@ -303,6 +312,38 @@ fn being_registered_does_not_by_itself_imply_being_able_to_answer() {
         health.blocked_reason(),
         Some("the network attachment is down"),
         "the attachment is named, since that is what has to be fixed"
+    );
+}
+
+#[test]
+fn a_down_gm_connection_stops_the_service_answering() {
+    // specs/028: a registered line whose Gm signaling connection is dead
+    // cannot answer — the exact observed failure. It must say so plainly
+    // rather than claim readiness.
+    let health = ServiceHealth {
+        gm_connection_up: false,
+        ..healthy()
+    };
+    assert!(!health.can_answer());
+    assert_eq!(
+        health.blocked_reason(),
+        Some("the carrier signaling connection is down")
+    );
+}
+
+#[test]
+fn a_down_attachment_outranks_a_down_gm_connection_in_blocked_reason() {
+    // The attachment is underneath the connection: a down attachment is the
+    // cause, the down connection the symptom. Report the cause, so an operator
+    // fixes the right layer (specs/028 R9).
+    let health = ServiceHealth {
+        attached: false,
+        gm_connection_up: false,
+        ..healthy()
+    };
+    assert_eq!(
+        health.blocked_reason(),
+        Some("the network attachment is down")
     );
 }
 

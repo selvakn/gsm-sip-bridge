@@ -52,8 +52,8 @@ use crate::modules::pcsc_card::PcscTransport;
 use crate::modules::usim::{self, AkaResult, ApduTransport};
 use gm_ipsec::GmEndpoints;
 use sip_client::{
-    build_register, extract_challenge, format_sip_addr, parse_digest_challenge, random_hex,
-    RegisterRequest, SipTransport,
+    build_options, build_register, extract_challenge, format_sip_addr, parse_digest_challenge,
+    random_hex, OptionsRequest, RegisterRequest, SipTransport,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -317,6 +317,36 @@ impl RegisteredSession {
             }
         }
     }
+
+    /// Send an out-of-dialog `OPTIONS` keepalive on the client connection and
+    /// return the `CSeq` it went out with, so the caller can correlate the
+    /// response back to it.
+    ///
+    /// **Fire-and-forget**: this uses `send`, not `send_and_recv`. The reader
+    /// thread (`session::spawn_client_reader`) owns the read half of this
+    /// socket; a second reader here would race it and corrupt SIP framing. The
+    /// response is delivered through that thread to the dispatch loop's
+    /// response arm, which matches it by `CSeq`. See specs/028-gm-tcp-reconnect
+    /// R1 — this constraint is the whole reason the probe is asynchronous.
+    pub(crate) fn send_gm_ping(&mut self) -> BridgeResult<u32> {
+        let via_transport = if self.use_tcp { "TCP" } else { "UDP" };
+        let request_uri = format_sip_addr(self.pcscf_addr);
+        self.cseq = self.cseq.wrapping_add(1);
+        let cseq = self.cseq;
+        let branch = format!("z9hG4bK{}", random_hex(6));
+        let options = build_options(&OptionsRequest {
+            request_uri: &request_uri,
+            local_addr: self.local_addr,
+            transport: via_transport,
+            public_uri: &self.public_uri,
+            from_tag: &self.from_tag,
+            call_id: &self.call_id,
+            cseq,
+            branch: &branch,
+        });
+        self.transport_mut()?.send(&options)?;
+        Ok(cseq)
+    }
 }
 
 /// Current lifecycle state of a *persistent* IMS-AKA registration
@@ -330,6 +360,56 @@ pub enum RegistrationState {
     Registered,
     Renewing,
     Failed,
+}
+
+/// Health of a registered line's Gm signaling connection, independent of the
+/// registration state above. A registration can read `Registered` while its
+/// Gm connection is silently dead — the exact failure
+/// specs/028-gm-tcp-reconnect addresses.
+///
+/// `Up` is the default (not an `Unknown` variant): a registration that just
+/// completed is itself a successful round trip, so treating a fresh line as
+/// unknown would report a false degradation on every startup. `Failed` is
+/// **not** terminal — the loop keeps retrying on backoff so a line can still
+/// self-heal when the network recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmConnectionState {
+    /// The last liveness probe round-tripped, including the confirming probe
+    /// after a reconnect.
+    Up,
+    /// A drop was detected; repair is in progress. `attempts` counts
+    /// *consecutive* failures, reset to zero on any confirmed recovery.
+    Reconnecting {
+        since: std::time::SystemTime,
+        attempts: u32,
+    },
+    /// Repair has been escalated to re-registration and that is also failing.
+    Failed { since: std::time::SystemTime },
+}
+
+impl GmConnectionState {
+    /// Whether the connection is currently healthy — the input `can_answer`
+    /// and the metrics gauge both read.
+    pub fn is_up(&self) -> bool {
+        matches!(self, GmConnectionState::Up)
+    }
+
+    /// Wire/CLI rendering: `up`, `reconnecting since <ts> (attempt N)`, or
+    /// `failed since <ts>`. Timestamps are RFC 3339 in UTC.
+    pub fn render(&self) -> String {
+        fn ts(t: std::time::SystemTime) -> String {
+            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+        }
+        match self {
+            GmConnectionState::Up => "up".to_string(),
+            GmConnectionState::Reconnecting { since, attempts } => {
+                format!("reconnecting since {} (attempt {})", ts(*since), attempts)
+            }
+            GmConnectionState::Failed { since } => {
+                format!("failed since {}", ts(*since))
+            }
+        }
+    }
 }
 
 /// Snapshot of Agent A's registration health, per
@@ -358,6 +438,11 @@ pub struct RegistrationStatus {
     /// Maintenance currently held back for a call, if any — reported so a
     /// deferral reads as deliberate rather than as a stall.
     pub deferred_maintenance: Option<crate::ims::lifecycle::Maintenance>,
+    /// Health of the Gm signaling connection underneath the registration.
+    /// In-memory only, like the health inputs above — `render_status`
+    /// persists only the first four fields, so a status read from disk
+    /// carries the `Up` default. See [`GmConnectionState`].
+    pub gm_connection: GmConnectionState,
 }
 
 impl Default for RegistrationStatus {
@@ -371,6 +456,7 @@ impl Default for RegistrationStatus {
             busy: false,
             pbx_registered: true,
             deferred_maintenance: None,
+            gm_connection: GmConnectionState::Up,
         }
     }
 }
@@ -387,6 +473,7 @@ impl RegistrationStatus {
             registered: self.state == RegistrationState::Registered,
             attached: self.attached,
             pbx_registered: self.pbx_registered,
+            gm_connection_up: self.gm_connection.is_up(),
             busy: self.busy,
             deferred: self.deferred_maintenance,
         }

@@ -476,6 +476,20 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
             .unwrap_or(d.registration_loss_thresholds.unhealthy_sec),
     };
 
+    let gcl_raw = raw.gm_connection_lost.unwrap_or_default();
+    let gm_connection_lost = CategoryAlertConfig {
+        // Defaults enabled (specs/028): a registered line whose Gm connection
+        // cannot be restored is an incident, not an opt-in.
+        enabled: gcl_raw.enabled.unwrap_or(true),
+        webhook_url_override: gcl_raw.discord_webhook_url,
+    };
+    let gm_connection_lost_thresholds = GmConnectionLostThresholds {
+        unhealthy_sec: gcl_raw
+            .unhealthy_sec
+            .and_then(|v| in_range_or_warn(v, "alerts.gm_connection_lost.unhealthy_sec", 30..=3600))
+            .unwrap_or(d.gm_connection_lost_thresholds.unhealthy_sec),
+    };
+
     AlertsConfig {
         // Falls back to the legacy `[sms].discord_webhook_url` so a
         // deployment that never adopted `[alerts]` keeps its SMS forwarding.
@@ -488,9 +502,11 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
         tunnel_failure,
         missed_call: category(raw.missed_call, false),
         line_discovery_failed: category(raw.line_discovery_failed, false),
+        gm_connection_lost,
         module_lifecycle_thresholds,
         tunnel_failure_thresholds,
         registration_loss_thresholds,
+        gm_connection_lost_thresholds,
     }
 }
 

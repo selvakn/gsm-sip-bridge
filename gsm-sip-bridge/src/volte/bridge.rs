@@ -511,6 +511,7 @@ fn print_line_live_status(
             last_failure,
             can_answer,
             blocked_reason,
+            gm_connection,
         }) => (
             state,
             registered_at,
@@ -518,6 +519,7 @@ fn print_line_live_status(
             last_failure,
             can_answer,
             blocked_reason,
+            gm_connection,
         ),
         // Unreachable, or an unexpected reply, both mean this line's carrier
         // half is not answering.
@@ -527,11 +529,20 @@ fn print_line_live_status(
         }
     };
 
-    let (state, registered_at, expires_at, last_failure, can_answer, blocked_reason) = reg;
+    let (state, registered_at, expires_at, last_failure, can_answer, blocked_reason, gm_connection) =
+        reg;
     println!("  registration:");
     println!("    state: {state}");
     println!("    registered_at: {}", format_unix(registered_at));
     println!("    expires_at: {}", format_unix(expires_at));
+    println!(
+        "    gm_connection: {}",
+        if gm_connection.is_empty() {
+            "unknown"
+        } else {
+            &gm_connection
+        }
+    );
     match last_failure {
         Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
         None => println!("    last_failure: none"),

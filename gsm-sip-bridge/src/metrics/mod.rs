@@ -391,6 +391,22 @@ pub static VOWIFI_TUNNEL_UP: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// 1 if this line's Gm signaling connection is up, 0 otherwise (specs/028).
+/// Retains the `vowifi_` prefix even for VoLTE lines — the `module` label
+/// distinguishes transports — matching the precedent already documented for
+/// `gsm_sip_bridge_vowifi_tunnel_up{module="volte"}` below, rather than
+/// fragmenting the metric vocabulary with a second prefix.
+pub static VOWIFI_GM_CONNECTION_UP: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_gm_connection_up",
+            "1 if this line's Gm signaling connection is up, 0 otherwise"
+        ),
+        &["module"]
+    )
+    .unwrap()
+});
+
 pub static BUILD_INFO: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         opts!("gsm_sip_bridge_build_info", "Build metadata"),

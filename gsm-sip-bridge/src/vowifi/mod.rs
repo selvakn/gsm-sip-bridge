@@ -1883,10 +1883,19 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                 last_failure,
                 can_answer,
                 blocked_reason,
+                gm_connection,
             }) => {
                 println!("    state: {state}");
                 println!("    registered_at: {}", format_unix(registered_at));
                 println!("    expires_at: {}", format_unix(expires_at));
+                println!(
+                    "    gm_connection: {}",
+                    if gm_connection.is_empty() {
+                        "unknown"
+                    } else {
+                        &gm_connection
+                    }
+                );
                 match last_failure {
                     Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
                     None => println!("    last_failure: none"),
