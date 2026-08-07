@@ -14,7 +14,7 @@ exists for.
 | P-CSCF | `2400:5200:a100:819::6`, picked up automatically from the ePDG capture |
 | Build | **The container build.** A plain local build lacks the wideband codec |
 | Privilege | Everything runs in the privileged container; the dev host has no root |
-| Test number | `+919789063708`, answered by a person |
+| Test number | `+919000000000`, answered by a person |
 
 ### Stop the registration loop first
 
@@ -61,7 +61,7 @@ be an *addition* to it.
 docker run --rm --privileged --network host -v /dev:/dev \
   docker-gsm-sip-bridge:latest \
   gsm-sip-bridge volte-call \
-    --callee +919789063708 \
+    --callee +919000000000 \
     --modem /dev/ttyUSB0 --iface enx024bb3b9ebe5 \
     --duration 30 --record /tmp/far-end.wav --record-sent /tmp/sent.wav
 ```
@@ -151,17 +151,17 @@ volte-call --callee <number-that-rejects>       # expect a named rejection reaso
 volte-call --callee <number-nobody-answers>     # expect "no answer", not a generic failure
 
 # US3 — stage attribution
-volte-call --callee +919789063708 --pcscf <wrong-address>   # expect a named stage
+volte-call --callee +919000000000 --pcscf <wrong-address>   # expect a named stage
 # start volte-register in parallel, then:
-volte-call --callee +919789063708               # expect refusal naming the conflict
+volte-call --callee +919000000000               # expect refusal naming the conflict
 
 # echo behaviour
-volte-call --callee +919789063708 --echo-attenuation 0.5   # quieter return
-volte-call --callee +919789063708 --marker-interval 2      # more frequent marker
+volte-call --callee +919000000000 --echo-attenuation 0.5   # quieter return
+volte-call --callee +919000000000 --marker-interval 2      # more frequent marker
 
 # direction attribution: stay silent for the whole call.
 # Expect SendOnly (the marker is still going out), never Neither.
-volte-call --callee +919789063708 --duration 30
+volte-call --callee +919000000000 --duration 30
 ```
 
 ### Success criteria mapping

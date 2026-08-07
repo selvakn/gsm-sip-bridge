@@ -485,7 +485,7 @@ pub struct VolteRegisterArgs {
 
 #[derive(Parser, Debug)]
 pub struct VolteCallArgs {
-    /// Destination in E.164, e.g. +919789063708.
+    /// Destination in E.164, e.g. +919000000000.
     #[arg(long)]
     pub callee: String,
     #[arg(long, default_value = "/dev/ttyUSB0")]
@@ -768,7 +768,7 @@ pub struct ImsCallArgs {
     #[command(flatten)]
     pub register: ImsRegisterArgs,
 
-    /// Callee, E.164 (e.g. +919789063708). This places a REAL call over
+    /// Callee, E.164 (e.g. +919000000000). This places a REAL call over
     /// the live network to this number — make sure whoever's on the other
     /// end is expecting it.
     #[arg(long)]

@@ -232,7 +232,7 @@ is not sufficient evidence.
 
 ## Test call
 
-A live test number is available for call validation: **+91 97890 63708**,
+A live test number is available for call validation: **+91 90000 00000**,
 answered manually. Note that **calls are out of scope for this feature** — it
 ends at registration. This number is for the follow-up feature and for
 verifying VoWiFi non-regression.

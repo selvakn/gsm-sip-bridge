@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn a_uri_user_is_extracted_as_the_dial_out_destination() {
         for (uri, want) in [
-            ("sip:+919789063708@bridge", Some("+919789063708")),
+            ("sip:+919000000000@bridge", Some("+919000000000")),
             ("sip:1001@192.168.1.50:5060", Some("1001")),
             ("sips:alice@host;transport=udp", Some("alice")),
             // No userinfo at all — nothing to extract.

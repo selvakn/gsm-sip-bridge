@@ -24,7 +24,7 @@ same `read_cmd`/`write_resp`-style helpers, can be reused rather than inventing 
 ### `incoming_call`
 
 ```json
-{"event": "incoming_call", "call_id": "a1b2c3", "caller": "+919789063708"}
+{"event": "incoming_call", "call_id": "a1b2c3", "caller": "+919000000000"}
 ```
 
 Sent the moment Agent A receives an inbound `INVITE` over the Gm-protected IMS transport and has

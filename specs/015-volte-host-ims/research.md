@@ -426,7 +426,7 @@ installing new virtual IP  2402:8100:7889:1d45:0:22:1e10:e901
 |---|---|
 | **P-CSCF** | **`2400:5200:a100:819::6`** (SIP port 5060) |
 | ePDG | `epdg.epc.mnc043.mcc404.pub.3gppnetwork.org` → `203.88.4.88` (**also has IPv4** — `203.88.11.33` too) |
-| MSISDN | `+918807793613`, from the reg-event NOTIFY |
+| MSISDN | `+919000000020`, from the reg-event NOTIFY |
 | IMPU realm | `ims.mnc043.mcc404.3gppnetwork.org` |
 
 Note the ePDG publishes **both** A and AAAA records. An earlier `dig +short

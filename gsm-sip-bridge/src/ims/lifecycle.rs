@@ -477,7 +477,7 @@ mod tests {
     fn call() -> BridgedCall {
         BridgedCall::new(
             "abc@carrier".to_string(),
-            "+919789063708".to_string(),
+            "+919000000000".to_string(),
             Some("Selvakumar Natesan".to_string()),
         )
     }

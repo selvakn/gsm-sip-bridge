@@ -1457,17 +1457,17 @@ mod tests {
             via_transport: "TCP",
             local_addr: "1.2.3.4:48584".parse().unwrap(),
             // Ours (was the INVITE's To), with the tag we generated.
-            from: "<sip:+919043062139@ims.example>;tag=ourtag",
+            from: "<sip:+919000000010@ims.example>;tag=ourtag",
             // Theirs (was the INVITE's From), with the tag they generated.
-            to: "\"Caller\" <sip:+919789063708@ims.example>;tag=theirtag",
+            to: "\"Caller\" <sip:+919000000000@ims.example>;tag=theirtag",
             call_id: "callid1",
             cseq: 1,
             branch: "z9hG4bKbye1",
         });
         assert!(msg.starts_with("BYE sip:caller@pcscf.example:5060 SIP/2.0\r\n"));
         assert!(msg.contains("Route: <sip:pcscf.example;lr>\r\n"));
-        assert!(msg.contains("From: <sip:+919043062139@ims.example>;tag=ourtag\r\n"));
-        assert!(msg.contains("To: \"Caller\" <sip:+919789063708@ims.example>;tag=theirtag\r\n"));
+        assert!(msg.contains("From: <sip:+919000000010@ims.example>;tag=ourtag\r\n"));
+        assert!(msg.contains("To: \"Caller\" <sip:+919000000000@ims.example>;tag=theirtag\r\n"));
         assert!(msg.contains("Call-ID: callid1\r\n"));
         assert!(msg.contains("CSeq: 1 BYE\r\n"));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
@@ -1543,11 +1543,11 @@ mod tests {
         "INVITE sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone SIP/2.0\r\n\
          Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKabc123;rport\r\n\
          Max-Forwards: 70\r\n\
-         From: <sip:+919789063708@ims.mnc094.mcc404.3gppnetwork.org>;tag=fromtag1\r\n\
+         From: <sip:+919000000000@ims.mnc094.mcc404.3gppnetwork.org>;tag=fromtag1\r\n\
          To: <sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n\
          Call-ID: abc123callid\r\n\
          CSeq: 1 INVITE\r\n\
-         Contact: <sip:+919789063708@10.0.0.5:5060;transport=TCP>\r\n\
+         Contact: <sip:+919000000000@10.0.0.5:5060;transport=TCP>\r\n\
          Content-Type: application/sdp\r\n\
          Content-Length: 9\r\n\r\n\
          v=0\r\ndone";
@@ -1594,7 +1594,7 @@ mod tests {
         let raw = "BYE sip:caller@10.0.0.5:5060 SIP/2.0\r\n\
                     Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKbye1\r\n\
                     From: <sip:404438083996440@realm>;tag=totag1\r\n\
-                    To: <sip:+919789063708@realm>;tag=fromtag1\r\n\
+                    To: <sip:+919000000000@realm>;tag=fromtag1\r\n\
                     Call-ID: abc123callid\r\n\
                     CSeq: 2 BYE\r\n\
                     Content-Length: 0\r\n\r\n";
@@ -1704,7 +1704,7 @@ mod tests {
     fn sample_message() -> SipRequest {
         let raw = "MESSAGE sip:404438083996440@realm SIP/2.0\r\n\
                     Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKmsg1\r\n\
-                    From: <sip:+919789063708@realm>;tag=fromtag1\r\n\
+                    From: <sip:+919000000000@realm>;tag=fromtag1\r\n\
                     To: <sip:404438083996440@realm>\r\n\
                     Call-ID: msgcallid\r\n\
                     CSeq: 1 MESSAGE\r\n\

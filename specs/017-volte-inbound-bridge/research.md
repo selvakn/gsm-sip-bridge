@@ -16,9 +16,9 @@ A probe held the registration open with the protected server port listening and
 declined calls with a busy response. Over one window:
 
 ```
-NOTIFY from <sip:+918807793613@ims.mnc043.mcc404.3gppnetwork.org>   ← control
-INVITE from "Selvakumar Natesan" <sip:+919789063708@...>            ← ×4
-ACK    from "Selvakumar Natesan" <sip:+919789063708@...>            ← ×4
+NOTIFY from <sip:+919000000020@ims.mnc043.mcc404.3gppnetwork.org>   ← control
+INVITE from "Selvakumar Natesan" <sip:+919000000000@...>            ← ×4
+ACK    from "Selvakumar Natesan" <sip:+919000000000@...>            ← ×4
 ```
 
 Four incoming calls, each carrying the caller's number **and display name**,

@@ -167,7 +167,7 @@ hardware-independent; this phase is where the feature's premise is tested.
 
 - [X] T054 Stop the registration loop, since the call command owns its own registration (research R1)
 - [X] T055 Baseline the quality class at idle — expect class 5 on the IMS context (research R4)
-- [X] T056 **Place the first live call to +919789063708 with a handset at the far end**, speak, and confirm the echo is audible
+- [X] T056 **Place the first live call to +919000000000 with a handset at the far end**, speak, and confirm the echo is audible
 - [X] T057 **Gate C1**: sample the quality class during the call on a second AT port; record whether a class-1 entry appears. **A confirmed absence is a valid result** and must be recorded as such
 - [ ] T058 **Gate C3**: confirm no feedback on a handset call; characterise the speakerphone case so the limitation is documented rather than discovered by a user — **half done**: two handset calls showed no feedback; the speakerphone case is still uncharacterised
 - [X] T059 Settle spec 015 research R9 — confirm which source address the network actually routes, now that media proves it

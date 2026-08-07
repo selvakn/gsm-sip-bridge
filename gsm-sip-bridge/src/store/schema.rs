@@ -360,13 +360,13 @@ mod tests {
         init_schema(&conn).unwrap();
         conn.execute(
             "INSERT INTO calls (module_id, caller_id, started_at, duration_seconds, status, sip_destination, transport)
-             VALUES ('volte', '+919789063708', '2026-07-23T00:00:00Z', 5.0, 'answered', '1001', 'volte')",
+             VALUES ('volte', '+919000000000', '2026-07-23T00:00:00Z', 5.0, 'answered', '1001', 'volte')",
             [],
         )
         .expect("a volte call must be recordable");
         conn.execute(
             "INSERT INTO sms (module_id, sender, body, received_at, forwarding_status, transport)
-             VALUES ('volte', '+919789063708', 'Hello', '2026-07-23T00:00:00Z', 'sent', 'volte')",
+             VALUES ('volte', '+919000000000', 'Hello', '2026-07-23T00:00:00Z', 'sent', 'volte')",
             [],
         )
         .expect("a volte text must be recordable");
@@ -389,7 +389,7 @@ mod tests {
 
         let refused = conn.execute(
             "INSERT INTO sms (module_id, sender, body, received_at, forwarding_status, transport)
-             VALUES ('volte', '+919789063708', 'Hello', '2026-07-23T00:00:00Z', 'sent', 'volte')",
+             VALUES ('volte', '+919000000000', 'Hello', '2026-07-23T00:00:00Z', 'sent', 'volte')",
             [],
         );
         assert!(refused.is_err(), "the v3 constraint must reject 'volte'");
@@ -398,7 +398,7 @@ mod tests {
 
         conn.execute(
             "INSERT INTO sms (module_id, sender, body, received_at, forwarding_status, transport)
-             VALUES ('volte', '+919789063708', 'Hello', '2026-07-23T00:00:00Z', 'sent', 'volte')",
+             VALUES ('volte', '+919000000000', 'Hello', '2026-07-23T00:00:00Z', 'sent', 'volte')",
             [],
         )
         .expect("after the v4 upgrade 'volte' must be accepted");

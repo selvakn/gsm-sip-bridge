@@ -255,7 +255,7 @@ mod tests {
     fn incoming_call_roundtrips() {
         let msg = ControlMessage::IncomingCall {
             call_id: "a1b2c3".to_string(),
-            caller: "+919789063708".to_string(),
+            caller: "+919000000000".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -290,7 +290,7 @@ mod tests {
     fn place_call_roundtrips() {
         let msg = ControlMessage::PlaceCall {
             call_id: "out1".to_string(),
-            destination: "+919789063708".to_string(),
+            destination: "+919000000000".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -417,12 +417,12 @@ mod tests {
     fn wire_format_matches_contract_shape() {
         let msg = ControlMessage::IncomingCall {
             call_id: "a1b2c3".to_string(),
-            caller: "+919789063708".to_string(),
+            caller: "+919000000000".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"event":"incoming_call","call_id":"a1b2c3","caller":"+919789063708"}"#
+            r#"{"event":"incoming_call","call_id":"a1b2c3","caller":"+919000000000"}"#
         );
     }
 
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn sms_received_roundtrips() {
         let msg = ControlMessage::SmsReceived {
-            sender: "+919789063708".to_string(),
+            sender: "+919000000000".to_string(),
             body: "hello over VoWiFi".to_string(),
             received_at: "2026-07-13T00:00:00+00:00".to_string(),
         };
@@ -500,7 +500,7 @@ mod tests {
     fn sms_received_has_no_call_id() {
         assert_eq!(
             ControlMessage::SmsReceived {
-                sender: "+919789063708".to_string(),
+                sender: "+919000000000".to_string(),
                 body: "hi".to_string(),
                 received_at: "2026-07-13T00:00:00+00:00".to_string(),
             }
@@ -566,7 +566,7 @@ mod tests {
             calls: vec![
                 CallRecord {
                     call_id: "1".to_string(),
-                    caller: "+919789063708".to_string(),
+                    caller: "+919000000000".to_string(),
                     outcome: "answered".to_string(),
                     started_at: 1_700_000_000,
                     ended_at: Some(1_700_000_300),

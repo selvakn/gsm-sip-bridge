@@ -34,8 +34,8 @@ fn through_modem(sender: &str, body: &str, index: u32) -> InboundMessage {
 #[test]
 fn a_message_on_either_route_is_handled_once() {
     for msg in [
-        over_registration("+919789063708", "hello"),
-        through_modem("+919789063708", "hello", 3),
+        over_registration("+919000000000", "hello"),
+        through_modem("+919000000000", "hello", 3),
     ] {
         let mut dedupe = Dedupe::default();
         assert_eq!(decide(&mut dedupe, &msg), Disposition::Handle);
@@ -50,11 +50,11 @@ fn the_same_message_arriving_on_both_routes_is_recorded_once() {
     // collapses to one — otherwise the operator sees every text twice.
     let mut dedupe = Dedupe::default();
     assert_eq!(
-        decide(&mut dedupe, &over_registration("+919789063708", "hello")),
+        decide(&mut dedupe, &over_registration("+919000000000", "hello")),
         Disposition::Handle
     );
     assert_eq!(
-        decide(&mut dedupe, &through_modem("+919789063708", "hello", 3)),
+        decide(&mut dedupe, &through_modem("+919000000000", "hello", 3)),
         Disposition::AcknowledgeOnly,
         "the delivery route must not be part of the message's identity"
     );
@@ -66,7 +66,7 @@ fn a_retransmission_is_still_acknowledged_so_the_network_stops_retrying() {
     // window causes a retransmission. Suppressing the duplicate is right;
     // failing to acknowledge it would leave the network retrying forever.
     let mut dedupe = Dedupe::default();
-    let msg = over_registration("+919789063708", "hello");
+    let msg = over_registration("+919000000000", "hello");
     assert_eq!(decide(&mut dedupe, &msg), Disposition::Handle);
     for _ in 0..10 {
         assert_eq!(decide(&mut dedupe, &msg), Disposition::AcknowledgeOnly);
@@ -112,7 +112,7 @@ fn messages_already_in_modem_storage_at_startup_are_recovered() {
     // Texts that arrived while the service was down would otherwise be
     // stepped over and eventually lost when storage filled.
     let lines: Vec<String> = [
-        "+CMGL: 1,\"REC UNREAD\",\"+919789063708\",,\"26/07/22,10:00:00+22\"",
+        "+CMGL: 1,\"REC UNREAD\",\"+919000000000\",,\"26/07/22,10:00:00+22\"",
         "hello",
         "+CMGL: 4,\"REC UNREAD\",\"+919876543210\",,\"26/07/22,10:05:00+22\"",
         "world",

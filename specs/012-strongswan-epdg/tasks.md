@@ -249,7 +249,7 @@ cycle and one forced outage with namespace/agents untouched (quickstart.md §3�
       (SC-003) — can piggyback on T025's soak window (depends on T025, T026). **Immediate
       call: PASS.** Both agents registered over the tunnel (`vowifi-sip-agent registered to
       PBX`, `vowifi-ims-agent registered, listening for inbound calls`); a real inbound call
-      from +919789063708 was answered (100 Trying → 180 Ringing → PBX answered → 200 OK,
+      from +919000000000 was answered (100 Trying → 180 Ringing → PBX answered → 200 OK,
       well under 5s), bridged with real two-way audio (AMR-NB↔PCMU transcoding), and torn
       down cleanly via BYE after ~42s. **The ≥12h-later repeat still needs T025's soak** —
       not run this session.

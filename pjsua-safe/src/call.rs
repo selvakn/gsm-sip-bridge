@@ -358,30 +358,30 @@ mod tests {
     #[test]
     fn parse_uri_user_bare() {
         assert_eq!(
-            parse_uri_user("sip:9789063708@192.168.1.1:5062"),
-            Some("9789063708".to_string())
+            parse_uri_user("sip:9000000000@192.168.1.1:5062"),
+            Some("9000000000".to_string())
         );
     }
 
     #[test]
     fn parse_uri_user_with_display_name_and_angle_brackets() {
         assert_eq!(
-            parse_uri_user("\"PBX\" <sip:9789063708@192.168.1.1:5062>"),
-            Some("9789063708".to_string())
+            parse_uri_user("\"PBX\" <sip:9000000000@192.168.1.1:5062>"),
+            Some("9000000000".to_string())
         );
     }
 
     #[test]
     fn parse_uri_user_strips_uri_parameters() {
         assert_eq!(
-            parse_uri_user("sip:9789063708;user=phone@192.168.1.1"),
-            Some("9789063708".to_string())
+            parse_uri_user("sip:9000000000;user=phone@192.168.1.1"),
+            Some("9000000000".to_string())
         );
     }
 
     #[test]
     fn parse_uri_user_none_for_non_sip_scheme() {
-        assert_eq!(parse_uri_user("tel:+919789063708"), None);
+        assert_eq!(parse_uri_user("tel:+919000000000"), None);
     }
 
     #[test]

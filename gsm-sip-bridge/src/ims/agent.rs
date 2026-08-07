@@ -3175,7 +3175,7 @@ mod tests {
     #[test]
     fn build_subscribe_formats_a_reg_event_subscription() {
         let msg = build_subscribe(&SubscribeParts {
-            impu: "sip:+919043062139@ims.mnc094.mcc404.3gppnetwork.org",
+            impu: "sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org",
             route_headers: &["Route: <sip:pcscf.example:6000;lr>".to_string()],
             via_transport: "TCP",
             local_addr: "1.2.3.4:48584".parse().unwrap(),
@@ -3187,11 +3187,11 @@ mod tests {
             expires: 3600,
         });
         assert!(msg
-            .starts_with("SUBSCRIBE sip:+919043062139@ims.mnc094.mcc404.3gppnetwork.org SIP/2.0"));
+            .starts_with("SUBSCRIBE sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org SIP/2.0"));
         assert!(msg.contains("Route: <sip:pcscf.example:6000;lr>\r\n"));
         assert!(msg
-            .contains("From: <sip:+919043062139@ims.mnc094.mcc404.3gppnetwork.org>;tag=tag1\r\n"));
-        assert!(msg.contains("To: <sip:+919043062139@ims.mnc094.mcc404.3gppnetwork.org>\r\n"));
+            .contains("From: <sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org>;tag=tag1\r\n"));
+        assert!(msg.contains("To: <sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org>\r\n"));
         assert!(msg.contains("CSeq: 7 SUBSCRIBE\r\n"));
         assert!(msg.contains("Event: reg\r\n"));
         assert!(msg.contains("Expires: 3600\r\n"));
@@ -3205,10 +3205,10 @@ mod tests {
     #[test]
     fn extract_caller_pulls_the_user_part_from_a_quoted_from_header() {
         let raw = "INVITE sip:x SIP/2.0\r\n\
-                    From: <sip:+919789063708@ims.mnc094.mcc404.3gppnetwork.org>;tag=abc\r\n\
+                    From: <sip:+919000000000@ims.mnc094.mcc404.3gppnetwork.org>;tag=abc\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
-        assert_eq!(extract_caller(&req), "+919789063708");
+        assert_eq!(extract_caller(&req), "+919000000000");
     }
 
     #[test]

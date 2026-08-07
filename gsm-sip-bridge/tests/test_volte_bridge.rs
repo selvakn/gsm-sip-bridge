@@ -33,7 +33,7 @@ fn a_second_call_is_refused_busy_while_one_is_bridged() {
     // rather than queued. What matters as much as the refusal is that the
     // refusal does not disturb the call already up.
     let mut slot = CallSlot::new();
-    assert!(slot.accept(bridged("first@carrier", "+919789063708")));
+    assert!(slot.accept(bridged("first@carrier", "+919000000000")));
 
     assert_eq!(slot.admit(), Admission::RejectBusy);
     assert!(!slot.accept(incoming("second@carrier", "+911111111111")));
@@ -47,7 +47,7 @@ fn a_second_call_is_refused_busy_while_one_is_bridged() {
 #[test]
 fn the_line_accepts_again_once_the_call_is_over() {
     let mut slot = CallSlot::new();
-    slot.accept(bridged("first@carrier", "+919789063708"));
+    slot.accept(bridged("first@carrier", "+919000000000"));
     slot.active_mut().unwrap().end(EndedBy::Caller);
 
     let recorded = slot.take_ended().expect("the ended call is handed back");
@@ -64,7 +64,7 @@ fn the_line_accepts_again_once_the_call_is_over() {
 fn a_call_cannot_be_bridged_without_the_telephone_system_ringing_first() {
     // Answering the carrier before a human picks up means the caller pays for
     // silence and hears no ringback.
-    let mut c = incoming("x@carrier", "+919789063708");
+    let mut c = incoming("x@carrier", "+919000000000");
     assert!(c.advance_to(CallStage::Answering));
     assert!(!c.advance_to(CallStage::Bridged));
     assert_eq!(c.stage, CallStage::Answering);
@@ -74,7 +74,7 @@ fn a_call_cannot_be_bridged_without_the_telephone_system_ringing_first() {
 fn a_one_way_call_is_never_reported_as_a_success() {
     // FR-017, carried forward from feature 016 where the rule caught a real
     // defect. Nobody investigates a success.
-    let mut c = bridged("x@carrier", "+919789063708");
+    let mut c = bridged("x@carrier", "+919000000000");
     c.end(EndedBy::Caller);
 
     assert!(c.succeeded(true));
@@ -102,7 +102,7 @@ fn losing_the_attachment_mid_call_is_not_recorded_as_a_hangup() {
     // The two demand opposite responses: one is normal, the other means the
     // network attachment needs rebuilding. Collapsing them would hide the
     // failure this feature most needs to see (FR-011).
-    let mut c = bridged("x@carrier", "+919789063708");
+    let mut c = bridged("x@carrier", "+919000000000");
     c.end(EndedBy::AttachmentLost);
 
     assert_eq!(c.ended_by, Some(EndedBy::AttachmentLost));
@@ -124,7 +124,7 @@ fn renewal_falling_due_during_a_call_waits_for_the_call_to_end() {
     // Renewing mid-call tears down the transport the call's own BYE needs.
     let mut slot = CallSlot::new();
     let mut policy = MaintenancePolicy::new();
-    slot.accept(bridged("x@carrier", "+919789063708"));
+    slot.accept(bridged("x@carrier", "+919000000000"));
 
     assert_eq!(
         policy.decide(Maintenance::Renewal, slot.is_busy()),
@@ -153,7 +153,7 @@ fn reattachment_falling_due_during_a_call_waits_too() {
     // dropped call every two hours, indefinitely.
     let mut slot = CallSlot::new();
     let mut policy = MaintenancePolicy::new();
-    slot.accept(bridged("x@carrier", "+919789063708"));
+    slot.accept(bridged("x@carrier", "+919000000000"));
 
     assert_eq!(
         policy.decide(Maintenance::Reattachment, slot.is_busy()),

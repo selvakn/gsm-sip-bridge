@@ -72,7 +72,7 @@ const L16_UNREACHABLE: &str = "ims-call never offers L16, so parse_answer cannot
 
 pub struct CallConfig {
     pub register: ImsRegisterConfig,
-    /// E.164, e.g. +919789063708.
+    /// E.164, e.g. +919000000000.
     pub callee: String,
     /// Where to record the received (incoming, far-end) audio.
     pub record_path: PathBuf,
@@ -867,20 +867,20 @@ mod tests {
     fn build_invite_includes_sdp_body_and_content_length() {
         let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
         let msg = build_invite(&InviteParts {
-            request_uri: "+919789063708@realm",
+            request_uri: "+919000000000@realm",
             route_headers: &[],
             via_transport: "TCP",
             local_addr: addr,
             contact_addr: addr,
             public_uri: "12345@realm",
-            callee_uri: "+919789063708@realm",
+            callee_uri: "+919000000000@realm",
             call_id: "callid",
             from_tag: "tag1",
             cseq: 1,
             branch: "branch1",
             body: "v=0\r\n",
         });
-        assert!(msg.starts_with("INVITE sip:+919789063708@realm SIP/2.0\r\n"));
+        assert!(msg.starts_with("INVITE sip:+919000000000@realm SIP/2.0\r\n"));
         assert!(msg.contains("Content-Length: 5\r\n"));
         assert!(msg.ends_with("v=0\r\n"));
         assert!(msg.contains("CSeq: 1 INVITE"));
@@ -960,13 +960,13 @@ mod tests {
     fn build_cancel_reuses_the_invites_branch_and_cseq_number() {
         let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
         let invite = build_invite(&InviteParts {
-            request_uri: "+919789063708@realm",
+            request_uri: "+919000000000@realm",
             route_headers: &[],
             via_transport: "TCP",
             local_addr: addr,
             contact_addr: addr,
             public_uri: "12345@realm",
-            callee_uri: "+919789063708@realm",
+            callee_uri: "+919000000000@realm",
             call_id: "callid",
             from_tag: "tag1",
             cseq: 7,
@@ -977,18 +977,18 @@ mod tests {
         assert!(invite.contains("CSeq: 7 INVITE"));
 
         let cancel = build_cancel(&CancelParts {
-            request_uri: "+919789063708@realm",
+            request_uri: "+919000000000@realm",
             route_headers: &[],
             via_transport: "TCP",
             local_addr: addr,
             public_uri: "12345@realm",
-            callee_uri: "+919789063708@realm",
+            callee_uri: "+919000000000@realm",
             call_id: "callid",
             from_tag: "tag1",
             cseq: 7,
             branch: "z9hG4bKinvitebranch",
         });
-        assert!(cancel.starts_with("CANCEL sip:+919789063708@realm SIP/2.0\r\n"));
+        assert!(cancel.starts_with("CANCEL sip:+919000000000@realm SIP/2.0\r\n"));
         assert!(cancel.contains("branch=z9hG4bKinvitebranch"));
         assert!(cancel.contains("CSeq: 7 CANCEL"));
     }

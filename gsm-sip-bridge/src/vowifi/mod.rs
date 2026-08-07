@@ -2142,7 +2142,7 @@ mod tests {
     fn record(id: &str) -> CallRecord {
         CallRecord {
             call_id: id.to_string(),
-            caller: "+919789063708".to_string(),
+            caller: "+919000000000".to_string(),
             outcome: "answered:caller_hangup".to_string(),
             started_at: 1_700_000_000,
             ended_at: Some(1_700_000_300),
