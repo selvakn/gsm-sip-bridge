@@ -178,6 +178,10 @@ discord_webhook_url = "env:TEST_ALERTS_LEGACY_WEBHOOK"
     assert!(!cfg.alerts.tunnel_failure.enabled);
     assert!(!cfg.alerts.missed_call.enabled);
     assert!(!cfg.alerts.line_discovery_failed.enabled);
+    // specs/028-gm-tcp-reconnect: this one defaults ENABLED — a registered
+    // line whose Gm connection cannot be restored is an incident, not an
+    // opt-in — unlike every other category above.
+    assert!(cfg.alerts.gm_connection_lost.enabled);
     assert_eq!(
         cfg.alerts
             .module_lifecycle_thresholds
@@ -186,6 +190,7 @@ discord_webhook_url = "env:TEST_ALERTS_LEGACY_WEBHOOK"
     );
     assert_eq!(cfg.alerts.tunnel_failure_thresholds.unhealthy_sec, 300);
     assert_eq!(cfg.alerts.registration_loss_thresholds.unhealthy_sec, 300);
+    assert_eq!(cfg.alerts.gm_connection_lost_thresholds.unhealthy_sec, 300);
 }
 
 /// An explicit `[alerts.sms]` table wins over the legacy `[sms]` keys.
@@ -298,6 +303,43 @@ discord_webhook_url = "https://discord.com/api/webhooks/line-discovery-failed"
             .map(|s| s.expose_secret().as_str()),
         Some("https://discord.com/api/webhooks/line-discovery-failed")
     );
+}
+
+/// specs/028-gm-tcp-reconnect: `[alerts.gm_connection_lost]` takes an
+/// `unhealthy_sec` threshold like registration/tunnel loss, can be disabled
+/// explicitly (it is the one category that defaults *enabled*), and an
+/// out-of-range threshold falls back to the 300s default.
+#[test]
+fn test_alerts_gm_connection_lost_enable_threshold_and_range() {
+    std::env::set_var("TEST_ALERTS_GCL_PASSWORD", "p");
+
+    let config = r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_ALERTS_GCL_PASSWORD"
+
+[alerts.gm_connection_lost]
+enabled = false
+discord_webhook_url = "https://discord.com/api/webhooks/gm-connection-lost"
+unhealthy_sec = 99999
+"#;
+
+    let f = write_config(config);
+    let cfg = load_config(f.path()).unwrap();
+
+    // Explicitly disabled overrides the enabled-by-default.
+    assert!(!cfg.alerts.gm_connection_lost.enabled);
+    assert_eq!(
+        cfg.alerts
+            .gm_connection_lost
+            .webhook_url_override
+            .as_ref()
+            .map(|s| s.expose_secret().as_str()),
+        Some("https://discord.com/api/webhooks/gm-connection-lost")
+    );
+    // 99999 is out of the 30..=3600 range, so it falls back to the default.
+    assert_eq!(cfg.alerts.gm_connection_lost_thresholds.unhealthy_sec, 300);
 }
 
 /// An out-of-range threshold falls back to the default rather than failing

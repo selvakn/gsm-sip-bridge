@@ -410,6 +410,11 @@ pub struct ServiceHealth {
     /// bridge leg needs. A bridged call needs *both* legs, so a call cannot be
     /// answered when this is false however healthy the carrier side is.
     pub pbx_registered: bool,
+    /// Whether the Gm signaling connection carrying this line's SIP is up
+    /// (specs/028). A registration can read accepted while its connection is
+    /// silently dead — in which case no inbound call can be delivered — so
+    /// this is a distinct condition from `registered`.
+    pub gm_connection_up: bool,
     /// Whether a call is in progress.
     pub busy: bool,
     /// Maintenance currently being held back for a call, if any.
@@ -432,16 +437,29 @@ impl ServiceHealth {
     /// `attached`: the registration is allowed to outlive the attachment
     /// briefly, which is exactly when an optimistic answer would be wrong.
     pub fn can_answer(&self) -> bool {
-        self.registered && self.attached && self.pbx_registered && !self.busy
+        self.registered
+            && self.attached
+            && self.gm_connection_up
+            && self.pbx_registered
+            && !self.busy
     }
 
     /// Why the service cannot answer, for an operator who needs to fix it
     /// rather than merely observe it. `None` when it can.
+    ///
+    /// Order matters: the two layers *underneath* the Gm connection
+    /// (`attached`, then `registered`) are reported first, because a down
+    /// attachment or registration is the *cause* of a down connection —
+    /// surfacing the symptom over the cause would send an operator to the
+    /// wrong place. The connection then ranks above `pbx_registered`, which is
+    /// the far telephone-side leg (specs/028 R9).
     pub fn blocked_reason(&self) -> Option<&'static str> {
         if !self.attached {
             Some("the network attachment is down")
         } else if !self.registered {
             Some("not registered")
+        } else if !self.gm_connection_up {
+            Some("the carrier signaling connection is down")
         } else if !self.pbx_registered {
             Some("the PBX registration is down")
         } else if self.busy {

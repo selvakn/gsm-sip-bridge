@@ -71,6 +71,13 @@ pub enum ControlMessage {
         /// when the peer did not report health.
         #[serde(default)]
         blocked_reason: Option<String>,
+        /// Rendered Gm signaling-connection health (specs/028): `up`,
+        /// `reconnecting since <ts> (attempt N)`, or `failed since <ts>`.
+        /// `#[serde(default)]` so a reply from an older peer that omits it
+        /// still parses — it then reads empty, which the CLI prints as
+        /// `unknown` rather than claiming health it was not told about.
+        #[serde(default)]
+        gm_connection: String,
     },
     /// Agent B → `vowifi-status`. Recent call outcomes, newest first.
     CallHistoryReply { calls: Vec<CallRecord> },
@@ -519,6 +526,7 @@ mod tests {
             last_failure: Some((1_699_999_000, "timed out".to_string())),
             can_answer: true,
             blocked_reason: None,
+            gm_connection: "up".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -532,8 +540,24 @@ mod tests {
             last_failure: None,
             can_answer: false,
             blocked_reason: Some("not registered".to_string()),
+            gm_connection: "reconnecting since 2026-08-07T10:14:03+00:00 (attempt 2)".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn registration_status_reply_from_an_older_peer_omitting_gm_connection_parses() {
+        // A reply serialised without `gm_connection` (an older Agent A) must
+        // still deserialise, defaulting the field to empty — the CLI then
+        // prints "unknown" rather than claiming the connection is up (specs/028).
+        let older = r#"{"event":"registration_status_reply","state":"Registered","registered_at":1700000000,"expires_at":1700003600,"last_failure":null,"can_answer":true,"blocked_reason":null}"#;
+        let parsed: ControlMessage = serde_json::from_str(older).unwrap();
+        match parsed {
+            ControlMessage::RegistrationStatusReply { gm_connection, .. } => {
+                assert_eq!(gm_connection, "");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

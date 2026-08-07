@@ -31,12 +31,13 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_vowifi_registered` | Gauge | 1 if the VoWiFi IMS registration is currently held |
 | `gsm_sip_bridge_vowifi_registrations_total` | Counter | VoWiFi IMS registration attempts by outcome |
 | `gsm_sip_bridge_vowifi_tunnel_up` | Gauge | 1 if Agent A has a P-CSCF assignment and a live transport to it — a liveness proxy, not raw IKE/ESP SA state |
+| `gsm_sip_bridge_vowifi_gm_connection_up` | Gauge | 1 if this line's Gm signaling connection is up, 0 while reconnecting or failed. Shared across VoWiFi and VoLTE lines, keyed by `module` (the `vowifi_` prefix is retained for VoLTE, matching `vowifi_tunnel_up`) |
 | `gsm_sip_bridge_vowifi_bridge_failures_total` | Counter | Inbound VoWiFi calls that failed to bridge, by reason |
 | `gsm_sip_bridge_agent_up` | Gauge | 1 if the named VoWiFi agent (`ims` or `sip`) has reported within the last 3 report intervals |
 | `gsm_sip_bridge_agent_last_report_seconds` | Gauge | Age of the named agent's most recent report |
 | `gsm_sip_bridge_observability_events_dropped_total` | Counter | Reports an agent's bounded buffer discarded on overflow |
-| `gsm_sip_bridge_critical_alerts_total` | Counter | Discord critical-alert dispatch outcomes by **category** (`sms`, `module_lifecycle`, `registration_loss`, `tunnel_failure`, `missed_call`) and **outcome** (`sent`, `suppressed`, `skipped`, `failed`) — see `[alerts]` in [configuration.md](configuration.md) |
-| `gsm_sip_bridge_critical_event_active` | Gauge | 1 while a `module_lifecycle`/`registration_loss`/`tunnel_failure` category is in an active (unresolved) incident for a given module/line, by **category** and **module** |
+| `gsm_sip_bridge_critical_alerts_total` | Counter | Discord critical-alert dispatch outcomes by **category** (`sms`, `module_lifecycle`, `registration_loss`, `tunnel_failure`, `missed_call`, `line_discovery_failed`, `gm_connection_lost`) and **outcome** (`sent`, `suppressed`, `skipped`, `failed`) — see `[alerts]` in [configuration.md](configuration.md) |
+| `gsm_sip_bridge_critical_event_active` | Gauge | 1 while a `module_lifecycle`/`registration_loss`/`tunnel_failure`/`line_discovery_failed`/`gm_connection_lost` category is in an active (unresolved) incident for a given module/line, by **category** and **module** |
 | `gsm_sip_bridge_sip_server_bindings` | Gauge | IP phones currently registered to the embedded registrar (`[sip_server]` mode) |
 | `gsm_sip_bridge_sip_server_ring_aor_registered` | Gauge | 1 when `[sip_server].ring_aor` specifically has a live registration — the gauge that answers "will a call ring?" |
 | `gsm_sip_bridge_sip_server_registrations_total` | Counter | Registration attempts by **outcome** (`accepted`, `challenged`, `rejected_auth`, `rejected_unknown_user`, `rejected_stale`, `rejected_interval`, `deregistered`) |

@@ -97,6 +97,9 @@ struct AgentRecord {
     /// Same pair, for `tunnel_up`.
     tunnel_unhealthy_since: Option<Instant>,
     tunnel_alert_phase: AlertPhase,
+    /// Same pair, for `gm_connection_up` (specs/028-gm-tcp-reconnect).
+    gm_connection_unhealthy_since: Option<Instant>,
+    gm_connection_alert_phase: AlertPhase,
 }
 
 /// Keyed by `(agent kind, module_id)`, not just agent kind — with
@@ -139,8 +142,11 @@ pub fn apply_report(report: &AgentReport) {
     let mut registered_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.registered_alert_phase);
     let mut tunnel_alert_phase = existing.map_or(AlertPhase::Idle, |r| r.tunnel_alert_phase);
+    let mut gm_connection_alert_phase =
+        existing.map_or(AlertPhase::Idle, |r| r.gm_connection_alert_phase);
     let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
     let mut tunnel_unhealthy_since = existing.and_then(|r| r.tunnel_unhealthy_since);
+    let mut gm_connection_unhealthy_since = existing.and_then(|r| r.gm_connection_unhealthy_since);
     // (category, transition, generation) to dispatch once the lock is
     // released. `generation` is the `*_unhealthy_since` value this
     // particular transition was decided against — threaded through to
@@ -159,6 +165,7 @@ pub fn apply_report(report: &AgentReport) {
             &report.state,
             &mut registered_unhealthy_since,
             &mut tunnel_unhealthy_since,
+            &mut gm_connection_unhealthy_since,
         );
 
         for event in &report.events {
@@ -206,6 +213,23 @@ pub fn apply_report(report: &AgentReport) {
                 }
                 Transition::None => {}
             }
+            let gm_connection_threshold =
+                Duration::from_secs(cfg.gm_connection_lost_thresholds.unhealthy_sec);
+            match decide_transition(
+                gm_connection_unhealthy_since,
+                &mut gm_connection_alert_phase,
+                gm_connection_threshold,
+            ) {
+                Transition::Event(kind) => pending_transitions.push((
+                    AlertCategory::GmConnectionLost,
+                    kind,
+                    gm_connection_unhealthy_since,
+                )),
+                Transition::Suppressed => {
+                    crate::alerts::record_suppressed(AlertCategory::GmConnectionLost)
+                }
+                Transition::None => {}
+            }
         }
     }
 
@@ -223,6 +247,8 @@ pub fn apply_report(report: &AgentReport) {
             registered_alert_phase,
             tunnel_unhealthy_since,
             tunnel_alert_phase,
+            gm_connection_unhealthy_since,
+            gm_connection_alert_phase,
         },
     );
     drop(guard);
@@ -310,7 +336,20 @@ fn dispatch_transition(
         (AlertCategory::TunnelFailure, CriticalEventKind::Recovered) => {
             format!("{} line's tunnel re-established", key.0.as_str())
         }
-        _ => unreachable!("only RegistrationLoss/TunnelFailure transitions are produced here"),
+        (AlertCategory::GmConnectionLost, CriticalEventKind::Failure) => format!(
+            "{} line's carrier signaling connection down for over {}s",
+            key.0.as_str(),
+            cfg.gm_connection_lost_thresholds.unhealthy_sec
+        ),
+        (AlertCategory::GmConnectionLost, CriticalEventKind::Recovered) => {
+            format!(
+                "{} line's carrier signaling connection re-established",
+                key.0.as_str()
+            )
+        }
+        _ => unreachable!(
+            "only RegistrationLoss/TunnelFailure/GmConnectionLost transitions are produced here"
+        ),
     };
     let event = CriticalEvent {
         category,
@@ -363,6 +402,10 @@ fn record_alert_outcome(
             &mut record.tunnel_alert_phase,
             record.tunnel_unhealthy_since,
         ),
+        AlertCategory::GmConnectionLost => (
+            &mut record.gm_connection_alert_phase,
+            record.gm_connection_unhealthy_since,
+        ),
         _ => return,
     };
     if *phase == AlertPhase::Pending && unhealthy_since == Some(generation) {
@@ -380,6 +423,7 @@ fn apply_state(
     state: &AgentState,
     registered_unhealthy_since: &mut Option<Instant>,
     tunnel_unhealthy_since: &mut Option<Instant>,
+    gm_connection_unhealthy_since: &mut Option<Instant>,
 ) {
     let transport = transport_label(agent);
     if let Some(active_calls) = state.active_calls {
@@ -435,6 +479,28 @@ fn apply_state(
             *tunnel_unhealthy_since = None;
         } else if tunnel_unhealthy_since.is_none() {
             *tunnel_unhealthy_since = Some(Instant::now());
+        }
+    }
+    // specs/028-gm-tcp-reconnect. `None` here means the agent did not report
+    // the signal (an older peer, or a partial report), and MUST leave both the
+    // gauge and the unhealthy timer untouched — reading absent as "down" would
+    // report every line down on any report that happens not to carry it.
+    if let Some(gm_connection_up) = state.gm_connection_up {
+        let up = if gm_connection_up { 1.0 } else { 0.0 };
+        match agent {
+            // Both the VoWiFi and VoLTE paths file under the one gauge, keyed
+            // by `module` — see the metric's own doc for why the `vowifi_`
+            // prefix is retained for VoLTE.
+            AgentKind::Ims | AgentKind::Sip | AgentKind::Volte => metrics::VOWIFI_GM_CONNECTION_UP
+                .with_label_values(&[module_id])
+                .set(up),
+            // The telephony half carries no Gm connection of its own.
+            AgentKind::VolteSip => {}
+        }
+        if gm_connection_up {
+            *gm_connection_unhealthy_since = None;
+        } else if gm_connection_unhealthy_since.is_none() {
+            *gm_connection_unhealthy_since = Some(Instant::now());
         }
     }
     // pbx_registered (Agent B) has no dedicated gauge yet — sip_registered
@@ -798,6 +864,7 @@ mod tests {
             },
             &mut None,
             &mut None,
+            &mut None,
         );
 
         assert_eq!(
@@ -1087,6 +1154,8 @@ mod tests {
                 registered_alert_phase: AlertPhase::Pending,
                 tunnel_unhealthy_since: None,
                 tunnel_alert_phase: AlertPhase::Idle,
+                gm_connection_unhealthy_since: None,
+                gm_connection_alert_phase: AlertPhase::Idle,
             },
         );
         generation

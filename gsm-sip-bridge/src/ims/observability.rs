@@ -86,6 +86,17 @@ impl AgentObservability {
         self.push(Vec::new());
     }
 
+    /// Report the Gm signaling connection's health (specs/028). Called on
+    /// state changes only — never per idle poll — so the reporter isn't asked
+    /// to coalesce a steady stream of identical values.
+    pub fn set_gm_connection_up(&self, up: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gm_connection_up = Some(up);
+        self.push(Vec::new());
+    }
+
     pub fn report_registration_attempt(&self, status: RegistrationStatus) {
         self.push(vec![ObservedEvent::RegistrationAttempt { status }]);
     }
