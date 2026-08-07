@@ -1,3 +1,3 @@
 {
-  "feature_directory": "specs/028-gm-tcp-reconnect"
+  "feature_directory": "specs/029-interruptible-origination-wait"
 }
