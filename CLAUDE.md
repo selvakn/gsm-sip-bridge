@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/029-interruptible-origination-wait/plan.md`.
+`specs/030-bad-port-isolation/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

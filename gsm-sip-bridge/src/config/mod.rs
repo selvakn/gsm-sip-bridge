@@ -6,6 +6,7 @@ pub mod secret;
 use crate::error::{BridgeError, BridgeResult};
 use secret::Secret;
 use std::path::Path;
+use std::time::Duration;
 use toml::Value;
 
 pub const ALERTS_TUNNEL_FAILURE_KEYS: &[&str] =
@@ -853,6 +854,97 @@ impl Default for VolteConfig {
     }
 }
 
+/// A single parsed `[discovery] excluded_ports` entry
+/// (specs/030-bad-port-isolation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PortMatcher {
+    /// An exact `/dev/ttyUSB*` device path, matched by exact equality. Easy to
+    /// copy from logs, but `ttyUSB` numbering is not stable across replug.
+    DevicePath(String),
+    /// A USB-topology fragment (e.g. `5-1.2.1.2:1.1`), matched against a port's
+    /// sysfs interface path by exact-equality OR a boundary-aligned leading
+    /// prefix, so a coarser fragment (`5-1.2.1.2`) excludes every interface on
+    /// that device. Stable across replug/reboot.
+    TopologyPrefix(String),
+}
+
+impl PortMatcher {
+    /// Parses one `excluded_ports` entry. An empty/whitespace entry is dropped
+    /// (returns `None`); a `/dev/...` entry is an exact device path, anything
+    /// else is treated as a topology fragment.
+    pub fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            None
+        } else if entry.starts_with("/dev/") {
+            Some(Self::DevicePath(entry.to_string()))
+        } else {
+            Some(Self::TopologyPrefix(entry.to_string()))
+        }
+    }
+
+    /// Whether this matcher excludes a port with the given device path and USB
+    /// interface (sysfs) path.
+    pub fn matches(&self, device_path: &Path, iface_path: &Path) -> bool {
+        match self {
+            Self::DevicePath(p) => device_path.to_string_lossy() == p.as_str(),
+            Self::TopologyPrefix(frag) => {
+                let iface = iface_path.to_string_lossy();
+                // Compare against the interface directory name (the last path
+                // component), which is the topology fragment, e.g.
+                // `5-1.2.1.2:1.1`.
+                let name = iface.rsplit('/').next().unwrap_or(&iface);
+                topology_prefix_matches(frag, name)
+            }
+        }
+    }
+}
+
+/// `frag` matches `name` when it equals it, or is a leading prefix aligned to a
+/// topology/interface boundary (`:`, `.`, or `-`) — never an unanchored
+/// substring. So `5-1.2.1.2` matches `5-1.2.1.2:1.1`, but `1.2` matches
+/// nothing.
+fn topology_prefix_matches(frag: &str, name: &str) -> bool {
+    if name == frag {
+        return true;
+    }
+    match name.strip_prefix(frag) {
+        Some(rest) => rest.starts_with(':') || rest.starts_with('.') || rest.starts_with('-'),
+        None => false,
+    }
+}
+
+/// Runtime view of `[discovery]` (specs/030-bad-port-isolation). Empty
+/// `excluded` + the default timeout reproduces pre-feature discovery behavior.
+#[derive(Clone, Debug)]
+pub struct DiscoveryConfig {
+    pub excluded: Vec<PortMatcher>,
+    pub probe_timeout: Duration,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            excluded: Vec::new(),
+            probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+        }
+    }
+}
+
+/// Default per-port probe abandon budget. 5s (not 3s): the SIM-status probe
+/// bounds an open plus `AT+CPIN?` and `AT+CIMI`, each of which can block up to
+/// the per-line port read timeout, so the worst healthy case approaches this —
+/// too tight a budget would falsely abandon a slow-but-working modem
+/// (specs/030-bad-port-isolation).
+pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 5000;
+
+/// Floor for `[discovery].probe_timeout_ms`. A value below this (notably `0`)
+/// would abandon every port immediately and, after three scans, quarantine
+/// every modem for the process lifetime — bricking discovery with no
+/// diagnosable cause. It must also stay above the internal ~800ms AT-open
+/// timeout. `build` clamps up to this and warns rather than failing.
+pub const MIN_PROBE_TIMEOUT_MS: u64 = 1000;
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub sip: SipConfig,
@@ -872,6 +964,7 @@ pub struct AppConfig {
     pub sip_server: SipServerConfig,
     pub outbound: OutboundConfig,
     pub cs: CsConfig,
+    pub discovery: DiscoveryConfig,
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
@@ -973,6 +1066,115 @@ mod tests {
     fn outbound_can_be_enabled() {
         let c = parse(&format!("{MINIMAL_TOML}\n[outbound]\nenabled = true\n"));
         assert!(c.outbound.enabled);
+    }
+
+    // --- specs/030-bad-port-isolation: [discovery] parsing + PortMatcher ---
+
+    #[test]
+    fn discovery_defaults_when_section_absent() {
+        let c = parse(MINIMAL_TOML);
+        assert!(
+            c.discovery.excluded.is_empty(),
+            "nothing excluded by default (FR-008)"
+        );
+        assert_eq!(
+            c.discovery.probe_timeout,
+            Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn discovery_clamps_a_too_low_probe_timeout() {
+        // 0 (or any sub-floor value) would abandon every port and quarantine
+        // all modems — clamp up instead of bricking discovery (finding 4).
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[discovery]\nprobe_timeout_ms = 0\n"
+        ));
+        assert_eq!(
+            c.discovery.probe_timeout,
+            Duration::from_millis(MIN_PROBE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn discovery_keeps_a_probe_timeout_at_or_above_the_floor() {
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[discovery]\nprobe_timeout_ms = 8000\n"
+        ));
+        assert_eq!(c.discovery.probe_timeout, Duration::from_millis(8000));
+    }
+
+    #[test]
+    fn discovery_parses_excluded_ports_and_timeout() {
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[discovery]\n\
+             excluded_ports = [\"5-1.2.1.2:1.1\", \"/dev/ttyUSB9\"]\n\
+             probe_timeout_ms = 4500\n"
+        ));
+        assert_eq!(c.discovery.excluded.len(), 2);
+        assert_eq!(c.discovery.probe_timeout, Duration::from_millis(4500));
+    }
+
+    #[test]
+    fn discovery_drops_blank_excluded_entries() {
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[discovery]\nexcluded_ports = [\"\", \"  \", \"/dev/ttyUSB1\"]\n"
+        ));
+        assert_eq!(c.discovery.excluded.len(), 1, "blank entries are dropped");
+    }
+
+    #[test]
+    fn port_matcher_parse_classifies_entries() {
+        assert_eq!(
+            PortMatcher::parse("/dev/ttyUSB1"),
+            Some(PortMatcher::DevicePath("/dev/ttyUSB1".to_string()))
+        );
+        assert_eq!(
+            PortMatcher::parse("5-1.2.1.2:1.1"),
+            Some(PortMatcher::TopologyPrefix("5-1.2.1.2:1.1".to_string()))
+        );
+        assert_eq!(PortMatcher::parse("   "), None);
+        assert_eq!(PortMatcher::parse(""), None);
+    }
+
+    #[test]
+    fn port_matcher_device_path_is_exact() {
+        let m = PortMatcher::parse("/dev/ttyUSB1").unwrap();
+        let iface = Path::new("/sys/bus/usb/devices/5-1.2.1.2:1.1");
+        assert!(m.matches(Path::new("/dev/ttyUSB1"), iface));
+        assert!(!m.matches(Path::new("/dev/ttyUSB10"), iface));
+    }
+
+    #[test]
+    fn port_matcher_topology_exact_and_whole_device_prefix() {
+        let dev = Path::new("/dev/ttyUSB1");
+        let iface = Path::new("/sys/bus/usb/devices/5-1.2.1.2:1.1");
+        assert!(
+            PortMatcher::parse("5-1.2.1.2:1.1")
+                .unwrap()
+                .matches(dev, iface),
+            "exact interface fragment matches"
+        );
+        assert!(
+            PortMatcher::parse("5-1.2.1.2").unwrap().matches(dev, iface),
+            "whole-device prefix matches every interface under it"
+        );
+    }
+
+    #[test]
+    fn port_matcher_topology_rejects_unanchored_substring() {
+        let dev = Path::new("/dev/ttyUSB1");
+        let iface = Path::new("/sys/bus/usb/devices/5-1.2.1.2:1.1");
+        assert!(
+            !PortMatcher::parse("1.2").unwrap().matches(dev, iface),
+            "a mid-token substring must not match"
+        );
+        assert!(
+            !PortMatcher::parse("1.2.1.2:1.1")
+                .unwrap()
+                .matches(dev, iface),
+            "a fragment must be anchored at the start of the interface name"
+        );
     }
 
     #[test]

@@ -408,6 +408,34 @@ left entirely to the PBX's dial plan, network access controls, and
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch. Off by default |
 
+### `[discovery]`
+
+Serial-port discovery controls (specs/030-bad-port-isolation). A specific
+misbehaving USB serial interface can hang the kernel `option` driver on any
+operation — even a bare open — in a way no userspace read-timeout can break.
+Left unhandled, probing such a port during the startup/rescan scan wedges the
+*whole* daemon. Discovery bounds each individual port probe: a port that does
+not respond within `probe_timeout_ms` is abandoned and the scan moves on, and a
+port that times out three times in a row is quarantined in memory for the rest
+of the process's life (logged once, at `WARN`, when it crosses that threshold).
+Both apply with the defaults below; the section is optional and, when absent,
+discovery behaves exactly as before this feature.
+
+`excluded_ports` is the operator escape hatch for a *known*-bad port: a listed
+port is never opened or probed at all. Each entry is either an exact device
+path (`/dev/ttyUSB1`) or a USB-topology fragment (`5-1.2.1.2:1.1`). Topology
+fragments are matched by exact-equality or a boundary-aligned leading prefix —
+so a full interface fragment excludes just that interface, while a coarser
+device fragment (`5-1.2.1.2`) excludes every interface on that device — and,
+unlike device paths, they survive replug/reboot (where `ttyUSB` numbering
+changes). Prefer the topology form. The abandon-on-timeout log line prints the
+port's interface path so it can be copied straight into this list.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `excluded_ports` | array of strings | `[]` | Ports never to open/probe. Exact `/dev/ttyUSB*` paths or USB-topology fragments (exact or whole-device prefix) |
+| `probe_timeout_ms` | integer (ms) | `5000` | Per-port probe abandon budget. Covers the SIM read (open + `AT+CPIN?` + `AT+CIMI`), so it is 5s, not just an open's worth. Values below `1000` are clamped up (a lower value would abandon every port and quarantine all modems) |
+
 ## Examples
 
 ### Single-card development

@@ -60,9 +60,11 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
         // one-shot and runs before any line carries traffic, so an
         // `AT+CFUN` cycle here can't interrupt a call the way it could on
         // `scan_modules`' ongoing rescans — see `SimRecovery`.
+        let mut policy = crate::modules::discovery::DiscoveryPolicy::new(config.discovery.clone());
         let modems = match crate::modules::discovery::scan_all_preferring_with_sim_recovery(
             &preferred_ports,
             crate::modules::discovery::SimRecovery::CfunCycleOnUnreadable,
+            &mut policy,
         ) {
             Ok(m) => m,
             Err(e) => {

@@ -898,6 +898,36 @@ fn build_cs(raw: RawCs) -> CsConfig {
     }
 }
 
+/// Lenient by design: an empty or whitespace `excluded_ports` entry is dropped
+/// rather than fatal (`PortMatcher::parse` returns `None`), so a stray blank in
+/// the list can't take the bridge down. `probe_timeout_ms` is clamped up to
+/// `MIN_PROBE_TIMEOUT_MS` (with a warning) rather than accepted as-is: `0` — or
+/// any value below the internal AT-open timeout — would abandon every port and,
+/// after three scans, quarantine every modem for the process lifetime, bricking
+/// discovery with no diagnosable cause. A too-*high* value is left alone (the
+/// operator's call).
+fn build_discovery(raw: RawDiscovery) -> DiscoveryConfig {
+    let probe_timeout_ms = if raw.probe_timeout_ms < MIN_PROBE_TIMEOUT_MS {
+        tracing::warn!(
+            configured_ms = raw.probe_timeout_ms,
+            floor_ms = MIN_PROBE_TIMEOUT_MS,
+            "[discovery].probe_timeout_ms is below the safe floor; clamping up \
+             (too low a value would abandon every port and quarantine all modems)"
+        );
+        MIN_PROBE_TIMEOUT_MS
+    } else {
+        raw.probe_timeout_ms
+    };
+    DiscoveryConfig {
+        excluded: raw
+            .excluded_ports
+            .iter()
+            .filter_map(|e| PortMatcher::parse(e))
+            .collect(),
+        probe_timeout: std::time::Duration::from_millis(probe_timeout_ms),
+    }
+}
+
 // ----------------------------------------------------------------- entry ---
 
 /// Assembles the runtime config from the deserialised document.
@@ -931,5 +961,6 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
         sip_server,
         outbound: build_outbound(raw.outbound)?,
         cs: build_cs(raw.cs),
+        discovery: build_discovery(raw.discovery),
     })
 }
