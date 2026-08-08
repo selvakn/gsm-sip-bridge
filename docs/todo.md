@@ -14,19 +14,25 @@ Observed pending items
       never been independently exercised for *outbound* calling (T050e left this
       deliberately open). Believed to work — shares `ims::agent`'s origination code
       with VoWiFi — but unconfirmed. Plan: [docs/plans/volte-outbound-verification.md](plans/volte-outbound-verification.md).
-- [ ] Agent A's `dispatch_loop` (`ims/agent.rs`) blocks entirely for up to
+- [x] ~~Agent A's `dispatch_loop` (`ims/agent.rs`) blocks entirely for up to
       ~80s (`OUTBOUND_INVITE_TIMEOUT` + `OUTBOUND_RING_TIMEOUT` +
       `VETH_INVITE_TIMEOUT`) while `originate_and_bridge` waits on an
-      outbound VoWiFi/VoLTE carrier leg. Nothing else the loop is
-      responsible for runs during that window: an inbound carrier INVITE
-      arriving then is effectively dropped (its bytes sit in `inbound.rx`,
-      but the caller's own SIP Timer B will very likely give up before the
-      loop gets back around to it), and a caller hanging up mid-ring can't
-      be observed to trigger a CANCEL (`cancel_pending_invite` only fires on
-      Agent A's own timeout, not on a phone/PBX-side hangup). Fixing either
-      needs an interruptible wait on this loop — a materially bigger change
-      than a review pass makes (specs/025-outbound-calling, second/third
-      code review, 2026-08-03).
+      outbound VoWiFi/VoLTE carrier leg~~ — **implemented in
+      specs/029-interruptible-origination-wait** (2026-08-08): origination is
+      now a `PendingOrigination` state machine the loop advances on its own
+      thread rather than a blocking call. Carrier responses arrive via
+      `inbound.rx` (matched by `Call-ID`), so the loop keeps servicing
+      everything else while the carrier rings: an inbound INVITE gets a prompt
+      `486` (it occupies the line via `Admission`), and a caller hangup relayed
+      by Agent B triggers a `CANCEL` toward the carrier within ~100ms instead of
+      never being observed. Agent B's own attempt-phase wait became a poll loop
+      too, so it notices its caller hanging up. Also fixed the outbound
+      lifecycle so a placed call actually reaches `Bridged` (was silently stuck
+      at `Answering`), and added a `caller_abandoned` outcome. Residual, by
+      design: still one call at a time per line (`Admission::RejectBusy`) — an
+      inbound call during an attempt is refused busy, not held.
+      **Still needs the live hardware re-test** against the original mid-ring
+      hangup scenario (spec T046) to confirm end to end.
       Plan: [docs/plans/dispatch-loop-interruptible-wait.md](plans/dispatch-loop-interruptible-wait.md).
 - [x] ~~Line 0's Gm TCP connection (VoWiFi ePDG tunnel) silently resets some
       minutes after registration with no reconnect logic~~ — **implemented in

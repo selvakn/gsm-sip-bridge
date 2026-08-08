@@ -1,5 +1,12 @@
 # Contract: Agent A/B outbound origination protocol
 
+> **Amended by specs/029** (2026-08-08): the attempt phase is now
+> interruptible — Agent B may send `CallEnded` before `CallPlaced`/`CallFailed`
+> to abandon an attempt whose caller hung up, and an inbound call arriving
+> during an attempt is refused busy. See
+> [`specs/029-interruptible-origination-wait/contracts/agent-outbound-protocol-delta.md`](../../029-interruptible-origination-wait/contracts/agent-outbound-protocol-delta.md).
+> The wire format is unchanged.
+
 **Feature**: 025-outbound-calling (revision 4)
 **Extends**: `vowifi::control::ControlMessage`
 (`specs/011-vowifi-sip-bridge/contracts/agent-control-protocol.md`), the

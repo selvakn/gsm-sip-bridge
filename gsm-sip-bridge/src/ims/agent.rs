@@ -1054,14 +1054,20 @@ const CANCEL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// immediately BYE'd, or the carrier leg would stay up with nothing on our
 /// end tracking it.
 ///
-/// KNOWN LIMITATION, only reachable *from our own side*: only reaches this
-/// function when *we* give up on a timeout. A caller hanging up mid-ring
-/// (while `dispatch_loop` is still blocked inside `originate_and_bridge`,
-/// see that call site's own doc comment) has no way to trigger this at
-/// all — `dispatch_loop` cannot observe the phone/PBX control connection
-/// during that whole window, so it never learns the caller gave up until
-/// its own timeout eventually elapses regardless. Fixing that needs an
-/// interruptible wait, not just this function.
+/// Two triggers reach this now (specs/029): our own carrier-response timeout
+/// (as before), and — since the origination wait became interruptible — a
+/// caller hanging up mid-ring. `dispatch_loop` watches the pending
+/// origination's control channel (`ctrl_rx`) every tick, so Agent B's
+/// `CallEnded` reaches it within ~100ms and `tick_pending_origination` calls
+/// this to CANCEL the still-pending INVITE, instead of the caller's hangup
+/// going unobserved until our own timeout elapsed.
+///
+/// One residual, pre-existing race (research R2): the short post-CANCEL read
+/// below (`recv_final_response_for_origination`) still reads the carrier
+/// socket directly, so the always-running client-reader thread may grab the
+/// `487`/`200` first. That only affects this courtesy teardown of a leg the
+/// CANCEL has already abandoned — it does not affect the main path, which no
+/// longer reads the socket directly.
 #[allow(clippy::too_many_arguments)]
 fn cancel_pending_invite(
     session: &mut super::RegisteredSession,

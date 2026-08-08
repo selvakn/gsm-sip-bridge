@@ -75,6 +75,16 @@ pub(crate) struct Inbound {
 /// over — the half of a Gm association that carries responses to requests
 /// *we* originate (e.g. the reg-event SUBSCRIBE, or a BYE toward the
 /// carrier) — feeding every message it parses into `tx`.
+///
+/// **This is the single reader of the client transport.** Anything that needs
+/// a response to a request it sent on this connection (outbound INVITE
+/// responses, keepalive `OPTIONS`) must consume it from `inbound.rx`, correlated
+/// there, rather than calling `transport.recv_*` directly: a second concurrent
+/// reader on the same socket races this one for the bytes and loses them
+/// intermittently (specs/029 research R2 — this is exactly why the outbound
+/// origination path was moved off a direct socket read). The one remaining
+/// direct reader, `cancel_pending_invite`'s post-CANCEL courtesy read, is
+/// documented there as an accepted best-effort exception.
 fn spawn_client_reader(
     session: &super::RegisteredSession,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
