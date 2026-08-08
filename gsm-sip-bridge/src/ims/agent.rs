@@ -1533,24 +1533,6 @@ impl PendingOrigination {
         OriginationStatus::Ended
     }
 
-    /// Re-send the ACK for a retransmitted `200 OK` (our first ACK was lost).
-    /// Reuses the INVITE's branch/CSeq (§17.1.1.3); best-effort.
-    fn resend_ack(&self, resp: &SipResponse, session: &mut super::RegisteredSession) {
-        let ack = super::call::build_ack(&super::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
-            via_transport: self.via_transport,
-            local_addr: session.local_addr,
-            public_uri: &session.public_uri,
-            to_header: resp.header("To").unwrap_or(&self.callee_uri),
-            call_id: &self.call_id,
-            from_tag: &self.from_tag,
-            cseq: self.invite_cseq,
-            branch: &format!("z9hG4bK{}", random_hex(6)),
-        });
-        let _ = session.transport_mut().and_then(|t| t.send(&ack));
-    }
-
     /// Advance on a carrier response delivered via `inbound.rx`. Returns
     /// `Ended` (and has already sent `CallFailed`/ACKed as needed) when the
     /// attempt is resolved as a failure; `Pending` while it is still in flight
@@ -1570,26 +1552,23 @@ impl PendingOrigination {
             OriginationStep::AwaitingVeth { .. } => {
                 // The INVITE's final was already handled and the veth leg is
                 // being placed. Re-running the answer path would spawn a second
-                // veth listener and send `CallPlaced` twice, so never do that.
-                // But a retransmitted `200` means our ACK was lost — re-ACK it
-                // (RFC 3261 §13.2.2.4), or the carrier keeps retransmitting and
-                // eventually tears the call down (greptile PR #35). Only an
-                // INVITE `200` warrants that; anything else is just ignored.
-                let is_invite_200 = resp.status == 200
-                    && resp
-                        .header("CSeq")
-                        .and_then(cseq_method)
-                        .is_some_and(|m| m.eq_ignore_ascii_case("INVITE"));
-                if is_invite_200 {
-                    tracing::debug!(call_id = %self.call_id, "outbound: re-ACKing a retransmitted 200 OK during the veth wait");
-                    self.resend_ack(resp, session);
-                } else {
-                    tracing::debug!(
-                        call_id = %self.call_id,
-                        status = resp.status,
-                        "ignoring a carrier response after the final was already handled"
-                    );
-                }
+                // veth listener and send `CallPlaced` twice; ignore the response
+                // instead, exactly as the old blocking code did (it never read
+                // the socket again during the veth wait).
+                //
+                // A retransmitted `2xx` (our ACK was lost, only possible on a
+                // UDP Gm) is therefore not re-ACKed here — and neither is one on
+                // an already-bridged `ActiveCall`, nor on an inbound call
+                // (greptile PR #35 round 4). Retransmitted-2xx re-ACK is a
+                // pre-existing gap orthogonal to this feature and uniform across
+                // both call directions; closing it belongs in a dedicated
+                // change, not piecemeal on only the outbound veth window. Moot
+                // on the TCP Gm transport this deployment uses.
+                tracing::debug!(
+                    call_id = %self.call_id,
+                    status = resp.status,
+                    "ignoring a carrier response after the final was already handled"
+                );
                 return OriginationStatus::Pending;
             }
             OriginationStep::AwaitingCarrier => {}
