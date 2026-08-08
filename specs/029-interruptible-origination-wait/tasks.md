@@ -33,8 +33,14 @@ Full suite green (1243 passed, 0 failed); `make lint` clean.
 - **R2 verdict:** analyzed as high-confidence from the source; not reproduced
   at runtime. The fix does not depend on reproducing it.
 
-**Outstanding:** T046 (live hardware mid-ring-hangup verification) — see the PR;
-being done against the attached hardware separately from CI.
+**T046 (live hardware verification): PASSED (2026-08-08).** A real outbound
+VoWiFi call over the EC200 line, hung up mid-ring, produced `sent CANCEL for an
+abandoned INVITE` toward the carrier ~1.6s after `180 Ringing` (inside SC-001);
+Agent B detected the hangup during the attempt phase and stopped line-retry; a
+`200` that raced the CANCEL was cleanly ACK+BYE'd (no phantom leg — the
+`AwaitingCancel` path from the greptile rounds, confirmed live); the line
+recovered to `Registered`/`can_answer` immediately (SC-003). An earlier run
+exercised the happy path (call placed, bridged, torn down). Evidence in the PR.
 
 **Input**: Design documents from `/specs/029-interruptible-origination-wait/`
 **Prerequisites**: [plan.md](./plan.md), [spec.md](./spec.md), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/](./contracts/)

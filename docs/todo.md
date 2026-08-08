@@ -31,8 +31,12 @@ Observed pending items
       at `Answering`), and added a `caller_abandoned` outcome. Residual, by
       design: still one call at a time per line (`Admission::RejectBusy`) — an
       inbound call during an attempt is refused busy, not held.
-      **Still needs the live hardware re-test** against the original mid-ring
-      hangup scenario (spec T046) to confirm end to end.
+      **Live hardware test passed (2026-08-08, spec T046)**: a real outbound
+      VoWiFi call over the EC200 line, hung up mid-ring, produced
+      `sent CANCEL for an abandoned INVITE` toward the carrier ~1.6s after
+      `180 Ringing`; a `200` that raced the CANCEL was cleanly ACK+BYE'd (no
+      phantom leg), and the line recovered to `Registered`/`can_answer`
+      immediately.
       Plan: [docs/plans/dispatch-loop-interruptible-wait.md](plans/dispatch-loop-interruptible-wait.md).
 - [x] ~~Line 0's Gm TCP connection (VoWiFi ePDG tunnel) silently resets some
       minutes after registration with no reconnect logic~~ — **implemented in
