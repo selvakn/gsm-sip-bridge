@@ -785,6 +785,16 @@ impl SipTransport {
     /// caller has no operator watching and must decide for itself how long
     /// "still ringing" is allowed to mean.
     ///
+    /// **No longer on the main origination path** (specs/029): `dispatch_loop`
+    /// now places outbound calls without blocking, receiving carrier responses
+    /// through `inbound.rx` (the single client-reader thread) rather than
+    /// reading this transport directly — which is also what removed the
+    /// two-readers-on-one-socket race (research R2). The one remaining caller is
+    /// `cancel_pending_invite`, whose short post-CANCEL read for a `487`/`200`
+    /// race still reads directly and so still races the client reader
+    /// best-effort; that path is unchanged from before and is only a courtesy
+    /// teardown of a leg the CANCEL has already abandoned.
+    ///
     /// `initial_timeout` bounds how long we wait for *any* response at all,
     /// even a bare `100 Trying` — if nothing arrives in that window,
     /// something transport-level is actually wrong, not just "the phone
