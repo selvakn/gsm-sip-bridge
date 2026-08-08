@@ -574,6 +574,15 @@ pub(crate) fn run_telephony_side(
 /// process-wide, matching the shared `endpoint`/`account` it polls.
 const OUTBOUND_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How long a single poll-read blocks while waiting for Agent A's next
+/// attempt-phase message before coming up for air to check whether our own
+/// caller has hung up (specs/029-interruptible-origination-wait). Short so a
+/// mid-attempt hangup is noticed within one tick; the overall wait is still
+/// bounded by `CALL_ATTEMPT_TIMEOUT`, which this does not change. Matches the
+/// cadence `PBX_RING_POLL_INTERVAL` already uses to watch an inbound call's
+/// PBX leg for the same class of hangup.
+const ATTEMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// How long to wait to connect to a line's Agent A and get its first reply
 /// — either `CallFailed` ("busy", no carrier round trip) or `CallAttempting`
 /// (committed; a real `CallPlaced`/`CallFailed` follows, waited for
@@ -758,6 +767,17 @@ fn run_outbound_listener(
                 PlaceCallOutcome::Unavailable(e) => {
                     tracing::debug!(card_id = %line.card_id, error = %e, "outbound: line unavailable, trying next");
                 }
+                PlaceCallOutcome::Abandoned => {
+                    // Our own caller hung up mid-attempt (specs/029). Agent A
+                    // has already been told to CANCEL the carrier leg, and the
+                    // phone leg is `Disconnected`, so there is nothing to
+                    // answer. Like a committed failure, this ends the whole
+                    // request — trying another line would ring a destination
+                    // for a caller who is gone (FR-004).
+                    tracing::info!(destination = %destination, card_id = %line.card_id, "outbound: caller abandoned the call during the attempt; not trying another line");
+                    report_outbound(reporter, OutboundAttemptOutcome::CallerAbandoned);
+                    continue 'outer;
+                }
                 PlaceCallOutcome::Committed(reason) => {
                     // FR-009a: the carrier already answered for this
                     // destination — trying another line would ring it
@@ -828,6 +848,51 @@ enum PlaceCallOutcome {
     /// and refuse the whole request with this reason, never try another
     /// line.
     Committed(String),
+    /// Our own originating caller hung up before the call connected
+    /// (specs/029-interruptible-origination-wait). Agent A has been told to
+    /// CANCEL the carrier attempt; there is no phone leg left to answer (it is
+    /// already `Disconnected`), and — like `Committed` — trying another line
+    /// would only ring a destination for a caller who is already gone.
+    Abandoned,
+}
+
+/// Reads from a short-timeout control connection, returning a parsed message
+/// only once a whole newline-terminated line has arrived. A read timeout
+/// (`WouldBlock`/`TimedOut`) yields `Ok(None)` and leaves any partial bytes in
+/// `pending_line` for the next call — the specs/029 R7 hazard: `read_msg`
+/// allocates a fresh `String` per read, so a message split across a poll
+/// boundary would be lost. This is the same carried-buffer discipline
+/// `service_active_outbound_call` already uses for an established call.
+/// A closed connection is surfaced as `UnexpectedEof`.
+fn poll_control_line<R: std::io::BufRead>(
+    reader: &mut R,
+    pending_line: &mut String,
+) -> std::io::Result<Option<ControlMessage>> {
+    match reader.read_line(pending_line) {
+        Ok(0) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "control connection closed",
+        )),
+        // `read_line` only returns `Ok(n>0)` once it has consumed a newline
+        // (or hit EOF mid-line, the rare no-newline case we keep buffering).
+        Ok(_) if pending_line.ends_with('\n') => {
+            let parsed = serde_json::from_str::<ControlMessage>(pending_line.trim());
+            pending_line.clear();
+            parsed.map(Some).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse error: {e}"))
+            })
+        }
+        Ok(_) => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// On success, returns the still-open connection to Agent A — it must stay
@@ -884,25 +949,28 @@ fn try_place_on_line(
         Ok(other) => return PlaceCallOutcome::Unavailable(format!("unexpected reply: {other:?}")),
         Err(e) => return PlaceCallOutcome::Unavailable(e),
     }
+    // Poll rather than block from here on (specs/029): a single blocking read
+    // with `CALL_ATTEMPT_TIMEOUT` left our own caller's mid-attempt hangup
+    // unnoticed for the whole ~80s carrier wait, so no CANCEL ever reached the
+    // carrier and it went on ringing a destination for a caller who had left.
+    // The read timeout drops to a short poll interval; `CALL_ATTEMPT_TIMEOUT`
+    // keeps its value but is now an overall *deadline* (FR-015), and
+    // `CallRinging` remains non-terminal — Agent A's own carrier-wait deadline
+    // sits comfortably inside that budget regardless of how many polls it takes.
     if let Err(e) = reader
         .get_ref()
-        .set_read_timeout(Some(CALL_ATTEMPT_TIMEOUT))
+        .set_read_timeout(Some(ATTEMPT_POLL_INTERVAL))
     {
         return PlaceCallOutcome::Unavailable(format!("set_read_timeout failed: {e}"));
     }
-
-    // `CallRinging` is non-terminal — Agent A's own deadline
-    // (`OUTBOUND_INVITE_TIMEOUT + OUTBOUND_RING_TIMEOUT`, comfortably under
-    // `CALL_ATTEMPT_TIMEOUT`'s per-read timeout below) covers everything
-    // between here and the real `CallPlaced`/`CallFailed` regardless of how
-    // many reads that takes, so looping past it doesn't risk waiting
-    // longer overall than `CALL_ATTEMPT_TIMEOUT` already accounts for.
+    let deadline = Instant::now() + CALL_ATTEMPT_TIMEOUT;
+    let mut pending_line = String::new();
     loop {
-        match read_msg(&mut reader) {
-            Ok(ControlMessage::CallRinging { .. }) => {
+        match poll_control_line(&mut reader, &mut pending_line) {
+            Ok(Some(ControlMessage::CallRinging { .. })) => {
                 let _ = call.answer(180);
             }
-            Ok(ControlMessage::CallPlaced { .. }) => {
+            Ok(Some(ControlMessage::CallPlaced { .. })) => {
                 // Short from here on: this same connection is now polled
                 // once per `OUTBOUND_POLL_INTERVAL` tick for the rest of
                 // the call (`service_active_outbound_call`), not waited on
@@ -915,13 +983,40 @@ fn try_place_on_line(
                 }
                 return PlaceCallOutcome::Placed(reader);
             }
-            Ok(ControlMessage::CallFailed { reason, .. }) => {
+            Ok(Some(ControlMessage::CallFailed { reason, .. })) => {
                 return PlaceCallOutcome::Committed(reason)
             }
-            Ok(other) => {
+            Ok(Some(other)) => {
                 return PlaceCallOutcome::Committed(format!("unexpected reply: {other:?}"))
             }
-            Err(e) => return PlaceCallOutcome::Committed(e),
+            // Nothing complete arrived this tick — fall through to the checks.
+            Ok(None) => {}
+            Err(e) => return PlaceCallOutcome::Committed(format!("control read failed: {e}")),
+        }
+
+        // Watch our own leg: if the caller hung up while the carrier is still
+        // being reached, tell Agent A to abandon the pending INVITE (which
+        // sends the CANCEL) and stop — the caller is gone, so no phone-leg
+        // answer is owed and no other line should be tried (FR-003, FR-004).
+        if call.poll_state() == CallState::Disconnected {
+            tracing::info!(
+                call_id,
+                "outbound: caller hung up during the attempt; telling Agent A to abandon it"
+            );
+            let _ = write_msg(
+                reader.get_mut(),
+                &ControlMessage::CallEnded {
+                    call_id: call_id.to_string(),
+                    reason: control::reason::CALLER_HANGUP.to_string(),
+                },
+            );
+            return PlaceCallOutcome::Abandoned;
+        }
+
+        if Instant::now() >= deadline {
+            return PlaceCallOutcome::Committed(
+                "timed out waiting for the carrier attempt to resolve".to_string(),
+            );
         }
     }
 }
@@ -1991,6 +2086,86 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A `Read` that yields a scripted sequence of results, so a control
+    /// message can be delivered in pieces with a `WouldBlock` (a poll-read
+    /// timeout) in between — reproducing the specs/029 R7 fragmentation hazard
+    /// deterministically, without a real socket.
+    struct ChunkedReader {
+        chunks: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(Ok(data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0),
+            }
+        }
+    }
+
+    /// R7: a control message split across a poll-read timeout must be
+    /// reassembled and parsed exactly once — a fresh buffer per read (as
+    /// `read_msg` allocates) would drop the half that arrived first.
+    #[test]
+    fn poll_control_line_reassembles_a_message_split_across_a_poll_timeout() {
+        let full = serde_json::to_string(&ControlMessage::CallRinging {
+            call_id: "c1".to_string(),
+        })
+        .unwrap();
+        let (a, b) = full.split_at(full.len() / 2);
+        let mut chunks: std::collections::VecDeque<std::io::Result<Vec<u8>>> =
+            std::collections::VecDeque::new();
+        chunks.push_back(Ok(a.as_bytes().to_vec()));
+        chunks.push_back(Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "poll timeout",
+        )));
+        chunks.push_back(Ok(format!("{b}\n").into_bytes()));
+        let mut reader = std::io::BufReader::new(ChunkedReader { chunks });
+        let mut pending = String::new();
+
+        // First poll: partial data then a timeout — nothing complete yet, but
+        // the partial line must survive for the next poll.
+        assert!(matches!(
+            poll_control_line(&mut reader, &mut pending),
+            Ok(None)
+        ));
+        assert!(
+            !pending.is_empty(),
+            "the partial line must be retained across the timeout, not discarded"
+        );
+
+        // Second poll: the remainder arrives with its newline — one message,
+        // parsed once, buffer cleared.
+        match poll_control_line(&mut reader, &mut pending) {
+            Ok(Some(ControlMessage::CallRinging { call_id })) => assert_eq!(call_id, "c1"),
+            other => panic!("expected a single reassembled CallRinging, got {other:?}"),
+        }
+        assert!(
+            pending.is_empty(),
+            "the buffer must be cleared once a complete line is consumed"
+        );
+    }
+
+    /// A cleanly closed connection (EOF) is a hard error, distinct from a
+    /// mere poll timeout — the caller must stop, not spin.
+    #[test]
+    fn poll_control_line_reports_eof_as_error_not_timeout() {
+        let mut reader = std::io::BufReader::new(ChunkedReader {
+            chunks: std::collections::VecDeque::new(),
+        });
+        let mut pending = String::new();
+        assert!(
+            poll_control_line(&mut reader, &mut pending).is_err(),
+            "a closed connection must surface as an error, not Ok(None)"
+        );
+    }
 
     /// specs/027-discover-retry-health review finding: this used to be keyed
     /// off `reason != "max_lines_exceeded"`, on the wrong assumption that

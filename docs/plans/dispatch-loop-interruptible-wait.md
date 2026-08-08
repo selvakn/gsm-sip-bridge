@@ -1,5 +1,25 @@
 # Plan: Interruptible wait for outbound origination in `dispatch_loop`
 
+> **SUPERSEDED (2026-08-08)** by
+> [`specs/029-interruptible-origination-wait`](../../specs/029-interruptible-origination-wait/),
+> which is what was implemented. Two things in this triage note turned out
+> wrong or incomplete and are corrected there:
+>
+> 1. **Step 2's premise about Agent B is incorrect.** It assumes Agent B
+>    already emits a caller-hangup signal that merely isn't heard. It doesn't:
+>    during the attempt phase Agent B was itself parked in a blocking read and
+>    never polled its own call's state, so *both* agents needed changing
+>    (research R1). Agent B's `await_place_call_outcome` is now a poll loop.
+> 2. **The recommended `on_poll` callback approach was not used.** It cannot
+>    satisfy FR-011 (an inbound INVITE during an attempt) without draining
+>    `inbound.rx` from inside the callback and dropping inbound SMS. The
+>    implementation instead holds the origination as `dispatch_loop` state and
+>    routes carrier responses through `inbound.rx`, which also removes a
+>    two-readers-on-one-socket race the triage missed (research R2).
+>
+> This file is kept for provenance; the spec/plan/research under specs/029 are
+> the authority.
+
 **Triaged**: 2026-08-06 · **Effort**: medium — single-threaded restructuring,
 no new concurrency primitives · **Origin**: `docs/todo.md` item 3
 

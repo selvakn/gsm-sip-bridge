@@ -31,6 +31,10 @@ pub enum OutboundOutcome {
     RefusedInvalidDestination,
     RefusedNetworkFailure,
     Unanswered,
+    /// The originating caller hung up before the call connected
+    /// (specs/029-interruptible-origination-wait, FR-018). Kept in lockstep
+    /// with `control::protocol::OutboundAttemptOutcome`'s mirror variant.
+    CallerAbandoned,
 }
 
 impl OutboundOutcome {
@@ -41,6 +45,7 @@ impl OutboundOutcome {
             OutboundOutcome::RefusedInvalidDestination => "refused_invalid_destination",
             OutboundOutcome::RefusedNetworkFailure => "refused_network_failure",
             OutboundOutcome::Unanswered => "unanswered",
+            OutboundOutcome::CallerAbandoned => "caller_abandoned",
         }
     }
 }

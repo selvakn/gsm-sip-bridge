@@ -141,8 +141,9 @@ pub static SIP_SERVER_RING_TARGET_MISSING_TOTAL: Lazy<Counter> = Lazy::new(|| {
 
 /// Outbound call attempts (spec 025), by outcome: `placed`,
 /// `refused_no_idle_line`, `refused_invalid_destination`,
-/// `refused_network_failure`, `unanswered` — the granularity data-model.md
-/// defines, matching what inbound calls already report.
+/// `refused_network_failure`, `unanswered`, `caller_abandoned` (spec 029) —
+/// the granularity data-model.md defines, matching what inbound calls already
+/// report.
 pub static OUTBOUND_ATTEMPTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         opts!(
