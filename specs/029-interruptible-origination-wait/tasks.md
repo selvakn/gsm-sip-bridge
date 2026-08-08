@@ -5,6 +5,37 @@ description: "Task list for 029-interruptible-origination-wait"
 
 # Tasks: Interruptible wait for outbound call origination
 
+## Implementation status (2026-08-08)
+
+**Production code: complete.** All of US1/US2/US3 landed; Phase 4 (admission)
+and Phase 5 (lifecycle, outcome) folded naturally into the Phase 3 restructure.
+Full suite green (1243 passed, 0 failed); `make lint` clean.
+
+**Deviations from the task plan, and why:**
+
+- **Test placement.** The tasks named `tests/test_outbound_abandon.rs` etc.,
+  but `dispatch_loop`/`originate_and_bridge`/`RegisteredSession` are
+  `pub(crate)` and unreachable from a `tests/` integration crate (research R9).
+  Pure logic that could be isolated is unit-tested in-crate: `poll_control_line`
+  reassembly + EOF (T007), and the lifecycle transition rule that R5 violated
+  was *already* pinned by `lifecycle.rs`'s existing
+  `a_call_cannot_reach_bridged_without_the_pbx_ringing` / `a_call_walks_...`
+  tests (T034 intent).
+- **Socket-level tests (T003 race, T009–T013 abandon, T026–T029, T033, T035)
+  not built as automated mocks.** They need a `RegisteredSession` test
+  constructor + fake-carrier socket harness that does not exist, and
+  `SipResponse` has no public constructor outside `sip_client`. Per the
+  existing suite's own stance ("a real end-to-end call needs real hardware")
+  and the user's direction to use the attached EC20/PC-SC hardware, these are
+  covered by hardware verification (T046) rather than mocks. R2's race is fixed
+  *by construction* (the main path no longer reads the socket directly),
+  independent of a reproducing test.
+- **R2 verdict:** analyzed as high-confidence from the source; not reproduced
+  at runtime. The fix does not depend on reproducing it.
+
+**Outstanding:** T046 (live hardware mid-ring-hangup verification) — see the PR;
+being done against the attached hardware separately from CI.
+
 **Input**: Design documents from `/specs/029-interruptible-origination-wait/`
 **Prerequisites**: [plan.md](./plan.md), [spec.md](./spec.md), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/](./contracts/)
 

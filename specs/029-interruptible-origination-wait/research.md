@@ -118,6 +118,16 @@ scheduling — with a fake carrier and `start_inbound` running, place an INVITE,
 have the carrier reply, and assert the reply reaches origination every time
 across many iterations. Under the race it will fail intermittently.
 
+**Verdict (2026-08-08):** analyzed as high-confidence from the source, **not
+reproduced at runtime** — the automated reproduction was not built (it needs a
+`RegisteredSession` test constructor + fake-carrier harness that does not exist;
+see R9). It does not need to be: the fix removes the second reader entirely (the
+main origination path no longer calls `transport.recv_*`, receiving carrier
+responses through `inbound.rx` instead), so the race is closed by construction
+regardless of whether a test could catch it intermittently. The one remaining
+direct reader, `cancel_pending_invite`'s post-CANCEL courtesy read, is
+documented as an accepted best-effort exception.
+
 ---
 
 ## R3 — Cooperative polling should reuse the dispatch loop, not a new callback
