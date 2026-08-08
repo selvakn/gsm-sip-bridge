@@ -502,8 +502,10 @@ pub(crate) fn resolve_volte_register_line(
         .iter()
         .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
         .collect();
-    let modems = crate::modules::discovery::scan_all_preferring(&preferred)
-        .map_err(|e| format!("modem discovery failed: {e}"))?;
+    let mut policy = crate::modules::discovery::DiscoveryPolicy::new(config.discovery.clone());
+    let modems =
+        crate::modules::discovery::scan_all_preferring_with_policy(&preferred, &mut policy)
+            .map_err(|e| format!("modem discovery failed: {e}"))?;
 
     let table = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte);
     for failed in &table.failed {
@@ -962,13 +964,15 @@ pub(crate) fn handle_volte_discover_lines_command(
         .iter()
         .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
         .collect();
-    let modems = match crate::modules::discovery::scan_all_preferring(&preferred) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("volte-discover-lines: modem discovery failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut policy = crate::modules::discovery::DiscoveryPolicy::new(app_config.discovery.clone());
+    let modems =
+        match crate::modules::discovery::scan_all_preferring_with_policy(&preferred, &mut policy) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("volte-discover-lines: modem discovery failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let table = discovery::resolve_volte_lines(&modems, volte);
     for failed in &table.failed {

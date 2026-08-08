@@ -203,6 +203,11 @@ pub struct CardPool {
     cycle: Option<CycleState>,
     next_scheduled_at: Option<tokio::time::Instant>,
     last_fired_tick: Option<chrono::DateTime<chrono::Local>>,
+    /// specs/030-bad-port-isolation: persistent across rescans so a port
+    /// quarantined after repeated probe timeouts stays skipped, and the
+    /// operator `[discovery]` blocklist/timeout apply on every rescan. Behind a
+    /// `Mutex` because the rescan methods take `&self`.
+    discovery_policy: std::sync::Mutex<discovery::DiscoveryPolicy>,
 }
 
 /// `SlotView` implementation backed by the pool's slot map. Built fresh on
@@ -357,6 +362,9 @@ impl CardPool {
             None
         };
 
+        let discovery_policy =
+            std::sync::Mutex::new(discovery::DiscoveryPolicy::new(config.discovery.clone()));
+
         Self {
             config,
             store,
@@ -368,6 +376,7 @@ impl CardPool {
             cycle: None,
             next_scheduled_at: None,
             last_fired_tick: None,
+            discovery_policy,
         }
     }
 
@@ -444,6 +453,7 @@ impl CardPool {
             None => match discovery::scan_modules_excluding_cards(
                 &discovery::volte_claimed_ports(&self.config.volte),
                 &discovery::volte_claimed_card_ids(&self.config.volte),
+                &mut self.discovery_policy.lock().unwrap(),
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -920,8 +930,12 @@ impl CardPool {
 
         let volte_ports = discovery::volte_claimed_ports(&self.config.volte);
         let volte_cards = discovery::volte_claimed_card_ids(&self.config.volte);
-        let new_modules = match discovery::scan_modules_excluding_cards(&volte_ports, &volte_cards)
-        {
+        let mut policy = self.discovery_policy.lock().unwrap();
+        let new_modules = match discovery::scan_modules_excluding_cards(
+            &volte_ports,
+            &volte_cards,
+            &mut policy,
+        ) {
             Ok(m) => m
                 .into_iter()
                 .filter(|m| !known_serials.contains(&m.serial_port))
