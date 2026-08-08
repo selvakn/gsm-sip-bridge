@@ -1244,13 +1244,19 @@ enum OriginationStep {
         /// check) is made — kept in the same order as the old blocking path.
         answer_codec: sdp::NegotiatedCodec,
     },
-    /// A CANCEL has been sent (abandonment or our own timeout) and we are
+    /// A CANCEL is being sent (abandonment or our own timeout) and we are
     /// waiting for its outcome — a `487` for the INVITE (expected), or a `200`
     /// that raced the CANCEL (the carrier answered anyway; we ACK then BYE).
     /// That outcome arrives on `inbound.rx` like every other response, so it is
     /// handled at the response arm rather than by a direct socket read that
     /// would race the client reader (greptile PR #35 / research R2).
-    AwaitingCancel,
+    ///
+    /// `sent` tracks whether the CANCEL actually went out: if the transport was
+    /// momentarily unavailable it is retried each tick, and the response window
+    /// is only armed once it succeeds — otherwise a failed send would drop a
+    /// still-live INVITE, leaking a phantom leg if the carrier later answered
+    /// (greptile PR #35, round 2).
+    AwaitingCancel { sent: bool },
 }
 
 /// Whether a pending origination is still in flight or has resolved this tick.
@@ -1445,6 +1451,16 @@ impl PendingOrigination {
     /// `CANCEL_RESPONSE_TIMEOUT` deadline) so a racing answer is still ACKed and
     /// BYE'd rather than leaking (greptile PR #35).
     fn begin_cancel(&mut self, session: &mut super::RegisteredSession) {
+        let sent = self.send_cancel_now(session);
+        self.step = OriginationStep::AwaitingCancel { sent };
+        self.deadline = Instant::now() + CANCEL_RESPONSE_TIMEOUT;
+    }
+
+    /// Send (or re-send) the CANCEL for this attempt's INVITE. Returns whether
+    /// it actually went out — a `false` means the transport was momentarily
+    /// unavailable and the caller should keep the origination alive and retry,
+    /// rather than assume the INVITE was cancelled (greptile PR #35).
+    fn send_cancel_now(&mut self, session: &mut super::RegisteredSession) -> bool {
         send_cancel(
             session,
             &self.callee_uri,
@@ -1454,9 +1470,7 @@ impl PendingOrigination {
             &self.from_tag,
             self.invite_cseq,
             &self.branch,
-        );
-        self.step = OriginationStep::AwaitingCancel;
-        self.deadline = Instant::now() + CANCEL_RESPONSE_TIMEOUT;
+        )
     }
 
     /// Handle a carrier response while awaiting the CANCEL's outcome. A `200`
@@ -1499,7 +1513,9 @@ impl PendingOrigination {
         // outcome. In the other phases a Call-ID-matched response is not a fresh
         // final to act on (greptile PR #35):
         match self.step {
-            OriginationStep::AwaitingCancel => return self.on_cancel_response(resp, session),
+            OriginationStep::AwaitingCancel { .. } => {
+                return self.on_cancel_response(resp, session)
+            }
             OriginationStep::AwaitingVeth { .. } => {
                 // A retransmitted `200` (our ACK was lost/slow) — the final was
                 // already handled and the veth leg is being placed. Re-running
@@ -1705,7 +1721,7 @@ fn tick_pending_origination(
         // If that left us awaiting the CANCEL's outcome, keep the origination
         // alive so a racing `200` is still ACKed and BYE'd (greptile PR #35);
         // otherwise it is fully resolved and dropped.
-        if matches!(p.step, OriginationStep::AwaitingCancel) {
+        if matches!(p.step, OriginationStep::AwaitingCancel { .. }) {
             *pending = Some(p);
         }
         return None;
@@ -1737,31 +1753,38 @@ fn tick_pending_origination(
         None => {}
     }
 
-    // 3. Awaiting the carrier or its CANCEL response — enforce the deadline.
+    // 3. Awaiting the carrier or its CANCEL response — enforce the deadline,
+    //    and retry a CANCEL that could not be sent yet.
+    let awaiting_cancel = matches!(p.step, OriginationStep::AwaitingCancel { .. });
+    let cancel_unsent = matches!(p.step, OriginationStep::AwaitingCancel { sent: false });
+
     if Instant::now() >= p.deadline {
-        match p.step {
-            OriginationStep::AwaitingCarrier => {
-                // Our own timeout: tell Agent B, then CANCEL and wait out the
-                // outcome via `inbound.rx` (AwaitingCancel), so a racing answer
-                // is still cleaned up rather than leaking.
-                tracing::warn!(call_id = %p.call_id, "outbound: no final response from carrier in time");
-                p.fail(&format!(
-                    "{}: no final response from carrier",
-                    reason::CARRIER_TIMEOUT
-                ));
-                p.begin_cancel(session);
-                *pending = Some(p);
-            }
-            OriginationStep::AwaitingCancel => {
-                // The CANCEL's own response never arrived within the window;
-                // stop tracking it. The CANCEL itself already abandoned the
-                // carrier's INVITE transaction.
-                tracing::debug!(call_id = %p.call_id, "outbound: CANCEL response window elapsed");
-            }
-            // Unreachable: the veth match above returns for `AwaitingVeth`.
-            OriginationStep::AwaitingVeth { .. } => {}
+        if awaiting_cancel {
+            // The CANCEL's response never arrived within the window (or it could
+            // never be sent). Stop tracking it — best-effort exhausted.
+            tracing::debug!(call_id = %p.call_id, "outbound: CANCEL response window elapsed");
+        } else {
+            // AwaitingCarrier timeout — our own give-up. Tell Agent B, then
+            // CANCEL and wait out the outcome via `inbound.rx` (AwaitingCancel),
+            // so a racing answer is cleaned up rather than leaking.
+            tracing::warn!(call_id = %p.call_id, "outbound: no final response from carrier in time");
+            p.fail(&format!(
+                "{}: no final response from carrier",
+                reason::CARRIER_TIMEOUT
+            ));
+            p.begin_cancel(session);
+            *pending = Some(p);
         }
         return None;
+    }
+
+    // A CANCEL that failed to send earlier (transport momentarily unavailable)
+    // is retried until it goes out; only then is the response window armed, so
+    // a still-live INVITE is never dropped as if it had been cancelled
+    // (greptile PR #35, round 2).
+    if cancel_unsent && p.send_cancel_now(session) {
+        p.step = OriginationStep::AwaitingCancel { sent: true };
+        p.deadline = Instant::now() + CANCEL_RESPONSE_TIMEOUT;
     }
 
     *pending = Some(p);
@@ -1780,7 +1803,7 @@ fn abandon_origination(p: &mut PendingOrigination, session: &mut super::Register
             hangup_pending_carrier_leg(p, session, reason::CALLER_HANGUP);
         }
         // Already cancelling — a duplicate `CallEnded`; nothing more to do.
-        OriginationStep::AwaitingCancel => {}
+        OriginationStep::AwaitingCancel { .. } => {}
     }
 }
 
