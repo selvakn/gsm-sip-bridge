@@ -427,3 +427,14 @@ lock_path = "/tmp/volte-registration.lock"
 # configured line is idle.
 # [outbound]
 # enabled = true
+
+# Serial-port discovery controls (specs/030-bad-port-isolation). Optional;
+# absent means today's behavior. Each port that hangs the scan is abandoned
+# after `probe_timeout_ms` and, after three consecutive timeouts, quarantined
+# for the process lifetime. `excluded_ports` skips a known-bad port entirely —
+# list an exact `/dev/ttyUSB*` path, or (preferred, survives replug/reboot) a
+# USB-topology fragment: `5-1.2.1.2:1.1` for one interface, `5-1.2.1.2` for a
+# whole device. The abandon-on-timeout log prints the interface path to copy.
+# [discovery]
+# excluded_ports = ["5-1.2.1.2:1.1"]
+# probe_timeout_ms = 5000

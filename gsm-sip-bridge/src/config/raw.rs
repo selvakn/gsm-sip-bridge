@@ -607,6 +607,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("sip_server.account", RawSipServerAccount::KEYS),
         ("outbound", RawOutbound::KEYS),
         ("cs", RawCs::KEYS),
+        ("discovery", RawDiscovery::KEYS),
     ]
 }
 
@@ -674,6 +675,28 @@ fn check_section(
     }
 }
 
+// ---------------------------------------------------------- [discovery] ----
+
+section! {
+    /// Serial-port discovery controls (specs/030-bad-port-isolation): which
+    /// ports never to open/probe, and how long to wait on a single port's
+    /// open/probe before abandoning it so one kernel-wedged port can't wedge
+    /// the whole scan.
+    pub struct RawDiscovery {
+        pub excluded_ports: Vec<String>,
+        pub probe_timeout_ms: u64,
+    }
+}
+
+impl Default for RawDiscovery {
+    fn default() -> Self {
+        Self {
+            excluded_ports: Vec::new(),
+            probe_timeout_ms: super::DEFAULT_PROBE_TIMEOUT_MS,
+        }
+    }
+}
+
 // --------------------------------------------------------------- root ------
 
 section! {
@@ -696,5 +719,6 @@ section! {
         pub sip_server: RawSipServer,
         pub outbound: RawOutbound,
         pub cs: RawCs,
+        pub discovery: RawDiscovery,
     }
 }
