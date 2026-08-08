@@ -217,6 +217,14 @@ fn parse_cseq_number(cseq: &str) -> Option<u32> {
     cseq.split_whitespace().next()?.parse().ok()
 }
 
+/// Extract the method from a `CSeq` header value (`"5 INVITE"` → `"INVITE"`).
+/// A response echoes its request's `CSeq`, so this is how the `200` answering a
+/// CANCEL (`"N CANCEL"`) is told apart from the INVITE's own final (`"N INVITE"`)
+/// — they share a `Call-ID` but resolve different transactions (greptile PR #35).
+fn cseq_method(cseq: &str) -> Option<&str> {
+    cseq.split_whitespace().nth(1)
+}
+
 /// When the current Gm failure episode began — carried across
 /// `Reconnecting`/`Failed`, restarted at "now" for a connection that was `Up`.
 fn gm_episode_since(gm_conn: super::GmConnectionState) -> SystemTime {
@@ -1035,6 +1043,14 @@ pub(crate) const OUTBOUND_RING_TIMEOUT: Duration = Duration::from_secs(60);
 /// to a CANCEL within a few seconds isn't going to.
 const CANCEL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to keep retrying a CANCEL that could not be sent (the transport was
+/// momentarily unavailable) before giving up. Generous: an INVITE we could not
+/// cancel is a phantom-leg liability, so we keep trying well past a transient
+/// blip (greptile PR #35). If the transport is dead this long, the dispatch
+/// loop's own Gm-liveness/renewal machinery is already replacing the session
+/// out from under this attempt anyway.
+const CANCEL_SEND_MAX_WAIT: Duration = Duration::from_secs(30);
+
 /// Sends CANCEL for a pending outbound INVITE we're giving up on before a
 /// final response ever arrived (RFC 3261 §9.1) — reusing the original
 /// INVITE's own branch/CSeq number, since this targets that same
@@ -1453,7 +1469,15 @@ impl PendingOrigination {
     fn begin_cancel(&mut self, session: &mut super::RegisteredSession) {
         let sent = self.send_cancel_now(session);
         self.step = OriginationStep::AwaitingCancel { sent };
-        self.deadline = Instant::now() + CANCEL_RESPONSE_TIMEOUT;
+        // Once the CANCEL is out, wait a short window for its response; if it
+        // could not be sent yet, allow a much longer window to keep retrying
+        // rather than dropping a still-live INVITE (greptile PR #35).
+        self.deadline = Instant::now()
+            + if sent {
+                CANCEL_RESPONSE_TIMEOUT
+            } else {
+                CANCEL_SEND_MAX_WAIT
+            };
     }
 
     /// Send (or re-send) the CANCEL for this attempt's INVITE. Returns whether
@@ -1473,15 +1497,24 @@ impl PendingOrigination {
         )
     }
 
-    /// Handle a carrier response while awaiting the CANCEL's outcome. A `200`
-    /// that raced the CANCEL is ACKed and BYE'd; a `487` (or any other final)
-    /// means the transaction is dead. Provisionals are ignored.
+    /// Handle a carrier response while awaiting the CANCEL's outcome. Only the
+    /// *INVITE*'s own final resolves the transaction: a `200` on the INVITE
+    /// raced the CANCEL and is ACKed then BYE'd; a `487` (or any other INVITE
+    /// final) means it is dead. The `200` answering the CANCEL request itself
+    /// (CSeq `... CANCEL`) merely confirms the CANCEL — acting on it would end
+    /// tracking too early and miss a racing INVITE answer, leaving a phantom leg
+    /// (greptile PR #35). Provisionals and the CANCEL's own response keep us
+    /// waiting.
     fn on_cancel_response(
         &mut self,
         resp: &SipResponse,
         session: &mut super::RegisteredSession,
     ) -> OriginationStatus {
-        if resp.status < 200 {
+        let is_invite = resp
+            .header("CSeq")
+            .and_then(cseq_method)
+            .is_some_and(|m| m.eq_ignore_ascii_case("INVITE"));
+        if !is_invite || resp.status < 200 {
             return OriginationStatus::Pending;
         }
         if resp.status == 200 {
@@ -1498,6 +1531,24 @@ impl PendingOrigination {
             );
         }
         OriginationStatus::Ended
+    }
+
+    /// Re-send the ACK for a retransmitted `200 OK` (our first ACK was lost).
+    /// Reuses the INVITE's branch/CSeq (§17.1.1.3); best-effort.
+    fn resend_ack(&self, resp: &SipResponse, session: &mut super::RegisteredSession) {
+        let ack = super::call::build_ack(&super::call::AckParts {
+            request_uri: &self.callee_uri,
+            route_headers: &self.route_headers,
+            via_transport: self.via_transport,
+            local_addr: session.local_addr,
+            public_uri: &session.public_uri,
+            to_header: resp.header("To").unwrap_or(&self.callee_uri),
+            call_id: &self.call_id,
+            from_tag: &self.from_tag,
+            cseq: self.invite_cseq,
+            branch: &format!("z9hG4bK{}", random_hex(6)),
+        });
+        let _ = session.transport_mut().and_then(|t| t.send(&ack));
     }
 
     /// Advance on a carrier response delivered via `inbound.rx`. Returns
@@ -1517,16 +1568,28 @@ impl PendingOrigination {
                 return self.on_cancel_response(resp, session)
             }
             OriginationStep::AwaitingVeth { .. } => {
-                // A retransmitted `200` (our ACK was lost/slow) — the final was
-                // already handled and the veth leg is being placed. Re-running
-                // the answer path would spawn a second veth listener and send
-                // `CallPlaced` twice; ignore it, as the old blocking code did
-                // (it simply never read the socket again during the veth wait).
-                tracing::debug!(
-                    call_id = %self.call_id,
-                    status = resp.status,
-                    "ignoring a carrier response after the final was already handled"
-                );
+                // The INVITE's final was already handled and the veth leg is
+                // being placed. Re-running the answer path would spawn a second
+                // veth listener and send `CallPlaced` twice, so never do that.
+                // But a retransmitted `200` means our ACK was lost — re-ACK it
+                // (RFC 3261 §13.2.2.4), or the carrier keeps retransmitting and
+                // eventually tears the call down (greptile PR #35). Only an
+                // INVITE `200` warrants that; anything else is just ignored.
+                let is_invite_200 = resp.status == 200
+                    && resp
+                        .header("CSeq")
+                        .and_then(cseq_method)
+                        .is_some_and(|m| m.eq_ignore_ascii_case("INVITE"));
+                if is_invite_200 {
+                    tracing::debug!(call_id = %self.call_id, "outbound: re-ACKing a retransmitted 200 OK during the veth wait");
+                    self.resend_ack(resp, session);
+                } else {
+                    tracing::debug!(
+                        call_id = %self.call_id,
+                        status = resp.status,
+                        "ignoring a carrier response after the final was already handled"
+                    );
+                }
                 return OriginationStatus::Pending;
             }
             OriginationStep::AwaitingCarrier => {}
@@ -1760,9 +1823,16 @@ fn tick_pending_origination(
 
     if Instant::now() >= p.deadline {
         if awaiting_cancel {
-            // The CANCEL's response never arrived within the window (or it could
-            // never be sent). Stop tracking it — best-effort exhausted.
-            tracing::debug!(call_id = %p.call_id, "outbound: CANCEL response window elapsed");
+            // Best-effort exhausted. Either the CANCEL's response never arrived
+            // within its window, or (worse) the CANCEL could not be sent at all
+            // within the long retry window — in that case the INVITE may linger
+            // at the carrier, but the transport being dead this long means the
+            // session is being re-established anyway.
+            if cancel_unsent {
+                tracing::warn!(call_id = %p.call_id, "outbound: could not send CANCEL within the retry window; giving up");
+            } else {
+                tracing::debug!(call_id = %p.call_id, "outbound: CANCEL response window elapsed");
+            }
         } else {
             // AwaitingCarrier timeout — our own give-up. Tell Agent B, then
             // CANCEL and wait out the outcome via `inbound.rx` (AwaitingCancel),
@@ -3326,6 +3396,21 @@ mod tests {
     // cover them stay here, exercising the same implementation.
     use crate::ims::session::{build_subscribe, SubscribeParts};
     use std::net::Ipv4Addr;
+
+    /// The CANCEL/INVITE `CSeq` distinction the `AwaitingCancel` handling relies
+    /// on (specs/029, greptile PR #35): a `200` answering the CANCEL must not be
+    /// mistaken for the INVITE's own final, or a racing answer is missed and a
+    /// phantom leg leaks.
+    #[test]
+    fn cseq_method_distinguishes_cancel_from_invite() {
+        assert_eq!(cseq_method("5 INVITE"), Some("INVITE"));
+        assert_eq!(cseq_method("5 CANCEL"), Some("CANCEL"));
+        assert_eq!(cseq_method("42 OPTIONS"), Some("OPTIONS"));
+        assert_eq!(cseq_method("5"), None);
+        assert_eq!(cseq_method(""), None);
+        // Number and method are still individually recoverable.
+        assert_eq!(parse_cseq_number("5 INVITE"), Some(5));
+    }
 
     fn loopback_socket() -> UdpSocket {
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()
