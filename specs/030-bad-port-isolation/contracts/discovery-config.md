@@ -50,11 +50,15 @@ probe_timeout_ms = 5000
   (topology) path, and the scan proceeds. Example intent:
   `WARN port=/dev/ttyUSB1 iface=5-1.2.1.2:1.1 timeout_ms=5000 "AT probe exceeded timeout; abandoning port…"`
 - **Quarantine (FR-013)**: the scan that first crosses 3 consecutive timeouts on
-  a port emits a one-time `WARN` (with the iface path) stating it is quarantined
-  for the process lifetime; subsequent scans skip it at `DEBUG` (the WARN is the
-  durable record). A SIM-read-phase timeout (as opposed to the AT open) does
-  **not** count toward this — a port that already answered `AT` is not
-  quarantined for slow SIM reads.
+  an interface emits a one-time `WARN` (with the iface path) stating it is
+  quarantined for the process lifetime; subsequent scans skip it at `DEBUG` (the
+  WARN is the durable record). Quarantine is keyed by the stable USB-topology
+  iface path, not the reused `/dev/ttyUSB*` device name. The AT-open probe and
+  the SIM-read phase have **separate** consecutive-timeout counters (each with
+  its own reset-on-success), both feeding the one quarantine set: a merely-slow
+  SIM read never blackholes a healthy modem, but a port that answers `AT` yet
+  hangs on the SIM read every rescan still gets quarantined (bounding the
+  otherwise-unbounded abandoned SIM-probe workers).
 - **Blocklist skip (FR-007, FR-012)**: a port matched by `excluded_ports` is
   never opened; an `INFO` line (visible at default log level, US3 scenario 2)
   names the port and states it was skipped by the exclusion list.

@@ -97,8 +97,15 @@ The research below records the *design* decisions the implementation depends on.
   clamped (not honored) because `0` makes every `recv_timeout` expire instantly
   → every port abandoned → all modems quarantined for the process lifetime, with
   no diagnosable cause.
-- **Related decision**: a SIM-read-phase timeout does **not** feed the
-  quarantine counter (only the AT-open probe does), so transient SIM slowness on
-  a modem that already answered `AT` can never blackhole it. Implemented by
-  giving `probe_sim_status_at` a plain `Duration` and no access to the policy's
-  quarantine state.
+- **Related decision (revised after review, P1-A)**: the SIM-read phase gets its
+  **own** quarantine counter, separate from the AT-open probe's. Exempting SIM
+  timeouts entirely (an earlier attempt) left a leak: a port that answers `AT`
+  every rescan but hangs on `AT+CPIN?`/`AT+CIMI` each time would abandon a new
+  worker forever with nothing suppressing it. A separate counter — which the
+  per-rescan AT success does not reset — lets a *persistent* SIM hang reach
+  quarantine (bounding the leak) while a single/occasional timeout still resets
+  on the next good read (so a merely-slow modem is never blackholed).
+- **Quarantine key (P1-B)**: quarantine (both counters + the set) is keyed by the
+  stable USB-topology interface path, not the `/dev/ttyUSB*` device path, which
+  is reused across replug — a device-name key could skip a healthy modem that
+  inherited a failed one's number while the daemon runs.

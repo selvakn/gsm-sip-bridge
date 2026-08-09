@@ -42,22 +42,30 @@ Empty `excluded` + default timeout ⇒ behavior identical to pre-feature
 the `section!` macro; `From<RawDiscovery>` parses each string into a
 `PortMatcher`.
 
-## Entity: `QuarantineState` (in-memory, caller-owned)
+## Entity: quarantine bookkeeping (in-memory, part of `DiscoveryPolicy`)
 
-Tracks consecutive timeouts per port across rescans; lives in the module-manager
-loop, not in the scan. Cleared on process restart (never persisted).
+Tracks consecutive timeouts across rescans; owned by the long-lived `CardPool`
+(via its `Mutex<DiscoveryPolicy>`) so it persists across rescans but is cleared
+on process restart (never persisted). **All keys are the stable USB-topology
+interface path**, not the `/dev/ttyUSB*` device path (which is reused across
+replug — a device-name key could skip a healthy replacement modem, P1-B).
 
 | Field | Type | Notes |
 |-------|------|-------|
-| consecutive_timeouts | `HashMap<PathBuf, u8>` | keyed by device path; incremented on timeout, reset to 0 on any successful/non-timeout probe |
-| quarantined | `HashSet<PathBuf>` | a port reaching 3 consecutive timeouts is inserted here and skipped by later rescans |
+| consecutive_at_timeouts | `HashMap<PathBuf, u8>` | AT-open-probe timeouts by iface path; reset on any non-timeout AT result |
+| consecutive_sim_timeouts | `HashMap<PathBuf, u8>` | SIM-read timeouts by iface path; **separate** so the per-rescan AT success doesn't reset it (P1-A); reset on any completed SIM read |
+| quarantined | `HashSet<PathBuf>` | an iface reaching 3 consecutive timeouts of *either* phase is inserted here and skipped by later scans |
 
-**Transitions**:
-- probe times out → `consecutive_timeouts[port] += 1`; if it reaches 3, insert
-  into `quarantined`.
-- probe returns (any result, incl. "not AT-capable") → `consecutive_timeouts[port] = 0`.
-- next rescan: a `quarantined` port is skipped exactly like a blocklisted one
-  (never opened), but the reason logged differs (auto-quarantine vs config).
+**Transitions** (each counter independently):
+- AT probe times out → `consecutive_at_timeouts[iface] += 1`; at 3, insert into
+  `quarantined` (one-time transition `WARN`).
+- AT probe returns any result → `consecutive_at_timeouts[iface] = 0`.
+- SIM read times out → `consecutive_sim_timeouts[iface] += 1`; at 3, insert into
+  `quarantined` (one-time transition `WARN`). Bounds the abandoned SIM-probe
+  workers a persistently SIM-hanging port would otherwise leak.
+- SIM read completes → `consecutive_sim_timeouts[iface] = 0`.
+- next scan: a `quarantined` iface is skipped like a blocklisted one (never
+  opened), logged at `DEBUG` (the transition `WARN` is the durable record).
 
 ## Entity: `ProbeOutcome` (result of probing one candidate)
 

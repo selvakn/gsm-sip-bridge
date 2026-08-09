@@ -66,11 +66,22 @@ struct CandidatePort {
 /// each scan; one-shot scans build a transient one.
 pub struct DiscoveryPolicy {
     config: DiscoveryConfig,
-    /// Consecutive probe timeouts per device path; reset on any non-timeout
+    /// Consecutive AT-open-probe timeouts, keyed by the stable USB-topology
+    /// interface path — NOT the `/dev/ttyUSB*` device path, which is reused
+    /// across replug (a device-name-keyed quarantine would skip a healthy modem
+    /// that inherited a failed one's number). Reset on any non-timeout AT
     /// result.
-    consecutive_timeouts: HashMap<PathBuf, u8>,
-    /// Ports that reached `QUARANTINE_THRESHOLD` consecutive timeouts — skipped
-    /// (never opened) by subsequent scans for the process lifetime.
+    consecutive_at_timeouts: HashMap<PathBuf, u8>,
+    /// Consecutive SIM-status-read timeouts, keyed the same way and kept
+    /// SEPARATE from the AT counter on purpose: a port can answer `AT` on every
+    /// rescan yet hang on `AT+CPIN?`/`AT+CIMI` each time, so the per-rescan AT
+    /// success must not keep resetting a streak that needs to accumulate —
+    /// otherwise the abandoned SIM-probe workers leak without bound. Reset on
+    /// any completed SIM read.
+    consecutive_sim_timeouts: HashMap<PathBuf, u8>,
+    /// Interface paths that reached `QUARANTINE_THRESHOLD` consecutive timeouts
+    /// of either phase — skipped (never opened) by later scans for the process
+    /// lifetime.
     quarantined: HashSet<PathBuf>,
 }
 
@@ -78,7 +89,8 @@ impl DiscoveryPolicy {
     pub fn new(config: DiscoveryConfig) -> Self {
         Self {
             config,
-            consecutive_timeouts: HashMap::new(),
+            consecutive_at_timeouts: HashMap::new(),
+            consecutive_sim_timeouts: HashMap::new(),
             quarantined: HashSet::new(),
         }
     }
@@ -98,34 +110,66 @@ impl DiscoveryPolicy {
             .any(|m| m.matches(&port.device_path, &port.iface_path))
     }
 
-    fn is_quarantined(&self, device_path: &Path) -> bool {
-        self.quarantined.contains(device_path)
+    /// Whether the interface at `iface_path` (the stable topology path) is
+    /// quarantined.
+    fn is_quarantined(&self, iface_path: &Path) -> bool {
+        self.quarantined.contains(iface_path)
     }
 
-    /// Records that `device_path` timed out; quarantines it once it has done so
-    /// `QUARANTINE_THRESHOLD` times in a row. Returns `true` only on the scan
-    /// that first crosses the threshold, so the caller can emit a one-time
-    /// transition warning — after that the port is silently skipped, so without
-    /// that log the quarantine would leave no trace.
-    fn record_timeout(&mut self, device_path: &Path) -> bool {
-        let counter = self
-            .consecutive_timeouts
-            .entry(device_path.to_path_buf())
-            .or_insert(0);
+    /// Records an AT-open-probe timeout for `iface_path`; quarantines it once it
+    /// has done so `QUARANTINE_THRESHOLD` times in a row. Returns `true` only on
+    /// the scan that first crosses the threshold, so the caller can emit a
+    /// one-time transition warning — after that the port is silently skipped, so
+    /// without that log the quarantine would leave no trace.
+    fn record_at_timeout(&mut self, iface_path: &Path) -> bool {
+        Self::bump(
+            &mut self.consecutive_at_timeouts,
+            &mut self.quarantined,
+            iface_path,
+        )
+    }
+
+    /// Records a completed AT probe (any non-timeout result) for `iface_path`,
+    /// resetting its AT-timeout streak.
+    fn record_at_responded(&mut self, iface_path: &Path) {
+        self.consecutive_at_timeouts.remove(iface_path);
+    }
+
+    /// Records a SIM-status-read timeout for `iface_path`; quarantines after
+    /// `QUARANTINE_THRESHOLD` in a row (bounding the SIM-probe workers a
+    /// persistently SIM-hanging port would otherwise leak). Returns `true` only
+    /// on the crossing scan.
+    fn record_sim_timeout(&mut self, iface_path: &Path) -> bool {
+        Self::bump(
+            &mut self.consecutive_sim_timeouts,
+            &mut self.quarantined,
+            iface_path,
+        )
+    }
+
+    /// Records a completed SIM read (any non-timeout result) for `iface_path`,
+    /// resetting its SIM-timeout streak.
+    fn record_sim_responded(&mut self, iface_path: &Path) {
+        self.consecutive_sim_timeouts.remove(iface_path);
+    }
+
+    /// Increments a phase counter and quarantines `iface_path` once it reaches
+    /// the threshold. Returns `true` only on the crossing. Takes the two fields
+    /// as disjoint borrows so it can be shared by both phases' record methods.
+    fn bump(
+        counters: &mut HashMap<PathBuf, u8>,
+        quarantined: &mut HashSet<PathBuf>,
+        iface_path: &Path,
+    ) -> bool {
+        let counter = counters.entry(iface_path.to_path_buf()).or_insert(0);
         *counter += 1;
         if *counter >= QUARANTINE_THRESHOLD {
             // `HashSet::insert` returns true only when newly inserted — exactly
             // the crossing event.
-            self.quarantined.insert(device_path.to_path_buf())
+            quarantined.insert(iface_path.to_path_buf())
         } else {
             false
         }
-    }
-
-    /// Records that `device_path` produced a result (any non-timeout outcome),
-    /// resetting its consecutive-timeout streak.
-    fn record_responded(&mut self, device_path: &Path) {
-        self.consecutive_timeouts.remove(device_path);
     }
 }
 
@@ -380,11 +424,11 @@ fn scan_all_inner(
 
         let audio_device = find_alsa_card(&dev_path);
         let net_device = find_net_iface(&dev_path);
-        let at_port = probe_at_port(&dev_path, preferred_ports, policy);
-        let sim_timeout = policy.config.probe_timeout;
-        let sim_status = at_port
+        let at_candidate = probe_at_port(&dev_path, preferred_ports, policy);
+        let sim_status = at_candidate
             .as_ref()
-            .map(|port| probe_sim_status_at(port, sim_recovery, sim_timeout));
+            .map(|c| probe_sim_status_at(&c.device_path, &c.iface_path, sim_recovery, policy));
+        let at_port = at_candidate.map(|c| c.device_path);
 
         match (&at_port, &sim_status) {
             (Some(port), Some(SimStatus::Ready { imsi })) => {
@@ -747,7 +791,7 @@ fn probe_at_port(
     dev_path: &Path,
     preferred: &[PathBuf],
     policy: &mut DiscoveryPolicy,
-) -> Option<PathBuf> {
+) -> Option<CandidatePort> {
     let candidates = order_candidates_with_preference(candidate_tty_ports(dev_path), preferred);
     select_at_capable_port(candidates, policy, probe_one_candidate)
 }
@@ -770,15 +814,16 @@ enum ProbeOutcome {
 /// unit-testable with a fake `probe_one`: it applies the blocklist and
 /// quarantine skips (so an excluded/quarantined port is *never handed to*
 /// `probe_one`, FR-007/FR-013/SC-003), calls `probe_one` for each remaining
-/// candidate in order, updates the quarantine bookkeeping, logs, and returns
-/// the first `AT`-capable device path — continuing past an abandoned one
-/// (FR-002/FR-003). Production passes [`probe_one_candidate`] (real bounded
-/// serial I/O); tests pass a scripted closure.
+/// candidate in order, updates the quarantine bookkeeping (keyed by the stable
+/// topology iface path), logs, and returns the first `AT`-capable candidate —
+/// continuing past an abandoned one (FR-002/FR-003). Production passes
+/// [`probe_one_candidate`] (real bounded serial I/O); tests pass a scripted
+/// closure.
 fn select_at_capable_port(
     candidates: Vec<CandidatePort>,
     policy: &mut DiscoveryPolicy,
     mut probe_one: impl FnMut(&Path, Duration) -> ProbeOutcome,
-) -> Option<PathBuf> {
+) -> Option<CandidatePort> {
     let timeout = policy.config.probe_timeout;
     for candidate in candidates {
         if policy.is_blocklisted(&candidate) {
@@ -791,9 +836,10 @@ fn select_at_capable_port(
             );
             continue;
         }
-        if policy.is_quarantined(&candidate.device_path) {
+        if policy.is_quarantined(&candidate.iface_path) {
             tracing::debug!(
                 port = %candidate.device_path.display(),
+                iface = %candidate.iface_path.display(),
                 "serial port quarantined after repeated probe timeouts; not probed again until \
                  process restart"
             );
@@ -802,12 +848,12 @@ fn select_at_capable_port(
 
         match probe_one(&candidate.device_path, timeout) {
             ProbeOutcome::AtCapable => {
-                policy.record_responded(&candidate.device_path);
-                return Some(candidate.device_path);
+                policy.record_at_responded(&candidate.iface_path);
+                return Some(candidate);
             }
-            ProbeOutcome::NotAtCapable => policy.record_responded(&candidate.device_path),
+            ProbeOutcome::NotAtCapable => policy.record_at_responded(&candidate.iface_path),
             ProbeOutcome::TimedOut => {
-                let newly_quarantined = policy.record_timeout(&candidate.device_path);
+                let newly_quarantined = policy.record_at_timeout(&candidate.iface_path);
                 tracing::warn!(
                     port = %candidate.device_path.display(),
                     iface = %candidate.iface_path.display(),
@@ -872,19 +918,28 @@ pub fn probe_is_at_capable(at: &mut AtCommander) -> bool {
 /// interpretation logic. On `Unreadable`, attempts one CFUN power-cycle via
 /// `recover_and_reprobe_sim` before giving up (specs/027-discover-retry-health
 /// — see that function's doc comment for why).
-fn probe_sim_status_at(port: &Path, sim_recovery: SimRecovery, timeout: Duration) -> SimStatus {
-    let open_port = port.to_path_buf();
+fn probe_sim_status_at(
+    device_path: &Path,
+    iface_path: &Path,
+    sim_recovery: SimRecovery,
+    policy: &mut DiscoveryPolicy,
+) -> SimStatus {
+    let timeout = policy.config.probe_timeout;
+    let open_port = device_path.to_path_buf();
     // The bounded region is the open PLUS the `AT+CPIN?`/`AT+CIMI` reads inside
     // `probe_sim_status` — each of which can itself block up to the per-line
     // port read timeout, so the worst case approaches the full `timeout` budget
     // (which is why that budget is generous, ~5s, not just an open's worth).
     //
-    // Unlike the AT-open probe, a timeout HERE does not feed the quarantine
-    // counter: this port already answered `AT`, so a slow SIM read is far more
-    // likely transient than a wedged driver, and must not blackhole a healthy
-    // modem for the process lifetime (specs/030-bad-port-isolation). The optional
-    // CFUN recovery below is deliberately left unbounded (specs/027): it sleeps
-    // for CFUN_CYCLE_DELAY plus a poll window by design and would be falsely
+    // SIM-read timeouts feed a SEPARATE quarantine counter from the AT-open
+    // probe (`record_sim_timeout`): a single/occasional one resets on the next
+    // good read, so a merely-slow-but-healthy modem is never blackholed — but a
+    // port that answers `AT` every rescan yet hangs on the SIM read *every* time
+    // still reaches the threshold and is quarantined, which bounds the SIM-probe
+    // workers it would otherwise leak forever (the AT-open success must not keep
+    // resetting this streak, hence the separate counter). The optional CFUN
+    // recovery below is deliberately left unbounded (specs/027): it sleeps for
+    // CFUN_CYCLE_DELAY plus a poll window by design and would be falsely
     // abandoned by the probe timeout.
     let opened = run_bounded(timeout, move || {
         match AtCommander::open_with_timeout(&open_port, PROBE_TIMEOUT) {
@@ -898,23 +953,40 @@ fn probe_sim_status_at(port: &Path, sim_recovery: SimRecovery, timeout: Duration
 
     let (status, mut at) = match opened {
         None => {
+            let newly_quarantined = policy.record_sim_timeout(iface_path);
             tracing::warn!(
-                port = %port.display(),
+                port = %device_path.display(),
+                iface = %iface_path.display(),
                 timeout_ms = timeout.as_millis(),
-                "SIM-status probe exceeded timeout; SIM left unread \
-                 (not counted toward quarantine — the port already answered AT)"
+                "SIM-status probe exceeded timeout; SIM left unread"
             );
+            if newly_quarantined {
+                tracing::warn!(
+                    port = %device_path.display(),
+                    iface = %iface_path.display(),
+                    threshold = QUARANTINE_THRESHOLD,
+                    "serial port quarantined for the process lifetime after consecutive SIM-read \
+                     timeouts; it will not be probed again until restart — add its iface path to \
+                     [discovery].excluded_ports to make this permanent"
+                );
+            }
             return SimStatus::Unreadable("SIM-status probe timed out".to_string());
         }
-        Some(SimProbe::OpenFailed(e)) => return SimStatus::Unreadable(e),
-        Some(SimProbe::Opened(status, at)) => (status, at),
+        Some(SimProbe::OpenFailed(e)) => {
+            policy.record_sim_responded(iface_path);
+            return SimStatus::Unreadable(e);
+        }
+        Some(SimProbe::Opened(status, at)) => {
+            policy.record_sim_responded(iface_path);
+            (status, at)
+        }
     };
 
     if sim_recovery == SimRecovery::CfunCycleOnUnreadable
         && matches!(status, SimStatus::Unreadable(_))
     {
         tracing::warn!(
-            port = %port.display(),
+            port = %device_path.display(),
             reason = ?status,
             "SIM unreadable on first probe; attempting a CFUN power-cycle before giving up"
         );
@@ -1217,14 +1289,17 @@ mod tests {
     #[test]
     fn port_is_quarantined_after_three_consecutive_timeouts() {
         let mut policy = DiscoveryPolicy::unfiltered();
-        let port = PathBuf::from("/dev/ttyUSB1");
-        assert!(!policy.is_quarantined(&port));
-        policy.record_timeout(&port);
-        policy.record_timeout(&port);
-        assert!(!policy.is_quarantined(&port), "only two timeouts so far");
-        policy.record_timeout(&port);
+        let iface = Path::new("5-1:1.1");
+        assert!(!policy.is_quarantined(iface));
+        policy.record_at_timeout(iface);
+        policy.record_at_timeout(iface);
+        assert!(!policy.is_quarantined(iface), "only two timeouts so far");
         assert!(
-            policy.is_quarantined(&port),
+            policy.record_at_timeout(iface),
+            "the third crossing returns true"
+        );
+        assert!(
+            policy.is_quarantined(iface),
             "quarantined on the third in a row"
         );
     }
@@ -1232,14 +1307,14 @@ mod tests {
     #[test]
     fn a_responding_probe_resets_the_timeout_streak() {
         let mut policy = DiscoveryPolicy::unfiltered();
-        let port = PathBuf::from("/dev/ttyUSB1");
-        policy.record_timeout(&port);
-        policy.record_timeout(&port);
-        policy.record_responded(&port); // streak broken by a real result
-        policy.record_timeout(&port);
-        policy.record_timeout(&port);
+        let iface = Path::new("5-1:1.1");
+        policy.record_at_timeout(iface);
+        policy.record_at_timeout(iface);
+        policy.record_at_responded(iface); // streak broken by a real result
+        policy.record_at_timeout(iface);
+        policy.record_at_timeout(iface);
         assert!(
-            !policy.is_quarantined(&port),
+            !policy.is_quarantined(iface),
             "two, a reset, then two more must not reach the threshold"
         );
     }
@@ -1308,19 +1383,18 @@ mod tests {
             scripted_probe(outcomes, probed.clone()),
         );
         assert_eq!(
-            result,
+            result.map(|c| c.device_path),
             Some(good.clone()),
             "abandons the wedged candidate and returns the next AT-capable one"
         );
+        assert_eq!(*probed.borrow(), vec![bad, good], "both tried, in order");
         assert_eq!(
-            *probed.borrow(),
-            vec![bad.clone(), good],
-            "both tried, in order"
-        );
-        assert_eq!(
-            policy.consecutive_timeouts.get(&bad).copied(),
+            policy
+                .consecutive_at_timeouts
+                .get(Path::new("5-1:1.1"))
+                .copied(),
             Some(1),
-            "the abandoned port took a timeout strike"
+            "the abandoned port took a timeout strike, keyed by its topology iface path"
         );
     }
 
@@ -1368,7 +1442,10 @@ mod tests {
             &mut policy,
             scripted_probe(outcomes, probed.clone()),
         );
-        assert_eq!(result, Some(PathBuf::from("/dev/ttyUSB2")));
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(PathBuf::from("/dev/ttyUSB2"))
+        );
         assert!(
             !probed.borrow().contains(&PathBuf::from("/dev/ttyUSB1")),
             "a blocklisted port is never opened/probed (SC-003)"
@@ -1377,17 +1454,18 @@ mod tests {
 
     #[test]
     fn probe_skips_a_quarantined_port() {
-        let p1 = PathBuf::from("/dev/ttyUSB1");
         let candidates = vec![
             cand("/dev/ttyUSB1", "5-1:1.1"),
             cand("/dev/ttyUSB2", "5-1:1.2"),
         ];
         let mut policy = DiscoveryPolicy::unfiltered();
+        // Quarantine ttyUSB1 by its stable topology iface path (P1-B: NOT the
+        // device path, which is reused across replug).
         for _ in 0..QUARANTINE_THRESHOLD {
-            policy.record_timeout(&p1);
+            policy.record_at_timeout(Path::new("5-1:1.1"));
         }
         let outcomes = HashMap::from([
-            (p1.clone(), ProbeOutcome::AtCapable),
+            (PathBuf::from("/dev/ttyUSB1"), ProbeOutcome::AtCapable),
             (PathBuf::from("/dev/ttyUSB2"), ProbeOutcome::AtCapable),
         ]);
         let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1396,28 +1474,57 @@ mod tests {
             &mut policy,
             scripted_probe(outcomes, probed.clone()),
         );
-        assert_eq!(result, Some(PathBuf::from("/dev/ttyUSB2")));
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(PathBuf::from("/dev/ttyUSB2"))
+        );
         assert!(
-            !probed.borrow().contains(&p1),
+            !probed.borrow().contains(&PathBuf::from("/dev/ttyUSB1")),
             "a quarantined port is not re-probed on a later scan"
         );
     }
 
     #[test]
+    fn quarantine_is_keyed_by_topology_not_device_path() {
+        // P1-B: a quarantined interface must stay pinned to its USB-topology
+        // path, so a healthy modem that later inherits the failed one's reused
+        // /dev/ttyUSB number is NOT wrongly skipped.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        for _ in 0..QUARANTINE_THRESHOLD {
+            policy.record_at_timeout(Path::new("5-1.2.1.2:1.1"));
+        }
+        // Same device path, different (healthy) topology position after replug.
+        let replacement = cand("/dev/ttyUSB1", "5-1.2.1.3:1.0");
+        let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let outcomes = HashMap::from([(PathBuf::from("/dev/ttyUSB1"), ProbeOutcome::AtCapable)]);
+        let result = select_at_capable_port(
+            vec![replacement],
+            &mut policy,
+            scripted_probe(outcomes, probed.clone()),
+        );
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(PathBuf::from("/dev/ttyUSB1")),
+            "the healthy replacement at a different topology position must be probed"
+        );
+        assert!(probed.borrow().contains(&PathBuf::from("/dev/ttyUSB1")));
+    }
+
+    #[test]
     fn multiple_bad_ports_are_tracked_and_quarantined_independently() {
-        // Edge case: several simultaneously-wedged ports must each accumulate
-        // their own streak, so one bad port hitting the threshold never
+        // Edge case: several simultaneously-wedged interfaces must each
+        // accumulate their own streak, so one hitting the threshold never
         // quarantines an unrelated one.
         let mut policy = DiscoveryPolicy::unfiltered();
-        let a = PathBuf::from("/dev/ttyUSB1");
-        let b = PathBuf::from("/dev/ttyUSB2");
+        let a = Path::new("5-1:1.1");
+        let b = Path::new("5-1:1.2");
         for _ in 0..QUARANTINE_THRESHOLD {
-            policy.record_timeout(&a);
+            policy.record_at_timeout(a);
         }
-        policy.record_timeout(&b);
-        assert!(policy.is_quarantined(&a), "the port that hit the threshold");
+        policy.record_at_timeout(b);
+        assert!(policy.is_quarantined(a), "the port that hit the threshold");
         assert!(
-            !policy.is_quarantined(&b),
+            !policy.is_quarantined(b),
             "one timeout must not quarantine a different port"
         );
     }
@@ -1440,22 +1547,54 @@ mod tests {
     }
 
     #[test]
-    fn sim_status_timeout_does_not_feed_the_quarantine_counter() {
-        // A slow SIM read on a port that already answered AT must not count
-        // toward quarantine (finding 5): a healthy modem must never be
-        // blackholed for the process lifetime by transient SIM slowness. The
-        // AT-probe seam is where timeouts are counted; the SIM path takes a
-        // plain `Duration` and touches no policy state at all — this test pins
-        // that contract at the type level.
+    fn sim_read_timeouts_quarantine_after_three_in_a_row() {
+        // P1-A: a port that answers AT but hangs on the SIM read every rescan
+        // would otherwise leak an abandoned worker forever. A run of SIM-read
+        // timeouts must reach quarantine (via its own counter) to bound that.
         let mut policy = DiscoveryPolicy::unfiltered();
-        let port = PathBuf::from("/dev/ttyUSB1");
-        // Three AT-probe timeouts DO quarantine…
-        for _ in 0..QUARANTINE_THRESHOLD {
-            policy.record_timeout(&port);
-        }
-        assert!(policy.is_quarantined(&port));
-        // …but `probe_sim_status_at` has no `&mut policy` to increment, by
-        // construction: its signature is `(&Path, SimRecovery, Duration)`.
+        let iface = Path::new("5-1:1.1");
+        assert!(!policy.record_sim_timeout(iface));
+        assert!(!policy.record_sim_timeout(iface));
+        assert!(
+            policy.record_sim_timeout(iface),
+            "the third consecutive SIM-read timeout quarantines"
+        );
+        assert!(policy.is_quarantined(iface));
+    }
+
+    #[test]
+    fn a_completed_sim_read_resets_the_sim_timeout_streak() {
+        // A merely-slow-but-healthy modem: an occasional SIM timeout that is
+        // followed by a good read must never reach the threshold.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        policy.record_sim_timeout(iface);
+        policy.record_sim_timeout(iface);
+        policy.record_sim_responded(iface);
+        policy.record_sim_timeout(iface);
+        policy.record_sim_timeout(iface);
+        assert!(
+            !policy.is_quarantined(iface),
+            "the reset prevents reaching the threshold"
+        );
+    }
+
+    #[test]
+    fn at_probe_success_does_not_reset_the_sim_timeout_streak() {
+        // The whole point of a SEPARATE SIM counter (P1-A): a port that answers
+        // AT on every rescan (resetting the AT streak) but hangs on the SIM read
+        // each time must still accumulate toward quarantine.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        policy.record_sim_timeout(iface);
+        policy.record_at_responded(iface); // AT-open success on the next rescan
+        policy.record_sim_timeout(iface);
+        policy.record_at_responded(iface);
+        assert!(
+            policy.record_sim_timeout(iface),
+            "AT success must not reset the SIM streak; the 3rd SIM timeout quarantines"
+        );
+        assert!(policy.is_quarantined(iface));
     }
 
     #[test]

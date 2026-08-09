@@ -231,9 +231,16 @@ reason.
   reads (`AT+CPIN?`, `AT+CIMI`), whose combined worst case on a slow-but-healthy
   modem approaches that budget; too tight a value would falsely abandon a
   working modem. The value is configurable, with a floor below which it is
-  clamped up. A false timeout on the SIM-read phase (as opposed to the initial
-  AT open) does NOT count toward quarantine, so transient SIM slowness cannot
-  blackhole a healthy modem.
+  clamped up. The SIM-read phase (open + `AT+CPIN?` + `AT+CIMI`) has its own
+  quarantine counter, separate from the AT-open probe's: a single or occasional
+  SIM timeout resets on the next good read (so a merely-slow-but-healthy modem
+  is never blackholed), but a port that answers `AT` yet hangs on the SIM read
+  on three consecutive scans *is* quarantined — otherwise it would leak an
+  abandoned worker on every rescan forever.
+- Quarantine is keyed by each interface's stable USB-topology path, not its
+  `/dev/ttyUSB*` device name — device numbers are reused across replug, so a
+  device-name key could skip a healthy modem that inherited a failed one's
+  number while the daemon keeps running.
 - The exclusion list accepts both exact device paths and USB-topology
   fragments; the topology form is the recommended way to pin a known-bad port
   because it survives replug/reboot.
