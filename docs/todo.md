@@ -53,7 +53,7 @@ Observed pending items
       to confirm against the original scenario** — never reproduced
       synthetically.
       Plan: [docs/plans/vowifi-gm-tcp-reconnect.md](plans/vowifi-gm-tcp-reconnect.md).
-- [ ] A specific attached Quectel EC20 (`2c7c:0125`, `EC20-CE-HDLG`) has one
+- [x] ~~A specific attached Quectel EC20 (`2c7c:0125`, `EC20-CE-HDLG`) has one
       of its four generic serial ports (`/dev/ttyUSB1` in this session,
       found during specs/025-outbound-calling T023/T033 hardware
       verification, 2026-08-03) that hangs the kernel `option` USB-serial
@@ -63,20 +63,25 @@ Observed pending items
       unconditionally, this silently wedges the **whole daemon's startup**
       (not just outbound calling) whenever this unit is attached — it
       happened once to the unmodified, already-deployed VoWiFi service too,
-      restarted for unrelated reasons while this unit was attached. Not a
-      bug in `AtCommander`'s timeout handling — the read timeout has no
-      effect on this particular blocking syscall (confirmed via
-      `/proc/<pid>/task/*/stack` showing `tty_wait_until_sent`). Worked
-      around for this session by unbinding the interface at the kernel
-      level (`echo '5-1.2.1.2:1.1' > /sys/bus/usb/drivers/option/unbind`,
-      after remounting the privileged container's `/sys` read-write) — a
-      host-level change, not something in this codebase to fix. A
-      permanent fix would be host/environment work: a udev rule
-      blocklisting the bad port, or root-causing why the `option` driver
-      wedges on it. Per the user, this port is the GNSS/NMEA interface —
-      plausibly explains the hang (an out-of-spec write to a port that
-      doesn't expect AT-style command framing), though not confirmed. The
-      unbind does not survive an unplug/replug or full reboot of the host,
-      so this will need to be reapplied (or fixed permanently) if the unit
-      is disconnected and reattached.
+      restarted for unrelated reasons while this unit was attached.~~ —
+      **implemented in specs/030-bad-port-isolation** (2026-08-09, released in
+      **v8.9.0**): the daemon-wedge gap is now closed in-code, superseding the
+      host-level `udev`/`sysfs` unbind workaround. Discovery runs each per-port
+      open/probe on an abandonable worker bounded by a timeout (default 5s): a
+      port that never responds is abandoned and the scan moves on, and an
+      interface that times out three times in a row is quarantined in memory for
+      the process lifetime (keyed by its stable USB-topology path). So one hung
+      port can no longer take down startup, the ongoing `CardPool` rescans, or
+      the VoLTE `volte-discover-lines` scan. A new `[discovery].excluded_ports`
+      config replaces the kernel unbind with an in-container escape hatch that
+      *does* survive replug/reboot: list the bad port by exact `/dev/ttyUSB*`
+      path or (preferred) USB-topology fragment (`5-1.2.1.2:1.1`, or `5-1.2.1.2`
+      for the whole device), which the scan then never opens. Residual, by
+      design: the kernel hang itself is **not** fixed (still a hardware/driver
+      issue) — this *contains* it, and the abandoned worker stays blocked in the
+      kernel for the process lifetime, bounded by the 3-strike quarantine and
+      the blocklist. The abandon-and-continue *mechanism* is unit-tested against
+      a never-returning fake, but has **not** been re-verified against the
+      physical `EC20-CE-HDLG` unit that found this — the literal kernel hang
+      needs that specific hardware to reproduce.
       Plan: [docs/plans/ec20-bad-port-isolation.md](plans/ec20-bad-port-isolation.md).
