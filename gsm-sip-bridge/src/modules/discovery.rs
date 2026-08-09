@@ -1,5 +1,7 @@
+use crate::config::DiscoveryConfig;
 use crate::error::BridgeResult;
 use crate::modules::at_commander::{AtCommander, AtResponse};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -41,6 +43,159 @@ const KNOWN_DEVICES: &[KnownDevice] = &[
 /// that are never going to answer AT (diagnostic/NMEA ports), and probing
 /// tries each one in turn.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Consecutive per-port probe timeouts after which a port is quarantined in
+/// memory for the process lifetime (specs/030-bad-port-isolation FR-013).
+const QUARANTINE_THRESHOLD: u8 = 3;
+
+/// One serial interface a modem exposes: its `/dev/ttyUSB*` device path and the
+/// sysfs USB interface directory it lives under. The interface directory's name
+/// is the stable USB-topology fragment (e.g. `5-1.2.1.2:1.1`) — carried
+/// alongside the device path so a hung-port timeout can log it and the operator
+/// blocklist can match on it (specs/030-bad-port-isolation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidatePort {
+    device_path: PathBuf,
+    iface_path: PathBuf,
+}
+
+/// The config-driven filtering plus the in-memory quarantine bookkeeping that a
+/// scan consults (specs/030-bad-port-isolation). The quarantine must persist
+/// *across* rescans but not across process restart, so a long-lived caller (the
+/// `CardPool` rescan loop) owns one `DiscoveryPolicy` and threads `&mut` into
+/// each scan; one-shot scans build a transient one.
+pub struct DiscoveryPolicy {
+    config: DiscoveryConfig,
+    /// Consecutive AT-open-probe timeouts, keyed by the stable USB-topology
+    /// interface path — NOT the `/dev/ttyUSB*` device path, which is reused
+    /// across replug (a device-name-keyed quarantine would skip a healthy modem
+    /// that inherited a failed one's number). Reset on any non-timeout AT
+    /// result.
+    consecutive_at_timeouts: HashMap<PathBuf, u8>,
+    /// Consecutive SIM-status-read timeouts, keyed the same way and kept
+    /// SEPARATE from the AT counter on purpose: a port can answer `AT` on every
+    /// rescan yet hang on `AT+CPIN?`/`AT+CIMI` each time, so the per-rescan AT
+    /// success must not keep resetting a streak that needs to accumulate —
+    /// otherwise the abandoned SIM-probe workers leak without bound. Reset on
+    /// any completed SIM read.
+    consecutive_sim_timeouts: HashMap<PathBuf, u8>,
+    /// Interface paths that reached `QUARANTINE_THRESHOLD` consecutive timeouts
+    /// of either phase — skipped (never opened) by later scans for the process
+    /// lifetime.
+    quarantined: HashSet<PathBuf>,
+}
+
+impl DiscoveryPolicy {
+    pub fn new(config: DiscoveryConfig) -> Self {
+        Self {
+            config,
+            consecutive_at_timeouts: HashMap::new(),
+            consecutive_sim_timeouts: HashMap::new(),
+            quarantined: HashSet::new(),
+        }
+    }
+
+    /// A policy that excludes nothing and uses the default probe timeout — for
+    /// tests and the one-shot/legacy scan paths that carry no operator config.
+    /// The bounded probe (and thus the wedge protection, FR-001) is still fully
+    /// active, since the default timeout is baked into `DiscoveryConfig`.
+    pub fn unfiltered() -> Self {
+        Self::new(DiscoveryConfig::default())
+    }
+
+    fn is_blocklisted(&self, port: &CandidatePort) -> bool {
+        self.config
+            .excluded
+            .iter()
+            .any(|m| m.matches(&port.device_path, &port.iface_path))
+    }
+
+    /// Whether the interface at `iface_path` (the stable topology path) is
+    /// quarantined.
+    fn is_quarantined(&self, iface_path: &Path) -> bool {
+        self.quarantined.contains(iface_path)
+    }
+
+    /// Records an AT-open-probe timeout for `iface_path`; quarantines it once it
+    /// has done so `QUARANTINE_THRESHOLD` times in a row. Returns `true` only on
+    /// the scan that first crosses the threshold, so the caller can emit a
+    /// one-time transition warning — after that the port is silently skipped, so
+    /// without that log the quarantine would leave no trace.
+    fn record_at_timeout(&mut self, iface_path: &Path) -> bool {
+        Self::bump(
+            &mut self.consecutive_at_timeouts,
+            &mut self.quarantined,
+            iface_path,
+        )
+    }
+
+    /// Records a completed AT probe (any non-timeout result) for `iface_path`,
+    /// resetting its AT-timeout streak.
+    fn record_at_responded(&mut self, iface_path: &Path) {
+        self.consecutive_at_timeouts.remove(iface_path);
+    }
+
+    /// Records a SIM-status-read timeout for `iface_path`; quarantines after
+    /// `QUARANTINE_THRESHOLD` in a row (bounding the SIM-probe workers a
+    /// persistently SIM-hanging port would otherwise leak). Returns `true` only
+    /// on the crossing scan.
+    fn record_sim_timeout(&mut self, iface_path: &Path) -> bool {
+        Self::bump(
+            &mut self.consecutive_sim_timeouts,
+            &mut self.quarantined,
+            iface_path,
+        )
+    }
+
+    /// Records a completed SIM read (any non-timeout result) for `iface_path`,
+    /// resetting its SIM-timeout streak.
+    fn record_sim_responded(&mut self, iface_path: &Path) {
+        self.consecutive_sim_timeouts.remove(iface_path);
+    }
+
+    /// Increments a phase counter and quarantines `iface_path` once it reaches
+    /// the threshold. Returns `true` only on the crossing. Takes the two fields
+    /// as disjoint borrows so it can be shared by both phases' record methods.
+    fn bump(
+        counters: &mut HashMap<PathBuf, u8>,
+        quarantined: &mut HashSet<PathBuf>,
+        iface_path: &Path,
+    ) -> bool {
+        let counter = counters.entry(iface_path.to_path_buf()).or_insert(0);
+        *counter += 1;
+        if *counter >= QUARANTINE_THRESHOLD {
+            // `HashSet::insert` returns true only when newly inserted — exactly
+            // the crossing event.
+            quarantined.insert(iface_path.to_path_buf())
+        } else {
+            false
+        }
+    }
+}
+
+/// Runs `work` on a throwaway thread and waits at most `timeout` for it.
+/// Returns `None` if it did not finish in time — the worker is then
+/// deliberately leaked. A serial `open`/read on a port that wedges the kernel
+/// `option` driver is uninterruptible from user space (a userspace read-timeout
+/// and even `SIGTERM` don't break it), so abandoning the worker is the only way
+/// to keep the scan moving (specs/030-bad-port-isolation). The leaked thread
+/// stays blocked for the process lifetime — bounded by the per-port quarantine
+/// and the operator blocklist. Same bounded-`recv_timeout` idiom already used in
+/// `ims/agent.rs` and `observability/reporter.rs`.
+fn run_bounded<T, F>(timeout: Duration, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // A send error just means the scan already gave up and dropped the
+        // receiver; nothing to do but let this thread end (or stay blocked in
+        // the kernel, if that is why we were abandoned).
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(timeout).ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredModule {
@@ -128,10 +283,14 @@ pub fn scan_all() -> BridgeResult<Vec<ProbedModem>> {
 /// passes `vowifi::discovery::effective_line_overrides`' configured ports
 /// here; a plain `scan_all()` (no hints) behaves exactly as before.
 pub fn scan_all_preferring(preferred_ports: &[PathBuf]) -> BridgeResult<Vec<ProbedModem>> {
+    // A one-shot scan with no operator config: the bounded probe and quarantine
+    // still protect it (default timeout), but there is no persistent state to
+    // carry, so a transient unfiltered policy is right.
     scan_all_inner(
         preferred_ports,
         &std::collections::HashSet::new(),
         SimRecovery::Disabled,
+        &mut DiscoveryPolicy::unfiltered(),
     )
 }
 
@@ -168,11 +327,31 @@ pub enum SimRecovery {
 pub fn scan_all_preferring_with_sim_recovery(
     preferred_ports: &[PathBuf],
     sim_recovery: SimRecovery,
+    policy: &mut DiscoveryPolicy,
 ) -> BridgeResult<Vec<ProbedModem>> {
     scan_all_inner(
         preferred_ports,
         &std::collections::HashSet::new(),
         sim_recovery,
+        policy,
+    )
+}
+
+/// Like [`scan_all_preferring`], but honoring an operator [`DiscoveryPolicy`]
+/// (its `[discovery].excluded_ports` blocklist and probe timeout). The VoLTE
+/// startup discovery path uses this so a known-bad port is skipped on the
+/// container-start scan that resolves the line table — not just on the
+/// circuit-switched rescans (specs/030-bad-port-isolation FR-007/FR-010,
+/// SC-003).
+pub fn scan_all_preferring_with_policy(
+    preferred_ports: &[PathBuf],
+    policy: &mut DiscoveryPolicy,
+) -> BridgeResult<Vec<ProbedModem>> {
+    scan_all_inner(
+        preferred_ports,
+        &std::collections::HashSet::new(),
+        SimRecovery::Disabled,
+        policy,
     )
 }
 
@@ -195,6 +374,7 @@ fn scan_all_inner(
     preferred_ports: &[PathBuf],
     skip_card_ids: &std::collections::HashSet<String>,
     sim_recovery: SimRecovery,
+    policy: &mut DiscoveryPolicy,
 ) -> BridgeResult<Vec<ProbedModem>> {
     let mut modems = Vec::new();
 
@@ -244,10 +424,11 @@ fn scan_all_inner(
 
         let audio_device = find_alsa_card(&dev_path);
         let net_device = find_net_iface(&dev_path);
-        let at_port = probe_at_port(&dev_path, preferred_ports);
-        let sim_status = at_port
+        let at_candidate = probe_at_port(&dev_path, preferred_ports, policy);
+        let sim_status = at_candidate
             .as_ref()
-            .map(|port| probe_sim_status_at(port, sim_recovery));
+            .map(|c| probe_sim_status_at(&c.device_path, &c.iface_path, sim_recovery, policy));
+        let at_port = at_candidate.map(|c| c.device_path);
 
         match (&at_port, &sim_status) {
             (Some(port), Some(SimStatus::Ready { imsi })) => {
@@ -357,7 +538,7 @@ pub fn volte_claimed_card_ids(config: &crate::config::VolteConfig) -> Vec<String
 /// [`scan_modules`] with an explicit extra exclusion set, so the caller can
 /// state which ports another subsystem owns rather than this module guessing.
 pub fn scan_modules_excluding(also_excluded: &[PathBuf]) -> BridgeResult<Vec<DiscoveredModule>> {
-    scan_modules_excluding_cards(also_excluded, &[])
+    scan_modules_excluding_cards(also_excluded, &[], &mut DiscoveryPolicy::unfiltered())
 }
 
 /// Like [`scan_modules_excluding`], but the caller can additionally name card
@@ -368,6 +549,7 @@ pub fn scan_modules_excluding(also_excluded: &[PathBuf]) -> BridgeResult<Vec<Dis
 pub fn scan_modules_excluding_cards(
     also_excluded: &[PathBuf],
     also_skip_cards: &[String],
+    policy: &mut DiscoveryPolicy,
 ) -> BridgeResult<Vec<DiscoveredModule>> {
     let mut excluded = excluded_ports_from_lines_file();
     excluded.extend(active_volte_line_ports());
@@ -395,7 +577,7 @@ pub fn scan_modules_excluding_cards(
     skip.extend(also_skip_cards.iter().cloned());
     // `SimRecovery::Disabled`: this is the ongoing-rescan path, which must
     // stay a read-only probe — see `SimRecovery`.
-    let modems = scan_all_inner(&[], &skip, SimRecovery::Disabled)?;
+    let modems = scan_all_inner(&[], &skip, SimRecovery::Disabled, policy)?;
     Ok(modems
         .into_iter()
         .filter(|m| m.has_audio_capability)
@@ -556,7 +738,7 @@ fn match_known_device(path: &Path) -> Option<&'static KnownDevice> {
 /// Every `ttyUSB*` serial interface this USB device exposes, in a stable
 /// (sorted) order — regardless of `bInterfaceNumber`, since which interface
 /// answers AT varies by model/firmware (FR-002) and is no longer assumed.
-fn candidate_tty_ports(dev_path: &Path) -> Vec<PathBuf> {
+fn candidate_tty_ports(dev_path: &Path) -> Vec<CandidatePort> {
     let mut candidates = Vec::new();
     let Ok(entries) = fs::read_dir(dev_path) else {
         return candidates;
@@ -568,24 +750,28 @@ fn candidate_tty_ports(dev_path: &Path) -> Vec<PathBuf> {
             continue;
         }
         if let Some(tty) = find_tty_in_path(&iface_path) {
-            candidates.push(PathBuf::from(format!("/dev/{tty}")));
+            candidates.push(CandidatePort {
+                device_path: PathBuf::from(format!("/dev/{tty}")),
+                iface_path,
+            });
         }
     }
-    candidates.sort();
+    candidates.sort_by(|a, b| a.device_path.cmp(&b.device_path));
     candidates
 }
 
-/// Reorders `candidates` so any that appear in `preferred` come first (each
-/// in its original relative order otherwise) — a device with several
-/// AT-capable interfaces should try an operator-named port before falling
-/// through to "whichever answers first" (see `scan_all_preferring`'s doc
-/// comment). Pure and unit-tested; `probe_at_port` (real serial I/O) is not.
+/// Reorders `candidates` so any whose device path appears in `preferred` come
+/// first (each in its original relative order otherwise) — a device with
+/// several AT-capable interfaces should try an operator-named port before
+/// falling through to "whichever answers first" (see `scan_all_preferring`'s
+/// doc comment). Pure and unit-tested; `probe_at_port` (real serial I/O) is not.
 fn order_candidates_with_preference(
-    candidates: Vec<PathBuf>,
+    candidates: Vec<CandidatePort>,
     preferred: &[PathBuf],
-) -> Vec<PathBuf> {
-    let (mut first, mut rest): (Vec<_>, Vec<_>) =
-        candidates.into_iter().partition(|c| preferred.contains(c));
+) -> Vec<CandidatePort> {
+    let (mut first, mut rest): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| preferred.contains(&c.device_path));
     first.append(&mut rest);
     first
 }
@@ -594,29 +780,128 @@ fn order_candidates_with_preference(
 /// one first, if present — see `order_candidates_with_preference`), opening
 /// it and sending a bare `AT`, and returns the first one that answers `OK` —
 /// the live probe replacing the old fixed-interface-number lookup (FR-002).
-/// Real hardware I/O; not unit-tested directly (same boundary as the rest of
-/// this file's sysfs/serial-opening helpers) — the AT-response
-/// interpretation itself (`probe_is_at_capable`) is unit-tested against a
-/// fake transport below.
-fn probe_at_port(dev_path: &Path, preferred: &[PathBuf]) -> Option<PathBuf> {
+///
+/// Each candidate the operator excluded (FR-007) or that has been quarantined
+/// after repeated timeouts (FR-013) is skipped without opening it. Every open +
+/// AT exchange runs on an abandonable worker bounded by `policy`'s probe
+/// timeout, so a port that wedges the kernel driver is abandoned rather than
+/// wedging the whole scan (FR-001/FR-002). Real hardware I/O; the bounded-runner
+/// mechanism, the matcher, and the quarantine counter are unit-tested below.
+fn probe_at_port(
+    dev_path: &Path,
+    preferred: &[PathBuf],
+    policy: &mut DiscoveryPolicy,
+) -> Option<CandidatePort> {
     let candidates = order_candidates_with_preference(candidate_tty_ports(dev_path), preferred);
+    select_at_capable_port(candidates, policy, probe_one_candidate)
+}
+
+/// The result of probing one candidate serial interface
+/// (specs/030-bad-port-isolation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// Answered `AT` with `OK` — usable.
+    AtCapable,
+    /// A real, non-timeout result: opened but not `AT`-capable, or the open
+    /// itself failed cleanly. Either way the port responded, so it resets the
+    /// consecutive-timeout streak.
+    NotAtCapable,
+    /// The bounded probe was abandoned because it did not finish in time.
+    TimedOut,
+}
+
+/// The candidate-selection logic, factored out of live serial I/O so it is
+/// unit-testable with a fake `probe_one`: it applies the blocklist and
+/// quarantine skips (so an excluded/quarantined port is *never handed to*
+/// `probe_one`, FR-007/FR-013/SC-003), calls `probe_one` for each remaining
+/// candidate in order, updates the quarantine bookkeeping (keyed by the stable
+/// topology iface path), logs, and returns the first `AT`-capable candidate —
+/// continuing past an abandoned one (FR-002/FR-003). Production passes
+/// [`probe_one_candidate`] (real bounded serial I/O); tests pass a scripted
+/// closure.
+fn select_at_capable_port(
+    candidates: Vec<CandidatePort>,
+    policy: &mut DiscoveryPolicy,
+    mut probe_one: impl FnMut(&Path, Duration) -> ProbeOutcome,
+) -> Option<CandidatePort> {
+    let timeout = policy.config.probe_timeout;
     for candidate in candidates {
-        match AtCommander::open_with_timeout(&candidate, PROBE_TIMEOUT) {
-            Ok(mut at) => {
-                if probe_is_at_capable(&mut at) {
-                    return Some(candidate);
-                }
+        if policy.is_blocklisted(&candidate) {
+            // info, not debug: US3 scenario 2 — an operator reading normal logs
+            // must be able to see that their exclusion is taking effect.
+            tracing::info!(
+                port = %candidate.device_path.display(),
+                iface = %candidate.iface_path.display(),
+                "serial port skipped by the [discovery].excluded_ports exclusion list; not probing"
+            );
+            continue;
+        }
+        if policy.is_quarantined(&candidate.iface_path) {
+            tracing::debug!(
+                port = %candidate.device_path.display(),
+                iface = %candidate.iface_path.display(),
+                "serial port quarantined after repeated probe timeouts; not probed again until \
+                 process restart"
+            );
+            continue;
+        }
+
+        match probe_one(&candidate.device_path, timeout) {
+            ProbeOutcome::AtCapable => {
+                policy.record_at_responded(&candidate.iface_path);
+                return Some(candidate);
             }
-            Err(e) => {
-                tracing::debug!(
-                    port = %candidate.display(),
-                    error = %e,
-                    "could not open candidate serial port during AT probe"
+            ProbeOutcome::NotAtCapable => policy.record_at_responded(&candidate.iface_path),
+            ProbeOutcome::TimedOut => {
+                let newly_quarantined = policy.record_at_timeout(&candidate.iface_path);
+                tracing::warn!(
+                    port = %candidate.device_path.display(),
+                    iface = %candidate.iface_path.display(),
+                    timeout_ms = timeout.as_millis(),
+                    "AT probe exceeded timeout; abandoning port, left unresolved \
+                     (add its iface path to [discovery].excluded_ports to skip it permanently)"
                 );
+                if newly_quarantined {
+                    // One-time transition record: after this the port is only
+                    // skipped at debug, so this is the durable evidence.
+                    tracing::warn!(
+                        port = %candidate.device_path.display(),
+                        iface = %candidate.iface_path.display(),
+                        threshold = QUARANTINE_THRESHOLD,
+                        "serial port quarantined for the process lifetime after consecutive probe \
+                         timeouts; it will not be probed again until restart — add its iface path \
+                         to [discovery].excluded_ports to make this permanent"
+                    );
+                }
             }
         }
     }
     None
+}
+
+/// Production `probe_one`: opens the port and sends a bare `AT` on an
+/// abandonable worker bounded by `timeout` (see [`run_bounded`]). Real hardware
+/// I/O — the surrounding selection logic ([`select_at_capable_port`]) is what's
+/// unit-tested.
+fn probe_one_candidate(device_path: &Path, timeout: Duration) -> ProbeOutcome {
+    let probe_path = device_path.to_path_buf();
+    match run_bounded(timeout, move || {
+        match AtCommander::open_with_timeout(&probe_path, PROBE_TIMEOUT) {
+            Ok(mut at) => probe_is_at_capable(&mut at),
+            Err(e) => {
+                tracing::debug!(
+                    port = %probe_path.display(),
+                    error = %e,
+                    "could not open candidate serial port during AT probe"
+                );
+                false
+            }
+        }
+    }) {
+        Some(true) => ProbeOutcome::AtCapable,
+        Some(false) => ProbeOutcome::NotAtCapable,
+        None => ProbeOutcome::TimedOut,
+    }
 }
 
 /// Sends a bare `AT` and returns whether the device answered with a
@@ -633,30 +918,95 @@ pub fn probe_is_at_capable(at: &mut AtCommander) -> bool {
 /// interpretation logic. On `Unreadable`, attempts one CFUN power-cycle via
 /// `recover_and_reprobe_sim` before giving up (specs/027-discover-retry-health
 /// — see that function's doc comment for why).
-fn probe_sim_status_at(port: &Path, sim_recovery: SimRecovery) -> SimStatus {
-    match AtCommander::open_with_timeout(port, PROBE_TIMEOUT) {
-        Ok(mut at) => {
-            let status = probe_sim_status(&mut at);
-            if sim_recovery == SimRecovery::CfunCycleOnUnreadable
-                && matches!(status, SimStatus::Unreadable(_))
-            {
-                tracing::warn!(
-                    port = %port.display(),
-                    reason = ?status,
-                    "SIM unreadable on first probe; attempting a CFUN power-cycle before giving up"
-                );
-                recover_and_reprobe_sim(
-                    &mut at,
-                    crate::supervise::sim_recovery::CFUN_CYCLE_DELAY,
-                    crate::supervise::sim_recovery::CPIN_POLL_INTERVAL,
-                    crate::supervise::sim_recovery::CPIN_POLL_ATTEMPTS,
-                )
-            } else {
-                status
+fn probe_sim_status_at(
+    device_path: &Path,
+    iface_path: &Path,
+    sim_recovery: SimRecovery,
+    policy: &mut DiscoveryPolicy,
+) -> SimStatus {
+    let timeout = policy.config.probe_timeout;
+    let open_port = device_path.to_path_buf();
+    // The bounded region is the open PLUS the `AT+CPIN?`/`AT+CIMI` reads inside
+    // `probe_sim_status` — each of which can itself block up to the per-line
+    // port read timeout, so the worst case approaches the full `timeout` budget
+    // (which is why that budget is generous, ~5s, not just an open's worth).
+    //
+    // SIM-read timeouts feed a SEPARATE quarantine counter from the AT-open
+    // probe (`record_sim_timeout`): a single/occasional one resets on the next
+    // good read, so a merely-slow-but-healthy modem is never blackholed — but a
+    // port that answers `AT` every rescan yet hangs on the SIM read *every* time
+    // still reaches the threshold and is quarantined, which bounds the SIM-probe
+    // workers it would otherwise leak forever (the AT-open success must not keep
+    // resetting this streak, hence the separate counter). The optional CFUN
+    // recovery below is deliberately left unbounded (specs/027): it sleeps for
+    // CFUN_CYCLE_DELAY plus a poll window by design and would be falsely
+    // abandoned by the probe timeout.
+    let opened = run_bounded(timeout, move || {
+        match AtCommander::open_with_timeout(&open_port, PROBE_TIMEOUT) {
+            Ok(mut at) => {
+                let status = probe_sim_status(&mut at);
+                SimProbe::Opened(status, at)
             }
+            Err(e) => SimProbe::OpenFailed(e.to_string()),
         }
-        Err(e) => SimStatus::Unreadable(e.to_string()),
+    });
+
+    let (status, mut at) = match opened {
+        None => {
+            let newly_quarantined = policy.record_sim_timeout(iface_path);
+            tracing::warn!(
+                port = %device_path.display(),
+                iface = %iface_path.display(),
+                timeout_ms = timeout.as_millis(),
+                "SIM-status probe exceeded timeout; SIM left unread"
+            );
+            if newly_quarantined {
+                tracing::warn!(
+                    port = %device_path.display(),
+                    iface = %iface_path.display(),
+                    threshold = QUARANTINE_THRESHOLD,
+                    "serial port quarantined for the process lifetime after consecutive SIM-read \
+                     timeouts; it will not be probed again until restart — add its iface path to \
+                     [discovery].excluded_ports to make this permanent"
+                );
+            }
+            return SimStatus::Unreadable("SIM-status probe timed out".to_string());
+        }
+        Some(SimProbe::OpenFailed(e)) => {
+            policy.record_sim_responded(iface_path);
+            return SimStatus::Unreadable(e);
+        }
+        Some(SimProbe::Opened(status, at)) => {
+            policy.record_sim_responded(iface_path);
+            (status, at)
+        }
+    };
+
+    if sim_recovery == SimRecovery::CfunCycleOnUnreadable
+        && matches!(status, SimStatus::Unreadable(_))
+    {
+        tracing::warn!(
+            port = %device_path.display(),
+            reason = ?status,
+            "SIM unreadable on first probe; attempting a CFUN power-cycle before giving up"
+        );
+        recover_and_reprobe_sim(
+            &mut at,
+            crate::supervise::sim_recovery::CFUN_CYCLE_DELAY,
+            crate::supervise::sim_recovery::CPIN_POLL_INTERVAL,
+            crate::supervise::sim_recovery::CPIN_POLL_ATTEMPTS,
+        )
+    } else {
+        status
     }
+}
+
+/// The result of the bounded SIM-status open, carrying the still-open
+/// `AtCommander` back out of the worker thread so an optional (unbounded) CFUN
+/// recovery can reuse it (see `probe_sim_status_at`).
+enum SimProbe {
+    Opened(SimStatus, AtCommander),
+    OpenFailed(String),
 }
 
 /// After a first-probe `Unreadable` result, power-cycles the SIM in place
@@ -856,13 +1206,21 @@ mod tests {
         fake_tty_interface(dir.path(), "1-1:1.2", "ttyUSB2", "02");
         fake_tty_interface(dir.path(), "1-1:1.4", "ttyUSB4", "04");
         let candidates = candidate_tty_ports(dir.path());
+        let device_paths: Vec<PathBuf> = candidates.iter().map(|c| c.device_path.clone()).collect();
         assert_eq!(
-            candidates,
+            device_paths,
             vec![
                 PathBuf::from("/dev/ttyUSB0"),
                 PathBuf::from("/dev/ttyUSB2"),
                 PathBuf::from("/dev/ttyUSB4"),
             ]
+        );
+        // The USB interface (topology) path is captured alongside each device
+        // path (specs/030-bad-port-isolation): the timeout log and the operator
+        // blocklist both key off it.
+        assert_eq!(
+            candidates[0].iface_path.file_name().unwrap(),
+            std::ffi::OsStr::new("1-1:1.0")
         );
     }
 
@@ -878,7 +1236,365 @@ mod tests {
         fs::write(dir.path().join("idVendor"), "2c7c").unwrap();
         fake_tty_interface(dir.path(), "1-1:1.4", "ttyUSB4", "04");
         let candidates = candidate_tty_ports(dir.path());
-        assert_eq!(candidates, vec![PathBuf::from("/dev/ttyUSB4")]);
+        let device_paths: Vec<PathBuf> = candidates.iter().map(|c| c.device_path.clone()).collect();
+        assert_eq!(device_paths, vec![PathBuf::from("/dev/ttyUSB4")]);
+    }
+
+    /// Builds a `CandidatePort` from a device path and an interface (topology)
+    /// fragment, for the ordering/matching tests below.
+    fn cand(dev: &str, iface: &str) -> CandidatePort {
+        CandidatePort {
+            device_path: PathBuf::from(dev),
+            iface_path: PathBuf::from(iface),
+        }
+    }
+
+    fn device_paths(cands: Vec<CandidatePort>) -> Vec<PathBuf> {
+        cands.into_iter().map(|c| c.device_path).collect()
+    }
+
+    // --- specs/030-bad-port-isolation: bounded probe, quarantine, blocklist.
+    // The real kernel hang needs the specific hardware; a never-returning
+    // closure is the faithful stand-in for "an open/read that never comes
+    // back", exercising the actual thread-spawn + recv_timeout mechanism. ---
+
+    #[test]
+    fn run_bounded_abandons_work_that_never_finishes() {
+        let start = std::time::Instant::now();
+        let result: Option<()> = run_bounded(Duration::from_millis(150), || {
+            // Stands in for a serial open that wedges the kernel driver.
+            std::thread::sleep(Duration::from_secs(3600));
+        });
+        assert!(
+            result.is_none(),
+            "a never-finishing probe must be abandoned"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "abandoning must happen at ~the timeout, not wait for the work"
+        );
+    }
+
+    #[test]
+    fn run_bounded_returns_a_slow_but_healthy_result() {
+        // Sleeps well under the timeout: a slow-but-working port must resolve,
+        // not be falsely abandoned (US1 acceptance scenario 3).
+        let result = run_bounded(Duration::from_secs(2), || {
+            std::thread::sleep(Duration::from_millis(100));
+            42
+        });
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn port_is_quarantined_after_three_consecutive_timeouts() {
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        assert!(!policy.is_quarantined(iface));
+        policy.record_at_timeout(iface);
+        policy.record_at_timeout(iface);
+        assert!(!policy.is_quarantined(iface), "only two timeouts so far");
+        assert!(
+            policy.record_at_timeout(iface),
+            "the third crossing returns true"
+        );
+        assert!(
+            policy.is_quarantined(iface),
+            "quarantined on the third in a row"
+        );
+    }
+
+    #[test]
+    fn a_responding_probe_resets_the_timeout_streak() {
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        policy.record_at_timeout(iface);
+        policy.record_at_timeout(iface);
+        policy.record_at_responded(iface); // streak broken by a real result
+        policy.record_at_timeout(iface);
+        policy.record_at_timeout(iface);
+        assert!(
+            !policy.is_quarantined(iface),
+            "two, a reset, then two more must not reach the threshold"
+        );
+    }
+
+    #[test]
+    fn blocklist_matches_device_prefix_and_leaves_others_alone() {
+        use crate::config::{DiscoveryConfig, PortMatcher};
+        let config = DiscoveryConfig {
+            excluded: vec![PortMatcher::parse("5-1.2.1.2").unwrap()],
+            ..DiscoveryConfig::default()
+        };
+        let policy = DiscoveryPolicy::new(config);
+        let excluded = CandidatePort {
+            device_path: PathBuf::from("/dev/ttyUSB1"),
+            iface_path: PathBuf::from("/sys/bus/usb/devices/5-1.2.1.2:1.1"),
+        };
+        let other = CandidatePort {
+            device_path: PathBuf::from("/dev/ttyUSB0"),
+            iface_path: PathBuf::from("/sys/bus/usb/devices/5-1.2.1.3:1.0"),
+        };
+        assert!(
+            policy.is_blocklisted(&excluded),
+            "a whole-device topology fragment excludes its interfaces"
+        );
+        assert!(
+            !policy.is_blocklisted(&other),
+            "a different device is untouched"
+        );
+    }
+
+    /// A scripted `probe_one` for `select_at_capable_port`: maps each device
+    /// path to a fixed outcome and records the order in which ports are actually
+    /// handed to it — so a test can assert both the selection result and that a
+    /// blocklisted/quarantined port is *never probed* (SC-003). A `TimedOut`
+    /// entry is the fake-port stand-in for an open that never returns.
+    fn scripted_probe(
+        outcomes: HashMap<PathBuf, ProbeOutcome>,
+        probed: std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>,
+    ) -> impl FnMut(&Path, Duration) -> ProbeOutcome {
+        move |port: &Path, _timeout| {
+            probed.borrow_mut().push(port.to_path_buf());
+            outcomes
+                .get(port)
+                .copied()
+                .unwrap_or(ProbeOutcome::NotAtCapable)
+        }
+    }
+
+    #[test]
+    fn probe_abandons_a_wedged_candidate_and_continues_to_the_next() {
+        let bad = PathBuf::from("/dev/ttyUSB1");
+        let good = PathBuf::from("/dev/ttyUSB2");
+        let candidates = vec![
+            cand("/dev/ttyUSB1", "5-1:1.1"),
+            cand("/dev/ttyUSB2", "5-1:1.2"),
+        ];
+        let outcomes = HashMap::from([
+            (bad.clone(), ProbeOutcome::TimedOut),
+            (good.clone(), ProbeOutcome::AtCapable),
+        ]);
+        let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let result = select_at_capable_port(
+            candidates,
+            &mut policy,
+            scripted_probe(outcomes, probed.clone()),
+        );
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(good.clone()),
+            "abandons the wedged candidate and returns the next AT-capable one"
+        );
+        assert_eq!(*probed.borrow(), vec![bad, good], "both tried, in order");
+        assert_eq!(
+            policy
+                .consecutive_at_timeouts
+                .get(Path::new("5-1:1.1"))
+                .copied(),
+            Some(1),
+            "the abandoned port took a timeout strike, keyed by its topology iface path"
+        );
+    }
+
+    #[test]
+    fn probe_returns_none_when_every_candidate_times_out() {
+        // FR-011 / T010: a modem whose only interfaces all wedge yields no
+        // usable AT port (and does not hang).
+        let candidates = vec![
+            cand("/dev/ttyUSB1", "5-1:1.1"),
+            cand("/dev/ttyUSB2", "5-1:1.2"),
+        ];
+        let outcomes = HashMap::from([
+            (PathBuf::from("/dev/ttyUSB1"), ProbeOutcome::TimedOut),
+            (PathBuf::from("/dev/ttyUSB2"), ProbeOutcome::TimedOut),
+        ]);
+        let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let result =
+            select_at_capable_port(candidates, &mut policy, scripted_probe(outcomes, probed));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn probe_never_opens_a_blocklisted_port() {
+        use crate::config::{DiscoveryConfig, PortMatcher};
+        // ttyUSB1 is blocklisted; even though the fake would answer AT on it, it
+        // must never be handed to the prober (SC-003), so the healthy ttyUSB2
+        // wins.
+        let candidates = vec![
+            cand("/dev/ttyUSB1", "5-1.2.1.2:1.1"),
+            cand("/dev/ttyUSB2", "5-1.2.1.3:1.0"),
+        ];
+        let config = DiscoveryConfig {
+            excluded: vec![PortMatcher::parse("5-1.2.1.2:1.1").unwrap()],
+            ..DiscoveryConfig::default()
+        };
+        let mut policy = DiscoveryPolicy::new(config);
+        let outcomes = HashMap::from([
+            (PathBuf::from("/dev/ttyUSB1"), ProbeOutcome::AtCapable),
+            (PathBuf::from("/dev/ttyUSB2"), ProbeOutcome::AtCapable),
+        ]);
+        let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let result = select_at_capable_port(
+            candidates,
+            &mut policy,
+            scripted_probe(outcomes, probed.clone()),
+        );
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(PathBuf::from("/dev/ttyUSB2"))
+        );
+        assert!(
+            !probed.borrow().contains(&PathBuf::from("/dev/ttyUSB1")),
+            "a blocklisted port is never opened/probed (SC-003)"
+        );
+    }
+
+    #[test]
+    fn probe_skips_a_quarantined_port() {
+        let candidates = vec![
+            cand("/dev/ttyUSB1", "5-1:1.1"),
+            cand("/dev/ttyUSB2", "5-1:1.2"),
+        ];
+        let mut policy = DiscoveryPolicy::unfiltered();
+        // Quarantine ttyUSB1 by its stable topology iface path (P1-B: NOT the
+        // device path, which is reused across replug).
+        for _ in 0..QUARANTINE_THRESHOLD {
+            policy.record_at_timeout(Path::new("5-1:1.1"));
+        }
+        let outcomes = HashMap::from([
+            (PathBuf::from("/dev/ttyUSB1"), ProbeOutcome::AtCapable),
+            (PathBuf::from("/dev/ttyUSB2"), ProbeOutcome::AtCapable),
+        ]);
+        let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let result = select_at_capable_port(
+            candidates,
+            &mut policy,
+            scripted_probe(outcomes, probed.clone()),
+        );
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(PathBuf::from("/dev/ttyUSB2"))
+        );
+        assert!(
+            !probed.borrow().contains(&PathBuf::from("/dev/ttyUSB1")),
+            "a quarantined port is not re-probed on a later scan"
+        );
+    }
+
+    #[test]
+    fn quarantine_is_keyed_by_topology_not_device_path() {
+        // P1-B: a quarantined interface must stay pinned to its USB-topology
+        // path, so a healthy modem that later inherits the failed one's reused
+        // /dev/ttyUSB number is NOT wrongly skipped.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        for _ in 0..QUARANTINE_THRESHOLD {
+            policy.record_at_timeout(Path::new("5-1.2.1.2:1.1"));
+        }
+        // Same device path, different (healthy) topology position after replug.
+        let replacement = cand("/dev/ttyUSB1", "5-1.2.1.3:1.0");
+        let probed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let outcomes = HashMap::from([(PathBuf::from("/dev/ttyUSB1"), ProbeOutcome::AtCapable)]);
+        let result = select_at_capable_port(
+            vec![replacement],
+            &mut policy,
+            scripted_probe(outcomes, probed.clone()),
+        );
+        assert_eq!(
+            result.map(|c| c.device_path),
+            Some(PathBuf::from("/dev/ttyUSB1")),
+            "the healthy replacement at a different topology position must be probed"
+        );
+        assert!(probed.borrow().contains(&PathBuf::from("/dev/ttyUSB1")));
+    }
+
+    #[test]
+    fn multiple_bad_ports_are_tracked_and_quarantined_independently() {
+        // Edge case: several simultaneously-wedged interfaces must each
+        // accumulate their own streak, so one hitting the threshold never
+        // quarantines an unrelated one.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let a = Path::new("5-1:1.1");
+        let b = Path::new("5-1:1.2");
+        for _ in 0..QUARANTINE_THRESHOLD {
+            policy.record_at_timeout(a);
+        }
+        policy.record_at_timeout(b);
+        assert!(policy.is_quarantined(a), "the port that hit the threshold");
+        assert!(
+            !policy.is_quarantined(b),
+            "one timeout must not quarantine a different port"
+        );
+    }
+
+    #[test]
+    fn unfiltered_policy_excludes_nothing_and_uses_the_default_timeout() {
+        let policy = DiscoveryPolicy::unfiltered();
+        let port = CandidatePort {
+            device_path: PathBuf::from("/dev/ttyUSB1"),
+            iface_path: PathBuf::from("/sys/bus/usb/devices/5-1.2.1.2:1.1"),
+        };
+        assert!(
+            !policy.is_blocklisted(&port),
+            "an empty [discovery] must exclude nothing (FR-008)"
+        );
+        assert_eq!(
+            policy.config.probe_timeout,
+            Duration::from_millis(crate::config::DEFAULT_PROBE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn sim_read_timeouts_quarantine_after_three_in_a_row() {
+        // P1-A: a port that answers AT but hangs on the SIM read every rescan
+        // would otherwise leak an abandoned worker forever. A run of SIM-read
+        // timeouts must reach quarantine (via its own counter) to bound that.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        assert!(!policy.record_sim_timeout(iface));
+        assert!(!policy.record_sim_timeout(iface));
+        assert!(
+            policy.record_sim_timeout(iface),
+            "the third consecutive SIM-read timeout quarantines"
+        );
+        assert!(policy.is_quarantined(iface));
+    }
+
+    #[test]
+    fn a_completed_sim_read_resets_the_sim_timeout_streak() {
+        // A merely-slow-but-healthy modem: an occasional SIM timeout that is
+        // followed by a good read must never reach the threshold.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        policy.record_sim_timeout(iface);
+        policy.record_sim_timeout(iface);
+        policy.record_sim_responded(iface);
+        policy.record_sim_timeout(iface);
+        policy.record_sim_timeout(iface);
+        assert!(
+            !policy.is_quarantined(iface),
+            "the reset prevents reaching the threshold"
+        );
+    }
+
+    #[test]
+    fn at_probe_success_does_not_reset_the_sim_timeout_streak() {
+        // The whole point of a SEPARATE SIM counter (P1-A): a port that answers
+        // AT on every rescan (resetting the AT streak) but hangs on the SIM read
+        // each time must still accumulate toward quarantine.
+        let mut policy = DiscoveryPolicy::unfiltered();
+        let iface = Path::new("5-1:1.1");
+        policy.record_sim_timeout(iface);
+        policy.record_at_responded(iface); // AT-open success on the next rescan
+        policy.record_sim_timeout(iface);
+        policy.record_at_responded(iface);
+        assert!(
+            policy.record_sim_timeout(iface),
+            "AT success must not reset the SIM streak; the 3rd SIM timeout quarantines"
+        );
+        assert!(policy.is_quarantined(iface));
     }
 
     #[test]
@@ -888,13 +1604,13 @@ mod tests {
         // sorts first" so an existing single-line config naming a
         // non-default AT port still gets used as-is (FR-009/FR-020).
         let candidates = vec![
-            PathBuf::from("/dev/ttyUSB0"),
-            PathBuf::from("/dev/ttyUSB2"),
-            PathBuf::from("/dev/ttyUSB6"),
+            cand("/dev/ttyUSB0", "5-1:1.0"),
+            cand("/dev/ttyUSB2", "5-1:1.2"),
+            cand("/dev/ttyUSB6", "5-1:1.6"),
         ];
         let preferred = vec![PathBuf::from("/dev/ttyUSB6")];
         assert_eq!(
-            order_candidates_with_preference(candidates, &preferred),
+            device_paths(order_candidates_with_preference(candidates, &preferred)),
             vec![
                 PathBuf::from("/dev/ttyUSB6"),
                 PathBuf::from("/dev/ttyUSB0"),
@@ -905,20 +1621,29 @@ mod tests {
 
     #[test]
     fn order_candidates_unchanged_when_no_preference_matches() {
-        let candidates = vec![PathBuf::from("/dev/ttyUSB0"), PathBuf::from("/dev/ttyUSB2")];
+        let candidates = vec![
+            cand("/dev/ttyUSB0", "5-1:1.0"),
+            cand("/dev/ttyUSB2", "5-1:1.2"),
+        ];
         let preferred = vec![PathBuf::from("/dev/ttyUSB9")];
         assert_eq!(
-            order_candidates_with_preference(candidates.clone(), &preferred),
-            candidates
+            device_paths(order_candidates_with_preference(
+                candidates.clone(),
+                &preferred
+            )),
+            device_paths(candidates)
         );
     }
 
     #[test]
     fn order_candidates_unchanged_when_no_preference_given() {
-        let candidates = vec![PathBuf::from("/dev/ttyUSB0"), PathBuf::from("/dev/ttyUSB2")];
+        let candidates = vec![
+            cand("/dev/ttyUSB0", "5-1:1.0"),
+            cand("/dev/ttyUSB2", "5-1:1.2"),
+        ];
         assert_eq!(
-            order_candidates_with_preference(candidates.clone(), &[]),
-            candidates
+            device_paths(order_candidates_with_preference(candidates.clone(), &[])),
+            device_paths(candidates)
         );
     }
 
