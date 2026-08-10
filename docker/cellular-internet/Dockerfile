@@ -9,10 +9,14 @@
 # AT+CSIM. See docs/ec20-internet-plus-vowifi.md.
 FROM alpine:3.20
 
-# libqmi   -> qmicli (QMI control over /dev/cdc-wdm0)
-# iproute2 -> `ip` (raw-ip link + address/route config)
-# bind-tools optional at runtime; busybox `nslookup` is the default probe tool.
-RUN apk add --no-cache libqmi iproute2
+# qmi-utils -> qmicli (QMI control over the modem's cdc-wdm node). NOTE: the
+#              `libqmi` package ships only the shared library — the CLI lives in
+#              `qmi-utils`. Installing libqmi alone builds a working image whose
+#              entrypoint dies at runtime with "qmicli not found".
+# iproute2  -> `ip` (raw-ip link + address/route config)
+# busybox provides nslookup/getent/timeout/udhcpc for the probe and DHCP paths.
+RUN apk add --no-cache qmi-utils iproute2 \
+    && qmicli --version >/dev/null
 
 COPY docker/cellular-internet/internet-lib.sh /usr/local/bin/internet-lib.sh
 COPY docker/cellular-internet/internet-entrypoint.sh /usr/local/bin/internet-entrypoint.sh

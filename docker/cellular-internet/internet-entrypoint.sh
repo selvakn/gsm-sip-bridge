@@ -20,6 +20,15 @@ INTERNET_PROBE_INTERVAL="${INTERNET_PROBE_INTERVAL:-10s}"
 
 PKT_HANDLE=""
 WDS_CID=""
+# 1 when the session was brought up by the modem itself (autoconnect) rather
+# than by us: we hold no client for it, so we must not try to stop it.
+ADOPTED=0
+
+# Is the modem's packet data session already up?
+session_connected() {
+    qmicli -d "$INTERNET_QMI_DEV" -p --wds-get-packet-service-status 2>/dev/null \
+        | grep -qi "connected"
+}
 
 # Run a qmicli WDS action, reusing the persistent client (WDS_CID) allocated by
 # --wds-start-network when we have one. --wds-start-network allocates a client
@@ -155,21 +164,43 @@ dial() {
 
     setup_raw_ip "$_d_iface"
 
-    _d_out=$(qmicli -d "$INTERNET_QMI_DEV" -p \
+    ADOPTED=0
+    if _d_out=$(qmicli -d "$INTERNET_QMI_DEV" -p \
         --wds-start-network="ip-type=4,apn=${INTERNET_APN}" \
-        --client-no-release-cid 2>/dev/null) || {
-        log "wds-start-network failed"
-        return 1
-    }
-    # Keep BOTH the packet-data handle and the allocated WDS client id — the
-    # latter is what all subsequent WDS actions must target (see qmi_wds).
-    PKT_HANDLE=$(printf '%s\n' "$_d_out" | grep -iE 'packet data handle' | grep -oE '[0-9]+' | head -n1)
-    WDS_CID=$(printf '%s\n' "$_d_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
-    log "session: handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?}"
-    if [ -z "$WDS_CID" ] || [ -z "$PKT_HANDLE" ]; then
-        # A started session we cannot address is a client we can never release.
-        # Say so loudly rather than silently skipping teardown later.
-        log "WARNING: could not parse the WDS client id/handle from qmicli output; this session cannot be torn down cleanly"
+        --client-no-release-cid 2>&1); then
+
+        # We started it: keep BOTH the packet-data handle and the allocated WDS
+        # client id — the latter is what every later WDS action must target.
+        PKT_HANDLE=$(printf '%s\n' "$_d_out" | grep -iE 'packet data handle' | grep -oE '[0-9]+' | head -n1)
+        WDS_CID=$(printf '%s\n' "$_d_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
+        log "session: handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?}"
+        if [ -z "$WDS_CID" ] || [ -z "$PKT_HANDLE" ]; then
+            # A started session we cannot address is a client we can never
+            # release. Say so loudly rather than silently skipping teardown.
+            log "WARNING: could not parse the WDS client id/handle from qmicli output; this session cannot be torn down cleanly"
+        fi
+    else
+        # A *failed* start can still have retained a client id — release it, or
+        # every retry leaks one until the modem can allocate no more.
+        _d_stray=$(printf '%s\n' "$_d_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
+        if [ -n "$_d_stray" ]; then
+            log "releasing stray WDS client $_d_stray left by the failed start"
+            qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$_d_stray" \
+                --wds-get-packet-service-status >/dev/null 2>&1 || true
+        fi
+
+        # 'NoEffect' means the network is already started — modems ship with
+        # autoconnect enabled and bring a session up by themselves. That is not
+        # an error: adopt the existing session rather than fighting it.
+        if printf '%s' "$_d_out" | grep -qi 'noeffect' || session_connected; then
+            log "a data session is already connected (modem autoconnect) — adopting it"
+            ADOPTED=1
+            PKT_HANDLE=""
+            WDS_CID=""
+        else
+            log "wds-start-network failed: $(printf '%s' "$_d_out" | grep -i 'error' | head -n1)"
+            return 1
+        fi
     fi
 
     _d_ip=$(apply_settings "$_d_iface") || {
@@ -199,6 +230,16 @@ dial() {
 teardown() {
     _t_iface="$1"
     ip addr flush dev "$_t_iface" 2>/dev/null || true
+
+    # An adopted (autoconnect) session is not ours to stop — we hold no client
+    # for it, and stopping it would fight the modem, which would just bring it
+    # back. Drop our host-side config and leave the carrier session alone.
+    if [ "$ADOPTED" -eq 1 ]; then
+        ADOPTED=0
+        PKT_HANDLE=""
+        WDS_CID=""
+        return 0
+    fi
 
     if [ -z "$WDS_CID" ] || [ -z "$PKT_HANDLE" ]; then
         PKT_HANDLE=""
