@@ -21,15 +21,26 @@ export PATH="$TMP/bin:$PATH"
 mkdir -p "$TMP/bin"
 
 STOP_RESULT="$TMP/stop_result"      # "ok" or "fail" — how the fake stop behaves
+START_MODE="$TMP/start_mode"        # "full", "no-handle", or "no-cid"
 QMI_DEV="$TMP/cdc-wdm0"             # presence stands in for the modem existing
 : > "$QMI_DEV"
 echo ok > "$STOP_RESULT"
+echo full > "$START_MODE"
 
 cat > "$TMP/bin/qmicli" <<EOF
 #!/usr/bin/env sh
 for a in "\$@"; do
     case "\$a" in
         --wds-start-network=*)
+            case "\$(cat $START_MODE)" in
+                no-handle)
+                    printf '[dev] Network started\n'
+                    printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'7'"
+                    exit 0 ;;
+                no-cid)
+                    printf '[dev] Network started\n\tPacket data handle: %s\n' "'2264216040'"
+                    exit 0 ;;
+            esac
             printf '[dev] Network started\n\tPacket data handle: %s\n' "'2264216040'"
             printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'7'"
             exit 0 ;;
@@ -100,6 +111,23 @@ echo "ok: dial refuses to stack a second client on an unreleased one"
 echo ok > "$STOP_RESULT"
 dial wwan0 >/dev/null 2>&1 || fail "dial should recover once the session can be released"
 echo "ok: dial recovers after the stuck session is released"
+
+# --- a started-but-unparseable session must fail the dial, not leak ---------
+# A start that returns a partial identity (missing handle or CID) can never be
+# torn down cleanly: teardown would clear it while the client stays retained,
+# and every redial would stack another until the modem refuses new sessions.
+teardown wwan0 >/dev/null 2>&1 || fail "teardown should clear the recovered session"
+for mode in no-handle no-cid; do
+    echo "$mode" > "$START_MODE"
+    if dial wwan0 >/dev/null 2>&1; then
+        fail "dial must fail when the start returns a $mode (unstoppable) session"
+    fi
+    if [ -n "$PKT_HANDLE" ] || [ -n "$WDS_CID" ]; then
+        fail "dial ($mode) must not retain a partial identity (handle='$PKT_HANDLE' cid='$WDS_CID')"
+    fi
+    echo "ok: dial fails and leaks nothing when the start is $mode"
+done
+echo full > "$START_MODE"
 
 # --- a vanished modem drops the identity (its clients died with it) ---------
 rm -f "$QMI_DEV"

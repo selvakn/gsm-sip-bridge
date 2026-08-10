@@ -175,9 +175,23 @@ dial() {
         WDS_CID=$(printf '%s\n' "$_d_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
         log "session: handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?}"
         if [ -z "$WDS_CID" ] || [ -z "$PKT_HANDLE" ]; then
-            # A started session we cannot address is a client we can never
-            # release. Say so loudly rather than silently skipping teardown.
-            log "WARNING: could not parse the WDS client id/handle from qmicli output; this session cannot be torn down cleanly"
+            # We started a session but can't fully address it, so teardown could
+            # never stop it: it would take the [ -z CID/handle ] shortcut and
+            # clear the identity while the client stays retained. Every redial
+            # would then stack a fresh client on the modem until it refuses new
+            # ones and the sidecar is stuck offline. Release whatever we can and
+            # fail this dial rather than proceed with an unstoppable session.
+            log "WARNING: could not parse the WDS client id/handle (handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?}) from qmicli output; releasing what we can and re-dialing"
+            if [ -n "$WDS_CID" ]; then
+                # A WDS action WITHOUT --client-no-release-cid frees the client.
+                # (Without a CID we can't target it at all; the next start will
+                # return NoEffect and we adopt the still-up session instead.)
+                qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$WDS_CID" \
+                    --wds-get-packet-service-status >/dev/null 2>&1 || true
+            fi
+            PKT_HANDLE=""
+            WDS_CID=""
+            return 1
         fi
     else
         # A *failed* start can still have retained a client id — release it, or
