@@ -1336,6 +1336,13 @@ fn start_line_tail(
             // this flag alone decides whether a Recovered notice is owed.
             let mut given_up_alerted = false;
             let agent_log = PathBuf::from(format!("/tmp/ims-agent-{idx}.out"));
+            // Whether this line has already been through at least one
+            // exit/restart. The recovery log below fires only *after* a
+            // restart, never on the first clean startup — its whole purpose is
+            // to mark the end of a visible "exited; restarting in 5s" loop
+            // (e.g. the ~2.5min one right after a container recreate, while the
+            // previous run's netns still holds the tunnel's XFRM if_id).
+            let mut had_restart = false;
             loop {
                 let guard = shutting_down.read().unwrap();
                 if *guard {
@@ -1375,10 +1382,33 @@ fn start_line_tail(
                 // (signaled by execute_shutdown_plan via
                 // `vowifi_child_handles`) stays signalable for as long as
                 // the process is actually alive.
+                // Log the moment the agent registers again after a restart
+                // loop. The agent's own "registered, listening for inbound
+                // calls" line is captured to the per-line file (`agent_log`),
+                // not the supervisor's stdout, so without this the recovery is
+                // invisible in the supervise log — only the "exited; restarting"
+                // side of the loop ever shows there. Gated on `had_restart` (so
+                // a clean first startup stays quiet) and latched by
+                // `recovery_logged` (so it prints once per spawn, not every
+                // poll); the file read stops once the line is seen.
+                let mut recovery_logged = false;
                 while runner.is_alive(&handle) {
+                    if had_restart
+                        && !recovery_logged
+                        && runner
+                            .read_file(&agent_log)
+                            .unwrap_or_default()
+                            .contains("registered, listening for inbound calls")
+                    {
+                        println!(
+                            "[supervise] line {idx}: vowifi-ims-agent registered after restart loop"
+                        );
+                        recovery_logged = true;
+                    }
                     runner.sleep(Duration::from_secs(1));
                 }
                 println!("[supervise] line {idx}: vowifi-ims-agent exited; restarting in 5s");
+                had_restart = true;
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
                 let outcome = if sim_recovery::has_csim_failure(&log_content) {
