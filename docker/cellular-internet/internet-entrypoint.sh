@@ -19,6 +19,20 @@ INTERNET_WWAN_IFACE="${INTERNET_WWAN_IFACE:-}"
 INTERNET_PROBE_INTERVAL="${INTERNET_PROBE_INTERVAL:-10s}"
 
 PKT_HANDLE=""
+WDS_CID=""
+
+# Run a qmicli WDS action, reusing the persistent client (WDS_CID) allocated by
+# --wds-start-network when we have one. --wds-start-network allocates a client
+# whose id is NOT guaranteed to be 1, so every later action (get-settings,
+# stop-network) MUST target that same client or it queries/tears down the wrong
+# one and leaks the real session across redials.
+qmi_wds() {
+    if [ -n "$WDS_CID" ]; then
+        qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$WDS_CID" --client-no-release-cid "$@"
+    else
+        qmicli -d "$INTERNET_QMI_DEV" -p "$@"
+    fi
+}
 
 # Strip a trailing unit and return whole seconds (e.g. "10s" -> 10, "2m" -> 120).
 to_seconds() {
@@ -99,7 +113,7 @@ setup_raw_ip() {
 # Configure the interface from QMI's granted settings. Echoes the assigned IPv4.
 apply_settings() {
     _as_iface="$1"
-    _as_settings=$(qmicli -d "$INTERNET_QMI_DEV" -p --wds-get-current-settings 2>/dev/null) || return 1
+    _as_settings=$(qmi_wds --wds-get-current-settings 2>/dev/null) || return 1
 
     _as_ip=$(echo "$_as_settings"   | sed -n 's/.*IPv4 address: *//p'         | head -n1)
     _as_gw=$(echo "$_as_settings"   | sed -n 's/.*IPv4 gateway address: *//p' | head -n1)
@@ -136,7 +150,11 @@ dial() {
         log "wds-start-network failed"
         return 1
     }
-    PKT_HANDLE=$(echo "$_d_out" | sed -n "s/.*handle: *'\{0,1\}//p" | tr -d "'" | head -n1)
+    # Keep BOTH the packet-data handle and the allocated WDS client id — the
+    # latter is what all subsequent WDS actions must target (see qmi_wds).
+    PKT_HANDLE=$(printf '%s\n' "$_d_out" | grep -iE 'packet data handle' | grep -oE '[0-9]+' | head -n1)
+    WDS_CID=$(printf '%s\n' "$_d_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
+    log "session: handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?}"
 
     _d_ip=$(apply_settings "$_d_iface") || {
         log "could not read/apply QMI settings"
@@ -151,10 +169,15 @@ dial() {
 
 teardown() {
     _t_iface="$1"
-    log "tearing down data session on $_t_iface"
-    qmicli -d "$INTERNET_QMI_DEV" -p --wds-stop-network="${PKT_HANDLE:-disable-autoconnect}" \
-        --client-cid=1 >/dev/null 2>&1 || true
+    log "tearing down data session on $_t_iface (handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?})"
+    # Stop on the SAME client that started the session, and let it be released
+    # (no --client-no-release-cid here) so redials do not leak WDS clients.
+    if [ -n "$WDS_CID" ] && [ -n "$PKT_HANDLE" ]; then
+        qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$WDS_CID" \
+            --wds-stop-network="$PKT_HANDLE" >/dev/null 2>&1 || true
+    fi
     PKT_HANDLE=""
+    WDS_CID=""
     ip addr flush dev "$_t_iface" 2>/dev/null || true
 }
 

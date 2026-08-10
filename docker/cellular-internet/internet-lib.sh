@@ -10,9 +10,12 @@
 INTERNET_STATUS_FILE="${INTERNET_STATUS_FILE:-/run/internet-status}"
 
 # Probe configuration (data-model.md). Empty resolver => use the system
-# resolver (getent), which is also what makes the probe unit-testable offline.
+# resolver (getent), which is also what makes the probe testable offline.
+# Note the resolver default uses `-` not `:-`: an *unset* resolver falls back
+# to 1.1.1.1, but an explicitly-empty one is honoured as "system resolver"
+# (the test harness relies on this to stay hermetic — no network, no nslookup).
 INTERNET_PROBE_HOST="${INTERNET_PROBE_HOST:-one.one.one.one}"
-INTERNET_PROBE_RESOLVER="${INTERNET_PROBE_RESOLVER:-1.1.1.1}"
+INTERNET_PROBE_RESOLVER="${INTERNET_PROBE_RESOLVER-1.1.1.1}"
 
 log() { echo "[internet] $*"; }
 
