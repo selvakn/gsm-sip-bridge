@@ -57,9 +57,13 @@ write_status() {
 # Resolve HOST (via RESOLVER when set, else the system resolver) through the
 # current default route. Returns 0 when an address is resolved, nonzero
 # otherwise. Bounded by `timeout` so a black-holed link fails fast.
+# Configured entirely through the environment (INTERNET_PROBE_HOST /
+# INTERNET_PROBE_RESOLVER) rather than positional parameters: every caller uses
+# the configured values, and taking no arguments keeps this free of shellcheck
+# SC2119 across shellcheck versions.
 probe_dns() {
-    _pd_host="${1:-$INTERNET_PROBE_HOST}"
-    _pd_resolver="${2:-$INTERNET_PROBE_RESOLVER}"
+    _pd_host="$INTERNET_PROBE_HOST"
+    _pd_resolver="$INTERNET_PROBE_RESOLVER"
 
     if [ -n "$_pd_resolver" ]; then
         # DNS query to the configured resolver (survives ICMP blocking; proves

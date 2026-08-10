@@ -155,9 +155,19 @@ dial() {
     PKT_HANDLE=$(printf '%s\n' "$_d_out" | grep -iE 'packet data handle' | grep -oE '[0-9]+' | head -n1)
     WDS_CID=$(printf '%s\n' "$_d_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
     log "session: handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?}"
+    if [ -z "$WDS_CID" ] || [ -z "$PKT_HANDLE" ]; then
+        # A started session we cannot address is a client we can never release.
+        # Say so loudly rather than silently skipping teardown later.
+        log "WARNING: could not parse the WDS client id/handle from qmicli output; this session cannot be torn down cleanly"
+    fi
 
     _d_ip=$(apply_settings "$_d_iface") || {
-        log "could not read/apply QMI settings"
+        # The session IS started at this point, so returning straight to the
+        # retry loop would strand the retained client: the next dial overwrites
+        # CID/handle and the modem eventually refuses to allocate any more.
+        # Release it before giving up.
+        log "could not read/apply QMI settings — releasing the started session"
+        teardown "$_d_iface"
         return 1
     }
 
