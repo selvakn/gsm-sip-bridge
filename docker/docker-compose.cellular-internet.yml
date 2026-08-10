@@ -24,7 +24,10 @@ services:
       context: ..
       dockerfile: docker/cellular-internet/Dockerfile
       network: host
-    image: gsm-sip-bridge-internet
+    # Published alongside the bridge on tagged releases, so this can be pulled
+    # (`docker compose ... pull internet`) instead of built from source. Set
+    # INTERNET_IMAGE to pin a version or point at your own registry/fork.
+    image: ${INTERNET_IMAGE:-ghcr.io/selvakn/gsm-sip-bridge-internet:latest}
     network_mode: host
     restart: unless-stopped
     privileged: true

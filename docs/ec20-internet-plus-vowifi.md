@@ -64,6 +64,24 @@ docker compose \
   up -d
 ```
 
+Start **both services together from a clean state**. The ePDG tunnel runs with
+`mobike = no` (the carrier's ePDG misbehaves with MOBIKE), which means an
+already-established tunnel *cannot* migrate to a new source address — so
+switching the default route underneath a running bridge will strand its tunnel.
+Bring the uplink up first and let the bridge bind to it, which is exactly what
+the readiness gate does for you.
+
+The sidecar image is published alongside the bridge, so it can be pulled instead
+of built:
+
+```bash
+docker compose -f docker/docker-compose.yml \
+  -f docker/docker-compose.cellular-internet.yml pull internet
+```
+
+Pin a version or use your own registry with `INTERNET_IMAGE`, e.g.
+`INTERNET_IMAGE=ghcr.io/selvakn/gsm-sip-bridge-internet:8.9.1`.
+
 Startup order:
 1. `internet` dials QMI, gets an IPv4, installs the default route.
 2. Its healthcheck probes DNS; within ~90s it goes **healthy** (grace 90s, probe
