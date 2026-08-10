@@ -57,6 +57,17 @@ write_status() {
 # Resolve HOST (via RESOLVER when set, else the system resolver) through the
 # current default route. Returns 0 when an address is resolved, nonzero
 # otherwise. Bounded by `timeout` so a black-holed link fails fast.
+# True once the entrypoint has completed a dial (it records the address the
+# carrier assigned). The healthcheck gates on this so it cannot report healthy
+# off some *other* uplink before this sidecar's cellular session exists — FR-003
+# requires reachability *through the cellular link*, not merely that the host
+# happens to have internet from somewhere.
+session_established() {
+    [ -r "$INTERNET_STATUS_FILE" ] || return 1
+    _se_ip=$(sed -n 's/^ipv4=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
+    [ -n "$_se_ip" ]
+}
+
 # Configured entirely through the environment (INTERNET_PROBE_HOST /
 # INTERNET_PROBE_RESOLVER) rather than positional parameters: every caller uses
 # the configured values, and taking no arguments keeps this free of shellcheck

@@ -139,6 +139,17 @@ apply_settings() {
 
 dial() {
     _d_iface="$1"
+
+    # A retained identity means an earlier teardown could not stop that session.
+    # Retry it before starting another, so we never stack a second retained
+    # client on top of an unreleased one.
+    if [ -n "$WDS_CID" ] || [ -n "$PKT_HANDLE" ]; then
+        teardown "$_d_iface" || {
+            log "previous session still not released — not starting another"
+            return 1
+        }
+    fi
+
     log "dialing APN '$INTERNET_APN' over $INTERNET_QMI_DEV (iface $_d_iface)"
     STATUS_IFACE="$_d_iface" write_status dialing "pending"
 
@@ -177,18 +188,52 @@ dial() {
     return 0
 }
 
+# Stop the data session and release the retained WDS client.
+#
+# The identity (CID + handle) is only cleared once we know the client is gone —
+# either because the stop succeeded, or because the modem itself went away and
+# took all of its clients with it. Clearing it after a *failed* stop would
+# strand that client: the next dial would allocate a second one on top of an
+# unreleased first, and repeated recovery failures would exhaust the modem's
+# WDS clients and leave the sidecar permanently offline.
 teardown() {
     _t_iface="$1"
-    log "tearing down data session on $_t_iface (handle=${PKT_HANDLE:-?} cid=${WDS_CID:-?})"
-    # Stop on the SAME client that started the session, and let it be released
-    # (no --client-no-release-cid here) so redials do not leak WDS clients.
-    if [ -n "$WDS_CID" ] && [ -n "$PKT_HANDLE" ]; then
-        qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$WDS_CID" \
-            --wds-stop-network="$PKT_HANDLE" >/dev/null 2>&1 || true
-    fi
-    PKT_HANDLE=""
-    WDS_CID=""
     ip addr flush dev "$_t_iface" 2>/dev/null || true
+
+    if [ -z "$WDS_CID" ] || [ -z "$PKT_HANDLE" ]; then
+        PKT_HANDLE=""
+        WDS_CID=""
+        return 0
+    fi
+
+    # A vanished QMI device means the modem reset/re-enumerated; every client it
+    # held died with it, so the identity is meaningless rather than leaked.
+    if [ ! -e "$INTERNET_QMI_DEV" ]; then
+        log "modem gone — session (handle=$PKT_HANDLE cid=$WDS_CID) died with it"
+        PKT_HANDLE=""
+        WDS_CID=""
+        return 0
+    fi
+
+    log "tearing down data session on $_t_iface (handle=$PKT_HANDLE cid=$WDS_CID)"
+    _t_try=1
+    while [ "$_t_try" -le 3 ]; do
+        # Stop on the SAME client that started the session, and let qmicli
+        # release it on exit (no --client-no-release-cid here).
+        if qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$WDS_CID" \
+            --wds-stop-network="$PKT_HANDLE" >/dev/null 2>&1; then
+            PKT_HANDLE=""
+            WDS_CID=""
+            return 0
+        fi
+        _t_try=$(( _t_try + 1 ))
+        [ "$_t_try" -le 3 ] && sleep 1
+    done
+
+    # Still ours, still unreleased — keep the identity so the next teardown
+    # retries this client instead of stacking another one behind it.
+    log "WARNING: could not stop WDS session (handle=$PKT_HANDLE cid=$WDS_CID) after 3 attempts; retaining its identity to retry"
+    return 1
 }
 
 main() {
@@ -233,4 +278,7 @@ main() {
     done
 }
 
-main "$@"
+# Test seam: sourcing this with INTERNET_NO_MAIN=1 loads the functions without
+# starting the supervise loop, so the WDS session lifecycle (dial/teardown) can
+# be exercised against a fake qmicli. POSIX sh has no __main__ idiom.
+[ "${INTERNET_NO_MAIN:-}" = "1" ] || main "$@"

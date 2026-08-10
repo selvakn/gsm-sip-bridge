@@ -21,14 +21,37 @@ STATUS="$TMP/internet-status"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Stand in for "the entrypoint has completed a dial": the healthcheck gates on
+# an assigned address so it cannot report healthy off an unrelated uplink.
+seed_dialed_session() {
+    cat > "$STATUS" <<'SEED'
+state=up
+iface=wwan0
+ipv4=100.72.13.4
+probe=pending
+since=2026-08-10T00:00:00Z
+last_change=2026-08-10T00:00:00Z
+SEED
+}
+
+# --- not dialed yet => unhealthy regardless of host connectivity ------------
+: > "$STATUS"
+if INTERNET_LIB="$LIB" INTERNET_STATUS_FILE="$STATUS" \
+   INTERNET_PROBE_RESOLVER="" INTERNET_PROBE_HOST="localhost" \
+   sh "$HC"; then
+    fail "healthcheck must not report healthy before the sidecar has dialed"
+fi
+echo "ok: no session yet -> nonzero even though the probe host would resolve"
+
 # --- success path ----------------------------------------------------------
 # Empty resolver => system resolver (getent), localhost is always in /etc/hosts.
+seed_dialed_session
 if INTERNET_LIB="$LIB" INTERNET_STATUS_FILE="$STATUS" \
    INTERNET_PROBE_RESOLVER="" INTERNET_PROBE_HOST="localhost" \
    sh "$HC"; then
     :
 else
-    fail "healthcheck should exit 0 when the probe host resolves (localhost)"
+    fail "healthcheck should exit 0 when dialed and the probe host resolves (localhost)"
 fi
 grep -q '^state=up' "$STATUS" || fail "status should be state=up on success (got: $(cat "$STATUS"))"
 grep -q '^probe=ok' "$STATUS" || fail "status should record probe=ok on success"
@@ -37,6 +60,7 @@ echo "ok: success path -> exit 0, state=up"
 # --- failure path ----------------------------------------------------------
 # `.invalid` is reserved (RFC 6761) and never resolves; getent fails fast and
 # nslookup returns NXDOMAIN (or times out offline) — either way nonzero.
+seed_dialed_session
 if INTERNET_LIB="$LIB" INTERNET_STATUS_FILE="$STATUS" \
    INTERNET_PROBE_RESOLVER="" INTERNET_PROBE_HOST="nope.this-does-not-exist.invalid" \
    sh "$HC"; then

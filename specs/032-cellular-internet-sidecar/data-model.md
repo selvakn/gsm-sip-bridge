@@ -13,11 +13,17 @@ from the bridge's `config.toml` (FR-011).
 | `INTERNET_APN` | Internet/data APN to dial | *(required)* | Carrier internet APN (e.g. `airtelgprs.com`); NOT an IMS APN |
 | `INTERNET_QMI_DEV` | QMI control device | `/dev/cdc-wdm0` | Must be the modem's QMI node; keeps AT port free |
 | `INTERNET_WWAN_IFACE` | Host netdev bound to the data session | *(auto-detect)* | e.g. `wwan0`; auto-derived from the QMI dev when unset |
-| `INTERNET_IP_FAMILY` | Requested PDP type | `IPV4V6` | IPv4 is what gates health; IPv6 best-effort |
 | `INTERNET_PROBE_HOST` | Hostname the DNS probe resolves | `one.one.one.one` | Operator-configurable (FR-011) |
-| `INTERNET_PROBE_RESOLVER` | Resolver queried | `1.1.1.1` | Fallback `8.8.8.8`; override for locked-down carriers |
-| `INTERNET_PROBE_INTERVAL` | Recurring probe cadence | `10s` | Maps to healthcheck `interval` |
-| `INTERNET_ATTACH_GRACE` | First-connect grace | `90s` | Maps to healthcheck `start_period` |
+| `INTERNET_PROBE_RESOLVER` | Resolver queried | `1.1.1.1` | Empty value = use the system resolver; override for locked-down carriers |
+| `INTERNET_PROBE_INTERVAL` | Cadence of the entrypoint's own supervise probe | `10s` | Drives self-heal polling, **not** the Docker healthcheck |
+
+The session is dialed as IPv4 (`ip-type=4`): internet APNs hand out IPv4
+reliably, and the readiness probe runs over it. There is no IP-family knob.
+
+**Healthcheck timings are not env-configurable.** Docker resolves `start_period`
+/ `interval` when the container is created, so they are declared in the image's
+`HEALTHCHECK` and the Compose overlay (90s / 10s) rather than read from the
+environment. Changing them means editing the overlay, not setting a variable.
 
 **Validation rules**:
 - `INTERNET_APN` MUST be set; the entrypoint fails fast with a clear message if

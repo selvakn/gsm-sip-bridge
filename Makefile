@@ -28,6 +28,7 @@ test: test-scripts ## Run the full test suite
 # sidecar's readiness probe, specs/032). Hermetic — no hardware or network.
 test-scripts: ## Run non-cargo shell integration tests
 	@sh docker/cellular-internet/tests/probe_test.sh
+	@sh docker/cellular-internet/tests/wds_lifecycle_test.sh
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)

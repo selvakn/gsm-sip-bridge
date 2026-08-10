@@ -16,9 +16,11 @@ for the full table. Contractual guarantees:
   sidecar MUST NOT open the AT port as a fallback.
 - `INTERNET_PROBE_HOST` (default `one.one.one.one`) and
   `INTERNET_PROBE_RESOLVER` (default `1.1.1.1`) — define the readiness probe.
-- `INTERNET_ATTACH_GRACE` (default `90s`) and `INTERNET_PROBE_INTERVAL`
-  (default `10s`) — map directly onto the healthcheck's `start_period` /
-  `interval`.
+  An explicitly-empty resolver means "use the system resolver".
+- `INTERNET_PROBE_INTERVAL` (default `10s`) — cadence of the entrypoint's own
+  supervise/self-heal probe. The Docker healthcheck's `start_period` (90s) and
+  `interval` (10s) are **not** env-configurable: Docker fixes them at container
+  creation, so they live in the image `HEALTHCHECK` and the Compose overlay.
 
 ## Behavioral contract
 

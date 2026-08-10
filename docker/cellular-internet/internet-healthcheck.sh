@@ -17,6 +17,14 @@ INTERNET_LIB="${INTERNET_LIB:-/usr/local/bin/internet-lib.sh}"
 # shellcheck source=docker/cellular-internet/internet-lib.sh
 . "$INTERNET_LIB"
 
+# Until the entrypoint has actually dialed, we are not healthy — even if the
+# host can reach the internet by some other route. Report unhealthy without
+# touching `state`: the entrypoint owns dialing/redialing and is already
+# describing what it is doing.
+if ! session_established; then
+    exit 1
+fi
+
 if probe_dns; then
     write_status up "ok ${INTERNET_PROBE_HOST}@${INTERNET_PROBE_RESOLVER:-system}"
     exit 0

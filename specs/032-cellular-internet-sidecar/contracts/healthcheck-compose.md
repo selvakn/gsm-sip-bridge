@@ -6,8 +6,14 @@ The sidecar's health is the gate the bridge waits on. Exit-code semantics:
 
 | Exit | Meaning | Docker health | Bridge gate |
 |------|---------|---------------|-------------|
-| `0`  | DNS probe resolved `INTERNET_PROBE_HOST` via `INTERNET_PROBE_RESOLVER` through the cellular link | healthy | released |
-| `1`  | Probe failed (no route / no session / name did not resolve) | unhealthy | held |
+| `0`  | The sidecar has dialed **and** the DNS probe resolved `INTERNET_PROBE_HOST` via `INTERNET_PROBE_RESOLVER` | healthy | released |
+| `1`  | No session dialed yet, or the probe failed (no route / name did not resolve) | unhealthy | held |
+
+Both conditions are required. Gating on the dial as well as the probe is what
+makes this "reachable **through the cellular link**" (FR-003) rather than merely
+"this host has internet from somewhere" — otherwise a box that still had another
+uplink would report healthy and release the bridge before the sidecar had
+brought the cellular session up at all.
 
 - The probe is a DNS resolution (not ICMP, not HTTP) — see research R3.
 - Timing (research R4): `start_period: 90s`, `interval: 10s`, `timeout: 5s`,
