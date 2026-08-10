@@ -436,6 +436,24 @@ port's interface path so it can be copied straight into this list.
 | `excluded_ports` | array of strings | `[]` | Ports never to open/probe. Exact `/dev/ttyUSB*` paths or USB-topology fragments (exact or whole-device prefix) |
 | `probe_timeout_ms` | integer (ms) | `5000` | Per-port probe abandon budget. Covers the SIM read (open + `AT+CPIN?` + `AT+CIMI`), so it is 5s, not just an open's worth. Values below `1000` are clamped up (a lower value would abandon every port and quarantine all modems) |
 
+## Cellular-internet sidecar (container env — not `config.toml`)
+
+For deployments where one cellular card serves **both** internet and VoWiFi
+calls, internet is provided by a separate, opt-in sidecar container
+(specs/032-cellular-internet-sidecar), not by the bridge. It is **not**
+configured in `config.toml` — these are container environment variables set in
+`docker/.env` (see `.env.example`) and consumed only when you start the stack
+with the `docker/docker-compose.cellular-internet.yml` overlay. The bridge waits
+for the sidecar's internet-reachable healthcheck before it starts. Full runbook:
+[`docs/ec20-internet-plus-vowifi.md`](ec20-internet-plus-vowifi.md).
+
+| Env var | Default | Description |
+|---|---|---|
+| `INTERNET_APN` | *(required)* | Carrier **internet** APN (never an IMS APN); no default is dialed |
+| `INTERNET_QMI_DEV` | `/dev/cdc-wdm0` | QMI control device; QMI-only keeps the modem's AT port free for the bridge's `AT+CSIM` |
+| `INTERNET_PROBE_HOST` | `one.one.one.one` | Hostname the DNS readiness probe resolves |
+| `INTERNET_PROBE_RESOLVER` | `1.1.1.1` | Resolver queried; override where the carrier blocks the default |
+
 ## Examples
 
 ### Single-card development

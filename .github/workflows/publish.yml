@@ -10,13 +10,27 @@ env:
 
 jobs:
   build:
+    # Two images, two platforms each:
+    #   <repo>            — the bridge itself (docker/Dockerfile)
+    #   <repo>-internet   — the optional cellular-internet sidecar
+    #                       (specs/032-cellular-internet-sidecar). Publishing it
+    #                       is what lets a same-card-internet deployment pull it
+    #                       rather than clone the repo to build a 20MB image.
     strategy:
       matrix:
+        platform: [linux/amd64, linux/arm64]
+        image: [bridge, internet]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+          - image: bridge
+            dockerfile: docker/Dockerfile
+            suffix: ""
+          - image: internet
+            dockerfile: docker/cellular-internet/Dockerfile
+            suffix: "-internet"
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -39,7 +53,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}
 
       - name: Platform pair slug
         id: platform
@@ -50,20 +64,25 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ steps.platform.outputs.slug }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}:${{ github.ref_name }}-${{ steps.platform.outputs.slug }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=build-${{ steps.platform.outputs.slug }}
-          cache-to: type=gha,scope=build-${{ steps.platform.outputs.slug }},mode=max
+          cache-from: type=gha,scope=build-${{ matrix.image }}-${{ steps.platform.outputs.slug }}
+          cache-to: type=gha,scope=build-${{ matrix.image }}-${{ steps.platform.outputs.slug }},mode=max
 
   merge:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      contents: write
+      contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - suffix: ""
+          - suffix: "-internet"
 
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +101,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -91,12 +110,23 @@ jobs:
       - name: Create multi-arch manifest
         run: |
           TAGS=(${{ steps.meta.outputs.tags }})
-          SOURCE_AMD64="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-linux-amd64"
-          SOURCE_ARM64="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-linux-arm64"
+          SOURCE_AMD64="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}:${{ github.ref_name }}-linux-amd64"
+          SOURCE_ARM64="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}:${{ github.ref_name }}-linux-arm64"
 
           for TAG in "${TAGS[@]}"; do
             docker buildx imagetools create -t "$TAG" "$SOURCE_AMD64" "$SOURCE_ARM64"
           done
+
+  release:
+    # Split out of `merge` so the release is created exactly once, not once per
+    # image in the merge matrix.
+    runs-on: ubuntu-latest
+    needs: merge
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Compute version without v prefix
         id: ver
@@ -142,21 +172,20 @@ jobs:
           generate_release_notes: false
           body: |
             ${{ steps.release_notes.outputs.NOTES }}
-            ## Docker Image
+            ## Docker Images
+
+            The bridge:
 
             ```
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
             ```
 
+            Optional cellular-internet sidecar — only for deployments whose
+            internet comes from the same cellular card that carries calls
+            (see docs/ec20-internet-plus-vowifi.md):
+
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-internet:${{ steps.ver.outputs.tag }}
+            ```
+
             **Platforms:** linux/amd64, linux/arm64
-
-            **Tags published:**
-            ${{ steps.meta.outputs.tags }}
-
-      - name: Clean up platform-specific tags
-        run: |
-          for PLATFORM in linux-amd64 linux-arm64; do
-            TAG="${{ github.ref_name }}-${PLATFORM}"
-            docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}" > /dev/null 2>&1 || continue
-            echo "Platform tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG} left as intermediate artifact"
-          done
