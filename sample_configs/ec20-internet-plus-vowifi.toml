@@ -1,0 +1,38 @@
+# ============================================================================
+# Sample: single EC20 — internet AND VoWiFi calls on the SAME card
+# ============================================================================
+# This is the bridge-side config for the "same-card internet" deployment
+# (specs/032-cellular-internet-sidecar). It is an ordinary VoWiFi config: the
+# bridge uses the modem only as a SIM/APDU reader and its ePDG tunnel rides the
+# host's default route — which the cellular-internet sidecar provides over the
+# modem's QMI data path.
+#
+# IMPORTANT: internet is NOT configured here. It is brought up out-of-band by
+# the sidecar container, and the bridge is gated on it via a Compose override:
+#
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.cellular-internet.yml \
+#     up -d
+#
+# Configure the sidecar (INTERNET_APN, probe target) in docker/.env — see
+# .env.example. Full runbook: docs/ec20-internet-plus-vowifi.md.
+
+[sip]
+server = "pbx.example.com"
+username = "gsm-bridge"
+password = "env:SIP_PASSWORD"
+
+[vowifi]
+enabled = true
+# strongSwan is the default engine and the one used here; the swu engine's
+# `apn` dialer setting is irrelevant to this deployment (the tunnel rides the
+# sidecar-provided uplink, it does not dial a cellular IMS APN itself).
+tunnel_engine = "strongswan"
+
+# Pin the line to the modem's AT port. An EC20 exposes a USB audio interface, so
+# it is not auto-selected by the "audio-less modem" VoWiFi discovery heuristic —
+# pin it explicitly. The sidecar uses this same modem's QMI node (/dev/cdc-wdm0)
+# for data; the two never contend (different device nodes).
+[[vowifi.line]]
+modem_port = "/dev/ttyUSB2"

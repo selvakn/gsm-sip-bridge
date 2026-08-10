@@ -1,0 +1,49 @@
+# Opt-in overlay: same-card internet via the cellular-internet sidecar
+# (specs/032-cellular-internet-sidecar). DISABLED BY DEFAULT.
+#
+# Include this file ONLY when the deployment's internet comes from the same
+# cellular card that carries VoWiFi calls:
+#
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.cellular-internet.yml \
+#     up -d
+#
+# INVARIANT (task T014 / SC-003): the base docker/docker-compose.yml is NOT
+# modified by this feature. The `internet` service and the bridge's dependency
+# on it live ONLY here, so a plain `docker compose -f docker/docker-compose.yml
+# up` starts no sidecar and adds no wait — behaviour identical to prior releases.
+#
+# Configure the sidecar in docker/.env (see .env.example): INTERNET_APN is
+# required; INTERNET_QMI_DEV / INTERNET_PROBE_HOST / INTERNET_PROBE_RESOLVER
+# are optional. The sidecar drives internet over QMI (/dev/cdc-wdm0) only and
+# never touches the modem's AT port (the bridge needs it for AT+CSIM).
+services:
+  internet:
+    build:
+      context: ..
+      dockerfile: docker/cellular-internet/Dockerfile
+      network: host
+    image: gsm-sip-bridge-internet
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /dev:/dev
+    env_file:
+      - .env
+    # Healthy only when a DNS probe actually resolves through the cellular link
+    # (research R3/R4). Grace 90s absorbs a slow first attach; probe every 10s.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/internet-healthcheck.sh"]
+      start_period: 90s
+      interval: 10s
+      timeout: 5s
+      retries: 1
+
+  # Merge-inject the startup gate onto the existing bridge service: it will not
+  # start until the sidecar reports a genuinely-reachable uplink (FR-004).
+  gsm-sip-bridge:
+    depends_on:
+      internet:
+        condition: service_healthy

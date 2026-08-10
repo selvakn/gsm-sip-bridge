@@ -1,8 +1,8 @@
 CONFIG ?= config.toml
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
 
-.PHONY: build test run clean lint format dev dev-gsm dev-sip \
-        docker-build docker-up docker-down docker-logs \
+.PHONY: build test test-scripts run clean lint format dev dev-gsm dev-sip \
+        docker-build docker-build-internet docker-up docker-down docker-logs \
         coverage mutants mutants-full help
 
 build: ## Compile all binaries (release mode)
@@ -16,13 +16,18 @@ build: ## Compile all binaries (release mode)
 # `--no-fail-fast` because `cargo test` otherwise stops at the first failing
 # *binary*, so the summary line reports only the tests that ran before it —
 # which reads as a smaller suite passing rather than as a failure.
-test: ## Run the full test suite
+test: test-scripts ## Run the full test suite
 	@if cargo nextest --version >/dev/null 2>&1; then \
 		cargo nextest run --workspace --no-fail-fast; \
 	else \
 		echo "note: cargo-nextest not installed — falling back to cargo test (no per-test timeout)"; \
 		cargo test --workspace --no-fail-fast; \
 	fi
+
+# Shell/integration tests that live outside cargo (e.g. the cellular-internet
+# sidecar's readiness probe, specs/032). Hermetic — no hardware or network.
+test-scripts: ## Run non-cargo shell integration tests
+	@sh docker/cellular-internet/tests/probe_test.sh
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)
@@ -49,9 +54,9 @@ lint: ## Run formatting check, clippy, cargo-deny, shellcheck, and unsafe audit
 		echo "         Install: cargo install cargo-deny --locked"; \
 	fi
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck -x docker/*.sh; \
+		shellcheck -x docker/*.sh docker/cellular-internet/*.sh docker/cellular-internet/tests/*.sh; \
 	else \
-		echo "WARNING: shellcheck not installed — skipping docker/*.sh lint"; \
+		echo "WARNING: shellcheck not installed — skipping shell lint"; \
 	fi
 	@bash tools/count-unsafe.sh
 
@@ -69,6 +74,9 @@ dev-sip: ## [Debug] Run SIP-only audio loopback
 
 docker-build: ## Build the production Docker image
 	@$(DOCKER_COMPOSE) build
+
+docker-build-internet: ## Build the cellular-internet sidecar image (specs/032)
+	@docker build -f docker/cellular-internet/Dockerfile -t gsm-sip-bridge-internet .
 
 docker-up: ## Start all containers (bridge + monitoring stack)
 	@$(DOCKER_COMPOSE) up -d
