@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to tag (e.g. 8.10.0 → :8.10.0-swu). Must match Cargo.toml on the checked-out ref."
+        description: "Released version to build the -swu image for (e.g. 8.10.0). A v<version> release tag must already exist; the image is built from that tagged commit."
         required: true
         type: string
   push:
@@ -23,18 +23,26 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Resolve and VALIDATE the version once. The tag is always derived from the
-  # workspace version in Cargo.toml on the checked-out ref, and any typed/tag
-  # value must match it — so a typo can't publish `:foo-swu`, and the `-swu`
-  # image can't be built from a ref whose code is a different version.
+  # Resolve the version, then bind the whole publish to the corresponding slim
+  # release COMMIT — not just a matching version number. The `-swu` image is
+  # always built from `refs/tags/v<version>`, so `:<version>-swu` is provably
+  # the same source as the `:<version>` slim release. Provenance guard: this
+  # repo keeps Cargo.toml at the released version until the next bump, so a
+  # number match on a branch HEAD (or on an arbitrary `v*-swu` tag) does NOT
+  # imply the code is the released code — only the release tag does.
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      release_ref: ${{ steps.v.outputs.release_ref }}
     steps:
+      # Full history + tags so the release tag can be verified and its Cargo.toml
+      # read (a shallow checkout of the triggering ref would not have them).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve and validate version
+      - name: Resolve version and bind to the release tag
         id: v
         env:
           # Route the dispatch input through env rather than interpolating it
@@ -42,19 +50,9 @@ jobs:
           INPUT_VERSION: ${{ github.event.inputs.version }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            # Only from the default branch: matching Cargo.toml alone would let
-            # a dispatch off any feature branch whose version happens to match
-            # publish an -swu tag from unreleased code. Tag pushes are inherently
-            # a release ref, so they're exempt.
-            if [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
-              echo "::error::dispatch this workflow from the default branch ('$DEFAULT_BRANCH') only; got '$REF_NAME'. The -swu image must be built from released code."
-              exit 1
-            fi
             REQ="$INPUT_VERSION"
           else
             REQ="${REF_NAME#v}"; REQ="${REQ%-swu}"
@@ -62,11 +60,23 @@ jobs:
           if [ -z "$REQ" ]; then
             echo "::error::no version provided"; exit 1
           fi
-          if [ "$REQ" != "$CARGO_VERSION" ]; then
-            echo "::error::requested version '$REQ' != Cargo.toml workspace version '$CARGO_VERSION' on this ref. Publish from the ref whose Cargo.toml is '$REQ', or dispatch with version=$CARGO_VERSION."
+          RELEASE_TAG="v${REQ}"
+          # The corresponding slim release tag MUST exist. The -swu image is
+          # built from its commit — never from a branch HEAD or the -swu tag's
+          # own commit — so it can never diverge from the slim release.
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null; then
+            echo "::error::release tag ${RELEASE_TAG} does not exist. Cut and publish the slim release first, then re-run."
             exit 1
           fi
-          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          # Defence in depth: the version at that tagged commit must match, so a
+          # mis-cut release tag can't publish under the wrong -swu tag.
+          TAG_VERSION=$(git show "refs/tags/${RELEASE_TAG}:Cargo.toml" | grep -m1 '^version = ' | cut -d'"' -f2)
+          if [ "$TAG_VERSION" != "$REQ" ]; then
+            echo "::error::Cargo.toml at ${RELEASE_TAG} is '${TAG_VERSION}', expected '${REQ}'."
+            exit 1
+          fi
+          echo "version=$REQ" >> "$GITHUB_OUTPUT"
+          echo "release_ref=refs/tags/${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
@@ -84,7 +94,11 @@ jobs:
       packages: write
 
     steps:
+      # Build from the release tag's commit, not the triggering ref — this is
+      # what guarantees :<version>-swu matches the :<version> slim release.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.release_ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

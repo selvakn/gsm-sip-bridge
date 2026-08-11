@@ -36,10 +36,19 @@ The interfaces this feature exposes/changes. Each has an acceptance check.
   `tags: ["v*"]` also matches a `v<version>-swu` tag, all three of its jobs are
   guarded with `if: ${{ !endsWith(github.ref_name, '-swu') }}`, so a `-swu`
   tag push runs only `publish-swu.yml`.
+- **Provenance**: the `:<version>-swu` image MUST be built from the exact commit
+  tagged `v<version>` (the slim release), never from a branch HEAD or the
+  `-swu` tag's own commit. `publish-swu.yml` requires the `v<version>` release
+  tag to exist and checks out `refs/tags/v<version>` for the build, so
+  `:<version>-swu` can never diverge from `:<version>`. A version-number match
+  against `Cargo.toml` alone is insufficient — this repo keeps `Cargo.toml` at
+  the released version until the next bump, so a branch HEAD can share the number
+  without being the released code.
 
 **Acceptance**: inspect `publish.yml` (no `INCLUDE_SWU=true` leg; `-swu`-tag
-guard on every job) and `publish-swu.yml` (pushes `-swu` tag via
-`workflow_dispatch` or a `v*-swu` tag).
+guard on every job) and `publish-swu.yml` (builds from `refs/tags/v<version>`,
+requires that tag to exist, triggered via `workflow_dispatch` or a `v*-swu`
+tag).
 
 ## C3 — `CommandRunner::resolve_host` contract
 

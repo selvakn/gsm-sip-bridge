@@ -170,11 +170,22 @@ missing). So only `dig` is fully gone; the rest is a package trim.
   `-internet` sidecar matrix entry is untouched.
 
 - **On-demand full image (`publish-swu.yml`, NEW)**: `workflow_dispatch` with a
-  `version` input (and optionally trigger on tags matching `v*-swu`). Mirrors the
-  bridge build/merge jobs but passes `build-args: INCLUDE_SWU=true` and pushes
-  the **same image name** with tag `${version}-swu` (per-platform
-  `${version}-swu-linux-amd64/arm64` then a merged `${version}-swu` manifest).
-  Distinct GHA cache scope so it never clobbers the slim cache.
+  `version` input (and a `v*-swu` tag trigger). Mirrors the bridge build/merge
+  jobs but passes `build-args: INCLUDE_SWU=true` and pushes the **same image
+  name** with tag `${version}-swu` (per-platform `${version}-swu-linux-amd64/arm64`
+  then a merged `${version}-swu` manifest). Distinct GHA cache scope so it never
+  clobbers the slim cache.
+
+- **Provenance (Greptile P1)**: the build MUST come from the exact commit of the
+  corresponding slim release, so `:${version}-swu` cannot diverge from
+  `:${version}`. A version-number match against `Cargo.toml` is not enough —
+  this repo leaves `Cargo.toml` at the released version until the next bump, so a
+  branch HEAD (or an arbitrary `v*-swu` tag) can carry the same number while
+  being different code. The `version` job therefore requires the `v${version}`
+  release tag to exist and validates the `Cargo.toml` at *that tagged commit*;
+  the `build` job checks out `refs/tags/v${version}` rather than the triggering
+  ref. This replaced the earlier default-branch-only guard, which the tag-based
+  build subsumes.
 
 - **Rationale**: keeps the common release cheap and fast; the full image is
   built only when someone triggers it (FR-008a). Same-name-`-swu`-tag matches
