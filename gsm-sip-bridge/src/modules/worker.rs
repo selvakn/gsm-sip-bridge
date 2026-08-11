@@ -21,6 +21,7 @@ use crate::modules::card::{CardInstance, CardState};
 use crate::modules::discovery::DiscoveredModule;
 use crate::modules::protocol::{BridgeEvent, ModuleCmd};
 use crate::modules::restart_policy::RestartMode;
+use crate::modules::slot::usable_phone;
 use crate::store::calls::CallRecord;
 use crate::store::StoreCommand;
 use chrono::Utc;
@@ -75,9 +76,19 @@ pub(crate) struct ModuleWorker {
     module: DiscoveredModule,
     at: AtCommander,
     card: CardInstance,
-    /// specs/034-alert-identity: this card's phone number (read once at open
-    /// via `AT+CNUM`), shown in the module's critical alerts. `None` when the
-    /// SIM's EF_MSISDN is blank/unreadable ⇒ alerts render `unknown`.
+    /// specs/034-alert-identity: the *last known* number of this modem's SIM —
+    /// seeded from the read `try_init_module` already did, then refreshed from
+    /// the card itself on every inbound SMS ([`refresh_sim_phone_number`]).
+    ///
+    /// The SMS path always emits a freshly-read value, so it names the card
+    /// that actually received the message. The critical-alert paths take this
+    /// cached value as-is: they fire when the AT channel may be wedged (the
+    /// "worker unresponsive" alert is precisely that case) or mid call-teardown,
+    /// where adding an AT round-trip would block or time out. Last-known is the
+    /// best obtainable there, and a stale number on a "this module is broken"
+    /// alert is far less consequential than one on a forwarded message.
+    ///
+    /// `None` when the SIM has no number provisioned ⇒ alerts render `unknown`.
     phone_number: Option<String>,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
@@ -430,17 +441,25 @@ impl ModuleWorker {
                 let (sender, body) = parse_sms_response(&lines);
                 let received_at = Utc::now().to_rfc3339();
 
+                // specs/034-alert-identity: read the number off the card that
+                // just produced this message, rather than trusting a copy
+                // cached at worker open (which a SIM swap invalidates) or one
+                // looked up from the slot map at dispatch time (which races
+                // with slot recovery). `AT+CNUM` does not touch SMS storage, so
+                // issuing it here leaves the pending delete-by-index valid.
+                refresh_sim_phone_number(&mut self.at, &mut self.phone_number);
+
                 let _ = self.event_tx.send(BridgeEvent::SmsReceived {
                     module_id: self.module.id.clone(),
                     sender,
                     body,
                     received_at,
-                    // specs/034-alert-identity: attach this worker's own card
-                    // number so the forward names the SIM that received the
-                    // message, regardless of any concurrent slot churn.
                     phone_number: self.phone_number.clone(),
                 });
 
+                // Deleted only after the event is queued, so the message is
+                // never dropped from the SIM before it is persisted downstream
+                // (specs/006-sms-discord-forward).
                 let del_cmd = format!("AT+CMGD={idx}");
                 self.at.send_command(&del_cmd).ok();
             }
@@ -530,6 +549,26 @@ fn read_line_from_at(at: &mut AtCommander) -> Result<String, String> {
                 Err(msg)
             }
         }
+    }
+}
+
+/// Re-reads the number of the SIM *currently* in this modem and updates
+/// `cached` (specs/034-alert-identity).
+///
+/// The MSISDN belongs to the SIM, not to the modem or the slot, so any cached
+/// copy goes stale the moment a card is swapped — the bug class behind three
+/// successive review findings on this feature. The SMS path therefore refreshes
+/// from the same AT session that just read the message, which is the only way
+/// to know the number and the message came off the same card.
+///
+/// A *successful* read always wins, including when it reports no number: a
+/// replacement SIM with a blank EF_MSISDN must render `unknown` rather than
+/// inherit the removed card's number (FR-005 — never a value that looks real
+/// but isn't). Only a read that fails outright leaves `cached` alone, since a
+/// broken AT channel says nothing about which SIM is present.
+fn refresh_sim_phone_number(at: &mut AtCommander, cached: &mut Option<String>) {
+    if let Ok(fresh) = at.query_phone_number() {
+        *cached = usable_phone(&fresh);
     }
 }
 
@@ -732,6 +771,33 @@ mod tests {
         AtCommander::from_stream(MockAtStream::new(response), Duration::from_secs(1))
     }
 
+    /// A wedged port: every read times out, which is what a real serial port
+    /// does when the modem stops answering (`read_response` turns this into an
+    /// `Err`, unlike EOF — which it reports as an empty `Ok` response).
+    struct MockAtTimeoutStream;
+
+    impl std::io::Read for MockAtTimeoutStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "mock timeout",
+            ))
+        }
+    }
+
+    impl std::io::Write for MockAtTimeoutStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_at_wedged() -> AtCommander {
+        AtCommander::from_stream(MockAtTimeoutStream, Duration::from_secs(1))
+    }
+
     fn mock_card(state: CardState) -> CardInstance {
         let mut card = CardInstance::new(
             "card0".to_string(),
@@ -741,6 +807,40 @@ mod tests {
         );
         card.state = state;
         card
+    }
+
+    // --- specs/034-alert-identity: SIM identity must follow the card ---
+
+    /// The SIM-swap case behind the review findings: a card replaced under a
+    /// live worker must report the number now in the modem, not the one cached
+    /// when that worker opened.
+    #[test]
+    fn refresh_sim_phone_number_replaces_a_stale_cached_number() {
+        let mut at = mock_at("+CNUM: \"\",\"+919000000002\",145\r\nOK\r\n");
+        let mut cached = Some("+919000000001".to_string());
+        refresh_sim_phone_number(&mut at, &mut cached);
+        assert_eq!(cached.as_deref(), Some("+919000000002"));
+    }
+
+    /// A replacement SIM with no number provisioned must clear the cache, so
+    /// the alert renders `unknown` instead of inheriting the removed card's
+    /// number (FR-005: never a value that looks real but isn't).
+    #[test]
+    fn refresh_sim_phone_number_clears_when_the_new_sim_has_no_number() {
+        let mut at = mock_at("OK\r\n");
+        let mut cached = Some("+919000000001".to_string());
+        refresh_sim_phone_number(&mut at, &mut cached);
+        assert_eq!(cached, None);
+    }
+
+    /// A failed read says nothing about which SIM is present, so the last known
+    /// number survives rather than being clobbered by a wedged AT channel.
+    #[test]
+    fn refresh_sim_phone_number_keeps_the_last_known_number_when_the_read_fails() {
+        let mut at = mock_at_wedged();
+        let mut cached = Some("+919000000001".to_string());
+        refresh_sim_phone_number(&mut at, &mut cached);
+        assert_eq!(cached.as_deref(), Some("+919000000001"));
     }
 
     #[test]
