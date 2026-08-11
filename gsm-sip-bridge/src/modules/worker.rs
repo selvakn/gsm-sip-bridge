@@ -435,6 +435,10 @@ impl ModuleWorker {
                     sender,
                     body,
                     received_at,
+                    // specs/034-alert-identity: attach this worker's own card
+                    // number so the forward names the SIM that received the
+                    // message, regardless of any concurrent slot churn.
+                    phone_number: self.phone_number.clone(),
                 });
 
                 let del_cmd = format!("AT+CMGD={idx}");

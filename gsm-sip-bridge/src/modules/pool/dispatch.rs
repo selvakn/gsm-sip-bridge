@@ -360,19 +360,13 @@ impl CardPool {
                 sender,
                 body,
                 received_at,
+                phone_number,
             } => {
-                // specs/034-alert-identity: tag the forward with this card's
-                // own number (from its slot), so the Discord message shows
-                // which line received the SMS. One module_id can have several
-                // slots — a stale `GivenUp` slot can linger beside the live one
-                // and still hold its pre-SIM-swap AT+CNUM value — so match the
-                // `Ready` slot the emitting worker owns, whose number is the
-                // current one (refreshed on recovery), rather than the first
-                // slot HashMap iteration happens to visit.
-                let phone_number = slots
-                    .values()
-                    .find(|s| s.module.id == module_id && s.lifecycle == LifecycleState::Ready)
-                    .and_then(|s| s.alert_phone());
+                // specs/034-alert-identity: the number is carried on the event
+                // by the emitting worker (its own card's `AT+CNUM`), so the
+                // forward names the SIM that actually received the message —
+                // never a different SIM that a concurrent slot swap under the
+                // same `module_id` might have left in the slot map.
                 sms::record_and_forward(
                     &tokio::runtime::Handle::current(),
                     self.store.sender(),
