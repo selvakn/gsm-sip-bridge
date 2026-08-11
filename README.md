@@ -129,6 +129,33 @@ later:
 docker compose pull && docker compose up -d
 ```
 
+### Image variants: slim (default) vs. full/SWu
+
+The published image comes in two variants, sharing one name and distinguished
+by tag:
+
+| Variant | Tags | Contains | Use when |
+|---|---|---|---|
+| **slim** (default) | `:<version>`, `:latest` | strongSwan VoWiFi engine only | Almost always — this is the default `[vowifi].tunnel_engine = "strongswan"` path |
+| **full** (on demand) | `:<version>-swu` | strongSwan **plus** the legacy SWu/Python engine | Only if you must run `[vowifi].tunnel_engine = "swu"` |
+
+The slim image drops the Python interpreter, its dependency tree, and the
+vendored SWu-IKEv2 dialer (~72 MB, over 60% of the old image). If you configure
+the `swu` engine on the slim image, the bridge **fails fast at startup** with a
+message pointing you to the `-swu` image.
+
+The full image is **not** published on every release — it is built on demand by
+the "Publish SWu (full) Docker Image" GitHub Actions workflow (or by pushing a
+`v<version>-swu` tag). To build either locally:
+
+```bash
+make docker-build       # slim (default)
+make docker-build-swu   # full, includes the SWu/Python engine
+```
+
+The SWu engine's code stays in the binary and in CI in both variants; only the
+image payload differs (see specs/033-slim-optional-swu-image).
+
 ## Configuration
 
 A single TOML file (see `config.toml.example`). The minimum that matters:

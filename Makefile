@@ -2,7 +2,7 @@ CONFIG ?= config.toml
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
 
 .PHONY: build test test-scripts run clean lint format dev dev-gsm dev-sip \
-        docker-build docker-build-internet docker-up docker-down docker-logs \
+        docker-build docker-build-swu docker-build-internet docker-up docker-down docker-logs \
         coverage mutants mutants-full help
 
 build: ## Compile all binaries (release mode)
@@ -73,8 +73,11 @@ dev-gsm: ## [Debug] Run GSM-only audio loopback
 dev-sip: ## [Debug] Run SIP-only audio loopback
 	@cargo run --bin sip-echo -- --config $(CONFIG) --verbose
 
-docker-build: ## Build the production Docker image
+docker-build: ## Build the production Docker image (slim, strongSwan-only)
 	@$(DOCKER_COMPOSE) build
+
+docker-build-swu: ## Build the full image incl. the SWu/Python engine (specs/033)
+	@docker build -f docker/Dockerfile --build-arg INCLUDE_SWU=true -t gsm-sip-bridge:swu .
 
 docker-build-internet: ## Build the cellular-internet sidecar image (specs/032)
 	@docker build -f docker/cellular-internet/Dockerfile -t gsm-sip-bridge-internet .

@@ -138,6 +138,42 @@ struct LineStartup<'a> {
 /// straight back to a process exit, while the retry caller only has a
 /// background thread to log from and gives up on starting the subsystem
 /// this run instead.
+/// specs/033-slim-optional-swu-image: filesystem markers that tell a running
+/// bridge whether the SWu/Python tunnel-engine payload is present in this
+/// image. The on-demand full (`-swu`) image ships both; the default slim image
+/// ships neither.
+const SWU_MARKER_PATH: &str = "/etc/gsm-sip-bridge/swu-available";
+const SWU_DIALER_PATH: &str = "/opt/SWu-IKEv2/swu_emulator.py";
+
+/// True iff this image carries the SWu engine payload. Does filesystem I/O
+/// (the two `exists()` probes) but takes its paths by argument rather than
+/// hard-coding them, so it is unit-testable against temp files while the caller
+/// passes the real image paths above.
+fn swu_payload_available(marker: &Path, dialer: &Path) -> bool {
+    marker.exists() && dialer.exists()
+}
+
+/// Env var that bypasses the SWu-payload check — the escape hatch for running
+/// `gsm-sip-bridge supervise` natively on the host off a pjsip-linked build,
+/// where the container-only marker file never exists.
+const SWU_PAYLOAD_OVERRIDE_ENV: &str = "GSM_SIP_BRIDGE_SWU_PAYLOAD";
+
+/// The actionable fatal message when a `swu`-engine config lands on an image
+/// (or host) that has no SWu payload. Shared so the pre-discovery guard in
+/// `run` speaks with one voice. Embeds the binary's own version so the `-swu`
+/// tag is copy-pasteable.
+fn swu_unavailable_message() -> &'static str {
+    concat!(
+        "[vowifi].tunnel_engine = \"swu\", but this image does not include the ",
+        "SWu/Python engine — the default \"slim\" image ships strongSwan only. ",
+        "Pull the on-demand full image (tag \"",
+        env!("CARGO_PKG_VERSION"),
+        "-swu\"), or set [vowifi].tunnel_engine = \"strongswan\". ",
+        "(Running natively off a pjsip-linked host build, not the container? ",
+        "Set GSM_SIP_BRIDGE_SWU_PAYLOAD=1 to bypass this check.)"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_vowifi_subsystem(
     vowifi_lines: &[LineResolutionEntry],
@@ -156,6 +192,13 @@ fn start_vowifi_subsystem(
     );
 
     check_pcsc_engine_compatibility(vowifi_lines, &config.vowifi.tunnel_engine)?;
+
+    // Note: the swu-on-slim payload check is NOT here — it is an image
+    // property, not a line-table one, so `run` performs it before discovery
+    // (see the `swu_payload_available` guard there). Sitting behind line
+    // resolution would let a slim deployment with no modem attached, or one
+    // reaching this via the discover-retry path (which only logs), keep
+    // running as a VoWiFi-less bridge instead of exiting (specs/033, SC-005).
 
     if runner
         .run(&["ip", "netns", "add", "__probe"])
@@ -655,6 +698,23 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // otherwise probe the same candidate modem's serial port at once).
     let mut vowifi_lines: Vec<LineResolutionEntry> = Vec::new();
     if config.vowifi.enabled {
+        // specs/033: fail fast BEFORE discovery when the `swu` engine is
+        // configured on a slim image that has no SWu payload. This is a
+        // property of the image, not of the line table — checking it here
+        // makes it unconditional: a slim deployment with no modem attached (so
+        // no lines ever resolve), or one that reaches the subsystem via the
+        // discover-retry path (which only logs, never exits), would otherwise
+        // run indefinitely as a VoWiFi-less bridge instead of exiting (SC-005).
+        // The env override is the escape hatch for a native host build, where
+        // the container-only marker never exists.
+        if config.vowifi.tunnel_engine == "swu"
+            && std::env::var_os(SWU_PAYLOAD_OVERRIDE_ENV).is_none()
+            && !swu_payload_available(Path::new(SWU_MARKER_PATH), Path::new(SWU_DIALER_PATH))
+        {
+            eprintln!("[supervise] FATAL: {}", swu_unavailable_message());
+            return ExitCode::FAILURE;
+        }
+
         match runner.run(&[&bin, "--config", &config_path_str, "discover"]) {
             Ok(o) if o.status.success() => {}
             _ => {
@@ -897,14 +957,90 @@ fn resolve_epdg_ip(
     } else {
         format!("epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org")
     };
-    let out = runner.run(&["dig", "+short", &fqdn, "A"]).ok()?;
-    if !out.status.success() {
-        return None;
+    // In-process resolution via the system resolver (specs/033): drops the
+    // `dig`/`bind-tools` runtime dependency. Takes the first A record, exactly
+    // as the previous `dig +short A | first line` did.
+    runner
+        .resolve_host(&fqdn)
+        .ok()?
+        .first()
+        .map(std::net::Ipv4Addr::to_string)
+}
+
+#[cfg(test)]
+mod resolve_epdg_ip_tests {
+    use super::*;
+    use crate::supervise::runner::MockCommandRunner;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn explicit_ip_override_short_circuits_before_dns() {
+        let runner = MockCommandRunner::new();
+        // No resolve_host seeding at all — the override must win regardless.
+        let got = resolve_epdg_ip(&runner, "", Some("198.51.100.7"), "404", "10");
+        assert_eq!(got.as_deref(), Some("198.51.100.7"));
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit() || c == '.'))
-        .map(str::to_string)
+
+    #[test]
+    fn empty_ip_override_falls_through_to_fqdn_override_resolution() {
+        let runner = MockCommandRunner::new();
+        runner.set_resolve_host(
+            "epdg.example.net",
+            vec![Ipv4Addr::new(203, 0, 113, 5), Ipv4Addr::new(203, 0, 113, 6)],
+        );
+        let got = resolve_epdg_ip(&runner, "epdg.example.net", Some(""), "404", "10");
+        // First A record, matching the old `dig +short | first line`.
+        assert_eq!(got.as_deref(), Some("203.0.113.5"));
+    }
+
+    #[test]
+    fn derived_fqdn_is_resolved_when_no_overrides() {
+        let runner = MockCommandRunner::new();
+        runner.set_resolve_host(
+            "epdg.epc.mnc10.mcc404.pub.3gppnetwork.org",
+            vec![Ipv4Addr::new(192, 0, 2, 42)],
+        );
+        let got = resolve_epdg_ip(&runner, "", None, "404", "10");
+        assert_eq!(got.as_deref(), Some("192.0.2.42"));
+    }
+
+    #[test]
+    fn no_a_record_yields_none() {
+        let runner = MockCommandRunner::new();
+        // Host unseeded → empty address list → unresolved.
+        let got = resolve_epdg_ip(&runner, "unresolvable.example", None, "404", "10");
+        assert_eq!(got, None);
+    }
+}
+
+#[cfg(test)]
+mod swu_payload_tests {
+    use super::*;
+
+    #[test]
+    fn payload_available_only_when_both_marker_and_dialer_present() {
+        let dir = std::env::temp_dir().join(format!("swu-payload-test-{}", std::process::id()));
+        // Rerun-safe: a previous run that panicked mid-test would leave the
+        // marker behind and make the first assertion below fail spuriously
+        // forever. Start from a clean slate.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("swu-available");
+        let dialer = dir.join("swu_emulator.py");
+
+        // Neither present → slim image.
+        assert!(!swu_payload_available(&marker, &dialer));
+
+        // Only the marker → still not usable (partial/broken image).
+        std::fs::write(&marker, "").unwrap();
+        assert!(!swu_payload_available(&marker, &dialer));
+
+        // Both present → full image.
+        std::fs::write(&dialer, "# dialer").unwrap();
+        assert!(swu_payload_available(&marker, &dialer));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Whether this line table needs pcscd's vpcd *virtual* reader provisioned.

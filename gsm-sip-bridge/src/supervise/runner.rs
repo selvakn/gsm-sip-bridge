@@ -248,6 +248,32 @@ pub trait CommandRunner: Send + Sync {
     /// not hypothetically: it made the container's `HEALTHCHECK` report every
     /// genuinely working deployment as unhealthy.
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool;
+
+    /// Resolve `host` to its IPv4 addresses via the system resolver
+    /// (getaddrinfo, honoring `/etc/resolv.conf`). Replaces the `dig +short A`
+    /// shell-out that used to back ePDG resolution, so the runtime image no
+    /// longer needs `bind-tools` (specs/033-slim-optional-swu-image). Routed
+    /// through the runner like every other real-world effect so
+    /// `resolve_epdg_ip` stays testable without real DNS.
+    ///
+    /// Deliberately NOT a byte-for-byte replacement for `dig +short A` — the
+    /// documented behavioural deltas (all benign for ePDG selection, since any
+    /// returned A record is a valid ePDG entry point):
+    /// - **Address order.** getaddrinfo is `AF_UNSPEC` and applies RFC 6724
+    ///   destination-address sorting; `dig +short A` returned records in server
+    ///   order. When a name has multiple A records the *first* address — the
+    ///   one `resolve_epdg_ip` picks — can therefore differ from what `dig`
+    ///   would have picked.
+    /// - **Literal IPs.** If `host` is already a literal IPv4 string,
+    ///   getaddrinfo returns it as-is; the old `dig` path returned nothing
+    ///   (it queried the literal as a name). A benign improvement.
+    /// - **Timeout.** getaddrinfo blocks per `/etc/resolv.conf` (musl's default
+    ///   is ~5s × 2 attempts) on the calling thread, with no flag to bound it —
+    ///   comparable to `dig`'s own default, just no longer tunable via a CLI
+    ///   flag. `resolve_epdg_ip` calls this from a *per-line* supervision thread
+    ///   (one per VoWiFi line), so a slow resolver blocks only that one line's
+    ///   bring-up, not process startup.
+    fn resolve_host(&self, host: &str) -> io::Result<Vec<std::net::Ipv4Addr>>;
 }
 
 /// Production implementation: real `std::process::Command`/`Child`, real
@@ -469,6 +495,20 @@ impl CommandRunner for RealCommandRunner {
             .map(|out| out.status.success())
             .unwrap_or(false)
     }
+
+    fn resolve_host(&self, host: &str) -> io::Result<Vec<std::net::Ipv4Addr>> {
+        use std::net::{IpAddr, ToSocketAddrs};
+        // Port 0 is irrelevant — only the A records matter. musl's
+        // getaddrinfo reads /etc/resolv.conf, the same place the old `dig`
+        // resolved from (the container's main netns, before per-line setup).
+        Ok((host, 0u16)
+            .to_socket_addrs()?
+            .filter_map(|addr| match addr.ip() {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -627,6 +667,25 @@ mod real_runner_tests {
             "spawn_detached must never insert a tracked table entry"
         );
     }
+
+    #[test]
+    fn resolve_host_handles_a_literal_ip_and_a_local_name_without_network() {
+        let runner = RealCommandRunner::new();
+        // Literal IPv4 → itself, via getaddrinfo's numeric-host path (no DNS).
+        assert_eq!(
+            runner.resolve_host("127.0.0.1").unwrap(),
+            vec![std::net::Ipv4Addr::LOCALHOST],
+            "a literal IPv4 must resolve to itself"
+        );
+        // `localhost` is resolvable from /etc/hosts without a network. Tolerant
+        // to IPv6-only environments (where the V4 filter yields an empty list):
+        // the call must succeed, and any V4 it returns must be loopback.
+        let localhost = runner.resolve_host("localhost").unwrap();
+        assert!(
+            localhost.is_empty() || localhost.contains(&std::net::Ipv4Addr::LOCALHOST),
+            "localhost must resolve to loopback when it yields any IPv4, got {localhost:?}"
+        );
+    }
 }
 
 /// The handle-lifecycle contract, asserted against **both** implementations.
@@ -738,6 +797,16 @@ mod conformance {
         assert_ne!(a.id(), b.id(), "each spawn must be a distinct child");
         runner.reap(&a);
         runner.reap(&b);
+
+        // 9. `resolve_host` echoes a literal IPv4 back unchanged, on both
+        //    implementations — the documented literal-IP behaviour of the real
+        //    getaddrinfo path, which the mock mirrors deterministically. Needs
+        //    no network (TEST-NET-1, 192.0.2.0/24, is never routed).
+        assert_eq!(
+            runner.resolve_host("192.0.2.1").unwrap(),
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 1)],
+            "resolve_host must return a literal IPv4 as itself"
+        );
     }
 
     #[test]
@@ -837,6 +906,10 @@ mod mock {
         /// `"host:port"` key; unseeded keys default to `false` (no
         /// real network in tests).
         pub tcp_connect_results: Mutex<Map<String, bool>>,
+        /// Overrides `resolve_host`'s return value for a given host;
+        /// unseeded hosts resolve to an empty address list (no real DNS in
+        /// tests).
+        pub resolve_results: Mutex<Map<String, Vec<std::net::Ipv4Addr>>>,
         /// Argv substrings that make a future `spawn()` create its child
         /// already dead (`is_alive` false from the start) — lets a test
         /// force a deterministic `EstablishOutcome::FatalProcessDied` for a
@@ -890,6 +963,14 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(format!("{host}:{port}"), ok);
+        }
+
+        /// Seeds the addresses `resolve_host(host)` returns.
+        pub fn set_resolve_host(&self, host: &str, addrs: Vec<std::net::Ipv4Addr>) {
+            self.resolve_results
+                .lock()
+                .unwrap()
+                .insert(host.to_string(), addrs);
         }
 
         /// Seeds a probe made *from inside* `netns`. Deliberately a separate
@@ -1110,6 +1191,31 @@ mod mock {
                 .get(&format!("netns:{netns}:{host}:{port}"))
                 .copied()
                 .unwrap_or(false)
+        }
+
+        fn resolve_host(&self, host: &str) -> io::Result<Vec<std::net::Ipv4Addr>> {
+            // A literal IPv4 resolves to itself with no DNS, exactly as
+            // getaddrinfo (and so the real impl) does. This is NOT the mock
+            // "inventing an answer" (cf. the conformance doctrine above) — the
+            // address is the input — so it is safe to pin in the conformance
+            // suite, and it lets the mock honour the documented literal-IP
+            // delta rather than diverge from it.
+            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                return Ok(vec![ip]);
+            }
+            // For hostnames: seeded addresses, else `Ok(vec![])` ("resolved,
+            // no A record"). The real impl instead returns `Err` when
+            // resolution *fails* entirely; both the empty-Ok and the Err paths
+            // collapse to `None` in `resolve_epdg_ip`, so no caller can tell
+            // them apart today. A test needing the resolver-error path
+            // specifically is out of this mock's scope by design.
+            Ok(self
+                .resolve_results
+                .lock()
+                .unwrap()
+                .get(host)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 

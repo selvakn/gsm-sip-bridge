@@ -1,0 +1,149 @@
+name: Publish SWu (full) Docker Image
+
+# specs/033-slim-optional-swu-image: the full image bundles the SWu/Python
+# tunnel engine (~72 MB of Python interpreter + deps + dialer). It is NOT built
+# on every release — the regular publish.yml ships only the slim image. This
+# workflow builds it on demand and publishes it under the SAME image name with
+# a `-swu` tag suffix (e.g. ghcr.io/<repo>:8.10.0-swu), so a deployment that
+# still needs the `swu` engine can pull it explicitly. Trigger it manually
+# (Actions → this workflow → Run workflow) with the version to tag, or by
+# pushing a `v*-swu` git tag.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag (e.g. 8.10.0 → :8.10.0-swu). Must match Cargo.toml on the checked-out ref."
+        required: true
+        type: string
+  push:
+    tags: ["v*-swu"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Resolve and VALIDATE the version once. The tag is always derived from the
+  # workspace version in Cargo.toml on the checked-out ref, and any typed/tag
+  # value must match it — so a typo can't publish `:foo-swu`, and the `-swu`
+  # image can't be built from a ref whose code is a different version.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and validate version
+        id: v
+        env:
+          # Route the dispatch input through env rather than interpolating it
+          # into the shell body (actionlint/zizmor: untrusted-ish input).
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # Only from the default branch: matching Cargo.toml alone would let
+            # a dispatch off any feature branch whose version happens to match
+            # publish an -swu tag from unreleased code. Tag pushes are inherently
+            # a release ref, so they're exempt.
+            if [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
+              echo "::error::dispatch this workflow from the default branch ('$DEFAULT_BRANCH') only; got '$REF_NAME'. The -swu image must be built from released code."
+              exit 1
+            fi
+            REQ="$INPUT_VERSION"
+          else
+            REQ="${REF_NAME#v}"; REQ="${REQ%-swu}"
+          fi
+          if [ -z "$REQ" ]; then
+            echo "::error::no version provided"; exit 1
+          fi
+          if [ "$REQ" != "$CARGO_VERSION" ]; then
+            echo "::error::requested version '$REQ' != Cargo.toml workspace version '$CARGO_VERSION' on this ref. Publish from the ref whose Cargo.toml is '$REQ', or dispatch with version=$CARGO_VERSION."
+            exit 1
+          fi
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Platform pair slug
+        id: platform
+        run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push single-platform full image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            INCLUDE_SWU=true
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-swu-${{ steps.platform.outputs.slug }}
+          # org.opencontainers.* labels, matching publish.yml's slim build.
+          labels: ${{ steps.meta.outputs.labels }}
+          # Distinct cache scope from the slim build (publish.yml uses
+          # build-bridge-*) so the two never clobber each other.
+          cache-from: type=gha,scope=build-swu-${{ steps.platform.outputs.slug }}
+          cache-to: type=gha,scope=build-swu-${{ steps.platform.outputs.slug }},mode=max
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch `-swu` manifest
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-swu"
+          SOURCE_AMD64="${TAG}-linux-amd64"
+          SOURCE_ARM64="${TAG}-linux-arm64"
+          docker buildx imagetools create -t "$TAG" "$SOURCE_AMD64" "$SOURCE_ARM64"

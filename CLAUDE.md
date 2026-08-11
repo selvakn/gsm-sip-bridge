@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/032-cellular-internet-sidecar/plan.md`.
+`specs/033-slim-optional-swu-image/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

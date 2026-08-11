@@ -271,7 +271,7 @@ gets discovered/resolved.
 | `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly — shared across every line if set |
 | `src_addr` | string | unset (auto-select) | Force the tunnel's local source address — shared across every line if set |
 | `keepalive_interval_sec` | integer | 20 | Idle-tunnel TCP keepalive interval |
-| `tunnel_engine` | enum | `strongswan` | `strongswan` or `swu` (specs/012-strongswan-epdg) |
+| `tunnel_engine` | enum | `strongswan` | `strongswan` or `swu` (specs/012-strongswan-epdg). **`swu` requires the full image** (`ghcr.io/selvakn/gsm-sip-bridge:<version>-swu`): the default slim image ships without the SWu/Python engine and fails fast at startup if this is set to `swu` (specs/033-slim-optional-swu-image) |
 | `vpcd_host` | string | `127.0.0.1` | pcscd's vpcd virtual reader host (strongswan engine) |
 | `vpcd_port` | integer | 15963 | Base TCP port pcscd's shared vpcd reader listens on — one reader serves every line, at `base + line-index`. Unlike the other per-line fields, this **is** a genuine config key: keep the base **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
 | `max_lines` | integer | 8 | Upper bound on concurrently supported VoWiFi lines (specs/013-multi-card-vowifi FR-016); modems discovered beyond this count are reported and skipped |

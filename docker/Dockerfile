@@ -3,12 +3,15 @@
 #      gracefully if no supported modem is attached)
 #   2. the inbound VoWiFi-to-SIP bridge (specs/011-vowifi-sip-bridge) — an
 #      ePDG tunnel + vowifi-ims-agent/vowifi-sip-agent, gated on
-#      [vowifi].enabled in the mounted config.toml. Two tunnel engines ship
-#      side by side (specs/012-strongswan-epdg), selected at deploy time by
-#      [vowifi].tunnel_engine: the original SWu-IKEv2 Python dialer ("swu")
-#      or strongSwan ("strongswan", the default — proper IKE
-#      rekeying/re-auth/DPD/MOBIKE and a network namespace that survives
-#      reconnects, via a pcscd/vpcd bridge to the SIM inside the modem).
+#      [vowifi].enabled in the mounted config.toml. Two tunnel engines exist
+#      (specs/012-strongswan-epdg), selected at deploy time by
+#      [vowifi].tunnel_engine: strongSwan ("strongswan", the default — proper
+#      IKE rekeying/re-auth/DPD/MOBIKE and a network namespace that survives
+#      reconnects, via a pcscd/vpcd bridge to the SIM inside the modem), or the
+#      original SWu-IKEv2 Python dialer ("swu"). Only strongSwan ships in the
+#      default *slim* image; the "swu" engine's Python payload is an opt-in
+#      build (ARG INCLUDE_SWU=true → the on-demand `-swu` full image), see
+#      specs/033-slim-optional-swu-image and the ARG below.
 #
 # docker/entrypoint.sh decides at container start which of these to launch,
 # by asking the binary itself (`gsm-sip-bridge config vowifi-enabled`)
@@ -24,6 +27,13 @@
 # applied to the vendored SWu-IKEv2 dialer.
 ARG PJSIP_VERSION=2.16
 ARG ALPINE_VERSION=3.21
+# specs/033-slim-optional-swu-image: the SWu/Python tunnel engine is an opt-in
+# build-time payload. Default false → the slim image (strongSwan only). Set
+# --build-arg INCLUDE_SWU=true for the on-demand full image (published under a
+# `-swu` tag). Global scope so it can be interpolated in the `FROM
+# swu-${INCLUDE_SWU}` selector below; re-declared inside the runtime stage to
+# gate python3.
+ARG INCLUDE_SWU=false
 
 # Stage 1: build PJSIP as static libraries.
 #
@@ -110,6 +120,27 @@ RUN pip install --no-cache-dir --target=/opt/pydeps \
         wheel pyserial requests cryptography pycryptodome pyscard \
     && pip install --no-cache-dir --target=/opt/pydeps \
         git+https://github.com/mitshell/CryptoMobile.git
+
+# Stage 4: assemble the SWu/Python payload the runtime stage COPYs, selected by
+# ARG INCLUDE_SWU (specs/033-slim-optional-swu-image). Two candidate stages,
+# one alias:
+#   swu-false — an empty /swu-root, no marker (the slim default)
+#   swu-true  — the real payload (dialer + pydeps) plus the swu-available
+#               marker the running binary checks to fail fast when a slim image
+#               is asked to run the `swu` engine
+# BuildKit only builds stages reachable from the final target, so a default
+# (slim) build never builds `python-builder`/`swu-true` — the ~72 MB Python
+# interpreter, deps, and dialer are never produced.
+FROM alpine:${ALPINE_VERSION} AS swu-false
+RUN mkdir -p /swu-root
+
+FROM python-builder AS swu-true
+RUN mkdir -p /swu-root/opt /swu-root/etc/gsm-sip-bridge \
+    && cp -a /opt/SWu-IKEv2 /swu-root/opt/SWu-IKEv2 \
+    && cp -a /opt/pydeps    /swu-root/opt/pydeps \
+    && touch /swu-root/etc/gsm-sip-bridge/swu-available
+
+FROM swu-${INCLUDE_SWU} AS swu-payload
 
 # Stage 5: build strongSwan (specs/012-strongswan-epdg) — the osmocom
 # "strongswan-epdg" fork, which adds two things upstream strongSwan lacks
@@ -198,14 +229,27 @@ RUN make -C src/ifd-vpcd install DESTDIR=/staging
 # (spec FR-001/FR-009).
 FROM alpine:${ALPINE_VERSION}
 
+# specs/033: re-declared here (global ARGs don't cross into a stage) to gate the
+# python3 runtime package on the full-image build.
+ARG INCLUDE_SWU=false
+
 # bash: docker/entrypoint.sh is now a 28-line precondition-check-and-exec
 #   shim, but the SWu-IKEv2 dialer's own scripts still expect bash.
-# python3 -> must match python-builder's python3 (same ALPINE_VERSION base)
-#   for the compiled pyscard/cryptography extensions copied in below to load.
-# iproute2 + net-tools -> the SWu dialer calls BOTH `ip` and net-tools `route`;
-#   also shelled out to by `supervise` for the vowifi bridge's veth pair
-# iputils/bind-tools/procps -> `supervise`'s DNS resolve (dig) + keepalive +
-#   pgrep
+# python3 -> only in the full (-swu) image (specs/033): installed by the
+#   conditional RUN below, not this list. Must match python-builder's python3
+#   (same ALPINE_VERSION base) for the compiled pyscard/cryptography extensions
+#   copied in below to load.
+# iproute2 -> `ip`, shelled out to by `supervise` for the vowifi bridge's veth
+#   pair; the SWu dialer also uses it. (net-tools moved to the full-image
+#   conditional above — specs/033. What actually needs it is the SWu dialer's
+#   `/sbin/ifconfig` call, which parses net-tools' output format; net-tools
+#   overwrites busybox's `/sbin/ifconfig` symlink with the real binary. Its
+#   `route add` calls resolve to busybox `/sbin/route` regardless, since
+#   net-tools ships `route` at `/bin/route`, which loses to `/sbin` in PATH.)
+# iputils/procps -> `supervise`'s keepalive + pgrep. (The ePDG DNS lookup no
+#   longer shells out to bind-tools' `dig`; it resolves in-process — specs/033.
+#   Alpine's base busybox still provides `dig`-less applets like `nslookup`,
+#   `wget`, and `route`, but nothing at runtime depends on those.)
 # alsa-lib/libssl3/libcrypto3/libuuid/eudev-libs/libgcc -> runtime shared libs
 #   for the gsm-sip-bridge binary (PJSIP itself is statically linked; these
 #   are its dynamic dependencies — eudev-libs via the `serialport` crate,
@@ -230,17 +274,34 @@ FROM alpine:${ALPINE_VERSION}
 #   whatever reader(s) pcscd exposes, real or virtual.
 RUN apk add --no-cache \
         bash \
-        python3 \
-        iproute2 net-tools iputils bind-tools procps \
+        iproute2 iputils procps \
         alsa-lib libssl3 libcrypto3 libuuid eudev-libs libgcc \
         opencore-amr vo-amrwbenc \
         pcsc-lite-libs pcsc-lite ccid \
-        ca-certificates wget
+        ca-certificates
+
+# specs/033: python3 and net-tools ship only in the full (-swu) image. The slim
+# default has no Python interpreter at all (the SWu payload COPYed below is
+# empty there). net-tools is needed only by the SWu dialer's `/sbin/ifconfig`
+# call, whose net-tools output format the dialer parses — installing net-tools
+# overwrites busybox's `/sbin/ifconfig` symlink with the real binary (its
+# `route` never wins over busybox `/sbin/route` in PATH, so `route` isn't the
+# reason). supervise and the strongSwan path use only iproute2's `ip`.
+#
+# The bind-tools and wget *packages* are dropped from both variants: the ePDG
+# DNS lookup now resolves in-process (supervise::orchestrate::resolve_epdg_ip)
+# so `dig` is genuinely gone, and nothing at runtime invokes wget. Note the
+# Alpine base's busybox still provides `wget`/`route`/`ifconfig` applets — this
+# removes the standalone packages, not those applets.
+RUN if [ "$INCLUDE_SWU" = "true" ]; then apk add --no-cache python3 net-tools; fi
 
 RUN addgroup -S bridge && adduser -S -G bridge -h /data bridge
 
-COPY --from=python-builder /opt/SWu-IKEv2 /opt/SWu-IKEv2
-COPY --from=python-builder /opt/pydeps /opt/pydeps
+# specs/033: the SWu/Python payload — the dialer, pydeps, and the
+# `swu-available` marker in the full image; an empty tree in the slim default.
+# Selected by ARG INCLUDE_SWU via the swu-payload stage alias above. PYTHONPATH
+# is harmless when /opt/pydeps is absent.
+COPY --from=swu-payload /swu-root/ /
 ENV PYTHONPATH="/opt/pydeps"
 
 COPY --from=rust-builder /app/target/release/gsm-sip-bridge /usr/local/bin/gsm-sip-bridge
@@ -286,6 +347,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # by a process that's actually root inside the container. Matches this
 # image's behavior before this change too (the old entrypoint execed
 # gsm-sip-bridge directly with no privilege drop).
+#
+# specs/033: this WORKDIR is the cwd the SWu dialer's `python3 swu_emulator.py`
+# is spawned relative to, so it stays unconditional. On the slim image (no SWu
+# payload) it just creates an empty /opt/SWu-IKEv2 and the container cwd points
+# there harmlessly — the strongSwan path never depends on cwd, and the swu-on-
+# slim guard in `run` has already exited before anything would use it.
 WORKDIR /opt/SWu-IKEv2
 
 # The probe is a subcommand of the binary itself, not a script: its per-line

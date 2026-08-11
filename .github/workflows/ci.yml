@@ -5,6 +5,11 @@ on:
     branches: [main, "**"]
   pull_request:
     branches: [main]
+  # specs/033: weekly build of the SWu/Python payload so its unpinned
+  # `pip install git+.../CryptoMobile` HEAD can't rot unnoticed between the
+  # rare on-demand -swu publishes (see the swu-payload-build job below).
+  schedule:
+    - cron: "0 6 * * 1"
 
 env:
   PJSIP_VERSION: "2.16"
@@ -12,6 +17,9 @@ env:
 
 jobs:
   build-and-test:
+    # The scheduled run exists only for swu-payload-build; skip the (long) Rust
+    # build/test job on that trigger — pushes and PRs already cover it.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -110,3 +118,21 @@ jobs:
           if ! docker compose -f docker/docker-compose.yml config --quiet 2>/dev/null; then
             echo "::warning::docker-compose.yml validation skipped (docker compose not available)"
           fi
+
+  # specs/033: the SWu/Python payload (python-builder stage) is only built
+  # on-demand by publish-swu.yml. Its `pip install git+.../CryptoMobile` pulls
+  # an UNPINNED git HEAD, so a break there would surface for the first time when
+  # an operator dispatches the -swu image — exactly when they're already
+  # reaching for the fallback. Build the stage here as cheap insurance (no push)
+  # so rot is caught weekly and on every main merge, not in an incident.
+  swu-payload-build:
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the SWu/Python payload stage (no push)
+        run: docker build -f docker/Dockerfile --target python-builder .
