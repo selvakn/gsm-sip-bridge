@@ -92,6 +92,7 @@ pub fn record_and_forward(
     received_at: String,
     transport: Transport,
     vowifi_reporter: Option<Reporter>,
+    phone_number: Option<String>,
 ) {
     let record = SmsRecord {
         module_id: module_id.clone(),
@@ -111,7 +112,13 @@ pub fn record_and_forward(
 
     handle.spawn(async move {
         let result = client
-            .forward_sms(&module_id, &sender, &body, &received_at)
+            .forward_sms(
+                &module_id,
+                &sender,
+                &body,
+                &received_at,
+                phone_number.as_deref(),
+            )
             .await;
         let (status_str, discord_code) = match &result {
             Ok(code) => ("sent", Some(*code as i32)),

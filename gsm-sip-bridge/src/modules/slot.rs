@@ -51,6 +51,15 @@ pub(crate) struct SlotState {
 }
 
 impl SlotState {
+    /// This card's phone number for alert notifications (specs/034-alert-
+    /// identity), or `None` when the SIM has no usable number — empty, or the
+    /// `AT+CNUM` `"Unknown"` sentinel — in which case the alert renders
+    /// `unknown` in its place.
+    pub(crate) fn alert_phone(&self) -> Option<String> {
+        let p = self.phone_number.trim();
+        (!p.is_empty() && p != "Unknown").then(|| p.to_string())
+    }
+
     pub(crate) fn info(&self) -> SlotInfo {
         SlotInfo {
             slot: self.slot,

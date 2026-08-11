@@ -735,6 +735,21 @@ impl From<&ResolvedLine> for LineResolutionEntry {
     }
 }
 
+impl LineResolutionEntry {
+    /// specs/034-alert-identity: this line's configured phone number — the
+    /// `msisdn` of the `[[vowifi.line]]` override that pinned it, matched by the
+    /// same identifier recorded as [`Self::configured_identifier`]. `None` for
+    /// an auto-discovered line with no override (renders `unknown` in alerts).
+    pub fn configured_msisdn(&self) -> Option<String> {
+        let id = self.configured_identifier.as_deref()?;
+        self.config
+            .line_overrides
+            .iter()
+            .find(|o| override_identifier(o).as_deref() == Some(id))
+            .and_then(|o| o.msisdn.clone())
+    }
+}
+
 impl LineResolution {
     pub fn from_result(vowifi: &[ProbedModem], result: &LineTableResult) -> Self {
         Self {

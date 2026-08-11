@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/033-slim-optional-swu-image/plan.md`.
+`specs/034-alert-identity/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

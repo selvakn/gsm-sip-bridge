@@ -82,6 +82,7 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
     ingest::init_alerts(
         AlertsConfig {
             default_webhook_url: Secret::new(String::new()),
+            instance_name: None,
             sms: enabled(None),
             module_lifecycle: CategoryAlertConfig {
                 enabled: false,
@@ -110,7 +111,8 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
             registration_loss_thresholds: RegistrationLossThresholds { unhealthy_sec: 0 },
             gm_connection_lost_thresholds: GmConnectionLostThresholds { unhealthy_sec: 0 },
         },
-        DiscordClient::new(Secret::new(String::new())).unwrap(),
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap(),
+        std::collections::HashMap::new(),
     );
 
     let module_id = "test-e2e-retry";

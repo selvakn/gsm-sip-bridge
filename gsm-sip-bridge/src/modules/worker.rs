@@ -70,6 +70,10 @@ pub(crate) struct ModuleWorker {
     module: DiscoveredModule,
     at: AtCommander,
     card: CardInstance,
+    /// specs/034-alert-identity: this card's phone number (read once at open
+    /// via `AT+CNUM`), shown in the module's critical alerts. `None` when the
+    /// SIM's EF_MSISDN is blank/unreadable ⇒ alerts render `unknown`.
+    phone_number: Option<String>,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
@@ -112,6 +116,14 @@ impl ModuleWorker {
             tracing::info!(module = %module.id, rssi = rssi, "signal quality");
         }
 
+        // specs/034-alert-identity: read the card's own number once for its
+        // alerts. `query_phone_number` returns the "Unknown" sentinel (not an
+        // error) when EF_MSISDN is blank — treat that and empty as "no number".
+        let phone_number = at
+            .query_phone_number()
+            .ok()
+            .filter(|n| !n.is_empty() && n != "Unknown");
+
         let card = CardInstance::new(
             module.id.clone(),
             module.serial_port.clone(),
@@ -129,6 +141,7 @@ impl ModuleWorker {
             module,
             at,
             card,
+            phone_number,
             store_tx: setup.store_tx,
             event_tx,
             cmd_rx,
@@ -182,6 +195,7 @@ impl ModuleWorker {
                     &self.store_tx,
                     &mut self.call_ctx,
                     "answered",
+                    self.phone_number.as_deref(),
                 );
                 self.card.state = CardState::Idle;
                 metrics::ACTIVE_CALLS
@@ -218,6 +232,7 @@ impl ModuleWorker {
                             category: alerts::AlertCategory::ModuleLifecycle,
                             unit_id: Some(self.module.id.clone()),
                             description: "AT command worker responsive again".to_string(),
+                            phone_number: self.phone_number.clone(),
                             at: Utc::now(),
                             kind: alerts::CriticalEventKind::Recovered,
                         }));
@@ -242,6 +257,7 @@ impl ModuleWorker {
                                 "AT command worker unresponsive for over {}s",
                                 self.at_worker_unresponsive_threshold.as_secs()
                             ),
+                            phone_number: self.phone_number.clone(),
                             at: Utc::now(),
                             kind: alerts::CriticalEventKind::Failure,
                         }));
@@ -291,6 +307,7 @@ impl ModuleWorker {
                     &self.store_tx,
                     &mut self.call_ctx,
                     "failed",
+                    self.phone_number.as_deref(),
                 );
                 false
             }
@@ -376,6 +393,7 @@ impl ModuleWorker {
                 &self.store_tx,
                 &mut self.call_ctx,
                 "answered",
+                self.phone_number.as_deref(),
             );
         } else if self.card.state == CardState::Ringing {
             record_call_end(
@@ -384,6 +402,7 @@ impl ModuleWorker {
                 &self.store_tx,
                 &mut self.call_ctx,
                 "missed",
+                self.phone_number.as_deref(),
             );
         }
         self.card.state = CardState::Idle;
@@ -558,12 +577,14 @@ fn record_call_start_outbound(
         .inc();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_call_end(
     module_id: &str,
     event_tx: &mpsc::UnboundedSender<BridgeEvent>,
     store_tx: &crossbeam_channel::Sender<StoreCommand>,
     call_ctx: &mut Option<CallContext>,
     status: &str,
+    phone_number: Option<&str>,
 ) {
     if let Some(ctx) = call_ctx.take() {
         let duration = Utc::now()
@@ -583,6 +604,7 @@ fn record_call_end(
                 category: alerts::AlertCategory::MissedCall,
                 unit_id: Some(module_id.to_string()),
                 description: format!("call from {} was never answered", ctx.caller_id),
+                phone_number: phone_number.map(str::to_string),
                 at: Utc::now(),
                 kind: alerts::CriticalEventKind::Failure,
             }));
@@ -791,7 +813,7 @@ mod tests {
             started_at: Utc::now(),
         });
 
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "missed");
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "missed", None);
 
         let event = event_rx.try_recv().expect("expected one dispatched event");
         let BridgeEvent::CriticalAlert(e) = event else {
@@ -817,7 +839,14 @@ mod tests {
             started_at: Utc::now(),
         });
 
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+        record_call_end(
+            "card0",
+            &event_tx,
+            &store_tx,
+            &mut call_ctx,
+            "answered",
+            None,
+        );
 
         assert!(event_rx.try_recv().is_err(), "no alert for answered calls");
     }
@@ -842,7 +871,14 @@ mod tests {
             "call_ctx must be populated once ATD is accepted"
         );
 
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+        record_call_end(
+            "card0",
+            &event_tx,
+            &store_tx,
+            &mut call_ctx,
+            "answered",
+            None,
+        );
         assert!(
             call_ctx.is_none(),
             "record_call_end must take the context, same as the inbound path"
@@ -873,7 +909,7 @@ mod tests {
         let mut call_ctx: Option<CallContext> = None;
 
         record_call_start_outbound("card0", "+15551234567", &mut call_ctx);
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "failed");
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "failed", None);
 
         assert!(
             call_ctx.is_none(),

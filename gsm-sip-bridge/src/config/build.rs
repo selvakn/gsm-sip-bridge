@@ -496,6 +496,7 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
         default_webhook_url: raw
             .discord_webhook_url
             .unwrap_or_else(|| sms.discord_webhook_url.clone()),
+        instance_name: raw.instance_name.filter(|s| !s.is_empty()),
         sms: sms_cat,
         module_lifecycle,
         registration_loss,
@@ -577,6 +578,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
             imsi_override: l.imsi_override,
             imei_override: l.imei_override,
             pcsc_reader: l.pcsc_reader,
+            msisdn: l.msisdn,
         });
     }
 

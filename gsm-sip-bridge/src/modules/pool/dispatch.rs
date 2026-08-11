@@ -361,6 +361,13 @@ impl CardPool {
                 body,
                 received_at,
             } => {
+                // specs/034-alert-identity: tag the forward with this card's
+                // own number (from its slot), so the Discord message shows
+                // which line received the SMS.
+                let phone_number = slots
+                    .values()
+                    .find(|s| s.module.id == module_id)
+                    .and_then(|s| s.alert_phone());
                 sms::record_and_forward(
                     &tokio::runtime::Handle::current(),
                     self.store.sender(),
@@ -371,6 +378,7 @@ impl CardPool {
                     received_at,
                     crate::store::Transport::Cs,
                     None,
+                    phone_number,
                 );
             }
             BridgeEvent::CriticalAlert(event) => {

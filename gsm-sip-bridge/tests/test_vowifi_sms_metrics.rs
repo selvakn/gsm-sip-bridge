@@ -74,6 +74,7 @@ async fn test_vowifi_sms_received_and_forwarded_metrics_and_history() {
         chrono::Utc::now().to_rfc3339(),
         Transport::Vowifi,
         Some(reporter.clone()),
+        None,
     );
 
     // Drain the store writer thread by re-opening a read connection after a

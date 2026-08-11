@@ -4,7 +4,7 @@ use gsm_sip_bridge::sms::discord::DiscordClient;
 #[tokio::test]
 async fn test_discord_client_creation() {
     let webhook = Secret::new("https://discord.com/api/webhooks/123/abc".into());
-    let client = DiscordClient::new(webhook);
+    let client = DiscordClient::new(webhook, "test-instance".to_string());
     assert!(client.is_ok());
 }
 

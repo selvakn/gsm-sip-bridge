@@ -17,6 +17,67 @@ use crate::config::secret::Secret;
 use crate::config::{AlertsConfig, CategoryAlertConfig};
 use chrono::{DateTime, Utc};
 
+/// The value shown in an alert's phone field when no number can be determined,
+/// and the ultimate hostname fallback (specs/034-alert-identity, FR-005).
+pub const UNKNOWN_IDENTITY: &str = "unknown";
+
+/// The host's system hostname, or [`UNKNOWN_IDENTITY`] if it can't be read.
+/// Reads the live kernel hostname from `/proc/sys/kernel/hostname` (Linux
+/// target) rather than calling `gethostname(2)`, keeping this crate
+/// zero-`unsafe` (tools/count-unsafe.sh, same rationale as
+/// `supervise::runner`). Falls back to `$HOSTNAME`, then the literal.
+pub fn system_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| UNKNOWN_IDENTITY.to_string())
+}
+
+/// The instance label shown in every alert footer (specs/034-alert-identity):
+/// the configured `[alerts].instance_name` when non-empty, else the system
+/// hostname.
+pub fn instance_label(config: &AlertsConfig) -> String {
+    match config.instance_name.as_deref() {
+        Some(name) if !name.trim().is_empty() => name.to_string(),
+        _ => system_hostname(),
+    }
+}
+
+/// Maps each line's `unit_id` — the `ec20-XXXXXX` card id its agent reports —
+/// to its configured phone number, for the daemon-detected alert categories
+/// (registration/tunnel/Gm loss) that hold only the `unit_id` and cannot reach
+/// the line's own process (specs/034-alert-identity, research R4). Built from
+/// the `[[volte.line]]`/`[[vowifi.line]]` overrides carrying both a
+/// `modem_serial` and an `msisdn`, since `derive_module_id(modem_serial)` is
+/// the exact transform that produced the reported card id. Lines pinned only
+/// by `modem_port` (no serial to hash) are absent and render `unknown`.
+pub fn line_phone_map(
+    config: &crate::config::AppConfig,
+) -> std::collections::HashMap<String, String> {
+    let volte = config
+        .volte
+        .line_overrides
+        .iter()
+        .filter_map(|l| Some((l.modem_serial.as_deref()?, l.msisdn.as_deref()?)));
+    let vowifi = config
+        .vowifi
+        .line_overrides
+        .iter()
+        .filter_map(|l| Some((l.modem_serial.as_deref()?, l.msisdn.as_deref()?)));
+    volte
+        .chain(vowifi)
+        .filter(|(serial, msisdn)| !serial.is_empty() && !msisdn.is_empty())
+        .map(|(serial, msisdn)| {
+            (
+                crate::modules::discovery::derive_module_id(serial),
+                msisdn.to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Which critical-event category an alert belongs to. A closed enum, not a
 /// free string, to keep Prometheus label cardinality bounded — the same
 /// convention `control::protocol::ObservedEvent` already uses.
@@ -84,6 +145,10 @@ pub struct CriticalEvent {
     /// Human-readable condition, e.g. "SIM unreadable after 5 recovery
     /// attempts" or "caller +91... never answered".
     pub description: String,
+    /// specs/034-alert-identity: the affected card/line's phone number, when
+    /// the origin can determine it. `None` renders as `unknown` in the alert
+    /// (FR-005) — never a fabricated value.
+    pub phone_number: Option<String>,
     pub at: DateTime<Utc>,
     pub kind: CriticalEventKind,
 }
@@ -343,5 +408,34 @@ mod tests {
         let default = Secret::new("https://default".to_string());
         let category = cfg(true, None);
         assert_eq!(precheck(&category, &default), None);
+    }
+
+    // --- specs/034-alert-identity ---
+
+    #[test]
+    fn instance_label_prefers_configured_name() {
+        let config = AlertsConfig {
+            instance_name: Some("bridge-01".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(instance_label(&config), "bridge-01");
+    }
+
+    #[test]
+    fn instance_label_falls_back_to_hostname_when_unset_or_blank() {
+        // Unset ⇒ the system hostname, which is always a non-empty string
+        // (`system_hostname` guarantees at least the `"unknown"` fallback).
+        assert!(!instance_label(&AlertsConfig::default()).is_empty());
+
+        let blank = AlertsConfig {
+            instance_name: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(instance_label(&blank), system_hostname());
+    }
+
+    #[test]
+    fn system_hostname_is_never_empty() {
+        assert!(!system_hostname().is_empty());
     }
 }

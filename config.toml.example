@@ -39,6 +39,12 @@ db_path = "/data/store.db"
 [alerts]
 # Shared default webhook for any category below with no override of its own.
 discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
+# Optional name identifying this deployment; shown in every alert footer
+# (SMS and critical events) as "gsm-sip-bridge · <instance_name>". Useful when
+# several bridges post to one channel. When unset, the host's system hostname
+# is used — set this explicitly under Docker, where the hostname is otherwise a
+# random container id.
+# instance_name = "bridge-01"
 
 [alerts.sms]
 enabled = true                  # default true; matches [sms].enabled above
@@ -265,6 +271,7 @@ max_lines = 8
 # mnc = "094"                      # this line's home network MNC (zero-padded to 3 digits)
 # imsi_override = "404940123456789" # override the IMSI from the SIM for this line
 # imei_override = "864650053414154" # override the IMEI from the modem for this line
+# msisdn = "+919000000001"         # this line's phone number, shown in its alerts
 #
 # Setting both imsi_override and imei_override (alongside mcc/mnc above)
 # pins this line's network identity completely, so vowifi-ims-agent never

@@ -92,9 +92,10 @@ impl CardPool {
         sip_bridge: SipBridge,
         sms_handler: SmsHandler,
     ) -> Self {
+        let instance = alerts::instance_label(&config.alerts);
         let discord_client = if sms_handler.has_webhook() {
             let url = config.sms.discord_webhook_url.clone();
-            match DiscordClient::new(url) {
+            match DiscordClient::new(url, instance.clone()) {
                 Ok(client) => Some(client),
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create Discord client");
@@ -105,7 +106,7 @@ impl CardPool {
             None
         };
 
-        let alerts_client = match DiscordClient::new(Secret::new(String::new())) {
+        let alerts_client = match DiscordClient::new(Secret::new(String::new()), instance) {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create critical-alerts Discord client");
@@ -454,6 +455,7 @@ impl CardPool {
                     &module.id,
                     format!("module failed to initialize after {retry_count} retries: {e}"),
                     alerts::CriticalEventKind::Failure,
+                    state.alert_phone(),
                 );
             }
         }
@@ -560,6 +562,7 @@ impl CardPool {
         module_id: &str,
         description: String,
         kind: alerts::CriticalEventKind,
+        phone_number: Option<String>,
     ) {
         let Some(client) = self.alerts_client.clone() else {
             return;
@@ -569,6 +572,7 @@ impl CardPool {
             category: alerts::AlertCategory::ModuleLifecycle,
             unit_id: Some(module_id.to_string()),
             description,
+            phone_number,
             at: Utc::now(),
             kind,
         };
@@ -668,6 +672,10 @@ impl CardPool {
             module_id,
             "module recovered after previously giving up".to_string(),
             alerts::CriticalEventKind::Recovered,
+            // The stale GivenUp slot is being cleared because the module is
+            // Ready again under a new slot; its number isn't in hand here, so
+            // this recovery notice renders `unknown` (the unit id identifies it).
+            None,
         );
     }
 
