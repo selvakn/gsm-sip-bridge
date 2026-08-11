@@ -10,6 +10,13 @@ env:
 
 jobs:
   build:
+    # specs/033: `tags: ["v*"]` above also matches a `v<version>-swu` tag, which
+    # is publish-swu.yml's territory (the on-demand full image). Skip this whole
+    # slim-image + release pipeline for any `-swu` tag so it never publishes a
+    # slim image to a `-swu` tag or cuts a spurious release (FR-008/SC-007). A
+    # skipped `build` cascades to `merge`/`release` via `needs`, but they carry
+    # the same guard so the intent is explicit at every stage.
+    if: ${{ !endsWith(github.ref_name, '-swu') }}
     # Two images, two platforms each:
     #   <repo>            — the bridge itself (docker/Dockerfile)
     #   <repo>-internet   — the optional cellular-internet sidecar
@@ -73,6 +80,7 @@ jobs:
           cache-to: type=gha,scope=build-${{ matrix.image }}-${{ steps.platform.outputs.slug }},mode=max
 
   merge:
+    if: ${{ !endsWith(github.ref_name, '-swu') }}
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -120,6 +128,7 @@ jobs:
   release:
     # Split out of `merge` so the release is created exactly once, not once per
     # image in the merge matrix.
+    if: ${{ !endsWith(github.ref_name, '-swu') }}
     runs-on: ubuntu-latest
     needs: merge
     permissions:
@@ -174,11 +183,21 @@ jobs:
             ${{ steps.release_notes.outputs.NOTES }}
             ## Docker Images
 
-            The bridge:
+            The bridge (slim image — strongSwan VoWiFi engine, the default):
 
             ```
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
             ```
+
+            > The `:${{ steps.ver.outputs.tag }}` and `:latest` tags are the
+            > **slim** image and no longer contain the legacy SWu/Python tunnel
+            > engine. If you set `[vowifi].tunnel_engine = "swu"`, pull the
+            > on-demand full image instead — same name, `-swu` tag suffix,
+            > published via the "Publish SWu (full) Docker Image" workflow:
+            >
+            > ```
+            > docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}-swu
+            > ```
 
             Optional cellular-internet sidecar — only for deployments whose
             internet comes from the same cellular card that carries calls

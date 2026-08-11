@@ -10,10 +10,13 @@
 #      survives reconnects, live-verified against Airtel India; "swu" is
 #      the original SWu-IKEv2 Python dialer, kept as an explicit fallback
 #      (the 24h soak and the Vi-carrier EAP-AKA check are still outstanding
-#      — see specs/012-strongswan-epdg/tasks.md). Switching is a container
-#      restart, not a rebuild — both engines ship in this one image. .env
-#      holds secrets only (see .env.example) — all other configuration,
-#      VoWiFi included, lives in config.toml.
+#      — see specs/012-strongswan-epdg/tasks.md). Switching to "swu" needs the
+#      full image: build it here with `INCLUDE_SWU=true docker compose build`
+#      (the build arg wired into the service below), or pull the `-swu` tag. The
+#      default slim image built below ships strongswan only and fails fast if
+#      configured for "swu" (specs/033). .env holds secrets only (see
+#      .env.example) — all other configuration, VoWiFi included, lives in
+#      config.toml.
 #
 #   3. the host-side LTE IMS bridge (specs/015/017/018-volte-*), started when
 #      [volte].enabled + bridge_inbound = true. Every SIM-ready modem
@@ -39,6 +42,11 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       network: host
+      # specs/033: slim by default; set INCLUDE_SWU=true in the environment to
+      # build the full image (with the SWu/Python engine) via compose. This is
+      # what makes the "--build-arg INCLUDE_SWU=true" note above reachable here.
+      args:
+        INCLUDE_SWU: ${INCLUDE_SWU:-false}
     network_mode: host
     restart: unless-stopped
     privileged: true

@@ -1,0 +1,163 @@
+name: Publish SWu (full) Docker Image
+
+# specs/033-slim-optional-swu-image: the full image bundles the SWu/Python
+# tunnel engine (~72 MB of Python interpreter + deps + dialer). It is NOT built
+# on every release — the regular publish.yml ships only the slim image. This
+# workflow builds it on demand and publishes it under the SAME image name with
+# a `-swu` tag suffix (e.g. ghcr.io/<repo>:8.10.0-swu), so a deployment that
+# still needs the `swu` engine can pull it explicitly. Trigger it manually
+# (Actions → this workflow → Run workflow) with the version to tag, or by
+# pushing a `v*-swu` git tag.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to build the -swu image for (e.g. 8.10.0). A v<version> release tag must already exist; the image is built from that tagged commit."
+        required: true
+        type: string
+  push:
+    tags: ["v*-swu"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Resolve the version, then bind the whole publish to the corresponding slim
+  # release COMMIT — not just a matching version number. The `-swu` image is
+  # always built from `refs/tags/v<version>`, so `:<version>-swu` is provably
+  # the same source as the `:<version>` slim release. Provenance guard: this
+  # repo keeps Cargo.toml at the released version until the next bump, so a
+  # number match on a branch HEAD (or on an arbitrary `v*-swu` tag) does NOT
+  # imply the code is the released code — only the release tag does.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release_ref: ${{ steps.v.outputs.release_ref }}
+    steps:
+      # Full history + tags so the release tag can be verified and its Cargo.toml
+      # read (a shallow checkout of the triggering ref would not have them).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and bind to the release tag
+        id: v
+        env:
+          # Route the dispatch input through env rather than interpolating it
+          # into the shell body (actionlint/zizmor: untrusted-ish input).
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            REQ="$INPUT_VERSION"
+          else
+            REQ="${REF_NAME#v}"; REQ="${REQ%-swu}"
+          fi
+          if [ -z "$REQ" ]; then
+            echo "::error::no version provided"; exit 1
+          fi
+          RELEASE_TAG="v${REQ}"
+          # The corresponding slim release tag MUST exist. The -swu image is
+          # built from its commit — never from a branch HEAD or the -swu tag's
+          # own commit — so it can never diverge from the slim release.
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null; then
+            echo "::error::release tag ${RELEASE_TAG} does not exist. Cut and publish the slim release first, then re-run."
+            exit 1
+          fi
+          # Defence in depth: the version at that tagged commit must match, so a
+          # mis-cut release tag can't publish under the wrong -swu tag.
+          TAG_VERSION=$(git show "refs/tags/${RELEASE_TAG}:Cargo.toml" | grep -m1 '^version = ' | cut -d'"' -f2)
+          if [ "$TAG_VERSION" != "$REQ" ]; then
+            echo "::error::Cargo.toml at ${RELEASE_TAG} is '${TAG_VERSION}', expected '${REQ}'."
+            exit 1
+          fi
+          echo "version=$REQ" >> "$GITHUB_OUTPUT"
+          echo "release_ref=refs/tags/${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # Build from the release tag's commit, not the triggering ref — this is
+      # what guarantees :<version>-swu matches the :<version> slim release.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.release_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Platform pair slug
+        id: platform
+        run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push single-platform full image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            INCLUDE_SWU=true
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-swu-${{ steps.platform.outputs.slug }}
+          # org.opencontainers.* labels, matching publish.yml's slim build.
+          labels: ${{ steps.meta.outputs.labels }}
+          # Distinct cache scope from the slim build (publish.yml uses
+          # build-bridge-*) so the two never clobber each other.
+          cache-from: type=gha,scope=build-swu-${{ steps.platform.outputs.slug }}
+          cache-to: type=gha,scope=build-swu-${{ steps.platform.outputs.slug }},mode=max
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch `-swu` manifest
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-swu"
+          SOURCE_AMD64="${TAG}-linux-amd64"
+          SOURCE_ARM64="${TAG}-linux-arm64"
+          docker buildx imagetools create -t "$TAG" "$SOURCE_AMD64" "$SOURCE_ARM64"

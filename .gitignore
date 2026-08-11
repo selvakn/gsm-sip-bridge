@@ -41,3 +41,5 @@ mutants-out/
 # the repository deliberately: they must never be committed, and must never be
 # used as test audio — see specs/016-volte-calls/research.md R3.
 samples/
+
+/config-bak/

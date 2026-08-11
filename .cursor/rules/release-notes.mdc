@@ -6,17 +6,26 @@ globs:
 
 # Release Notes Process
 
-`RELEASE_NOTES.md` is a cumulative changelog that carries historical release notes for all versions (newest first). Before creating a new git tag, a new section MUST be added at the top of the file.
+`RELEASE_NOTES.md` is a cumulative changelog that carries historical release notes for all versions (newest first).
+
+Notes are written **as work lands**, not at tag time: every user-facing change adds its bullets to an `## Unreleased` section at the top of the file. At release time — when the version number is bumped — that heading is renamed to the real `## vX.Y.Z`.
 
 ## Format
 
 ```markdown
 # Release Notes
 
-## vX.Y.Z
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
 
 - **Feature Name** -- One-sentence description of the feature and its user-facing value.
 - **Another Feature** -- Description.
+
+## vX.Y.Z (last release)
+
+- ...
 
 ## vX.Y.W (previous release)
 
@@ -25,16 +34,28 @@ globs:
 
 ## Rules
 
-1. Add a new `## vX.Y.Z` section at the top (below the `# Release Notes` heading) before tagging.
-2. Each bullet must start with a bold feature name followed by a concise description.
-3. Focus on user-facing changes: new capabilities, changed behavior, removed functionality.
-4. Do NOT list internal refactors, CI changes, or dependency bumps unless they affect users.
-5. For patch releases (x.y.Z), list bug fixes instead of features.
-6. NEVER remove or edit older version sections -- the file is the historical record.
-7. The publish workflow extracts the section matching the tagged version and includes it on the GitHub Release page.
+1. Add bullets for user-facing changes under `## Unreleased` at the top of the file (below the `# Release Notes` heading), as the work merges. If no `## Unreleased` section exists, create one — together with the HTML comment reminder shown above.
+2. There is at most ONE `## Unreleased` section, and it is always the topmost section. Never create a second one; append to the existing one.
+3. Never write a `## vX.Y.Z` heading ahead of the actual release — the version number is not known until the bump, and a premature heading makes the publish workflow attach notes to the wrong tag.
+4. Each bullet must start with a bold feature name followed by a concise description.
+5. Focus on user-facing changes: new capabilities, changed behavior, removed functionality.
+6. Do NOT list internal refactors, CI changes, or dependency bumps unless they affect users.
+7. For patch releases (x.y.Z), list bug fixes instead of features.
+8. NEVER remove or edit older version sections -- the file is the historical record.
+9. The publish workflow extracts the section matching the tagged version and includes it on the GitHub Release page. Its matcher is exact (`^## v${TAG}$`) and stops at the next `^## v` heading, so an `## Unreleased` heading yields empty release notes.
 
 ## Workflow
 
-1. As features merge to main, add bullets under a new `## vX.Y.Z` heading at the top.
-2. Review and finalize the section before running `git tag vX.Y.Z`.
-3. Push the tag -- CI extracts the matching section and publishes the release with those notes.
+### As features merge to main
+
+1. Add bullets under the `## Unreleased` heading at the top of the file (creating the section if it isn't there).
+2. Keep bullets in the section ordered most-significant first; a later change may be inserted above earlier ones.
+
+### At release time (version bump)
+
+1. Decide the version from the accumulated `## Unreleased` bullets (features -> minor, fixes only -> patch, breaking -> major).
+2. Bump the version in `Cargo.toml` and refresh `Cargo.lock`.
+3. Rename `## Unreleased` to `## vX.Y.Z` — matching the bumped `Cargo.toml` version exactly — and delete the HTML comment reminder that sat above it.
+4. Review and finalize the section's wording, then commit as `chore(release): X.Y.Z` (version bump + renamed section together).
+5. Run `git tag vX.Y.Z` and push the tag -- CI extracts the matching section and publishes the release with those notes.
+6. The next user-facing change starts a fresh `## Unreleased` section (with the comment) at the top.
