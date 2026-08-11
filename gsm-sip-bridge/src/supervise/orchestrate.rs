@@ -460,6 +460,19 @@ fn still_missing_from_resolution(
         .collect()
 }
 
+/// specs/034-alert-identity: the configured phone number for a VoWiFi line
+/// identified by `id` (its `modem_port`/`modem_serial` override identifier) —
+/// for a line-discovery alert fired before the line ever resolved into a
+/// `LineResolutionEntry`. `None` when no override carries an msisdn.
+fn configured_line_msisdn(config: &crate::config::AppConfig, id: &str) -> Option<String> {
+    config
+        .vowifi
+        .line_overrides
+        .iter()
+        .find(|o| crate::vowifi::discovery::override_identifier(o).as_deref() == Some(id))
+        .and_then(|o| o.msisdn.clone())
+}
+
 /// Pure decision core of one retry tick, kept separate from
 /// `spawn_discover_retry`'s threading/file-IO so it's testable without real
 /// sleeping: given which of `pending`'s identifiers are still missing after
@@ -567,6 +580,7 @@ fn spawn_discover_retry(
                         description: format!(
                             "configured VoWiFi line {id} was not found after {DISCOVER_RETRY_WINDOW:?} of retrying discovery"
                         ),
+                        phone_number: configured_line_msisdn(&config, id),
                         at: chrono::Utc::now(),
                         kind: alerts::CriticalEventKind::Failure,
                     });
@@ -603,6 +617,7 @@ fn spawn_discover_retry(
                                 description: format!(
                                     "configured VoWiFi line {id} was found and started after previously being reported as not found"
                                 ),
+                                phone_number: configured_line_msisdn(&config, id),
                                 at: chrono::Utc::now(),
                                 kind: alerts::CriticalEventKind::Recovered,
                             });
@@ -644,7 +659,10 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // process does — every `AlertContext::fire` spawns onto its `Handle`.
     let _alerts_runtime = tokio::runtime::Runtime::new();
     let alert_ctx = match &_alerts_runtime {
-        Ok(rt) => match DiscordClient::new(Secret::new(String::new())) {
+        Ok(rt) => match DiscordClient::new(
+            Secret::new(String::new()),
+            alerts::instance_label(&config.alerts),
+        ) {
             Ok(client) => Some(AlertContext::new(
                 client,
                 config.alerts.clone(),
@@ -1462,6 +1480,10 @@ fn start_line_tail(
         let shutting_down = Arc::clone(shutting_down);
         let alert_ctx = alert_ctx.cloned();
         let line_id = line.card_id.clone();
+        // specs/034-alert-identity: resolve this line's number before the
+        // 'static thread closure, so it captures the owned `Option` rather than
+        // borrowing `line` (which does not outlive the spawn).
+        let line_msisdn = line.configured_msisdn();
         std::thread::spawn(move || {
             let mut csim_fails = sim_recovery::IncidentCounters::default();
             // specs/022-discord-critical-alerts FR-004 (research.md R2):
@@ -1582,6 +1604,7 @@ fn start_line_tail(
                             category: alerts::AlertCategory::ModuleLifecycle,
                             unit_id: Some(line_id.clone()),
                             description: description.to_string(),
+                            phone_number: line_msisdn.clone(),
                             at: chrono::Utc::now(),
                             kind,
                         });
@@ -2095,6 +2118,7 @@ mod tests {
             mnc: "043".to_string(),
             pcsc_reader: true,
             configured_identifier: None,
+            msisdn: None,
             config,
         }
     }
@@ -2116,6 +2140,7 @@ mod tests {
             mnc: "094".to_string(),
             pcsc_reader: false,
             configured_identifier: None,
+            msisdn: None,
             config: VowifiConfig::default(),
         }
     }

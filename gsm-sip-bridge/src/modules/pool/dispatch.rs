@@ -360,7 +360,13 @@ impl CardPool {
                 sender,
                 body,
                 received_at,
+                phone_number,
             } => {
+                // specs/034-alert-identity: the number is carried on the event
+                // by the emitting worker (its own card's `AT+CNUM`), so the
+                // forward names the SIM that actually received the message —
+                // never a different SIM that a concurrent slot swap under the
+                // same `module_id` might have left in the slot map.
                 sms::record_and_forward(
                     &tokio::runtime::Handle::current(),
                     self.store.sender(),
@@ -371,6 +377,7 @@ impl CardPool {
                     received_at,
                     crate::store::Transport::Cs,
                     None,
+                    phone_number,
                 );
             }
             BridgeEvent::CriticalAlert(event) => {

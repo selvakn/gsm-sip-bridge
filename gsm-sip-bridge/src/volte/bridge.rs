@@ -209,6 +209,9 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
             veth_peer_addr: non_empty_or_loopback(&l.veth_telephony_addr),
             control_port: l.control_port,
             sip_leg_port: l.sip_leg_port,
+            // specs/034-alert-identity: the VoLTE line's configured MSISDN,
+            // shown when forwarding this line's SMS to Discord.
+            msisdn: l.msisdn.clone().filter(|m| !m.is_empty()),
         })
         .collect();
 

@@ -15,6 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn enabled_alerts_config(default_webhook: &str) -> AlertsConfig {
     AlertsConfig {
         default_webhook_url: Secret::new(default_webhook.to_string()),
+        instance_name: Some("test-instance".to_string()),
         sms: CategoryAlertConfig {
             enabled: true,
             webhook_url_override: None,
@@ -55,9 +56,109 @@ fn module_lifecycle_event() -> CriticalEvent {
         category: AlertCategory::ModuleLifecycle,
         unit_id: Some("card0".to_string()),
         description: "SIM unreadable after 5 recovery attempts".to_string(),
+        phone_number: None,
         at: Utc::now(),
         kind: CriticalEventKind::Failure,
     }
+}
+
+/// The parsed JSON body of the single request the mock server received.
+async fn captured_embed(server: &MockServer) -> serde_json::Value {
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "exactly one POST expected");
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    body["embeds"][0].clone()
+}
+
+fn field_value<'a>(embed: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    embed["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == name)
+        .and_then(|f| f["value"].as_str())
+}
+
+/// specs/034-alert-identity (US1+US2): a critical-event embed carries the
+/// instance name in its footer and a `Phone` field with the resolved number.
+#[tokio::test]
+async fn send_alert_embed_includes_instance_footer_and_phone_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let client = DiscordClient::new(Secret::new(String::new()), "bridge-01".to_string()).unwrap();
+    let webhook = format!("{}/webhook", server.uri());
+
+    let event = CriticalEvent {
+        category: AlertCategory::ModuleLifecycle,
+        unit_id: Some("ec20-A1B2C3".to_string()),
+        description: "SIM unreadable".to_string(),
+        phone_number: Some("+919000000001".to_string()),
+        at: Utc::now(),
+        kind: CriticalEventKind::Failure,
+    };
+    client.send_alert(&webhook, &event).await.unwrap();
+
+    let embed = captured_embed(&server).await;
+    assert_eq!(embed["footer"]["text"], "gsm-sip-bridge · bridge-01");
+    assert_eq!(field_value(&embed, "Phone"), Some("+919000000001"));
+}
+
+/// specs/034-alert-identity (FR-005): an unresolved number renders the literal
+/// `unknown`, and the alert still posts.
+#[tokio::test]
+async fn send_alert_embed_shows_unknown_when_no_phone() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let client = DiscordClient::new(Secret::new(String::new()), "bridge-01".to_string()).unwrap();
+    let webhook = format!("{}/webhook", server.uri());
+
+    client
+        .send_alert(&webhook, &module_lifecycle_event())
+        .await
+        .unwrap();
+
+    let embed = captured_embed(&server).await;
+    assert_eq!(field_value(&embed, "Phone"), Some("unknown"));
+}
+
+/// specs/034-alert-identity (US1+US2): an SMS-forward embed likewise carries the
+/// instance footer and a `Phone` field with the receiving card's number.
+#[tokio::test]
+async fn forward_sms_embed_includes_instance_footer_and_phone_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let client = DiscordClient::new(
+        Secret::new(format!("{}/webhook", server.uri())),
+        "bridge-01".to_string(),
+    )
+    .unwrap();
+
+    client
+        .forward_sms(
+            "ec20-A1B2C3",
+            "+919000000000",
+            "hi",
+            "2026-08-11T00:00:00Z",
+            Some("+919000000001"),
+        )
+        .await
+        .unwrap();
+
+    let embed = captured_embed(&server).await;
+    assert_eq!(embed["footer"]["text"], "gsm-sip-bridge · bridge-01");
+    assert_eq!(field_value(&embed, "Phone"), Some("+919000000001"));
 }
 
 /// T012 (US1): dispatching a `ModuleLifecycle` event posts an embed
@@ -72,7 +173,8 @@ async fn dispatch_posts_module_lifecycle_alert_with_module_id_and_description() 
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
 
     dispatch(&client, &config, module_lifecycle_event()).await;
@@ -92,7 +194,8 @@ async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
 
     dispatch(
@@ -102,6 +205,7 @@ async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
             category: AlertCategory::TunnelFailure,
             unit_id: Some("line0".to_string()),
             description: "tunnel non-established for 300s".to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },
@@ -114,6 +218,7 @@ async fn dispatch_posts_tunnel_and_registration_alerts_independently() {
             category: AlertCategory::RegistrationLoss,
             unit_id: Some("line0".to_string()),
             description: "unregistered for 300s".to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },
@@ -140,7 +245,8 @@ async fn dispatch_posts_line_discovery_failed_and_its_recovery_pair() {
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
     let identifier = "/dev/ttyUSB3-recovery-pair-test";
 
@@ -153,6 +259,7 @@ async fn dispatch_posts_line_discovery_failed_and_its_recovery_pair() {
             description:
                 "configured VoWiFi line /dev/ttyUSB3 was not found after 3m of retrying discovery"
                     .to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },
@@ -173,6 +280,7 @@ async fn dispatch_posts_line_discovery_failed_and_its_recovery_pair() {
             category: AlertCategory::LineDiscoveryFailed,
             unit_id: Some(identifier.to_string()),
             description: "configured VoWiFi line /dev/ttyUSB3 was found and started after previously being reported as not found".to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Recovered,
         },
@@ -201,7 +309,8 @@ async fn dispatch_skips_disabled_line_discovery_failed_without_any_http_call() {
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let mut config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
     config.line_discovery_failed.enabled = false;
 
@@ -212,6 +321,7 @@ async fn dispatch_skips_disabled_line_discovery_failed_without_any_http_call() {
             category: AlertCategory::LineDiscoveryFailed,
             unit_id: Some("/dev/ttyUSB3".to_string()),
             description: "configured VoWiFi line /dev/ttyUSB3 was not found".to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },
@@ -233,7 +343,8 @@ async fn dispatch_posts_missed_call_alert() {
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
 
     dispatch(
@@ -243,6 +354,7 @@ async fn dispatch_posts_missed_call_alert() {
             category: AlertCategory::MissedCall,
             unit_id: Some("card0".to_string()),
             description: "call from +911234567890 was never answered".to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },
@@ -263,7 +375,8 @@ async fn dispatch_skips_disabled_category_without_any_http_call() {
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let mut config = enabled_alerts_config(&format!("{}/webhook", server.uri()));
     config.missed_call.enabled = false;
 
@@ -274,6 +387,7 @@ async fn dispatch_skips_disabled_category_without_any_http_call() {
             category: AlertCategory::MissedCall,
             unit_id: Some("card0".to_string()),
             description: "call from +911234567890 was never answered".to_string(),
+            phone_number: None,
             at: Utc::now(),
             kind: CriticalEventKind::Failure,
         },
@@ -302,7 +416,8 @@ async fn dispatch_uses_category_webhook_override_not_shared_default() {
         .mount(&override_server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let mut config = enabled_alerts_config(&format!("{}/default", default_server.uri()));
     config.module_lifecycle.webhook_url_override =
         Some(Secret::new(format!("{}/override", override_server.uri())));
@@ -324,7 +439,8 @@ async fn dispatch_skips_when_no_webhook_resolves_at_all() {
         .mount(&server)
         .await;
 
-    let client = DiscordClient::new(Secret::new(String::new())).unwrap();
+    let client =
+        DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap();
     let config = enabled_alerts_config("");
 
     dispatch(&client, &config, module_lifecycle_event()).await;

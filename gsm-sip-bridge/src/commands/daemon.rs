@@ -151,8 +151,15 @@ pub fn run(cli: &Cli) -> ExitCode {
         // arrival rather than an external Prometheus scrape — this must be
         // wired up before start_control_server below starts accepting the
         // reports that trigger it.
-        match DiscordClient::new(Secret::new(String::new())) {
-            Ok(client) => metrics::ingest::init_alerts(config.alerts.clone(), client),
+        match DiscordClient::new(
+            Secret::new(String::new()),
+            crate::alerts::instance_label(&config.alerts),
+        ) {
+            Ok(client) => metrics::ingest::init_alerts(
+                config.alerts.clone(),
+                client,
+                crate::alerts::line_phone_map(&config),
+            ),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create critical-alerts Discord client")
             }

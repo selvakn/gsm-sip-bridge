@@ -189,6 +189,13 @@ pub struct ResolvedLine {
     /// modem resolving would have been read as the *other* one recovering.
     /// Both were P1 review findings on specs/027-discover-retry-health.
     pub configured_identifier: Option<String>,
+    /// specs/034-alert-identity: this line's configured phone number, recorded
+    /// here at the one point the override→line match is actually known (the
+    /// same rationale as `configured_identifier`). It must NOT be reconstructed
+    /// later from `config.line_overrides`: `resolve_one_line`/
+    /// `resolve_one_pcsc_line` blank that list on the per-line derived config,
+    /// so any after-the-fact lookup would always return `None`.
+    pub msisdn: Option<String>,
     pub config: VowifiConfig,
 }
 
@@ -437,6 +444,9 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
         // authoritative answer to "which configured line is this" — see the
         // field's doc comment.
         configured_identifier: over.and_then(override_identifier),
+        // Recorded from the matched override now, before `line_overrides` is
+        // blanked on `config` above (specs/034-alert-identity).
+        msisdn: over.and_then(|o| o.msisdn.clone()),
         config,
     }
 }
@@ -536,6 +546,10 @@ fn resolve_one_pcsc_line(
         // excludes pcsc overrides entirely (`unmatched_overrides`), since
         // nothing in the USB scan can confirm or deny a reader's presence.
         configured_identifier: override_identifier(over),
+        // specs/034-alert-identity: taken straight from the reader override —
+        // a PC/SC line is never reachable via `override_identifier`, so this
+        // is the only path that gives it a phone number.
+        msisdn: over.msisdn.clone(),
         config,
     }
 }
@@ -709,6 +723,11 @@ pub struct LineResolutionEntry {
     /// keeps waiting rather than falsely reporting recovery.
     #[serde(default)]
     pub configured_identifier: Option<String>,
+    /// specs/034-alert-identity: this line's configured phone number, carried
+    /// across the discover→agent handoff. `#[serde(default)]` so a resolution
+    /// file written by an older build still deserializes (reads back `None`).
+    #[serde(default)]
+    pub msisdn: Option<String>,
     pub config: VowifiConfig,
 }
 
@@ -730,8 +749,19 @@ impl From<&ResolvedLine> for LineResolutionEntry {
             mnc: line.mnc.clone(),
             pcsc_reader: line.pcsc_reader,
             configured_identifier: line.configured_identifier.clone(),
+            msisdn: line.msisdn.clone(),
             config: line.config.clone(),
         }
+    }
+}
+
+impl LineResolutionEntry {
+    /// specs/034-alert-identity: this line's configured phone number, recorded
+    /// at discovery time from the `[[vowifi.line]]` override that pinned it
+    /// (including PC/SC reader lines). `None` for an auto-discovered line with
+    /// no override — renders `unknown` in alerts.
+    pub fn configured_msisdn(&self) -> Option<String> {
+        self.msisdn.clone()
     }
 }
 
@@ -875,6 +905,7 @@ mod tests {
             imsi_override: None,
             pcsc_reader: false,
             configured_identifier: None,
+            msisdn: None,
             config: VowifiConfig::default(),
         }
     }
@@ -1198,6 +1229,43 @@ mod tests {
             result.lines[0].configured_identifier.as_deref(),
             Some(result.lines[0].card_id.as_str()),
             "fixture sanity: card_id is a lossy derivation and must not be what is recorded"
+        );
+    }
+
+    /// specs/034-alert-identity (review round 1, blocker): a configured line's
+    /// `msisdn` must survive into the resolved line and the resolution entry.
+    /// `resolve_one_line` blanks `config.line_overrides` on the per-line derived
+    /// config, so the number has to be recorded as a first-class field at the
+    /// point of match — reconstructing it afterward from `line_overrides` always
+    /// returns `None`, which had made every VoWiFi SMS render `Phone: unknown`.
+    #[test]
+    fn a_configured_lines_msisdn_reaches_the_resolution_entry() {
+        let base = VowifiConfig {
+            line_overrides: vec![VowifiLineOverride {
+                modem_port: Some("/dev/ttyUSB3".to_string()),
+                msisdn: Some("+919000000001".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let modems = vec![ready_modem(
+            "ec20-ABCDEF",
+            "/dev/ttyUSB3",
+            false,
+            "404011111111111",
+        )];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].msisdn.as_deref(), Some("+919000000001"));
+
+        // Survives the discover→agent handoff struct — where the blanked
+        // `line_overrides` would otherwise have made a later lookup fail.
+        let entry = LineResolutionEntry::from(&result.lines[0]);
+        assert_eq!(entry.configured_msisdn().as_deref(), Some("+919000000001"));
+        assert!(
+            entry.config.line_overrides.is_empty(),
+            "guards the blocker: the per-line config carries no overrides to reconstruct from"
         );
     }
 

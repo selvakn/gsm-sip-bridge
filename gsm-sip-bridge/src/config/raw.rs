@@ -338,6 +338,8 @@ section! {
     #[derive(Default)]
     pub struct RawAlerts {
         pub discord_webhook_url: Option<Secret<String>>,
+        /// specs/034-alert-identity: `[alerts].instance_name`.
+        pub instance_name: Option<String>,
         pub sms: Option<RawAlertCategory>,
         pub module_lifecycle: Option<RawModuleLifecycle>,
         pub registration_loss: Option<RawUnhealthyCategory>,
@@ -421,6 +423,8 @@ section! {
         pub imsi_override: Option<String>,
         pub imei_override: Option<String>,
         pub pcsc_reader: bool,
+        /// specs/034-alert-identity: `[[vowifi.line]].msisdn`.
+        pub msisdn: Option<String>,
     }
 }
 

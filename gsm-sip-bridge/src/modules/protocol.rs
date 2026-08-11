@@ -29,6 +29,13 @@ pub(crate) enum BridgeEvent {
         sender: String,
         body: String,
         received_at: String,
+        /// specs/034-alert-identity: the receiving card's own number, captured
+        /// by the emitting worker (`AT+CNUM` at its slot's init). Carried on the
+        /// event rather than looked up from the slot map at dispatch time, so a
+        /// concurrent SIM swap / slot recovery under the same `module_id` can
+        /// never attribute this message to a different SIM. `None` when the
+        /// SIM's EF_MSISDN is blank.
+        phone_number: Option<String>,
     },
     NetworkLost {
         module_id: String,

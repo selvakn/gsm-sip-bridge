@@ -26,7 +26,9 @@ use crate::modules::at_commander::{AtCommander, AtResponse, NetworkMode, Network
 use crate::modules::discovery::{self, DiscoveredModule};
 use crate::modules::protocol::{BridgeEvent, ControlCmdReceiver, ModuleCmd};
 use crate::modules::scheduler::{self, CycleState};
-use crate::modules::slot::{backoff_delay, find_given_up_slot, LifecycleState, SlotState};
+use crate::modules::slot::{
+    backoff_delay, find_given_up_slot, usable_phone, LifecycleState, SlotState,
+};
 use crate::modules::worker::{self, ModuleAudioInit, WorkerSetup};
 use crate::sip::SipBridge;
 use crate::sms::discord::DiscordClient;
@@ -92,9 +94,10 @@ impl CardPool {
         sip_bridge: SipBridge,
         sms_handler: SmsHandler,
     ) -> Self {
+        let instance = alerts::instance_label(&config.alerts);
         let discord_client = if sms_handler.has_webhook() {
             let url = config.sms.discord_webhook_url.clone();
-            match DiscordClient::new(url) {
+            match DiscordClient::new(url, instance.clone()) {
                 Ok(client) => Some(client),
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create Discord client");
@@ -105,7 +108,7 @@ impl CardPool {
             None
         };
 
-        let alerts_client = match DiscordClient::new(Secret::new(String::new())) {
+        let alerts_client = match DiscordClient::new(Secret::new(String::new()), instance) {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create critical-alerts Discord client");
@@ -310,7 +313,8 @@ impl CardPool {
                         .with_label_values(&[&module.id, "success", ""])
                         .inc();
 
-                    let cmd_tx = self.spawn_worker(tasks, &module, slot, event_tx);
+                    let cmd_tx =
+                        self.spawn_worker(tasks, &module, slot, event_tx, usable_phone(&phone));
                     slots.insert(
                         slot,
                         SlotState {
@@ -400,7 +404,9 @@ impl CardPool {
                     .with_label_values(&[&module.id, "success", ""])
                     .inc();
 
-                let cmd_tx = self.spawn_worker(tasks, &module, new_slot, event_tx);
+                let worker_phone = usable_phone(&phone);
+                let cmd_tx =
+                    self.spawn_worker(tasks, &module, new_slot, event_tx, worker_phone.clone());
 
                 if let Some(state) = slots.get_mut(&slot) {
                     state.imei = imei;
@@ -423,7 +429,7 @@ impl CardPool {
                 // created a fresh `Initializing` slot for a module that
                 // already had a `GivenUp` slot from an earlier incident, and
                 // it's that fresh slot recovering here.
-                self.clear_stale_given_up(slots, &module.id);
+                self.clear_stale_given_up(slots, &module.id, worker_phone);
             }
             Err(e) => {
                 tracing::debug!(module = %module.id, error = %e, "retry failed");
@@ -454,6 +460,7 @@ impl CardPool {
                     &module.id,
                     format!("module failed to initialize after {retry_count} retries: {e}"),
                     alerts::CriticalEventKind::Failure,
+                    state.alert_phone(),
                 );
             }
         }
@@ -513,7 +520,7 @@ impl CardPool {
     /// The per-worker slice of config, rebuilt per spawn. Cheap (two channel
     /// clones and four scalars) and keeps the three spawn sites from each
     /// re-deriving the same argument list.
-    fn worker_setup(&self) -> WorkerSetup {
+    fn worker_setup(&self, phone_number: Option<String>) -> WorkerSetup {
         WorkerSetup {
             store_tx: self.store.sender(),
             ring_capacity: self.config.audio.settings.ring_capacity,
@@ -527,21 +534,25 @@ impl CardPool {
                     .module_lifecycle_thresholds
                     .at_worker_unresponsive_sec,
             ),
+            phone_number,
         }
     }
 
     /// Spawns the blocking worker thread for `module` and returns the command
     /// channel the pool talks to it through. Tracked in `tasks` (not detached)
     /// so `run`'s `join_next` arm sees the exit and reschedules the slot.
+    /// `phone_number` is the number `try_init_module` already read for this
+    /// card (specs/034-alert-identity), passed to the worker for its alerts.
     fn spawn_worker(
         &self,
         tasks: &mut JoinSet<(u32, String)>,
         module: &DiscoveredModule,
         slot: u32,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
+        phone_number: Option<String>,
     ) -> crossbeam_channel::Sender<ModuleCmd> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ModuleCmd>();
-        let setup = self.worker_setup();
+        let setup = self.worker_setup(phone_number);
         let module = module.clone();
         let event_tx = event_tx.clone();
         tasks.spawn_blocking(move || {
@@ -560,6 +571,7 @@ impl CardPool {
         module_id: &str,
         description: String,
         kind: alerts::CriticalEventKind,
+        phone_number: Option<String>,
     ) {
         let Some(client) = self.alerts_client.clone() else {
             return;
@@ -569,6 +581,7 @@ impl CardPool {
             category: alerts::AlertCategory::ModuleLifecycle,
             unit_id: Some(module_id.to_string()),
             description,
+            phone_number,
             at: Utc::now(),
             kind,
         };
@@ -659,7 +672,17 @@ impl CardPool {
     /// `ModuleLifecycle` `Recovered` event — otherwise that slot (and its
     /// `CRITICAL_EVENT_ACTIVE` gauge) would sit there forever, alongside the
     /// new healthy one, with no recovery notification ever sent.
-    fn clear_stale_given_up(&self, slots: &mut HashMap<u32, SlotState>, module_id: &str) {
+    /// `phone_number` is the recovering card's number (specs/034-alert-identity),
+    /// passed explicitly rather than read back from `slots`: one call site fires
+    /// this before the fresh Ready slot is inserted, so a slot lookup would miss
+    /// it. Passing it in makes the recovery notice name the same card its
+    /// failure alert did, regardless of call-site ordering.
+    fn clear_stale_given_up(
+        &self,
+        slots: &mut HashMap<u32, SlotState>,
+        module_id: &str,
+        phone_number: Option<String>,
+    ) {
         let Some(stale_slot) = find_given_up_slot(slots, module_id) else {
             return;
         };
@@ -668,6 +691,7 @@ impl CardPool {
             module_id,
             "module recovered after previously giving up".to_string(),
             alerts::CriticalEventKind::Recovered,
+            phone_number,
         );
     }
 
@@ -719,9 +743,10 @@ impl CardPool {
                     // clear the stale slot and its active-incident gauge
                     // rather than leaving a dead entry sitting alongside the
                     // new, healthy one forever.
-                    self.clear_stale_given_up(slots, &module.id);
+                    let worker_phone = usable_phone(&phone);
+                    self.clear_stale_given_up(slots, &module.id, worker_phone.clone());
 
-                    let cmd_tx = self.spawn_worker(tasks, &module, slot, event_tx);
+                    let cmd_tx = self.spawn_worker(tasks, &module, slot, event_tx, worker_phone);
                     slots.insert(
                         slot,
                         SlotState {

@@ -21,6 +21,7 @@ use crate::modules::card::{CardInstance, CardState};
 use crate::modules::discovery::DiscoveredModule;
 use crate::modules::protocol::{BridgeEvent, ModuleCmd};
 use crate::modules::restart_policy::RestartMode;
+use crate::modules::slot::usable_phone;
 use crate::store::calls::CallRecord;
 use crate::store::StoreCommand;
 use chrono::Utc;
@@ -47,6 +48,11 @@ pub(crate) struct WorkerSetup {
     pub(crate) ring_capacity: usize,
     pub(crate) audio: ModuleAudioInit,
     pub(crate) at_worker_unresponsive_threshold: Duration,
+    /// specs/034-alert-identity: the card's phone number, already read via
+    /// `AT+CNUM` during `try_init_module` and passed in here so the worker does
+    /// not issue a second, redundant query on a serial port this repo has a
+    /// history of contention on. `None` when the SIM's EF_MSISDN is blank.
+    pub(crate) phone_number: Option<String>,
 }
 
 /// How often the idle-tick liveness probe (`AT`) is sent while otherwise
@@ -70,6 +76,20 @@ pub(crate) struct ModuleWorker {
     module: DiscoveredModule,
     at: AtCommander,
     card: CardInstance,
+    /// specs/034-alert-identity: the *last known* number of this modem's SIM —
+    /// seeded from the read `try_init_module` already did, then refreshed from
+    /// the card itself on every inbound SMS ([`refresh_sim_phone_number`]).
+    ///
+    /// The SMS path always emits a freshly-read value, so it names the card
+    /// that actually received the message. The critical-alert paths take this
+    /// cached value as-is: they fire when the AT channel may be wedged (the
+    /// "worker unresponsive" alert is precisely that case) or mid call-teardown,
+    /// where adding an AT round-trip would block or time out. Last-known is the
+    /// best obtainable there, and a stale number on a "this module is broken"
+    /// alert is far less consequential than one on a forwarded message.
+    ///
+    /// `None` when the SIM has no number provisioned ⇒ alerts render `unknown`.
+    phone_number: Option<String>,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     cmd_rx: crossbeam_channel::Receiver<ModuleCmd>,
@@ -112,6 +132,10 @@ impl ModuleWorker {
             tracing::info!(module = %module.id, rssi = rssi, "signal quality");
         }
 
+        // specs/034-alert-identity: the card's number was already read via
+        // AT+CNUM in `try_init_module`; reuse it rather than querying again.
+        let phone_number = setup.phone_number;
+
         let card = CardInstance::new(
             module.id.clone(),
             module.serial_port.clone(),
@@ -129,6 +153,7 @@ impl ModuleWorker {
             module,
             at,
             card,
+            phone_number,
             store_tx: setup.store_tx,
             event_tx,
             cmd_rx,
@@ -182,6 +207,7 @@ impl ModuleWorker {
                     &self.store_tx,
                     &mut self.call_ctx,
                     "answered",
+                    self.phone_number.as_deref(),
                 );
                 self.card.state = CardState::Idle;
                 metrics::ACTIVE_CALLS
@@ -218,6 +244,7 @@ impl ModuleWorker {
                             category: alerts::AlertCategory::ModuleLifecycle,
                             unit_id: Some(self.module.id.clone()),
                             description: "AT command worker responsive again".to_string(),
+                            phone_number: self.phone_number.clone(),
                             at: Utc::now(),
                             kind: alerts::CriticalEventKind::Recovered,
                         }));
@@ -242,6 +269,7 @@ impl ModuleWorker {
                                 "AT command worker unresponsive for over {}s",
                                 self.at_worker_unresponsive_threshold.as_secs()
                             ),
+                            phone_number: self.phone_number.clone(),
                             at: Utc::now(),
                             kind: alerts::CriticalEventKind::Failure,
                         }));
@@ -291,6 +319,7 @@ impl ModuleWorker {
                     &self.store_tx,
                     &mut self.call_ctx,
                     "failed",
+                    self.phone_number.as_deref(),
                 );
                 false
             }
@@ -376,6 +405,7 @@ impl ModuleWorker {
                 &self.store_tx,
                 &mut self.call_ctx,
                 "answered",
+                self.phone_number.as_deref(),
             );
         } else if self.card.state == CardState::Ringing {
             record_call_end(
@@ -384,6 +414,7 @@ impl ModuleWorker {
                 &self.store_tx,
                 &mut self.call_ctx,
                 "missed",
+                self.phone_number.as_deref(),
             );
         }
         self.card.state = CardState::Idle;
@@ -410,13 +441,25 @@ impl ModuleWorker {
                 let (sender, body) = parse_sms_response(&lines);
                 let received_at = Utc::now().to_rfc3339();
 
+                // specs/034-alert-identity: read the number off the card that
+                // just produced this message, rather than trusting a copy
+                // cached at worker open (which a SIM swap invalidates) or one
+                // looked up from the slot map at dispatch time (which races
+                // with slot recovery). `AT+CNUM` does not touch SMS storage, so
+                // issuing it here leaves the pending delete-by-index valid.
+                refresh_sim_phone_number(&mut self.at, &mut self.phone_number);
+
                 let _ = self.event_tx.send(BridgeEvent::SmsReceived {
                     module_id: self.module.id.clone(),
                     sender,
                     body,
                     received_at,
+                    phone_number: self.phone_number.clone(),
                 });
 
+                // Deleted only after the event is queued, so the message is
+                // never dropped from the SIM before it is persisted downstream
+                // (specs/006-sms-discord-forward).
                 let del_cmd = format!("AT+CMGD={idx}");
                 self.at.send_command(&del_cmd).ok();
             }
@@ -509,6 +552,26 @@ fn read_line_from_at(at: &mut AtCommander) -> Result<String, String> {
     }
 }
 
+/// Re-reads the number of the SIM *currently* in this modem and updates
+/// `cached` (specs/034-alert-identity).
+///
+/// The MSISDN belongs to the SIM, not to the modem or the slot, so any cached
+/// copy goes stale the moment a card is swapped — the bug class behind three
+/// successive review findings on this feature. The SMS path therefore refreshes
+/// from the same AT session that just read the message, which is the only way
+/// to know the number and the message came off the same card.
+///
+/// A *successful* read always wins, including when it reports no number: a
+/// replacement SIM with a blank EF_MSISDN must render `unknown` rather than
+/// inherit the removed card's number (FR-005 — never a value that looks real
+/// but isn't). Only a read that fails outright leaves `cached` alone, since a
+/// broken AT channel says nothing about which SIM is present.
+fn refresh_sim_phone_number(at: &mut AtCommander, cached: &mut Option<String>) {
+    if let Ok(fresh) = at.query_phone_number() {
+        *cached = usable_phone(&fresh);
+    }
+}
+
 fn extract_caller_id(at: &mut AtCommander) -> String {
     for _ in 0..5 {
         match at.read_line_raw() {
@@ -564,6 +627,7 @@ fn record_call_end(
     store_tx: &crossbeam_channel::Sender<StoreCommand>,
     call_ctx: &mut Option<CallContext>,
     status: &str,
+    phone_number: Option<&str>,
 ) {
     if let Some(ctx) = call_ctx.take() {
         let duration = Utc::now()
@@ -583,6 +647,7 @@ fn record_call_end(
                 category: alerts::AlertCategory::MissedCall,
                 unit_id: Some(module_id.to_string()),
                 description: format!("call from {} was never answered", ctx.caller_id),
+                phone_number: phone_number.map(str::to_string),
                 at: Utc::now(),
                 kind: alerts::CriticalEventKind::Failure,
             }));
@@ -706,6 +771,33 @@ mod tests {
         AtCommander::from_stream(MockAtStream::new(response), Duration::from_secs(1))
     }
 
+    /// A wedged port: every read times out, which is what a real serial port
+    /// does when the modem stops answering (`read_response` turns this into an
+    /// `Err`, unlike EOF — which it reports as an empty `Ok` response).
+    struct MockAtTimeoutStream;
+
+    impl std::io::Read for MockAtTimeoutStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "mock timeout",
+            ))
+        }
+    }
+
+    impl std::io::Write for MockAtTimeoutStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_at_wedged() -> AtCommander {
+        AtCommander::from_stream(MockAtTimeoutStream, Duration::from_secs(1))
+    }
+
     fn mock_card(state: CardState) -> CardInstance {
         let mut card = CardInstance::new(
             "card0".to_string(),
@@ -715,6 +807,40 @@ mod tests {
         );
         card.state = state;
         card
+    }
+
+    // --- specs/034-alert-identity: SIM identity must follow the card ---
+
+    /// The SIM-swap case behind the review findings: a card replaced under a
+    /// live worker must report the number now in the modem, not the one cached
+    /// when that worker opened.
+    #[test]
+    fn refresh_sim_phone_number_replaces_a_stale_cached_number() {
+        let mut at = mock_at("+CNUM: \"\",\"+919000000002\",145\r\nOK\r\n");
+        let mut cached = Some("+919000000001".to_string());
+        refresh_sim_phone_number(&mut at, &mut cached);
+        assert_eq!(cached.as_deref(), Some("+919000000002"));
+    }
+
+    /// A replacement SIM with no number provisioned must clear the cache, so
+    /// the alert renders `unknown` instead of inheriting the removed card's
+    /// number (FR-005: never a value that looks real but isn't).
+    #[test]
+    fn refresh_sim_phone_number_clears_when_the_new_sim_has_no_number() {
+        let mut at = mock_at("OK\r\n");
+        let mut cached = Some("+919000000001".to_string());
+        refresh_sim_phone_number(&mut at, &mut cached);
+        assert_eq!(cached, None);
+    }
+
+    /// A failed read says nothing about which SIM is present, so the last known
+    /// number survives rather than being clobbered by a wedged AT channel.
+    #[test]
+    fn refresh_sim_phone_number_keeps_the_last_known_number_when_the_read_fails() {
+        let mut at = mock_at_wedged();
+        let mut cached = Some("+919000000001".to_string());
+        refresh_sim_phone_number(&mut at, &mut cached);
+        assert_eq!(cached.as_deref(), Some("+919000000001"));
     }
 
     #[test]
@@ -791,7 +917,7 @@ mod tests {
             started_at: Utc::now(),
         });
 
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "missed");
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "missed", None);
 
         let event = event_rx.try_recv().expect("expected one dispatched event");
         let BridgeEvent::CriticalAlert(e) = event else {
@@ -817,7 +943,14 @@ mod tests {
             started_at: Utc::now(),
         });
 
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+        record_call_end(
+            "card0",
+            &event_tx,
+            &store_tx,
+            &mut call_ctx,
+            "answered",
+            None,
+        );
 
         assert!(event_rx.try_recv().is_err(), "no alert for answered calls");
     }
@@ -842,7 +975,14 @@ mod tests {
             "call_ctx must be populated once ATD is accepted"
         );
 
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "answered");
+        record_call_end(
+            "card0",
+            &event_tx,
+            &store_tx,
+            &mut call_ctx,
+            "answered",
+            None,
+        );
         assert!(
             call_ctx.is_none(),
             "record_call_end must take the context, same as the inbound path"
@@ -873,7 +1013,7 @@ mod tests {
         let mut call_ctx: Option<CallContext> = None;
 
         record_call_start_outbound("card0", "+15551234567", &mut call_ctx);
-        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "failed");
+        record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "failed", None);
 
         assert!(
             call_ctx.is_none(),

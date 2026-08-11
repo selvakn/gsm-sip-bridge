@@ -138,6 +138,11 @@ pub(crate) struct RuntimeLine {
     /// `volte::bridge::LOOPBACK_SIP_PORT` over loopback for the cellular one,
     /// which is the only thing that differs between them here.
     pub sip_leg_port: u16,
+    /// specs/034-alert-identity: this line's configured `[[vowifi.line]].msisdn`
+    /// (resolved from the override that pinned it), shown when forwarding this
+    /// line's SMS to Discord. `None` ⇒ the forward's phone field renders
+    /// `unknown`.
+    pub msisdn: Option<String>,
 }
 
 /// Reads the `discover` subcommand's line-resolution file and returns every
@@ -169,6 +174,9 @@ fn runtime_lines_from_resolution(resolution: &discovery::LineResolution) -> Vec<
             veth_peer_addr: l.veth_peer_addr.clone(),
             control_port: l.control_port,
             sip_leg_port: VETH_SIP_PORT,
+            // specs/034-alert-identity: the msisdn of the `[[vowifi.line]]`
+            // override that pinned this line (auto-discovered lines have none).
+            msisdn: l.configured_msisdn(),
         })
         .collect()
 }
@@ -543,6 +551,7 @@ pub(crate) fn run_telephony_side(
             let sms_runtime = &sms_runtime;
             let store_tx = store.sender();
             let card_id = line.card_id.clone();
+            let line_msisdn = line.msisdn.clone();
             let listen_addr = (line.veth_peer_addr.clone(), line.control_port);
             let leg_addr = line.veth_local_addr.clone();
             let leg_port = line.sip_leg_port;
@@ -562,6 +571,7 @@ pub(crate) fn run_telephony_side(
                     discord_client,
                     sms_runtime,
                     store_tx,
+                    line_msisdn.as_deref(),
                 );
             });
         }
@@ -1298,6 +1308,7 @@ fn run_line_listener(
     discord_client: &Option<DiscordClient>,
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
+    line_msisdn: Option<&str>,
 ) {
     // This same telephony code serves both paths, so the reporter's kind must
     // follow the transport it is bridging: reported as `Sip` the VoLTE
@@ -1364,6 +1375,7 @@ fn run_line_listener(
             sms_runtime,
             store_tx.clone(),
             &reporter,
+            line_msisdn,
         ) {
             tracing::warn!(card_id = %card_id, error = %e, "error handling Agent A control connection");
         }
@@ -1386,7 +1398,10 @@ fn build_discord_client(config: &AppConfig) -> Option<DiscordClient> {
         );
         return None;
     }
-    match DiscordClient::new(config.sms.discord_webhook_url.clone()) {
+    match DiscordClient::new(
+        config.sms.discord_webhook_url.clone(),
+        crate::alerts::instance_label(&config.alerts),
+    ) {
         Ok(client) => Some(client),
         Err(e) => {
             tracing::error!(error = %e, "failed to create Discord client");
@@ -1479,6 +1494,7 @@ fn handle_connection(
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     reporter: &Reporter,
+    line_msisdn: Option<&str>,
 ) -> BridgeResult<()> {
     let mut reader = std::io::BufReader::new(
         stream
@@ -1517,6 +1533,7 @@ fn handle_connection(
                 received_at,
                 reporter.clone(),
                 transport,
+                line_msisdn.map(str::to_string),
             );
             return Ok(());
         }
@@ -1720,6 +1737,7 @@ fn forward_vowifi_sms(
     received_at: String,
     reporter: Reporter,
     transport: crate::store::Transport,
+    phone_number: Option<String>,
 ) {
     // Records first (status "pending"), forwards second, updates the status
     // after — so a message survives a downstream outage rather than being
@@ -1734,6 +1752,7 @@ fn forward_vowifi_sms(
         received_at,
         transport,
         Some(reporter),
+        phone_number,
     );
 }
 

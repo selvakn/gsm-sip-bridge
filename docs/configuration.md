@@ -55,6 +55,7 @@ clears — never a repeating stream while a condition stays unhealthy.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `discord_webhook_url` | string | `""` | Shared default webhook for any category below with no override of its own. Supports `env:VAR` syntax |
+| `instance_name` | string | (host hostname) | Name identifying this deployment, shown in every alert footer as `gsm-sip-bridge · <instance_name>`. Falls back to the system hostname when unset — set it explicitly under Docker, where the hostname is a random container id |
 
 | Sub-table | Key | Type | Default | Description |
 |---|---|---|---|---|
@@ -291,6 +292,7 @@ network identity. Every field is optional except the matcher.
 | `mnc` | string | unset (auto-derive) | This line's home network MNC, zero-padded to 3 digits |
 | `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch: use this IMSI instead of reading it from the SIM |
 | `imei_override` | string | unset (read via AT+CGSN, or auto-generated for a `pcsc_reader` line) | Diagnostic escape hatch: use this IMEI instead of reading it from the modem |
+| `msisdn` | string | none | This line's phone number, shown in its alert notifications (specs/034-alert-identity) |
 | `pcsc_reader` | bool | `false` | This line's SIM comes from a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem (specs/023-omnikey-pcsc-vowifi) — see [docs/omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md). `imsi_override` becomes mandatory — not because the IMSI is unreadable (it is read from `EF_IMSI` over PC/SC) but because it names which reader's card this line owns, which must be known before any card session exists; run `gsm-sip-bridge pcsc-list` to see every attached reader's card (IMSI, MCC/MNC, carrier) before writing this in. `mcc`/`mnc` stay optional and auto-derive from the card's own `EF_IMSI`/`EF_AD` via `vowifi-plmn --pcsc-imsi`; pin them only for a card whose `EF_AD` omits the MNC-length byte, which fails at startup saying so. `imei_override` stays optional — left unset, a stable, Luhn-valid IMEI is auto-generated from the line's IMSI (an IMEI is a device identity, genuinely not on the card). Requires `[vowifi].tunnel_engine = "strongswan"` (the default); the `swu` engine has no PC/SC support and refuses to start with this set |
 
 ### `[volte]`

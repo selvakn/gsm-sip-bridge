@@ -25,10 +25,15 @@ pub struct DiscordClient {
     /// explicitly, since a shared client now serves every category, each
     /// possibly resolving to a different webhook.
     webhook_url: Secret<String>,
+    /// specs/034-alert-identity: the deployment instance label rendered in
+    /// every embed footer — resolved once (`alerts::instance_label`) when the
+    /// client is built. All split processes run on the same host, so each
+    /// process's client carries the same value.
+    instance: String,
 }
 
 impl DiscordClient {
-    pub fn new(webhook_url: Secret<String>) -> BridgeResult<Self> {
+    pub fn new(webhook_url: Secret<String>, instance: String) -> BridgeResult<Self> {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(10))
@@ -38,7 +43,14 @@ impl DiscordClient {
         Ok(Self {
             client,
             webhook_url,
+            instance,
         })
+    }
+
+    /// The embed footer shown on every alert: the shared product name plus this
+    /// deployment's instance label (specs/034-alert-identity, FR-006).
+    fn footer(&self) -> serde_json::Value {
+        serde_json::json!({ "text": format!("gsm-sip-bridge · {}", self.instance) })
     }
 
     pub async fn forward_sms(
@@ -47,6 +59,7 @@ impl DiscordClient {
         sender: &str,
         body: &str,
         timestamp: &str,
+        phone_number: Option<&str>,
     ) -> Result<u16, String> {
         let description = if body.len() > MAX_DESCRIPTION_LEN {
             format!("{}…", &body[..MAX_DESCRIPTION_LEN])
@@ -62,9 +75,10 @@ impl DiscordClient {
                 "color": 3447003,
                 "fields": [
                     { "name": "Module", "value": module_id, "inline": true },
-                    { "name": "Sender", "value": sender, "inline": true }
+                    { "name": "Sender", "value": sender, "inline": true },
+                    { "name": "Phone", "value": phone_field(phone_number), "inline": true }
                 ],
-                "footer": { "text": "gsm-sip-bridge" }
+                "footer": self.footer()
             }]
         });
 
@@ -106,6 +120,11 @@ impl DiscordClient {
                 "inline": true
             }));
         }
+        fields.push(serde_json::json!({
+            "name": "Phone",
+            "value": phone_field(event.phone_number.as_deref()),
+            "inline": true
+        }));
 
         let payload = serde_json::json!({
             "embeds": [{
@@ -114,7 +133,7 @@ impl DiscordClient {
                 "timestamp": event.at.to_rfc3339(),
                 "color": color,
                 "fields": fields,
-                "footer": { "text": "gsm-sip-bridge" }
+                "footer": self.footer()
             }]
         });
 
@@ -178,6 +197,16 @@ impl DiscordClient {
         Err(format!(
             "failed after {MAX_RETRIES} retries, last status: {last_status}"
         ))
+    }
+}
+
+/// The value for an embed's `Phone` field (specs/034-alert-identity, FR-005):
+/// the resolved number when present and non-empty, else the literal
+/// `unknown` — never a fabricated or empty-looking value.
+fn phone_field(phone_number: Option<&str>) -> String {
+    match phone_number.map(str::trim) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => crate::alerts::UNKNOWN_IDENTITY.to_string(),
     }
 }
 

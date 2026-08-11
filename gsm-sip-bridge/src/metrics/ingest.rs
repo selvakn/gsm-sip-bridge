@@ -30,14 +30,23 @@ use std::time::{Duration, Instant};
 /// second — the two used to behave differently, which is the bug.
 static ALERTS_CONFIG: OnceLock<AlertsConfig> = OnceLock::new();
 static ALERTS_CLIENT: OnceLock<DiscordClient> = OnceLock::new();
+/// specs/034-alert-identity: `unit_id → phone number` for the categories
+/// evaluated here, which only know the reporting line's `unit_id`
+/// (`crate::alerts::line_phone_map`). Empty when no line configures an msisdn.
+static ALERTS_PHONE_MAP: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
 
 /// Called once from `main.rs`. A missing call (e.g. `DiscordClient::new`
 /// failing, which in practice only happens if the HTTP client itself
 /// can't be built) leaves alert dispatch permanently skipped — reports are
 /// still ingested and gauges still update normally either way.
-pub fn init_alerts(config: AlertsConfig, client: DiscordClient) {
+pub fn init_alerts(
+    config: AlertsConfig,
+    client: DiscordClient,
+    phone_map: std::collections::HashMap<String, String>,
+) {
     ALERTS_CONFIG.get_or_init(|| config);
     ALERTS_CLIENT.get_or_init(|| client);
+    ALERTS_PHONE_MAP.get_or_init(|| phone_map);
 }
 
 /// A category's alert lifecycle for one signal (registration or tunnel),
@@ -351,10 +360,12 @@ fn dispatch_transition(
             "only RegistrationLoss/TunnelFailure/GmConnectionLost transitions are produced here"
         ),
     };
+    let phone_number = ALERTS_PHONE_MAP.get().and_then(|m| m.get(&key.1).cloned());
     let event = CriticalEvent {
         category,
         unit_id: Some(key.1.clone()),
         description,
+        phone_number,
         at: chrono::Utc::now(),
         kind,
     };

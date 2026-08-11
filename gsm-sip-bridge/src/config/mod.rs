@@ -394,6 +394,10 @@ pub struct AlertsConfig {
     /// Shared default webhook, used by any category without its own
     /// override. Empty means "no default" (FR-008).
     pub default_webhook_url: Secret<String>,
+    /// specs/034-alert-identity: operator-set name identifying this
+    /// deployment, shown in every alert footer. `None`/empty ⇒ fall back to
+    /// the host's system hostname (`alerts::instance_label`).
+    pub instance_name: Option<String>,
     pub sms: CategoryAlertConfig,
     pub module_lifecycle: CategoryAlertConfig,
     pub registration_loss: CategoryAlertConfig,
@@ -492,6 +496,7 @@ impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
             default_webhook_url: Secret::new(String::new()),
+            instance_name: None,
             sms: CategoryAlertConfig {
                 enabled: true,
                 webhook_url_override: None,
@@ -698,6 +703,10 @@ pub struct VowifiLineOverride {
     /// talks to `pcscd` directly; the `swu` engine has no PC/SC support and
     /// `supervise` fails fast at startup if this is set under it.
     pub pcsc_reader: bool,
+    /// specs/034-alert-identity: this line's phone number, shown in its alert
+    /// notifications. Mirrors `VolteLineOverride::msisdn`. Optional; unset ⇒
+    /// alerts for this line show `unknown` in the phone field.
+    pub msisdn: Option<String>,
 }
 
 impl Default for VowifiConfig {
@@ -1066,6 +1075,66 @@ mod tests {
     fn outbound_can_be_enabled() {
         let c = parse(&format!("{MINIMAL_TOML}\n[outbound]\nenabled = true\n"));
         assert!(c.outbound.enabled);
+    }
+
+    // --- specs/034-alert-identity: instance name + per-line phone number ---
+
+    #[test]
+    fn alerts_instance_name_parses_and_defaults_to_none() {
+        let set = parse(&format!(
+            "{MINIMAL_TOML}\n[alerts]\ninstance_name = \"bridge-01\"\n"
+        ));
+        assert_eq!(set.alerts.instance_name.as_deref(), Some("bridge-01"));
+        assert_eq!(parse(MINIMAL_TOML).alerts.instance_name, None);
+    }
+
+    #[test]
+    fn vowifi_line_msisdn_parses() {
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[[vowifi.line]]\nmodem_serial = \"abc123def456\"\nmsisdn = \"+919000000001\"\n"
+        ));
+        assert_eq!(
+            c.vowifi.line_overrides[0].msisdn.as_deref(),
+            Some("+919000000001")
+        );
+    }
+
+    #[test]
+    fn line_phone_map_keys_configured_lines_by_derived_card_id() {
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[[vowifi.line]]\nmodem_serial = \"abc123def456\"\nmsisdn = \"+919000000001\"\n"
+        ));
+        let card_id = crate::modules::discovery::derive_module_id("abc123def456");
+        assert_eq!(
+            crate::alerts::line_phone_map(&c)
+                .get(&card_id)
+                .map(String::as_str),
+            Some("+919000000001"),
+        );
+        // A deployment with no configured msisdn yields an empty map.
+        assert!(crate::alerts::line_phone_map(&parse(MINIMAL_TOML)).is_empty());
+    }
+
+    #[test]
+    fn line_phone_map_drops_colliding_derived_card_ids() {
+        // Two distinct serials sharing their last six alphanumerics collapse to
+        // one derived card id. Showing either card the other's number is worse
+        // than `unknown`, so both are dropped (specs/034-alert-identity review).
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n\
+             [[vowifi.line]]\nmodem_serial = \"aaa111ABCDEF\"\nmsisdn = \"+919000000001\"\n\
+             [[vowifi.line]]\nmodem_serial = \"bbb222ABCDEF\"\nmsisdn = \"+919000000002\"\n"
+        ));
+        let colliding = crate::modules::discovery::derive_module_id("aaa111ABCDEF");
+        assert_eq!(
+            crate::modules::discovery::derive_module_id("bbb222ABCDEF"),
+            colliding,
+            "fixture sanity: both serials must derive the same card id"
+        );
+        assert!(
+            !crate::alerts::line_phone_map(&c).contains_key(&colliding),
+            "a colliding card id must be dropped, not attributed to one card"
+        );
     }
 
     // --- specs/030-bad-port-isolation: [discovery] parsing + PortMatcher ---
