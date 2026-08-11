@@ -47,6 +47,11 @@ pub(crate) struct WorkerSetup {
     pub(crate) ring_capacity: usize,
     pub(crate) audio: ModuleAudioInit,
     pub(crate) at_worker_unresponsive_threshold: Duration,
+    /// specs/034-alert-identity: the card's phone number, already read via
+    /// `AT+CNUM` during `try_init_module` and passed in here so the worker does
+    /// not issue a second, redundant query on a serial port this repo has a
+    /// history of contention on. `None` when the SIM's EF_MSISDN is blank.
+    pub(crate) phone_number: Option<String>,
 }
 
 /// How often the idle-tick liveness probe (`AT`) is sent while otherwise
@@ -116,13 +121,9 @@ impl ModuleWorker {
             tracing::info!(module = %module.id, rssi = rssi, "signal quality");
         }
 
-        // specs/034-alert-identity: read the card's own number once for its
-        // alerts. `query_phone_number` returns the "Unknown" sentinel (not an
-        // error) when EF_MSISDN is blank — treat that and empty as "no number".
-        let phone_number = at
-            .query_phone_number()
-            .ok()
-            .filter(|n| !n.is_empty() && n != "Unknown");
+        // specs/034-alert-identity: the card's number was already read via
+        // AT+CNUM in `try_init_module`; reuse it rather than querying again.
+        let phone_number = setup.phone_number;
 
         let card = CardInstance::new(
             module.id.clone(),
@@ -577,7 +578,6 @@ fn record_call_start_outbound(
         .inc();
 }
 
-#[allow(clippy::too_many_arguments)]
 fn record_call_end(
     module_id: &str,
     event_tx: &mpsc::UnboundedSender<BridgeEvent>,

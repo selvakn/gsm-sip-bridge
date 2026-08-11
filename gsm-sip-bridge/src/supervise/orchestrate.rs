@@ -444,19 +444,6 @@ fn start_vowifi_subsystem(
 /// modem resolving reads as the configured one recovering). Recording the
 /// match where it is actually known removes the guesswork instead of
 /// refining it.
-/// specs/034-alert-identity: the configured phone number for a VoWiFi line
-/// identified by `id` (its `modem_port`/`modem_serial` override identifier) —
-/// for a line-discovery alert fired before the line ever resolved into a
-/// `LineResolutionEntry`. `None` when no override carries an msisdn.
-fn configured_line_msisdn(config: &crate::config::AppConfig, id: &str) -> Option<String> {
-    config
-        .vowifi
-        .line_overrides
-        .iter()
-        .find(|o| crate::vowifi::discovery::override_identifier(o).as_deref() == Some(id))
-        .and_then(|o| o.msisdn.clone())
-}
-
 fn still_missing_from_resolution(
     pending: &std::collections::HashMap<String, std::time::Instant>,
     resolution: &crate::vowifi::discovery::LineResolution,
@@ -471,6 +458,19 @@ fn still_missing_from_resolution(
         .filter(|id| !resolved.contains(id.as_str()))
         .cloned()
         .collect()
+}
+
+/// specs/034-alert-identity: the configured phone number for a VoWiFi line
+/// identified by `id` (its `modem_port`/`modem_serial` override identifier) —
+/// for a line-discovery alert fired before the line ever resolved into a
+/// `LineResolutionEntry`. `None` when no override carries an msisdn.
+fn configured_line_msisdn(config: &crate::config::AppConfig, id: &str) -> Option<String> {
+    config
+        .vowifi
+        .line_overrides
+        .iter()
+        .find(|o| crate::vowifi::discovery::override_identifier(o).as_deref() == Some(id))
+        .and_then(|o| o.msisdn.clone())
 }
 
 /// Pure decision core of one retry tick, kept separate from
@@ -2118,6 +2118,7 @@ mod tests {
             mnc: "043".to_string(),
             pcsc_reader: true,
             configured_identifier: None,
+            msisdn: None,
             config,
         }
     }
@@ -2139,6 +2140,7 @@ mod tests {
             mnc: "094".to_string(),
             pcsc_reader: false,
             configured_identifier: None,
+            msisdn: None,
             config: VowifiConfig::default(),
         }
     }

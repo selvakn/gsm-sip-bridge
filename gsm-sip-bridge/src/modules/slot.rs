@@ -56,8 +56,7 @@ impl SlotState {
     /// `AT+CNUM` `"Unknown"` sentinel — in which case the alert renders
     /// `unknown` in its place.
     pub(crate) fn alert_phone(&self) -> Option<String> {
-        let p = self.phone_number.trim();
-        (!p.is_empty() && p != "Unknown").then(|| p.to_string())
+        usable_phone(&self.phone_number)
     }
 
     pub(crate) fn info(&self) -> SlotInfo {
@@ -72,6 +71,16 @@ impl SlotState {
             network: self.network_type.to_string(),
         }
     }
+}
+
+/// Normalizes a raw `AT+CNUM` result into an alertable number (specs/034-alert-
+/// identity): `None` for the empty string or the `"Unknown"` sentinel
+/// `query_phone_number` returns when EF_MSISDN is blank, else the trimmed
+/// number. Shared by `SlotState::alert_phone` and the pool's worker spawn, so
+/// the card's number is read once (at init) and reused, not re-queried.
+pub(crate) fn usable_phone(phone: &str) -> Option<String> {
+    let p = phone.trim();
+    (!p.is_empty() && p != "Unknown").then(|| p.to_string())
 }
 
 pub(crate) fn backoff_delay(attempt: u32, initial_sec: u64, max_sec: u64) -> Duration {

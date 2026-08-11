@@ -327,6 +327,7 @@ mod tests {
             mnc: "043".to_string(),
             pcsc_reader: false,
             configured_identifier: None,
+            msisdn: None,
             config: Default::default(),
         }
     }

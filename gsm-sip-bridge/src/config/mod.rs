@@ -1115,6 +1115,28 @@ mod tests {
         assert!(crate::alerts::line_phone_map(&parse(MINIMAL_TOML)).is_empty());
     }
 
+    #[test]
+    fn line_phone_map_drops_colliding_derived_card_ids() {
+        // Two distinct serials sharing their last six alphanumerics collapse to
+        // one derived card id. Showing either card the other's number is worse
+        // than `unknown`, so both are dropped (specs/034-alert-identity review).
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n\
+             [[vowifi.line]]\nmodem_serial = \"aaa111ABCDEF\"\nmsisdn = \"+919000000001\"\n\
+             [[vowifi.line]]\nmodem_serial = \"bbb222ABCDEF\"\nmsisdn = \"+919000000002\"\n"
+        ));
+        let colliding = crate::modules::discovery::derive_module_id("aaa111ABCDEF");
+        assert_eq!(
+            crate::modules::discovery::derive_module_id("bbb222ABCDEF"),
+            colliding,
+            "fixture sanity: both serials must derive the same card id"
+        );
+        assert!(
+            !crate::alerts::line_phone_map(&c).contains_key(&colliding),
+            "a colliding card id must be dropped, not attributed to one card"
+        );
+    }
+
     // --- specs/030-bad-port-isolation: [discovery] parsing + PortMatcher ---
 
     #[test]

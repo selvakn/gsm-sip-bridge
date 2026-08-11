@@ -363,11 +363,15 @@ impl CardPool {
             } => {
                 // specs/034-alert-identity: tag the forward with this card's
                 // own number (from its slot), so the Discord message shows
-                // which line received the SMS.
+                // which line received the SMS. One module_id can have several
+                // slots (a stale GivenUp one beside a fresh Ready one, whose
+                // `phone_number` is still empty) — pick the first slot that
+                // actually has a number rather than depending on HashMap
+                // iteration order.
                 let phone_number = slots
                     .values()
-                    .find(|s| s.module.id == module_id)
-                    .and_then(|s| s.alert_phone());
+                    .filter(|s| s.module.id == module_id)
+                    .find_map(|s| s.alert_phone());
                 sms::record_and_forward(
                     &tokio::runtime::Handle::current(),
                     self.store.sender(),

@@ -39,8 +39,8 @@ pub fn system_hostname() -> String {
 /// the configured `[alerts].instance_name` when non-empty, else the system
 /// hostname.
 pub fn instance_label(config: &AlertsConfig) -> String {
-    match config.instance_name.as_deref() {
-        Some(name) if !name.trim().is_empty() => name.to_string(),
+    match config.instance_name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
         _ => system_hostname(),
     }
 }
@@ -51,8 +51,18 @@ pub fn instance_label(config: &AlertsConfig) -> String {
 /// the line's own process (specs/034-alert-identity, research R4). Built from
 /// the `[[volte.line]]`/`[[vowifi.line]]` overrides carrying both a
 /// `modem_serial` and an `msisdn`, since `derive_module_id(modem_serial)` is
-/// the exact transform that produced the reported card id. Lines pinned only
-/// by `modem_port` (no serial to hash) are absent and render `unknown`.
+/// the exact transform that produced the reported card id.
+///
+/// Two classes of line are deliberately absent (and so render `unknown`):
+/// - lines pinned only by `modem_port`, which has no serial to hash;
+/// - PC/SC reader lines, whose `card_id` is `pcsc{i}` — never `ec20-*` — so a
+///   `modem_serial`-derived key could not match them anyway.
+///
+/// `derive_module_id` keeps only the last six alphanumerics uppercased, so two
+/// distinct configured serials can collapse to one key. Rather than silently
+/// keep whichever the iterator visited last — attributing one card's number to
+/// another, which is worse for triage than `unknown` and violates FR-005's
+/// "never a fabricated value" — such colliding keys are dropped entirely.
 pub fn line_phone_map(
     config: &crate::config::AppConfig,
 ) -> std::collections::HashMap<String, String> {
@@ -66,16 +76,27 @@ pub fn line_phone_map(
         .line_overrides
         .iter()
         .filter_map(|l| Some((l.modem_serial.as_deref()?, l.msisdn.as_deref()?)));
-    volte
+
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut collided: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (serial, msisdn) in volte
         .chain(vowifi)
         .filter(|(serial, msisdn)| !serial.is_empty() && !msisdn.is_empty())
-        .map(|(serial, msisdn)| {
-            (
-                crate::modules::discovery::derive_module_id(serial),
-                msisdn.to_string(),
-            )
-        })
-        .collect()
+    {
+        let card_id = crate::modules::discovery::derive_module_id(serial);
+        if collided.contains(&card_id) {
+            continue;
+        }
+        if map.remove(&card_id).is_some() {
+            // A second configured serial hashes to the same card id: we cannot
+            // tell which number belongs to which card, so neither is safe to
+            // show. Drop both and let them fall back to `unknown`.
+            collided.insert(card_id);
+        } else {
+            map.insert(card_id, msisdn.to_string());
+        }
+    }
+    map
 }
 
 /// Which critical-event category an alert belongs to. A closed enum, not a
@@ -413,12 +434,19 @@ mod tests {
     // --- specs/034-alert-identity ---
 
     #[test]
-    fn instance_label_prefers_configured_name() {
+    fn instance_label_prefers_configured_name_and_trims_it() {
         let config = AlertsConfig {
             instance_name: Some("bridge-01".to_string()),
             ..Default::default()
         };
         assert_eq!(instance_label(&config), "bridge-01");
+
+        // Surrounding whitespace must not render padded inside the footer.
+        let padded = AlertsConfig {
+            instance_name: Some("  bridge-01  ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(instance_label(&padded), "bridge-01");
     }
 
     #[test]
