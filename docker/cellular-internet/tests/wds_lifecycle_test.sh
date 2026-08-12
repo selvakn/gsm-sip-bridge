@@ -22,13 +22,24 @@ mkdir -p "$TMP/bin"
 
 STOP_RESULT="$TMP/stop_result"      # "ok" or "fail" — how the fake stop behaves
 START_MODE="$TMP/start_mode"        # "full", "no-handle", or "no-cid"
+REACHABLE="$TMP/reachable"          # "ok" or "hangup" — can qmicli open the node?
+CONNECTED="$TMP/connected"          # "connected" or "disconnected" — PS session
 QMI_DEV="$TMP/cdc-wdm0"             # presence stands in for the modem existing
 : > "$QMI_DEV"
 echo ok > "$STOP_RESULT"
 echo full > "$START_MODE"
+echo ok > "$REACHABLE"
+echo connected > "$CONNECTED"
 
 cat > "$TMP/bin/qmicli" <<EOF
 #!/usr/bin/env sh
+# A wedged control endpoint fails EVERY action, not just the stop, with the
+# libqmi "endpoint hangup" open error. Model that first so a "hangup" run can't
+# accidentally satisfy any command.
+if [ "\$(cat $REACHABLE)" != ok ]; then
+    echo "error: couldn't open the QmiDevice: endpoint hangup" >&2
+    exit 1
+fi
 for a in "\$@"; do
     case "\$a" in
         --wds-start-network=*)
@@ -50,6 +61,11 @@ for a in "\$@"; do
         --wds-get-current-settings)
             printf '\tIPv4 address: 100.72.13.4\n\tIPv4 gateway address: 100.72.13.1\n\tIPv4 subnet mask: 255.255.255.0\n\tIPv4 primary DNS: 8.8.8.8\n'
             exit 0 ;;
+        --wds-get-packet-service-status)
+            printf "Connection status: '%s'\n" "\$(cat $CONNECTED)"
+            exit 0 ;;
+        --get-service-version-info)
+            exit 0 ;;
     esac
 done
 exit 0
@@ -58,7 +74,13 @@ cat > "$TMP/bin/ip" <<'EOF'
 #!/usr/bin/env sh
 exit 0
 EOF
-chmod +x "$TMP/bin/qmicli" "$TMP/bin/ip"
+# Keep proxy recovery hermetic: report no running qmi-proxy, so recover_qmi_proxy
+# is inert and the test never signals a real process on the build host.
+cat > "$TMP/bin/pidof" <<'EOF'
+#!/usr/bin/env sh
+exit 1
+EOF
+chmod +x "$TMP/bin/qmicli" "$TMP/bin/ip" "$TMP/bin/pidof"
 
 # Load the functions without starting the supervise loop.
 INTERNET_NO_MAIN=1
@@ -91,7 +113,10 @@ fi
 echo "ok: successful teardown clears the identity"
 
 # --- a FAILED teardown retains the identity so it can be retried ------------
+# Precondition for RETAINING: the modem is reachable AND the session is still
+# connected, so the stuck stop really is a live session of ours worth retrying.
 echo ok > "$STOP_RESULT"
+echo ok > "$REACHABLE"; echo connected > "$CONNECTED"
 dial wwan0 >/dev/null 2>&1 || fail "second dial should succeed"
 echo fail > "$STOP_RESULT"
 if teardown wwan0 >/dev/null 2>&1; then
@@ -111,6 +136,38 @@ echo "ok: dial refuses to stack a second client on an unreleased one"
 echo ok > "$STOP_RESULT"
 dial wwan0 >/dev/null 2>&1 || fail "dial should recover once the session can be released"
 echo "ok: dial recovers after the stuck session is released"
+
+# --- a stop that fails because QMI is UNREACHABLE drops the identity ---------
+# A present-but-wedged control endpoint (endpoint hangup after a firmware stall
+# or a silent USB re-enumeration) fails every action, stop included. Retaining
+# the identity there deadlocks the sidecar forever (dial refuses to start a new
+# session while one is retained); teardown must instead drop it — and recycle
+# the proxy — so the redial loop can recover once the channel is back.
+echo ok > "$STOP_RESULT"; echo ok > "$REACHABLE"; echo connected > "$CONNECTED"
+dial wwan0 >/dev/null 2>&1 || fail "dial should succeed before the unreachable case"
+echo fail > "$STOP_RESULT"
+echo hangup > "$REACHABLE"
+teardown wwan0 >/dev/null 2>&1 || fail "teardown must succeed (drop identity) when QMI is unreachable"
+if [ -n "$PKT_HANDLE" ] || [ -n "$WDS_CID" ]; then
+    fail "an unreachable-QMI teardown must drop the stale identity (handle='$PKT_HANDLE' cid='$WDS_CID')"
+fi
+echo "ok: unreachable-QMI teardown drops the identity instead of deadlocking"
+echo ok > "$REACHABLE"
+
+# --- a stop that fails but the session already ended drops the identity ------
+# The carrier can tear the session down on its own, leaving our handle stale:
+# the stop then fails with nothing to stop. Retaining would deadlock exactly the
+# same way; teardown must drop the identity and let the next dial start fresh.
+echo ok > "$STOP_RESULT"; echo ok > "$REACHABLE"; echo connected > "$CONNECTED"
+dial wwan0 >/dev/null 2>&1 || fail "dial should succeed before the disconnected case"
+echo fail > "$STOP_RESULT"
+echo disconnected > "$CONNECTED"
+teardown wwan0 >/dev/null 2>&1 || fail "teardown must succeed (drop identity) when the session already ended"
+if [ -n "$PKT_HANDLE" ] || [ -n "$WDS_CID" ]; then
+    fail "a teardown whose session already ended must drop the stale identity (handle='$PKT_HANDLE' cid='$WDS_CID')"
+fi
+echo "ok: already-ended-session teardown drops the identity instead of deadlocking"
+echo connected > "$CONNECTED"
 
 # --- a started-but-unparseable session must fail the dial, not leak ---------
 # A start that returns a partial identity (missing handle or CID) can never be

@@ -24,10 +24,41 @@ WDS_CID=""
 # than by us: we hold no client for it, so we must not try to stop it.
 ADOPTED=0
 
-# Is the modem's packet data session already up?
+# Is the modem's packet data session already up? Match "connected" as a whole
+# word: a plain substring match also fires on "Connection status: 'disconnected'"
+# and would report a torn-down session as still up.
 session_connected() {
     qmicli -d "$INTERNET_QMI_DEV" -p --wds-get-packet-service-status 2>/dev/null \
-        | grep -qi "connected"
+        | grep -qiw "connected"
+}
+
+# Can we open a QMI channel to the modem at all? This distinguishes a wedged
+# control endpoint — the node is present but every open returns "endpoint
+# hangup", seen after a firmware stall or a silent USB re-enumeration — from a
+# modem that is merely idle. A cheap version-info query forces an actual open +
+# QMI transaction; if that can't get through, no WDS action can either, so a
+# failed teardown there is a dead channel, not a stuck session we could stop.
+qmi_reachable() {
+    [ -e "$INTERNET_QMI_DEV" ] || return 1
+    qmicli -d "$INTERNET_QMI_DEV" -p --get-service-version-info >/dev/null 2>&1
+}
+
+# Restart the libqmi proxy so the next `qmicli -p` re-opens the current device.
+# qmi-proxy (spawned by our `-p`) caches its connection to the cdc-wdm node; when
+# the endpoint hangs up or the modem silently re-enumerates, the proxy keeps
+# serving the DEAD fd, so every later `-p` command fails with "endpoint hangup"
+# even after the modem itself recovers (observed after a USB reset: a direct
+# qmicli worked, `-p` did not, until the proxy was killed). Recycling it is the
+# self-heal that otherwise required a manual container restart. Safe here: this
+# sidecar is the only QMI user in its container — the bridge drives the modem
+# over AT, never QMI.
+recover_qmi_proxy() {
+    _rq_pids=$(pidof qmi-proxy 2>/dev/null) || _rq_pids=""
+    [ -n "$_rq_pids" ] || return 0
+    log "recycling stale qmi-proxy (pids: $_rq_pids) so a fresh one re-opens $INTERNET_QMI_DEV"
+    # Word-splitting is intended here: signal every listed pid.
+    # shellcheck disable=SC2086
+    kill $_rq_pids 2>/dev/null || true
 }
 
 # Run a qmicli WDS action, reusing the persistent client (WDS_CID) allocated by
@@ -285,8 +316,36 @@ teardown() {
         [ "$_t_try" -le 3 ] && sleep 1
     done
 
-    # Still ours, still unreleased — keep the identity so the next teardown
-    # retries this client instead of stacking another one behind it.
+    # Every stop attempt failed. Retaining the identity blocks ALL future dials
+    # (dial() refuses to start a new session while one is retained), so before we
+    # wedge the sidecar that way, work out WHY the stop failed — only a session
+    # that is genuinely still ours warrants holding on:
+    #
+    #   * QMI unreachable — the control endpoint hung up, or the modem silently
+    #     re-enumerated. No qmicli action can get through, so this is not a stuck
+    #     session we can stop; the channel needs a reset. Recycle the (possibly
+    #     stale) proxy and drop the identity so the redial loop resumes instead
+    #     of spinning forever on a stop that can never open the device.
+    #   * session already gone — the carrier tore it down and our handle is
+    #     stale. There is nothing left to stop; drop the identity and let dial()
+    #     start a fresh session.
+    if ! qmi_reachable; then
+        log "WARNING: QMI control endpoint unreachable while stopping (handle=$PKT_HANDLE cid=$WDS_CID) — modem wedged or re-enumerated; recycling the proxy and dropping the stale identity"
+        recover_qmi_proxy
+        PKT_HANDLE=""
+        WDS_CID=""
+        return 0
+    fi
+    if ! session_connected; then
+        log "data session already ended (handle=$PKT_HANDLE cid=$WDS_CID) — dropping the stale identity"
+        PKT_HANDLE=""
+        WDS_CID=""
+        return 0
+    fi
+
+    # Reachable AND still connected but the stop keeps failing — genuinely ours
+    # and stuck. Keep the identity so the next teardown retries this client
+    # instead of stacking another one behind it.
     log "WARNING: could not stop WDS session (handle=$PKT_HANDLE cid=$WDS_CID) after 3 attempts; retaining its identity to retry"
     return 1
 }
