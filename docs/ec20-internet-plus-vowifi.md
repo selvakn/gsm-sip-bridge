@@ -113,6 +113,52 @@ vowifi-status                               # registered: true
 See [`specs/032-cellular-internet-sidecar/quickstart.md`](../specs/032-cellular-internet-sidecar/quickstart.md)
 for the full validation (independent restart, drop recovery, default-off).
 
+## IPv6 reach-back (dual-stack)
+
+Carrier IPv4 is usually CGNAT, so the host has no inbound reachability over IPv4.
+When the carrier grants IPv6, the sidecar also brings up a **global IPv6 address +
+default route** on the WWAN interface, making this host reachable inbound (e.g. SSH)
+over IPv6. Dual-stack is **ON by default**; IPv4/VoWiFi is unchanged and stays the
+health-gating uplink, so a v6 problem never blocks calls or the bridge.
+
+The sidecar dials a **separate `ip-type=6` session** alongside the v4 one (so the
+v4 session stays byte-identical), and adopts an already-up v6 session if the modem
+brought one up via autoconnect.
+
+```bash
+# One-off: does your carrier/modem actually grant IPv6? (sidecar stopped so the
+# QMI node is free). A global address starts 2xxx:/3xxx:, not fe80:/fc00:/fd00:.
+# This is exactly what the sidecar does:
+qmicli -d /dev/cdc-wdm0 -p --wds-start-network="ip-type=6,apn=$INTERNET_APN" \
+       --client-no-release-cid
+qmicli -d /dev/cdc-wdm0 -p --wds-get-current-settings | grep -i 'IPv6'
+# (A combined `ip-type=8` start is a fine capability probe too, but the sidecar
+# does not use it — it keeps v4 and v6 as separate sessions.)
+
+# Verify once enabled:
+ip -6 addr show dev wwan0 | grep 'scope global'   # global v6 address present
+ip -6 route show default                          # default v6 route present
+docker exec <internet-ctr> cat /run/internet-status
+#   ipv6=2401:4900:...:1   ipv6_state=up
+ssh user@2401:4900:...:1                           # reach the host from outside
+```
+
+Keep the current address discoverable with the change hook — point
+`INTERNET_IPV6_HOOK` at a script run as `hook <new-addr>` on every appear/change
+(wire up your own DDNS). The hook does **not** fire on loss, so give your AAAA
+record a short TTL. The sidecar installs no firewall and no forwarding: the global
+v6 address lands on the **host** (host-network mode), so you own the host firewall —
+allow inbound SSH over IPv6. If the address is up but unreachable from outside, your
+carrier may filter inbound v6 at its edge (outside the sidecar's control).
+
+> One detail is pinned to what your specific EC20/EC25 + libqmi report: the exact
+> `IPv6 address:` label emitted by `--wds-get-current-settings` (the sidecar parses
+> `IPv6 address: <addr>/<prefix>`). Confirm it against your hardware with the
+> command above; if the label differs, the parser is a one-line change.
+
+See [`specs/035-dual-stack-ipv6/quickstart.md`](../specs/035-dual-stack-ipv6/quickstart.md)
+for the full walkthrough.
+
 ## Troubleshooting
 
 - **Sidecar stuck unhealthy, bridge never starts** — read
