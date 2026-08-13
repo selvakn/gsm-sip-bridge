@@ -31,9 +31,11 @@ global IPv6 address on the WWAN interface would restore inbound reach-back.
   short TTL rather than relying on a withdrawal signal.
 - Q: While IPv6 is unavailable but IPv4 is up, how often should the sidecar retry
   establishing IPv6 in the background? → A: A capped backoff — start at the probe
-  interval and grow to a bounded maximum — so a v6-incapable carrier is not
-  hammered with a start attempt every probe interval, while a transient drop still
-  recovers promptly.
+  interval and grow to a bounded maximum. **[SUPERSEDED by the single-bearer design
+  — see below.]** Hardware testing (Jio) showed dual-stack must be ONE IPv4v6 bearer,
+  not a separate v6 dial; "retrying v6" is now just re-reading the bearer's settings
+  each probe interval (a cheap query with no separate session to rate-limit), so
+  there is no backoff. The intent (don't churn the modem) is met more strongly.
 - Q: Should dual-stack be ON by default for every sidecar deployment, or opt-in?
   → A: ON by default — request dual-stack everywhere and degrade to IPv4-only when
   no IPv6 is granted. A documented kill-switch disables it for deployments that
@@ -182,12 +184,13 @@ invoked when the address is unchanged.
   same redial, never on its own separate teardown of a healthy IPv4 session.
 - **Hook script missing/not executable**: logged as a warning; does not affect
   connectivity.
-- **IPv6 lost while IPv4 stays up**: status flips to `ipv6_state=unavailable` and
-  the loss is logged, but the change hook is NOT fired (it fires only on
-  appear/change). Background retry resumes under the capped backoff; consumers of
-  the old address rely on TTL expiry.
-- **Persistently v6-incapable carrier**: background retry backs off to the capped
-  maximum interval so the modem/logs are not hammered; the container stays
+- **IPv6 lost while IPv4 stays up**: the stale global v6 address/route are flushed,
+  status flips to `ipv6_state=unavailable`, and the loss is logged, but the change
+  hook is NOT fired (it fires only on appear/change). Each probe tick re-reads the
+  bearer, so v6 is re-applied automatically if it returns; consumers of the old
+  address rely on TTL expiry.
+- **Persistently v6-incapable carrier**: the bearer simply carries no v6; each probe
+  tick re-reads its settings (a cheap query — no separate v6 dial), so the container stays
   IPv4-healthy indefinitely.
 - **Stale IPv6 default route after a redial that yields no IPv6**: any previous
   IPv6 address/route for this interface is cleaned up so no black-hole v6 route
@@ -199,9 +202,12 @@ invoked when the address is unchanged.
 
 ### Functional Requirements
 
-- **FR-001**: The sidecar MUST request a dual-stack (IPv4 + IPv6) cellular data
-  session from the modem over the QMI control device, without ever opening the
-  modem's AT port.
+- **FR-001**: The sidecar MUST bring up a dual-stack (IPv4 + IPv6) cellular data
+  path over the QMI control device, without ever opening the modem's AT port. It
+  MUST do so as a **single IPv4v6 bearer** (provisioning the data profile's PDP type
+  to IPv4v6 and reading both address families from that one session) — NOT as two
+  separate sessions, which carriers such as Jio refuse
+  (`multiple-connection-to-same-pdn-not-allowed`).
 - **FR-002**: When the carrier grants IPv6, the sidecar MUST configure the WWAN
   interface with the granted global IPv6 address (and prefix) and install a
   default IPv6 route so the host can reach and be reached over the IPv6 internet.
@@ -212,13 +218,12 @@ invoked when the address is unchanged.
   through the cellular link. A missing, failed, or dropped IPv6 session MUST NOT
   make the container unhealthy and MUST NOT block the bridge from starting or
   running.
-- **FR-005**: The sidecar MUST treat IPv6 as best-effort: when IPv6 is
-  unavailable, it MUST keep IPv4 up, retry IPv6 establishment in the background
-  using a **capped backoff** (first retry no sooner than the probe interval,
-  growing to a bounded maximum interval), and log the attempts, without tearing
-  down or interrupting the IPv4 session. A transient drop MUST recover promptly
-  (the backoff resets once IPv6 is up), while a persistently v6-incapable carrier
-  MUST NOT be retried more often than the capped maximum.
+- **FR-005**: The sidecar MUST treat IPv6 as best-effort: when the bearer carries
+  no v6, it MUST keep IPv4 up and re-read the bearer's settings each probe interval,
+  re-applying v6 automatically if it appears, without tearing down or interrupting
+  the IPv4 session. (Because v6 rides the single IPv4v6 bearer — see FR-001 — there
+  is no separate v6 dial, so this is a cheap settings read rather than a rate-limited
+  re-establish; the earlier "capped backoff" requirement is superseded.)
 - **FR-006**: The sidecar MUST NOT install any firewall rule that blocks inbound
   IPv6 traffic to the host; a granted global IPv6 address MUST be usable for
   inbound reach-back (e.g. SSH) to the host.
@@ -277,9 +282,9 @@ invoked when the address is unchanged.
 - **SC-005**: The current global IPv6 address (or a clear "unavailable" state) is
   observable in the sidecar status within one probe interval of a change.
 - **SC-006**: Deployments on IPv6-incapable carriers/modems continue to run with
-  no operator action and no new failures (default-safe degradation), and the
-  background IPv6 retry backs off to no more frequent than the capped maximum
-  interval rather than attempting a start every probe interval.
+  no operator action and no new failures (default-safe degradation); the bearer
+  simply carries no v6 and each probe interval re-reads its settings (a cheap query,
+  no separate v6 dial to churn the modem).
 - **SC-007**: An operator can force byte-identical IPv4-only behavior via a single
   documented kill-switch (no IPv6 dialing, no `ip -6` changes, empty v6 status
   fields).

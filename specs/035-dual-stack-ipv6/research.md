@@ -5,46 +5,56 @@ Rationale / Alternatives considered. Items marked **VERIFY-ON-HW** need a one-of
 check against the actual EC20/EC25 + carrier before the corresponding task is
 closed; the plan is written so either outcome is a small, localized change.
 
-## R1 — How to request a dual-stack session over QMI
+## R1 — How to request a dual-stack session over QMI (HARDWARE-VERIFIED, revised)
 
-**Decision (as implemented)**: Keep the existing `ip-type=4` session exactly as
-today and start a **separate, independent `ip-type=6` WDS session** on the same
-APN, each with its own retained CID/handle pair (`V6_MODE=dual-session`). If a v6
-start returns `NoEffect`, a v6 session is already up via modem autoconnect — adopt
-it read-only (`V6_MODE=adopted`), holding no client for it. The sidecar does **not**
-issue a combined `ip-type=8` start.
+**Decision (as implemented)**: Dual-stack is ONE IPv4v6 bearer, not two sessions.
+When v6 is enabled the sidecar provisions the data profile
+(`INTERNET_IPV6_PROFILE`, default 1) as `pdp-type=IPv4v6` with the APN
+(`--wds-modify-profile`), dials a single session by `profile-index`, and reads BOTH
+IPv4 and IPv6 from that one session's `--wds-get-current-settings`. v6 rides the same
+WDS client (`WDS_CID`) as v4; there is no separate v6 identity. When v6 is disabled,
+the sidecar dials `ip-type=4` exactly as before.
 
-**Rationale**: libqmi's `--wds-start-network` `ip-type` takes `4`, `6`, or (on some
-builds) a combined value, but Quectel EC20/EC25 modems commonly expose v4 and v6 as
-**separate PDN contexts**, so the separate-session approach is the reliable lowest
-common denominator. Choosing it unconditionally (rather than trying combined first)
-keeps the v4 dial/teardown code path byte-identical and avoids a second code path to
-maintain — simpler per Constitution Principle V, at no cost to correctness. Both v6
-modes reuse the proven retained-CID discipline from `dial()`/`teardown()`.
+**Why the original two-session design was wrong (Jio, 2026-08-13)**:
+- `ip-type=6` **alone** returns a real global v6 address
+  (`2409:4072:99:1a6a:.../64`) — so the carrier grants IPv6 and the parser's
+  `IPv6 address: <addr>/<prefix>` format is exactly right.
+- But `ip-type=6` **alongside** an `ip-type=4` session to the same APN is refused
+  with QMI error 14 `CallFailed` / verbose `multiple-connection-to-same-pdn-not-allowed`.
+  Jio (like most modern carriers) permits only ONE connection per PDN, carrying both
+  families. Two separate sessions cannot work.
+- There is **no `ip-type=8`** in QMI — the WDS IP-family preference is only 4 or 6.
+  `ip-type=8` hung the modem. Dual-stack therefore MUST come from the profile's
+  `pdp-type=IPv4v6`, not a per-call flag.
+- A plain start (no ip-type) on this modem gave IPv4 only, because the default
+  profile's PDP type is IPv4 — hence the sidecar must set it to IPv4v6.
+
+**Consequences / simplifications**: one bearer means the whole separate-v6-session
+machinery is gone — no `V6_WDS_CID`/`V6_PKT_HANDLE`/`V6_MODE`, no `qmi_wds_v6`, no
+`bring_up_v6`/`v6_teardown_cleanup`, and the entire class of "stale retained v6
+identity" bugs disappears. v4 stays healthy whether or not the bearer carries v6.
 
 **Alternatives considered**:
-- *Combined `ip-type=8` first, fall back to separate*: rejected — it would change
-  the v4 start/handle parsing and add a second dial path for a "fast" case with no
-  functional benefit over two separate sessions. Dropped for simplicity.
-- *v6-only session*: rejected — breaks dual-stack (VoWiFi/IPv4-only sites) and the
-  health model.
-- *Rely solely on modem autoconnect for v6*: rejected as the primary path —
-  autoconnect behaviour varies; we start our own session and only adopt an existing
-  one on `NoEffect`.
+- *Two separate sessions (original design)*: rejected — refused by Jio
+  (`multiple-connection-to-same-pdn-not-allowed`).
+- *Sidecar does not modify the profile, relies on it already being IPv4v6*:
+  rejected as the default — the observed modem profile was IPv4, so v6 would never
+  come up without provisioning. The modify is best-effort and logged on failure.
 
-**VERIFY-ON-HW**: confirm the carrier grants a global v6 address on an `ip-type=6`
-session:
-`qmicli -d /dev/cdc-wdm0 -p --wds-start-network="ip-type=6,apn=$APN" --client-no-release-cid`
-then `--wds-get-current-settings` and look for an `IPv6 address:` line.
+**STILL VERIFY-ON-HW**: the profile→IPv4v6 provisioning path (`--wds-modify-profile`
+then `profile-index` dial) yielding BOTH families in one bearer was NOT completed
+end-to-end on hardware (the test window closed). The carrier-grants-v6 fact and the
+`IPv6 address:` label ARE confirmed; the single-bearer provisioning needs a live
+run on the Jio SIM to confirm the dual bearer comes up as designed.
 
 ## R2 — Reading the granted IPv6 settings
 
 **Decision**: Parse `qmicli --wds-get-current-settings` for the lines
 `IPv6 address:` (form `2401:4900:...:1/64` — address **with** prefix length),
 `IPv6 gateway address:`, and `IPv6 primary/secondary DNS:`. Extract the address and
-the prefix length from the single `addr/prefix` token. The query targets the v6
-session's own client id (`qmi_wds_v6` uses `V6_WDS_CID`) so it reads the v6 grant,
-not the v4 one.
+the prefix length from the single `addr/prefix` token. The query uses `qmi_wds` (the
+SAME shared client as v4) — the single IPv4v6 bearer's settings carry both families,
+so one `--wds-get-current-settings` returns IPv4 *and* IPv6 lines.
 
 **Rationale**: qmicli prints the QMI-granted IPv6 address already carrying its
 prefix length, unlike IPv4 which reports a separate subnet mask. So no
@@ -104,19 +114,20 @@ address-parsing dependency.
 ## R5 — Best-effort supervision without disturbing IPv4 (FR-004/FR-005)
 
 **Decision**: Keep the existing supervise loop and IPv4 health semantics untouched.
-Add v6 as a **secondary, non-gating** concern inside the same loop iteration: after
-the (unchanged) IPv4 probe/redial logic, check whether a global v6 address is
-present; if not, attempt a bounded v6 (re)establish that must never `teardown` or
-`ip addr flush` the v4 address, never `exit`, and never affect the healthcheck. The
-healthcheck script stays byte-for-byte behavior-identical (gates on
-`session_established` = IPv4 + `probe_dns`); a test asserts it ignores v6.
+After the (unchanged) IPv4 probe/redial logic, `refresh_v6` re-reads the current
+bearer's settings and applies/clears the global v6 accordingly. It must never
+`teardown` or `ip addr flush` the v4 address, never `exit`, and never affect the
+healthcheck (which stays byte-for-byte identical, gating on `session_established` =
+IPv4 + `probe_dns`; a test asserts it ignores v6).
 
-The v6 (re)establish is rate-limited by a **capped backoff** (Clarification
-2026-08-13): the next attempt is due no sooner than `INTERNET_PROBE_INTERVAL`,
-doubling up to `INTERNET_IPV6_RETRY_MAX` (default `5m`). The backoff resets the
-moment a global v6 address is up, so a transient drop recovers within a probe
-interval while a v6-incapable carrier is not retried every loop. State is a
-`V6_NEXT_RETRY` deadline + current interval carried across iterations.
+**Superseded — no backoff (revised after the R1 hardware finding)**: the original
+Clarification (2026-08-13) called for a capped backoff because v6 was a *separate
+dial* to rate-limit. In the single-bearer model there is no separate v6 dial —
+`refresh_v6` is just a `--wds-get-current-settings` read on the existing bearer, so
+running it every probe interval is cheap and cannot "hammer" the modem. The backoff,
+`V6_NEXT_RETRY`, `V6_RETRY_INTERVAL`, and `INTERNET_IPV6_RETRY_MAX` are therefore
+removed. The intent of the clarification (don't churn the modem chasing v6) is met
+even more strongly.
 
 **Rationale**: Coupling v6 into the same single loop honors Principle V (one
 supervisor, not two) while the strict "v6 code path may not touch v4 state or exit"
@@ -218,11 +229,11 @@ explicitly out of scope (spec Edge Cases / Assumptions).
 
 | # | Decision | Feeds |
 |---|----------|-------|
-| R1 | Always a separate `ip-type=6` session alongside v4 (`dual-session`); adopt on `NoEffect` | data-model (v6 session identity), tasks |
+| R1 | Single IPv4v6 bearer (provision profile `pdp-type=IPv4v6`, dial by `profile-index`, read both families); no separate v6 session, no `ip-type=8` | data-model, dial |
 | R2 | Parse `IPv6 address:` (addr/prefix) from current-settings | apply-v6 function |
 | R3 | `ip -6 addr add` / `ip -6 route replace default`; flush global on redial | apply/teardown v6 |
 | R4 | `is_global_v6()` rejects fe80::/10, ::1, fc00::/7 | status + hook gating |
-| R5 | v6 folded into existing loop; may never touch v4 state or exit | supervise loop |
+| R5 | v6 folded into existing loop as a cheap settings re-read; no separate dial, so no backoff; may never touch v4 state or exit | supervise loop |
 | R6 | `INTERNET_IPV6_HOOK` fired backgrounded+`timeout`; de-dupe on a success marker, retried until it succeeds | hook contract |
 | R7 | v6 is observability-only in status; health stays v4-only | status-file contract, healthcheck (unchanged) |
 | R8 | No firewall; no forwarding; document host-firewall responsibility | quickstart |

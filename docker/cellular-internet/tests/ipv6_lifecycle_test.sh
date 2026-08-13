@@ -2,12 +2,13 @@
 # Integration test for the sidecar's dual-stack IPv6 lifecycle
 # (specs/035-dual-stack-ipv6).
 #
-# Exercises the REAL v6 functions from internet-entrypoint.sh (bring_up_v6,
-# apply_settings_v6, supervise_v6, v6_teardown_cleanup, _mark_v6_*). Only the
-# modem is faked: `qmicli` and `ip` are scripted stubs on PATH — the constitution's
-# "hardware not available in CI" exception. The logic under test — dual-stack dial,
-# global-v6 detection, best-effort capped backoff, and the strict rule that v6 code
-# never disturbs the v4 session or `state` — is the real thing.
+# Model: v6 rides the SAME single IPv4v6 bearer as v4 (one PDN) — hardware-verified
+# on Jio, where a separate ip-type=6 session to the same APN is refused. Exercises
+# the REAL functions from internet-entrypoint.sh (dial, refresh_v6, apply_settings_v6,
+# teardown, _mark_v6_*). Only the modem is faked: `qmicli`/`ip` are scripted stubs on
+# PATH — the constitution's "hardware not available in CI" exception. The logic under
+# test — single-bearer dual-stack, global-v6 detection, and the rule that v6 never
+# disturbs the v4 session or `state` — is the real thing.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -20,79 +21,41 @@ mkdir -p "$TMP/bin"
 
 QMI_DEV="$TMP/cdc-wdm0"; : > "$QMI_DEV"
 IP_LOG="$TMP/ip_log"; : > "$IP_LOG"
-V6_START_MODE="$TMP/v6_start_mode"   # ok | fail | noeffect
-V6_HAS_SETTINGS="$TMP/v6_has_settings" # 1 => get-current-settings includes IPv6
-V6_PRESENT="$TMP/v6_present"          # 1 => `ip -6 addr show` reports the addr
-echo ok > "$V6_START_MODE"
-echo 1  > "$V6_HAS_SETTINGS"
-echo 1  > "$V6_PRESENT"
-V6_STOP="$TMP/v6_stop";           echo ok        > "$V6_STOP"        # ok | fail
-V6_CONNECTED="$TMP/v6_connected"; echo connected > "$V6_CONNECTED"   # connected | disconnected
-REACHABLE="$TMP/reachable";       echo ok        > "$REACHABLE"      # ok | hangup
-V6_STALE_CID="$TMP/v6_stale_cid"; : > "$V6_STALE_CID"                # a cid the modem no longer knows
-V6_NEW_CID="$TMP/v6_new_cid";     echo 9         > "$V6_NEW_CID"     # cid handed out by the next v6 start
-
-V6ADDR="2401:4900:1c30:abcd::1"
+V6_HAS_SETTINGS="$TMP/v6_has_settings"; echo 1 > "$V6_HAS_SETTINGS"  # 1 => bearer carries v6
+V6ADDR_FILE="$TMP/v6addr"                                            # current granted v6 (settable)
+MODIFY_LOG="$TMP/modify_log"; : > "$MODIFY_LOG"                      # records modify-profile calls
+START_LOG="$TMP/start_log"; : > "$START_LOG"                        # records start-network args
+V6ADDR="2409:4072:99:1a6a:48bc:a7c9:296b:a03f"
+echo "$V6ADDR" > "$V6ADDR_FILE"
 
 cat > "$TMP/bin/qmicli" <<EOF
 #!/usr/bin/env sh
-# A wedged endpoint fails EVERY action (models "endpoint hangup").
-if [ "\$(cat $REACHABLE)" != ok ]; then
-    echo "error: couldn't open the QmiDevice: endpoint hangup" >&2
-    exit 1
-fi
-# A STALE client: the modem no longer knows this cid, so every action targeting it
-# fails — including the settings query the sidecar reuses it for.
-_stale=\$(cat $V6_STALE_CID)
-if [ -n "\$_stale" ]; then
-    for a in "\$@"; do
-        if [ "\$a" = "--client-cid=\$_stale" ]; then
-            echo "error: couldn't allocate client: unknown client id" >&2
-            exit 1
-        fi
-    done
-fi
 for a in "\$@"; do
     case "\$a" in
-        --wds-start-network=*ip-type=4*)
+        --wds-modify-profile=*) echo "\$a" >> $MODIFY_LOG; exit 0 ;;
+        --wds-start-network=*)
+            echo "\$a" >> $START_LOG
             printf '[dev] Network started\n\tPacket data handle: %s\n' "'2264216040'"
             printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'7'"
             exit 0 ;;
-        --wds-start-network=*ip-type=6*)
-            case "\$(cat $V6_START_MODE)" in
-                fail)     echo "error: wds-start-network failed" >&2; exit 1 ;;
-                noeffect) echo "error: NoEffect" >&2; exit 1 ;;
-            esac
-            printf '[dev] Network started\n\tPacket data handle: %s\n' "'3300000006'"
-            printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'\$(cat $V6_NEW_CID)'"
-            exit 0 ;;
-        --wds-stop-network=*)
-            if [ "\$(cat $V6_STOP)" = ok ]; then exit 0; fi
-            exit 1 ;;
+        --wds-stop-network=*) exit 0 ;;
         --wds-get-current-settings)
-            printf '\tIPv4 address: 100.72.13.4\n\tIPv4 gateway address: 100.72.13.1\n\tIPv4 subnet mask: 255.255.255.0\n\tIPv4 primary DNS: 8.8.8.8\n'
+            printf '\tIPv4 address: 100.77.232.222\n\tIPv4 gateway address: 100.77.232.221\n\tIPv4 subnet mask: 255.255.255.252\n\tIPv4 primary DNS: 8.8.8.8\n'
             if [ "\$(cat $V6_HAS_SETTINGS)" = 1 ]; then
-                printf '\tIPv6 address: $V6ADDR/64\n\tIPv6 gateway address: fe80::1\n\tIPv6 primary DNS: 2401:4900::1\n'
+                printf '\tIPv6 address: %s/64\n\tIPv6 gateway address: 2409:4072:99:1a6a::1\n' "\$(cat $V6ADDR_FILE)"
             fi
             exit 0 ;;
-        --wds-get-packet-service-status)
-            printf "Connection status: '%s'\n" "\$(cat $V6_CONNECTED)"; exit 0 ;;
+        --wds-get-packet-service-status) printf "Connection status: 'connected'\n"; exit 0 ;;
         --get-service-version-info) exit 0 ;;
     esac
 done
 exit 0
 EOF
-
 cat > "$TMP/bin/ip" <<EOF
 #!/usr/bin/env sh
 echo "\$*" >> $IP_LOG
-case "\$*" in
-    "-6 addr show"*)
-        [ "\$(cat $V6_PRESENT 2>/dev/null)" = 1 ] && echo "    inet6 $V6ADDR/64 scope global" ;;
-esac
 exit 0
 EOF
-
 cat > "$TMP/bin/pidof" <<'EOF'
 #!/usr/bin/env sh
 exit 1
@@ -102,181 +65,96 @@ chmod +x "$TMP/bin/qmicli" "$TMP/bin/ip" "$TMP/bin/pidof"
 INTERNET_NO_MAIN=1; export INTERNET_NO_MAIN
 INTERNET_LIB="$DIR/internet-lib.sh"; export INTERNET_LIB
 INTERNET_STATUS_FILE="$TMP/status"; export INTERNET_STATUS_FILE
-INTERNET_APN="testapn"; export INTERNET_APN
+INTERNET_APN="jionet"; export INTERNET_APN
 INTERNET_QMI_DEV="$QMI_DEV"; export INTERNET_QMI_DEV
 INTERNET_ENABLE_IPV6=1; export INTERNET_ENABLE_IPV6
-INTERNET_IPV6_RETRY_MAX=5m; export INTERNET_IPV6_RETRY_MAX
 # shellcheck source=docker/cellular-internet/internet-entrypoint.sh
 . "$DIR/internet-entrypoint.sh"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 status_field() { sed -n "s/^$1=//p" "$INTERNET_STATUS_FILE" 2>/dev/null; }
 
-# --- 1. dual-stack dial: v4 unchanged AND a global v6 addr+route applied ------
-echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"; echo 1 > "$V6_PRESENT"
+# --- 1. dual-stack dial: ONE bearer, v4 + v6 from the same session -----------
+echo 1 > "$V6_HAS_SETTINGS"; echo "$V6ADDR" > "$V6ADDR_FILE"
 dial wwan0 >/dev/null 2>&1 || fail "dual-stack dial should succeed"
-[ "$PKT_HANDLE" = "2264216040" ] || fail "v4 handle changed (got '$PKT_HANDLE')"
-[ "$WDS_CID" = "7" ] || fail "v4 cid changed (got '$WDS_CID')"
+[ "$PKT_HANDLE" = "2264216040" ] || fail "v4 handle not captured (got '$PKT_HANDLE')"
+[ "$WDS_CID" = "7" ] || fail "v4 cid not captured (got '$WDS_CID')"
+grep -q 'pdp-type=ipv4v6' "$MODIFY_LOG" || fail "profile should have been provisioned IPv4v6"
+grep -q 'profile-index=1' "$START_LOG" || fail "dual-stack should dial by profile-index, got: $(cat "$START_LOG")"
 [ "$V6_ADDR" = "$V6ADDR" ] || fail "v6 address not applied (got '$V6_ADDR')"
 [ "$V6_PREFIX" = "64" ] || fail "v6 prefix not parsed (got '$V6_PREFIX')"
-[ "$V6_WDS_CID" = "9" ] || fail "v6 client id not captured (got '$V6_WDS_CID')"
-[ "$V6_MODE" = "dual-session" ] || fail "v6 mode should be dual-session (got '$V6_MODE')"
 grep -q -- "-6 addr add $V6ADDR/64 dev wwan0" "$IP_LOG" || fail "no 'ip -6 addr add' recorded"
-grep -q -- "-6 route replace default via fe80::1 dev wwan0" "$IP_LOG" || fail "no 'ip -6 route' recorded"
+grep -q -- "-6 route replace default via 2409:4072:99:1a6a::1 dev wwan0" "$IP_LOG" || fail "no 'ip -6 route' recorded"
 [ "$(status_field ipv6)" = "$V6ADDR" ] || fail "status ipv6 not set"
 [ "$(status_field ipv6_state)" = "up" ] || fail "status ipv6_state should be up"
+[ "$(status_field ipv4)" = "100.77.232.222" ] || fail "status ipv4 not set"
 [ "$(status_field state)" = "up" ] || fail "v4 state should be up"
-echo "ok: dual-stack dial applies a global v6 address, v4 unchanged"
+echo "ok: dual-stack dials one IPv4v6 bearer and applies both families"
 
-# --- 2. carrier grants no v6: v4 stays up, v6 unavailable, v4 untouched -------
-teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
-: > "$IP_LOG"; echo fail > "$V6_START_MODE"; echo 0 > "$V6_HAS_SETTINGS"
+# --- 2. carrier grants no v6: v4 healthy, v6 unavailable, no ip -6 add --------
+teardown wwan0 >/dev/null 2>&1
+: > "$IP_LOG"; : > "$START_LOG"; echo 0 > "$V6_HAS_SETTINGS"
 dial wwan0 >/dev/null 2>&1 || fail "dial should still succeed when v6 is ungranted"
 [ "$PKT_HANDLE" = "2264216040" ] || fail "v4 must be up even without v6"
 [ -z "$V6_ADDR" ] || fail "v6 address must be empty when ungranted (got '$V6_ADDR')"
-[ -z "$V6_WDS_CID" ] || fail "no v6 client should be retained on a failed v6 start"
-[ "$V6_MODE" = "none" ] || fail "v6 mode should be none when ungranted (got '$V6_MODE')"
 [ "$(status_field ipv6_state)" = "unavailable" ] || fail "ipv6_state should be unavailable"
 [ "$(status_field state)" = "up" ] || fail "v4 state must stay up when v6 is ungranted"
 grep -q -- "-6 addr add" "$IP_LOG" && fail "no v6 address should have been added"
 echo "ok: v6 ungranted leaves IPv4 healthy and untouched"
 
-# --- 3. capped backoff while v6 stays unavailable ----------------------------
-echo fail > "$V6_START_MODE"; echo 0 > "$V6_HAS_SETTINGS"
-V6_ADDR=""; V6_NEXT_RETRY=0; V6_RETRY_INTERVAL=0
-supervise_v6 wwan0 10 || fail "supervise_v6 must never return nonzero"
-[ "$V6_RETRY_INTERVAL" = "10" ] || fail "first backoff should be the floor 10 (got '$V6_RETRY_INTERVAL')"
-[ "$V6_NEXT_RETRY" -gt 0 ] 2>/dev/null || fail "next-retry deadline should be scheduled"
-# Before the deadline, no new attempt and the interval is unchanged.
-_saved_iface_calls=$(wc -l < "$IP_LOG")
-supervise_v6 wwan0 10 || fail "supervise_v6 must never return nonzero"
-[ "$V6_RETRY_INTERVAL" = "10" ] || fail "interval must not grow before the deadline"
-# Force the deadline to pass: the interval doubles to 20.
-V6_NEXT_RETRY=0
-supervise_v6 wwan0 10 || fail "supervise_v6 must never return nonzero"
-[ "$V6_RETRY_INTERVAL" = "20" ] || fail "backoff should double to 20 (got '$V6_RETRY_INTERVAL')"
-# Cap at INTERNET_IPV6_RETRY_MAX (5m => 300s).
-V6_RETRY_INTERVAL=200; V6_NEXT_RETRY=0
-supervise_v6 wwan0 10 || fail "supervise_v6 must never return nonzero"
-[ "$V6_RETRY_INTERVAL" = "300" ] || fail "backoff should cap at 300 (got '$V6_RETRY_INTERVAL')"
-[ "$(status_field state)" = "up" ] || fail "v4 state must stay up throughout v6 backoff"
-echo "ok: v6 retry uses a capped backoff and never disturbs v4"
+# --- 3. v6 appears later (RA delay) — a supervise refresh picks it up ---------
+echo 1 > "$V6_HAS_SETTINGS"; echo "$V6ADDR" > "$V6ADDR_FILE"
+refresh_v6 wwan0 || fail "refresh_v6 must never fail"
+[ "$V6_ADDR" = "$V6ADDR" ] || fail "a later refresh should apply the now-granted v6"
+[ "$(status_field ipv6_state)" = "up" ] || fail "ipv6_state should flip to up"
+echo "ok: a later supervise refresh brings up v6 without a redial"
 
-# --- 4. success resets the backoff -------------------------------------------
-echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"; echo 1 > "$V6_PRESENT"
-V6_WDS_CID=""; V6_MODE="none"; V6_ADDR=""; V6_NEXT_RETRY=0; V6_RETRY_INTERVAL=99
-supervise_v6 wwan0 10 || fail "supervise_v6 must never return nonzero"
-[ "$V6_ADDR" = "$V6ADDR" ] || fail "v6 should re-establish on success"
-[ "$V6_RETRY_INTERVAL" = "0" ] || fail "backoff must reset to 0 once v6 is up (got '$V6_RETRY_INTERVAL')"
-echo "ok: a successful re-establish resets the backoff"
+# --- 4. v6 address change is re-applied --------------------------------------
+NEW6="2409:4072:99:1a6a:dead:beef:cafe:0001"
+echo "$NEW6" > "$V6ADDR_FILE"; : > "$IP_LOG"
+refresh_v6 wwan0 || fail "refresh_v6 must never fail"
+[ "$V6_ADDR" = "$NEW6" ] || fail "a changed v6 address should be re-applied (got '$V6_ADDR')"
+grep -q -- "-6 addr add $NEW6/64 dev wwan0" "$IP_LOG" || fail "the new v6 address should be added"
+[ "$(status_field ipv6)" = "$NEW6" ] || fail "status should reflect the new v6 address"
+echo "ok: a changed v6 address is re-applied"
 
-# --- 5. carrier drop while v4 up: v6 flipped down, v4 identity untouched ------
+# --- 5. v6 drop while v4 up: v6 flushed, v4 identity untouched ----------------
 _h_before="$PKT_HANDLE"; _c_before="$WDS_CID"
-echo fail > "$V6_START_MODE"; echo 0 > "$V6_HAS_SETTINGS"; echo 0 > "$V6_PRESENT"
-: > "$IP_LOG"
-supervise_v6 wwan0 10 || fail "supervise_v6 must never return nonzero"
+echo 0 > "$V6_HAS_SETTINGS"; : > "$IP_LOG"
+refresh_v6 wwan0 || fail "refresh_v6 must never fail"
 [ -z "$V6_ADDR" ] || fail "a dropped v6 address must be cleared (got '$V6_ADDR')"
 [ "$(status_field ipv6_state)" = "unavailable" ] || fail "ipv6_state should be unavailable after a drop"
+grep -q -- "-6 addr flush dev wwan0 scope global" "$IP_LOG" || fail "the stale v6 address should be flushed on drop"
 [ "$PKT_HANDLE" = "$_h_before" ] || fail "v4 handle must be untouched by a v6 drop"
 [ "$WDS_CID" = "$_c_before" ] || fail "v4 cid must be untouched by a v6 drop"
-[ "$(status_field ipv4)" = "100.72.13.4" ] || fail "v4 address must survive a v6 drop"
+[ "$(status_field ipv4)" = "100.77.232.222" ] || fail "v4 address must survive a v6 drop"
 [ "$(status_field state)" = "up" ] || fail "v4 state must stay up on a v6 drop"
-grep -q -- "-6 " "$IP_LOG" || fail "the drop path should only touch v6 (ip -6 ...)"
 grep -qE "^addr (add 100|flush)" "$IP_LOG" && fail "the v6 drop must not touch the v4 address"
 echo "ok: a v6 drop clears v6 only and leaves the v4 session intact"
 
-# --- 6. failed v6 stop on a GONE session drops the stale id and recovers ------
-# A retained-but-dead v6 client would make bring_up_v6 skip starting a fresh
-# session and forever query the dead client, stranding reach-back. When the stop
-# fails AND the session is no longer connected, teardown must DROP the identity so
-# a fresh session can start.
-echo ok > "$V6_STOP"; echo connected > "$V6_CONNECTED"; echo ok > "$REACHABLE"
-echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"; echo 1 > "$V6_PRESENT"
-teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
-dial wwan0 >/dev/null 2>&1 || fail "setup dial should succeed"
-[ "$V6_WDS_CID" = "9" ] || fail "setup: v6 session should be up (cid 9), got '$V6_WDS_CID'"
-echo fail > "$V6_STOP"; echo disconnected > "$V6_CONNECTED"
-v6_teardown_cleanup wwan0 >/dev/null 2>&1
-[ -z "$V6_WDS_CID" ] || fail "a stop-fail on a GONE session must drop the stale cid (got '$V6_WDS_CID')"
-[ "$V6_MODE" = "none" ] || fail "mode should reset to none after dropping a stale v6 client"
-echo ok > "$V6_STOP"; echo connected > "$V6_CONNECTED"
-bring_up_v6 wwan0 >/dev/null 2>&1 || fail "bring_up_v6 should start a FRESH session after the stale id is dropped"
-[ "$V6_WDS_CID" = "9" ] || fail "a fresh v6 session should be started (cid 9)"
-[ "$V6_ADDR" = "$V6ADDR" ] || fail "v6 should be back up after recovery"
-echo "ok: a stop-fail on a gone session drops the stale id and recovers"
+# --- 6. teardown of the bearer flushes v6 ------------------------------------
+echo 1 > "$V6_HAS_SETTINGS"; refresh_v6 wwan0 >/dev/null 2>&1
+[ -n "$V6_ADDR" ] || fail "setup: v6 should be up before teardown"
+: > "$IP_LOG"
+teardown wwan0 >/dev/null 2>&1 || fail "teardown should succeed"
+grep -q -- "-6 addr flush dev wwan0 scope global" "$IP_LOG" || fail "teardown should flush v6"
+[ -z "$V6_ADDR" ] || fail "teardown should clear the v6 address"
+[ "$(status_field ipv6_state)" = "unavailable" ] || fail "ipv6_state should be unavailable after teardown"
+echo "ok: teardown of the single bearer flushes v6"
 
-# --- 7. failed v6 stop but STILL CONNECTED retains the id to retry ------------
-echo fail > "$V6_STOP"; echo connected > "$V6_CONNECTED"; echo ok > "$REACHABLE"
-v6_teardown_cleanup wwan0 >/dev/null 2>&1
-[ "$V6_WDS_CID" = "9" ] || fail "a stop-fail on a still-connected session must RETAIN the cid"
-[ "$V6_MODE" = "dual-session" ] || fail "a retained v6 session stays dual-session"
-echo "ok: a stop-fail on a still-connected session retains the id to retry"
-echo ok > "$V6_STOP"
-
-# --- 8. a RETAINED client that later goes stale must not strand IPv6 ----------
-# The scenario the retain path creates: a stop failed while the session still
-# reported connected, so the cid was retained (test 7) — and that client later dies.
-# Nothing else revalidates it (v6_teardown_cleanup only runs on shutdown or an IPv4
-# redial, and IPv4 stays healthy), so reusing it forever would strand reach-back
-# until a container restart. bring_up_v6 must drop it and dial a REPLACEMENT.
-[ "$V6_WDS_CID" = "9" ] || fail "setup: expected the retained cid 9 from test 7"
-echo 9 > "$V6_STALE_CID"          # the retained client dies
-echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"; echo 1 > "$V6_PRESENT"
-if bring_up_v6 wwan0 >/dev/null 2>&1; then
-    fail "bring_up_v6 should fail while the retained client is stale"
-fi
-[ -z "$V6_WDS_CID" ] || fail "a stale REUSED identity must be released (got cid '$V6_WDS_CID')"
-[ "$V6_MODE" = "none" ] || fail "mode should reset to none after releasing a stale identity"
-# Next attempt starts a FRESH session (new cid) and reach-back is restored.
-echo 11 > "$V6_NEW_CID"
-bring_up_v6 wwan0 >/dev/null 2>&1 || fail "bring_up_v6 should start a replacement session"
-[ "$V6_WDS_CID" = "11" ] || fail "a REPLACEMENT session should have been started (got cid '$V6_WDS_CID')"
-[ "$V6_ADDR" = "$V6ADDR" ] || fail "IPv6 reach-back should be restored"
-: > "$V6_STALE_CID"; echo 9 > "$V6_NEW_CID"
-echo "ok: a retained client that goes stale is released and replaced"
-
-# --- 9. an ADOPTED session that ends must not strand IPv6 either --------------
-# Same class: V6_MODE=adopted holds no cid, so the start block is skipped. If the
-# modem's autoconnect session ends, we must stop adopting and dial our own.
-teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
-V6_MODE="adopted"; V6_WDS_CID=""; V6_PKT_HANDLE=""; V6_ADDR=""
-echo 0 > "$V6_HAS_SETTINGS"       # the adopted session is gone: no v6 settings
-if bring_up_v6 wwan0 >/dev/null 2>&1; then
-    fail "bring_up_v6 should fail once the adopted session is gone"
-fi
-[ "$V6_MODE" = "none" ] || fail "a dead adopted session must clear the mode (got '$V6_MODE')"
-echo 1 > "$V6_HAS_SETTINGS"; echo ok > "$V6_START_MODE"
-bring_up_v6 wwan0 >/dev/null 2>&1 || fail "bring_up_v6 should now dial its own session"
-[ "$V6_MODE" = "dual-session" ] || fail "should have started its own session (got '$V6_MODE')"
-[ "$V6_ADDR" = "$V6ADDR" ] || fail "IPv6 should be back up via our own session"
-echo "ok: a dead adopted session stops being adopted and is replaced"
-
-# --- 10. a FRESH start whose settings fail releases, never leaks --------------
-teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
-echo ok > "$V6_START_MODE"; echo 0 > "$V6_HAS_SETTINGS"   # starts, but no v6 grant
-if bring_up_v6 wwan0 >/dev/null 2>&1; then
-    fail "bring_up_v6 should fail when the started session grants no v6"
-fi
-[ -z "$V6_WDS_CID" ] || fail "a just-started session with no settings must be released, not leaked"
-[ "$V6_MODE" = "none" ] || fail "mode should reset after releasing a just-started session"
-echo 1 > "$V6_HAS_SETTINGS"
-echo "ok: a just-started session that grants no v6 is released, not leaked"
-
-# --- 11. INTERNET_ENABLE_IPV6=0 forces byte-identical IPv4-only ---------------
-teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
+# --- 7. INTERNET_ENABLE_IPV6=0 forces byte-identical IPv4-only ---------------
 INTERNET_ENABLE_IPV6=0
-: > "$IP_LOG"; echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"
+: > "$IP_LOG"; : > "$START_LOG"; : > "$MODIFY_LOG"; echo 1 > "$V6_HAS_SETTINGS"
 dial wwan0 >/dev/null 2>&1 || fail "v4-only dial should succeed with IPv6 disabled"
 [ "$PKT_HANDLE" = "2264216040" ] || fail "v4 must be up with IPv6 disabled"
 [ -z "$V6_ADDR" ] || fail "no v6 address when IPv6 disabled"
+grep -q 'ip-type=4' "$START_LOG" || fail "disabled dial should use ip-type=4, got: $(cat "$START_LOG")"
+[ -s "$MODIFY_LOG" ] && fail "disabled dial must NOT provision an IPv4v6 profile"
 grep -q -- "-6 " "$IP_LOG" && fail "no 'ip -6' calls allowed when IPv6 disabled"
 [ "$(status_field ipv6_state)" = "unavailable" ] || fail "ipv6_state should be unavailable when disabled"
-# The kill-switch must ALSO silence the teardown/trap path (FR-011/SC-007): a
-# redial or shutdown must make no ip -6 change on a disabled interface, in case
-# something else manages v6 there.
 : > "$IP_LOG"
-v6_teardown_cleanup wwan0 >/dev/null 2>&1
-grep -q -- "-6 " "$IP_LOG" && fail "v6_teardown_cleanup must be a no-op when IPv6 disabled"
+teardown wwan0 >/dev/null 2>&1
+grep -q -- "-6 " "$IP_LOG" && fail "teardown must make no ip -6 change when IPv6 disabled"
 INTERNET_ENABLE_IPV6=1
 echo "ok: INTERNET_ENABLE_IPV6=0 disables all v6 behavior (dial AND teardown)"
 

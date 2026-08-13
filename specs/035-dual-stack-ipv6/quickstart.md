@@ -9,19 +9,21 @@ for IPv4.
 Before enabling, verify the modem+carrier hand out a global IPv6 address:
 
 ```sh
-# On the host, with the sidecar temporarily stopped (so the QMI node is free):
+# On the host, with the sidecar temporarily stopped (so the QMI node is free).
+# Capability check — does the carrier grant a global v6 at all?
 qmicli -d /dev/cdc-wdm0 -p \
-  --wds-start-network="ip-type=8,apn=$YOUR_APN" --client-no-release-cid
+  --wds-start-network="ip-type=6,apn=$YOUR_APN" --client-no-release-cid
 qmicli -d /dev/cdc-wdm0 -p --wds-get-current-settings | grep -i 'IPv6'
 ```
 
 - If you see an `IPv6 address:` line with a **global** address (starts `2xxx:`/`3xxx:`,
-  not `fe80:` or `fc00:`/`fd00:`), dual-stack will work.
-- If `ip-type=8` is rejected, the sidecar falls back to a separate `ip-type=6`
-  session automatically — try
-  `--wds-start-network="ip-type=6,apn=$YOUR_APN"` to confirm v6 alone is granted.
+  not `fe80:` or `fc00:`/`fd00:`), the carrier grants IPv6.
+- The sidecar itself dials ONE IPv4v6 bearer (not a separate v6 session — carriers
+  like Jio refuse that). To mimic it: `--wds-modify-profile="3gpp,1,pdp-type=ipv4v6,apn=$YOUR_APN"`
+  then `--wds-start-network="profile-index=1"` and check `--wds-get-current-settings`
+  shows **both** IPv4 and IPv6.
 - If no v6 address appears at all, the carrier/plan does not offer IPv6; the sidecar
-  will stay IPv4-only and healthy (nothing else to do).
+  stays IPv4-only and healthy (nothing else to do).
 
 ## 2. Enable dual-stack in the sidecar
 
@@ -30,10 +32,10 @@ In `docker/.env` (see `.env.example`):
 ```sh
 INTERNET_APN=your.carrier.apn      # required (unchanged)
 INTERNET_ENABLE_IPV6=1             # default; dual-stack on
+INTERNET_IPV6_PROFILE=1            # profile provisioned IPv4v6 + dialed (default 1)
 # Optional: notify your own tooling when the v6 address changes
 INTERNET_IPV6_HOOK=/opt/ddns/update-aaaa.sh
 INTERNET_IPV6_HOOK_TIMEOUT=10s
-INTERNET_IPV6_RETRY_MAX=5m         # cap for the background v6 re-establish backoff
 ```
 
 Bring the stack up as usual:

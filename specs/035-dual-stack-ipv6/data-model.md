@@ -14,30 +14,23 @@ of logic owns and how it transitions.
 
 Unchanged by this feature. IPv4 remains the health-gating uplink.
 
-## Entity: IPv6 session identity (new)
+## Entity: the bearer (single IPv4v6 session)
+
+There is **no separate v6 session identity**. Dual-stack is one IPv4v6 bearer, so v6
+rides the same `WDS_CID`/`PKT_HANDLE` as v4 (see research.md R1: a second session to
+the same APN is refused by Jio). The only v6-specific "identity" work is provisioning
+the profile:
 
 | Field | Holder | Meaning |
 |-------|--------|---------|
-| `V6_PKT_HANDLE` | entrypoint var | v6 packet-data handle — set for the `dual-session` case (empty when the session was adopted from autoconnect, or absent) |
-| `V6_WDS_CID` | entrypoint var | retained v6 WDS client id (same discipline as `WDS_CID`); empty for adopted/absent |
-| `V6_MODE` | entrypoint var | `adopted` \| `dual-session` \| `none`. The sidecar always dials a **separate `ip-type=6` session** (`dual-session`) alongside v4; `adopted` means a v6 session the modem already had up (autoconnect) that we use read-only. It never issues a combined `ip-type=8` start. |
+| `INTERNET_IPV6_PROFILE` | env (config, default `1`) | 3GPP profile index provisioned as `pdp-type=IPv4v6` (with the APN) and dialed by `profile-index` when v6 is enabled |
 
 **Rules**:
-- The v6 identity follows the exact retained-CID discipline as v4: a *failed* stop
-  retains the CID **only** when the client is genuinely still ours and stuck (QMI
-  reachable AND the session still connected); a vanished/unreachable modem or an
-  already-ended session drops it.
-- **A retained/adopted identity is only valid while it can still produce a global
-  v6 address.** On reuse, if `apply_settings_v6` yields no global address, the
-  identity is released (client freed, vars cleared) so the next attempt dials a
-  replacement. This is mandatory: nothing else revalidates it — `v6_teardown_cleanup`
-  runs only on shutdown or an **IPv4** redial, and IPv4 staying healthy is the normal
-  case, so a stale identity would otherwise be re-queried forever and strand
-  reach-back until a container restart. The same applies to `adopted`: a dead
-  autoconnect session must clear the mode so the sidecar dials its own.
-- An identity created in the *current* `bring_up_v6` call is torn down (not merely
-  forgotten) if its settings fail, so a just-started client is never leaked.
-- v6 teardown/redial MUST NOT touch `PKT_HANDLE`/`WDS_CID` or the v4 address.
+- When v6 is enabled, `dial()` provisions the profile IPv4v6 and starts ONE bearer
+  by `profile-index`; when disabled it dials `ip-type=4` (byte-identical to pre-035).
+- Tearing down the single bearer (`teardown`) drops both families; there is no
+  separate v6 stop. `teardown` also flushes the host-side v6 address/route.
+- v6 apply/read uses `qmi_wds` (the shared client), never a separate client.
 
 ## Entity: IPv6 address state (new)
 
@@ -45,37 +38,28 @@ Unchanged by this feature. IPv4 remains the health-gating uplink.
 |-------|--------|---------|
 | `V6_ADDR` | entrypoint var | current **global** IPv6 address applied to the iface (empty = none) |
 | `V6_PREFIX` | entrypoint var | prefix length granted with the address (e.g. `64`) |
-| `V6_GW` | entrypoint var | granted v6 gateway (may be empty → on-link default route) |
 | `V6_SINCE` | entrypoint var | UTC timestamp of the last v6 up transition |
 | *(marker file)* | `${INTERNET_STATUS_FILE}.v6notified` | the last global address a hook run **succeeded** for; de-dupe gates on this so a failed hook is retried and de-dupe survives a restart |
-| `V6_NEXT_RETRY` | entrypoint var | monotonic deadline before which no v6 re-establish is attempted (capped-backoff gate) |
-| `V6_RETRY_INTERVAL` | entrypoint var | current backoff interval; starts at `INTERNET_PROBE_INTERVAL`, doubles up to `INTERNET_IPV6_RETRY_MAX`, resets to the floor once v6 is up |
+
+There is **no backoff state**. v6 rides the v4 bearer, so `refresh_v6` on each
+supervise tick is just a settings read (cheap) — there is no separate v6 dial to
+rate-limit, hence no `V6_NEXT_RETRY`/`V6_RETRY_INTERVAL`.
 
 **State transitions** (per supervise iteration, after the unchanged v4 logic):
 
-```
-        no global v6            global v6 applied
-   ┌────────────────────┐   ┌───────────────────────┐
-   ▼                    │   ▼                       │
-[unavailable] ──apply success (is_global_v6)──▶ [up]
-   ▲   │                                          │  │
-   │   └── attempt (bounded, may not touch v4) ───┘  │
-   │                                                 │
-   └────── address dropped / redial yields none ─────┘   (flush stale global v6)
-```
+Each transition is driven by `refresh_v6` re-reading the current bearer's settings
+(`--wds-get-current-settings`) on every supervise tick — there is no separate v6
+dial:
 
-- Entering **up** or changing `V6_ADDR` to a different global value ⇒ fire the hook
-  (if configured; unless the success marker already records this address); reset
-  `V6_RETRY_INTERVAL` to the floor.
-- Staying **up** across a supervise tick ⇒ re-attempt the hook only if the success
-  marker is stale (i.e. the previous hook run failed) — this is the retry.
-- Re-observing the same global `V6_ADDR` ⇒ no hook, no status churn.
-- Leaving **up** (address dropped) ⇒ flush the stale global v6, set
-  `ipv6_state=unavailable`, log it, and **do not** fire the hook (Clarification
-  2026-08-13); schedule the next re-establish per the capped backoff.
-- While **unavailable** ⇒ attempt a v6 re-establish only once `V6_NEXT_RETRY` has
-  passed, then set `V6_NEXT_RETRY = now + V6_RETRY_INTERVAL` and double
-  `V6_RETRY_INTERVAL` up to `INTERNET_IPV6_RETRY_MAX`.
+- Bearer carries a global v6 that is **new/changed** ⇒ apply it, set
+  `ipv6_state=up`, and fire the hook (unless the success marker already records this
+  address).
+- Bearer carries the **same** global v6 ⇒ no status churn; re-attempt the hook only
+  if the success marker is stale (a prior hook run failed) — this is the retry.
+- Bearer **stops carrying v6** (was up) ⇒ flush the stale global v6 address/route,
+  set `ipv6_state=unavailable`, log it, and **do not** fire the hook (Clarification
+  2026-08-13).
+- Bearer carries **no v6** (was already down) ⇒ no-op (no status churn).
 - A non-global address (fe80::/10, ::1, fc00::/7) ⇒ treated as **unavailable** for
   reach-back purposes (FR-012).
 

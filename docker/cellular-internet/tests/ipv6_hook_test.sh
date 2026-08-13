@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Integration test for the IPv6 address-change hook (specs/035-dual-stack-ipv6).
 #
-# Exercises the REAL notify_v6_hook / _mark_v6_* / bring_up_v6 / supervise_v6 from
+# Exercises the REAL notify_v6_hook / _mark_v6_* / refresh_v6 from
 # internet-entrypoint.sh. `qmicli`, `ip`, and `timeout` are scripted stubs on PATH
 # (the modem is the only "hardware" mock; the stub `timeout` just runs the command
 # so the test is deterministic). Verifies the hook contract: fire once on
@@ -20,34 +20,31 @@ mkdir -p "$TMP/bin"
 
 QMI_DEV="$TMP/cdc-wdm0"; : > "$QMI_DEV"
 V6ADDR_FILE="$TMP/v6addr"
-V6_PRESENT="$TMP/v6_present"; echo 1 > "$V6_PRESENT"
+V6_HAS_SETTINGS="$TMP/v6_has_settings"; echo 1 > "$V6_HAS_SETTINGS"
 A1="2401:4900:1c30:abcd::1"
 A2="2401:4900:1c30:ef01::2"
 A3="2401:4900:1c30:2222::3"
 echo "$A1" > "$V6ADDR_FILE"
 
+# v6 rides the single bearer: refresh_v6 just reads current-settings (the granted v6
+# address is settable via $V6ADDR_FILE, or absent when $V6_HAS_SETTINGS=0).
 cat > "$TMP/bin/qmicli" <<EOF
 #!/usr/bin/env sh
 for a in "\$@"; do
     case "\$a" in
-        --wds-start-network=*ip-type=6*)
-            printf '[dev] Network started\n\tPacket data handle: %s\n' "'3300000006'"
-            printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'9'"
-            exit 0 ;;
         --wds-get-current-settings)
-            printf '\tIPv6 address: %s/64\n\tIPv6 gateway address: fe80::1\n' "\$(cat $V6ADDR_FILE)"
+            printf '\tIPv4 address: 100.77.232.222\n'
+            if [ "\$(cat $V6_HAS_SETTINGS)" = 1 ]; then
+                printf '\tIPv6 address: %s/64\n\tIPv6 gateway address: 2409:4072:99:1a6a::1\n' "\$(cat $V6ADDR_FILE)"
+            fi
             exit 0 ;;
         --get-service-version-info) exit 0 ;;
     esac
 done
 exit 0
 EOF
-# Fake ip: report the address as present (for supervise_v6 liveness) when asked.
-cat > "$TMP/bin/ip" <<EOF
+cat > "$TMP/bin/ip" <<'EOF'
 #!/usr/bin/env sh
-case "\$*" in
-    "-6 addr show"*) [ "\$(cat $V6_PRESENT 2>/dev/null)" = 1 ] && echo "    inet6 present/64 scope global" ;;
-esac
 exit 0
 EOF
 # Deterministic stub timeout: ignore the duration, run the rest.
@@ -144,26 +141,26 @@ notify_v6_hook; wait
 [ "$(marker)" = "$A3" ] || fail "a successful retry should advance the marker"
 echo "ok: a stale marker is retried until the hook succeeds"
 
-# --- 9. end-to-end: a real bring_up_v6 fires the hook once -------------------
+# --- 9. end-to-end: a real refresh_v6 fires the hook once --------------------
 write_hook 0; : > "$HOOK_LOG"; rm -f "$MARKER"
-V6_ADDR=""; V6_WDS_CID=""; V6_MODE="none"; echo "$A1" > "$V6ADDR_FILE"
-bring_up_v6 wwan0 >/dev/null 2>&1 || fail "bring_up_v6 should succeed"
+V6_ADDR=""; echo 1 > "$V6_HAS_SETTINGS"; echo "$A1" > "$V6ADDR_FILE"
+refresh_v6 wwan0 >/dev/null 2>&1 || fail "refresh_v6 should succeed"
 wait
-[ "$(hook_count)" = 1 ] || fail "a real bring_up should fire the hook once (got $(hook_count))"
+[ "$(hook_count)" = 1 ] || fail "a real refresh should fire the hook once (got $(hook_count))"
 [ "$(marker)" = "$A1" ] || fail "end-to-end should record the marker"
-echo "ok: bring_up_v6 wires the hook on the up transition"
+echo "ok: refresh_v6 wires the hook on the up transition"
 
-# --- 10. supervise_v6 retries a failed hook while v6 stays up -----------------
-rm -f "$MARKER"; : > "$HOOK_LOG"; echo 1 > "$V6_PRESENT"; write_hook 1
-V6_ADDR="$A1"; V6_WDS_CID="9"; V6_MODE="dual-session"
-supervise_v6 wwan0 10 || fail "supervise must not fail"
+# --- 10. a supervise refresh retries a failed hook while v6 stays up ---------
+rm -f "$MARKER"; : > "$HOOK_LOG"; echo 1 > "$V6_HAS_SETTINGS"; echo "$A1" > "$V6ADDR_FILE"
+V6_ADDR="$A1"; write_hook 1
+refresh_v6 wwan0 || fail "refresh must not fail"
 wait
-[ "$(hook_count)" = 1 ] || fail "supervise up-branch should (re)fire a stale hook"
+[ "$(hook_count)" = 1 ] || fail "a refresh should (re)fire a stale hook"
 [ "$(marker)" != "$A1" ] || fail "a failed hook must leave the marker stale"
 write_hook 0
-supervise_v6 wwan0 10 || fail "supervise must not fail"
+refresh_v6 wwan0 || fail "refresh must not fail"
 wait
-[ "$(marker)" = "$A1" ] || fail "supervise should keep retrying until the hook succeeds"
-echo "ok: supervise_v6 retries a failed hook while v6 stays up"
+[ "$(marker)" = "$A1" ] || fail "refresh should keep retrying until the hook succeeds"
+echo "ok: a supervise refresh retries a failed hook while v6 stays up"
 
 echo "PASS: ipv6_hook_test.sh"

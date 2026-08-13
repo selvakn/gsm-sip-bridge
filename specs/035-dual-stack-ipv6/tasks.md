@@ -4,6 +4,15 @@ description: "Task list for Dual-Stack IPv6 for the Cellular-Internet Sidecar"
 
 # Tasks: Dual-Stack IPv6 for the Cellular-Internet Sidecar
 
+> **REVISED after hardware testing (2026-08-13).** The tasks below were completed
+> against the original *two-session* design (separate `ip-type=6` alongside
+> `ip-type=4`). On-hardware testing on Jio showed that design cannot work — a second
+> session to the same APN is refused (`multiple-connection-to-same-pdn-not-allowed`)
+> and there is no `ip-type=8` — so dual-stack was reworked into a **single IPv4v6
+> bearer** (provision the profile `pdp-type=IPv4v6`, dial by `profile-index`, read
+> both families from one session). The task text below is kept as a historical
+> record; the current design is in research.md R1, data-model.md, and spec.md FR-001.
+
 **Input**: Design documents from `/specs/035-dual-stack-ipv6/`
 **Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/
 

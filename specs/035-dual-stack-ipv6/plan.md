@@ -15,11 +15,14 @@ background without disturbing the IPv4 session. When the global IPv6 address fir
 appears or changes, an optional operator-supplied **hook script** is invoked with
 the new address as its single argument (so the operator can drive their own DDNS).
 
-Technical approach: request a v4+v6 session from QMI (single WDS start with
-`ip-type=8` where the modem supports it, else a second `ip-type=6` WDS session
-adopted alongside the v4 one), parse the granted IPv6 address/prefix/gateway from
-`--wds-get-current-settings`, and apply it with `ip -6 addr add` / `ip -6 route
-replace default`. All changes stay inside `docker/cellular-internet/` shell
+Technical approach (revised after hardware testing — see research.md R1): dual-stack
+is a **single IPv4v6 bearer**, not two sessions. When v6 is enabled the sidecar
+provisions the data profile (`INTERNET_IPV6_PROFILE`) as `pdp-type=IPv4v6` and dials
+one session by `profile-index`, then parses BOTH families from
+`--wds-get-current-settings` and applies v6 with `ip -6 addr add` / `ip -6 route
+replace default`. (Two separate sessions were the original design but Jio refuses a
+second connection to the same APN; QMI has no `ip-type=8`.) All changes stay inside
+`docker/cellular-internet/` shell
 scripts; the sidecar remains QMI-only and never opens the AT port.
 
 ## Technical Context
@@ -124,4 +127,4 @@ sourcing + scripted `qmicli`/`ip` stubs) rather than introducing new machinery.
 | Violation | Why Needed | Simpler Alternative Rejected Because |
 |-----------|------------|--------------------------------------|
 | Address-change **hook subprocess** (new indirection vs. Principle V) | FR-008/FR-009 require notifying operator tooling of a changed, unstable carrier prefix without coupling the sidecar to any DNS provider or credentials | Built-in DDNS was explicitly declined by the operator (adds config, secrets, a network dependency); status-file-only was declined in favor of push. A single fire-and-forget hook, isolated from the supervise loop, is the minimal mechanism that satisfies the requirement. |
-| **Second WDS (v6) session** alongside the v4 one | EC20/EC25 firmwares negotiate v4 and v6 as separate PDN contexts, so a global v6 address needs its own `ip-type=6` session | A v4-only single session cannot deliver the feature's purpose (inbound v6). The v6 session reuses the existing retained-CID/teardown bookkeeping, so it adds a parallel identity pair, not a parallel supervisor. Implemented unconditionally (no combined `ip-type=8` fast path) to keep the v4 dial byte-identical and avoid a second dial code path — see research.md R1. |
+| **Provisioning the modem profile to IPv4v6** (`--wds-modify-profile`) | Dual-stack is a single IPv4v6 bearer; the modem's default profile was IPv4, so v6 needs the profile's PDP type set to IPv4v6 (QMI has no per-call dual ip-type) | Two separate sessions (the simpler-looking alternative) are refused by Jio (`multiple-connection-to-same-pdn-not-allowed`), so they cannot deliver v6 at all. The modify is best-effort and logged on failure; it is the minimal way to obtain one dual bearer — see research.md R1. |

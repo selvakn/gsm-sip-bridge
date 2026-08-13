@@ -20,9 +20,13 @@ behavior (FR-011).
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `INTERNET_ENABLE_IPV6` | `1` (on) | Master switch for dual-stack. `0` = force today's IPv4-only behavior. Present so a deployment can hard-disable v6 without removing config. |
+| `INTERNET_IPV6_PROFILE` | `1` | 3GPP profile index the sidecar provisions as `pdp-type=IPv4v6` (with the APN) and dials by `profile-index` for dual-stack. Dual-stack is a SINGLE IPv4v6 bearer (a second session to the same APN is refused), so v6 comes from the profile, not a separate session. |
 | `INTERNET_IPV6_HOOK` | *(unset)* | Path to an executable invoked when the global IPv6 address first appears or changes. Unset/empty = no hook (address still recorded in status/logs). |
 | `INTERNET_IPV6_HOOK_TIMEOUT` | `10s` | Max wall-clock time a single hook invocation may run before it is killed. Bounds a hanging hook so it cannot accumulate. |
-| `INTERNET_IPV6_RETRY_MAX` | `5m` | Cap for the background IPv6 re-establish backoff. While IPv6 is unavailable, retries start at `INTERNET_PROBE_INTERVAL` and grow (doubling) up to this maximum, so a v6-incapable carrier is not retried every probe interval. Backoff resets once IPv6 is up. |
+
+> Note: there is no v6 re-establish backoff knob. v6 rides the single v4 bearer, so
+> "retrying v6" is just re-reading the bearer's settings each probe interval (a cheap
+> query) — there is no separate v6 dial to rate-limit.
 
 ### `INTERNET_ENABLE_IPV6` behavior
 
