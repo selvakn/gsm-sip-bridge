@@ -387,6 +387,12 @@ bring_up_v6() {
                 V6_MODE="adopted"
                 _bv_started_now=1
             else
+                # Surface the carrier's reason instead of a generic "not
+                # established": e.g. QMI error 79 'PolicyMismatch' means the APN is
+                # provisioned IPv4-only, so no amount of retrying will grant v6 —
+                # that is a carrier/plan change, not a bug. (Observed on a live
+                # IPv4-only APN, specs/035.)
+                log "IPv6 session not started: $(printf '%s' "$_bv_out" | grep -i 'error' | head -n1) — the carrier may not offer IPv6 on this APN (IPv4 is unaffected)"
                 return 1
             fi
         fi
