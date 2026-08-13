@@ -124,10 +124,26 @@ rule enforces FR-004/FR-005. The container healthcheck is what gates the bridge
 (`depends_on: service_healthy`), so leaving it v4-only is the mechanism that
 guarantees v6 can never block VoWiFi.
 
+**Identity revalidation (added after review)**: because this loop is the *only*
+thing that runs while IPv4 is healthy, it is also the only place a stale v6 identity
+can be caught. `v6_teardown_cleanup` runs solely on shutdown or an IPv4 redial, so a
+retained CID (kept by a stop that failed while the session still reported connected)
+or an `adopted` mode whose autoconnect session ended would otherwise be reused
+forever — every attempt re-querying a dead client, never dialling a replacement,
+stranding reach-back until a container restart. Rule: **a reused identity that
+cannot produce a global v6 address is released and forgotten**, so the next attempt
+starts fresh. An identity started in the same call is torn down instead, so a
+just-created client is never leaked.
+
 **Alternatives considered**:
 - *Separate background v6 supervisor process*: rejected — two supervisors touching
   one interface invites races on redial (v4 teardown vs. v6 bring-up) and doubles the
   lifecycle bugs 032 was careful to avoid. YAGNI.
+- *Probe the retained client's status each tick to decide validity*: rejected —
+  `--wds-get-packet-service-status` on a fresh client can report the *modem's*
+  overall (IPv4) session as connected, so it is an ambiguous liveness signal for v6.
+  Keying off "can it still give us a global v6 address" tests exactly what the
+  feature needs, with no extra QMI round trip.
 - *Make health `require_ipv6` configurable*: the operator explicitly chose
   "stay healthy on v4, keep retrying v6", so no such flag is added (keeps surface
   minimal; can be added later if a deployment ever needs it).

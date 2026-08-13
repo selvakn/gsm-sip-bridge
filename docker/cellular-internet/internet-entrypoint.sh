@@ -322,16 +322,41 @@ _mark_v6_down() {
         write_status "$(_current_state)"
 }
 
+# Give up a retained/adopted v6 identity: free the client if we hold one, then
+# forget it so the next bring_up_v6 starts a FRESH session.
+#
+# A WDS action WITHOUT --client-no-release-cid releases the client on exit (the
+# same idiom dial() uses for stray/partial ids), so this does not leak the client
+# on a modem that is still answering.
+v6_release_identity() {
+    if [ -n "$V6_WDS_CID" ] && [ -e "$INTERNET_QMI_DEV" ]; then
+        qmicli -d "$INTERNET_QMI_DEV" -p --client-cid="$V6_WDS_CID" \
+            --wds-get-packet-service-status >/dev/null 2>&1 || true
+    fi
+    V6_PKT_HANDLE=""
+    V6_WDS_CID=""
+    V6_MODE="none"
+}
+
 # Start (if needed) and apply a SEPARATE IPv6 (ip-type=6) session alongside the v4
 # one, keeping the v4 session byte-identical (research R1 dual-session path). A
 # retained V6_WDS_CID is reused across re-applies; the same retained-CID discipline
 # as v4 avoids stacking clients. Best-effort: returns nonzero without touching v4.
+#
+# A REUSED identity is only worth keeping while it can still produce a global v6
+# address. Nothing else revalidates it: v6_teardown_cleanup runs only on shutdown or
+# an IPv4 redial, and IPv4 staying healthy is the normal case — so a retained client
+# that went stale (or an adopted session the modem dropped) would otherwise be
+# queried forever and strand reach-back until a container restart. Hence the failure
+# path below distinguishes "just started" (release it, never leak) from "reused"
+# (drop it so the next attempt starts fresh).
 bring_up_v6() {
     _bv_iface="$1"
     [ "$INTERNET_ENABLE_IPV6" = "1" ] || return 1
 
     enable_v6_iface "$_bv_iface"
 
+    _bv_started_now=0
     if [ -z "$V6_WDS_CID" ] && [ "$V6_MODE" != "adopted" ]; then
         if _bv_out=$(qmicli -d "$INTERNET_QMI_DEV" -p \
             --wds-start-network="ip-type=6,apn=${INTERNET_APN}" \
@@ -339,6 +364,7 @@ bring_up_v6() {
             V6_PKT_HANDLE=$(printf '%s\n' "$_bv_out" | grep -iE 'packet data handle' | grep -oE '[0-9]+' | head -n1)
             V6_WDS_CID=$(printf '%s\n' "$_bv_out" | grep -iE 'CID:' | grep -oE '[0-9]+' | head -n1)
             V6_MODE="dual-session"
+            _bv_started_now=1
             if [ -z "$V6_WDS_CID" ] || [ -z "$V6_PKT_HANDLE" ]; then
                 # A partial identity can never be cleanly stopped — release what we
                 # can and fail rather than retain an unstoppable v6 client.
@@ -359,13 +385,30 @@ bring_up_v6() {
             # read-only. We hold no client for it, so we must never try to stop it.
             if printf '%s' "$_bv_out" | grep -qi 'noeffect'; then
                 V6_MODE="adopted"
+                _bv_started_now=1
             else
                 return 1
             fi
         fi
     fi
 
-    _bv_applied=$(apply_settings_v6 "$_bv_iface") || return 1
+    if ! _bv_applied=$(apply_settings_v6 "$_bv_iface"); then
+        if [ "$_bv_started_now" = 1 ]; then
+            # We just started/adopted this session but cannot read or apply its
+            # settings. Release it rather than leak the client (mirrors dial()'s
+            # "could not read/apply QMI settings" path on the v4 side).
+            v6_teardown_cleanup "$_bv_iface"
+        else
+            # A REUSED identity that can no longer produce a global v6 address is
+            # stale — the retained client died, or the adopted session ended. Keeping
+            # it would make every later attempt re-query a dead client and never
+            # start a replacement. Drop it so the next attempt dials fresh.
+            log "retained IPv6 identity (mode=$V6_MODE cid=${V6_WDS_CID:-none}) yields no global address — releasing it so a fresh session can start"
+            v6_release_identity
+            _mark_v6_down
+        fi
+        return 1
+    fi
     V6_PREFIX=${_bv_applied##* }
     _mark_v6_up "${_bv_applied%% *}"
     return 0

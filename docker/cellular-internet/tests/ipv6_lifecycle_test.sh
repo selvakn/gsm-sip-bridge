@@ -29,6 +29,8 @@ echo 1  > "$V6_PRESENT"
 V6_STOP="$TMP/v6_stop";           echo ok        > "$V6_STOP"        # ok | fail
 V6_CONNECTED="$TMP/v6_connected"; echo connected > "$V6_CONNECTED"   # connected | disconnected
 REACHABLE="$TMP/reachable";       echo ok        > "$REACHABLE"      # ok | hangup
+V6_STALE_CID="$TMP/v6_stale_cid"; : > "$V6_STALE_CID"                # a cid the modem no longer knows
+V6_NEW_CID="$TMP/v6_new_cid";     echo 9         > "$V6_NEW_CID"     # cid handed out by the next v6 start
 
 V6ADDR="2401:4900:1c30:abcd::1"
 
@@ -38,6 +40,17 @@ cat > "$TMP/bin/qmicli" <<EOF
 if [ "\$(cat $REACHABLE)" != ok ]; then
     echo "error: couldn't open the QmiDevice: endpoint hangup" >&2
     exit 1
+fi
+# A STALE client: the modem no longer knows this cid, so every action targeting it
+# fails — including the settings query the sidecar reuses it for.
+_stale=\$(cat $V6_STALE_CID)
+if [ -n "\$_stale" ]; then
+    for a in "\$@"; do
+        if [ "\$a" = "--client-cid=\$_stale" ]; then
+            echo "error: couldn't allocate client: unknown client id" >&2
+            exit 1
+        fi
+    done
 fi
 for a in "\$@"; do
     case "\$a" in
@@ -51,7 +64,7 @@ for a in "\$@"; do
                 noeffect) echo "error: NoEffect" >&2; exit 1 ;;
             esac
             printf '[dev] Network started\n\tPacket data handle: %s\n' "'3300000006'"
-            printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'9'"
+            printf '[dev] Client ID not released:\n\tService: %s\n\t    CID: %s\n' "'wds'" "'\$(cat $V6_NEW_CID)'"
             exit 0 ;;
         --wds-stop-network=*)
             if [ "\$(cat $V6_STOP)" = ok ]; then exit 0; fi
@@ -200,7 +213,56 @@ v6_teardown_cleanup wwan0 >/dev/null 2>&1
 echo "ok: a stop-fail on a still-connected session retains the id to retry"
 echo ok > "$V6_STOP"
 
-# --- 8. INTERNET_ENABLE_IPV6=0 forces byte-identical IPv4-only ----------------
+# --- 8. a RETAINED client that later goes stale must not strand IPv6 ----------
+# The scenario the retain path creates: a stop failed while the session still
+# reported connected, so the cid was retained (test 7) — and that client later dies.
+# Nothing else revalidates it (v6_teardown_cleanup only runs on shutdown or an IPv4
+# redial, and IPv4 stays healthy), so reusing it forever would strand reach-back
+# until a container restart. bring_up_v6 must drop it and dial a REPLACEMENT.
+[ "$V6_WDS_CID" = "9" ] || fail "setup: expected the retained cid 9 from test 7"
+echo 9 > "$V6_STALE_CID"          # the retained client dies
+echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"; echo 1 > "$V6_PRESENT"
+if bring_up_v6 wwan0 >/dev/null 2>&1; then
+    fail "bring_up_v6 should fail while the retained client is stale"
+fi
+[ -z "$V6_WDS_CID" ] || fail "a stale REUSED identity must be released (got cid '$V6_WDS_CID')"
+[ "$V6_MODE" = "none" ] || fail "mode should reset to none after releasing a stale identity"
+# Next attempt starts a FRESH session (new cid) and reach-back is restored.
+echo 11 > "$V6_NEW_CID"
+bring_up_v6 wwan0 >/dev/null 2>&1 || fail "bring_up_v6 should start a replacement session"
+[ "$V6_WDS_CID" = "11" ] || fail "a REPLACEMENT session should have been started (got cid '$V6_WDS_CID')"
+[ "$V6_ADDR" = "$V6ADDR" ] || fail "IPv6 reach-back should be restored"
+: > "$V6_STALE_CID"; echo 9 > "$V6_NEW_CID"
+echo "ok: a retained client that goes stale is released and replaced"
+
+# --- 9. an ADOPTED session that ends must not strand IPv6 either --------------
+# Same class: V6_MODE=adopted holds no cid, so the start block is skipped. If the
+# modem's autoconnect session ends, we must stop adopting and dial our own.
+teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
+V6_MODE="adopted"; V6_WDS_CID=""; V6_PKT_HANDLE=""; V6_ADDR=""
+echo 0 > "$V6_HAS_SETTINGS"       # the adopted session is gone: no v6 settings
+if bring_up_v6 wwan0 >/dev/null 2>&1; then
+    fail "bring_up_v6 should fail once the adopted session is gone"
+fi
+[ "$V6_MODE" = "none" ] || fail "a dead adopted session must clear the mode (got '$V6_MODE')"
+echo 1 > "$V6_HAS_SETTINGS"; echo ok > "$V6_START_MODE"
+bring_up_v6 wwan0 >/dev/null 2>&1 || fail "bring_up_v6 should now dial its own session"
+[ "$V6_MODE" = "dual-session" ] || fail "should have started its own session (got '$V6_MODE')"
+[ "$V6_ADDR" = "$V6ADDR" ] || fail "IPv6 should be back up via our own session"
+echo "ok: a dead adopted session stops being adopted and is replaced"
+
+# --- 10. a FRESH start whose settings fail releases, never leaks --------------
+teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
+echo ok > "$V6_START_MODE"; echo 0 > "$V6_HAS_SETTINGS"   # starts, but no v6 grant
+if bring_up_v6 wwan0 >/dev/null 2>&1; then
+    fail "bring_up_v6 should fail when the started session grants no v6"
+fi
+[ -z "$V6_WDS_CID" ] || fail "a just-started session with no settings must be released, not leaked"
+[ "$V6_MODE" = "none" ] || fail "mode should reset after releasing a just-started session"
+echo 1 > "$V6_HAS_SETTINGS"
+echo "ok: a just-started session that grants no v6 is released, not leaked"
+
+# --- 11. INTERNET_ENABLE_IPV6=0 forces byte-identical IPv4-only ---------------
 teardown wwan0 >/dev/null 2>&1; v6_teardown_cleanup wwan0 >/dev/null 2>&1
 INTERNET_ENABLE_IPV6=0
 : > "$IP_LOG"; echo ok > "$V6_START_MODE"; echo 1 > "$V6_HAS_SETTINGS"

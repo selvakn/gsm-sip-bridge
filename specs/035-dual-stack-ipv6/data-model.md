@@ -23,9 +23,20 @@ Unchanged by this feature. IPv4 remains the health-gating uplink.
 | `V6_MODE` | entrypoint var | `adopted` \| `dual-session` \| `none`. The sidecar always dials a **separate `ip-type=6` session** (`dual-session`) alongside v4; `adopted` means a v6 session the modem already had up (autoconnect) that we use read-only. It never issues a combined `ip-type=8` start. |
 
 **Rules**:
-- The v6 identity follows the exact retained-CID discipline as v4 (never clear a
-  CID after a *failed* stop; a vanished/unreachable modem drops it). It exists only
-  in the `dual-session` mode.
+- The v6 identity follows the exact retained-CID discipline as v4: a *failed* stop
+  retains the CID **only** when the client is genuinely still ours and stuck (QMI
+  reachable AND the session still connected); a vanished/unreachable modem or an
+  already-ended session drops it.
+- **A retained/adopted identity is only valid while it can still produce a global
+  v6 address.** On reuse, if `apply_settings_v6` yields no global address, the
+  identity is released (client freed, vars cleared) so the next attempt dials a
+  replacement. This is mandatory: nothing else revalidates it — `v6_teardown_cleanup`
+  runs only on shutdown or an **IPv4** redial, and IPv4 staying healthy is the normal
+  case, so a stale identity would otherwise be re-queried forever and strand
+  reach-back until a container restart. The same applies to `adopted`: a dead
+  autoconnect session must clear the mode so the sidecar dials its own.
+- An identity created in the *current* `bring_up_v6` call is torn down (not merely
+  forgotten) if its settings fail, so a just-started client is never leaked.
 - v6 teardown/redial MUST NOT touch `PKT_HANDLE`/`WDS_CID` or the v4 address.
 
 ## Entity: IPv6 address state (new)
