@@ -377,6 +377,10 @@ pub fn install_gm_sas(
     let auth_key = hex_encode(&derive_auth_key(&theirs.alg, ik)?);
     let enc_key = hex_encode(&derive_cipher_key(&theirs.ealg, ck)?);
 
+    // TS 33.203 keys all four SAs identically from one `IK`.
+    let in_auth_name = auth_name;
+    let in_auth_key = auth_key.clone();
+
     // Outbound: we send, tagged with the SPI *they* told us to use.
     xfrm_state_add(
         endpoints.local_c.ip(),
@@ -401,8 +405,8 @@ pub fn install_gm_sas(
         endpoints.remote_c.ip(),
         endpoints.local_s.ip(),
         ours.spi_s,
-        auth_name,
-        &auth_key,
+        in_auth_name,
+        &in_auth_key,
         enc_name,
         &enc_key,
     )?;
@@ -410,40 +414,56 @@ pub fn install_gm_sas(
         endpoints.remote_s.ip(),
         endpoints.local_c.ip(),
         ours.spi_c,
-        auth_name,
-        &auth_key,
+        in_auth_name,
+        &in_auth_key,
         enc_name,
         &enc_key,
     )?;
 
-    xfrm_policy_add(
-        endpoints.local_c,
-        endpoints.remote_s,
-        theirs.spi_s,
-        false,
-        proto,
-    )?;
-    xfrm_policy_add(
-        endpoints.local_s,
-        endpoints.remote_c,
-        theirs.spi_c,
-        false,
-        proto,
-    )?;
-    xfrm_policy_add(
-        endpoints.remote_c,
-        endpoints.local_s,
-        ours.spi_s,
-        true,
-        proto,
-    )?;
-    xfrm_policy_add(
-        endpoints.remote_s,
-        endpoints.local_c,
-        ours.spi_c,
-        true,
-        proto,
-    )?;
+    // TS 33.203: one set of Gm SAs protects **both** transports between the
+    // negotiated port pairs. Which one the network uses for a request it
+    // originates is its choice, not ours, so `proto` (the transport we picked
+    // for our own client connection) must not decide what we accept.
+    //
+    // Installing only our own transport made inbound calls impossible.
+    // Measured on Jio 2026-08-14: it delivers network-initiated INVITEs over
+    // UDP, so with TCP-only policies the ESP arrived, decrypted, and landed on
+    // a port with no UDP socket — the kernel answered ICMP port-unreachable
+    // and the caller heard "out of coverage area". Nothing in
+    // /proc/net/xfrm_stat records that, and the SAs themselves are
+    // wildcard-selector so they were never the limiting factor; only these
+    // four selectors were.
+    let _ = proto;
+    for policy_proto in ["tcp", "udp"] {
+        xfrm_policy_add(
+            endpoints.local_c,
+            endpoints.remote_s,
+            theirs.spi_s,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.local_s,
+            endpoints.remote_c,
+            theirs.spi_c,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_c,
+            endpoints.local_s,
+            ours.spi_s,
+            true,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_s,
+            endpoints.local_c,
+            ours.spi_c,
+            true,
+            policy_proto,
+        )?;
+    }
 
     Ok(())
 }

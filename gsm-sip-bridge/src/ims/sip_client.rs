@@ -22,6 +22,56 @@ pub fn random_hex(n_bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Expand an RFC 3261 §7.3.3 compact header name to its canonical form,
+/// leaving every other name untouched.
+///
+/// This is not cosmetic. Jio's P-CSCF answers **entirely** in compact form
+/// (`v:`, `i:`, `f:`, `t:`, `l:`), and not understanding those broke two
+/// things at once when a call was placed on 2026-08-14:
+///
+/// 1. **Framing.** An unrecognised `l:` makes `Content-Length` read as `0`,
+///    so a message body is left sitting in the buffer and the next parse
+///    starts *inside* it. A `183 Session Progress` carrying SDP therefore
+///    killed the reader with `malformed request line: v=0`, after which no
+///    further response on that connection was delivered at all — including
+///    the call's final one. The visible symptom was a 16-second
+///    `carrier_timeout: no final response from carrier`, blaming the network
+///    for a message it had already sent.
+/// 2. **Lookup.** Matching a transaction reads `Via`/`Call-ID`, which found
+///    nothing against `v:`/`i:` — hence provisional responses being logged as
+///    `received response outside an active transaction`.
+///
+/// Registration survived this only because those responses carry `l:0`, so
+/// there was no body to desynchronise on.
+fn canonical_header_name(name: &str) -> &str {
+    // Only single-character names are compact forms; anything longer is
+    // already canonical (or an extension header we pass through untouched).
+    if name.len() != 1 {
+        return name;
+    }
+    match name.as_bytes()[0].to_ascii_lowercase() {
+        b'a' => "Accept-Contact",
+        b'b' => "Referred-By",
+        b'c' => "Content-Type",
+        b'd' => "Request-Disposition",
+        b'e' => "Content-Encoding",
+        b'f' => "From",
+        b'i' => "Call-ID",
+        b'j' => "Reject-Contact",
+        b'k' => "Supported",
+        b'l' => "Content-Length",
+        b'm' => "Contact",
+        b'o' => "Event",
+        b'r' => "Refer-To",
+        b's' => "Subject",
+        b't' => "To",
+        b'u' => "Allow-Events",
+        b'v' => "Via",
+        b'x' => "Session-Expires",
+        _ => name,
+    }
+}
+
 /// A parsed SIP response: status line + headers (in original order, values
 /// joined if a header name repeats) + reason phrase + body (e.g. an SDP
 /// answer on an INVITE's 200 OK).
@@ -60,6 +110,10 @@ impl SipResponse {
     /// to back, e.g. `100 Trying` immediately followed by `180 Ringing`).
     /// Returns `Ok(None)` if `buf` doesn't yet hold a full message, along
     /// with how many bytes were consumed so the caller can drain them.
+    ///
+    /// Header names are canonicalised on the way in — see
+    /// [`canonical_header_name`] for why that is load-bearing rather than
+    /// cosmetic.
     fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
         let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
             return Ok(None);
@@ -97,8 +151,12 @@ impl SipResponse {
         let headers: Vec<(String, String)> = unfolded
             .into_iter()
             .filter_map(|line| {
-                line.split_once(':')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                line.split_once(':').map(|(k, v)| {
+                    (
+                        canonical_header_name(k.trim()).to_string(),
+                        v.trim().to_string(),
+                    )
+                })
             })
             .collect();
 
@@ -206,8 +264,12 @@ impl SipRequest {
         let headers: Vec<(String, String)> = unfolded
             .into_iter()
             .filter_map(|line| {
-                line.split_once(':')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                line.split_once(':').map(|(k, v)| {
+                    (
+                        canonical_header_name(k.trim()).to_string(),
+                        v.trim().to_string(),
+                    )
+                })
             })
             .collect();
 
@@ -811,6 +873,16 @@ impl SipTransport {
                 let is_response = self.buf[..line_end].starts_with("SIP/2.0");
                 if is_response {
                     if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
+                        // Symmetric with the request arm below. Without this
+                        // the single reader of the client transport — which is
+                        // where every carrier response to an outbound INVITE
+                        // arrives — logged nothing at all, so a call that the
+                        // network answered with a `183` and then tore down was
+                        // undiagnosable from the logs. Packet capture is not a
+                        // substitute here: the Gm traffic is ESP-encrypted, and
+                        // GRO aggregates the larger responses on the xfrm
+                        // interface into frames whose ICV no longer verifies.
+                        tracing::debug!(response = %self.buf[..consumed], "received SIP response");
                         self.buf.drain(..consumed);
                         return Ok(Some(SipMessage::Response(resp)));
                     }
@@ -978,12 +1050,29 @@ pub fn spawn_gm_server(
 ) -> BridgeResult<GmServer> {
     let stop = Arc::new(AtomicBool::new(false));
     let alive = Arc::new(AtomicBool::new(true));
+    // Listen on BOTH transports, not just the one we chose for our own client
+    // connection. The network picks the transport for anything it originates,
+    // and it does not have to match ours: Jio advertises our `transport=TCP`
+    // Contact back to us and then delivers INVITEs over UDP. Binding only TCP
+    // meant the decrypted packet hit a port with no UDP socket, the kernel
+    // replied ICMP port-unreachable, and the caller heard "out of coverage
+    // area" — with nothing logged on our side at all (measured 2026-08-14).
+    //
+    // `use_tcp` now only decides which failure is fatal to report: the
+    // transport we actively use must bind, the other is best-effort so a
+    // UDP-only or TCP-only environment still starts.
     if use_tcp {
-        spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone())?;
+        spawn_gm_tcp_server(local, tx.clone(), stop.clone(), alive.clone())?;
+        if let Err(e) = spawn_gm_udp_server(local, tx, stop.clone(), alive.clone()) {
+            tracing::warn!(error = %e, "could not also listen on UDP for network-initiated requests; inbound calls may not arrive");
+        }
     } else {
-        spawn_gm_udp_server(local, tx, stop.clone(), alive.clone())?;
+        spawn_gm_udp_server(local, tx.clone(), stop.clone(), alive.clone())?;
+        if let Err(e) = spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone()) {
+            tracing::warn!(error = %e, "could not also listen on TCP for network-initiated requests; inbound calls may not arrive");
+        }
     }
-    tracing::info!(local = %local, transport = if use_tcp { "TCP" } else { "UDP" }, "listening on the Gm protected server port for network-initiated requests");
+    tracing::info!(local = %local, transport = "TCP+UDP", "listening on the Gm protected server port for network-initiated requests");
     Ok(GmServer { stop, alive })
 }
 
@@ -1354,6 +1443,51 @@ mod tests {
         let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
         assert_eq!(resp.body, "hi");
         assert_eq!(&raw[consumed..], "SIP/2.0 100 Trying\r\n\r\n");
+    }
+
+    #[test]
+    fn compact_content_length_frames_the_body_so_the_stream_stays_in_sync() {
+        // Jio's P-CSCF answers in compact form. Reading `l:` as an unknown
+        // header makes Content-Length 0, so the body is left in the buffer
+        // and the next parse starts inside it — on a `183` carrying SDP that
+        // killed the reader with `malformed request line: v=0` and silently
+        // dropped every later response, including the call's final one.
+        let raw =
+            "SIP/2.0 183 Session Progress\r\nv:SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bKabc\r\n\
+                   i:out-1\r\nCSeq:5 INVITE\r\nc:application/sdp\r\nl:14\r\n\r\n\
+                   v=0\r\no=- 1 1\r\nSIP/2.0 480 Temporarily Unavailable\r\nl:0\r\n\r\n";
+        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        assert_eq!(resp.status, 183);
+        assert_eq!(resp.body, "v=0\r\no=- 1 1\r\n");
+        // The critical part: the *next* message must be parseable, not the
+        // middle of this one's SDP.
+        let (next, _) = SipResponse::try_parse(&raw[consumed..]).unwrap().unwrap();
+        assert_eq!(next.status, 480);
+    }
+
+    #[test]
+    fn compact_header_names_are_canonicalised_so_lookups_find_them() {
+        // `v:`/`i:` not resolving to Via/Call-ID is why provisional responses
+        // were logged as "outside an active transaction".
+        let raw = "SIP/2.0 100 Trying\r\nv:SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bKabc\r\n\
+                   i:out-1\r\nf:<sip:a@b>;tag=x\r\nt:<sip:c@d>\r\nm:<sip:e@f>\r\nl:0\r\n\r\n";
+        let (resp, _) = SipResponse::try_parse(raw).unwrap().unwrap();
+        assert!(resp.header("Via").unwrap().contains("z9hG4bKabc"));
+        assert_eq!(resp.header("Call-ID").unwrap(), "out-1");
+        assert!(resp.header("From").unwrap().contains("tag=x"));
+        assert_eq!(resp.header("To").unwrap(), "<sip:c@d>");
+        assert_eq!(resp.header("Contact").unwrap(), "<sip:e@f>");
+    }
+
+    #[test]
+    fn canonical_header_name_leaves_long_names_alone() {
+        assert_eq!(canonical_header_name("Content-Length"), "Content-Length");
+        assert_eq!(canonical_header_name("Via"), "Via");
+        // An extension header we do not know is passed through untouched.
+        assert_eq!(canonical_header_name("P-Weird-Thing"), "P-Weird-Thing");
+        // Case-insensitive, per RFC 3261.
+        assert_eq!(canonical_header_name("L"), "Content-Length");
+        assert_eq!(canonical_header_name("v"), "Via");
     }
 
     #[test]
