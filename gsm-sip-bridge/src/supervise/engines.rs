@@ -47,13 +47,28 @@ pub fn charon_log_shows_established(charon_log: &str, conn_name: &str) -> bool {
 /// imported, since this crate has no shared "bash-parity log parsers" module
 /// yet — both read the identical `received P-CSCF server IP ...` marker.
 pub fn extract_latest_pcscf(charon_log: &str, conn_name: &str) -> Option<String> {
+    pick_stable_pcscf(&latest_pcscf_batch(charon_log, conn_name))
+}
+
+fn is_valid_pcscf_addr(s: &str) -> bool {
+    let is_v4 = s.split('.').count() == 4 && s.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let is_v6 = s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
+    is_v4 || is_v6
+}
+
+/// The P-CSCF addresses advertised by the **most recent** negotiation on this
+/// connection.
+///
+/// The charon log accumulates, and one negotiation emits several of these
+/// lines in a row (Jio sends four: two IPv6, two IPv4) followed by the
+/// `CHILD_SA ... established` line. So a batch is the run of addresses since
+/// the last establishment: seeing an establishment closes the current batch,
+/// and the next address starts a fresh one.
+fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> Vec<String> {
     const MARKER: &str = "received P-CSCF server IP ";
-    let is_valid_addr = |s: &str| {
-        let is_v4 = s.split('.').count() == 4 && s.chars().all(|c| c.is_ascii_digit() || c == '.');
-        let is_v6 = s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
-        is_v4 || is_v6
-    };
-    lines_for_conn(charon_log, conn_name)
+    let mut batch: Vec<String> = Vec::new();
+    let mut closed = false;
+    for line in lines_for_conn(charon_log, conn_name) {
         // `grep -oE 'received P-CSCF server IP .*'` matches the marker
         // ANYWHERE in the line, not just at its start — real charon output
         // prefixes every line with a facility tag (`[CFG] received P-CSCF
@@ -62,10 +77,44 @@ pub fn extract_latest_pcscf(charon_log: &str, conn_name: &str) -> Option<String>
         // loop treat every successful connection as "stuck without P-CSCF"
         // forever, so it kept terminating and re-initiating a perfectly
         // good tunnel every ~30s instead of ever reporting success.
-        .filter_map(|l| l.find(MARKER).map(|pos| &l[pos + MARKER.len()..]))
-        .map(str::trim)
-        .rfind(|s| is_valid_addr(s))
-        .map(str::to_string)
+        if let Some(pos) = line.find(MARKER) {
+            let addr = line[pos + MARKER.len()..].trim();
+            if is_valid_pcscf_addr(addr) {
+                if closed {
+                    batch.clear();
+                    closed = false;
+                }
+                batch.push(addr.to_string());
+            }
+        } else if line.contains("CHILD_SA")
+            && line
+                .find("CHILD_SA")
+                .is_some_and(|pos| line[pos..].contains("established"))
+        {
+            closed = true;
+        }
+    }
+    batch
+}
+
+/// Choose one P-CSCF from a batch, as a **deterministic function of the set**
+/// rather than of log order.
+///
+/// This used to be "whichever address charon logged last", which made the
+/// steady-state check compare a value that moved on its own. The carrier
+/// returns the same pool in varying order across rekeys, so a pure reorder
+/// read as `P-CSCF changed` and refreshed the line — tearing down a perfectly
+/// healthy registration. Observed on Jio 2026-08-14 with the trailing address
+/// rotating between `56.2.134.134`, `56.2.134.146`, `10.56.156.21` and
+/// `10.56.156.24` for one unchanging pool.
+///
+/// IPv4 is preferred because that is the family the Gm path uses in practice;
+/// within a family the minimum is taken purely because it is stable. A
+/// genuinely different pool still changes the answer, which is the only time
+/// a refresh is warranted.
+fn pick_stable_pcscf(batch: &[String]) -> Option<String> {
+    let v4 = batch.iter().filter(|a| !a.contains(':')).min();
+    v4.or_else(|| batch.iter().min()).cloned()
 }
 
 /// 1:1 port of `grep -q '^ims:' <<<"$sas_output"`, scoped to one connection —
@@ -581,11 +630,47 @@ mod tests {
     }
 
     #[test]
-    fn extract_latest_pcscf_picks_the_chronologically_last_valid_line() {
+    fn extract_latest_pcscf_prefers_ipv4_and_ignores_the_order_they_arrived_in() {
+        // Deliberate change from "chronologically last": that made the value
+        // move on its own, because the carrier returns one pool in varying
+        // order and the steady-state check read a reorder as a real change.
         let log = "<ims0|1> received P-CSCF server IP 10.0.0.1\n<ims0|1> received P-CSCF server IP 2001:db8::1\n<ims0|1> received P-CSCF server IP 10.0.0.9\n";
         assert_eq!(
             extract_latest_pcscf(log, "ims0"),
-            Some("10.0.0.9".to_string())
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn the_same_pcscf_pool_in_any_order_yields_the_same_choice() {
+        // The bug this guards: a pure reorder used to read as
+        // `P-CSCF changed` and refresh the line, tearing down a healthy
+        // registration. Observed repeatedly on Jio 2026-08-14.
+        let pool = ["56.2.134.146", "10.56.156.21", "2405:200:666::15"];
+        let one = format!(
+            "<ims0|1> received P-CSCF server IP {}\n<ims0|1> received P-CSCF server IP {}\n<ims0|1> received P-CSCF server IP {}\n",
+            pool[0], pool[1], pool[2]
+        );
+        let other = format!(
+            "<ims0|1> received P-CSCF server IP {}\n<ims0|1> received P-CSCF server IP {}\n<ims0|1> received P-CSCF server IP {}\n",
+            pool[2], pool[0], pool[1]
+        );
+        assert_eq!(
+            extract_latest_pcscf(&one, "ims0"),
+            extract_latest_pcscf(&other, "ims0")
+        );
+    }
+
+    #[test]
+    fn a_new_negotiation_replaces_the_previous_pcscf_batch() {
+        // A genuinely different pool must still be picked up — the stickiness
+        // above must not make the line blind to a real move.
+        let log = "<ims0|1> received P-CSCF server IP 10.0.0.1\n\
+                   <ims0|1> CHILD_SA ims0{1} established with SPIs\n\
+                   <ims0|1> received P-CSCF server IP 10.7.7.7\n";
+        assert_eq!(
+            extract_latest_pcscf(log, "ims0"),
+            Some("10.7.7.7".to_string())
         );
     }
 
@@ -616,10 +701,12 @@ mod tests {
         // silently keeping every line "stuck without P-CSCF" forever (caught
         // by live-testing against the real EC20 + Airtel SIM: the tunnel
         // established successfully but the establish loop never noticed).
+        // IPv6-only pool, so the IPv4 preference does not apply and the
+        // stable (minimum) member is chosen.
         let log = "[CFG] <ims0|1> received P-CSCF server IP 2401:4900:c4:4035::8\n[CFG] <ims0|1> received P-CSCF server IP 2401:4900:c4:4035::b\n";
         assert_eq!(
             extract_latest_pcscf(log, "ims0"),
-            Some("2401:4900:c4:4035::b".to_string())
+            Some("2401:4900:c4:4035::8".to_string())
         );
     }
 
