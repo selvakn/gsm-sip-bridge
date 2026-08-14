@@ -168,6 +168,41 @@ pub(crate) struct RegisteredSession {
 }
 
 impl RegisteredSession {
+    /// The identity to originate requests from, as a bare `user@host` (every
+    /// caller wraps it as `sip:{}`).
+    ///
+    /// TS 24.229 requires an originating request to use a **registered public
+    /// user identity**. We register with the IMSI-derived identity, which is
+    /// legitimate for REGISTER but is not one of the IMPUs the network
+    /// actually provisions for calls. Jio accepts it at registration and then
+    /// fails anything it originates with `Q.850;cause=41 "temporary
+    /// failure"`, routing the caller to an MSML announcement server for ~13s
+    /// before answering `480` — a rejection that looks nothing like an
+    /// identity problem (measured 2026-08-14).
+    ///
+    /// The registrar tells us the right identities in `P-Associated-URI` on
+    /// the REGISTER `200 OK`; prefer the first `sip:` one. Falls back to the
+    /// registration identity for networks that return none, which is what
+    /// every carrier before this one did.
+    pub(crate) fn origination_identity(&self) -> String {
+        self.default_impu()
+            .map(|impu| impu.trim_start_matches("sip:").to_string())
+            .unwrap_or_else(|| self.public_uri.clone())
+    }
+
+    /// First `sip:` `P-Associated-URI` from the REGISTER `200 OK`, scheme
+    /// included (`sip:+1555…@ims…`). `None` if the registrar returned none.
+    pub(crate) fn default_impu(&self) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case("P-Associated-URI") && v.contains("sip:"))
+            .and_then(|(_, v)| {
+                let start = v.find('<')? + 1;
+                let end = v.find('>')?;
+                Some(v[start..end].to_string())
+            })
+    }
+
     /// Our Gm **protected server port** (`port-s`) endpoint — where the
     /// network opens connections to deliver everything it originates
     /// (reg-event `NOTIFY`s, mobile-terminating `INVITE`s). `None` when the
@@ -813,7 +848,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                     cfg.gm_auth_alg.as_deref(),
                     cfg.gm_cipher_alg.as_deref(),
                 ) {
-                    Ok((params, raw)) => {
+                    Ok((params, _selected_raw)) => {
                         tracing::info!(
                             alg = %params.alg,
                             ealg = %params.ealg,
@@ -821,7 +856,16 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                             offered = offers.len(),
                             "selected Gm IPsec algorithm"
                         );
-                        Some((params, raw))
+                        // The echo is the *whole* Security-Server list, not
+                        // just the mechanism we committed to. Security-Verify
+                        // is RFC 3329's downgrade check: the P-CSCF compares
+                        // what we send back against everything it offered, so
+                        // a partial echo reads as a tampered negotiation.
+                        // Measured on Jio 2026-08-14 — it offers five
+                        // mechanisms, we echoed the one we picked, and every
+                        // protected REGISTER came back `494 Security
+                        // Agreement Required`.
+                        Some((params, offers.join(", ")))
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "no usable Security-Server offer");
@@ -833,7 +877,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         let (auth_header, was_resync) = match aka {
             AkaResult::Success { res, ck, ik } => {
                 tracing::info!("AKA success, building Authorization response");
-                if let (Some(p), Some((theirs, sec_server))) = (proposal.as_ref(), sec_selected) {
+                if let (Some(p), Some((theirs, sec_verify))) = (proposal.as_ref(), sec_selected) {
                     {
                         {
                             let endpoints =
@@ -866,7 +910,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                                             // use (a captured working Asterisk registration
                                             // always includes this on the post-IPsec retry).
                                             extra_headers
-                                                .push(format!("Security-Verify: {sec_server}"));
+                                                .push(format!("Security-Verify: {sec_verify}"));
                                             gm_state = Some((endpoints, p.clone(), theirs));
                                         }
                                         Err(e) => {
