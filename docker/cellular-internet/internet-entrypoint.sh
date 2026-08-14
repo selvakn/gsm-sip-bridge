@@ -18,11 +18,37 @@ INTERNET_QMI_DEV="${INTERNET_QMI_DEV:-/dev/cdc-wdm0}"
 INTERNET_WWAN_IFACE="${INTERNET_WWAN_IFACE:-}"
 INTERNET_PROBE_INTERVAL="${INTERNET_PROBE_INTERVAL:-10s}"
 
+# ---- dual-stack IPv6 (specs/035-dual-stack-ipv6) ---------------------------
+# Dual-stack is ON by default. Modern carriers (verified on Jio) do dual-stack as a
+# SINGLE IPv4v6 bearer, NOT two sessions: a second WDS session to the same APN is
+# refused with 'multiple-connection-to-same-pdn-not-allowed', and QMI has no per-call
+# "dual" ip-type (only 4 or 6). So when v6 is enabled the sidecar provisions the data
+# profile as IPv4v6 and dials ONE bearer, reading BOTH address families from it.
+# INTERNET_ENABLE_IPV6=0 forces a v4-only (ip-type=4) bearer, byte-identical to the
+# pre-035 behaviour.
+INTERNET_ENABLE_IPV6="${INTERNET_ENABLE_IPV6:-1}"
+# 3GPP profile index the sidecar provisions as IPv4v6 and dials for dual-stack.
+INTERNET_IPV6_PROFILE="${INTERNET_IPV6_PROFILE:-1}"
+# Optional operator hook, invoked as `hook <new-global-v6-addr>` when the global
+# IPv6 address first appears or changes. Empty = no hook.
+INTERNET_IPV6_HOOK="${INTERNET_IPV6_HOOK:-}"
+INTERNET_IPV6_HOOK_TIMEOUT="${INTERNET_IPV6_HOOK_TIMEOUT:-10s}"
+
 PKT_HANDLE=""
 WDS_CID=""
 # 1 when the session was brought up by the modem itself (autoconnect) rather
 # than by us: we hold no client for it, so we must not try to stop it.
 ADOPTED=0
+
+# Current applied global IPv6 address state. v6 rides the SAME single bearer as v4
+# (same WDS_CID / PKT_HANDLE), so there is no separate v6 session identity to track —
+# teardown of the one bearer drops both families.
+V6_ADDR=""
+V6_PREFIX=""
+V6_SINCE=""
+# The "last successfully notified" address lives in a marker file next to the status
+# file (see notify_v6_hook), NOT an in-memory var: firing gates on it so a failed
+# hook is retried on a later tick, and de-dupe survives a restart.
 
 # Is the modem's packet data session already up? Match "connected" as a whole
 # word: a plain substring match also fires on "Connection status: 'disconnected'"
@@ -177,6 +203,150 @@ apply_settings() {
     echo "$_as_ip"
 }
 
+# ---- IPv6 dual-stack (specs/035-dual-stack-ipv6) ---------------------------
+# v6 rides the SAME single bearer as v4 (one IPv4v6 PDN — see the config note on why
+# separate sessions don't work). These helpers read the v6 address from the current
+# session (via qmi_wds, the shared client) and apply it; they touch only V6_* vars +
+# `ip -6`, so a v6 problem never disturbs v4 (FR-003/FR-004/FR-005).
+
+# Read the status `state` so a v6-only status update preserves the IPv4-derived
+# state: IPv6 must never change `state` or the healthcheck (FR-004/FR-007).
+_current_state() {
+    _cs=""
+    [ -r "$INTERNET_STATUS_FILE" ] && _cs=$(sed -n 's/^state=//p' "$INTERNET_STATUS_FILE" 2>/dev/null | head -n1)
+    if [ -n "$_cs" ]; then echo "$_cs"; else echo up; fi
+}
+
+# Provision the data profile as IPv4v6 so ONE bearer carries both families. QMI has
+# no per-call "dual" ip-type (only 4 or 6) and a second session to the same APN is
+# refused, so dual-stack must come from the profile's PDP type. Best-effort: a modem
+# that rejects the modify still dials (it just won't get v6). Sets the APN on the
+# profile too, since the dial then starts by profile-index.
+ensure_dualstack_profile() {
+    qmicli -d "$INTERNET_QMI_DEV" -p \
+        --wds-modify-profile="3gpp,${INTERNET_IPV6_PROFILE},pdp-type=ipv4v6,apn=${INTERNET_APN}" \
+        >/dev/null 2>&1 \
+        || log "WARNING: could not set profile ${INTERNET_IPV6_PROFILE} to IPv4v6 — the carrier/modem may only grant IPv4"
+}
+
+# Un-disable IPv6 on the interface (raw_ip ifaces often come up with it off).
+# Guarded so the test harness (no such sysctl node) is a no-op.
+enable_v6_iface() {
+    _ev_k="/proc/sys/net/ipv6/conf/$1/disable_ipv6"
+    if [ -w "$_ev_k" ]; then
+        echo 0 > "$_ev_k" 2>/dev/null || true
+    fi
+}
+
+# Apply the granted global IPv6 address + default route from the CURRENT bearer's
+# settings (the SAME session as v4, read via qmi_wds). Echoes "<addr> <prefix>"; the
+# caller sets V6_ADDR/V6_PREFIX in the parent shell (this runs in a $() subshell).
+# Returns nonzero (no side effects) when the bearer carries no global v6. Flushes
+# prior global v6 first so a changed prefix leaves nothing stale.
+apply_settings_v6() {
+    _asv_iface="$1"
+    _asv_settings=$(qmi_wds --wds-get-current-settings 2>/dev/null) || return 1
+
+    _asv_ipp=$(echo "$_asv_settings" | sed -n 's/.*IPv6 address: *//p'         | head -n1 | tr -d ' \r')
+    _asv_gw=$(echo "$_asv_settings"  | sed -n 's/.*IPv6 gateway address: *//p' | head -n1 | tr -d ' \r')
+
+    # qmicli reports the v6 address WITH its prefix (addr/prefix), unlike v4.
+    _asv_ip=${_asv_ipp%%/*}
+    _asv_prefix=${_asv_ipp#*/}
+    [ "$_asv_prefix" = "$_asv_ipp" ] && _asv_prefix=64   # no /prefix => assume 64
+
+    is_global_v6 "$_asv_ip" || return 1
+
+    ip -6 addr flush dev "$_asv_iface" scope global 2>/dev/null || true
+    ip -6 addr add "${_asv_ip}/${_asv_prefix}" dev "$_asv_iface"
+    if [ -n "$_asv_gw" ] && [ "$_asv_gw" != "::" ]; then
+        ip -6 route replace default via "$_asv_gw" dev "$_asv_iface"
+    else
+        ip -6 route replace default dev "$_asv_iface"
+    fi
+    echo "$_asv_ip $_asv_prefix"
+}
+
+# Fire the operator hook when the global v6 address first appears or CHANGES. Never
+# on unchanged, never on loss, never when unconfigured (FR-008). Backgrounded and
+# time-bounded so a slow/broken hook cannot stall the supervise loop (FR-009).
+#
+# De-dupe gates on a MARKER FILE that records the address a hook run SUCCEEDED for,
+# not an in-memory var: a hook that fails (e.g. the DDNS endpoint is briefly down)
+# leaves the marker stale, so a later supervise tick retries it instead of stranding
+# the record for this prefix's whole lifetime.
+notify_v6_hook() {
+    [ -n "$INTERNET_IPV6_HOOK" ] || return 0
+    [ -n "$V6_ADDR" ] || return 0
+    _nh_marker="${INTERNET_STATUS_FILE}.v6notified"
+    _nh_done=""
+    [ -r "$_nh_marker" ] && _nh_done=$(cat "$_nh_marker" 2>/dev/null)
+    [ "$V6_ADDR" = "$_nh_done" ] && return 0
+    if [ ! -x "$INTERNET_IPV6_HOOK" ]; then
+        log "WARNING: INTERNET_IPV6_HOOK=$INTERNET_IPV6_HOOK is not executable — skipping notification"
+        return 0
+    fi
+    log "notifying IPv6 hook of new address $V6_ADDR"
+    _nh_to=$(to_seconds "$INTERNET_IPV6_HOOK_TIMEOUT")
+    [ "$_nh_to" -ge 1 ] 2>/dev/null || _nh_to=10
+    _nh_addr="$V6_ADDR"
+    # Detached + bounded (FR-009). Record the address ONLY on hook success, so a
+    # failed run leaves the marker stale and the next tick retries.
+    ( timeout "$_nh_to" "$INTERNET_IPV6_HOOK" "$_nh_addr" >/dev/null 2>&1 &&
+        printf '%s' "$_nh_addr" > "$_nh_marker" 2>/dev/null ) &
+}
+
+# Record a v6 up/change: on a CHANGED address, update state + status and log; always
+# (re)try the hook (its own marker de-dupes). Writes status only on change, so a
+# stable v6 does not churn the status file every probe tick.
+_mark_v6_up() {
+    _mu_addr="$1"
+    if [ "$_mu_addr" != "$V6_ADDR" ]; then
+        V6_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
+        V6_ADDR="$_mu_addr"
+        STATUS_IPV6="$V6_ADDR" STATUS_IPV6_PREFIX="$V6_PREFIX" \
+            STATUS_IPV6_STATE="up" STATUS_IPV6_SINCE="$V6_SINCE" \
+            write_status "$(_current_state)"
+        log "internet v6 up: ipv6=$V6_ADDR/$V6_PREFIX"
+    fi
+    notify_v6_hook
+}
+
+# Record v6 as unavailable. No-op (no status churn) when already down. Does NOT fire
+# the hook (FR-008: never on loss).
+_mark_v6_down() {
+    [ -z "$V6_ADDR" ] && return 0
+    V6_ADDR=""
+    V6_PREFIX=""
+    V6_SINCE=""
+    STATUS_IPV6="" STATUS_IPV6_PREFIX="" STATUS_IPV6_STATE="unavailable" STATUS_IPV6_SINCE="" \
+        write_status "$(_current_state)"
+}
+
+# Read the current bearer's global IPv6 and apply/refresh it. Best-effort: never
+# touches v4, never exits. Called from dial() and every supervise tick — since v6
+# rides the v4 bearer this is just a settings read (cheap), so there is no separate
+# v6 dial to back off. Fires the hook on appear/change; clears v6 on loss.
+refresh_v6() {
+    _rv_iface="$1"
+    [ "$INTERNET_ENABLE_IPV6" = "1" ] || return 0
+    enable_v6_iface "$_rv_iface"
+    if _rv_applied=$(apply_settings_v6 "$_rv_iface"); then
+        V6_PREFIX=${_rv_applied##* }
+        _mark_v6_up "${_rv_applied%% *}"
+    else
+        if [ -n "$V6_ADDR" ]; then
+            # The bearer dropped v6 while v4 stays up — flush the now-stale global
+            # address/route so nothing lingers, then clear the status.
+            log "IPv6 address withdrawn from the bearer"
+            ip -6 addr flush dev "$_rv_iface" scope global 2>/dev/null || true
+            ip -6 route flush default dev "$_rv_iface" 2>/dev/null || true
+        fi
+        _mark_v6_down
+    fi
+    return 0
+}
+
 dial() {
     _d_iface="$1"
 
@@ -195,9 +365,18 @@ dial() {
 
     setup_raw_ip "$_d_iface"
 
+    # Dual-stack dials ONE IPv4v6 bearer via the profile we provision; v4-only dials
+    # ip-type=4 exactly as before. Both start a single WDS session (PKT_HANDLE/CID).
+    if [ "$INTERNET_ENABLE_IPV6" = "1" ]; then
+        ensure_dualstack_profile
+        _d_start="profile-index=${INTERNET_IPV6_PROFILE}"
+    else
+        _d_start="ip-type=4,apn=${INTERNET_APN}"
+    fi
+
     ADOPTED=0
     if _d_out=$(qmicli -d "$INTERNET_QMI_DEV" -p \
-        --wds-start-network="ip-type=4,apn=${INTERNET_APN}" \
+        --wds-start-network="${_d_start}" \
         --client-no-release-cid 2>&1); then
 
         # We started it: keep BOTH the packet-data handle and the allocated WDS
@@ -261,6 +440,11 @@ dial() {
     STATUS_IFACE="$_d_iface" STATUS_IPV4="$_d_ip" STATUS_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
         write_status up "pending"
     log "internet up: iface=$_d_iface ipv4=$_d_ip"
+
+    # Best-effort dual-stack: read+apply the v6 address the same bearer granted.
+    # Failure never fails the dial — the supervise loop re-reads it each tick.
+    # IPv4/VoWiFi is up regardless (FR-004/FR-005).
+    refresh_v6 "$_d_iface"
     return 0
 }
 
@@ -275,6 +459,15 @@ dial() {
 teardown() {
     _t_iface="$1"
     ip addr flush dev "$_t_iface" 2>/dev/null || true
+
+    # v6 rides the same bearer, so stopping the session below drops it; just clear
+    # the host-side v6 config and status. Guarded by the kill-switch so a v4-only
+    # deployment makes no ip -6 change (FR-011/SC-007).
+    if [ "$INTERNET_ENABLE_IPV6" = "1" ]; then
+        ip -6 addr flush dev "$_t_iface" scope global 2>/dev/null || true
+        ip -6 route flush default dev "$_t_iface" 2>/dev/null || true
+        _mark_v6_down
+    fi
 
     # An adopted (autoconnect) session is not ours to stop — we hold no client
     # for it, and stopping it would fight the modem, which would just bring it
@@ -370,11 +563,15 @@ main() {
         sleep 5
     done
 
-    # Supervise: probe on an interval; self-heal on loss (FR-007).
+    # Supervise: probe on an interval; self-heal on loss (FR-007). IPv6 is a
+    # best-effort SECONDARY concern refreshed AFTER the v4 logic (a cheap settings
+    # read on the same bearer) — it never blocks health, redial, or the bridge
+    # (FR-004/FR-005).
     while true; do
         sleep "$_m_interval"
         if probe_dns; then
             STATUS_IFACE="$_m_iface" write_status up "ok ${INTERNET_PROBE_HOST}@${INTERNET_PROBE_RESOLVER:-system}"
+            refresh_v6 "$_m_iface"
             continue
         fi
         log "reachability lost — re-dialing"

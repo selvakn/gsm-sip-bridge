@@ -113,6 +113,59 @@ vowifi-status                               # registered: true
 See [`specs/032-cellular-internet-sidecar/quickstart.md`](../specs/032-cellular-internet-sidecar/quickstart.md)
 for the full validation (independent restart, drop recovery, default-off).
 
+## IPv6 reach-back (dual-stack)
+
+Carrier IPv4 is usually CGNAT, so the host has no inbound reachability over IPv4.
+When the carrier grants IPv6, the sidecar also brings up a **global IPv6 address +
+default route** on the WWAN interface, making this host reachable inbound (e.g. SSH)
+over IPv6. Dual-stack is **ON by default**; IPv4/VoWiFi is unchanged and stays the
+health-gating uplink, so a v6 problem never blocks calls or the bridge.
+
+Dual-stack is a **single IPv4v6 bearer**, not two sessions: modern carriers
+(verified on Jio) refuse a second connection to the same APN
+(`multiple-connection-to-same-pdn-not-allowed`), and QMI has no per-call "dual"
+ip-type. So when v6 is enabled the sidecar provisions the data profile
+(`INTERNET_IPV6_PROFILE`, default 1) as `pdp-type=IPv4v6` and dials one bearer,
+reading both address families from it.
+
+```bash
+# One-off capability check (sidecar stopped so the QMI node is free). Jio grants a
+# global v6 on an ip-type=6 session — a global address starts 2xxx:/3xxx:, not
+# fe80:/fc00:/fd00:
+qmicli -d /dev/cdc-wdm0 -p --wds-start-network="ip-type=6,apn=$INTERNET_APN" \
+       --client-no-release-cid
+qmicli -d /dev/cdc-wdm0 -p --wds-get-current-settings | grep -i 'IPv6'
+# The sidecar itself instead provisions the profile IPv4v6 and dials ONE bearer:
+qmicli -d /dev/cdc-wdm0 -p \
+  --wds-modify-profile="3gpp,1,pdp-type=ipv4v6,apn=$INTERNET_APN"
+qmicli -d /dev/cdc-wdm0 -p --wds-start-network="profile-index=1" --client-no-release-cid
+qmicli -d /dev/cdc-wdm0 -p --wds-get-current-settings   # expect IPv4 AND IPv6
+
+# Verify once enabled:
+ip -6 addr show dev wwan0 | grep 'scope global'   # global v6 address present
+ip -6 route show default                          # default v6 route present
+docker exec <internet-ctr> cat /run/internet-status
+#   ipv6=2409:...   ipv6_state=up
+ssh user@2409:...                                  # reach the host from outside
+```
+
+Keep the current address discoverable with the change hook — point
+`INTERNET_IPV6_HOOK` at a script run as `hook <new-addr>` on every appear/change
+(wire up your own DDNS). The hook does **not** fire on loss, so give your AAAA
+record a short TTL. The sidecar installs no firewall and no forwarding: the global
+v6 address lands on the **host** (host-network mode), so you own the host firewall —
+allow inbound SSH over IPv6. If the address is up but unreachable from outside, your
+carrier may filter inbound v6 at its edge (outside the sidecar's control).
+
+> Hardware status: on Jio, `ip-type=6` returns a global address and the parser's
+> `IPv6 address: <addr>/<prefix>` format is confirmed correct. What still needs a
+> live run is the single-bearer provisioning path above (`--wds-modify-profile`
+> IPv4v6 → `profile-index` dial) actually yielding **both** families in one bearer —
+> if your modem's internet profile isn't index 1, set `INTERNET_IPV6_PROFILE`.
+
+See [`specs/035-dual-stack-ipv6/quickstart.md`](../specs/035-dual-stack-ipv6/quickstart.md)
+for the full walkthrough.
+
 ## Troubleshooting
 
 - **Sidecar stuck unhealthy, bridge never starts** — read

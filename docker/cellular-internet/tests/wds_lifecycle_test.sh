@@ -93,6 +93,11 @@ INTERNET_APN="testapn"
 export INTERNET_APN
 INTERNET_QMI_DEV="$QMI_DEV"
 export INTERNET_QMI_DEV
+# This test is deliberately scoped to the IPv4 WDS lifecycle. Disable dual-stack
+# (specs/035) so `dial` does not make incidental v6 calls against this v4-only
+# fake modem — the v4-parity of a dual-stack dial is proven in ipv6_lifecycle_test.
+INTERNET_ENABLE_IPV6=0
+export INTERNET_ENABLE_IPV6
 # shellcheck source=docker/cellular-internet/internet-entrypoint.sh
 . "$DIR/internet-entrypoint.sh"
 

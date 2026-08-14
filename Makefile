@@ -29,6 +29,8 @@ test: test-scripts ## Run the full test suite
 test-scripts: ## Run non-cargo shell integration tests
 	@sh docker/cellular-internet/tests/probe_test.sh
 	@sh docker/cellular-internet/tests/wds_lifecycle_test.sh
+	@sh docker/cellular-internet/tests/ipv6_lifecycle_test.sh
+	@sh docker/cellular-internet/tests/ipv6_hook_test.sh
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)

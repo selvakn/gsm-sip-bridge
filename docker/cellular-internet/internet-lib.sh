@@ -19,6 +19,26 @@ INTERNET_PROBE_RESOLVER="${INTERNET_PROBE_RESOLVER-1.1.1.1}"
 
 log() { echo "[internet] $*"; }
 
+# is_global_v6 ADDR
+# Return 0 only for a global unicast IPv6 address — the kind that provides inbound
+# reach-back (specs/035). Reject the unspecified/loopback addresses, link-local
+# (fe80::/10), ULA (fc00::/7), and multicast (ff00::/8). A non-global address is
+# never written to status as the reach-back address, and never fires the hook.
+is_global_v6() {
+    _ig_a=$(printf '%s' "${1:-}" | tr 'A-F' 'a-f')
+    case "$_ig_a" in
+        '' | :: | ::1) return 1 ;;                 # empty / unspecified / loopback
+        fe8* | fe9* | fea* | feb*) return 1 ;;     # fe80::/10 link-local
+        fc* | fd*) return 1 ;;                      # fc00::/7 unique-local
+        ff*) return 1 ;;                            # ff00::/8 multicast
+    esac
+    # Anything else that still looks like an IPv6 literal is treated as global.
+    case "$_ig_a" in
+        *:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # write_status STATE [PROBE_RESULT]
 # Atomically (temp + mv) rewrite the status file. Merges over prior values so a
 # writer that only knows the new state/probe preserves iface/ipv4/since.
@@ -29,16 +49,34 @@ write_status() {
     _st_iface=""
     _st_ipv4=""
     _st_since=""
+    _st_ipv6=""
+    _st_ipv6_prefix=""
+    _st_ipv6_state=""
+    _st_ipv6_since=""
     if [ -r "$INTERNET_STATUS_FILE" ]; then
         _st_iface=$(sed -n 's/^iface=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
         _st_ipv4=$(sed -n 's/^ipv4=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
         _st_since=$(sed -n 's/^since=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
         [ -z "$_st_probe" ] && _st_probe=$(sed -n 's/^probe=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
+        _st_ipv6=$(sed -n 's/^ipv6=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
+        _st_ipv6_prefix=$(sed -n 's/^ipv6_prefix=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
+        _st_ipv6_state=$(sed -n 's/^ipv6_state=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
+        _st_ipv6_since=$(sed -n 's/^ipv6_since=//p' "$INTERNET_STATUS_FILE" 2>/dev/null)
     fi
     # Allow callers to export overrides for the fuller fields.
     [ -n "${STATUS_IFACE:-}" ] && _st_iface="$STATUS_IFACE"
     [ -n "${STATUS_IPV4:-}" ] && _st_ipv4="$STATUS_IPV4"
     [ -n "${STATUS_SINCE:-}" ] && _st_since="$STATUS_SINCE"
+    # v6 overrides use set-or-unset (${VAR+x}) semantics, NOT non-empty: an
+    # explicitly-empty override CLEARS the field (v6 lost), while an unset
+    # override preserves the prior value. `state` is derived from IPv4 only —
+    # ipv6_state is informational and never influences it (FR-004/FR-007).
+    [ -n "${STATUS_IPV6+x}" ] && _st_ipv6="$STATUS_IPV6"
+    [ -n "${STATUS_IPV6_PREFIX+x}" ] && _st_ipv6_prefix="$STATUS_IPV6_PREFIX"
+    [ -n "${STATUS_IPV6_STATE+x}" ] && _st_ipv6_state="$STATUS_IPV6_STATE"
+    [ -n "${STATUS_IPV6_SINCE+x}" ] && _st_ipv6_since="$STATUS_IPV6_SINCE"
+    # A file that never carried v6 state reads as unavailable.
+    [ -z "$_st_ipv6_state" ] && _st_ipv6_state="unavailable"
 
     _st_now=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
     _st_tmp="${INTERNET_STATUS_FILE}.tmp.$$"
@@ -49,6 +87,10 @@ write_status() {
         echo "probe=${_st_probe}"
         echo "since=${_st_since}"
         echo "last_change=${_st_now}"
+        echo "ipv6=${_st_ipv6}"
+        echo "ipv6_prefix=${_st_ipv6_prefix}"
+        echo "ipv6_state=${_st_ipv6_state}"
+        echo "ipv6_since=${_st_ipv6_since}"
     } > "$_st_tmp" 2>/dev/null || return 0
     mv -f "$_st_tmp" "$INTERNET_STATUS_FILE" 2>/dev/null || rm -f "$_st_tmp"
 }

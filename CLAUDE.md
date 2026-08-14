@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/034-alert-identity/plan.md`.
+`specs/035-dual-stack-ipv6/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
