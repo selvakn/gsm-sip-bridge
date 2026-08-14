@@ -106,6 +106,17 @@ pub(super) struct PendingOrigination {
     deadline: Instant,
     any_response_seen: bool,
     ringing_relayed: bool,
+    /// Set once the attempt has been abandoned, so the abandon path runs
+    /// exactly once.
+    ///
+    /// `CallEnded` is consumed by the `try_recv` that observes it, but a
+    /// *disconnected* control channel is a permanent condition: every later
+    /// poll reports it again. Without this flag an attempt left in
+    /// `AwaitingCancel` re-abandoned and re-logged on every tick — measured
+    /// 2026-08-14, 463 iterations at ~10/s and still climbing. Worse, it kept
+    /// the single pending slot occupied, so the next outbound call was
+    /// refused with "no VoWiFi/VoLTE line available".
+    abandoned: bool,
     pub(super) lifecycle: BridgedCall,
 }
 
@@ -245,7 +256,7 @@ pub(super) fn begin_origination(
         via_transport,
         local_addr: session.local_addr,
         contact_addr: session.contact_addr,
-        public_uri: &session.public_uri,
+        public_uri: &session.origination_identity(),
         callee_uri: &callee_uri,
         call_id: &call_id,
         from_tag: &from_tag,
@@ -312,6 +323,7 @@ pub(super) fn begin_origination(
         deadline: Instant::now() + OUTBOUND_INVITE_TIMEOUT,
         any_response_seen: false,
         ringing_relayed: false,
+        abandoned: false,
         lifecycle,
     })
 }
@@ -669,26 +681,33 @@ pub(super) fn tick_pending_origination(
     // 1. A caller hangup (or Agent B vanishing) abandons the attempt (FR-003).
     //    A `CallEnded` naming a different call is ignored, never acted on
     //    (FR-010).
-    let abandoned = match p.ctrl_rx.try_recv() {
-        Ok(ControlMessage::CallEnded { call_id, .. }) if call_id == p.call_id => {
-            tracing::info!(call_id = %p.call_id, "outbound: caller abandoned the attempt; abandoning the carrier leg");
-            true
+    // Already abandoned and only waiting out the CANCEL: do not re-enter the
+    // abandon path. See `PendingOrigination::abandoned`.
+    let abandoned = if p.abandoned {
+        false
+    } else {
+        match p.ctrl_rx.try_recv() {
+            Ok(ControlMessage::CallEnded { call_id, .. }) if call_id == p.call_id => {
+                tracing::info!(call_id = %p.call_id, "outbound: caller abandoned the attempt; abandoning the carrier leg");
+                true
+            }
+            Ok(ControlMessage::CallEnded { call_id, .. }) => {
+                tracing::warn!(this = %p.call_id, other = %call_id, "ignoring CallEnded for a different call during origination");
+                false
+            }
+            Ok(other) => {
+                tracing::debug!(message = ?other, "ignoring control message during origination");
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tracing::warn!(call_id = %p.call_id, "Agent B control connection dropped during origination; abandoning");
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
         }
-        Ok(ControlMessage::CallEnded { call_id, .. }) => {
-            tracing::warn!(this = %p.call_id, other = %call_id, "ignoring CallEnded for a different call during origination");
-            false
-        }
-        Ok(other) => {
-            tracing::debug!(message = ?other, "ignoring control message during origination");
-            false
-        }
-        Err(mpsc::TryRecvError::Disconnected) => {
-            tracing::warn!(call_id = %p.call_id, "Agent B control connection dropped during origination; abandoning");
-            true
-        }
-        Err(mpsc::TryRecvError::Empty) => false,
     };
     if abandoned {
+        p.abandoned = true;
         abandon_origination(&mut p, session);
         // If that left us awaiting the CANCEL's outcome, keep the origination
         // alive so a racing `200` is still ACKed and BYE'd (greptile PR #35);
