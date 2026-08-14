@@ -41,6 +41,18 @@ impl SipResponse {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Every header matching `name`, in order. A P-CSCF sends one
+    /// `Security-Server` header per algorithm combination it accepts, so
+    /// taking only the first (`header`) silently discards the rest — and with
+    /// them any chance of picking the combination the network is really using.
+    pub fn headers_all<'a>(&'a self, name: &str) -> Vec<&'a str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
     /// Try to parse ONE complete SIP message from the front of `buf` (a
     /// message is complete once the header/body separator is present *and*
     /// `buf` holds at least `Content-Length` more bytes after it — a single

@@ -121,6 +121,11 @@ pub fn run(
         // Names the serving cell, so the network can apply the right policy
         // and an operator can tell which radio a call actually used.
         access_network_info: super::read_access_network_info(&line.settings.modem_port),
+        // The LTE path keeps the P-CSCF-address request line it has always
+        // used; only the VoWiFi side has a carrier needing the other form.
+        register_uri_home_domain: false,
+        gm_auth_alg: None,
+        gm_cipher_alg: None,
     };
 
     // Rebuilding the attachment is what must never happen mid-call. Passing it

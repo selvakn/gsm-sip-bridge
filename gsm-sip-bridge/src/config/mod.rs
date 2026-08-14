@@ -554,6 +554,20 @@ pub struct VowifiConfig {
     /// IPsec. Required by networks (e.g. Vi) that reject a plain REGISTER;
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
+    /// Which URI goes in the REGISTER request line: `"pcscf"` (the literal
+    /// P-CSCF address, the long-standing default) or `"home-domain"` (the
+    /// `ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org` realm that TS 24.229 §5.1.1.2
+    /// actually mandates). Carriers disagree and both forms are rejected
+    /// somewhere, so this cannot be a compile-time constant — see
+    /// `ims::register_session` for the captured evidence on each side.
+    pub register_request_uri: String,
+    /// Pin the Gm IPsec auth/cipher algorithm rather than taking the P-CSCF's
+    /// highest-`q` offer. Empty = follow the network's preference. Needed when
+    /// a P-CSCF advertises a preference it does not actually use, which shows
+    /// up only as its ESP replies failing integrity — see
+    /// `ims::gm_ipsec::select_security_server`.
+    pub gm_auth_alg: String,
+    pub gm_cipher_alg: String,
     /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
     /// by `supervise::orchestrate` once this line's tunnel is up.
     ///
@@ -718,6 +732,9 @@ impl Default for VowifiConfig {
             modem_port: String::new(),
             use_tcp: true,
             sec_agree: true,
+            register_request_uri: "pcscf".to_string(),
+            gm_auth_alg: String::new(),
+            gm_cipher_alg: String::new(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
             veth_local_addr: "10.99.0.1".to_string(),
             veth_peer_addr: "10.99.0.2".to_string(),
@@ -1782,6 +1799,38 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("vowifi.tunnel_engine must be"));
+    }
+
+    #[test]
+    fn vowifi_register_request_uri_defaults_to_pcscf() {
+        // Existing Airtel/Vodafone deployments must keep the request-line form
+        // they already register with, so this default is load-bearing.
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.vowifi.register_request_uri, "pcscf");
+    }
+
+    #[test]
+    fn vowifi_register_request_uri_accepts_home_domain() {
+        let src = format!(
+            "{}\n[vowifi]\nregister_request_uri = \"home-domain\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&src);
+        assert_eq!(cfg.vowifi.register_request_uri, "home-domain");
+    }
+
+    #[test]
+    fn vowifi_register_request_uri_rejects_unknown_value() {
+        let src = format!(
+            "{}\n[vowifi]\nregister_request_uri = \"realm\"\n",
+            MINIMAL_TOML
+        );
+        let result = try_parse(&src).map(|c| c.vowifi);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vowifi.register_request_uri must be"));
     }
 
     #[test]

@@ -188,6 +188,9 @@ pub(crate) fn handle_volte_listen_command(args: &crate::cli::VolteListenArgs) ->
         sec_agree: true,
         msisdn: args.msisdn.clone(),
         access_network_info: crate::volte::read_access_network_info(&args.modem),
+        register_uri_home_domain: false,
+        gm_auth_alg: None,
+        gm_cipher_alg: None,
     };
 
     println!(
@@ -346,6 +349,9 @@ pub(crate) fn handle_volte_call_command(args: &crate::cli::VolteCallArgs) -> Exi
             sec_agree: true,
             msisdn: args.msisdn.clone(),
             access_network_info: crate::volte::read_access_network_info(&args.modem),
+            register_uri_home_domain: false,
+            gm_auth_alg: None,
+            gm_cipher_alg: None,
         },
         callee: args.callee.clone(),
         record_path: args.record.clone(),
@@ -680,6 +686,9 @@ pub(crate) fn handle_volte_register_command(
         sec_agree: args.sec_agree,
         msisdn: line.msisdn.clone(),
         access_network_info: crate::volte::read_access_network_info(&line.modem),
+        register_uri_home_domain: false,
+        gm_auth_alg: None,
+        gm_cipher_alg: None,
     };
 
     // Staying up and renewing is the default; --once is the one-shot

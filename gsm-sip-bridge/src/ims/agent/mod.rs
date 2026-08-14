@@ -253,6 +253,9 @@ fn run_inner(
         sec_agree: config.sec_agree,
         msisdn: None,
         access_network_info: crate::ims::ACCESS_NETWORK_WLAN.to_string(),
+        register_uri_home_domain: config.register_request_uri == "home-domain",
+        gm_auth_alg: Some(config.gm_auth_alg.clone()).filter(|s| !s.is_empty()),
+        gm_cipher_alg: Some(config.gm_cipher_alg.clone()).filter(|s| !s.is_empty()),
     };
 
     let veth_local_ip: IpAddr = config

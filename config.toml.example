@@ -211,6 +211,29 @@ enabled = false
 # Airtel; some networks (e.g. Vi) reject a plain UDP/no-sec-agree REGISTER.
 use_tcp = true
 sec_agree = true
+# What goes in the REGISTER request line: "pcscf" (the literal P-CSCF address,
+# the default) or "home-domain" (the ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org
+# realm that TS 24.229 5.1.1.2 mandates). Carriers genuinely disagree, so
+# there is no universally correct value:
+#   Jio    -> "home-domain". Its P-CSCF finds its own address in the request
+#             line, routes the REGISTER back to itself and trips loop
+#             detection: 483 Too Many Hops from one instance, a blanket 403
+#             Forbidden from another, both before any challenge and both
+#             easily misread as "this SIM is not provisioned for VoWiFi".
+#   Airtel -> "pcscf" (the default). It answers 406 User Unknown to the realm
+#             form.
+register_request_uri = "pcscf"
+# Pin the Gm IPsec algorithms rather than following the P-CSCF's own q= order.
+# Leave empty (the default) to follow it. Set these only when a network
+# advertises a preference it does not actually use — the symptom is a
+# registration that authenticates fine (AKA succeeds, SAs install) and then
+# times out connecting to the protected port, with XfrmInStateProtoError
+# climbing in /proc/net/xfrm_stat because the P-CSCF's ESP replies arrive but
+# fail integrity under the algorithm we picked.
+#   gm_auth_alg   = "hmac-sha-1-96" | "hmac-md5-96"
+#   gm_cipher_alg = "aes-cbc" | "null"
+gm_auth_alg = ""
+gm_cipher_alg = ""
 # BASE path Agent A reads its tunnel-assigned P-CSCF address from, written by
 # the supervisor once that line's tunnel is up. The line index is appended,
 # giving /tmp/pcscf-0, /tmp/pcscf-1, ... — each line's carrier assigns its own
