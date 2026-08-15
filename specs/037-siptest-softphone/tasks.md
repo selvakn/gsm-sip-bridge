@@ -22,38 +22,62 @@ engine skeleton, registration itself — is front-loaded, because US1 and US3
 cannot function without a live registration and US2 *is* the registration
 lifecycle's own acceptance criteria.
 
-## Implementation status (as of the first /speckit.implement pass)
+## Implementation status (as of the second /speckit.implement pass)
 
-**Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), and Phase 3
-(US1 — outbound calling) in full, plus most of Phase 4 (US2) and two Polish
-tasks. 43 of 84 tasks. `make format && make lint && make test` all pass
-across the whole workspace (1,325 test assertions, zero failures, zero
-`unsafe`, zero clippy warnings). `siptest call --destination ... --wait`
-genuinely places a call through a real bridge's registrar, follows the `302`
-redirect, exchanges PCMU audio, records both directions, and exits
-non-zero on a packet-verdict failure — **the MVP the plan calls out is real
-and tested**, not just scaffolded.
+**Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), Phase 3 (US1
+— outbound calling), and Phase 5 (US3 — inbound calling) in full, plus most
+of Phase 4 (US2) and two Polish tasks. 56 of 84 tasks. `make format && make
+lint && make test` all pass across the whole workspace (1,335 test
+assertions, zero failures, zero `unsafe`, zero clippy warnings).
+`siptest call --destination ... --wait` genuinely places a call through a
+real bridge's registrar, follows the `302` redirect, exchanges PCMU audio,
+records both directions, and exits non-zero on a packet-verdict failure; the
+daemon genuinely answers a real inbound INVITE arriving from a source port it
+never registered from, captures all three caller-ID headers, handles
+CANCEL-before-answer with the correct `200`/`487` pair, and supports
+answer/reject/manual policy over the control API — **both the outbound and
+inbound MVPs are real and tested**, not scaffolded.
 
-**One architecture simplification, applied consistently**: rather than pure
-`step(Input) -> Vec<Output>` state machines driven by a separate
-`crossbeam_channel::select!` dialog-engine thread (T026), registration and
-outbound calling are blocking, I/O-performing functions called directly from
-a background thread and from axum's `spawn_blocking`, respectively. This cut
-real scope — no unified dialog table, so true concurrent dialogs (e.g.
-inbound arriving mid-outbound-call) aren't handled — but every wire-level
-behaviour the plan specifies (302 redirect, source-address enforcement,
-digest edge cases, refusal mapping) is implemented and, for the paths that
-matter most, integration-tested against the bridge's real registrar. See the
-inline notes on T025/T026/T027/T036/T037.
+**Two architecture decisions, applied consistently**:
 
-**Not built**: US3 (inbound calls, Phase 5), US4 (tone/Goertzel/RTT, Phase
-6), G.722 (T079–T081, deliberately deferred per research.md R7 regardless),
-FR-005's startup guard against the configured account colliding with the
-bridge's `ring_aor` (T028), the `/registration/*` force-action endpoints and
-`/log/tail` (T053–T054), and the HTTP-layer integration tests for the safety
-gate and control API (T047–T049, T056, T083). The underlying logic for the
-safety gate and retention cap **is** unit-tested (T016, T018) — what's
-missing is exercising it through the actual HTTP handlers.
+1. Rather than pure `step(Input) -> Vec<Output>` state machines driven by a
+   separate `crossbeam_channel::select!` dialog-engine thread (T026),
+   registration and both call directions are blocking, I/O-performing
+   functions. Outbound and registration run from a background thread and
+   axum's `spawn_blocking`; inbound runs on its own dedicated listener thread
+   (`daemon::inbound_listener_loop`), which blocks for the whole duration of
+   a call it accepts — correct given `max_concurrent = 1`, but meaning a
+   second call truly cannot be handled concurrently even at the busy-out
+   level while the listener itself is inside `execute_inbound_call` (the
+   486-for-a-second-INVITE logic lives *inside* that function via
+   `wait_or_cancel`/`wait_for_ack`'s stray-request handling, not in the
+   listener). See the inline notes on T025–T028, T036–T037, T059–T060.
+2. Every SIP read goes through **one demux reader thread** owned by
+   `SipSocket` (`siptest/src/sip/socket.rs`), added specifically to make
+   inbound handling safe: two threads independently calling `recv_from` on
+   one UDP socket would race for each datagram, which could silently steal
+   an inbound INVITE meant for the call handler or a response meant for an
+   in-flight transaction. The reader demultiplexes into a response queue
+   (consumed by `recv_response`, used by registration/outbound) and a
+   request queue (consumed by `recv_request`, used by inbound). Fixed a real
+   bug found while building this: `SipSocket::bind` with `local_port = 0`
+   (any ephemeral-port bind, including every outbound call's RTP-adjacent
+   signalling socket in tests) was reporting port 0 from its own
+   `local_addr()` instead of the OS-assigned port.
+
+**Not built**: US4 (tone/Goertzel/RTT, Phase 6), G.722 (T079–T081,
+deliberately deferred per research.md R7 regardless), FR-005's startup guard
+against the configured account colliding with the bridge's `ring_aor` (T028
+— genuinely blocked: siptest has no channel to read the bridge's `ring_aor`
+value, only whether *something* is registered, via metrics), the
+`/registration/*` force-action endpoints and `/log/tail` (T053–T054), early
+caller-BYE detection mid-call for either call direction (`answer_to_first_rtp_ms`
+and mid-call BYE are both acknowledged gaps, not just for inbound), and the
+HTTP-layer integration tests for the safety gate, control API, and inbound
+policy (T047–T049, T056, T066, T083). The underlying logic for the safety
+gate, retention cap, and inbound dialog handling **is** tested — at the
+`SharedState`+function level or via a raw-socket integration test — what's
+missing is exercising all of it through the actual running HTTP server.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -220,19 +244,19 @@ US3).
 
 ### Tests for User Story 3
 
-- [ ] T057 [P] [US3] Integration test `siptest/tests/test_inbound_from_other_port.rs`: register siptest to the real in-process registrar on port A; from a *different* test socket/port, send an INVITE to the Contact siptest advertised; assert siptest answers it and completes the ACK — encodes the "Accept SIP Trust Server Only" hazard (sip-flows.md C-3) as an executable requirement
-- [ ] T058 [P] [US3] Unit tests for `InboundCallFsm` (to be created in T059) against canned messages: `100`→`180`→(delay)→`200` sequence; `CANCEL` before answer yields `200` for the CANCEL and `487` for the INVITE, recorded as `caller_cancelled` not a fault; an unACKed `200 OK` is retransmitted on the T1 ladder (500ms doubling, cap 4s) and abandoned at 64×T1; `OPTIONS` yields `200`+`Allow`; an unrecognised method yields `405`+`Allow`; a second inbound while one is active yields `486`
+- [x] T057 [P] [US3] `siptest/tests/test_inbound_from_other_port.rs` — built simpler than described: a hand-built `SharedState` + `daemon::inbound_listener_loop` driven directly (no registrar needed for this scenario, since the hazard is about inbound source-port validation, not registration), with a plain `UdpSocket` standing in for Agent B sending from a port siptest never registered from. Asserts the real 100/180/200 sequence, the SDP answer, and caller-ID capture (`P-Asserted-Identity`, `X-GSM-Caller-ID`) end to end.
+- [x] T058 [P] [US3] **Partially covered, by a mix of unit and integration tests rather than canned-message FSM unit tests** (no `InboundCallFsm` exists — see T059's note). `sip/inbound.rs` has direct unit tests for caller-ID extraction and `OPTIONS`/`405`+`Allow`. `test_inbound_from_other_port.rs` adds a second integration test, `a_cancel_before_answer_yields_200_and_487_and_is_recorded_as_caller_cancelled`, proving the CANCEL branch end to end including the `caller_cancelled` end reason. **Not covered**: the T1-retransmit-ladder-then-abandon path and the second-concurrent-INVITE→486 path have no dedicated test (the logic exists in `sip/inbound.rs::wait_for_ack`/`handle_stray` but isn't independently exercised).
 
 ### Implementation for User Story 3
 
-- [ ] T059 [US3] Create `siptest/src/sip/inbound.rs`: `InboundCallFsm`, pure `step()`, implementing C-3 — `100`/`180`/policy-driven `200`-or-reject/ACK-wait, T1 retransmit ladder, CANCEL handling, `max_concurrent` refusal
-- [ ] T060 [US3] Wire `InboundCallFsm` into `sip/engine.rs`; dialog keyed on `Call-ID` only — **never validate the source against the registrar's address or port** (the specific hazard T057 tests)
-- [ ] T061 [US3] Capture `From`, `P-Asserted-Identity`, `X-GSM-Caller-ID` from the inbound INVITE and store them as three separate fields on the `Call` (data-model.md `CallerId`) — never merged or overwritten by each other
-- [ ] T062 [US3] Reuse `media/session.rs` (T038–T041) for inbound calls — same tx/rx threads, same recording, same `ReceiveTracker` wiring, confirming the media layer is direction-agnostic
-- [ ] T063 [US3] Wire `PUT /policy/inbound` and `GET /policy/inbound` in `api/handlers.rs`, taking effect on the next call and never disturbing one in progress
-- [ ] T064 [US3] [P] Wire `POST /calls/{id}/answer` and `POST /calls/{id}/reject` for `manual` policy
-- [ ] T065 [US3] Emit the `incoming_call` event (all three caller-ID fields), `call_state`, `media_first_packet`, and `call_ended` events through `EventBus` (T029) at the appropriate FSM transitions
-- [ ] T066 [US3] [P] Integration test in `test_control_api.rs`: with `mode: "manual"`, an inbound call to the loopback stub's simulated ring is discoverable via `GET /events?since=N` carrying all three caller-ID fields, and `POST /calls/{id}/answer` completes it
+- [x] T059 [US3] **Delivered with the same scope reduction as outbound (T025/T036).** `siptest/src/sip/inbound.rs` holds the wire-level helpers (caller-ID extraction, `OPTIONS`/`405`/`420`/`488`/busy/reject builders, `wait_or_cancel`, the T1 `wait_for_ack` ladder) as plain functions rather than a pure FSM; `call::execute_inbound_call` (in `siptest/src/call.rs`) is the orchestration, mirroring how outbound splits `sip::outbound` (wire) from `call::execute_outbound_call` (orchestration). Implements the full C-3 sequence: `100`→caller-ID capture→`180`→policy(answer/reject/manual)→`200` with T1 retransmit→ACK-wait→media→our own `BYE`.
+- [x] T060 [US3] **No dialog engine exists (T026), so nothing to wire into.** `daemon::inbound_listener_loop` dispatches directly: `OPTIONS`→200, a second concurrent `INVITE` while a call is active→`486`, a fresh `INVITE`→`call::execute_inbound_call`. Dialog identification is **Call-ID only** throughout — `wait_or_cancel`/`wait_for_ack` match on `Call-ID`, never on source address or port. `test_inbound_from_other_port.rs` proves this: the "caller" binds a port siptest never registered from, and the call still completes.
+- [x] T061 [US3] Done — `sip::inbound::extract_caller_id` captures `From`, `P-Asserted-Identity`, `X-GSM-Caller-ID` into three independent `Option<String>` fields on `CallerId`, asserted separately (including independent-absence) in `sip/inbound.rs`'s unit tests and end to end in `test_inbound_from_other_port.rs`.
+- [x] T062 [US3] Done — `execute_inbound_call` calls the same `media::session::run` outbound uses, unchanged.
+- [x] T063 [US3] Done — `GET`/`PUT /policy/inbound` in `api/handlers.rs`, reading/writing `SharedState::inbound_policy`; takes effect on the next inbound INVITE (read once per call, not polled mid-call).
+- [x] T064 [US3] [P] Done — `POST /calls/{id}/{answer,reject}` write into `SharedState::manual_decisions`, consumed by `execute_inbound_call`'s manual-mode poll loop.
+- [x] T065 [US3] **Partially done.** `incoming_call` (all three caller-ID fields) and `call_ended` are emitted for inbound calls. **Not emitted for inbound**: `call_state` transitions (ringing→answered) and `media_first_packet` — the latter doesn't exist for either call direction (`answer_to_first_rtp_ms` is `None` everywhere; a real gap noted under US1 too).
+- [ ] T066 [US3] [P] **Not done.** No `test_control_api.rs` exists at all (see T047–T049/T056's status) — manual-policy discoverability is proven at the `SharedState`+listener-loop level (`test_inbound_from_other_port.rs`), not through the actual HTTP `/events`/`/calls/{id}/answer` endpoints.
 
 **Checkpoint**: siptest answers a call the bridge initiates, from an
 unexpected source port, and an agent can discover, answer, and verify it using

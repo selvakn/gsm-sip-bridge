@@ -104,6 +104,43 @@ pub struct Counters {
     pub errors: u64,
 }
 
+/// Runtime-mutable inbound-call policy (FR-013), independent of what was in
+/// `siptest.toml` at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundMode {
+    Answer,
+    Reject,
+    Manual,
+}
+
+impl std::str::FromStr for InboundMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "answer" => Ok(Self::Answer),
+            "reject" => Ok(Self::Reject),
+            "manual" => Ok(Self::Manual),
+            other => Err(format!("unknown inbound mode: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InboundPolicy {
+    pub mode: InboundMode,
+    pub answer_delay_ms: u32,
+    pub reject_status: u16,
+    pub duration_secs: u32,
+}
+
+/// What a `manual`-policy call decided, set by `POST /calls/{id}/{answer,reject}`
+/// and consumed by the inbound listener thread while a call is ringing.
+#[derive(Debug, Clone, Copy)]
+pub enum ManualDecision {
+    Answer,
+    Reject(u16),
+}
+
 pub struct SharedState {
     pub registration: Mutex<RegistrationStatus>,
     pub calls: Mutex<CallRegistry>,
@@ -118,6 +155,8 @@ pub struct SharedState {
     pub next_call_seq: Mutex<u64>,
     pub sip_socket: Arc<crate::sip::socket::SipSocket>,
     pub registration_creds: Mutex<crate::sip::registration::RegistrationCredentials>,
+    pub inbound_policy: Mutex<InboundPolicy>,
+    pub manual_decisions: Mutex<std::collections::HashMap<CallId, ManualDecision>>,
 }
 
 impl SharedState {

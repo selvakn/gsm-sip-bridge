@@ -42,6 +42,74 @@ pub struct SdpAnswer {
     pub payload_type: u8,
 }
 
+/// A parsed inbound offer — enough to build an answer and open the RTP
+/// socket toward the caller.
+#[derive(Debug, Clone)]
+pub struct SdpOffer {
+    pub remote_rtp: std::net::SocketAddr,
+    pub payload_types: Vec<u8>,
+}
+
+impl SdpOffer {
+    /// True when `pt` was offered — used to decide whether we can answer with
+    /// a codec we support (PCMU, PT 0, until G.722 lands).
+    pub fn offers(&self, pt: u8) -> bool {
+        self.payload_types.contains(&pt)
+    }
+}
+
+/// Parses an inbound SDP offer down to the connection address, the
+/// `m=audio` port, and every offered payload type in order. Shares
+/// `parse_answer`'s explicit-failure rules for `c=0.0.0.0`/`m=audio 0`.
+pub fn parse_offer(body: &str) -> SipTestResult<SdpOffer> {
+    let mut conn_ip: Option<IpAddr> = None;
+    let mut rtp_port: Option<u16> = None;
+    let mut payload_types: Vec<u8> = Vec::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("c=IN ") {
+            if let Some(addr) = rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|a| a.parse::<IpAddr>().ok())
+            {
+                conn_ip = Some(addr);
+            }
+        } else if let Some(rest) = line.strip_prefix("m=audio ") {
+            let mut fields = rest.split_whitespace();
+            rtp_port = fields.next().and_then(|p| p.parse().ok());
+            // Skip the "RTP/AVP" token, the rest are payload types.
+            if let Some(_proto) = fields.next() {
+                payload_types = fields.filter_map(|pt| pt.parse().ok()).collect();
+            }
+        }
+    }
+
+    let conn_ip =
+        conn_ip.ok_or_else(|| SipTestError::Config("SDP offer missing c= address".into()))?;
+    if conn_ip.is_unspecified() {
+        return Err(SipTestError::Config(
+            "SDP offer's c= address is 0.0.0.0".into(),
+        ));
+    }
+    let rtp_port =
+        rtp_port.ok_or_else(|| SipTestError::Config("SDP offer missing m=audio port".into()))?;
+    if rtp_port == 0 {
+        return Err(SipTestError::Config("SDP offer's m=audio port is 0".into()));
+    }
+    if payload_types.is_empty() {
+        return Err(SipTestError::Config(
+            "SDP offer's m=audio line has no payload types".into(),
+        ));
+    }
+
+    Ok(SdpOffer {
+        remote_rtp: std::net::SocketAddr::new(conn_ip, rtp_port),
+        payload_types,
+    })
+}
+
 /// Parses an SDP answer down to the connection address, the `m=audio` port,
 /// and the selected payload type. Explicit failures for `c=0.0.0.0`,
 /// `m=audio 0`, and `a=inactive` — an answer meaning "no media" must be
@@ -108,6 +176,29 @@ mod tests {
         assert!(offer.contains("m=audio 40000 RTP/AVP 0 101"));
         assert!(offer.contains("a=rtpmap:0 PCMU/8000"));
         assert!(offer.contains("a=rtpmap:101 telephone-event/8000"));
+    }
+
+    #[test]
+    fn inbound_offer_with_pcmu_parses_and_offers_pt_zero() {
+        let body = "v=0\r\no=- 1 1 IN IP4 192.168.15.10\r\ns=-\r\nc=IN IP4 192.168.15.10\r\nt=0 0\r\nm=audio 41000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(offer.remote_rtp.port(), 41000);
+        assert!(offer.offers(0));
+        assert!(!offer.offers(9));
+    }
+
+    #[test]
+    fn inbound_offer_without_pcmu_does_not_claim_to_offer_it() {
+        let body =
+            "v=0\r\nc=IN IP4 192.168.15.10\r\nm=audio 41000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert!(!offer.offers(0));
+    }
+
+    #[test]
+    fn inbound_offer_with_zero_connection_address_is_rejected() {
+        let body = "v=0\r\nc=IN IP4 0.0.0.0\r\nm=audio 41000 RTP/AVP 0\r\n";
+        assert!(parse_offer(body).is_err());
     }
 
     #[test]

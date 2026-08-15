@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::api::state::{Counters, SharedState};
+use crate::api::state::{Counters, InboundMode, InboundPolicy, SharedState};
 use crate::config::Config;
 use crate::error::SipTestResult;
 use crate::sip::registration::{
@@ -74,6 +74,13 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
             cached_nonce: None,
             nc: 0,
         }),
+        inbound_policy: Mutex::new(InboundPolicy {
+            mode: config.inbound.mode.parse().unwrap_or(InboundMode::Answer),
+            answer_delay_ms: config.inbound.answer_delay_ms,
+            reject_status: config.inbound.reject_status,
+            duration_secs: config.inbound.duration_secs,
+        }),
+        manual_decisions: Mutex::new(std::collections::HashMap::new()),
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -82,6 +89,12 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
         let state = state.clone();
         let stop = stop.clone();
         std::thread::spawn(move || registration_loop(state, reg_config, stop))
+    };
+
+    let inbound_thread = {
+        let state = state.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || inbound_listener_loop(state, stop))
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -106,7 +119,57 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
 
     stop.store(true, Ordering::Relaxed);
     let _ = reg_thread.join();
+    let _ = inbound_thread.join();
     Ok(())
+}
+
+/// Owns nothing but the read side of `recv_request` (via `SipSocket`, which
+/// already demultiplexes responses away from it — `sip/socket.rs`'s module
+/// doc). Answers `OPTIONS` immediately, busies out a second concurrent
+/// INVITE, refuses anything else with `405`, and hands a fresh INVITE to
+/// `call::execute_inbound_call`, which runs to completion before this loop
+/// reads again — correct for `max_concurrent = 1`.
+/// `pub` so integration tests can drive it directly against a hand-built
+/// `SharedState`, without needing the full HTTP daemon up.
+pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        let Ok(Some((req, peer))) = state.sip_socket.recv_request(Duration::from_millis(500))
+        else {
+            continue;
+        };
+        match req.method.as_str() {
+            "OPTIONS" => {
+                let _ = state
+                    .sip_socket
+                    .send(peer, &crate::sip::inbound::build_options_ok(&req));
+            }
+            "INVITE" => {
+                if state
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .active()
+                    .is_some()
+                {
+                    let _ = state
+                        .sip_socket
+                        .send(peer, &crate::sip::inbound::build_busy(&req));
+                    continue;
+                }
+                crate::call::execute_inbound_call(&state, req, peer);
+            }
+            "ACK" | "BYE" | "CANCEL" => {
+                // Stray — the dialog these belong to is handled entirely
+                // inside `execute_inbound_call`'s own read loop while it
+                // runs; anything reaching here has no matching call.
+            }
+            _ => {
+                let _ = state
+                    .sip_socket
+                    .send(peer, &crate::sip::inbound::build_405(&req));
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {

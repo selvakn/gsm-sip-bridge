@@ -7,7 +7,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::api::state::{AppState, Lookup};
+use crate::api::state::{AppState, InboundMode, Lookup, ManualDecision};
 use crate::call::{execute_outbound_call, CallId};
 use crate::error::SipTestError;
 
@@ -154,6 +154,11 @@ pub async fn list_calls(State(state): State<AppState>) -> Json<serde_json::Value
             "direction": format!("{:?}", c.direction).to_lowercase(),
             "state": format!("{:?}", c.state).to_lowercase(),
             "peer": c.peer,
+            "caller_id": {
+                "from": c.caller_id.from,
+                "p_asserted_identity": c.caller_id.p_asserted_identity,
+                "x_gsm_caller_id": c.caller_id.x_gsm_caller_id,
+            },
             "success": c.report.as_ref().map(|r| r.success),
         }))
         .collect::<Vec<_>>()))
@@ -172,6 +177,11 @@ pub async fn get_call(State(state): State<AppState>, Path(id): Path<String>) -> 
                     "state": format!("{:?}", call.state).to_lowercase(),
                     "peer": call.peer,
                     "peer_uri": call.peer_uri,
+                    "caller_id": {
+                        "from": call.caller_id.from,
+                        "p_asserted_identity": call.caller_id.p_asserted_identity,
+                        "x_gsm_caller_id": call.caller_id.x_gsm_caller_id,
+                    },
                     "end_reason": call.end_reason,
                     "report": call.report,
                     "report_text": report_text,
@@ -181,6 +191,119 @@ pub async fn get_call(State(state): State<AppState>, Path(id): Path<String>) -> 
         }
         Lookup::Evicted => error_response(SipTestError::CallEvicted(id)),
         Lookup::NotFound => error_response(SipTestError::CallNotFound(id)),
+    }
+}
+
+pub async fn answer_call(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let call_id = CallId(id);
+    state
+        .manual_decisions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(call_id, ManualDecision::Answer);
+    (StatusCode::OK, Json(json!({}))).into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub struct RejectRequest {
+    #[serde(default = "default_reject_status")]
+    pub status: u16,
+}
+
+fn default_reject_status() -> u16 {
+    486
+}
+
+pub async fn reject_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<RejectRequest>>,
+) -> Response {
+    let status = body
+        .map(|Json(b)| b.status)
+        .unwrap_or_else(default_reject_status);
+    let call_id = CallId(id);
+    state
+        .manual_decisions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(call_id, ManualDecision::Reject(status));
+    (StatusCode::OK, Json(json!({}))).into_response()
+}
+
+pub async fn get_inbound_policy(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let p = *state
+        .inbound_policy
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Json(json!({
+        "mode": inbound_mode_str(p.mode),
+        "answer_delay_ms": p.answer_delay_ms,
+        "reject_status": p.reject_status,
+        "duration_secs": p.duration_secs,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct PolicyUpdate {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub answer_delay_ms: Option<u32>,
+    #[serde(default)]
+    pub reject_status: Option<u16>,
+    #[serde(default)]
+    pub duration_secs: Option<u32>,
+}
+
+pub async fn put_inbound_policy(
+    State(state): State<AppState>,
+    Json(update): Json<PolicyUpdate>,
+) -> Response {
+    let mode = match update.mode.as_deref() {
+        Some(m) => match m.parse::<InboundMode>() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid_mode", "detail": e})),
+                )
+                    .into_response()
+            }
+        },
+        None => None,
+    };
+    let mut p = state
+        .inbound_policy
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mode) = mode {
+        p.mode = mode;
+    }
+    if let Some(d) = update.answer_delay_ms {
+        p.answer_delay_ms = d;
+    }
+    if let Some(s) = update.reject_status {
+        p.reject_status = s;
+    }
+    if let Some(d) = update.duration_secs {
+        p.duration_secs = d;
+    }
+    let response = json!({
+        "mode": inbound_mode_str(p.mode),
+        "answer_delay_ms": p.answer_delay_ms,
+        "reject_status": p.reject_status,
+        "duration_secs": p.duration_secs,
+    });
+    drop(p);
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+fn inbound_mode_str(mode: InboundMode) -> &'static str {
+    match mode {
+        InboundMode::Answer => "answer",
+        InboundMode::Reject => "reject",
+        InboundMode::Manual => "manual",
     }
 }
 
