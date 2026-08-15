@@ -131,31 +131,7 @@ impl CodecOffer {
 }
 
 pub fn build_offer(local_ip: IpAddr, rtp_port: u16, session_id: u64, offer: CodecOffer) -> String {
-    build_offer_with(local_ip, rtp_port, session_id, offer, mtsi_offer())
-}
-
-/// [`build_offer`] with the MTSI decision passed in, so both shapes are testable
-/// without touching process environment.
-pub fn build_offer_with(
-    local_ip: IpAddr,
-    rtp_port: u16,
-    session_id: u64,
-    offer: CodecOffer,
-    full: bool,
-) -> String {
     let addrtype = ip_addrtype(local_ip);
-    let wideband = offer != CodecOffer::PcmuOnly;
-    // TS 26.114 makes DTMF mandatory for MMTEL voice, so a conformant offer
-    // carries `telephone-event` at each clock rate it offers audio at. These two
-    // dynamic numbers are the ones Jio itself uses, and neither collides with
-    // the payload types above.
-    let dtmf_wb = 105u8;
-    let dtmf_nb = 100u8;
-    let dtmf_types = match (full, wideband) {
-        (false, _) => String::new(),
-        (true, true) => format!(" {dtmf_wb} {dtmf_nb}"),
-        (true, false) => format!(" {dtmf_nb}"),
-    };
     let payload_types = match offer {
         CodecOffer::PcmuOnly => PCMU_PAYLOAD_TYPE.to_string(),
         CodecOffer::PcmuThenWideband => {
@@ -172,26 +148,13 @@ pub fn build_offer_with(
          s=gsm-sip-bridge test call\r\n\
          c=IN {addrtype} {local_ip}\r\n\
          t=0 0\r\n\
-         m=audio {rtp_port} RTP/AVP {payload_types}{dtmf_types}\r\n",
+         m=audio {rtp_port} RTP/AVP {payload_types}\r\n",
     );
-    if full {
-        // Bandwidth must come before any `a=` line in the media section
-        // (RFC 4566 orders `m=` `i=` `c=` `b=` `k=` `a=`).
-        let as_kbps = if wideband { 49 } else { 80 };
-        sdp.push_str(&format!("b=AS:{as_kbps}\r\nb=RS:800\r\nb=RR:2400\r\n"));
-    }
     // rtpmap lines follow the same order as the m= line, so the preference is
     // stated consistently rather than only in the payload-type list.
-    let wideband_fmtp = if full {
-        // What Jio's own answer states, and what an MTSI UE offers: the mode set
-        // it will accept and its mode-change behaviour.
-        "mode-set=0,1,2,3;octet-align=1;mode-change-capability=2"
-    } else {
-        "octet-align=1"
-    };
     let wideband_rtpmap = format!(
         "a=rtpmap:{AMR_WB_PAYLOAD_TYPE} AMR-WB/16000\r\n\
-         a=fmtp:{AMR_WB_PAYLOAD_TYPE} {wideband_fmtp}\r\n",
+         a=fmtp:{AMR_WB_PAYLOAD_TYPE} octet-align=1\r\n",
     );
     let pcmu_rtpmap = format!("a=rtpmap:{PCMU_PAYLOAD_TYPE} PCMU/8000\r\n");
     match offer {
@@ -205,40 +168,8 @@ pub fn build_offer_with(
             sdp.push_str(&pcmu_rtpmap);
         }
     }
-    if full {
-        if wideband {
-            sdp.push_str(&format!(
-                "a=rtpmap:{dtmf_wb} telephone-event/16000\r\na=fmtp:{dtmf_wb} 0-15\r\n"
-            ));
-        }
-        sdp.push_str(&format!(
-            "a=rtpmap:{dtmf_nb} telephone-event/8000\r\na=fmtp:{dtmf_nb} 0-15\r\n\
-             a=ptime:20\r\na=maxptime:240\r\n"
-        ));
-    }
     sdp.push_str("a=sendrecv\r\n");
     sdp
-}
-
-/// EXPERIMENT, gated on `GM_ORIG_FULL_SDP=1`: offer a conformant MTSI voice
-/// stream instead of a bare two-codec one.
-///
-/// Our originating offer stated a codec and nothing else — no `a=ptime`, no
-/// `a=maxptime`, no `b=AS`/`b=RS`/`b=RR`, no `telephone-event`, and an AMR-WB
-/// `fmtp` of just `octet-align=1`. TS 26.114 requires all of them for MMTEL
-/// voice, and Jio's own SDP carries every one.
-///
-/// Measured on Jio 2026-08-15: with PRACK in place the INVITE finally drew a
-/// `200 OK`, but the network **forked** and the other branch came back
-/// `487 Request Terminated - invalid SDP offer or answer` 77 ms later, having
-/// never sent a `180` — the destination was never rung, and a network element
-/// auto-answered with 15 packets of media and nothing more.
-///
-/// Gated because the other carriers place calls successfully on the bare offer
-/// today (`CodecOffer` shapes are covered by tests asserting the exact bytes).
-fn mtsi_offer() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GM_ORIG_FULL_SDP").is_some())
 }
 
 pub struct SdpAnswer {
@@ -1170,56 +1101,15 @@ mod tests {
         assert!(parse_answer(body).is_err());
     }
 
-    /// A conformant MTSI offer states far more than a codec. Every element here
-    /// is one Jio's own SDP carries and ours omitted; the network forked our
-    /// bare offer and killed the destination leg with
-    /// `487 ... invalid SDP offer or answer`.
+    /// Every carrier in production places calls on this exact offer, so its
+    /// bytes must not move without a measurement to justify it.
     #[test]
-    fn the_mtsi_offer_states_everything_ts26114_requires() {
-        let sdp = build_offer_with(
+    fn the_offer_states_a_codec_and_nothing_more() {
+        let sdp = build_offer(
             "1.2.3.4".parse().unwrap(),
             40000,
             7,
             CodecOffer::WidebandThenPcmu,
-            true,
-        );
-
-        assert!(
-            sdp.contains("m=audio 40000 RTP/AVP 96 0 105 100\r\n"),
-            "telephone-event at both clock rates must be on the m= line: {sdp}"
-        );
-        for required in [
-            "b=AS:49\r\n",
-            "b=RS:800\r\n",
-            "b=RR:2400\r\n",
-            "a=fmtp:96 mode-set=0,1,2,3;octet-align=1;mode-change-capability=2\r\n",
-            "a=rtpmap:105 telephone-event/16000\r\n",
-            "a=fmtp:105 0-15\r\n",
-            "a=rtpmap:100 telephone-event/8000\r\n",
-            "a=ptime:20\r\n",
-            "a=maxptime:240\r\n",
-        ] {
-            assert!(sdp.contains(required), "missing {required:?} in: {sdp}");
-        }
-        // RFC 4566 orders a media section m= i= c= b= k= a=; bandwidth before
-        // any attribute.
-        let first_attr = sdp.find("\r\na=").expect("attributes present");
-        assert!(
-            sdp.find("b=AS:").expect("bandwidth present") < first_attr,
-            "b= lines must precede the a= lines: {sdp}"
-        );
-    }
-
-    /// The other carriers place calls on the bare offer today, so its bytes must
-    /// not move.
-    #[test]
-    fn the_bare_offer_is_unchanged() {
-        let sdp = build_offer_with(
-            "1.2.3.4".parse().unwrap(),
-            40000,
-            7,
-            CodecOffer::WidebandThenPcmu,
-            false,
         );
 
         assert!(sdp.contains("m=audio 40000 RTP/AVP 96 0\r\n"), "{sdp}");

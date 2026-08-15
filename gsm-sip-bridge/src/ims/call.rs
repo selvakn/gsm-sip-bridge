@@ -242,7 +242,6 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         cseq: invite_cseq,
         branch: &branch,
         body: &offer,
-        imei: &session.imei,
     });
 
     tracing::info!(callee = %cfg.callee, "sending INVITE");
@@ -672,43 +671,9 @@ pub(crate) struct InviteParts<'a> {
     pub(crate) cseq: u32,
     pub(crate) branch: &'a str,
     pub(crate) body: &'a str,
-    /// For the `Contact`'s `+sip.instance` — see [`orig_full_headers`].
-    pub(crate) imei: &'a str,
-}
-
-/// The MMTEL IMS communication service identifier, escaped as it goes on the
-/// wire (TS 24.229 / TS 24.173).
-const ICSI_MMTEL: &str = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
-
-/// EXPERIMENT, gated on `GM_ORIG_FULL_HEADERS=1`: declare an originating INVITE
-/// as an MMTEL voice session, and say who we are and what we support.
-///
-/// Our INVITE carried no `Supported:` at all, no `P-Preferred-Identity`, a
-/// five-method `Allow`, and a `Contact` with none of the feature tags we
-/// register with — in particular **no `+g.3gpp.icsi-ref`**. Without the MMTEL
-/// ICSI the S-CSCF's initial filter criteria cannot match the MMTEL application
-/// server, so the request is not treated as a telephony call. Measured on Jio
-/// 2026-08-15: `100 Trying`, then a `183` whose SDP announces itself as
-/// `s=media server session`, ~13 s of announcement, then
-/// `480 Temporarily Unavailable`.
-///
-/// The same class of omission — a response that never declared its
-/// capabilities — was the *inbound* teardown, where adding `Allow`/`Supported`
-/// turned `cause=503 "SIP SDP Protocol Error"` into a working call after five
-/// SDP-body variants had changed nothing. Gated so Airtel/Vi origination is not
-/// altered until this is proven.
-fn orig_full_headers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GM_ORIG_FULL_HEADERS").is_some())
 }
 
 pub(crate) fn build_invite(p: &InviteParts) -> String {
-    build_invite_with(p, orig_full_headers())
-}
-
-/// [`build_invite`] with the header set chosen explicitly, so both shapes are
-/// testable without touching process environment.
-pub(crate) fn build_invite_with(p: &InviteParts, full_headers: bool) -> String {
     let via_addr = format_sip_addr(p.local_addr);
     let contact_addr = format_sip_addr(p.contact_addr);
     let public_user = p.public_uri.split('@').next().unwrap_or(p.public_uri);
@@ -725,37 +690,13 @@ pub(crate) fn build_invite_with(p: &InviteParts, full_headers: bool) -> String {
         msg.push_str(route);
         msg.push_str("\r\n");
     }
-    let (contact_params, allow, service_headers) = if full_headers {
-        (
-            format!(
-                ";+g.3gpp.icsi-ref=\"{ICSI_MMTEL}\";audio\
-                 ;+sip.instance=\"<urn:gsma:imei:{imei}>\"",
-                imei = p.imei
-            ),
-            "INVITE, ACK, CANCEL, BYE, UPDATE, OPTIONS, INFO, PRACK, MESSAGE, REFER, NOTIFY",
-            format!(
-                "Accept-Contact: *;+g.3gpp.icsi-ref=\"{ICSI_MMTEL}\"\r\n\
-                 P-Preferred-Identity: <sip:{public_uri}>\r\n\
-                 Supported: timer, 100rel, replaces, path, gruu\r\n\
-                 P-Early-Media: supported\r\n",
-                public_uri = p.public_uri,
-            ),
-        )
-    } else {
-        (
-            String::new(),
-            "INVITE, ACK, BYE, CANCEL, OPTIONS",
-            String::new(),
-        )
-    };
     msg.push_str(&format!(
         "From: <sip:{public_uri}>;tag={from_tag}\r\n\
          To: <sip:{callee_uri}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} INVITE\r\n\
-         Contact: <sip:{public_user}@{contact_addr};transport={transport}>{contact_params}\r\n\
-         Allow: {allow}\r\n\
-         {service_headers}\
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>\r\n\
+         Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n\
          P-Access-Network-Info: 3GPP-WLAN\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
          Content-Type: application/sdp\r\n\
@@ -769,9 +710,6 @@ pub(crate) fn build_invite_with(p: &InviteParts, full_headers: bool) -> String {
         public_user = public_user,
         contact_addr = contact_addr,
         transport = p.via_transport,
-        contact_params = contact_params,
-        allow = allow,
-        service_headers = service_headers,
         body_len = p.body.len(),
         body = p.body,
     ));
@@ -959,7 +897,6 @@ mod tests {
             cseq: 1,
             branch: "branch1",
             body: "v=0\r\n",
-            imei: "860000000000000",
         });
         assert!(msg.starts_with("INVITE sip:+919000000000@realm SIP/2.0\r\n"));
         assert!(msg.contains("Content-Length: 5\r\n"));
@@ -982,51 +919,19 @@ mod tests {
             cseq: 1,
             branch: "branch1",
             body: "v=0\r\n",
-            imei: "860000000000000",
         }
     }
 
-    /// An originating INVITE has to say it is an MMTEL voice call, or the
-    /// S-CSCF's filter criteria never hand it to the telephony application
-    /// server. Measured on Jio: without these the call reaches an announcement
-    /// server (`s=media server session`) and ends `480` after ~13 s.
+    /// Every carrier in production originates on this exact header set, so it
+    /// must not move without a measurement to justify it.
     #[test]
-    fn the_full_header_set_declares_an_mmtel_voice_session() {
+    fn the_originating_header_set_is_pinned() {
         let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
-        let msg = build_invite_with(&invite_parts(addr), true);
-
-        assert!(
-            msg.contains(
-                "Contact: <sip:+919000000001@1.2.3.4:5060;transport=TCP>\
-                 ;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"\
-                 ;audio;+sip.instance=\"<urn:gsma:imei:860000000000000>\"\r\n"
-            ),
-            "the Contact must carry the MMTEL ICSI and our instance: {msg}"
-        );
-        assert!(
-            msg.contains("P-Preferred-Identity: <sip:+919000000001@realm>\r\n"),
-            "the network must be told which registered identity to assert: {msg}"
-        );
-        assert!(
-            msg.contains("Supported: timer, 100rel, replaces, path, gruu\r\n"),
-            "we sent no Supported header at all before this: {msg}"
-        );
-        assert!(
-            msg.contains("Accept-Contact: *;+g.3gpp.icsi-ref=") && msg.contains("PRACK"),
-            "caller preferences and the full Allow set: {msg}"
-        );
-    }
-
-    /// The other carriers are in production on the short header set, so the
-    /// default must stay exactly as it was.
-    #[test]
-    fn the_default_header_set_is_unchanged() {
-        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
-        let msg = build_invite_with(&invite_parts(addr), false);
+        let msg = build_invite(&invite_parts(addr));
 
         assert!(
             msg.contains("Contact: <sip:+919000000001@1.2.3.4:5060;transport=TCP>\r\n"),
-            "no feature tags on the default path: {msg}"
+            "no feature tags on the Contact: {msg}"
         );
         assert!(
             msg.contains("Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"),
@@ -1034,67 +939,6 @@ mod tests {
         );
         for absent in ["Supported:", "P-Preferred-Identity:", "Accept-Contact:"] {
             assert!(!msg.contains(absent), "{absent} must not appear: {msg}");
-        }
-    }
-
-    /// A `PRACK` is an ordinary in-dialog request plus `RAck` (RFC 3262 §7.2),
-    /// which names the provisional's `RSeq` and the request it answered. Without
-    /// it the carrier retransmits the reliable provisional and abandons the call.
-    #[test]
-    fn a_prack_carries_the_rack_naming_the_provisional_it_acknowledges() {
-        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
-        let msg = build_prack(
-            &AckParts {
-                request_uri: "+919000000000@realm",
-                route_headers: &["Route: <sip:p@2.3.4.5;lr>".to_string()],
-                via_transport: "TCP",
-                local_addr: addr,
-                public_uri: "+919000000001@realm",
-                to_header: "<sip:+919000000000@realm>;tag=farend",
-                call_id: "callid",
-                from_tag: "tag1",
-                cseq: 6,
-                branch: "branch2",
-            },
-            "1 5 INVITE",
-        );
-
-        assert!(
-            msg.starts_with("PRACK sip:+919000000000@realm SIP/2.0\r\n"),
-            "{msg}"
-        );
-        assert!(msg.contains("RAck: 1 5 INVITE\r\n"), "{msg}");
-        assert!(
-            msg.contains("CSeq: 6 PRACK\r\n"),
-            "the PRACK needs its own sequence number: {msg}"
-        );
-        assert!(
-            msg.contains("To: <sip:+919000000000@realm>;tag=farend\r\n"),
-            "the far end's tag from the provisional establishes the dialog: {msg}"
-        );
-        assert!(msg.contains("Route: <sip:p@2.3.4.5;lr>\r\n"), "{msg}");
-        assert!(msg.ends_with("Content-Length: 0\r\n\r\n"), "{msg}");
-    }
-
-    /// `RAck` must not leak into the requests that never carry it.
-    #[test]
-    fn ack_and_bye_carry_no_rack() {
-        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
-        let parts = AckParts {
-            request_uri: "+919000000000@realm",
-            route_headers: &[],
-            via_transport: "TCP",
-            local_addr: addr,
-            public_uri: "+919000000001@realm",
-            to_header: "<sip:+919000000000@realm>;tag=farend",
-            call_id: "callid",
-            from_tag: "tag1",
-            cseq: 5,
-            branch: "branch1",
-        };
-        for msg in [build_ack(&parts), build_bye(&parts)] {
-            assert!(!msg.contains("RAck"), "{msg}");
-            assert!(msg.ends_with("Content-Length: 0\r\n\r\n"), "{msg}");
         }
     }
 
@@ -1117,7 +961,6 @@ mod tests {
             cseq: 1,
             branch: "b",
             body: "",
-            imei: "860000000000000",
         });
         assert!(msg.contains("Via: SIP/2.0/TCP 1.2.3.4:48584;branch=b;rport\r\n"));
         assert!(msg.contains("Contact: <sip:u@1.2.3.4:48586;transport=TCP>\r\n"));
@@ -1140,7 +983,6 @@ mod tests {
             cseq: 1,
             branch: "b",
             body: "",
-            imei: "860000000000000",
         });
         let a_pos = msg.find("Route: <sip:a>").unwrap();
         let b_pos = msg.find("Route: <sip:b>").unwrap();
@@ -1186,7 +1028,6 @@ mod tests {
             cseq: 7,
             branch: "z9hG4bKinvitebranch",
             body: "",
-            imei: "860000000000000",
         });
         assert!(invite.contains("branch=z9hG4bKinvitebranch"));
         assert!(invite.contains("CSeq: 7 INVITE"));

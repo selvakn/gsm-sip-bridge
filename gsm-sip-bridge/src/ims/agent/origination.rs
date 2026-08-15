@@ -274,7 +274,6 @@ pub(super) fn begin_origination(
         cseq: invite_cseq,
         branch: &branch,
         body: &offer,
-        imei: &session.imei,
     });
 
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
