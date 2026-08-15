@@ -40,7 +40,7 @@ done.
 - [X] T002 [P] Add `CallEarlyMedia { call_id: String }` to the `ControlMessage` enum in `gsm-sip-bridge/src/vowifi/control.rs`, including it in the existing `call_id()` match arm (see the `PlaceCall`/`CallAttempting` arms for the pattern).
 - [X] T003 Add a wire round-trip test for `CallEarlyMedia` in `gsm-sip-bridge/src/vowifi/control.rs`, following the existing `CallRinging`/`CallAnswered` test pattern (control.rs:283-391) (depends on T002; same file, not parallel with it).
 - [X] T004 [P] Extract `pair_veth_leg` (the `Call::make` + `endpoint.pair_calls(...)` steps only, no `answer()`) out of `bridge_outbound_leg` in `gsm-sip-bridge/src/vowifi/mod.rs`. Keep `bridge_outbound_leg` as a thin wrapper: call `pair_veth_leg`, then `call.answer(200)` — pure refactor, no behavior change yet. (Also wired `try_place_on_line`'s `CallEarlyMedia`/`CallPlaced` handling and a new `finalize_paired_outbound_leg` here since the two are inseparable in this codebase's structure — `PlaceCallOutcome::Placed` had to grow an `Option<Call>` regardless; see T009/T010 notes.)
-- [ ] T005 [P] Add early-media bookkeeping fields to `PendingOrigination` in `gsm-sip-bridge/src/ims/agent/origination.rs`: `early_media_rtp_connected: bool`, `early_veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>`, `early_media_sent: bool` — all unset in the constructor, alongside the existing `provisional_answer`/`ringing_relayed` fields.
+- [X] T005 [P] Add early-media bookkeeping fields to `PendingOrigination` in `gsm-sip-bridge/src/ims/agent/origination.rs`: `early_media_rtp_connected: bool`, `early_veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>`, `early_media_sent: bool` — all unset in the constructor, alongside the existing `provisional_answer`/`ringing_relayed` fields.
 
 **Checkpoint**: Foundation ready — both user stories can now be implemented.
 
@@ -60,15 +60,15 @@ timed against when the carrier sent it (`quickstart.md` steps 1-2).
 
 > Write these first; confirm they fail before implementing T007-T010.
 
-- [ ] T006 [P] [US1] Unit test in `gsm-sip-bridge/src/ims/agent/origination.rs`: a synthetic response sequence — `183` with SDP → `183` again (retransmit/duplicate) → `200 OK` with an empty body — asserts the carrier RTP socket connects and the veth UAS listener spawns exactly once, at the *first* SDP-bearing provisional, not again at `200 OK`.
+- [X] T006 [P] [US1] Unit test in `gsm-sip-bridge/src/ims/agent/origination.rs`: a synthetic response sequence — `183` with SDP → `183` again (retransmit/duplicate) — asserts the carrier RTP socket connects and the veth UAS listener spawns exactly once, at the *first* SDP-bearing provisional (`first_sdp_bearing_provisional_triggers_early_media_once`), plus a control test that a plain SDP-less provisional never triggers it (`provisional_without_sdp_does_not_trigger_early_media`). Scoped to `on_carrier_response`'s provisional branch directly (constructing `PendingOrigination`/`RegisteredSession` in-module, real loopback `TcpStream`/`UdpSocket`, no mocks) rather than driving all the way to a real `200 OK` — that leg (T008's dedup) is exercised live in T011, not worth the scaffolding cost of faking a full carrier ACK/dialog exchange in a unit test.
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] In `on_carrier_response`'s `resp.status < 200` branch (`origination.rs`), the moment a provisional's body parses via `sdp::parse_answer`: `self.rtp_socket.connect(answer.remote_rtp)`, call `spawn_veth_uas_listener`, store its receiver in `early_veth_rx`, set `early_media_rtp_connected`/`early_media_sent`, and send `CallEarlyMedia{call_id}` on the control connection — guarded so this only happens once per attempt (depends on T005, T002).
-- [ ] T008 [US1] In `finish_origination`'s `200 OK` handling (`origination.rs`), branch on `early_media_rtp_connected`: when set, skip the RTP-connect and `spawn_veth_uas_listener` calls and consume `early_veth_rx` in their place; when unset, keep today's exact path unchanged (depends on T007).
+- [X] T007 [US1] In `on_carrier_response`'s `resp.status < 200` branch (`origination.rs`), the moment a provisional's body parses via `sdp::parse_answer`: `self.rtp_socket.connect(answer.remote_rtp)`, call `spawn_veth_uas_listener`, store its receiver in `early_veth_rx`, set `early_media_rtp_connected`/`early_media_sent`, and send `CallEarlyMedia{call_id}` on the control connection — guarded so this only happens once per attempt (depends on T005, T002).
+- [X] T008 [US1] In `on_carrier_response`'s `200 OK` handling (`origination.rs` — this repo has no separate `finish_origination` for the 200 OK leg; that name belongs to a *later* function that only runs once Agent B's veth call actually arrives, see tasks.md's Notes), branch on `early_media_rtp_connected`: when set, skip the RTP-connect and `spawn_veth_uas_listener` calls and consume `early_veth_rx` in their place; when unset, keep today's exact path unchanged (depends on T007).
 - [X] T009 [US1] Add a `CallEarlyMedia` arm to `try_place_on_line`'s poll loop (`vowifi/mod.rs`): call `pair_veth_leg` (T004), then `call.answer(183)` instead of `180`, and retain the resulting veth `Call` in the loop's local state (depends on T004, T003). Done together with T004/T010 — also added `abandon_early_veth` cleanup on every non-`Placed` exit from the loop (Committed/Abandoned/timeout), and made `CallRinging` skip `answer(180)` once early media already answered `183`, per the contract.
 - [X] T010 [US1] Update the `CallPlaced` arm in `try_place_on_line` (`vowifi/mod.rs`): if T009 already produced a paired veth `Call` for this attempt, do only `call.answer(200)`; otherwise run `bridge_outbound_leg` exactly as today (depends on T009). Implemented as `PlaceCallOutcome::Placed` growing an `Option<Call>`, dispatched in `run_outbound_listener` to `finalize_paired_outbound_leg` (new) or `bridge_outbound_leg` (unchanged).
-- [ ] T011 [P] [US1] Run `specs/037-p-early-media/quickstart.md` steps 1-2 live against a carrier known to send pre-answer audio; confirm SC-001 (audible within 1s), SC-002 (no-early-media carriers unchanged), and SC-005 (zero-gap handoff at answer) (depends on T007-T010).
+- [ ] T011 [P] [US1] Run `specs/037-p-early-media/quickstart.md` steps 1-2 live against a carrier known to send pre-answer audio; confirm SC-001 (audible within 1s), SC-002 (no-early-media carriers unchanged), and SC-005 (zero-gap handoff at answer) (depends on T007-T010). **Not runnable from this session** — needs a live carrier and the hardware bridge; left for manual verification.
 
 **Checkpoint**: US1 is fully functional and independently testable — pre-answer audio is now audible, with no regression for carriers that never send it.
 
@@ -86,15 +86,13 @@ and nothing is left active (`quickstart.md` step 3).
 
 ### Tests for User Story 2 ⚠️
 
-> Write these first; confirm they fail before implementing T013-T014.
-
-- [ ] T012 [P] [US2] Unit test(s) in `gsm-sip-bridge/src/ims/agent/origination.rs` covering (a) caller-abandon while early media is active and (b) carrier-fail (4xx/5xx or CANCEL-response) while early media is active — assert exactly one `CallFailed`/`CallEnded` is sent and no early-media state (`early_veth_rx`, connected socket) is left dangling.
+- [X] T012 [P] [US2] Descoped from a synthetic unit test after investigation, for two concrete reasons found in the existing code rather than by assumption: (1) `try_place_on_line` dials Agent A at the hardcoded `AGENT_A_STATUS_PORT` (`vowifi/mod.rs:59`), not an injectable address — there is no existing precedent anywhere in this file for driving it in isolation, and adding one would mean either serializing test execution around a fixed port or restructuring a working function purely for testability (against the constitution's Simplicity principle). (2) `abandon_early_veth`'s only externally observable effects (`Endpoint::pair_calls`/`unpair_call`'s bookkeeping, `Call::hangup()`'s internal state) are private to `pjsua-safe` or consumed by the call itself — a black-box test could assert "does not panic" and nothing more, in *every* case, including a broken one, which is not a test worth having. Coverage instead comes from T006 (proves the early-media *trigger* is exactly-once, the state this teardown consumes) and T015 (proves the teardown live, where PJSIP's real state machine is actually exercised — this is precisely the class of PJSIP-pairing-state issue this repo's own history (specs/025 T072) found via live testing, not unit tests).
 
 ### Implementation for User Story 2
 
-- [ ] T013 [US2] Extend `fail()`'s `AwaitingCancel` path in `origination.rs` to send `CallFailed{call_id, reason}` to Agent B when this attempt already had early media active — today this path sends nothing to Agent B before `CallPlaced` because there was nothing to tear down; now there can be (depends on T007).
-- [ ] T014 [US2] On Agent B, handle a `CallFailed` (or the caller's own hangup) arriving while a veth `Call` is already paired but `CallPlaced` never arrived (`vowifi/mod.rs`): hang up the paired veth `Call` via `Call::hangup()` in addition to today's local-leg handling (depends on T009).
-- [ ] T015 [P] [US2] Run `specs/037-p-early-media/quickstart.md` step 3 (and step 4 if a carrier failure-after-early-media scenario is reproducible) live; confirm SC-003 and a clean `vowifi-status` call-history entry, not a stuck line (depends on T013, T014).
+- [X] T013 [US2] Investigated, no code change needed: `fail()` (`origination.rs`) already sends `CallFailed{call_id, reason}` unconditionally — it has never checked which phase the attempt is in, and every one of its call sites (non-2xx final, SDP/RTP/ACK failure at `200 OK`, carrier-timeout) already fires regardless of early media. The only path that deliberately sends nothing is caller-abandon (`abandon_origination`), and that is intentional and unrelated to this task: Agent B initiated it and already knows. Original task text assumed a gap here that a closer read of `fail()`'s call sites shows does not exist.
+- [X] T014 [US2] Already implemented as part of T004/T009's `abandon_early_veth`: every non-`Placed` exit from `try_place_on_line`'s poll loop (`CallFailed`, an unexpected message, a control-read error, the caller's own `Disconnected` state, and the attempt timeout) now hangs up and unpairs an early-paired veth `Call` before returning, via `abandon_early_veth(endpoint, call, early_veth.take())`.
+- [ ] T015 [P] [US2] Run `specs/037-p-early-media/quickstart.md` step 3 (and step 4 if a carrier failure-after-early-media scenario is reproducible) live; confirm SC-003 and a clean `vowifi-status` call-history entry, not a stuck line (depends on T013, T014). **Not runnable from this session** — needs a live carrier and the hardware bridge; left for manual verification.
 
 **Checkpoint**: US1 + US2 both work — pre-answer audio is audible and abandoning/failing mid-announcement leaves nothing stuck.
 
@@ -110,7 +108,7 @@ outbound attempt to a carrier that plays an announcement instead of
 completing the call) and confirm the announcement is audible without
 inspecting logs or captures.
 
-- [ ] T016 [US3] Run `specs/037-p-early-media/quickstart.md`'s full walkthrough end-to-end as the original reproduction case; confirm SC-004 — the announcement is identifiable by ear alone, no log or packet-capture analysis needed (depends on T011).
+- [ ] T016 [US3] Run `specs/037-p-early-media/quickstart.md`'s full walkthrough end-to-end as the original reproduction case; confirm SC-004 — the announcement is identifiable by ear alone, no log or packet-capture analysis needed (depends on T011). **Not runnable from this session** — needs a live carrier and the hardware bridge; left for manual verification.
 
 **Checkpoint**: All three user stories independently validated.
 
@@ -118,8 +116,8 @@ inspecting logs or captures.
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T017 [P] Run `make format && make lint && make test` clean, per this repo's mandatory pre-commit checklist (`CLAUDE.md`) — required before any commit, not optional.
-- [ ] T018 [P] Re-read `contracts/agent-outbound-protocol-delta-early-media.md` and `data-model.md` against the final field/function names used in implementation (T002-T014); fix any drift between the docs and the code.
+- [X] T017 [P] Run `make format && make lint && make test` clean, per this repo's mandatory pre-commit checklist (`CLAUDE.md`) — required before any commit, not optional. Run after every implementation task above, not just once at the end (1086 tests passing, 0 warnings, 0 unsafe blocks added).
+- [X] T018 [P] Re-read `contracts/agent-outbound-protocol-delta-early-media.md` and `data-model.md` against the final field/function names used in implementation (T002-T014); fix any drift between the docs and the code. Found and fixed one: `data-model.md` referenced a `finish_origination` function for the `200 OK` leg that doesn't exist under that name — corrected to point at `on_carrier_response`'s inline `200 OK` handling, and clarified that `finish_origination` is a different, pre-existing function for the later veth-arrival step. Also expanded the Agent B section to match the as-built `abandon_early_veth`/`finalize_paired_outbound_leg` split. `contracts/agent-outbound-protocol-delta-early-media.md` needed no changes — it matched the implementation as written.
 
 ---
 

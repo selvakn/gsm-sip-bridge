@@ -26,40 +26,52 @@ Existing fields relevant here: `provisional_answer: Option<String>`,
 `ringing_relayed: bool`, `step: OriginationStep` (unchanged variant set,
 per research R4).
 
-New fields (name illustrative, exact naming is an implementation
-decision for tasks, not the spec):
+New fields, as built (names matched the original proposal exactly):
 
 | Field | Type | Meaning |
 |---|---|---|
 | `early_media_rtp_connected` | `bool` | Whether `self.rtp_socket` has already been `connect()`-ed to a carrier-provided address from a provisional response — guards against redoing it at the real `200 OK` (R5). |
-| `early_veth_rx` | `Option<mpsc::Receiver<BridgeResult<VethUasResult>>>` | The veth UAS listener's receiver, if spawned early. `finish_origination` consumes this instead of spawning a fresh listener when present. |
-| `early_media_sent` | `bool` | Guards `CallEarlyMedia` to exactly one send per call attempt, mirroring the existing `ringing_relayed` one-shot guard. |
+| `early_veth_rx` | `Option<mpsc::Receiver<BridgeResult<VethUasResult>>>` | The veth UAS listener's receiver, if spawned early. Consumed instead of a fresh `spawn_veth_uas_listener` call when present. |
+| `early_media_sent` | `bool` | Guards `CallEarlyMedia` to exactly one attempt per call, mirroring the existing `ringing_relayed` one-shot guard. |
 
 Lifecycle: all three start unset. The first SDP-parseable provisional in
 `on_carrier_response`'s `resp.status < 200` branch sets all three
 together (RTP connect + veth spawn + send `CallEarlyMedia` are one atomic
-step — none happens without the others). `finish_origination` checks
-`early_media_rtp_connected`: if true, skip the RTP-connect and
-veth-listener-spawn steps and consume `early_veth_rx` in place of calling
-`spawn_veth_uas_listener` again.
+step — none happens without the others).
+
+**Naming correction from the original proposal**: there is no separate
+`finish_origination` function for the `200 OK` leg — that name belongs to
+a *different*, pre-existing function that only runs later, once Agent B's
+veth call actually arrives (called from `tick_pending_origination`). The
+`200 OK` handling that checks `early_media_rtp_connected` and consumes
+`early_veth_rx` is inline inside `on_carrier_response` itself, immediately
+after the `resp.status != 200` early-return.
 
 ## Agent B: outbound attempt local state (`vowifi/mod.rs`)
 
 The existing `try_place_on_line` loop's local variables (currently just
-the `call: &mut Call` parameter and the `reader`/`pending_line`) gain:
+the `call: &mut Call` parameter and the `reader`/`pending_line`) gain a
+local `early_veth: Option<Call>` — set once `pair_veth_leg` has paired the
+veth leg from the `CallEarlyMedia` arm. `PlaceCallOutcome::Placed` grew a
+second field (`Option<Call>`) to carry it out of the function; every
+non-`Placed` exit from the poll loop passes it to the new
+`abandon_early_veth(endpoint, call, early_veth.take())` helper, which
+hangs up and unpairs it if present (a no-op when it's `None` — the
+common no-early-media case).
 
-| Field | Type | Meaning |
-|---|---|---|
-| `paired_veth_call` | `Option<Call>` | Set once `pair_veth_leg` has run (either from `CallEarlyMedia` or, for carriers with no early media, from `CallPlaced` directly). `CallPlaced`'s handling checks this before calling `pair_veth_leg` again. |
+This is the same shape `bridge_outbound_leg` already returned before this
+feature (a `Call`) — what changed is *when* it's captured (a second call
+site, `CallEarlyMedia`, can now produce it before `CallPlaced` does) and
+that `bridge_outbound_leg` itself split into `pair_veth_leg` (make +
+pair, no answer) plus the answer step, so both call sites — the original
+`CallPlaced`-only path and the new early-paired path — share the pairing
+logic instead of duplicating it.
 
-This is the same shape `bridge_outbound_leg` already returns today (a
-`Call`) — the only change is *when* it's captured and that a second call
-site (`CallEarlyMedia`) can produce it before `CallPlaced` does.
-
-`ActiveOutboundCall` (used once `try_place_on_line` returns `Placed`)
-already carries `call` and `veth_call` — unchanged shape once
-`try_place_on_line` finalizes; only the finalizing branch's job shrinks
-(construct-and-answer(200) vs. answer(200)-only-on-already-paired-legs).
+`run_outbound_listener`'s `Placed` handling now dispatches to one of two
+finalizers based on whether `early_veth` came back `Some`:
+`finalize_paired_outbound_leg` (new — `answer(200)` only, no pairing) or
+`bridge_outbound_leg` (unchanged — full pair + `answer(200)`, the
+no-early-media path).
 
 ## New wire message
 
