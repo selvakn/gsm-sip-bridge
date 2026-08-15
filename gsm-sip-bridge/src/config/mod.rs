@@ -554,12 +554,25 @@ pub struct VowifiConfig {
     /// IPsec. Required by networks (e.g. Vi) that reject a plain REGISTER;
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
-    /// Which URI goes in the REGISTER request line: `"pcscf"` (the literal
-    /// P-CSCF address, the long-standing default) or `"home-domain"` (the
-    /// `ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org` realm that TS 24.229 §5.1.1.2
-    /// actually mandates). Carriers disagree and both forms are rejected
-    /// somewhere, so this cannot be a compile-time constant — see
-    /// `ims::register_session` for the captured evidence on each side.
+    /// Which URI goes in the REGISTER request line: `"home-domain"` (the
+    /// default — the `ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org` realm that
+    /// TS 24.229 §5.1.1.2 mandates, and what every real handset sends) or
+    /// `"pcscf"` (the literal P-CSCF address, the historical default).
+    ///
+    /// The default moved to `"home-domain"` on evidence: Jio rejects the
+    /// P-CSCF-address form *before any authentication challenge* — `483 Too
+    /// Many Hops` from one instance, `403 Forbidden` from another, across four
+    /// P-CSCFs and two SIMs on two hosts — because the proxy finds its own
+    /// address in the request line and trips loop detection. Vodafone was then
+    /// verified to register with the realm form too (2026-08-15).
+    ///
+    /// It stays configurable rather than becoming a constant because of one
+    /// unverified counter-example: Airtel is recorded as answering `406 User
+    /// Unknown` to the realm form. That predates this work and was never
+    /// re-tested; `406` is an identity-resolution error, so it more likely
+    /// pointed at a wrong IMPU at the time. If an Airtel deployment regresses,
+    /// set `"pcscf"` — and please record the capture, because that would be
+    /// the first real evidence for the old default.
     pub register_request_uri: String,
     /// Pin the Gm IPsec auth/cipher algorithm rather than taking the P-CSCF's
     /// highest-`q` offer. Empty = follow the network's preference. Needed when
@@ -732,7 +745,7 @@ impl Default for VowifiConfig {
             modem_port: String::new(),
             use_tcp: true,
             sec_agree: true,
-            register_request_uri: "pcscf".to_string(),
+            register_request_uri: "home-domain".to_string(),
             gm_auth_alg: String::new(),
             gm_cipher_alg: String::new(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
@@ -1802,21 +1815,26 @@ password = "pass"
     }
 
     #[test]
-    fn vowifi_register_request_uri_defaults_to_pcscf() {
-        // Existing Airtel/Vodafone deployments must keep the request-line form
-        // they already register with, so this default is load-bearing.
+    fn vowifi_register_request_uri_defaults_to_home_domain() {
+        // TS 24.229 §5.1.1.2 mandates the home domain and every real handset
+        // sends it. Jio rejects the P-CSCF-address form before it will even
+        // issue an authentication challenge (483/403 across four P-CSCFs and
+        // two SIMs), and Vodafone was verified on the realm form too.
         let cfg = parse(MINIMAL_TOML);
-        assert_eq!(cfg.vowifi.register_request_uri, "pcscf");
+        assert_eq!(cfg.vowifi.register_request_uri, "home-domain");
     }
 
     #[test]
-    fn vowifi_register_request_uri_accepts_home_domain() {
+    fn vowifi_register_request_uri_still_accepts_pcscf() {
+        // The escape hatch for the one unverified counter-example: Airtel is
+        // recorded — unreproduced — as answering `406 User Unknown` to the
+        // realm form.
         let src = format!(
-            "{}\n[vowifi]\nregister_request_uri = \"home-domain\"\n",
+            "{}\n[vowifi]\nregister_request_uri = \"pcscf\"\n",
             MINIMAL_TOML
         );
         let cfg = parse(&src);
-        assert_eq!(cfg.vowifi.register_request_uri, "home-domain");
+        assert_eq!(cfg.vowifi.register_request_uri, "pcscf");
     }
 
     #[test]

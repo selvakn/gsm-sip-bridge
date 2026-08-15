@@ -370,10 +370,10 @@ section! {
         pub enabled: bool,
         pub use_tcp: bool,
         pub sec_agree: bool,
-        /// `"pcscf"` (default) or `"home-domain"` — which URI goes in the
-        /// REGISTER request line. Carriers genuinely disagree; see
-        /// `ims::register_session`'s `request_uri` for the captured evidence
-        /// on both sides.
+        /// `"home-domain"` (default) or `"pcscf"` — which URI goes in the
+        /// REGISTER request line. See `ims::register_session`'s `request_uri`
+        /// for the captured evidence, and `AppConfig`'s field docs for why the
+        /// default moved.
         pub register_request_uri: String,
         /// Pin the Gm IPsec algorithms instead of following the network's own
         /// `q=` preference. Empty string = follow it. See
@@ -406,7 +406,7 @@ impl Default for RawVowifi {
             enabled: false,
             use_tcp: true,
             sec_agree: true,
-            register_request_uri: "pcscf".to_string(),
+            register_request_uri: "home-domain".to_string(),
             gm_auth_alg: String::new(),
             gm_cipher_alg: String::new(),
             pcscf_source_path: "/tmp/pcscf".to_string(),

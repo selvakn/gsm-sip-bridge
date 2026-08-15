@@ -1258,9 +1258,10 @@ mod tests {
     }
 
     #[test]
-    fn register_request_uri_defaults_to_the_pcscf_address() {
-        // Airtel's registrar answers `406 User Unknown` to the realm form, so
-        // the address form has to stay the default.
+    fn register_request_uri_uses_the_pcscf_address_when_home_domain_is_off() {
+        // No longer the default (see `VowifiConfig::register_request_uri`), but
+        // kept reachable as the escape hatch for Airtel, which is recorded —
+        // unreproduced — as answering `406 User Unknown` to the realm form.
         let pcscf: SocketAddr = "56.2.134.134:5060".parse().unwrap();
         let uri = register_request_uri(pcscf, "ims.mnc869.mcc405.3gppnetwork.org", false);
         assert_eq!(uri, "56.2.134.134:5060");
