@@ -117,17 +117,25 @@ impl SipSocket {
         Ok(())
     }
 
-    /// Blocks until a SIP response whose `Call-ID` matches `call_id` arrives,
-    /// or `timeout` elapses. This one socket is shared by every concurrent
-    /// transaction (registration's background refresh, an outbound call, a
-    /// future one running alongside it) — with no correlation, an early FIFO
-    /// pop here could hand a registration's `200 OK` to a call in progress,
-    /// or vice versa, instead of the response either one actually sent a
-    /// request for. Anything that doesn't match `call_id` is left in the
-    /// queue for its own owner rather than discarded.
+    /// Blocks until a SIP response matching both `call_id` and `cseq`
+    /// arrives, or `timeout` elapses. This one socket is shared by every
+    /// concurrent transaction (registration's background refresh, an
+    /// outbound call, a future one running alongside it) — with no
+    /// correlation, an early FIFO pop here could hand a registration's
+    /// `200 OK` to a call in progress, or vice versa, instead of the
+    /// response either one actually sent a request for. `Call-ID` alone is
+    /// not enough either: a redirected outbound call reuses the *same*
+    /// `Call-ID` for both its INVITE to the registrar (`CSeq: 1`) and its
+    /// re-INVITE to the redirect target (`CSeq: 2`), and a REGISTER retried
+    /// after a challenge reuses its `Call-ID` across `CSeq`s the same way —
+    /// so a late or retransmitted response to an *earlier* transaction in
+    /// the same dialog must not be mistaken for the response to a *later*
+    /// one. Anything that doesn't match both is left in the queue for its
+    /// own owner rather than discarded.
     pub fn recv_response(
         &self,
         call_id: &str,
+        cseq: u32,
         timeout: Duration,
     ) -> SipTestResult<Option<SipResponse>> {
         let deadline = Instant::now() + timeout;
@@ -137,10 +145,9 @@ impl SipSocket {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(pos) = guard
-                .iter()
-                .position(|r| r.header("Call-ID") == Some(call_id))
-            {
+            if let Some(pos) = guard.iter().position(|r| {
+                r.header("Call-ID") == Some(call_id) && response_cseq_number(r) == Some(cseq)
+            }) {
                 return Ok(guard.remove(pos));
             }
             let now = Instant::now();
@@ -199,6 +206,12 @@ impl Drop for SipSocket {
             let _ = h.join();
         }
     }
+}
+
+/// The leading number of a `CSeq` header (`"2 INVITE"` -> `Some(2)`), or
+/// `None` if the header is missing or malformed.
+fn response_cseq_number(resp: &SipResponse) -> Option<u32> {
+    resp.header("CSeq")?.split_whitespace().next()?.parse().ok()
 }
 
 fn reader_loop(socket: Arc<UdpSocket>, inbox: Arc<Inbox>, stop: Arc<AtomicBool>) {
@@ -310,7 +323,7 @@ mod tests {
 
         // a's response queue must still be empty — nothing crossed over.
         assert!(a
-            .recv_response("call1", Duration::from_millis(50))
+            .recv_response("call1", 1, Duration::from_millis(50))
             .unwrap()
             .is_none());
 
@@ -321,7 +334,7 @@ mod tests {
         )
         .unwrap();
         let resp = a
-            .recv_response("call1", Duration::from_secs(2))
+            .recv_response("call1", 1, Duration::from_secs(2))
             .unwrap()
             .expect("expected a to receive the 200 OK");
         assert_eq!(resp.status, 200);
@@ -361,16 +374,69 @@ mod tests {
         .unwrap();
 
         let resp = a
-            .recv_response("our-call", Duration::from_secs(2))
+            .recv_response("our-call", 1, Duration::from_secs(2))
             .unwrap()
             .expect("expected our-call's response even though it wasn't first in the queue");
         assert_eq!(resp.header("Call-ID"), Some("our-call"));
 
         // The other transaction's response is still there, waiting for it.
         let other = a
-            .recv_response("someone-elses-call", Duration::from_secs(2))
+            .recv_response("someone-elses-call", 1, Duration::from_secs(2))
             .unwrap()
             .expect("the other transaction's response must not have been consumed or dropped");
         assert_eq!(other.header("Call-ID"), Some("someone-elses-call"));
+    }
+
+    /// `Call-ID` alone is not enough: a redirected outbound call
+    /// (`sip::outbound::place_call`) reuses the same `Call-ID` for its
+    /// initial INVITE to the registrar (`CSeq: 1`) and its re-INVITE to the
+    /// redirect target (`CSeq: 2`), and a REGISTER retried after a `401`
+    /// (`sip::registration::register`) reuses its `Call-ID` across `CSeq`s
+    /// the same way. A late or retransmitted response to the *earlier*
+    /// transaction must not be handed to a caller now waiting on the
+    /// *later* one in the same dialog.
+    #[test]
+    fn same_call_id_different_cseq_are_not_confused() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let b = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+
+        // A stale/retransmitted response to CSeq 1 (e.g. the registrar's
+        // 302, already acted on) arrives after we've already moved on to
+        // CSeq 2's re-INVITE.
+        b.send(
+            a.local_addr(),
+            "SIP/2.0 302 Moved Temporarily\r\nCall-ID: redirected-call\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        b.send(
+            a.local_addr(),
+            "SIP/2.0 200 OK\r\nCall-ID: redirected-call\r\nCSeq: 2 INVITE\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        let resp = a
+            .recv_response("redirected-call", 2, Duration::from_secs(2))
+            .unwrap()
+            .expect("expected CSeq 2's response despite CSeq 1's stale one sharing the Call-ID");
+        assert_eq!(resp.status, 200);
+        assert_eq!(response_cseq_number(&resp), Some(2));
+
+        // CSeq 1's stale response is still there, not silently consumed by
+        // the CSeq-2 waiter above.
+        let stale = a
+            .recv_response("redirected-call", 1, Duration::from_secs(2))
+            .unwrap()
+            .expect("CSeq 1's response must not have been consumed by the CSeq-2 waiter");
+        assert_eq!(stale.status, 302);
     }
 }

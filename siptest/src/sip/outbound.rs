@@ -98,7 +98,7 @@ pub fn place_call(
     });
     socket.send(registrar_addr, &invite1)?;
 
-    let resp1 = wait_final_response(socket, &call_id, ring_timeout)?;
+    let resp1 = wait_final_response(socket, &call_id, 1, ring_timeout)?;
     let Some(resp1) = resp1 else {
         return Ok(timeout_outcome());
     };
@@ -182,7 +182,7 @@ pub fn place_call(
                 dialog: None,
             });
         }
-        let Some(resp) = socket.recv_response(&call_id, RESPONSE_POLL)? else {
+        let Some(resp) = socket.recv_response(&call_id, 2, RESPONSE_POLL)? else {
             continue;
         };
         match resp.status {
@@ -361,6 +361,7 @@ fn send_cancel(
 fn wait_final_response(
     socket: &SipSocket,
     call_id: &str,
+    cseq: u32,
     timeout: Duration,
 ) -> SipTestResult<Option<SipResponse>> {
     let deadline = Instant::now() + timeout;
@@ -368,7 +369,7 @@ fn wait_final_response(
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        if let Some(resp) = socket.recv_response(call_id, RESPONSE_POLL)? {
+        if let Some(resp) = socket.recv_response(call_id, cseq, RESPONSE_POLL)? {
             if resp.status >= 200 {
                 return Ok(Some(resp));
             }

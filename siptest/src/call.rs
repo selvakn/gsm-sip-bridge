@@ -400,6 +400,25 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             return;
         }
     };
+    // The signalling source-IP check in `daemon::inbound_listener_loop` only
+    // establishes who sent the INVITE — it says nothing about where the SDP
+    // body then tells us to send RTP. Without this, a signalling peer we do
+    // trust could still name a third party's address in `c=`/`m=` and turn
+    // every answered call into sustained RTP traffic aimed at them. The
+    // offer's media address must be the same host the signalling itself came
+    // from.
+    if offer.remote_rtp.ip() != peer.ip() {
+        let to_tag = crate::sip::message::new_tag();
+        let _ = state
+            .sip_socket
+            .send(peer, &crate::sip::inbound::build_488(&req, &to_tag));
+        call.state = CallState::Ended;
+        call.end_reason = Some(EndReason::Failed {
+            detail: "SDP media address does not match the signalling peer".to_string(),
+        });
+        finish(state, call_id, call);
+        return;
+    }
     let codec = match select_inbound_codec(&state.config.media.codec, &offer) {
         Some(c) => c,
         None => {

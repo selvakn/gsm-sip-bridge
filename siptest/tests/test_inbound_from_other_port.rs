@@ -313,6 +313,87 @@ fn an_inbound_invite_from_an_unexpected_source_ip_is_dropped_with_no_reply() {
     let _ = listener.join();
 }
 
+/// The source-IP check alone is not the whole story: even a signalling peer
+/// that *is* the trusted bridge host can still write an arbitrary third
+/// party's address into its SDP's `c=`/`m=` line. `execute_inbound_call`
+/// must refuse a call whose media address doesn't match the address the
+/// signalling itself came from, rather than trusting the SDP body verbatim
+/// as an RTP destination for an answered call's whole duration.
+#[test]
+fn an_offer_whose_media_address_does_not_match_the_signalling_peer_is_refused() {
+    let config = test_config();
+    std::fs::create_dir_all(&config.media.recording_dir).unwrap();
+
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let siptest_addr = sip_socket.local_addr();
+    // Trusted signalling source per `build_state`'s `bridge_registrar`.
+    let state = build_state(config, sip_socket);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener = {
+        let state = state.clone();
+        let stop = stop.clone();
+        thread::spawn(move || siptest::daemon::inbound_listener_loop(state, stop))
+    };
+
+    let caller = UdpSocket::bind("127.0.0.1:0").unwrap();
+    caller
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let caller_addr = caller.local_addr().unwrap();
+
+    // The signalling is from the trusted host (127.0.0.1), but the SDP
+    // names a media address elsewhere entirely.
+    let sdp_body = "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+    let invite = format!(
+        "INVITE sip:1002@{siptest_addr} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {caller_addr};branch=z9hG4bKmismatchbranch\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:+919000000000@127.0.0.1:5060>;tag=mismatchtag\r\n\
+         To: <sip:1002@{siptest_addr}>\r\n\
+         Call-ID: inbound-test-mismatch-call\r\n\
+         CSeq: 1 INVITE\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n\
+         {sdp_body}",
+        sdp_body.len(),
+    );
+    caller.send_to(invite.as_bytes(), siptest_addr).unwrap();
+
+    let trying = recv_line(&caller);
+    assert!(
+        trying.starts_with("SIP/2.0 100"),
+        "expected 100 Trying (the check runs after it), got: {trying}"
+    );
+
+    let refusal = recv_line(&caller);
+    assert!(
+        refusal.starts_with("SIP/2.0 488"),
+        "expected 488 Not Acceptable Here for a mismatched media address, got: {refusal}"
+    );
+
+    thread::sleep(Duration::from_millis(200));
+    let calls = state.calls.lock().unwrap();
+    let recent = calls.recent(5);
+    assert_eq!(
+        recent.len(),
+        1,
+        "expected the refused call to still be recorded, as ended"
+    );
+    assert_eq!(recent[0].state, siptest::call::CallState::Ended);
+    drop(calls);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = listener.join();
+}
+
 /// contracts/sip-flows.md C-3: a CANCEL arriving before we answer must get a
 /// `200` for the CANCEL itself and a `487` for the original INVITE — and the
 /// call must be recorded as caller-cancelled, not as a fault (spec.md edge

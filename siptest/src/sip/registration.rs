@@ -98,7 +98,7 @@ pub fn register(
         socket.send(cfg.registrar_addr, &msg)?;
 
         let resp = socket
-            .recv_response(&creds.call_id, RESPONSE_TIMEOUT)?
+            .recv_response(&creds.call_id, creds.cseq, RESPONSE_TIMEOUT)?
             .ok_or_else(|| {
                 SipTestError::Config("REGISTER timed out waiting for a response".into())
             })?;
