@@ -543,6 +543,22 @@ pub struct RegisterRequest<'a> {
     pub imei: &'a str,
 }
 
+/// `+g.3gpp.smsip` (GSMA IR.92/IR.51) — a bare Contact feature tag declaring
+/// SMS-over-IP support. We already implement receiving it
+/// (`agent::mod::handle_message`), so this only makes a real capability
+/// visible rather than claiming one we don't have.
+///
+/// Added because inbound SIP `MESSAGE` never arrived at all on Jio: zero
+/// hits for `MESSAGE sip:` across every packet-level trace this session
+/// captured, despite the registration otherwise being healthy. A reg-event
+/// `NOTIFY` for the same AOR showed a second contact (a paired Apple Watch,
+/// which does receive SMS) carrying this tag while ours did not — the one
+/// difference between a contact the network delivers SMS to and one it
+/// doesn't. Not proven in general: specs/017 R4 found this same Contact
+/// *without* the tag receiving messages over IMS on a different carrier
+/// path, before any Jio testing existed.
+const SMSIP_FEATURE_TAG: &str = ";+g.3gpp.smsip";
+
 pub fn format_sip_addr(addr: SocketAddr) -> String {
     match addr.ip() {
         IpAddr::V6(ip) => format!("[{ip}]:{}", addr.port()),
@@ -562,7 +578,8 @@ pub fn build_register(req: &RegisterRequest) -> String {
          To: <sip:{public}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:{imei}>\"\r\n\
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio{smsip}\
+         ;+sip.instance=\"<urn:gsma:imei:{imei}>\"\r\n\
          Expires: {expires}\r\n\
          Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n",
@@ -578,6 +595,7 @@ pub fn build_register(req: &RegisterRequest) -> String {
         public_user = req.public_uri.split('@').next().unwrap_or(req.public_uri),
         expires = req.expires,
         imei = req.imei,
+        smsip = SMSIP_FEATURE_TAG,
     );
     if let Some(auth) = req.authorization {
         msg.push_str("Authorization: ");
@@ -1565,6 +1583,48 @@ mod tests {
         assert!(msg.contains("[2402:8100::1]:5060"));
         assert!(msg.contains("CSeq: 1 REGISTER"));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// A registrar decides which contacts on an AOR are SMS-capable from this
+    /// tag, not from the fact that we happen to answer inbound `MESSAGE`
+    /// requests. Measured on Jio: a second registered contact (a paired watch)
+    /// carried `+g.3gpp.smsip` and received SMS; ours didn't and never once
+    /// saw an inbound `MESSAGE` arrive.
+    #[test]
+    fn build_register_advertises_sms_over_ip_capability() {
+        let addr: SocketAddr = "10.0.0.5:5060".parse().unwrap();
+        let msg = build_register(&RegisterRequest {
+            registrar_uri: "ims.example",
+            public_uri: "+919000000000@ims.example",
+            local_addr: addr,
+            contact_addr: addr,
+            call_id: "callid",
+            from_tag: "tag1",
+            branch: "z9hG4bKbranch",
+            cseq: 1,
+            expires: 600,
+            transport: "TCP",
+            authorization: None,
+            extra_headers: &[],
+            imei: "860000000000000",
+        });
+
+        let contact_line = msg
+            .lines()
+            .find(|l| l.starts_with("Contact:"))
+            .expect("Contact header present");
+        assert!(
+            contact_line.contains(";+g.3gpp.smsip;"),
+            "must sit between the existing tags, as its own bare parameter: {contact_line}"
+        );
+        // A feature tag is a Contact *header* parameter and must stay outside
+        // the angle-bracketed URI, or it becomes a URI parameter and means
+        // something else entirely.
+        let closing = contact_line.find('>').expect("URI is bracketed");
+        assert!(
+            contact_line.find("+g.3gpp.smsip").unwrap() > closing,
+            "must sit after the closing bracket: {contact_line}"
+        );
     }
 
     /// A BYE from the side that *answered* flows opposite to the INVITE: our
