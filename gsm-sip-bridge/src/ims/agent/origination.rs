@@ -484,7 +484,12 @@ impl PendingOrigination {
         else {
             return;
         };
-        if !requires_100rel || self.pracked_rseq == Some(rseq) {
+        // RFC 3262 §7.1: RSeq strictly increases across one dialog's reliable
+        // provisionals, so `<=` (not just `==`) catches a reordered
+        // retransmission of an *older* one arriving after a newer RSeq has
+        // already been PRACKed — the Gm UDP transport this bridge uses makes
+        // that a real possibility, not just a defensive check.
+        if !requires_100rel || self.pracked_rseq.is_some_and(|last| rseq <= last) {
             return;
         }
 

@@ -52,7 +52,20 @@ pub fn parse_security_server(header: &str) -> BridgeResult<SecurityServerParams>
             "spi-s" => spi_s = value.parse::<u32>().ok(),
             "port-c" => port_c = value.parse::<u16>().ok(),
             "port-s" => port_s = value.parse::<u16>().ok(),
-            "q" => q = value.parse::<f32>().unwrap_or(0.0),
+            // `str::parse::<f32>` accepts the literal "nan" and returns
+            // `Ok(NaN)`, so `unwrap_or` alone never catches it. A `q=nan`
+            // offer would then win `select_security_server`'s `best.is_none()`
+            // branch unconditionally and stay unbeatable forever after --
+            // `x > NaN` is false for every later `x` under IEEE 754 -- so
+            // reject non-finite values explicitly rather than trusting them
+            // to fail to parse.
+            "q" => {
+                q = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0)
+            }
             _ => {}
         }
     }
@@ -550,22 +563,51 @@ pub fn remove_gm_sas(
         "state remote_s->local_c",
         xfrm_state_del(endpoints.remote_s.ip(), endpoints.local_c.ip(), ours.spi_c),
     );
-    warn_on_err(
-        "policy local_c->remote_s",
-        xfrm_policy_del(endpoints.local_c, endpoints.remote_s, proto, false),
-    );
-    warn_on_err(
-        "policy local_s->remote_c",
-        xfrm_policy_del(endpoints.local_s, endpoints.remote_c, proto, false),
-    );
-    warn_on_err(
-        "policy remote_c->local_s",
-        xfrm_policy_del(endpoints.remote_c, endpoints.local_s, proto, true),
-    );
-    warn_on_err(
-        "policy remote_s->local_c",
-        xfrm_policy_del(endpoints.remote_s, endpoints.local_c, proto, true),
-    );
+
+    // `install_gm_sas` installs 8 policies (4 canonical + 4 cross-product) per
+    // protocol, for both "tcp" and "udp" — 16 in total, regardless of which
+    // transport `proto` names. This must delete exactly that set, or every
+    // re-registration leaks 12 of the 16 (found in review: this used to
+    // delete only the 4 canonical policies for the single passed-in `proto`).
+    // A stale policy left in the kernel table can match live traffic on a
+    // reused port pairing after the SA generation it referenced is gone,
+    // silently dropping packets in a way indistinguishable from the Jio
+    // inbound-routing bug the cross-product policies exist to fix.
+    let _ = proto;
+    for policy_proto in ["tcp", "udp"] {
+        warn_on_err(
+            "policy local_c->remote_s",
+            xfrm_policy_del(endpoints.local_c, endpoints.remote_s, policy_proto, false),
+        );
+        warn_on_err(
+            "policy local_s->remote_c",
+            xfrm_policy_del(endpoints.local_s, endpoints.remote_c, policy_proto, false),
+        );
+        warn_on_err(
+            "policy remote_c->local_s",
+            xfrm_policy_del(endpoints.remote_c, endpoints.local_s, policy_proto, true),
+        );
+        warn_on_err(
+            "policy remote_s->local_c",
+            xfrm_policy_del(endpoints.remote_s, endpoints.local_c, policy_proto, true),
+        );
+        warn_on_err(
+            "policy local_c->remote_c",
+            xfrm_policy_del(endpoints.local_c, endpoints.remote_c, policy_proto, false),
+        );
+        warn_on_err(
+            "policy local_s->remote_s",
+            xfrm_policy_del(endpoints.local_s, endpoints.remote_s, policy_proto, false),
+        );
+        warn_on_err(
+            "policy remote_c->local_c",
+            xfrm_policy_del(endpoints.remote_c, endpoints.local_c, policy_proto, true),
+        );
+        warn_on_err(
+            "policy remote_s->local_s",
+            xfrm_policy_del(endpoints.remote_s, endpoints.local_s, policy_proto, true),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +683,26 @@ mod tests {
         let no_q = "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=1;port-s=2";
         let (params, _) = select_security_server(&[no_q, JIO_OFFERS[0]], None, None).unwrap();
         assert_eq!(params.alg, "hmac-md5-96", "the q=0.6 offer must still win");
+    }
+
+    /// `f32::parse` accepts the literal `"nan"` — a `q=nan` offer must not
+    /// win `best.is_none()` unconditionally and then be unbeatable forever
+    /// after (`x > NaN` is false for every later `x`).
+    #[test]
+    fn select_treats_a_non_finite_q_as_lowest_preference() {
+        let nan_first =
+            "ipsec-3gpp;q=nan;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=1;port-s=2";
+        let (params, _) = select_security_server(&[nan_first, JIO_OFFERS[0]], None, None).unwrap();
+        assert_eq!(
+            params.alg, "hmac-md5-96",
+            "the real q=0.6 offer must win, not NaN"
+        );
+
+        let (params, _) = parse_security_server(nan_first).map(|p| (p, ())).unwrap();
+        assert_eq!(
+            params.q, 0.0,
+            "a non-finite q parses as the lowest preference, not NaN"
+        );
     }
 
     #[test]
