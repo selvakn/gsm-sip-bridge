@@ -68,6 +68,9 @@ pub struct PlaceCallRequest {
     pub duration_secs: Option<u64>,
     #[serde(default)]
     pub ring_timeout_secs: Option<u64>,
+    /// `auto` | `pcmu` | `g722`. Defaults to `[media].codec` when omitted.
+    #[serde(default)]
+    pub codec: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,10 +93,15 @@ pub async fn place_call(
             .unwrap_or(state.config.call.ring_timeout_secs as u64),
     );
 
+    let codec = req
+        .codec
+        .clone()
+        .unwrap_or_else(|| state.config.media.codec.clone());
+
     let state2 = state.clone();
     let destination = req.destination.clone();
     let result = tokio::task::spawn_blocking(move || {
-        execute_outbound_call(&state2, destination, duration, ring_timeout)
+        execute_outbound_call(&state2, destination, duration, ring_timeout, &codec)
     })
     .await;
 
@@ -127,6 +135,7 @@ pub async fn place_call(
 fn error_response(e: SipTestError) -> Response {
     let (status, code) = match &e {
         SipTestError::InvalidDestination(_) => (StatusCode::BAD_REQUEST, "invalid_destination"),
+        SipTestError::InvalidCodec(_) => (StatusCode::BAD_REQUEST, "invalid_codec"),
         SipTestError::DestinationNotAllowed(_) => {
             (StatusCode::FORBIDDEN, "destination_not_allowed")
         }

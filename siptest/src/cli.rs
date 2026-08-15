@@ -32,6 +32,9 @@ pub enum Commands {
         destination: String,
         #[arg(long)]
         duration_secs: Option<u64>,
+        /// `auto` | `pcmu` | `g722`. Defaults to `[media].codec` when omitted.
+        #[arg(long)]
+        codec: Option<String>,
         /// Block until the call reaches a terminal state (always on for this
         /// subcommand; kept as a flag for symmetry with the API's `?wait=`).
         #[arg(long, default_value_t = true)]

@@ -29,6 +29,9 @@ pub enum SipTestError {
     #[error("invalid destination: {0}")]
     InvalidDestination(String),
 
+    #[error("invalid codec: {0}")]
+    InvalidCodec(String),
+
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
 

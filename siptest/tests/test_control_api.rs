@@ -175,6 +175,35 @@ async fn health_and_status_reflect_real_daemon_state() {
     assert!(status["active_call"].is_null());
 }
 
+/// T081: `codec` is a real, validated field on `POST /calls`, not just a
+/// config default — a bad value is refused with 400 before the call ever
+/// dials, the same way an unregistered daemon or a disallowed destination is.
+#[tokio::test]
+async fn posting_an_unknown_codec_is_rejected_with_400_before_dialling() {
+    let config = test_config();
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let state = build_state(config, sip_socket, true);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/calls"))
+        .json(&serde_json::json!({"destination": "+919000000000", "codec": "opus"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_codec");
+}
+
 #[tokio::test]
 async fn inbound_policy_can_be_read_and_updated_over_http() {
     let config = test_config();

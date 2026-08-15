@@ -24,7 +24,7 @@ use gsm_sip_bridge::ims::sip_client::{
 };
 use gsm_sip_bridge::sip::server::Registrar;
 
-use siptest::media::codec::PCMU;
+use siptest::media::codec::{resolve_codec, PCMU};
 use siptest::sip::registration::{register, RegistrationConfig, RegistrationCredentials};
 use siptest::sip::socket::SipSocket;
 
@@ -41,6 +41,10 @@ struct StubUas {
     stop: Arc<AtomicBool>,
     sip_handle: Option<thread::JoinHandle<()>>,
     rtp_handle: Option<thread::JoinHandle<()>>,
+    /// The SDP body of the last INVITE this stub received — lets a test
+    /// assert on what codec was actually offered on the wire, not just
+    /// whether the call was answered.
+    last_offer: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl StubUas {
@@ -58,9 +62,11 @@ impl StubUas {
         let rtp_port = rtp_socket.local_addr().unwrap().port();
 
         let stop = Arc::new(AtomicBool::new(false));
+        let last_offer = Arc::new(std::sync::Mutex::new(None));
 
         let sip_handle = {
             let stop = stop.clone();
+            let last_offer = last_offer.clone();
             thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 while !stop.load(Ordering::Relaxed) {
@@ -74,6 +80,7 @@ impl StubUas {
                     if req.method != "INVITE" {
                         continue;
                     }
+                    *last_offer.lock().unwrap() = Some(req.body.clone());
                     let _ = sip_socket.send_to(build_100_trying(&req).as_bytes(), src);
                     let to_tag = "stubtag";
                     let contact = format!("sip:agentb@127.0.0.1:{sip_port}");
@@ -115,6 +122,7 @@ impl StubUas {
             stop,
             sip_handle: Some(sip_handle),
             rtp_handle: Some(rtp_handle),
+            last_offer,
         }
     }
 }
@@ -250,6 +258,80 @@ fn siptest_registers_places_a_call_through_a_302_redirect_and_carries_bothways_a
     assert_eq!(
         verdict,
         gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays
+    );
+
+    if let Some(dialog) = &outcome.dialog {
+        let _ = siptest::sip::outbound::send_bye(&sip_socket, dialog);
+    }
+}
+
+/// T081: `resolve_codec("g722")` is not just a library-level lookup — its
+/// result is what actually goes out on the wire. Places a real call through
+/// the real registrar's 302 dance and asserts the INVITE the stub UAS
+/// received named PT 9 / G722, not PCMU's PT 0.
+#[test]
+fn siptest_offers_g722_on_the_wire_when_the_g722_codec_is_selected() {
+    let stub = StubUas::start();
+
+    let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let registrar_addr = registrar_socket.local_addr().unwrap();
+    let _registrar =
+        Registrar::start_on_with_outbound(registrar_socket, &server_config(), stub.sip_port)
+            .expect("start registrar");
+
+    let sip_socket =
+        SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
+
+    let reg_config = RegistrationConfig {
+        registrar_addr,
+        registrar_host: REALM.to_string(),
+        aor_user: USER.to_string(),
+        realm: REALM.to_string(),
+        password: Secret::new(PASSWORD.to_string()),
+        expires: 300,
+    };
+    let mut creds = RegistrationCredentials {
+        cseq: 0,
+        call_id: "reg-call-id-g722".to_string(),
+        from_tag: "reg-from-tag-g722".to_string(),
+        cached_nonce: None,
+        nc: 0,
+    };
+    let status = register(&sip_socket, &reg_config, &mut creds).unwrap();
+    assert_eq!(
+        status.state,
+        siptest::sip::registration::RegState::Registered
+    );
+
+    let codec = resolve_codec("g722").expect("g722 is a known codec name");
+
+    let outcome = siptest::sip::outbound::place_call(
+        &sip_socket,
+        registrar_addr,
+        REALM,
+        USER,
+        "+919000000000",
+        codec,
+        0,
+        Duration::from_secs(5),
+    )
+    .expect("place_call should not error");
+
+    assert!(outcome.answered, "expected the stub UAS to answer");
+
+    let offer = stub
+        .last_offer
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("stub UAS should have captured the re-INVITE's SDP body");
+    assert!(
+        offer.contains("RTP/AVP 9"),
+        "expected the offer to name PT 9 for G.722, got: {offer}"
+    );
+    assert!(
+        offer.contains("a=rtpmap:9 G722/8000"),
+        "expected the offer's rtpmap to name G722/8000, got: {offer}"
     );
 
     if let Some(dialog) = &outcome.dialog {

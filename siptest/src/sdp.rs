@@ -168,7 +168,7 @@ pub fn parse_answer(body: &str) -> SipTestResult<SdpAnswer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::codec::PCMU;
+    use crate::media::codec::{G722, PCMU};
 
     #[test]
     fn offer_lists_pcmu_and_telephone_event() {
@@ -176,6 +176,23 @@ mod tests {
         assert!(offer.contains("m=audio 40000 RTP/AVP 0 101"));
         assert!(offer.contains("a=rtpmap:0 PCMU/8000"));
         assert!(offer.contains("a=rtpmap:101 telephone-event/8000"));
+    }
+
+    /// `build_offer`/`parse_offer`/`parse_answer` are payload-type-generic
+    /// by construction (unlike `ims::sdp`, research.md R5) — this is the
+    /// regression guard that G.722 needed no changes here to work.
+    #[test]
+    fn offer_lists_g722_with_its_pt9_and_the_wire_says_8000_even_though_audio_is_16k() {
+        let offer = build_offer("192.168.15.10".parse().unwrap(), 40000, 1, G722);
+        assert!(offer.contains("m=audio 40000 RTP/AVP 9 101"));
+        assert!(offer.contains("a=rtpmap:9 G722/8000"));
+    }
+
+    #[test]
+    fn an_answer_selecting_g722_parses_with_pt9() {
+        let body = "v=0\r\no=- 1 1 IN IP4 192.168.15.10\r\ns=-\r\nc=IN IP4 192.168.15.10\r\nt=0 0\r\nm=audio 41000 RTP/AVP 9\r\na=rtpmap:9 G722/8000\r\n";
+        let answer = parse_answer(body).unwrap();
+        assert_eq!(answer.payload_type, 9);
     }
 
     #[test]

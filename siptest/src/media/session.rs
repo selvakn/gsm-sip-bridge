@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use gsm_sip_bridge::ims::media_stats::ReceiveTracker;
 use gsm_sip_bridge::ims::rtp::{build_packet, parse_packet, WavWriter};
 
-use crate::media::codec::{decode_pcmu, encode_pcmu, CodecProfile};
+use crate::media::codec::{new_coder, CodecProfile};
 use crate::media::goertzel::SymbolDecoder;
 use crate::media::level::LevelMeter;
 use crate::media::tone;
@@ -233,6 +233,7 @@ fn tx_loop(
     let mut ts: u32 = rand::random();
     let mut n: u64 = 0;
     let mut last_symbol: Option<usize> = None;
+    let mut coder = new_coder(codec);
 
     while !stop.load(Ordering::Relaxed) {
         let samples = generate_frame(n, &codec, tone_enabled);
@@ -255,7 +256,7 @@ fn tx_loop(
                 let _ = w.write_samples(&samples);
             }
         }
-        let payload = encode_pcmu(&samples);
+        let payload = coder.encode(&samples);
         let pkt = build_packet(seq, ts, ssrc, codec.pt, &payload);
         let _ = socket.send(&pkt);
         sent_packets.fetch_add(1, Ordering::Relaxed);
@@ -286,9 +287,10 @@ fn rx_loop(
     let start = Instant::now();
     let mut buf = [0u8; 2048];
     let mut level = LevelMeter::new();
-    let mut decoder = SymbolDecoder::new(codec.audio_hz, PTIME.as_millis() as u64);
+    let mut symbol_decoder = SymbolDecoder::new(codec.audio_hz, PTIME.as_millis() as u64);
     let mut tone_stats = ToneStats::default();
     let mut rtt_samples: Vec<u64> = Vec::new();
+    let mut coder = new_coder(codec);
 
     while !stop.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
@@ -299,7 +301,7 @@ fn rx_loop(
                         if let Ok(mut t) = tracker.lock() {
                             t.on_packet(parsed.seq, parsed.timestamp, arrival, codec.rtp_clock_hz);
                         }
-                        let samples = decode_pcmu(parsed.payload);
+                        let samples = coder.decode(parsed.payload);
                         if let Some(w) = &received_wav {
                             if let Ok(mut w) = w.lock() {
                                 let _ = w.write_samples(&samples);
@@ -308,7 +310,7 @@ fn rx_loop(
                         level.feed(&samples);
 
                         if tone_enabled {
-                            if let Some(symbol) = decoder.feed(&samples) {
+                            if let Some(symbol) = symbol_decoder.feed(&samples) {
                                 let now = Instant::now();
                                 tone_stats.rx_symbols_detected += 1;
                                 if tone_stats.first_detected_ms_after_start.is_none() {
@@ -479,6 +481,61 @@ mod tests {
         assert!(
             avg_rtt < 500,
             "RTT should be small on a local loopback with a 20ms artificial delay, got {avg_rtt}ms"
+        );
+    }
+
+    /// The same proof as the PCMU tone-loopback test above, through the
+    /// wideband path Agent B actually prefers — the whole reason G.722
+    /// exists in this crate (research.md R5). Also stands as the T080
+    /// regression guard: swapping `audio_hz`/`rtp_clock_hz` in
+    /// `CodecProfile::G722` would make the receive-side Goertzel bank
+    /// analyse windows at the wrong sample count, and tone detection would
+    /// fail loudly here rather than silently misreporting quality.
+    #[test]
+    fn g722_tone_plan_is_detected_through_a_real_encode_decode_round_trip() {
+        use crate::media::codec::G722;
+        use std::net::UdpSocket as StdUdp;
+
+        let far_socket = StdUdp::bind("127.0.0.1:0").unwrap();
+        far_socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let far_addr = far_socket.local_addr().unwrap();
+        let echo_stop = Arc::new(AtomicBool::new(false));
+        let echo_handle = {
+            let stop = echo_stop.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok((n, src)) = far_socket.recv_from(&mut buf) {
+                        let _ = far_socket.send_to(&buf[..n], src);
+                    }
+                }
+            })
+        };
+
+        let config = MediaSessionConfig {
+            local_rtp: "127.0.0.1:0".parse().unwrap(),
+            remote_rtp: far_addr,
+            codec: G722,
+            duration: Duration::from_millis(2500),
+            sent_wav_path: None,
+            received_wav_path: None,
+            tone_enabled: true,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let result = run(config, stop).unwrap();
+
+        echo_stop.store(true, Ordering::Relaxed);
+        let _ = echo_handle.join();
+
+        assert!(
+            result.tone.rx_symbols_detected > 0,
+            "expected the tone to be detected after a real G.722 encode+decode round trip"
+        );
+        assert!(
+            !result.tone.rtt_samples_ms.is_empty(),
+            "expected at least one round-trip measurement through the G.722 path"
         );
     }
 }

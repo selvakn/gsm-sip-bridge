@@ -217,9 +217,15 @@ as absent while still reporting that packets arrived.
 - **FR-004**: The tool MUST advertise a contact address that is routable from
   the bridge, and MUST surface that address so a misconfiguration is visible
   rather than silent.
-- **FR-005**: The tool MUST refuse to start when configured with the account
-  the bridge is currently configured to ring, unless the operator explicitly
-  opts in to displacing it.
+- **FR-005**: **WON'T DO** (user decision, 2026-08-15). Originally: the tool
+  MUST refuse to start when configured with the account the bridge is
+  currently configured to ring, unless the operator explicitly opts in to
+  displacing it. Descoped rather than implemented — the tool has no way to
+  read the bridge's `ring_aor` value at all (only whether *some* account is
+  currently registered, via metrics), so there was no data to check against.
+  Provisioning a dedicated account (never the operator's own handset's) stays
+  a documented operator responsibility (quickstart.md) instead of an enforced
+  check.
 
 **Outbound calling**
 

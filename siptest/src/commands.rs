@@ -22,8 +22,15 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
         Commands::Call {
             destination,
             duration_secs,
+            codec,
             ..
-        } => call(&client, &base, destination, *duration_secs),
+        } => call(
+            &client,
+            &base,
+            destination,
+            *duration_secs,
+            codec.as_deref(),
+        ),
         Commands::Status => status(&client, &base),
     }
 }
@@ -39,10 +46,14 @@ fn call(
     base: &str,
     destination: &str,
     duration_secs: Option<u64>,
+    codec: Option<&str>,
 ) -> ExitCode {
     let mut body = serde_json::json!({"destination": destination});
     if let Some(d) = duration_secs {
         body["duration_secs"] = serde_json::json!(d);
+    }
+    if let Some(c) = codec {
+        body["codec"] = serde_json::json!(c);
     }
     let resp = match client
         .post(format!("{base}/calls?wait=true"))

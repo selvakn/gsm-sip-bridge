@@ -22,31 +22,35 @@ engine skeleton, registration itself — is front-loaded, because US1 and US3
 cannot function without a live registration and US2 *is* the registration
 lifecycle's own acceptance criteria.
 
-## Implementation status (as of the fourth /speckit.implement pass)
+## Implementation status (as of the fifth /speckit.implement pass)
 
 **Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), Phase 3 (US1
-— outbound calling), Phase 5 (US3 — inbound calling), and Phase 6 (US4 —
-tone/Goertzel/RTT) in full, plus almost all of Phase 4 (US2) and four Polish
-tasks. **72 of 84 tasks.** `make format && make lint && make test` all pass
-across the whole workspace (1,364 test assertions, zero failures, zero
-`unsafe`, zero clippy warnings). `siptest call --destination ... --wait`
-genuinely places a call through a real bridge's registrar, follows the `302`
-redirect, exchanges real PCMU audio carrying the `grid8` tone plan by
-default, records both directions, and exits non-zero on a packet-verdict
-failure; the daemon genuinely answers a real inbound INVITE arriving from a
-source port it never registered from, captures all three caller-ID headers,
-handles CANCEL-before-answer with the correct `200`/`487` pair, and supports
-answer/reject/manual policy over the control API; every call's report
-carries a **real** tone-detection verdict and, when the signal loops back, a
-**measured round-trip delay** — filling the gap
+— outbound calling), Phase 5 (US3 — inbound calling), Phase 6 (US4 —
+tone/Goertzel/RTT) in full, plus almost all of Phase 4 (US2) and Phase 7's
+G.722 trio (T079–T081, this pass), plus FR-005's startup guard (T028) marked
+won't-do by the user. **76 of 84 tasks resolved.** `make format && make lint
+&& make test` all pass across the whole workspace, zero `unsafe`, zero
+clippy warnings. `siptest call --destination ... --wait` genuinely places a
+call through a real bridge's registrar, follows the `302` redirect, exchanges
+real audio (PCMU or, since this pass, G.722 — `--codec {auto,pcmu,g722}`)
+carrying the `grid8` tone plan by default, records both directions, and
+exits non-zero on a packet-verdict failure; the daemon genuinely answers a
+real inbound INVITE arriving from a source port it never registered from,
+captures all three caller-ID headers, handles CANCEL-before-answer with the
+correct `200`/`487` pair, and supports answer/reject/manual policy over the
+control API, now selecting its answer codec from what the caller actually
+offered rather than assuming PCMU; every call's report carries a **real**
+tone-detection verdict and, when the signal loops back, a **measured
+round-trip delay** — filling the gap
 `gsm-sip-bridge/src/ims/call.rs:153`'s `round_trip_delay: None` comment
-names. **All three MVPs (outbound, inbound, tone-verified audio) are real
-and tested**, not scaffolded — and, new in this pass, `test_control_api.rs`
-proves the two headline flows (an inbound call discovered and answered
-purely by polling `GET /events`, `/status`/`/policy`/`/log/tail` reflecting
-real state) through the **actual running HTTP server** with `reqwest`, not
-just at the function or raw-socket level. `test_cli.rs` covers the CLI
-parser directly.
+names, and this pass proved that pipeline survives a real G.722 encode/decode
+round trip too. **All three MVPs (outbound, inbound, tone-verified audio)
+are real and tested**, not scaffolded, and `test_control_api.rs` proves the
+two headline flows (an inbound call discovered and answered purely by
+polling `GET /events`, `/status`/`/policy`/`/log/tail` reflecting real state,
+plus a bad `codec` value rejected with `400` before ever dialling) through
+the **actual running HTTP server** with `reqwest`, not just at the function
+or raw-socket level. `test_cli.rs` covers the CLI parser directly.
 
 **Three architecture decisions, applied consistently**:
 
@@ -83,17 +87,18 @@ parser directly.
    for every test case built so far, including PCMU-quantised tone and
    synthetic noise/off-grid rejection.
 
-**Not built — 12 tasks, all with a specific, named reason**:
+**Won't do**: FR-005's `ring_aor`-collision startup guard (T028) — user
+decision, 2026-08-15. Was also genuinely blocked regardless: siptest has no
+channel to read the bridge's configured `ring_aor` value, only whether
+*something* is currently registered (via metrics). Provisioning a dedicated
+account stays a documented operator responsibility in quickstart.md instead
+of an enforced check.
 
-- **G.722** (T079–T081) — deliberately deferred per research.md R7 regardless
-  of time remaining; PCMU alone satisfies every FR the spec states.
+**Not built — 8 tasks, all with a specific, named reason**:
+
 - **`dtmf`/`single` tone-plan variants** — `silence` is covered structurally
   via `tone_enabled: false`; the other two names in the config schema aren't
   implemented.
-- **FR-005's `ring_aor`-collision startup guard** (T028) — genuinely blocked,
-  not merely undone: siptest has no channel to read the bridge's configured
-  `ring_aor` value, only whether *something* is currently registered (via
-  metrics). Documented as an operator responsibility in quickstart.md instead.
 - **The dialog-engine architecture itself** (T026, T037, and the FSM-shape
   half of T025/T036/T059/T060) — the single consistent simplification
   explained in the section below; every *behaviour* those tasks specify is
@@ -186,7 +191,7 @@ without it; US2 is literally its lifecycle guarantees).
 - [x] T025 **Delivered with a scope reduction.** `siptest/src/sip/registration.rs` implements `register()`/`deregister()` covering every documented case (401/qop=auth, `stale=true` nonce adoption, second-401-fails, 423→Min-Expires, granted-expires parsing) — but as a **blocking, I/O-performing function**, not a pure `step(Input) -> Vec<Output>` state machine. Chosen to fit the session's time budget: a pure FSM plus the T026 engine to drive it is materially more code, and this shape is still fully covered by the real-registrar integration test. The trade-off: the specific edge cases (423, stale nonce, second-401) are exercised only by the happy-path integration test, not by isolated canned-message unit tests, since the function can't be driven without a socket. **Gap, not covered elsewhere.**
 - [ ] T026 **Not built.** No `sip/engine.rs` / dialog-engine thread exists. Registration runs in its own background thread (`daemon::registration_loop`) and outbound calls run synchronously inside the axum handler via `spawn_blocking` (`call::execute_outbound_call`) — see T025's note. This is the single biggest architectural simplification versus the plan: there is no unified per-call dialog table, so a second concurrent dialog (e.g. inbound arriving while an outbound call is mid-flight) is not handled at all. Acceptable for the MVP's single-call-at-a-time scope, but blocks true concurrent dialog handling.
 - [x] T027 **Delivered, shaped differently.** `siptest/src/daemon.rs` is the composition root — builds config, binds the shared `SipSocket`, spawns the registration thread, builds the tokio runtime explicitly and serves axum with graceful shutdown, de-registers on exit. No separate "dialog-engine thread" (see T026) — the registration thread and the API's blocking call-handlers are the only two consumers of the socket.
-- [ ] T028 **Not built.** No startup check comparing the configured `username` against the bridge's `ring_aor`. The provisioning guidance (use a dedicated account, e.g. `1002`, never the handset's `1001`) is documented in quickstart.md but not enforced in code. Real gap — `git blame`-visible as a follow-up.
+- [x] T028 **WON'T DO** (user decision, 2026-08-15): no startup check comparing the configured `username` against the bridge's `ring_aor`. Was genuinely blocked in any case — siptest has no channel to read the bridge's `ring_aor` value, only whether *something* is registered, via metrics. Provisioning guidance (use a dedicated account, e.g. `1002`, never the handset's `1001`) stays documented in quickstart.md as the operator's responsibility instead. FR-005 in spec.md is marked accordingly.
 - [x] T029 [P] Create `siptest/src/api/mod.rs` (axum router skeleton + `AppState { cmd_tx, snapshot, events, calls }`) and `siptest/src/api/events.rs` (`EventBus`: monotonic `seq`, bounded ring buffer, `since`-cursor long-poll with `timeout_ms` — contract control-api.md, no SSE per research.md R9)
 - [x] T030 [P] Unit test in `siptest/src/api/events.rs`: events published while a `since` request is blocked are delivered without a missed wakeup; a `since` older than the ring buffer's oldest retained event is still answered (no silent gap)
 - [x] T031 Wire `GET /health` and a registration-only `GET /status` (registration state, contact, `local.sip_addr`, `event_seq`) in `siptest/src/api/handlers.rs`, and start the registration FSM against the engine's socket
@@ -337,9 +342,9 @@ adding scope the spec didn't ask for.
 
 - [x] T077 [P] Extend `tools/count-unsafe.sh` to loop over `gsm-sip-bridge/src` and `siptest/src` (it currently hardcodes only the former, per research.md R12); tighten the match from a bare `grep "unsafe"` to `grep -rnE '\bunsafe\s*[{(]|\bunsafe\s+(fn|impl|trait)\b'` so a doc comment mentioning "unsafe" no longer fails the crate
 - [x] T078 [P] Add two Makefile targets, each with the constitution-required `## ` description: `siptest` (run the daemon) and `siptest-status` (curl `/status` and pretty-print)
-- [ ] T079 Decide and implement the G.722 codec (research.md R7 — deferred deliberately until the tone pipeline is proven on PCMU): either ~400 lines of in-crate sub-band ADPCM validated against ITU-T G.191 vectors, or a re-evaluated external crate if the landscape has changed; add the `G722` `CodecProfile` (pt 9, `rtp_clock_hz=8000`, `audio_hz=16000`, `samples_per_frame=320`, `ts_increment=160` — the trap T024's test guards against) and extend `sdp.rs` to offer/negotiate it
-- [ ] T080 [P] Unit test: the tone-through-codec round trip (T068) repeated through G.722, asserting detection still succeeds and that a deliberately wrong rate assignment (swapping `audio_hz`/`rtp_clock_hz`) makes the test fail loudly (regression guard for the trap itself)
-- [ ] T081 [P] Wire `--codec {auto,pcmu,g722}` through CLI, config, and `POST /calls`
+- [x] T079 **Done.** `siptest/src/media/g722.rs`: an original ~410-line in-crate implementation of ITU-T G.722 mode-1 sub-band ADPCM (QMF analysis/synthesis filterbank, low/high-band adaptive predictors and quantizers). Constants transcribed from the ITU-T G.722 Table 11 / standard quantizer tables, cross-checked against real FFmpeg LGPL source (downloaded to a scratch dir, never copied into the repo — used only to verify numeric constants, not copyrightable expression) rather than `ezk-g722` (pulls a whole SIP framework as a mandatory dependency) or `audio-codec` (zero test coverage on its G.722 module). Added the `G722` `CodecProfile` (pt 9, `rtp_clock_hz=8000`, `audio_hz=16000`, `samples_per_frame=320`, `ts_increment=160`) and the `CodecCoder` trait (`PcmuCoder`/`G722Coder`) in `media/codec.rs` so encode/decode state persists correctly across a call — PCMU is memoryless, G.722's ADPCM predictors are not. `sdp.rs` needed no changes: `build_offer`/`parse_offer`/`parse_answer` were already payload-type-generic (only new regression tests were added confirming PT 9 round-trips). Notable debugging finding, preserved here since it is easy to rediscover the hard way: a naive sample-for-sample SNR test comparing `decoded[i]` against `input[i]` fails (~-5dB) not because of an ADPCM bug but because G.722's QMF filterbank has an inherent ~22-sample algorithmic delay (confirmed against FFmpeg's own `initial_padding = 22`) — the correct test delay-compensates the comparison, which now measures a genuine ~42dB SNR.
+- [x] T080 [P] **Done.** `media/codec.rs`'s `g722_audio_rate_and_clock_rate_deliberately_differ` pins the `audio_hz`/`rtp_clock_hz` trap directly on the `G722` const. The tone-through-codec round trip itself lives in `media/session.rs`'s `g722_tone_plan_is_detected_through_a_real_encode_decode_round_trip` — the same real UDP-loopback pipeline as the existing PCMU test (`tone_plan_is_detected_on_both_sides_of_a_real_loopback_with_measurable_rtt`), but routed through a real G.722 encode/decode round trip; asserts symbols are still detected and RTT is still measured through the codec.
+- [x] T081 [P] **Done.** `media/codec.rs` gained `resolve_codec(name) -> Result<CodecProfile, String>` (outbound: `"auto"`/`"g722"` prefer G.722, `"pcmu"` forces PCMU, anything else is a named error) and `select_inbound_codec(name, &offer) -> Option<CodecProfile>` (inbound: constrained by what the caller actually offered, `"auto"` tries G.722 then falls back to PCMU). Wired end to end: `siptest call --destination ... --codec {auto,pcmu,g722}` (`cli.rs`/`commands.rs`) → `POST /calls` body's new optional `codec` field, defaulting to `[media].codec` when omitted (`api/handlers.rs`) → `call::execute_outbound_call`'s new `codec_name` parameter, resolved before any state mutation so a bad value fails fast as `400 invalid_codec` rather than after consuming a rate-limit slot (new `SipTestError::InvalidCodec`). Inbound answers now call `select_inbound_codec(&state.config.media.codec, &offer)` instead of a hardcoded PCMU-only offer check. Proven two ways: `test_control_api.rs`'s `posting_an_unknown_codec_is_rejected_with_400_before_dialling` (real HTTP, bad value) and `test_against_registrar.rs`'s `siptest_offers_g722_on_the_wire_when_the_g722_codec_is_selected` (real registrar + 302 dance; the stub UAS captures the actual re-INVITE and asserts it names PT 9 / `G722/8000`, not just that `resolve_codec` returns the right struct in isolation).
 - [ ] T082 Run `specs/037-siptest-softphone/quickstart.md` end to end against a live bridge (provision account `1002`, place a call, verify recordings and report, temporarily set `ring_aor` for an inbound run) and fix any drift between the doc and the real CLI/API surface
 - [x] T083 [P] Done — `siptest/tests/test_cli.rs`, 7 tests: top-level and `call --help` both render as clap's `DisplayHelp`, not a panic; `call` without `--destination` is `MissingRequiredArgument`, not a panic; `call`/`status` parse correctly; global flags (`--config`, `-v`) are read regardless of subcommand.
 - [x] T084 Final `make format && make lint && make test` across the whole workspace

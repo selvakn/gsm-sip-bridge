@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::api::state::{InboundMode, ManualDecision, SharedState};
 use crate::error::{SipTestError, SipTestResult};
-use crate::media::codec::PCMU;
+use crate::media::codec::{resolve_codec, select_inbound_codec};
 use crate::media::report::{
     CallReport, MediaCounters, Recordings, RequireLevel, SignallingTimings,
 };
@@ -104,7 +104,9 @@ pub fn execute_outbound_call(
     destination: String,
     duration: Duration,
     ring_timeout: Duration,
+    codec_name: &str,
 ) -> SipTestResult<Call> {
+    let codec = resolve_codec(codec_name).map_err(SipTestError::InvalidCodec)?;
     let now = Instant::now();
     {
         let history = state
@@ -153,7 +155,6 @@ pub fn execute_outbound_call(
         .calls_placed += 1;
 
     let call_id = state.next_call_id();
-    let codec = PCMU; // MVP: PCMU only; G.722 lands later (research.md R7)
     let rtp_port = pick_rtp_port(
         state.config.media.rtp_port_min,
         state.config.media.rtp_port_max,
@@ -381,11 +382,27 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
         .parse()
         .unwrap_or(RequireLevel::Packets);
 
-    // The offer must name a codec we can answer with (PCMU only, until
-    // G.722 lands) — an unusable offer is refused before ever ringing.
+    // The offer must name a codec we can answer with, constrained by both
+    // `[media].codec` and what the caller actually offered — an unusable
+    // offer is refused before ever ringing.
     let offer = match crate::sdp::parse_offer(&req.body) {
-        Ok(o) if o.offers(PCMU.pt) => o,
-        _ => {
+        Ok(o) => o,
+        Err(_) => {
+            let to_tag = crate::sip::message::new_tag();
+            let _ = state
+                .sip_socket
+                .send(peer, &crate::sip::inbound::build_488(&req, &to_tag));
+            call.state = CallState::Ended;
+            call.end_reason = Some(EndReason::Failed {
+                detail: "unparseable SDP offer".to_string(),
+            });
+            finish(state, call_id, call);
+            return;
+        }
+    };
+    let codec = match select_inbound_codec(&state.config.media.codec, &offer) {
+        Some(c) => c,
+        None => {
             let to_tag = crate::sip::message::new_tag();
             let _ = state
                 .sip_socket
@@ -517,7 +534,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
             let local_rtp = SocketAddr::new(state.sip_socket.local_ip, rtp_port);
             let session_id: u64 = rand::random();
             let sdp_body =
-                crate::sdp::build_offer(state.sip_socket.local_ip, rtp_port, session_id, PCMU);
+                crate::sdp::build_offer(state.sip_socket.local_ip, rtp_port, session_id, codec);
 
             let send_200 = || {
                 let _ = state.sip_socket.send(
@@ -560,7 +577,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 crate::media::session::MediaSessionConfig {
                     local_rtp,
                     remote_rtp: offer.remote_rtp,
-                    codec: PCMU,
+                    codec,
                     duration,
                     sent_wav_path: sent_wav_path.clone(),
                     received_wav_path: received_wav_path.clone(),
@@ -598,9 +615,12 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 answer_to_first_rtp_ms: None,
                 final_status: Some(200),
             };
-            let media_counters =
-                MediaCounters::new(PCMU, media_result.sent_packets, &media_result.receive_stats)
-                    .with_tone_and_level(&media_result.level, &media_result.tone);
+            let media_counters = MediaCounters::new(
+                codec,
+                media_result.sent_packets,
+                &media_result.receive_stats,
+            )
+            .with_tone_and_level(&media_result.level, &media_result.tone);
             let recordings = Recordings {
                 received: received_wav_path.map(|p| p.display().to_string()),
                 sent: sent_wav_path.map(|p| p.display().to_string()),
