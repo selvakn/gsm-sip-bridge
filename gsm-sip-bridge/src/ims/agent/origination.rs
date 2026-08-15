@@ -95,6 +95,22 @@ pub(super) struct PendingOrigination {
     /// provisional the offer/answer exchange completes there and the `200 OK`
     /// has no body at all, so this is the only copy of the answer we get.
     provisional_answer: Option<String>,
+    /// Set once a provisional response's SDP has been used to connect
+    /// `rtp_socket` early (specs/037-p-early-media) — guards the real `200
+    /// OK` handling against reconnecting the socket a second time, which
+    /// would risk a brief audio gap the zero-gap handoff requirement
+    /// (spec.md SC-005) rules out.
+    early_media_rtp_connected: bool,
+    /// The veth UAS listener's receiver, if spawned early alongside
+    /// `early_media_rtp_connected`. Consumed (in place of a fresh
+    /// `spawn_veth_uas_listener` call) once the real `200 OK` arrives.
+    early_veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>,
+    /// Guards `CallEarlyMedia` to one attempt per call — set the first time
+    /// a provisional's body is examined for early media, whether or not
+    /// that attempt actually succeeded (FR-006: a failed attempt is not
+    /// retried on a later provisional; the call just proceeds without early
+    /// media, exactly as it did before this feature existed).
+    early_media_sent: bool,
     callee_uri: String,
     route_headers: Vec<String>,
     via_transport: &'static str,
@@ -324,6 +340,9 @@ pub(super) fn begin_origination(
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
+        early_media_rtp_connected: false,
+        early_veth_rx: None,
+        early_media_sent: false,
         callee_uri,
         route_headers,
         via_transport,
@@ -658,6 +677,49 @@ impl PendingOrigination {
                     },
                 );
             }
+
+            // specs/037-p-early-media: the first SDP-bearing provisional is
+            // early media (an announcement/ringback the carrier is actually
+            // sending, e.g. Jio's ~13.7s `P-Early-Media: sendonly`) — relay
+            // it to Agent B's local caller now instead of discarding it
+            // until the real `200 OK`. At most one attempt per call
+            // (`early_media_sent`); FR-006 makes a failed attempt here
+            // best-effort, not a reason to fail the whole call — the
+            // attempt just proceeds without early media, exactly as it did
+            // before this feature existed.
+            if !self.early_media_sent && !resp.body.trim().is_empty() {
+                self.early_media_sent = true;
+                match sdp::parse_answer(&resp.body) {
+                    Ok(early_answer) => {
+                        if let Err(e) = self.rtp_socket.connect(early_answer.remote_rtp) {
+                            tracing::warn!(call_id = %self.call_id, error = %e, "outbound: early-media RTP connect failed; continuing without it (FR-006)");
+                        } else {
+                            match spawn_veth_uas_listener(
+                                self.veth_local_ip,
+                                self.veth_sip_port,
+                                self.wideband,
+                            ) {
+                                Ok(rx) => {
+                                    self.early_veth_rx = Some(rx);
+                                    self.early_media_rtp_connected = true;
+                                    let _ = write_msg(
+                                        &mut self.control,
+                                        &ControlMessage::CallEarlyMedia {
+                                            call_id: self.call_id.clone(),
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(call_id = %self.call_id, error = %e, "outbound: early-media veth listener spawn failed; continuing without it (FR-006)");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(call_id = %self.call_id, error = %e, "outbound: provisional body did not parse as SDP; no early media");
+                    }
+                }
+            }
             return OriginationStatus::Pending;
         }
 
@@ -705,9 +767,19 @@ impl PendingOrigination {
                 return OriginationStatus::Ended;
             }
         };
-        if let Err(e) = self.rtp_socket.connect(answer.remote_rtp) {
-            self.fail(&format!("RTP connect failed: {e}"));
-            return OriginationStatus::Ended;
+        // specs/037-p-early-media: if a provisional already connected this
+        // socket, don't reconnect it here — that would risk exactly the
+        // audible gap the zero-gap handoff requirement (SC-005) rules out.
+        // Trusts the carrier to keep using the same media session it
+        // already gave early media on, which holds for every carrier this
+        // bridge has been tested against (the reliable-provisional/100rel
+        // case above already relies on the same assumption for the SDP
+        // answer itself).
+        if !self.early_media_rtp_connected {
+            if let Err(e) = self.rtp_socket.connect(answer.remote_rtp) {
+                self.fail(&format!("RTP connect failed: {e}"));
+                return OriginationStatus::Ended;
+            }
         }
 
         let ack_branch = format!("z9hG4bK{}", random_hex(6));
@@ -739,30 +811,35 @@ impl PendingOrigination {
             session,
         );
 
-        // Spawn the veth listener *before* telling Agent B to call in — same
-        // ordering `handle_invite` uses for the inbound direction, so the
-        // listener is guaranteed up by the time Agent B's `Call::make` reaches
-        // it.
-        let veth_rx = match spawn_veth_uas_listener(
-            self.veth_local_ip,
-            self.veth_sip_port,
-            self.wideband,
-        ) {
-            Ok(rx) => rx,
-            Err(e) => {
-                // The carrier leg is already ACKed and up (the `dialog`
-                // proves it) — `fail()` alone only tells Agent B, it does
-                // not hang up the real carrier call.
-                tracing::warn!(call_id = %self.call_id, error = %e, "outbound: veth listener failed");
-                let call_id = self.call_id.clone();
-                hangup_answered_carrier_leg(
-                    session,
-                    &mut self.control,
-                    &dialog,
-                    &call_id,
-                    reason::VETH_LEG_FAILED,
-                );
-                return OriginationStatus::Ended;
+        // specs/037-p-early-media: reuse the listener a provisional already
+        // spawned (and is guaranteed already up) instead of spawning a
+        // second one — same reasoning as the RTP-connect skip above. Spawn
+        // fresh, exactly as before, when no early media happened for this
+        // attempt.
+        //
+        // Spawn *before* telling Agent B to call in — same ordering
+        // `handle_invite` uses for the inbound direction, so the listener is
+        // guaranteed up by the time Agent B's `Call::make` reaches it.
+        let veth_rx = if let Some(rx) = self.early_veth_rx.take() {
+            rx
+        } else {
+            match spawn_veth_uas_listener(self.veth_local_ip, self.veth_sip_port, self.wideband) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    // The carrier leg is already ACKed and up (the `dialog`
+                    // proves it) — `fail()` alone only tells Agent B, it
+                    // does not hang up the real carrier call.
+                    tracing::warn!(call_id = %self.call_id, error = %e, "outbound: veth listener failed");
+                    let call_id = self.call_id.clone();
+                    hangup_answered_carrier_leg(
+                        session,
+                        &mut self.control,
+                        &dialog,
+                        &call_id,
+                        reason::VETH_LEG_FAILED,
+                    );
+                    return OriginationStatus::Ended;
+                }
             }
         };
 
@@ -1091,4 +1168,173 @@ fn finish_origination(
         meter,
         lifecycle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
+    /// A connected loopback pair for `PendingOrigination::control` — the
+    /// server half must stay alive for the whole test (an accepted-then-
+    /// dropped peer would reset the connection on the next write), so
+    /// callers keep both halves in scope even though only the client half
+    /// is read from `control`'s field position.
+    fn control_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    /// Fields here are never touched by the early-media path under test
+    /// (`prack_if_required` returns before reading `session` when the
+    /// response carries no `RSeq`) — values are realistic-but-arbitrary,
+    /// not meant to resemble a real registration.
+    fn test_session() -> crate::ims::RegisteredSession {
+        crate::ims::RegisteredSession {
+            transport: None,
+            realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            public_uri: "sip:9000000000@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
+            contact_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
+            use_tcp: true,
+            cseq: 2,
+            gm_state: None,
+            xfrm_proto: "esp",
+            status: 200,
+            reason: "OK".to_string(),
+            headers: Vec::new(),
+            call_id: "reg-1".to_string(),
+            from_tag: "regtag".to_string(),
+            pcscf_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
+            imei: "000000000000000".to_string(),
+        }
+    }
+
+    fn test_pending(call_id: &str, control: TcpStream) -> PendingOrigination {
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel();
+        let rtp_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut lifecycle = BridgedCall::new(call_id.to_string(), "9000000001".to_string(), None);
+        lifecycle.advance_to(CallStage::Answering);
+        PendingOrigination {
+            step: OriginationStep::AwaitingCarrier,
+            call_id: call_id.to_string(),
+            from_tag: "ftag".to_string(),
+            branch: "z9hG4bKtest".to_string(),
+            invite_cseq: 1,
+            extra_cseq: 0,
+            pracked_rseq: None,
+            provisional_answer: None,
+            early_media_rtp_connected: false,
+            early_veth_rx: None,
+            early_media_sent: false,
+            callee_uri: "sip:9000000001@example.test".to_string(),
+            route_headers: Vec::new(),
+            via_transport: "TCP",
+            destination: "9000000001".to_string(),
+            control,
+            ctrl_rx,
+            rtp_socket,
+            veth_local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            veth_sip_port: 0,
+            wideband: false,
+            deadline: Instant::now() + Duration::from_secs(30),
+            any_response_seen: false,
+            ringing_relayed: false,
+            abandoned: false,
+            lifecycle,
+        }
+    }
+
+    fn provisional_183_with_sdp(call_id: &str) -> SipResponse {
+        SipResponse {
+            status: 183,
+            reason: "Session Progress".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        }
+    }
+
+    /// specs/037-p-early-media, US1 (T006): the first SDP-bearing
+    /// provisional connects the carrier RTP socket and spawns the veth
+    /// listener; a retransmit of that same provisional must not redo either
+    /// — reconnecting the socket a second time is exactly the kind of
+    /// re-establishment SC-005's zero-gap handoff rules out.
+    #[test]
+    fn first_sdp_bearing_provisional_triggers_early_media_once() {
+        let call_id = "out-early-1";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let mut p = test_pending(call_id, control);
+
+        let resp1 = provisional_183_with_sdp(call_id);
+        let status1 = p.on_carrier_response(&resp1, &mut session);
+        assert!(matches!(status1, OriginationStatus::Pending));
+        assert!(
+            p.early_media_sent,
+            "the first SDP-bearing provisional should attempt early media"
+        );
+        assert!(
+            p.early_media_rtp_connected,
+            "the carrier RTP socket should be connected from the first provisional"
+        );
+        assert!(
+            p.early_veth_rx.is_some(),
+            "the veth listener should be spawned from the first provisional"
+        );
+        let peer_after_first = p.rtp_socket.peer_addr().unwrap();
+        assert_eq!(
+            peer_after_first,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000)
+        );
+
+        // A retransmit of the exact same provisional (RSeq is absent here
+        // regardless, so this is indistinguishable from a genuine resend at
+        // the transport level) must not reconnect the socket or spawn a
+        // second listener.
+        let resp2 = provisional_183_with_sdp(call_id);
+        let status2 = p.on_carrier_response(&resp2, &mut session);
+        assert!(matches!(status2, OriginationStatus::Pending));
+        assert_eq!(
+            p.rtp_socket.peer_addr().unwrap(),
+            peer_after_first,
+            "a retransmitted provisional must not reconnect the RTP socket"
+        );
+    }
+
+    /// A provisional with no SDP body (e.g. a plain `100 Trying`/`180
+    /// Ringing`) must not trigger early media at all — the no-early-media
+    /// path (spec.md FR-002) stays exactly as it was.
+    #[test]
+    fn provisional_without_sdp_does_not_trigger_early_media() {
+        let call_id = "out-early-2";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let mut p = test_pending(call_id, control);
+
+        let resp = SipResponse {
+            status: 180,
+            reason: "Ringing".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: String::new(),
+        };
+
+        let status = p.on_carrier_response(&resp, &mut session);
+        assert!(matches!(status, OriginationStatus::Pending));
+        assert!(!p.early_media_sent);
+        assert!(!p.early_media_rtp_connected);
+        assert!(p.early_veth_rx.is_none());
+        assert!(
+            p.rtp_socket.peer_addr().is_err(),
+            "an unconnected UDP socket has no peer"
+        );
+    }
 }

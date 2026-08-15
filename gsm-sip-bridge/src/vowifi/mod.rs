@@ -738,9 +738,22 @@ fn run_outbound_listener(
 
         let wire_call_id = format!("out-{call_id}");
         for line in lines {
-            match try_place_on_line(line, &wire_call_id, &destination, &mut call) {
-                PlaceCallOutcome::Placed(control) => {
-                    match bridge_outbound_leg(endpoint, account, &mut call, line) {
+            match try_place_on_line(
+                endpoint,
+                account,
+                line,
+                &wire_call_id,
+                &destination,
+                &mut call,
+            ) {
+                PlaceCallOutcome::Placed(control, early_veth) => {
+                    let bridge_result = match early_veth {
+                        Some(veth_call) => {
+                            finalize_paired_outbound_leg(endpoint, &mut call, veth_call)
+                        }
+                        None => bridge_outbound_leg(endpoint, account, &mut call, line),
+                    };
+                    match bridge_result {
                         Ok(veth_call) => {
                             tracing::info!(destination = %destination, card_id = %line.card_id, "outbound call placed over VoWiFi/VoLTE");
                             report_outbound(reporter, OutboundAttemptOutcome::Placed);
@@ -839,8 +852,12 @@ fn report_outbound(reporter: &Reporter, outcome: OutboundAttemptOutcome) {
 /// What happened trying to place a call on one line.
 enum PlaceCallOutcome {
     /// Committed and the carrier accepted it — the call is up. Carries the
-    /// still-open connection to Agent A (see `try_place_on_line`'s doc).
-    Placed(std::io::BufReader<TcpStream>),
+    /// still-open connection to Agent A (see `try_place_on_line`'s doc), and
+    /// — when `CallEarlyMedia` fired earlier in this same attempt
+    /// (specs/037-p-early-media) — the veth `Call` already paired to the
+    /// phone/PBX leg, so the caller only needs to finalize it
+    /// (`finalize_paired_outbound_leg`) rather than pair a second one.
+    Placed(std::io::BufReader<TcpStream>, Option<Call>),
     /// Never reached the carrier at all — busy, unreachable, or a
     /// malformed reply. Cheap to have tried; the caller should move on to
     /// the next line.
@@ -905,6 +922,18 @@ fn poll_control_line<R: std::io::BufRead>(
     }
 }
 
+/// Tears down a veth leg that `CallEarlyMedia` already paired but that
+/// never reached a `CallPlaced` finalization — used by every non-`Placed`
+/// exit from `try_place_on_line`'s poll loop once early media may have
+/// fired (specs/037-p-early-media). A no-op when `early_veth` is `None`,
+/// the common case where no early media happened for this attempt.
+fn abandon_early_veth(endpoint: &Endpoint, call: &Call, early_veth: Option<Call>) {
+    if let Some(mut veth_call) = early_veth {
+        endpoint.unpair_call(call.call_id());
+        let _ = veth_call.hangup();
+    }
+}
+
 /// On success, returns the still-open connection to Agent A — it must stay
 /// open for the whole call (Agent A expects to send `CallEnded` on it when
 /// the carrier hangs up, and we need it to tell Agent A when the phone leg
@@ -916,6 +945,8 @@ fn poll_control_line<R: std::io::BufRead>(
 /// bridge was wired correctly and the relay was running; there was simply
 /// nothing left alive downstream by the time either had anything to carry.
 fn try_place_on_line(
+    endpoint: &Endpoint,
+    account: &Account,
     line: &RuntimeLine,
     call_id: &str,
     destination: &str,
@@ -975,10 +1006,46 @@ fn try_place_on_line(
     }
     let deadline = Instant::now() + CALL_ATTEMPT_TIMEOUT;
     let mut pending_line = String::new();
+    // Set once `CallEarlyMedia` fires (specs/037-p-early-media) — the veth
+    // leg is already paired and the phone/PBX leg already answered `183`.
+    // `CallPlaced` then only needs to finalize it (`Some`), rather than
+    // pair a fresh one as it does when no early media ever happened
+    // (`None`, the pre-existing path, unchanged).
+    let mut early_veth: Option<Call> = None;
     loop {
         match poll_control_line(&mut reader, &mut pending_line) {
             Ok(Some(ControlMessage::CallRinging { .. })) => {
-                let _ = call.answer(180);
+                // Only when early media hasn't already put the caller on an
+                // audio-bearing `183` — re-answering `180` after that would
+                // downgrade a real early-media dialog to a silent one for no
+                // reason (contract: CallRinging and CallEarlyMedia are
+                // independent one-shot flags for the same attempt).
+                if early_veth.is_none() {
+                    let _ = call.answer(180);
+                }
+            }
+            Ok(Some(ControlMessage::CallEarlyMedia { .. })) => {
+                if early_veth.is_none() {
+                    match pair_veth_leg(endpoint, account, call, line) {
+                        Ok(veth_call) => {
+                            if let Err(e) = call.answer(183) {
+                                tracing::warn!(call_id, error = %e, "outbound: early-media answer(183) failed; continuing without it (FR-006)");
+                                endpoint.unpair_call(call.call_id());
+                                let mut veth_call = veth_call;
+                                let _ = veth_call.hangup();
+                            } else {
+                                early_veth = Some(veth_call);
+                            }
+                        }
+                        Err(e) => {
+                            // FR-006: early media is additive — if pairing
+                            // fails, the attempt proceeds exactly as it
+                            // would have if `CallEarlyMedia` never arrived,
+                            // not as a call failure.
+                            tracing::warn!(call_id, error = %e, "outbound: early-media pairing failed; continuing without it (FR-006)");
+                        }
+                    }
+                }
             }
             Ok(Some(ControlMessage::CallPlaced { .. })) => {
                 // Short from here on: this same connection is now polled
@@ -989,19 +1056,25 @@ fn try_place_on_line(
                     .get_ref()
                     .set_read_timeout(Some(OUTBOUND_POLL_INTERVAL))
                 {
+                    abandon_early_veth(endpoint, call, early_veth.take());
                     return PlaceCallOutcome::Committed(format!("set_read_timeout failed: {e}"));
                 }
-                return PlaceCallOutcome::Placed(reader);
+                return PlaceCallOutcome::Placed(reader, early_veth.take());
             }
             Ok(Some(ControlMessage::CallFailed { reason, .. })) => {
-                return PlaceCallOutcome::Committed(reason)
+                abandon_early_veth(endpoint, call, early_veth.take());
+                return PlaceCallOutcome::Committed(reason);
             }
             Ok(Some(other)) => {
-                return PlaceCallOutcome::Committed(format!("unexpected reply: {other:?}"))
+                abandon_early_veth(endpoint, call, early_veth.take());
+                return PlaceCallOutcome::Committed(format!("unexpected reply: {other:?}"));
             }
             // Nothing complete arrived this tick — fall through to the checks.
             Ok(None) => {}
-            Err(e) => return PlaceCallOutcome::Committed(format!("control read failed: {e}")),
+            Err(e) => {
+                abandon_early_veth(endpoint, call, early_veth.take());
+                return PlaceCallOutcome::Committed(format!("control read failed: {e}"));
+            }
         }
 
         // Watch our own leg: if the caller hung up while the carrier is still
@@ -1020,10 +1093,12 @@ fn try_place_on_line(
                     reason: control::reason::CALLER_HANGUP.to_string(),
                 },
             );
+            abandon_early_veth(endpoint, call, early_veth.take());
             return PlaceCallOutcome::Abandoned;
         }
 
         if Instant::now() >= deadline {
+            abandon_early_veth(endpoint, call, early_veth.take());
             return PlaceCallOutcome::Committed(
                 "timed out waiting for the carrier attempt to resolve".to_string(),
             );
@@ -1081,32 +1156,46 @@ fn outbound_outcome_for_committed_failure(reason: &str) -> (u32, OutboundAttempt
 /// Places this line's veth-side `Call::make` toward Agent A's now-waiting
 /// veth listener and conference-bridges it to the already-accepted
 /// phone/PBX leg — the same `pjsua_safe::Endpoint::pair_calls` primitive
-/// `bridge_call` already uses for inbound (`vowifi/mod.rs`), called here
-/// with the leg roles reversed: `call` was accepted first, the veth leg is
-/// placed second. Returns the veth `Call` on success — the caller must hang
-/// it up (and unpair) once the bridged call ends, same as it must for
-/// `call`.
-fn bridge_outbound_leg(
+/// `bridge_call` already uses for inbound (`vowifi/mod.rs`). Does not
+/// answer either leg — callers decide what status to answer `call` with
+/// (`bridge_outbound_leg` answers `200` immediately; `try_place_on_line`'s
+/// `CallEarlyMedia` handling, specs/037-p-early-media, answers `183`
+/// instead, before the call is really placed).
+///
+/// Pair *before* either leg is answered: `answer()` can complete the
+/// INVITE transaction and fire this call's media-active callback on a
+/// PJSIP worker thread almost immediately (sub-millisecond, found live —
+/// specs/025-outbound-calling T072 pass 4). `pair_calls` is documented as
+/// safe to call before either call's media is active precisely for this
+/// reason; calling it after left a real window where the phone leg's
+/// media-active callback ran before `BRIDGE_PAIRS` had this pairing, so it
+/// fell through to the sound-device branch instead of the peer-call
+/// branch — audio silently went nowhere, no error on either side.
+fn pair_veth_leg(
     endpoint: &Endpoint,
     account: &Account,
     call: &mut Call,
     line: &RuntimeLine,
 ) -> BridgeResult<Call> {
     let veth_uri = format!("sip:agent-a@{}:{}", line.veth_local_addr, line.sip_leg_port);
-    let mut veth_call = Call::make(account, &veth_uri, None, &[])
+    let veth_call = Call::make(account, &veth_uri, None, &[])
         .map_err(|e| BridgeError::Ims(format!("veth-side call failed: {e}")))?;
-
-    // Pair *before* answering: `answer(200)` can complete the INVITE
-    // transaction and fire this call's media-active callback on a PJSIP
-    // worker thread almost immediately (sub-millisecond, found live —
-    // specs/025-outbound-calling T072 pass 4). `pair_calls` is documented
-    // as safe to call before either call's media is active precisely for
-    // this reason; calling it after left a real window where the phone
-    // leg's media-active callback ran before `BRIDGE_PAIRS` had this
-    // pairing, so it fell through to the sound-device branch instead of
-    // the peer-call branch — audio silently went nowhere, no error on
-    // either side.
     endpoint.pair_calls(call.call_id(), veth_call.call_id());
+    Ok(veth_call)
+}
+
+/// `pair_veth_leg` followed by `answer(200)` — the full no-early-media
+/// path: `call` was accepted first, the veth leg is placed and paired
+/// second, then answered. Returns the veth `Call` on success — the caller
+/// must hang it up (and unpair) once the bridged call ends, same as it
+/// must for `call`.
+fn bridge_outbound_leg(
+    endpoint: &Endpoint,
+    account: &Account,
+    call: &mut Call,
+    line: &RuntimeLine,
+) -> BridgeResult<Call> {
+    let mut veth_call = pair_veth_leg(endpoint, account, call, line)?;
     if let Err(e) = call.answer(200) {
         // The pairing just made above and the veth call `Call::make` just
         // placed would otherwise leak: `Call` has no `Drop`, and a stale
@@ -1121,6 +1210,29 @@ fn bridge_outbound_leg(
         veth_call_id = veth_call.call_id(),
         card_id = %line.card_id,
         "outbound: placed and paired both legs"
+    );
+    Ok(veth_call)
+}
+
+/// The `CallPlaced` finalization when `try_place_on_line` already paired
+/// the veth leg early (`CallEarlyMedia` fired for this attempt,
+/// specs/037-p-early-media) — only `answer(200)` is left to do; pairing
+/// already happened, so redoing it would place a second, orphaned veth
+/// call. Mirrors `bridge_outbound_leg`'s answer-failure cleanup exactly.
+fn finalize_paired_outbound_leg(
+    endpoint: &Endpoint,
+    call: &mut Call,
+    mut veth_call: Call,
+) -> BridgeResult<Call> {
+    if let Err(e) = call.answer(200) {
+        endpoint.unpair_call(call.call_id());
+        let _ = veth_call.hangup();
+        return Err(BridgeError::Ims(format!("{e}")));
+    }
+    tracing::info!(
+        phone_call_id = call.call_id(),
+        veth_call_id = veth_call.call_id(),
+        "outbound: answered 200 on an already-paired (early media) leg"
     );
     Ok(veth_call)
 }

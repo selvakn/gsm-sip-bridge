@@ -129,6 +129,22 @@ pub enum ControlMessage {
     /// nothing at all for up to `OUTBOUND_INVITE_TIMEOUT +
     /// OUTBOUND_RING_TIMEOUT` (75s) and then a sudden answer.
     CallRinging { call_id: String },
+    /// Agent A → Agent B. The carrier's first SDP-bearing provisional
+    /// response (`180`-`183`) for an originated INVITE has arrived — early
+    /// media, e.g. a carrier announcement (specs/037-p-early-media).
+    /// Non-terminal, sent at most once per call, independent of
+    /// `CallRinging` (either, both in either order, or neither may fire for
+    /// a given attempt). By the time this is sent, Agent A has already
+    /// `connect()`-ed its carrier-facing RTP socket to the address the SDP
+    /// named and has a veth UAS listener up and waiting — mirrors
+    /// `CallPlaced`'s role, just earlier. Agent B places its veth leg and
+    /// `pjsua_safe::Endpoint::pair_calls`s it to the already-accepted
+    /// phone/PBX leg (the same steps `CallPlaced` triggers), then answers
+    /// that leg with `183` instead of `180` so the caller hears the
+    /// carrier's pre-answer audio. If `CallPlaced` later arrives for the
+    /// same call, Agent B does not repeat the pairing — see
+    /// `contracts/agent-outbound-protocol-delta-early-media.md`.
+    CallEarlyMedia { call_id: String },
     /// Agent A → Agent B. The carrier leg is up (2xx received, ACK sent)
     /// and Agent A's veth-facing UAS listener is up and waiting — the
     /// outbound mirror of `IncomingCall`, direction reversed. No port is
@@ -161,6 +177,7 @@ impl ControlMessage {
             | ControlMessage::PlaceCall { call_id, .. }
             | ControlMessage::CallAttempting { call_id, .. }
             | ControlMessage::CallRinging { call_id, .. }
+            | ControlMessage::CallEarlyMedia { call_id, .. }
             | ControlMessage::CallPlaced { call_id, .. }
             | ControlMessage::CallFailed { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
@@ -312,6 +329,14 @@ mod tests {
     }
 
     #[test]
+    fn call_early_media_roundtrips() {
+        let msg = ControlMessage::CallEarlyMedia {
+            call_id: "out1".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
     fn call_placed_roundtrips() {
         let msg = ControlMessage::CallPlaced {
             call_id: "out1".to_string(),
@@ -347,6 +372,13 @@ mod tests {
         );
         assert_eq!(
             ControlMessage::CallRinging {
+                call_id: "x".to_string(),
+            }
+            .call_id(),
+            Some("x")
+        );
+        assert_eq!(
+            ControlMessage::CallEarlyMedia {
                 call_id: "x".to_string(),
             }
             .call_id(),
