@@ -577,6 +577,39 @@ fn run_status_listener(
     Ok(())
 }
 
+/// Decodes an inbound `MESSAGE`'s body when it's 3GPP SMS-over-IP
+/// (`Content-Type: application/vnd.3gpp.sms`, TS 24.341) rather than text —
+/// which is what a real carrier sends (Vi, measured 2026-08-15), and
+/// `req.body` alone is unreadable for it: it's a raw binary TPDU, not text
+/// that happened to look garbled. `None` for a plain-text `MESSAGE` (no
+/// content type to key off, or one naming something else), so the caller's
+/// existing `req.body`/`extract_caller` behaviour is unchanged for those.
+///
+/// Logs and returns `None` on a decode failure too, rather than propagating
+/// the error — decoding better beats decoding not at all, but a `MESSAGE` we
+/// can't parse is still one we received, and the caller must still relay and
+/// acknowledge *something* rather than drop it (specs/017 FR-026's ordering
+/// exists precisely so a message is never silently lost).
+fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> {
+    let is_3gpp_sms = req
+        .header("Content-Type")
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("application/vnd.3gpp.sms"));
+    if !is_3gpp_sms {
+        return None;
+    }
+    match crate::ims::sms_pdu::decode_vnd_3gpp_sms(&req.body_bytes) {
+        Ok(decoded) => Some(decoded),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                body_len = req.body_bytes.len(),
+                "could not decode a 3GPP SMS-over-IP body; forwarding it undecoded"
+            );
+            None
+        }
+    }
+}
+
 /// Handles an inbound SIP `MESSAGE` (RFC 3428) — the carrier's VoWiFi/IMS
 /// transport for SMS, the counterpart to `AT+CMTI`/`AT+CMGR` in the
 /// circuit-switched flow — and relays it to Agent B over the control channel
@@ -602,8 +635,23 @@ fn run_status_listener(
 /// *unacknowledged*: the network retrying is the recovery mechanism, and
 /// acknowledging something we failed to record would throw that away.
 fn handle_message(sink: &SipSink, req: &SipRequest, control_addr: SocketAddr) {
-    let sender = extract_caller(req);
-    let body = req.body.clone();
+    // The SIP `From` on a real network's MT SMS names an IMS core element
+    // relaying the message (a carrier-internal SMSC gateway hostname), not
+    // the person who sent it — measured on Vi 2026-08-15:
+    // `From: <sip:invitn14cbt5tasx05nk.ims.mnc043.mcc404.3gppnetwork.org>`.
+    // The real sender is inside the TPDU (`decode_pdu_body` below), which is
+    // why a successful decode's `sender` always wins over `extract_caller`.
+    let mut sender = extract_caller(req);
+    let mut body = req.body.clone();
+
+    if let Some(decoded) = decode_pdu_body(req) {
+        sender = decoded.sender;
+        body = match decoded.part {
+            Some((seq, total)) => format!("[{seq}/{total}] {}", decoded.text),
+            None => decoded.text,
+        };
+    }
+
     tracing::info!(sender = %sender, "received SIP MESSAGE");
 
     let msg = ControlMessage::SmsReceived {
@@ -1460,5 +1508,74 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\nFrom: garbage\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "unknown");
+    }
+
+    /// A minimal RP-DATA + SMS-DELIVER TPDU for "Hi" from +919000000001 — same
+    /// construction as `sms_pdu`'s own tests, kept independent so this test
+    /// exercises the header-gated call site, not just the decoder itself.
+    fn a_3gpp_sms_pdu() -> Vec<u8> {
+        let sender = "919000000001";
+        let bcd: Vec<u8> = sender
+            .as_bytes()
+            .chunks(2)
+            .map(|p| match p {
+                [a, b] => (b - b'0') << 4 | (a - b'0'),
+                [a] => 0xF0 | (a - b'0'),
+                _ => unreachable!(),
+            })
+            .collect();
+        // "Hi" in the GSM 7-bit default alphabet happens to equal its ASCII
+        // codepoints, so no separate encode table is needed here.
+        let septets = [b'H' & 0x7F, b'i' & 0x7F];
+        let mut packed = 0u16;
+        packed |= u16::from(septets[0]);
+        packed |= u16::from(septets[1]) << 7;
+        let packed_bytes = packed.to_le_bytes();
+
+        let mut tpdu = vec![0x00, sender.len() as u8, 0x91];
+        tpdu.extend_from_slice(&bcd);
+        tpdu.extend_from_slice(&[0x00, 0x00]); // TP-PID, TP-DCS (GSM7)
+        tpdu.extend_from_slice(&[0u8; 7]); // TP-SCTS
+        tpdu.push(2); // TP-UDL: 2 septets
+        tpdu.extend_from_slice(&packed_bytes);
+
+        let mut rp = vec![0x01, 0x00, 0, 0];
+        rp.push(tpdu.len() as u8);
+        rp.extend_from_slice(&tpdu);
+        rp
+    }
+
+    /// The header-gated path `handle_message` actually depends on: a
+    /// `MESSAGE` naming the 3GPP content type gets its sender and body
+    /// replaced with what the TPDU says, not the SIP `From` (a network
+    /// element's own hostname on a real carrier) or the raw undecoded bytes.
+    #[test]
+    fn decode_pdu_body_decodes_a_3gpp_sms_message() {
+        let pdu = a_3gpp_sms_pdu();
+        let mut raw = b"MESSAGE sip:x SIP/2.0\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n"
+            .to_vec();
+        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", pdu.len()).as_bytes());
+        raw.extend_from_slice(&pdu);
+
+        let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
+        let decoded = decode_pdu_body(&req).expect("a 3GPP SMS body must decode");
+        assert_eq!(decoded.sender, "+919000000001");
+        assert_eq!(decoded.text, "Hi");
+    }
+
+    /// An ordinary text `MESSAGE` (no 3GPP content type) must be left alone —
+    /// this is the shape `sample_message()` elsewhere in this crate uses, and
+    /// it must keep working exactly as before.
+    #[test]
+    fn decode_pdu_body_ignores_a_plain_text_message() {
+        let raw = "MESSAGE sip:x SIP/2.0\r\n\
+                    Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: 5\r\n\r\nhello";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(decode_pdu_body(&req).is_none());
     }
 }

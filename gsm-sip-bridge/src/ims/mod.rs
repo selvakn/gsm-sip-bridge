@@ -43,6 +43,7 @@ pub mod session;
 /// module's request parser and UAS response builder to serve IP phones. See
 /// `digest` above for the same rationale (spec 024, research.md R-007).
 pub(crate) mod sip_client;
+pub(crate) mod sms_pdu;
 mod transcode;
 pub mod transport;
 

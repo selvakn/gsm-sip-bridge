@@ -224,7 +224,20 @@ pub struct SipRequest {
     pub method: String,
     pub request_uri: String,
     pub headers: Vec<(String, String)>,
+    /// Lossily decoded to text. Correct and sufficient for every method this
+    /// bridge originates or answers as a UAS (SDP is always text) — but for an
+    /// inbound `MESSAGE` whose `Content-Type` names a binary encoding
+    /// (`application/vnd.3gpp.sms`, the 3GPP SMS-over-IP TPDU), this is
+    /// already-destroyed data: `String::from_utf8_lossy` replaces each invalid
+    /// byte sequence with U+FFFD, and that's irreversible. Use
+    /// [`body_bytes`](Self::body_bytes) for anything that needs the bytes the
+    /// carrier actually sent.
     pub body: String,
+    /// The body's raw wire bytes, before any UTF-8 interpretation — see
+    /// `body`'s docs. Sliced from the same correctly-bounded range as `body`,
+    /// so the two always describe the same content; only `body_bytes` is
+    /// bit-exact when that content isn't text.
+    pub body_bytes: Vec<u8>,
 }
 
 impl SipRequest {
@@ -317,7 +330,8 @@ impl SipRequest {
             return Ok(None);
         }
         // Bounded, correctly-offset per the RAW bytes — see `find_subslice`.
-        let body = String::from_utf8_lossy(&buf[header_len..total_len]).into_owned();
+        let body_bytes = buf[header_len..total_len].to_vec();
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
         Ok(Some((
             Self {
@@ -325,6 +339,7 @@ impl SipRequest {
                 request_uri,
                 headers,
                 body,
+                body_bytes,
             },
             total_len,
         )))
@@ -2041,6 +2056,10 @@ mod tests {
 
         let (first, consumed) = SipRequest::try_parse(&buf).unwrap().unwrap();
         assert_eq!(first.method, "MESSAGE");
+        assert_eq!(
+            first.body_bytes, binary_body,
+            "the raw bytes must survive exactly, for a PDU decoder to work on"
+        );
 
         // The framing offset must land exactly on the second message's start —
         // not a few bytes short or long, which is what a lossily-reencoded
