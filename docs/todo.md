@@ -85,3 +85,17 @@ Observed pending items
       physical `EC20-CE-HDLG` unit that found this — the literal kernel hang
       needs that specific hardware to reproduce.
       Plan: [docs/plans/ec20-bad-port-isolation.md](plans/ec20-bad-port-isolation.md).
+- [ ] `siptest` (specs/037-siptest-softphone) has no unified dialog engine —
+      T026/T037 in that spec's task list. Registration runs as a blocking
+      function in its own background thread, outbound calls run
+      synchronously inside the HTTP handler via `spawn_blocking`, and
+      inbound calls run on their own dedicated listener thread, instead of
+      one `step(Input) -> Vec<Output>` state machine driving a shared
+      per-call dialog table. Every documented *behaviour* (302 handling,
+      digest auth, CANCEL/timeout, caller-ID capture) is implemented and
+      tested regardless. Concrete consequence: no second concurrent dialog
+      can be handled — an inbound call arriving while an outbound call is
+      already mid-flight has no path to be processed, since the inbound
+      listener thread is blocked inside the first call. Fine for the
+      current single-call-at-a-time scope; would block true concurrent-call
+      support if that's ever needed.
