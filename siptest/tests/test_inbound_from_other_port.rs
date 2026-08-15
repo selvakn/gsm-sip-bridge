@@ -107,6 +107,14 @@ fn build_state(config: Config, sip_socket: Arc<SipSocket>) -> Arc<SharedState> {
             cached_nonce: None,
             nc: 0,
         }),
+        registration_config: siptest::sip::registration::RegistrationConfig {
+            registrar_addr: "127.0.0.1:1".parse().unwrap(),
+            registrar_host: "test-realm".to_string(),
+            aor_user: "1002".to_string(),
+            realm: "test-realm".to_string(),
+            password: Secret::new("hunter2".to_string()),
+            expires: 300,
+        },
         inbound_policy: Mutex::new(inbound_policy),
         manual_decisions: Mutex::new(std::collections::HashMap::new()),
     })

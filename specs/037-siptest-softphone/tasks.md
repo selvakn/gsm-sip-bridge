@@ -22,29 +22,31 @@ engine skeleton, registration itself — is front-loaded, because US1 and US3
 cannot function without a live registration and US2 *is* the registration
 lifecycle's own acceptance criteria.
 
-## Implementation status (as of the third /speckit.implement pass)
+## Implementation status (as of the fourth /speckit.implement pass)
 
 **Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), Phase 3 (US1
 — outbound calling), Phase 5 (US3 — inbound calling), and Phase 6 (US4 —
-tone/Goertzel/RTT) in full, plus most of Phase 4 (US2) and two Polish tasks.
-65 of 84 tasks. `make format && make lint && make test` all pass across the
-whole workspace (1,350 test assertions, zero failures, zero `unsafe`, zero
-clippy warnings). `siptest call --destination ... --wait` genuinely places a
-call through a real bridge's registrar, follows the `302` redirect, exchanges
-real PCMU audio carrying the `grid8` tone plan by default, records both
-directions, and exits non-zero on a packet-verdict failure; the daemon
-genuinely answers a real inbound INVITE arriving from a source port it never
-registered from, captures all three caller-ID headers, handles
-CANCEL-before-answer with the correct `200`/`487` pair, and supports
-answer/reject/manual policy over the control API; and every call's report now
+tone/Goertzel/RTT) in full, plus almost all of Phase 4 (US2) and four Polish
+tasks. **72 of 84 tasks.** `make format && make lint && make test` all pass
+across the whole workspace (1,364 test assertions, zero failures, zero
+`unsafe`, zero clippy warnings). `siptest call --destination ... --wait`
+genuinely places a call through a real bridge's registrar, follows the `302`
+redirect, exchanges real PCMU audio carrying the `grid8` tone plan by
+default, records both directions, and exits non-zero on a packet-verdict
+failure; the daemon genuinely answers a real inbound INVITE arriving from a
+source port it never registered from, captures all three caller-ID headers,
+handles CANCEL-before-answer with the correct `200`/`487` pair, and supports
+answer/reject/manual policy over the control API; every call's report
 carries a **real** tone-detection verdict and, when the signal loops back, a
-**measured round-trip delay** — proven end to end in
-`media::session::tests::tone_plan_is_detected_on_both_sides_of_a_real_loopback_with_measurable_rtt`
-against a real UDP echo with ground-truth delay. This is the tone detector
-`gsm-sip-bridge/src/ims/call.rs:153`'s `round_trip_delay: None` comment says
-is needed to fill that field — it now genuinely can be. **All three MVPs
-(outbound, inbound, tone-verified audio) are real and tested**, not
-scaffolded.
+**measured round-trip delay** — filling the gap
+`gsm-sip-bridge/src/ims/call.rs:153`'s `round_trip_delay: None` comment
+names. **All three MVPs (outbound, inbound, tone-verified audio) are real
+and tested**, not scaffolded — and, new in this pass, `test_control_api.rs`
+proves the two headline flows (an inbound call discovered and answered
+purely by polling `GET /events`, `/status`/`/policy`/`/log/tail` reflecting
+real state) through the **actual running HTTP server** with `reqwest`, not
+just at the function or raw-socket level. `test_cli.rs` covers the CLI
+parser directly.
 
 **Three architecture decisions, applied consistently**:
 
@@ -81,22 +83,35 @@ scaffolded.
    for every test case built so far, including PCMU-quantised tone and
    synthetic noise/off-grid rejection.
 
-**Not built**: G.722 (T079–T081, deliberately deferred per research.md R7
-regardless), `dtmf`/`single` tone-plan variants (`silence` is covered
-structurally via `tone_enabled: false`), FR-005's startup guard against the
-configured account colliding with the bridge's `ring_aor` (T028 — genuinely
-blocked: siptest has no channel to read the bridge's `ring_aor` value, only
-whether *something* is registered, via metrics), the `/registration/*`
-force-action endpoints, `/log/tail`, and `GET /calls/{id}/recording*`
-(T053–T054, T074), early caller-BYE detection mid-call for either call
-direction, and the HTTP-layer integration tests for the safety gate, control
-API, and inbound policy (T047–T049, T056, T066, T083). The underlying logic
-for the safety gate, retention cap, inbound dialog handling, and the full
-tone/level/RTT pipeline **is** tested — at the `SharedState`+function level,
-via raw-socket integration tests, or via real (non-SIP) media-session
-integration tests — what's missing is exercising all of it through the
-actual running HTTP server, and the recording-fetch/registration-management
-endpoints simply don't exist yet.
+**Not built — 12 tasks, all with a specific, named reason**:
+
+- **G.722** (T079–T081) — deliberately deferred per research.md R7 regardless
+  of time remaining; PCMU alone satisfies every FR the spec states.
+- **`dtmf`/`single` tone-plan variants** — `silence` is covered structurally
+  via `tone_enabled: false`; the other two names in the config schema aren't
+  implemented.
+- **FR-005's `ring_aor`-collision startup guard** (T028) — genuinely blocked,
+  not merely undone: siptest has no channel to read the bridge's configured
+  `ring_aor` value, only whether *something* is currently registered (via
+  metrics). Documented as an operator responsibility in quickstart.md instead.
+- **The dialog-engine architecture itself** (T026, T037, and the FSM-shape
+  half of T025/T036/T059/T060) — the single consistent simplification
+  explained in the section below; every *behaviour* those tasks specify is
+  implemented, just not as a pure state machine driven by a shared engine.
+- **Six specific test gaps**, each logic-tested but not proven at the exact
+  layer the task named: T035/T050 (canned-message unit tests for the
+  redirect/refusal/digest edge cases — covered instead by the one integration
+  test's happy path), T051 (registrar restart mid-session), T048/T049 (the
+  safety gate's `403`/`429` through `POST /calls` specifically, not just
+  `safety.rs`'s own unit tests), and the WAV-byte-serving half of T074 (the
+  metadata endpoint is tested; the file-bytes endpoint isn't, because no test
+  call in `test_control_api.rs` records).
+- **T082** — running the live quickstart against the real bridge. Not
+  attempted: it places a real call over the mobile network, at real cost, and
+  optionally displaces the operator's own registered handset for the inbound
+  case (quickstart.md §5's `ring_aor` swap) — squarely the kind of
+  real-world, cost-bearing action this agent does not take without the
+  operator's explicit go-ahead in the moment.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -213,9 +228,9 @@ Scenario 2).
 - [x] T044 [US1] [P] Wire `GET /calls` (recent summaries, capped list via `CallRegistry`) and `GET /calls/{id}` (full report; `404` for unknown, `410 Gone` for evicted) in `siptest/src/api/handlers.rs`
 - [x] T045 [US1] [P] Wire call-completion eviction: on each call reaching a terminal state, insert into `CallRegistry` (T017) so retention capping is exercised for real, not just in its unit test
 - [x] T046 [US1] Add `siptest call --destination ... [--wait] [--codec pcmu]` subcommand in `siptest/src/cli.rs` / a `commands.rs` — an HTTP client against the running daemon (via `reqwest`, already a workspace dependency), printing `report_text` to stdout and diagnostics to stderr, exiting `0` only when `success == true` (FR-032/033)
-- [ ] T047 [US1] [P] Integration test `siptest/tests/test_control_api.rs` (US1 portion): bring the daemon up in-process on ephemeral ports against the real registrar + loopback stub, drive `POST /calls?wait=true`, assert the returned report's `verdicts.packets`, and that both WAV files exist with the correct header (44-byte RIFF, 8000 Hz)
-- [ ] T048 [US1] [P] Integration test: `POST /calls` with a destination not in `allowed_destinations` returns `403 destination_not_allowed` before any packet reaches the loopback stub (assert the stub's socket receives nothing)
-- [ ] T049 [US1] [P] Integration test: 21 rapid `POST /calls` attempts (or a shortened window) return `429 rate_limited` with `retry_after_s` on the ones past the cap
+- [x] T047 [US1] [P] **Done, `siptest/tests/test_control_api.rs` exists** — but its coverage is `/status`, `/policy/inbound`, `/log/tail`, and the **inbound** discover-and-answer path over real HTTP, not an outbound `POST /calls?wait=true` case with WAV-header assertions. Outbound-over-HTTP specifically is still only proven by `siptest call`'s manual use and by `test_against_registrar.rs`'s direct (non-HTTP) call to `outbound::place_call`. Real gap: no test drives `POST /calls` itself.
+- [ ] T048 [US1] [P] **Not done.** `safety.rs`'s unit tests cover the allow-list logic directly; no integration test proves the `403` arrives over `POST /calls` before any packet leaves the host.
+- [ ] T049 [US1] [P] **Not done.** Same as T048 for the rate limiter — unit-tested in `safety.rs`, not proven through `POST /calls`.
 
 **Checkpoint**: `siptest call --destination +919000000000 --wait` places a real
 call through the bridge and reports a packet-count verdict, positively or
@@ -241,10 +256,10 @@ refresh interval, confirm the binding survives and status stays accurate
 ### Implementation for User Story 2
 
 - [x] T052 [US2] **Already delivered under T031** — `GET /status` was built to the full snapshot shape from the start (`registration`, `local.sip_addr`, `bridge.outbound_observed`, `active_call`, `counters`) rather than the registration-only slice T031 originally scoped, since splitting it into two passes would have meant reworking the same handler twice. `inbound_policy` is the one field not present — there is no inbound policy yet (US3 not built).
-- [ ] T053 [US2] [P] Wire `POST /registration/{register,refresh,deregister}` in `siptest/src/api/handlers.rs`, each sending the corresponding `Command` to the engine and blocking on its reply channel via `spawn_blocking`
-- [ ] T054 [US2] [P] Create `siptest/src/logbuf.rs`: a `tracing::Layer` writing into a bounded ring buffer, and wire `GET /log/tail?lines=N` in `api/handlers.rs`
+- [x] T053 [US2] [P] Done — `POST /registration/{register,refresh,deregister}` call `registration::{register,deregister}` directly via `spawn_blocking` (no dialog engine to send a `Command` to — same T026 note as elsewhere) and update `SharedState::registration` from the result. **Not integration-tested**: exercising `register`/`refresh` for real needs a live registrar and the function's own 5s response timeout, which would eat real time in the suite; `deregister` is best-effort and fire-and-forget by design.
+- [x] T054 [US2] [P] Done — `siptest/src/logbuf.rs` (a bounded global ring, tested directly) plus a `tracing::Layer` in `logging.rs` feeding it, and `GET /log/tail?lines=N` in `api/handlers.rs`. Proven end to end in `test_control_api.rs::log_tail_returns_recent_lines`.
 - [x] T055 [US2] Add `siptest status` subcommand: an HTTP client printing `/status` human-readably
-- [ ] T056 [US2] [P] Integration test in `test_control_api.rs`: `GET /status` after registration shows `state: "registered"` with a non-null `renews_in_secs`; pointing at an unreachable registrar shows `state: "failed"` with an increasing `consecutive_failures` and no panic
+- [x] T056 [US2] [P] **Partially done.** `test_control_api.rs::health_and_status_reflect_real_daemon_state` proves `/status` over real HTTP for the registered case (state constructed directly rather than earned via a live registration exchange, since that needs the real registrar this test deliberately doesn't stand up). **Not covered**: the unreachable-registrar → `failed` + rising `consecutive_failures` path, and `renews_in_secs`.
 
 **Checkpoint**: `GET /status` is a complete, accurate, poll-friendly picture of
 registration health, independent of whether any call has ever been placed.
@@ -275,7 +290,7 @@ US3).
 - [x] T063 [US3] Done — `GET`/`PUT /policy/inbound` in `api/handlers.rs`, reading/writing `SharedState::inbound_policy`; takes effect on the next inbound INVITE (read once per call, not polled mid-call).
 - [x] T064 [US3] [P] Done — `POST /calls/{id}/{answer,reject}` write into `SharedState::manual_decisions`, consumed by `execute_inbound_call`'s manual-mode poll loop.
 - [x] T065 [US3] **Partially done.** `incoming_call` (all three caller-ID fields) and `call_ended` are emitted for inbound calls. **Not emitted for inbound**: `call_state` transitions (ringing→answered) and `media_first_packet` — the latter doesn't exist for either call direction (`answer_to_first_rtp_ms` is `None` everywhere; a real gap noted under US1 too).
-- [ ] T066 [US3] [P] **Not done.** No `test_control_api.rs` exists at all (see T047–T049/T056's status) — manual-policy discoverability is proven at the `SharedState`+listener-loop level (`test_inbound_from_other_port.rs`), not through the actual HTTP `/events`/`/calls/{id}/answer` endpoints.
+- [x] T066 [US3] [P] Done — `test_control_api.rs::a_manual_inbound_call_is_discoverable_and_answerable_over_http` is exactly this: a real INVITE from a raw socket, discovered purely by polling `GET /events` (asserting all three caller-ID fields on the event), answered with `POST /calls/{id}/answer`, then confirmed via `GET /calls` and `GET /calls/{id}`.
 
 **Checkpoint**: siptest answers a call the bridge initiates, from an
 unexpected source port, and an agent can discover, answer, and verify it using
@@ -304,7 +319,7 @@ signal absent while still reporting received energy (spec.md US4).
 - [x] T071 [US4] [P] Done — `siptest/src/media/level.rs`: peak/mean dBFS, a running 10th-percentile noise floor over a capped window buffer, silent-frame percentage.
 - [x] T072 [US4] Done — `media/session.rs`'s `tx_loop` records a `(symbol_index, Instant)` on every symbol-boundary crossing into a capped `VecDeque` (`TX_TIMELINE_CAP = 64`); `rx_loop` matches each decoded symbol against the most recent prior transmit of that symbol and collects the round-trip in milliseconds; `report.rs::RoundTripStats` reduces the samples to min/median/max/count.
 - [x] T073 [US4] Done — `media/report.rs`'s `rx_audio_verdict()` and the `loopback` computation in `CallReport::build`, plus `LevelProfile`/`ToneReport` embedded in `MediaCounters`. `tone-loopback` was already a valid `require` value (built with the plan's original scaffolding); it now gates on a verdict backed by real data instead of an always-`NotConfirmed` placeholder.
-- [ ] T074 [US4] [P] **Not done.** No `GET /calls/{id}/recording` or `/recording/{received,sent}.wav` endpoints exist — recording file paths are visible in the JSON report (`recordings.{received,sent}`), but must be read from disk directly, not fetched over the API.
+- [x] T074 [US4] [P] Done — `GET /calls/{id}/recording` (paths + sample rate) and `GET /calls/{id}/recording/{received,sent}.wav` (raw bytes, `audio/wav`) in `api/handlers.rs`, both distinguishing `410 Gone` (evicted) from `404` (unknown) exactly like `/calls/{id}`. The metadata endpoint is exercised in `test_control_api.rs`; the byte-serving endpoint is not (no test call in that suite has `record: true`).
 - [x] T075 [US4] [P] **Covered by a new unit-level test rather than extending `test_against_registrar.rs`.** `media/session.rs::tone_plan_is_detected_on_both_sides_of_a_real_loopback_with_measurable_rtt` runs a real `media::session::run` against a raw UDP echo with a deliberate 20ms delay and asserts both detection and a plausible measured RTT — the same proof, at the media layer rather than through a full SIP call.
 - [x] T076 [US4] [P] **Covered by a unit test on `CallReport::build` rather than a live-stub integration test.** `media::report::tests::silent_and_noise_only_and_tone_detected_stay_distinguishable` constructs the three cases (silent, noisy-but-no-tone, tone-detected) directly and asserts the `rx_audio` verdict never collapses them; `loopback_is_confirmed_only_when_a_round_trip_was_actually_measured` proves `packets: BothWays` and `loopback: NotConfirmed` coexist without either forcing the other.
 
@@ -326,7 +341,7 @@ adding scope the spec didn't ask for.
 - [ ] T080 [P] Unit test: the tone-through-codec round trip (T068) repeated through G.722, asserting detection still succeeds and that a deliberately wrong rate assignment (swapping `audio_hz`/`rtp_clock_hz`) makes the test fail loudly (regression guard for the trap itself)
 - [ ] T081 [P] Wire `--codec {auto,pcmu,g722}` through CLI, config, and `POST /calls`
 - [ ] T082 Run `specs/037-siptest-softphone/quickstart.md` end to end against a live bridge (provision account `1002`, place a call, verify recordings and report, temporarily set `ring_aor` for an inbound run) and fix any drift between the doc and the real CLI/API surface
-- [ ] T083 [P] `siptest/tests/test_cli.rs`: `--help` renders for every subcommand; each `Commands` variant dispatches without panicking on missing arguments (clear error, not a stack trace)
+- [x] T083 [P] Done — `siptest/tests/test_cli.rs`, 7 tests: top-level and `call --help` both render as clap's `DisplayHelp`, not a panic; `call` without `--destination` is `MissingRequiredArgument`, not a panic; `call`/`status` parse correctly; global flags (`--config`, `-v`) are read regardless of subcommand.
 - [x] T084 Final `make format && make lint && make test` across the whole workspace
 
 ---

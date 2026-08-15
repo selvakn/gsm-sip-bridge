@@ -19,6 +19,7 @@ use crate::sip::socket::SipSocket;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct RegistrationConfig {
     pub registrar_addr: SocketAddr,
     pub registrar_host: String,

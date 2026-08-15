@@ -74,6 +74,7 @@ fn run_with_config(config: Config) -> SipTestResult<()> {
             cached_nonce: None,
             nc: 0,
         }),
+        registration_config: reg_config.clone(),
         inbound_policy: Mutex::new(InboundPolicy {
             mode: config.inbound.mode.parse().unwrap_or(InboundMode::Answer),
             answer_delay_ms: config.inbound.answer_delay_ms,

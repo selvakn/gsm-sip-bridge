@@ -155,6 +155,7 @@ pub struct SharedState {
     pub next_call_seq: Mutex<u64>,
     pub sip_socket: Arc<crate::sip::socket::SipSocket>,
     pub registration_creds: Mutex<crate::sip::registration::RegistrationCredentials>,
+    pub registration_config: crate::sip::registration::RegistrationConfig,
     pub inbound_policy: Mutex<InboundPolicy>,
     pub manual_decisions: Mutex<std::collections::HashMap<CallId, ManualDecision>>,
 }

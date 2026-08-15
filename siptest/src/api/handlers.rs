@@ -319,6 +319,164 @@ fn default_timeout_ms() -> u64 {
     25000
 }
 
+pub async fn recording_info(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let calls = state.calls.lock().unwrap_or_else(|e| e.into_inner());
+    match calls.lookup(&CallId(id.clone())) {
+        Lookup::Found(call) => {
+            let (received, sent, sample_rate) = call
+                .report
+                .as_ref()
+                .map(|r| {
+                    (
+                        r.recordings.received.clone(),
+                        r.recordings.sent.clone(),
+                        r.media.audio_hz,
+                    )
+                })
+                .unwrap_or((None, None, 0));
+            (
+                StatusCode::OK,
+                Json(json!({"received": received, "sent": sent, "sample_rate": sample_rate})),
+            )
+                .into_response()
+        }
+        Lookup::Evicted => error_response(SipTestError::CallEvicted(id)),
+        Lookup::NotFound => error_response(SipTestError::CallNotFound(id)),
+    }
+}
+
+/// `which` is `received.wav` or `sent.wav`, matching contracts/control-api.md.
+pub async fn recording_file(
+    State(state): State<AppState>,
+    Path((id, which)): Path<(String, String)>,
+) -> Response {
+    let path = {
+        let calls = state.calls.lock().unwrap_or_else(|e| e.into_inner());
+        let call = match calls.lookup(&CallId(id.clone())) {
+            Lookup::Found(call) => call,
+            Lookup::Evicted => return error_response(SipTestError::CallEvicted(id)),
+            Lookup::NotFound => return error_response(SipTestError::CallNotFound(id)),
+        };
+        let Some(report) = &call.report else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "recording_not_found"})),
+            )
+                .into_response();
+        };
+        let path = match which.as_str() {
+            "received.wav" => report.recordings.received.clone(),
+            "sent.wav" => report.recordings.sent.clone(),
+            _ => None,
+        };
+        match path {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "recording_not_found"})),
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "recording_file_missing"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LogTailQuery {
+    #[serde(default = "default_log_lines")]
+    pub lines: usize,
+}
+
+fn default_log_lines() -> usize {
+    200
+}
+
+pub async fn log_tail(Query(q): Query<LogTailQuery>) -> Json<serde_json::Value> {
+    Json(json!({ "lines": crate::logbuf::tail(q.lines) }))
+}
+
+async fn registration_action(state: AppState) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut creds = state
+            .registration_creds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::sip::registration::register(
+            &state.sip_socket,
+            &state.registration_config,
+            &mut creds,
+        )
+        .inspect(|status| {
+            *state.registration.lock().unwrap_or_else(|e| e.into_inner()) = status.clone();
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(status)) => (
+            StatusCode::OK,
+            Json(json!({
+                "state": format!("{:?}", status.state).to_lowercase(),
+                "granted_expires": status.granted_expires,
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => error_response(e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "internal_error"})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn force_register(State(state): State<AppState>) -> Response {
+    registration_action(state).await
+}
+
+pub async fn force_refresh(State(state): State<AppState>) -> Response {
+    registration_action(state).await
+}
+
+pub async fn force_deregister(State(state): State<AppState>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut creds = state
+            .registration_creds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::sip::registration::deregister(
+            &state.sip_socket,
+            &state.registration_config,
+            &mut creds,
+        );
+        *state.registration.lock().unwrap_or_else(|e| e.into_inner()) =
+            crate::sip::registration::RegistrationStatus::default();
+    })
+    .await;
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "internal_error"})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn events(
     State(state): State<AppState>,
     Query(q): Query<EventsQuery>,
