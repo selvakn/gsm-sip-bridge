@@ -4,22 +4,35 @@ set -uo pipefail
 count_unsafe() {
     local dir="$1"
     local count
-    count=$(grep -rn "unsafe" "$dir" 2>/dev/null | grep -v "//.*unsafe" | wc -l)
+    # Matches an actual `unsafe` keyword use (a block, or an fn/impl/trait
+    # marked unsafe), not the bare word appearing in prose — a doc comment
+    # or string mentioning "unsafe" must not fail the crate.
+    count=$(grep -rnE '\bunsafe\s*[{(]|\bunsafe\s+(fn|impl|trait)\b' "$dir" 2>/dev/null | wc -l)
     echo "${count// /}"
 }
 
-BRIDGE_UNSAFE=$(count_unsafe "gsm-sip-bridge/src/")
+# Crates required to be zero-`unsafe`. siptest joins gsm-sip-bridge here
+# (specs/037-siptest-softphone) — this script used to hardcode only the
+# latter, so a new crate was never actually checked.
+ZERO_UNSAFE_DIRS=("gsm-sip-bridge/src/" "siptest/src/")
 SAFE_UNSAFE=$(count_unsafe "pjsua-safe/src/")
 SAFE_TOTAL=$(find pjsua-safe/src/ -name '*.rs' -exec cat {} + 2>/dev/null | wc -l)
 SAFE_TOTAL="${SAFE_TOTAL// /}"
 : "${SAFE_TOTAL:=1}"
 
 echo "=== Unsafe Block Count ==="
-echo "  gsm-sip-bridge/src: ${BRIDGE_UNSAFE} unsafe blocks"
+FAILED=0
+for dir in "${ZERO_UNSAFE_DIRS[@]}"; do
+    count=$(count_unsafe "$dir")
+    echo "  ${dir}: ${count} unsafe blocks"
+    if [ "${count}" -gt 0 ]; then
+        echo "FAIL: ${dir} must contain zero unsafe blocks"
+        FAILED=1
+    fi
+done
 echo "  pjsua-safe/src:     ${SAFE_UNSAFE} unsafe blocks (${SAFE_TOTAL} total lines)"
 
-if [ "${BRIDGE_UNSAFE}" -gt 0 ]; then
-    echo "FAIL: gsm-sip-bridge must contain zero unsafe blocks"
+if [ "${FAILED}" -eq 1 ]; then
     exit 1
 fi
 
