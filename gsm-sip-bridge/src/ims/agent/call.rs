@@ -175,7 +175,13 @@ impl DialogInfo {
                 let end = c[start..].find('>')? + start;
                 Some(c[start..end].to_string())
             })
-            .unwrap_or_else(|| callee_uri.to_string());
+            // `callee_uri` is a bare `user@host`, so the scheme has to go back
+            // on: a `Contact`-less response produced `BYE +91...@ims... SIP/2.0`
+            // with no `sip:` at all, which Jio refused
+            // `400 Bad Request - P - 16004` (observed 2026-08-15, when the
+            // dialog was mistakenly built from a PRACK's response — those carry
+            // no Contact).
+            .unwrap_or_else(|| format!("sip:{callee_uri}"));
 
         let to = resp
             .header("To")
