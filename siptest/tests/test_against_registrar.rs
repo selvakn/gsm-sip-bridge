@@ -395,3 +395,61 @@ fn an_invite_from_a_different_socket_than_the_registered_one_is_refused() {
     assert_eq!(outcome.final_status, 403);
     assert_eq!(outcome.refusal_reason, Some("untrusted_source"));
 }
+
+/// T051: the registrar bouncing mid-session (a real restart, not merely a
+/// dropped packet) must not leave siptest permanently deregistered — the
+/// same `register()` call `daemon::registration_loop`'s refresh timer would
+/// make on its next cycle has to succeed again once a registrar is back,
+/// carrying the same credentials forward rather than needing a fresh dialog.
+/// (The other half of T051 — advancing a fake clock to prove the *timer*
+/// itself fires on schedule — would need an injectable clock seam that
+/// doesn't exist anywhere in this crate; adding one is new production code,
+/// not a test, so it is left out rather than faked.)
+#[test]
+fn registration_recovers_after_the_registrar_is_stopped_and_restarted_on_the_same_port() {
+    let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let registrar_addr = registrar_socket.local_addr().unwrap();
+    let mut registrar = Registrar::start_on(registrar_socket, &server_config()).unwrap();
+
+    let sip_socket =
+        SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
+    let reg_config = RegistrationConfig {
+        registrar_addr,
+        registrar_host: REALM.to_string(),
+        aor_user: USER.to_string(),
+        realm: REALM.to_string(),
+        password: Secret::new(PASSWORD.to_string()),
+        expires: 300,
+    };
+    let mut creds = RegistrationCredentials {
+        cseq: 0,
+        call_id: "reg-call-id-restart".to_string(),
+        from_tag: "reg-from-tag-restart".to_string(),
+        cached_nonce: None,
+        nc: 0,
+    };
+
+    let first = register(&sip_socket, &reg_config, &mut creds).unwrap();
+    assert_eq!(
+        first.state,
+        siptest::sip::registration::RegState::Registered,
+        "expected the initial registration to succeed: {:?}",
+        first.last_status
+    );
+
+    // A real restart: stop the old registrar (frees the port), then bind a
+    // brand new one on the exact same address — a fresh `Registrar` with an
+    // empty binding table, standing in for a process restart rather than a
+    // network blip.
+    registrar.stop();
+    let restarted_socket = UdpSocket::bind(registrar_addr).unwrap();
+    let _registrar2 = Registrar::start_on(restarted_socket, &server_config()).unwrap();
+
+    let second = register(&sip_socket, &reg_config, &mut creds).unwrap();
+    assert_eq!(
+        second.state,
+        siptest::sip::registration::RegState::Registered,
+        "expected re-registration against the restarted registrar to succeed: {:?}",
+        second.last_status
+    );
+}

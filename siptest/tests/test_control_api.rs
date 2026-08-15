@@ -204,6 +204,87 @@ async fn posting_an_unknown_codec_is_rejected_with_400_before_dialling() {
     assert_eq!(body["error"], "invalid_codec");
 }
 
+/// T048: `safety.rs`'s allow-list is unit-tested in isolation, but the
+/// point of the gate is that a disallowed destination's `INVITE` never
+/// leaves the host — proven here by going through the real `POST /calls`
+/// handler with the default (fail-closed, empty allow-list) config, not by
+/// calling `SafetyPolicy::check` directly.
+#[tokio::test]
+async fn posting_a_disallowed_destination_is_rejected_with_403_before_dialling() {
+    let config = test_config();
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let state = build_state(config, sip_socket, true);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/calls"))
+        .json(&serde_json::json!({"destination": "+919000000000"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "destination_not_allowed");
+}
+
+/// T049: same proof as T048, for the rate limiter — a second call inside
+/// `min_call_interval_secs` of the first is rejected with `429` and a
+/// `retry_after_s`, through the real HTTP handler, not `safety.rs`'s own
+/// unit tests. The first call is left to actually run (nothing answers
+/// `127.0.0.1:1`, so it fails via the configured ring timeout) because the
+/// attempt is only recorded once a call clears every earlier gate — the
+/// same ordering `posting_an_unknown_codec_is_rejected...` relies on for
+/// codec validation to run before this one.
+#[tokio::test]
+async fn a_second_call_within_the_minimum_interval_is_rejected_with_429() {
+    let mut config = test_config();
+    config.safety.allowed_destinations = vec!["+919000000000".to_string()];
+    config.safety.min_call_interval_secs = 3600;
+    config.call.ring_timeout_secs = 1;
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let state = build_state(config, sip_socket, true);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{base}/calls"))
+        .json(&serde_json::json!({"destination": "+919000000000"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "the first call should clear the safety gate and run (and then fail to connect, which is fine)"
+    );
+
+    let second = client
+        .post(format!("{base}/calls"))
+        .json(&serde_json::json!({"destination": "+919000000000"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(body["error"], "rate_limited");
+    assert!(body["retry_after_s"].as_u64().unwrap() > 0);
+}
+
 #[tokio::test]
 async fn inbound_policy_can_be_read_and_updated_over_http() {
     let config = test_config();

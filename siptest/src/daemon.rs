@@ -205,19 +205,17 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
                     serde_json::json!({"registered": registered, "granted_expires": expires}),
                 );
                 if registered {
-                    let refresh_in = expires.map(|e| (e / 2).max(30)).unwrap_or(60);
-                    sleep_unless_stopped(&stop, Duration::from_secs(refresh_in as u64));
+                    sleep_unless_stopped(
+                        &stop,
+                        Duration::from_secs(refresh_interval_secs(expires) as u64),
+                    );
                 } else {
                     let failures = state
                         .registration
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .consecutive_failures;
-                    let backoff = [2u64, 4, 8, 16, 30]
-                        .get(failures.min(4) as usize)
-                        .copied()
-                        .unwrap_or(30);
-                    sleep_unless_stopped(&stop, Duration::from_secs(backoff));
+                    sleep_unless_stopped(&stop, Duration::from_secs(backoff_secs(failures)));
                 }
             }
             Err(e) => {
@@ -244,5 +242,57 @@ fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
         }
         std::thread::sleep(step.min(d - waited));
         waited += step;
+    }
+}
+
+/// Half the granted lease, floored at 30s so a short-lived grant doesn't
+/// drive a refresh storm. Falls back to 60s when the registrar granted no
+/// `Expires` at all.
+fn refresh_interval_secs(granted_expires: Option<u32>) -> u32 {
+    granted_expires.map(|e| (e / 2).max(30)).unwrap_or(60)
+}
+
+/// The documented backoff ladder for consecutive registration failures —
+/// 2/4/8/16/30s, holding at 30s past the fourth failure.
+fn backoff_secs(consecutive_failures: u32) -> u64 {
+    [2u64, 4, 8, 16, 30]
+        .get(consecutive_failures.min(4) as usize)
+        .copied()
+        .unwrap_or(30)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_interval_is_half_the_grant_floored_at_thirty_seconds() {
+        assert_eq!(refresh_interval_secs(Some(300)), 150);
+        assert_eq!(
+            refresh_interval_secs(Some(40)),
+            30,
+            "20 would be below the floor"
+        );
+        assert_eq!(
+            refresh_interval_secs(Some(20)),
+            30,
+            "10 would be below the floor"
+        );
+        assert_eq!(
+            refresh_interval_secs(None),
+            60,
+            "no granted Expires falls back to a fixed 60s"
+        );
+    }
+
+    #[test]
+    fn backoff_follows_the_documented_ladder_and_holds_at_thirty() {
+        assert_eq!(backoff_secs(0), 2);
+        assert_eq!(backoff_secs(1), 4);
+        assert_eq!(backoff_secs(2), 8);
+        assert_eq!(backoff_secs(3), 16);
+        assert_eq!(backoff_secs(4), 30);
+        assert_eq!(backoff_secs(5), 30, "past the ladder's end, holds at 30s");
+        assert_eq!(backoff_secs(100), 30);
     }
 }

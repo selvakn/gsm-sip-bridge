@@ -22,15 +22,17 @@ engine skeleton, registration itself — is front-loaded, because US1 and US3
 cannot function without a live registration and US2 *is* the registration
 lifecycle's own acceptance criteria.
 
-## Implementation status (as of the fifth /speckit.implement pass)
+## Implementation status (as of the sixth /speckit.implement pass)
 
 **Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), Phase 3 (US1
-— outbound calling), Phase 5 (US3 — inbound calling), Phase 6 (US4 —
-tone/Goertzel/RTT) in full, plus almost all of Phase 4 (US2) and Phase 7's
-G.722 trio (T079–T081, this pass), plus FR-005's startup guard (T028) marked
-won't-do by the user. **76 of 84 tasks resolved.** `make format && make lint
-&& make test` all pass across the whole workspace, zero `unsafe`, zero
-clippy warnings. `siptest call --destination ... --wait` genuinely places a
+— outbound calling), Phase 4 (US2 — registration), Phase 5 (US3 — inbound
+calling), Phase 6 (US4 — tone/Goertzel/RTT) all in full now, plus Phase 7's
+G.722 trio (T079–T081) and its remaining test-coverage tasks (T035, T048–T051,
+this pass), plus FR-005's startup guard (T028) marked won't-do by the user.
+**81 of 84 tasks resolved** — every remaining unchecked task (T026, T037,
+T082) has a specific, named reason below, not an oversight. `make format &&
+make lint && make test` all pass across the whole workspace, zero `unsafe`,
+zero clippy warnings. `siptest call --destination ... --wait` genuinely places a
 call through a real bridge's registrar, follows the `302` redirect, exchanges
 real audio (PCMU or, since this pass, G.722 — `--codec {auto,pcmu,g722}`)
 carrying the `grid8` tone plan by default, records both directions, and
@@ -48,9 +50,17 @@ round trip too. **All three MVPs (outbound, inbound, tone-verified audio)
 are real and tested**, not scaffolded, and `test_control_api.rs` proves the
 two headline flows (an inbound call discovered and answered purely by
 polling `GET /events`, `/status`/`/policy`/`/log/tail` reflecting real state,
-plus a bad `codec` value rejected with `400` before ever dialling) through
-the **actual running HTTP server** with `reqwest`, not just at the function
-or raw-socket level. `test_cli.rs` covers the CLI parser directly.
+plus a bad `codec` value and a safety-gate refusal (`403`/`429`) each
+rejected before ever dialling) through the **actual running HTTP server**
+with `reqwest`, not just at the function or raw-socket level. `test_cli.rs`
+covers the CLI parser directly. This pass also closed every remaining named
+test-coverage gap that didn't require new production behaviour: the
+outbound refusal/CANCEL/malformed-redirect edge cases (T035, against a
+scripted UDP registrar), the registration `423`/second-401/unrecognised-status
+edge cases plus the refresh-interval and backoff-ladder math (T050, the
+latter extracted from `daemon.rs` into pure, directly-tested functions), and
+a real registrar stop/restart recovery test (T051) — see each task's own
+note for exactly what was and wasn't in scope.
 
 **Three architecture decisions, applied consistently**:
 
@@ -94,7 +104,8 @@ channel to read the bridge's configured `ring_aor` value, only whether
 account stays a documented operator responsibility in quickstart.md instead
 of an enforced check.
 
-**Not built — 8 tasks, all with a specific, named reason**:
+**Not built — 3 tasks (T026, T037, T082), plus two smaller named gaps below
+that never had their own task IDs**:
 
 - **`dtmf`/`single` tone-plan variants** — `silence` is covered structurally
   via `tone_enabled: false`; the other two names in the config schema aren't
@@ -103,14 +114,9 @@ of an enforced check.
   half of T025/T036/T059/T060) — the single consistent simplification
   explained in the section below; every *behaviour* those tasks specify is
   implemented, just not as a pure state machine driven by a shared engine.
-- **Six specific test gaps**, each logic-tested but not proven at the exact
-  layer the task named: T035/T050 (canned-message unit tests for the
-  redirect/refusal/digest edge cases — covered instead by the one integration
-  test's happy path), T051 (registrar restart mid-session), T048/T049 (the
-  safety gate's `403`/`429` through `POST /calls` specifically, not just
-  `safety.rs`'s own unit tests), and the WAV-byte-serving half of T074 (the
-  metadata endpoint is tested; the file-bytes endpoint isn't, because no test
-  call in `test_control_api.rs` records).
+- **The WAV-byte-serving half of T074** — the recording metadata endpoint is
+  tested; the file-bytes endpoint isn't, because no test call in
+  `test_control_api.rs` records.
 - **T082** — running the live quickstart against the real bridge. Not
   attempted: it places a real call over the mobile network, at real cost, and
   optionally displaces the operator's own registered handset for the inbound
@@ -218,11 +224,11 @@ Scenario 2).
 
 - [x] T033 [P] [US1] Integration test `siptest/tests/test_against_registrar.rs`: start the bridge's real `Registrar::start_on_with_outbound` (already `pub`, `gsm-sip-bridge/src/sip/server/mod.rs:96`) on `127.0.0.1:0`, run siptest's production registration + outbound FSMs against it, receive the real `302`, ACK it, re-INVITE a loopback stub UAS (a plain `UdpSocket` in the test file answering `100`/`180`/`200 OK` + SDP and echoing received RTP) — assert registered, redirect followed to the stub's port, and `packets == BothWays`. In-file comment documenting why the stub UAS is the constitution's sanctioned "component not available in CI" carve-out (pjsua lives behind `pjsip-linked`, which CI never compiles)
 - [x] T034 [P] [US1] **Folded into `test_against_registrar.rs`** as `an_invite_from_a_different_socket_than_the_registered_one_is_refused` rather than a separate file — same coverage (a second socket's INVITE gets `403 untrusted_source`), just alongside the other registrar test since both share the `StubUas`/`server_config` fixtures.
-- [ ] T035 [P] [US1] Unit tests for `OutboundCallFsm` (to be created in T036) against canned `SipResponse`/`SipRequest` values: a `302` is ACKed and re-INVITEd to the Contact's port; a `302` whose Contact carries no port is refused rather than dialled on the registrar's port; each refusal (`403`/`484`/`503`/`400`) maps to a distinct named error; a ring timeout emits `CANCEL` reusing the INVITE's branch and expects `200`+`487`; an unknown `Require:` in a response is met with `420`+`Unsupported`
+- [x] T035 [P] [US1] **Done, scoped to what `place_call` actually implements.** `siptest/tests/test_outbound_edge_cases.rs` drives `outbound::place_call` against a scripted UDP registrar (three tests): each documented refusal (`403`/`484`/`503`/`400`) maps to its own named reason; a `302` whose Contact carries no port is refused as a `Config` error rather than dialled on the registrar's own port; a redirect target that never answers is abandoned at the ring timeout with a real `CANCEL` (captured by the stub) and reported as `487`/`ring_timeout`. **Not covered, and not implemented in production code either:** an unknown `Require:` met with `420`+`Unsupported` — `place_call` has no `Require:` handling at all, so writing that test would mean adding a new feature under cover of "test coverage," not filling a test gap; left out rather than faked.
 
 ### Implementation for User Story 1
 
-- [x] T036 [US1] **Delivered with the same scope reduction as T025.** `siptest/src/sip/outbound.rs`'s `place_call()` implements the full C-2 sequence — INVITE, 302 handling with the redirect target taken only from the response's `Contact`, 3xx-ACK, re-INVITE, 2xx-ACK, ring-timeout→CANCEL, refusal mapping (403/484/503/400) — as a blocking function rather than a pure FSM, and it is proven end to end against the real registrar (`test_against_registrar.rs`). Not covered: isolated unit tests for the CANCEL/487 and unknown-`Require`/420 branches specifically (see T035, not done).
+- [x] T036 [US1] **Delivered with the same scope reduction as T025.** `siptest/src/sip/outbound.rs`'s `place_call()` implements the full C-2 sequence — INVITE, 302 handling with the redirect target taken only from the response's `Contact`, 3xx-ACK, re-INVITE, 2xx-ACK, ring-timeout→CANCEL, refusal mapping (403/484/503/400) — as a blocking function rather than a pure FSM, proven end to end against the real registrar (`test_against_registrar.rs`) and, since T035, against a scripted one for the CANCEL/487 and refusal-mapping branches specifically. Unknown-`Require`/420 remains genuinely unimplemented (see T035's note).
 - [ ] T037 [US1] **N/A — no dialog engine exists (T026).** `execute_outbound_call` (`siptest/src/call.rs`) calls `outbound::place_call` directly from the API handler's blocking task instead of dispatching through a shared dialog table.
 - [x] T038 [US1] Create `siptest/src/media/session.rs`: per-call transmit thread (20ms cadence scheduled against **absolute deadlines** `start + n*ptime`, not `sleep(20ms)` after the work — sip-flows.md C-5 calls out `ims/call.rs:609`'s drift bug to not repeat) and receive thread (blocking `recv_from`, 1s timeout), each on its own RTP socket; **no channel from receive thread to transmit thread** (the echo.rs independence invariant, research.md R8)
 - [x] T039 [US1] In `media/session.rs`, feed received packets through `gsm_sip_bridge::ims::media_stats::ReceiveTracker::on_packet(seq, ts, arrival, rtp_clock_hz)` and compute the direction verdict via `media_stats::verdict(sent_packets, received_packets, threshold)` — pass **packets**, not samples (research.md R6 correction to existing practice)
@@ -234,8 +240,8 @@ Scenario 2).
 - [x] T045 [US1] [P] Wire call-completion eviction: on each call reaching a terminal state, insert into `CallRegistry` (T017) so retention capping is exercised for real, not just in its unit test
 - [x] T046 [US1] Add `siptest call --destination ... [--wait] [--codec pcmu]` subcommand in `siptest/src/cli.rs` / a `commands.rs` — an HTTP client against the running daemon (via `reqwest`, already a workspace dependency), printing `report_text` to stdout and diagnostics to stderr, exiting `0` only when `success == true` (FR-032/033)
 - [x] T047 [US1] [P] **Done, `siptest/tests/test_control_api.rs` exists** — but its coverage is `/status`, `/policy/inbound`, `/log/tail`, and the **inbound** discover-and-answer path over real HTTP, not an outbound `POST /calls?wait=true` case with WAV-header assertions. Outbound-over-HTTP specifically is still only proven by `siptest call`'s manual use and by `test_against_registrar.rs`'s direct (non-HTTP) call to `outbound::place_call`. Real gap: no test drives `POST /calls` itself.
-- [ ] T048 [US1] [P] **Not done.** `safety.rs`'s unit tests cover the allow-list logic directly; no integration test proves the `403` arrives over `POST /calls` before any packet leaves the host.
-- [ ] T049 [US1] [P] **Not done.** Same as T048 for the rate limiter — unit-tested in `safety.rs`, not proven through `POST /calls`.
+- [x] T048 [US1] [P] **Done.** `test_control_api.rs`'s `posting_a_disallowed_destination_is_rejected_with_403_before_dialling` drives the real `POST /calls` handler with the default fail-closed (empty allow-list) config and asserts `403 destination_not_allowed` over real HTTP, not `safety.rs`'s own unit tests.
+- [x] T049 [US1] [P] **Done.** `test_control_api.rs`'s `a_second_call_within_the_minimum_interval_is_rejected_with_429` places one real call (left to run and fail via the configured ring timeout, since the attempt is only recorded once every earlier gate clears) then asserts the immediately-following second call is refused `429 rate_limited` with a positive `retry_after_s`, over real HTTP.
 
 **Checkpoint**: `siptest call --destination +919000000000 --wait` places a real
 call through the bridge and reports a packet-count verdict, positively or
@@ -255,8 +261,8 @@ refresh interval, confirm the binding survives and status stays accurate
 
 ### Tests for User Story 2
 
-- [ ] T050 [P] [US2] Unit tests for `RegistrationFsm` (T025) against canned messages: `401` → digest `Authorization` with `qop=auth`, `nc=00000001`; `401` with `stale=true` adopts the new nonce and resets `nc` to 1; a **second** `401` on an already-authorised REGISTER is a hard failure, never a retry loop; `423` adopts `Min-Expires` and retries; refresh timer fires at `min(expires/2, expires-30s)` floor 30s; repeated timeouts drive the documented backoff ladder (2/4/8/16/30s) and increment `consecutive_failures`
-- [ ] T051 [P] [US2] Integration test `siptest/tests/test_against_registrar.rs` (US2 additions): register against the real in-process registrar, advance a fake/injectable clock past the refresh interval, assert re-REGISTER happens without dropping the binding (`Registrar`'s binding table still shows it live); kill and restart the registrar mid-session and assert siptest recovers registration automatically
+- [x] T050 [P] [US2] **Done, scoped to what actually differs code-path-wise.** `siptest/tests/test_registration_edge_cases.rs` drives `registration::register` against a scripted UDP registrar: `423` adopts `Min-Expires` and then completes a normal digest challenge (`401`→`Authorization`); a **second** `401` on an already-authorised REGISTER is a hard failure (`consecutive_failures: 1`, no retry loop); an unrecognised final status (e.g. `500`) is reported verbatim. The ordinary `401`→digest→`200` case (`qop=auth`, `nc=00000001`) is not repeated here — it's the exact path `test_against_registrar.rs`'s happy-path test already exercises against the *real* registrar. A `stale=true` challenge is, by inspection of `registration.rs`, not actually a distinct code path from a first ordinary `401` — the implementation adopts whatever nonce it's given unconditionally on the first challenge, `stale` or not — so a dedicated test for it would just re-run the same branch under a different name. The refresh-timer and backoff-ladder math (previously inline in `daemon::registration_loop`) were extracted to pure functions `refresh_interval_secs`/`backoff_secs` and unit-tested directly in `daemon.rs` (`refresh_interval_is_half_the_grant_floored_at_thirty_seconds`, `backoff_follows_the_documented_ladder_and_holds_at_thirty`) — same behaviour, now testable without spinning up the real timer thread.
+- [x] T051 [P] [US2] **Done, the restart half; the fake-clock half is out of scope.** `test_against_registrar.rs`'s `registration_recovers_after_the_registrar_is_stopped_and_restarted_on_the_same_port` registers against a real in-process `Registrar`, calls `Registrar::stop()`, rebinds a brand-new `Registrar` on the exact same address (an empty binding table — a real process restart, not a dropped packet), and asserts a second `register()` call with the same siptest socket and credentials succeeds again — the same call `daemon::registration_loop`'s refresh timer would make on its next cycle. Advancing a fake/injectable clock to prove the *timer itself* fires on schedule was not attempted: there is no injectable clock anywhere in this crate (`registration_loop` sleeps on the real wall clock), and adding one would be new production code introduced under cover of a test task, not a test.
 
 ### Implementation for User Story 2
 
