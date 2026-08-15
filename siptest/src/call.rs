@@ -263,6 +263,7 @@ pub fn execute_outbound_call(
         .record
         .then(|| recording_dir.join(format!("{}-received.wav", call_id.0)));
 
+    let tone_enabled = state.config.media.tone_plan != "silence";
     let stop = Arc::new(AtomicBool::new(false));
     let media_result = crate::media::session::run(
         crate::media::session::MediaSessionConfig {
@@ -272,6 +273,7 @@ pub fn execute_outbound_call(
             duration,
             sent_wav_path: sent_wav_path.clone(),
             received_wav_path: received_wav_path.clone(),
+            tone_enabled,
         },
         stop,
     )?;
@@ -293,7 +295,8 @@ pub fn execute_outbound_call(
         codec,
         media_result.sent_packets,
         &media_result.receive_stats,
-    );
+    )
+    .with_tone_and_level(&media_result.level, &media_result.tone);
     let recordings = Recordings {
         received: received_wav_path.map(|p| p.display().to_string()),
         sent: sent_wav_path.map(|p| p.display().to_string()),
@@ -551,6 +554,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 .record
                 .then(|| recording_dir.join(format!("{}-received.wav", call_id.0)));
 
+            let tone_enabled = state.config.media.tone_plan != "silence";
             let stop = Arc::new(AtomicBool::new(false));
             let media_result = crate::media::session::run(
                 crate::media::session::MediaSessionConfig {
@@ -560,6 +564,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                     duration,
                     sent_wav_path: sent_wav_path.clone(),
                     received_wav_path: received_wav_path.clone(),
+                    tone_enabled,
                 },
                 stop,
             );
@@ -594,7 +599,8 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 final_status: Some(200),
             };
             let media_counters =
-                MediaCounters::new(PCMU, media_result.sent_packets, &media_result.receive_stats);
+                MediaCounters::new(PCMU, media_result.sent_packets, &media_result.receive_stats)
+                    .with_tone_and_level(&media_result.level, &media_result.tone);
             let recordings = Recordings {
                 received: received_wav_path.map(|p| p.display().to_string()),
                 sent: sent_wav_path.map(|p| p.display().to_string()),

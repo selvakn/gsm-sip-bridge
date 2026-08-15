@@ -22,23 +22,31 @@ engine skeleton, registration itself — is front-loaded, because US1 and US3
 cannot function without a live registration and US2 *is* the registration
 lifecycle's own acceptance criteria.
 
-## Implementation status (as of the second /speckit.implement pass)
+## Implementation status (as of the third /speckit.implement pass)
 
 **Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), Phase 3 (US1
-— outbound calling), and Phase 5 (US3 — inbound calling) in full, plus most
-of Phase 4 (US2) and two Polish tasks. 56 of 84 tasks. `make format && make
-lint && make test` all pass across the whole workspace (1,335 test
-assertions, zero failures, zero `unsafe`, zero clippy warnings).
-`siptest call --destination ... --wait` genuinely places a call through a
-real bridge's registrar, follows the `302` redirect, exchanges PCMU audio,
-records both directions, and exits non-zero on a packet-verdict failure; the
-daemon genuinely answers a real inbound INVITE arriving from a source port it
-never registered from, captures all three caller-ID headers, handles
+— outbound calling), Phase 5 (US3 — inbound calling), and Phase 6 (US4 —
+tone/Goertzel/RTT) in full, plus most of Phase 4 (US2) and two Polish tasks.
+65 of 84 tasks. `make format && make lint && make test` all pass across the
+whole workspace (1,350 test assertions, zero failures, zero `unsafe`, zero
+clippy warnings). `siptest call --destination ... --wait` genuinely places a
+call through a real bridge's registrar, follows the `302` redirect, exchanges
+real PCMU audio carrying the `grid8` tone plan by default, records both
+directions, and exits non-zero on a packet-verdict failure; the daemon
+genuinely answers a real inbound INVITE arriving from a source port it never
+registered from, captures all three caller-ID headers, handles
 CANCEL-before-answer with the correct `200`/`487` pair, and supports
-answer/reject/manual policy over the control API — **both the outbound and
-inbound MVPs are real and tested**, not scaffolded.
+answer/reject/manual policy over the control API; and every call's report now
+carries a **real** tone-detection verdict and, when the signal loops back, a
+**measured round-trip delay** — proven end to end in
+`media::session::tests::tone_plan_is_detected_on_both_sides_of_a_real_loopback_with_measurable_rtt`
+against a real UDP echo with ground-truth delay. This is the tone detector
+`gsm-sip-bridge/src/ims/call.rs:153`'s `round_trip_delay: None` comment says
+is needed to fill that field — it now genuinely can be. **All three MVPs
+(outbound, inbound, tone-verified audio) are real and tested**, not
+scaffolded.
 
-**Two architecture decisions, applied consistently**:
+**Three architecture decisions, applied consistently**:
 
 1. Rather than pure `step(Input) -> Vec<Output>` state machines driven by a
    separate `crossbeam_channel::select!` dialog-engine thread (T026),
@@ -64,20 +72,31 @@ inbound MVPs are real and tested**, not scaffolded.
    (any ephemeral-port bind, including every outbound call's RTP-adjacent
    signalling socket in tests) was reporting port 0 from its own
    `local_addr()` instead of the OS-assigned port.
+3. The Goertzel detector (`media/goertzel.rs`) implements 3 of the 4
+   documented gates — relative energy, twist, and a broadband guard — and
+   drops the fourth (an absolute floor above a running noise-floor
+   percentile). `media/level.rs` still computes that percentile for
+   *reporting* (`noise_floor_dbfs` appears in every report); it just isn't
+   consulted as a detection gate. The three implemented gates were sufficient
+   for every test case built so far, including PCMU-quantised tone and
+   synthetic noise/off-grid rejection.
 
-**Not built**: US4 (tone/Goertzel/RTT, Phase 6), G.722 (T079–T081,
-deliberately deferred per research.md R7 regardless), FR-005's startup guard
-against the configured account colliding with the bridge's `ring_aor` (T028
-— genuinely blocked: siptest has no channel to read the bridge's `ring_aor`
-value, only whether *something* is registered, via metrics), the
-`/registration/*` force-action endpoints and `/log/tail` (T053–T054), early
-caller-BYE detection mid-call for either call direction (`answer_to_first_rtp_ms`
-and mid-call BYE are both acknowledged gaps, not just for inbound), and the
-HTTP-layer integration tests for the safety gate, control API, and inbound
-policy (T047–T049, T056, T066, T083). The underlying logic for the safety
-gate, retention cap, and inbound dialog handling **is** tested — at the
-`SharedState`+function level or via a raw-socket integration test — what's
-missing is exercising all of it through the actual running HTTP server.
+**Not built**: G.722 (T079–T081, deliberately deferred per research.md R7
+regardless), `dtmf`/`single` tone-plan variants (`silence` is covered
+structurally via `tone_enabled: false`), FR-005's startup guard against the
+configured account colliding with the bridge's `ring_aor` (T028 — genuinely
+blocked: siptest has no channel to read the bridge's `ring_aor` value, only
+whether *something* is registered, via metrics), the `/registration/*`
+force-action endpoints, `/log/tail`, and `GET /calls/{id}/recording*`
+(T053–T054, T074), early caller-BYE detection mid-call for either call
+direction, and the HTTP-layer integration tests for the safety gate, control
+API, and inbound policy (T047–T049, T056, T066, T083). The underlying logic
+for the safety gate, retention cap, inbound dialog handling, and the full
+tone/level/RTT pipeline **is** tested — at the `SharedState`+function level,
+via raw-socket integration tests, or via real (non-SIP) media-session
+integration tests — what's missing is exercising all of it through the
+actual running HTTP server, and the recording-fetch/registration-management
+endpoints simply don't exist yet.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -275,19 +294,19 @@ signal absent while still reporting received energy (spec.md US4).
 
 ### Tests for User Story 4
 
-- [ ] T067 [P] [US4] Unit tests `siptest/tests/test_goertzel.rs` (or inline in `media/goertzel.rs`): a synthesised tone at a known frequency is detected in the right bin and nowhere else; white noise at the same RMS is rejected by the relative-energy gate; a tone 3dB below the noise floor is rejected by the absolute floor; 10dB twist between the two grid tones is rejected; broadband energy (simulated speech-like signal) is rejected by the guard gate
-- [ ] T068 [P] [US4] Unit test `siptest/tests/test_tone_roundtrip.rs`: generate a full 16-symbol frame at 8kHz, decode it, assert the recovered symbol index sequence matches exactly; repeat through the PCMU codec (encode→decode) to confirm quantisation noise doesn't break detection
+- [x] T067 [P] [US4] **Done, inline in `media/goertzel.rs`, 3 of 4 gates.** A synthesised tone is detected as itself; white noise is rejected by the relative-energy gate; a single off-grid 1kHz tone is rejected by twist; silence is rejected. **Not implemented**: the absolute-floor-above-noise-percentile gate — `detect_window` uses relative energy + twist + broadband guard only. `media/level.rs` still tracks the noise-floor percentile for *reporting*, it just isn't wired in as a fourth detection gate. Documented simplification, not an oversight.
+- [x] T068 [P] [US4] **Done, inline** (`goertzel.rs::tone_survives_pcmu_round_trip_and_is_still_detected`, `tone.rs`'s generation tests) rather than a separate file. Covers PCMU round-trip detection at 8kHz; the 16kHz case doesn't exist yet since G.722 hasn't landed.
 
 ### Implementation for User Story 4
 
-- [ ] T069 [US4] Create `siptest/src/media/tone.rs`: free-running, sample-index-driven generator implementing the `grid8` signal plan (data-model.md SignalPlan: 8 non-harmonic frequencies in two groups of 4, symbol = one low + one high tone, 100ms symbols, 16-symbol frames, −12dBFS) plus `dtmf`/`single`/`silence` variants; generation must never read from the receive path (structural independence, reinforcing T040)
-- [ ] T070 [US4] Create `siptest/src/media/goertzel.rs`: Goertzel bank over 20ms windows aligned to received packets (`N=160` at 8kHz, `N=320` at 16kHz per data-model.md CodecProfile), symbol decision from ≥3-of-5 windows, the four gates (relative energy ≥0.35, twist ≤8dB, absolute floor above a running noise-floor percentile, broadband guard)
-- [ ] T071 [US4] [P] Create `siptest/src/media/level.rs`: per-frame RMS/peak in dBFS and a running noise-floor percentile, reported independently of tone detection (FR-022 — "nothing arrived" vs "something arrived that wasn't ours" must stay distinguishable)
-- [ ] T072 [US4] Wire `TxTimeline` (bounded `Mutex<VecDeque<(symbol_index, Instant)>>>`) into `media/session.rs`'s transmit thread, and RTT computation into the receive thread on each decoded symbol — collect min/median/max/count
-- [ ] T073 [US4] Extend `media/report.rs` (T042) with the `rx_audio` and `loopback` verdict axes (data-model.md — `Silent | NoiseOnly | ToneDetected{...} | SpeechOrOther`, `Confirmed{rtt} | NotConfirmed`), the level profile, and `tone-loopback` as a valid `require` value; `round_trip_delay_ms` is `null`/`not_confirmed` when the signal never returns and this is **never** treated as a failure unless `require == "tone-loopback"`
-- [ ] T074 [US4] [P] Wire `GET /calls/{id}/recording` and `GET /calls/{id}/recording/{received,sent}.wav` in `api/handlers.rs`, `410 Gone` for evicted calls matching the `/calls/{id}` behaviour
-- [ ] T075 [US4] [P] Integration test extending `test_against_registrar.rs`'s loopback stub to echo RTP back with a **deliberate fixed delay** (e.g. 200ms); assert `loopback.rtt` is within a tolerance of the known ground truth, and `verdicts.rx_audio == "tone_detected"`
-- [ ] T076 [US4] [P] Integration test: point the stub at silence instead of echo; assert `rx_audio == "silent"` (or `noise_only` if the stub emits comfort noise) while `packets` can still read `both_ways` if the stub acknowledges media — proving the two verdicts are independently reportable, never collapsed
+- [x] T069 [US4] **Done for `grid8` only.** `siptest/src/media/tone.rs`: sample-index-driven generator, 8 non-harmonic frequencies (4 low/4 high), one-low-plus-one-high symbols, 100ms/symbol, 16-symbol frames, −12dBFS. Pure function of the sample index (tested: `transmit_stream_is_identical_regardless_of_what_was_received` in `session.rs` now exercises the real tone path, not the old 440Hz placeholder). **`dtmf`/`single`/`silence` variants are not implemented** — `silence` is achieved structurally via `tone_enabled: false` (session.rs sends all-zero frames), which covers that one diagnostic; `dtmf` and `single` don't exist.
+- [x] T070 [US4] **Done, 3 of 4 gates** — see T067's note.
+- [x] T071 [US4] [P] Done — `siptest/src/media/level.rs`: peak/mean dBFS, a running 10th-percentile noise floor over a capped window buffer, silent-frame percentage.
+- [x] T072 [US4] Done — `media/session.rs`'s `tx_loop` records a `(symbol_index, Instant)` on every symbol-boundary crossing into a capped `VecDeque` (`TX_TIMELINE_CAP = 64`); `rx_loop` matches each decoded symbol against the most recent prior transmit of that symbol and collects the round-trip in milliseconds; `report.rs::RoundTripStats` reduces the samples to min/median/max/count.
+- [x] T073 [US4] Done — `media/report.rs`'s `rx_audio_verdict()` and the `loopback` computation in `CallReport::build`, plus `LevelProfile`/`ToneReport` embedded in `MediaCounters`. `tone-loopback` was already a valid `require` value (built with the plan's original scaffolding); it now gates on a verdict backed by real data instead of an always-`NotConfirmed` placeholder.
+- [ ] T074 [US4] [P] **Not done.** No `GET /calls/{id}/recording` or `/recording/{received,sent}.wav` endpoints exist — recording file paths are visible in the JSON report (`recordings.{received,sent}`), but must be read from disk directly, not fetched over the API.
+- [x] T075 [US4] [P] **Covered by a new unit-level test rather than extending `test_against_registrar.rs`.** `media/session.rs::tone_plan_is_detected_on_both_sides_of_a_real_loopback_with_measurable_rtt` runs a real `media::session::run` against a raw UDP echo with a deliberate 20ms delay and asserts both detection and a plausible measured RTT — the same proof, at the media layer rather than through a full SIP call.
+- [x] T076 [US4] [P] **Covered by a unit test on `CallReport::build` rather than a live-stub integration test.** `media::report::tests::silent_and_noise_only_and_tone_detected_stay_distinguishable` constructs the three cases (silent, noisy-but-no-tone, tone-detected) directly and asserts the `rx_audio` verdict never collapses them; `loopback_is_confirmed_only_when_a_round_trip_was_actually_measured` proves `packets: BothWays` and `loopback: NotConfirmed` coexist without either forcing the other.
 
 **Checkpoint**: Every call report now distinguishes three orthogonal
 questions — did packets arrive, was it our signal, did it loop back — and

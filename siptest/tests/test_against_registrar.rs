@@ -226,6 +226,7 @@ fn siptest_registers_places_a_call_through_a_302_redirect_and_carries_bothways_a
             duration: Duration::from_millis(600),
             sent_wav_path: None,
             received_wav_path: None,
+            tone_enabled: false,
         },
         stop,
     )
