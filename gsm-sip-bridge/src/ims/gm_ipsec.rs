@@ -25,6 +25,9 @@ pub struct SecurityServerParams {
     pub spi_s: u32,
     pub port_c: u16,
     pub port_s: u16,
+    /// The offer's `q=` preference, 0.0 when absent. Only meaningful for
+    /// ranking one offer against another — see `select_security_server`.
+    pub q: f32,
 }
 
 pub fn parse_security_server(header: &str) -> BridgeResult<SecurityServerParams> {
@@ -34,6 +37,7 @@ pub fn parse_security_server(header: &str) -> BridgeResult<SecurityServerParams>
     let mut spi_s = None;
     let mut port_c = None;
     let mut port_s = None;
+    let mut q = 0.0f32;
 
     for field in header.split(';').skip(1) {
         let field = field.trim();
@@ -48,6 +52,20 @@ pub fn parse_security_server(header: &str) -> BridgeResult<SecurityServerParams>
             "spi-s" => spi_s = value.parse::<u32>().ok(),
             "port-c" => port_c = value.parse::<u16>().ok(),
             "port-s" => port_s = value.parse::<u16>().ok(),
+            // `str::parse::<f32>` accepts the literal "nan" and returns
+            // `Ok(NaN)`, so `unwrap_or` alone never catches it. A `q=nan`
+            // offer would then win `select_security_server`'s `best.is_none()`
+            // branch unconditionally and stay unbeatable forever after --
+            // `x > NaN` is false for every later `x` under IEEE 754 -- so
+            // reject non-finite values explicitly rather than trusting them
+            // to fail to parse.
+            "q" => {
+                q = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0)
+            }
             _ => {}
         }
     }
@@ -59,6 +77,69 @@ pub fn parse_security_server(header: &str) -> BridgeResult<SecurityServerParams>
         spi_s: spi_s.ok_or_else(|| BridgeError::Ims("Security-Server missing spi-s=".into()))?,
         port_c: port_c.ok_or_else(|| BridgeError::Ims("Security-Server missing port-c=".into()))?,
         port_s: port_s.ok_or_else(|| BridgeError::Ims("Security-Server missing port-s=".into()))?,
+        q,
+    })
+}
+
+/// Auth/cipher algorithms `derive_auth_key`/`derive_cipher_key` can actually
+/// key. `des-ede3-cbc` is deliberately absent: its 192-bit key needs the
+/// TS 33.203 Annex I CK-expansion we don't implement.
+const SUPPORTED_AUTH: [&str; 2] = ["hmac-sha-1-96", "hmac-md5-96"];
+const SUPPORTED_CIPHER: [&str; 2] = ["aes-cbc", "null"];
+
+/// Pick which of the network's `Security-Server` offers to build SAs from.
+///
+/// A P-CSCF sends one header per algorithm combination it accepts, and we have
+/// to commit to exactly one *before* we can talk to it — the choice keys the
+/// SAs, and the network only learns it from the `Security-Verify` we send back
+/// over those very SAs. Choose the combination the P-CSCF isn't actually using
+/// and the failure is mute: our ESP goes out fine, its replies arrive and fail
+/// the integrity check, and the protected connection just times out
+/// (`XfrmInStateProtoError` climbing in `/proc/net/xfrm_stat` is the only
+/// direct evidence, observed live on Jio 2026-08-14).
+///
+/// Offers naming algorithms we cannot key are skipped rather than failed on —
+/// picking one would abort a registration the remaining offers could complete.
+/// Among what's left the highest `q` wins, which is the preference the network
+/// itself expressed; `want_auth`/`want_cipher` override that when a deployment
+/// has to pin a combination the q-ordering would not have chosen.
+/// Returns the parsed offer alongside its verbatim header text, which RFC 3329
+/// §2.4 requires be echoed back in `Security-Verify` — reserialising the parsed
+/// form instead would risk differing by a space and failing that check.
+pub fn select_security_server(
+    offers: &[&str],
+    want_auth: Option<&str>,
+    want_cipher: Option<&str>,
+) -> BridgeResult<(SecurityServerParams, String)> {
+    let mut best: Option<(SecurityServerParams, String)> = None;
+    for offer in offers {
+        let Ok(params) = parse_security_server(offer) else {
+            continue;
+        };
+        if !SUPPORTED_AUTH.contains(&params.alg.as_str())
+            || !SUPPORTED_CIPHER.contains(&params.ealg.as_str())
+        {
+            continue;
+        }
+        if want_auth.is_some_and(|w| w != params.alg) {
+            continue;
+        }
+        if want_cipher.is_some_and(|w| w != params.ealg) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(b, _)| params.q > b.q) {
+            best = Some((params, (*offer).to_string()));
+        }
+    }
+    best.ok_or_else(|| {
+        BridgeError::Ims(format!(
+            "no usable Security-Server offer among {} (wanted auth={:?} cipher={:?}); \
+             offered: {}",
+            offers.len(),
+            want_auth.unwrap_or("any"),
+            want_cipher.unwrap_or("any"),
+            offers.join(" | ")
+        ))
     })
 }
 
@@ -309,6 +390,10 @@ pub fn install_gm_sas(
     let auth_key = hex_encode(&derive_auth_key(&theirs.alg, ik)?);
     let enc_key = hex_encode(&derive_cipher_key(&theirs.ealg, ck)?);
 
+    // TS 33.203 keys all four SAs identically from one `IK`.
+    let in_auth_name = auth_name;
+    let in_auth_key = auth_key.clone();
+
     // Outbound: we send, tagged with the SPI *they* told us to use.
     xfrm_state_add(
         endpoints.local_c.ip(),
@@ -333,8 +418,8 @@ pub fn install_gm_sas(
         endpoints.remote_c.ip(),
         endpoints.local_s.ip(),
         ours.spi_s,
-        auth_name,
-        &auth_key,
+        in_auth_name,
+        &in_auth_key,
         enc_name,
         &enc_key,
     )?;
@@ -342,40 +427,99 @@ pub fn install_gm_sas(
         endpoints.remote_s.ip(),
         endpoints.local_c.ip(),
         ours.spi_c,
-        auth_name,
-        &auth_key,
+        in_auth_name,
+        &in_auth_key,
         enc_name,
         &enc_key,
     )?;
 
-    xfrm_policy_add(
-        endpoints.local_c,
-        endpoints.remote_s,
-        theirs.spi_s,
-        false,
-        proto,
-    )?;
-    xfrm_policy_add(
-        endpoints.local_s,
-        endpoints.remote_c,
-        theirs.spi_c,
-        false,
-        proto,
-    )?;
-    xfrm_policy_add(
-        endpoints.remote_c,
-        endpoints.local_s,
-        ours.spi_s,
-        true,
-        proto,
-    )?;
-    xfrm_policy_add(
-        endpoints.remote_s,
-        endpoints.local_c,
-        ours.spi_c,
-        true,
-        proto,
-    )?;
+    // TS 33.203: one set of Gm SAs protects **both** transports between the
+    // negotiated port pairs. Which one the network uses for a request it
+    // originates is its choice, not ours, so `proto` (the transport we picked
+    // for our own client connection) must not decide what we accept.
+    //
+    // Installing only our own transport made inbound calls impossible.
+    // Measured on Jio 2026-08-14: it delivers network-initiated INVITEs over
+    // UDP, so with TCP-only policies the ESP arrived, decrypted, and landed on
+    // a port with no UDP socket — the kernel answered ICMP port-unreachable
+    // and the caller heard "out of coverage area". Nothing in
+    // /proc/net/xfrm_stat records that, and the SAs themselves are
+    // wildcard-selector so they were never the limiting factor; only these
+    // four selectors were.
+    let _ = proto;
+    for policy_proto in ["tcp", "udp"] {
+        xfrm_policy_add(
+            endpoints.local_c,
+            endpoints.remote_s,
+            theirs.spi_s,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.local_s,
+            endpoints.remote_c,
+            theirs.spi_c,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_c,
+            endpoints.local_s,
+            ours.spi_s,
+            true,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_s,
+            endpoints.local_c,
+            ours.spi_c,
+            true,
+            policy_proto,
+        )?;
+
+        // The two canonical pairs above are what TS 33.203 draws, but they
+        // only cover a client port talking to the *opposite* server port.
+        // RFC 3261 §18.2.2 routes a response to the `Via` sent-by, and Jio's
+        // P-CSCF sends network-initiated requests from its client port while
+        // naming its *server* port in that `Via` — so the reply belongs on a
+        // pairing the four canonical policies do not describe, and would
+        // otherwise leave unprotected (silently: an unmatched policy is not an
+        // error, the packet just goes out in the clear and the carrier drops
+        // it).
+        //
+        // Completing the cross product costs four more selectors per protocol
+        // and makes every combination of our two protected ports with their
+        // two protected ports carry ESP, so response routing is free to follow
+        // the SIP rules without a transport-layer trap underneath it.
+        xfrm_policy_add(
+            endpoints.local_c,
+            endpoints.remote_c,
+            theirs.spi_c,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.local_s,
+            endpoints.remote_s,
+            theirs.spi_s,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_c,
+            endpoints.local_c,
+            ours.spi_c,
+            true,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_s,
+            endpoints.local_s,
+            ours.spi_s,
+            true,
+            policy_proto,
+        )?;
+    }
 
     Ok(())
 }
@@ -419,22 +563,51 @@ pub fn remove_gm_sas(
         "state remote_s->local_c",
         xfrm_state_del(endpoints.remote_s.ip(), endpoints.local_c.ip(), ours.spi_c),
     );
-    warn_on_err(
-        "policy local_c->remote_s",
-        xfrm_policy_del(endpoints.local_c, endpoints.remote_s, proto, false),
-    );
-    warn_on_err(
-        "policy local_s->remote_c",
-        xfrm_policy_del(endpoints.local_s, endpoints.remote_c, proto, false),
-    );
-    warn_on_err(
-        "policy remote_c->local_s",
-        xfrm_policy_del(endpoints.remote_c, endpoints.local_s, proto, true),
-    );
-    warn_on_err(
-        "policy remote_s->local_c",
-        xfrm_policy_del(endpoints.remote_s, endpoints.local_c, proto, true),
-    );
+
+    // `install_gm_sas` installs 8 policies (4 canonical + 4 cross-product) per
+    // protocol, for both "tcp" and "udp" — 16 in total, regardless of which
+    // transport `proto` names. This must delete exactly that set, or every
+    // re-registration leaks 12 of the 16 (found in review: this used to
+    // delete only the 4 canonical policies for the single passed-in `proto`).
+    // A stale policy left in the kernel table can match live traffic on a
+    // reused port pairing after the SA generation it referenced is gone,
+    // silently dropping packets in a way indistinguishable from the Jio
+    // inbound-routing bug the cross-product policies exist to fix.
+    let _ = proto;
+    for policy_proto in ["tcp", "udp"] {
+        warn_on_err(
+            "policy local_c->remote_s",
+            xfrm_policy_del(endpoints.local_c, endpoints.remote_s, policy_proto, false),
+        );
+        warn_on_err(
+            "policy local_s->remote_c",
+            xfrm_policy_del(endpoints.local_s, endpoints.remote_c, policy_proto, false),
+        );
+        warn_on_err(
+            "policy remote_c->local_s",
+            xfrm_policy_del(endpoints.remote_c, endpoints.local_s, policy_proto, true),
+        );
+        warn_on_err(
+            "policy remote_s->local_c",
+            xfrm_policy_del(endpoints.remote_s, endpoints.local_c, policy_proto, true),
+        );
+        warn_on_err(
+            "policy local_c->remote_c",
+            xfrm_policy_del(endpoints.local_c, endpoints.remote_c, policy_proto, false),
+        );
+        warn_on_err(
+            "policy local_s->remote_s",
+            xfrm_policy_del(endpoints.local_s, endpoints.remote_s, policy_proto, false),
+        );
+        warn_on_err(
+            "policy remote_c->local_c",
+            xfrm_policy_del(endpoints.remote_c, endpoints.local_c, policy_proto, true),
+        );
+        warn_on_err(
+            "policy remote_s->local_s",
+            xfrm_policy_del(endpoints.remote_s, endpoints.local_s, policy_proto, true),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +630,79 @@ mod tests {
     fn parse_security_server_rejects_missing_field() {
         let header = "ipsec-3gpp; alg=hmac-md5-96; ealg=null; spi-c=1; spi-s=2; port-c=3";
         assert!(parse_security_server(header).is_err());
+    }
+
+    /// Jio's real offer list, verbatim from a live `401` (2026-08-14).
+    const JIO_OFFERS: [&str; 6] = [
+        "ipsec-3gpp;q=0.6;alg=hmac-md5-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=32920;port-s=5067",
+        "ipsec-3gpp;q=0.4;alg=hmac-md5-96;ealg=des-ede3-cbc;spi-c=1;spi-s=2;port-c=32920;port-s=5067",
+        "ipsec-3gpp;q=0.3;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=32920;port-s=5067",
+        "ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=des-ede3-cbc;spi-c=1;spi-s=2;port-c=32920;port-s=5067",
+        "ipsec-3gpp;q=0.2;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=32920;port-s=5067",
+        "ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;ealg=null;spi-c=1;spi-s=2;port-c=32920;port-s=5067",
+    ];
+
+    #[test]
+    fn select_takes_the_highest_q_supported_offer() {
+        let (params, _) = select_security_server(&JIO_OFFERS, None, None).unwrap();
+        assert_eq!(params.alg, "hmac-md5-96");
+        assert_eq!(params.ealg, "aes-cbc");
+        assert_eq!(params.q, 0.6);
+    }
+
+    #[test]
+    fn select_can_pin_an_algorithm_the_q_order_would_not_have_chosen() {
+        // The whole point of the override: q=0.2 loses on preference, but is
+        // what we need when the P-CSCF advertises one thing and uses another.
+        let (params, raw) =
+            select_security_server(&JIO_OFFERS, Some("hmac-sha-1-96"), Some("aes-cbc")).unwrap();
+        assert_eq!(params.alg, "hmac-sha-1-96");
+        assert_eq!(params.ealg, "aes-cbc");
+        assert_eq!(params.q, 0.2);
+        assert_eq!(raw, JIO_OFFERS[4], "Security-Verify must echo it verbatim");
+    }
+
+    #[test]
+    fn select_skips_offers_whose_algorithms_cannot_be_keyed() {
+        // des-ede3-cbc needs the Annex I CK-expansion we don't implement;
+        // choosing it would abort a registration the others could complete.
+        let only_3des = [JIO_OFFERS[1], JIO_OFFERS[3]];
+        assert!(select_security_server(&only_3des, None, None).is_err());
+    }
+
+    #[test]
+    fn select_errors_when_the_pinned_combination_is_not_offered() {
+        let err = select_security_server(&JIO_OFFERS, Some("hmac-md5-96"), Some("bogus-cbc"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no usable Security-Server offer"), "{err}");
+    }
+
+    #[test]
+    fn select_treats_a_missing_q_as_lowest_preference() {
+        let no_q = "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=1;port-s=2";
+        let (params, _) = select_security_server(&[no_q, JIO_OFFERS[0]], None, None).unwrap();
+        assert_eq!(params.alg, "hmac-md5-96", "the q=0.6 offer must still win");
+    }
+
+    /// `f32::parse` accepts the literal `"nan"` — a `q=nan` offer must not
+    /// win `best.is_none()` unconditionally and then be unbeatable forever
+    /// after (`x > NaN` is false for every later `x`).
+    #[test]
+    fn select_treats_a_non_finite_q_as_lowest_preference() {
+        let nan_first =
+            "ipsec-3gpp;q=nan;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=1;port-s=2";
+        let (params, _) = select_security_server(&[nan_first, JIO_OFFERS[0]], None, None).unwrap();
+        assert_eq!(
+            params.alg, "hmac-md5-96",
+            "the real q=0.6 offer must win, not NaN"
+        );
+
+        let (params, _) = parse_security_server(nan_first).map(|p| (p, ())).unwrap();
+        assert_eq!(
+            params.q, 0.0,
+            "a non-finite q parses as the lowest preference, not NaN"
+        );
     }
 
     #[test]

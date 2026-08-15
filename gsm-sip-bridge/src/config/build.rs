@@ -606,6 +606,37 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         enabled: raw.enabled,
         use_tcp: raw.use_tcp,
         sec_agree: raw.sec_agree,
+        register_request_uri: {
+            if raw.register_request_uri != "pcscf" && raw.register_request_uri != "home-domain" {
+                return Err(BridgeError::Config(format!(
+                    "vowifi.register_request_uri must be \"pcscf\" or \"home-domain\", got {:?}",
+                    raw.register_request_uri
+                )));
+            }
+            raw.register_request_uri
+        },
+        gm_auth_alg: {
+            const OK: [&str; 3] = ["", "hmac-sha-1-96", "hmac-md5-96"];
+            if !OK.contains(&raw.gm_auth_alg.as_str()) {
+                return Err(BridgeError::Config(format!(
+                    "vowifi.gm_auth_alg must be \"hmac-sha-1-96\", \"hmac-md5-96\", \
+                     or \"\" (follow the network's preference), got {:?}",
+                    raw.gm_auth_alg
+                )));
+            }
+            raw.gm_auth_alg
+        },
+        gm_cipher_alg: {
+            const OK: [&str; 3] = ["", "aes-cbc", "null"];
+            if !OK.contains(&raw.gm_cipher_alg.as_str()) {
+                return Err(BridgeError::Config(format!(
+                    "vowifi.gm_cipher_alg must be \"aes-cbc\", \"null\", \
+                     or \"\" (follow the network's preference), got {:?}",
+                    raw.gm_cipher_alg
+                )));
+            }
+            raw.gm_cipher_alg
+        },
         pcscf_source_path: raw.pcscf_source_path,
         control_port: in_range(raw.control_port, "vowifi.control_port", 1..=65535)?,
         wideband: raw.wideband,

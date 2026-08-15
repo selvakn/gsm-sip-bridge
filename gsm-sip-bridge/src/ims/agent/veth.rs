@@ -75,8 +75,7 @@ fn accept_veth_invite(
     let (n, peer) = sip_socket
         .recv_from(&mut buf)
         .map_err(|e| BridgeError::Ims(format!("veth INVITE recv failed: {e}")))?;
-    let text = String::from_utf8_lossy(&buf[..n]);
-    let (req, _consumed) = SipRequest::try_parse(&text)?
+    let (req, _consumed) = SipRequest::try_parse(&buf[..n])?
         .ok_or_else(|| BridgeError::Ims("incomplete veth INVITE datagram".into()))?;
     if req.method != "INVITE" {
         return Err(BridgeError::Ims(format!(

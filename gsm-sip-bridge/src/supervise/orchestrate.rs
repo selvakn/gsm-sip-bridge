@@ -1405,6 +1405,27 @@ fn start_vowifi_line_strongswan(
                     }
                 }
                 drop(guard);
+                // A recovery that renegotiates the tunnel comes back with a
+                // *fresh* P-CSCF pool — the carrier assigns a different set
+                // per IKE_SA, along with a new virtual IP — so the recorded
+                // value is stale the instant the recovery finishes. Sync it
+                // here, before the agent restarts below, rather than leaving
+                // it for the next steady-state tick to notice.
+                //
+                // Leaving it caused a self-inflicted teardown, measured on
+                // Jio 2026-08-14: the `tun23-0 missing; recreating and
+                // forcing reinitiate` path renegotiated at T+0, the agent
+                // restarted and *registered successfully* at T+8s, and then
+                // the steady-state tick at T+30s compared the new pool
+                // against the pre-recovery value, logged `P-CSCF changed`
+                // for a reinitiate we had caused ourselves, and killed a
+                // healthy registration.
+                if let Some(latest) = engine.latest_pcscf(runner.as_ref()) {
+                    if latest != current_pcscf {
+                        let _ = runner.write_file(Path::new(&line.pcscf_source_path), &latest);
+                        current_pcscf = latest;
+                    }
+                }
                 if line_supervisor::recovery_restarts_agent(reason) {
                     let _ =
                         runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);

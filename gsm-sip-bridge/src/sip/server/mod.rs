@@ -246,7 +246,7 @@ fn handle_datagram(
     state: &ServerState,
     now: Instant,
 ) -> Option<String> {
-    let request = match SipRequest::try_parse(text) {
+    let request = match SipRequest::try_parse(text.as_bytes()) {
         Ok(Some((request, _))) => request,
         // An incomplete or unparseable datagram is not a SIP request we can
         // even name, so there is nothing to answer — a response needs the
@@ -714,7 +714,7 @@ mod tests {
              CSeq: 1 REGISTER\r\n\
              {headers}Content-Length: 0\r\n\r\n"
         );
-        SipRequest::try_parse(&raw).unwrap().unwrap().0
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
     #[test]

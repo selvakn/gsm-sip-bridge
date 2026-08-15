@@ -202,6 +202,7 @@ mod tests {
             request_uri: "sip:1002@192.168.15.10:5065".to_string(),
             headers,
             body: String::new(),
+            body_bytes: Vec::new(),
         }
     }
 

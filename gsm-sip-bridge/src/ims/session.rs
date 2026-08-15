@@ -282,14 +282,7 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
 /// `dispatch_loop`, and a send failure only costs us that visibility.
 pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession) {
     let impu = session
-        .headers
-        .iter()
-        .find(|(k, v)| k.eq_ignore_ascii_case("P-Associated-URI") && v.contains("sip:"))
-        .and_then(|(_, v)| {
-            let start = v.find('<')? + 1;
-            let end = v.find('>')?;
-            Some(v[start..end].to_string())
-        })
+        .default_impu()
         .unwrap_or_else(|| format!("sip:{}", session.public_uri));
     let route_headers: Vec<String> = session
         .headers

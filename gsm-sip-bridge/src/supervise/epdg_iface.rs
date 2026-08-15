@@ -229,14 +229,27 @@ pub fn ensure_epdg_interface(
     );
     // Received IPsec traffic gets dropped if IPsec policy isn't disabled on
     // the interface itself (osmocom wiki's Option 2 walkthrough).
-    let _ = runner.run_in_netns(
-        netns,
-        &[
-            "sh",
-            "-c",
-            &format!("echo 1 > /proc/sys/net/ipv6/conf/{tun_iface}/disable_policy"),
-        ],
-    );
+    //
+    // BOTH families need this, and for a long time only `ipv6` was set. A
+    // carrier that hands out an IPv4 P-CSCF (Jio does; Airtel's v6 one is why
+    // this went unnoticed) runs Gm IPsec over IPv4, and with `ipv4` left at 0
+    // the kernel drops every inbound packet *after* it has already verified
+    // the ICV and decrypted it. Nothing in /proc/net/xfrm_stat counts that
+    // drop, so the only visible symptom was the protected-port connect timing
+    // out — which reads exactly like the network never answering. Measured
+    // 2026-08-14 against Jio: the P-CSCF's SYN-ACKs were arriving with valid
+    // ICVs, correct TCP checksums and correct ACK numbers the whole time.
+    // The per-interface knob alone is sufficient; conf/all stays untouched.
+    for family in ["ipv4", "ipv6"] {
+        let _ = runner.run_in_netns(
+            netns,
+            &[
+                "sh",
+                "-c",
+                &format!("echo 1 > /proc/sys/net/{family}/conf/{tun_iface}/disable_policy"),
+            ],
+        );
+    }
 
     // Confirm rather than assume. Every step above deliberately ignores its
     // own result (they are all idempotent and individually survivable), so
@@ -498,15 +511,24 @@ src 2402:8100::1/128 dst ::/0
         // was ported (osmocom wiki's Option 2 walkthrough — received IPsec
         // traffic gets dropped if IPsec policy isn't disabled on the
         // interface itself) but nothing asserted it was actually issued.
+        //
+        // Both families are asserted because for a long time only `ipv6` was
+        // written, which silently broke Gm IPsec against every carrier with
+        // an IPv4 P-CSCF: the kernel verified and decrypted the inbound
+        // packet and then dropped it, uncounted. Assert v4 explicitly so the
+        // family can never be dropped again.
         let runner = MockCommandRunner::new();
         ensure_epdg_interface(&runner, "ims0", "tun23-0", "23");
         let netns_calls = runner.run_in_netns_calls.lock().unwrap();
-        assert!(netns_calls.iter().any(|(ns, c)| ns == "ims0"
-            && c == &[
-                "sh",
-                "-c",
-                "echo 1 > /proc/sys/net/ipv6/conf/tun23-0/disable_policy"
-            ]));
+        for family in ["ipv4", "ipv6"] {
+            let expected = format!("echo 1 > /proc/sys/net/{family}/conf/tun23-0/disable_policy");
+            assert!(
+                netns_calls
+                    .iter()
+                    .any(|(ns, c)| ns == "ims0" && c == &["sh", "-c", expected.as_str()]),
+                "missing disable_policy write for {family}"
+            );
+        }
     }
 
     fn failure_output() -> std::process::Output {

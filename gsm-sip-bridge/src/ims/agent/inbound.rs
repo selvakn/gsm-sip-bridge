@@ -18,7 +18,8 @@ use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_200_ok_invite, build_486_busy_here,
-    build_uas_response, format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
+    build_uas_response, build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage,
+    SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -37,6 +38,63 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// How often, while ringing, to check the control channel and the carrier's
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What a real UE states in a session response and we never have: the methods
+/// it accepts and the extensions it understands (RFC 3261 §20.5, and the
+/// `Supported` set TS 24.229 expects of an IMS UE).
+const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[
+    (
+        "Allow",
+        "INVITE, ACK, CANCEL, BYE, UPDATE, OPTIONS, INFO, PRACK, MESSAGE, REFER, NOTIFY",
+    ),
+    ("Supported", "timer, 100rel, replaces, path, gruu"),
+];
+
+/// The `Contact` for a response that answers a network-initiated INVITE.
+///
+/// Must carry the same feature tags we registered with, not just the address.
+/// See the call site for the measurement that motivated this.
+fn uas_contact(public_user: &str, addr: &str, transport: Option<&str>, imei: &str) -> String {
+    let transport = match transport {
+        Some(t) => format!(";transport={t}"),
+        None => String::new(),
+    };
+    format!(
+        "<sip:{public_user}@{addr}{transport}>\
+         ;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"\
+         ;audio;+sip.instance=\"<urn:gsma:imei:{imei}>\""
+    )
+}
+
+/// EXPERIMENT, gated on `GM_UAS_CONTACT_NO_TRANSPORT=1`: leave `transport=` off
+/// the Contact of a response to a network-initiated INVITE.
+///
+/// The `ACK` for our `200 OK` is a new request whose Request-URI *is* that
+/// Contact. We advertise `transport=TCP` because that is how we registered, but
+/// Jio has been measured never to open TCP toward us — it delivers every
+/// network-initiated request (INVITE, BYE) to `port_us` over UDP. If its B2BUA
+/// routes the ACK by the Contact URI verbatim, `transport=TCP` makes that ACK
+/// undeliverable, which is exactly what we see: on every failing call the SBC
+/// sends **no ACK at all** (its BYE is `CSeq: 2`) and tears the session down
+/// ~0.5 s later. Omitting the parameter lets it fall back to UDP, the only
+/// transport it actually uses in this direction.
+fn uas_contact_omits_transport() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GM_UAS_CONTACT_NO_TRANSPORT").is_some())
+}
+
+/// EXPERIMENT, gated on `GM_UAS_FULL_HEADERS=1`: add [`UAS_EXTRA_HEADERS`] to
+/// the `200 OK`.
+///
+/// Deliberately separate from the Contact feature tags added above, which are
+/// the stronger hypothesis (Jio *requires* them via `Accept-Contact`) and go
+/// out unconditionally. Keeping this behind a flag means the two can be tested
+/// one at a time with a restart rather than a rebuild — the discipline that
+/// killed six wrong theories on this bug in a single morning.
+fn full_uas_headers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GM_UAS_FULL_HEADERS").is_some())
+}
 
 /// Everything `handle_invite` needs that is fixed for the life of the agent.
 pub(super) struct InviteContext<'a> {
@@ -128,9 +186,32 @@ pub(super) fn handle_invite(
     // The protected server port, not the client port we send from — this is
     // the address the carrier's in-dialog requests (the eventual BYE) come
     // back to. See `RegisteredSession::contact_addr`.
-    let contact = format!(
-        "<sip:{public_user}@{};transport={via_transport}>",
-        format_sip_addr(session.contact_addr)
+    // The feature tags matter as much as the address. Jio's inbound INVITE
+    // carries RFC 3841 caller preferences that *require* them:
+    //
+    //   Accept-Contact: *;require;explicit;+sip.instance="<urn:gsma:imei:...>"
+    //   Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+    //
+    // `require` means the caller is demanding the answering contact match
+    // those tags, and TS 24.229 §5.1.3 has the UE state its IMS communication
+    // service in the Contact of a session response regardless. We registered
+    // with both (see `sip_client::RegisterRequest`'s Contact) and then answered
+    // with a bare `<sip:user@addr;transport=...>`, so the contact that picked
+    // the call up advertised neither the MMTEL ICSI nor the instance the caller
+    // asked for.
+    //
+    // Measured on Jio 2026-08-15: five different SDP answer bodies (with and
+    // without `telephone-event`, `maxptime`, the `b=` trio, and both AMR-WB
+    // framings) were each torn down ~460 ms after the `200 OK` with
+    // `BYE Reason:SIP;cause=503;text="IO: SIP SDP Protocol Error."`, while the
+    // answer itself was verified byte-perfect on the wire and media negotiated
+    // and flowed both ways. The SDP body was never the variable; this omission
+    // is invariant across all five.
+    let contact = uas_contact(
+        &public_user,
+        &format_sip_addr(session.contact_addr),
+        Some(via_transport).filter(|_| !uas_contact_omits_transport()),
+        &session.imei,
     );
     // Ring the caller. The network turns this into audible ringback and keeps
     // playing it until we answer — which we now deliberately don't do until a
@@ -223,7 +304,20 @@ pub(super) fn handle_invite(
                 }
             }
 
-            sink.send(&build_200_ok_invite(req, &to_tag, &contact, &answer_sdp))?;
+            let response = if full_uas_headers() {
+                build_uas_response_with_headers(
+                    200,
+                    "OK",
+                    req,
+                    Some(&to_tag),
+                    Some(&contact),
+                    Some(&answer_sdp),
+                    UAS_EXTRA_HEADERS,
+                )
+            } else {
+                build_200_ok_invite(req, &to_tag, &contact, &answer_sdp)
+            };
+            sink.send(&response)?;
 
             let stop = Arc::new(AtomicBool::new(false));
             // Counts audio each way so the completed call can be judged
@@ -399,4 +493,63 @@ fn await_pbx_answer(
     Ok(RingOutcome::Abandoned {
         reason: reason::PBX_NO_ANSWER,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Jio's inbound INVITE carries
+    /// `Accept-Contact: *;require;explicit;+sip.instance="<urn:gsma:imei:...>"`
+    /// and a second one naming the MMTEL ICSI. `require` makes those caller
+    /// preferences mandatory, so the contact that answers has to advertise
+    /// them — a bare `<sip:user@addr;transport=...>` does not.
+    #[test]
+    fn the_answering_contact_advertises_the_tags_the_caller_requires() {
+        let c = uas_contact(
+            "405800000000000",
+            "10.0.0.1:41126",
+            Some("TCP"),
+            "860000000000000",
+        );
+
+        assert!(
+            c.starts_with("<sip:405800000000000@10.0.0.1:41126;transport=TCP>"),
+            "the address must still lead, or nothing network-initiated reaches us: {c}"
+        );
+        assert!(
+            c.contains(";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""),
+            "TS 24.229 §5.1.3 has the UE state its IMS communication service: {c}"
+        );
+        assert!(
+            c.contains(";+sip.instance=\"<urn:gsma:imei:860000000000000>\""),
+            "the instance the caller's Accept-Contact requires: {c}"
+        );
+        // The feature tags are Contact *header* parameters, so they must sit
+        // outside the angle brackets — inside, they would be URI parameters and
+        // mean something else entirely.
+        let closing = c.find('>').expect("the URI must be bracketed");
+        assert!(
+            c.find("+sip.instance").expect("tag present") > closing,
+            "feature tags belong after the closing bracket: {c}"
+        );
+    }
+
+    /// With the transport parameter omitted, the ACK for our `200 OK` can fall
+    /// back to UDP — the only transport Jio actually uses toward us. The feature
+    /// tags must survive, and no stray `;>` may be left behind.
+    #[test]
+    fn omitting_the_transport_leaves_a_well_formed_contact() {
+        let c = uas_contact("405800000000000", "10.0.0.1:41126", None, "860000000000000");
+
+        assert!(
+            c.starts_with("<sip:405800000000000@10.0.0.1:41126>"),
+            "no transport parameter, and no dangling semicolon: {c}"
+        );
+        assert!(!c.contains("transport="), "transport must be absent: {c}");
+        assert!(
+            c.contains(";+sip.instance=\"<urn:gsma:imei:860000000000000>\""),
+            "the required feature tags must survive: {c}"
+        );
+    }
 }

@@ -278,6 +278,12 @@ mod tests {
         assert_eq!(cseq_method(""), None);
         // Number and method are still individually recoverable.
         assert_eq!(parse_cseq_number("5 INVITE"), Some(5));
+        // PRACK shares the INVITE's dialog and Call-ID but resolves its own
+        // transaction: taking its `200 OK` for the INVITE's final made an
+        // outbound call ACK a transaction that had no final response, and the
+        // network killed it with `487 ... invalid SDP offer or answer`.
+        assert_eq!(cseq_method("6 PRACK"), Some("PRACK"));
+        assert_eq!(cseq_method("10 prack"), Some("prack"));
     }
 
     #[test]

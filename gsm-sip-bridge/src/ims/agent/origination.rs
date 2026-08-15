@@ -84,6 +84,17 @@ pub(super) struct PendingOrigination {
     from_tag: String,
     branch: String,
     invite_cseq: u32,
+    /// In-dialog requests sent after the INVITE (each `PRACK`), so a later
+    /// `BYE` picks a `CSeq` above them rather than reusing one — RFC 3261
+    /// §12.2.1.1 requires the sequence to increase within a dialog.
+    extra_cseq: u32,
+    /// The `RSeq` already acknowledged, so retransmissions of the *same*
+    /// reliable provisional are not PRACKed twice.
+    pracked_rseq: Option<u32>,
+    /// The SDP answer a provisional response carried, if any. With a reliable
+    /// provisional the offer/answer exchange completes there and the `200 OK`
+    /// has no body at all, so this is the only copy of the answer we get.
+    provisional_answer: Option<String>,
     callee_uri: String,
     route_headers: Vec<String>,
     via_transport: &'static str,
@@ -106,6 +117,17 @@ pub(super) struct PendingOrigination {
     deadline: Instant,
     any_response_seen: bool,
     ringing_relayed: bool,
+    /// Set once the attempt has been abandoned, so the abandon path runs
+    /// exactly once.
+    ///
+    /// `CallEnded` is consumed by the `try_recv` that observes it, but a
+    /// *disconnected* control channel is a permanent condition: every later
+    /// poll reports it again. Without this flag an attempt left in
+    /// `AwaitingCancel` re-abandoned and re-logged on every tick — measured
+    /// 2026-08-14, 463 iterations at ~10/s and still climbing. Worse, it kept
+    /// the single pending slot occupied, so the next outbound call was
+    /// refused with "no VoWiFi/VoLTE line available".
+    abandoned: bool,
     pub(super) lifecycle: BridgedCall,
 }
 
@@ -245,7 +267,7 @@ pub(super) fn begin_origination(
         via_transport,
         local_addr: session.local_addr,
         contact_addr: session.contact_addr,
-        public_uri: &session.public_uri,
+        public_uri: &session.origination_identity(),
         callee_uri: &callee_uri,
         call_id: &call_id,
         from_tag: &from_tag,
@@ -299,6 +321,9 @@ pub(super) fn begin_origination(
         from_tag,
         branch,
         invite_cseq,
+        extra_cseq: 0,
+        pracked_rseq: None,
+        provisional_answer: None,
         callee_uri,
         route_headers,
         via_transport,
@@ -312,6 +337,7 @@ pub(super) fn begin_origination(
         deadline: Instant::now() + OUTBOUND_INVITE_TIMEOUT,
         any_response_seen: false,
         ringing_relayed: false,
+        abandoned: false,
         lifecycle,
     })
 }
@@ -377,7 +403,7 @@ impl PendingOrigination {
             route_headers: &self.route_headers,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
-            public_uri: &session.public_uri,
+            public_uri: &session.origination_identity(),
             callee_uri: &self.callee_uri,
             call_id: &self.call_id,
             from_tag: &self.from_tag,
@@ -414,7 +440,7 @@ impl PendingOrigination {
             route_headers: &self.route_headers,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
-            public_uri: &session.public_uri,
+            public_uri: &session.origination_identity(),
             to_header: &to_header,
             call_id: &self.call_id,
             from_tag: &self.from_tag,
@@ -427,14 +453,83 @@ impl PendingOrigination {
             route_headers: &self.route_headers,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
-            public_uri: &session.public_uri,
+            public_uri: &session.origination_identity(),
             to_header: &to_header,
             call_id: &self.call_id,
             from_tag: &self.from_tag,
-            cseq: self.invite_cseq + 1,
+            cseq: self.invite_cseq + self.extra_cseq + 1,
             branch: &format!("z9hG4bK{}", random_hex(6)),
         });
         let _ = session.transport_mut().and_then(|t| t.send(&bye));
+    }
+
+    /// Acknowledge a reliable provisional response (RFC 3262).
+    ///
+    /// A provisional carrying `Require: 100rel` is retransmitted at T1 backoff
+    /// until PRACKed, and the network abandons the call if it never is — see
+    /// [`crate::ims::call::build_prack`] for the measurement. Silent when the
+    /// response is an ordinary unreliable provisional, so carriers that never
+    /// use 100rel are unaffected.
+    fn prack_if_required(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        resp: &SipResponse,
+    ) {
+        let requires_100rel = resp
+            .header("Require")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("100rel"));
+        let Some(rseq) = resp
+            .header("RSeq")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        else {
+            return;
+        };
+        // RFC 3262 §7.1: RSeq strictly increases across one dialog's reliable
+        // provisionals, so `<=` (not just `==`) catches a reordered
+        // retransmission of an *older* one arriving after a newer RSeq has
+        // already been PRACKed — the Gm UDP transport this bridge uses makes
+        // that a real possibility, not just a defensive check.
+        if !requires_100rel || self.pracked_rseq.is_some_and(|last| rseq <= last) {
+            return;
+        }
+
+        // The dialog's remote target and tag come from this very response; the
+        // From/tag and route set stay those of the INVITE.
+        let to_header = resp.header("To").unwrap_or(&self.callee_uri).to_string();
+        self.extra_cseq += 1;
+        let cseq = self.invite_cseq + self.extra_cseq;
+        let prack = crate::ims::call::build_prack(
+            &crate::ims::call::AckParts {
+                request_uri: &self.callee_uri,
+                route_headers: &self.route_headers,
+                via_transport: self.via_transport,
+                local_addr: session.local_addr,
+                public_uri: &session.origination_identity(),
+                to_header: &to_header,
+                call_id: &self.call_id,
+                from_tag: &self.from_tag,
+                cseq,
+                branch: &format!("z9hG4bK{}", random_hex(6)),
+            },
+            &format!("{rseq} {} INVITE", self.invite_cseq),
+        );
+        match session.transport_mut().and_then(|t| t.send(&prack)) {
+            Ok(()) => {
+                self.pracked_rseq = Some(rseq);
+                tracing::info!(
+                    call_id = %self.call_id,
+                    rseq,
+                    cseq,
+                    "outbound: PRACKed a reliable provisional"
+                );
+            }
+            Err(e) => tracing::warn!(
+                call_id = %self.call_id,
+                rseq,
+                error = %e,
+                "outbound: could not send PRACK; the carrier will retransmit and may abandon the call"
+            ),
+        }
     }
 
     /// Handle a carrier response while awaiting the CANCEL's outcome. Only the
@@ -504,6 +599,30 @@ impl PendingOrigination {
             OriginationStep::AwaitingCarrier => {}
         }
 
+        // Only the INVITE's own responses resolve this attempt. A response
+        // echoes its request's `CSeq`, so anything else sharing the `Call-ID`
+        // — notably the `200 OK` for a `PRACK` — must be dropped here.
+        //
+        // Measured on Jio 2026-08-15, and caused by adding PRACK without
+        // teaching this path about it: the `183` was PRACKed, the PRACK's own
+        // `200 OK` (`CSeq: 6 PRACK`) was taken for the INVITE's final, we sent
+        // `CSeq: 5 ACK` for a transaction that had no final response, and the
+        // network killed the call 66 ms later with
+        // `487 Request Terminated - P - 14018 - invalid SDP offer or answer`.
+        // The destination never rang, and the call reported itself "placed and
+        // bridged".
+        if let Some(method) = resp.header("CSeq").and_then(super::ping::cseq_method) {
+            if !method.eq_ignore_ascii_case("INVITE") {
+                tracing::debug!(
+                    call_id = %self.call_id,
+                    status = resp.status,
+                    method,
+                    "ignoring a response for another transaction in this dialog"
+                );
+                return OriginationStatus::Pending;
+            }
+        }
+
         // First response of any kind (even a provisional) switches from the
         // short "did the network acknowledge us at all" window to the long
         // ring window — the same rule the old blocking origination read
@@ -515,6 +634,16 @@ impl PendingOrigination {
 
         if resp.status < 200 {
             tracing::info!(status = resp.status, reason = %resp.reason, "provisional response");
+            // Keep the first provisional SDP we see: with a reliable provisional
+            // this is the answer, and the 2xx that follows will be empty.
+            if self.provisional_answer.is_none() && !resp.body.trim().is_empty() {
+                tracing::debug!(
+                    status = resp.status,
+                    "outbound: provisional carried the SDP answer"
+                );
+                self.provisional_answer = Some(resp.body.clone());
+            }
+            self.prack_if_required(session, resp);
             // Relay ringback exactly once, and advance the lifecycle to
             // `PbxRinging` — the transition the old outbound path skipped, so
             // no successful outbound call ever recorded as reaching `Bridged`
@@ -542,7 +671,7 @@ impl PendingOrigination {
                 route_headers: &self.route_headers,
                 via_transport: self.via_transport,
                 local_addr: session.local_addr,
-                public_uri: &session.public_uri,
+                public_uri: &session.origination_identity(),
                 to_header: resp.header("To").unwrap_or(&self.callee_uri),
                 call_id: &self.call_id,
                 from_tag: &self.from_tag,
@@ -557,7 +686,19 @@ impl PendingOrigination {
         // 200 OK. Everything from here mirrors the old post-final block, in the
         // same order (SDP → RTP → ACK → dialog → veth listener → CallPlaced),
         // so every teardown path keeps its original meaning.
-        let answer = match sdp::parse_answer(&resp.body) {
+        // The answer is not always in the 2xx. When the carrier sends a
+        // *reliable* provisional (RFC 3262), the offer/answer exchange completes
+        // there and the `200 OK` arrives with `Content-Length: 0` — which is
+        // exactly what Jio does: its `183 Session Progress` carries the SDP and
+        // every 200 OK is empty. Parsing only the 2xx failed the call with
+        // "SDP answer missing c= connection address" *after* the carrier had
+        // already answered it (measured 2026-08-15).
+        let answer_body = if resp.body.trim().is_empty() {
+            self.provisional_answer.as_deref().unwrap_or(&resp.body)
+        } else {
+            &resp.body
+        };
+        let answer = match sdp::parse_answer(answer_body) {
             Ok(a) => a,
             Err(e) => {
                 self.fail(&format!("bad SDP answer: {e}"));
@@ -575,7 +716,7 @@ impl PendingOrigination {
             route_headers: &self.route_headers,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
-            public_uri: &session.public_uri,
+            public_uri: &session.origination_identity(),
             to_header: resp.header("To").unwrap_or(&self.callee_uri),
             call_id: &self.call_id,
             from_tag: &self.from_tag,
@@ -586,13 +727,13 @@ impl PendingOrigination {
             self.fail(&format!("ACK send failed: {e}"));
             return OriginationStatus::Ended;
         }
-        session.cseq = self.invite_cseq + 1;
+        session.cseq = self.invite_cseq + self.extra_cseq + 1;
 
         let dialog = DialogInfo::from_uac_response(
             resp,
             self.route_headers.clone(),
             &self.callee_uri,
-            &session.public_uri,
+            &session.origination_identity(),
             &self.from_tag,
             session.cseq,
             session,
@@ -669,26 +810,33 @@ pub(super) fn tick_pending_origination(
     // 1. A caller hangup (or Agent B vanishing) abandons the attempt (FR-003).
     //    A `CallEnded` naming a different call is ignored, never acted on
     //    (FR-010).
-    let abandoned = match p.ctrl_rx.try_recv() {
-        Ok(ControlMessage::CallEnded { call_id, .. }) if call_id == p.call_id => {
-            tracing::info!(call_id = %p.call_id, "outbound: caller abandoned the attempt; abandoning the carrier leg");
-            true
+    // Already abandoned and only waiting out the CANCEL: do not re-enter the
+    // abandon path. See `PendingOrigination::abandoned`.
+    let abandoned = if p.abandoned {
+        false
+    } else {
+        match p.ctrl_rx.try_recv() {
+            Ok(ControlMessage::CallEnded { call_id, .. }) if call_id == p.call_id => {
+                tracing::info!(call_id = %p.call_id, "outbound: caller abandoned the attempt; abandoning the carrier leg");
+                true
+            }
+            Ok(ControlMessage::CallEnded { call_id, .. }) => {
+                tracing::warn!(this = %p.call_id, other = %call_id, "ignoring CallEnded for a different call during origination");
+                false
+            }
+            Ok(other) => {
+                tracing::debug!(message = ?other, "ignoring control message during origination");
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tracing::warn!(call_id = %p.call_id, "Agent B control connection dropped during origination; abandoning");
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
         }
-        Ok(ControlMessage::CallEnded { call_id, .. }) => {
-            tracing::warn!(this = %p.call_id, other = %call_id, "ignoring CallEnded for a different call during origination");
-            false
-        }
-        Ok(other) => {
-            tracing::debug!(message = ?other, "ignoring control message during origination");
-            false
-        }
-        Err(mpsc::TryRecvError::Disconnected) => {
-            tracing::warn!(call_id = %p.call_id, "Agent B control connection dropped during origination; abandoning");
-            true
-        }
-        Err(mpsc::TryRecvError::Empty) => false,
     };
     if abandoned {
+        p.abandoned = true;
         abandon_origination(&mut p, session);
         // If that left us awaiting the CANCEL's outcome, keep the origination
         // alive so a racing `200` is still ACKed and BYE'd (greptile PR #35);

@@ -191,10 +191,18 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
     for line in body.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("c=IN ") {
-            // "IP4 1.2.3.4" or "IP6 2001:db8::1"
-            let addr_str = rest.split_whitespace().nth(1);
-            if let Some(addr_str) = addr_str {
-                conn_ip = addr_str.parse().ok();
+            // "IP4 1.2.3.4" or "IP6 2001:db8::1". Only *replace* a value we
+            // already have when this line actually parses — RFC 4566 allows a
+            // `c=` per media section as well as one at session level, and
+            // assigning `.ok()` unconditionally let a later unparseable one
+            // (a hostname, say) discard a perfectly good address and fail the
+            // call with "missing c= connection address".
+            if let Some(addr) = rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|a| a.parse::<IpAddr>().ok())
+            {
+                conn_ip = Some(addr);
             }
         } else if let Some(rest) = line.strip_prefix("m=audio ") {
             // "<port> RTP/AVP <pt> [<pt> ...]" — take the first payload type.
@@ -273,6 +281,23 @@ pub struct SdpOffer {
     /// rejected outright — an offer can list codecs we don't support
     /// alongside ones we do, and that isn't itself an error.
     pub offered: Vec<OfferedCodec>,
+    /// `telephone-event` payload types the offer carried, as
+    /// `(payload_type, clock_rate)` in `m=audio` order.
+    ///
+    /// Not a codec — it is RFC 4733 DTMF — but TS 26.114 makes it mandatory for
+    /// MMTEL voice, and an answer that drops it is rejected outright. Measured
+    /// on Jio 2026-08-14: the dialog established, the ACK arrived, and 2ms
+    /// later the carrier sent `BYE` with
+    /// `Reason: SIP;cause=503;text="PO: SIP SDP Protocol Error."` — our answer
+    /// had selected AMR-WB and silently omitted the two `telephone-event`
+    /// payloads (16000 and 8000) the offer listed.
+    pub dtmf: Vec<(u8, u32)>,
+    /// The offer's `a=maxptime`, if it carried one.
+    ///
+    /// TS 26.114 §6.2.2 has the UE state both `ptime` and `maxptime` for
+    /// AMR/AMR-WB; we only ever sent `ptime`. Echoed rather than asserted, so
+    /// the answer never claims a longer packetisation than the offerer allows.
+    pub maxptime: Option<u32>,
 }
 
 /// Parse an inbound SDP offer (the inverse of `build_offer`): the connection
@@ -285,6 +310,7 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     let mut listed_pts: Vec<u8> = Vec::new();
     let mut rtpmap: std::collections::HashMap<u8, (String, u32)> = std::collections::HashMap::new();
     let mut fmtp: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
+    let mut maxptime: Option<u32> = None;
 
     // An SDP body can hold several media sections, and payload-type numbers are
     // scoped to the section they appear in — the *same* number can mean
@@ -336,6 +362,8 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
                 continue;
             };
             rtpmap.insert(pt, (name.to_ascii_uppercase(), rate));
+        } else if let Some(rest) = line.strip_prefix("a=maxptime:") {
+            maxptime = rest.trim().parse().ok();
         } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
             // "<pt> <params>"
             let mut parts = rest.splitn(2, ' ');
@@ -356,6 +384,15 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
         return Err(BridgeError::Ims(
             "SDP offer's m=audio line lists no payload types".into(),
         ));
+    }
+
+    let mut dtmf = Vec::new();
+    for pt in &listed_pts {
+        if let Some((name, rate)) = rtpmap.get(pt) {
+            if name == "TELEPHONE-EVENT" {
+                dtmf.push((*pt, *rate));
+            }
+        }
     }
 
     let mut offered = Vec::new();
@@ -391,6 +428,8 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     Ok(SdpOffer {
         remote_rtp: SocketAddr::new(conn_ip, rtp_port),
         offered,
+        dtmf,
+        maxptime,
     })
 }
 
@@ -530,10 +569,76 @@ pub fn select_veth_codec(offer: &SdpOffer, wideband: bool) -> Option<&OfferedCod
     pick_offered(offer, NegotiatedCodec::Pcmu)
 }
 
+/// EXPERIMENT, gated on `GM_ANSWER_OFFER_FRAMING=1`: when the offer lists the
+/// same codec under two payload types differing only in AMR framing, take the
+/// one the *offerer* listed first instead of forcing octet-aligned.
+///
+/// Jio's mobile-terminating offer does exactly that — `104` AMR-WB
+/// bandwidth-efficient, then `110` AMR-WB `octet-align=1` — and the only reason
+/// to offer one codec twice is to let the answerer choose. Our `pick_offered`
+/// inverts that choice for a documented convenience ("purely because it's the
+/// simpler path"), so we answer `110` where every handset on the network
+/// answers `104`. Jio then ACKs and immediately sends
+/// `BYE Reason:SIP;cause=503;text="PO: SIP SDP Protocol Error."` with
+/// `carrier_rx=0` — no RTP ever arrives, consistent with a media gateway that
+/// could not instantiate the framing we asked for.
+///
+/// Gated rather than made default because Airtel and Vi are in production on
+/// the octet-aligned path and this would silently change their framing too
+/// whenever they offer both.
+fn honour_offer_framing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GM_ANSWER_OFFER_FRAMING").is_some())
+}
+
+/// AMR-WB `b=AS:` as *Jio itself* states it, captured 2026-08-15 from the
+/// `183 Session Progress` answering one of our outbound INVITEs.
+const CARRIER_AMR_WB_AS: u32 = 32;
+
+/// `a=maxptime` as Jio itself states it, from the same reference SDP. Its
+/// mobile-terminating offer asks for 240, which we echoed back; its own answer
+/// never claims more than 80.
+const CARRIER_MAXPTIME: u32 = 80;
+
+/// EXPERIMENT, gated on `GM_SDP_MATCH_CARRIER=1`: state the bandwidth and
+/// packetisation limits Jio's own SDP states, rather than the ones our
+/// arithmetic derives.
+///
+/// The reference is a real Jio-generated answer:
+///
+/// ```text
+/// b=AS:32  b=RR:2400  b=RS:800
+/// a=fmtp:96 octet-align=1;mode-set=0,1,2,3;mode-change-capability=2
+/// a=ptime:20  a=maxptime:80
+/// ```
+///
+/// Worth testing precisely because it is not invention: `b=AS:49`/`maxptime:240`
+/// were both added on speculation and neither was ever validated, and the
+/// earlier reasoning that "the failure predates `b=`, so `b=` is exonerated" was
+/// unsound — *absent* bandwidth and *overstated* bandwidth are different
+/// conditions and can fail independently.
+fn match_carrier_limits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GM_SDP_MATCH_CARRIER").is_some())
+}
+
 /// The offer's entry for `codec`, preferring an octet-aligned payload type
 /// when the offer lists more than one (see `select_codec`).
 fn pick_offered(offer: &SdpOffer, codec: NegotiatedCodec) -> Option<&OfferedCodec> {
+    pick_offered_with(offer, codec, honour_offer_framing())
+}
+
+/// [`pick_offered`] with the framing decision passed in, so both branches are
+/// testable without touching process environment.
+fn pick_offered_with(
+    offer: &SdpOffer,
+    codec: NegotiatedCodec,
+    honour_offer_order: bool,
+) -> Option<&OfferedCodec> {
     let of_codec = || offer.offered.iter().filter(|c| c.codec == codec);
+    if honour_offer_order {
+        return of_codec().next();
+    }
     of_codec()
         .find(|c| c.is_octet_aligned())
         .or_else(|| of_codec().next())
@@ -558,7 +663,14 @@ pub fn build_answer(
         select_codec_with(offer, amr_available, wideband, preference).ok_or_else(|| {
             BridgeError::Ims("SDP offer has no codec this client can answer with".into())
         })?;
-    Ok(build_answer_for(local_ip, rtp_port, session_id, chosen))
+    Ok(build_answer_for(
+        local_ip,
+        rtp_port,
+        session_id,
+        chosen,
+        &offer.dtmf,
+        offer.maxptime,
+    ))
 }
 
 /// Build an SDP answer to Agent B's veth-link `offer`, choosing one codec per
@@ -573,7 +685,14 @@ pub fn build_veth_answer(
     let chosen = select_veth_codec(offer, wideband).ok_or_else(|| {
         BridgeError::Ims("veth-link SDP offer has neither L16/16000 nor PCMU".into())
     })?;
-    Ok(build_answer_for(local_ip, rtp_port, session_id, chosen))
+    Ok(build_answer_for(
+        local_ip,
+        rtp_port,
+        session_id,
+        chosen,
+        &offer.dtmf,
+        offer.maxptime,
+    ))
 }
 
 /// Render an answer that accepts exactly `chosen`, echoing the offer's own
@@ -585,9 +704,31 @@ fn build_answer_for(
     rtp_port: u16,
     session_id: u64,
     chosen: &OfferedCodec,
+    dtmf: &[(u8, u32)],
+    maxptime: Option<u32>,
 ) -> (String, ChosenCodec) {
     let addrtype = ip_addrtype(local_ip);
     let pt = chosen.payload_type;
+
+    // Keep the offer's `telephone-event` — see `SdpOffer::dtmf` for why
+    // dropping it is fatal. Prefer the one whose clock rate matches the codec
+    // we picked (RFC 4733 §2.1 ties the event stream's rate to the audio it
+    // accompanies); fall back to the first offered rather than none.
+    let chosen_rate = match chosen.codec {
+        NegotiatedCodec::AmrWb | NegotiatedCodec::L16 => 16000,
+        NegotiatedCodec::AmrNb | NegotiatedCodec::Pcmu => 8000,
+    };
+    let dtmf_pick = dtmf
+        .iter()
+        .find(|(_, rate)| *rate == chosen_rate)
+        .or_else(|| dtmf.first());
+    let (dtmf_pts, dtmf_lines) = match dtmf_pick {
+        Some((dpt, drate)) => (
+            format!(" {dpt}"),
+            format!("a=rtpmap:{dpt} telephone-event/{drate}\r\na=fmtp:{dpt} 0-15\r\n"),
+        ),
+        None => (String::new(), String::new()),
+    };
     let rtpmap_line = match chosen.codec {
         NegotiatedCodec::Pcmu => format!("a=rtpmap:{pt} PCMU/8000\r\n"),
         NegotiatedCodec::L16 => format!("a=rtpmap:{pt} L16/16000\r\n"),
@@ -601,15 +742,53 @@ fn build_answer_for(
         ),
     };
 
+    let maxptime_line = match maxptime.map(|mp| {
+        if match_carrier_limits() {
+            mp.min(CARRIER_MAXPTIME)
+        } else {
+            mp
+        }
+    }) {
+        Some(mp) => format!("a=maxptime:{mp}\r\n"),
+        None => String::new(),
+    };
+
+    // Media and RTCP bandwidth. TS 26.114 §6.2.10 requires an IMS UE to state
+    // `b=AS:` and the RTCP `b=RS:`/`b=RR:` pair for a voice stream, and we sent
+    // none at all. Jio does send them (its own media SDP carries `b=AS:32`,
+    // `b=RR:2400`, `b=RS:800`), and after echoing `telephone-event` and
+    // `maxptime` this was the last spec-mandated element our answer omitted.
+    //
+    // `AS` is the codec's payload rate plus IPv4/UDP/RTP framing at a 20 ms
+    // ptime (40 bytes of header every 20 ms ≈ 16 kbit/s), rounded the way the
+    // 3GPP tables do. The RTCP values are the customary 3GPP defaults.
+    let as_kbps = match chosen.codec {
+        NegotiatedCodec::AmrNb => 41,
+        // Our arithmetic says 49; Jio's own answer says 32 (see
+        // `match_carrier_limits`). On a network that authorises a dedicated
+        // voice bearer from the negotiated bandwidth, claiming more than the
+        // network's own figure is a plausible way to be refused.
+        NegotiatedCodec::AmrWb if match_carrier_limits() => CARRIER_AMR_WB_AS,
+        NegotiatedCodec::AmrWb => 49,
+        NegotiatedCodec::Pcmu => 80,
+        // Only ever on the internal veth link: 16-bit 16 kHz PCM is 256 kbit/s.
+        NegotiatedCodec::L16 => 280,
+    };
+
     let sdp = format!(
         "v=0\r\n\
          o=- {session_id} {session_id} IN {addrtype} {local_ip}\r\n\
          s=gsm-sip-bridge vowifi bridge\r\n\
          c=IN {addrtype} {local_ip}\r\n\
          t=0 0\r\n\
-         m=audio {rtp_port} RTP/AVP {pt}\r\n\
+         m=audio {rtp_port} RTP/AVP {pt}{dtmf_pts}\r\n\
+         b=AS:{as_kbps}\r\n\
+         b=RS:800\r\n\
+         b=RR:2400\r\n\
          {rtpmap_line}\
+         {dtmf_lines}\
          a=ptime:20\r\n\
+         {maxptime_line}\
          a=sendrecv\r\n",
     );
 
@@ -712,6 +891,62 @@ mod tests {
             }
         }
         parse_offer(&body).expect("test offer must parse")
+    }
+
+    /// Jio's real mobile-terminating offer, captured 2026-08-15. It lists
+    /// AMR-WB twice — `104` bandwidth-efficient then `110` octet-aligned — and
+    /// the framing choice is the whole point of the fixture. Carrier
+    /// infrastructure addresses only; no subscriber identifiers.
+    const JIO_MT_OFFER: &str = "v=0\r\n\
+         o=JIO_ISBC 1764081157 1764081157 IN IP4 ims.mnc869.mcc405.3gppnetwork.org\r\n\
+         s=-\r\nc=IN IP4 10.56.159.86\r\nt=0 0\r\na=sendrecv\r\n\
+         m=audio 19730 RTP/AVP 109 104 110 102 108 105 100\r\n\
+         a=rtpmap:109 EVS/16000\r\n\
+         a=fmtp:109 br=5.9-24.4;bw=nb-swb;evs-mode-switch=0;cmr=-1;max-red=220\r\n\
+         a=rtpmap:104 AMR-WB/16000\r\n\
+         a=rtpmap:110 AMR-WB/16000\r\n\
+         a=rtpmap:102 AMR/8000\r\n\
+         a=fmtp:102 mode-change-capability=2\r\n\
+         a=rtpmap:108 AMR/8000\r\n\
+         a=fmtp:108 octet-align=1; mode-change-capability=2\r\n\
+         a=rtpmap:105 telephone-event/16000\r\na=fmtp:105 0-15\r\n\
+         a=rtpmap:100 telephone-event/8000\r\na=fmtp:100 0-15\r\n\
+         a=sendrecv\r\na=ptime:20\r\na=maxptime:240\r\n\
+         a=fmtp:104 mode-set=0,1,2,3;mode-change-capability=2\r\n\
+         a=fmtp:110 mode-set=0,1,2,3;octet-align=1; mode-change-capability=2\r\n";
+
+    /// The offerer listed the same codec twice differing only in framing, which
+    /// is how it says "pick one". Honouring that order takes `104`; the
+    /// historical convenience preference takes `110` — and `110` is what Jio
+    /// answers with `cause=503 "SIP SDP Protocol Error"`.
+    #[test]
+    fn honouring_the_offer_order_takes_the_flavour_the_carrier_listed_first() {
+        let offer = parse_offer(JIO_MT_OFFER).expect("Jio's real offer must parse");
+
+        let honoured = pick_offered_with(&offer, NegotiatedCodec::AmrWb, true)
+            .expect("AMR-WB is offered twice");
+        assert_eq!(honoured.payload_type, 104, "the offer's own first choice");
+        assert!(
+            !honoured.is_octet_aligned(),
+            "104 carries no octet-align=1, so the answer must not claim it"
+        );
+
+        let convenient = pick_offered_with(&offer, NegotiatedCodec::AmrWb, false)
+            .expect("AMR-WB is offered twice");
+        assert_eq!(convenient.payload_type, 110, "the octet-aligned one");
+        assert!(convenient.is_octet_aligned());
+    }
+
+    /// The gate must not disturb an offer that names one flavour only — which
+    /// is every Airtel/Vi offer seen so far, and why this is safe to land.
+    #[test]
+    fn the_framing_gate_is_a_no_op_when_only_one_flavour_is_offered() {
+        let offer = offer_of(&[(96, "AMR-WB/16000")]);
+        for honour in [true, false] {
+            let chosen = pick_offered_with(&offer, NegotiatedCodec::AmrWb, honour)
+                .expect("AMR-WB is offered");
+            assert_eq!(chosen.payload_type, 96, "honour_offer_order={honour}");
+        }
     }
 
     // ---- answer-side codec preference (specs/017 T027/T035) ---------------
@@ -866,6 +1101,50 @@ mod tests {
         assert!(parse_answer(body).is_err());
     }
 
+    /// Every carrier in production places calls on this exact offer, so its
+    /// bytes must not move without a measurement to justify it.
+    #[test]
+    fn the_offer_states_a_codec_and_nothing_more() {
+        let sdp = build_offer(
+            "1.2.3.4".parse().unwrap(),
+            40000,
+            7,
+            CodecOffer::WidebandThenPcmu,
+        );
+
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 96 0\r\n"), "{sdp}");
+        assert!(sdp.contains("a=fmtp:96 octet-align=1\r\n"), "{sdp}");
+        for absent in ["b=AS", "telephone-event", "a=ptime", "a=maxptime"] {
+            assert!(!sdp.contains(absent), "{absent} must not appear: {sdp}");
+        }
+        assert!(sdp.ends_with("a=sendrecv\r\n"), "{sdp}");
+    }
+
+    /// Jio's real answer, captured 2026-08-15 from the `183` to one of our
+    /// outbound INVITEs. Two things about it broke us: the `c=` sits at *media*
+    /// level (RFC 4566 allows either), and `o=` names a **hostname** — so a
+    /// parser that reassigns `conn_ip` on every `c=`-ish line, or only looks
+    /// before the first `m=`, gets this wrong.
+    #[test]
+    fn parse_answer_takes_a_media_level_connection_address() {
+        let body = "v=0\r\n\
+                    o=- 1374049043 1374049043 IN IP4 ims.mnc869.mcc405.3gppnetwork.org\r\n\
+                    s=media server session\r\nb=AS:32\r\nt=0 0\r\n\
+                    m=audio 18160 RTP/AVP 96\r\n\
+                    c=IN IP4 10.56.159.84\r\n\
+                    b=AS:32\r\nb=RR:2400\r\nb=RS:800\r\n\
+                    a=rtpmap:96 AMR-WB/16000\r\n\
+                    a=fmtp:96 octet-align=1;mode-set=0,1,2,3;mode-change-capability=2\r\n\
+                    a=rtcp-xr\r\na=ptime:20\r\na=maxptime:80\r\na=sendrecv\r\n";
+
+        let answer = parse_answer(body).expect("a media-level c= is valid SDP");
+        assert_eq!(
+            answer.remote_rtp,
+            "10.56.159.84:18160".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(answer.codec, NegotiatedCodec::AmrWb);
+    }
+
     /// A realistic Airtel-shaped inbound INVITE offer: PCMU plus AMR-WB,
     /// PCMU listed first (matches how build_offer itself orders payload
     /// types, and how real VoWiFi/VoLTE offers were observed in
@@ -1004,10 +1283,142 @@ mod tests {
         assert_eq!(chosen.codec, NegotiatedCodec::AmrNb);
         assert_eq!(chosen.payload_type, 108, "first listed AMR-NB payload type");
         assert!(!chosen.octet_aligned);
-        assert!(sdp.contains("m=audio 40000 RTP/AVP 108\r\n"));
+        // The offer's `telephone-event` rides along with the codec — dropping
+        // it gets the whole answer rejected. See `SdpOffer::dtmf`.
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 108 116\r\n"));
         assert!(sdp.contains("a=rtpmap:108 AMR/8000\r\n"));
+        assert!(sdp.contains("a=rtpmap:116 telephone-event/8000\r\n"));
+        assert!(sdp.contains("a=fmtp:116 0-15\r\n"));
         // The offer's own parameters, echoed.
         assert!(sdp.contains("a=fmtp:108 mode-set=0,2,4,7; mode-change-period=2; max-red=0\r\n"));
+    }
+
+    #[test]
+    fn the_answer_keeps_the_telephone_event_matching_the_chosen_codecs_rate() {
+        // Jio offers both rates. Picking AMR-WB (16 kHz) must keep the 16 kHz
+        // event stream, not the 8 kHz one — RFC 4733 §2.1 ties the event
+        // stream's clock to the audio it accompanies.
+        let body = "v=0\r\nc=IN IP4 10.56.153.59\r\n\
+                     m=audio 50010 RTP/AVP 110 102 105 100\r\n\
+                     a=rtpmap:110 AMR-WB/16000\r\n\
+                     a=fmtp:110 mode-set=0,1,2,3;octet-align=1; mode-change-capability=2\r\n\
+                     a=rtpmap:102 AMR/8000\r\n\
+                     a=rtpmap:105 telephone-event/16000\r\n\
+                     a=fmtp:105 0-15\r\n\
+                     a=rtpmap:100 telephone-event/8000\r\n\
+                     a=fmtp:100 0-15\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(offer.dtmf, vec![(105, 16000), (100, 8000)]);
+        let (sdp, chosen) = build_answer(
+            "10.6.170.49".parse().unwrap(),
+            46179,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
+        assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
+        assert!(
+            sdp.contains("m=audio 46179 RTP/AVP 110 105\r\n"),
+            "want the 16 kHz event stream alongside AMR-WB, got: {sdp}"
+        );
+        assert!(sdp.contains("a=rtpmap:105 telephone-event/16000\r\n"));
+        assert!(!sdp.contains("telephone-event/8000"), "wrong clock rate");
+    }
+
+    #[test]
+    fn the_answer_states_media_and_rtcp_bandwidth_before_its_attributes() {
+        // TS 26.114 §6.2.10 requires b=AS plus the RTCP b=RS/b=RR pair. RFC
+        // 4566 §5 fixes the order within a media section (m=, i=, c=, b=, k=,
+        // a=), so the bandwidth lines must precede every a= line or the whole
+        // description is malformed.
+        let body = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                    m=audio 5000 RTP/AVP 110\r\n\
+                    a=rtpmap:110 AMR-WB/16000\r\na=fmtp:110 octet-align=1\r\n";
+        let offer = parse_offer(body).unwrap();
+        let (sdp, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
+        assert!(sdp.contains("b=AS:49\r\n"), "AMR-WB rate, got: {sdp}");
+        assert!(sdp.contains("b=RS:800\r\n"));
+        assert!(sdp.contains("b=RR:2400\r\n"));
+        let first_b = sdp.find("b=").expect("a bandwidth line");
+        let first_a = sdp.find("a=").expect("an attribute line");
+        assert!(
+            first_b < first_a,
+            "b= must precede a= per RFC 4566 §5, got: {sdp}"
+        );
+    }
+
+    #[test]
+    fn the_answer_echoes_the_offers_maxptime_and_omits_it_when_absent() {
+        // TS 26.114 §6.2.2 has the UE state ptime *and* maxptime for AMR/AMR-WB;
+        // we only sent ptime. Echoed, never asserted, so the answer cannot
+        // claim a longer packetisation than the offerer permits.
+        let with = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                    m=audio 5000 RTP/AVP 110\r\n\
+                    a=rtpmap:110 AMR-WB/16000\r\n\
+                    a=fmtp:110 octet-align=1\r\n\
+                    a=ptime:20\r\na=maxptime:240\r\n";
+        let offer = parse_offer(with).unwrap();
+        assert_eq!(offer.maxptime, Some(240));
+        let (sdp, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
+        assert!(sdp.contains("a=maxptime:240\r\n"), "got: {sdp}");
+
+        let without = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                       m=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse_offer(without).unwrap();
+        assert_eq!(offer.maxptime, None);
+        let (sdp, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
+        assert!(!sdp.contains("maxptime"));
+    }
+
+    #[test]
+    fn an_offer_without_telephone_event_is_answered_without_one() {
+        let body = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                     m=audio 5000 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert!(offer.dtmf.is_empty());
+        let (sdp, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"));
+        assert!(!sdp.contains("telephone-event"));
     }
 
     /// Without a linked AMR codec there is genuinely nothing to answer such an

@@ -22,6 +22,80 @@ pub fn random_hex(n_bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Expand an RFC 3261 §7.3.3 compact header name to its canonical form,
+/// leaving every other name untouched.
+///
+/// This is not cosmetic. Jio's P-CSCF answers **entirely** in compact form
+/// (`v:`, `i:`, `f:`, `t:`, `l:`), and not understanding those broke two
+/// things at once when a call was placed on 2026-08-14:
+///
+/// 1. **Framing.** An unrecognised `l:` makes `Content-Length` read as `0`,
+///    so a message body is left sitting in the buffer and the next parse
+///    starts *inside* it. A `183 Session Progress` carrying SDP therefore
+///    killed the reader with `malformed request line: v=0`, after which no
+///    further response on that connection was delivered at all — including
+///    the call's final one. The visible symptom was a 16-second
+///    `carrier_timeout: no final response from carrier`, blaming the network
+///    for a message it had already sent.
+/// 2. **Lookup.** Matching a transaction reads `Via`/`Call-ID`, which found
+///    nothing against `v:`/`i:` — hence provisional responses being logged as
+///    `received response outside an active transaction`.
+///
+/// Registration survived this only because those responses carry `l:0`, so
+/// there was no body to desynchronise on.
+fn canonical_header_name(name: &str) -> &str {
+    // Only single-character names are compact forms; anything longer is
+    // already canonical (or an extension header we pass through untouched).
+    if name.len() != 1 {
+        return name;
+    }
+    match name.as_bytes()[0].to_ascii_lowercase() {
+        b'a' => "Accept-Contact",
+        b'b' => "Referred-By",
+        b'c' => "Content-Type",
+        b'd' => "Request-Disposition",
+        b'e' => "Content-Encoding",
+        b'f' => "From",
+        b'i' => "Call-ID",
+        b'j' => "Reject-Contact",
+        b'k' => "Supported",
+        b'l' => "Content-Length",
+        b'm' => "Contact",
+        b'o' => "Event",
+        b'r' => "Refer-To",
+        b's' => "Subject",
+        b't' => "To",
+        b'u' => "Allow-Events",
+        b'v' => "Via",
+        b'x' => "Session-Expires",
+        _ => name,
+    }
+}
+
+/// The byte offset of `needle`'s first occurrence in `haystack`, or `None`.
+///
+/// Framing (finding `\r\n\r\n`, then slicing `Content-Length` bytes of body)
+/// has to happen on the message's *actual wire bytes*, never on a `String`
+/// produced by lossily re-encoding them first. A carrier's IMS `MESSAGE` body
+/// (`Content-Type: application/vnd.3gpp.sms`) is an arbitrary binary TPDU, not
+/// text; `String::from_utf8_lossy` replaces each invalid byte sequence with
+/// U+FFFD (3 bytes), so the "string" holding it is no longer the same length
+/// as the bytes that arrived. `Content-Length` — a byte count from the wire —
+/// then slices the wrong range, corrupting that message and, on a persistent
+/// TCP buffer, everything parsed after it on the same connection.
+///
+/// Measured on Vi 2026-08-15: an inbound SMS's binary body did exactly this —
+/// the *next* request's start line arrived prefixed with a few leftover
+/// undigested bytes from the previous message's misconverted body, and a
+/// later message crashed the reader thread outright
+/// (`byte index 1559 is not a char boundary`) when a slice point landed inside
+/// one of the synthesized replacement characters. `find_subslice` and the
+/// `&[u8]`-typed `try_parse` below operate on the original bytes throughout;
+/// only the body's *final*, correctly-bounded slice is ever lossily converted.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// A parsed SIP response: status line + headers (in original order, values
 /// joined if a header name repeats) + reason phrase + body (e.g. an SDP
 /// answer on an INVITE's 200 OK).
@@ -41,6 +115,18 @@ impl SipResponse {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Every header matching `name`, in order. A P-CSCF sends one
+    /// `Security-Server` header per algorithm combination it accepts, so
+    /// taking only the first (`header`) silently discards the rest — and with
+    /// them any chance of picking the combination the network is really using.
+    pub fn headers_all<'a>(&'a self, name: &str) -> Vec<&'a str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
     /// Try to parse ONE complete SIP message from the front of `buf` (a
     /// message is complete once the header/body separator is present *and*
     /// `buf` holds at least `Content-Length` more bytes after it — a single
@@ -48,11 +134,18 @@ impl SipResponse {
     /// to back, e.g. `100 Trying` immediately followed by `180 Ringing`).
     /// Returns `Ok(None)` if `buf` doesn't yet hold a full message, along
     /// with how many bytes were consumed so the caller can drain them.
-    fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
-        let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
+    ///
+    /// Header names are canonicalised on the way in — see
+    /// [`canonical_header_name`] for why that is load-bearing rather than
+    /// cosmetic.
+    fn try_parse(buf: &[u8]) -> BridgeResult<Option<(Self, usize)>> {
+        let Some(header_len) = find_subslice(buf, b"\r\n\r\n").map(|idx| idx + 4) else {
             return Ok(None);
         };
-        let header_part = &buf[..header_len];
+        // Headers are ASCII per RFC 3261, so converting only this slice to
+        // text is always lossless — unlike the body, which is sliced from the
+        // original bytes below rather than this converted copy.
+        let header_part = String::from_utf8_lossy(&buf[..header_len]);
 
         let mut lines = header_part.split("\r\n");
         let status_line = lines
@@ -85,8 +178,12 @@ impl SipResponse {
         let headers: Vec<(String, String)> = unfolded
             .into_iter()
             .filter_map(|line| {
-                line.split_once(':')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                line.split_once(':').map(|(k, v)| {
+                    (
+                        canonical_header_name(k.trim()).to_string(),
+                        v.trim().to_string(),
+                    )
+                })
             })
             .collect();
 
@@ -100,7 +197,10 @@ impl SipResponse {
         if buf.len() < total_len {
             return Ok(None);
         }
-        let body = buf[header_len..total_len].to_string();
+        // Bounded, correctly-offset per the RAW bytes — sliced from `buf`
+        // itself, never from a lossily-reencoded copy of it. See
+        // `find_subslice`'s doc comment for why that distinction is load-bearing.
+        let body = String::from_utf8_lossy(&buf[header_len..total_len]).into_owned();
 
         Ok(Some((
             Self {
@@ -124,7 +224,20 @@ pub struct SipRequest {
     pub method: String,
     pub request_uri: String,
     pub headers: Vec<(String, String)>,
+    /// Lossily decoded to text. Correct and sufficient for every method this
+    /// bridge originates or answers as a UAS (SDP is always text) — but for an
+    /// inbound `MESSAGE` whose `Content-Type` names a binary encoding
+    /// (`application/vnd.3gpp.sms`, the 3GPP SMS-over-IP TPDU), this is
+    /// already-destroyed data: `String::from_utf8_lossy` replaces each invalid
+    /// byte sequence with U+FFFD, and that's irreversible. Use
+    /// [`body_bytes`](Self::body_bytes) for anything that needs the bytes the
+    /// carrier actually sent.
     pub body: String,
+    /// The body's raw wire bytes, before any UTF-8 interpretation — see
+    /// `body`'s docs. Sliced from the same correctly-bounded range as `body`,
+    /// so the two always describe the same content; only `body_bytes` is
+    /// bit-exact when that content isn't text.
+    pub body_bytes: Vec<u8>,
 }
 
 impl SipRequest {
@@ -157,11 +270,14 @@ impl SipRequest {
     /// `SipTransport::recv_message` (in this module) parses one from a
     /// buffered stream — and so `sip::server`'s registrar can parse a REGISTER
     /// datagram from an IP phone (spec 024, research.md R-007).
-    pub(crate) fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
-        let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
+    pub(crate) fn try_parse(buf: &[u8]) -> BridgeResult<Option<(Self, usize)>> {
+        let Some(header_len) = find_subslice(buf, b"\r\n\r\n").map(|idx| idx + 4) else {
             return Ok(None);
         };
-        let header_part = &buf[..header_len];
+        // Headers are ASCII per RFC 3261; see `find_subslice`'s doc comment
+        // for why the body below must NOT go through this same conversion
+        // before its length is known.
+        let header_part = String::from_utf8_lossy(&buf[..header_len]);
 
         let mut lines = header_part.split("\r\n");
         let request_line = lines
@@ -194,8 +310,12 @@ impl SipRequest {
         let headers: Vec<(String, String)> = unfolded
             .into_iter()
             .filter_map(|line| {
-                line.split_once(':')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                line.split_once(':').map(|(k, v)| {
+                    (
+                        canonical_header_name(k.trim()).to_string(),
+                        v.trim().to_string(),
+                    )
+                })
             })
             .collect();
 
@@ -209,7 +329,9 @@ impl SipRequest {
         if buf.len() < total_len {
             return Ok(None);
         }
-        let body = buf[header_len..total_len].to_string();
+        // Bounded, correctly-offset per the RAW bytes — see `find_subslice`.
+        let body_bytes = buf[header_len..total_len].to_vec();
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
         Ok(Some((
             Self {
@@ -217,6 +339,7 @@ impl SipRequest {
                 request_uri,
                 headers,
                 body,
+                body_bytes,
             },
             total_len,
         )))
@@ -270,6 +393,20 @@ pub fn build_uas_response_with_headers(
     let mut msg = format!("SIP/2.0 {status} {reason}\r\n");
     for via in request.headers_all("Via") {
         msg.push_str(&format!("Via: {via}\r\n"));
+    }
+    // RFC 3261 §12.1.1: a UAS copies the request's `Record-Route` values into
+    // the response, in the order received. That set is how the caller builds
+    // its route set, so omitting it means the `ACK` for our `200 OK` has no
+    // path back through the proxies that inserted themselves.
+    //
+    // Measured on Jio 2026-08-14: an inbound call rang, was answered and
+    // bridged locally, and the carrier went on retransmitting the INVITE and
+    // playing ringback to the caller because it never saw a usable answer. Our
+    // later BYE was refused `481 Call/Transaction Does Not Exist` — from the
+    // network's side that dialog had never been established. Jio's inbound
+    // INVITEs carry three Record-Route hops, and we echoed none of them.
+    for rr in request.headers_all("Record-Route") {
+        msg.push_str(&format!("Record-Route: {rr}\r\n"));
     }
     if let Some(from) = request.header("From") {
         msg.push_str(&format!("From: {from}\r\n"));
@@ -455,6 +592,22 @@ pub struct RegisterRequest<'a> {
     pub imei: &'a str,
 }
 
+/// `+g.3gpp.smsip` (GSMA IR.92/IR.51) — a bare Contact feature tag declaring
+/// SMS-over-IP support. We already implement receiving it
+/// (`agent::mod::handle_message`), so this only makes a real capability
+/// visible rather than claiming one we don't have.
+///
+/// Added because inbound SIP `MESSAGE` never arrived at all on Jio: zero
+/// hits for `MESSAGE sip:` across every packet-level trace this session
+/// captured, despite the registration otherwise being healthy. A reg-event
+/// `NOTIFY` for the same AOR showed a second contact (a paired Apple Watch,
+/// which does receive SMS) carrying this tag while ours did not — the one
+/// difference between a contact the network delivers SMS to and one it
+/// doesn't. Not proven in general: specs/017 R4 found this same Contact
+/// *without* the tag receiving messages over IMS on a different carrier
+/// path, before any Jio testing existed.
+const SMSIP_FEATURE_TAG: &str = ";+g.3gpp.smsip";
+
 pub fn format_sip_addr(addr: SocketAddr) -> String {
     match addr.ip() {
         IpAddr::V6(ip) => format!("[{ip}]:{}", addr.port()),
@@ -474,7 +627,8 @@ pub fn build_register(req: &RegisterRequest) -> String {
          To: <sip:{public}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio;+sip.instance=\"<urn:gsma:imei:{imei}>\"\r\n\
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio{smsip}\
+         ;+sip.instance=\"<urn:gsma:imei:{imei}>\"\r\n\
          Expires: {expires}\r\n\
          Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n",
@@ -490,6 +644,7 @@ pub fn build_register(req: &RegisterRequest) -> String {
         public_user = req.public_uri.split('@').next().unwrap_or(req.public_uri),
         expires = req.expires,
         imei = req.imei,
+        smsip = SMSIP_FEATURE_TAG,
     );
     if let Some(auth) = req.authorization {
         msg.push_str("Authorization: ");
@@ -566,7 +721,7 @@ enum Socket {
 /// back (e.g. `100 Trying` immediately followed by `180 Ringing`).
 pub struct SipTransport {
     socket: Socket,
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SipTransport {
@@ -595,7 +750,7 @@ impl SipTransport {
         };
         Ok(Self {
             socket,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -652,7 +807,7 @@ impl SipTransport {
         };
         Ok(Self {
             socket,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -710,7 +865,11 @@ impl SipTransport {
                 "connection closed by peer with no data (0 bytes read)".into(),
             )),
             Ok(n) => {
-                self.buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                // Raw bytes in, unconverted — see `find_subslice`'s doc
+                // comment. Framing on a lossily-reencoded copy of this is what
+                // corrupted a binary `MESSAGE` body and everything parsed
+                // after it on the same connection.
+                self.buf.extend_from_slice(&tmp[..n]);
                 Ok(true)
             }
             Err(e)
@@ -734,7 +893,16 @@ impl SipTransport {
     pub fn recv_response(&mut self) -> BridgeResult<SipResponse> {
         loop {
             if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
-                tracing::debug!(response = %self.buf[..consumed], "received SIP response");
+                // `trace`, not `debug`: this is the full message, headers and
+                // body — caller identity and (once decoded) SMS content —
+                // and `debug` is routinely enabled in the field (this
+                // project's own deployments run with
+                // `sip_client=debug` to diagnose exactly these messages),
+                // where `trace` is an operator's deliberate, one-off choice.
+                tracing::trace!(
+                    response = %String::from_utf8_lossy(&self.buf[..consumed]),
+                    "received SIP response"
+                );
                 self.buf.drain(..consumed);
                 return Ok(resp);
             }
@@ -796,8 +964,25 @@ impl SipTransport {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some((msg, consumed)) = try_parse_one(&self.buf)? {
-                if let SipMessage::Request(_) = &msg {
-                    tracing::debug!(request = %self.buf[..consumed], "received SIP request");
+                // Symmetric logging for both arms, `trace` not `debug` — see
+                // `recv_response`'s comment: this is the full message, not a
+                // summary, and packet capture is not a substitute here (Gm
+                // traffic is ESP-encrypted, and GRO aggregates the larger
+                // responses on the xfrm interface into frames whose ICV no
+                // longer verifies). Without the response arm specifically,
+                // the single reader of the client transport — where every
+                // carrier response to an outbound INVITE arrives — logged
+                // nothing at all, so a call the network answered with a
+                // `183` and then tore down was undiagnosable from the logs.
+                match &msg {
+                    SipMessage::Request(_) => tracing::trace!(
+                        request = %String::from_utf8_lossy(&self.buf[..consumed]),
+                        "received SIP request"
+                    ),
+                    SipMessage::Response(_) => tracing::trace!(
+                        response = %String::from_utf8_lossy(&self.buf[..consumed]),
+                        "received SIP response"
+                    ),
                 }
                 self.buf.drain(..consumed);
                 return Ok(Some(msg));
@@ -816,11 +1001,11 @@ impl SipTransport {
 /// streaming reader above (which needs the consumed length to drain a buffer
 /// that may hold more than one message) and [`parse_datagram`] below (which
 /// does not).
-fn try_parse_one(buf: &str) -> BridgeResult<Option<(SipMessage, usize)>> {
-    let Some(line_end) = buf.find("\r\n") else {
+fn try_parse_one(buf: &[u8]) -> BridgeResult<Option<(SipMessage, usize)>> {
+    let Some(line_end) = find_subslice(buf, b"\r\n") else {
         return Ok(None);
     };
-    let is_response = buf[..line_end].starts_with("SIP/2.0");
+    let is_response = buf[..line_end].starts_with(b"SIP/2.0");
     if is_response {
         Ok(SipResponse::try_parse(buf)?.map(|(resp, n)| (SipMessage::Response(resp), n)))
     } else {
@@ -835,7 +1020,7 @@ fn try_parse_one(buf: &str) -> BridgeResult<Option<(SipMessage, usize)>> {
 /// that owns a `recv_from`-based unconnected socket rather than a
 /// [`SipTransport`], this is the public entry point to the same parser.
 pub fn parse_datagram(text: &str) -> BridgeResult<Option<SipMessage>> {
-    Ok(try_parse_one(text)?.map(|(msg, _consumed)| msg))
+    Ok(try_parse_one(text.as_bytes())?.map(|(msg, _consumed)| msg))
 }
 
 /// The write half of a SIP connection — cloneable and shareable across
@@ -855,7 +1040,8 @@ pub struct SipSink {
 enum SinkInner {
     Tcp(Mutex<TcpStream>),
     /// A server-side UDP socket is not `connect()`ed to one peer, so the
-    /// address to answer is captured per-message from `recv_from`.
+    /// address to answer is captured per-message — see
+    /// [`response_destination`], which is *not* simply the sender's address.
     Udp(UdpSocket, SocketAddr),
 }
 
@@ -884,7 +1070,7 @@ impl SipTransport {
             .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
         Ok(Self {
             socket: Socket::Tcp(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -936,7 +1122,7 @@ impl SipTransport {
         };
         Ok(Self {
             socket,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 }
@@ -988,12 +1174,29 @@ pub fn spawn_gm_server(
 ) -> BridgeResult<GmServer> {
     let stop = Arc::new(AtomicBool::new(false));
     let alive = Arc::new(AtomicBool::new(true));
+    // Listen on BOTH transports, not just the one we chose for our own client
+    // connection. The network picks the transport for anything it originates,
+    // and it does not have to match ours: Jio advertises our `transport=TCP`
+    // Contact back to us and then delivers INVITEs over UDP. Binding only TCP
+    // meant the decrypted packet hit a port with no UDP socket, the kernel
+    // replied ICMP port-unreachable, and the caller heard "out of coverage
+    // area" — with nothing logged on our side at all (measured 2026-08-14).
+    //
+    // `use_tcp` now only decides which failure is fatal to report: the
+    // transport we actively use must bind, the other is best-effort so a
+    // UDP-only or TCP-only environment still starts.
     if use_tcp {
-        spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone())?;
+        spawn_gm_tcp_server(local, tx.clone(), stop.clone(), alive.clone())?;
+        if let Err(e) = spawn_gm_udp_server(local, tx, stop.clone(), alive.clone()) {
+            tracing::warn!(error = %e, "could not also listen on UDP for network-initiated requests; inbound calls may not arrive");
+        }
     } else {
-        spawn_gm_udp_server(local, tx, stop.clone(), alive.clone())?;
+        spawn_gm_udp_server(local, tx.clone(), stop.clone(), alive.clone())?;
+        if let Err(e) = spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone()) {
+            tracing::warn!(error = %e, "could not also listen on TCP for network-initiated requests; inbound calls may not arrive");
+        }
     }
-    tracing::info!(local = %local, transport = if use_tcp { "TCP" } else { "UDP" }, "listening on the Gm protected server port for network-initiated requests");
+    tracing::info!(local = %local, transport = "TCP+UDP", "listening on the Gm protected server port for network-initiated requests");
     Ok(GmServer { stop, alive })
 }
 
@@ -1125,11 +1328,34 @@ fn spawn_gm_udp_server(
             };
             // Every SIP datagram is a complete message, so unlike the TCP
             // path there is no cross-read buffering to do here.
-            let text = String::from_utf8_lossy(&buf[..n]);
-            let parsed = if text.starts_with("SIP/2.0") {
-                SipResponse::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
+            let datagram = &buf[..n];
+            // `text` is for the log line only — parsing below reads
+            // `datagram` directly. A carrier's `MESSAGE` body
+            // (`application/vnd.3gpp.sms`) is an arbitrary binary TPDU; lossily
+            // converting it *then framing on the conversion's output* was what
+            // corrupted a message and, on the TCP sibling, crashed the reader
+            // thread. See `find_subslice`'s doc comment.
+            let text = String::from_utf8_lossy(datagram);
+            // The TCP sibling logs through `recv_message_deadline`; this path
+            // parses inline and logged nothing at all. That left the *only*
+            // channel a carrier uses to reach us — network-initiated INVITEs
+            // arrive here over UDP on Jio — invisible at any log level, so a
+            // second INVITE could not be told apart from a retransmission of
+            // the first without a decrypted packet capture.
+            //
+            // `trace`, not `debug`: this is the complete datagram, unredacted
+            // — caller/callee identity in every header, and (since carriers
+            // deliver SMS here too) the SMS body. `debug` is what this
+            // project's own deployments actually run with in the field
+            // (`RUST_LOG=...,gsm_sip_bridge::ims::sip_client=debug`, used to
+            // diagnose the exact carrier issues this datagram trace exists
+            // for), so anything short of `trace` here lands in routinely
+            // retained logs, not just a deliberately-enabled one-off capture.
+            tracing::trace!(peer = %peer, message = %text, "received SIP datagram on the Gm server port");
+            let parsed = if datagram.starts_with(b"SIP/2.0") {
+                SipResponse::try_parse(datagram).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
             } else {
-                SipRequest::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Request(r)))
+                SipRequest::try_parse(datagram).map(|o| o.map(|(r, _)| SipMessage::Request(r)))
             };
             let msg = match parsed {
                 Ok(Some(msg)) => msg,
@@ -1142,6 +1368,19 @@ fn spawn_gm_udp_server(
                     continue;
                 }
             };
+            // Answer the datagram's source, NOT the `Via` sent-by.
+            //
+            // RFC 3261 §18.2.2 would route the response to the sent-by host
+            // and port, and Jio's P-CSCF names its protected *server* port
+            // there while sending from its protected *client* port. Following
+            // the generic rule is wrong inside Gm: TS 33.203 defines exactly
+            // four SAs, and `our port_us -> their port_ps` is not one of them.
+            // A response sent there is valid SIP arriving on a pairing with no
+            // security association, so the P-CSCF discards it below SIP and
+            // just keeps retransmitting. Verified on the wire 2026-08-14 —
+            // our `200 OK` went out correctly encrypted to `port_ps` four
+            // times, once per NOTIFY retransmission, and was ignored every
+            // time. The SA pairing decides the destination here.
             let sink = match socket.try_clone() {
                 Ok(s) => SipSink {
                     inner: Arc::new(SinkInner::Udp(s, peer)),
@@ -1358,7 +1597,7 @@ mod tests {
                    Via: SIP/2.0/UDP 1.2.3.4:5060\r\n\
                    WWW-Authenticate: Digest realm=\"ims.example.org\", nonce=\"abc==\", algorithm=AKAv1-MD5\r\n\
                    Content-Length: 0\r\n\r\n";
-        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, consumed) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(consumed, raw.len());
         assert_eq!(resp.status, 401);
         assert_eq!(resp.reason, "Unauthorized");
@@ -1373,7 +1612,7 @@ mod tests {
         let raw = "SIP/2.0 200 OK\r\n\
                    Contact: <sip:foo@bar>\r\n\
                    \t;expires=600\r\n\r\n";
-        let (resp, _) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, _) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(
             resp.header("Contact").unwrap(),
             "<sip:foo@bar> ;expires=600"
@@ -1383,15 +1622,62 @@ mod tests {
     #[test]
     fn try_parse_returns_none_when_incomplete() {
         let raw = "SIP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nhel";
-        assert!(SipResponse::try_parse(raw).unwrap().is_none());
+        assert!(SipResponse::try_parse(raw.as_bytes()).unwrap().is_none());
     }
 
     #[test]
     fn try_parse_extracts_body_and_leaves_remainder_for_next_message() {
         let raw = "SIP/2.0 200 OK\r\nContent-Length: 2\r\n\r\nhiSIP/2.0 100 Trying\r\n\r\n";
-        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, consumed) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(resp.body, "hi");
         assert_eq!(&raw[consumed..], "SIP/2.0 100 Trying\r\n\r\n");
+    }
+
+    #[test]
+    fn compact_content_length_frames_the_body_so_the_stream_stays_in_sync() {
+        // Jio's P-CSCF answers in compact form. Reading `l:` as an unknown
+        // header makes Content-Length 0, so the body is left in the buffer
+        // and the next parse starts inside it — on a `183` carrying SDP that
+        // killed the reader with `malformed request line: v=0` and silently
+        // dropped every later response, including the call's final one.
+        let raw =
+            "SIP/2.0 183 Session Progress\r\nv:SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bKabc\r\n\
+                   i:out-1\r\nCSeq:5 INVITE\r\nc:application/sdp\r\nl:14\r\n\r\n\
+                   v=0\r\no=- 1 1\r\nSIP/2.0 480 Temporarily Unavailable\r\nl:0\r\n\r\n";
+        let (resp, consumed) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(resp.status, 183);
+        assert_eq!(resp.body, "v=0\r\no=- 1 1\r\n");
+        // The critical part: the *next* message must be parseable, not the
+        // middle of this one's SDP.
+        let (next, _) = SipResponse::try_parse(&raw.as_bytes()[consumed..])
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.status, 480);
+    }
+
+    #[test]
+    fn compact_header_names_are_canonicalised_so_lookups_find_them() {
+        // `v:`/`i:` not resolving to Via/Call-ID is why provisional responses
+        // were logged as "outside an active transaction".
+        let raw = "SIP/2.0 100 Trying\r\nv:SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bKabc\r\n\
+                   i:out-1\r\nf:<sip:a@b>;tag=x\r\nt:<sip:c@d>\r\nm:<sip:e@f>\r\nl:0\r\n\r\n";
+        let (resp, _) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(resp.header("Via").unwrap().contains("z9hG4bKabc"));
+        assert_eq!(resp.header("Call-ID").unwrap(), "out-1");
+        assert!(resp.header("From").unwrap().contains("tag=x"));
+        assert_eq!(resp.header("To").unwrap(), "<sip:c@d>");
+        assert_eq!(resp.header("Contact").unwrap(), "<sip:e@f>");
+    }
+
+    #[test]
+    fn canonical_header_name_leaves_long_names_alone() {
+        assert_eq!(canonical_header_name("Content-Length"), "Content-Length");
+        assert_eq!(canonical_header_name("Via"), "Via");
+        // An extension header we do not know is passed through untouched.
+        assert_eq!(canonical_header_name("P-Weird-Thing"), "P-Weird-Thing");
+        // Case-insensitive, per RFC 3261.
+        assert_eq!(canonical_header_name("L"), "Content-Length");
+        assert_eq!(canonical_header_name("v"), "Via");
     }
 
     #[test]
@@ -1434,6 +1720,48 @@ mod tests {
         assert!(msg.contains("[2402:8100::1]:5060"));
         assert!(msg.contains("CSeq: 1 REGISTER"));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// A registrar decides which contacts on an AOR are SMS-capable from this
+    /// tag, not from the fact that we happen to answer inbound `MESSAGE`
+    /// requests. Measured on Jio: a second registered contact (a paired watch)
+    /// carried `+g.3gpp.smsip` and received SMS; ours didn't and never once
+    /// saw an inbound `MESSAGE` arrive.
+    #[test]
+    fn build_register_advertises_sms_over_ip_capability() {
+        let addr: SocketAddr = "10.0.0.5:5060".parse().unwrap();
+        let msg = build_register(&RegisterRequest {
+            registrar_uri: "ims.example",
+            public_uri: "+919000000000@ims.example",
+            local_addr: addr,
+            contact_addr: addr,
+            call_id: "callid",
+            from_tag: "tag1",
+            branch: "z9hG4bKbranch",
+            cseq: 1,
+            expires: 600,
+            transport: "TCP",
+            authorization: None,
+            extra_headers: &[],
+            imei: "860000000000000",
+        });
+
+        let contact_line = msg
+            .lines()
+            .find(|l| l.starts_with("Contact:"))
+            .expect("Contact header present");
+        assert!(
+            contact_line.contains(";+g.3gpp.smsip;"),
+            "must sit between the existing tags, as its own bare parameter: {contact_line}"
+        );
+        // A feature tag is a Contact *header* parameter and must stay outside
+        // the angle-bracketed URI, or it becomes a URI parameter and means
+        // something else entirely.
+        let closing = contact_line.find('>').expect("URI is bracketed");
+        assert!(
+            contact_line.find("+g.3gpp.smsip").unwrap() > closing,
+            "must sit after the closing bracket: {contact_line}"
+        );
     }
 
     /// A BYE from the side that *answered* flows opposite to the INVITE: our
@@ -1545,7 +1873,9 @@ mod tests {
 
     #[test]
     fn sip_request_try_parse_extracts_method_and_uri() {
-        let (req, consumed) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, consumed) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(consumed, SAMPLE_INVITE.len());
         assert_eq!(req.method, "INVITE");
         assert_eq!(
@@ -1560,7 +1890,7 @@ mod tests {
     #[test]
     fn sip_request_try_parse_returns_none_when_body_incomplete() {
         let partial = "BYE sip:x SIP/2.0\r\nContent-Length: 10\r\n\r\nshort";
-        assert!(SipRequest::try_parse(partial).unwrap().is_none());
+        assert!(SipRequest::try_parse(partial.as_bytes()).unwrap().is_none());
     }
 
     #[test]
@@ -1569,7 +1899,7 @@ mod tests {
                     Via: SIP/2.0/TCP 1.1.1.1:5060;branch=b1\r\n\
                     Via: SIP/2.0/TCP 2.2.2.2:5060;branch=b2\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         let vias = req.headers_all("Via");
         assert_eq!(vias.len(), 2);
         assert!(vias[0].contains("1.1.1.1"));
@@ -1578,7 +1908,7 @@ mod tests {
 
     #[test]
     fn sip_request_try_parse_rejects_empty_input() {
-        assert!(SipRequest::try_parse("").unwrap().is_none());
+        assert!(SipRequest::try_parse("".as_bytes()).unwrap().is_none());
     }
 
     fn sample_bye() -> SipRequest {
@@ -1589,12 +1919,14 @@ mod tests {
                     Call-ID: abc123callid\r\n\
                     CSeq: 2 BYE\r\n\
                     Content-Length: 0\r\n\r\n";
-        SipRequest::try_parse(raw).unwrap().unwrap().0
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
     #[test]
     fn build_100_trying_has_no_to_tag_and_no_contact() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_100_trying(&req);
         assert!(resp.starts_with("SIP/2.0 100 Trying\r\n"));
         assert!(!resp.contains("Contact:"));
@@ -1608,7 +1940,9 @@ mod tests {
 
     #[test]
     fn build_180_ringing_adds_to_tag_and_contact() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_180_ringing(&req, "totag1", "<sip:agent@10.0.0.9:5060>");
         assert!(resp.starts_with("SIP/2.0 180 Ringing\r\n"));
         assert!(resp.contains(";tag=totag1\r\n"));
@@ -1616,8 +1950,43 @@ mod tests {
     }
 
     #[test]
+    fn a_uas_response_echoes_every_record_route_in_order() {
+        // Without this the caller cannot build its route set, so the ACK for
+        // our 200 OK has no path back through the proxies that inserted
+        // themselves. Live symptom on Jio: the call rang, was answered and
+        // bridged on our side, and the carrier kept retransmitting the INVITE
+        // and playing ringback because it never saw a usable answer — then
+        // refused our BYE with 481, having never established the dialog.
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      Record-Route: <sip:rr1@10.1.1.1:5060;lr>\r\n\
+                      Record-Route: <sip:rr2@10.2.2.2:5090;lr>\r\n\
+                      Record-Route: <sip:rr3@10.3.3.3:5067;lr>\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
+        let resp = build_200_ok_invite(&req, "totag1", "<sip:agent@10.0.0.9:5060>", "");
+        let rrs: Vec<&str> = resp
+            .lines()
+            .filter(|l| l.starts_with("Record-Route: "))
+            .collect();
+        assert_eq!(
+            rrs,
+            vec![
+                "Record-Route: <sip:rr1@10.1.1.1:5060;lr>",
+                "Record-Route: <sip:rr2@10.2.2.2:5090;lr>",
+                "Record-Route: <sip:rr3@10.3.3.3:5067;lr>",
+            ],
+            "all three hops must be echoed, in the order received"
+        );
+    }
+
+    #[test]
     fn build_200_ok_invite_includes_sdp_body_and_content_length() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n";
         let resp = build_200_ok_invite(&req, "totag1", "<sip:agent@10.0.0.9:5060>", sdp);
         assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
@@ -1637,7 +2006,9 @@ mod tests {
 
     #[test]
     fn extra_headers_appear_after_the_echoed_ones_and_before_the_body() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_uas_response_with_headers(
             401,
             "Unauthorized",
@@ -1667,7 +2038,10 @@ mod tests {
         // Pins the delegation in `build_uas_response`: the IMS path must not
         // shift by a single byte now that it routes through the new function.
         for req in [
-            SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap().0,
+            SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+                .unwrap()
+                .unwrap()
+                .0,
             sample_bye(),
         ] {
             let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n";
@@ -1686,7 +2060,9 @@ mod tests {
 
     #[test]
     fn build_486_busy_here_declines_with_no_body() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_486_busy_here(&req, "totag1");
         assert!(resp.starts_with("SIP/2.0 486 Busy Here\r\n"));
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
@@ -1702,7 +2078,7 @@ mod tests {
                     Content-Type: text/plain\r\n\
                     Content-Length: 5\r\n\r\n\
                     hello";
-        SipRequest::try_parse(raw).unwrap().unwrap().0
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
     #[test]
@@ -1721,13 +2097,51 @@ mod tests {
         assert_eq!(req.body, "hello");
     }
 
+    /// The bug this guards against: a body that isn't valid UTF-8 — exactly
+    /// what 3GPP SMS-over-IP sends (`Content-Type: application/vnd.3gpp.sms`,
+    /// a raw TPDU) — must not corrupt whatever follows it in the same buffer.
+    /// Measured on Vi 2026-08-15: an inbound SMS's binary body desynced a TCP
+    /// stream's byte offsets against a lossily-reencoded copy of it, garbling
+    /// the *next* message's start line and eventually panicking a reader
+    /// thread (`byte index 1559 is not a char boundary`) when a slice point
+    /// landed inside a synthesized replacement character.
+    #[test]
+    fn a_binary_body_does_not_corrupt_the_next_pipelined_message() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MESSAGE sip:x SIP/2.0\r\nCall-ID: c1\r\nCSeq: 1 MESSAGE\r\n");
+        // Not valid UTF-8 on its own terms — lone continuation/leading bytes
+        // that only ever mean something as part of a multi-byte sequence.
+        let binary_body: &[u8] = &[0xC0, 0x80, 0xFF, 0xFE, 0x00, 0x9c, 0x1b, 0x80, 0x81];
+        buf.extend_from_slice(format!("Content-Length: {}\r\n\r\n", binary_body.len()).as_bytes());
+        buf.extend_from_slice(binary_body);
+        // A second, ordinary text message immediately behind it in the same
+        // buffer — exactly the TCP-pipelining shape that desynced.
+        buf.extend_from_slice(
+            b"OPTIONS sip:y SIP/2.0\r\nCall-ID: c2\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+        );
+
+        let (first, consumed) = SipRequest::try_parse(&buf).unwrap().unwrap();
+        assert_eq!(first.method, "MESSAGE");
+        assert_eq!(
+            first.body_bytes, binary_body,
+            "the raw bytes must survive exactly, for a PDU decoder to work on"
+        );
+
+        // The framing offset must land exactly on the second message's start —
+        // not a few bytes short or long, which is what a lossily-reencoded
+        // length mismatch produces.
+        let (second, _) = SipRequest::try_parse(&buf[consumed..]).unwrap().unwrap();
+        assert_eq!(second.method, "OPTIONS");
+        assert_eq!(second.request_uri, "sip:y");
+    }
+
     #[test]
     fn via_headers_are_echoed_verbatim_in_order_on_responses() {
         let raw = "INVITE sip:x SIP/2.0\r\n\
                     Via: SIP/2.0/TCP 1.1.1.1:5060;branch=b1\r\n\
                     Via: SIP/2.0/TCP 2.2.2.2:5060;branch=b2\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         let resp = build_100_trying(&req);
         let first_via = resp.find("Via: SIP/2.0/TCP 1.1.1.1").unwrap();
         let second_via = resp.find("Via: SIP/2.0/TCP 2.2.2.2").unwrap();
@@ -1770,7 +2184,9 @@ mod tests {
     fn an_initial_invite_response_still_adds_the_tag_that_creates_the_dialog() {
         // The other half of the rule: an initial INVITE has an untagged `To`,
         // and our response is what establishes the dialog.
-        let (invite, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (invite, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let response = build_uas_response(200, "OK", &invite, Some("mine"), None, None);
         let to_line = response
             .lines()
