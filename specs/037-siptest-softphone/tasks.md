@@ -22,17 +22,17 @@ engine skeleton, registration itself — is front-loaded, because US1 and US3
 cannot function without a live registration and US2 *is* the registration
 lifecycle's own acceptance criteria.
 
-## Implementation status (as of the sixth /speckit.implement pass)
+## Implementation status (as of the seventh /speckit.implement pass)
 
-**Done and verified**: Phase 1 (Setup), Phase 2 (Foundational), Phase 3 (US1
-— outbound calling), Phase 4 (US2 — registration), Phase 5 (US3 — inbound
-calling), Phase 6 (US4 — tone/Goertzel/RTT) all in full now, plus Phase 7's
-G.722 trio (T079–T081) and its remaining test-coverage tasks (T035, T048–T051,
-this pass), plus FR-005's startup guard (T028) marked won't-do by the user.
-**81 of 84 tasks resolved** — every remaining unchecked task (T026, T037,
-T082) has a specific, named reason below, not an oversight. `make format &&
-make lint && make test` all pass across the whole workspace, zero `unsafe`,
-zero clippy warnings. `siptest call --destination ... --wait` genuinely places a
+**Done and verified**: every phase (Setup, Foundational, US1–US4) and all of
+Phase 7 including T082 — the live quickstart run against the real bridge,
+this pass, with the operator's explicit go-ahead (see T082's own note for
+the full result and the two doc drifts it found and fixed). **82 of 84 tasks
+resolved** — the only two remaining unchecked tasks, T026 and T037, are the
+single documented dialog-engine simplification, not an oversight. `make
+format && make lint && make test` all pass across the whole workspace, zero
+`unsafe`, zero clippy warnings. `siptest call --destination ... --wait`
+genuinely places a
 call through a real bridge's registrar, follows the `302` redirect, exchanges
 real audio (PCMU or, since this pass, G.722 — `--codec {auto,pcmu,g722}`)
 carrying the `grid8` tone plan by default, records both directions, and
@@ -104,8 +104,8 @@ channel to read the bridge's configured `ring_aor` value, only whether
 account stays a documented operator responsibility in quickstart.md instead
 of an enforced check.
 
-**Not built — 3 tasks (T026, T037, T082), plus two smaller named gaps below
-that never had their own task IDs**:
+**Not built — 2 tasks (T026, T037), plus two smaller named gaps below that
+never had their own task IDs**:
 
 - **`dtmf`/`single` tone-plan variants** — `silence` is covered structurally
   via `tone_enabled: false`; the other two names in the config schema aren't
@@ -117,12 +117,6 @@ that never had their own task IDs**:
 - **The WAV-byte-serving half of T074** — the recording metadata endpoint is
   tested; the file-bytes endpoint isn't, because no test call in
   `test_control_api.rs` records.
-- **T082** — running the live quickstart against the real bridge. Not
-  attempted: it places a real call over the mobile network, at real cost, and
-  optionally displaces the operator's own registered handset for the inbound
-  case (quickstart.md §5's `ring_aor` swap) — squarely the kind of
-  real-world, cost-bearing action this agent does not take without the
-  operator's explicit go-ahead in the moment.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -351,7 +345,7 @@ adding scope the spec didn't ask for.
 - [x] T079 **Done.** `siptest/src/media/g722.rs`: an original ~410-line in-crate implementation of ITU-T G.722 mode-1 sub-band ADPCM (QMF analysis/synthesis filterbank, low/high-band adaptive predictors and quantizers). Constants transcribed from the ITU-T G.722 Table 11 / standard quantizer tables, cross-checked against real FFmpeg LGPL source (downloaded to a scratch dir, never copied into the repo — used only to verify numeric constants, not copyrightable expression) rather than `ezk-g722` (pulls a whole SIP framework as a mandatory dependency) or `audio-codec` (zero test coverage on its G.722 module). Added the `G722` `CodecProfile` (pt 9, `rtp_clock_hz=8000`, `audio_hz=16000`, `samples_per_frame=320`, `ts_increment=160`) and the `CodecCoder` trait (`PcmuCoder`/`G722Coder`) in `media/codec.rs` so encode/decode state persists correctly across a call — PCMU is memoryless, G.722's ADPCM predictors are not. `sdp.rs` needed no changes: `build_offer`/`parse_offer`/`parse_answer` were already payload-type-generic (only new regression tests were added confirming PT 9 round-trips). Notable debugging finding, preserved here since it is easy to rediscover the hard way: a naive sample-for-sample SNR test comparing `decoded[i]` against `input[i]` fails (~-5dB) not because of an ADPCM bug but because G.722's QMF filterbank has an inherent ~22-sample algorithmic delay (confirmed against FFmpeg's own `initial_padding = 22`) — the correct test delay-compensates the comparison, which now measures a genuine ~42dB SNR.
 - [x] T080 [P] **Done.** `media/codec.rs`'s `g722_audio_rate_and_clock_rate_deliberately_differ` pins the `audio_hz`/`rtp_clock_hz` trap directly on the `G722` const. The tone-through-codec round trip itself lives in `media/session.rs`'s `g722_tone_plan_is_detected_through_a_real_encode_decode_round_trip` — the same real UDP-loopback pipeline as the existing PCMU test (`tone_plan_is_detected_on_both_sides_of_a_real_loopback_with_measurable_rtt`), but routed through a real G.722 encode/decode round trip; asserts symbols are still detected and RTT is still measured through the codec.
 - [x] T081 [P] **Done.** `media/codec.rs` gained `resolve_codec(name) -> Result<CodecProfile, String>` (outbound: `"auto"`/`"g722"` prefer G.722, `"pcmu"` forces PCMU, anything else is a named error) and `select_inbound_codec(name, &offer) -> Option<CodecProfile>` (inbound: constrained by what the caller actually offered, `"auto"` tries G.722 then falls back to PCMU). Wired end to end: `siptest call --destination ... --codec {auto,pcmu,g722}` (`cli.rs`/`commands.rs`) → `POST /calls` body's new optional `codec` field, defaulting to `[media].codec` when omitted (`api/handlers.rs`) → `call::execute_outbound_call`'s new `codec_name` parameter, resolved before any state mutation so a bad value fails fast as `400 invalid_codec` rather than after consuming a rate-limit slot (new `SipTestError::InvalidCodec`). Inbound answers now call `select_inbound_codec(&state.config.media.codec, &offer)` instead of a hardcoded PCMU-only offer check. Proven two ways: `test_control_api.rs`'s `posting_an_unknown_codec_is_rejected_with_400_before_dialling` (real HTTP, bad value) and `test_against_registrar.rs`'s `siptest_offers_g722_on_the_wire_when_the_g722_codec_is_selected` (real registrar + 302 dance; the stub UAS captures the actual re-INVITE and asserts it names PT 9 / `G722/8000`, not just that `resolve_codec` returns the right struct in isolation).
-- [ ] T082 Run `specs/037-siptest-softphone/quickstart.md` end to end against a live bridge (provision account `1002`, place a call, verify recordings and report, temporarily set `ring_aor` for an inbound run) and fix any drift between the doc and the real CLI/API surface
+- [x] T082 **Done, 2026-08-15, against the live bridge with the operator's explicit go-ahead.** The operator provisioned `[[sip_server.account]] username="1002"` (plain literal password, not `env:` — a throwaway local test credential) and set `ring_aor="1002"` in the shared checkout's `config.toml` themselves (this worktree-isolated session cannot write outside its own worktree, confirmed by the Edit tool refusing the path) and restarted the bridge container. Real results, both directions, over the real Jio VoWiFi path: **outbound** call `c-1` to the operator's phone — answered, `G722/8000` auto-negotiated by `"auto"`, `packets: both_ways`, `success: true`, `c-1-{sent,received}.wav` written and size-consistent with the reported packet/sample counts. **Inbound** call `c-2` from the same phone — discovered purely by polling `GET /events` (`kind: incoming_call`, all three caller-ID headers populated), auto-answered after the configured 2s delay, same codec/verdict/recording outcome. `verdicts.rx_audio: tone_detected` fired on both calls off only ~1 matched symbol out of ~1000+ sent — expected, not a bug: a human-answered call has no echo path for the tone to loop back through, so that axis is only meaningful against a real loopback (as the unit tests use), while `verdicts.packets` (the actual pass/fail signal) was solid both times. Two real doc/API drifts found and fixed in `quickstart.md`: (1) every `POST`/`PUT` example carrying a JSON body was missing `-H 'Content-Type: application/json'` — axum's extractor rejects a bare `-d` body outright, confirmed by hitting the exact error live; added the header to all three affected commands plus a troubleshooting-table row. (2) Section 4's `jq '.verdicts, .media.rx_level, .success'` read from the response root, but `GET /calls/{id}` nests all of that under `.report` — fixed to `.report.verdicts, .report.media.rx_level, .report.success`. Cleanup: siptest daemon stopped after the run; the operator still needs to revert `ring_aor` to `1001` and restart the bridge themselves, for the same reason they had to provision it.
 - [x] T083 [P] Done — `siptest/tests/test_cli.rs`, 7 tests: top-level and `call --help` both render as clap's `DisplayHelp`, not a panic; `call` without `--destination` is `MissingRequiredArgument`, not a panic; `call`/`status` parse correctly; global flags (`--config`, `-v`) are read regardless of subcommand.
 - [x] T084 Final `make format && make lint && make test` across the whole workspace
 

@@ -106,14 +106,14 @@ curl -s localhost:9091/metrics | grep sip_server_bindings   # should now read 2
 ## 4. Place a call
 
 ```bash
-curl -sXPOST localhost:8099/calls \
+curl -sXPOST localhost:8099/calls -H 'Content-Type: application/json' \
   -d '{"destination":"+919000000000","duration_secs":20}' | jq -r .id
 ```
 
 The handset rings; answer it and speak. Then:
 
 ```bash
-curl -s localhost:8099/calls/c-1 | jq '.verdicts, .media.rx_level, .success'
+curl -s localhost:8099/calls/c-1 | jq '.report.verdicts, .report.media.rx_level, .report.success'
 curl -s localhost:8099/calls/c-1 | jq -r .report_text
 ```
 
@@ -159,9 +159,9 @@ done
 For manual control:
 
 ```bash
-curl -sXPUT  localhost:8099/policy/inbound -d '{"mode":"manual"}'
+curl -sXPUT  localhost:8099/policy/inbound -H 'Content-Type: application/json' -d '{"mode":"manual"}'
 curl -sXPOST localhost:8099/calls/c-2/answer
-curl -sXPOST localhost:8099/calls/c-2/reject -d '{"status":486}'
+curl -sXPOST localhost:8099/calls/c-2/reject -H 'Content-Type: application/json' -d '{"status":486}'
 ```
 
 ## 6. Recordings
@@ -184,6 +184,7 @@ curl -s 'localhost:8099/log/tail?lines=200' | jq -r '.lines[]'
 
 | Symptom | Cause |
 |---|---|
+| `Expected request with Content-Type: application/json` | A `-d` body was posted without `-H 'Content-Type: application/json'` — axum's JSON extractor rejects it outright rather than guessing. Every `POST`/`PUT` example above that sends a body includes the header for this reason |
 | `403` on an outbound call | Registration lapsed, or the INVITE left from a different local port than the REGISTER. The bridge matches the full `SocketAddr`, so this looks like an auth fault but is not |
 | Inbound never arrives | `ring_aor` does not name siptest's account; or `local.sip_addr` is unroutable; or the real handset re-registered and displaced the binding |
 | `484` | Destination contains characters outside `[0-9*#+]` |
