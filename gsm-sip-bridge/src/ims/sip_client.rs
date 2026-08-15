@@ -345,6 +345,20 @@ pub fn build_uas_response_with_headers(
     for via in request.headers_all("Via") {
         msg.push_str(&format!("Via: {via}\r\n"));
     }
+    // RFC 3261 §12.1.1: a UAS copies the request's `Record-Route` values into
+    // the response, in the order received. That set is how the caller builds
+    // its route set, so omitting it means the `ACK` for our `200 OK` has no
+    // path back through the proxies that inserted themselves.
+    //
+    // Measured on Jio 2026-08-14: an inbound call rang, was answered and
+    // bridged locally, and the carrier went on retransmitting the INVITE and
+    // playing ringback to the caller because it never saw a usable answer. Our
+    // later BYE was refused `481 Call/Transaction Does Not Exist` — from the
+    // network's side that dialog had never been established. Jio's inbound
+    // INVITEs carry three Record-Route hops, and we echoed none of them.
+    for rr in request.headers_all("Record-Route") {
+        msg.push_str(&format!("Record-Route: {rr}\r\n"));
+    }
     if let Some(from) = request.header("From") {
         msg.push_str(&format!("From: {from}\r\n"));
     }
@@ -917,7 +931,8 @@ pub struct SipSink {
 enum SinkInner {
     Tcp(Mutex<TcpStream>),
     /// A server-side UDP socket is not `connect()`ed to one peer, so the
-    /// address to answer is captured per-message from `recv_from`.
+    /// address to answer is captured per-message — see
+    /// [`response_destination`], which is *not* simply the sender's address.
     Udp(UdpSocket, SocketAddr),
 }
 
@@ -1205,6 +1220,13 @@ fn spawn_gm_udp_server(
             // Every SIP datagram is a complete message, so unlike the TCP
             // path there is no cross-read buffering to do here.
             let text = String::from_utf8_lossy(&buf[..n]);
+            // The TCP sibling logs through `recv_message_deadline`; this path
+            // parses inline and logged nothing at all. That left the *only*
+            // channel a carrier uses to reach us — network-initiated INVITEs
+            // arrive here over UDP on Jio — invisible at any log level, so a
+            // second INVITE could not be told apart from a retransmission of
+            // the first without a decrypted packet capture.
+            tracing::debug!(peer = %peer, message = %text, "received SIP datagram on the Gm server port");
             let parsed = if text.starts_with("SIP/2.0") {
                 SipResponse::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
             } else {
@@ -1221,6 +1243,19 @@ fn spawn_gm_udp_server(
                     continue;
                 }
             };
+            // Answer the datagram's source, NOT the `Via` sent-by.
+            //
+            // RFC 3261 §18.2.2 would route the response to the sent-by host
+            // and port, and Jio's P-CSCF names its protected *server* port
+            // there while sending from its protected *client* port. Following
+            // the generic rule is wrong inside Gm: TS 33.203 defines exactly
+            // four SAs, and `our port_us -> their port_ps` is not one of them.
+            // A response sent there is valid SIP arriving on a pairing with no
+            // security association, so the P-CSCF discards it below SIP and
+            // just keeps retransmitting. Verified on the wire 2026-08-14 —
+            // our `200 OK` went out correctly encrypted to `port_ps` four
+            // times, once per NOTIFY retransmission, and was ignored every
+            // time. The SA pairing decides the destination here.
             let sink = match socket.try_clone() {
                 Ok(s) => SipSink {
                     inner: Arc::new(SinkInner::Udp(s, peer)),
@@ -1709,6 +1744,39 @@ mod tests {
         assert!(resp.starts_with("SIP/2.0 180 Ringing\r\n"));
         assert!(resp.contains(";tag=totag1\r\n"));
         assert!(resp.contains("Contact: <sip:agent@10.0.0.9:5060>\r\n"));
+    }
+
+    #[test]
+    fn a_uas_response_echoes_every_record_route_in_order() {
+        // Without this the caller cannot build its route set, so the ACK for
+        // our 200 OK has no path back through the proxies that inserted
+        // themselves. Live symptom on Jio: the call rang, was answered and
+        // bridged on our side, and the carrier kept retransmitting the INVITE
+        // and playing ringback because it never saw a usable answer — then
+        // refused our BYE with 481, having never established the dialog.
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      Record-Route: <sip:rr1@10.1.1.1:5060;lr>\r\n\
+                      Record-Route: <sip:rr2@10.2.2.2:5090;lr>\r\n\
+                      Record-Route: <sip:rr3@10.3.3.3:5067;lr>\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite).unwrap().unwrap();
+        let resp = build_200_ok_invite(&req, "totag1", "<sip:agent@10.0.0.9:5060>", "");
+        let rrs: Vec<&str> = resp
+            .lines()
+            .filter(|l| l.starts_with("Record-Route: "))
+            .collect();
+        assert_eq!(
+            rrs,
+            vec![
+                "Record-Route: <sip:rr1@10.1.1.1:5060;lr>",
+                "Record-Route: <sip:rr2@10.2.2.2:5090;lr>",
+                "Record-Route: <sip:rr3@10.3.3.3:5067;lr>",
+            ],
+            "all three hops must be echoed, in the order received"
+        );
     }
 
     #[test]

@@ -748,6 +748,13 @@ fn dispatch_loop(
     place_call_rx: mpsc::Receiver<PendingPlaceCall>,
 ) -> BridgeResult<()> {
     let mut st = LoopState::new();
+    // Read once: see the `GM_RESPOND_ON_CLIENT` comment at the receive below.
+    let respond_on_client = std::env::var_os("GM_RESPOND_ON_CLIENT").is_some();
+    if respond_on_client {
+        tracing::warn!(
+            "GM_RESPOND_ON_CLIENT is set — answering network-initiated requests on the client leg (experimental, Jio-specific)"
+        );
+    }
     loop {
         st.sync_shared_status(p);
 
@@ -772,7 +779,37 @@ fn dispatch_loop(
         } else {
             IDLE_POLL_INTERVAL
         };
-        match inbound.rx.recv_timeout(poll) {
+        // EXPERIMENT, gated on `GM_RESPOND_ON_CLIENT=1`: answer a
+        // network-initiated request over the *client* leg instead of the
+        // socket it arrived on.
+        //
+        // Jio ignores every response we send from `port_us` — verified on the
+        // wire to both of its protected ports, with the correct SPI,
+        // monotonic ESP sequence, and well-formed SIP. Yet it validates our
+        // ESP on the client SA (`spi-s`) continuously, and TS 33.203 keys all
+        // four SAs from one `IK`, so there is no cryptographic difference
+        // between the packets it accepts and the ones it drops. This tests
+        // the one pairing never tried: replying on the SA it demonstrably
+        // trusts. It contradicts the spec, so it stays behind an env var and
+        // must not become default — Airtel and Vi answer correctly today.
+        let received = match inbound.rx.recv_timeout(poll) {
+            Ok((msg, sink)) if respond_on_client && matches!(msg, SipMessage::Request(_)) => {
+                match session.transport().and_then(|t| t.sink()) {
+                    Ok(client_sink) => {
+                        tracing::debug!(
+                            "GM_RESPOND_ON_CLIENT: answering on the client leg, not the arrival socket"
+                        );
+                        Ok((msg, client_sink))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GM_RESPOND_ON_CLIENT set but no client sink; using the arrival socket");
+                        Ok((msg, sink))
+                    }
+                }
+            }
+            other => other,
+        };
+        match received {
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {
                 st.handle_inbound_invite(session, inbound, p, &req, &sink);
             }

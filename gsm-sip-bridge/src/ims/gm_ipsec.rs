@@ -463,6 +463,49 @@ pub fn install_gm_sas(
             true,
             policy_proto,
         )?;
+
+        // The two canonical pairs above are what TS 33.203 draws, but they
+        // only cover a client port talking to the *opposite* server port.
+        // RFC 3261 §18.2.2 routes a response to the `Via` sent-by, and Jio's
+        // P-CSCF sends network-initiated requests from its client port while
+        // naming its *server* port in that `Via` — so the reply belongs on a
+        // pairing the four canonical policies do not describe, and would
+        // otherwise leave unprotected (silently: an unmatched policy is not an
+        // error, the packet just goes out in the clear and the carrier drops
+        // it).
+        //
+        // Completing the cross product costs four more selectors per protocol
+        // and makes every combination of our two protected ports with their
+        // two protected ports carry ESP, so response routing is free to follow
+        // the SIP rules without a transport-layer trap underneath it.
+        xfrm_policy_add(
+            endpoints.local_c,
+            endpoints.remote_c,
+            theirs.spi_c,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.local_s,
+            endpoints.remote_s,
+            theirs.spi_s,
+            false,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_c,
+            endpoints.local_c,
+            ours.spi_c,
+            true,
+            policy_proto,
+        )?;
+        xfrm_policy_add(
+            endpoints.remote_s,
+            endpoints.local_s,
+            ours.spi_s,
+            true,
+            policy_proto,
+        )?;
     }
 
     Ok(())
