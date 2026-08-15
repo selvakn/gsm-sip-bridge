@@ -1451,14 +1451,14 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\n\
                     From: <sip:+919000000000@ims.mnc094.mcc404.3gppnetwork.org>;tag=abc\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "+919000000000");
     }
 
     #[test]
     fn extract_caller_falls_back_to_unknown_when_from_is_unparseable() {
         let raw = "INVITE sip:x SIP/2.0\r\nFrom: garbage\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "unknown");
     }
 }

@@ -72,6 +72,30 @@ fn canonical_header_name(name: &str) -> &str {
     }
 }
 
+/// The byte offset of `needle`'s first occurrence in `haystack`, or `None`.
+///
+/// Framing (finding `\r\n\r\n`, then slicing `Content-Length` bytes of body)
+/// has to happen on the message's *actual wire bytes*, never on a `String`
+/// produced by lossily re-encoding them first. A carrier's IMS `MESSAGE` body
+/// (`Content-Type: application/vnd.3gpp.sms`) is an arbitrary binary TPDU, not
+/// text; `String::from_utf8_lossy` replaces each invalid byte sequence with
+/// U+FFFD (3 bytes), so the "string" holding it is no longer the same length
+/// as the bytes that arrived. `Content-Length` — a byte count from the wire —
+/// then slices the wrong range, corrupting that message and, on a persistent
+/// TCP buffer, everything parsed after it on the same connection.
+///
+/// Measured on Vi 2026-08-15: an inbound SMS's binary body did exactly this —
+/// the *next* request's start line arrived prefixed with a few leftover
+/// undigested bytes from the previous message's misconverted body, and a
+/// later message crashed the reader thread outright
+/// (`byte index 1559 is not a char boundary`) when a slice point landed inside
+/// one of the synthesized replacement characters. `find_subslice` and the
+/// `&[u8]`-typed `try_parse` below operate on the original bytes throughout;
+/// only the body's *final*, correctly-bounded slice is ever lossily converted.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// A parsed SIP response: status line + headers (in original order, values
 /// joined if a header name repeats) + reason phrase + body (e.g. an SDP
 /// answer on an INVITE's 200 OK).
@@ -114,11 +138,14 @@ impl SipResponse {
     /// Header names are canonicalised on the way in — see
     /// [`canonical_header_name`] for why that is load-bearing rather than
     /// cosmetic.
-    fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
-        let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
+    fn try_parse(buf: &[u8]) -> BridgeResult<Option<(Self, usize)>> {
+        let Some(header_len) = find_subslice(buf, b"\r\n\r\n").map(|idx| idx + 4) else {
             return Ok(None);
         };
-        let header_part = &buf[..header_len];
+        // Headers are ASCII per RFC 3261, so converting only this slice to
+        // text is always lossless — unlike the body, which is sliced from the
+        // original bytes below rather than this converted copy.
+        let header_part = String::from_utf8_lossy(&buf[..header_len]);
 
         let mut lines = header_part.split("\r\n");
         let status_line = lines
@@ -170,7 +197,10 @@ impl SipResponse {
         if buf.len() < total_len {
             return Ok(None);
         }
-        let body = buf[header_len..total_len].to_string();
+        // Bounded, correctly-offset per the RAW bytes — sliced from `buf`
+        // itself, never from a lossily-reencoded copy of it. See
+        // `find_subslice`'s doc comment for why that distinction is load-bearing.
+        let body = String::from_utf8_lossy(&buf[header_len..total_len]).into_owned();
 
         Ok(Some((
             Self {
@@ -227,11 +257,14 @@ impl SipRequest {
     /// `SipTransport::recv_message` (in this module) parses one from a
     /// buffered stream — and so `sip::server`'s registrar can parse a REGISTER
     /// datagram from an IP phone (spec 024, research.md R-007).
-    pub(crate) fn try_parse(buf: &str) -> BridgeResult<Option<(Self, usize)>> {
-        let Some(header_len) = buf.find("\r\n\r\n").map(|idx| idx + 4) else {
+    pub(crate) fn try_parse(buf: &[u8]) -> BridgeResult<Option<(Self, usize)>> {
+        let Some(header_len) = find_subslice(buf, b"\r\n\r\n").map(|idx| idx + 4) else {
             return Ok(None);
         };
-        let header_part = &buf[..header_len];
+        // Headers are ASCII per RFC 3261; see `find_subslice`'s doc comment
+        // for why the body below must NOT go through this same conversion
+        // before its length is known.
+        let header_part = String::from_utf8_lossy(&buf[..header_len]);
 
         let mut lines = header_part.split("\r\n");
         let request_line = lines
@@ -283,7 +316,8 @@ impl SipRequest {
         if buf.len() < total_len {
             return Ok(None);
         }
-        let body = buf[header_len..total_len].to_string();
+        // Bounded, correctly-offset per the RAW bytes — see `find_subslice`.
+        let body = String::from_utf8_lossy(&buf[header_len..total_len]).into_owned();
 
         Ok(Some((
             Self {
@@ -672,7 +706,7 @@ enum Socket {
 /// back (e.g. `100 Trying` immediately followed by `180 Ringing`).
 pub struct SipTransport {
     socket: Socket,
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SipTransport {
@@ -701,7 +735,7 @@ impl SipTransport {
         };
         Ok(Self {
             socket,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -758,7 +792,7 @@ impl SipTransport {
         };
         Ok(Self {
             socket,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -816,7 +850,11 @@ impl SipTransport {
                 "connection closed by peer with no data (0 bytes read)".into(),
             )),
             Ok(n) => {
-                self.buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                // Raw bytes in, unconverted — see `find_subslice`'s doc
+                // comment. Framing on a lossily-reencoded copy of this is what
+                // corrupted a binary `MESSAGE` body and everything parsed
+                // after it on the same connection.
+                self.buf.extend_from_slice(&tmp[..n]);
                 Ok(true)
             }
             Err(e)
@@ -840,7 +878,10 @@ impl SipTransport {
     pub fn recv_response(&mut self) -> BridgeResult<SipResponse> {
         loop {
             if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
-                tracing::debug!(response = %self.buf[..consumed], "received SIP response");
+                tracing::debug!(
+                    response = %String::from_utf8_lossy(&self.buf[..consumed]),
+                    "received SIP response"
+                );
                 self.buf.drain(..consumed);
                 return Ok(resp);
             }
@@ -901,8 +942,8 @@ impl SipTransport {
     pub fn recv_message_deadline(&mut self, timeout: Duration) -> BridgeResult<Option<SipMessage>> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some(line_end) = self.buf.find("\r\n") {
-                let is_response = self.buf[..line_end].starts_with("SIP/2.0");
+            if let Some(line_end) = find_subslice(&self.buf, b"\r\n") {
+                let is_response = self.buf[..line_end].starts_with(b"SIP/2.0");
                 if is_response {
                     if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
                         // Symmetric with the request arm below. Without this
@@ -914,12 +955,18 @@ impl SipTransport {
                         // substitute here: the Gm traffic is ESP-encrypted, and
                         // GRO aggregates the larger responses on the xfrm
                         // interface into frames whose ICV no longer verifies.
-                        tracing::debug!(response = %self.buf[..consumed], "received SIP response");
+                        tracing::debug!(
+                            response = %String::from_utf8_lossy(&self.buf[..consumed]),
+                            "received SIP response"
+                        );
                         self.buf.drain(..consumed);
                         return Ok(Some(SipMessage::Response(resp)));
                     }
                 } else if let Some((req, consumed)) = SipRequest::try_parse(&self.buf)? {
-                    tracing::debug!(request = %self.buf[..consumed], "received SIP request");
+                    tracing::debug!(
+                        request = %String::from_utf8_lossy(&self.buf[..consumed]),
+                        "received SIP request"
+                    );
                     self.buf.drain(..consumed);
                     return Ok(Some(SipMessage::Request(req)));
                 }
@@ -979,7 +1026,7 @@ impl SipTransport {
             .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
         Ok(Self {
             socket: Socket::Tcp(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -1031,7 +1078,7 @@ impl SipTransport {
         };
         Ok(Self {
             socket,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 }
@@ -1237,7 +1284,14 @@ fn spawn_gm_udp_server(
             };
             // Every SIP datagram is a complete message, so unlike the TCP
             // path there is no cross-read buffering to do here.
-            let text = String::from_utf8_lossy(&buf[..n]);
+            let datagram = &buf[..n];
+            // `text` is for the log line only — parsing below reads
+            // `datagram` directly. A carrier's `MESSAGE` body
+            // (`application/vnd.3gpp.sms`) is an arbitrary binary TPDU; lossily
+            // converting it *then framing on the conversion's output* was what
+            // corrupted a message and, on the TCP sibling, crashed the reader
+            // thread. See `find_subslice`'s doc comment.
+            let text = String::from_utf8_lossy(datagram);
             // The TCP sibling logs through `recv_message_deadline`; this path
             // parses inline and logged nothing at all. That left the *only*
             // channel a carrier uses to reach us — network-initiated INVITEs
@@ -1245,10 +1299,10 @@ fn spawn_gm_udp_server(
             // second INVITE could not be told apart from a retransmission of
             // the first without a decrypted packet capture.
             tracing::debug!(peer = %peer, message = %text, "received SIP datagram on the Gm server port");
-            let parsed = if text.starts_with("SIP/2.0") {
-                SipResponse::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
+            let parsed = if datagram.starts_with(b"SIP/2.0") {
+                SipResponse::try_parse(datagram).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
             } else {
-                SipRequest::try_parse(&text).map(|o| o.map(|(r, _)| SipMessage::Request(r)))
+                SipRequest::try_parse(datagram).map(|o| o.map(|(r, _)| SipMessage::Request(r)))
             };
             let msg = match parsed {
                 Ok(Some(msg)) => msg,
@@ -1462,7 +1516,7 @@ mod tests {
                    Via: SIP/2.0/UDP 1.2.3.4:5060\r\n\
                    WWW-Authenticate: Digest realm=\"ims.example.org\", nonce=\"abc==\", algorithm=AKAv1-MD5\r\n\
                    Content-Length: 0\r\n\r\n";
-        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, consumed) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(consumed, raw.len());
         assert_eq!(resp.status, 401);
         assert_eq!(resp.reason, "Unauthorized");
@@ -1477,7 +1531,7 @@ mod tests {
         let raw = "SIP/2.0 200 OK\r\n\
                    Contact: <sip:foo@bar>\r\n\
                    \t;expires=600\r\n\r\n";
-        let (resp, _) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, _) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(
             resp.header("Contact").unwrap(),
             "<sip:foo@bar> ;expires=600"
@@ -1487,13 +1541,13 @@ mod tests {
     #[test]
     fn try_parse_returns_none_when_incomplete() {
         let raw = "SIP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nhel";
-        assert!(SipResponse::try_parse(raw).unwrap().is_none());
+        assert!(SipResponse::try_parse(raw.as_bytes()).unwrap().is_none());
     }
 
     #[test]
     fn try_parse_extracts_body_and_leaves_remainder_for_next_message() {
         let raw = "SIP/2.0 200 OK\r\nContent-Length: 2\r\n\r\nhiSIP/2.0 100 Trying\r\n\r\n";
-        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, consumed) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(resp.body, "hi");
         assert_eq!(&raw[consumed..], "SIP/2.0 100 Trying\r\n\r\n");
     }
@@ -1509,12 +1563,14 @@ mod tests {
             "SIP/2.0 183 Session Progress\r\nv:SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bKabc\r\n\
                    i:out-1\r\nCSeq:5 INVITE\r\nc:application/sdp\r\nl:14\r\n\r\n\
                    v=0\r\no=- 1 1\r\nSIP/2.0 480 Temporarily Unavailable\r\nl:0\r\n\r\n";
-        let (resp, consumed) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, consumed) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(resp.status, 183);
         assert_eq!(resp.body, "v=0\r\no=- 1 1\r\n");
         // The critical part: the *next* message must be parseable, not the
         // middle of this one's SDP.
-        let (next, _) = SipResponse::try_parse(&raw[consumed..]).unwrap().unwrap();
+        let (next, _) = SipResponse::try_parse(&raw.as_bytes()[consumed..])
+            .unwrap()
+            .unwrap();
         assert_eq!(next.status, 480);
     }
 
@@ -1524,7 +1580,7 @@ mod tests {
         // were logged as "outside an active transaction".
         let raw = "SIP/2.0 100 Trying\r\nv:SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bKabc\r\n\
                    i:out-1\r\nf:<sip:a@b>;tag=x\r\nt:<sip:c@d>\r\nm:<sip:e@f>\r\nl:0\r\n\r\n";
-        let (resp, _) = SipResponse::try_parse(raw).unwrap().unwrap();
+        let (resp, _) = SipResponse::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert!(resp.header("Via").unwrap().contains("z9hG4bKabc"));
         assert_eq!(resp.header("Call-ID").unwrap(), "out-1");
         assert!(resp.header("From").unwrap().contains("tag=x"));
@@ -1736,7 +1792,9 @@ mod tests {
 
     #[test]
     fn sip_request_try_parse_extracts_method_and_uri() {
-        let (req, consumed) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, consumed) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(consumed, SAMPLE_INVITE.len());
         assert_eq!(req.method, "INVITE");
         assert_eq!(
@@ -1751,7 +1809,7 @@ mod tests {
     #[test]
     fn sip_request_try_parse_returns_none_when_body_incomplete() {
         let partial = "BYE sip:x SIP/2.0\r\nContent-Length: 10\r\n\r\nshort";
-        assert!(SipRequest::try_parse(partial).unwrap().is_none());
+        assert!(SipRequest::try_parse(partial.as_bytes()).unwrap().is_none());
     }
 
     #[test]
@@ -1760,7 +1818,7 @@ mod tests {
                     Via: SIP/2.0/TCP 1.1.1.1:5060;branch=b1\r\n\
                     Via: SIP/2.0/TCP 2.2.2.2:5060;branch=b2\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         let vias = req.headers_all("Via");
         assert_eq!(vias.len(), 2);
         assert!(vias[0].contains("1.1.1.1"));
@@ -1769,7 +1827,7 @@ mod tests {
 
     #[test]
     fn sip_request_try_parse_rejects_empty_input() {
-        assert!(SipRequest::try_parse("").unwrap().is_none());
+        assert!(SipRequest::try_parse("".as_bytes()).unwrap().is_none());
     }
 
     fn sample_bye() -> SipRequest {
@@ -1780,12 +1838,14 @@ mod tests {
                     Call-ID: abc123callid\r\n\
                     CSeq: 2 BYE\r\n\
                     Content-Length: 0\r\n\r\n";
-        SipRequest::try_parse(raw).unwrap().unwrap().0
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
     #[test]
     fn build_100_trying_has_no_to_tag_and_no_contact() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_100_trying(&req);
         assert!(resp.starts_with("SIP/2.0 100 Trying\r\n"));
         assert!(!resp.contains("Contact:"));
@@ -1799,7 +1859,9 @@ mod tests {
 
     #[test]
     fn build_180_ringing_adds_to_tag_and_contact() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_180_ringing(&req, "totag1", "<sip:agent@10.0.0.9:5060>");
         assert!(resp.starts_with("SIP/2.0 180 Ringing\r\n"));
         assert!(resp.contains(";tag=totag1\r\n"));
@@ -1822,7 +1884,7 @@ mod tests {
                       From: <sip:caller@example.net>;tag=abc\r\n\
                       To: <sip:me@example.net>\r\n\
                       Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(invite).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
         let resp = build_200_ok_invite(&req, "totag1", "<sip:agent@10.0.0.9:5060>", "");
         let rrs: Vec<&str> = resp
             .lines()
@@ -1841,7 +1903,9 @@ mod tests {
 
     #[test]
     fn build_200_ok_invite_includes_sdp_body_and_content_length() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n";
         let resp = build_200_ok_invite(&req, "totag1", "<sip:agent@10.0.0.9:5060>", sdp);
         assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
@@ -1861,7 +1925,9 @@ mod tests {
 
     #[test]
     fn extra_headers_appear_after_the_echoed_ones_and_before_the_body() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_uas_response_with_headers(
             401,
             "Unauthorized",
@@ -1891,7 +1957,10 @@ mod tests {
         // Pins the delegation in `build_uas_response`: the IMS path must not
         // shift by a single byte now that it routes through the new function.
         for req in [
-            SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap().0,
+            SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+                .unwrap()
+                .unwrap()
+                .0,
             sample_bye(),
         ] {
             let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n";
@@ -1910,7 +1979,9 @@ mod tests {
 
     #[test]
     fn build_486_busy_here_declines_with_no_body() {
-        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let resp = build_486_busy_here(&req, "totag1");
         assert!(resp.starts_with("SIP/2.0 486 Busy Here\r\n"));
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
@@ -1926,7 +1997,7 @@ mod tests {
                     Content-Type: text/plain\r\n\
                     Content-Length: 5\r\n\r\n\
                     hello";
-        SipRequest::try_parse(raw).unwrap().unwrap().0
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
     #[test]
@@ -1945,13 +2016,47 @@ mod tests {
         assert_eq!(req.body, "hello");
     }
 
+    /// The bug this guards against: a body that isn't valid UTF-8 — exactly
+    /// what 3GPP SMS-over-IP sends (`Content-Type: application/vnd.3gpp.sms`,
+    /// a raw TPDU) — must not corrupt whatever follows it in the same buffer.
+    /// Measured on Vi 2026-08-15: an inbound SMS's binary body desynced a TCP
+    /// stream's byte offsets against a lossily-reencoded copy of it, garbling
+    /// the *next* message's start line and eventually panicking a reader
+    /// thread (`byte index 1559 is not a char boundary`) when a slice point
+    /// landed inside a synthesized replacement character.
+    #[test]
+    fn a_binary_body_does_not_corrupt_the_next_pipelined_message() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MESSAGE sip:x SIP/2.0\r\nCall-ID: c1\r\nCSeq: 1 MESSAGE\r\n");
+        // Not valid UTF-8 on its own terms — lone continuation/leading bytes
+        // that only ever mean something as part of a multi-byte sequence.
+        let binary_body: &[u8] = &[0xC0, 0x80, 0xFF, 0xFE, 0x00, 0x9c, 0x1b, 0x80, 0x81];
+        buf.extend_from_slice(format!("Content-Length: {}\r\n\r\n", binary_body.len()).as_bytes());
+        buf.extend_from_slice(binary_body);
+        // A second, ordinary text message immediately behind it in the same
+        // buffer — exactly the TCP-pipelining shape that desynced.
+        buf.extend_from_slice(
+            b"OPTIONS sip:y SIP/2.0\r\nCall-ID: c2\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+        );
+
+        let (first, consumed) = SipRequest::try_parse(&buf).unwrap().unwrap();
+        assert_eq!(first.method, "MESSAGE");
+
+        // The framing offset must land exactly on the second message's start —
+        // not a few bytes short or long, which is what a lossily-reencoded
+        // length mismatch produces.
+        let (second, _) = SipRequest::try_parse(&buf[consumed..]).unwrap().unwrap();
+        assert_eq!(second.method, "OPTIONS");
+        assert_eq!(second.request_uri, "sip:y");
+    }
+
     #[test]
     fn via_headers_are_echoed_verbatim_in_order_on_responses() {
         let raw = "INVITE sip:x SIP/2.0\r\n\
                     Via: SIP/2.0/TCP 1.1.1.1:5060;branch=b1\r\n\
                     Via: SIP/2.0/TCP 2.2.2.2:5060;branch=b2\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(raw).unwrap().unwrap();
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         let resp = build_100_trying(&req);
         let first_via = resp.find("Via: SIP/2.0/TCP 1.1.1.1").unwrap();
         let second_via = resp.find("Via: SIP/2.0/TCP 2.2.2.2").unwrap();
@@ -1994,7 +2099,9 @@ mod tests {
     fn an_initial_invite_response_still_adds_the_tag_that_creates_the_dialog() {
         // The other half of the rule: an initial INVITE has an untagged `To`,
         // and our response is what establishes the dialog.
-        let (invite, _) = SipRequest::try_parse(SAMPLE_INVITE).unwrap().unwrap();
+        let (invite, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
         let response = build_uas_response(200, "OK", &invite, Some("mine"), None, None);
         let to_line = response
             .lines()
