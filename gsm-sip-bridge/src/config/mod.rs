@@ -554,6 +554,33 @@ pub struct VowifiConfig {
     /// IPsec. Required by networks (e.g. Vi) that reject a plain REGISTER;
     /// also the combination that worked on Airtel.
     pub sec_agree: bool,
+    /// Which URI goes in the REGISTER request line: `"home-domain"` (the
+    /// default — the `ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org` realm that
+    /// TS 24.229 §5.1.1.2 mandates, and what every real handset sends) or
+    /// `"pcscf"` (the literal P-CSCF address, the historical default).
+    ///
+    /// The default moved to `"home-domain"` on evidence: Jio rejects the
+    /// P-CSCF-address form *before any authentication challenge* — `483 Too
+    /// Many Hops` from one instance, `403 Forbidden` from another, across four
+    /// P-CSCFs and two SIMs on two hosts — because the proxy finds its own
+    /// address in the request line and trips loop detection. Vodafone was then
+    /// verified to register with the realm form too (2026-08-15).
+    ///
+    /// It stays configurable rather than becoming a constant because of one
+    /// unverified counter-example: Airtel is recorded as answering `406 User
+    /// Unknown` to the realm form. That predates this work and was never
+    /// re-tested; `406` is an identity-resolution error, so it more likely
+    /// pointed at a wrong IMPU at the time. If an Airtel deployment regresses,
+    /// set `"pcscf"` — and please record the capture, because that would be
+    /// the first real evidence for the old default.
+    pub register_request_uri: String,
+    /// Pin the Gm IPsec auth/cipher algorithm rather than taking the P-CSCF's
+    /// highest-`q` offer. Empty = follow the network's preference. Needed when
+    /// a P-CSCF advertises a preference it does not actually use, which shows
+    /// up only as its ESP replies failing integrity — see
+    /// `ims::gm_ipsec::select_security_server`.
+    pub gm_auth_alg: String,
+    pub gm_cipher_alg: String,
     /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
     /// by `supervise::orchestrate` once this line's tunnel is up.
     ///
@@ -718,6 +745,9 @@ impl Default for VowifiConfig {
             modem_port: String::new(),
             use_tcp: true,
             sec_agree: true,
+            register_request_uri: "home-domain".to_string(),
+            gm_auth_alg: String::new(),
+            gm_cipher_alg: String::new(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
             veth_local_addr: "10.99.0.1".to_string(),
             veth_peer_addr: "10.99.0.2".to_string(),
@@ -1782,6 +1812,43 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("vowifi.tunnel_engine must be"));
+    }
+
+    #[test]
+    fn vowifi_register_request_uri_defaults_to_home_domain() {
+        // TS 24.229 §5.1.1.2 mandates the home domain and every real handset
+        // sends it. Jio rejects the P-CSCF-address form before it will even
+        // issue an authentication challenge (483/403 across four P-CSCFs and
+        // two SIMs), and Vodafone was verified on the realm form too.
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.vowifi.register_request_uri, "home-domain");
+    }
+
+    #[test]
+    fn vowifi_register_request_uri_still_accepts_pcscf() {
+        // The escape hatch for the one unverified counter-example: Airtel is
+        // recorded — unreproduced — as answering `406 User Unknown` to the
+        // realm form.
+        let src = format!(
+            "{}\n[vowifi]\nregister_request_uri = \"pcscf\"\n",
+            MINIMAL_TOML
+        );
+        let cfg = parse(&src);
+        assert_eq!(cfg.vowifi.register_request_uri, "pcscf");
+    }
+
+    #[test]
+    fn vowifi_register_request_uri_rejects_unknown_value() {
+        let src = format!(
+            "{}\n[vowifi]\nregister_request_uri = \"realm\"\n",
+            MINIMAL_TOML
+        );
+        let result = try_parse(&src).map(|c| c.vowifi);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vowifi.register_request_uri must be"));
     }
 
     #[test]

@@ -43,6 +43,7 @@ pub mod session;
 /// module's request parser and UAS response builder to serve IP phones. See
 /// `digest` above for the same rationale (spec 024, research.md R-007).
 pub(crate) mod sip_client;
+pub(crate) mod sms_pdu;
 mod transcode;
 pub mod transport;
 
@@ -110,6 +111,14 @@ pub struct ImsRegisterConfig {
     /// The LTE path supplies an E-UTRAN value instead; see
     /// `crate::volte::pani::access_network_info`.
     pub access_network_info: String,
+    /// Put the home-network domain in the REGISTER request line instead of the
+    /// literal P-CSCF address. See `register_session`'s `request_uri`.
+    pub register_uri_home_domain: bool,
+    /// Pin the Gm IPsec auth / cipher algorithm instead of taking the
+    /// network's highest-`q` offer. `None` = follow the offered preference.
+    /// See `gm_ipsec::select_security_server`.
+    pub gm_auth_alg: Option<String>,
+    pub gm_cipher_alg: Option<String>,
 }
 
 #[derive(Debug)]
@@ -160,6 +169,41 @@ pub(crate) struct RegisteredSession {
 }
 
 impl RegisteredSession {
+    /// The identity to originate requests from, as a bare `user@host` (every
+    /// caller wraps it as `sip:{}`).
+    ///
+    /// TS 24.229 requires an originating request to use a **registered public
+    /// user identity**. We register with the IMSI-derived identity, which is
+    /// legitimate for REGISTER but is not one of the IMPUs the network
+    /// actually provisions for calls. Jio accepts it at registration and then
+    /// fails anything it originates with `Q.850;cause=41 "temporary
+    /// failure"`, routing the caller to an MSML announcement server for ~13s
+    /// before answering `480` — a rejection that looks nothing like an
+    /// identity problem (measured 2026-08-14).
+    ///
+    /// The registrar tells us the right identities in `P-Associated-URI` on
+    /// the REGISTER `200 OK`; prefer the first `sip:` one. Falls back to the
+    /// registration identity for networks that return none, which is what
+    /// every carrier before this one did.
+    pub(crate) fn origination_identity(&self) -> String {
+        self.default_impu()
+            .map(|impu| impu.trim_start_matches("sip:").to_string())
+            .unwrap_or_else(|| self.public_uri.clone())
+    }
+
+    /// First `sip:` `P-Associated-URI` from the REGISTER `200 OK`, scheme
+    /// included (`sip:+1555…@ims…`). `None` if the registrar returned none.
+    pub(crate) fn default_impu(&self) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case("P-Associated-URI") && v.contains("sip:"))
+            .and_then(|(_, v)| {
+                let start = v.find('<')? + 1;
+                let end = v.find('>')?;
+                Some(v[start..end].to_string())
+            })
+    }
+
     /// Our Gm **protected server port** (`port-s`) endpoint — where the
     /// network opens connections to deliver everything it originates
     /// (reg-event `NOTIFY`s, mobile-terminating `INVITE`s). `None` when the
@@ -662,12 +706,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         None => impi_uri.clone(),
     };
     let pcscf: SocketAddr = SocketAddr::new(cfg.pcscf_addr, cfg.pcscf_port);
-    // PJSIP-based implementations (e.g. Asterisk's res_pjsip_outbound_registration,
-    // via pjsip_regc_init's srv_url) set the REGISTER Request-URI to the
-    // literal P-CSCF address from `server_uri`, not the home-network realm —
-    // matching that is what gets past this network's registrar (a realm
-    // Request-URI got an instant `406 User Unknown` on Airtel).
-    let request_uri = format_sip_addr(pcscf);
+    let request_uri = register_request_uri(pcscf, &realm, cfg.register_uri_home_domain);
 
     let call_id = random_hex(8);
     let from_tag = random_hex(4);
@@ -797,14 +836,51 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         // RFC 2617 requires this to match the Request-URI of the message it's
         // attached to (it feeds into the HA2 digest and the server checks it).
         let uri = format!("sip:{request_uri}");
-        let sec_server_hdr = resp.header("Security-Server").map(|s| s.to_string());
+        // Every offer, not just the first: the P-CSCF sends one header per
+        // algorithm combination it accepts, and which one we commit to decides
+        // whether its ESP replies will authenticate at all.
+        let sec_selected = {
+            let offers = resp.headers_all("Security-Server");
+            if offers.is_empty() {
+                None
+            } else {
+                match gm_ipsec::select_security_server(
+                    &offers,
+                    cfg.gm_auth_alg.as_deref(),
+                    cfg.gm_cipher_alg.as_deref(),
+                ) {
+                    Ok((params, _selected_raw)) => {
+                        tracing::info!(
+                            alg = %params.alg,
+                            ealg = %params.ealg,
+                            q = params.q,
+                            offered = offers.len(),
+                            "selected Gm IPsec algorithm"
+                        );
+                        // The echo is the *whole* Security-Server list, not
+                        // just the mechanism we committed to. Security-Verify
+                        // is RFC 3329's downgrade check: the P-CSCF compares
+                        // what we send back against everything it offered, so
+                        // a partial echo reads as a tampered negotiation.
+                        // Measured on Jio 2026-08-14 — it offers five
+                        // mechanisms, we echoed the one we picked, and every
+                        // protected REGISTER came back `494 Security
+                        // Agreement Required`.
+                        Some((params, offers.join(", ")))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no usable Security-Server offer");
+                        None
+                    }
+                }
+            }
+        };
         let (auth_header, was_resync) = match aka {
             AkaResult::Success { res, ck, ik } => {
                 tracing::info!("AKA success, building Authorization response");
-                if let (Some(p), Some(sec_server)) = (proposal.as_ref(), sec_server_hdr.as_deref())
-                {
-                    match gm_ipsec::parse_security_server(sec_server) {
-                        Ok(theirs) => {
+                if let (Some(p), Some((theirs, sec_verify))) = (proposal.as_ref(), sec_selected) {
+                    {
+                        {
                             let endpoints =
                                 GmEndpoints::new(local_addr.ip(), pcscf.ip(), p, &theirs);
                             match gm_ipsec::install_gm_sas(
@@ -835,7 +911,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                                             // use (a captured working Asterisk registration
                                             // always includes this on the post-IPsec retry).
                                             extra_headers
-                                                .push(format!("Security-Verify: {sec_server}"));
+                                                .push(format!("Security-Verify: {sec_verify}"));
                                             gm_state = Some((endpoints, p.clone(), theirs));
                                         }
                                         Err(e) => {
@@ -851,9 +927,6 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                                     tracing::warn!(error = %e, "failed to install Gm IPsec SAs; resending on the original transport")
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to parse Security-Server header")
                         }
                     }
                 }
@@ -956,6 +1029,39 @@ pub struct SaProposal {
     pub spi_s: u32,
     pub port_c: u16,
     pub port_s: u16,
+}
+
+/// The URI for the REGISTER request line (`REGISTER sip:<this> SIP/2.0`).
+///
+/// Which form belongs here is carrier-specific, and each one is rejected
+/// outright by some network, so it cannot be a constant.
+///
+/// `home_domain == false` (the default): PJSIP-based implementations (e.g.
+/// Asterisk's res_pjsip_outbound_registration, via pjsip_regc_init's
+/// `srv_url`) use the literal P-CSCF address from `server_uri` rather than
+/// the home-network realm, and matching that is what gets past Airtel's
+/// registrar — a realm Request-URI there draws an instant `406 User
+/// Unknown`.
+///
+/// `home_domain == true`: what TS 24.229 §5.1.1.2 actually mandates, and what
+/// Jio requires. Its P-CSCF finds its own address in the request line, routes
+/// the REGISTER back to itself and trips loop detection — `483 Too Many Hops`
+/// from one instance and a blanket `403 Forbidden` from another, both arriving
+/// before any challenge, and both indistinguishable at a glance from "this
+/// subscriber is not provisioned for VoWiFi" (which is exactly how they were
+/// first misread). Bisected live 2026-08-14 with a raw-REGISTER prober:
+/// byte-identical REGISTERs differing only in the request line, where the
+/// home-domain form draws the real `401` + AKA challenge and a populated
+/// `Security-Server` list.
+///
+/// The digest `uri` parameter follows this value (RFC 2617 requires the two to
+/// match, and the server checks it) — see `register_session`'s `uri`.
+fn register_request_uri(pcscf: SocketAddr, realm: &str, home_domain: bool) -> String {
+    if home_domain {
+        realm.to_string()
+    } else {
+        format_sip_addr(pcscf)
+    }
 }
 
 /// Build the `Supported: sec-agree` + `Security-Client: ipsec-3gpp` header
@@ -1150,6 +1256,36 @@ mod tests {
         assert!(status.registered_at.is_none());
         assert!(status.expires_at.is_none());
         assert!(status.last_failure.is_none());
+    }
+
+    #[test]
+    fn register_request_uri_uses_the_pcscf_address_when_home_domain_is_off() {
+        // No longer the default (see `VowifiConfig::register_request_uri`), but
+        // kept reachable as the escape hatch for Airtel, which is recorded —
+        // unreproduced — as answering `406 User Unknown` to the realm form.
+        let pcscf: SocketAddr = "56.2.134.134:5060".parse().unwrap();
+        let uri = register_request_uri(pcscf, "ims.mnc869.mcc405.3gppnetwork.org", false);
+        assert_eq!(uri, "56.2.134.134:5060");
+    }
+
+    #[test]
+    fn register_request_uri_uses_the_realm_when_home_domain_is_set() {
+        // Jio's P-CSCF answers 483/403 to the address form — see this
+        // function's docs for the live bisection.
+        let pcscf: SocketAddr = "56.2.134.134:5060".parse().unwrap();
+        let uri = register_request_uri(pcscf, "ims.mnc869.mcc405.3gppnetwork.org", true);
+        assert_eq!(uri, "ims.mnc869.mcc405.3gppnetwork.org");
+        assert!(
+            !uri.contains("56.2.134.134"),
+            "the P-CSCF address must not leak into the request line"
+        );
+    }
+
+    #[test]
+    fn register_request_uri_wraps_ipv6_pcscf_addresses() {
+        let pcscf: SocketAddr = "[2405:200:6ae::1e]:5060".parse().unwrap();
+        let uri = register_request_uri(pcscf, "ims.mnc869.mcc405.3gppnetwork.org", false);
+        assert_eq!(uri, "[2405:200:6ae::1e]:5060");
     }
 
     #[test]

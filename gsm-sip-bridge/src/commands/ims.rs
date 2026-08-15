@@ -17,6 +17,9 @@ fn build_ims_register_config(args: &crate::cli::ImsRegisterArgs) -> crate::ims::
         sec_agree: args.sec_agree,
         msisdn: args.msisdn.clone(),
         access_network_info: crate::ims::ACCESS_NETWORK_WLAN.to_string(),
+        register_uri_home_domain: args.register_uri_home_domain,
+        gm_auth_alg: None,
+        gm_cipher_alg: None,
     }
 }
 

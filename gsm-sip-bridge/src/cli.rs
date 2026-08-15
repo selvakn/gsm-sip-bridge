@@ -750,6 +750,15 @@ pub struct ImsRegisterArgs {
     #[arg(long)]
     pub sec_agree: bool,
 
+    /// Put the home-network domain (ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org)
+    /// in the REGISTER request line instead of the literal P-CSCF address.
+    /// TS 24.229 §5.1.1.2 mandates this form and Jio requires it — its
+    /// P-CSCF answers 483 Too Many Hops / 403 Forbidden to the address form,
+    /// before any challenge. Airtel rejects it with 406 User Unknown, hence
+    /// the flag.
+    #[arg(long)]
+    pub register_uri_home_domain: bool,
+
     /// Use this MSISDN (E.164, e.g. +919876543210) as the Public User
     /// Identity in To/From/Contact instead of the IMSI-derived temporary
     /// IMPU (`sip:<IMSI>@<realm>`). The Authorization header's username

@@ -782,14 +782,30 @@ pub(crate) struct AckParts<'a> {
 }
 
 pub(crate) fn build_ack(p: &AckParts) -> String {
-    build_in_dialog_request("ACK", p)
+    build_in_dialog_request("ACK", p, "")
 }
 
 pub(crate) fn build_bye(p: &AckParts) -> String {
-    build_in_dialog_request("BYE", p)
+    build_in_dialog_request("BYE", p, "")
 }
 
-fn build_in_dialog_request(method: &str, p: &AckParts) -> String {
+/// `PRACK` acknowledging a reliable provisional response (RFC 3262 §7.2).
+///
+/// Required, not optional: a provisional carrying `Require: 100rel` is
+/// retransmitted at T1 backoff until it is PRACKed, and the network abandons
+/// the call if it never is. Measured on Jio 2026-08-15: our originating INVITE
+/// drew a `183 Session Progress` with `Require: timer,100rel` and `RSeq: 1`,
+/// which arrived three times (≈2 s, then 4 s apart) before the network gave up
+/// and returned `480 Temporarily Unavailable`
+/// (`Reason:Q.850;cause=20;text="subscriber absent"`).
+///
+/// `rack` is the `RAck` value — the provisional's `RSeq`, then the sequence
+/// number and method of the request it responded to.
+pub(crate) fn build_prack(p: &AckParts, rack: &str) -> String {
+    build_in_dialog_request("PRACK", p, &format!("RAck: {rack}\r\n"))
+}
+
+fn build_in_dialog_request(method: &str, p: &AckParts, extra_headers: &str) -> String {
     let via_addr = format_sip_addr(p.local_addr);
     let mut msg = format!(
         "{method} sip:{request_uri} SIP/2.0\r\n\
@@ -810,6 +826,7 @@ fn build_in_dialog_request(method: &str, p: &AckParts) -> String {
          To: {to_header}\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} {method}\r\n\
+         {extra_headers}\
          Content-Length: 0\r\n\r\n",
         public_uri = p.public_uri,
         from_tag = p.from_tag,
@@ -817,6 +834,7 @@ fn build_in_dialog_request(method: &str, p: &AckParts) -> String {
         call_id = p.call_id,
         cseq = p.cseq,
         method = method,
+        extra_headers = extra_headers,
     ));
     msg
 }
@@ -884,6 +902,44 @@ mod tests {
         assert!(msg.contains("Content-Length: 5\r\n"));
         assert!(msg.ends_with("v=0\r\n"));
         assert!(msg.contains("CSeq: 1 INVITE"));
+    }
+
+    fn invite_parts(addr: std::net::SocketAddr) -> InviteParts<'static> {
+        // Leaked so the borrows live for the test's duration without a local.
+        InviteParts {
+            request_uri: "+919000000000@realm",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            contact_addr: addr,
+            public_uri: "+919000000001@realm",
+            callee_uri: "+919000000000@realm",
+            call_id: "callid",
+            from_tag: "tag1",
+            cseq: 1,
+            branch: "branch1",
+            body: "v=0\r\n",
+        }
+    }
+
+    /// Every carrier in production originates on this exact header set, so it
+    /// must not move without a measurement to justify it.
+    #[test]
+    fn the_originating_header_set_is_pinned() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let msg = build_invite(&invite_parts(addr));
+
+        assert!(
+            msg.contains("Contact: <sip:+919000000001@1.2.3.4:5060;transport=TCP>\r\n"),
+            "no feature tags on the Contact: {msg}"
+        );
+        assert!(
+            msg.contains("Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"),
+            "{msg}"
+        );
+        for absent in ["Supported:", "P-Preferred-Identity:", "Accept-Contact:"] {
+            assert!(!msg.contains(absent), "{absent} must not appear: {msg}");
+        }
     }
 
     /// Via carries the port we send from; Contact carries the Gm protected
