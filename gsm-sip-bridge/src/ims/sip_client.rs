@@ -893,7 +893,13 @@ impl SipTransport {
     pub fn recv_response(&mut self) -> BridgeResult<SipResponse> {
         loop {
             if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
-                tracing::debug!(
+                // `trace`, not `debug`: this is the full message, headers and
+                // body — caller identity and (once decoded) SMS content —
+                // and `debug` is routinely enabled in the field (this
+                // project's own deployments run with
+                // `sip_client=debug` to diagnose exactly these messages),
+                // where `trace` is an operator's deliberate, one-off choice.
+                tracing::trace!(
                     response = %String::from_utf8_lossy(&self.buf[..consumed]),
                     "received SIP response"
                 );
@@ -970,7 +976,9 @@ impl SipTransport {
                         // substitute here: the Gm traffic is ESP-encrypted, and
                         // GRO aggregates the larger responses on the xfrm
                         // interface into frames whose ICV no longer verifies.
-                        tracing::debug!(
+                        // `trace`, not `debug` — see `recv_response`'s comment:
+                        // this is a full message, not a summary.
+                        tracing::trace!(
                             response = %String::from_utf8_lossy(&self.buf[..consumed]),
                             "received SIP response"
                         );
@@ -978,7 +986,7 @@ impl SipTransport {
                         return Ok(Some(SipMessage::Response(resp)));
                     }
                 } else if let Some((req, consumed)) = SipRequest::try_parse(&self.buf)? {
-                    tracing::debug!(
+                    tracing::trace!(
                         request = %String::from_utf8_lossy(&self.buf[..consumed]),
                         "received SIP request"
                     );
@@ -1313,7 +1321,16 @@ fn spawn_gm_udp_server(
             // arrive here over UDP on Jio — invisible at any log level, so a
             // second INVITE could not be told apart from a retransmission of
             // the first without a decrypted packet capture.
-            tracing::debug!(peer = %peer, message = %text, "received SIP datagram on the Gm server port");
+            //
+            // `trace`, not `debug`: this is the complete datagram, unredacted
+            // — caller/callee identity in every header, and (since carriers
+            // deliver SMS here too) the SMS body. `debug` is what this
+            // project's own deployments actually run with in the field
+            // (`RUST_LOG=...,gsm_sip_bridge::ims::sip_client=debug`, used to
+            // diagnose the exact carrier issues this datagram trace exists
+            // for), so anything short of `trace` here lands in routinely
+            // retained logs, not just a deliberately-enabled one-off capture.
+            tracing::trace!(peer = %peer, message = %text, "received SIP datagram on the Gm server port");
             let parsed = if datagram.starts_with(b"SIP/2.0") {
                 SipResponse::try_parse(datagram).map(|o| o.map(|(r, _)| SipMessage::Response(r)))
             } else {
