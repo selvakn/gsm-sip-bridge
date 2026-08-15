@@ -117,8 +117,19 @@ impl SipSocket {
         Ok(())
     }
 
-    /// Blocks until a SIP response arrives or `timeout` elapses.
-    pub fn recv_response(&self, timeout: Duration) -> SipTestResult<Option<SipResponse>> {
+    /// Blocks until a SIP response whose `Call-ID` matches `call_id` arrives,
+    /// or `timeout` elapses. This one socket is shared by every concurrent
+    /// transaction (registration's background refresh, an outbound call, a
+    /// future one running alongside it) — with no correlation, an early FIFO
+    /// pop here could hand a registration's `200 OK` to a call in progress,
+    /// or vice versa, instead of the response either one actually sent a
+    /// request for. Anything that doesn't match `call_id` is left in the
+    /// queue for its own owner rather than discarded.
+    pub fn recv_response(
+        &self,
+        call_id: &str,
+        timeout: Duration,
+    ) -> SipTestResult<Option<SipResponse>> {
         let deadline = Instant::now() + timeout;
         let mut guard = self
             .inbox
@@ -126,8 +137,11 @@ impl SipSocket {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(resp) = guard.pop_front() {
-                return Ok(Some(resp));
+            if let Some(pos) = guard
+                .iter()
+                .position(|r| r.header("Call-ID") == Some(call_id))
+            {
+                return Ok(guard.remove(pos));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -296,20 +310,67 @@ mod tests {
 
         // a's response queue must still be empty — nothing crossed over.
         assert!(a
-            .recv_response(Duration::from_millis(50))
+            .recv_response("call1", Duration::from_millis(50))
             .unwrap()
             .is_none());
 
         // Now b sends a response; a should see it via recv_response, not recv_request.
         b.send(
             a.local_addr(),
-            "SIP/2.0 200 OK\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+            "SIP/2.0 200 OK\r\nCall-ID: call1\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
         let resp = a
-            .recv_response(Duration::from_secs(2))
+            .recv_response("call1", Duration::from_secs(2))
             .unwrap()
             .expect("expected a to receive the 200 OK");
         assert_eq!(resp.status, 200);
+    }
+
+    /// Reproduces the scenario a shared, uncorrelated FIFO gets wrong: two
+    /// transactions (e.g. a registration refresh and an outbound call) whose
+    /// responses arrive interleaved on the same socket. A caller waiting for
+    /// one Call-ID must not be handed the other's response, and must still
+    /// receive its own once it actually arrives — not silently starve because
+    /// an earlier, non-matching response is stuck at the front of the queue.
+    #[test]
+    fn responses_are_routed_to_the_call_id_waiting_for_them_not_fifo_order() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let b = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+
+        // "someone-elses-call"'s response arrives first, ahead of ours.
+        b.send(
+            a.local_addr(),
+            "SIP/2.0 200 OK\r\nCall-ID: someone-elses-call\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        b.send(
+            a.local_addr(),
+            "SIP/2.0 200 OK\r\nCall-ID: our-call\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        let resp = a
+            .recv_response("our-call", Duration::from_secs(2))
+            .unwrap()
+            .expect("expected our-call's response even though it wasn't first in the queue");
+        assert_eq!(resp.header("Call-ID"), Some("our-call"));
+
+        // The other transaction's response is still there, waiting for it.
+        let other = a
+            .recv_response("someone-elses-call", Duration::from_secs(2))
+            .unwrap()
+            .expect("the other transaction's response must not have been consumed or dropped");
+        assert_eq!(other.header("Call-ID"), Some("someone-elses-call"));
     }
 }

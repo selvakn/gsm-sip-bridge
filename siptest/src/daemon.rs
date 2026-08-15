@@ -138,6 +138,20 @@ pub fn inbound_listener_loop(state: Arc<SharedState>, stop: Arc<AtomicBool>) {
         else {
             continue;
         };
+        // Matched on IP only, never port — the bridge's telephony agent
+        // sends INVITEs from a different port than its registrar
+        // (`test_inbound_from_other_port.rs`), so port can't be part of the
+        // check. Anything from elsewhere is dropped with no reply at all,
+        // not just refused: this is the daemon's only defense against an
+        // unauthenticated peer directing an answered call's RTP at an
+        // arbitrary third-party destination via its own SDP offer
+        // (`execute_inbound_call` trusts whatever `c=`/`m=` the offer
+        // names), and replying to a spoofed source would make siptest a
+        // UDP reflection amplifier for that same peer.
+        if peer.ip() != state.bridge_registrar.ip() {
+            tracing::warn!(%peer, "dropping SIP request from an unexpected source IP");
+            continue;
+        }
         match req.method.as_str() {
             "OPTIONS" => {
                 let _ = state

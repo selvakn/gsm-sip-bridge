@@ -238,6 +238,81 @@ fn an_inbound_invite_from_an_unexpected_source_port_is_accepted_and_answered() {
     let _ = listener.join();
 }
 
+/// The other half of the source check `an_inbound_invite_from_an_unexpected_source_port_is_accepted_and_answered`
+/// proves: port is irrelevant, but IP is not. An unauthenticated sender at a
+/// different address must not be able to ring the daemon at all — the offer
+/// it carries would otherwise have its `c=`/`m=` address trusted verbatim as
+/// the RTP destination for an answered call's whole duration, turning
+/// siptest into a UDP reflector for whatever third party the sender names.
+/// The daemon's only defense is to never engage with such a peer in the
+/// first place: no `100 Trying`, no reply of any kind, and no call recorded.
+#[test]
+fn an_inbound_invite_from_an_unexpected_source_ip_is_dropped_with_no_reply() {
+    let config = test_config();
+    std::fs::create_dir_all(&config.media.recording_dir).unwrap();
+
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let siptest_addr = sip_socket.local_addr();
+    // `build_state`'s `bridge_registrar` is `127.0.0.1:1` — an attacker on
+    // `127.0.0.2` (a different address on the same loopback range) is not it.
+    let state = build_state(config, sip_socket);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener = {
+        let state = state.clone();
+        let stop = stop.clone();
+        thread::spawn(move || siptest::daemon::inbound_listener_loop(state, stop))
+    };
+
+    let attacker = UdpSocket::bind("127.0.0.2:0").unwrap();
+    attacker
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let attacker_addr = attacker.local_addr().unwrap();
+
+    let sdp_body = "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+    let invite = format!(
+        "INVITE sip:1002@{siptest_addr} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {attacker_addr};branch=z9hG4bKattackerbranch\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:+919000000000@127.0.0.1:5060>;tag=attackertag\r\n\
+         To: <sip:1002@{siptest_addr}>\r\n\
+         Call-ID: inbound-test-attacker-call\r\n\
+         CSeq: 1 INVITE\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n\
+         {sdp_body}",
+        sdp_body.len(),
+    );
+    attacker.send_to(invite.as_bytes(), siptest_addr).unwrap();
+
+    let mut buf = [0u8; 4096];
+    let result = attacker.recv_from(&mut buf);
+    assert!(
+        result.is_err(),
+        "expected no reply at all to an INVITE from an unrecognised source IP, got one"
+    );
+
+    thread::sleep(Duration::from_millis(200));
+    let calls = state.calls.lock().unwrap();
+    assert_eq!(
+        calls.recent(5).len(),
+        0,
+        "expected no call to have been created from the unrecognised peer"
+    );
+    drop(calls);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = listener.join();
+}
+
 /// contracts/sip-flows.md C-3: a CANCEL arriving before we answer must get a
 /// `200` for the CANCEL itself and a `487` for the original INVITE — and the
 /// call must be recorded as caller-cancelled, not as a fault (spec.md edge
