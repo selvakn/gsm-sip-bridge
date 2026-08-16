@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/037-siptest-softphone/plan.md`.
+`specs/037-p-early-media/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

@@ -72,6 +72,31 @@ fn hangup_answered_carrier_leg(
     );
 }
 
+/// Spawns a fresh veth UAS listener for an already-answered carrier leg, or
+/// hangs that leg up (and tells Agent B) if it can't be spawned — the
+/// shared tail both the no-early-media path and specs/037-p-early-media's
+/// stale-listener fallback need at the real `200 OK`. `None` means the
+/// caller must treat the attempt as `Ended`; the hangup has already been
+/// sent.
+fn spawn_fresh_veth_listener_or_hangup(
+    session: &mut crate::ims::RegisteredSession,
+    control: &mut TcpStream,
+    dialog: &DialogInfo,
+    call_id: &str,
+    veth_local_ip: IpAddr,
+    veth_sip_port: u16,
+    wideband: bool,
+) -> Option<mpsc::Receiver<BridgeResult<VethUasResult>>> {
+    match spawn_veth_uas_listener(veth_local_ip, veth_sip_port, wideband) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            tracing::warn!(call_id, error = %e, "outbound: veth listener failed");
+            hangup_answered_carrier_leg(session, control, dialog, call_id, reason::VETH_LEG_FAILED);
+            None
+        }
+    }
+}
+
 /// An outbound origination in flight, held by the dispatch loop across poll
 /// ticks so the wait for the carrier (and then Agent B's veth leg) is
 /// interruptible (specs/029-interruptible-origination-wait).
@@ -95,6 +120,60 @@ pub(super) struct PendingOrigination {
     /// provisional the offer/answer exchange completes there and the `200 OK`
     /// has no body at all, so this is the only copy of the answer we get.
     provisional_answer: Option<String>,
+    /// The veth UAS listener's receiver, if a provisional's SDP already
+    /// triggered early media (specs/037-p-early-media) — `Some` exactly
+    /// when RTP was connected and the listener spawned together, in the
+    /// same step. Consulted (not necessarily consumed unchanged — see the
+    /// real `200 OK` handling's stale-result fallback) once the real `200
+    /// OK` arrives, in place of spawning a fresh listener from scratch.
+    early_veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>,
+    /// Guards `CallEarlyMedia` to one attempt per call — set the first time
+    /// a provisional's body is examined for early media, whether or not
+    /// that attempt actually succeeded (FR-006: a failed attempt is not
+    /// retried on a later provisional; the call just proceeds without early
+    /// media, exactly as it did before this feature existed).
+    early_media_sent: bool,
+    /// The codec the early SDP negotiated, captured alongside
+    /// `early_media_sent` — needed once `early_veth_rx` resolves (which can
+    /// happen well before the real final response) to decide whether the
+    /// relay started then needs transcoding.
+    early_media_codec: Option<NegotiatedCodec>,
+    /// Set once `early_veth_rx` resolves successfully and the audio relay
+    /// actually starts — *not* merely once early media was attempted.
+    /// Without this, early media was signaling-only: Agent B would pair and
+    /// answer `183`, but no RTP ever moved, because the relay this codebase
+    /// already has (`spawn_relay`/`spawn_transcoding_relay`) was only ever
+    /// started from `finish_origination`, reachable solely via the real
+    /// `200 OK` → `AwaitingVeth` → veth-arrival path — a call that never
+    /// reaches `200 OK` (e.g. carrier plays an announcement then rejects
+    /// with `480`, exactly Jio's diagnosed behavior) never ran that path at
+    /// all. Found live (specs/037-p-early-media, 2026-08-16): signaling
+    /// paired and answered `183` correctly, but a real test call reported
+    /// zero RTP packets in either direction. Once this is `Some`, the real
+    /// `200 OK` handling reuses it instead of spawning a second relay; any
+    /// termination path that drops this `PendingOrigination` without
+    /// reaching `ActiveCall` must stop it (`stop.store(true, ..)`) or the
+    /// relay thread leaks.
+    /// `chosen` is what the relay was actually built to speak on the
+    /// carrier side — compared against the real `200 OK`'s answer at reuse
+    /// time (code review finding, specs/037-p-early-media): a carrier's
+    /// final SDP can legitimately select a different codec than an early,
+    /// non-`100rel` provisional's (RFC 3264 doesn't bind them together),
+    /// and reusing a relay built for the wrong one would silently corrupt
+    /// or drop audio rather than error. On a mismatch, the real `200 OK`
+    /// handling stops this relay and rebuilds one from `early_veth_socket`
+    /// instead of trusting it.
+    early_relay: Option<(
+        Arc<AtomicBool>,
+        crate::ims::media_stats::MediaMeter,
+        sdp::ChosenCodec,
+    )>,
+    /// A second handle to the veth-side RTP socket and its codec, kept only
+    /// while `early_relay` is `Some` — the relay thread owns the other
+    /// (cloned) handle. Needed solely to rebuild the relay if the real
+    /// `200 OK`'s codec doesn't match `early_relay`'s; otherwise dropped
+    /// unused, same as `rtp_socket` is in the ordinary reuse case.
+    early_veth_socket: Option<(UdpSocket, sdp::ChosenCodec)>,
     callee_uri: String,
     route_headers: Vec<String>,
     via_transport: &'static str,
@@ -143,10 +222,17 @@ enum OriginationStep {
     /// `veth_rx.recv_timeout`.
     AwaitingVeth {
         dialog: DialogInfo,
-        veth_rx: mpsc::Receiver<BridgeResult<VethUasResult>>,
+        /// `None` (specs/037-p-early-media) means the audio relay is
+        /// already running — started once the early veth handshake
+        /// resolved (`tick_pending_origination`) — so there is nothing left
+        /// to wait for; `finish_origination` reuses `PendingOrigination::
+        /// early_relay` instead of spawning or waiting for anything.
+        veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>,
         /// The codec the carrier answered with, carried to `finish_origination`
         /// where the transcoding decision (and the "codec we never offered"
         /// check) is made — kept in the same order as the old blocking path.
+        /// Unused when `veth_rx` is `None` (the relay's codecs were already
+        /// resolved during early media).
         answer_codec: sdp::NegotiatedCodec,
     },
     /// A CANCEL is being sent (abandonment or our own timeout) and we are
@@ -324,6 +410,11 @@ pub(super) fn begin_origination(
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
+        early_veth_rx: None,
+        early_media_sent: false,
+        early_media_codec: None,
+        early_relay: None,
+        early_veth_socket: None,
         callee_uri,
         route_headers,
         via_transport,
@@ -356,6 +447,21 @@ impl PendingOrigination {
     fn fail(&mut self, reason: &str) {
         let call_id = self.call_id.clone();
         origination_failed(&mut self.control, &call_id, reason);
+        self.stop_early_relay();
+    }
+
+    /// Stops a relay already running from early media (specs/037-p-early-media),
+    /// if one is. A no-op when none was ever started. Every termination path
+    /// that drops this `PendingOrigination` without reaching
+    /// `finish_origination`'s success case must call this, or the relay
+    /// thread (and the sockets it owns) leaks — `finish_origination` itself
+    /// takes ownership of `early_relay` via its consuming destructure, so it
+    /// needs no separate stop call.
+    fn stop_early_relay(&mut self) {
+        if let Some((stop, _meter, _chosen)) = self.early_relay.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.early_veth_socket = None;
     }
 
     /// Send a CANCEL for a still-pending INVITE and move to `AwaitingCancel`,
@@ -658,6 +764,58 @@ impl PendingOrigination {
                     },
                 );
             }
+
+            // specs/037-p-early-media: the first SDP-bearing provisional is
+            // early media (an announcement/ringback the carrier is actually
+            // sending, e.g. Jio's ~13.7s `P-Early-Media: sendonly`) — relay
+            // it to Agent B's local caller now instead of discarding it
+            // until the real `200 OK`. At most one attempt per call
+            // (`early_media_sent`); FR-006 makes a failed attempt here
+            // best-effort, not a reason to fail the whole call — the
+            // attempt just proceeds without early media, exactly as it did
+            // before this feature existed.
+            //
+            // `early_media_sent` is set only once the body actually parses
+            // as SDP (code review finding, specs/037-p-early-media): a
+            // provisional whose non-empty body *fails* to parse (malformed,
+            // or not SDP at all) must not permanently lock this out — a
+            // later provisional carrying genuinely usable SDP still needs
+            // its shot. The guard exists to stop a *successful* attempt
+            // from being redone (e.g. on a retransmit), not to give up
+            // after the first unparseable body.
+            if !self.early_media_sent && !resp.body.trim().is_empty() {
+                match sdp::parse_answer(&resp.body) {
+                    Ok(early_answer) => {
+                        self.early_media_sent = true;
+                        if let Err(e) = self.rtp_socket.connect(early_answer.remote_rtp) {
+                            tracing::warn!(call_id = %self.call_id, error = %e, "outbound: early-media RTP connect failed; continuing without it (FR-006)");
+                        } else {
+                            match spawn_veth_uas_listener(
+                                self.veth_local_ip,
+                                self.veth_sip_port,
+                                self.wideband,
+                            ) {
+                                Ok(rx) => {
+                                    self.early_veth_rx = Some(rx);
+                                    self.early_media_codec = Some(early_answer.codec);
+                                    let _ = write_msg(
+                                        &mut self.control,
+                                        &ControlMessage::CallEarlyMedia {
+                                            call_id: self.call_id.clone(),
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(call_id = %self.call_id, error = %e, "outbound: early-media veth listener spawn failed; continuing without it (FR-006)");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(call_id = %self.call_id, error = %e, "outbound: provisional body did not parse as SDP; no early media");
+                    }
+                }
+            }
             return OriginationStatus::Pending;
         }
 
@@ -705,6 +863,19 @@ impl PendingOrigination {
                 return OriginationStatus::Ended;
             }
         };
+        // specs/037-p-early-media: always (re)connect, even when a
+        // provisional already connected this socket for early media —
+        // `UdpSocket::connect` only updates the kernel's notion of the
+        // default peer for this socket, a local, instantaneous operation
+        // with no I/O of its own, so reconnecting to the *same* address
+        // (the common case: `answer` came from the cached
+        // `provisional_answer`, identical bytes) costs nothing and causes
+        // no audible gap. Skipping it unconditionally was the actual bug:
+        // early media does not require `Require: 100rel` (FR-008), so an
+        // early SDP is not always the guaranteed-final answer the way a
+        // reliable provisional's is — a `200 OK` carrying its *own*,
+        // different SDP (legal per RFC 3264) would have left RTP pointed at
+        // a stale address with skipping in place.
         if let Err(e) = self.rtp_socket.connect(answer.remote_rtp) {
             self.fail(&format!("RTP connect failed: {e}"));
             return OriginationStatus::Ended;
@@ -739,31 +910,72 @@ impl PendingOrigination {
             session,
         );
 
-        // Spawn the veth listener *before* telling Agent B to call in — same
-        // ordering `handle_invite` uses for the inbound direction, so the
-        // listener is guaranteed up by the time Agent B's `Call::make` reaches
-        // it.
-        let veth_rx = match spawn_veth_uas_listener(
-            self.veth_local_ip,
-            self.veth_sip_port,
-            self.wideband,
-        ) {
-            Ok(rx) => rx,
-            Err(e) => {
-                // The carrier leg is already ACKed and up (the `dialog`
-                // proves it) — `fail()` alone only tells Agent B, it does
-                // not hang up the real carrier call.
-                tracing::warn!(call_id = %self.call_id, error = %e, "outbound: veth listener failed");
-                let call_id = self.call_id.clone();
-                hangup_answered_carrier_leg(
+        // specs/037-p-early-media: reuse the listener a provisional already
+        // spawned, *if* it's still usable. Its `VETH_INVITE_TIMEOUT` clock
+        // started back at the provisional, not now — on a carrier like Jio
+        // (~13.7s of early media before the real `200 OK`) it can easily
+        // have already timed out by the time we get here. Blindly reusing a
+        // receiver that already holds a stale failure would hang up a
+        // carrier leg the carrier just successfully answered, which FR-006
+        // rules out — so a resolved-but-failed (or disconnected) early
+        // listener falls back to a *fresh* one, giving Agent B a full new
+        // window starting now, exactly as if no early media had ever
+        // happened. A still-pending one (the common case: Agent B pairs
+        // within milliseconds of `CallEarlyMedia`, so this rarely lingers
+        // long enough to matter) is used as-is. An already-succeeded one is
+        // forwarded through a fresh one-shot channel so the `AwaitingVeth`
+        // poll loop below can treat every case identically.
+        //
+        // Spawn *before* telling Agent B to call in — same ordering
+        // `handle_invite` uses for the inbound direction, so the listener is
+        // guaranteed up by the time Agent B's `Call::make` reaches it.
+        // specs/037-p-early-media: if the relay is already running (started
+        // once the early veth handshake resolved, `tick_pending_origination`),
+        // there is nothing left to wait for here — `veth_rx: None` tells
+        // `finish_origination` to reuse it rather than spawn or wait for
+        // anything. Otherwise, unchanged from before that field existed:
+        // reuse an early handshake that's already succeeded, retry fresh if
+        // it already failed, or spawn fresh if none was ever attempted.
+        let veth_rx = if self.early_relay.is_some() {
+            None
+        } else {
+            Some(match self.early_veth_rx.take() {
+                Some(rx) => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => rx,
+                    Ok(Ok(result)) => {
+                        let (tx, fresh_rx) = mpsc::channel();
+                        let _ = tx.send(Ok(result));
+                        fresh_rx
+                    }
+                    Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                        tracing::warn!(call_id = %self.call_id, "outbound: early-media veth handshake had already failed by the real 200 OK; giving Agent B a fresh window (FR-006)");
+                        match spawn_fresh_veth_listener_or_hangup(
+                            session,
+                            &mut self.control,
+                            &dialog,
+                            &self.call_id.clone(),
+                            self.veth_local_ip,
+                            self.veth_sip_port,
+                            self.wideband,
+                        ) {
+                            Some(rx) => rx,
+                            None => return OriginationStatus::Ended,
+                        }
+                    }
+                },
+                None => match spawn_fresh_veth_listener_or_hangup(
                     session,
                     &mut self.control,
                     &dialog,
-                    &call_id,
-                    reason::VETH_LEG_FAILED,
-                );
-                return OriginationStatus::Ended;
-            }
+                    &self.call_id.clone(),
+                    self.veth_local_ip,
+                    self.veth_sip_port,
+                    self.wideband,
+                ) {
+                    Some(rx) => rx,
+                    None => return OriginationStatus::Ended,
+                },
+            })
         };
 
         if let Err(e) = write_msg(
@@ -847,13 +1059,107 @@ pub(super) fn tick_pending_origination(
         return None;
     }
 
-    // 2. Read the veth channel without holding a borrow into `p` across a move.
+    // 1.5. specs/037-p-early-media: if a provisional already has a veth
+    // handshake in flight (`early_veth_rx`), check whether it resolved.
+    // Signaling alone — Agent B pairing and answering `183`, already done
+    // when `CallEarlyMedia` was sent — moves no audio; starting the actual
+    // relay here is what makes early media audible. Found live 2026-08-16:
+    // without this, pairing/answering succeeded but a real test call
+    // reported zero RTP packets in either direction, because the relay this
+    // codebase already had (`spawn_relay`/`spawn_transcoding_relay`) was
+    // only ever reachable via `finish_origination`, itself only reachable
+    // via the real `200 OK` — a call that never reaches `200 OK` (e.g. the
+    // carrier plays an announcement then rejects with `480`, exactly Jio's
+    // diagnosed behavior) never ran that path at all.
+    if p.early_relay.is_none() {
+        if let Some(rx) = &p.early_veth_rx {
+            match rx.try_recv() {
+                Ok(Ok(veth_result)) => {
+                    p.early_veth_rx = None;
+                    let early_codec = p
+                        .early_media_codec
+                        .expect("early_media_codec is always set alongside early_veth_rx");
+                    match offered_chosen_codec(early_codec) {
+                        // Clone both sockets: one clone of each goes into the
+                        // relay, the originals stay available in `p` — the
+                        // carrier one for the existing unconditional
+                        // reconnect at the real `200 OK`, the veth one
+                        // (`early_veth_socket`) solely in case that `200 OK`
+                        // selects a different codec than this one and the
+                        // relay needs rebuilding from scratch (code review
+                        // finding — see `early_relay`'s doc comment).
+                        Some(chosen) => {
+                            match (p.rtp_socket.try_clone(), veth_result.rtp_socket.try_clone()) {
+                                (Ok(carrier_sock), Ok(veth_sock_clone)) => {
+                                    let stop = Arc::new(AtomicBool::new(false));
+                                    let meter = crate::ims::media_stats::MediaMeter::new();
+                                    let transcoding = chosen.codec != veth_result.codec.codec;
+                                    let started = if transcoding {
+                                        crate::ims::transcode::spawn_transcoding_relay(
+                                            carrier_sock,
+                                            veth_sock_clone,
+                                            chosen,
+                                            veth_result.codec,
+                                            stop.clone(),
+                                            &meter,
+                                        )
+                                        .is_ok()
+                                    } else {
+                                        spawn_relay(
+                                            carrier_sock,
+                                            veth_sock_clone,
+                                            stop.clone(),
+                                            &meter,
+                                        );
+                                        true
+                                    };
+                                    if started {
+                                        tracing::info!(call_id = %p.call_id, transcoding, "outbound: early media relay started");
+                                        p.early_relay = Some((stop, meter, chosen));
+                                        p.early_veth_socket =
+                                            Some((veth_result.rtp_socket, veth_result.codec));
+                                    } else {
+                                        tracing::warn!(call_id = %p.call_id, "outbound: early-media transcoding relay failed to start; continuing without it (FR-006)");
+                                    }
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    tracing::warn!(call_id = %p.call_id, error = %e, "outbound: could not clone an RTP socket for early media; continuing without it (FR-006)");
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!(call_id = %p.call_id, codec = early_codec.name(), "outbound: carrier's early SDP selected a codec we never offered; continuing without early media (FR-006)");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(call_id = %p.call_id, error = %e, "outbound: early-media veth handshake failed; the real 200 OK path will retry (FR-006)");
+                    p.early_veth_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    tracing::debug!(call_id = %p.call_id, "outbound: early-media veth listener thread gone without a result; the real 200 OK path will retry (FR-006)");
+                    p.early_veth_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    // 2. Read the veth channel without holding a borrow into `p` across a
+    // move. `veth_rx: None` means the relay is already running via early
+    // media (step 1.5, an earlier tick) — ready immediately, nothing to
+    // poll.
     let veth_ready = match &p.step {
-        OriginationStep::AwaitingVeth { veth_rx, .. } => Some(veth_rx.try_recv()),
+        OriginationStep::AwaitingVeth { veth_rx: None, .. } => Some(Ok(None)),
+        OriginationStep::AwaitingVeth {
+            veth_rx: Some(rx), ..
+        } => Some(rx.try_recv().map(Some)),
         _ => None,
     };
     match veth_ready {
-        // Agent B's veth leg arrived — bridge the two legs.
+        // Agent B's veth leg arrived — bridge the two legs. `None` here
+        // means they're already bridged (early media); `finish_origination`
+        // just finalizes the signaling around the relay already running.
         Some(Ok(veth_result)) => return finish_origination(p, veth_result, session),
         // Nothing yet: enforce the veth deadline, else keep waiting.
         Some(Err(mpsc::TryRecvError::Empty)) => {
@@ -924,6 +1230,12 @@ pub(super) fn tick_pending_origination(
 /// BYE an already-answered leg. No `CallFailed` is sent — Agent B initiated
 /// this and has already reported `CallerAbandoned`.
 fn abandon_origination(p: &mut PendingOrigination, session: &mut crate::ims::RegisteredSession) {
+    // specs/037-p-early-media: covers the `AwaitingCarrier` case (early
+    // media active, real final response never arrived) directly; a
+    // no-op if there was never a relay to stop, or if it's about to be
+    // covered again by `hangup_pending_carrier_leg` below (idempotent —
+    // `stop_early_relay` uses `Option::take`).
+    p.stop_early_relay();
     match &p.step {
         OriginationStep::AwaitingCarrier => p.begin_cancel(session),
         OriginationStep::AwaitingVeth { .. } => {
@@ -941,11 +1253,37 @@ fn hangup_pending_carrier_leg(
     session: &mut crate::ims::RegisteredSession,
     reason: &str,
 ) {
+    // specs/037-p-early-media: a relay can already be running here (started
+    // during early media, before the veth handshake this function is
+    // reacting to a failure/timeout/abandonment of) — stop it, or it leaks.
+    p.stop_early_relay();
     // Disjoint field borrows: `dialog` reads `p.step`, the BYE writes
     // `p.control`, `call_id` is copied out first — so none of these alias.
     if let OriginationStep::AwaitingVeth { dialog, .. } = &p.step {
         let call_id = p.call_id.clone();
         hangup_answered_carrier_leg(session, &mut p.control, dialog, &call_id, reason);
+    }
+}
+
+/// The `ChosenCodec` for a codec `sdp::build_offer` actually offers (PCMU or
+/// AMR-WB) — `None` for anything else (`AmrNb`, `L16`), which an answer can
+/// only select by carrier misbehavior, not a codec we'd ever have agreed to.
+/// Shared between `finish_origination`'s codec resolution and
+/// `tick_pending_origination`'s early-media relay start (specs/037-p-early-media)
+/// so the two don't drift.
+fn offered_chosen_codec(negotiated: NegotiatedCodec) -> Option<sdp::ChosenCodec> {
+    match negotiated {
+        NegotiatedCodec::Pcmu => Some(sdp::ChosenCodec {
+            codec: NegotiatedCodec::Pcmu,
+            payload_type: 0,
+            octet_aligned: false,
+        }),
+        NegotiatedCodec::AmrWb => Some(sdp::ChosenCodec {
+            codec: NegotiatedCodec::AmrWb,
+            payload_type: 96,
+            octet_aligned: true,
+        }),
+        _ => None,
     }
 }
 
@@ -955,7 +1293,7 @@ fn hangup_pending_carrier_leg(
 /// leg down if bridging fails.
 fn finish_origination(
     p: PendingOrigination,
-    veth_result: BridgeResult<VethUasResult>,
+    veth_result: Option<BridgeResult<VethUasResult>>,
     session: &mut crate::ims::RegisteredSession,
 ) -> Option<ActiveCall> {
     let PendingOrigination {
@@ -967,6 +1305,8 @@ fn finish_origination(
         ctrl_rx,
         rtp_socket,
         mut lifecycle,
+        early_relay,
+        early_veth_socket,
         ..
     } = p;
     let mut control = control;
@@ -980,46 +1320,109 @@ fn finish_origination(
         return None;
     };
 
-    let veth = match veth_result.map_err(|e| e.to_string()) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(call_id, error = %e, "outbound: Agent B's veth call failed");
-            hangup_answered_carrier_leg(
-                session,
-                &mut control,
-                &dialog,
-                &call_id,
-                reason::VETH_LEG_FAILED,
-            );
-            return None;
-        }
-    };
-
-    // `parse_answer` only returns which codec the answer picked
-    // (`NegotiatedCodec`), not a payload type — by RFC 3264, a re-used dynamic
-    // payload type on the answer must mean what *our own offer* said it meant,
-    // so there is nothing to re-parse. Reconstructs the rest from what
-    // `sdp::build_offer` is known to always send.
-    let chosen = match answer_codec {
-        NegotiatedCodec::Pcmu => sdp::ChosenCodec {
-            codec: NegotiatedCodec::Pcmu,
-            payload_type: 0,
-            octet_aligned: false,
+    // specs/037-p-early-media: `veth_result: None` means the relay is
+    // already running — it was started once the early veth handshake
+    // resolved (`tick_pending_origination`'s early-relay check), well
+    // before this real `200 OK` ever arrived. Reuse it rather than spawn a
+    // second one; `rtp_socket` here is the *original* handle, unused since
+    // the relay was started from a clone of it — dropped harmlessly at the
+    // end of this function, the clone the relay thread owns keeps the
+    // underlying socket alive.
+    let (stop, meter, carrier_codec_name, transcoding) = match (veth_result, early_relay) {
+        (None, Some((stop, meter, early_chosen))) => match offered_chosen_codec(answer_codec) {
+            Some(final_chosen) if final_chosen.codec == early_chosen.codec => {
+                // The real 200 OK agrees with what the relay was already
+                // built for — trust it, exactly as before this check
+                // existed.
+                let transcoding = early_veth_socket
+                    .as_ref()
+                    .is_some_and(|(_, vc)| early_chosen.codec != vc.codec);
+                (stop, meter, early_chosen.codec.name(), transcoding)
+            }
+            Some(final_chosen) => {
+                // Real 200 OK selected a *different* codec than the early,
+                // non-100rel provisional did (code review finding — RFC
+                // 3264 doesn't bind them together, so this is legal, not a
+                // carrier bug). Reusing the running relay here would feed
+                // it RTP payloads its encoder/decoder pair was never built
+                // for, corrupting or silently dropping audio rather than
+                // erroring. Stop it and rebuild from the retained veth
+                // socket instead — `rtp_socket` (the carrier side) is
+                // already reconnected to the real answer's address by the
+                // unconditional reconnect above this function's call site.
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let Some((veth_sock, veth_codec)) = early_veth_socket else {
+                    tracing::error!(
+                        call_id,
+                        "outbound: early relay had no retained veth socket to rebuild the relay from"
+                    );
+                    hangup_answered_carrier_leg(
+                        session,
+                        &mut control,
+                        &dialog,
+                        &call_id,
+                        reason::TRANSPORT_ERROR,
+                    );
+                    return None;
+                };
+                let new_stop = Arc::new(AtomicBool::new(false));
+                let new_meter = crate::ims::media_stats::MediaMeter::new();
+                let transcoding = final_chosen.codec != veth_codec.codec;
+                let relay_result = if transcoding {
+                    crate::ims::transcode::spawn_transcoding_relay(
+                        rtp_socket,
+                        veth_sock,
+                        final_chosen,
+                        veth_codec,
+                        new_stop.clone(),
+                        &new_meter,
+                    )
+                } else {
+                    spawn_relay(rtp_socket, veth_sock, new_stop.clone(), &new_meter);
+                    Ok(())
+                };
+                if let Err(e) = relay_result {
+                    tracing::error!(call_id, error = %e, "outbound: failed to rebuild the media relay for the real answer's codec");
+                    hangup_answered_carrier_leg(
+                        session,
+                        &mut control,
+                        &dialog,
+                        &call_id,
+                        reason::TRANSPORT_ERROR,
+                    );
+                    return None;
+                }
+                tracing::info!(
+                    call_id,
+                    old_codec = early_chosen.codec.name(),
+                    new_codec = final_chosen.codec.name(),
+                    "outbound: real 200 OK selected a different codec than early media; rebuilt the relay"
+                );
+                (new_stop, new_meter, final_chosen.codec.name(), transcoding)
+            }
+            None => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    call_id,
+                    codec = answer_codec.name(),
+                    "outbound: carrier answered with a codec we never offered"
+                );
+                hangup_answered_carrier_leg(
+                    session,
+                    &mut control,
+                    &dialog,
+                    &call_id,
+                    reason::TRANSPORT_ERROR,
+                );
+                return None;
+            }
         },
-        NegotiatedCodec::AmrWb => sdp::ChosenCodec {
-            codec: NegotiatedCodec::AmrWb,
-            payload_type: 96,
-            octet_aligned: true,
-        },
-        other => {
-            // Never offered — `sdp::build_offer` only ever lists PCMU/AMR-WB.
-            // Agent B's phone/PBX leg is already answered by this point, so
-            // leaving it stranded on dead air on top of leaking the carrier leg
-            // would compound the failure.
+        (None, None) => {
+            // Unreachable: `veth_rx: None` in `AwaitingVeth` is only ever
+            // constructed alongside `early_relay: Some(..)`.
             tracing::error!(
                 call_id,
-                codec = other.name(),
-                "outbound: carrier answered with a codec we never offered"
+                "outbound: AwaitingVeth had no veth result and no early relay"
             );
             hangup_answered_carrier_leg(
                 session,
@@ -1030,40 +1433,87 @@ fn finish_origination(
             );
             return None;
         }
-    };
+        (Some(veth_result), _) => {
+            let veth = match veth_result.map_err(|e| e.to_string()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(call_id, error = %e, "outbound: Agent B's veth call failed");
+                    hangup_answered_carrier_leg(
+                        session,
+                        &mut control,
+                        &dialog,
+                        &call_id,
+                        reason::VETH_LEG_FAILED,
+                    );
+                    return None;
+                }
+            };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let meter = crate::ims::media_stats::MediaMeter::new();
-    let transcoding = chosen.codec != veth.codec.codec;
-    let relay_result = if transcoding {
-        crate::ims::transcode::spawn_transcoding_relay(
-            rtp_socket,
-            veth.rtp_socket,
-            chosen,
-            veth.codec,
-            stop.clone(),
-            &meter,
-        )
-    } else {
-        spawn_relay(rtp_socket, veth.rtp_socket, stop.clone(), &meter);
-        Ok(())
+            // `parse_answer` only returns which codec the answer picked
+            // (`NegotiatedCodec`), not a payload type — by RFC 3264, a re-used
+            // dynamic payload type on the answer must mean what *our own
+            // offer* said it meant, so there is nothing to re-parse.
+            // Reconstructs the rest from what `sdp::build_offer` is known to
+            // always send.
+            let chosen = match offered_chosen_codec(answer_codec) {
+                Some(c) => c,
+                None => {
+                    // Never offered — `sdp::build_offer` only ever lists
+                    // PCMU/AMR-WB. Agent B's phone/PBX leg is already
+                    // answered by this point, so leaving it stranded on dead
+                    // air on top of leaking the carrier leg would compound
+                    // the failure.
+                    tracing::error!(
+                        call_id,
+                        codec = answer_codec.name(),
+                        "outbound: carrier answered with a codec we never offered"
+                    );
+                    hangup_answered_carrier_leg(
+                        session,
+                        &mut control,
+                        &dialog,
+                        &call_id,
+                        reason::TRANSPORT_ERROR,
+                    );
+                    return None;
+                }
+            };
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let meter = crate::ims::media_stats::MediaMeter::new();
+            let transcoding = chosen.codec != veth.codec.codec;
+            let relay_result = if transcoding {
+                crate::ims::transcode::spawn_transcoding_relay(
+                    rtp_socket,
+                    veth.rtp_socket,
+                    chosen,
+                    veth.codec,
+                    stop.clone(),
+                    &meter,
+                )
+            } else {
+                spawn_relay(rtp_socket, veth.rtp_socket, stop.clone(), &meter);
+                Ok(())
+            };
+            if let Err(e) = relay_result {
+                tracing::error!(call_id, error = %e, "outbound: failed to start media relay");
+                hangup_answered_carrier_leg(
+                    session,
+                    &mut control,
+                    &dialog,
+                    &call_id,
+                    reason::TRANSPORT_ERROR,
+                );
+                return None;
+            }
+            (stop, meter, chosen.codec.name(), transcoding)
+        }
     };
-    if let Err(e) = relay_result {
-        tracing::error!(call_id, error = %e, "outbound: failed to start media relay");
-        hangup_answered_carrier_leg(
-            session,
-            &mut control,
-            &dialog,
-            &call_id,
-            reason::TRANSPORT_ERROR,
-        );
-        return None;
-    }
 
     tracing::info!(
         call_id,
         destination,
-        carrier_codec = chosen.codec.name(),
+        carrier_codec = carrier_codec_name,
         transcoding,
         "outbound: call placed and bridged"
     );
@@ -1091,4 +1541,477 @@ fn finish_origination(
         meter,
         lifecycle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
+    /// A connected loopback pair for `PendingOrigination::control` — the
+    /// server half must stay alive for the whole test (an accepted-then-
+    /// dropped peer would reset the connection on the next write), so
+    /// callers keep both halves in scope even though only the client half
+    /// is read from `control`'s field position.
+    fn control_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    /// Fields here are never touched by the early-media path under test
+    /// (`prack_if_required` returns before reading `session` when the
+    /// response carries no `RSeq`) — values are realistic-but-arbitrary,
+    /// not meant to resemble a real registration.
+    fn test_session() -> crate::ims::RegisteredSession {
+        crate::ims::RegisteredSession {
+            transport: None,
+            realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            public_uri: "sip:9000000000@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
+            contact_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
+            use_tcp: true,
+            cseq: 2,
+            gm_state: None,
+            xfrm_proto: "esp",
+            status: 200,
+            reason: "OK".to_string(),
+            headers: Vec::new(),
+            call_id: "reg-1".to_string(),
+            from_tag: "regtag".to_string(),
+            pcscf_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
+            imei: "000000000000000".to_string(),
+        }
+    }
+
+    /// Returns the `ControlMessage` sender alongside the `PendingOrigination`
+    /// — most callers just let it drop (equivalent to today's behavior,
+    /// which never kept it), but `tick_pending_origination` treats a
+    /// disconnected `ctrl_rx` as caller-abandonment, so any test that drives
+    /// a tick (rather than calling `on_carrier_response` directly) must keep
+    /// it alive for the duration.
+    fn test_pending(
+        call_id: &str,
+        control: TcpStream,
+    ) -> (PendingOrigination, mpsc::Sender<ControlMessage>) {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel();
+        let rtp_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut lifecycle = BridgedCall::new(call_id.to_string(), "9000000001".to_string(), None);
+        lifecycle.advance_to(CallStage::Answering);
+        let p = PendingOrigination {
+            step: OriginationStep::AwaitingCarrier,
+            call_id: call_id.to_string(),
+            from_tag: "ftag".to_string(),
+            branch: "z9hG4bKtest".to_string(),
+            invite_cseq: 1,
+            extra_cseq: 0,
+            pracked_rseq: None,
+            provisional_answer: None,
+            early_veth_rx: None,
+            early_media_sent: false,
+            early_media_codec: None,
+            early_relay: None,
+            early_veth_socket: None,
+            callee_uri: "sip:9000000001@example.test".to_string(),
+            route_headers: Vec::new(),
+            via_transport: "TCP",
+            destination: "9000000001".to_string(),
+            control,
+            ctrl_rx,
+            rtp_socket,
+            veth_local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            veth_sip_port: 0,
+            wideband: false,
+            deadline: Instant::now() + Duration::from_secs(30),
+            any_response_seen: false,
+            ringing_relayed: false,
+            abandoned: false,
+            lifecycle,
+        };
+        (p, ctrl_tx)
+    }
+
+    fn provisional_183_with_sdp(call_id: &str) -> SipResponse {
+        SipResponse {
+            status: 183,
+            reason: "Session Progress".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        }
+    }
+
+    /// specs/037-p-early-media, US1 (T006): the first SDP-bearing
+    /// provisional connects the carrier RTP socket and spawns the veth
+    /// listener; a retransmit of that same provisional must not redo either
+    /// — reconnecting the socket a second time is exactly the kind of
+    /// re-establishment SC-005's zero-gap handoff rules out.
+    #[test]
+    fn first_sdp_bearing_provisional_triggers_early_media_once() {
+        let call_id = "out-early-1";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let resp1 = provisional_183_with_sdp(call_id);
+        let status1 = p.on_carrier_response(&resp1, &mut session);
+        assert!(matches!(status1, OriginationStatus::Pending));
+        assert!(
+            p.early_media_sent,
+            "the first SDP-bearing provisional should attempt early media"
+        );
+        assert!(
+            p.early_veth_rx.is_some(),
+            "the veth listener should be spawned from the first provisional"
+        );
+        let peer_after_first = p.rtp_socket.peer_addr().unwrap();
+        assert_eq!(
+            peer_after_first,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000)
+        );
+
+        // A retransmit of the exact same provisional (RSeq is absent here
+        // regardless, so this is indistinguishable from a genuine resend at
+        // the transport level) must not reconnect the socket or spawn a
+        // second listener.
+        let resp2 = provisional_183_with_sdp(call_id);
+        let status2 = p.on_carrier_response(&resp2, &mut session);
+        assert!(matches!(status2, OriginationStatus::Pending));
+        assert_eq!(
+            p.rtp_socket.peer_addr().unwrap(),
+            peer_after_first,
+            "a retransmitted provisional must not reconnect the RTP socket"
+        );
+    }
+
+    /// A provisional with no SDP body (e.g. a plain `100 Trying`/`180
+    /// Ringing`) must not trigger early media at all — the no-early-media
+    /// path (spec.md FR-002) stays exactly as it was.
+    #[test]
+    fn provisional_without_sdp_does_not_trigger_early_media() {
+        let call_id = "out-early-2";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let resp = SipResponse {
+            status: 180,
+            reason: "Ringing".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: String::new(),
+        };
+
+        let status = p.on_carrier_response(&resp, &mut session);
+        assert!(matches!(status, OriginationStatus::Pending));
+        assert!(!p.early_media_sent);
+        assert!(p.early_veth_rx.is_none());
+        assert!(
+            p.rtp_socket.peer_addr().is_err(),
+            "an unconnected UDP socket has no peer"
+        );
+    }
+
+    /// Code review finding (specs/037-p-early-media): the early-media veth
+    /// listener's `VETH_INVITE_TIMEOUT` clock starts at the provisional, not
+    /// at the real `200 OK` — on a carrier with a long early-media window
+    /// (Jio: ~13.7s) the listener can have already timed out by the time
+    /// the real answer arrives. Blindly reusing that stale, already-failed
+    /// receiver would hang up a carrier leg the carrier just successfully
+    /// answered — a regression against FR-006 ("this feature must not
+    /// reduce the reliability of outbound call setup"). The fix falls back
+    /// to a fresh listener when the reused one has already resolved to a
+    /// failure; this proves that fallback actually fires rather than
+    /// trusting the stale result.
+    #[test]
+    fn stale_early_veth_failure_falls_back_to_a_fresh_listener_at_200_ok() {
+        let call_id = "out-early-3";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        // A real (if unreachable) UDP "connection" so the 200 OK path's ACK
+        // send succeeds and this test actually reaches the veth-listener
+        // decision under test, rather than failing earlier at the ACK step.
+        let dummy_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(dummy_peer.local_addr().unwrap(), false)
+                .unwrap();
+        session.transport = Some(transport);
+
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        // Simulate an early-media veth listener that already failed (timed
+        // out) by the time the real 200 OK arrives.
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(Err(crate::error::BridgeError::Ims(
+            "veth INVITE timed out".to_string(),
+        )));
+        p.early_veth_rx = Some(rx);
+
+        let resp = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        };
+
+        let status = p.on_carrier_response(&resp, &mut session);
+        // Must still be in flight, not immediately hung up as
+        // VETH_LEG_FAILED because of the stale result.
+        assert!(matches!(status, OriginationStatus::Pending));
+        let OriginationStep::AwaitingVeth { veth_rx, .. } = &p.step else {
+            panic!("expected AwaitingVeth, got a different step");
+        };
+        // The critical assertion: `on_carrier_response` alone returning
+        // `Pending` is not enough to prove the fix, because the *old*,
+        // buggy code also reached `AwaitingVeth` here — it just carried the
+        // stale, already-failed receiver forward, and the failure only
+        // surfaced one tick later in `tick_pending_origination`. Proving
+        // the fix means proving the receiver in `AwaitingVeth` is a fresh,
+        // still-pending one, not the stale one: `try_recv` on a genuinely
+        // fresh listener (nothing sent yet) must be `Empty`, whereas the
+        // stale receiver would immediately yield the buffered `Err`.
+        let veth_rx = veth_rx
+            .as_ref()
+            .expect("no early relay was running in this test, so veth_rx must be Some");
+        assert!(
+            matches!(veth_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "expected a fresh, still-pending veth listener, not the stale failed one"
+        );
+    }
+
+    /// Regression test for the root cause behind "signaling paired and
+    /// answered `183`, but a real test call reported zero RTP packets"
+    /// (specs/037-p-early-media, found live 2026-08-16): pairing/answering
+    /// alone moves no audio — the actual relay must start once the veth
+    /// handshake resolves, not wait for the real `200 OK`. Exercises
+    /// `tick_pending_origination` directly (not `on_carrier_response`) since
+    /// that's where the fix lives.
+    #[test]
+    fn early_relay_starts_as_soon_as_the_veth_handshake_resolves() {
+        let call_id = "out-early-4";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        // State right after `CallEarlyMedia` fired: RTP already connected,
+        // codec known, veth listener "spawned" — substituted here with a
+        // channel this test controls directly rather than a real
+        // `spawn_veth_uas_listener` thread.
+        let carrier_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        p.rtp_socket
+            .connect(carrier_peer.local_addr().unwrap())
+            .unwrap();
+        p.early_media_codec = Some(NegotiatedCodec::Pcmu);
+        let (veth_tx, veth_rx) = mpsc::channel();
+        p.early_veth_rx = Some(veth_rx);
+
+        // Agent B's veth leg "arrives": a real, connected UDP socket
+        // standing in for the veth-side RTP endpoint.
+        let veth_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let veth_rtp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        veth_rtp.connect(veth_peer.local_addr().unwrap()).unwrap();
+        veth_tx
+            .send(Ok(VethUasResult {
+                rtp_socket: veth_rtp,
+                codec: sdp::ChosenCodec {
+                    codec: NegotiatedCodec::Pcmu,
+                    payload_type: 0,
+                    octet_aligned: false,
+                },
+            }))
+            .unwrap();
+
+        let mut pending = Some(p);
+        let result = tick_pending_origination(&mut pending, &mut session);
+        assert!(
+            result.is_none(),
+            "the attempt isn't answered yet — no ActiveCall should come out of this tick"
+        );
+        let mut p =
+            pending.expect("the attempt should still be pending, now with the relay running");
+        assert!(
+            p.early_relay.is_some(),
+            "the relay should have started as soon as the veth handshake resolved, \
+             not waited for the real 200 OK"
+        );
+        assert!(
+            p.early_veth_rx.is_none(),
+            "the resolved receiver should have been cleared, not left to be polled again"
+        );
+        assert!(
+            matches!(p.step, OriginationStep::AwaitingCarrier),
+            "still waiting for the real final response — early media doesn't answer the call"
+        );
+
+        // Prove real bytes actually move — send one packet each way through
+        // the now-running relay and confirm it arrives.
+        carrier_peer
+            .send_to(b"hello-from-carrier", p.rtp_socket.local_addr().unwrap())
+            .unwrap();
+        veth_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = veth_peer.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-from-carrier");
+
+        // Clean up: stop the relay thread this test started.
+        p.stop_early_relay();
+    }
+
+    /// Code review finding (specs/037-p-early-media): a provisional whose
+    /// non-empty body fails to parse as SDP used to set `early_media_sent`
+    /// unconditionally, permanently locking out early media for the rest of
+    /// the attempt — even if a *later* provisional carried perfectly good
+    /// SDP. Proves the fix: the flag stays clear after a bad body, and a
+    /// subsequent good one still triggers early media normally.
+    #[test]
+    fn unparseable_provisional_body_does_not_lock_out_a_later_valid_one() {
+        let call_id = "out-early-5";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let bad_resp = SipResponse {
+            status: 183,
+            reason: "Session Progress".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: "not valid sdp at all".to_string(),
+        };
+        let status1 = p.on_carrier_response(&bad_resp, &mut session);
+        assert!(matches!(status1, OriginationStatus::Pending));
+        assert!(
+            !p.early_media_sent,
+            "an unparseable body must not lock out a later valid one"
+        );
+        assert!(p.early_veth_rx.is_none());
+
+        let good_resp = provisional_183_with_sdp(call_id);
+        let status2 = p.on_carrier_response(&good_resp, &mut session);
+        assert!(matches!(status2, OriginationStatus::Pending));
+        assert!(
+            p.early_media_sent,
+            "the later, valid provisional should have triggered early media"
+        );
+        assert!(p.early_veth_rx.is_some());
+    }
+
+    /// Code review finding (specs/037-p-early-media): RFC 3264 doesn't bind
+    /// a non-`100rel` provisional's SDP to the real `200 OK`'s — a carrier
+    /// can legally answer with a different codec than its early media used.
+    /// Blindly reusing the already-running early relay in that case would
+    /// feed it RTP payloads its encoder/decoder pair was never built for.
+    /// Proves the fix: the real `200 OK` selecting a different codec stops
+    /// the early relay and builds a fresh one, rather than trusting it.
+    #[test]
+    fn mismatched_final_codec_rebuilds_the_relay_instead_of_reusing_it() {
+        let call_id = "out-early-6";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let dummy_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(dummy_peer.local_addr().unwrap(), false)
+                .unwrap();
+        session.transport = Some(transport);
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        // Early media negotiates PCMU (matching the veth leg's own PCMU,
+        // so a plain passthrough relay — no transcoding needed to prove
+        // this specific bug).
+        let carrier_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        p.rtp_socket
+            .connect(carrier_peer.local_addr().unwrap())
+            .unwrap();
+        p.early_media_codec = Some(NegotiatedCodec::Pcmu);
+        let (veth_tx, veth_rx) = mpsc::channel();
+        p.early_veth_rx = Some(veth_rx);
+        let veth_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let veth_rtp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        veth_rtp.connect(veth_peer.local_addr().unwrap()).unwrap();
+        veth_tx
+            .send(Ok(VethUasResult {
+                rtp_socket: veth_rtp,
+                codec: sdp::ChosenCodec {
+                    codec: NegotiatedCodec::Pcmu,
+                    payload_type: 0,
+                    octet_aligned: false,
+                },
+            }))
+            .unwrap();
+
+        // Tick 1: the veth handshake resolves, the early (PCMU) relay starts.
+        let mut pending = Some(p);
+        assert!(tick_pending_origination(&mut pending, &mut session).is_none());
+        let mut p = pending.expect("still pending after starting the early relay");
+        let (early_stop, _early_meter, early_chosen) = p
+            .early_relay
+            .clone()
+            .expect("the early relay should have started");
+        assert_eq!(early_chosen.codec, NegotiatedCodec::Pcmu);
+        assert!(
+            !early_stop.load(std::sync::atomic::Ordering::Relaxed),
+            "the early relay should still be running at this point"
+        );
+
+        // The real 200 OK arrives, selecting AMR-WB instead — a different
+        // codec than the early relay was built for.
+        let final_resp = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40001 RTP/AVP 96\r\n".to_string(),
+        };
+        let status = p.on_carrier_response(&final_resp, &mut session);
+        assert!(matches!(status, OriginationStatus::Pending));
+
+        // Tick 2: `veth_rx: None` (already relaying) resolves immediately —
+        // `finish_origination` runs now.
+        let mut pending = Some(p);
+        let outcome = tick_pending_origination(&mut pending, &mut session);
+
+        // The one invariant this test can check in every environment: the
+        // stale PCMU relay must never be *reused* once a mismatch is
+        // detected. Whether a fresh AMR-WB relay can actually be *built*
+        // afterward depends on AMR-WB codec support being linked in
+        // (`amr-linked`, not available in this test environment — its
+        // encoder/decoder construction fails gracefully with a `BridgeResult`
+        // error, not a panic, so this path exercises the same graceful
+        // failure a real deployment without AMR-WB support would hit). Both
+        // outcomes are correct here as long as the old relay was stopped:
+        // an `ActiveCall` running a genuinely different relay, or a clean
+        // hangup because the replacement couldn't be built.
+        assert!(
+            early_stop.load(std::sync::atomic::Ordering::Relaxed),
+            "the mismatched-codec early relay must have been stopped, not reused"
+        );
+        if let Some(active_call) = outcome {
+            assert!(
+                !Arc::ptr_eq(&early_stop, &active_call.stop),
+                "if the call finalized, it must be running a freshly built relay, not the old PCMU one"
+            );
+        }
+    }
 }
