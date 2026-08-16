@@ -150,6 +150,19 @@ impl Dedupe {
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
+
+    /// Reverses a prior `admit`. For a caller sharing one `Dedupe` across
+    /// concurrent routes (specs/038-reliable-sms-delivery): admitting must
+    /// happen *before* attempting the relay, not after, or two routes racing
+    /// on the same message can both see "not yet admitted" and both relay it.
+    /// But admitting before relaying means a relay that then fails has
+    /// already claimed the key — `forget` releases that claim so the next
+    /// attempt (a network retransmission, or the next modem sweep) is treated
+    /// as fresh rather than permanently suppressed by a delivery that never
+    /// actually happened.
+    pub fn forget(&mut self, key: &str) {
+        self.seen.retain(|k| k != key);
+    }
 }
 
 /// What the caller should do with a message after `decide`.
@@ -239,6 +252,12 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// consults for the same line — the whole point of a shared `Dedupe` is that
 /// a message delivered over *both* routes collapses to one, which is only
 /// true if both routes admit into the same set.
+///
+/// Only `modem_lock` is held for the whole sweep (it serialises this line's
+/// AT port, unrelated to `dedupe`). `dedupe` is locked briefly per message
+/// inside `sweep_modem_storage`, not for the sweep's duration — see that
+/// function's docs for why holding it across a relay would be a bug, not
+/// just a missed optimisation.
 pub fn run_modem_reader(
     modem_port: PathBuf,
     control_addr: SocketAddr,
@@ -249,8 +268,7 @@ pub fn run_modem_reader(
     loop {
         {
             let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let mut dedupe = dedupe.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &mut dedupe) {
+            if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &dedupe) {
                 tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
             }
         }
@@ -260,10 +278,25 @@ pub fn run_modem_reader(
 
 /// One pass over modem storage. Separated from the loop so a caller can drive a
 /// single sweep, and so the loop's lock discipline is visible at its call site.
+///
+/// # `dedupe` is admitted *before* relaying, not after
+///
+/// Locking `dedupe` for this whole function (as an early version of this code
+/// did) would block the registration-route handler for the entire sweep,
+/// including every message's blocking network relay — needless latency/risk
+/// of the network's own retransmission timer firing for an unrelated message.
+/// The alternative of checking `contains` early but only calling `admit`
+/// after a successful relay is worse: it reopens exactly the race a shared
+/// `Dedupe` exists to close — two routes can both see "not yet admitted"
+/// while each other's relay is in flight, and both then relay it, straight to
+/// a duplicate. So each message here takes the lock twice, briefly: once via
+/// [`decide`] to admit-or-detect-duplicate atomically *before* the relay, and
+/// again via [`Dedupe::forget`] only if the relay then fails, so a message
+/// that never actually got through is not permanently treated as handled.
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
-    dedupe: &mut Dedupe,
+    dedupe: &Arc<Mutex<Dedupe>>,
 ) -> BridgeResult<()> {
     let mut at = AtCommander::open(modem_port)?;
     // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
@@ -284,23 +317,27 @@ fn sweep_modem_storage(
                 continue;
             }
         };
-        let key = InboundMessage {
+        let inbound = InboundMessage {
             route: MessageRoute::ThroughModem,
             sender: sms.sender.clone(),
             body: sms.body.clone(),
             modem_index: Some(index),
-        }
-        .dedupe_key();
+        };
+        let key = inbound.dedupe_key();
+        let disposition = {
+            let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            decide(&mut d, &inbound)
+        };
 
-        // Already handed on this run — a previous delete must have failed.
-        // Clear it now so storage does not fill; do not forward it again.
-        if dedupe.contains(&key) {
+        // Already handed — either a previous delete failed (a re-read within
+        // this same route) or the registration route just relayed it. Clear
+        // it now so storage does not fill; do not forward it again.
+        if disposition == Disposition::AcknowledgeOnly {
             let _ = crate::sms::reader::delete_sms(&mut at, index);
             continue;
         }
 
         if relay_modem_message(control_addr, &sms.sender, &sms.body) {
-            dedupe.admit(&key);
             tracing::info!(
                 index,
                 route = MessageRoute::ThroughModem.as_str(),
@@ -310,8 +347,14 @@ fn sweep_modem_storage(
             if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
                 tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
             }
+        } else {
+            // Leave it in storage, unmarked, to retry next sweep — and release
+            // the admission above so that retry is not mistaken for a repeat.
+            dedupe
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget(&key);
         }
-        // On relay failure: leave it in storage, unmarked, to retry next sweep.
     }
     Ok(())
 }
@@ -531,6 +574,33 @@ mod tests {
         assert!(!d.contains(&key), "checking must not record");
         assert!(d.admit(&key));
         assert!(d.contains(&key), "an admitted key reports as handled");
+    }
+
+    // ---- rollback on relay failure (specs/038-reliable-sms-delivery) ------
+
+    #[test]
+    fn forget_releases_an_admission_so_a_retry_is_treated_as_fresh() {
+        let mut d = Dedupe::default();
+        let key = msg(MessageRoute::OverRegistration, "+91123", "hello").dedupe_key();
+
+        assert!(d.admit(&key));
+        d.forget(&key);
+        assert!(
+            !d.contains(&key),
+            "forget must fully release the admission, not just mark it stale"
+        );
+        assert!(
+            d.admit(&key),
+            "a forgotten key must be admittable again, exactly like a fresh one"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_unadmitted_key_is_a_harmless_no_op() {
+        let mut d = Dedupe::default();
+        let key = msg(MessageRoute::ThroughModem, "+91123", "hello").dedupe_key();
+        d.forget(&key); // must not panic
+        assert!(!d.contains(&key));
     }
 
     #[test]

@@ -696,6 +696,16 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> 
 /// `Disposition::AcknowledgeOnly` — still acknowledged/cleared so the network
 /// or the modem's own storage does not keep it pending, just not recorded or
 /// forwarded again.
+///
+/// Admission happens *before* the relay below, not after: checking
+/// `contains` early but only calling `admit` once the relay is known to have
+/// succeeded looks safer but is not — it reopens a window where this
+/// function and the modem sweep, running on different threads, can both see
+/// "not yet admitted" while each other's relay is in flight, and both then
+/// relay it. [`decide`] closes that window by admitting atomically. If the
+/// relay then fails, [`Dedupe::forget`] releases the admission so the
+/// network's retransmission is treated as fresh rather than silently
+/// swallowed as a duplicate of a delivery that never actually happened.
 fn handle_message(
     sink: &SipSink,
     req: &SipRequest,
@@ -729,16 +739,11 @@ fn handle_message(
         modem_index: None,
     };
     let key = inbound.dedupe_key();
-    // Check without admitting (mirrors `sweep_modem_storage`): admitting here,
-    // before the relay below is known to succeed, would mean a retransmission
-    // of a message whose relay failed gets silently swallowed as "already
-    // seen" instead of retried — the same failure mode `contains`'s own docs
-    // warn against.
-    let already_seen = {
-        let dedupe = dedupe.lock().unwrap_or_else(|e| e.into_inner());
-        dedupe.contains(&key)
+    let disposition = {
+        let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+        crate::volte::sms::decide(&mut d, &inbound)
     };
-    if already_seen {
+    if disposition == crate::volte::sms::Disposition::AcknowledgeOnly {
         // Already handled via the other bearer (or a prior delivery of this
         // same MESSAGE) in this same process — the network still needs the
         // retry stopped, but it must not be recorded or forwarded again.
@@ -766,9 +771,15 @@ fn handle_message(
     };
 
     if relayed {
-        dedupe.lock().unwrap_or_else(|e| e.into_inner()).admit(&key);
         let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
     } else {
+        // Release the admission above so the retransmission this triggers is
+        // treated as fresh, not as a duplicate of a delivery that never
+        // happened.
+        dedupe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(&key);
         // Deliberately silent toward the network: an unacknowledged MESSAGE is
         // retransmitted, which is the recovery we want. Acknowledging one we
         // failed to record would discard the only chance to get it back.

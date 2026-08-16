@@ -177,6 +177,39 @@ fn the_duplicate_window_stays_bounded() {
 // pre-refactor owned-`Dedupe` case exercised by the tests above.
 
 #[test]
+fn a_failed_relay_is_rolled_back_so_the_retry_is_not_swallowed() {
+    // The bug a naive "check contains, admit only after a successful relay"
+    // implementation has: admitting *before* the relay closes the
+    // two-routes-race-on-one-message window, but only if a relay failure then
+    // releases the admission — otherwise a message whose relay genuinely
+    // failed is stuck looking "already handled" forever.
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let msg = over_registration("+919000000000", "hello");
+
+    let admitted = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &msg) == Disposition::Handle
+    };
+    assert!(admitted, "first delivery attempt must be admitted");
+
+    // Simulate the relay failing: the caller must roll back.
+    {
+        let mut d = dedupe.lock().unwrap();
+        d.forget(&msg.dedupe_key());
+    }
+
+    let retried = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &msg)
+    };
+    assert_eq!(
+        retried,
+        Disposition::Handle,
+        "a retransmission after a rolled-back failed relay must be treated as fresh, not a duplicate"
+    );
+}
+
+#[test]
 fn cross_bearer_duplicate_is_suppressed_through_one_shared_instance() {
     // This is what production wiring now does: `ims::agent::handle_message`
     // (registration route) and `run_modem_reader`'s sweep (modem route) for
