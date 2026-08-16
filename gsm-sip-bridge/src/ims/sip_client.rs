@@ -963,36 +963,29 @@ impl SipTransport {
     pub fn recv_message_deadline(&mut self, timeout: Duration) -> BridgeResult<Option<SipMessage>> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some(line_end) = find_subslice(&self.buf, b"\r\n") {
-                let is_response = self.buf[..line_end].starts_with(b"SIP/2.0");
-                if is_response {
-                    if let Some((resp, consumed)) = SipResponse::try_parse(&self.buf)? {
-                        // Symmetric with the request arm below. Without this
-                        // the single reader of the client transport — which is
-                        // where every carrier response to an outbound INVITE
-                        // arrives — logged nothing at all, so a call that the
-                        // network answered with a `183` and then tore down was
-                        // undiagnosable from the logs. Packet capture is not a
-                        // substitute here: the Gm traffic is ESP-encrypted, and
-                        // GRO aggregates the larger responses on the xfrm
-                        // interface into frames whose ICV no longer verifies.
-                        // `trace`, not `debug` — see `recv_response`'s comment:
-                        // this is a full message, not a summary.
-                        tracing::trace!(
-                            response = %String::from_utf8_lossy(&self.buf[..consumed]),
-                            "received SIP response"
-                        );
-                        self.buf.drain(..consumed);
-                        return Ok(Some(SipMessage::Response(resp)));
-                    }
-                } else if let Some((req, consumed)) = SipRequest::try_parse(&self.buf)? {
-                    tracing::trace!(
+            if let Some((msg, consumed)) = try_parse_one(&self.buf)? {
+                // Symmetric logging for both arms, `trace` not `debug` — see
+                // `recv_response`'s comment: this is the full message, not a
+                // summary, and packet capture is not a substitute here (Gm
+                // traffic is ESP-encrypted, and GRO aggregates the larger
+                // responses on the xfrm interface into frames whose ICV no
+                // longer verifies). Without the response arm specifically,
+                // the single reader of the client transport — where every
+                // carrier response to an outbound INVITE arrives — logged
+                // nothing at all, so a call the network answered with a
+                // `183` and then tore down was undiagnosable from the logs.
+                match &msg {
+                    SipMessage::Request(_) => tracing::trace!(
                         request = %String::from_utf8_lossy(&self.buf[..consumed]),
                         "received SIP request"
-                    );
-                    self.buf.drain(..consumed);
-                    return Ok(Some(SipMessage::Request(req)));
+                    ),
+                    SipMessage::Response(_) => tracing::trace!(
+                        response = %String::from_utf8_lossy(&self.buf[..consumed]),
+                        "received SIP response"
+                    ),
                 }
+                self.buf.drain(..consumed);
+                return Ok(Some(msg));
             }
             self.read_more()?;
             if std::time::Instant::now() >= deadline {
@@ -1000,6 +993,34 @@ impl SipTransport {
             }
         }
     }
+}
+
+/// Attempts to parse exactly one complete SIP message from the start of
+/// `buf`, returning the message and how many bytes it consumed. The single
+/// implementation of the request-vs-response discrimination, shared by the
+/// streaming reader above (which needs the consumed length to drain a buffer
+/// that may hold more than one message) and [`parse_datagram`] below (which
+/// does not).
+fn try_parse_one(buf: &[u8]) -> BridgeResult<Option<(SipMessage, usize)>> {
+    let Some(line_end) = find_subslice(buf, b"\r\n") else {
+        return Ok(None);
+    };
+    let is_response = buf[..line_end].starts_with(b"SIP/2.0");
+    if is_response {
+        Ok(SipResponse::try_parse(buf)?.map(|(resp, n)| (SipMessage::Response(resp), n)))
+    } else {
+        Ok(SipRequest::try_parse(buf)?.map(|(req, n)| (SipMessage::Request(req), n)))
+    }
+}
+
+/// Parses one complete SIP message from a single UDP datagram. Unlike the
+/// stream-framing case above, a datagram is all-or-nothing: there is no
+/// partial message and no trailing second message to preserve, so the
+/// consumed length is irrelevant and dropped. For a caller (e.g. `siptest`)
+/// that owns a `recv_from`-based unconnected socket rather than a
+/// [`SipTransport`], this is the public entry point to the same parser.
+pub fn parse_datagram(text: &str) -> BridgeResult<Option<SipMessage>> {
+    Ok(try_parse_one(text.as_bytes())?.map(|(msg, _consumed)| msg))
 }
 
 /// The write half of a SIP connection — cloneable and shareable across
@@ -1460,6 +1481,34 @@ pub fn extract_challenge(params: &[(String, String)]) -> BridgeResult<DigestChal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_datagram_recognises_a_request() {
+        let raw = "REGISTER sip:example.com SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 1.2.3.4:5060\r\n\
+                   CSeq: 1 REGISTER\r\n\
+                   Content-Length: 0\r\n\r\n";
+        match parse_datagram(raw).unwrap() {
+            Some(SipMessage::Request(req)) => assert_eq!(req.method, "REGISTER"),
+            other => panic!("expected a parsed request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_datagram_recognises_a_response() {
+        let raw = "SIP/2.0 200 OK\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n";
+        match parse_datagram(raw).unwrap() {
+            Some(SipMessage::Response(resp)) => assert_eq!(resp.status, 200),
+            other => panic!("expected a parsed response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_datagram_returns_none_rather_than_erroring_on_garbage() {
+        assert!(parse_datagram("not a sip message at all")
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn gm_server_reports_alive_and_delivers_a_real_message() {

@@ -1,0 +1,28 @@
+[package]
+name = "siptest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "siptest"
+path = "src/main.rs"
+
+[dependencies]
+gsm-sip-bridge = { path = "../gsm-sip-bridge" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "blocking"], default-features = false }
+thiserror = "2"
+crossbeam-channel = "0.5"
+socket2 = "0.6"
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

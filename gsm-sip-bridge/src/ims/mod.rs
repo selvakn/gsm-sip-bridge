@@ -25,24 +25,37 @@
 pub mod agent;
 mod amr_rtp;
 pub mod call;
-/// `pub(crate)` rather than private: `sip::server`'s registrar verifies inbound
+/// `pub` rather than `pub(crate)`: `sip::server`'s registrar verifies inbound
 /// REGISTER credentials with the same RFC 2617 math this module computes
-/// outbound IMS-AKA responses with. A second MD5 digest implementation in the
+/// outbound IMS-AKA responses with — a second MD5 digest implementation in the
 /// same binary is exactly the duplication the constitution's simplicity
-/// principle targets (spec 024, research.md R-007).
-pub(crate) mod digest;
+/// principle targets (spec 024, research.md R-007). Widened again to `pub`
+/// for the `siptest` crate (specs/037-siptest-softphone, research.md R1),
+/// which needs the same digest math to REGISTER as a plain handset — the
+/// same rationale, one crate further out.
+pub mod digest;
 pub mod echo;
 mod gm_ipsec;
 pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
-mod rtp;
+/// `pub` rather than private: `siptest` (specs/037-siptest-softphone,
+/// research.md R1) reuses RTP framing, the μ-law codec and the WAV writer
+/// rather than re-implementing them — the reasoning `digest` and
+/// `sip_client` below already carry, extended one module further.
+pub mod rtp;
 pub mod sdp;
 pub mod session;
-/// `pub(crate)` rather than private: `sip::server`'s registrar reuses this
-/// module's request parser and UAS response builder to serve IP phones. See
-/// `digest` above for the same rationale (spec 024, research.md R-007).
-pub(crate) mod sip_client;
+/// `pub` rather than `pub(crate)`: `sip::server`'s registrar reuses this
+/// module's request parser and UAS response builder to serve IP phones (spec
+/// 024, research.md R-007). Widened again to `pub` for `siptest`
+/// (specs/037-siptest-softphone, research.md R1), which builds a plain RFC
+/// 3261 handset on the same message model and UAS response builders — see
+/// `digest` above for the same rationale one crate further out. The
+/// IMS-specific builders (`build_register`, `build_invite`) are visible too,
+/// but `siptest` deliberately does not call them; its own REGISTER/INVITE are
+/// plain RFC 3261, not IMS.
+pub mod sip_client;
 pub(crate) mod sms_pdu;
 mod transcode;
 pub mod transport;
