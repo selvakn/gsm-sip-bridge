@@ -308,8 +308,31 @@ pub fn run_modem_reader(
 /// port (and therefore `serialport`'s own exclusive lock on it — see
 /// `run_modem_reader`'s docs) that long would starve `vowifi-usim-bridge`/
 /// charon's own AT needs far beyond the "seconds-long transaction" duty
-/// cycle the shared port's design assumes. `modem_lock` is taken fresh for
-/// phase 1 and phase 3 only, not held across phase 2.
+/// cycle the shared port's design assumes.
+///
+/// # Every individual AT round-trip re-opens the port, on purpose
+///
+/// A real backlog is not one message — the bug this feature exists to fix
+/// was found with 12 pending, and storage can hold up to 100. Holding one
+/// continuous session across `AT+CMGF` + `AT+CMGL` + N × `AT+CMGR` (an
+/// earlier version of this function did) makes phase 1's single hold scale
+/// with backlog size — for a dozen-plus messages, easily several seconds,
+/// comfortably exceeding `vowifi-usim-bridge`'s own total retry budget for a
+/// busy port (5 attempts, linear backoff, ~5s total — see `usim_bridge`'s
+/// `try_open_with_backoff`/`OPEN_RETRY_ATTEMPTS`/`OPEN_RETRY_BASE_DELAY`).
+/// That risks the exact failure this design most wants to avoid: USIM
+/// power-on giving up and muting EAP-SIM APDUs, failing the whole
+/// registration, over an SMS sweep.
+///
+/// So `modem_lock` is taken, and the port opened, fresh for `AT+CMGF`+
+/// `AT+CMGL` (one brief unit — listing needs both), then again individually
+/// for *each* `AT+CMGR` read and each `AT+CMGD` delete — releasing the port
+/// between every single AT command, not just between phases. This bounds
+/// the worst-case *continuous* hold to one AT round-trip regardless of how
+/// large the backlog is, so `vowifi-usim-bridge` always has a gap to slot
+/// into, while a full backlog still drains in one sweep pass (no per-pass
+/// cap): draining more slowly in wall-clock terms (one extra port re-open
+/// per message) is a cost worth paying for that guarantee.
 ///
 /// # `dedupe` is admitted *before* relaying, not after
 ///
@@ -353,25 +376,35 @@ fn sweep_modem_storage(
     modem_lock: &Arc<Mutex<()>>,
     dedupe: &Arc<Mutex<Dedupe>>,
 ) -> BridgeResult<()> {
-    // Phase 1: pure AT I/O — read whatever is sitting in storage, then let
-    // the port go before touching the network at all.
-    let messages = {
+    // Phase 1a: text mode + list indexes — one brief, combined session.
+    let indexes = {
         let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut at = AtCommander::open(modem_port)?;
         // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
         let _ = at.send_command("AT+CMGF=1")?;
-        let indexes = crate::sms::reader::list_sms_indexes(&mut at)?;
-        let mut messages = Vec::with_capacity(indexes.len());
-        for index in indexes {
-            match crate::sms::reader::read_sms(&mut at, index) {
-                Ok(sms) => messages.push(sms),
-                Err(e) => {
-                    tracing::warn!(index, error = %e, "could not read a stored message; leaving it in place");
-                }
+        crate::sms::reader::list_sms_indexes(&mut at)?
+    };
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 1b: read each message in its own port session, so the port is
+    // free between every read for vowifi-usim-bridge/charon to use if they
+    // need it, regardless of how many messages are pending.
+    let mut messages = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let sms = {
+            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+            AtCommander::open(modem_port)
+                .and_then(|mut at| crate::sms::reader::read_sms(&mut at, index))
+        };
+        match sms {
+            Ok(sms) => messages.push(sms),
+            Err(e) => {
+                tracing::warn!(index, error = %e, "could not read a stored message; leaving it in place");
             }
         }
-        messages
-    };
+    }
     if messages.is_empty() {
         return Ok(());
     }
@@ -438,14 +471,16 @@ fn sweep_modem_storage(
         }
     }
 
-    // Phase 3: pure AT I/O again — clear whatever is now confirmed handled.
-    if !to_delete.is_empty() {
-        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut at = AtCommander::open(modem_port)?;
-        for index in to_delete {
-            if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
-                tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
-            }
+    // Phase 3: clear whatever is now confirmed handled — again, one port
+    // session per message, for the same reason as phase 1b.
+    for index in to_delete {
+        let result = {
+            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+            AtCommander::open(modem_port)
+                .and_then(|mut at| crate::sms::reader::delete_sms(&mut at, index))
+        };
+        if let Err(e) = result {
+            tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
         }
     }
     Ok(())
