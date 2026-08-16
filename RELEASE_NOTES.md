@@ -1,5 +1,12 @@
 # Release Notes
 
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time -- publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **VoWiFi lines no longer lose SMS the carrier delivers through the modem's own storage.** A VoWiFi registration advertises voice capability, not messaging, so a carrier can deliver a text into the modem's own SIM storage instead of over the IMS registration — confirmed live: 6 of 7 parts of a real multi-part message sat unread because nothing on the VoWiFi path ever read that storage. The line's modem storage is now swept periodically (independent of `[cs].enabled`), reusing the same mechanism already shipped for VoLTE (specs/017). When a carrier delivers the same text over both the registration and the modem — which does happen — the operator now sees it exactly once instead of twice; VoLTE gains this same duplicate-suppression fix too, closing a latent gap that predated this change and affected it as well. The modem-storage sweep coexists safely with `vowifi-usim-bridge`'s own use of the same AT port (brief per-command sessions with a bounded retry, rather than one long hold), so it does not risk destabilizing EAP-SIM/registration. No configuration change. See specs/038-reliable-sms-delivery.
+
 ## v8.12.0
 
 - **Inbound VoWiFi calls on Jio now connect instead of failing with a misleading `SDP Protocol Error`.** Jio's network was rejecting the bridge's `200 OK` because it never declared its own SIP capabilities (`Allow`/`Supported`) — the carrier's `cause=503 "SDP Protocol Error"` was boilerplate and had nothing to do with the SDP body itself, which sent five different SDP variants down a dead end before this was found. No configuration change; live-verified with a real inbound call on a Jio line (`media="both-ways"`, zero SDP-protocol-error `BYE`s).
