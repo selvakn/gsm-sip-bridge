@@ -274,11 +274,15 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// (`vowifi-usim-bridge`) drives it too for EAP-SIM's `AT+CSIM` traffic. Two
 /// readers interleaving on one port is the documented "no status in response"
 /// hazard (research R6). `modem_lock` only ever serialises threads *within*
-/// this process — nothing at that level protects against `vowifi-usim-bridge`
-/// — so cross-process exclusion is `AtCommander::open`'s job now (see its
-/// docs): every AT touch here still takes `modem_lock` first, for ordering
-/// against this process's own registration/renewal, and `AtCommander::open`
-/// underneath it also takes the cross-process advisory lock.
+/// this process — nothing at that level protects against `vowifi-usim-bridge`.
+/// Cross-process exclusion doesn't need anything from this crate, though:
+/// `AtCommander::open` opens through the `serialport` crate's default
+/// exclusive mode, which already takes `TIOCEXCL` *and* a non-blocking
+/// exclusive `flock` on the device path itself (confirmed in `serialport`
+/// 4.9.0's source) — a concurrent holder is rejected immediately, the same
+/// "fail fast and tolerate it" shape every caller here (including this one)
+/// already handles by retrying later. `modem_lock` is still taken first, for
+/// ordering against this *process's own* registration/renewal specifically.
 ///
 /// Renewal is already deferred while a call is up, and a call's own media
 /// rides the data bearer, not this AT port — so sweeping does not disturb a
@@ -300,12 +304,12 @@ pub fn run_modem_reader(
 
 /// One pass over modem storage, in three phases so the AT port is held only
 /// for actual AT round-trips, never across a network relay or the
-/// cross-route settle wait below — both of which can take seconds, and
-/// holding the port that long would starve `vowifi-usim-bridge`/charon's own
-/// AT needs far beyond the "seconds-long transaction" duty cycle the shared
-/// port's design assumes (see `run_modem_reader`'s docs). `modem_lock` (and
-/// therefore the cross-process lock underneath `AtCommander::open`) is taken
-/// fresh for phase 1 and phase 3 only, not held across phase 2.
+/// cross-route wait below — both of which can take seconds, and holding the
+/// port (and therefore `serialport`'s own exclusive lock on it — see
+/// `run_modem_reader`'s docs) that long would starve `vowifi-usim-bridge`/
+/// charon's own AT needs far beyond the "seconds-long transaction" duty
+/// cycle the shared port's design assumes. `modem_lock` is taken fresh for
+/// phase 1 and phase 3 only, not held across phase 2.
 ///
 /// # `dedupe` is admitted *before* relaying, not after
 ///
