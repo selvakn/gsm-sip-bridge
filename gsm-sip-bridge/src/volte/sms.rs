@@ -334,6 +334,18 @@ pub fn run_modem_reader(
 /// cap): draining more slowly in wall-clock terms (one extra port re-open
 /// per message) is a cost worth paying for that guarantee.
 ///
+/// Bounding hold time only helps once this side has the port; it does
+/// nothing for the reverse — a genuinely busy port (`vowifi-usim-bridge`
+/// mid-session) makes `open` fail immediately (`serialport`'s own exclusive
+/// open, not a lock this code owns — see `AtCommander::open_with_timeout`'s
+/// docs). Failing once and waiting a full `MODEM_SWEEP_INTERVAL` (~20s) for
+/// the next attempt would leave stored SMS unread for that whole window over
+/// what is usually a session lasting a few seconds, so every open here goes
+/// through [`open_with_retry`] instead: a short, bounded, caller-local
+/// backoff — symmetric with `usim_bridge`'s own retry for the identical
+/// contention from its side, just budgeted smaller since this can run many
+/// times per sweep pass.
+///
 /// # `dedupe` is admitted *before* relaying, not after
 ///
 /// Locking `dedupe` for this whole function (as an early version of this code
@@ -370,6 +382,42 @@ pub fn run_modem_reader(
 /// means this route delivers it itself instead of discarding the only copy;
 /// timing out still claimed-but-unconfirmed leaves the message untouched for
 /// the next sweep pass to re-evaluate from scratch, rather than guessing.
+/// How many times [`open_with_retry`] will retry a busy port before giving
+/// up, and the linear backoff step between attempts — the same shape as
+/// `vowifi_usim_bridge`'s own `try_open_with_backoff`/`OPEN_RETRY_ATTEMPTS`/
+/// `OPEN_RETRY_BASE_DELAY`, so the two sides of this exact contention treat
+/// each other symmetrically rather than one waiting on the other's terms.
+/// ~1.8s worst case (300 + 600 + 900ms) per open, not the same numbers as
+/// `usim_bridge`'s ~5s: this runs per *individual* AT command inside a
+/// sweep, potentially many times per pass, so its budget stays smaller to
+/// avoid one contended message stalling an entire backlog drain, while
+/// still meaningfully outlasting a brief collision instead of failing on
+/// the first try and waiting a full `MODEM_SWEEP_INTERVAL` for the next.
+const OPEN_RETRY_ATTEMPTS: u32 = 4;
+const OPEN_RETRY_BASE_DELAY: Duration = Duration::from_millis(300);
+
+/// Opens the modem port, retrying a busy-port failure with linear backoff
+/// before giving up — see the constants above for why, and
+/// `modules::at_commander::AtCommander::open_with_timeout`'s docs for why
+/// this is a caller-local retry rather than something built into `open`
+/// itself (discovery's fast-fail-across-many-candidates need would be hurt
+/// by baking retries into every caller unconditionally).
+fn open_with_retry(modem_port: &Path) -> BridgeResult<AtCommander> {
+    let mut last_err = None;
+    for attempt in 0..OPEN_RETRY_ATTEMPTS {
+        match AtCommander::open(modem_port) {
+            Ok(at) => return Ok(at),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < OPEN_RETRY_ATTEMPTS {
+                    std::thread::sleep(OPEN_RETRY_BASE_DELAY * (attempt + 1));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
@@ -379,7 +427,7 @@ fn sweep_modem_storage(
     // Phase 1a: text mode + list indexes — one brief, combined session.
     let indexes = {
         let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut at = AtCommander::open(modem_port)?;
+        let mut at = open_with_retry(modem_port)?;
         // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
         let _ = at.send_command("AT+CMGF=1")?;
         crate::sms::reader::list_sms_indexes(&mut at)?
@@ -395,7 +443,7 @@ fn sweep_modem_storage(
     for index in indexes {
         let sms = {
             let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            AtCommander::open(modem_port)
+            open_with_retry(modem_port)
                 .and_then(|mut at| crate::sms::reader::read_sms(&mut at, index))
         };
         match sms {
@@ -476,7 +524,7 @@ fn sweep_modem_storage(
     for index in to_delete {
         let result = {
             let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            AtCommander::open(modem_port)
+            open_with_retry(modem_port)
                 .and_then(|mut at| crate::sms::reader::delete_sms(&mut at, index))
         };
         if let Err(e) = result {
@@ -854,5 +902,26 @@ mod tests {
         // Left exactly as found: still claimed, still unconfirmed.
         assert!(dedupe.lock().unwrap().contains(&key));
         assert!(!dedupe.lock().unwrap().is_confirmed(&key));
+    }
+
+    // ---- open_with_retry (specs/038 review follow-up) ----------------------
+
+    #[test]
+    fn open_with_retry_gives_up_after_the_full_attempt_budget() {
+        // A path that can never succeed exercises the retry *mechanics*
+        // (attempt count, backoff) even though it's not a "busy port"
+        // specifically — every attempt fails fast, so the elapsed time is
+        // dominated by the backoff sleeps between attempts, which is exactly
+        // what this asserts on.
+        let bogus = Path::new("/nonexistent/gsm-sip-bridge-test-path");
+        let started = Instant::now();
+        assert!(open_with_retry(bogus).is_err());
+        let expected_min: Duration = (1..OPEN_RETRY_ATTEMPTS)
+            .map(|n| OPEN_RETRY_BASE_DELAY * n)
+            .sum();
+        assert!(
+            started.elapsed() >= expected_min,
+            "must actually wait out the backoff between attempts, not fail immediately"
+        );
     }
 }
