@@ -99,3 +99,30 @@ Observed pending items
       listener thread is blocked inside the first call. Fine for the
       current single-call-at-a-time scope; would block true concurrent-call
       support if that's ever needed.
+- [x] ~~Outbound call issue with Jio~~ — **resolved 2026-08-16**
+      (specs/037-p-early-media): the caller heard silence instead of the
+      carrier's pre-answer announcement (Jio: ~13.7s of `P-Early-Media`
+      audio before a `480`), which read as "no call is being placed."
+      Fixed by relaying any SDP-bearing provisional's audio to the caller
+      instead of discarding it until the real `200 OK`. Live-verified on
+      pi@192.168.100.2 (real Jio line) with a real phone call — early
+      media is now audible.
+- [ ] `siptest` (specs/037-siptest-softphone) has no early-media (`18x` +
+      SDP) support — found live while verifying specs/037-p-early-media
+      (2026-08-16). `sip/outbound.rs`'s response loop explicitly skips the
+      body on every `180`/`183` and only calls `sdp::parse_answer`/starts a
+      media session on `200`, so a `siptest call` against a carrier that
+      answers with early media (exactly the Jio case above) always reports
+      zero packets sent *and* received — not because the bridge dropped
+      anything, but because siptest never opens a socket for it in the
+      first place. Confirmed via IPsec SA packet counters
+      (`swanctl --list-sas`, counted pre-decryption) that the carrier really
+      was sending ~50 pkt/s of real audio the whole time; a real phone
+      (which implements early media, unlike siptest) heard it fine on the
+      same build. Net effect: `siptest` cannot currently be used to verify
+      early-media relay behavior end-to-end — only signaling-level checks
+      (`invite_to_180_ms` etc.) and post-`200` media. Fixing this means
+      teaching the outbound-call loop to treat a `180`/`183` carrying SDP as
+      "start the media session now" (RFC 3262/5009 early-media UAC
+      behavior), the same asymmetry `ims::agent::origination` had to learn
+      on the bridge side for this exact feature.
