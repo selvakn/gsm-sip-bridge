@@ -5,6 +5,7 @@
      "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
+- **Outbound calls now play the carrier's pre-answer audio instead of silence.** A carrier that sends an announcement before answering (or rejecting) an outbound call — e.g. Jio playing ~13.7s of message audio before a `480` — is now relayed live to the caller, the same way any other SIP client would render early media. Previously that audio was discarded until the real `200 OK`, so a caller heard nothing at all and a carrier-side rejection read as "no call is being placed." No configuration change; applies to every outbound call automatically. Live-verified against a real Jio line with a real phone call (specs/037-p-early-media).
 - **New `siptest` daemon for agent-driven end-to-end testing of the bridge.** A standalone SIP softphone, driven over an HTTP control API, that registers to the bridge like an ordinary handset, places and receives real calls, and verifies audio in both directions with tone generation and Goertzel detection rather than just packet counts — closing the long-standing gap where `MediaReport::round_trip_delay` was always `None`. Supports PCMU and G.722 (`--codec {auto,pcmu,g722}`), records both directions to WAV, and rejects an inbound `INVITE` from anywhere but the configured bridge host outright, with no reply, so it cannot be made to send RTP at an arbitrary third-party destination. Ships as a separate binary (`siptest`); no change to the bridge's own runtime behavior. See `specs/037-siptest-softphone/quickstart.md`.
 
 ## v8.11.1
