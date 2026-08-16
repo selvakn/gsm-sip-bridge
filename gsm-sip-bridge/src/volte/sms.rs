@@ -51,7 +51,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How a message reached us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +105,15 @@ impl InboundMessage {
 pub struct Dedupe {
     seen: VecDeque<String>,
     capacity: usize,
+    /// Subset of `seen` known to have been *durably delivered*, not merely
+    /// claimed (specs/038-reliable-sms-delivery review follow-up). `admit`
+    /// alone cannot tell a caller "this claim already succeeded" from "this
+    /// claim is still in flight and might yet fail" — and confusing the two
+    /// is exactly what let a message be deleted from modem storage on the
+    /// strength of a claim that later turned out to have failed. Populated
+    /// only by `confirm`, which the caller must call once its relay actually
+    /// succeeds; never inferred from admission or elapsed time.
+    confirmed: std::collections::HashSet<String>,
 }
 
 impl Default for Dedupe {
@@ -118,6 +127,7 @@ impl Dedupe {
         Self {
             seen: VecDeque::with_capacity(capacity),
             capacity: capacity.max(1),
+            confirmed: std::collections::HashSet::new(),
         }
     }
 
@@ -129,7 +139,9 @@ impl Dedupe {
             return false;
         }
         if self.seen.len() >= self.capacity {
-            self.seen.pop_front();
+            if let Some(evicted) = self.seen.pop_front() {
+                self.confirmed.remove(&evicted);
+            }
         }
         self.seen.push_back(key.to_string());
         true
@@ -139,8 +151,29 @@ impl Dedupe {
     /// caller decide *before* it commits to an irreversible step — clearing a
     /// message from modem storage — whether the message is a fresh one to relay
     /// or a re-read of one already handed on.
+    ///
+    /// This answers "has *anyone* claimed it", not "did that claim succeed" —
+    /// for the latter, see `is_confirmed`. A caller about to do something
+    /// irreversible (deleting the modem's only copy) on the strength of
+    /// someone else's claim needs `is_confirmed`, not this.
     pub fn contains(&self, key: &str) -> bool {
         self.seen.iter().any(|k| k == key)
+    }
+
+    /// Whether `key`'s claim is known to have been *durably delivered* — set
+    /// only by `confirm`, never inferred. A key can be `contains`-true and
+    /// `is_confirmed`-false at the same time: claimed, outcome still pending.
+    pub fn is_confirmed(&self, key: &str) -> bool {
+        self.confirmed.contains(key)
+    }
+
+    /// Marks an existing claim as durably delivered. Call this — and only
+    /// this — once a relay has actually succeeded; nothing else may treat a
+    /// message as safe to irreversibly discard a backup copy of.
+    pub fn confirm(&mut self, key: &str) {
+        if self.contains(key) {
+            self.confirmed.insert(key.to_string());
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -159,9 +192,12 @@ impl Dedupe {
     /// already claimed the key — `forget` releases that claim so the next
     /// attempt (a network retransmission, or the next modem sweep) is treated
     /// as fresh rather than permanently suppressed by a delivery that never
-    /// actually happened.
+    /// actually happened. A failed relay was, by definition, never
+    /// `confirm`ed, but this clears any confirmation anyway as a defensive
+    /// no-op should a caller ever call both for the same key.
     pub fn forget(&mut self, key: &str) {
         self.seen.retain(|k| k != key);
+        self.confirmed.remove(key);
     }
 }
 
@@ -216,15 +252,6 @@ const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(12);
 
 /// How long to wait to reach and write to the telephone side's control port.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long to wait, when a modem-stored message turns out to already be
-/// claimed by another concurrent attempt (almost always the registration
-/// route), before trusting that claim enough to delete the modem's copy.
-/// Must exceed [`CONTROL_TIMEOUT`] — the longest a racing relay attempt can
-/// run before it either succeeds or gives up and rolls back — so that by the
-/// time this elapses the other side's outcome is no longer ambiguous. See
-/// `sweep_modem_storage`'s docs for the failure mode this closes.
-const CROSS_ROUTE_SETTLE_DELAY: Duration = Duration::from_secs(6);
 
 /// Reads text messages the network left in the **modem's own storage** — the
 /// circuit-switched delivery route — and hands each to the telephone side for
@@ -299,14 +326,23 @@ pub fn run_modem_reader(
 ///
 /// `decide` returning `AcknowledgeOnly` only means some other attempt admitted
 /// this key first — not that it succeeded. That other attempt's relay may
-/// still be in flight, or may fail and roll back a moment later. Deleting the
-/// modem's copy on the strength of a bare claim would silently lose the
-/// message if that claim then fails — there would be nothing left to retry.
-/// So a claimed message is not deleted immediately: this waits out
-/// [`CROSS_ROUTE_SETTLE_DELAY`] (longer than the other side's relay could
-/// still be running) and re-decides. Still claimed means it genuinely
-/// succeeded (safe to clear); no longer claimed means it was rolled back, and
-/// this route relays it itself instead of losing it.
+/// still be in flight, or may fail and roll back a moment later, and a
+/// retransmission may re-claim it yet again after that. A fixed "wait once,
+/// then trust whatever `decide` says now" is not enough: a re-claim that
+/// lands late in the wait window resets the clock without this function
+/// knowing, so a bare re-check can still observe "claimed" for an attempt
+/// that has barely started and may yet fail — deleting the modem's only copy
+/// on that basis would silently lose the message.
+///
+/// So this never infers success from elapsed time. It polls
+/// [`Dedupe::is_confirmed`] — set only by [`Dedupe::confirm`], which a
+/// claimant calls only once its relay has actually succeeded — up to
+/// [`CROSS_ROUTE_SETTLE_TIMEOUT`], checking every [`CROSS_ROUTE_POLL_INTERVAL`]:
+/// confirmed at any point means genuinely delivered (safe to clear); the
+/// claim disappearing (forgotten — rolled back, nothing re-claimed it since)
+/// means this route delivers it itself instead of discarding the only copy;
+/// timing out still claimed-but-unconfirmed leaves the message untouched for
+/// the next sweep pass to re-evaluate from scratch, rather than guessing.
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
@@ -350,27 +386,30 @@ fn sweep_modem_storage(
             modem_index: Some(sms.index),
         };
         let key = inbound.dedupe_key();
-        let mut disposition = {
+        let disposition = {
             let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
             decide(&mut d, &inbound)
         };
 
         if disposition == Disposition::AcknowledgeOnly {
-            std::thread::sleep(CROSS_ROUTE_SETTLE_DELAY);
-            // Re-decide, not merely re-check: if the other claim was rolled
-            // back in the meantime this both detects that *and* atomically
-            // admits this route as the new sole claimant, so it can relay
-            // below without reopening the original race.
-            disposition = {
-                let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
-                decide(&mut d, &inbound)
-            };
-            if disposition == Disposition::AcknowledgeOnly {
-                // Still claimed after outlasting the other side's longest
-                // possible relay attempt: it genuinely succeeded (or a fresh
-                // attempt has since re-claimed it) — safe to clear.
-                to_delete.push(sms.index);
-                continue;
+            match wait_for_resolution(dedupe, &key) {
+                ClaimResolution::Confirmed => {
+                    to_delete.push(sms.index);
+                    continue;
+                }
+                ClaimResolution::Reclaimed => {
+                    // The prior claim rolled back and `wait_for_resolution`
+                    // has atomically re-claimed this key for us — fall
+                    // through and relay it below.
+                }
+                ClaimResolution::TimedOut => {
+                    // Still claimed, still unconfirmed, after outlasting
+                    // every bound this codebase places on a relay attempt.
+                    // Something is stuck rather than merely racing — leave
+                    // the modem's copy untouched and let the next sweep
+                    // pass, ~20s away, re-evaluate with a fresh look.
+                    continue;
+                }
             }
         }
 
@@ -380,6 +419,10 @@ fn sweep_modem_storage(
                 route = MessageRoute::ThroughModem.as_str(),
                 "relayed a message found in modem storage"
             );
+            dedupe
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .confirm(&key);
             to_delete.push(sms.index);
         } else {
             // Leave it in storage, unmarked, to retry next sweep — and release
@@ -402,6 +445,59 @@ fn sweep_modem_storage(
         }
     }
     Ok(())
+}
+
+/// How often [`wait_for_resolution`] polls while a claim it does not own is
+/// pending.
+const CROSS_ROUTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Total time [`wait_for_resolution`] will wait for a pending claim to
+/// resolve before giving up. Comfortably longer than [`CONTROL_TIMEOUT`] (the
+/// longest a single relay attempt can run), so an attempt that starts even
+/// right before this budget begins still has time to finish within it.
+const CROSS_ROUTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How a claim this function did not make itself turned out.
+enum ClaimResolution {
+    /// The claim was confirmed delivered — someone's relay actually succeeded.
+    Confirmed,
+    /// The claim was rolled back and nothing has re-claimed it since. This
+    /// call re-decided on the caller's behalf as part of observing that, so
+    /// the key is now claimed *by this caller* — proceed to relay it.
+    Reclaimed,
+    /// Still claimed by someone else, outcome still unknown, after waiting
+    /// the full budget. Left exactly as found; the caller must not act on it.
+    TimedOut,
+}
+
+/// Polls a key's fate until it is confirmed, reclaimed, or the wait budget
+/// runs out — never assumes success from elapsed time alone. See
+/// `sweep_modem_storage`'s docs for why a single wait-then-recheck is not
+/// enough: a retransmission racing into that window resets the clock without
+/// the caller knowing, so only an explicit, caller-set confirmation signal
+/// (never inferred) is trustworthy grounds for the irreversible modem delete
+/// this exists to gate.
+fn wait_for_resolution(dedupe: &Arc<Mutex<Dedupe>>, key: &str) -> ClaimResolution {
+    let deadline = Instant::now() + CROSS_ROUTE_SETTLE_TIMEOUT;
+    loop {
+        {
+            let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            if d.is_confirmed(key) {
+                return ClaimResolution::Confirmed;
+            }
+            if !d.contains(key) {
+                // Rolled back and nothing has re-claimed it — claim it now,
+                // atomically, so no window opens for a third party to sneak
+                // in between this observation and the caller's relay attempt.
+                d.admit(key);
+                return ClaimResolution::Reclaimed;
+            }
+        }
+        if Instant::now() >= deadline {
+            return ClaimResolution::TimedOut;
+        }
+        std::thread::sleep(CROSS_ROUTE_POLL_INTERVAL);
+    }
 }
 
 /// Hands one modem-delivered message to the telephone side over the same
@@ -654,5 +750,70 @@ mod tests {
         // message records how it arrived.
         assert_eq!(MessageRoute::OverRegistration.as_str(), "registration");
         assert_eq!(MessageRoute::ThroughModem.as_str(), "modem");
+    }
+
+    // ---- wait_for_resolution (specs/038 review follow-up) ------------------
+
+    #[test]
+    fn wait_for_resolution_returns_confirmed_once_the_claimant_confirms() {
+        let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+        let key = "k1".to_string();
+        dedupe.lock().unwrap().admit(&key);
+
+        {
+            let dedupe = dedupe.clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                dedupe.lock().unwrap().confirm(&key);
+            });
+        }
+
+        assert!(matches!(
+            wait_for_resolution(&dedupe, &key),
+            ClaimResolution::Confirmed
+        ));
+    }
+
+    #[test]
+    fn wait_for_resolution_reclaims_once_the_claim_is_forgotten() {
+        let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+        let key = "k2".to_string();
+        dedupe.lock().unwrap().admit(&key);
+
+        {
+            let dedupe = dedupe.clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                dedupe.lock().unwrap().forget(&key);
+            });
+        }
+
+        assert!(matches!(
+            wait_for_resolution(&dedupe, &key),
+            ClaimResolution::Reclaimed
+        ));
+        // The reclaim must have atomically re-admitted it for the caller.
+        assert!(dedupe.lock().unwrap().contains(&key));
+        assert!(!dedupe.lock().unwrap().is_confirmed(&key));
+    }
+
+    #[test]
+    fn wait_for_resolution_times_out_on_a_claim_that_never_resolves() {
+        let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+        let key = "k3".to_string();
+        dedupe.lock().unwrap().admit(&key);
+        // Nobody ever confirms or forgets it.
+
+        let started = Instant::now();
+        assert!(matches!(
+            wait_for_resolution(&dedupe, &key),
+            ClaimResolution::TimedOut
+        ));
+        assert!(started.elapsed() >= CROSS_ROUTE_SETTLE_TIMEOUT);
+        // Left exactly as found: still claimed, still unconfirmed.
+        assert!(dedupe.lock().unwrap().contains(&key));
+        assert!(!dedupe.lock().unwrap().is_confirmed(&key));
     }
 }

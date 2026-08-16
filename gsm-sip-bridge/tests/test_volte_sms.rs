@@ -209,85 +209,92 @@ fn a_failed_relay_is_rolled_back_so_the_retry_is_not_swallowed() {
     );
 }
 
-// ---- the modem sweep's settle-and-redecide (specs/038 review follow-up) ---
+// ---- confirmed vs. merely claimed (specs/038 review follow-up) ------------
 //
-// `sweep_modem_storage` does not delete a modem-stored message purely
-// because `decide` returned `AcknowledgeOnly` — that only means some other
-// attempt (almost always the registration route) claimed it first, not that
-// the claim succeeded. It waits out `CROSS_ROUTE_SETTLE_DELAY` (longer than
-// the other side's relay could still be running) and calls `decide` again.
-// These tests model both outcomes of that second call using the same public
-// primitives the sweep itself uses, without needing the real multi-second
-// wait or a mock modem.
+// A second Greptile pass found that even a "wait a bit, then re-decide"
+// check is not enough: a retransmission racing into that wait window resets
+// the clock without the waiter knowing, so a bare re-check can still observe
+// "claimed" for an attempt that has barely started. `sweep_modem_storage`
+// now never infers success from elapsed time — only `Dedupe::confirm`
+// (called exactly once, by whichever attempt's relay actually succeeds) can
+// make `is_confirmed` true. These tests exercise that distinction directly.
 
 #[test]
-fn a_claim_still_standing_after_the_settle_wait_means_the_other_side_delivered_it() {
-    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
-    let text = through_modem("+919000000000", "hello", 11);
+fn a_bare_claim_is_not_confirmed_until_the_claimant_says_so() {
+    let mut d = Dedupe::default();
+    let key = over_registration("+919000000000", "hello").dedupe_key();
 
-    // Someone else (the registration route) claims it first.
-    {
-        let mut d = dedupe.lock().unwrap();
-        assert_eq!(
-            decide(&mut d, &over_registration("+919000000000", "hello")),
-            Disposition::Handle
-        );
-    }
-
-    // The sweep sees it claimed...
-    let first_look = {
-        let mut d = dedupe.lock().unwrap();
-        decide(&mut d, &text)
-    };
-    assert_eq!(first_look, Disposition::AcknowledgeOnly);
-
-    // ...waits out the settle delay (nothing changes: the claim was never
-    // rolled back, meaning the registration route's relay succeeded)...
-    let after_settling = {
-        let mut d = dedupe.lock().unwrap();
-        decide(&mut d, &text)
-    };
     assert_eq!(
-        after_settling,
-        Disposition::AcknowledgeOnly,
-        "a claim that is still standing after the settle wait was genuinely delivered — safe to clear"
+        decide(&mut d, &over_registration("+919000000000", "hello")),
+        Disposition::Handle
     );
+    assert!(d.contains(&key), "claimed the moment it's admitted");
+    assert!(
+        !d.is_confirmed(&key),
+        "but not confirmed until the claimant's relay actually succeeds"
+    );
+
+    d.confirm(&key);
+    assert!(d.is_confirmed(&key), "confirm makes it so, explicitly");
 }
 
 #[test]
-fn a_claim_rolled_back_during_the_settle_wait_means_this_route_must_deliver_it() {
-    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
-    let text = through_modem("+919000000001", "world", 12);
-    let over_reg = over_registration("+919000000001", "world");
+fn forgetting_a_claim_also_clears_any_confirmation() {
+    // Defensive: a real caller never confirms then forgets the same claim,
+    // but forget() must not leave a stale "confirmed" flag behind regardless.
+    let mut d = Dedupe::default();
+    let key = "k".to_string();
+    d.admit(&key);
+    d.confirm(&key);
+    d.forget(&key);
+    assert!(!d.contains(&key));
+    assert!(!d.is_confirmed(&key));
+}
 
-    // The registration route claims it first...
-    {
-        let mut d = dedupe.lock().unwrap();
-        assert_eq!(decide(&mut d, &over_reg), Disposition::Handle);
-    }
-    let first_look = {
-        let mut d = dedupe.lock().unwrap();
-        decide(&mut d, &text)
-    };
-    assert_eq!(first_look, Disposition::AcknowledgeOnly);
+#[test]
+fn confirming_an_unclaimed_key_is_a_harmless_no_op() {
+    let mut d = Dedupe::default();
+    d.confirm("never-admitted");
+    assert!(!d.is_confirmed("never-admitted"));
+}
 
-    // ...but its relay then fails, and it rolls back (this is what would
-    // happen during the sweep's settle wait, on a different thread).
-    {
-        let mut d = dedupe.lock().unwrap();
-        d.forget(&over_reg.dedupe_key());
-    }
+#[test]
+fn eviction_clears_confirmation_along_with_the_claim() {
+    // The bounded window evicts old keys; a confirmed flag for an evicted
+    // key must not survive it (or `is_confirmed` could wrongly answer `true`
+    // for a since-reused key that collides after eviction wrapped around).
+    let mut d = Dedupe::new(2);
+    d.admit("a");
+    d.confirm("a");
+    d.admit("b");
+    d.admit("c"); // evicts "a"
+    assert!(!d.contains("a"));
+    assert!(!d.is_confirmed("a"));
+}
 
-    // Re-deciding after the settle wait must now find it free — and claim it
-    // for this route, atomically, in the same call.
-    let after_settling = {
-        let mut d = dedupe.lock().unwrap();
-        decide(&mut d, &text)
-    };
+#[test]
+fn a_retransmission_racing_into_the_wait_window_is_still_not_confirmed() {
+    // The exact scenario the second review pass found: the original claim
+    // rolls back, a retransmission re-admits the same key, and — critically —
+    // that new attempt has *not yet* relayed anything. A waiter must see this
+    // as "claimed, unconfirmed", never as "safe to treat as delivered".
+    let mut d = Dedupe::default();
+    let key = over_registration("+919000000002", "retry me").dedupe_key();
+
     assert_eq!(
-        after_settling,
-        Disposition::Handle,
-        "a rolled-back claim must free the message for this route to deliver, not discard it"
+        decide(&mut d, &over_registration("+919000000002", "retry me")),
+        Disposition::Handle
+    );
+    d.forget(&key); // the first attempt's relay failed and rolled back
+
+    // A retransmission re-admits it — but has not relayed anything yet.
+    assert_eq!(
+        decide(&mut d, &over_registration("+919000000002", "retry me")),
+        Disposition::Handle
+    );
+    assert!(
+        d.contains(&key) && !d.is_confirmed(&key),
+        "re-claimed but not yet delivered — a waiter must keep waiting, not delete anything"
     );
 }
 

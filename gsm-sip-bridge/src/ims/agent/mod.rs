@@ -771,6 +771,13 @@ fn handle_message(
     };
 
     if relayed {
+        // Durably delivered now, not merely claimed — the modem sweep may be
+        // waiting on exactly this distinction before it trusts this claim
+        // enough to discard its own backup copy (specs/038 review follow-up).
+        dedupe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .confirm(&key);
         let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
     } else {
         // Release the admission above so the retransmission this triggers is
