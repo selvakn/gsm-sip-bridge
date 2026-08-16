@@ -319,6 +319,10 @@ fn run_line(
     // renewal, re-attachment) and the modem SMS reader. Each line has its own
     // modem, so each has its own lock. Both outlive every retry below.
     let modem_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    // Shared with `carrier_agent::run` below, not owned by the sweep thread:
+    // the same message delivered over both the registration and the modem
+    // must collapse to one (specs/038-reliable-sms-delivery).
+    let dedupe = std::sync::Arc::new(std::sync::Mutex::new(super::sms::Dedupe::default()));
     let control_addr = SocketAddr::new(LOOPBACK, line.control_port);
 
     // The circuit-switched SMS route (FR-036): the carrier may deliver a text
@@ -330,9 +334,10 @@ fn run_line(
     {
         let modem_port = line.settings.modem_port.clone();
         let lock = modem_lock.clone();
+        let dedupe = dedupe.clone();
         if let Err(e) = std::thread::Builder::new()
             .name(format!("volte-sms-{}", line.card_id))
-            .spawn(move || super::sms::run_modem_reader(modem_port, control_addr, lock))
+            .spawn(move || super::sms::run_modem_reader(modem_port, control_addr, lock, dedupe))
         {
             tracing::error!(card_id = %line.card_id, error = %e, "failed to start the modem SMS reader for this line");
         }
@@ -343,6 +348,7 @@ fn run_line(
             line,
             app_config,
             modem_lock.clone(),
+            dedupe.clone(),
             Some(pbx_registered.clone()),
         );
         // The carrier half returned — a failed attach/registration or a lost

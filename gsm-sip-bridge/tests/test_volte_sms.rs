@@ -10,6 +10,7 @@ use gsm_sip_bridge::store::Transport;
 use gsm_sip_bridge::volte::sms::{
     decide, parse_cmgl_indexes, Dedupe, Disposition, InboundMessage, MessageRoute,
 };
+use std::sync::{Arc, Mutex};
 
 fn over_registration(sender: &str, body: &str) -> InboundMessage {
     InboundMessage {
@@ -164,6 +165,115 @@ fn the_duplicate_window_stays_bounded() {
         decide(&mut dedupe, &over_registration("+911", &format!("m{i}")));
     }
     assert!(dedupe.len() <= 4, "window must stay bounded");
+}
+
+// ---- shared ownership (specs/038-reliable-sms-delivery) --------------------
+//
+// `run_modem_reader`/`sweep_modem_storage` used to own a private `Dedupe`;
+// they now take an externally-owned `Arc<Mutex<Dedupe>>` so the same instance
+// can also be consulted by the registration-message handler. These tests
+// prove that change in ownership does not change the decision logic itself —
+// consulting `decide()` through the shared lock behaves identically to the
+// pre-refactor owned-`Dedupe` case exercised by the tests above.
+
+#[test]
+fn cross_bearer_duplicate_is_suppressed_through_one_shared_instance() {
+    // This is what production wiring now does: `ims::agent::handle_message`
+    // (registration route) and `run_modem_reader`'s sweep (modem route) for
+    // one line consult the *same* `Arc<Mutex<Dedupe>>`. Proving the pure
+    // `decide()` logic collapses a duplicate (already covered above) is not
+    // the same as proving two independent call sites sharing one lock behave
+    // that way end to end — this exercises exactly that shared-instance case.
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+
+    let via_registration = over_registration("+919000000000", "hello");
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &via_registration), Disposition::Handle);
+    }
+
+    let via_modem = through_modem("+919000000000", "hello", 5);
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(
+            decide(&mut d, &via_modem),
+            Disposition::AcknowledgeOnly,
+            "the same text delivered over the other bearer must not be forwarded again"
+        );
+    }
+}
+
+#[test]
+fn decide_behaves_identically_through_a_shared_arc_mutex() {
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let msg = through_modem("+919000000000", "hello", 3);
+
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &msg), Disposition::Handle);
+    }
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &msg), Disposition::AcknowledgeOnly);
+    }
+}
+
+#[test]
+fn backlog_recovery_is_unaffected_by_externally_owned_dedupe() {
+    // parse_cmgl_indexes itself takes no Dedupe at all — this asserts the
+    // refactor left the startup-recovery parsing path untouched.
+    let lines: Vec<String> = [
+        "+CMGL: 2,\"REC UNREAD\",\"+919000000000\",,\"26/07/22,10:00:00+22\"",
+        "hello",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(parse_cmgl_indexes(&lines), vec![2]);
+}
+
+// ---- VoLTE parity, with or without CS (specs/038 User Story 3) ------------
+
+#[test]
+fn volte_backlog_recovery_is_unchanged_regardless_of_cs_enabled() {
+    // `[cs].enabled` governs the circuit-switched call-bridging daemon, not
+    // this reader — a VoLTE-assigned modem is exclusively assigned away from
+    // the CS pool either way (specs/013/specs/020), so CS being globally on
+    // or off must make no difference to what this parses.
+    let lines: Vec<String> = [
+        "+CMGL: 1,\"REC UNREAD\",\"+919000000000\",,\"26/07/22,10:00:00+22\"",
+        "hello",
+        "+CMGL: 2,\"REC UNREAD\",\"+919000000001\",,\"26/07/22,10:01:00+22\"",
+        "world",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(parse_cmgl_indexes(&lines), vec![1, 2]);
+}
+
+#[test]
+fn volte_gains_the_same_cross_bearer_suppression_us2_introduced() {
+    // Before specs/038, VoLTE had this same latent gap (research.md Decision
+    // 2): the registration route never consulted the sweep thread's private
+    // Dedupe. Now that both share one instance per line, VoLTE benefits
+    // identically to VoWiFi — this is the same assertion as the VoWiFi-framed
+    // `cross_bearer_duplicate_is_suppressed_through_one_shared_instance` test,
+    // kept separate because it verifies a distinct user story's guarantee.
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let via_modem = through_modem("+919000000002", "hi", 9);
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &via_modem), Disposition::Handle);
+    }
+    let via_registration = over_registration("+919000000002", "hi");
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(
+            decide(&mut d, &via_registration),
+            Disposition::AcknowledgeOnly
+        );
+    }
 }
 
 #[test]

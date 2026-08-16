@@ -1,13 +1,19 @@
-//! Text messages over the host-side LTE path (specs/017-volte-inbound-bridge,
-//! US5).
+//! Text messages delivered to a line's own modem storage rather than over its
+//! IMS registration. Despite the module path, this is no longer LTE-specific:
+//! introduced for the host-side LTE path (specs/017-volte-inbound-bridge,
+//! US5), and reused as-is by the VoWiFi agent (`ims::agent::run_inner`,
+//! specs/038-reliable-sms-delivery) once the same gap was confirmed to exist
+//! there too. It stays in `volte::sms` rather than moving to a
+//! transport-neutral module — the logic is identical either way, and a move
+//! is a larger change than the bug it would fix.
 //!
 //! # Why this exists at all
 //!
 //! Holding the subscriber's IMS registration means the network delivers their
-//! text messages *here*. An earlier draft of the spec listed messaging as out
-//! of scope; that was wrong and dangerous, because "out of scope" would have
-//! meant texts arriving and being silently discarded. A call that fails to
-//! connect announces itself. A lost text does not.
+//! text messages *here*. An earlier draft of the VoLTE spec listed messaging
+//! as out of scope; that was wrong and dangerous, because "out of scope"
+//! would have meant texts arriving and being silently discarded. A call that
+//! fails to connect announces itself. A lost text does not.
 //!
 //! This is therefore not a feature being added — it is an existing capability
 //! being taken away unless it is handled.
@@ -227,12 +233,23 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// first would lose it outright on a crash in between. If a relay succeeds but
 /// the delete then fails, the message is re-read on the next sweep — and
 /// [`Dedupe`] recognises it, so it is cleared without being forwarded twice.
-pub fn run_modem_reader(modem_port: PathBuf, control_addr: SocketAddr, modem_lock: Arc<Mutex<()>>) {
+///
+/// `dedupe` is owned by the caller, not this function, and is the same
+/// instance the registration-message handler (`ims::agent::handle_message`)
+/// consults for the same line — the whole point of a shared `Dedupe` is that
+/// a message delivered over *both* routes collapses to one, which is only
+/// true if both routes admit into the same set.
+pub fn run_modem_reader(
+    modem_port: PathBuf,
+    control_addr: SocketAddr,
+    modem_lock: Arc<Mutex<()>>,
+    dedupe: Arc<Mutex<Dedupe>>,
+) {
     std::thread::sleep(FIRST_SWEEP_DELAY);
-    let mut dedupe = Dedupe::default();
     loop {
         {
             let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dedupe = dedupe.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &mut dedupe) {
                 tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
             }
@@ -284,6 +301,11 @@ fn sweep_modem_storage(
 
         if relay_modem_message(control_addr, &sms.sender, &sms.body) {
             dedupe.admit(&key);
+            tracing::info!(
+                index,
+                route = MessageRoute::ThroughModem.as_str(),
+                "relayed a message found in modem storage"
+            );
             // Relayed — now, and only now, clear it from the modem.
             if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
                 tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
