@@ -123,6 +123,28 @@ impl AtCommander {
     /// `modules::discovery`'s AT-probe (specs/013-multi-card-vowifi FR-002),
     /// which tries several candidate serial interfaces per modem and wants a
     /// short per-candidate timeout rather than `DEFAULT_TIMEOUT`'s 5s.
+    ///
+    /// # Cross-process serialization (research/012 item 6) is already handled
+    ///
+    /// One physical AT port can have several independent OS processes wanting
+    /// it — this half's own registration/renewal, `vowifi-usim-bridge`'s
+    /// EAP-SIM APDUs over `AT+CSIM`, `modules::discovery`'s probes, and the
+    /// modem SMS sweep (specs/038-reliable-sms-delivery). research/012 item 6
+    /// named "an advisory `flock` on the device path inside `AtCommander::
+    /// open`" as the escalation if this ever needed closing.
+    ///
+    /// An earlier version of this function did exactly that, with its own
+    /// separate lock file handle. It was both redundant and actively broken:
+    /// the `serialport` crate (confirmed in its source, v4.9.0) already opens
+    /// exclusively by default — `TIOCEXCL` *and* a non-blocking exclusive
+    /// `flock` on the device path itself, failing fast with a distinct,
+    /// already-propagated error when another holder has it. Taking a second,
+    /// separately-held lock on the same path before calling `serialport`'s
+    /// own `open()` made *that* call's internal flock always fail (a process
+    /// cannot hold two independently-acquired, conflicting flocks on one
+    /// inode via different file descriptions — confirmed empirically) —
+    /// every real-device open would have failed, always. Nothing here needs
+    /// to add locking; `serialport` already provides it, correctly, for free.
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> BridgeResult<Self> {
         let port = serialport::new(path.to_string_lossy(), BAUD_RATE)
             .timeout(timeout)

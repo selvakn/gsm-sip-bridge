@@ -298,6 +298,15 @@ network identity. Every field is optional except the matcher.
 | `msisdn` | string | none | This line's phone number, shown in its alert notifications (specs/034-alert-identity) |
 | `pcsc_reader` | bool | `false` | This line's SIM comes from a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem (specs/023-omnikey-pcsc-vowifi) — see [docs/omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md). `imsi_override` becomes mandatory — not because the IMSI is unreadable (it is read from `EF_IMSI` over PC/SC) but because it names which reader's card this line owns, which must be known before any card session exists; run `gsm-sip-bridge pcsc-list` to see every attached reader's card (IMSI, MCC/MNC, carrier) before writing this in. `mcc`/`mnc` stay optional and auto-derive from the card's own `EF_IMSI`/`EF_AD` via `vowifi-plmn --pcsc-imsi`; pin them only for a card whose `EF_AD` omits the MNC-length byte, which fails at startup saying so. `imei_override` stays optional — left unset, a stable, Luhn-valid IMEI is auto-generated from the line's IMSI (an IMEI is a device identity, genuinely not on the card). Requires `[vowifi].tunnel_engine = "strongswan"` (the default); the `swu` engine has no PC/SC support and refuses to start with this set |
 
+**SMS delivery** (specs/038-reliable-sms-delivery): a VoWiFi registration
+advertises voice capability, not messaging — the carrier can and does deliver
+some texts into the line's own modem storage instead of as an IMS `MESSAGE`.
+For any line with a real modem (`pcsc_reader = false`), that storage is now
+swept every ~20s regardless of `[cs].enabled`, so nothing sent through the
+classic cellular bearer is left unread. A `pcsc_reader` line has no modem to
+sweep — its SIM sits in the reader with no cellular attach at all, so its SMS
+delivery is over the IMS registration only.
+
 ### `[volte]`
 
 Host-side IMS over LTE (specs/015-volte-host-ims) — the bridge runs its OWN IMS

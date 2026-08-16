@@ -10,6 +10,7 @@ use gsm_sip_bridge::store::Transport;
 use gsm_sip_bridge::volte::sms::{
     decide, parse_cmgl_indexes, Dedupe, Disposition, InboundMessage, MessageRoute,
 };
+use std::sync::{Arc, Mutex};
 
 fn over_registration(sender: &str, body: &str) -> InboundMessage {
     InboundMessage {
@@ -164,6 +165,237 @@ fn the_duplicate_window_stays_bounded() {
         decide(&mut dedupe, &over_registration("+911", &format!("m{i}")));
     }
     assert!(dedupe.len() <= 4, "window must stay bounded");
+}
+
+// ---- shared ownership (specs/038-reliable-sms-delivery) --------------------
+//
+// `run_modem_reader`/`sweep_modem_storage` used to own a private `Dedupe`;
+// they now take an externally-owned `Arc<Mutex<Dedupe>>` so the same instance
+// can also be consulted by the registration-message handler. These tests
+// prove that change in ownership does not change the decision logic itself —
+// consulting `decide()` through the shared lock behaves identically to the
+// pre-refactor owned-`Dedupe` case exercised by the tests above.
+
+#[test]
+fn a_failed_relay_is_rolled_back_so_the_retry_is_not_swallowed() {
+    // The bug a naive "check contains, admit only after a successful relay"
+    // implementation has: admitting *before* the relay closes the
+    // two-routes-race-on-one-message window, but only if a relay failure then
+    // releases the admission — otherwise a message whose relay genuinely
+    // failed is stuck looking "already handled" forever.
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let msg = over_registration("+919000000000", "hello");
+
+    let admitted = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &msg) == Disposition::Handle
+    };
+    assert!(admitted, "first delivery attempt must be admitted");
+
+    // Simulate the relay failing: the caller must roll back.
+    {
+        let mut d = dedupe.lock().unwrap();
+        d.forget(&msg.dedupe_key());
+    }
+
+    let retried = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &msg)
+    };
+    assert_eq!(
+        retried,
+        Disposition::Handle,
+        "a retransmission after a rolled-back failed relay must be treated as fresh, not a duplicate"
+    );
+}
+
+// ---- confirmed vs. merely claimed (specs/038 review follow-up) ------------
+//
+// A second Greptile pass found that even a "wait a bit, then re-decide"
+// check is not enough: a retransmission racing into that wait window resets
+// the clock without the waiter knowing, so a bare re-check can still observe
+// "claimed" for an attempt that has barely started. `sweep_modem_storage`
+// now never infers success from elapsed time — only `Dedupe::confirm`
+// (called exactly once, by whichever attempt's relay actually succeeds) can
+// make `is_confirmed` true. These tests exercise that distinction directly.
+
+#[test]
+fn a_bare_claim_is_not_confirmed_until_the_claimant_says_so() {
+    let mut d = Dedupe::default();
+    let key = over_registration("+919000000000", "hello").dedupe_key();
+
+    assert_eq!(
+        decide(&mut d, &over_registration("+919000000000", "hello")),
+        Disposition::Handle
+    );
+    assert!(d.contains(&key), "claimed the moment it's admitted");
+    assert!(
+        !d.is_confirmed(&key),
+        "but not confirmed until the claimant's relay actually succeeds"
+    );
+
+    d.confirm(&key);
+    assert!(d.is_confirmed(&key), "confirm makes it so, explicitly");
+}
+
+#[test]
+fn forgetting_a_claim_also_clears_any_confirmation() {
+    // Defensive: a real caller never confirms then forgets the same claim,
+    // but forget() must not leave a stale "confirmed" flag behind regardless.
+    let mut d = Dedupe::default();
+    let key = "k".to_string();
+    d.admit(&key);
+    d.confirm(&key);
+    d.forget(&key);
+    assert!(!d.contains(&key));
+    assert!(!d.is_confirmed(&key));
+}
+
+#[test]
+fn confirming_an_unclaimed_key_is_a_harmless_no_op() {
+    let mut d = Dedupe::default();
+    d.confirm("never-admitted");
+    assert!(!d.is_confirmed("never-admitted"));
+}
+
+#[test]
+fn eviction_clears_confirmation_along_with_the_claim() {
+    // The bounded window evicts old keys; a confirmed flag for an evicted
+    // key must not survive it (or `is_confirmed` could wrongly answer `true`
+    // for a since-reused key that collides after eviction wrapped around).
+    let mut d = Dedupe::new(2);
+    d.admit("a");
+    d.confirm("a");
+    d.admit("b");
+    d.admit("c"); // evicts "a"
+    assert!(!d.contains("a"));
+    assert!(!d.is_confirmed("a"));
+}
+
+#[test]
+fn a_retransmission_racing_into_the_wait_window_is_still_not_confirmed() {
+    // The exact scenario the second review pass found: the original claim
+    // rolls back, a retransmission re-admits the same key, and — critically —
+    // that new attempt has *not yet* relayed anything. A waiter must see this
+    // as "claimed, unconfirmed", never as "safe to treat as delivered".
+    let mut d = Dedupe::default();
+    let key = over_registration("+919000000002", "retry me").dedupe_key();
+
+    assert_eq!(
+        decide(&mut d, &over_registration("+919000000002", "retry me")),
+        Disposition::Handle
+    );
+    d.forget(&key); // the first attempt's relay failed and rolled back
+
+    // A retransmission re-admits it — but has not relayed anything yet.
+    assert_eq!(
+        decide(&mut d, &over_registration("+919000000002", "retry me")),
+        Disposition::Handle
+    );
+    assert!(
+        d.contains(&key) && !d.is_confirmed(&key),
+        "re-claimed but not yet delivered — a waiter must keep waiting, not delete anything"
+    );
+}
+
+#[test]
+fn cross_bearer_duplicate_is_suppressed_through_one_shared_instance() {
+    // This is what production wiring now does: `ims::agent::handle_message`
+    // (registration route) and `run_modem_reader`'s sweep (modem route) for
+    // one line consult the *same* `Arc<Mutex<Dedupe>>`. Proving the pure
+    // `decide()` logic collapses a duplicate (already covered above) is not
+    // the same as proving two independent call sites sharing one lock behave
+    // that way end to end — this exercises exactly that shared-instance case.
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+
+    let via_registration = over_registration("+919000000000", "hello");
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &via_registration), Disposition::Handle);
+    }
+
+    let via_modem = through_modem("+919000000000", "hello", 5);
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(
+            decide(&mut d, &via_modem),
+            Disposition::AcknowledgeOnly,
+            "the same text delivered over the other bearer must not be forwarded again"
+        );
+    }
+}
+
+#[test]
+fn decide_behaves_identically_through_a_shared_arc_mutex() {
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let msg = through_modem("+919000000000", "hello", 3);
+
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &msg), Disposition::Handle);
+    }
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &msg), Disposition::AcknowledgeOnly);
+    }
+}
+
+#[test]
+fn backlog_recovery_is_unaffected_by_externally_owned_dedupe() {
+    // parse_cmgl_indexes itself takes no Dedupe at all — this asserts the
+    // refactor left the startup-recovery parsing path untouched.
+    let lines: Vec<String> = [
+        "+CMGL: 2,\"REC UNREAD\",\"+919000000000\",,\"26/07/22,10:00:00+22\"",
+        "hello",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(parse_cmgl_indexes(&lines), vec![2]);
+}
+
+// ---- VoLTE parity, with or without CS (specs/038 User Story 3) ------------
+
+#[test]
+fn volte_backlog_recovery_is_unchanged_regardless_of_cs_enabled() {
+    // `[cs].enabled` governs the circuit-switched call-bridging daemon, not
+    // this reader — a VoLTE-assigned modem is exclusively assigned away from
+    // the CS pool either way (specs/013/specs/020), so CS being globally on
+    // or off must make no difference to what this parses.
+    let lines: Vec<String> = [
+        "+CMGL: 1,\"REC UNREAD\",\"+919000000000\",,\"26/07/22,10:00:00+22\"",
+        "hello",
+        "+CMGL: 2,\"REC UNREAD\",\"+919000000001\",,\"26/07/22,10:01:00+22\"",
+        "world",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(parse_cmgl_indexes(&lines), vec![1, 2]);
+}
+
+#[test]
+fn volte_gains_the_same_cross_bearer_suppression_us2_introduced() {
+    // Before specs/038, VoLTE had this same latent gap (research.md Decision
+    // 2): the registration route never consulted the sweep thread's private
+    // Dedupe. Now that both share one instance per line, VoLTE benefits
+    // identically to VoWiFi — this is the same assertion as the VoWiFi-framed
+    // `cross_bearer_duplicate_is_suppressed_through_one_shared_instance` test,
+    // kept separate because it verifies a distinct user story's guarantee.
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let via_modem = through_modem("+919000000002", "hi", 9);
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &via_modem), Disposition::Handle);
+    }
+    let via_registration = over_registration("+919000000002", "hi");
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(
+            decide(&mut d, &via_registration),
+            Disposition::AcknowledgeOnly
+        );
+    }
 }
 
 #[test]

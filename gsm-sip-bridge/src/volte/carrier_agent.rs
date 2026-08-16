@@ -60,6 +60,7 @@ pub fn run(
     line: &BridgeLine,
     app_config: &AppConfig,
     modem_lock: Arc<Mutex<()>>,
+    dedupe: Arc<Mutex<super::sms::Dedupe>>,
     pbx_registered: Option<Arc<AtomicBool>>,
 ) {
     // Attach and PLMN derivation both touch the AT port, so hold the modem
@@ -191,6 +192,7 @@ pub fn run(
         pre_renewal: Some(&pre_renewal),
         attachment_check: Some(&attachment_check),
         modem_lock: Some(modem_lock),
+        dedupe,
         pbx_registered,
         app_config,
         agent_label: "volte-ims-agent",

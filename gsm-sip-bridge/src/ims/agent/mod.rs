@@ -182,6 +182,15 @@ pub fn run(
     }
 }
 
+/// Whether this line's own modem storage should be swept for SMS the carrier
+/// delivered through the classic cellular bearer instead of the IMS
+/// registration (specs/038-reliable-sms-delivery). `false` for a `pcsc_reader`
+/// line: the SIM there sits in a PC/SC reader with no modem/cellular attach at
+/// all, so there is no such bearer, and no `modem_port` to open either.
+fn wants_modem_sms_reader(pcsc_reader: bool) -> bool {
+    !pcsc_reader
+}
+
 fn run_inner(
     card_id: &str,
     config: &VowifiConfig,
@@ -266,6 +275,35 @@ fn run_inner(
         .parse()
         .map_err(|e| BridgeError::Ims(format!("invalid vowifi control address: {e}")))?;
 
+    // Every line gets a dedupe, whether or not it has a modem: `handle_message`
+    // always consults one (specs/038-reliable-sms-delivery). Only a line with
+    // a real modem also gets a `modem_lock` and a background sweep of that
+    // modem's own SMS storage — a `pcsc_reader` line has no AT port to
+    // protect and no cellular bearer to poll.
+    let dedupe = Arc::new(Mutex::new(crate::volte::sms::Dedupe::default()));
+    let modem_lock = if wants_modem_sms_reader(config.pcsc_reader) {
+        let lock = Arc::new(Mutex::new(()));
+        let modem_port = PathBuf::from(&config.modem_port);
+        let sweep_lock = lock.clone();
+        let sweep_dedupe = dedupe.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("vowifi-sms-{card_id}"))
+            .spawn(move || {
+                crate::volte::sms::run_modem_reader(
+                    modem_port,
+                    control_addr,
+                    sweep_lock,
+                    sweep_dedupe,
+                )
+            })
+        {
+            tracing::error!(card_id, error = %e, "failed to start the modem SMS reader for this line");
+        }
+        Some(lock)
+    } else {
+        None
+    };
+
     serve_inbound(InboundParams {
         card_id,
         reg_cfg: &reg_cfg,
@@ -283,8 +321,11 @@ fn run_inner(
         // The ePDG tunnel is charon's to watch, and a lost tunnel already
         // surfaces as the control connection dropping — no mid-call probe here.
         attachment_check: None,
-        // No LTE modem on this path, so nothing competes for an AT port.
-        modem_lock: None,
+        // `Some` for any line with a real modem, serialising registration/renewal
+        // AT access with the modem SMS reader spawned above (specs/038) — `None`
+        // only for a `pcsc_reader` line, which has no AT port at all.
+        modem_lock,
+        dedupe,
         // Wi-Fi Agent A cannot see Agent B's PBX registration (separate
         // processes), so it does not gate on it.
         pbx_registered: None,
@@ -323,9 +364,17 @@ pub(crate) struct InboundParams<'a> {
     /// with the cause stated (FR-011). `None` on the Wi-Fi path.
     pub attachment_check: Option<&'a AttachmentHook>,
     /// Serialises this half's modem AT access (registration, renewal) with any
-    /// other user of the same port — the cellular path's modem SMS reader.
-    /// `None` on the Wi-Fi path, which has no such competitor and no LTE modem.
+    /// other user of the same port — the modem SMS reader (specs/038), on
+    /// either path now. `None` only for a `pcsc_reader` line, which has no
+    /// modem/AT port at all.
     pub modem_lock: Option<Arc<Mutex<()>>>,
+    /// Shared with this line's modem SMS reader (specs/038-reliable-sms-delivery)
+    /// so a message delivered over both the registration and the modem
+    /// collapses to one: whichever route sees it first wins, the other
+    /// acknowledges/clears without forwarding again. Always present — every
+    /// line has one, unlike `modem_lock`, which only exists where there is an
+    /// AT port to protect.
+    pub dedupe: Arc<Mutex<crate::volte::sms::Dedupe>>,
     /// Whether the telephone-side half holds the PBX registration the outbound
     /// bridge leg needs — shared from that half (cellular only; the two halves
     /// are one process there). `None` on the Wi-Fi path, where health does not
@@ -359,6 +408,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         pre_renewal,
         attachment_check,
         modem_lock,
+        dedupe,
         pbx_registered,
         app_config,
         agent_label,
@@ -477,6 +527,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             pre_renewal,
             attachment_check,
             modem_lock: modem_lock.as_ref(),
+            dedupe: &dedupe,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
         },
@@ -634,7 +685,33 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> 
 /// suppressed. So a relay failure deliberately leaves the message
 /// *unacknowledged*: the network retrying is the recovery mechanism, and
 /// acknowledging something we failed to record would throw that away.
-fn handle_message(sink: &SipSink, req: &SipRequest, control_addr: SocketAddr) {
+///
+/// # Sharing `dedupe` with the modem SMS reader (specs/038)
+///
+/// `dedupe` is the same instance this line's modem-storage sweep
+/// (`volte::sms::run_modem_reader`) consults. A carrier occasionally delivers
+/// the identical text over both bearers; without a shared `Dedupe` each side
+/// would admit it independently and the operator would see it twice. Whichever
+/// side sees a message first calls it `Disposition::Handle` and the other gets
+/// `Disposition::AcknowledgeOnly` — still acknowledged/cleared so the network
+/// or the modem's own storage does not keep it pending, just not recorded or
+/// forwarded again.
+///
+/// Admission happens *before* the relay below, not after: checking
+/// `contains` early but only calling `admit` once the relay is known to have
+/// succeeded looks safer but is not — it reopens a window where this
+/// function and the modem sweep, running on different threads, can both see
+/// "not yet admitted" while each other's relay is in flight, and both then
+/// relay it. [`decide`] closes that window by admitting atomically. If the
+/// relay then fails, [`Dedupe::forget`] releases the admission so the
+/// network's retransmission is treated as fresh rather than silently
+/// swallowed as a duplicate of a delivery that never actually happened.
+fn handle_message(
+    sink: &SipSink,
+    req: &SipRequest,
+    control_addr: SocketAddr,
+    dedupe: &Arc<Mutex<crate::volte::sms::Dedupe>>,
+) {
     // The SIP `From` on a real network's MT SMS names an IMS core element
     // relaying the message (a carrier-internal SMSC gateway hostname), not
     // the person who sent it — measured on Vi 2026-08-15:
@@ -652,7 +729,27 @@ fn handle_message(sink: &SipSink, req: &SipRequest, control_addr: SocketAddr) {
         };
     }
 
-    tracing::info!(sender = %sender, "received SIP MESSAGE");
+    let route = crate::volte::sms::MessageRoute::OverRegistration;
+    tracing::info!(sender = %sender, route = route.as_str(), "received SIP MESSAGE");
+
+    let inbound = crate::volte::sms::InboundMessage {
+        route,
+        sender: sender.clone(),
+        body: body.clone(),
+        modem_index: None,
+    };
+    let key = inbound.dedupe_key();
+    let disposition = {
+        let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+        crate::volte::sms::decide(&mut d, &inbound)
+    };
+    if disposition == crate::volte::sms::Disposition::AcknowledgeOnly {
+        // Already handled via the other bearer (or a prior delivery of this
+        // same MESSAGE) in this same process — the network still needs the
+        // retry stopped, but it must not be recorded or forwarded again.
+        let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
+        return;
+    }
 
     let msg = ControlMessage::SmsReceived {
         sender: sender.clone(),
@@ -674,8 +771,22 @@ fn handle_message(sink: &SipSink, req: &SipRequest, control_addr: SocketAddr) {
     };
 
     if relayed {
+        // Durably delivered now, not merely claimed — the modem sweep may be
+        // waiting on exactly this distinction before it trusts this claim
+        // enough to discard its own backup copy (specs/038 review follow-up).
+        dedupe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .confirm(&key);
         let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
     } else {
+        // Release the admission above so the retransmission this triggers is
+        // treated as fresh, not as a duplicate of a delivery that never
+        // happened.
+        dedupe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(&key);
         // Deliberately silent toward the network: an unacknowledged MESSAGE is
         // retransmitted, which is the recovery we want. Acknowledging one we
         // failed to record would discard the only chance to get it back.
@@ -699,6 +810,7 @@ struct DispatchParams<'a> {
     pre_renewal: Option<&'a PreRenewalHook>,
     attachment_check: Option<&'a AttachmentHook>,
     modem_lock: Option<&'a Arc<Mutex<()>>>,
+    dedupe: &'a Arc<Mutex<crate::volte::sms::Dedupe>>,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
 }
@@ -871,7 +983,7 @@ fn dispatch_loop(
                 handle_notify(&sink, &req);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
-                handle_message(&sink, &req, p.control_addr);
+                handle_message(&sink, &req, p.control_addr, p.dedupe);
             }
             Ok((SipMessage::Request(req), _)) => {
                 tracing::info!(method = %req.method, "ignoring unsupported inbound request");
@@ -1577,5 +1689,20 @@ mod tests {
                     Content-Length: 5\r\n\r\nhello";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert!(decode_pdu_body(&req).is_none());
+    }
+
+    // ---- modem SMS sweep spawn decision (specs/038-reliable-sms-delivery) ---
+
+    #[test]
+    fn wants_modem_sms_reader_for_a_real_modem_line() {
+        assert!(wants_modem_sms_reader(false));
+    }
+
+    #[test]
+    fn does_not_want_modem_sms_reader_for_a_pcsc_reader_line() {
+        // A pcsc_reader line's SIM sits in a PC/SC reader with no modem/cellular
+        // attach at all — there is no legacy bearer to poll and no modem_port
+        // to open.
+        assert!(!wants_modem_sms_reader(true));
     }
 }

@@ -1,13 +1,19 @@
-//! Text messages over the host-side LTE path (specs/017-volte-inbound-bridge,
-//! US5).
+//! Text messages delivered to a line's own modem storage rather than over its
+//! IMS registration. Despite the module path, this is no longer LTE-specific:
+//! introduced for the host-side LTE path (specs/017-volte-inbound-bridge,
+//! US5), and reused as-is by the VoWiFi agent (`ims::agent::run_inner`,
+//! specs/038-reliable-sms-delivery) once the same gap was confirmed to exist
+//! there too. It stays in `volte::sms` rather than moving to a
+//! transport-neutral module — the logic is identical either way, and a move
+//! is a larger change than the bug it would fix.
 //!
 //! # Why this exists at all
 //!
 //! Holding the subscriber's IMS registration means the network delivers their
-//! text messages *here*. An earlier draft of the spec listed messaging as out
-//! of scope; that was wrong and dangerous, because "out of scope" would have
-//! meant texts arriving and being silently discarded. A call that fails to
-//! connect announces itself. A lost text does not.
+//! text messages *here*. An earlier draft of the VoLTE spec listed messaging
+//! as out of scope; that was wrong and dangerous, because "out of scope"
+//! would have meant texts arriving and being silently discarded. A call that
+//! fails to connect announces itself. A lost text does not.
 //!
 //! This is therefore not a feature being added — it is an existing capability
 //! being taken away unless it is handled.
@@ -45,7 +51,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How a message reached us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +105,15 @@ impl InboundMessage {
 pub struct Dedupe {
     seen: VecDeque<String>,
     capacity: usize,
+    /// Subset of `seen` known to have been *durably delivered*, not merely
+    /// claimed (specs/038-reliable-sms-delivery review follow-up). `admit`
+    /// alone cannot tell a caller "this claim already succeeded" from "this
+    /// claim is still in flight and might yet fail" — and confusing the two
+    /// is exactly what let a message be deleted from modem storage on the
+    /// strength of a claim that later turned out to have failed. Populated
+    /// only by `confirm`, which the caller must call once its relay actually
+    /// succeeds; never inferred from admission or elapsed time.
+    confirmed: std::collections::HashSet<String>,
 }
 
 impl Default for Dedupe {
@@ -112,6 +127,7 @@ impl Dedupe {
         Self {
             seen: VecDeque::with_capacity(capacity),
             capacity: capacity.max(1),
+            confirmed: std::collections::HashSet::new(),
         }
     }
 
@@ -123,7 +139,9 @@ impl Dedupe {
             return false;
         }
         if self.seen.len() >= self.capacity {
-            self.seen.pop_front();
+            if let Some(evicted) = self.seen.pop_front() {
+                self.confirmed.remove(&evicted);
+            }
         }
         self.seen.push_back(key.to_string());
         true
@@ -133,8 +151,29 @@ impl Dedupe {
     /// caller decide *before* it commits to an irreversible step — clearing a
     /// message from modem storage — whether the message is a fresh one to relay
     /// or a re-read of one already handed on.
+    ///
+    /// This answers "has *anyone* claimed it", not "did that claim succeed" —
+    /// for the latter, see `is_confirmed`. A caller about to do something
+    /// irreversible (deleting the modem's only copy) on the strength of
+    /// someone else's claim needs `is_confirmed`, not this.
     pub fn contains(&self, key: &str) -> bool {
         self.seen.iter().any(|k| k == key)
+    }
+
+    /// Whether `key`'s claim is known to have been *durably delivered* — set
+    /// only by `confirm`, never inferred. A key can be `contains`-true and
+    /// `is_confirmed`-false at the same time: claimed, outcome still pending.
+    pub fn is_confirmed(&self, key: &str) -> bool {
+        self.confirmed.contains(key)
+    }
+
+    /// Marks an existing claim as durably delivered. Call this — and only
+    /// this — once a relay has actually succeeded; nothing else may treat a
+    /// message as safe to irreversibly discard a backup copy of.
+    pub fn confirm(&mut self, key: &str) {
+        if self.contains(key) {
+            self.confirmed.insert(key.to_string());
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -143,6 +182,22 @@ impl Dedupe {
 
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
+    }
+
+    /// Reverses a prior `admit`. For a caller sharing one `Dedupe` across
+    /// concurrent routes (specs/038-reliable-sms-delivery): admitting must
+    /// happen *before* attempting the relay, not after, or two routes racing
+    /// on the same message can both see "not yet admitted" and both relay it.
+    /// But admitting before relaying means a relay that then fails has
+    /// already claimed the key — `forget` releases that claim so the next
+    /// attempt (a network retransmission, or the next modem sweep) is treated
+    /// as fresh rather than permanently suppressed by a delivery that never
+    /// actually happened. A failed relay was, by definition, never
+    /// `confirm`ed, but this clears any confirmation anyway as a defensive
+    /// no-op should a caller ever call both for the same key.
+    pub fn forget(&mut self, key: &str) {
+        self.seen.retain(|k| k != key);
+        self.confirmed.remove(key);
     }
 }
 
@@ -214,84 +269,322 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// # Coordinating with the registration for the one AT port
 ///
 /// The registration side also drives the modem's AT port — `register_session`
-/// on renewal, `refresh_attachment` on re-attach. Two readers interleaving on
-/// one port is the documented "no status in response" hazard (research R6), so
-/// every modem touch here is taken under `modem_lock`, the same lock the
-/// renewal path holds. Renewal is already deferred while a call is up, and a
-/// call's own media rides the data bearer, not this AT port — so sweeping does
-/// not disturb a call and a call does not disturb sweeping (FR-028).
+/// on renewal, `refresh_attachment` on re-attach — and, on a VoWiFi line
+/// (specs/038-reliable-sms-delivery), a wholly separate OS process
+/// (`vowifi-usim-bridge`) drives it too for EAP-SIM's `AT+CSIM` traffic. Two
+/// readers interleaving on one port is the documented "no status in response"
+/// hazard (research R6). `modem_lock` only ever serialises threads *within*
+/// this process — nothing at that level protects against `vowifi-usim-bridge`.
+/// Cross-process exclusion doesn't need anything from this crate, though:
+/// `AtCommander::open` opens through the `serialport` crate's default
+/// exclusive mode, which already takes `TIOCEXCL` *and* a non-blocking
+/// exclusive `flock` on the device path itself (confirmed in `serialport`
+/// 4.9.0's source) — a concurrent holder is rejected immediately, the same
+/// "fail fast and tolerate it" shape every caller here (including this one)
+/// already handles by retrying later. `modem_lock` is still taken first, for
+/// ordering against this *process's own* registration/renewal specifically.
 ///
-/// # Exactly-once and the order of operations
-///
-/// A message is **relayed before it is cleared**, never the reverse: clearing
-/// first would lose it outright on a crash in between. If a relay succeeds but
-/// the delete then fails, the message is re-read on the next sweep — and
-/// [`Dedupe`] recognises it, so it is cleared without being forwarded twice.
-pub fn run_modem_reader(modem_port: PathBuf, control_addr: SocketAddr, modem_lock: Arc<Mutex<()>>) {
+/// Renewal is already deferred while a call is up, and a call's own media
+/// rides the data bearer, not this AT port — so sweeping does not disturb a
+/// call and a call does not disturb sweeping (FR-028).
+pub fn run_modem_reader(
+    modem_port: PathBuf,
+    control_addr: SocketAddr,
+    modem_lock: Arc<Mutex<()>>,
+    dedupe: Arc<Mutex<Dedupe>>,
+) {
     std::thread::sleep(FIRST_SWEEP_DELAY);
-    let mut dedupe = Dedupe::default();
     loop {
-        {
-            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &mut dedupe) {
-                tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
-            }
+        if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &modem_lock, &dedupe) {
+            tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
         }
         std::thread::sleep(MODEM_SWEEP_INTERVAL);
     }
 }
 
-/// One pass over modem storage. Separated from the loop so a caller can drive a
-/// single sweep, and so the loop's lock discipline is visible at its call site.
+/// One pass over modem storage, in three phases so the AT port is held only
+/// for actual AT round-trips, never across a network relay or the
+/// cross-route wait below — both of which can take seconds, and holding the
+/// port (and therefore `serialport`'s own exclusive lock on it — see
+/// `run_modem_reader`'s docs) that long would starve `vowifi-usim-bridge`/
+/// charon's own AT needs far beyond the "seconds-long transaction" duty
+/// cycle the shared port's design assumes.
+///
+/// # Every individual AT round-trip re-opens the port, on purpose
+///
+/// A real backlog is not one message — the bug this feature exists to fix
+/// was found with 12 pending, and storage can hold up to 100. Holding one
+/// continuous session across `AT+CMGF` + `AT+CMGL` + N × `AT+CMGR` (an
+/// earlier version of this function did) makes phase 1's single hold scale
+/// with backlog size — for a dozen-plus messages, easily several seconds,
+/// comfortably exceeding `vowifi-usim-bridge`'s own total retry budget for a
+/// busy port (5 attempts, linear backoff, ~5s total — see `usim_bridge`'s
+/// `try_open_with_backoff`/`OPEN_RETRY_ATTEMPTS`/`OPEN_RETRY_BASE_DELAY`).
+/// That risks the exact failure this design most wants to avoid: USIM
+/// power-on giving up and muting EAP-SIM APDUs, failing the whole
+/// registration, over an SMS sweep.
+///
+/// So `modem_lock` is taken, and the port opened, fresh for `AT+CMGF`+
+/// `AT+CMGL` (one brief unit — listing needs both), then again individually
+/// for *each* `AT+CMGR` read and each `AT+CMGD` delete — releasing the port
+/// between every single AT command, not just between phases. This bounds
+/// the worst-case *continuous* hold to one AT round-trip regardless of how
+/// large the backlog is, so `vowifi-usim-bridge` always has a gap to slot
+/// into, while a full backlog still drains in one sweep pass (no per-pass
+/// cap): draining more slowly in wall-clock terms (one extra port re-open
+/// per message) is a cost worth paying for that guarantee.
+///
+/// Bounding hold time only helps once this side has the port; it does
+/// nothing for the reverse — a genuinely busy port (`vowifi-usim-bridge`
+/// mid-session) makes `open` fail immediately (`serialport`'s own exclusive
+/// open, not a lock this code owns — see `AtCommander::open_with_timeout`'s
+/// docs). Failing once and waiting a full `MODEM_SWEEP_INTERVAL` (~20s) for
+/// the next attempt would leave stored SMS unread for that whole window over
+/// what is usually a session lasting a few seconds, so every open here goes
+/// through [`open_with_retry`] instead: a short, bounded, caller-local
+/// backoff — symmetric with `usim_bridge`'s own retry for the identical
+/// contention from its side, just budgeted smaller since this can run many
+/// times per sweep pass.
+///
+/// # `dedupe` is admitted *before* relaying, not after
+///
+/// Locking `dedupe` for this whole function (as an early version of this code
+/// did) would block the registration-route handler for the entire sweep,
+/// including every message's blocking network relay — needless latency/risk
+/// of the network's own retransmission timer firing for an unrelated message.
+/// The alternative of checking `contains` early but only calling `admit`
+/// after a successful relay is worse: it reopens exactly the race a shared
+/// `Dedupe` exists to close — two routes can both see "not yet admitted"
+/// while each other's relay is in flight, and both then relay it, straight to
+/// a duplicate. So each message here takes the lock twice, briefly: once via
+/// [`decide`] to admit-or-detect-duplicate atomically *before* the relay, and
+/// again via [`Dedupe::forget`] only if the relay then fails, so a message
+/// that never actually got through is not permanently treated as handled.
+///
+/// # A bare "claimed elsewhere" is not "delivered elsewhere"
+///
+/// `decide` returning `AcknowledgeOnly` only means some other attempt admitted
+/// this key first — not that it succeeded. That other attempt's relay may
+/// still be in flight, or may fail and roll back a moment later, and a
+/// retransmission may re-claim it yet again after that. A fixed "wait once,
+/// then trust whatever `decide` says now" is not enough: a re-claim that
+/// lands late in the wait window resets the clock without this function
+/// knowing, so a bare re-check can still observe "claimed" for an attempt
+/// that has barely started and may yet fail — deleting the modem's only copy
+/// on that basis would silently lose the message.
+///
+/// So this never infers success from elapsed time. It polls
+/// [`Dedupe::is_confirmed`] — set only by [`Dedupe::confirm`], which a
+/// claimant calls only once its relay has actually succeeded — up to
+/// [`CROSS_ROUTE_SETTLE_TIMEOUT`], checking every [`CROSS_ROUTE_POLL_INTERVAL`]:
+/// confirmed at any point means genuinely delivered (safe to clear); the
+/// claim disappearing (forgotten — rolled back, nothing re-claimed it since)
+/// means this route delivers it itself instead of discarding the only copy;
+/// timing out still claimed-but-unconfirmed leaves the message untouched for
+/// the next sweep pass to re-evaluate from scratch, rather than guessing.
+/// How many times [`open_with_retry`] will retry a busy port before giving
+/// up, and the linear backoff step between attempts — the same shape as
+/// `vowifi_usim_bridge`'s own `try_open_with_backoff`/`OPEN_RETRY_ATTEMPTS`/
+/// `OPEN_RETRY_BASE_DELAY`, so the two sides of this exact contention treat
+/// each other symmetrically rather than one waiting on the other's terms.
+/// ~1.8s worst case (300 + 600 + 900ms) per open, not the same numbers as
+/// `usim_bridge`'s ~5s: this runs per *individual* AT command inside a
+/// sweep, potentially many times per pass, so its budget stays smaller to
+/// avoid one contended message stalling an entire backlog drain, while
+/// still meaningfully outlasting a brief collision instead of failing on
+/// the first try and waiting a full `MODEM_SWEEP_INTERVAL` for the next.
+const OPEN_RETRY_ATTEMPTS: u32 = 4;
+const OPEN_RETRY_BASE_DELAY: Duration = Duration::from_millis(300);
+
+/// Opens the modem port, retrying a busy-port failure with linear backoff
+/// before giving up — see the constants above for why, and
+/// `modules::at_commander::AtCommander::open_with_timeout`'s docs for why
+/// this is a caller-local retry rather than something built into `open`
+/// itself (discovery's fast-fail-across-many-candidates need would be hurt
+/// by baking retries into every caller unconditionally).
+fn open_with_retry(modem_port: &Path) -> BridgeResult<AtCommander> {
+    let mut last_err = None;
+    for attempt in 0..OPEN_RETRY_ATTEMPTS {
+        match AtCommander::open(modem_port) {
+            Ok(at) => return Ok(at),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < OPEN_RETRY_ATTEMPTS {
+                    std::thread::sleep(OPEN_RETRY_BASE_DELAY * (attempt + 1));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
-    dedupe: &mut Dedupe,
+    modem_lock: &Arc<Mutex<()>>,
+    dedupe: &Arc<Mutex<Dedupe>>,
 ) -> BridgeResult<()> {
-    let mut at = AtCommander::open(modem_port)?;
-    // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
-    let _ = at.send_command("AT+CMGF=1")?;
-    let indexes = crate::sms::reader::list_sms_indexes(&mut at)?;
+    // Phase 1a: text mode + list indexes — one brief, combined session.
+    let indexes = {
+        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut at = open_with_retry(modem_port)?;
+        // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
+        let _ = at.send_command("AT+CMGF=1")?;
+        crate::sms::reader::list_sms_indexes(&mut at)?
+    };
     if indexes.is_empty() {
         return Ok(());
     }
-    tracing::info!(
-        count = indexes.len(),
-        "found messages in modem storage; relaying and clearing them"
-    );
+
+    // Phase 1b: read each message in its own port session, so the port is
+    // free between every read for vowifi-usim-bridge/charon to use if they
+    // need it, regardless of how many messages are pending.
+    let mut messages = Vec::with_capacity(indexes.len());
     for index in indexes {
-        let sms = match crate::sms::reader::read_sms(&mut at, index) {
-            Ok(s) => s,
+        let sms = {
+            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+            open_with_retry(modem_port)
+                .and_then(|mut at| crate::sms::reader::read_sms(&mut at, index))
+        };
+        match sms {
+            Ok(sms) => messages.push(sms),
             Err(e) => {
                 tracing::warn!(index, error = %e, "could not read a stored message; leaving it in place");
-                continue;
             }
-        };
-        let key = InboundMessage {
+        }
+    }
+    if messages.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        count = messages.len(),
+        "found messages in modem storage; relaying and clearing them"
+    );
+
+    // Phase 2: decide and relay each message. No AT port held here.
+    let mut to_delete = Vec::new();
+    for sms in messages {
+        let inbound = InboundMessage {
             route: MessageRoute::ThroughModem,
             sender: sms.sender.clone(),
             body: sms.body.clone(),
-            modem_index: Some(index),
-        }
-        .dedupe_key();
+            modem_index: Some(sms.index),
+        };
+        let key = inbound.dedupe_key();
+        let disposition = {
+            let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            decide(&mut d, &inbound)
+        };
 
-        // Already handed on this run — a previous delete must have failed.
-        // Clear it now so storage does not fill; do not forward it again.
-        if dedupe.contains(&key) {
-            let _ = crate::sms::reader::delete_sms(&mut at, index);
-            continue;
+        if disposition == Disposition::AcknowledgeOnly {
+            match wait_for_resolution(dedupe, &key) {
+                ClaimResolution::Confirmed => {
+                    to_delete.push(sms.index);
+                    continue;
+                }
+                ClaimResolution::Reclaimed => {
+                    // The prior claim rolled back and `wait_for_resolution`
+                    // has atomically re-claimed this key for us — fall
+                    // through and relay it below.
+                }
+                ClaimResolution::TimedOut => {
+                    // Still claimed, still unconfirmed, after outlasting
+                    // every bound this codebase places on a relay attempt.
+                    // Something is stuck rather than merely racing — leave
+                    // the modem's copy untouched and let the next sweep
+                    // pass, ~20s away, re-evaluate with a fresh look.
+                    continue;
+                }
+            }
         }
 
         if relay_modem_message(control_addr, &sms.sender, &sms.body) {
-            dedupe.admit(&key);
-            // Relayed — now, and only now, clear it from the modem.
-            if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
-                tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
-            }
+            tracing::info!(
+                index = sms.index,
+                route = MessageRoute::ThroughModem.as_str(),
+                "relayed a message found in modem storage"
+            );
+            dedupe
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .confirm(&key);
+            to_delete.push(sms.index);
+        } else {
+            // Leave it in storage, unmarked, to retry next sweep — and release
+            // the admission above so that retry is not mistaken for a repeat.
+            dedupe
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget(&key);
         }
-        // On relay failure: leave it in storage, unmarked, to retry next sweep.
+    }
+
+    // Phase 3: clear whatever is now confirmed handled — again, one port
+    // session per message, for the same reason as phase 1b.
+    for index in to_delete {
+        let result = {
+            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+            open_with_retry(modem_port)
+                .and_then(|mut at| crate::sms::reader::delete_sms(&mut at, index))
+        };
+        if let Err(e) = result {
+            tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
+        }
     }
     Ok(())
+}
+
+/// How often [`wait_for_resolution`] polls while a claim it does not own is
+/// pending.
+const CROSS_ROUTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Total time [`wait_for_resolution`] will wait for a pending claim to
+/// resolve before giving up. Comfortably longer than [`CONTROL_TIMEOUT`] (the
+/// longest a single relay attempt can run), so an attempt that starts even
+/// right before this budget begins still has time to finish within it.
+const CROSS_ROUTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How a claim this function did not make itself turned out.
+enum ClaimResolution {
+    /// The claim was confirmed delivered — someone's relay actually succeeded.
+    Confirmed,
+    /// The claim was rolled back and nothing has re-claimed it since. This
+    /// call re-decided on the caller's behalf as part of observing that, so
+    /// the key is now claimed *by this caller* — proceed to relay it.
+    Reclaimed,
+    /// Still claimed by someone else, outcome still unknown, after waiting
+    /// the full budget. Left exactly as found; the caller must not act on it.
+    TimedOut,
+}
+
+/// Polls a key's fate until it is confirmed, reclaimed, or the wait budget
+/// runs out — never assumes success from elapsed time alone. See
+/// `sweep_modem_storage`'s docs for why a single wait-then-recheck is not
+/// enough: a retransmission racing into that window resets the clock without
+/// the caller knowing, so only an explicit, caller-set confirmation signal
+/// (never inferred) is trustworthy grounds for the irreversible modem delete
+/// this exists to gate.
+fn wait_for_resolution(dedupe: &Arc<Mutex<Dedupe>>, key: &str) -> ClaimResolution {
+    let deadline = Instant::now() + CROSS_ROUTE_SETTLE_TIMEOUT;
+    loop {
+        {
+            let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            if d.is_confirmed(key) {
+                return ClaimResolution::Confirmed;
+            }
+            if !d.contains(key) {
+                // Rolled back and nothing has re-claimed it — claim it now,
+                // atomically, so no window opens for a third party to sneak
+                // in between this observation and the caller's relay attempt.
+                d.admit(key);
+                return ClaimResolution::Reclaimed;
+            }
+        }
+        if Instant::now() >= deadline {
+            return ClaimResolution::TimedOut;
+        }
+        std::thread::sleep(CROSS_ROUTE_POLL_INTERVAL);
+    }
 }
 
 /// Hands one modem-delivered message to the telephone side over the same
@@ -511,11 +804,124 @@ mod tests {
         assert!(d.contains(&key), "an admitted key reports as handled");
     }
 
+    // ---- rollback on relay failure (specs/038-reliable-sms-delivery) ------
+
+    #[test]
+    fn forget_releases_an_admission_so_a_retry_is_treated_as_fresh() {
+        let mut d = Dedupe::default();
+        let key = msg(MessageRoute::OverRegistration, "+91123", "hello").dedupe_key();
+
+        assert!(d.admit(&key));
+        d.forget(&key);
+        assert!(
+            !d.contains(&key),
+            "forget must fully release the admission, not just mark it stale"
+        );
+        assert!(
+            d.admit(&key),
+            "a forgotten key must be admittable again, exactly like a fresh one"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_unadmitted_key_is_a_harmless_no_op() {
+        let mut d = Dedupe::default();
+        let key = msg(MessageRoute::ThroughModem, "+91123", "hello").dedupe_key();
+        d.forget(&key); // must not panic
+        assert!(!d.contains(&key));
+    }
+
     #[test]
     fn route_is_reported_so_the_delivery_path_is_observable() {
         // Which route the carrier actually uses is unmeasured, so every
         // message records how it arrived.
         assert_eq!(MessageRoute::OverRegistration.as_str(), "registration");
         assert_eq!(MessageRoute::ThroughModem.as_str(), "modem");
+    }
+
+    // ---- wait_for_resolution (specs/038 review follow-up) ------------------
+
+    #[test]
+    fn wait_for_resolution_returns_confirmed_once_the_claimant_confirms() {
+        let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+        let key = "k1".to_string();
+        dedupe.lock().unwrap().admit(&key);
+
+        {
+            let dedupe = dedupe.clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                dedupe.lock().unwrap().confirm(&key);
+            });
+        }
+
+        assert!(matches!(
+            wait_for_resolution(&dedupe, &key),
+            ClaimResolution::Confirmed
+        ));
+    }
+
+    #[test]
+    fn wait_for_resolution_reclaims_once_the_claim_is_forgotten() {
+        let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+        let key = "k2".to_string();
+        dedupe.lock().unwrap().admit(&key);
+
+        {
+            let dedupe = dedupe.clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                dedupe.lock().unwrap().forget(&key);
+            });
+        }
+
+        assert!(matches!(
+            wait_for_resolution(&dedupe, &key),
+            ClaimResolution::Reclaimed
+        ));
+        // The reclaim must have atomically re-admitted it for the caller.
+        assert!(dedupe.lock().unwrap().contains(&key));
+        assert!(!dedupe.lock().unwrap().is_confirmed(&key));
+    }
+
+    #[test]
+    fn wait_for_resolution_times_out_on_a_claim_that_never_resolves() {
+        let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+        let key = "k3".to_string();
+        dedupe.lock().unwrap().admit(&key);
+        // Nobody ever confirms or forgets it.
+
+        let started = Instant::now();
+        assert!(matches!(
+            wait_for_resolution(&dedupe, &key),
+            ClaimResolution::TimedOut
+        ));
+        assert!(started.elapsed() >= CROSS_ROUTE_SETTLE_TIMEOUT);
+        // Left exactly as found: still claimed, still unconfirmed.
+        assert!(dedupe.lock().unwrap().contains(&key));
+        assert!(!dedupe.lock().unwrap().is_confirmed(&key));
+    }
+
+    // ---- open_with_retry (specs/038 review follow-up) ----------------------
+
+    #[test]
+    fn open_with_retry_gives_up_after_the_full_attempt_budget() {
+        // A path that can never succeed exercises the retry *mechanics*
+        // (attempt count, backoff) even though it's not a "busy port"
+        // specifically — every attempt fails fast, so the elapsed time is
+        // dominated by the backoff sleeps between attempts, which is exactly
+        // what this asserts on.
+        let bogus = Path::new("/nonexistent/gsm-sip-bridge-test-path");
+        let started = Instant::now();
+        assert!(open_with_retry(bogus).is_err());
+        let expected_min: Duration = (1..OPEN_RETRY_ATTEMPTS)
+            .map(|n| OPEN_RETRY_BASE_DELAY * n)
+            .sum();
+        assert!(
+            started.elapsed() >= expected_min,
+            "must actually wait out the backoff between attempts, not fail immediately"
+        );
     }
 }

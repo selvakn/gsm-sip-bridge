@@ -1160,9 +1160,14 @@ pub(crate) fn handle_volte_carrier_agent_command(
 
     let modem_port = line.settings.modem_port.clone();
     let modem_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    // Shared with `carrier_agent::run` below, not owned by the sweep thread:
+    // the same message delivered over both the registration and the modem
+    // must collapse to one (specs/038-reliable-sms-delivery).
+    let dedupe = std::sync::Arc::new(std::sync::Mutex::new(crate::volte::sms::Dedupe::default()));
     {
         let modem_port = modem_port.clone();
         let lock = modem_lock.clone();
+        let dedupe = dedupe.clone();
         let control_addr = std::net::SocketAddr::new(
             if line.veth_telephony_addr.is_empty() {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -1175,7 +1180,9 @@ pub(crate) fn handle_volte_carrier_agent_command(
         );
         if let Err(e) = std::thread::Builder::new()
             .name(format!("volte-sms-{}", line.card_id))
-            .spawn(move || crate::volte::sms::run_modem_reader(modem_port, control_addr, lock))
+            .spawn(move || {
+                crate::volte::sms::run_modem_reader(modem_port, control_addr, lock, dedupe)
+            })
         {
             eprintln!(
                 "volte-carrier-agent: failed to start the modem SMS reader for this line: {e}"
@@ -1186,7 +1193,7 @@ pub(crate) fn handle_volte_carrier_agent_command(
     // Cross-process: cannot share the telephony half's `pbx_registered` flag
     // (see carrier_agent.rs's module docs) — the same limitation
     // `vowifi-ims-agent` already has for the same reason.
-    crate::volte::carrier_agent::run(&line, &app_config, modem_lock, None);
+    crate::volte::carrier_agent::run(&line, &app_config, modem_lock, dedupe, None);
 
     eprintln!(
         "volte-carrier-agent: line {} ({}) stopped",
