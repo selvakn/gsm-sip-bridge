@@ -74,6 +74,7 @@ COPY pjsua-sys/ pjsua-sys/
 COPY pjsua-safe/ pjsua-safe/
 COPY amr-sys/ amr-sys/
 COPY amr-safe/ amr-safe/
+COPY siptest/ siptest/
 COPY gsm-sip-bridge/ gsm-sip-bridge/
 
 ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"
