@@ -1,9 +1,10 @@
 use crate::error::{BridgeError, BridgeResult};
 use std::fmt;
+use std::fs::{File, TryLockError};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const BAUD_RATE: u32 = 115200;
@@ -14,8 +15,27 @@ const BAUD_RATE: u32 = 115200;
 /// recipe, so the same wait.
 const RADIO_CYCLE_DELAY: Duration = Duration::from_secs(4);
 
+/// How often to retry an advisory lock on a busy AT port (see
+/// [`acquire_port_lock`]) before giving up.
+const PORT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Total time to keep retrying before returning "busy" to the caller. Every
+/// documented AT-port user (registration/renewal, `vowifi-usim-bridge`'s
+/// EAP-SIM APDUs, discovery's probes, and the modem SMS sweep,
+/// specs/038-reliable-sms-delivery) already holds the port only for a
+/// seconds-long transaction and already tolerates/retries an open failure at
+/// its own cadence — this just needs to outlast one such transaction, not be
+/// unbounded.
+const PORT_LOCK_MAX_WAIT: Duration = Duration::from_secs(3);
+
 pub struct AtCommander {
     port: Box<dyn ReadWrite + Send>,
+    /// Held for the lifetime of a real (`open`/`open_with_timeout`) instance
+    /// so the OS releases the advisory lock the moment this is dropped, even
+    /// on an early return or panic. `None` for `from_stream` (tests, and the
+    /// in-process `EpdgTransport`/USIM-bridge scripted-modem paths), which
+    /// never touches a real device node to contend with another process over.
+    _port_lock: Option<File>,
 }
 
 pub trait ReadWrite: Read + Write {}
@@ -123,7 +143,31 @@ impl AtCommander {
     /// `modules::discovery`'s AT-probe (specs/013-multi-card-vowifi FR-002),
     /// which tries several candidate serial interfaces per modem and wants a
     /// short per-candidate timeout rather than `DEFAULT_TIMEOUT`'s 5s.
+    ///
+    /// # Cross-process serialization (research/012 item 6, closed here)
+    ///
+    /// One physical AT port can have several independent OS processes wanting
+    /// it — this half's own registration/renewal, `vowifi-usim-bridge`'s
+    /// EAP-SIM APDUs over `AT+CSIM`, `modules::discovery`'s probes, and the
+    /// modem SMS sweep (specs/038-reliable-sms-delivery). An in-process
+    /// `Mutex` (this crate's `modem_lock`) only ever serializes threads
+    /// *within* one of those processes — it does nothing for the others. The
+    /// original strongSwan-epdg design (specs/012 research item 6) accepted
+    /// that gap for a "collision window measured in seconds per hour" and
+    /// named the escalation if it ever stopped being negligible: "an advisory
+    /// `flock` on the device path inside `AtCommander::open`". The SMS sweep
+    /// added here is a much higher-duty-cycle AT-port user than anything that
+    /// existed when that call was made — polling every ~20s indefinitely,
+    /// not "seconds per hour" — so this takes that escalation now rather than
+    /// waiting for a soak test to prove the collision live.
+    ///
+    /// The lock is acquired on `path` itself, not a side-car lock file: every
+    /// current caller already opens this exact path (confirmed: `vowifi-
+    /// usim-bridge`, `discovery::probe`/`discovery::sim`, and the SMS reader
+    /// all go through this one function), so this is the "one-place change,
+    /// no agent-code changes" research/012 described.
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> BridgeResult<Self> {
+        let port_lock = acquire_port_lock(path)?;
         let port = serialport::new(path.to_string_lossy(), BAUD_RATE)
             .timeout(timeout)
             .open()
@@ -132,12 +176,14 @@ impl AtCommander {
             })?;
         Ok(Self {
             port: Box::new(port),
+            _port_lock: Some(port_lock),
         })
     }
 
     pub fn from_stream<S: Read + Write + Send + 'static>(stream: S, _timeout: Duration) -> Self {
         Self {
             port: Box::new(stream),
+            _port_lock: None,
         }
     }
 
@@ -600,6 +646,43 @@ impl AtCommander {
     }
 }
 
+/// Acquires an advisory exclusive lock on `path` itself, retrying on
+/// contention up to [`PORT_LOCK_MAX_WAIT`] before giving up. Returns the open
+/// [`File`] the caller must keep alive for as long as the lock should be
+/// held — the OS releases an advisory lock the moment every handle on it
+/// closes, so dropping the returned `File` (including via `AtCommander`'s own
+/// `Drop`) is what releases it. See `open_with_timeout`'s docs for why this
+/// exists and why the path itself, not a side-car lock file.
+fn acquire_port_lock(path: &Path) -> BridgeResult<File> {
+    let lock_file = File::open(path).map_err(|e| {
+        BridgeError::Discovery(format!(
+            "failed to open {} for locking: {e}",
+            path.display()
+        ))
+    })?;
+    let deadline = Instant::now() + PORT_LOCK_MAX_WAIT;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(lock_file),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(BridgeError::Discovery(format!(
+                        "AT port {} is held by another process",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(PORT_LOCK_RETRY_INTERVAL);
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(BridgeError::Discovery(format!(
+                    "failed to lock {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,5 +973,42 @@ mod tests {
     fn test_query_network_type_edge_keyword() {
         let mut at = make_commander("+QNWINFO: \"EDGE\",\"46001\",\"GSM 900\",80\r\nOK\r\n");
         assert_eq!(at.query_network_type().unwrap(), NetworkType::TwoGEdge);
+    }
+
+    // ---- cross-process AT-port locking (specs/038-reliable-sms-delivery) --
+
+    #[test]
+    fn acquire_port_lock_succeeds_when_the_path_is_free() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let lock = acquire_port_lock(tmp.path()).unwrap();
+        drop(lock);
+    }
+
+    #[test]
+    fn acquire_port_lock_fails_fast_while_another_holder_has_it() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let holder = acquire_port_lock(tmp.path()).unwrap();
+
+        let started = Instant::now();
+        let err = acquire_port_lock(tmp.path()).unwrap_err();
+        // Must actually contend (not silently succeed) and must give up
+        // within roughly PORT_LOCK_MAX_WAIT, not block indefinitely.
+        assert!(err.to_string().contains("held by another process"));
+        assert!(started.elapsed() < PORT_LOCK_MAX_WAIT + Duration::from_secs(1));
+
+        drop(holder);
+    }
+
+    #[test]
+    fn acquire_port_lock_succeeds_again_once_the_holder_releases_it() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let holder = acquire_port_lock(tmp.path()).unwrap();
+        drop(holder); // releases the advisory lock immediately
+
+        // Must not have to wait out PORT_LOCK_MAX_WAIT once the path is free.
+        let started = Instant::now();
+        let lock = acquire_port_lock(tmp.path()).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(lock);
     }
 }

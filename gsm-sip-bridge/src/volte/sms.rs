@@ -217,6 +217,15 @@ const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(12);
 /// How long to wait to reach and write to the telephone side's control port.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to wait, when a modem-stored message turns out to already be
+/// claimed by another concurrent attempt (almost always the registration
+/// route), before trusting that claim enough to delete the modem's copy.
+/// Must exceed [`CONTROL_TIMEOUT`] — the longest a racing relay attempt can
+/// run before it either succeeds or gives up and rolls back — so that by the
+/// time this elapses the other side's outcome is no longer ambiguous. See
+/// `sweep_modem_storage`'s docs for the failure mode this closes.
+const CROSS_ROUTE_SETTLE_DELAY: Duration = Duration::from_secs(6);
+
 /// Reads text messages the network left in the **modem's own storage** — the
 /// circuit-switched delivery route — and hands each to the telephone side for
 /// recording, then clears it (FR-036, US5 scenario 7).
@@ -233,31 +242,20 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// # Coordinating with the registration for the one AT port
 ///
 /// The registration side also drives the modem's AT port — `register_session`
-/// on renewal, `refresh_attachment` on re-attach. Two readers interleaving on
-/// one port is the documented "no status in response" hazard (research R6), so
-/// every modem touch here is taken under `modem_lock`, the same lock the
-/// renewal path holds. Renewal is already deferred while a call is up, and a
-/// call's own media rides the data bearer, not this AT port — so sweeping does
-/// not disturb a call and a call does not disturb sweeping (FR-028).
+/// on renewal, `refresh_attachment` on re-attach — and, on a VoWiFi line
+/// (specs/038-reliable-sms-delivery), a wholly separate OS process
+/// (`vowifi-usim-bridge`) drives it too for EAP-SIM's `AT+CSIM` traffic. Two
+/// readers interleaving on one port is the documented "no status in response"
+/// hazard (research R6). `modem_lock` only ever serialises threads *within*
+/// this process — nothing at that level protects against `vowifi-usim-bridge`
+/// — so cross-process exclusion is `AtCommander::open`'s job now (see its
+/// docs): every AT touch here still takes `modem_lock` first, for ordering
+/// against this process's own registration/renewal, and `AtCommander::open`
+/// underneath it also takes the cross-process advisory lock.
 ///
-/// # Exactly-once and the order of operations
-///
-/// A message is **relayed before it is cleared**, never the reverse: clearing
-/// first would lose it outright on a crash in between. If a relay succeeds but
-/// the delete then fails, the message is re-read on the next sweep — and
-/// [`Dedupe`] recognises it, so it is cleared without being forwarded twice.
-///
-/// `dedupe` is owned by the caller, not this function, and is the same
-/// instance the registration-message handler (`ims::agent::handle_message`)
-/// consults for the same line — the whole point of a shared `Dedupe` is that
-/// a message delivered over *both* routes collapses to one, which is only
-/// true if both routes admit into the same set.
-///
-/// Only `modem_lock` is held for the whole sweep (it serialises this line's
-/// AT port, unrelated to `dedupe`). `dedupe` is locked briefly per message
-/// inside `sweep_modem_storage`, not for the sweep's duration — see that
-/// function's docs for why holding it across a relay would be a bug, not
-/// just a missed optimisation.
+/// Renewal is already deferred while a call is up, and a call's own media
+/// rides the data bearer, not this AT port — so sweeping does not disturb a
+/// call and a call does not disturb sweeping (FR-028).
 pub fn run_modem_reader(
     modem_port: PathBuf,
     control_addr: SocketAddr,
@@ -266,18 +264,21 @@ pub fn run_modem_reader(
 ) {
     std::thread::sleep(FIRST_SWEEP_DELAY);
     loop {
-        {
-            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &dedupe) {
-                tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
-            }
+        if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &modem_lock, &dedupe) {
+            tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
         }
         std::thread::sleep(MODEM_SWEEP_INTERVAL);
     }
 }
 
-/// One pass over modem storage. Separated from the loop so a caller can drive a
-/// single sweep, and so the loop's lock discipline is visible at its call site.
+/// One pass over modem storage, in three phases so the AT port is held only
+/// for actual AT round-trips, never across a network relay or the
+/// cross-route settle wait below — both of which can take seconds, and
+/// holding the port that long would starve `vowifi-usim-bridge`/charon's own
+/// AT needs far beyond the "seconds-long transaction" duty cycle the shared
+/// port's design assumes (see `run_modem_reader`'s docs). `modem_lock` (and
+/// therefore the cross-process lock underneath `AtCommander::open`) is taken
+/// fresh for phase 1 and phase 3 only, not held across phase 2.
 ///
 /// # `dedupe` is admitted *before* relaying, not after
 ///
@@ -293,60 +294,93 @@ pub fn run_modem_reader(
 /// [`decide`] to admit-or-detect-duplicate atomically *before* the relay, and
 /// again via [`Dedupe::forget`] only if the relay then fails, so a message
 /// that never actually got through is not permanently treated as handled.
+///
+/// # A bare "claimed elsewhere" is not "delivered elsewhere"
+///
+/// `decide` returning `AcknowledgeOnly` only means some other attempt admitted
+/// this key first — not that it succeeded. That other attempt's relay may
+/// still be in flight, or may fail and roll back a moment later. Deleting the
+/// modem's copy on the strength of a bare claim would silently lose the
+/// message if that claim then fails — there would be nothing left to retry.
+/// So a claimed message is not deleted immediately: this waits out
+/// [`CROSS_ROUTE_SETTLE_DELAY`] (longer than the other side's relay could
+/// still be running) and re-decides. Still claimed means it genuinely
+/// succeeded (safe to clear); no longer claimed means it was rolled back, and
+/// this route relays it itself instead of losing it.
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
+    modem_lock: &Arc<Mutex<()>>,
     dedupe: &Arc<Mutex<Dedupe>>,
 ) -> BridgeResult<()> {
-    let mut at = AtCommander::open(modem_port)?;
-    // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
-    let _ = at.send_command("AT+CMGF=1")?;
-    let indexes = crate::sms::reader::list_sms_indexes(&mut at)?;
-    if indexes.is_empty() {
+    // Phase 1: pure AT I/O — read whatever is sitting in storage, then let
+    // the port go before touching the network at all.
+    let messages = {
+        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut at = AtCommander::open(modem_port)?;
+        // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
+        let _ = at.send_command("AT+CMGF=1")?;
+        let indexes = crate::sms::reader::list_sms_indexes(&mut at)?;
+        let mut messages = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            match crate::sms::reader::read_sms(&mut at, index) {
+                Ok(sms) => messages.push(sms),
+                Err(e) => {
+                    tracing::warn!(index, error = %e, "could not read a stored message; leaving it in place");
+                }
+            }
+        }
+        messages
+    };
+    if messages.is_empty() {
         return Ok(());
     }
     tracing::info!(
-        count = indexes.len(),
+        count = messages.len(),
         "found messages in modem storage; relaying and clearing them"
     );
-    for index in indexes {
-        let sms = match crate::sms::reader::read_sms(&mut at, index) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(index, error = %e, "could not read a stored message; leaving it in place");
-                continue;
-            }
-        };
+
+    // Phase 2: decide and relay each message. No AT port held here.
+    let mut to_delete = Vec::new();
+    for sms in messages {
         let inbound = InboundMessage {
             route: MessageRoute::ThroughModem,
             sender: sms.sender.clone(),
             body: sms.body.clone(),
-            modem_index: Some(index),
+            modem_index: Some(sms.index),
         };
         let key = inbound.dedupe_key();
-        let disposition = {
+        let mut disposition = {
             let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
             decide(&mut d, &inbound)
         };
 
-        // Already handed — either a previous delete failed (a re-read within
-        // this same route) or the registration route just relayed it. Clear
-        // it now so storage does not fill; do not forward it again.
         if disposition == Disposition::AcknowledgeOnly {
-            let _ = crate::sms::reader::delete_sms(&mut at, index);
-            continue;
+            std::thread::sleep(CROSS_ROUTE_SETTLE_DELAY);
+            // Re-decide, not merely re-check: if the other claim was rolled
+            // back in the meantime this both detects that *and* atomically
+            // admits this route as the new sole claimant, so it can relay
+            // below without reopening the original race.
+            disposition = {
+                let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+                decide(&mut d, &inbound)
+            };
+            if disposition == Disposition::AcknowledgeOnly {
+                // Still claimed after outlasting the other side's longest
+                // possible relay attempt: it genuinely succeeded (or a fresh
+                // attempt has since re-claimed it) — safe to clear.
+                to_delete.push(sms.index);
+                continue;
+            }
         }
 
         if relay_modem_message(control_addr, &sms.sender, &sms.body) {
             tracing::info!(
-                index,
+                index = sms.index,
                 route = MessageRoute::ThroughModem.as_str(),
                 "relayed a message found in modem storage"
             );
-            // Relayed — now, and only now, clear it from the modem.
-            if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
-                tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
-            }
+            to_delete.push(sms.index);
         } else {
             // Leave it in storage, unmarked, to retry next sweep — and release
             // the admission above so that retry is not mistaken for a repeat.
@@ -354,6 +388,17 @@ fn sweep_modem_storage(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .forget(&key);
+        }
+    }
+
+    // Phase 3: pure AT I/O again — clear whatever is now confirmed handled.
+    if !to_delete.is_empty() {
+        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut at = AtCommander::open(modem_port)?;
+        for index in to_delete {
+            if let Err(e) = crate::sms::reader::delete_sms(&mut at, index) {
+                tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");
+            }
         }
     }
     Ok(())

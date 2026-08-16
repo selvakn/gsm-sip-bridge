@@ -209,6 +209,88 @@ fn a_failed_relay_is_rolled_back_so_the_retry_is_not_swallowed() {
     );
 }
 
+// ---- the modem sweep's settle-and-redecide (specs/038 review follow-up) ---
+//
+// `sweep_modem_storage` does not delete a modem-stored message purely
+// because `decide` returned `AcknowledgeOnly` — that only means some other
+// attempt (almost always the registration route) claimed it first, not that
+// the claim succeeded. It waits out `CROSS_ROUTE_SETTLE_DELAY` (longer than
+// the other side's relay could still be running) and calls `decide` again.
+// These tests model both outcomes of that second call using the same public
+// primitives the sweep itself uses, without needing the real multi-second
+// wait or a mock modem.
+
+#[test]
+fn a_claim_still_standing_after_the_settle_wait_means_the_other_side_delivered_it() {
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let text = through_modem("+919000000000", "hello", 11);
+
+    // Someone else (the registration route) claims it first.
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(
+            decide(&mut d, &over_registration("+919000000000", "hello")),
+            Disposition::Handle
+        );
+    }
+
+    // The sweep sees it claimed...
+    let first_look = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &text)
+    };
+    assert_eq!(first_look, Disposition::AcknowledgeOnly);
+
+    // ...waits out the settle delay (nothing changes: the claim was never
+    // rolled back, meaning the registration route's relay succeeded)...
+    let after_settling = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &text)
+    };
+    assert_eq!(
+        after_settling,
+        Disposition::AcknowledgeOnly,
+        "a claim that is still standing after the settle wait was genuinely delivered — safe to clear"
+    );
+}
+
+#[test]
+fn a_claim_rolled_back_during_the_settle_wait_means_this_route_must_deliver_it() {
+    let dedupe = Arc::new(Mutex::new(Dedupe::default()));
+    let text = through_modem("+919000000001", "world", 12);
+    let over_reg = over_registration("+919000000001", "world");
+
+    // The registration route claims it first...
+    {
+        let mut d = dedupe.lock().unwrap();
+        assert_eq!(decide(&mut d, &over_reg), Disposition::Handle);
+    }
+    let first_look = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &text)
+    };
+    assert_eq!(first_look, Disposition::AcknowledgeOnly);
+
+    // ...but its relay then fails, and it rolls back (this is what would
+    // happen during the sweep's settle wait, on a different thread).
+    {
+        let mut d = dedupe.lock().unwrap();
+        d.forget(&over_reg.dedupe_key());
+    }
+
+    // Re-deciding after the settle wait must now find it free — and claim it
+    // for this route, atomically, in the same call.
+    let after_settling = {
+        let mut d = dedupe.lock().unwrap();
+        decide(&mut d, &text)
+    };
+    assert_eq!(
+        after_settling,
+        Disposition::Handle,
+        "a rolled-back claim must free the message for this route to deliver, not discard it"
+    );
+}
+
 #[test]
 fn cross_bearer_duplicate_is_suppressed_through_one_shared_instance() {
     // This is what production wiring now does: `ims::agent::handle_message`
