@@ -72,6 +72,31 @@ fn hangup_answered_carrier_leg(
     );
 }
 
+/// Spawns a fresh veth UAS listener for an already-answered carrier leg, or
+/// hangs that leg up (and tells Agent B) if it can't be spawned — the
+/// shared tail both the no-early-media path and specs/037-p-early-media's
+/// stale-listener fallback need at the real `200 OK`. `None` means the
+/// caller must treat the attempt as `Ended`; the hangup has already been
+/// sent.
+fn spawn_fresh_veth_listener_or_hangup(
+    session: &mut crate::ims::RegisteredSession,
+    control: &mut TcpStream,
+    dialog: &DialogInfo,
+    call_id: &str,
+    veth_local_ip: IpAddr,
+    veth_sip_port: u16,
+    wideband: bool,
+) -> Option<mpsc::Receiver<BridgeResult<VethUasResult>>> {
+    match spawn_veth_uas_listener(veth_local_ip, veth_sip_port, wideband) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            tracing::warn!(call_id, error = %e, "outbound: veth listener failed");
+            hangup_answered_carrier_leg(session, control, dialog, call_id, reason::VETH_LEG_FAILED);
+            None
+        }
+    }
+}
+
 /// An outbound origination in flight, held by the dispatch loop across poll
 /// ticks so the wait for the carrier (and then Agent B's veth leg) is
 /// interruptible (specs/029-interruptible-origination-wait).
@@ -95,15 +120,12 @@ pub(super) struct PendingOrigination {
     /// provisional the offer/answer exchange completes there and the `200 OK`
     /// has no body at all, so this is the only copy of the answer we get.
     provisional_answer: Option<String>,
-    /// Set once a provisional response's SDP has been used to connect
-    /// `rtp_socket` early (specs/037-p-early-media) — guards the real `200
-    /// OK` handling against reconnecting the socket a second time, which
-    /// would risk a brief audio gap the zero-gap handoff requirement
-    /// (spec.md SC-005) rules out.
-    early_media_rtp_connected: bool,
-    /// The veth UAS listener's receiver, if spawned early alongside
-    /// `early_media_rtp_connected`. Consumed (in place of a fresh
-    /// `spawn_veth_uas_listener` call) once the real `200 OK` arrives.
+    /// The veth UAS listener's receiver, if a provisional's SDP already
+    /// triggered early media (specs/037-p-early-media) — `Some` exactly
+    /// when RTP was connected and the listener spawned together, in the
+    /// same step. Consulted (not necessarily consumed unchanged — see the
+    /// real `200 OK` handling's stale-result fallback) once the real `200
+    /// OK` arrives, in place of spawning a fresh listener from scratch.
     early_veth_rx: Option<mpsc::Receiver<BridgeResult<VethUasResult>>>,
     /// Guards `CallEarlyMedia` to one attempt per call — set the first time
     /// a provisional's body is examined for early media, whether or not
@@ -340,7 +362,6 @@ pub(super) fn begin_origination(
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
-        early_media_rtp_connected: false,
         early_veth_rx: None,
         early_media_sent: false,
         callee_uri,
@@ -701,7 +722,6 @@ impl PendingOrigination {
                             ) {
                                 Ok(rx) => {
                                     self.early_veth_rx = Some(rx);
-                                    self.early_media_rtp_connected = true;
                                     let _ = write_msg(
                                         &mut self.control,
                                         &ControlMessage::CallEarlyMedia {
@@ -767,19 +787,22 @@ impl PendingOrigination {
                 return OriginationStatus::Ended;
             }
         };
-        // specs/037-p-early-media: if a provisional already connected this
-        // socket, don't reconnect it here — that would risk exactly the
-        // audible gap the zero-gap handoff requirement (SC-005) rules out.
-        // Trusts the carrier to keep using the same media session it
-        // already gave early media on, which holds for every carrier this
-        // bridge has been tested against (the reliable-provisional/100rel
-        // case above already relies on the same assumption for the SDP
-        // answer itself).
-        if !self.early_media_rtp_connected {
-            if let Err(e) = self.rtp_socket.connect(answer.remote_rtp) {
-                self.fail(&format!("RTP connect failed: {e}"));
-                return OriginationStatus::Ended;
-            }
+        // specs/037-p-early-media: always (re)connect, even when a
+        // provisional already connected this socket for early media —
+        // `UdpSocket::connect` only updates the kernel's notion of the
+        // default peer for this socket, a local, instantaneous operation
+        // with no I/O of its own, so reconnecting to the *same* address
+        // (the common case: `answer` came from the cached
+        // `provisional_answer`, identical bytes) costs nothing and causes
+        // no audible gap. Skipping it unconditionally was the actual bug:
+        // early media does not require `Require: 100rel` (FR-008), so an
+        // early SDP is not always the guaranteed-final answer the way a
+        // reliable provisional's is — a `200 OK` carrying its *own*,
+        // different SDP (legal per RFC 3264) would have left RTP pointed at
+        // a stale address with skipping in place.
+        if let Err(e) = self.rtp_socket.connect(answer.remote_rtp) {
+            self.fail(&format!("RTP connect failed: {e}"));
+            return OriginationStatus::Ended;
         }
 
         let ack_branch = format!("z9hG4bK{}", random_hex(6));
@@ -812,35 +835,60 @@ impl PendingOrigination {
         );
 
         // specs/037-p-early-media: reuse the listener a provisional already
-        // spawned (and is guaranteed already up) instead of spawning a
-        // second one — same reasoning as the RTP-connect skip above. Spawn
-        // fresh, exactly as before, when no early media happened for this
-        // attempt.
+        // spawned, *if* it's still usable. Its `VETH_INVITE_TIMEOUT` clock
+        // started back at the provisional, not now — on a carrier like Jio
+        // (~13.7s of early media before the real `200 OK`) it can easily
+        // have already timed out by the time we get here. Blindly reusing a
+        // receiver that already holds a stale failure would hang up a
+        // carrier leg the carrier just successfully answered, which FR-006
+        // rules out — so a resolved-but-failed (or disconnected) early
+        // listener falls back to a *fresh* one, giving Agent B a full new
+        // window starting now, exactly as if no early media had ever
+        // happened. A still-pending one (the common case: Agent B pairs
+        // within milliseconds of `CallEarlyMedia`, so this rarely lingers
+        // long enough to matter) is used as-is. An already-succeeded one is
+        // forwarded through a fresh one-shot channel so the `AwaitingVeth`
+        // poll loop below can treat every case identically.
         //
         // Spawn *before* telling Agent B to call in — same ordering
         // `handle_invite` uses for the inbound direction, so the listener is
         // guaranteed up by the time Agent B's `Call::make` reaches it.
-        let veth_rx = if let Some(rx) = self.early_veth_rx.take() {
-            rx
-        } else {
-            match spawn_veth_uas_listener(self.veth_local_ip, self.veth_sip_port, self.wideband) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    // The carrier leg is already ACKed and up (the `dialog`
-                    // proves it) — `fail()` alone only tells Agent B, it
-                    // does not hang up the real carrier call.
-                    tracing::warn!(call_id = %self.call_id, error = %e, "outbound: veth listener failed");
-                    let call_id = self.call_id.clone();
-                    hangup_answered_carrier_leg(
+        let veth_rx = match self.early_veth_rx.take() {
+            Some(rx) => match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => rx,
+                Ok(Ok(result)) => {
+                    let (tx, fresh_rx) = mpsc::channel();
+                    let _ = tx.send(Ok(result));
+                    fresh_rx
+                }
+                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                    tracing::warn!(call_id = %self.call_id, "outbound: early-media veth handshake had already failed by the real 200 OK; giving Agent B a fresh window (FR-006)");
+                    match spawn_fresh_veth_listener_or_hangup(
                         session,
                         &mut self.control,
                         &dialog,
-                        &call_id,
-                        reason::VETH_LEG_FAILED,
-                    );
-                    return OriginationStatus::Ended;
+                        &self.call_id.clone(),
+                        self.veth_local_ip,
+                        self.veth_sip_port,
+                        self.wideband,
+                    ) {
+                        Some(rx) => rx,
+                        None => return OriginationStatus::Ended,
+                    }
                 }
-            }
+            },
+            None => match spawn_fresh_veth_listener_or_hangup(
+                session,
+                &mut self.control,
+                &dialog,
+                &self.call_id.clone(),
+                self.veth_local_ip,
+                self.veth_sip_port,
+                self.wideband,
+            ) {
+                Some(rx) => rx,
+                None => return OriginationStatus::Ended,
+            },
         };
 
         if let Err(e) = write_msg(
@@ -1227,7 +1275,6 @@ mod tests {
             extra_cseq: 0,
             pracked_rseq: None,
             provisional_answer: None,
-            early_media_rtp_connected: false,
             early_veth_rx: None,
             early_media_sent: false,
             callee_uri: "sip:9000000001@example.test".to_string(),
@@ -1280,10 +1327,6 @@ mod tests {
             "the first SDP-bearing provisional should attempt early media"
         );
         assert!(
-            p.early_media_rtp_connected,
-            "the carrier RTP socket should be connected from the first provisional"
-        );
-        assert!(
             p.early_veth_rx.is_some(),
             "the veth listener should be spawned from the first provisional"
         );
@@ -1330,11 +1373,81 @@ mod tests {
         let status = p.on_carrier_response(&resp, &mut session);
         assert!(matches!(status, OriginationStatus::Pending));
         assert!(!p.early_media_sent);
-        assert!(!p.early_media_rtp_connected);
         assert!(p.early_veth_rx.is_none());
         assert!(
             p.rtp_socket.peer_addr().is_err(),
             "an unconnected UDP socket has no peer"
+        );
+    }
+
+    /// Code review finding (specs/037-p-early-media): the early-media veth
+    /// listener's `VETH_INVITE_TIMEOUT` clock starts at the provisional, not
+    /// at the real `200 OK` — on a carrier with a long early-media window
+    /// (Jio: ~13.7s) the listener can have already timed out by the time
+    /// the real answer arrives. Blindly reusing that stale, already-failed
+    /// receiver would hang up a carrier leg the carrier just successfully
+    /// answered — a regression against FR-006 ("this feature must not
+    /// reduce the reliability of outbound call setup"). The fix falls back
+    /// to a fresh listener when the reused one has already resolved to a
+    /// failure; this proves that fallback actually fires rather than
+    /// trusting the stale result.
+    #[test]
+    fn stale_early_veth_failure_falls_back_to_a_fresh_listener_at_200_ok() {
+        let call_id = "out-early-3";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        // A real (if unreachable) UDP "connection" so the 200 OK path's ACK
+        // send succeeds and this test actually reaches the veth-listener
+        // decision under test, rather than failing earlier at the ACK step.
+        let dummy_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(dummy_peer.local_addr().unwrap(), false)
+                .unwrap();
+        session.transport = Some(transport);
+
+        let mut p = test_pending(call_id, control);
+
+        // Simulate an early-media veth listener that already failed (timed
+        // out) by the time the real 200 OK arrives.
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(Err(crate::error::BridgeError::Ims(
+            "veth INVITE timed out".to_string(),
+        )));
+        p.early_veth_rx = Some(rx);
+
+        let resp = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        };
+
+        let status = p.on_carrier_response(&resp, &mut session);
+        // Must still be in flight, not immediately hung up as
+        // VETH_LEG_FAILED because of the stale result.
+        assert!(matches!(status, OriginationStatus::Pending));
+        let OriginationStep::AwaitingVeth { veth_rx, .. } = &p.step else {
+            panic!("expected AwaitingVeth, got a different step");
+        };
+        // The critical assertion: `on_carrier_response` alone returning
+        // `Pending` is not enough to prove the fix, because the *old*,
+        // buggy code also reached `AwaitingVeth` here — it just carried the
+        // stale, already-failed receiver forward, and the failure only
+        // surfaced one tick later in `tick_pending_origination`. Proving
+        // the fix means proving the receiver in `AwaitingVeth` is a fresh,
+        // still-pending one, not the stale one: `try_recv` on a genuinely
+        // fresh listener (nothing sent yet) must be `Empty`, whereas the
+        // stale receiver would immediately yield the buffered `Err`.
+        assert!(
+            matches!(veth_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "expected a fresh, still-pending veth listener, not the stale failed one"
         );
     }
 }

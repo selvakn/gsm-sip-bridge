@@ -26,18 +26,53 @@ Existing fields relevant here: `provisional_answer: Option<String>`,
 `ringing_relayed: bool`, `step: OriginationStep` (unchanged variant set,
 per research R4).
 
-New fields, as built (names matched the original proposal exactly):
+New fields, as built:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `early_media_rtp_connected` | `bool` | Whether `self.rtp_socket` has already been `connect()`-ed to a carrier-provided address from a provisional response — guards against redoing it at the real `200 OK` (R5). |
-| `early_veth_rx` | `Option<mpsc::Receiver<BridgeResult<VethUasResult>>>` | The veth UAS listener's receiver, if spawned early. Consumed instead of a fresh `spawn_veth_uas_listener` call when present. |
+| `early_veth_rx` | `Option<mpsc::Receiver<BridgeResult<VethUasResult>>>` | The veth UAS listener's receiver, if spawned early. Consulted (not blindly consumed — see below) instead of a fresh `spawn_veth_uas_listener` call when present. |
 | `early_media_sent` | `bool` | Guards `CallEarlyMedia` to exactly one attempt per call, mirroring the existing `ringing_relayed` one-shot guard. |
 
-Lifecycle: all three start unset. The first SDP-parseable provisional in
-`on_carrier_response`'s `resp.status < 200` branch sets all three
-together (RTP connect + veth spawn + send `CallEarlyMedia` are one atomic
-step — none happens without the others).
+Lifecycle: both start unset. The first SDP-parseable provisional in
+`on_carrier_response`'s `resp.status < 200` branch sets both together
+(RTP connect + veth spawn + send `CallEarlyMedia` are one atomic step —
+none happens without the others).
+
+**Dropped from the original proposal, post-implementation (code review
+finding)**: `early_media_rtp_connected` (a bool gating the RTP-connect
+step at the real `200 OK`) was removed entirely. Two review findings
+against the original design:
+
+1. **Reconnecting the RTP socket at `200 OK` is not actually a gap.**
+   `UdpSocket::connect` only updates the kernel's notion of the default
+   peer for that socket — a local, instantaneous operation, not I/O.
+   Reconnecting to the *same* address (the common case, since `answer`
+   usually still comes from the cached `provisional_answer`) costs
+   nothing. The proposed skip was solving a non-problem.
+2. **Skipping it unconditionally was an actual bug.** Early media does
+   not require `Require: 100rel` (FR-008) — an early SDP is therefore not
+   always the guaranteed-final answer the way a reliable provisional's
+   is. A `200 OK` carrying its own, genuinely different SDP (legal per
+   RFC 3264) would have left RTP pointed at a stale address with the skip
+   in place. The fix: always `connect()`, exactly as before this feature.
+
+With that fix, `early_media_rtp_connected` had no remaining reader — it
+was set and checked together with `early_veth_rx`, so it was fully
+redundant with `early_veth_rx.is_some()`. Removed rather than kept as
+dead state.
+
+**`early_veth_rx`'s reuse at the real `200 OK` is not unconditional
+either (second code review finding)**: its `VETH_INVITE_TIMEOUT` clock
+started back at the provisional, not at the real `200 OK` — on a carrier
+with a long early-media window (Jio: ~13.7s) it can have already resolved
+to a failure by the time `200 OK` arrives. Blindly trusting a stale
+failure there would hang up a carrier leg the carrier just successfully
+answered, violating FR-006. The real `200 OK` handling now does a
+non-blocking `try_recv()` on it first: still-pending → use as-is;
+already succeeded → forward the result through a fresh one-shot channel;
+already failed/disconnected → fall back to a *fresh*
+`spawn_veth_uas_listener` call, giving Agent B a full new window starting
+now, exactly as if no early media had ever happened.
 
 **Naming correction from the original proposal**: there is no separate
 `finish_origination` function for the `200 OK` leg — that name belongs to
