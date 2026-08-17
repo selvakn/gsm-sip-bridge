@@ -142,6 +142,20 @@ pub struct AgentState {
     /// live binding — the gauge that answers "will a call ring?".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sip_server_ring_registered: Option<bool>,
+    /// When this line's registration lapses, as an absolute unix timestamp
+    /// (specs/039-at-stall-watchdog, FR-018).
+    ///
+    /// Absolute rather than a countdown so it need only be reported when it
+    /// changes — once per renewal — with the daemon computing the remaining
+    /// seconds at scrape time. Reporting a countdown would mean a report every
+    /// second, drowning the bounded reporter channel to say nothing new. This
+    /// mirrors how `agent_up`/`last_report_seconds` are already evaluated at
+    /// scrape rather than on a timer.
+    ///
+    /// `None` means the agent does not report it; the ingest side leaves the
+    /// gauge untouched rather than reading absent as expired.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registration_expires_at: Option<u64>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is

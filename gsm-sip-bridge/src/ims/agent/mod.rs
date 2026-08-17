@@ -516,6 +516,10 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     obs.set_registered(true);
     obs.set_tunnel_up(true);
     obs.set_active_calls(0);
+    obs.set_registration_expiry(
+        SystemTime::now()
+            + Duration::from_secs(session.granted_expires(crate::ims::DEFAULT_EXPIRES) as u64),
+    );
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection.
     let mut inbound = start_inbound(&session)?;
@@ -1590,11 +1594,14 @@ impl LoopState {
                 drop(guard);
                 self.backoff = RETRY_INITIAL_BACKOFF;
                 self.next_renewal_attempt = None;
-                tracing::info!("registration renewed");
+                tracing::info!(granted_expires_secs = granted, "registration renewed");
                 p.obs
                     .report_registration_attempt(RegistrationStatus::Success);
                 p.obs.set_registered(true);
                 p.obs.set_tunnel_up(true);
+                p.obs.set_registration_expiry(
+                    SystemTime::now() + Duration::from_secs(granted as u64),
+                );
                 // The renewal replaced `session` and `inbound` wholesale — a
                 // fresh Gm SA, transport, and both readers. Any in-flight ping
                 // referenced the old socket and can never be answered on the

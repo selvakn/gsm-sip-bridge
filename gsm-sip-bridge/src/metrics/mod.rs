@@ -408,6 +408,28 @@ pub static VOWIFI_GM_CONNECTION_UP: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Seconds until this line's registration lapses; **negative once it has**
+/// (specs/039-at-stall-watchdog, FR-018).
+///
+/// Signed deliberately. A gauge that merely clamps at zero cannot distinguish
+/// "expired a moment ago" from "expired three hours ago", and that distinction
+/// is the whole diagnostic: during the 2026-08-16 outage the binding had been
+/// dead for 9752 seconds while every other signal read healthy.
+///
+/// Computed at scrape time from the absolute expiry the agent reports, so a
+/// countdown costs no extra reports. Same `vowifi_` prefix convention as the
+/// gauges above — the `module` label distinguishes transports.
+pub static VOWIFI_REGISTRATION_EXPIRES_IN_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_registration_expires_in_seconds",
+            "Seconds until this line's IMS registration expires; negative once it has"
+        ),
+        &["module"]
+    )
+    .unwrap()
+});
+
 pub static BUILD_INFO: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         opts!("gsm_sip_bridge_build_info", "Build metadata"),
