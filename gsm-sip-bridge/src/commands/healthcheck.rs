@@ -41,6 +41,11 @@ pub enum LineFault {
     /// A P-CSCF address was captured, but nothing answers SIP on it through
     /// this line's namespace.
     PcscfUnreachable { addr: String },
+    /// This line's IMS registration has lapsed, so the network is telling
+    /// callers the phone is switched off (specs/039-at-stall-watchdog,
+    /// FR-020). Every other probe here can pass while this is true — which is
+    /// precisely what happened for 2h45m on 2026-08-16.
+    RegistrationExpired { module: String, ago_seconds: i64 },
 }
 
 impl std::fmt::Display for LineFault {
@@ -50,6 +55,13 @@ impl std::fmt::Display for LineFault {
                 write!(f, "tunnel interface {iface} has no address")
             }
             LineFault::PcscfUnreachable { addr } => write!(f, "P-CSCF {addr} unreachable"),
+            LineFault::RegistrationExpired {
+                module,
+                ago_seconds,
+            } => write!(
+                f,
+                "line {module}'s IMS registration expired {ago_seconds}s ago"
+            ),
         }
     }
 }
@@ -182,6 +194,34 @@ pub fn evaluate(
     resolution: &LineResolution,
     tunnel_engine: &str,
 ) -> Health {
+    evaluate_with_metrics(
+        runner,
+        metrics_ok,
+        cs_enabled,
+        vowifi_enabled,
+        resolution,
+        tunnel_engine,
+        "",
+    )
+}
+
+/// [`evaluate`], additionally consulting a `/metrics` body for lapsed
+/// registrations (specs/039-at-stall-watchdog, FR-020).
+///
+/// Split rather than folded in so the existing cases keep asserting the
+/// behaviour they always had, and the new condition is tested on its own.
+/// `metrics_body` empty means "nothing to consult", which is the pre-existing
+/// behaviour exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_with_metrics(
+    runner: &dyn CommandRunner,
+    metrics_ok: bool,
+    cs_enabled: bool,
+    vowifi_enabled: bool,
+    resolution: &LineResolution,
+    tunnel_engine: &str,
+    metrics_body: &str,
+) -> Health {
     if !metrics_ok {
         return Health::MetricsEndpointDown;
     }
@@ -218,7 +258,31 @@ pub fn evaluate(
         .map(|f| f.card_id.clone())
         .collect();
 
-    if resolution.lines.is_empty() && configured_failed.is_empty() {
+    // A lapsed registration is as real a fault as an unreachable P-CSCF, and
+    // unlike the probes below it is invisible from the outside: the tunnel is
+    // up, the P-CSCF answers, and the phone is still switched off as far as
+    // the network is concerned.
+    //
+    // Evaluated *before* the "no lines resolved, nothing to report" shortcut.
+    // A gauge naming a module is positive evidence that a line exists and has
+    // lapsed, which outranks an empty resolution file -- the same reasoning
+    // that put the configured-but-unresolved check ahead of this shortcut.
+    let expired: Vec<(u32, LineFault)> = expired_registrations(metrics_body)
+        .into_iter()
+        .map(|fault| {
+            let index = match &fault {
+                LineFault::RegistrationExpired { module, .. } => resolution
+                    .lines
+                    .iter()
+                    .find(|l| &l.card_id == module)
+                    .map_or(0, |l| l.index),
+                _ => 0,
+            };
+            (index, fault)
+        })
+        .collect();
+
+    if resolution.lines.is_empty() && configured_failed.is_empty() && expired.is_empty() {
         return if cs_enabled {
             Health::Healthy
         } else {
@@ -226,11 +290,13 @@ pub fn evaluate(
         };
     }
 
-    let line_faults: Vec<(u32, LineFault)> = resolution
+    let mut line_faults: Vec<(u32, LineFault)> = resolution
         .lines
         .iter()
         .filter_map(|l| check_line(runner, l, tunnel_engine).map(|f| (l.index, f)))
         .collect();
+
+    line_faults.extend(expired);
 
     if line_faults.is_empty() && configured_failed.is_empty() {
         Health::Healthy
@@ -242,9 +308,52 @@ pub fn evaluate(
     }
 }
 
-/// Whether the circuit-switched daemon's metrics endpoint is answering.
-fn metrics_endpoint_ok(runner: &dyn CommandRunner, port: u16) -> bool {
-    runner.tcp_connect_ok("127.0.0.1", port)
+/// The daemon's own `/metrics`, or `None` if it is not answering.
+///
+/// A real GET rather than the bare TCP connect this used to be: the port
+/// accepting a connection proves the daemon is up, not that any line is
+/// usable. On 2026-08-16 this check passed continuously for 2h45m while the
+/// line behind it was unreachable.
+fn fetch_metrics(runner: &dyn CommandRunner, port: u16) -> Option<String> {
+    runner.http_get(&format!("http://127.0.0.1:{port}/metrics"))
+}
+
+/// Lines whose registration has lapsed, read from a `/metrics` body.
+///
+/// Pure over the body, so the decision is testable against a canned scrape
+/// without a daemon. A missing series is deliberately *not* a fault: it means
+/// the agent has not reported an expiry yet — it has just started, or it is an
+/// older build — and an absent signal is not evidence of failure. This mirrors
+/// the stance `evaluate_liveness` already takes on agents that have never
+/// reported.
+fn expired_registrations(metrics_body: &str) -> Vec<LineFault> {
+    const PREFIX: &str = "gsm_sip_bridge_vowifi_registration_expires_in_seconds{module=\"";
+    let mut faults = Vec::new();
+    for line in metrics_body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let Some((module, tail)) = rest.split_once('"') else {
+            continue;
+        };
+        let Some(value) = tail.split_whitespace().next_back() else {
+            continue;
+        };
+        let Ok(remaining) = value.parse::<f64>() else {
+            continue;
+        };
+        if remaining < 0.0 {
+            faults.push(LineFault::RegistrationExpired {
+                module: module.to_string(),
+                ago_seconds: (-remaining) as i64,
+            });
+        }
+    }
+    faults
 }
 
 pub fn run(cli: &Cli) -> ExitCode {
@@ -261,7 +370,8 @@ pub fn run(cli: &Cli) -> ExitCode {
     };
 
     let runner = RealCommandRunner::new();
-    let metrics_ok = metrics_endpoint_ok(&runner, config.metrics.port);
+    let metrics_body = fetch_metrics(&runner, config.metrics.port);
+    let metrics_ok = metrics_body.is_some();
 
     // Read what `supervise` resolved at startup; never re-scan (see the
     // module doc). A missing/unparsable file is an empty resolution, which
@@ -338,6 +448,84 @@ mod tests {
             lines,
             failed: vec![],
         }
+    }
+
+    /// A `/metrics` body carrying one line's expiry gauge, plus enough
+    /// surrounding noise (HELP/TYPE lines, another metric) that the parser is
+    /// exercised against something shaped like a real scrape.
+    fn metrics_with_expiry(module: &str, remaining: &str) -> String {
+        format!(
+            "# HELP gsm_sip_bridge_uptime_seconds Seconds since process start\n\
+             # TYPE gsm_sip_bridge_uptime_seconds gauge\n\
+             gsm_sip_bridge_uptime_seconds 1234.5\n\
+             # HELP gsm_sip_bridge_vowifi_registration_expires_in_seconds Seconds until expiry\n\
+             # TYPE gsm_sip_bridge_vowifi_registration_expires_in_seconds gauge\n\
+             gsm_sip_bridge_vowifi_registration_expires_in_seconds{{module=\"{module}\"}} {remaining}\n"
+        )
+    }
+
+    #[test]
+    fn a_lapsed_registration_makes_the_container_unhealthy() {
+        // FR-020. Every other probe here passes -- tunnel up, P-CSCF
+        // answering, metrics endpoint fine -- which is exactly the state the
+        // container reported as `healthy` for 2h45m on 2026-08-16.
+        let faults = expired_registrations(&metrics_with_expiry("ec20-11", "-9752"));
+        assert_eq!(
+            faults,
+            vec![LineFault::RegistrationExpired {
+                module: "ec20-11".to_string(),
+                ago_seconds: 9752,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_live_registration_is_not_a_fault() {
+        assert!(expired_registrations(&metrics_with_expiry("ec20-11", "2841")).is_empty());
+    }
+
+    #[test]
+    fn a_metrics_body_without_the_series_is_not_a_fault() {
+        // An agent that has not reported an expiry yet -- freshly started, or
+        // an older build. An absent signal is not evidence of failure, matching
+        // how liveness treats an agent that has never reported.
+        assert!(expired_registrations("gsm_sip_bridge_uptime_seconds 1.0\n").is_empty());
+        assert!(expired_registrations("").is_empty());
+    }
+
+    #[test]
+    fn the_expiry_gauges_help_and_type_lines_are_not_parsed_as_samples() {
+        // The HELP/TYPE lines contain the metric name; treating either as a
+        // sample would produce a bogus fault on every scrape.
+        let body = metrics_with_expiry("ec20-11", "600");
+        assert!(body.contains("# HELP gsm_sip_bridge_vowifi_registration_expires_in_seconds"));
+        assert!(expired_registrations(&body).is_empty());
+    }
+
+    #[test]
+    fn several_lapsed_lines_are_each_reported() {
+        let body = format!(
+            "{}{}",
+            metrics_with_expiry("ec20-11", "-10"),
+            "gsm_sip_bridge_vowifi_registration_expires_in_seconds{module=\"ec20-12\"} -20\n"
+        );
+        let faults = expired_registrations(&body);
+        assert_eq!(faults.len(), 2, "{faults:?}");
+    }
+
+    #[test]
+    fn an_expired_line_flips_the_overall_verdict_unhealthy() {
+        let runner = MockCommandRunner::default();
+        let health = evaluate_with_metrics(
+            &runner,
+            true,
+            true,
+            true,
+            &resolution(vec![]),
+            "strongswan",
+            &metrics_with_expiry("ec20-11", "-9752"),
+        );
+        assert!(!health.is_healthy(), "{health:?}");
     }
 
     /// Makes `ip addr show <iface>` in `netns` report an address.

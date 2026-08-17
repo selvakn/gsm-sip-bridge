@@ -249,6 +249,18 @@ pub trait CommandRunner: Send + Sync {
     /// genuinely working deployment as unhealthy.
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool;
 
+    /// Fetch a URL over plain HTTP/1.0, returning the response body.
+    ///
+    /// Exists so the container healthcheck can read the daemon's own
+    /// `/metrics` rather than merely proving the port accepts a connection --
+    /// a distinction that mattered on 2026-08-16, when the port answered
+    /// perfectly while the line behind it had been unreachable for hours
+    /// (specs/039-at-stall-watchdog, FR-020).
+    ///
+    /// Routed through the runner like every other real-world effect, so the
+    /// healthcheck's decision logic stays a pure function over the body.
+    fn http_get(&self, url: &str) -> Option<String>;
+
     /// Resolve `host` to its IPv4 addresses via the system resolver
     /// (getaddrinfo, honoring `/etc/resolv.conf`). Replaces the `dig +short A`
     /// shell-out that used to back ePDG resolution, so the runtime image no
@@ -478,6 +490,37 @@ impl CommandRunner for RealCommandRunner {
             return false;
         };
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+    }
+
+    fn http_get(&self, url: &str) -> Option<String> {
+        use std::io::{Read, Write};
+        use std::net::ToSocketAddrs;
+
+        // Deliberately hand-rolled rather than pulling in an HTTP client: the
+        // only caller fetches one loopback URL from the healthcheck, and a new
+        // dependency for that would be out of proportion. Every step is
+        // bounded -- this runs inside a container HEALTHCHECK with its own 5s
+        // limit, and a probe that hangs is a probe that reports nothing.
+        let rest = url.strip_prefix("http://")?;
+        let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, format!("/{p}")),
+            None => (rest, "/".to_string()),
+        };
+        let addr = authority.to_socket_addrs().ok()?.next()?;
+        let timeout = std::time::Duration::from_secs(3);
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
+        stream.set_read_timeout(Some(timeout)).ok()?;
+        stream.set_write_timeout(Some(timeout)).ok()?;
+        // HTTP/1.0 so the server closes the connection when done and the read
+        // below terminates without having to parse Content-Length.
+        write!(stream, "GET {path} HTTP/1.0\r\nHost: {authority}\r\n\r\n").ok()?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).ok()?;
+        let (head, body) = raw.split_once("\r\n\r\n")?;
+        if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") {
+            return None;
+        }
+        Some(body.to_string())
     }
 
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
@@ -910,6 +953,9 @@ mod mock {
         /// unseeded hosts resolve to an empty address list (no real DNS in
         /// tests).
         pub resolve_results: Mutex<Map<String, Vec<std::net::Ipv4Addr>>>,
+        /// Overrides `http_get`'s response body for a given URL; unseeded URLs
+        /// return `None` (no real HTTP in tests).
+        pub http_responses: Mutex<Map<String, String>>,
         /// Argv substrings that make a future `spawn()` create its child
         /// already dead (`is_alive` false from the start) — lets a test
         /// force a deterministic `EstablishOutcome::FatalProcessDied` for a
@@ -1182,6 +1228,10 @@ mod mock {
                 .get(&format!("{host}:{port}"))
                 .copied()
                 .unwrap_or(false)
+        }
+
+        fn http_get(&self, url: &str) -> Option<String> {
+            self.http_responses.lock().unwrap().get(url).cloned()
         }
 
         fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
