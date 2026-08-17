@@ -59,7 +59,7 @@ use super::bridge::BridgeLine;
 pub fn run(
     line: &BridgeLine,
     app_config: &AppConfig,
-    modem_lock: Arc<Mutex<()>>,
+    modem_lock: Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: Arc<Mutex<super::sms::Dedupe>>,
     pbx_registered: Option<Arc<AtomicBool>>,
 ) {
@@ -84,7 +84,14 @@ pub fn run(
     // *before* it rebinds, so the container's cleanup can restore it even if
     // this line is killed mid-attach.
     let plmn = {
-        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_guard) = modem_lock.lock() else {
+            tracing::error!(
+                card_id = %line.card_id,
+                "could not get the modem to attach: another user of the AT port has held it \
+                 beyond the timeout"
+            );
+            return;
+        };
         let attach = match super::attach(&line.settings) {
             Ok(a) => a,
             Err(e) => {
@@ -157,7 +164,18 @@ pub fn run(
     let attach_modem = line.settings.modem_port.clone();
     let attach_lock = modem_lock.clone();
     let attachment_check = move || {
-        let _guard = attach_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_guard) = attach_lock.lock() else {
+            // We could not look, so we must not claim the attachment is gone:
+            // this check's only consumer ends a live call when it returns
+            // false, and dropping a working call because the *lock* was busy
+            // would be a worse error than a delayed detection. A genuinely
+            // dead attachment still surfaces through the call's own signalling.
+            tracing::warn!(
+                "could not check the attachment: the modem is held by another user; \
+                 assuming it is still up rather than ending the call on a guess"
+            );
+            return true;
+        };
         super::is_attached(&attach_modem)
     };
 

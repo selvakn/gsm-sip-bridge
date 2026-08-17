@@ -23,10 +23,12 @@
 //! historical path after its implementation moved into a submodule.
 
 pub mod at_commander;
+pub(crate) mod at_worker;
 pub mod audio_pipeline;
 pub mod beep;
 pub mod card;
 pub mod discovery;
+pub mod modem_lock;
 pub mod pcsc_card;
 pub mod pcsc_list;
 pub mod scheduler;

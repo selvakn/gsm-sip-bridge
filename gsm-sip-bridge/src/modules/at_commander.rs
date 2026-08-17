@@ -1,6 +1,6 @@
 use crate::error::{BridgeError, BridgeResult};
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -44,8 +44,53 @@ const BAUD_RATE: u32 = 115200;
 /// recipe, so the same wait.
 const RADIO_CYCLE_DELAY: Duration = Duration::from_secs(4);
 
+/// Slack added to the port's own timeout when waiting on the worker.
+///
+/// The worker applies the port timeout internally, so in normal operation it
+/// always answers first and this outer wait never fires. It exists only to
+/// catch the case the worker cannot report itself: its own `read(2)` never
+/// returning.
+const WORKER_GRACE: Duration = Duration::from_secs(2);
+
+/// How the commands issued through this handle actually reach a modem.
+enum Transport {
+    /// A real serial port, owned by a worker thread
+    /// (specs/039-at-stall-watchdog). The caller waits on a channel with its
+    /// own deadline, so a `read(2)` that never returns costs a leaked worker
+    /// rather than a frozen line.
+    Worker {
+        tx: std::sync::mpsc::Sender<crate::modules::at_worker::Request>,
+        timeout: Duration,
+        /// Set once a command has timed out. The next command resyncs before
+        /// doing anything else; if that fails the channel is dead and every
+        /// further command fails fast rather than queueing behind a worker
+        /// that may never come back.
+        state: ChannelState,
+    },
+    /// An in-memory stream, used only by tests.
+    ///
+    /// No worker: an in-memory `Read` cannot block on a syscall, so the whole
+    /// reason the worker exists does not apply, and giving every scripted test
+    /// a thread would buy nothing. Verified at the time of writing that all 26
+    /// `from_stream` call sites are inside `#[cfg(test)]`.
+    Direct(Box<crate::modules::at_worker::Session>),
+}
+
+/// Whether this handle's link to its worker is still usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelState {
+    Healthy,
+    /// A command timed out; try to resync before the next one.
+    Suspect,
+    /// Resync and reopen both failed — the worker is stuck holding the port.
+    Dead,
+}
+
 pub struct AtCommander {
-    port: Box<dyn ReadWrite + Send>,
+    transport: Transport,
+    /// Kept so a dead channel can attempt a fresh open before giving up
+    /// (FR-036). `None` for the in-memory test transport, which has no path.
+    path: Option<std::path::PathBuf>,
 }
 
 pub trait ReadWrite: Read + Write {}
@@ -175,21 +220,64 @@ impl AtCommander {
     /// inode via different file descriptions — confirmed empirically) —
     /// every real-device open would have failed, always. Nothing here needs
     /// to add locking; `serialport` already provides it, correctly, for free.
+    ///
+    /// That still holds — but note it is *cross-process* exclusion only.
+    /// Threads within this process contend through
+    /// [`crate::modules::modem_lock::ModemLock`], and since
+    /// specs/039-at-stall-watchdog the port itself is owned by a worker thread
+    /// rather than by the returned handle: a `read(2)` that never comes back
+    /// therefore strands that worker, and with it this `flock`, until the
+    /// process exits. That is deliberate — see `modules::at_worker` for why
+    /// bounding the caller is worth stranding the worker — but it means "the
+    /// port is free again" is not something a surviving process can assume
+    /// after a timeout. `AtCommander::ensure_usable` is what tries to find out.
     pub fn open_with_timeout(path: &Path, timeout: Duration) -> BridgeResult<Self> {
+        let (tx, worker_rx) = std::sync::mpsc::channel();
+        let session = Self::open_session(path, timeout)?;
+        std::thread::Builder::new()
+            .name(format!(
+                "at-port-{}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into())
+            ))
+            .spawn(move || crate::modules::at_worker::run(session, worker_rx))
+            .map_err(|e| {
+                BridgeError::Discovery(format!("could not start the AT port worker: {e}"))
+            })?;
+        Ok(Self {
+            transport: Transport::Worker {
+                tx,
+                timeout,
+                state: ChannelState::Healthy,
+            },
+            path: Some(path.to_path_buf()),
+        })
+    }
+
+    fn open_session(
+        path: &Path,
+        timeout: Duration,
+    ) -> BridgeResult<crate::modules::at_worker::Session> {
         let port = serialport::new(path.to_string_lossy(), BAUD_RATE)
             .timeout(timeout)
             .open()
             .map_err(|e| {
                 BridgeError::Discovery(format!("failed to open serial {}: {e}", path.display()))
             })?;
-        Ok(Self {
-            port: Box::new(port),
-        })
+        Ok(crate::modules::at_worker::Session::new(
+            Box::new(port),
+            timeout,
+        ))
     }
 
-    pub fn from_stream<S: Read + Write + Send + 'static>(stream: S, _timeout: Duration) -> Self {
+    pub fn from_stream<S: Read + Write + Send + 'static>(stream: S, timeout: Duration) -> Self {
         Self {
-            port: Box::new(stream),
+            transport: Transport::Direct(Box::new(crate::modules::at_worker::Session::new(
+                Box::new(stream),
+                timeout,
+            ))),
+            path: None,
         }
     }
 
@@ -214,81 +302,168 @@ impl AtCommander {
 
     pub fn send_command(&mut self, cmd: &str) -> BridgeResult<AtResponse> {
         record_last_at_command(cmd);
-        let full_cmd = format!("{cmd}\r\n");
-        let port = self.port.as_mut();
-        port.write_all(full_cmd.as_bytes())
-            .map_err(|e| BridgeError::Discovery(format!("AT write failed: {e}")))?;
-        port.flush()
-            .map_err(|e| BridgeError::Discovery(format!("AT flush failed: {e}")))?;
-
-        tracing::trace!(target: "at", cmd = cmd, "sent");
-        self.read_response()
-    }
-
-    fn read_response(&mut self) -> BridgeResult<AtResponse> {
-        let mut reader = BufReader::new(self.port.as_mut() as &mut dyn Read);
-        let mut lines = Vec::new();
-
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let trimmed = line.trim().to_string();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    tracing::trace!(target: "at", line = %trimmed, "recv");
-                    if trimmed == "OK" {
-                        return Ok(AtResponse::Ok(lines));
-                    } else if trimmed == "ERROR" {
-                        return Ok(AtResponse::Error("ERROR".into()));
-                    } else if let Some(cme) = trimmed.strip_prefix("+CME ERROR: ") {
-                        let code = cme.parse::<u32>().unwrap_or(0);
-                        return Ok(AtResponse::CmeError(code, cme.into()));
-                    } else {
-                        lines.push(trimmed);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    return Err(BridgeError::Discovery("AT command timeout".into()));
-                }
-                Err(e) => {
-                    return Err(BridgeError::Discovery(format!("AT read error: {e}")));
-                }
+        match &mut self.transport {
+            Transport::Direct(session) => session.send_command(cmd),
+            Transport::Worker { .. } => {
+                self.ensure_usable()?;
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                self.dispatch(
+                    crate::modules::at_worker::Request::Command {
+                        cmd: cmd.to_string(),
+                        reply: reply_tx,
+                    },
+                    reply_rx,
+                )
             }
         }
-        Ok(AtResponse::Ok(lines))
     }
 
     pub fn read_line_raw(&mut self) -> BridgeResult<String> {
-        let mut buf = [0u8; 1];
-        let mut line = Vec::new();
-
-        loop {
-            match self.port.as_mut().read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if buf[0] == b'\n' {
-                        break;
-                    }
-                    if buf[0] != b'\r' {
-                        line.push(buf[0]);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    if line.is_empty() {
-                        return Err(BridgeError::Discovery("AT read timeout".into()));
-                    }
-                    break;
-                }
-                Err(e) => {
-                    return Err(BridgeError::Discovery(format!("AT read error: {e}")));
-                }
+        match &mut self.transport {
+            Transport::Direct(session) => session.read_line_raw(),
+            Transport::Worker { .. } => {
+                self.ensure_usable()?;
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                self.dispatch(
+                    crate::modules::at_worker::Request::ReadLine { reply: reply_tx },
+                    reply_rx,
+                )
             }
         }
+    }
 
-        Ok(String::from_utf8_lossy(&line).to_string())
+    /// Hand a request to the worker and wait for it, bounded by our own
+    /// deadline rather than the port's.
+    ///
+    /// The deadline is deliberately a little longer than the port's own
+    /// timeout: the worker applies that timeout internally, so under normal
+    /// operation it always answers first and this outer bound only fires when
+    /// the worker itself is stuck in a syscall that will not return.
+    fn dispatch<T>(
+        &mut self,
+        request: crate::modules::at_worker::Request,
+        reply_rx: std::sync::mpsc::Receiver<BridgeResult<T>>,
+    ) -> BridgeResult<T> {
+        let Transport::Worker { tx, timeout, state } = &mut self.transport else {
+            unreachable!("dispatch is only reached on the worker transport");
+        };
+        let wait = *timeout + WORKER_GRACE;
+        if tx.send(request).is_err() {
+            *state = ChannelState::Dead;
+            return Err(BridgeError::Discovery(
+                "the AT port worker has stopped".into(),
+            ));
+        }
+        match reply_rx.recv_timeout(wait) {
+            Ok(result) => {
+                if result.is_err() {
+                    // The worker answered, but the command failed -- most
+                    // likely its own timeout. Treat the channel as suspect so
+                    // the next command resyncs rather than risking a stale
+                    // reply being read as its answer.
+                    *state = ChannelState::Suspect;
+                }
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                *state = ChannelState::Suspect;
+                Err(BridgeError::Discovery("AT command timeout".into()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                *state = ChannelState::Dead;
+                Err(BridgeError::Discovery(
+                    "the AT port worker has stopped".into(),
+                ))
+            }
+        }
+    }
+
+    /// Bring a suspect channel back, or conclude it is dead (FR-036/FR-037).
+    ///
+    /// Cheapest remedy first. A resync costs one bare `AT` and rescues the
+    /// common case where the worker was merely slow -- no restart, no
+    /// interruption. Only if the worker will not answer at all do we try a
+    /// fresh open, which succeeds if the stuck worker has since finished and
+    /// dropped the port. If that fails too, the port is held by a worker that
+    /// is never coming back, and nothing short of restarting this process will
+    /// free it -- so the channel is marked dead and every subsequent command
+    /// fails immediately instead of queueing behind it.
+    fn ensure_usable(&mut self) -> BridgeResult<()> {
+        let state = match &self.transport {
+            Transport::Worker { state, .. } => *state,
+            Transport::Direct(_) => return Ok(()),
+        };
+        match state {
+            ChannelState::Healthy => Ok(()),
+            ChannelState::Dead => Err(BridgeError::Discovery(
+                "the AT port is held by an abandoned operation and cannot be used;                  this line needs to be restarted"
+                    .into(),
+            )),
+            ChannelState::Suspect => {
+                if self.try_resync() {
+                    if let Transport::Worker { state, .. } = &mut self.transport {
+                        *state = ChannelState::Healthy;
+                    }
+                    return Ok(());
+                }
+                if self.try_reopen() {
+                    return Ok(());
+                }
+                if let Transport::Worker { state, .. } = &mut self.transport {
+                    *state = ChannelState::Dead;
+                }
+                Err(BridgeError::Discovery(
+                    "the AT port could not be resynchronised or reopened;                      this line needs to be restarted"
+                        .into(),
+                ))
+            }
+        }
+    }
+
+    fn try_resync(&mut self) -> bool {
+        let (tx, timeout) = match &self.transport {
+            Transport::Worker { tx, timeout, .. } => (tx.clone(), *timeout),
+            Transport::Direct(_) => return true,
+        };
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if tx
+            .send(crate::modules::at_worker::Request::Resync { reply: reply_tx })
+            .is_err()
+        {
+            return false;
+        }
+        matches!(reply_rx.recv_timeout(timeout + WORKER_GRACE), Ok(Ok(())))
+    }
+
+    /// Try to take the port over with a brand-new worker.
+    fn try_reopen(&mut self) -> bool {
+        let (Some(path), Transport::Worker { timeout, .. }) = (self.path.clone(), &self.transport)
+        else {
+            return false;
+        };
+        let timeout = *timeout;
+        let Ok(session) = Self::open_session(&path, timeout) else {
+            // Expected whenever the abandoned worker still holds the flock.
+            return false;
+        };
+        let (tx, worker_rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("at-port-reopen".to_string())
+            .spawn(move || crate::modules::at_worker::run(session, worker_rx))
+            .is_err()
+        {
+            return false;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "reopened the modem port after an abandoned AT operation; the previous worker              had released it"
+        );
+        self.transport = Transport::Worker {
+            tx,
+            timeout,
+            state: ChannelState::Healthy,
+        };
+        true
     }
 
     pub fn check_signal(&mut self) -> BridgeResult<(u8, u8)> {

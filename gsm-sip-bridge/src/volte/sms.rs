@@ -290,7 +290,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn run_modem_reader(
     modem_port: PathBuf,
     control_addr: SocketAddr,
-    modem_lock: Arc<Mutex<()>>,
+    modem_lock: Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: Arc<Mutex<Dedupe>>,
 ) {
     // This thread is detached and, before specs/039-at-stall-watchdog, entirely
@@ -434,12 +434,20 @@ fn open_with_retry(modem_port: &Path) -> BridgeResult<AtCommander> {
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
-    modem_lock: &Arc<Mutex<()>>,
+    modem_lock: &Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: &Arc<Mutex<Dedupe>>,
 ) -> BridgeResult<()> {
     // Phase 1a: text mode + list indexes — one brief, combined session.
     let indexes = {
-        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Bounded (specs/039-at-stall-watchdog): skipping this pass and
+        // retrying in 20s is strictly better than joining a queue behind a
+        // wedged holder, which is how one stuck activity used to become
+        // several.
+        let Some(_guard) = modem_lock.lock() else {
+            return Err(crate::error::BridgeError::Discovery(
+                "the modem is held by another user beyond the timeout; skipping this sweep".into(),
+            ));
+        };
         let mut at = open_with_retry(modem_port)?;
         // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
         let _ = at.send_command("AT+CMGF=1")?;
@@ -455,9 +463,13 @@ fn sweep_modem_storage(
     let mut messages = Vec::with_capacity(indexes.len());
     for index in indexes {
         let sms = {
-            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            open_with_retry(modem_port)
-                .and_then(|mut at| crate::sms::reader::read_sms(&mut at, index))
+            match modem_lock.lock() {
+                Some(_guard) => open_with_retry(modem_port)
+                    .and_then(|mut at| crate::sms::reader::read_sms(&mut at, index)),
+                None => Err(crate::error::BridgeError::Discovery(
+                    "the modem is held by another user beyond the timeout".into(),
+                )),
+            }
         };
         match sms {
             Ok(sms) => messages.push(sms),
@@ -536,9 +548,13 @@ fn sweep_modem_storage(
     // session per message, for the same reason as phase 1b.
     for index in to_delete {
         let result = {
-            let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
-            open_with_retry(modem_port)
-                .and_then(|mut at| crate::sms::reader::delete_sms(&mut at, index))
+            match modem_lock.lock() {
+                Some(_guard) => open_with_retry(modem_port)
+                    .and_then(|mut at| crate::sms::reader::delete_sms(&mut at, index)),
+                None => Err(crate::error::BridgeError::Discovery(
+                    "the modem is held by another user beyond the timeout".into(),
+                )),
+            }
         };
         if let Err(e) = result {
             tracing::warn!(index, error = %e, "relayed the message but could not clear it; the dedupe will suppress the re-read");

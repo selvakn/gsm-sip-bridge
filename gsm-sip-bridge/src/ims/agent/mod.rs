@@ -291,7 +291,7 @@ fn run_inner(
     // protect and no cellular bearer to poll.
     let dedupe = Arc::new(Mutex::new(crate::volte::sms::Dedupe::default()));
     let modem_lock = if wants_modem_sms_reader(config.pcsc_reader) {
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(crate::modules::modem_lock::ModemLock::new());
         let modem_port = PathBuf::from(&config.modem_port);
         let sweep_lock = lock.clone();
         let sweep_dedupe = dedupe.clone();
@@ -377,7 +377,7 @@ pub(crate) struct InboundParams<'a> {
     /// other user of the same port — the modem SMS reader (specs/038), on
     /// either path now. `None` only for a `pcsc_reader` line, which has no
     /// modem/AT port at all.
-    pub modem_lock: Option<Arc<Mutex<()>>>,
+    pub modem_lock: Option<Arc<crate::modules::modem_lock::ModemLock>>,
     /// Shared with this line's modem SMS reader (specs/038-reliable-sms-delivery)
     /// so a message delivered over both the registration and the modem
     /// collapses to one: whichever route sees it first wins, the other
@@ -466,9 +466,23 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // the cellular path's SMS reader also uses (no-op on Wi-Fi, where the lock
     // is `None`).
     let mut session = {
-        let _guard = modem_lock
-            .as_ref()
-            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        // A bounded acquire: if another user of this modem is wedged, fail the
+        // registration attempt rather than waiting on it forever. The
+        // supervisor retries, which is a far better outcome than an agent that
+        // never finishes starting up and never says why.
+        let _guard = match modem_lock.as_ref() {
+            Some(l) => match l.lock() {
+                Some(g) => Some(g),
+                None => {
+                    return Err(BridgeError::Ims(
+                        "could not get the modem to register: another user of the AT port has \
+                         held it beyond the timeout"
+                            .into(),
+                    ))
+                }
+            },
+            None => None,
+        };
         match crate::ims::register_session(reg_cfg) {
             Ok(s) => s,
             Err(e) => {
@@ -826,7 +840,7 @@ struct DispatchParams<'a> {
     veth_sip_port: u16,
     pre_renewal: Option<&'a PreRenewalHook>,
     attachment_check: Option<&'a AttachmentHook>,
-    modem_lock: Option<&'a Arc<Mutex<()>>>,
+    modem_lock: Option<&'a Arc<crate::modules::modem_lock::ModemLock>>,
     dedupe: &'a Arc<Mutex<crate::volte::sms::Dedupe>>,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
@@ -1474,9 +1488,35 @@ impl LoopState {
         // AT port. Serialises with the cellular SMS reader that shares that
         // port (research R6); `None`, so a no-op, on the Wi-Fi path. Released
         // when this returns.
-        let _modem_guard = p
-            .modem_lock
-            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        //
+        // Bounded (specs/039-at-stall-watchdog, FR-005): the SMS sweep holds
+        // this lock every 20s while it does its own AT work, so an unbounded
+        // wait here is how a wedged sweep used to take the registration down
+        // with it. Failing the renewal instead lands on the existing backoff,
+        // and the watchdog is still watching in case nothing recovers.
+        let _modem_guard = match p.modem_lock {
+            Some(l) => match l.lock() {
+                Some(g) => Some(g),
+                None => {
+                    tracing::warn!(
+                        retry_in_secs = self.backoff.as_secs(),
+                        "cannot renew: another user of the modem has held it beyond the timeout"
+                    );
+                    let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.state = crate::ims::RegistrationState::Failed;
+                    guard.last_failure = Some((
+                        SystemTime::now(),
+                        "the modem was held by another user beyond the timeout".to_string(),
+                    ));
+                    drop(guard);
+                    p.obs.set_registered(false);
+                    self.next_renewal_attempt = Some(Instant::now() + self.backoff);
+                    self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
         // Rebuild the layer underneath before spending a REGISTER on it.
         // Reaching here already means no call is in progress (the maintenance
         // policy deferred it above otherwise), which is precisely how

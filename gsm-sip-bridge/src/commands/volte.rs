@@ -1159,7 +1159,7 @@ pub(crate) fn handle_volte_carrier_agent_command(
     };
 
     let modem_port = line.settings.modem_port.clone();
-    let modem_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let modem_lock = std::sync::Arc::new(crate::modules::modem_lock::ModemLock::new());
     // Shared with `carrier_agent::run` below, not owned by the sweep thread:
     // the same message delivered over both the registration and the modem
     // must collapse to one (specs/038-reliable-sms-delivery).

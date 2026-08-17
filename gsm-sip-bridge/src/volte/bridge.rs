@@ -318,7 +318,7 @@ fn run_line(
     // interleave on it (research R6): the carrier half (attach, registration,
     // renewal, re-attachment) and the modem SMS reader. Each line has its own
     // modem, so each has its own lock. Both outlive every retry below.
-    let modem_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let modem_lock = std::sync::Arc::new(crate::modules::modem_lock::ModemLock::new());
     // Shared with `carrier_agent::run` below, not owned by the sweep thread:
     // the same message delivered over both the registration and the modem
     // must collapse to one (specs/038-reliable-sms-delivery).
