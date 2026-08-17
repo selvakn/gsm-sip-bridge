@@ -1586,16 +1586,30 @@ fn start_line_tail(
                     }
                     runner.sleep(Duration::from_secs(1));
                 }
-                println!("[supervise] line {idx}: vowifi-ims-agent exited; restarting in 5s");
                 had_restart = true;
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
-                let outcome = if sim_recovery::has_csim_failure(&log_content) {
+                // A stall is checked first: a run that stalled may *also* have
+                // an older `AT+CSIM failed` earlier in its log, and the stall is
+                // the more specific and more recent explanation for this exit.
+                let outcome = if sim_recovery::has_at_stall(&log_content) {
+                    sim_recovery::AgentExitOutcome::AtStall
+                } else if sim_recovery::has_csim_failure(&log_content) {
                     sim_recovery::AgentExitOutcome::CsimFailure
                 } else {
                     sim_recovery::AgentExitOutcome::Other
                 };
                 let action = csim_fails.observe(outcome);
+                let restart_delay = csim_fails.restart_delay();
+                let reason = match outcome {
+                    sim_recovery::AgentExitOutcome::AtStall => " (stalled on the modem)",
+                    sim_recovery::AgentExitOutcome::CsimFailure => " (AT+CSIM failure)",
+                    sim_recovery::AgentExitOutcome::Other => "",
+                };
+                println!(
+                    "[supervise] line {idx}: vowifi-ims-agent exited{reason}; restarting in {}s",
+                    restart_delay.as_secs()
+                );
                 if action == sim_recovery::Action::ResetSim {
                     let holder = usim_holder.lock().unwrap().clone();
                     let reset_log = PathBuf::from(format!("/tmp/sim-reset-{idx}.log"));
@@ -1609,17 +1623,21 @@ fn start_line_tail(
                 if action == sim_recovery::Action::GiveUpForThisIncident {
                     tracing::error!(
                         line = idx,
+                        retry_in_secs = sim_recovery::EXHAUSTED_RESTART_DELAY.as_secs(),
                         "SIM recovery exhausted (MAX_SIM_RESETS reached this incident); \
-                         giving up on this reset cycle, will keep retrying the agent"
+                         backing off to a slow retry so the line still recovers by itself \
+                         if the hardware does, without restarting in a tight loop"
                     );
                 }
                 if let Some(kind) = sim_alert_transition(action, &mut given_up_alerted) {
                     if let Some(ctx) = &alert_ctx {
                         let description = match kind {
                             alerts::CriticalEventKind::Failure => {
-                                "VoWiFi line's SIM recovery exhausted (max resets reached this incident)"
+                                "VoWiFi line's modem recovery exhausted (max SIM resets reached \
+                                 this incident); the line is now on a slow retry and will \
+                                 recover by itself only if the hardware does"
                             }
-                            alerts::CriticalEventKind::Recovered => "VoWiFi line's SIM recovered",
+                            alerts::CriticalEventKind::Recovered => "VoWiFi line's modem recovered",
                         };
                         ctx.fire(alerts::CriticalEvent {
                             category: alerts::AlertCategory::ModuleLifecycle,
@@ -1632,7 +1650,7 @@ fn start_line_tail(
                     }
                 }
 
-                runner.sleep(Duration::from_secs(5));
+                runner.sleep(restart_delay);
             }
         });
     }
