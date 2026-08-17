@@ -442,11 +442,14 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             None
         }
     };
-    let reporter = Reporter::spawn(
+    // Watched, so the heartbeat stops while this line is stalled and the
+    // liveness gauges tell the truth (specs/039-at-stall-watchdog, FR-021).
+    let reporter = Reporter::spawn_watched(
         app_config.control.socket_path.clone(),
         agent_kind,
         card_id.to_string(),
         Duration::from_secs(app_config.metrics.agent_report_interval_seconds),
+        Some(Arc::clone(&progress)),
     );
     // Both paths run this code; the store's call rows must carry the right
     // transport or VoLTE and VoWiFi history collapse into one.
@@ -518,12 +521,14 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     let mut inbound = start_inbound(&session)?;
     subscribe_reg_event(&mut session);
 
+    // What the registrar actually granted, not what we asked for: renewing on
+    // the requested value would leave a window where the binding has lapsed
+    // while we still believe it is live (FR-023).
+    let granted_expires = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
     let status = Arc::new(Mutex::new(crate::ims::RegistrationStatus {
         state: crate::ims::RegistrationState::Registered,
         registered_at: Some(SystemTime::now()),
-        expires_at: Some(
-            SystemTime::now() + Duration::from_secs(crate::ims::DEFAULT_EXPIRES as u64),
-        ),
+        expires_at: Some(SystemTime::now() + Duration::from_secs(granted_expires as u64)),
         last_failure: None,
         // Health starts able-to-answer: we reach here only after a successful
         // registration, and the attachment underneath it is up (the Wi-Fi path
@@ -1440,13 +1445,25 @@ impl LoopState {
         // Never renew mid-call — that would tear down the transport a call's
         // own signaling (e.g. the eventual BYE) still needs; renewal is
         // deferred until the call ends.
-        let expires_at = p
-            .status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .expires_at;
-        let due = expires_at
-            .is_some_and(|e| crate::ims::renewal_due(SystemTime::now(), e, RENEWAL_HEADROOM));
+        let (expires_at, registered_at) = {
+            let guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            (guard.expires_at, guard.registered_at)
+        };
+        // The headroom scales to the lifetime the registrar actually granted
+        // (FR-024). The granted value needs no separate field: it is exactly
+        // the span the status already records. Without the scaling, a grant
+        // shorter than twice the fixed headroom would make `renewal_due`
+        // permanently true and re-register on every idle poll, once a second,
+        // forever.
+        let headroom = match (expires_at, registered_at) {
+            (Some(exp), Some(reg)) => crate::ims::renewal_headroom_for(
+                exp.duration_since(reg).unwrap_or(RENEWAL_HEADROOM),
+                RENEWAL_HEADROOM,
+            ),
+            _ => RENEWAL_HEADROOM,
+        };
+        let due =
+            expires_at.is_some_and(|e| crate::ims::renewal_due(SystemTime::now(), e, headroom));
         // `force_renewal` is the Gm-liveness escalation: re-register now even
         // though expiry is far off, because only a re-registration can
         // renegotiate a Gm SA that has gone dead underneath the connection
@@ -1559,12 +1576,14 @@ impl LoopState {
                 // A renewal negotiates a fresh Gm SA on fresh ports, so the old
                 // listeners are now bound to dead ones.
                 *inbound = start_inbound(session)?;
+                // Re-read the granted lifetime on every renewal: a registrar is free to
+                // grant a different one each time, and carrying the first
+                // response's value forever would eventually mis-time renewal.
+                let granted = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
                 let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
                 guard.state = crate::ims::RegistrationState::Registered;
                 guard.registered_at = Some(SystemTime::now());
-                guard.expires_at = Some(
-                    SystemTime::now() + Duration::from_secs(crate::ims::DEFAULT_EXPIRES as u64),
-                );
+                guard.expires_at = Some(SystemTime::now() + Duration::from_secs(granted as u64));
                 // A renewal only reaches here through a successful re-attach
                 // (the hook above), so the attachment is up.
                 guard.attached = true;

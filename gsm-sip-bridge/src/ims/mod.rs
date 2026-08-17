@@ -182,6 +182,15 @@ pub(crate) struct RegisteredSession {
 }
 
 impl RegisteredSession {
+    /// The lifetime the registrar granted this binding, in seconds.
+    ///
+    /// Falls back to `requested` when the response says nothing, which keeps
+    /// behaviour identical on the networks in use today — every current
+    /// carrier grants the hour that was asked for.
+    pub(crate) fn granted_expires(&self, requested: u32) -> u32 {
+        granted_expires(&self.headers, requested)
+    }
+
     /// The identity to originate requests from, as a bare `user@host` (every
     /// caller wraps it as `sip:{}`).
     ///
@@ -526,8 +535,20 @@ impl RegistrationStatus {
     /// applies. `registered` is *only* the `Registered` state: `Renewing` or
     /// `Failed` cannot answer, which is the honest answer even mid-renewal.
     pub fn health(&self) -> crate::ims::lifecycle::ServiceHealth {
+        self.health_at(std::time::SystemTime::now())
+    }
+
+    /// [`Self::health`] with the clock injected, so expiry is testable without
+    /// waiting an hour.
+    ///
+    /// This is where `expires_at` finally gets *consulted*. It was recorded
+    /// from the first release and read by nothing: the 2026-08-16 status output
+    /// printed an expiry two and three-quarter hours in the past directly above
+    /// `can_answer: true`, because no code compared the two.
+    pub fn health_at(&self, now: std::time::SystemTime) -> crate::ims::lifecycle::ServiceHealth {
         crate::ims::lifecycle::ServiceHealth {
             registered: self.state == RegistrationState::Registered,
+            registration_expired: self.expires_at.is_some_and(|e| now >= e),
             attached: self.attached,
             pbx_registered: self.pbx_registered,
             gm_connection_up: self.gm_connection.is_up(),
@@ -544,6 +565,53 @@ impl RegistrationStatus {
 /// actually lapse (FR-001/FR-007: no gap in which an inbound call would go
 /// unanswered). Pure and clock-injectable so it's testable without waiting
 /// on a real timer.
+/// The registration lifetime the network actually granted.
+///
+/// A registrar may grant less than was requested, and renewing on the requested
+/// value would then leave a window where the binding has lapsed but we still
+/// believe it is live. Prefers the `Expires` header, falls back to `Contact`'s
+/// `expires=` parameter, then to what was asked for.
+pub fn granted_expires(headers: &[(String, String)], requested: u32) -> u32 {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("expires") {
+            if let Ok(v) = value.trim().parse::<u32>() {
+                return v;
+            }
+        }
+    }
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("contact") {
+            if let Some(rest) = value.to_ascii_lowercase().find("expires=").map(|i| i + 8) {
+                let tail: String = value[rest..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(v) = tail.parse::<u32>() {
+                    return v;
+                }
+            }
+        }
+    }
+    requested
+}
+
+/// How far before expiry to renew, for a registration of `granted` seconds.
+///
+/// Honouring a short granted lifetime is only safe together with this. The
+/// headroom used to be a flat 300s against an assumed 3600s lifetime; the
+/// moment a registrar grants less than twice the headroom, `renewal_due`
+/// becomes permanently true and the agent re-registers on *every idle poll* —
+/// once per second — for as long as the line is up. Scaling the margin to the
+/// lifetime keeps a comfortable early renewal without that runaway.
+///
+/// Pure and clock-free, like `renewal_due`, so the schedule is testable.
+pub fn renewal_headroom_for(
+    granted: std::time::Duration,
+    preferred: std::time::Duration,
+) -> std::time::Duration {
+    preferred.min(granted / 2)
+}
+
 pub fn renewal_due(
     now: std::time::SystemTime,
     expires_at: std::time::SystemTime,
@@ -1232,6 +1300,138 @@ mod tests {
             ..base
         };
         assert!(!renewing.health().can_answer());
+    }
+
+    #[test]
+    fn an_elapsed_registration_cannot_answer_however_healthy_it_looks() {
+        // The 2026-08-16 state, exactly: state still says Registered, the Gm
+        // connection is up, the attachment is fine — and the binding lapsed
+        // hours ago. `can_answer` said yes for 2h45m.
+        let now = SystemTime::now();
+        let status = RegistrationStatus {
+            state: RegistrationState::Registered,
+            registered_at: Some(now - Duration::from_secs(3600 + 9900)),
+            expires_at: Some(now - Duration::from_secs(9900)),
+            ..Default::default()
+        };
+        let health = status.health_at(now);
+        assert!(!health.can_answer());
+        assert_eq!(
+            health.blocked_reason(),
+            Some("the registration has expired"),
+            "the reason must name expiry, not the generic 'not registered' that made \
+             this take live forensics to diagnose"
+        );
+    }
+
+    #[test]
+    fn expiry_outranks_a_down_signalling_connection_in_the_reason() {
+        // Ordering matters: expiry is the cause, a dead Gm connection is a
+        // symptom, and reporting the symptom sends an operator to the wrong
+        // place.
+        let now = SystemTime::now();
+        let status = RegistrationStatus {
+            state: RegistrationState::Registered,
+            expires_at: Some(now - Duration::from_secs(60)),
+            gm_connection: GmConnectionState::Failed { since: now },
+            ..Default::default()
+        };
+        assert_eq!(
+            status.health_at(now).blocked_reason(),
+            Some("the registration has expired")
+        );
+    }
+
+    #[test]
+    fn a_registration_still_inside_its_lifetime_is_unaffected() {
+        let now = SystemTime::now();
+        let status = RegistrationStatus {
+            state: RegistrationState::Registered,
+            registered_at: Some(now),
+            expires_at: Some(now + Duration::from_secs(3600)),
+            ..Default::default()
+        };
+        let health = status.health_at(now);
+        assert!(health.can_answer());
+        assert_eq!(health.blocked_reason(), None);
+    }
+
+    #[test]
+    fn a_registration_with_no_recorded_expiry_is_never_treated_as_expired() {
+        // `expires_at: None` means "not known", not "long past" — reading it as
+        // expiry would take a healthy line out of service.
+        let now = SystemTime::now();
+        let status = RegistrationStatus {
+            state: RegistrationState::Registered,
+            expires_at: None,
+            ..Default::default()
+        };
+        assert!(status.health_at(now).can_answer());
+    }
+
+    #[test]
+    fn a_short_granted_lifetime_scales_the_headroom_instead_of_renewing_constantly() {
+        // The trap that opens the moment a granted lifetime is honoured: with a
+        // fixed 300s headroom, anything granted under 600s is *always* "due",
+        // so the agent re-registers on every idle poll — once a second —
+        // forever. Scaling the margin is what makes honouring the grant safe.
+        let preferred = Duration::from_secs(300);
+        let granted = Duration::from_secs(120);
+        let headroom = renewal_headroom_for(granted, preferred);
+        assert_eq!(headroom, Duration::from_secs(60));
+
+        let now = SystemTime::now();
+        let expires_at = now + granted;
+        assert!(
+            !renewal_due(now, expires_at, headroom),
+            "a freshly granted 120s registration must not already be due"
+        );
+        assert!(
+            renewal_due(now + Duration::from_secs(61), expires_at, headroom),
+            "it must still renew comfortably before it lapses"
+        );
+    }
+
+    #[test]
+    fn a_generous_granted_lifetime_keeps_the_preferred_headroom() {
+        let preferred = Duration::from_secs(300);
+        assert_eq!(
+            renewal_headroom_for(Duration::from_secs(3600), preferred),
+            preferred
+        );
+        // Exactly twice the headroom is the boundary where scaling starts.
+        assert_eq!(
+            renewal_headroom_for(Duration::from_secs(600), preferred),
+            preferred
+        );
+    }
+
+    #[test]
+    fn a_600s_grant_renews_at_300s_not_at_the_default_lifetime() {
+        let now = SystemTime::now();
+        let granted = Duration::from_secs(600);
+        let headroom = renewal_headroom_for(granted, Duration::from_secs(300));
+        let expires_at = now + granted;
+        assert!(!renewal_due(now, expires_at, headroom));
+        assert!(
+            renewal_due(now + Duration::from_secs(301), expires_at, headroom),
+            "must renew 300s in, not wait as if the lifetime were an hour"
+        );
+    }
+
+    #[test]
+    fn a_response_without_an_expires_header_falls_back_to_what_was_requested() {
+        // The current carriers all grant the hour asked for, so this is the
+        // path in production today: behaviour must be unchanged.
+        let headers = vec![("Via".to_string(), "SIP/2.0/TCP 10.0.0.1".to_string())];
+        assert_eq!(granted_expires(&headers, DEFAULT_EXPIRES), DEFAULT_EXPIRES);
+        assert_eq!(
+            renewal_headroom_for(
+                Duration::from_secs(DEFAULT_EXPIRES as u64),
+                Duration::from_secs(300)
+            ),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]

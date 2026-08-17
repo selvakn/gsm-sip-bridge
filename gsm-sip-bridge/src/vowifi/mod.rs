@@ -2115,6 +2115,16 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                 println!("    registered_at: {}", format_unix(registered_at));
                 println!("    expires_at: {}", format_unix(expires_at));
                 println!(
+                    "    expires_in: {}",
+                    format_expires_in(
+                        expires_at,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                );
+                println!(
                     "    gm_connection: {}",
                     if gm_connection.is_empty() {
                         "unknown"
@@ -2197,6 +2207,28 @@ pub fn format_unix(t: Option<u64>) -> String {
     t.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
+/// How long until the registration lapses, relative to `now`, rendered for an
+/// operator rather than as a bare unix timestamp.
+///
+/// A lapsed binding is called out explicitly. During the 2026-08-16 outage the
+/// status printed `expires_at: 1786878275` — a number nobody converts in their
+/// head — directly above `can_answer: true`, and the disagreement went unnoticed
+/// for nearly three hours.
+pub fn format_expires_in(expires_at: Option<u64>, now: u64) -> String {
+    match expires_at {
+        None => "-".to_string(),
+        Some(exp) => {
+            let remaining =
+                i64::try_from(exp).unwrap_or(i64::MAX) - i64::try_from(now).unwrap_or(0);
+            if remaining < 0 {
+                format!("{remaining}s (LAPSED)")
+            } else {
+                format!("{remaining}s")
+            }
+        }
+    }
+}
+
 /// Connects to `addr` (`host:port`), sends `StatusQuery`, and returns
 /// whatever single reply comes back. Used against both Agent A's status
 /// port and Agent B's control port — each answers with the reply variant
@@ -2217,6 +2249,25 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn expires_in_marks_a_lapsed_registration_rather_than_leaving_arithmetic_to_the_reader() {
+        // The literal numbers from the 2026-08-16 outage.
+        assert_eq!(
+            format_expires_in(Some(1_786_878_275), 1_786_888_027),
+            "-9752s (LAPSED)"
+        );
+    }
+
+    #[test]
+    fn expires_in_reports_remaining_time_while_the_registration_is_live() {
+        assert_eq!(format_expires_in(Some(1_000_600), 1_000_000), "600s");
+    }
+
+    #[test]
+    fn expires_in_is_blank_when_no_expiry_is_known() {
+        assert_eq!(format_expires_in(None, 1_000_000), "-");
+    }
 
     /// A `Read` that yields a scripted sequence of results, so a control
     /// message can be delivered in pieces with a `WouldBlock` (a poll-read

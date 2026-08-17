@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// research.md §R4: roughly 3 hours of heartbeats at the default 10s
 /// interval, or thousands of calls — far beyond any routine daemon restart,
@@ -75,6 +75,19 @@ impl Reporter {
         module_id: String,
         report_interval: Duration,
     ) -> Reporter {
+        Self::spawn_watched(socket_path, agent, module_id, report_interval, None)
+    }
+
+    /// Like [`Self::spawn`], but with the agent's progress handle so the
+    /// heartbeat can be withheld while the agent is stalled
+    /// (specs/039-at-stall-watchdog).
+    pub(crate) fn spawn_watched(
+        socket_path: String,
+        agent: AgentKind,
+        module_id: String,
+        report_interval: Duration,
+        progress: Option<Arc<crate::ims::agent::watchdog::Progress>>,
+    ) -> Reporter {
         let (tx, rx) = mpsc::sync_channel(CAPACITY);
         let ingress_dropped = Arc::new(AtomicU64::new(0));
         let ingress_dropped_worker = ingress_dropped.clone();
@@ -87,13 +100,16 @@ impl Reporter {
             .name(format!("observability-reporter-{}", agent.as_str()))
             .spawn(move || {
                 worker_loop(
-                    socket_path,
-                    agent,
-                    module_id,
-                    report_interval,
+                    WorkerConfig {
+                        socket_path,
+                        agent,
+                        module_id,
+                        report_interval,
+                        ingress_dropped: ingress_dropped_worker,
+                        epoch,
+                        progress,
+                    },
                     rx,
-                    ingress_dropped_worker,
-                    epoch,
                 )
             })
             .expect("failed to spawn observability reporter thread");
@@ -128,15 +144,54 @@ struct WorkerState {
     next_seq: u64,
 }
 
-fn worker_loop(
+/// Whether the periodic heartbeat should be sent.
+///
+/// Pure, so the policy is testable without a reporter, a socket or a clock.
+///
+/// An agent with no progress handle always heartbeats — that is every agent
+/// that is not stall-monitored, and withholding their heartbeat would report
+/// them as dead.
+fn should_heartbeat(
+    progress: Option<&crate::ims::agent::watchdog::Progress>,
+    now: Instant,
+) -> bool {
+    match progress {
+        None => true,
+        Some(p) => {
+            crate::ims::agent::watchdog::stall_verdict(
+                p.snapshot(),
+                None,
+                now,
+                crate::ims::agent::watchdog::DEFER_CEILING,
+            ) == crate::ims::agent::watchdog::StallVerdict::Healthy
+        }
+    }
+}
+
+/// Everything the sender thread needs. A struct rather than a positional list,
+/// matching `ims::agent`'s `DispatchParams`/`InboundParams` -- eight
+/// same-shaped arguments are easy to transpose silently.
+struct WorkerConfig {
     socket_path: String,
     agent: AgentKind,
     module_id: String,
     report_interval: Duration,
-    rx: mpsc::Receiver<ReporterCmd>,
     ingress_dropped: Arc<AtomicU64>,
     epoch: u64,
-) {
+    /// `None` for an agent that is not stall-monitored.
+    progress: Option<Arc<crate::ims::agent::watchdog::Progress>>,
+}
+
+fn worker_loop(cfg: WorkerConfig, rx: mpsc::Receiver<ReporterCmd>) {
+    let WorkerConfig {
+        socket_path,
+        agent,
+        module_id,
+        report_interval,
+        ingress_dropped,
+        epoch,
+        progress,
+    } = cfg;
     let mut state = WorkerState {
         queue: VecDeque::new(),
         dropped_since_last_send: 0,
@@ -157,8 +212,20 @@ fn worker_loop(
                 // Heartbeat: re-report the last known state with no events,
                 // so liveness (AGENT_UP) has something to key off during
                 // otherwise-idle periods (FR-021).
-                let hb_state = state.last_state;
-                enqueue(&mut state, agent, &module_id, hb_state, Vec::new());
+                //
+                // Withheld while the agent is stalled
+                // (specs/039-at-stall-watchdog, FR-021). This thread is
+                // independent of the dispatch loop, so it happily kept
+                // re-reporting a cached "everything is fine" for the entire
+                // 2h45m the line was unreachable. Falling silent instead lets
+                // the report age cross `staleness_threshold`, at which point
+                // `metrics::server::refresh_agent_liveness` *already* zeroes
+                // AGENT_UP and the VoWiFi gauges — reusing machinery that
+                // exists and is tested, rather than adding a parallel one.
+                if should_heartbeat(progress.as_deref(), Instant::now()) {
+                    let hb_state = state.last_state;
+                    enqueue(&mut state, agent, &module_id, hb_state, Vec::new());
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -250,6 +317,47 @@ fn send_one(socket_path: &str, report: &AgentReport) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ims::agent::watchdog::{Phase, Progress};
+
+    #[test]
+    fn an_agent_with_no_progress_handle_always_heartbeats() {
+        // Not every agent is stall-monitored; withholding their heartbeat
+        // would report a perfectly healthy agent as dead.
+        assert!(should_heartbeat(None, Instant::now()));
+    }
+
+    #[test]
+    fn a_moving_agent_heartbeats() {
+        let p = Progress::new("test");
+        p.enter(Phase::Renewal);
+        assert!(should_heartbeat(Some(&p), Instant::now()));
+    }
+
+    #[test]
+    fn a_stalled_agent_falls_silent_so_its_liveness_gauge_can_go_stale() {
+        // The fix for the signal that lied for 2h45m. This thread is
+        // independent of the dispatch loop, so it kept re-reporting a cached
+        // "registered, tunnel up, everything fine" throughout the outage.
+        let p = Progress::new("test");
+        p.enter(Phase::Renewal);
+        let long_after = Instant::now() + Phase::Renewal.budget() + Duration::from_secs(1);
+        assert!(
+            !should_heartbeat(Some(&p), long_after),
+            "a stalled agent must stop claiming to be alive"
+        );
+    }
+
+    #[test]
+    fn an_idle_agent_within_its_poll_interval_still_heartbeats() {
+        // Idle is the overwhelmingly common state; treating it as a stall
+        // would take every quiet line out of service.
+        let p = Progress::new("test");
+        p.enter(Phase::Idle);
+        assert!(should_heartbeat(
+            Some(&p),
+            Instant::now() + Duration::from_secs(2)
+        ));
+    }
 
     #[test]
     fn test_enqueue_evicts_oldest_past_capacity() {

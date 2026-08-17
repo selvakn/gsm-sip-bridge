@@ -1676,14 +1676,17 @@ fn start_line_tail(
                 let pcscf_now = runner.read_file(Path::new(&pcscf_path)).unwrap_or_default();
                 let pcscf_now = pcscf_now.trim();
                 if !pcscf_now.is_empty() {
-                    let _ = runner.run_in_netns(
-                        &netns,
-                        &[
-                            "bash",
-                            "-c",
-                            &format!("timeout 3 bash -c '>/dev/tcp/{pcscf_now}/5060'"),
-                        ],
-                    );
+                    // Uses the runner's own probe rather than shelling out to
+                    // `timeout 3 bash -c '>/dev/tcp/...'`
+                    // (specs/039-at-stall-watchdog, FR-028). That shell form
+                    // left the inner `timeout` process orphaned on every cycle,
+                    // reparented to this process as PID 1, and never reaped:
+                    // 462 zombies had accumulated in 3.8 hours, which at ~120
+                    // an hour eventually exhausts the process table and takes
+                    // out something entirely unrelated. This has the same 3s
+                    // connect timeout, waits for its child properly, and does
+                    // not interpolate a file's contents into a shell command.
+                    let _ = runner.tcp_connect_ok_in_netns(&netns, pcscf_now, 5060);
                 }
                 runner.sleep(interval);
             }

@@ -50,33 +50,10 @@ pub fn next_backoff(current: Duration) -> Duration {
 
 /// The registration lifetime the network actually granted.
 ///
-/// A registrar may grant less than was requested, and renewing on the
-/// requested value would then leave a window where the binding has lapsed but
-/// we still believe it is live. Prefers the `Expires` header, falls back to
-/// `Contact`'s `expires=` parameter, then to what was asked for.
-pub fn granted_expires(headers: &[(String, String)], requested: u32) -> u32 {
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("expires") {
-            if let Ok(v) = value.trim().parse::<u32>() {
-                return v;
-            }
-        }
-    }
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("contact") {
-            if let Some(rest) = value.to_ascii_lowercase().find("expires=").map(|i| i + 8) {
-                let tail: String = value[rest..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(v) = tail.parse::<u32>() {
-                    return v;
-                }
-            }
-        }
-    }
-    requested
-}
+/// Lives in `ims` beside `renewal_due`, because both bearers need it and the
+/// dependency runs `volte` -> `ims`, never the other way. Re-exported here so
+/// this module's existing callers and tests are unaffected by the move.
+pub use crate::ims::granted_expires;
 
 /// Operator-facing name for a registration state. The vocabulary is the shared
 /// `RegistrationState` enum, which is what makes VoLTE and VoWiFi status read
