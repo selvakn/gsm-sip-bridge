@@ -582,7 +582,10 @@ const MODEM_OPEN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Bounded, unlike Agent B's control-channel bind: the conflict this waits out
 /// is one EAP-AKA exchange, which takes seconds. A genuinely wrong or missing
 /// port must still surface as an error rather than hanging the agent forever.
-const MODEM_OPEN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// `pub(crate)` so `ims::agent::watchdog`'s budget-derivation test can recompute
+/// the renewal worst case from the real constants rather than a copy of them.
+pub(crate) const MODEM_OPEN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Opens the modem's serial port, waiting out a transient exclusive-open
 /// conflict with `vowifi-usim-bridge`.

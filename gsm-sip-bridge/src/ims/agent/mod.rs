@@ -32,6 +32,7 @@ mod origination;
 mod ping;
 mod probe;
 mod veth;
+pub(crate) mod watchdog;
 
 use crate::config::VowifiConfig;
 use crate::control::protocol::{AgentKind, BridgeFailureReason, CallStatus, RegistrationStatus};
@@ -196,6 +197,14 @@ fn run_inner(
     config: &VowifiConfig,
     app_config: &crate::config::AppConfig,
 ) -> BridgeResult<()> {
+    // Arm stall detection before anything touches the modem
+    // (specs/039-at-stall-watchdog). `derive_plmn` below opens the AT port, and
+    // that open is itself a wedge point — starting the watchdog only once the
+    // dispatch loop exists would leave the whole startup path unmonitored.
+    let progress = watchdog::register(Arc::new(watchdog::Progress::new("ims-dispatch")));
+    watchdog::spawn(config.watchdog_recovery_enabled)?;
+    let _startup = progress.phase_guard(watchdog::Phase::Startup);
+
     // The ePDG tunnel is one of two `ImsTransport`s feeding the same
     // registration machinery (specs/015-volte-host-ims); the LTE IMS PDN is
     // the other. For VoWiFi this is exactly the P-CSCF file read that used to
@@ -330,6 +339,7 @@ fn run_inner(
         // processes), so it does not gate on it.
         pbx_registered: None,
         app_config,
+        progress: Arc::clone(&progress),
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
     })
@@ -381,6 +391,11 @@ pub(crate) struct InboundParams<'a> {
     /// track the PBX leg and so treats it as available.
     pub pbx_registered: Option<Arc<AtomicBool>>,
     pub app_config: &'a crate::config::AppConfig,
+    /// This line's stall-detection handle (specs/039-at-stall-watchdog).
+    /// Created and registered by the caller before it touches the modem, so
+    /// the startup path is monitored too, and shared with the dispatch loop
+    /// here so every blocking region publishes which phase it is in.
+    pub progress: Arc<watchdog::Progress>,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
     /// Which agent this is, for the `transport` label its reports land under.
@@ -411,6 +426,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         dedupe,
         pbx_registered,
         app_config,
+        progress,
         agent_label,
         agent_kind,
     } = p;
@@ -530,6 +546,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             dedupe: &dedupe,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
+            progress: &progress,
         },
         place_call_rx,
     );
@@ -813,6 +830,9 @@ struct DispatchParams<'a> {
     dedupe: &'a Arc<Mutex<crate::volte::sms::Dedupe>>,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
+    /// Publishes which phase the loop is in, so the watchdog can tell a line
+    /// that is working from one that has stopped (specs/039-at-stall-watchdog).
+    progress: &'a Arc<watchdog::Progress>,
 }
 
 impl DispatchParams<'_> {
@@ -939,6 +959,14 @@ fn dispatch_loop(
         } else {
             IDLE_POLL_INTERVAL
         };
+        // Every completed pass of this loop is the definition of "still making
+        // progress" (specs/039-at-stall-watchdog). Re-entering `Idle` each
+        // iteration restarts the phase clock, so only a pass that never
+        // finishes — because something inside it blocked — can go over budget.
+        // `busy` drives the watchdog's deferral: a stalled control loop often
+        // leaves a call's audio intact, so it is worth not killing.
+        p.progress.set_busy(st.busy());
+        p.progress.enter(watchdog::Phase::Idle);
         // EXPERIMENT, gated on `GM_RESPOND_ON_CLIENT=1`: answer a
         // network-initiated request over the *client* leg instead of the
         // socket it arrived on.
@@ -971,6 +999,7 @@ fn dispatch_loop(
         };
         match received {
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {
+                let _phase = p.progress.phase_guard(watchdog::Phase::InboundCall);
                 st.handle_inbound_invite(session, inbound, p, &req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "BYE" => {
@@ -1382,6 +1411,7 @@ impl LoopState {
         // or a reconnect must not cut across it. Repeated repair failure sets
         // `force_renewal`, which the renewal gate below honours.
         if !self.busy() {
+            let _phase = p.progress.phase_guard(watchdog::Phase::GmProbe);
             probe_gm_connection(
                 session,
                 inbound,
@@ -1429,6 +1459,14 @@ impl LoopState {
                 return Ok(());
             }
         }
+        // Everything from here to the end of this function is the renewal, and
+        // all of it can block: acquiring the modem lock (which the SMS sweep
+        // holds while it does its own AT work), the re-attach hook, the SIM
+        // APDUs, the REGISTER round trips, the SA install. The phase is entered
+        // *before* the lock acquisition deliberately — a sweep that wedges
+        // while holding the lock would otherwise stall this loop outside any
+        // budget, which is precisely the second route to the 2026-08-16 outage.
+        let _phase = p.progress.phase_guard(watchdog::Phase::Renewal);
         p.status.lock().unwrap_or_else(|e| e.into_inner()).state =
             crate::ims::RegistrationState::Renewing;
         // Hold the modem lock across the whole renewal: the hook re-attaches

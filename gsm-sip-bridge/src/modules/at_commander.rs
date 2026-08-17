@@ -3,9 +3,39 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `pub(crate)` so `ims::agent::watchdog`'s budget-derivation test can recompute
+/// the renewal worst case from the real constants rather than a copy of them.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most recent AT command this process issued, and when.
+///
+/// Recorded purely as a diagnostic for `ims::agent::watchdog`: when the
+/// watchdog terminates a stalled line, "which AT command was it waiting on?" is
+/// the first question anyone asks, and answering it in the log is the
+/// difference between a five-second diagnosis and the live kernel-stack
+/// forensics the 2026-08-16 incident needed.
+///
+/// A process-wide global rather than per-`AtCommander` state because agents run
+/// one process per line, so there is exactly one interesting modem per process,
+/// and threading a handle through every construction site would add parameters
+/// to code paths that have no other reason to know about the watchdog.
+static LAST_AT_COMMAND: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+fn record_last_at_command(cmd: &str) {
+    let mut guard = LAST_AT_COMMAND.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some((cmd.to_string(), Instant::now()));
+}
+
+/// The most recent AT command and when it was issued, if any.
+pub(crate) fn last_at_command() -> Option<(String, Instant)> {
+    LAST_AT_COMMAND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 const BAUD_RATE: u32 = 115200;
 
 /// Matches `AT+CFUN=0` -> `AT+CFUN=1`'s settle time elsewhere in this
@@ -183,6 +213,7 @@ impl AtCommander {
     }
 
     pub fn send_command(&mut self, cmd: &str) -> BridgeResult<AtResponse> {
+        record_last_at_command(cmd);
         let full_cmd = format!("{cmd}\r\n");
         let port = self.port.as_mut();
         port.write_all(full_cmd.as_bytes())

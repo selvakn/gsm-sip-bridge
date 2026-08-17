@@ -612,6 +612,15 @@ pub struct VowifiConfig {
     /// with the veth link staying on PCMU. Turn this off only if the PBX
     /// mishandles a G.722 offer.
     pub wideband: bool,
+    /// Whether a confirmed stall terminates the agent so the supervisor
+    /// restarts this line (specs/039-at-stall-watchdog, FR-034).
+    ///
+    /// On by default. Turn it off only to preserve a wedged line for live
+    /// diagnosis: the stall is still detected, logged, and reported through
+    /// `vowifi-status`, the metrics and the container healthcheck (FR-035) —
+    /// the process simply is not exited. Leaving this off in production
+    /// reinstates the multi-hour silent outage this feature exists to prevent.
+    pub watchdog_recovery_enabled: bool,
     /// APN used by the `swu` engine's dialer (specs/011-vowifi-sip-bridge).
     pub apn: String,
     /// Network namespace the ePDG tunnel lives in — created by
@@ -753,6 +762,7 @@ impl Default for VowifiConfig {
             veth_peer_addr: "10.99.0.2".to_string(),
             control_port: 7050,
             wideband: true,
+            watchdog_recovery_enabled: true,
             apn: "ims".to_string(),
             netns: "ims".to_string(),
             epdg_fqdn: String::new(),

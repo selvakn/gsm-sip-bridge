@@ -293,10 +293,23 @@ pub fn run_modem_reader(
     modem_lock: Arc<Mutex<()>>,
     dedupe: Arc<Mutex<Dedupe>>,
 ) {
+    // This thread is detached and, before specs/039-at-stall-watchdog, entirely
+    // unwatched — yet it is now the *most frequent* user of the AT port (every
+    // 20s, versus an hourly renewal), and it holds `modem_lock` while it works.
+    // A sweep that wedges therefore takes the whole line down with it: the next
+    // renewal blocks forever acquiring that lock. Registering here means such a
+    // sweep is caught in its own right, in seconds, rather than only when a
+    // renewal eventually piles up behind it.
+    let progress = crate::ims::agent::watchdog::register(Arc::new(
+        crate::ims::agent::watchdog::Progress::new("sms-sweep"),
+    ));
     std::thread::sleep(FIRST_SWEEP_DELAY);
     loop {
-        if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &modem_lock, &dedupe) {
-            tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
+        {
+            let _phase = progress.phase_guard(crate::ims::agent::watchdog::Phase::SmsSweep);
+            if let Err(e) = sweep_modem_storage(&modem_port, control_addr, &modem_lock, &dedupe) {
+                tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
+            }
         }
         std::thread::sleep(MODEM_SWEEP_INTERVAL);
     }

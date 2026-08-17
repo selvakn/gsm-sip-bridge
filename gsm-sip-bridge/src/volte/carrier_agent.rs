@@ -63,6 +63,21 @@ pub fn run(
     dedupe: Arc<Mutex<super::sms::Dedupe>>,
     pbx_registered: Option<Arc<AtomicBool>>,
 ) {
+    // Arm stall detection before anything touches the modem
+    // (specs/039-at-stall-watchdog, FR-032). The LTE bearer shares the AT
+    // access, modem lock and renewal machinery the VoWiFi one does, so it has
+    // the same defect and gets the same monitoring. The attach and PLMN
+    // derivation immediately below are themselves wedge points.
+    let progress = crate::ims::agent::watchdog::register(Arc::new(
+        crate::ims::agent::watchdog::Progress::new("volte-dispatch"),
+    ));
+    if let Err(e) = crate::ims::agent::watchdog::spawn(app_config.vowifi.watchdog_recovery_enabled)
+    {
+        tracing::error!(card_id = %line.card_id, error = %e, "could not start the stall watchdog");
+        return;
+    }
+    let _startup = progress.phase_guard(crate::ims::agent::watchdog::Phase::Startup);
+
     // Attach and PLMN derivation both touch the AT port, so hold the modem
     // lock across them to stay clear of the SMS reader running concurrently.
     // `attach` records the displaced context (via `settings.restore_cid_path`)
@@ -195,6 +210,7 @@ pub fn run(
         dedupe,
         pbx_registered,
         app_config,
+        progress: Arc::clone(&progress),
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,
     }) {

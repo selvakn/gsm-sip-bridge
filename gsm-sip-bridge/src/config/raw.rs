@@ -383,6 +383,9 @@ section! {
         pub pcscf_source_path: String,
         pub control_port: u16,
         pub wideband: bool,
+        /// Whether a confirmed stall restarts the line. See
+        /// `VowifiConfig::watchdog_recovery_enabled`.
+        pub watchdog_recovery_enabled: bool,
         pub apn: String,
         pub epdg_fqdn: String,
         pub epdg_ip: Option<String>,
@@ -412,6 +415,7 @@ impl Default for RawVowifi {
             pcscf_source_path: "/tmp/pcscf".to_string(),
             control_port: 7050,
             wideband: true,
+            watchdog_recovery_enabled: true,
             apn: "ims".to_string(),
             epdg_fqdn: String::new(),
             epdg_ip: None,
