@@ -77,8 +77,18 @@ pub(crate) const DEFER_MARKER: &str = "watchdog: recovery deferred while a call 
 /// the stall would deadlock the watchdog itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// Waiting for work. Not a stall unless the loop stops polling entirely.
+    /// Actively polling for work, and expected to re-enter this phase every
+    /// poll interval. Over-budget here means the loop has stopped iterating.
     Idle,
+    /// Deliberately asleep until the next scheduled pass, for however long that
+    /// is. **Never a stall.**
+    ///
+    /// This distinction is not academic. The SMS sweep rests between passes for
+    /// `MODEM_SWEEP_INTERVAL`, which is longer than `Idle`'s budget -- so while
+    /// it rested in `Idle`, the watchdog confirmed a stall and killed the agent
+    /// every ~36 seconds. Caught on the live line within a minute of deploying.
+    /// A phase an activity sits in *by design* cannot carry a deadline.
+    Dormant,
     /// First registration, including the PLMN derive that opens the modem.
     Startup,
     /// Gm signaling liveness probe.
@@ -99,6 +109,7 @@ impl Phase {
     const fn as_u8(self) -> u8 {
         match self {
             Phase::Idle => 0,
+            Phase::Dormant => 7,
             Phase::Startup => 1,
             Phase::GmProbe => 2,
             Phase::Renewal => 3,
@@ -116,6 +127,7 @@ impl Phase {
             4 => Phase::InboundCall,
             5 => Phase::Origination,
             6 => Phase::SmsSweep,
+            7 => Phase::Dormant,
             // Includes 0. An unknown discriminant can only arise from a bug,
             // and `Idle` is the safe reading: it never trips the watchdog.
             _ => Phase::Idle,
@@ -125,6 +137,7 @@ impl Phase {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Phase::Idle => "idle",
+            Phase::Dormant => "dormant",
             Phase::Startup => "startup",
             Phase::GmProbe => "gm-probe",
             Phase::Renewal => "renewal",
@@ -134,13 +147,21 @@ impl Phase {
         }
     }
 
-    /// How long this phase may take before it is considered stalled.
+    /// How long this phase may take before it is considered stalled, or `None`
+    /// for a phase that is never a stall.
     ///
     /// Every value is derived from the summed worst case of the operations the
     /// phase performs, with margin — see the module docs and the derivation
     /// test. Do not hand-tune these without updating that test.
-    pub(crate) fn budget(self) -> Duration {
-        match self {
+    ///
+    /// `None` is not a shortcut for "a very long budget": it states that the
+    /// activity is *supposed* to be sitting here, so elapsed time carries no
+    /// information about health. Giving such a phase a number, however large,
+    /// reintroduces the false-restart bug the moment a schedule outgrows it.
+    pub(crate) fn budget(self) -> Option<Duration> {
+        Some(match self {
+            // Asleep by design, for as long as its schedule says.
+            Phase::Dormant => return None,
             // The loop polls every second when idle and every 100ms during a
             // call; 15s is generous slack over either.
             Phase::Idle => Duration::from_secs(15),
@@ -156,8 +177,9 @@ impl Phase {
             // Invite timeout + ring timeout + slack.
             Phase::Origination => Duration::from_secs(120),
             // A sweep re-opens the port per message; this bounds one pass.
+            // Only the pass itself -- the wait between passes is `Dormant`.
             Phase::SmsSweep => Duration::from_secs(90),
-        }
+        })
     }
 }
 
@@ -174,8 +196,8 @@ pub(crate) struct ProgressSnapshot {
 impl ProgressSnapshot {
     /// How far past its budget this phase is, if at all.
     fn overrun(&self, now: Instant) -> Option<Duration> {
+        let budget = self.phase.budget()?;
         let elapsed = now.saturating_duration_since(self.since);
-        let budget = self.phase.budget();
         (elapsed > budget).then_some(elapsed)
     }
 }
@@ -489,7 +511,7 @@ fn run_loop(recovery_enabled: bool) {
                             activity = progress.label(),
                             phase = phase.label(),
                             stalled_secs = elapsed.as_secs(),
-                            budget_secs = phase.budget().as_secs(),
+                            budget_secs = phase.budget().map(|b| b.as_secs()),
                             "{}",
                             DEFER_MARKER
                         );
@@ -531,7 +553,7 @@ fn report_stall(activity: &'static str, phase: Phase, elapsed: Duration) {
         activity,
         phase = phase.label(),
         stalled_secs = elapsed.as_secs(),
-        budget_secs = phase.budget().as_secs(),
+        budget_secs = phase.budget().map(|b| b.as_secs()),
         last_at_command = %last_cmd,
         last_at_command_age_secs = ?last_cmd_age_secs,
         "{}",
@@ -569,7 +591,9 @@ mod tests {
         // restarts: if someone raises `DEFAULT_TIMEOUT` or the APDU count, this
         // fails the build instead of the watchdog killing healthy lines.
         let worst = derived_renewal_worst_case();
-        let budget = Phase::Renewal.budget();
+        let budget = Phase::Renewal
+            .budget()
+            .expect("renewal is a working phase and must carry a budget");
         assert!(
             budget > worst,
             "renewal budget {budget:?} must exceed its derived worst case {worst:?}"
@@ -584,7 +608,9 @@ mod tests {
 
     #[test]
     fn idle_budget_dwarfs_the_poll_interval() {
-        assert!(Phase::Idle.budget() >= super::super::IDLE_POLL_INTERVAL * 10);
+        assert!(Phase::Idle
+            .budget()
+            .is_some_and(|b| b >= super::super::IDLE_POLL_INTERVAL * 10));
     }
 
     #[test]
@@ -600,6 +626,14 @@ mod tests {
         ] {
             assert_eq!(Phase::from_u8(phase.as_u8()), phase);
         }
+    }
+
+    /// A working phase's budget. Panics for a no-deadline phase, which is
+    /// exactly what a test asserting on elapsed time should do.
+    fn budget_of(phase: Phase) -> Duration {
+        phase
+            .budget()
+            .unwrap_or_else(|| panic!("{phase:?} carries no budget"))
     }
 
     fn snap(phase: Phase, since: Instant, busy: bool) -> ProgressSnapshot {
@@ -619,7 +653,7 @@ mod tests {
     #[test]
     fn a_single_overrun_is_only_suspected() {
         let now = Instant::now();
-        let since = now - Phase::GmProbe.budget() - Duration::from_secs(1);
+        let since = now - budget_of(Phase::GmProbe) - Duration::from_secs(1);
         let s = snap(Phase::GmProbe, since, false);
         // No previous sample: this is the first observation.
         let v = stall_verdict(s, None, now, DEFER_CEILING);
@@ -630,7 +664,7 @@ mod tests {
     #[test]
     fn two_consecutive_overruns_confirm() {
         let now = Instant::now();
-        let since = now - Phase::GmProbe.budget() - Duration::from_secs(1);
+        let since = now - budget_of(Phase::GmProbe) - Duration::from_secs(1);
         let s = snap(Phase::GmProbe, since, false);
         let v = stall_verdict(s, Some(s), now, DEFER_CEILING);
         assert!(matches!(v, StallVerdict::Confirmed { .. }), "{v:?}");
@@ -646,12 +680,12 @@ mod tests {
         let now = Instant::now();
         let old = snap(
             Phase::Renewal,
-            now - Phase::Renewal.budget() - Duration::from_secs(30),
+            now - budget_of(Phase::Renewal) - Duration::from_secs(30),
             false,
         );
         let fresh = snap(
             Phase::Renewal,
-            now - Phase::Renewal.budget() - Duration::from_secs(1),
+            now - budget_of(Phase::Renewal) - Duration::from_secs(1),
             false,
         );
         let v = stall_verdict(fresh, Some(old), now, DEFER_CEILING);
@@ -661,7 +695,7 @@ mod tests {
     #[test]
     fn a_call_in_progress_defers_recovery() {
         let now = Instant::now();
-        let since = now - Phase::Renewal.budget() - Duration::from_secs(1);
+        let since = now - budget_of(Phase::Renewal) - Duration::from_secs(1);
         let s = snap(Phase::Renewal, since, true);
         let v = stall_verdict(s, Some(s), now, DEFER_CEILING);
         assert!(matches!(v, StallVerdict::Deferred { .. }), "{v:?}");
@@ -689,6 +723,54 @@ mod tests {
     }
 
     #[test]
+    fn a_dormant_activity_never_trips_however_long_it_rests() {
+        // Regression test for a live false-restart. The SMS sweep sleeps
+        // `MODEM_SWEEP_INTERVAL` between passes; it rested in `Idle`, whose
+        // budget is *shorter* than that sleep, so the watchdog confirmed a
+        // stall and killed the agent roughly every 36 seconds. The line could
+        // not stay registered, which is strictly worse than the bug this
+        // feature exists to fix.
+        assert_eq!(
+            Phase::Dormant.budget(),
+            None,
+            "a phase an activity rests in by design must carry no deadline"
+        );
+        let now = Instant::now();
+        let rested = crate::volte::sms::MODEM_SWEEP_INTERVAL + Duration::from_secs(3600);
+        let s = snap(Phase::Dormant, now - rested, false);
+        assert_eq!(
+            stall_verdict(s, Some(s), now, DEFER_CEILING),
+            StallVerdict::Healthy
+        );
+
+        // ...and pin why `Idle` cannot be reused for that, so nobody "tidies"
+        // `Dormant` away or gives it a budget for symmetry.
+        let as_idle = snap(Phase::Idle, now - rested, false);
+        assert!(
+            matches!(
+                stall_verdict(as_idle, Some(as_idle), now, DEFER_CEILING),
+                StallVerdict::Confirmed { .. }
+            ),
+            "resting in Idle for a sweep interval is exactly the bug that shipped"
+        );
+    }
+
+    #[test]
+    fn every_scheduled_wait_outlives_or_avoids_its_phase_budget() {
+        // The general form of the bug above: any interval a thread deliberately
+        // sleeps for must either be `Dormant` or be shorter than the budget of
+        // the phase it sleeps in. Checked against the real constants, so a
+        // future change to either side fails here rather than on the phone line.
+        let sweep_wait = crate::volte::sms::MODEM_SWEEP_INTERVAL;
+        assert!(
+            budget_of(Phase::Idle) < sweep_wait,
+            "if Idle's budget ever exceeds the sweep interval this test stops \
+             protecting anything -- re-derive it rather than deleting this"
+        );
+        assert_eq!(Phase::Dormant.budget(), None);
+    }
+
+    #[test]
     fn idle_within_its_budget_never_trips() {
         let now = Instant::now();
         let s = snap(Phase::Idle, now - Duration::from_secs(2), false);
@@ -704,7 +786,7 @@ mod tests {
         // diagnosis; it must not quietly restore the original condition in
         // which a stalled line looked perfectly healthy.
         let now = Instant::now();
-        let since = now - Phase::Renewal.budget() - Duration::from_secs(1);
+        let since = now - budget_of(Phase::Renewal) - Duration::from_secs(1);
         let s = snap(Phase::Renewal, since, false);
         let v = stall_verdict(s, Some(s), now, DEFER_CEILING);
         assert_eq!(action_for(v, false), WatchdogAction::ReportOnly);

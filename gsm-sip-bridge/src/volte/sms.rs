@@ -303,6 +303,11 @@ pub fn run_modem_reader(
     let progress = crate::ims::agent::watchdog::register(Arc::new(
         crate::ims::agent::watchdog::Progress::new("sms-sweep"),
     ));
+    // `Dormant`, not `Idle`, for both waits below. This thread is *supposed* to
+    // be asleep between passes, and `MODEM_SWEEP_INTERVAL` is longer than
+    // `Idle`'s budget -- resting in `Idle` made the watchdog confirm a stall and
+    // kill the agent every ~36 seconds. Caught on the live line.
+    progress.enter(crate::ims::agent::watchdog::Phase::Dormant);
     std::thread::sleep(FIRST_SWEEP_DELAY);
     loop {
         {
@@ -311,6 +316,7 @@ pub fn run_modem_reader(
                 tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
             }
         }
+        progress.enter(crate::ims::agent::watchdog::Phase::Dormant);
         std::thread::sleep(MODEM_SWEEP_INTERVAL);
     }
 }

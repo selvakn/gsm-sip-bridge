@@ -340,7 +340,10 @@ mod tests {
         // "registered, tunnel up, everything fine" throughout the outage.
         let p = Progress::new("test");
         p.enter(Phase::Renewal);
-        let long_after = Instant::now() + Phase::Renewal.budget() + Duration::from_secs(1);
+        let renewal_budget = Phase::Renewal
+            .budget()
+            .expect("renewal is a working phase and carries a budget");
+        let long_after = Instant::now() + renewal_budget + Duration::from_secs(1);
         assert!(
             !should_heartbeat(Some(&p), long_after),
             "a stalled agent must stop claiming to be alive"
