@@ -59,7 +59,10 @@ enum Transport {
     /// own deadline, so a `read(2)` that never returns costs a leaked worker
     /// rather than a frozen line.
     Worker {
-        tx: std::sync::mpsc::Sender<crate::modules::at_worker::Request>,
+        /// `None` between dropping a doomed worker's sender and installing a
+        /// replacement — see `try_reopen`. A `None` here means no worker can be
+        /// reached, which `dispatch` treats as dead.
+        tx: Option<std::sync::mpsc::Sender<crate::modules::at_worker::Request>>,
         timeout: Duration,
         /// Set once a command has timed out. The next command resyncs before
         /// doing anything else; if that fails the channel is dead and every
@@ -247,7 +250,7 @@ impl AtCommander {
             })?;
         Ok(Self {
             transport: Transport::Worker {
-                tx,
+                tx: Some(tx),
                 timeout,
                 state: ChannelState::Healthy,
             },
@@ -318,18 +321,32 @@ impl AtCommander {
         }
     }
 
+    /// Read one line, or fail on the deadline.
+    ///
+    /// The signature is unchanged for callers, but the *channel-state* decision
+    /// underneath is not. A deadline reached with nothing buffered comes back
+    /// from the worker as `Ok(None)` and leaves the channel `Healthy`; only then
+    /// is it turned into the timeout error callers already handle. Treating an
+    /// empty idle read as a worker error marked the channel `Suspect` on every
+    /// poll of the circuit-switched URC loop, and the resync that followed
+    /// discarded buffered bytes — silently dropping inbound `RING`/`+CMTI:`
+    /// notifications, which is a strictly worse fault than the one being
+    /// guarded against.
     pub fn read_line_raw(&mut self) -> BridgeResult<String> {
-        match &mut self.transport {
-            Transport::Direct(session) => session.read_line_raw(),
+        let line = match &mut self.transport {
+            Transport::Direct(session) => session.read_line_raw()?,
             Transport::Worker { .. } => {
                 self.ensure_usable()?;
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 self.dispatch(
                     crate::modules::at_worker::Request::ReadLine { reply: reply_tx },
                     reply_rx,
-                )
+                )?
             }
-        }
+        };
+        // Same error text as before, so `worker.rs`'s `contains("timeout")`
+        // classification and every other caller keep working unchanged.
+        line.ok_or_else(|| BridgeError::Discovery("AT read timeout".into()))
     }
 
     /// Hand a request to the worker and wait for it, bounded by our own
@@ -348,6 +365,12 @@ impl AtCommander {
             unreachable!("dispatch is only reached on the worker transport");
         };
         let wait = *timeout + WORKER_GRACE;
+        let Some(tx) = tx.as_ref() else {
+            *state = ChannelState::Dead;
+            return Err(BridgeError::Discovery(
+                "the AT port has no worker; this line needs to be restarted".into(),
+            ));
+        };
         if tx.send(request).is_err() {
             *state = ChannelState::Dead;
             return Err(BridgeError::Discovery(
@@ -422,7 +445,13 @@ impl AtCommander {
 
     fn try_resync(&mut self) -> bool {
         let (tx, timeout) = match &self.transport {
-            Transport::Worker { tx, timeout, .. } => (tx.clone(), *timeout),
+            Transport::Worker {
+                tx: Some(tx),
+                timeout,
+                ..
+            } => (tx.clone(), *timeout),
+            // No worker to ask.
+            Transport::Worker { tx: None, .. } => return false,
             Transport::Direct(_) => return true,
         };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -436,17 +465,58 @@ impl AtCommander {
     }
 
     /// Try to take the port over with a brand-new worker.
+    ///
+    /// Dropping our sender first is what makes this reachable at all. A worker's
+    /// `run` loop exits when every `Request` sender is gone, and only then does
+    /// it drop the `Session` holding the port and its `flock`. While we kept the
+    /// old `tx` alive, the old worker could never exit even after it had finished
+    /// the command that made us suspicious, so `open_session` always failed with
+    /// the port still held and this whole recovery path was dead code.
+    ///
+    /// It still cannot rescue a *genuinely* wedged worker: one parked in
+    /// `read(2)` never returns to `recv()` and so never observes the closed
+    /// channel. That case is what `ChannelState::Dead` and the process restart
+    /// are for. What this rescues is the worker that was merely slow — it has
+    /// since gone back to waiting, and now unwinds cleanly.
     fn try_reopen(&mut self) -> bool {
-        let (Some(path), Transport::Worker { timeout, .. }) = (self.path.clone(), &self.transport)
+        let (Some(path), Transport::Worker { timeout, tx, .. }) =
+            (self.path.clone(), &mut self.transport)
         else {
             return false;
         };
         let timeout = *timeout;
-        let Ok(session) = Self::open_session(&path, timeout) else {
-            // Expected whenever the abandoned worker still holds the flock.
+        // Release our end of the channel and let the old worker unwind.
+        drop(tx.take());
+
+        // The old worker has to be scheduled, notice the closed channel, and
+        // drop its port before we can open it. Give it a bounded window rather
+        // than one immediate attempt that would almost always lose that race.
+        const REOPEN_ATTEMPTS: usize = 20;
+        const REOPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
+        let mut session = None;
+        for attempt in 0..REOPEN_ATTEMPTS {
+            match Self::open_session(&path, timeout) {
+                Ok(s) => {
+                    session = Some(s);
+                    break;
+                }
+                // Expected while the abandoned worker still holds the flock.
+                Err(_) if attempt + 1 < REOPEN_ATTEMPTS => {
+                    std::thread::sleep(REOPEN_RETRY_DELAY);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not reopen the modem port; the previous worker is still holding it"
+                    );
+                }
+            }
+        }
+        let Some(session) = session else {
             return false;
         };
-        let (tx, worker_rx) = std::sync::mpsc::channel();
+        let (new_tx, worker_rx) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("at-port-reopen".to_string())
             .spawn(move || crate::modules::at_worker::run(session, worker_rx))
@@ -459,7 +529,7 @@ impl AtCommander {
             "reopened the modem port after an abandoned AT operation; the previous worker              had released it"
         );
         self.transport = Transport::Worker {
-            tx,
+            tx: Some(new_tx),
             timeout,
             state: ChannelState::Healthy,
         };

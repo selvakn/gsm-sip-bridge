@@ -58,8 +58,11 @@ pub(crate) enum Request {
         cmd: String,
         reply: mpsc::Sender<BridgeResult<AtResponse>>,
     },
+    /// `Ok(None)` means the deadline passed with nothing buffered and nothing in
+    /// flight — the normal state of an idle URC poll, and explicitly *not* a
+    /// fault. See [`Session::read_line_raw`].
     ReadLine {
-        reply: mpsc::Sender<BridgeResult<String>>,
+        reply: mpsc::Sender<BridgeResult<Option<String>>>,
     },
     /// Drain anything pending and confirm the modem still answers.
     Resync {
@@ -102,12 +105,29 @@ impl Session {
 
     /// Read more bytes into `rx`. `Ok(false)` means the read timed out with
     /// nothing new.
+    ///
+    /// Every error path here leaves `desynced` set, because every one of them
+    /// can return with unparsed bytes still sitting in `rx`. Without that, the
+    /// next `send_command` skips its drain and parses the leftovers as its own
+    /// reply — the permanent off-by-one this whole module exists to prevent,
+    /// reintroduced through the error path instead of the timeout path.
     fn fill(&mut self) -> BridgeResult<bool> {
         let mut buf = [0u8; 1024];
         match self.port.read(&mut buf) {
-            Ok(0) => Ok(false),
+            // End of file, not "nothing to read": the modem has gone (unplugged,
+            // USB re-enumerated, peer closed). Reporting this as a timeout made
+            // the read loops spin without ever blocking — a 100%-CPU busy loop
+            // for the whole deadline, on every command, for as long as the port
+            // stayed gone.
+            Ok(0) => {
+                self.desynced = true;
+                Err(BridgeError::Discovery(
+                    "the modem port reported end-of-file; the device has gone away".into(),
+                ))
+            }
             Ok(n) => {
                 if self.rx.len() + n > MAX_BUFFERED_BYTES {
+                    self.desynced = true;
                     return Err(BridgeError::Discovery(format!(
                         "AT response exceeded {MAX_BUFFERED_BYTES} buffered bytes without \
                          terminating; treating the channel as desynchronised"
@@ -128,7 +148,10 @@ impl Session {
                 Ok(false)
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(true),
-            Err(e) => Err(BridgeError::Discovery(format!("AT read error: {e}"))),
+            Err(e) => {
+                self.desynced = true;
+                Err(BridgeError::Discovery(format!("AT read error: {e}")))
+            }
         }
     }
 
@@ -146,9 +169,13 @@ impl Session {
         }
 
         let full = format!("{cmd}\r\n");
-        self.port
-            .write_all(full.as_bytes())
-            .map_err(|e| BridgeError::Discovery(format!("AT write failed: {e}")))?;
+        // A failed write may still have put a partial command on the wire, so
+        // the modem's next reply is to something we cannot name. That is a
+        // desync by definition.
+        if let Err(e) = self.port.write_all(full.as_bytes()) {
+            self.desynced = true;
+            return Err(BridgeError::Discovery(format!("AT write failed: {e}")));
+        }
         // Deliberately no `tcdrain`-style flush here: on a 115200 baud line an
         // AT command is microseconds of wire time, so there is nothing to wait
         // for, and `flush()` on a serial port is itself unbounded — if the line
@@ -173,6 +200,10 @@ impl Session {
                     return Ok(AtResponse::CmeError(code, cme.into()));
                 }
                 if lines.len() >= MAX_RESPONSE_LINES {
+                    // Abandoning a response mid-stream leaves the rest of it
+                    // arriving behind us, so the channel must be treated as
+                    // desynchronised exactly as a timeout is.
+                    self.desynced = true;
                     return Err(BridgeError::Discovery(format!(
                         "AT response exceeded {MAX_RESPONSE_LINES} lines without terminating"
                     )));
@@ -190,15 +221,34 @@ impl Session {
     }
 
     /// Read a single line, bounded by the same overall deadline.
-    pub(crate) fn read_line_raw(&mut self) -> BridgeResult<String> {
+    ///
+    /// `Ok(None)` is "the deadline passed and there was nothing to read", which
+    /// is the *normal* outcome for the circuit-switched worker's URC poll: it
+    /// calls this in a tight loop waiting for a `RING`/`+CLIP:`/`+CMTI:` that
+    /// mostly is not there. Reporting that as an error made the channel
+    /// permanently `Suspect`, so every subsequent command resynchronised first —
+    /// and a resync *discards buffered bytes*, throwing away exactly the URCs
+    /// this loop exists to catch, as well as roughly doubling the cost of every
+    /// idle iteration.
+    ///
+    /// A deadline reached with a *partial* line still in `rx` is a different
+    /// thing entirely: a reply is genuinely in flight and we are abandoning it
+    /// halfway, so that does set `desynced` and does return an error.
+    pub(crate) fn read_line_raw(&mut self) -> BridgeResult<Option<String>> {
         let deadline = Instant::now() + self.timeout;
         loop {
             if let Some(line) = self.take_line() {
-                return Ok(line);
+                return Ok(Some(line));
             }
             if Instant::now() >= deadline {
+                if self.rx.is_empty() {
+                    // Nothing buffered, nothing in flight: an idle line.
+                    return Ok(None);
+                }
                 self.desynced = true;
-                return Err(BridgeError::Discovery("AT read timeout".into()));
+                return Err(BridgeError::Discovery(
+                    "AT read timeout with a partial line buffered".into(),
+                ));
             }
             self.fill()?;
         }
@@ -350,7 +400,7 @@ mod tests {
                 // Answers the first command, but far too late for its caller.
                 (Duration::from_millis(300), "+CSIM: 4,\"9000\"\r\nOK\r\n"),
                 // Answers the second promptly.
-                (Duration::ZERO, "405869170516130\r\nOK\r\n"),
+                (Duration::ZERO, "999990000000000\r\nOK\r\n"),
             ],
         );
 
@@ -365,7 +415,7 @@ mod tests {
         match s.send_command("AT+CIMI").expect("second command") {
             AtResponse::Ok(lines) => assert_eq!(
                 lines,
-                vec!["405869170516130".to_string()],
+                vec!["999990000000000".to_string()],
                 "the IMSI query must return its own answer, not the abandoned CSIM reply"
             ),
             other => panic!("unexpected: {other:?}"),
@@ -405,6 +455,137 @@ mod tests {
         modem.write_all(flood.as_bytes()).expect("flood");
         let err = s.send_command("AT").unwrap_err();
         assert!(err.to_string().contains("without terminating"), "{err}");
+    }
+
+    #[test]
+    fn an_unterminated_flood_leaves_the_channel_desynced() {
+        // Bailing out mid-response abandons the rest of it, still arriving. If
+        // that does not set `desynced`, the next command skips its drain and
+        // parses the leftovers as its own answer — the same permanent off-by-one
+        // the timeout path is careful to avoid, arrived at through the error path.
+        let (mut s, mut modem) = port(Duration::from_millis(300));
+        let flood: String = (0..MAX_RESPONSE_LINES + 50)
+            .map(|i| format!("+JUNK: {i}\r\n"))
+            .collect();
+        modem.write_all(flood.as_bytes()).expect("flood");
+        assert!(s.send_command("AT").is_err());
+        assert!(
+            s.desynced,
+            "a response abandoned mid-stream must mark the channel desynchronised"
+        );
+    }
+
+    #[test]
+    fn a_command_after_an_abandoned_flood_reads_its_own_answer() {
+        // The consequence, stated end to end.
+        let (mut s, mut modem) = port(Duration::from_millis(300));
+        let flood: String = (0..MAX_RESPONSE_LINES + 50)
+            .map(|i| format!("+JUNK: {i}\r\n"))
+            .collect();
+        modem.write_all(flood.as_bytes()).expect("flood");
+        assert!(s.send_command("AT").is_err());
+        assert!(s.desynced);
+
+        // The modem answers the *next* command, once it arrives — replying
+        // before it would be answering a question nobody asked yet, and the
+        // pre-write drain would rightly throw it away. The first script entry
+        // exists to absorb the `AT` above, which is still sitting unread in the
+        // modem's receive queue; without it that command would satisfy the entry
+        // meant for `AT+CSQ` and the reply would again arrive too early.
+        let _m = spawn_modem(
+            modem,
+            vec![
+                (Duration::ZERO, ""),
+                (Duration::ZERO, "+CSQ: 19,99\r\nOK\r\n"),
+            ],
+        );
+        match s.send_command("AT+CSQ").expect("second command") {
+            AtResponse::Ok(lines) => assert_eq!(
+                lines,
+                vec!["+CSQ: 19,99".to_string()],
+                "the second command must not be handed the abandoned flood"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_idle_read_with_nothing_pending_is_not_a_fault() {
+        // The circuit-switched worker polls this in a loop waiting for a
+        // `RING`/`+CLIP:`/`+CMTI:` that is usually not there. Reporting that as
+        // an error marked the channel `Suspect`, and the resync that followed
+        // discarded buffered bytes — dropping the very URCs the poll exists to
+        // catch. An empty idle read must be an ordinary, stateless "nothing yet".
+        let (mut s, _modem) = port(Duration::from_millis(100));
+        assert_eq!(s.read_line_raw().expect("idle read"), None);
+        assert!(
+            !s.desynced,
+            "an idle poll with nothing in flight is not a desynchronisation"
+        );
+        // Repeatable: still no state accumulating across polls.
+        assert_eq!(s.read_line_raw().expect("idle read"), None);
+        assert!(!s.desynced);
+    }
+
+    #[test]
+    fn an_idle_poll_does_not_swallow_the_urc_that_follows_it() {
+        // What the bug actually cost on a GSM line: a missed inbound call.
+        let (mut s, mut modem) = port(Duration::from_millis(100));
+        assert_eq!(s.read_line_raw().expect("idle read"), None);
+        modem.write_all(b"RING\r\n").expect("urc");
+        assert_eq!(
+            s.read_line_raw().expect("urc read"),
+            Some("RING".to_string()),
+            "a URC arriving after an idle poll must still be delivered"
+        );
+    }
+
+    #[test]
+    fn a_partial_line_at_the_deadline_is_a_desync() {
+        // The other half of the distinction: bytes *are* in flight and we are
+        // abandoning them halfway, so the channel genuinely is out of step.
+        let (mut s, mut modem) = port(Duration::from_millis(100));
+        modem.write_all(b"+CLIP: \"+919000").expect("partial");
+        std::thread::sleep(Duration::from_millis(50));
+        let err = s
+            .read_line_raw()
+            .expect_err("a partial line must not be Ok");
+        assert!(err.to_string().contains("partial line"), "{err}");
+        assert!(s.desynced);
+    }
+
+    #[test]
+    fn a_closed_port_reports_eof_rather_than_spinning() {
+        // `Ok(0)` is EOF, not "nothing to read". Mapping it to a timeout made
+        // both read loops spin with no blocking call in them at all — 100% CPU
+        // for the whole deadline, per read, for as long as the modem stayed
+        // unplugged. Asserted through `read_line_raw` because it is a pure read
+        // path: `send_command` writes first, and on a socket a dropped peer
+        // surfaces there as `EPIPE` before any read happens.
+        let (mut s, modem) = port(Duration::from_secs(5));
+        drop(modem);
+        let started = Instant::now();
+        let err = s.read_line_raw().expect_err("EOF must be an error");
+        assert!(err.to_string().contains("end-of-file"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "EOF must fail immediately, not spin until the deadline (took {:?})",
+            started.elapsed()
+        );
+        assert!(s.desynced, "a vanished port leaves nothing trustworthy");
+    }
+
+    #[test]
+    fn a_failed_write_marks_the_channel_desynced() {
+        // A write that fails may still have put a partial command on the wire,
+        // so the modem's next utterance answers something we cannot name.
+        let (mut s, modem) = port(Duration::from_millis(100));
+        drop(modem);
+        let err = s
+            .send_command("AT+CSQ")
+            .expect_err("write to a closed peer");
+        assert!(err.to_string().contains("AT write failed"), "{err}");
+        assert!(s.desynced);
     }
 
     #[test]
