@@ -1386,6 +1386,7 @@ fn start_vowifi_line_strongswan(
             runner.as_ref(),
             &current_pcscf,
             &mut unreachable_streak,
+            line_supervisor::STEADY_STATE_POLL_INTERVAL,
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
@@ -1614,7 +1615,7 @@ fn start_line_tail(
                     sim_recovery::AgentExitOutcome::Other
                 };
                 let action = csim_fails.observe(outcome);
-                let restart_delay = csim_fails.restart_delay();
+                let restart_delay = csim_fails.restart_delay(action);
                 let reason = match outcome {
                     sim_recovery::AgentExitOutcome::AtStall => " (stalled on the modem)",
                     sim_recovery::AgentExitOutcome::CsimFailure => " (AT+CSIM failure)",
@@ -1802,7 +1803,10 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     let mut current_pcscf = pcscf;
     let mut unreachable_streak = 0u32;
     loop {
-        runner.sleep(Duration::from_secs(5));
+        // Named, and shared with the reachability-window derivation: this loop
+        // polls six times faster than the strongswan one, so any threshold
+        // expressed in ticks means two different amounts of real time.
+        runner.sleep(line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL);
         // See the strongswan steady-state loop's identical pattern: the
         // guard is held across the whole tick_steady_state call, not just a
         // one-off check before it, because the Recovered branch below can
@@ -1818,6 +1822,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             runner.as_ref(),
             &current_pcscf,
             &mut unreachable_streak,
+            line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);

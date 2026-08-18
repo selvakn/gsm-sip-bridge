@@ -78,16 +78,43 @@ pub const ESTABLISH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub const STRONGSWAN_REINITIATE_EVERY: u32 = 15;
 /// Matches the swu establish-time loop's `seq 1 90` bound (90 * 2s = 180s).
 pub const SWU_MAX_ESTABLISH_ATTEMPTS: u32 = 90;
-/// Matches the steady-state loop's `sleep 30` cadence.
+/// Matches the strongswan steady-state loop's `sleep 30` cadence.
 pub const STEADY_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Consecutive unreachable ticks before the tunnel is rebuilt.
+/// The swu steady-state loop's own, much faster cadence.
 ///
-/// Three, so at `STEADY_STATE_POLL_INTERVAL` a genuine loss of the data path
-/// is repaired in ~90s rather than never. More than one, because a single
-/// failed TCP connect is a routine thing on a mobile bearer -- one dropped
-/// packet during a rekey should not tear down a working tunnel.
-pub const PCSCF_UNREACHABLE_STRIKES: u32 = 3;
+/// Named rather than inline in `orchestrate` because the reachability window
+/// below is derived from it: the two engines poll six times apart, so anything
+/// expressed in ticks means two different things depending on which loop is
+/// running it.
+pub const SWU_STEADY_STATE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long the P-CSCF must stay unreachable before the tunnel is rebuilt.
+///
+/// A *duration*, not a tick count. This was three ticks, which gives ~90s on the
+/// strongswan loop but only ~15s on the swu loop — so on swu a routine 15s
+/// bearer blip tore down a working tunnel and restarted the agent, while the
+/// doc comment and the real-time bound test both described the 90s figure.
+///
+/// 90s because a genuine loss of the data path should be repaired in about a
+/// minute and a half rather than never, and because a single failed TCP connect
+/// is a routine thing on a mobile bearer — one dropped packet during a rekey
+/// must not be enough.
+pub const PCSCF_UNREACHABLE_WINDOW: Duration = Duration::from_secs(90);
+
+/// However fast a loop polls, never act on fewer than this many consecutive
+/// failures. A time window alone would let an arbitrarily slow poll act on one
+/// sample, and one sample is exactly what is too noisy to trust.
+pub const PCSCF_UNREACHABLE_MIN_STRIKES: u32 = 2;
+
+/// Consecutive unreachable ticks that cover [`PCSCF_UNREACHABLE_WINDOW`] at
+/// `poll_interval`.
+pub fn pcscf_unreachable_strikes(poll_interval: Duration) -> u32 {
+    let per_tick = poll_interval.as_secs().max(1);
+    let ticks = PCSCF_UNREACHABLE_WINDOW.as_secs().div_ceil(per_tick);
+    u32::try_from(ticks)
+        .unwrap_or(u32::MAX)
+        .max(PCSCF_UNREACHABLE_MIN_STRIKES)
+}
 
 /// SIP port probed on the P-CSCF -- the thing a line's data path has to be able
 /// to reach for the line to be worth anything.
@@ -248,6 +275,7 @@ pub fn tick_steady_state(
     runner: &dyn CommandRunner,
     current_pcscf: &str,
     unreachable_streak: &mut u32,
+    poll_interval: Duration,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
         engine.restart_process(runner);
@@ -327,7 +355,9 @@ pub fn tick_steady_state(
         *unreachable_streak = 0;
     } else {
         *unreachable_streak = unreachable_streak.saturating_add(1);
-        if *unreachable_streak >= PCSCF_UNREACHABLE_STRIKES {
+        // Derived from this loop's own cadence, so both engines wait the same
+        // ~90s of real time rather than the same number of ticks.
+        if *unreachable_streak >= pcscf_unreachable_strikes(poll_interval) {
             *unreachable_streak = 0;
             // The same remedy as `TunVanished`, and for the same underlying
             // reason: there is no working data path. `recreate_interface` runs
@@ -380,6 +410,25 @@ mod tests {
     use super::*;
     use crate::supervise::runner::MockCommandRunner;
     use std::cell::RefCell;
+
+    /// `tick_steady_state` at the strongswan cadence, which is what almost every
+    /// test here means. Shadows the real one so the cases that do not care about
+    /// the poll interval stay readable; the ones that *do* care call
+    /// `super::tick_steady_state` explicitly with the interval under test.
+    fn tick_steady_state(
+        engine: &dyn TunnelEngine,
+        runner: &dyn CommandRunner,
+        current_pcscf: &str,
+        unreachable_streak: &mut u32,
+    ) -> SteadyOutcome {
+        super::tick_steady_state(
+            engine,
+            runner,
+            current_pcscf,
+            unreachable_streak,
+            STEADY_STATE_POLL_INTERVAL,
+        )
+    }
 
     // MOCK JUSTIFICATION (constitution Principle I): TunnelEngine's real
     // implementations (StrongswanEngine/SwuEngine) drive real charon/pcscd/
@@ -801,14 +850,87 @@ mod tests {
     }
 
     #[test]
-    fn the_repair_window_is_bounded_in_real_time() {
+    fn the_repair_window_is_bounded_in_real_time_on_every_engine() {
         // Pins the outcome an operator cares about: how long a lost data path
-        // can persist. Three ticks at the steady-state cadence.
-        let worst = STEADY_STATE_POLL_INTERVAL * PCSCF_UNREACHABLE_STRIKES;
-        assert!(
-            worst <= Duration::from_secs(120),
-            "a lost data path must be repaired in ~2 minutes, not {worst:?}"
-        );
+        // can persist. This used to assert against `STEADY_STATE_POLL_INTERVAL`
+        // only, which is the strongswan loop's cadence — so it passed while the
+        // swu loop, polling six times faster, was acting after ~15s and tearing
+        // down working tunnels on routine bearer blips.
+        for interval in [
+            STEADY_STATE_POLL_INTERVAL,
+            SWU_STEADY_STATE_POLL_INTERVAL,
+            Duration::from_secs(1),
+        ] {
+            let strikes = pcscf_unreachable_strikes(interval);
+            let worst = interval * strikes;
+            assert!(
+                worst <= Duration::from_secs(120),
+                "at a {interval:?} cadence a lost data path must be repaired in ~2 minutes, \
+                 not {worst:?}"
+            );
+            assert!(
+                worst >= PCSCF_UNREACHABLE_WINDOW,
+                "at a {interval:?} cadence the tunnel must survive a blip shorter than \
+                 {PCSCF_UNREACHABLE_WINDOW:?}, but it is torn down after {worst:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_poll_still_needs_more_than_one_failure() {
+        // A window alone would let an arbitrarily slow loop act on a single
+        // sample, and one failed TCP connect on a mobile bearer is routine.
+        let strikes = pcscf_unreachable_strikes(Duration::from_secs(600));
+        assert_eq!(strikes, PCSCF_UNREACHABLE_MIN_STRIKES);
+        assert!(strikes > 1);
+        // A zero interval must not divide by zero.
+        assert!(pcscf_unreachable_strikes(Duration::ZERO) >= PCSCF_UNREACHABLE_MIN_STRIKES);
+    }
+
+    #[test]
+    fn the_swu_cadence_does_not_rebuild_on_a_short_blip() {
+        // The concrete regression: 15s of unreachability used to be enough on
+        // swu. It must not be.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut streak = 0;
+        let blip_ticks =
+            (Duration::from_secs(15).as_secs() / SWU_STEADY_STATE_POLL_INTERVAL.as_secs()) as u32;
+        for tick in 0..blip_ticks {
+            assert_eq!(
+                super::tick_steady_state(
+                    &engine,
+                    &runner,
+                    "10.0.0.1",
+                    &mut streak,
+                    SWU_STEADY_STATE_POLL_INTERVAL,
+                ),
+                SteadyOutcome::StillUp,
+                "tick {tick} of a 15s blip must not rebuild the tunnel"
+            );
+        }
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+
+        // ...but a genuinely lost data path is still repaired, within the window.
+        let remaining = pcscf_unreachable_strikes(SWU_STEADY_STATE_POLL_INTERVAL) - blip_ticks;
+        let mut rebuilt = false;
+        for _ in 0..remaining {
+            if let SteadyOutcome::Recovered {
+                reason: DegradeReason::PcscfUnreachable,
+            } = super::tick_steady_state(
+                &engine,
+                &runner,
+                "10.0.0.1",
+                &mut streak,
+                SWU_STEADY_STATE_POLL_INTERVAL,
+            ) {
+                rebuilt = true;
+            }
+        }
+        assert!(rebuilt, "a sustained loss must still be repaired");
     }
 
     #[test]

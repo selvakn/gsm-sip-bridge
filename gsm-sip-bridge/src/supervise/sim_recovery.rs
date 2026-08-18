@@ -89,17 +89,29 @@ impl IncidentCounters {
         }
     }
 
-    /// How long to wait before restarting the agent after this observation.
+    /// How long to wait before restarting the agent, given what
+    /// [`Self::observe`] just decided to do about this exit.
     ///
-    /// Slows right down once this incident has used up its SIM resets, so an
+    /// Slows right down once this incident has given up resetting, so an
     /// unrecoverable fault stops churning while still self-healing if the
     /// hardware comes back (FR-030). A clean run resets `sim_resets`, which
     /// restores the normal cadence automatically.
-    pub fn restart_delay(&self) -> Duration {
-        if self.sim_resets >= MAX_SIM_RESETS {
-            EXHAUSTED_RESTART_DELAY
-        } else {
-            NORMAL_RESTART_DELAY
+    ///
+    /// Keyed on the `Action` rather than on `sim_resets`, because callers read
+    /// this *after* `observe` has already advanced the counters. Reading
+    /// `sim_resets >= MAX_SIM_RESETS` there meant the observation that performed
+    /// the last permitted reset had, by that point, incremented itself to the
+    /// limit — so the agent was held down for a quarter of an hour immediately
+    /// after applying the remedy most likely to have fixed it.
+    pub fn restart_delay(&self, action: Action) -> Duration {
+        match action {
+            // A remedy was just applied. Restart promptly and find out whether
+            // it worked; that is the whole point of having applied it.
+            Action::ResetSim => NORMAL_RESTART_DELAY,
+            // No resets left this incident: stop churning.
+            Action::GiveUpForThisIncident => EXHAUSTED_RESTART_DELAY,
+            // Still counting towards a threshold, or a clean/unrelated exit.
+            Action::None => NORMAL_RESTART_DELAY,
         }
     }
 }
@@ -323,11 +335,20 @@ mod tests {
     #[test]
     fn restart_slows_down_once_resets_are_exhausted_and_speeds_up_after_a_clean_run() {
         let mut c = IncidentCounters::default();
-        assert_eq!(c.restart_delay(), NORMAL_RESTART_DELAY);
+        assert_eq!(c.restart_delay(Action::None), NORMAL_RESTART_DELAY);
 
+        // The incident has used up its resets, so the next threshold hit gives
+        // up rather than resetting again -- that is what earns the slow cadence.
         c.sim_resets = MAX_SIM_RESETS;
+        let action = {
+            let mut counting = c;
+            counting.observe(AgentExitOutcome::CsimFailure);
+            counting.observe(AgentExitOutcome::CsimFailure);
+            counting.observe(AgentExitOutcome::CsimFailure)
+        };
+        assert_eq!(action, Action::GiveUpForThisIncident);
         assert_eq!(
-            c.restart_delay(),
+            c.restart_delay(action),
             EXHAUSTED_RESTART_DELAY,
             "an exhausted incident must stop churning at 5s intervals"
         );
@@ -338,8 +359,29 @@ mod tests {
 
         // The line comes back on its own: a clean run clears the incident and
         // the normal cadence resumes without human intervention.
-        c.observe(AgentExitOutcome::Other);
-        assert_eq!(c.restart_delay(), NORMAL_RESTART_DELAY);
+        let action = c.observe(AgentExitOutcome::Other);
+        assert_eq!(c.restart_delay(action), NORMAL_RESTART_DELAY);
+    }
+
+    #[test]
+    fn the_reset_that_may_have_fixed_it_is_not_punished_with_the_slow_cadence() {
+        // `restart_delay` is read *after* `observe`, and `observe` increments
+        // `sim_resets` before returning `ResetSim`. Keyed on the counter, the
+        // observation that performed the *last permitted* reset therefore
+        // measured itself as exhausted and held the agent down for 15 minutes —
+        // immediately after applying the remedy most likely to have worked.
+        let mut c = IncidentCounters {
+            csim_fails: CSIM_FAIL_THRESHOLD - 1,
+            sim_resets: MAX_SIM_RESETS - 1,
+        };
+        let action = c.observe(AgentExitOutcome::CsimFailure);
+        assert_eq!(action, Action::ResetSim, "the last permitted reset");
+        assert_eq!(c.sim_resets, MAX_SIM_RESETS, "which exhausts the incident");
+        assert_eq!(
+            c.restart_delay(action),
+            NORMAL_RESTART_DELAY,
+            "a SIM reset must be followed by a prompt restart to see if it worked"
+        );
     }
 
     #[test]
