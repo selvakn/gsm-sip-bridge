@@ -1398,6 +1398,12 @@ fn start_vowifi_line_strongswan(
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
             line_supervisor::SteadyOutcome::Recovered { reason } => {
+                // Recoveries used to leave no record at all, which made a
+                // tunnel rebuild indistinguishable from nothing happening --
+                // both in a soak and for an operator afterwards. A remedy this
+                // heavy (terminate + reinitiate, and a re-registration behind
+                // it) has to say so.
+                println!("[supervise] line {idx}: recovered from {reason:?}");
                 if let Some(new_handle) = engine.shared.current_handle() {
                     let mut st = started.lock().unwrap();
                     // Dedupe by identity: most recoveries are connection-
@@ -1820,7 +1826,8 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 drop(guard);
                 current_pcscf = new_pcscf;
             }
-            line_supervisor::SteadyOutcome::Recovered { .. } => {
+            line_supervisor::SteadyOutcome::Recovered { reason } => {
+                println!("[supervise] line {idx}: recovered from {reason:?}");
                 if let Some(h) = engine.dialer_handle.borrow().clone() {
                     started.lock().unwrap().vowifi_child_handles.push(h);
                 }
