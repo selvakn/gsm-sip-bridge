@@ -346,6 +346,14 @@ impl StrongswanEngine {
 }
 
 impl TunnelEngine for StrongswanEngine {
+    fn pcscf_reachable(&self, runner: &dyn CommandRunner, pcscf: &str) -> bool {
+        if pcscf.is_empty() {
+            // Nothing captured yet: not a failure, just nothing to test.
+            return true;
+        }
+        runner.tcp_connect_ok_in_netns(&self.netns, pcscf, super::line_supervisor::PCSCF_SIP_PORT)
+    }
+
     fn is_tunnel_established(&self, runner: &dyn CommandRunner) -> bool {
         runner
             .read_file(&self.shared.charon_log)
@@ -538,6 +546,14 @@ impl SwuEngine {
 }
 
 impl TunnelEngine for SwuEngine {
+    fn pcscf_reachable(&self, runner: &dyn CommandRunner, pcscf: &str) -> bool {
+        if pcscf.is_empty() {
+            // Nothing captured yet: not a failure, just nothing to test.
+            return true;
+        }
+        runner.tcp_connect_ok_in_netns(&self.netns, pcscf, super::line_supervisor::PCSCF_SIP_PORT)
+    }
+
     fn is_tunnel_established(&self, runner: &dyn CommandRunner) -> bool {
         runner
             .read_file(&self.log_file)

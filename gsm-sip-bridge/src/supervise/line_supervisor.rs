@@ -43,6 +43,18 @@ pub enum DegradeReason {
     TunUnavailable,
     ChildSaMissing,
     PcscfChanged,
+    /// The P-CSCF became unreachable from inside this line's namespace for
+    /// several consecutive ticks, while every structural check still passed
+    /// (specs/039-at-stall-watchdog).
+    ///
+    /// This is the 2026-08-17 outage: after the carrier moved the P-CSCF, the
+    /// tunnel re-established -- IKE SA up, CHILD_SA installed, interface
+    /// present -- but the `default dev tun23-0` route was never reinstalled.
+    /// So there was no data path, the inbound SA carried 0 bytes, and the
+    /// agent got `ENETUNREACH` and exited every 6 seconds for **8 hours**.
+    /// Every structural check passed the whole time, because none of them
+    /// looks at whether anything can actually be reached.
+    PcscfUnreachable,
 }
 
 /// Steady-state-only health, beyond "is the process alive" and "is a P-CSCF
@@ -68,6 +80,18 @@ pub const STRONGSWAN_REINITIATE_EVERY: u32 = 15;
 pub const SWU_MAX_ESTABLISH_ATTEMPTS: u32 = 90;
 /// Matches the steady-state loop's `sleep 30` cadence.
 pub const STEADY_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Consecutive unreachable ticks before the tunnel is rebuilt.
+///
+/// Three, so at `STEADY_STATE_POLL_INTERVAL` a genuine loss of the data path
+/// is repaired in ~90s rather than never. More than one, because a single
+/// failed TCP connect is a routine thing on a mobile bearer -- one dropped
+/// packet during a rekey should not tear down a working tunnel.
+pub const PCSCF_UNREACHABLE_STRIKES: u32 = 3;
+
+/// SIP port probed on the P-CSCF -- the thing a line's data path has to be able
+/// to reach for the line to be worth anything.
+pub const PCSCF_SIP_PORT: u16 = 5060;
 
 /// Engine-specific behavior the shared state machine drives. One
 /// implementation per `[vowifi].tunnel_engine` value
@@ -127,6 +151,15 @@ pub trait TunnelEngine {
     /// periodic action beyond polling — it only ever fully restarts the
     /// dialer, on the steady-state side, never re-initiates in place).
     fn reinitiate_cadence(&self) -> Option<u32>;
+
+    /// Can this line's P-CSCF actually be reached, from inside this line's
+    /// namespace, right now?
+    ///
+    /// The only check here that tests the *data path* rather than its
+    /// structure. Everything else asks whether the pieces exist; this asks
+    /// whether they carry traffic, which is the question the 2026-08-17 outage
+    /// went 8 hours without anyone asking.
+    fn pcscf_reachable(&self, runner: &dyn CommandRunner, pcscf: &str) -> bool;
 }
 
 /// Outcome of one establish-time tick.
@@ -214,6 +247,7 @@ pub fn tick_steady_state(
     engine: &dyn TunnelEngine,
     runner: &dyn CommandRunner,
     current_pcscf: &str,
+    unreachable_streak: &mut u32,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
         engine.restart_process(runner);
@@ -279,9 +313,38 @@ pub fn tick_steady_state(
         SteadyStateHealth::Ok => {}
     }
 
+    // Reachability is checked last, and deliberately *after* the P-CSCF-changed
+    // branch above: when the carrier moves the P-CSCF, the old address becoming
+    // unreachable is expected, and refreshing to the new one is the right
+    // remedy rather than rebuilding the tunnel.
     if let Some(latest) = engine.latest_pcscf(runner) {
         if latest != current_pcscf {
             return SteadyOutcome::PcscfChanged { new_pcscf: latest };
+        }
+    }
+
+    if engine.pcscf_reachable(runner, current_pcscf) {
+        *unreachable_streak = 0;
+    } else {
+        *unreachable_streak = unreachable_streak.saturating_add(1);
+        if *unreachable_streak >= PCSCF_UNREACHABLE_STRIKES {
+            *unreachable_streak = 0;
+            // The same remedy as `TunVanished`, and for the same underlying
+            // reason: there is no working data path. `recreate_interface` runs
+            // first and the rebuild is conditional on it, exactly as there —
+            // a terminate+reinitiate that lands on an interface with no route
+            // just churns the carrier and negotiates another SA that carries
+            // nothing, which is precisely the state this recovers from.
+            if !engine.recreate_interface(runner) {
+                return SteadyOutcome::Recovered {
+                    reason: DegradeReason::TunUnavailable,
+                };
+            }
+            engine.terminate(runner);
+            engine.reinitiate(runner);
+            return SteadyOutcome::Recovered {
+                reason: DegradeReason::PcscfUnreachable,
+            };
         }
     }
 
@@ -325,6 +388,10 @@ mod tests {
     // every transition in data-model.md's table directly, independent of
     // engine wiring.
     struct FakeEngine {
+        /// Whether the data path works. Separate from every structural field
+        /// below, because the whole point is that structure can be perfect
+        /// while nothing is reachable.
+        pcscf_reachable: RefCell<bool>,
         established: RefCell<bool>,
         pcscf: RefCell<Option<String>>,
         alive: RefCell<bool>,
@@ -349,6 +416,9 @@ mod tests {
             Self {
                 established: RefCell::new(false),
                 pcscf: RefCell::new(None),
+                // Default reachable: every pre-existing test asserts on the
+                // structural checks and must keep passing unchanged.
+                pcscf_reachable: RefCell::new(true),
                 alive: RefCell::new(true),
                 health: RefCell::new(SteadyStateHealth::Ok),
                 max_attempts: None,
@@ -364,6 +434,10 @@ mod tests {
     }
 
     impl TunnelEngine for FakeEngine {
+        fn pcscf_reachable(&self, _runner: &dyn CommandRunner, _pcscf: &str) -> bool {
+            *self.pcscf_reachable.borrow()
+        }
+
         fn is_tunnel_established(&self, _runner: &dyn CommandRunner) -> bool {
             *self.established.borrow()
         }
@@ -518,7 +592,7 @@ mod tests {
             alive: RefCell::new(false),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -535,7 +609,7 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::ViciBroken),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -552,7 +626,7 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::TunVanished),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -583,7 +657,7 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::TunVanished),
             ..Default::default()
         };
-        tick_steady_state(&engine, &runner, "10.0.0.1");
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             *engine.call_order.borrow(),
             vec!["recreate_interface", "terminate", "reinitiate"],
@@ -600,7 +674,7 @@ mod tests {
             recreate_ok: false,
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -628,13 +702,123 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_pcscf_rebuilds_the_tunnel_after_three_strikes() {
+        // The 2026-08-17 outage, as a test. Every structural check passes --
+        // process alive, vici fine, interface present, CHILD_SA installed,
+        // P-CSCF unchanged -- and nothing can be reached, because the route
+        // through the tunnel was never reinstalled. That state lasted 8 hours
+        // and the agent exited 4804 times, because no check asked whether the
+        // data path carried traffic.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut streak = 0;
+
+        // A single failure is routine on a mobile bearer -- one dropped packet
+        // during a rekey must not tear down a working tunnel.
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0, "no churn yet");
+
+        // Sustained, though, means the data path is genuinely gone.
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::PcscfUnreachable
+            }
+        );
+        // Same remedy as TunVanished, and in the same order: recreate the
+        // interface first, then rebuild the negotiation onto it.
+        assert_eq!(*engine.recreate_interface_calls.borrow(), 1);
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+        assert_eq!(streak, 0, "the streak resets after acting");
+    }
+
+    #[test]
+    fn a_recovered_reachability_resets_the_streak_before_it_ever_acts() {
+        // A flapping bearer must never accumulate its way to a teardown.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine::default();
+        let mut streak = 0;
+        for _ in 0..10 {
+            *engine.pcscf_reachable.borrow_mut() = false;
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak);
+            *engine.pcscf_reachable.borrow_mut() = true;
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak);
+        }
+        assert_eq!(streak, 0);
+        assert_eq!(
+            *engine.reinitiate_calls.borrow(),
+            0,
+            "alternating reachability is not a sustained loss and must not rebuild"
+        );
+    }
+
+    #[test]
+    fn a_reachable_pcscf_is_still_up_and_touches_nothing() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine::default();
+        let mut streak = 0;
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+        assert_eq!(*engine.restart_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn a_changed_pcscf_is_refreshed_rather_than_rebuilt_even_when_unreachable() {
+        // Ordering matters: when the carrier moves the P-CSCF, the *old*
+        // address going unreachable is expected. Refreshing to the new one is
+        // the cheap correct remedy; rebuilding the tunnel would be churn. This
+        // is the exact sequence that preceded the outage.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf: RefCell::new(Some("10.0.0.2".to_string())),
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut streak = 0;
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::PcscfChanged {
+                new_pcscf: "10.0.0.2".to_string()
+            }
+        );
+        assert_eq!(streak, 0, "a refresh must not count as an unreachable tick");
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn the_repair_window_is_bounded_in_real_time() {
+        // Pins the outcome an operator cares about: how long a lost data path
+        // can persist. Three ticks at the steady-state cadence.
+        let worst = STEADY_STATE_POLL_INTERVAL * PCSCF_UNREACHABLE_STRIKES;
+        assert!(
+            worst <= Duration::from_secs(120),
+            "a lost data path must be repaired in ~2 minutes, not {worst:?}"
+        );
+    }
+
+    #[test]
     fn steady_state_child_sa_missing_only_reinitiates_no_terminate_no_restart() {
         let runner = MockCommandRunner::new();
         let engine = FakeEngine {
             health: RefCell::new(SteadyStateHealth::ChildSaMissing),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -653,7 +837,7 @@ mod tests {
             pcscf: RefCell::new(Some("10.0.0.9".to_string())),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1");
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
         assert_eq!(
             outcome,
             SteadyOutcome::PcscfChanged {
@@ -672,7 +856,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            tick_steady_state(&engine, &runner, "10.0.0.1"),
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0),
             SteadyOutcome::StillUp
         );
     }
@@ -707,12 +891,16 @@ mod tests {
             DegradeReason::TunUnavailable,
             DegradeReason::ChildSaMissing,
             DegradeReason::PcscfChanged,
+            DegradeReason::PcscfUnreachable,
         ] {
             match reason {
                 DegradeReason::ProcessDied
                 | DegradeReason::ViciBroken
                 | DegradeReason::TunVanished
-                | DegradeReason::PcscfChanged => assert!(recovery_restarts_agent(reason)),
+                | DegradeReason::PcscfChanged
+                // A rebuilt tunnel means a new data path, which the agent has
+                // to re-register over -- so it must be restarted.
+                | DegradeReason::PcscfUnreachable => assert!(recovery_restarts_agent(reason)),
                 DegradeReason::TunUnavailable | DegradeReason::ChildSaMissing => {
                     assert!(!recovery_restarts_agent(reason))
                 }

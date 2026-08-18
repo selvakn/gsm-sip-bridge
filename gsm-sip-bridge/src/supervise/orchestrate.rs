@@ -1359,6 +1359,9 @@ fn start_vowifi_line_strongswan(
 
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
+    // Consecutive ticks the P-CSCF has been unreachable. Owned by the loop, like
+    // `current_pcscf`, so the tick function stays a decision over inputs.
+    let mut unreachable_streak = 0u32;
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1378,7 +1381,12 @@ fn start_vowifi_line_strongswan(
         if *guard {
             return;
         }
-        match line_supervisor::tick_steady_state(&engine, runner.as_ref(), &current_pcscf) {
+        match line_supervisor::tick_steady_state(
+            &engine,
+            runner.as_ref(),
+            &current_pcscf,
+            &mut unreachable_streak,
+        ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
             }
@@ -1686,7 +1694,22 @@ fn start_line_tail(
                     // out something entirely unrelated. This has the same 3s
                     // connect timeout, waits for its child properly, and does
                     // not interpolate a file's contents into a shell command.
-                    let _ = runner.tcp_connect_ok_in_netns(&netns, pcscf_now, 5060);
+                    // The result is deliberately discarded *here*: this loop's
+                    // job is to put traffic on the tunnel so the bearer's NAT
+                    // mapping stays alive, not to decide anything.
+                    //
+                    // It used to be the only thing in the whole system that
+                    // probed reachability, and dropping the answer is what let
+                    // the 2026-08-17 outage run for 8 hours: this probe failed
+                    // roughly 960 consecutive times and told nobody. The
+                    // decision now lives in `line_supervisor::tick_steady_state`
+                    // (`DegradeReason::PcscfUnreachable`), which has the engine
+                    // handle needed to actually repair the tunnel.
+                    let _ = runner.tcp_connect_ok_in_netns(
+                        &netns,
+                        pcscf_now,
+                        line_supervisor::PCSCF_SIP_PORT,
+                    );
                 }
                 runner.sleep(interval);
             }
@@ -1771,6 +1794,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     let mut current_pcscf = pcscf;
+    let mut unreachable_streak = 0u32;
     loop {
         runner.sleep(Duration::from_secs(5));
         // See the strongswan steady-state loop's identical pattern: the
@@ -1783,7 +1807,12 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         if *guard {
             return;
         }
-        match line_supervisor::tick_steady_state(&engine, runner.as_ref(), &current_pcscf) {
+        match line_supervisor::tick_steady_state(
+            &engine,
+            runner.as_ref(),
+            &current_pcscf,
+            &mut unreachable_streak,
+        ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
             }
