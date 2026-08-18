@@ -21,7 +21,7 @@
 //!   serial ports open.
 //! - **TCP connect, not ICMP**, to the P-CSCF: operators commonly filter ping.
 
-use super::super::supervise::runner::{CommandRunner, RealCommandRunner};
+use super::super::supervise::runner::{CommandRunner, HttpProbe, RealCommandRunner};
 use crate::cli::Cli;
 use crate::config::load_config;
 use crate::vowifi::discovery::{LineResolution, LineResolutionEntry};
@@ -186,6 +186,12 @@ pub fn run_tcp_probe(host: &str, port: u16) -> ExitCode {
 }
 
 /// The full probe, given an already-loaded resolution.
+///
+/// Equivalent to [`evaluate_with_metrics`] with no scrape to consult. Kept for
+/// the tests that predate the lapsed-registration check; **production goes
+/// through `evaluate_with_metrics`**, because `run` has a real body and passing
+/// `""` here silently disabled FR-020 entirely.
+#[cfg(test)]
 pub fn evaluate(
     runner: &dyn CommandRunner,
     metrics_ok: bool,
@@ -308,13 +314,18 @@ pub fn evaluate_with_metrics(
     }
 }
 
-/// The daemon's own `/metrics`, or `None` if it is not answering.
+/// Probe the daemon's own `/metrics`.
 ///
 /// A real GET rather than the bare TCP connect this used to be: the port
 /// accepting a connection proves the daemon is up, not that any line is
 /// usable. On 2026-08-16 this check passed continuously for 2h45m while the
 /// line behind it was unreachable.
-fn fetch_metrics(runner: &dyn CommandRunner, port: u16) -> Option<String> {
+///
+/// Returns the three-way [`HttpProbe`] rather than an `Option`, so the caller
+/// can keep "the daemon is not answering" (a fault, as it always was) apart
+/// from "the daemon answered but the scrape was unreadable" (no body to draw
+/// conclusions from, and not by itself a reason to fail the container).
+fn fetch_metrics(runner: &dyn CommandRunner, port: u16) -> HttpProbe {
     runner.http_get(&format!("http://127.0.0.1:{port}/metrics"))
 }
 
@@ -370,8 +381,7 @@ pub fn run(cli: &Cli) -> ExitCode {
     };
 
     let runner = RealCommandRunner::new();
-    let metrics_body = fetch_metrics(&runner, config.metrics.port);
-    let metrics_ok = metrics_body.is_some();
+    let metrics = fetch_metrics(&runner, config.metrics.port);
 
     // Read what `supervise` resolved at startup; never re-scan (see the
     // module doc). A missing/unparsable file is an empty resolution, which
@@ -381,13 +391,19 @@ pub fn run(cli: &Cli) -> ExitCode {
     )
     .unwrap_or_default();
 
-    let health = evaluate(
+    // `evaluate_with_metrics`, not `evaluate`: the latter hardcodes an empty
+    // body, so calling it here fetched the scrape and then threw it away —
+    // leaving the lapsed-registration check (FR-020) exercised only by its unit
+    // tests and never once in production, which is the exact blind spot this
+    // feature was written to close.
+    let health = evaluate_with_metrics(
         &runner,
-        metrics_ok,
+        metrics.reachable(),
         config.cs.enabled,
         config.vowifi.enabled,
         &resolution,
         &config.vowifi.tunnel_engine,
+        metrics.body(),
     );
 
     match &health {
@@ -526,6 +542,89 @@ mod tests {
             &metrics_with_expiry("ec20-11", "-9752"),
         );
         assert!(!health.is_healthy(), "{health:?}");
+    }
+
+    #[test]
+    fn fetch_metrics_reports_the_body_the_daemon_served() {
+        // Pins the wiring the production call site got wrong: `run` fetched the
+        // scrape and then called the body-less `evaluate`, so `metrics_body` was
+        // always `""` and no lapsed registration could ever be detected outside
+        // these tests. `evaluate` is now `#[cfg(test)]`, so that mistake cannot
+        // be made again from production code.
+        let runner = MockCommandRunner::default();
+        let body = metrics_with_expiry("ec20-11", "-9752");
+        runner.http_responses.lock().unwrap().insert(
+            "http://127.0.0.1:9099/metrics".to_string(),
+            HttpProbe::Body(body.clone()),
+        );
+        let probe = fetch_metrics(&runner, 9099);
+        assert!(probe.reachable());
+        assert_eq!(probe.body(), body);
+
+        let health = evaluate_with_metrics(
+            &runner,
+            probe.reachable(),
+            true,
+            true,
+            &resolution(vec![]),
+            "strongswan",
+            probe.body(),
+        );
+        assert!(
+            !health.is_healthy(),
+            "the fetched body must reach the verdict: {health:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_scrape_is_not_a_fault_but_yields_no_expiry_data() {
+        // Upgrading this probe from a bare TCP connect to a full GET introduced
+        // a new way to fail: a slow or truncated encode under load. The endpoint
+        // answered, so it is up -- exactly what the old connect check concluded
+        // -- and there is simply no body to draw conclusions from.
+        let runner = MockCommandRunner::default();
+        runner.http_responses.lock().unwrap().insert(
+            "http://127.0.0.1:9099/metrics".to_string(),
+            HttpProbe::Unreadable,
+        );
+        let probe = fetch_metrics(&runner, 9099);
+        assert!(probe.reachable(), "a server that answered is not down");
+        assert_eq!(probe.body(), "");
+        let health = evaluate_with_metrics(
+            &runner,
+            probe.reachable(),
+            true,
+            true,
+            &resolution(vec![]),
+            "strongswan",
+            probe.body(),
+        );
+        assert_ne!(
+            health,
+            Health::MetricsEndpointDown,
+            "an unreadable body must not report the whole container down"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_endpoint_is_still_a_fault() {
+        // The other side of that distinction, unchanged from before.
+        let runner = MockCommandRunner::default();
+        let probe = fetch_metrics(&runner, 9099);
+        assert_eq!(probe, HttpProbe::Unreachable);
+        assert!(!probe.reachable());
+        assert_eq!(
+            evaluate_with_metrics(
+                &runner,
+                probe.reachable(),
+                true,
+                true,
+                &resolution(vec![]),
+                "strongswan",
+                probe.body(),
+            ),
+            Health::MetricsEndpointDown
+        );
     }
 
     /// Makes `ip addr show <iface>` in `netns` report an address.
