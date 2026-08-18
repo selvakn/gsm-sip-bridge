@@ -151,19 +151,33 @@ struct WorkerState {
 /// An agent with no progress handle always heartbeats — that is every agent
 /// that is not stall-monitored, and withholding their heartbeat would report
 /// them as dead.
+///
+/// Requires two consecutive over-budget observations before withholding,
+/// matching the watchdog's own policy. Passing `previous: None` — as this used to
+/// — pins every verdict at `Suspected`, which the watchdog defines as explicitly
+/// *not* actionable, so a single momentary overrun withheld the heartbeat. Report
+/// age would then climb toward `staleness_threshold`, which zeroes `AGENT_UP` and
+/// the VoWiFi gauges: a working line reported dead, which is its own kind of lie.
+///
+/// Returns the observation to feed back as `previous` next time, so the caller
+/// holds the state and this stays pure.
 fn should_heartbeat(
     progress: Option<&crate::ims::agent::watchdog::Progress>,
+    previous: Option<crate::ims::agent::watchdog::ProgressSnapshot>,
     now: Instant,
-) -> bool {
+) -> (bool, Option<crate::ims::agent::watchdog::ProgressSnapshot>) {
+    use crate::ims::agent::watchdog::{stall_verdict, StallVerdict, DEFER_CEILING};
     match progress {
-        None => true,
+        None => (true, None),
         Some(p) => {
-            crate::ims::agent::watchdog::stall_verdict(
-                p.snapshot(),
-                None,
-                now,
-                crate::ims::agent::watchdog::DEFER_CEILING,
-            ) == crate::ims::agent::watchdog::StallVerdict::Healthy
+            let current = p.snapshot();
+            let heartbeat = match stall_verdict(current, previous, now, DEFER_CEILING) {
+                StallVerdict::Healthy | StallVerdict::Suspected { .. } => true,
+                StallVerdict::Confirmed { .. }
+                | StallVerdict::Deferred { .. }
+                | StallVerdict::Forced { .. } => false,
+            };
+            (heartbeat, Some(current))
         }
     }
 }
@@ -199,6 +213,9 @@ fn worker_loop(cfg: WorkerConfig, rx: mpsc::Receiver<ReporterCmd>) {
         epoch,
         next_seq: 1,
     };
+    // The previous heartbeat's progress observation, which is what gives
+    // `should_heartbeat` the same two-sample confirmation the watchdog uses.
+    let mut last_progress: Option<crate::ims::agent::watchdog::ProgressSnapshot> = None;
 
     loop {
         match rx.recv_timeout(report_interval) {
@@ -222,7 +239,14 @@ fn worker_loop(cfg: WorkerConfig, rx: mpsc::Receiver<ReporterCmd>) {
                 // `metrics::server::refresh_agent_liveness` *already* zeroes
                 // AGENT_UP and the VoWiFi gauges — reusing machinery that
                 // exists and is tested, rather than adding a parallel one.
-                if should_heartbeat(progress.as_deref(), Instant::now()) {
+                //
+                // Two consecutive over-budget observations are required, so a
+                // phase that momentarily overruns and recovers does not fall
+                // silent and get its own line reported dead.
+                let (heartbeat, observed) =
+                    should_heartbeat(progress.as_deref(), last_progress, Instant::now());
+                last_progress = observed;
+                if heartbeat {
                     let hb_state = state.last_state;
                     enqueue(&mut state, agent, &module_id, hb_state, Vec::new());
                 }
@@ -319,18 +343,28 @@ mod tests {
     use super::*;
     use crate::ims::agent::watchdog::{Phase, Progress};
 
+    /// One observation, discarding the returned state — for the cases that only
+    /// care about a single verdict.
+    fn heartbeats(
+        p: Option<&Progress>,
+        previous: Option<crate::ims::agent::watchdog::ProgressSnapshot>,
+        now: Instant,
+    ) -> bool {
+        should_heartbeat(p, previous, now).0
+    }
+
     #[test]
     fn an_agent_with_no_progress_handle_always_heartbeats() {
         // Not every agent is stall-monitored; withholding their heartbeat
         // would report a perfectly healthy agent as dead.
-        assert!(should_heartbeat(None, Instant::now()));
+        assert!(heartbeats(None, None, Instant::now()));
     }
 
     #[test]
     fn a_moving_agent_heartbeats() {
         let p = Progress::new("test");
         p.enter(Phase::Renewal);
-        assert!(should_heartbeat(Some(&p), Instant::now()));
+        assert!(heartbeats(Some(&p), None, Instant::now()));
     }
 
     #[test]
@@ -344,9 +378,40 @@ mod tests {
             .budget()
             .expect("renewal is a working phase and carries a budget");
         let long_after = Instant::now() + renewal_budget + Duration::from_secs(1);
+
+        // First observation: over budget, but a single sample is not actionable.
+        let (first, observed) = should_heartbeat(Some(&p), None, long_after);
         assert!(
-            !should_heartbeat(Some(&p), long_after),
-            "a stalled agent must stop claiming to be alive"
+            first,
+            "one over-budget sample must not be enough -- that is the watchdog's own policy"
+        );
+        // Second observation of the same stuck phase: now it counts.
+        assert!(
+            !heartbeats(Some(&p), observed, long_after + Duration::from_secs(5)),
+            "a confirmed stall must stop claiming to be alive"
+        );
+    }
+
+    #[test]
+    fn a_momentary_overrun_does_not_take_the_line_out_of_service() {
+        // `previous: None` pinned every verdict at `Suspected`, which the
+        // watchdog defines as explicitly non-actionable -- so a phase that
+        // overran once and recovered withheld its heartbeat anyway, pushing the
+        // report age toward `staleness_threshold` and zeroing `AGENT_UP` and the
+        // VoWiFi gauges for a line that was working.
+        let p = Progress::new("test");
+        p.enter(Phase::GmProbe);
+        let budget = Phase::GmProbe.budget().expect("a working phase");
+        let over = Instant::now() + budget + Duration::from_secs(1);
+
+        let (first, observed) = should_heartbeat(Some(&p), None, over);
+        assert!(first);
+
+        // The probe finishes and the loop goes back to polling.
+        p.enter(Phase::Idle);
+        assert!(
+            heartbeats(Some(&p), observed, over + Duration::from_secs(5)),
+            "a recovered phase must resume heartbeating immediately"
         );
     }
 
@@ -356,8 +421,9 @@ mod tests {
         // would take every quiet line out of service.
         let p = Progress::new("test");
         p.enter(Phase::Idle);
-        assert!(should_heartbeat(
+        assert!(heartbeats(
             Some(&p),
+            None,
             Instant::now() + Duration::from_secs(2)
         ));
     }

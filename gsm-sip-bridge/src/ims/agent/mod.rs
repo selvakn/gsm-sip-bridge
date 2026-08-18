@@ -1231,13 +1231,23 @@ impl LoopState {
         // responses arrive on `inbound.rx` (via the client-reader thread) like
         // everything else — this no longer reads the carrier socket directly,
         // which also removes the two-readers-on-one-socket race (research R2).
-        self.origination = begin_origination(
-            session,
-            pending.control,
-            pending.call_id,
-            &pending.destination,
-            &p.origination_setup(),
-        );
+        //
+        // Watched (specs/039-at-stall-watchdog): this is the one part of an
+        // origination that blocks the dispatch loop, and its INVITE write has no
+        // timeout of its own — a P-CSCF whose receive window never opens parks
+        // this thread indefinitely, exactly as the modem read did. The *waiting*
+        // afterwards is tick-driven and needs no phase; `Phase::Origination`
+        // therefore covers precisely this call and nothing else.
+        self.origination = {
+            let _phase = p.progress.phase_guard(watchdog::Phase::Origination);
+            begin_origination(
+                session,
+                pending.control,
+                pending.call_id,
+                &pending.destination,
+                &p.origination_setup(),
+            )
+        };
         true
     }
 

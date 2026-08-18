@@ -437,19 +437,77 @@ fn open_with_retry(modem_port: &Path) -> BridgeResult<AtCommander> {
     Err(last_err.expect("loop runs at least once"))
 }
 
+/// How long one sweep pass may run before it abandons the rest of its work.
+///
+/// A pass has to be bounded because its *phase* is: the stall watchdog judges
+/// `Phase::SmsSweep` against a fixed budget, and a pass that outruns it is killed
+/// as a stall even though every individual step behaved correctly. That is easy
+/// to reach — each per-message step can legitimately wait the full
+/// `MODEM_LOCK_TIMEOUT` for a renewal to finish with the modem, so a handful of
+/// stored messages is enough on its own.
+///
+/// Abandoning the remainder is cheap and safe, because a pass is idempotent by
+/// design: unread messages stay in modem storage, relayed-but-undeleted ones are
+/// suppressed by the dedupe, and the next pass is only
+/// `MODEM_SWEEP_INTERVAL` away. Pinned against the watchdog budget by
+/// [`tests::a_sweep_pass_cannot_outrun_its_watchdog_budget`].
+const SWEEP_PASS_BUDGET: Duration = Duration::from_secs(60);
+
+/// Worst case for one message's port work (read, or delete): waiting for the
+/// modem, opening it, then one AT round trip.
+const PER_MESSAGE_PORT_BUDGET: Duration = Duration::from_secs(30);
+
+/// Worst case for relaying one message: a cross-route settle followed by one
+/// relay attempt. No AT port involved.
+const PER_MESSAGE_RELAY_BUDGET: Duration = Duration::from_secs(15);
+
+/// The wall-clock bound on one sweep pass.
+///
+/// Only ever consulted *between* units of work — a pass never interrupts an AT
+/// round trip half-way, it just declines to start another one it cannot finish.
+struct PassBudget {
+    deadline: Instant,
+}
+
+impl PassBudget {
+    fn start() -> Self {
+        Self {
+            deadline: Instant::now() + SWEEP_PASS_BUDGET,
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Whether there is time to start a unit of work that could take `need`.
+    fn room_for(&self, need: Duration) -> bool {
+        self.remaining() >= need
+    }
+
+    /// How long to wait for the modem: the usual timeout, but never past this
+    /// pass's own deadline.
+    fn lock_wait(&self) -> Duration {
+        self.remaining()
+            .min(crate::modules::modem_lock::MODEM_LOCK_TIMEOUT)
+    }
+}
+
 fn sweep_modem_storage(
     modem_port: &Path,
     control_addr: SocketAddr,
     modem_lock: &Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: &Arc<Mutex<Dedupe>>,
 ) -> BridgeResult<()> {
+    let budget = PassBudget::start();
+
     // Phase 1a: text mode + list indexes — one brief, combined session.
     let indexes = {
         // Bounded (specs/039-at-stall-watchdog): skipping this pass and
         // retrying in 20s is strictly better than joining a queue behind a
         // wedged holder, which is how one stuck activity used to become
         // several.
-        let Some(_guard) = modem_lock.lock() else {
+        let Some(_guard) = modem_lock.lock_timeout(budget.lock_wait()) else {
             return Err(crate::error::BridgeError::Discovery(
                 "the modem is held by another user beyond the timeout; skipping this sweep".into(),
             ));
@@ -468,8 +526,15 @@ fn sweep_modem_storage(
     // need it, regardless of how many messages are pending.
     let mut messages = Vec::with_capacity(indexes.len());
     for index in indexes {
+        if !budget.room_for(PER_MESSAGE_PORT_BUDGET) {
+            tracing::warn!(
+                from_index = index,
+                "sweep pass out of budget; leaving the remaining messages for the next pass"
+            );
+            break;
+        }
         let sms = {
-            match modem_lock.lock() {
+            match modem_lock.lock_timeout(budget.lock_wait()) {
                 Some(_guard) => open_with_retry(modem_port)
                     .and_then(|mut at| crate::sms::reader::read_sms(&mut at, index)),
                 None => Err(crate::error::BridgeError::Discovery(
@@ -495,6 +560,18 @@ fn sweep_modem_storage(
     // Phase 2: decide and relay each message. No AT port held here.
     let mut to_delete = Vec::new();
     for sms in messages {
+        // Checked *before* `decide` below, which claims the key: breaking after
+        // a claim but before the relay would leave the key claimed and
+        // unconfirmed, and the next pass would then read `AcknowledgeOnly` ->
+        // `TimedOut` and skip the message forever. Breaking here claims nothing.
+        if !budget.room_for(PER_MESSAGE_RELAY_BUDGET) {
+            tracing::warn!(
+                from_index = sms.index,
+                "sweep pass out of budget; leaving the remaining messages unrelayed for the \
+                 next pass"
+            );
+            break;
+        }
         let inbound = InboundMessage {
             route: MessageRoute::ThroughModem,
             sender: sms.sender.clone(),
@@ -553,8 +630,18 @@ fn sweep_modem_storage(
     // Phase 3: clear whatever is now confirmed handled — again, one port
     // session per message, for the same reason as phase 1b.
     for index in to_delete {
+        if !budget.room_for(PER_MESSAGE_PORT_BUDGET) {
+            // Safe to abandon: these were relayed and confirmed, so the dedupe
+            // suppresses the re-read next pass, which will clear them then.
+            tracing::warn!(
+                from_index = index,
+                "sweep pass out of budget; the dedupe will suppress these until the next pass \
+                 clears them"
+            );
+            break;
+        }
         let result = {
-            match modem_lock.lock() {
+            match modem_lock.lock_timeout(budget.lock_wait()) {
                 Some(_guard) => open_with_retry(modem_port)
                     .and_then(|mut at| crate::sms::reader::delete_sms(&mut at, index)),
                 None => Err(crate::error::BridgeError::Discovery(
@@ -649,6 +736,83 @@ fn relay_modem_message(control_addr: SocketAddr, sender: &str, body: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sweep_pass_cannot_outrun_its_watchdog_budget() {
+        // The bug this closes: nothing tied the pass's duration to the budget the
+        // watchdog judges it against. Each per-message step can legitimately wait
+        // the full `MODEM_LOCK_TIMEOUT` while a renewal holds the modem, so a
+        // handful of stored messages pushed a *correctly behaving* pass past the
+        // deadline and the watchdog killed a healthy line.
+        let watchdog = crate::ims::agent::watchdog::Phase::SmsSweep
+            .budget()
+            .expect("the sweep is working, not resting, so it must carry a budget");
+        assert!(
+            SWEEP_PASS_BUDGET < watchdog,
+            "a pass may run {SWEEP_PASS_BUDGET:?} but is judged against {watchdog:?}"
+        );
+        let margin = watchdog.as_secs_f64() / SWEEP_PASS_BUDGET.as_secs_f64() - 1.0;
+        assert!(
+            margin >= 0.20,
+            "only {:.0}% headroom between the pass budget and the watchdog's; want >=20%",
+            margin * 100.0
+        );
+    }
+
+    #[test]
+    fn the_per_step_budgets_cover_their_worst_legitimate_case() {
+        // Recomputed from the real constants, so raising any of them fails the
+        // build rather than quietly letting a pass overrun again.
+        let open_worst = OPEN_RETRY_BASE_DELAY * (1 + 2 + 3);
+        let port_worst = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT
+            + open_worst
+            + crate::modules::at_commander::DEFAULT_TIMEOUT;
+        assert!(
+            PER_MESSAGE_PORT_BUDGET >= port_worst,
+            "{PER_MESSAGE_PORT_BUDGET:?} must cover one message's port work ({port_worst:?})"
+        );
+
+        let relay_worst = CROSS_ROUTE_SETTLE_TIMEOUT + CONTROL_TIMEOUT;
+        assert!(
+            PER_MESSAGE_RELAY_BUDGET >= relay_worst,
+            "{PER_MESSAGE_RELAY_BUDGET:?} must cover one relay ({relay_worst:?})"
+        );
+
+        // And a pass must have room for at least the listing plus one message,
+        // or it could make no progress at all and the queue would never drain.
+        assert!(
+            SWEEP_PASS_BUDGET >= PER_MESSAGE_PORT_BUDGET * 2,
+            "a pass must fit the index listing and at least one message"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_pass_declines_further_work_but_an_unstarted_one_allows_it() {
+        let fresh = PassBudget::start();
+        assert!(fresh.room_for(PER_MESSAGE_PORT_BUDGET));
+        assert_eq!(
+            fresh.lock_wait(),
+            crate::modules::modem_lock::MODEM_LOCK_TIMEOUT,
+            "a fresh pass should wait the ordinary modem timeout"
+        );
+
+        let spent = PassBudget {
+            deadline: Instant::now(),
+        };
+        assert!(!spent.room_for(PER_MESSAGE_PORT_BUDGET));
+        assert!(!spent.room_for(PER_MESSAGE_RELAY_BUDGET));
+        assert_eq!(
+            spent.lock_wait(),
+            Duration::ZERO,
+            "a spent pass must not start a fresh 20s wait for the modem"
+        );
+
+        // Part-spent: the lock wait is clipped to what is left, never extended.
+        let nearly = PassBudget {
+            deadline: Instant::now() + Duration::from_secs(3),
+        };
+        assert!(nearly.lock_wait() <= Duration::from_secs(3));
+    }
 
     fn msg(route: MessageRoute, sender: &str, body: &str) -> InboundMessage {
         InboundMessage {

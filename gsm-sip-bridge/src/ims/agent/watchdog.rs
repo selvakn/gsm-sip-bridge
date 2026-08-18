@@ -103,7 +103,12 @@ pub(crate) enum Phase {
     Renewal,
     /// Answering and bridging an inbound call.
     InboundCall,
-    /// Placing an outbound leg.
+    /// Sending an outbound INVITE — the synchronous part of placing a call.
+    ///
+    /// Not the whole attempt: waiting for the carrier's response and for Agent
+    /// B's veth leg is tick-driven, spends its time in `Idle`, and needs no phase
+    /// of its own. This covers `begin_origination`, whose INVITE write is
+    /// unbounded.
     Origination,
     /// Sweeping the modem's own message storage.
     SmsSweep,
@@ -202,8 +207,12 @@ impl Phase {
             Phase::Renewal => Duration::from_secs(360),
             // Control timeout, PBX ring, bridge setup.
             Phase::InboundCall => Duration::from_secs(180),
-            // Invite timeout + ring timeout + slack.
-            Phase::Origination => Duration::from_secs(120),
+            // An RTP socket bind, an SDP/INVITE build and one SIP write. Only
+            // the write can take real time, and it has no timeout of its own,
+            // so this budget *is* its bound. 60s is absurdly generous for a
+            // ~1KB write to the P-CSCF, which is the point: the cost of being
+            // wrong here is a restart.
+            Phase::Origination => Duration::from_secs(60),
             // A sweep re-opens the port per message; this bounds one pass.
             // Only the pass itself -- the wait between passes is `Dormant`.
             Phase::SmsSweep => Duration::from_secs(90),
