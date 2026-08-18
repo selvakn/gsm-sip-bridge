@@ -54,6 +54,12 @@ pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// drop a call that was otherwise fine. But a stalled loop also cannot observe
 /// the call ending, so an unbounded deferral would simply never recover. This
 /// ceiling is what makes deferring safe rather than a second way to hang.
+///
+/// Measured from the moment the phase went *over budget*, not from when it was
+/// entered. Measuring from entry would silently scale the deferral to the
+/// phase's budget — 240s for `Renewal`, 180s for `Startup` — and any future
+/// phase with a budget at or above this ceiling would get no deferral at all,
+/// dropping a live call on the first confirmed sample.
 pub(crate) const DEFER_CEILING: Duration = Duration::from_secs(600);
 
 /// Exit code used when the watchdog terminates a stalled agent. Distinct from
@@ -104,6 +110,20 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
+    /// Every variant, so tests can assert over the whole enum rather than a
+    /// hand-maintained list that silently omits the newest one.
+    #[cfg(test)]
+    const ALL: [Phase; 8] = [
+        Phase::Idle,
+        Phase::Dormant,
+        Phase::Startup,
+        Phase::GmProbe,
+        Phase::Renewal,
+        Phase::InboundCall,
+        Phase::Origination,
+        Phase::SmsSweep,
+    ];
+
     /// Explicit round-trip rather than `as`/`transmute`, so the atomic
     /// representation is total and no cast lint applies.
     const fn as_u8(self) -> u8 {
@@ -119,6 +139,16 @@ impl Phase {
         }
     }
 
+    /// The inverse of [`Phase::as_u8`], pinned by
+    /// [`tests::phase_discriminants_round_trip`].
+    ///
+    /// The catch-all is deliberately `Idle`, but note that `Idle` *carries a
+    /// budget*, so "unrecognised" is only safe for a value no phase actually
+    /// stores. A variant whose discriminant is missing here would be read as
+    /// `Idle` and judged against a 15s deadline — which is exactly how the
+    /// 36-second false-restart loop behaved when the SMS sweep rested in `Idle`.
+    /// That is why the round-trip test enumerates every variant rather than a
+    /// list someone has to remember to extend.
     fn from_u8(v: u8) -> Phase {
         match v {
             1 => Phase::Startup,
@@ -128,8 +158,6 @@ impl Phase {
             5 => Phase::Origination,
             6 => Phase::SmsSweep,
             7 => Phase::Dormant,
-            // Includes 0. An unknown discriminant can only arise from a bug,
-            // and `Idle` is the safe reading: it never trips the watchdog.
             _ => Phase::Idle,
         }
     }
@@ -194,11 +222,16 @@ pub(crate) struct ProgressSnapshot {
 }
 
 impl ProgressSnapshot {
-    /// How far past its budget this phase is, if at all.
-    fn overrun(&self, now: Instant) -> Option<Duration> {
+    /// The elapsed time and the budget it exceeded, or `None` if this phase is
+    /// within budget (or carries none).
+    ///
+    /// Returns the budget alongside the elapsed time because the deferral
+    /// ceiling has to be measured from the moment the budget was passed, not
+    /// from when the phase was entered — see [`DEFER_CEILING`].
+    fn overrun(&self, now: Instant) -> Option<(Duration, Duration)> {
         let budget = self.phase.budget()?;
         let elapsed = now.saturating_duration_since(self.since);
-        (elapsed > budget).then_some(elapsed)
+        (elapsed > budget).then_some((elapsed, budget))
     }
 }
 
@@ -336,7 +369,7 @@ pub(crate) fn stall_verdict(
     now: Instant,
     defer_ceiling: Duration,
 ) -> StallVerdict {
-    let Some(elapsed) = current.overrun(now) else {
+    let Some((elapsed, budget)) = current.overrun(now) else {
         return StallVerdict::Healthy;
     };
     let phase = current.phase;
@@ -356,7 +389,14 @@ pub(crate) fn stall_verdict(
     if current.busy {
         // A call is up. Hold off — unless we have held off so long that the
         // loop is clearly never going to tell us the call ended.
-        if elapsed >= defer_ceiling {
+        //
+        // The comparison is against time spent *past the budget*, so every
+        // phase gets the same deferral window regardless of how long its budget
+        // is. Comparing total elapsed time instead would give `Renewal` 240s and
+        // `Startup` 180s, and would give any phase whose budget reaches this
+        // ceiling no deferral whatsoever — dropping a live call the instant the
+        // stall was confirmed.
+        if elapsed.saturating_sub(budget) >= defer_ceiling {
             return StallVerdict::Forced { phase, elapsed };
         }
         return StallVerdict::Deferred { phase, elapsed };
@@ -410,27 +450,70 @@ pub(crate) fn action_for(verdict: StallVerdict, recovery_enabled: bool) -> Watch
 /// handle to each would add a parameter to functions that otherwise have no
 /// reason to know a watchdog exists. Agents are one process per line, so a
 /// process-wide registry is exactly the right scope.
-static REGISTRY: std::sync::Mutex<Vec<std::sync::Arc<Progress>>> =
+/// Entries carry a stable id so the sampling loop can key its per-activity
+/// state by identity. Positional indexing worked only while the registry could
+/// never shrink, and that "only ever grows" property is precisely what made a
+/// finished activity impossible to remove.
+static REGISTRY: std::sync::Mutex<Vec<(u64, std::sync::Arc<Progress>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Register an activity to be monitored, returning it for the caller's own use.
+static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A monitored activity's place in the registry, removed when this is dropped.
+///
+/// RAII rather than a bare `register` call, because an activity that *ends*
+/// leaves its `Progress` parked in whatever phase it last entered — and
+/// `PhaseGuard::drop` puts that at `Phase::Idle`, with a start time frozen at
+/// the moment it finished. A registry that cannot forget therefore keeps
+/// sampling a corpse, sees `Idle` sitting still for longer than its 15s budget,
+/// confirms a stall and kills the process. `volte::carrier_agent::run` is called
+/// in an unbounded retry loop, so before this existed every retry armed another
+/// such handle and the whole multi-line process died during the backoff.
+///
+/// Derefs to the `Arc<Progress>` it owns, so holders use it exactly as they
+/// would the `Arc` itself.
+pub(crate) struct Registration {
+    id: u64,
+    progress: std::sync::Arc<Progress>,
+}
+
+impl std::ops::Deref for Registration {
+    type Target = std::sync::Arc<Progress>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.progress
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// Register an activity to be monitored for as long as the returned handle
+/// lives.
 ///
 /// Safe to call before or after [`spawn`] — the sampling loop re-reads the
 /// registry each pass, so an activity that starts later is picked up.
-pub(crate) fn register(progress: std::sync::Arc<Progress>) -> std::sync::Arc<Progress> {
+pub(crate) fn register(progress: std::sync::Arc<Progress>) -> Registration {
+    let id = NEXT_REGISTRATION_ID.fetch_add(1, Ordering::SeqCst);
     REGISTRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(std::sync::Arc::clone(&progress));
-    progress
+        .push((id, std::sync::Arc::clone(&progress)));
+    Registration { id, progress }
 }
 
-fn registered() -> Vec<std::sync::Arc<Progress>> {
+fn registered() -> Vec<(u64, std::sync::Arc<Progress>)> {
     REGISTRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .map(std::sync::Arc::clone)
+        .map(|(id, p)| (*id, std::sync::Arc::clone(p)))
         .collect()
 }
 
@@ -476,17 +559,21 @@ pub(crate) fn spawn(recovery_enabled: bool) -> crate::error::BridgeResult<()> {
 }
 
 fn run_loop(recovery_enabled: bool) {
-    // Indexed in lockstep with the registry, which only ever grows.
-    let mut tracked: Vec<Tracked> = Vec::new();
+    // Keyed by registration id, not by position: the registry can now shrink
+    // when an activity ends, and positional state would then be attributed to
+    // whichever activity slid into that slot.
+    let mut tracked: std::collections::HashMap<u64, Tracked> = std::collections::HashMap::new();
 
     loop {
         std::thread::sleep(SAMPLE_INTERVAL);
         let now = Instant::now();
         let activities = registered();
-        if tracked.len() < activities.len() {
-            tracked.resize_with(activities.len(), Tracked::default);
-        }
-        for (progress, t) in activities.iter().zip(tracked.iter_mut()) {
+        // Forget state for activities that have deregistered, so this map is
+        // bounded by the number of *live* activities rather than by every
+        // activity the process has ever had.
+        tracked.retain(|id, _| activities.iter().any(|(live, _)| live == id));
+        for (id, progress) in &activities {
+            let t = tracked.entry(*id).or_default();
             let current = progress.snapshot();
             let verdict = stall_verdict(current, t.previous, now, DEFER_CEILING);
             t.previous = Some(current);
@@ -615,17 +702,52 @@ mod tests {
 
     #[test]
     fn phase_discriminants_round_trip() {
-        for phase in [
-            Phase::Idle,
-            Phase::Startup,
-            Phase::GmProbe,
-            Phase::Renewal,
-            Phase::InboundCall,
-            Phase::Origination,
-            Phase::SmsSweep,
-        ] {
-            assert_eq!(Phase::from_u8(phase.as_u8()), phase);
+        // `Phase::ALL` rather than a list written out here: the previous version
+        // of this test omitted `Dormant` — the newest variant, and the only one
+        // whose mis-mapping has already caused an outage. `from_u8`'s catch-all
+        // reads an unknown discriminant as `Idle`, which carries a 15s budget,
+        // so a `Dormant` that failed to round-trip would put the SMS sweep back
+        // into the 36-second false-restart loop while this test still passed.
+        for phase in Phase::ALL {
+            assert_eq!(
+                Phase::from_u8(phase.as_u8()),
+                phase,
+                "{phase:?} does not survive the atomic round trip"
+            );
         }
+
+        // And prove `ALL` really is every variant. The match has no catch-all,
+        // so adding a phase without listing it here fails to compile.
+        fn is_listed(p: Phase) -> bool {
+            match p {
+                Phase::Idle
+                | Phase::Dormant
+                | Phase::Startup
+                | Phase::GmProbe
+                | Phase::Renewal
+                | Phase::InboundCall
+                | Phase::Origination
+                | Phase::SmsSweep => Phase::ALL.contains(&p),
+            }
+        }
+        assert!(Phase::ALL.into_iter().all(is_listed));
+
+        // No two phases may share a discriminant, or one would silently read
+        // back as the other.
+        let mut seen: Vec<u8> = Phase::ALL.iter().map(|p| p.as_u8()).collect();
+        seen.sort_unstable();
+        let count = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "two phases share a discriminant");
+    }
+
+    /// `REGISTRY` is process-wide, and `cargo test` runs these in parallel in
+    /// one process, so the tests that assert on its *contents* have to take
+    /// turns. Held for the whole body of each such test.
+    static REGISTRY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A working phase's budget. Panics for a no-deadline phase, which is
@@ -715,11 +837,116 @@ mod tests {
         // The case that stops deferral becoming a second way to hang: a wedged
         // loop can never observe the call ending, so `busy` stays true forever.
         let now = Instant::now();
-        let since = now - DEFER_CEILING - Duration::from_secs(1);
+        let since = now - budget_of(Phase::Renewal) - DEFER_CEILING - Duration::from_secs(1);
         let s = snap(Phase::Renewal, since, true);
         let v = stall_verdict(s, Some(s), now, DEFER_CEILING);
         assert!(matches!(v, StallVerdict::Forced { .. }), "{v:?}");
         assert_eq!(action_for(v, true), WatchdogAction::Terminate);
+    }
+
+    #[test]
+    fn the_deferral_window_is_the_ceiling_for_every_phase() {
+        // The ceiling is time past the budget, not time since the phase was
+        // entered. Measured from entry, `Renewal` would defer for only
+        // `DEFER_CEILING - 360s` and a phase whose budget reached the ceiling
+        // would not defer at all — it would drop a live call on the first
+        // confirmed sample, which is the opposite of what deferral is for.
+        let now = Instant::now();
+        for phase in [Phase::Renewal, Phase::Startup, Phase::GmProbe] {
+            let budget = budget_of(phase);
+
+            // One second short of the ceiling past the budget: still deferring.
+            let nearly = snap(
+                phase,
+                now - budget - DEFER_CEILING + Duration::from_secs(1),
+                true,
+            );
+            assert!(
+                matches!(
+                    stall_verdict(nearly, Some(nearly), now, DEFER_CEILING),
+                    StallVerdict::Deferred { .. }
+                ),
+                "{phase:?} stopped deferring before the ceiling"
+            );
+
+            // One second past it: forced, whatever the budget was.
+            let past = snap(
+                phase,
+                now - budget - DEFER_CEILING - Duration::from_secs(1),
+                true,
+            );
+            assert!(
+                matches!(
+                    stall_verdict(past, Some(past), now, DEFER_CEILING),
+                    StallVerdict::Forced { .. }
+                ),
+                "{phase:?} kept deferring past the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_a_registration_stops_it_being_sampled() {
+        // The bug this closes: `volte::carrier_agent::run` registers on every
+        // entry and is called in an unbounded retry loop. Each abandoned handle
+        // stayed in the registry parked at `Idle` — via `PhaseGuard::drop` —
+        // with a start time frozen at the moment it finished, so ~20s later the
+        // watchdog confirmed a stall on a *finished* activity and exited the
+        // whole multi-line process during the retry backoff.
+        let _serial = registry_test_lock();
+        let before = registered().len();
+        {
+            let _reg = register(std::sync::Arc::new(Progress::new("test-activity")));
+            assert_eq!(registered().len(), before + 1);
+        }
+        assert_eq!(
+            registered().len(),
+            before,
+            "a finished activity must leave the registry, or it is sampled forever"
+        );
+    }
+
+    #[test]
+    fn a_finished_activity_would_have_tripped_the_watchdog() {
+        // Why the test above matters, stated as the verdict itself: an activity
+        // that returned looks exactly like one that stopped moving.
+        let p = Progress::new("finished");
+        {
+            let _g = p.phase_guard(Phase::Startup);
+        }
+        // `leave()` parked it in `Idle` and nothing will ever advance it again.
+        let parked = p.snapshot();
+        assert_eq!(parked.phase, Phase::Idle);
+        let now = parked.since + budget_of(Phase::Idle) + Duration::from_secs(1);
+        assert!(
+            matches!(
+                stall_verdict(parked, Some(parked), now, DEFER_CEILING),
+                StallVerdict::Confirmed { .. }
+            ),
+            "a parked Progress is indistinguishable from a stall, which is why \
+             deregistration cannot be optional"
+        );
+    }
+
+    #[test]
+    fn registrations_are_removed_by_identity_not_position() {
+        // Positional bookkeeping was safe only while the registry could never
+        // shrink. Drop from the middle and the survivors must be untouched.
+        let _serial = registry_test_lock();
+        let before = registered().len();
+        let a = register(std::sync::Arc::new(Progress::new("a")));
+        let b = register(std::sync::Arc::new(Progress::new("b")));
+        let c = register(std::sync::Arc::new(Progress::new("c")));
+        drop(b);
+        let labels: Vec<&'static str> = registered()
+            .iter()
+            .skip(before)
+            .map(|(_, p)| p.label())
+            .collect();
+        assert_eq!(labels, vec!["a", "c"]);
+        drop(a);
+        drop(c);
+        assert_eq!(registered().len(), before);
     }
 
     #[test]

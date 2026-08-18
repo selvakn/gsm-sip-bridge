@@ -1193,7 +1193,14 @@ pub(crate) fn handle_volte_carrier_agent_command(
     // Cross-process: cannot share the telephony half's `pbx_registered` flag
     // (see carrier_agent.rs's module docs) — the same limitation
     // `vowifi-ims-agent` already has for the same reason.
-    crate::volte::carrier_agent::run(&line, &app_config, modem_lock, dedupe, None);
+    // One attempt only on this path — the subcommand *is* the attempt — so the
+    // registration lives exactly as long as the call. `carrier_agent::run` no
+    // longer registers for itself; see its docs for the retry-loop leak that
+    // forced the ownership the other way round.
+    let progress = crate::ims::agent::watchdog::register(std::sync::Arc::new(
+        crate::ims::agent::watchdog::Progress::new("volte-dispatch"),
+    ));
+    crate::volte::carrier_agent::run(&line, &app_config, modem_lock, dedupe, None, &progress);
 
     eprintln!(
         "volte-carrier-agent: line {} ({}) stopped",

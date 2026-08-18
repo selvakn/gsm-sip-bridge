@@ -343,6 +343,14 @@ fn run_line(
         }
     }
 
+    // Registered once, outside the loop, and reused by every attempt. Doing it
+    // per attempt leaked one watchdog registration per retry — each parked at
+    // `Phase::Idle` the moment its attempt returned, with a frozen start time —
+    // so the watchdog confirmed a stall on a *finished* attempt roughly 20s into
+    // the backoff and exited this process, taking every other line with it.
+    let progress = crate::ims::agent::watchdog::register(std::sync::Arc::new(
+        crate::ims::agent::watchdog::Progress::new("volte-dispatch"),
+    ));
     loop {
         super::carrier_agent::run(
             line,
@@ -350,6 +358,7 @@ fn run_line(
             modem_lock.clone(),
             dedupe.clone(),
             Some(pbx_registered.clone()),
+            &progress,
         );
         // The carrier half returned — a failed attach/registration or a lost
         // one. Back off before retrying, so a persistent fault (no SIM, no

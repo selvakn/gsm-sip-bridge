@@ -56,21 +56,27 @@ use super::bridge::BridgeLine;
 /// regression this feature introduces so much as one it does not yet close
 /// for VoLTE's shared-trunk case the way VoWiFi's independent-trunk-per-line
 /// model never needed to.
-pub fn run(
+///
+/// `progress` is owned by the *caller*, not registered here, because this
+/// function is called once per retry attempt: registering per call left one
+/// abandoned handle in the watchdog registry per attempt, each parked at
+/// `Phase::Idle` with a frozen start time, and the watchdog then confirmed a
+/// stall on a finished attempt and exited the whole process mid-backoff.
+/// `pub(crate)` rather than `pub` only because `progress` is a crate-internal
+/// type; the two call sites are both in-crate.
+pub(crate) fn run(
     line: &BridgeLine,
     app_config: &AppConfig,
     modem_lock: Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: Arc<Mutex<super::sms::Dedupe>>,
     pbx_registered: Option<Arc<AtomicBool>>,
+    progress: &Arc<crate::ims::agent::watchdog::Progress>,
 ) {
     // Arm stall detection before anything touches the modem
     // (specs/039-at-stall-watchdog, FR-032). The LTE bearer shares the AT
     // access, modem lock and renewal machinery the VoWiFi one does, so it has
     // the same defect and gets the same monitoring. The attach and PLMN
     // derivation immediately below are themselves wedge points.
-    let progress = crate::ims::agent::watchdog::register(Arc::new(
-        crate::ims::agent::watchdog::Progress::new("volte-dispatch"),
-    ));
     if let Err(e) = crate::ims::agent::watchdog::spawn(app_config.vowifi.watchdog_recovery_enabled)
     {
         tracing::error!(card_id = %line.card_id, error = %e, "could not start the stall watchdog");
@@ -228,7 +234,7 @@ pub fn run(
         dedupe,
         pbx_registered,
         app_config,
-        progress: Arc::clone(&progress),
+        progress: Arc::clone(progress),
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,
     }) {
