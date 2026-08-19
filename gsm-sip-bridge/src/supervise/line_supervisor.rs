@@ -55,6 +55,20 @@ pub enum DegradeReason {
     /// Every structural check passed the whole time, because none of them
     /// looks at whether anything can actually be reached.
     PcscfUnreachable,
+    /// The line's netns had no default route through its tunnel, and one has
+    /// been reinstated (specs/039-at-stall-watchdog).
+    ///
+    /// The 2026-08-19 outage: a 2-minute WAN blip (a scheduled router reboot)
+    /// tore the CHILD_SA down, charon's `down-client` removed the carrier
+    /// address, and the kernel deleted the interface's default route along with
+    /// it. The reconnect restored the address but nothing restored the route, so
+    /// every SIP connect got `ENETUNREACH` for six hours while
+    /// `swanctl --list-sas` reported a healthy tunnel throughout.
+    ///
+    /// Distinct from [`Self::PcscfUnreachable`] because the remedy is completely
+    /// different — one `ip route replace`, no renegotiation, no dropped call —
+    /// and because a rebuild provably cannot fix it.
+    DefaultRouteMissing,
 }
 
 /// Steady-state-only health, beyond "is the process alive" and "is a P-CSCF
@@ -164,6 +178,17 @@ pub trait TunnelEngine {
     /// that churn is worse than waiting. Always `true` for swu, which has no
     /// interface to be missing.
     fn recreate_interface(&self, runner: &dyn CommandRunner) -> bool;
+    /// Reinstate this line's default route if it is missing, returning whether
+    /// it had to (`true` = it was missing and has now been repaired).
+    ///
+    /// Separate from [`TunnelEngine::recreate_interface`] because it is the
+    /// cheapest possible repair — one `ip route replace`, no disruption —
+    /// whereas a rebuild costs a renegotiation and drops any call. A route that
+    /// has gone missing is also *the* observed cause of a line that is
+    /// structurally perfect and completely unreachable, so it is worth ruling
+    /// out before tearing anything down. Always `false` for swu, which manages
+    /// its own device and routing through the dialer.
+    fn repair_default_route(&self, runner: &dyn CommandRunner) -> bool;
     /// Fully restarts this line's primary process from scratch (strongswan:
     /// kill, clear log, remove the stale unqualified pidfile, respawn
     /// charon, `swanctl --load-all`, `swanctl --initiate`; swu: respawn the
@@ -354,6 +379,22 @@ pub fn tick_steady_state(
     if engine.pcscf_reachable(runner, current_pcscf) {
         *unreachable_streak = 0;
     } else {
+        // Before escalating: is the route simply gone? That is a millisecond
+        // repair with no disruption, against a rebuild that renegotiates the SA
+        // and drops any call — and it is the one fault that presents exactly
+        // like this, with every structural check passing.
+        //
+        // It is also what a rebuild cannot fix. The kernel deletes an
+        // interface's default route when the last address of that family goes,
+        // so the `terminate` below destroys the route `recreate_interface`
+        // installs moments earlier. On 2026-08-19 that loop ran 202 times over
+        // six hours without ever restoring the data path.
+        if engine.repair_default_route(runner) {
+            *unreachable_streak = 0;
+            return SteadyOutcome::Recovered {
+                reason: DegradeReason::DefaultRouteMissing,
+            };
+        }
         *unreachable_streak = unreachable_streak.saturating_add(1);
         // Derived from this loop's own cadence, so both engines wait the same
         // ~90s of real time rather than the same number of ticks.
@@ -441,6 +482,11 @@ mod tests {
         /// below, because the whole point is that structure can be perfect
         /// while nothing is reachable.
         pcscf_reachable: RefCell<bool>,
+        /// Whether this line's default route has gone missing. Separate from
+        /// `pcscf_reachable` because the whole point is that a missing route is
+        /// one specific *cause* of unreachability with its own cheap remedy.
+        route_missing: RefCell<bool>,
+        route_repairs: RefCell<u32>,
         established: RefCell<bool>,
         pcscf: RefCell<Option<String>>,
         alive: RefCell<bool>,
@@ -468,6 +514,11 @@ mod tests {
                 // Default reachable: every pre-existing test asserts on the
                 // structural checks and must keep passing unchanged.
                 pcscf_reachable: RefCell::new(true),
+                // Default present: an unreachable P-CSCF in a pre-existing test
+                // means "unreachable for some other reason", so the route repair
+                // must not silently absorb those cases.
+                route_missing: RefCell::new(false),
+                route_repairs: RefCell::new(0),
                 alive: RefCell::new(true),
                 health: RefCell::new(SteadyStateHealth::Ok),
                 max_attempts: None,
@@ -503,6 +554,19 @@ mod tests {
         fn reinitiate(&self, _runner: &dyn CommandRunner) {
             *self.reinitiate_calls.borrow_mut() += 1;
             self.call_order.borrow_mut().push("reinitiate");
+        }
+        fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
+            if !*self.route_missing.borrow() {
+                return false;
+            }
+            // Repaired: the route is back, and with it reachability. Modelling
+            // that here is the point -- a missing route is a *cause* of
+            // unreachability, so fixing it must clear the symptom too.
+            *self.route_missing.borrow_mut() = false;
+            *self.pcscf_reachable.borrow_mut() = true;
+            *self.route_repairs.borrow_mut() += 1;
+            self.call_order.borrow_mut().push("repair_route");
+            true
         }
         fn steady_state_health(&self, _runner: &dyn CommandRunner) -> SteadyStateHealth {
             *self.health.borrow()
@@ -850,6 +914,84 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_default_route_is_repaired_without_touching_the_tunnel() {
+        // The 2026-08-19 outage. A 2-minute WAN blip (a scheduled router reboot)
+        // tore the CHILD_SA down; charon's `down-client` removed the carrier
+        // address, and the kernel deleted the interface's default route with it.
+        // The reconnect restored the address and nothing restored the route, so
+        // every SIP connect got ENETUNREACH for six hours while every structural
+        // check -- process alive, VICI fine, interface present, CHILD_SA
+        // installed -- passed.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let mut streak = 0;
+
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::DefaultRouteMissing
+            },
+            "a missing route must be named as such, not inferred from unreachability"
+        );
+        assert_eq!(*engine.route_repairs.borrow(), 1);
+        // The whole point: no renegotiation. A rebuild costs a dropped call and
+        // -- as the outage proved -- cannot fix this anyway.
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+        assert_eq!(*engine.recreate_interface_calls.borrow(), 0);
+        assert_eq!(streak, 0, "a repaired route must not count as a strike");
+
+        // And the line is well again on the next tick.
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+    }
+
+    #[test]
+    fn unreachable_with_the_route_present_still_escalates_to_a_rebuild() {
+        // The route repair must not swallow the fault it does not explain --
+        // otherwise it becomes a way to report success while the line stays dead.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            route_missing: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut streak = 0;
+        let strikes = pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL);
+        let mut rebuilt = false;
+        for _ in 0..strikes {
+            if let SteadyOutcome::Recovered {
+                reason: DegradeReason::PcscfUnreachable,
+            } = tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak)
+            {
+                rebuilt = true;
+            }
+        }
+        assert!(rebuilt, "a genuinely dead data path must still be rebuilt");
+        assert_eq!(*engine.route_repairs.borrow(), 0);
+    }
+
+    #[test]
+    fn a_reachable_line_is_never_probed_for_its_route() {
+        // Cheap as the repair is, it is still two `ip` invocations per line per
+        // tick. A healthy line must not pay for them.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine::default();
+        let mut streak = 0;
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+        assert!(!engine.call_order.borrow().contains(&"repair_route"));
+    }
+
+    #[test]
     fn the_repair_window_is_bounded_in_real_time_on_every_engine() {
         // Pins the outcome an operator cares about: how long a lost data path
         // can persist. This used to assert against `STEADY_STATE_POLL_INTERVAL`
@@ -1014,6 +1156,7 @@ mod tests {
             DegradeReason::ChildSaMissing,
             DegradeReason::PcscfChanged,
             DegradeReason::PcscfUnreachable,
+            DegradeReason::DefaultRouteMissing,
         ] {
             match reason {
                 DegradeReason::ProcessDied
@@ -1022,7 +1165,12 @@ mod tests {
                 | DegradeReason::PcscfChanged
                 // A rebuilt tunnel means a new data path, which the agent has
                 // to re-register over -- so it must be restarted.
-                | DegradeReason::PcscfUnreachable => assert!(recovery_restarts_agent(reason)),
+                | DegradeReason::PcscfUnreachable
+                // Restarted despite the repair itself being non-disruptive:
+                // with no route there was no data path, so the agent's
+                // registration and any call over it were already dead. Nothing
+                // is lost by restarting, and its cached socket is useless.
+                | DegradeReason::DefaultRouteMissing => assert!(recovery_restarts_agent(reason)),
                 DegradeReason::TunUnavailable | DegradeReason::ChildSaMissing => {
                     assert!(!recovery_restarts_agent(reason))
                 }

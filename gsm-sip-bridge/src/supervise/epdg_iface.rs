@@ -142,6 +142,58 @@ pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
 /// returns. Callers must report `false` rather than carrying on silently: the
 /// recovery loop's whole job is to recreate a missing interface, and a
 /// recreation that cannot succeed makes it spin forever.
+/// Whether this line's netns has a default route through its tunnel.
+///
+/// Worth asking on its own, because a line can have a perfectly healthy
+/// CHILD_SA, a present interface and a carrier-assigned address while having no
+/// route at all — and in that state every connect fails with `ENETUNREACH`
+/// while every structural check passes. See [`ensure_default_route`].
+pub fn has_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: &str) -> bool {
+    runner
+        .run_in_netns(netns, &["ip", "route", "show", "default", "dev", tun_iface])
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Install the default route through the tunnel, for both families.
+///
+/// Returns whether an IPv4 default route is present afterwards — the family
+/// that carries Gm for the carriers here.
+///
+/// **This is not the only thing that installs it**, and deliberately so:
+/// `docker/strongswan/ims.updown` installs it alongside the carrier address on
+/// every `up-client`, because the kernel deletes an interface's default route
+/// when the last address of that family is removed. That made the route a
+/// casualty of every CHILD_SA teardown, including the ones this function's
+/// callers perform themselves, and cost a 6-hour outage on 2026-08-19 when a
+/// 2-minute WAN blip tore the SA down and the reconnect restored only the
+/// address. Both places install it; both are idempotent.
+///
+/// Failures are logged rather than discarded. The previous version threw away
+/// the result of every one of these commands, which is why 202 consecutive
+/// recovery attempts produced no record of why the data path never returned.
+pub fn ensure_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: &str) -> bool {
+    for family in [None, Some("-6")] {
+        let mut argv = vec!["ip"];
+        argv.extend(family);
+        argv.extend(["route", "replace", "default", "dev", tun_iface]);
+        match runner.run_in_netns(netns, &argv) {
+            Ok(out) if !out.status.success() => eprintln!(
+                "[supervise] could not install the {} default route via {tun_iface} in netns \
+                 {netns}: {}",
+                if family.is_some() { "IPv6" } else { "IPv4" },
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => eprintln!(
+                "[supervise] could not run `ip route replace default dev {tun_iface}` in netns \
+                 {netns}: {e}"
+            ),
+            _ => {}
+        }
+    }
+    has_default_route(runner, netns, tun_iface)
+}
+
 pub fn ensure_epdg_interface(
     runner: &dyn CommandRunner,
     netns: &str,
@@ -219,14 +271,7 @@ pub fn ensure_epdg_interface(
     }
 
     let _ = runner.run_in_netns(netns, &["ip", "link", "set", tun_iface, "up"]);
-    let _ = runner.run_in_netns(
-        netns,
-        &["ip", "route", "replace", "default", "dev", tun_iface],
-    );
-    let _ = runner.run_in_netns(
-        netns,
-        &["ip", "-6", "route", "replace", "default", "dev", tun_iface],
-    );
+    ensure_default_route(runner, netns, tun_iface);
     // Received IPsec traffic gets dropped if IPsec policy isn't disabled on
     // the interface itself (osmocom wiki's Option 2 walkthrough).
     //

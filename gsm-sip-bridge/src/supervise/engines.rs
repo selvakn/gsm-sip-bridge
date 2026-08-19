@@ -451,6 +451,18 @@ impl TunnelEngine for StrongswanEngine {
         Some(super::line_supervisor::STRONGSWAN_REINITIATE_EVERY)
     }
 
+    fn repair_default_route(&self, runner: &dyn CommandRunner) -> bool {
+        if super::epdg_iface::has_default_route(runner, &self.netns, &self.tun_iface) {
+            return false;
+        }
+        println!(
+            "[supervise] line {}: netns {} has no default route via {} — the P-CSCF is \
+             unreachable for that reason alone, not because the tunnel is broken; reinstating it",
+            self.idx, self.netns, self.tun_iface
+        );
+        super::epdg_iface::ensure_default_route(runner, &self.netns, &self.tun_iface)
+    }
+
     fn recreate_interface(&self, runner: &dyn CommandRunner) -> bool {
         if super::epdg_iface::ensure_epdg_interface(
             runner,
@@ -615,6 +627,14 @@ impl TunnelEngine for SwuEngine {
         // current script's own comment on `start_line_swu`. `true` so this
         // engine's recovery is never gated on an interface it does not have.
         true
+    }
+
+    fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
+        // Same reason: the dialer owns this engine's device and its routing, so
+        // there is no externally-managed route here to have gone missing.
+        // `false` means "nothing repaired", which leaves the caller's escalation
+        // exactly as it was for this engine.
+        false
     }
 }
 
