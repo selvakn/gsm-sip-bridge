@@ -527,6 +527,51 @@ Check:
 2. Network connectivity from bridge host
 3. Check `sms` table for `forwarding_status = 'failed'` with `discord_status_code`
 
+### Discord alerts/forwarding fail only *inside* the container (host is fine)
+
+Symptom: `curl https://discord.com/` works on the host, but nothing is ever
+delivered and the daemon reports DNS errors. The give-away is that the
+container's resolver has been replaced by carrier addresses:
+
+```bash
+docker exec <bridge-ctr> cat /etc/resolv.conf
+#   nameserver 2405:200:800::1   # by strongSwan   <-- carrier's, replacing yours
+docker exec <bridge-ctr> getent ahostsv4 discord.com   # exits 2, no output
+```
+
+Cause: strongSwan's `resolve` plugin writing the ePDG's assigned
+`INTERNAL_IP4_DNS`/`INTERNAL_IP6_DNS` into `/etc/resolv.conf`. It *replaces*
+the resolvers Docker put there at container start rather than adding to them,
+so the container is left with a single carrier-controlled nameserver and no
+fallback. It recurs on every IKE re-auth, so restarting only helps until the
+next one. Confirm from the tunnel log:
+
+```bash
+docker exec <bridge-ctr> grep "installing DNS server" /tmp/charon.log
+```
+
+Whether this presents as a hard outage depends on whether the host has a route
+to the assigned server, which is not a property you control:
+
+- No IPv6 default route → the assigned v6 resolver is unreachable and
+  *nothing* resolves (`ip route get <addr>` says `Network unreachable`).
+- A v6 default route present (e.g. the cellular bearer came up dual-stack) →
+  it resolves, but every lookup now leaves over that bearer instead of your
+  LAN, and one `REFUSED` from the carrier takes out all alerting with no
+  second nameserver to fall back to. The assigned *v4* resolver has been
+  observed returning `REFUSED` while its v6 sibling answered fine.
+
+The same host can flip between these without any config change. Fixed in the
+image by `docker/strongswan/resolve.conf`, which points the plugin at a scratch
+file (`/run/ims-resolv.conf`) and leaves the system resolver alone. If you see
+this, you are running an image from before that change — rebuild/pull and
+recreate the container. To confirm the fix took:
+
+```bash
+docker exec <bridge-ctr> cat /etc/resolv.conf        # your resolvers, no strongSwan line
+docker exec <bridge-ctr> cat /run/ims-resolv.conf    # carrier IMS DNS lands here instead
+```
+
 ### Metrics endpoint returns 5xx
 
 Check:
