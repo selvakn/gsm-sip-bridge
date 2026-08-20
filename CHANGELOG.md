@@ -10,6 +10,21 @@ across releases.
 
 ### Fixed
 
+- **The container's DNS resolver was replaced by the carrier's whenever an
+  ePDG tunnel came up.** strongSwan's `resolve` plugin was writing the
+  assigned IMS DNS servers into `/etc/resolv.conf`, *replacing* the resolvers
+  Docker put there at container start rather than adding to them — leaving
+  one carrier-controlled nameserver and no fallback. Whether that still
+  resolves anything depends entirely on whether the host happens to have a
+  route to it: observed live on a Jio line with no IPv6 default route, the
+  assigned v6 resolver was unreachable outright and every outbound HTTPS call
+  the daemon makes failed, Discord critical alerts and SMS forwarding
+  included. Nothing reported it — the alert channel itself was the casualty —
+  and it recurred on every IKE re-auth, so a container restart only bought
+  until the next one. The plugin now writes to `/run/ims-resolv.conf`
+  instead, leaving the system resolver alone; the config request sent to the
+  ePDG is unchanged, so this cannot perturb a carrier that is fussy about it.
+
 - **Jio VoWiFi inbound calls.** Our `200 OK` never declared its own
   capabilities (`Allow`/`Supported`), which Jio rejected ~460ms in with a
   boilerplate `cause=503 "SDP Protocol Error"` that had nothing to do with

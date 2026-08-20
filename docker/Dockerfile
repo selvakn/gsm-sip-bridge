@@ -323,13 +323,19 @@ COPY --from=vpcd-builder /staging/usr/lib/pcsc/drivers/serial /usr/lib/pcsc/driv
 COPY --from=vpcd-builder /staging/etc/reader.conf.d/vpcd /etc/reader.conf.d/vpcd
 
 # This project's own strongSwan config overrides (specs/012-strongswan-epdg,
-# docker/strongswan/): p-cscf's `enable { ims = yes }` block and the extra
-# reliability settings, replacing/adding to the fork's empty-by-default
+# docker/strongswan/): p-cscf's `enable { ims = yes }` block, resolve's
+# scratch-file redirect, and the extra reliability settings, replacing/adding
+# to the fork's empty-by-default
 # strongswan.d templates. swanctl-epdg.conf.template is rendered by
 # entrypoint.sh at runtime (needs the SIM's IMSI), not baked in here.
 COPY docker/strongswan/charon-logging.conf /etc/strongswan.d/charon-logging.conf
 COPY docker/strongswan/charon-extra.conf /etc/strongswan.d/charon-extra.conf
 COPY docker/strongswan/p-cscf.conf /etc/strongswan.d/charon/p-cscf.conf
+# Overwrites the fork's 0-byte placeholder. Without it the `resolve` plugin
+# writes the carrier's IMS DNS servers into /etc/resolv.conf on every tunnel
+# establishment, breaking every outbound HTTPS call the daemon makes (Discord
+# alerts, SMS forwarding) — see the file itself for the live diagnosis.
+COPY docker/strongswan/resolve.conf /etc/strongswan.d/charon/resolve.conf
 COPY docker/strongswan/ims.updown /etc/strongswan.d/ims.updown
 COPY docker/strongswan/swanctl-epdg.conf.template /etc/strongswan.d/swanctl-epdg.conf.template
 COPY docker/strongswan/swanctl.conf /etc/swanctl/swanctl.conf
