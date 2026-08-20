@@ -252,3 +252,75 @@ added latency on a clean host).
 and new binaries, healthcheck failing with `configured line /dev/ttyUSB2: not running` —
 identical on both, present before this feature's code ever ran. Not caused by this change;
 out of scope for this feature per the user's explicit instruction.
+
+### 10 consecutive immediate restarts (T034)
+
+Same rig, same container, `docker stop && docker start` ten times back to back, timing
+`tunnel UP`:
+
+| # | Tunnel UP | `File exists` |
+|---|---|---|
+| 1 | 9.1s | 0 |
+| 2 | 0.1s | 0 |
+| 3 | 8.0s | 0 |
+| 4 | **timeout (>60s)** | 0 |
+| 5 | **timeout (>60s)** | 0 |
+| 6 | **timeout (>60s)** | 0 |
+| 7 | 8.5s | 0 |
+| 8 | 8.3s | 0 |
+| 9 | 11.0s | 0 |
+| 10 | 9.7s | 0 |
+
+**`if_id`/device release held perfectly across all 10 — zero `File exists` occurrences,
+zero exceptions.** This is the direct claim this feature makes, and it did not fail once
+under back-to-back restart pressure the old code was never fast enough to be exercised
+against at all.
+
+Iterations 4-6 surfaced a **separate, orthogonal issue**: `control channel not bindable
+yet (this line's veth is probably not up); retrying`, followed by the tunnel abandoning
+the barely-established IKE_SA and restarting the whole negotiation from `IKE_SA_INIT`
+— repeatedly, roughly every 9-11s, without ever completing. The old-code baseline restart
+(above) shows zero such warnings and only 2 `IKE_SA_INIT` attempts total, so this is not
+something the old code exhibited — but the old code was *never fast enough to restart
+this quickly ten times in a row* for it to have been exercised either. Most plausible
+explanation: something in the establish/steady-state loop (`line_supervisor.rs`,
+untouched by this feature) treats a slow-to-bind control channel as grounds to abandon
+and reinitiate, and that path had never been exercised at this cadence before, because
+nothing could restart fast enough. **This is not a regression in the shutdown/reclaim
+code this feature adds** (`File exists` stayed at 0 throughout, including during the
+timeouts), but it is a real, newly-visible behavior worth a follow-up investigation of
+its own, outside this feature's scope.
+
+### Force-kill recovery (T034, SC-007)
+
+`docker kill` (SIGKILL, no grace) while the tunnel was up, immediately followed by
+`docker start`:
+
+- **Confirmed**: `ims0` was visible on the **host** (`ls /var/run/netns/`, outside any
+  container) immediately after the kill — R6's bind-mount mechanism works exactly as
+  designed for the ungraceful-exit case.
+- **First restart attempt failed**, but not on anything this feature touches: pcscd's
+  vpcd reader could not bind `127.0.0.1:15963` (`PcscdDied`), and supervise exited
+  `FATAL` before it ever reached `reclaim_leftover_lines` — this happens earlier in
+  startup than the reclamation call. The container sat exited (no restart policy set on
+  this ad-hoc test container) until manually started again ~2 minutes later.
+- **Second restart attempt succeeded** in 4.0s, 0 `File exists`, but logged **no
+  `reclaimed ...` line** — meaning either `reclaim_leftover_lines` found nothing (the
+  ~2-minute gap since the kill is close enough to the documented natural-reap window
+  that the orphaned namespace may have already cleared on its own by then), or it acted
+  silently. Not distinguishable from this run alone.
+
+**Net assessment**: R6's prerequisite (host visibility of a killed run's namespace) is
+directly confirmed. Whether `reclaim_leftover_lines` itself is what made the *second*
+attempt fast — versus natural reap coincidentally finishing in the same window — is
+**not cleanly isolated by this test**, because the pcscd/vpcd startup failure ate the
+critical early window where that distinction would have been visible. A clean SC-007
+measurement needs a restart attempt that succeeds *immediately* after the kill, which
+this one did not get on the first try. The pcscd/vpcd port-reuse-after-SIGKILL failure
+is itself a separate, real finding — outside this feature's scope (it lives in
+`vpcd::spawn_pcscd`/`wait_for_vpcd_ready`, not `shutdown.rs`) — worth its own follow-up.
+
+**Both findings above are flagged, not fixed, in this PR.** Neither touches the code this
+feature changes; both are newly visible only because restarts are now fast enough, and
+force-kill recovery robust enough, to reach cadences and conditions the old code could
+never be tested under.

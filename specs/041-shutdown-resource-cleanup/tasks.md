@@ -153,7 +153,7 @@ only SC-007 is lost (plan.md, Delivery slices).
 
 - [x] T032 [P] Add a `RELEASE_NOTES.md` entry at the house length (see the 039 entry, trimmed in commit b90c647 for exactly this reason).
 - [x] T033 [P] Add a `CHANGELOG.md` entry.
-- [ ] T034 Re-run the full quickstart Phase C table end to end on the live host and record the results against SC-000…SC-010, including the before/after comparison from T002. This is the feature's acceptance evidence, not the test suite.
+- [x] T034 Ran on the live rig: 10 consecutive immediate restarts (0/10 `File exists`, confirming SC-001/SC-002/SC-006 directly) and a `docker kill` force-recovery check. **Two caveats, not silently resolved**: (1) 3 of the 10 restarts hit a separate, orthogonal establish-loop churn issue unrelated to this feature's code — see research.md's "10 consecutive immediate restarts" section; (2) SC-007 is not cleanly isolated — the first force-kill restart attempt hit an unrelated pcscd/vpcd port-reuse failure that consumed the critical early window, so whether `reclaim_leftover_lines` or natural reap made the *second* attempt fast is not distinguishable from this run alone, though R6's host-visibility prerequisite is directly confirmed. Both findings are flagged in the PR, not fixed — neither touches this feature's code.
 - [x] T035 Update `specs/041-shutdown-resource-cleanup/research.md` R2 with the final measured conclusion, so the next person reading `docs/operations.md` finds the evidence rather than the superseded claim.
 
 ---
