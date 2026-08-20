@@ -96,8 +96,8 @@ call-answering within 10s of the SC-000 baseline, with no "already claimed" repo
 - [x] T016 [US1] Add ordering tests in `shutdown.rs` for O-1 through O-7, O-9 and O-11, as position assertions over `build_shutdown_plan`'s output. One test per invariant, named for the invariant.
 - [x] T017 [US1] Add tests: every blocking step carries a non-zero `timeout_secs` (O-8, FR-009); a namespace with no `StartedLine` still gets a `DeleteNetns` (O-7, FR-007); building and executing the same plan twice yields no error and no extra steps (FR-008).
 - [x] T018 [US1] Add a `STOP_ALLOWANCE` constant to `shutdown.rs`, documented as "must match `stop_grace_period` in docker/docker-compose.yml", sized per research.md R8 (60s for 4 lines).
-- [ ] T019 [P] [US1] Set `stop_grace_period: 60s` on the bridge service in `docker/docker-compose.yml`, and in `docker/docker-compose.cellular-internet.yml` if it starts that service.
-- [ ] T020 [US1] Add a contract test asserting the compose file declares a `stop_grace_period` at least equal to `STOP_ALLOWANCE`, so the two cannot drift — same pattern as `tests/test_config_docs.rs`.
+- [x] T019 [P] [US1] Set `stop_grace_period: 60s` on the bridge service in `docker/docker-compose.yml`, and in `docker/docker-compose.cellular-internet.yml` if it starts that service.
+- [x] T020 [US1] Add a contract test asserting the compose file declares a `stop_grace_period` at least equal to `STOP_ALLOWANCE`, so the two cannot drift — same pattern as `tests/test_config_docs.rs`.
 
 **Checkpoint**: live-verify SC-001 through SC-006 and SC-008 per quickstart Phase C.
 This slice alone resolves the original complaint.

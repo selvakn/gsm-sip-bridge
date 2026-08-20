@@ -52,6 +52,15 @@ services:
     privileged: true
     # tini as PID 1 reaps orphaned zombie processes (supervise deliberately doesn't).
     init: true
+    # specs/041-shutdown-resource-cleanup: a graceful stop now waits for every
+    # child, terminates each line's IKE_SA, flushes this deployment's XFRM
+    # state and explicitly deletes each line's tunnel/veth devices before
+    # deleting its namespace — releasing the tunnel identifier a leftover
+    # interface would otherwise hold hostage against the next restart (see
+    # docs/operations.md). That takes longer than Docker's 10s default; must
+    # stay >= supervise::shutdown::STOP_ALLOWANCE + headroom (research.md
+    # R8), which a contract test pins against this file.
+    stop_grace_period: 60s
     volumes:
       - bridge-data:/data
       # Root-level config.toml is canonical (config.toml.example documents
