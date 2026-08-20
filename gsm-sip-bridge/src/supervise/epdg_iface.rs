@@ -83,6 +83,56 @@ pub fn classify_xfrm_dump(dump: &str, ours: &BTreeSet<u32>) -> XfrmReclaim {
 /// Does nothing unless every entry is identifiably ours; see
 /// [`classify_xfrm_dump`].
 pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
+    match classify_and_maybe_flush(runner, ours) {
+        XfrmFlushOutcome::Empty => {}
+        XfrmFlushOutcome::Flushed => println!(
+            "[supervise] clearing XFRM state left by a previous run (it keeps this \
+             deployment's if_ids claimed, which makes the per-line tunnel interfaces \
+             impossible to create)"
+        ),
+        XfrmFlushOutcome::LeftForeign => eprintln!(
+            "[supervise] found XFRM state that is not this deployment's, so it was left \
+             untouched. Clear it by hand if a line's tunnel misbehaves — see \
+             docs/operations.md. (A line reporting its if_id is already claimed is \
+             usually unrelated and self-clearing.)"
+        ),
+        XfrmFlushOutcome::Unreadable => eprintln!(
+            "[supervise] could not read the host's XFRM state, so it was left untouched. \
+             Stale SAs/policies from a previous run can degrade a line's tunnel; clear \
+             them by hand if one misbehaves — see docs/operations.md. (A line reporting \
+             its if_id is already claimed is usually unrelated and self-clearing.)"
+        ),
+    }
+}
+
+/// What [`classify_and_maybe_flush`] did, so each caller — startup's
+/// [`reclaim_stale_xfrm`] and `shutdown`'s `FlushXfrm` step — can report it in
+/// its own context-appropriate wording rather than sharing one message meant
+/// for the other's caller.
+#[derive(Debug, PartialEq, Eq)]
+pub enum XfrmFlushOutcome {
+    /// Nothing was there — no action, nothing to report.
+    Empty,
+    /// Everything present was ours; it has been flushed.
+    Flushed,
+    /// Something present was not identifiably ours; left untouched.
+    LeftForeign,
+    /// The inventory itself could not be read; left untouched (see
+    /// [`reclaim_stale_xfrm`]'s doc comment on why a failed query is never
+    /// treated as an empty one).
+    Unreadable,
+}
+
+/// Reads the host's XFRM state and policy, classifies it via
+/// [`classify_xfrm_dump`], and flushes it if and only if every entry is
+/// identifiably ours (`ours`) — the one piece of logic startup's stale-claim
+/// reclamation and stop's tunnel teardown must share exactly, since the flush
+/// itself is unfiltered (iproute2 has no `ip xfrm policy deleteall if_id N`)
+/// and the all-ours-or-nothing rule is the only safe guard around it.
+pub fn classify_and_maybe_flush(
+    runner: &dyn CommandRunner,
+    ours: &BTreeSet<u32>,
+) -> XfrmFlushOutcome {
     let dump = |args: &[&str]| -> Option<String> {
         runner
             .run(args)
@@ -102,35 +152,18 @@ pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
         dump(&["ip", "xfrm", "state"]),
         dump(&["ip", "xfrm", "policy"]),
     ) else {
-        eprintln!(
-            "[supervise] could not read the host's XFRM state, so it was left untouched. \
-             Stale SAs/policies from a previous run can degrade a line's tunnel; clear \
-             them by hand if one misbehaves — see docs/operations.md. (A line reporting \
-             its if_id is already claimed is usually unrelated and self-clearing.)"
-        );
-        return;
+        return XfrmFlushOutcome::Unreadable;
     };
     let combined = format!("{state}\n{policy}");
 
     match classify_xfrm_dump(&combined, ours) {
-        XfrmReclaim::Empty => {}
+        XfrmReclaim::Empty => XfrmFlushOutcome::Empty,
         XfrmReclaim::AllOurs => {
-            println!(
-                "[supervise] clearing XFRM state left by a previous run (it keeps this \
-                 deployment's if_ids claimed, which makes the per-line tunnel interfaces \
-                 impossible to create)"
-            );
             let _ = runner.run(&["ip", "xfrm", "policy", "flush"]);
             let _ = runner.run(&["ip", "xfrm", "state", "flush"]);
+            XfrmFlushOutcome::Flushed
         }
-        XfrmReclaim::ForeignPresent => {
-            eprintln!(
-                "[supervise] found XFRM state that is not this deployment's, so it was left \
-                 untouched. Clear it by hand if a line's tunnel misbehaves — see \
-                 docs/operations.md. (A line reporting its if_id is already claimed is \
-                 usually unrelated and self-clearing.)"
-            );
-        }
+        XfrmReclaim::ForeignPresent => XfrmFlushOutcome::LeftForeign,
     }
 }
 

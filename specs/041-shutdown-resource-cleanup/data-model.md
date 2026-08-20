@@ -6,37 +6,48 @@ Everything here lives in `gsm-sip-bridge/src/supervise/shutdown.rs` unless state
 
 ## Entities
 
-### `StartedLine` (new, replaces `StartedVolteLine`)
+### `StartedVowifiLine` (new) and `StartedVolteLine` (extended)
 
-What one line — of **either** bearer — caused to exist, recorded so teardown can name it.
-Per the 2026-08-20 clarification, both bearers are described by one teardown, so they are
-described by one record rather than two that resemble each other (FR-018). It absorbs
-`StartedVolteLine` and is appended under that type's existing append-on-success
-discipline and the same `shutting_down` read-guard that protects handle registration.
+**Implementation deviation from the original design here**, recorded rather than
+retrofitted into the plan text: this was designed as one merged `StartedLine` struct
+covering both bearers, but built as **two** structs — `StartedVowifiLine` (new) and the
+existing `StartedVolteLine`, extended with one field. Reason: VoWiFi's and VoLTE's fields
+diverge enough (`if_id`/`tun_iface`/`conn_name` have no VoLTE analogue at all) that a
+merged struct would carry a `None` for most of its fields on one bearer or the other, for
+no benefit over two small structs. What FR-018 actually requires — the ordering,
+bounding and reporting guarantees hold for a VoLTE line *by construction* — is delivered
+by both structs feeding the **same** `TeardownStep` vocabulary through the **same**
+builder logic in `build_shutdown_plan`, not by struct identity.
+
+**`StartedVowifiLine`** (new):
 
 | Field | Purpose in teardown |
 |---|---|
 | `index: u32` | identity in logs and messages |
-| `bearer: Bearer` (`Vowifi` \| `Volte`) | selects which steps arise at all |
-| `engine: Option<Engine>` (`Strongswan` \| `Swu`) | VoWiFi only: whether a terminate step is emitted (R4) |
-| `conn_name: Option<String>` | VoWiFi/strongswan only: `swanctl --terminate --ike <conn>`, line-scoped, never the bare `ims` |
+| `strongswan: Option<StrongswanTeardownInfo>` | `Some` only for the strongswan engine; `None` for swu, which has no terminate concept (R4) and no `if_id` |
+| `strongswan.conn_name: String` | `swanctl --terminate --ike <conn>`, line-scoped, never the bare `ims` |
+| `strongswan.tun_iface: String` | the XFRM device to delete — the load-bearing step (R1) |
+| `strongswan.if_id: u32` | feeds the all-ours set for the flush guard |
 | `netns: String` | namespace to run in, and to delete last |
-| `tun_iface: Option<String>` | VoWiFi only: the XFRM device to delete — the load-bearing step (R1) |
-| `if_id: Option<u32>` | VoWiFi only: reported in messages; feeds the all-ours set for the flush guard |
-| `veth_host: String` | the container-side veth end; deleting it removes the pair. **Both bearers** — VoLTE creates one too (`orchestrate_volte.rs:359`) and nothing deletes it today |
-| `agent_handles: Vec<Arc<ChildHandle>>` | the line's own processes, from `StartedVolteLine` |
-| `cleanup_argv: Option<Vec<String>>` | VoLTE only: the existing in-namespace `volte-cleanup` invocation, now carried as data rather than special-cased in the builder |
+| `veth_host: String` | the host-side (container-default-namespace) veth end; deleting it removes the pair — present regardless of engine |
 
-A VoLTE line simply has `None` where a concept does not apply to it; no step is emitted
-for a `None`. This is what makes "the guarantees hold for VoLTE by construction" true
-rather than aspirational — there is no second code path in which they could fail to hold.
+**`StartedVolteLine`** (existing struct, one field added): gains `veth_host:
+Option<String>` — `Some` when `ensure_volte_line_veth` created a carrier veth pair for
+this line, `None` for the diagnostic single-`--modem` path, which has neither a namespace
+nor a veth. Its existing `index`, `netns`, `carrier_agent_handles` fields are unchanged.
+No `cleanup_argv` field was added: the existing `RunInNetns` step already carries the
+`volte-cleanup` invocation as a plain `Vec<String>` built inline in
+`build_shutdown_plan`, which was simpler to keep than to lift into a new field for no
+behavioural difference.
 
-`StartedState.started_netns` stays as it is: a namespace must be deletable even for a
-line that failed before its `StartedLine` could be recorded (FR-007).
+`StartedState` holds both `vowifi_lines: Vec<StartedVowifiLine>` and the existing
+`volte_lines: Vec<StartedVolteLine>`. `started_netns` stays as it is: a namespace must be
+deletable even for a line that failed before either record could be made (FR-007).
 
-**Invariant**: a `StartedLine` is recorded at the point the namespace and interface setup
-returns, *before* anything else can fail — the same position `started_netns.push` occupies
-today (`orchestrate.rs:1184`). A line that fails later is still fully torn down.
+**Invariant**: a `StartedVowifiLine` is recorded at the point the namespace and interface
+setup returns, *before* anything else can fail — the same position `started_netns.push`
+occupies today (`orchestrate.rs:1215` after this change; strongswan and swu paths both
+record it). A line that fails later is still fully torn down.
 
 ### `TeardownStep` (extended)
 

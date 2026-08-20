@@ -158,6 +158,15 @@ fn start_multiline(
                 index: idx,
                 netns: netns.clone(),
                 carrier_agent_handles: Vec::new(),
+                // `None` when this line has no carrier veth pair at all —
+                // the diagnostic single-`--modem` path (`carrier_agent.rs`'s
+                // empty-address branch) never calls `ensure_volte_line_veth`
+                // below, so there is nothing here to delete at stop.
+                veth_host: if veth_carrier_addr.is_empty() {
+                    None
+                } else {
+                    Some(veth_telephony_iface.clone())
+                },
             });
         }
         drop(state);

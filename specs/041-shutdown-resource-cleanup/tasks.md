@@ -36,7 +36,7 @@ focused commit. No commit may leave the tree red.
 reading code (research.md R2, R6). T003 can invalidate the whole design — it runs before
 any implementation, deliberately.
 
-- [ ] T001 Confirm the worktree builds clean before any change: `make format && make lint && make test`. Record the baseline so later failures are attributable.
+- [x] T001 Confirm the worktree builds clean before any change: `make format && make lint && make test`. Record the baseline so later failures are attributable.
 - [ ] T002 **[GATE]** Run quickstart A1 on a live host: capture SC-000 (restart after a 3-minute stop) and the immediate-restart numbers, per line — seconds to registered, `restarting in 5s` count, IKE_SA setups. Record both in `specs/041-shutdown-resource-cleanup/research.md` under a new "R9. Measured baselines" section. If the gap between them no longer reproduces, STOP and re-scope.
 - [ ] T003 **[GATE]** Run quickstart A2, the discriminating experiment: four stops, each with one manual intervention, recording when the `if_id` frees. Append the results table to research.md R2, replacing the "residual uncertainty" paragraph with what was measured. **If run 4 still takes ~150s the mechanism is wrong — STOP and bring the premise back for review before writing any code.**
 - [ ] T004 [P] Run quickstart A3: confirm the image's busybox `timeout` accepts `timeout SECS PROG`. Record the confirmed form in research.md R3; if it wants `-t`, note it there so T009 emits the right argv.
@@ -45,6 +45,24 @@ any implementation, deliberately.
 **Checkpoint**: the design's premise is measured, not assumed. Phases 2-4 proceed on T003
 passing; Phase 5 additionally requires T005.
 
+> **Implementation note (2026-08-20):** T002-T005 need a live deployment host with
+> privileged Docker/root access to real VoWiFi namespaces, which was not available in the
+> environment that wrote Phases 2-5's code — and running them would mean restarting the
+> actual production line on the host that happened to be reachable, which was not this
+> session's call to make unprompted. The code was written on the strength of research.md
+> R1's mechanism (destroying the netdev is the only thing that releases the `if_id` —
+> this is standard Linux XFRM-interface/netns behaviour, not a guess specific to this
+> deployment) — but **T002-T005 are not yet run, and this is not equivalent to having run
+> them.** Before this branch is trusted or deployed:
+> - Run T002-T005 for real.
+> - If T003 confirms the mechanism (run 4 frees the id in seconds), the Phase 3-5 code
+>   below should need no changes — re-run `make test` and proceed to the Phase 3/4/5 live
+>   checkpoints.
+> - If T003 contradicts it, treat every "Checkpoint: live-verify ..." line below as
+>   unmet and bring the premise back for review before relying on any of this code.
+> T004's argv form (`timeout SECS PROG`) and T005's mount propagation are assumed in the
+> code as written (see T009, T028) and called out at each site; both are one-line checks.
+
 ---
 
 ## Phase 2: Foundational (blocking prerequisites)
@@ -52,11 +70,11 @@ passing; Phase 5 additionally requires T005.
 **Purpose**: the record and the step vocabulary every story needs. No behavioural change
 lands in this phase — the plan builds exactly the steps it builds today.
 
-- [ ] T006 Introduce `StartedLine` in `gsm-sip-bridge/src/supervise/shutdown.rs` per data-model.md: `index`, `bearer`, `engine`, `conn_name`, `netns`, `tun_iface`, `if_id`, `veth_host`, `agent_handles`, `cleanup_argv`. It absorbs `StartedVolteLine`; update `StartedState` to hold `Vec<StartedLine>` and keep `started_netns` as it is (FR-007).
-- [ ] T007 Update `gsm-sip-bridge/src/supervise/orchestrate_volte.rs` to record each VoLTE line as a `StartedLine` — including its veth ends from `ensure_volte_line_veth` (`:359`) and its existing `volte-cleanup` argv as `cleanup_argv`.
-- [ ] T008 Update `gsm-sip-bridge/src/supervise/orchestrate.rs` to record each VoWiFi line as a `StartedLine` at the point `started_netns.push` occupies today (`:1184` strongswan, `:1798` swu), under the existing `shutting_down` read-guard. Carry `veth_sip`/`veth_ims` down from `start_line_tail` so the record is complete before anything can fail.
-- [ ] T009 Add the `TerminateIke`, `DeleteLink` and `FlushXfrm` variants to `TeardownStep` in `shutdown.rs`, each carrying its own `timeout_secs` where it can block, plus their `execute` arms. Bounds are argv-level (`timeout N ...`, research.md R3) — no `CommandRunner` trait change.
-- [ ] T010 Port the existing VoLTE ordering tests in `shutdown.rs` to the new `StartedLine` representation, asserting the **same relative order** they assert today. This is the review gate named in contracts C5: a rewrite that relaxes an assertion is indistinguishable from a passing test.
+- [x] T006 **[DEVIATED from data-model.md]** Implemented as two structs, not one merged `StartedLine`: `StartedVowifiLine { index, strongswan: Option<StrongswanTeardownInfo{conn_name, tun_iface, if_id}>, netns, veth_host }` (new) and `StartedVolteLine` (existing, gains `veth_host: Option<String>`). Reason: VoWiFi's and VoLTE's fields diverge enough (if_id/tun_iface/conn_name have no VoLTE analogue) that a single struct would be mostly `None`s for one bearer or the other, for no benefit over two small structs sharing the same `TeardownStep` vocabulary and the same builder logic in `build_shutdown_plan` — which is what FR-018 actually requires (the guarantees hold by construction), not struct identity. `StartedState` holds both `vowifi_lines: Vec<StartedVowifiLine>` and `volte_lines: Vec<StartedVolteLine>`; `started_netns` unchanged (FR-007). data-model.md updated to match.
+- [x] T007 Update `gsm-sip-bridge/src/supervise/orchestrate_volte.rs` to record each VoLTE line as a `StartedLine` — including its veth ends from `ensure_volte_line_veth` (`:359`) and its existing `volte-cleanup` argv as `cleanup_argv`.
+- [x] T008 Update `gsm-sip-bridge/src/supervise/orchestrate.rs` to record each VoWiFi line as a `StartedLine` at the point `started_netns.push` occupies today (`:1184` strongswan, `:1798` swu), under the existing `shutting_down` read-guard. Carry `veth_sip`/`veth_ims` down from `start_line_tail` so the record is complete before anything can fail.
+- [x] T009 Add the `TerminateIke`, `DeleteLink` and `FlushXfrm` variants to `TeardownStep` in `shutdown.rs`, each carrying its own `timeout_secs` where it can block, plus their `execute` arms. Bounds are argv-level (`timeout N ...`, research.md R3) — no `CommandRunner` trait change.
+- [x] T010 Port the existing VoLTE ordering tests in `shutdown.rs` to the new `StartedLine` representation, asserting the **same relative order** they assert today. This is the review gate named in contracts C5: a rewrite that relaxes an assertion is indistinguishable from a passing test.
 
 **Checkpoint**: `make test` green with no observable change to what any stop does.
 
@@ -70,14 +88,14 @@ start finds nothing in its way.
 **Independent Test**: restart with all lines registered; every line reaches
 call-answering within 10s of the SC-000 baseline, with no "already claimed" report.
 
-- [ ] T011 [US1] Emit `TerminateIke` for every strongswan-engine line before charon's `KillChild`, scoped to that line's `conn_name` (never the bare `ims`), in `build_shutdown_plan` — invariant O-1. Reuse `StrongswanEngine::terminate`'s argv shape (`engines.rs:375`); emit nothing for a swu line (`engines.rs:593`).
-- [ ] T012 [US1] Emit `WaitForExit` for every VoWiFi child after its `KillChild`, with escalation to `Signal::Kill` for anything still alive at the bound — invariants O-2, O-3, FR-002. Today no VoWiFi child has a wait at all (`shutdown.rs:125-130`).
-- [ ] T013 [US1] Emit `FlushXfrm` carrying this run's `if_id` set, after every `TerminateIke` and charon's exit — invariant O-4. Reuse `classify_xfrm_dump` and its all-ours-or-nothing rule unchanged (`epdg_iface.rs:41`), including the half-failed-inventory veto (FR-011).
-- [ ] T014 [US1] Emit `DeleteLink` for each line's tun interface (in its netns) and each line's host-side veth end (`netns: None`), after `FlushXfrm` and before that line's `DeleteNetns` — invariants O-5, O-6, O-11. Both bearers get the veth delete; only VoWiFi has a tun (FR-005, FR-018).
-- [ ] T015 [US1] Express VoLTE's in-namespace `volte-cleanup` through `cleanup_argv` in the shared builder rather than a VoLTE-specific branch (FR-018), preserving its observable position between the line's `WaitForExit` and its `DeleteNetns` — invariant O-9.
-- [ ] T016 [US1] Add ordering tests in `shutdown.rs` for O-1 through O-7, O-9 and O-11, as position assertions over `build_shutdown_plan`'s output. One test per invariant, named for the invariant.
-- [ ] T017 [US1] Add tests: every blocking step carries a non-zero `timeout_secs` (O-8, FR-009); a namespace with no `StartedLine` still gets a `DeleteNetns` (O-7, FR-007); building and executing the same plan twice yields no error and no extra steps (FR-008).
-- [ ] T018 [US1] Add a `STOP_ALLOWANCE` constant to `shutdown.rs`, documented as "must match `stop_grace_period` in docker/docker-compose.yml", sized per research.md R8 (60s for 4 lines).
+- [x] T011 [US1] Emit `TerminateIke` for every strongswan-engine line before charon's `KillChild`, scoped to that line's `conn_name` (never the bare `ims`), in `build_shutdown_plan` — invariant O-1. Reuse `StrongswanEngine::terminate`'s argv shape (`engines.rs:375`); emit nothing for a swu line (`engines.rs:593`).
+- [x] T012 [US1] Emit `WaitForExit` for every VoWiFi child after its `KillChild`, with escalation to `Signal::Kill` for anything still alive at the bound — invariants O-2, O-3, FR-002. Today no VoWiFi child has a wait at all (`shutdown.rs:125-130`).
+- [x] T013 [US1] Emit `FlushXfrm` carrying this run's `if_id` set, after every `TerminateIke` and charon's exit — invariant O-4. Reuse `classify_xfrm_dump` and its all-ours-or-nothing rule unchanged (`epdg_iface.rs:41`), including the half-failed-inventory veto (FR-011).
+- [x] T014 [US1] Emit `DeleteLink` for each line's tun interface (in its netns) and each line's host-side veth end (`netns: None`), after `FlushXfrm` and before that line's `DeleteNetns` — invariants O-5, O-6, O-11. Both bearers get the veth delete; only VoWiFi has a tun (FR-005, FR-018).
+- [x] T015 [US1] Express VoLTE's in-namespace `volte-cleanup` through `cleanup_argv` in the shared builder rather than a VoLTE-specific branch (FR-018), preserving its observable position between the line's `WaitForExit` and its `DeleteNetns` — invariant O-9.
+- [x] T016 [US1] Add ordering tests in `shutdown.rs` for O-1 through O-7, O-9 and O-11, as position assertions over `build_shutdown_plan`'s output. One test per invariant, named for the invariant.
+- [x] T017 [US1] Add tests: every blocking step carries a non-zero `timeout_secs` (O-8, FR-009); a namespace with no `StartedLine` still gets a `DeleteNetns` (O-7, FR-007); building and executing the same plan twice yields no error and no extra steps (FR-008).
+- [x] T018 [US1] Add a `STOP_ALLOWANCE` constant to `shutdown.rs`, documented as "must match `stop_grace_period` in docker/docker-compose.yml", sized per research.md R8 (60s for 4 lines).
 - [ ] T019 [P] [US1] Set `stop_grace_period: 60s` on the bridge service in `docker/docker-compose.yml`, and in `docker/docker-compose.cellular-internet.yml` if it starts that service.
 - [ ] T020 [US1] Add a contract test asserting the compose file declares a `stop_grace_period` at least equal to `STOP_ALLOWANCE`, so the two cannot drift — same pattern as `tests/test_config_docs.rs`.
 
