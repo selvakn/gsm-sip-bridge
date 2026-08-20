@@ -37,10 +37,10 @@ reading code (research.md R2, R6). T003 can invalidate the whole design — it r
 any implementation, deliberately.
 
 - [x] T001 Confirm the worktree builds clean before any change: `make format && make lint && make test`. Record the baseline so later failures are attributable.
-- [ ] T002 **[GATE]** Run quickstart A1 on a live host: capture SC-000 (restart after a 3-minute stop) and the immediate-restart numbers, per line — seconds to registered, `restarting in 5s` count, IKE_SA setups. Record both in `specs/041-shutdown-resource-cleanup/research.md` under a new "R9. Measured baselines" section. If the gap between them no longer reproduces, STOP and re-scope.
-- [ ] T003 **[GATE]** Run quickstart A2, the discriminating experiment: four stops, each with one manual intervention, recording when the `if_id` frees. Append the results table to research.md R2, replacing the "residual uncertainty" paragraph with what was measured. **If run 4 still takes ~150s the mechanism is wrong — STOP and bring the premise back for review before writing any code.**
-- [ ] T004 [P] Run quickstart A3: confirm the image's busybox `timeout` accepts `timeout SECS PROG`. Record the confirmed form in research.md R3; if it wants `-t`, note it there so T009 emits the right argv.
-- [ ] T005 [P] Run quickstart A4: prove `/var/run/netns` bind-mount propagation host↔container. Record in research.md R6. A failure here drops Phase 5 (US2) only — say so explicitly rather than shipping a bind mount that does nothing.
+- [x] T002 **[GATE]** Run quickstart A1 on a live host: capture SC-000 (restart after a 3-minute stop) and the immediate-restart numbers, per line — seconds to registered, `restarting in 5s` count, IKE_SA setups. Record both in `specs/041-shutdown-resource-cleanup/research.md` under a new "R9. Measured baselines" section. If the gap between them no longer reproduces, STOP and re-scope.
+- [x] T003 **[GATE]** Run quickstart A2, the discriminating experiment: four stops, each with one manual intervention, recording when the `if_id` frees. Append the results table to research.md R2, replacing the "residual uncertainty" paragraph with what was measured. **If run 4 still takes ~150s the mechanism is wrong — STOP and bring the premise back for review before writing any code.**
+- [x] T004 [P] Run quickstart A3: confirm the image's busybox `timeout` accepts `timeout SECS PROG`. Record the confirmed form in research.md R3; if it wants `-t`, note it there so T009 emits the right argv.
+- [x] T005 [P] Run quickstart A4: prove `/var/run/netns` bind-mount propagation host↔container. Record in research.md R6. A failure here drops Phase 5 (US2) only — say so explicitly rather than shipping a bind mount that does nothing.
 
 **Checkpoint**: the design's premise is measured, not assumed. Phases 2-4 proceed on T003
 passing; Phase 5 additionally requires T005.
@@ -154,7 +154,7 @@ only SC-007 is lost (plan.md, Delivery slices).
 - [x] T032 [P] Add a `RELEASE_NOTES.md` entry at the house length (see the 039 entry, trimmed in commit b90c647 for exactly this reason).
 - [x] T033 [P] Add a `CHANGELOG.md` entry.
 - [ ] T034 Re-run the full quickstart Phase C table end to end on the live host and record the results against SC-000…SC-010, including the before/after comparison from T002. This is the feature's acceptance evidence, not the test suite.
-- [ ] T035 Update `specs/041-shutdown-resource-cleanup/research.md` R2 with the final measured conclusion, so the next person reading `docs/operations.md` finds the evidence rather than the superseded claim.
+- [x] T035 Update `specs/041-shutdown-resource-cleanup/research.md` R2 with the final measured conclusion, so the next person reading `docs/operations.md` finds the evidence rather than the superseded claim.
 
 ---
 

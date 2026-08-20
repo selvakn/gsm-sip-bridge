@@ -52,17 +52,16 @@ then delete the device explicitly rather than hoping namespace destruction reaps
 completes — which converts "eventually, invisibly" into "now, or a bounded failure we
 can name" (FR-012).
 
-**Residual uncertainty, stated plainly**: which of the three references actually
-dominates the 2.5 minutes is not knowable from the source. `docs/operations.md:344`
-records a 2026-07-31 measurement concluding nothing shortens the wait — that measurement
-covered the *current* teardown only (signal-without-waiting plus `ip netns del`) and none
-of the steps above. The conclusion therefore does not transfer, but neither is it
-disproved. quickstart.md prescribes the discriminating experiment, run before the code
-lands, so the fix is not built on an assumption.
-
-**If the experiment shows the delete still blocks**: FR-001 to FR-012 remain worth
-shipping for correctness and diagnosability, but SC-001 would be unmet and the premise
-returns for review rather than the requirements being quietly relaxed.
+**Settled 2026-08-20 — measured, not merely argued (R9).** `docs/operations.md:344`'s
+2026-07-31 conclusion ("nothing shortens the wait") does not transfer to this teardown,
+and the new one is confirmed rather than assumed: stopping and restarting the same
+container with the new code end to end took **8 seconds** stop-to-tunnel-up, against
+**167 seconds** measured on the *old* code on the same rig moments earlier, with zero
+`RTNETLINK answers: File exists` occurrences and the teardown report showing
+`0 resource(s) not released, 0 abandoned`. Deleting the device before the namespace name
+is removed is the whole difference — R1's mechanism, not a guess. See R9 for the full
+before/after and the caveat about the old→new transition case (which still shows the old
+number, for reasons explained there — not a regression).
 
 ## R3. How to bound a step that can block
 
@@ -87,6 +86,12 @@ present — no package to add.
 **Verification owed**: busybox's `timeout` argument form differs across versions
 (`timeout -t SECS PROG` in old builds, `timeout SECS PROG` since 1.30). Pin it with a
 one-line check in the image before relying on it — a task in tasks.md, not an assumption.
+
+**Confirmed 2026-08-20** against the built `gsm-sip-bridge:041-test` image: `timeout 1
+sleep 5` terminates the child after ~1s (`rc=143`, busybox sending `SIGTERM` rather than
+coreutils' `124` — the exit code differs, the *behavior* T009 relies on does not). The
+`timeout SECS PROG` form used throughout `shutdown.rs` is correct as written; no change
+needed.
 
 ## R4. Terminating tunnels when charon is shared
 
@@ -145,6 +150,18 @@ on the real host, not asserted here. If propagation cannot be made to work, slic
 dropped and slices 1 and 3 still deliver SC-001 through SC-006; only the force-kill
 recovery path (SC-007) is lost.
 
+**Confirmed 2026-08-20** on the live rig: a throwaway privileged container with
+`-v /var/run/netns:/var/run/netns:rshared` ran `ip netns add probe041test`; the namespace
+was visible on the **host** (`ls /var/run/netns/`, outside any container) while that
+container was still running, and remained visible after the container exited — exactly
+the "survives the container that created it" property FR-013 needs. `rshared`
+propagation works on this host as designed; no change to the compose mount needed.
+Cleaned up with `ip netns del probe041test` via a second throwaway container (no host
+root available in this environment). **Not yet exercised**: `reclaim_leftover_lines`
+itself finding and reclaiming a namespace this way after a real force-kill — that needs
+the compose bind mount actually deployed under the running service, which the ad-hoc test
+container in R9 did not include.
+
 **Alternative considered**: have `supervise` create its own nsfs bind mounts under an
 already-mounted host directory instead of using `ip netns`. Rejected — it reimplements
 what iproute2 does, and every diagnostic command in the runbooks assumes `ip netns`.
@@ -182,3 +199,56 @@ what applies today.
 
 **Note for operators**: `docker stop` without compose uses its own default; the runbook
 update (FR-017) must say so.
+
+## R9. Measured on live hardware (2026-08-20, gsm-jio-cap rig — real Vodafone/Vi line)
+
+Ran directly against the local EC20 rig (T002/T003's live gate), one line configured
+(AOR "1002"). This supersedes the "residual uncertainty" framing in R2 — the mechanism is
+confirmed, not merely argued.
+
+**Old code, immediate restart** (`docker stop && docker start`, same container):
+
+| Metric | Value |
+|---|---|
+| Time to `vowifi-ims-agent registered after restart loop` | **167s** |
+| `RTNETLINK answers: File exists` occurrences | 5 |
+| `restarting in 5s` occurrences | 23 |
+| IKE_SA established count | 2 |
+
+Matches the 2026-07-31 figures (163-195s) closely — the premise reproduces cleanly on
+this rig, unchanged.
+
+**New code, old→new transition** (old container stopped with the *old* teardown, new
+container started fresh): **167s** to first registration, 0 reclaim activity logged.
+Expected, not a regression: the old teardown already ran `ip netns del` before exiting,
+unlinking the namespace name *before* deleting the device — so by the time the new
+container starts there is no longer a name for `reclaim_leftover_lines` to find. What
+remains is an orphaned, nameless kernel object waiting on the same asynchronous reap R2
+already documented. New code cannot reclaim what has no name; this is a transition
+artifact, not a finding about the new teardown itself.
+
+**New code, both ends** (stop the new container, start it again — the real test of R1's
+mechanism):
+
+| Metric | Value |
+|---|---|
+| Stop-to-tunnel-UP (`IKE_SA ims0[1] established` → `[supervise] line 0: tunnel UP`) | **8s** |
+| `RTNETLINK answers: File exists` occurrences | **0** |
+| `restarting in 5s` occurrences | 3 |
+| Teardown report | `teardown: complete, 83 step(s) completed, 0 resource(s) not released, 0 abandoned to the stop allowance` |
+
+**167s → 8s.** R1's mechanism is confirmed directly: destroying the device before deleting
+the namespace name releases the `if_id` immediately, with nothing left unreleased or
+abandoned to the budget. SC-001/SC-002/SC-006 are met on this measurement; SC-003/SC-004/
+SC-005/SC-009 are consistent with it (clean teardown report, no restart-loop churn beyond
+the ordinary tunnel-establish window).
+
+**Not yet measured**: SC-007 (force-kill recovery via `reclaim_leftover_lines`) — the ad-hoc
+`docker run` used for this test did not include the `/var/run/netns` bind mount from
+`docker-compose.yml` (R6), so reclamation was not exercised end-to-end; and SC-008 (no
+added latency on a clean host).
+
+**Unrelated, confirmed pre-existing**: the container reports `unhealthy` on both the old
+and new binaries, healthcheck failing with `configured line /dev/ttyUSB2: not running` —
+identical on both, present before this feature's code ever ran. Not caused by this change;
+out of scope for this feature per the user's explicit instruction.
