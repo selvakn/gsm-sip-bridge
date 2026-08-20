@@ -640,6 +640,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         pcscf_source_path: raw.pcscf_source_path,
         control_port: in_range(raw.control_port, "vowifi.control_port", 1..=65535)?,
         wideband: raw.wideband,
+        watchdog_recovery_enabled: raw.watchdog_recovery_enabled,
         apn: raw.apn,
         epdg_fqdn: raw.epdg_fqdn,
         epdg_ip: raw.epdg_ip.filter(|s| !s.is_empty()),

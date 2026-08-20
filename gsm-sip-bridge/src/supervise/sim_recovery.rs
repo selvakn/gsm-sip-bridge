@@ -32,6 +32,14 @@ pub struct IncidentCounters {
 pub enum AgentExitOutcome {
     /// `grep -q 'AT+CSIM failed'` matched this run's log.
     CsimFailure,
+    /// The stall watchdog terminated this run (specs/039-at-stall-watchdog).
+    ///
+    /// A separate variant from [`Self::CsimFailure`] so the log and the alert
+    /// can say which one happened, but counted against the *same* incident
+    /// counter: a SIM that answers `AT+CSIM` with an error and one that stops
+    /// answering at all are the same physical fault, and `AT+CFUN=0/1` is the
+    /// remedy for both.
+    AtStall,
     /// A clean run or a non-CSIM failure — either way, the original script
     /// resets both counters (a non-CSIM failure is a different problem, not
     /// evidence of a dropped USIM continuing).
@@ -64,7 +72,7 @@ impl IncidentCounters {
                 self.sim_resets = 0;
                 Action::None
             }
-            AgentExitOutcome::CsimFailure => {
+            AgentExitOutcome::CsimFailure | AgentExitOutcome::AtStall => {
                 self.csim_fails += 1;
                 if self.csim_fails >= CSIM_FAIL_THRESHOLD {
                     self.csim_fails = 0;
@@ -80,12 +88,66 @@ impl IncidentCounters {
             }
         }
     }
+
+    /// How long to wait before restarting the agent, given what
+    /// [`Self::observe`] just decided to do about this exit.
+    ///
+    /// Slows right down once this incident has given up resetting, so an
+    /// unrecoverable fault stops churning while still self-healing if the
+    /// hardware comes back (FR-030). A clean run resets `sim_resets`, which
+    /// restores the normal cadence automatically.
+    ///
+    /// Keyed on the `Action` rather than on `sim_resets`, because callers read
+    /// this *after* `observe` has already advanced the counters. Reading
+    /// `sim_resets >= MAX_SIM_RESETS` there meant the observation that performed
+    /// the last permitted reset had, by that point, incremented itself to the
+    /// limit — so the agent was held down for a quarter of an hour immediately
+    /// after applying the remedy most likely to have fixed it.
+    pub fn restart_delay(&self, action: Action) -> Duration {
+        match action {
+            // A remedy was just applied. Restart promptly and find out whether
+            // it worked; that is the whole point of having applied it.
+            Action::ResetSim => NORMAL_RESTART_DELAY,
+            // No resets left this incident: stop churning.
+            Action::GiveUpForThisIncident => EXHAUSTED_RESTART_DELAY,
+            // Still counting towards a threshold, or a clean/unrelated exit.
+            Action::None => NORMAL_RESTART_DELAY,
+        }
+    }
 }
 
 /// 1:1 port of `grep -q 'AT+CSIM failed'`.
 pub fn has_csim_failure(agent_log: &str) -> bool {
     agent_log.contains("AT+CSIM failed")
 }
+
+/// Whether the stall watchdog terminated this run
+/// (specs/039-at-stall-watchdog).
+///
+/// Matches the marker `ims::agent::watchdog` emits immediately before exiting.
+/// The two sides are pinned together by
+/// [`tests::has_at_stall_matches_the_marker_the_watchdog_emits`], so the string
+/// cannot drift out of agreement.
+pub fn has_at_stall(agent_log: &str) -> bool {
+    agent_log.contains(crate::ims::agent::watchdog::STALL_MARKER)
+}
+
+/// How long to wait before restarting an agent, once escalation has run out of
+/// remedies for this incident (FR-030).
+///
+/// Give-up used to mean "keep restarting every 5s forever", which on genuinely
+/// dead hardware is a restart loop that achieves nothing and buries the logs.
+/// It must not mean "stop trying" either: the line is unattended, and the
+/// common causes of a hard modem fault (a power blip, a USB re-enumeration, a
+/// SIM reseating itself) clear on their own. So it backs off instead, and the
+/// line returns to service by itself when the hardware does.
+///
+/// 15 minutes keeps the worst case — this delay plus a registration — inside
+/// the 30-minute self-heal target (SC-011).
+pub const EXHAUSTED_RESTART_DELAY: Duration = Duration::from_secs(900);
+
+/// The normal delay between an agent exiting and being restarted.
+pub const NORMAL_RESTART_DELAY: Duration = Duration::from_secs(5);
 
 /// 1:1 port of `grep -q '+CPIN: READY'`.
 pub fn is_cpin_ready(reset_log: &str) -> bool {
@@ -232,6 +294,94 @@ mod tests {
         };
         c.observe(AgentExitOutcome::Other);
         assert_eq!(c, IncidentCounters::default());
+    }
+
+    #[test]
+    fn has_at_stall_matches_the_marker_the_watchdog_emits() {
+        // Pins the two sides together: the watchdog owns the string, this grep
+        // consumes it, and a silent divergence would mean a stalled line
+        // restarting forever without ever escalating to a SIM reset.
+        let log = format!(
+            "2026-08-17T10:00:00Z ERROR {} activity=ims-dispatch phase=renewal",
+            crate::ims::agent::watchdog::STALL_MARKER
+        );
+        assert!(has_at_stall(&log));
+        assert!(!has_at_stall(
+            "2026-08-17T10:00:00Z INFO registration renewed"
+        ));
+        // A deferral is not a stall exit — the process is still alive.
+        assert!(!has_at_stall(crate::ims::agent::watchdog::DEFER_MARKER));
+    }
+
+    #[test]
+    fn three_consecutive_at_stalls_trigger_a_reset() {
+        let mut c = IncidentCounters::default();
+        assert_eq!(c.observe(AgentExitOutcome::AtStall), Action::None);
+        assert_eq!(c.observe(AgentExitOutcome::AtStall), Action::None);
+        assert_eq!(c.observe(AgentExitOutcome::AtStall), Action::ResetSim);
+    }
+
+    #[test]
+    fn an_at_stall_and_a_csim_failure_count_toward_one_incident() {
+        // They are the same physical fault with the same remedy, so mixing
+        // them must still reach the threshold — counting them separately would
+        // let a modem alternating between the two symptoms never escalate.
+        let mut c = IncidentCounters::default();
+        assert_eq!(c.observe(AgentExitOutcome::AtStall), Action::None);
+        assert_eq!(c.observe(AgentExitOutcome::CsimFailure), Action::None);
+        assert_eq!(c.observe(AgentExitOutcome::AtStall), Action::ResetSim);
+    }
+
+    #[test]
+    fn restart_slows_down_once_resets_are_exhausted_and_speeds_up_after_a_clean_run() {
+        let mut c = IncidentCounters::default();
+        assert_eq!(c.restart_delay(Action::None), NORMAL_RESTART_DELAY);
+
+        // The incident has used up its resets, so the next threshold hit gives
+        // up rather than resetting again -- that is what earns the slow cadence.
+        c.sim_resets = MAX_SIM_RESETS;
+        let action = {
+            let mut counting = c;
+            counting.observe(AgentExitOutcome::CsimFailure);
+            counting.observe(AgentExitOutcome::CsimFailure);
+            counting.observe(AgentExitOutcome::CsimFailure)
+        };
+        assert_eq!(action, Action::GiveUpForThisIncident);
+        assert_eq!(
+            c.restart_delay(action),
+            EXHAUSTED_RESTART_DELAY,
+            "an exhausted incident must stop churning at 5s intervals"
+        );
+        assert!(
+            EXHAUSTED_RESTART_DELAY < Duration::from_secs(1800),
+            "the slow cadence must still meet the 30-minute self-heal target"
+        );
+
+        // The line comes back on its own: a clean run clears the incident and
+        // the normal cadence resumes without human intervention.
+        let action = c.observe(AgentExitOutcome::Other);
+        assert_eq!(c.restart_delay(action), NORMAL_RESTART_DELAY);
+    }
+
+    #[test]
+    fn the_reset_that_may_have_fixed_it_is_not_punished_with_the_slow_cadence() {
+        // `restart_delay` is read *after* `observe`, and `observe` increments
+        // `sim_resets` before returning `ResetSim`. Keyed on the counter, the
+        // observation that performed the *last permitted* reset therefore
+        // measured itself as exhausted and held the agent down for 15 minutes —
+        // immediately after applying the remedy most likely to have worked.
+        let mut c = IncidentCounters {
+            csim_fails: CSIM_FAIL_THRESHOLD - 1,
+            sim_resets: MAX_SIM_RESETS - 1,
+        };
+        let action = c.observe(AgentExitOutcome::CsimFailure);
+        assert_eq!(action, Action::ResetSim, "the last permitted reset");
+        assert_eq!(c.sim_resets, MAX_SIM_RESETS, "which exhausts the incident");
+        assert_eq!(
+            c.restart_delay(action),
+            NORMAL_RESTART_DELAY,
+            "a SIM reset must be followed by a prompt restart to see if it worked"
+        );
     }
 
     #[test]

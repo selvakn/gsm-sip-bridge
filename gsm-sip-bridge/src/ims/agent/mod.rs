@@ -32,6 +32,7 @@ mod origination;
 mod ping;
 mod probe;
 mod veth;
+pub(crate) mod watchdog;
 
 use crate::config::VowifiConfig;
 use crate::control::protocol::{AgentKind, BridgeFailureReason, CallStatus, RegistrationStatus};
@@ -196,6 +197,14 @@ fn run_inner(
     config: &VowifiConfig,
     app_config: &crate::config::AppConfig,
 ) -> BridgeResult<()> {
+    // Arm stall detection before anything touches the modem
+    // (specs/039-at-stall-watchdog). `derive_plmn` below opens the AT port, and
+    // that open is itself a wedge point — starting the watchdog only once the
+    // dispatch loop exists would leave the whole startup path unmonitored.
+    let progress = watchdog::register(Arc::new(watchdog::Progress::new("ims-dispatch")));
+    watchdog::spawn(config.watchdog_recovery_enabled)?;
+    let _startup = progress.phase_guard(watchdog::Phase::Startup);
+
     // The ePDG tunnel is one of two `ImsTransport`s feeding the same
     // registration machinery (specs/015-volte-host-ims); the LTE IMS PDN is
     // the other. For VoWiFi this is exactly the P-CSCF file read that used to
@@ -282,7 +291,7 @@ fn run_inner(
     // protect and no cellular bearer to poll.
     let dedupe = Arc::new(Mutex::new(crate::volte::sms::Dedupe::default()));
     let modem_lock = if wants_modem_sms_reader(config.pcsc_reader) {
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(crate::modules::modem_lock::ModemLock::new());
         let modem_port = PathBuf::from(&config.modem_port);
         let sweep_lock = lock.clone();
         let sweep_dedupe = dedupe.clone();
@@ -330,6 +339,7 @@ fn run_inner(
         // processes), so it does not gate on it.
         pbx_registered: None,
         app_config,
+        progress: Arc::clone(&progress),
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
     })
@@ -367,7 +377,7 @@ pub(crate) struct InboundParams<'a> {
     /// other user of the same port — the modem SMS reader (specs/038), on
     /// either path now. `None` only for a `pcsc_reader` line, which has no
     /// modem/AT port at all.
-    pub modem_lock: Option<Arc<Mutex<()>>>,
+    pub modem_lock: Option<Arc<crate::modules::modem_lock::ModemLock>>,
     /// Shared with this line's modem SMS reader (specs/038-reliable-sms-delivery)
     /// so a message delivered over both the registration and the modem
     /// collapses to one: whichever route sees it first wins, the other
@@ -381,6 +391,11 @@ pub(crate) struct InboundParams<'a> {
     /// track the PBX leg and so treats it as available.
     pub pbx_registered: Option<Arc<AtomicBool>>,
     pub app_config: &'a crate::config::AppConfig,
+    /// This line's stall-detection handle (specs/039-at-stall-watchdog).
+    /// Created and registered by the caller before it touches the modem, so
+    /// the startup path is monitored too, and shared with the dispatch loop
+    /// here so every blocking region publishes which phase it is in.
+    pub progress: Arc<watchdog::Progress>,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
     /// Which agent this is, for the `transport` label its reports land under.
@@ -411,6 +426,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         dedupe,
         pbx_registered,
         app_config,
+        progress,
         agent_label,
         agent_kind,
     } = p;
@@ -426,11 +442,14 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             None
         }
     };
-    let reporter = Reporter::spawn(
+    // Watched, so the heartbeat stops while this line is stalled and the
+    // liveness gauges tell the truth (specs/039-at-stall-watchdog, FR-021).
+    let reporter = Reporter::spawn_watched(
         app_config.control.socket_path.clone(),
         agent_kind,
         card_id.to_string(),
         Duration::from_secs(app_config.metrics.agent_report_interval_seconds),
+        Some(Arc::clone(&progress)),
     );
     // Both paths run this code; the store's call rows must carry the right
     // transport or VoLTE and VoWiFi history collapse into one.
@@ -450,9 +469,23 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // the cellular path's SMS reader also uses (no-op on Wi-Fi, where the lock
     // is `None`).
     let mut session = {
-        let _guard = modem_lock
-            .as_ref()
-            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        // A bounded acquire: if another user of this modem is wedged, fail the
+        // registration attempt rather than waiting on it forever. The
+        // supervisor retries, which is a far better outcome than an agent that
+        // never finishes starting up and never says why.
+        let _guard = match modem_lock.as_ref() {
+            Some(l) => match l.lock() {
+                Some(g) => Some(g),
+                None => {
+                    return Err(BridgeError::Ims(
+                        "could not get the modem to register: another user of the AT port has \
+                         held it beyond the timeout"
+                            .into(),
+                    ))
+                }
+            },
+            None => None,
+        };
         match crate::ims::register_session(reg_cfg) {
             Ok(s) => s,
             Err(e) => {
@@ -483,17 +516,23 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     obs.set_registered(true);
     obs.set_tunnel_up(true);
     obs.set_active_calls(0);
+    obs.set_registration_expiry(
+        SystemTime::now()
+            + Duration::from_secs(session.granted_expires(crate::ims::DEFAULT_EXPIRES) as u64),
+    );
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection.
     let mut inbound = start_inbound(&session)?;
     subscribe_reg_event(&mut session);
 
+    // What the registrar actually granted, not what we asked for: renewing on
+    // the requested value would leave a window where the binding has lapsed
+    // while we still believe it is live (FR-023).
+    let granted_expires = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
     let status = Arc::new(Mutex::new(crate::ims::RegistrationStatus {
         state: crate::ims::RegistrationState::Registered,
         registered_at: Some(SystemTime::now()),
-        expires_at: Some(
-            SystemTime::now() + Duration::from_secs(crate::ims::DEFAULT_EXPIRES as u64),
-        ),
+        expires_at: Some(SystemTime::now() + Duration::from_secs(granted_expires as u64)),
         last_failure: None,
         // Health starts able-to-answer: we reach here only after a successful
         // registration, and the attachment underneath it is up (the Wi-Fi path
@@ -530,6 +569,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             dedupe: &dedupe,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
+            progress: &progress,
         },
         place_call_rx,
     );
@@ -809,10 +849,13 @@ struct DispatchParams<'a> {
     veth_sip_port: u16,
     pre_renewal: Option<&'a PreRenewalHook>,
     attachment_check: Option<&'a AttachmentHook>,
-    modem_lock: Option<&'a Arc<Mutex<()>>>,
+    modem_lock: Option<&'a Arc<crate::modules::modem_lock::ModemLock>>,
     dedupe: &'a Arc<Mutex<crate::volte::sms::Dedupe>>,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
+    /// Publishes which phase the loop is in, so the watchdog can tell a line
+    /// that is working from one that has stopped (specs/039-at-stall-watchdog).
+    progress: &'a Arc<watchdog::Progress>,
 }
 
 impl DispatchParams<'_> {
@@ -939,6 +982,14 @@ fn dispatch_loop(
         } else {
             IDLE_POLL_INTERVAL
         };
+        // Every completed pass of this loop is the definition of "still making
+        // progress" (specs/039-at-stall-watchdog). Re-entering `Idle` each
+        // iteration restarts the phase clock, so only a pass that never
+        // finishes — because something inside it blocked — can go over budget.
+        // `busy` drives the watchdog's deferral: a stalled control loop often
+        // leaves a call's audio intact, so it is worth not killing.
+        p.progress.set_busy(st.busy());
+        p.progress.enter(watchdog::Phase::Idle);
         // EXPERIMENT, gated on `GM_RESPOND_ON_CLIENT=1`: answer a
         // network-initiated request over the *client* leg instead of the
         // socket it arrived on.
@@ -971,6 +1022,7 @@ fn dispatch_loop(
         };
         match received {
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {
+                let _phase = p.progress.phase_guard(watchdog::Phase::InboundCall);
                 st.handle_inbound_invite(session, inbound, p, &req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "BYE" => {
@@ -1179,13 +1231,23 @@ impl LoopState {
         // responses arrive on `inbound.rx` (via the client-reader thread) like
         // everything else — this no longer reads the carrier socket directly,
         // which also removes the two-readers-on-one-socket race (research R2).
-        self.origination = begin_origination(
-            session,
-            pending.control,
-            pending.call_id,
-            &pending.destination,
-            &p.origination_setup(),
-        );
+        //
+        // Watched (specs/039-at-stall-watchdog): this is the one part of an
+        // origination that blocks the dispatch loop, and its INVITE write has no
+        // timeout of its own — a P-CSCF whose receive window never opens parks
+        // this thread indefinitely, exactly as the modem read did. The *waiting*
+        // afterwards is tick-driven and needs no phase; `Phase::Origination`
+        // therefore covers precisely this call and nothing else.
+        self.origination = {
+            let _phase = p.progress.phase_guard(watchdog::Phase::Origination);
+            begin_origination(
+                session,
+                pending.control,
+                pending.call_id,
+                &pending.destination,
+                &p.origination_setup(),
+            )
+        };
         true
     }
 
@@ -1382,6 +1444,7 @@ impl LoopState {
         // or a reconnect must not cut across it. Repeated repair failure sets
         // `force_renewal`, which the renewal gate below honours.
         if !self.busy() {
+            let _phase = p.progress.phase_guard(watchdog::Phase::GmProbe);
             probe_gm_connection(
                 session,
                 inbound,
@@ -1396,13 +1459,25 @@ impl LoopState {
         // Never renew mid-call — that would tear down the transport a call's
         // own signaling (e.g. the eventual BYE) still needs; renewal is
         // deferred until the call ends.
-        let expires_at = p
-            .status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .expires_at;
-        let due = expires_at
-            .is_some_and(|e| crate::ims::renewal_due(SystemTime::now(), e, RENEWAL_HEADROOM));
+        let (expires_at, registered_at) = {
+            let guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            (guard.expires_at, guard.registered_at)
+        };
+        // The headroom scales to the lifetime the registrar actually granted
+        // (FR-024). The granted value needs no separate field: it is exactly
+        // the span the status already records. Without the scaling, a grant
+        // shorter than twice the fixed headroom would make `renewal_due`
+        // permanently true and re-register on every idle poll, once a second,
+        // forever.
+        let headroom = match (expires_at, registered_at) {
+            (Some(exp), Some(reg)) => crate::ims::renewal_headroom_for(
+                exp.duration_since(reg).unwrap_or(RENEWAL_HEADROOM),
+                RENEWAL_HEADROOM,
+            ),
+            _ => RENEWAL_HEADROOM,
+        };
+        let due =
+            expires_at.is_some_and(|e| crate::ims::renewal_due(SystemTime::now(), e, headroom));
         // `force_renewal` is the Gm-liveness escalation: re-register now even
         // though expiry is far off, because only a re-registration can
         // renegotiate a Gm SA that has gone dead underneath the connection
@@ -1429,6 +1504,14 @@ impl LoopState {
                 return Ok(());
             }
         }
+        // Everything from here to the end of this function is the renewal, and
+        // all of it can block: acquiring the modem lock (which the SMS sweep
+        // holds while it does its own AT work), the re-attach hook, the SIM
+        // APDUs, the REGISTER round trips, the SA install. The phase is entered
+        // *before* the lock acquisition deliberately — a sweep that wedges
+        // while holding the lock would otherwise stall this loop outside any
+        // budget, which is precisely the second route to the 2026-08-16 outage.
+        let _phase = p.progress.phase_guard(watchdog::Phase::Renewal);
         p.status.lock().unwrap_or_else(|e| e.into_inner()).state =
             crate::ims::RegistrationState::Renewing;
         // Hold the modem lock across the whole renewal: the hook re-attaches
@@ -1436,9 +1519,35 @@ impl LoopState {
         // AT port. Serialises with the cellular SMS reader that shares that
         // port (research R6); `None`, so a no-op, on the Wi-Fi path. Released
         // when this returns.
-        let _modem_guard = p
-            .modem_lock
-            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        //
+        // Bounded (specs/039-at-stall-watchdog, FR-005): the SMS sweep holds
+        // this lock every 20s while it does its own AT work, so an unbounded
+        // wait here is how a wedged sweep used to take the registration down
+        // with it. Failing the renewal instead lands on the existing backoff,
+        // and the watchdog is still watching in case nothing recovers.
+        let _modem_guard = match p.modem_lock {
+            Some(l) => match l.lock() {
+                Some(g) => Some(g),
+                None => {
+                    tracing::warn!(
+                        retry_in_secs = self.backoff.as_secs(),
+                        "cannot renew: another user of the modem has held it beyond the timeout"
+                    );
+                    let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.state = crate::ims::RegistrationState::Failed;
+                    guard.last_failure = Some((
+                        SystemTime::now(),
+                        "the modem was held by another user beyond the timeout".to_string(),
+                    ));
+                    drop(guard);
+                    p.obs.set_registered(false);
+                    self.next_renewal_attempt = Some(Instant::now() + self.backoff);
+                    self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
         // Rebuild the layer underneath before spending a REGISTER on it.
         // Reaching here already means no call is in progress (the maintenance
         // policy deferred it above otherwise), which is precisely how
@@ -1481,23 +1590,28 @@ impl LoopState {
                 // A renewal negotiates a fresh Gm SA on fresh ports, so the old
                 // listeners are now bound to dead ones.
                 *inbound = start_inbound(session)?;
+                // Re-read the granted lifetime on every renewal: a registrar is free to
+                // grant a different one each time, and carrying the first
+                // response's value forever would eventually mis-time renewal.
+                let granted = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
                 let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
                 guard.state = crate::ims::RegistrationState::Registered;
                 guard.registered_at = Some(SystemTime::now());
-                guard.expires_at = Some(
-                    SystemTime::now() + Duration::from_secs(crate::ims::DEFAULT_EXPIRES as u64),
-                );
+                guard.expires_at = Some(SystemTime::now() + Duration::from_secs(granted as u64));
                 // A renewal only reaches here through a successful re-attach
                 // (the hook above), so the attachment is up.
                 guard.attached = true;
                 drop(guard);
                 self.backoff = RETRY_INITIAL_BACKOFF;
                 self.next_renewal_attempt = None;
-                tracing::info!("registration renewed");
+                tracing::info!(granted_expires_secs = granted, "registration renewed");
                 p.obs
                     .report_registration_attempt(RegistrationStatus::Success);
                 p.obs.set_registered(true);
                 p.obs.set_tunnel_up(true);
+                p.obs.set_registration_expiry(
+                    SystemTime::now() + Duration::from_secs(granted as u64),
+                );
                 // The renewal replaced `session` and `inbound` wholesale — a
                 // fresh Gm SA, transport, and both readers. Any in-flight ping
                 // referenced the old socket and can never be answered on the

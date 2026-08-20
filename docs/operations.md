@@ -82,6 +82,58 @@ sqlite3 /var/lib/gsm-sip-bridge/store.db ".backup /backup/store-$(date +%Y%m%d).
 
 ## Troubleshooting
 
+### A line went unreachable and something restarted it
+
+Look for this line in the agent's log (`/tmp/ims-agent-<line>.out`, also in
+`docker logs`):
+
+```
+watchdog: the dispatch loop has made no progress
+```
+
+It carries `activity`, `phase`, `stalled_secs`, `budget_secs` and — most
+usefully — `last_at_command`, the modem command the line was waiting on when it
+stopped moving. The agent exits `70` and the supervisor restarts that line
+within ~5s; a restarted line has been observed re-registering in ~150s.
+
+This exists because of a 2026-08-16 incident in which a line was unreachable for
+2h45m while every health signal reported it healthy. A modem had stopped
+answering, and a re-registration blocked forever in `read(2)` on the serial port
+— on the same thread that answers calls.
+
+**Repeated stalls** escalate through the same ladder as a dropped USIM: three
+strikes trigger an `AT+CFUN=0`→`1` SIM reset, and after five resets the line
+alerts once and drops to a 15-minute retry cadence rather than restarting in a
+tight loop. It keeps retrying deliberately — the common causes (a power blip, a
+USB re-enumeration, a SIM reseating itself) clear on their own, and the line
+then returns to service unattended.
+
+**To keep a wedged line for diagnosis**, set `[vowifi].watchdog_recovery_enabled
+= false`. The stall is still detected, logged and reported — only the restart is
+suppressed. Do not leave this off in production: it reinstates exactly the
+silent outage the watchdog exists to prevent.
+
+### Is this line actually reachable right now?
+
+Three surfaces, which must now agree:
+
+```bash
+gsm-sip-bridge -c /etc/gsm-sip-bridge/config.toml vowifi-status
+#   expires_in: -9752s (LAPSED)
+#   can_answer: false
+#   blocked_reason: the registration has expired
+
+wget -qO- http://127.0.0.1:9091/metrics | grep -E 'registration_expires_in_seconds|agent_up'
+#   negative value = the binding has already lapsed
+
+docker ps            # reports (unhealthy) while a resolved line's registration is expired
+```
+
+Before this feature, all three reported healthy for the whole outage:
+`expires_at` was recorded but read by nothing, the Prometheus heartbeat came
+from a thread independent of the dispatch loop, and the healthcheck only proved
+the metrics port accepted connections.
+
 ### No `/dev/ttyUSB*` devices
 
 Check `dmesg | grep ttyUSB`. Ensure the `option` and `qcserial` kernel

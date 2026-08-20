@@ -78,6 +78,25 @@ impl AgentObservability {
         self.push(Vec::new());
     }
 
+    /// Report when this line's registration lapses
+    /// (specs/039-at-stall-watchdog, FR-018).
+    ///
+    /// Absolute, and reported only when it changes — once per renewal. The
+    /// daemon turns it into a countdown at scrape time, so an operator can see
+    /// at a glance that a binding lapsed hours ago rather than inferring it
+    /// from a raw timestamp nobody converts by hand.
+    pub fn set_registration_expiry(&self, expires_at: std::time::SystemTime) {
+        let unix = expires_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .registration_expires_at = Some(unix);
+        self.push(Vec::new());
+    }
+
     pub fn set_tunnel_up(&self, up: bool) {
         self.state
             .lock()

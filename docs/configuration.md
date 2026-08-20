@@ -270,6 +270,7 @@ gets discovered/resolved.
 | `pcscf_source_path` | string | `/tmp/pcscf` | **Base** path Agent A reads its tunnel-assigned P-CSCF from; the line index is appended, so this becomes `/tmp/pcscf-0`, `/tmp/pcscf-1`, ... Each line's carrier assigns its own P-CSCF, so one shared file would have the lines overwriting each other. Point `[volte].pcscf_source_path` at a specific line's file to reuse that address over LTE |
 | `control_port` | integer | 7050 | Agent A↔B control channel TCP port — shared across every line; lines are told apart by their (internally derived) veth address, not this port |
 | `wideband` | boolean | `true` | Carry AMR-WB/G.722 end-to-end instead of narrowing to 8 kHz |
+| `watchdog_recovery_enabled` | boolean | `true` | Restart a line whose work has demonstrably stalled. Turn off **only** to preserve a wedged line for diagnosis — the stall is still detected and reported either way, but with this off nothing recovers the line |
 | `apn` | string | `ims` | APN used by the `swu` engine's dialer — shared across every line |
 | `epdg_fqdn` | string | unset (derived per line from that line's `mcc`/`mnc`) | Override the derived 3GPP ePDG FQDN — shared across every line if set |
 | `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly — shared across every line if set |

@@ -1359,6 +1359,9 @@ fn start_vowifi_line_strongswan(
 
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
+    // Consecutive ticks the P-CSCF has been unreachable. Owned by the loop, like
+    // `current_pcscf`, so the tick function stays a decision over inputs.
+    let mut unreachable_streak = 0u32;
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1378,7 +1381,13 @@ fn start_vowifi_line_strongswan(
         if *guard {
             return;
         }
-        match line_supervisor::tick_steady_state(&engine, runner.as_ref(), &current_pcscf) {
+        match line_supervisor::tick_steady_state(
+            &engine,
+            runner.as_ref(),
+            &current_pcscf,
+            &mut unreachable_streak,
+            line_supervisor::STEADY_STATE_POLL_INTERVAL,
+        ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
             }
@@ -1390,6 +1399,12 @@ fn start_vowifi_line_strongswan(
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
             line_supervisor::SteadyOutcome::Recovered { reason } => {
+                // Recoveries used to leave no record at all, which made a
+                // tunnel rebuild indistinguishable from nothing happening --
+                // both in a soak and for an operator afterwards. A remedy this
+                // heavy (terminate + reinitiate, and a re-registration behind
+                // it) has to say so.
+                println!("[supervise] line {idx}: recovered from {reason:?}");
                 if let Some(new_handle) = engine.shared.current_handle() {
                     let mut st = started.lock().unwrap();
                     // Dedupe by identity: most recoveries are connection-
@@ -1586,16 +1601,30 @@ fn start_line_tail(
                     }
                     runner.sleep(Duration::from_secs(1));
                 }
-                println!("[supervise] line {idx}: vowifi-ims-agent exited; restarting in 5s");
                 had_restart = true;
 
                 let log_content = runner.read_file(&agent_log).unwrap_or_default();
-                let outcome = if sim_recovery::has_csim_failure(&log_content) {
+                // A stall is checked first: a run that stalled may *also* have
+                // an older `AT+CSIM failed` earlier in its log, and the stall is
+                // the more specific and more recent explanation for this exit.
+                let outcome = if sim_recovery::has_at_stall(&log_content) {
+                    sim_recovery::AgentExitOutcome::AtStall
+                } else if sim_recovery::has_csim_failure(&log_content) {
                     sim_recovery::AgentExitOutcome::CsimFailure
                 } else {
                     sim_recovery::AgentExitOutcome::Other
                 };
                 let action = csim_fails.observe(outcome);
+                let restart_delay = csim_fails.restart_delay(action);
+                let reason = match outcome {
+                    sim_recovery::AgentExitOutcome::AtStall => " (stalled on the modem)",
+                    sim_recovery::AgentExitOutcome::CsimFailure => " (AT+CSIM failure)",
+                    sim_recovery::AgentExitOutcome::Other => "",
+                };
+                println!(
+                    "[supervise] line {idx}: vowifi-ims-agent exited{reason}; restarting in {}s",
+                    restart_delay.as_secs()
+                );
                 if action == sim_recovery::Action::ResetSim {
                     let holder = usim_holder.lock().unwrap().clone();
                     let reset_log = PathBuf::from(format!("/tmp/sim-reset-{idx}.log"));
@@ -1609,17 +1638,21 @@ fn start_line_tail(
                 if action == sim_recovery::Action::GiveUpForThisIncident {
                     tracing::error!(
                         line = idx,
+                        retry_in_secs = sim_recovery::EXHAUSTED_RESTART_DELAY.as_secs(),
                         "SIM recovery exhausted (MAX_SIM_RESETS reached this incident); \
-                         giving up on this reset cycle, will keep retrying the agent"
+                         backing off to a slow retry so the line still recovers by itself \
+                         if the hardware does, without restarting in a tight loop"
                     );
                 }
                 if let Some(kind) = sim_alert_transition(action, &mut given_up_alerted) {
                     if let Some(ctx) = &alert_ctx {
                         let description = match kind {
                             alerts::CriticalEventKind::Failure => {
-                                "VoWiFi line's SIM recovery exhausted (max resets reached this incident)"
+                                "VoWiFi line's modem recovery exhausted (max SIM resets reached \
+                                 this incident); the line is now on a slow retry and will \
+                                 recover by itself only if the hardware does"
                             }
-                            alerts::CriticalEventKind::Recovered => "VoWiFi line's SIM recovered",
+                            alerts::CriticalEventKind::Recovered => "VoWiFi line's modem recovered",
                         };
                         ctx.fire(alerts::CriticalEvent {
                             category: alerts::AlertCategory::ModuleLifecycle,
@@ -1632,7 +1665,7 @@ fn start_line_tail(
                     }
                 }
 
-                runner.sleep(Duration::from_secs(5));
+                runner.sleep(restart_delay);
             }
         });
     }
@@ -1658,13 +1691,31 @@ fn start_line_tail(
                 let pcscf_now = runner.read_file(Path::new(&pcscf_path)).unwrap_or_default();
                 let pcscf_now = pcscf_now.trim();
                 if !pcscf_now.is_empty() {
-                    let _ = runner.run_in_netns(
+                    // Uses the runner's own probe rather than shelling out to
+                    // `timeout 3 bash -c '>/dev/tcp/...'`
+                    // (specs/039-at-stall-watchdog, FR-028). That shell form
+                    // left the inner `timeout` process orphaned on every cycle,
+                    // reparented to this process as PID 1, and never reaped:
+                    // 462 zombies had accumulated in 3.8 hours, which at ~120
+                    // an hour eventually exhausts the process table and takes
+                    // out something entirely unrelated. This has the same 3s
+                    // connect timeout, waits for its child properly, and does
+                    // not interpolate a file's contents into a shell command.
+                    // The result is deliberately discarded *here*: this loop's
+                    // job is to put traffic on the tunnel so the bearer's NAT
+                    // mapping stays alive, not to decide anything.
+                    //
+                    // It used to be the only thing in the whole system that
+                    // probed reachability, and dropping the answer is what let
+                    // the 2026-08-17 outage run for 8 hours: this probe failed
+                    // roughly 960 consecutive times and told nobody. The
+                    // decision now lives in `line_supervisor::tick_steady_state`
+                    // (`DegradeReason::PcscfUnreachable`), which has the engine
+                    // handle needed to actually repair the tunnel.
+                    let _ = runner.tcp_connect_ok_in_netns(
                         &netns,
-                        &[
-                            "bash",
-                            "-c",
-                            &format!("timeout 3 bash -c '>/dev/tcp/{pcscf_now}/5060'"),
-                        ],
+                        pcscf_now,
+                        line_supervisor::PCSCF_SIP_PORT,
                     );
                 }
                 runner.sleep(interval);
@@ -1750,8 +1801,12 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     let mut current_pcscf = pcscf;
+    let mut unreachable_streak = 0u32;
     loop {
-        runner.sleep(Duration::from_secs(5));
+        // Named, and shared with the reachability-window derivation: this loop
+        // polls six times faster than the strongswan one, so any threshold
+        // expressed in ticks means two different amounts of real time.
+        runner.sleep(line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL);
         // See the strongswan steady-state loop's identical pattern: the
         // guard is held across the whole tick_steady_state call, not just a
         // one-off check before it, because the Recovered branch below can
@@ -1762,7 +1817,13 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         if *guard {
             return;
         }
-        match line_supervisor::tick_steady_state(&engine, runner.as_ref(), &current_pcscf) {
+        match line_supervisor::tick_steady_state(
+            &engine,
+            runner.as_ref(),
+            &current_pcscf,
+            &mut unreachable_streak,
+            line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
+        ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
             }
@@ -1770,7 +1831,8 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 drop(guard);
                 current_pcscf = new_pcscf;
             }
-            line_supervisor::SteadyOutcome::Recovered { .. } => {
+            line_supervisor::SteadyOutcome::Recovered { reason } => {
+                println!("[supervise] line {idx}: recovered from {reason:?}");
                 if let Some(h) = engine.dialer_handle.borrow().clone() {
                     started.lock().unwrap().vowifi_child_handles.push(h);
                 }

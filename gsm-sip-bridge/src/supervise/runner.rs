@@ -121,6 +121,48 @@ pub enum Signal {
 const REAP_MAX_POLLS: u32 = 20;
 const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The outcome of [`CommandRunner::http_get`].
+///
+/// Three states rather than `Option<String>`, because the healthcheck has to
+/// tell "the daemon is not answering" apart from "the daemon answered but its
+/// scrape could not be read". Collapsing them made a slow or truncated
+/// `/metrics` encode report the *whole container* unhealthy — a new failure mode
+/// introduced by upgrading this probe from a bare TCP connect, and one that a
+/// large registry under load can plausibly trigger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpProbe {
+    /// A 200 response, with its body.
+    Body(String),
+    /// The connection was established, but the response could not be read
+    /// within the timeout, was malformed, or was not a 200. The endpoint is up;
+    /// there is simply no body to draw conclusions from.
+    ///
+    /// Note this deliberately does *not* become a fault on its own. An endpoint
+    /// that stays unreadable shows up as a gap in the metrics themselves, which
+    /// is where a persistent scrape failure belongs; making it a container-level
+    /// fault here would trade a real signal for a flaky one.
+    Unreadable,
+    /// Nothing answered at all.
+    Unreachable,
+}
+
+impl HttpProbe {
+    /// Whether the endpoint answered, regardless of what it said. This is the
+    /// exact question the pre-existing bare TCP connect answered, so it keeps
+    /// that check's behaviour unchanged.
+    pub fn reachable(&self) -> bool {
+        !matches!(self, HttpProbe::Unreachable)
+    }
+
+    /// The response body, or `""` when there is nothing to consult.
+    pub fn body(&self) -> &str {
+        match self {
+            HttpProbe::Body(b) => b,
+            HttpProbe::Unreadable | HttpProbe::Unreachable => "",
+        }
+    }
+}
+
 /// The trait every orchestration decision is written against.
 pub trait CommandRunner: Send + Sync {
     /// One-shot command, captures stdout/stderr/status. Replaces a direct
@@ -248,6 +290,18 @@ pub trait CommandRunner: Send + Sync {
     /// not hypothetically: it made the container's `HEALTHCHECK` report every
     /// genuinely working deployment as unhealthy.
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool;
+
+    /// Fetch a URL over plain HTTP/1.0.
+    ///
+    /// Exists so the container healthcheck can read the daemon's own
+    /// `/metrics` rather than merely proving the port accepts a connection --
+    /// a distinction that mattered on 2026-08-16, when the port answered
+    /// perfectly while the line behind it had been unreachable for hours
+    /// (specs/039-at-stall-watchdog, FR-020).
+    ///
+    /// Routed through the runner like every other real-world effect, so the
+    /// healthcheck's decision logic stays a pure function over the body.
+    fn http_get(&self, url: &str) -> HttpProbe;
 
     /// Resolve `host` to its IPv4 addresses via the system resolver
     /// (getaddrinfo, honoring `/etc/resolv.conf`). Replaces the `dig +short A`
@@ -478,6 +532,61 @@ impl CommandRunner for RealCommandRunner {
             return false;
         };
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+    }
+
+    fn http_get(&self, url: &str) -> HttpProbe {
+        use std::io::{Read, Write};
+        use std::net::ToSocketAddrs;
+
+        /// Everything from the connect attempt onwards. Split out so the
+        /// distinction between "never connected" and "connected but unreadable"
+        /// is structural rather than a flag threaded through `?`.
+        fn fetch(addr: std::net::SocketAddr, authority: &str, path: &str) -> HttpProbe {
+            let timeout = std::time::Duration::from_secs(3);
+            let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+                return HttpProbe::Unreachable;
+            };
+            // Past this point the endpoint has answered, so every failure is
+            // `Unreadable` -- never `Unreachable`.
+            if stream.set_read_timeout(Some(timeout)).is_err()
+                || stream.set_write_timeout(Some(timeout)).is_err()
+            {
+                return HttpProbe::Unreadable;
+            }
+            // HTTP/1.0 so the server closes the connection when done and the
+            // read below terminates without having to parse Content-Length.
+            if write!(stream, "GET {path} HTTP/1.0\r\nHost: {authority}\r\n\r\n").is_err() {
+                return HttpProbe::Unreadable;
+            }
+            let mut raw = String::new();
+            if stream.read_to_string(&mut raw).is_err() {
+                return HttpProbe::Unreadable;
+            }
+            let Some((head, body)) = raw.split_once("\r\n\r\n") else {
+                return HttpProbe::Unreadable;
+            };
+            if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") {
+                return HttpProbe::Unreadable;
+            }
+            HttpProbe::Body(body.to_string())
+        }
+
+        // Deliberately hand-rolled rather than pulling in an HTTP client: the
+        // only caller fetches one loopback URL from the healthcheck, and a new
+        // dependency for that would be out of proportion. Every step is
+        // bounded -- this runs inside a container HEALTHCHECK with its own 5s
+        // limit, and a probe that hangs is a probe that reports nothing.
+        let Some(rest) = url.strip_prefix("http://") else {
+            return HttpProbe::Unreachable;
+        };
+        let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, format!("/{p}")),
+            None => (rest, "/".to_string()),
+        };
+        let Some(addr) = authority.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
+            return HttpProbe::Unreachable;
+        };
+        fetch(addr, authority, &path)
     }
 
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
@@ -910,6 +1019,11 @@ mod mock {
         /// unseeded hosts resolve to an empty address list (no real DNS in
         /// tests).
         pub resolve_results: Mutex<Map<String, Vec<std::net::Ipv4Addr>>>,
+        /// Overrides `http_get`'s outcome for a given URL; unseeded URLs come
+        /// back `Unreachable` (no real HTTP in tests). Seed `Unreadable` to
+        /// exercise "the endpoint answered but its body could not be read",
+        /// which is a distinct case from either of the other two.
+        pub http_responses: Mutex<Map<String, HttpProbe>>,
         /// Argv substrings that make a future `spawn()` create its child
         /// already dead (`is_alive` false from the start) — lets a test
         /// force a deterministic `EstablishOutcome::FatalProcessDied` for a
@@ -1182,6 +1296,15 @@ mod mock {
                 .get(&format!("{host}:{port}"))
                 .copied()
                 .unwrap_or(false)
+        }
+
+        fn http_get(&self, url: &str) -> HttpProbe {
+            self.http_responses
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .unwrap_or(HttpProbe::Unreachable)
         }
 
         fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {

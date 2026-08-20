@@ -231,6 +231,7 @@ use gsm_sip_bridge::ims::lifecycle::ServiceHealth;
 fn healthy() -> ServiceHealth {
     ServiceHealth {
         registered: true,
+        registration_expired: false,
         attached: true,
         pbx_registered: true,
         gm_connection_up: true,
@@ -301,6 +302,7 @@ fn being_registered_does_not_by_itself_imply_being_able_to_answer() {
     // precisely the window where inferring one from the other would be wrong.
     let health = ServiceHealth {
         registered: true,
+        registration_expired: false,
         attached: false,
         pbx_registered: true,
         gm_connection_up: true,

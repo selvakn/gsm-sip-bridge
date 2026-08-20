@@ -109,6 +109,11 @@ struct AgentRecord {
     /// Same pair, for `gm_connection_up` (specs/028-gm-tcp-reconnect).
     gm_connection_unhealthy_since: Option<Instant>,
     gm_connection_alert_phase: AlertPhase,
+    /// When this line's registration lapses, as reported by the agent
+    /// (specs/039-at-stall-watchdog). Absolute, so the countdown can be
+    /// computed fresh at every scrape without the agent reporting per second.
+    /// `None` until an agent reports one.
+    registration_expires_at: Option<u64>,
 }
 
 /// Keyed by `(agent kind, module_id)`, not just agent kind — with
@@ -156,6 +161,7 @@ pub fn apply_report(report: &AgentReport) {
     let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
     let mut tunnel_unhealthy_since = existing.and_then(|r| r.tunnel_unhealthy_since);
     let mut gm_connection_unhealthy_since = existing.and_then(|r| r.gm_connection_unhealthy_since);
+    let mut registration_expires_at = existing.and_then(|r| r.registration_expires_at);
     // (category, transition, generation) to dispatch once the lock is
     // released. `generation` is the `*_unhealthy_since` value this
     // particular transition was decided against — threaded through to
@@ -175,6 +181,7 @@ pub fn apply_report(report: &AgentReport) {
             &mut registered_unhealthy_since,
             &mut tunnel_unhealthy_since,
             &mut gm_connection_unhealthy_since,
+            &mut registration_expires_at,
         );
 
         for event in &report.events {
@@ -258,6 +265,7 @@ pub fn apply_report(report: &AgentReport) {
             tunnel_alert_phase,
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
+            registration_expires_at,
         },
     );
     drop(guard);
@@ -435,6 +443,7 @@ fn apply_state(
     registered_unhealthy_since: &mut Option<Instant>,
     tunnel_unhealthy_since: &mut Option<Instant>,
     gm_connection_unhealthy_since: &mut Option<Instant>,
+    registration_expires_at: &mut Option<u64>,
 ) {
     let transport = transport_label(agent);
     if let Some(active_calls) = state.active_calls {
@@ -513,6 +522,12 @@ fn apply_state(
         } else if gm_connection_unhealthy_since.is_none() {
             *gm_connection_unhealthy_since = Some(Instant::now());
         }
+    }
+    // specs/039-at-stall-watchdog. Absent means "not reported", which must
+    // leave the recorded expiry alone rather than clearing it -- clearing it
+    // would silently retire the one signal that says the binding has lapsed.
+    if let Some(expires_at) = state.registration_expires_at {
+        *registration_expires_at = Some(expires_at);
     }
     // pbx_registered (Agent B) has no dedicated gauge yet — sip_registered
     // remains the daemon's own PBX registration (metrics-inventory.md
@@ -605,6 +620,10 @@ pub struct AgentLiveness {
     pub up: bool,
     pub age_seconds: f64,
     pub module_id: String,
+    /// When this line's registration lapses, if the agent reports it
+    /// (specs/039-at-stall-watchdog). Absolute unix seconds; the scrape
+    /// converts it to a countdown.
+    pub registration_expires_at: Option<u64>,
 }
 
 pub fn evaluate_liveness(staleness_threshold: std::time::Duration) -> Vec<AgentLiveness> {
@@ -619,6 +638,7 @@ pub fn evaluate_liveness(staleness_threshold: std::time::Duration) -> Vec<AgentL
                 up: age <= staleness_threshold,
                 age_seconds: age.as_secs_f64(),
                 module_id: module_id.clone(),
+                registration_expires_at: record.registration_expires_at,
             }
         })
         .collect()
@@ -873,6 +893,7 @@ mod tests {
                 tunnel_up: Some(true),
                 ..AgentState::default()
             },
+            &mut None,
             &mut None,
             &mut None,
             &mut None,
@@ -1167,6 +1188,7 @@ mod tests {
                 tunnel_alert_phase: AlertPhase::Idle,
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
+                registration_expires_at: None,
             },
         );
         generation

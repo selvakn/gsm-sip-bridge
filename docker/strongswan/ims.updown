@@ -26,14 +26,55 @@ log() { echo "[ims.updown] $*" >&2; }
 # not set" (confirmed live: this crashed on every real up-client-v6 event
 # until fixed). "${1:-}" tolerates that; the trailing ":*" glob in each
 # case arm never needed a real $1 value anyway.
+# Reinstall the family's default route through the tunnel.
+#
+# This belongs here, next to the address, because of a kernel behaviour that
+# caused a 6-hour outage on 2026-08-19: removing the *last* address of a family
+# from an interface also deletes that interface's `default dev <iface> scope
+# link` route. So every `down-client` below silently destroys the route, and
+# before this the only thing that ever installed it was `ensure_epdg_interface`
+# at establish time. A transient WAN outage was therefore unrecoverable: the
+# router rebooted, charon tore the CHILD_SA down (`addr del` -> route gone),
+# and when the internet came back the reconnect restored the *address* and
+# nothing restored the route. Every SIP connect then got ENETUNREACH forever,
+# while `swanctl --list-sas` reported a perfectly healthy tunnel.
+#
+# Doing it on the up path makes it event-driven rather than ordering-dependent:
+# whenever an address exists, so does its route, regardless of what the
+# supervisor happens to be doing. `replace` is idempotent, so a rekey that does
+# not disturb the route is a no-op.
+install_default_route() {
+    _fam="$1" # "" for IPv4, "-6" for IPv6
+    # shellcheck disable=SC2086 # $_fam is a deliberate 0-or-1 word flag
+    if ip netns exec "$NETNS" ip $_fam route replace default dev "$TUN_IFACE" 2>/dev/null; then
+        log "installed default route${_fam:+ (IPv6)} via $TUN_IFACE in netns $NETNS"
+    else
+        # Never silent. The Rust side's own attempt at this discarded its
+        # result, which is why 202 recovery attempts left no record of why the
+        # data path never came back.
+        log "WARNING: could not install default route${_fam:+ (IPv6)} via $TUN_IFACE in netns $NETNS"
+    fi
+    unset _fam
+}
+
 case "$PLUTO_VERB:${1:-}" in
-up-client:* | up-client-v6:*)
+up-client:*)
     if [ -z "${PLUTO_MY_CLIENT:-}" ]; then
         log "no PLUTO_MY_CLIENT set on $PLUTO_VERB; nothing to install"
         exit 0
     fi
     log "installing $PLUTO_MY_CLIENT on $TUN_IFACE in netns $NETNS"
     ip netns exec "$NETNS" ip addr add "$PLUTO_MY_CLIENT" dev "$TUN_IFACE" 2>/dev/null || true
+    install_default_route ""
+    ;;
+up-client-v6:*)
+    if [ -z "${PLUTO_MY_CLIENT:-}" ]; then
+        log "no PLUTO_MY_CLIENT set on $PLUTO_VERB; nothing to install"
+        exit 0
+    fi
+    log "installing $PLUTO_MY_CLIENT on $TUN_IFACE in netns $NETNS"
+    ip netns exec "$NETNS" ip addr add "$PLUTO_MY_CLIENT" dev "$TUN_IFACE" 2>/dev/null || true
+    install_default_route "-6"
     ;;
 down-client:* | down-client-v6:*)
     if [ -z "${PLUTO_MY_CLIENT:-}" ]; then

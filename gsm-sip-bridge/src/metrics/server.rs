@@ -30,6 +30,21 @@ fn refresh_agent_liveness() {
             .with_label_values(&[state.agent.as_str(), &state.module_id])
             .set(state.age_seconds);
 
+        // specs/039-at-stall-watchdog: the countdown is computed here rather
+        // than reported, so the agent only sends the absolute expiry when it
+        // changes — once per renewal — instead of once per second. Signed, so
+        // "expired three hours ago" is distinguishable from "expired just now".
+        if let Some(expires_at) = state.registration_expires_at {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let remaining = expires_at as f64 - now as f64;
+            super::VOWIFI_REGISTRATION_EXPIRES_IN_SECONDS
+                .with_label_values(&[&state.module_id])
+                .set(remaining);
+        }
+
         if !state.up {
             super::ACTIVE_CALLS
                 .with_label_values(&[&state.module_id, "vowifi"])

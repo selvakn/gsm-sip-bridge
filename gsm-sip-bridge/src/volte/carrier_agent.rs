@@ -56,20 +56,48 @@ use super::bridge::BridgeLine;
 /// regression this feature introduces so much as one it does not yet close
 /// for VoLTE's shared-trunk case the way VoWiFi's independent-trunk-per-line
 /// model never needed to.
-pub fn run(
+///
+/// `progress` is owned by the *caller*, not registered here, because this
+/// function is called once per retry attempt: registering per call left one
+/// abandoned handle in the watchdog registry per attempt, each parked at
+/// `Phase::Idle` with a frozen start time, and the watchdog then confirmed a
+/// stall on a finished attempt and exited the whole process mid-backoff.
+/// `pub(crate)` rather than `pub` only because `progress` is a crate-internal
+/// type; the two call sites are both in-crate.
+pub(crate) fn run(
     line: &BridgeLine,
     app_config: &AppConfig,
-    modem_lock: Arc<Mutex<()>>,
+    modem_lock: Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: Arc<Mutex<super::sms::Dedupe>>,
     pbx_registered: Option<Arc<AtomicBool>>,
+    progress: &Arc<crate::ims::agent::watchdog::Progress>,
 ) {
+    // Arm stall detection before anything touches the modem
+    // (specs/039-at-stall-watchdog, FR-032). The LTE bearer shares the AT
+    // access, modem lock and renewal machinery the VoWiFi one does, so it has
+    // the same defect and gets the same monitoring. The attach and PLMN
+    // derivation immediately below are themselves wedge points.
+    if let Err(e) = crate::ims::agent::watchdog::spawn(app_config.vowifi.watchdog_recovery_enabled)
+    {
+        tracing::error!(card_id = %line.card_id, error = %e, "could not start the stall watchdog");
+        return;
+    }
+    let _startup = progress.phase_guard(crate::ims::agent::watchdog::Phase::Startup);
+
     // Attach and PLMN derivation both touch the AT port, so hold the modem
     // lock across them to stay clear of the SMS reader running concurrently.
     // `attach` records the displaced context (via `settings.restore_cid_path`)
     // *before* it rebinds, so the container's cleanup can restore it even if
     // this line is killed mid-attach.
     let plmn = {
-        let _guard = modem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_guard) = modem_lock.lock() else {
+            tracing::error!(
+                card_id = %line.card_id,
+                "could not get the modem to attach: another user of the AT port has held it \
+                 beyond the timeout"
+            );
+            return;
+        };
         let attach = match super::attach(&line.settings) {
             Ok(a) => a,
             Err(e) => {
@@ -142,7 +170,18 @@ pub fn run(
     let attach_modem = line.settings.modem_port.clone();
     let attach_lock = modem_lock.clone();
     let attachment_check = move || {
-        let _guard = attach_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_guard) = attach_lock.lock() else {
+            // We could not look, so we must not claim the attachment is gone:
+            // this check's only consumer ends a live call when it returns
+            // false, and dropping a working call because the *lock* was busy
+            // would be a worse error than a delayed detection. A genuinely
+            // dead attachment still surfaces through the call's own signalling.
+            tracing::warn!(
+                "could not check the attachment: the modem is held by another user; \
+                 assuming it is still up rather than ending the call on a guess"
+            );
+            return true;
+        };
         super::is_attached(&attach_modem)
     };
 
@@ -195,6 +234,7 @@ pub fn run(
         dedupe,
         pbx_registered,
         app_config,
+        progress: Arc::clone(progress),
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,
     }) {

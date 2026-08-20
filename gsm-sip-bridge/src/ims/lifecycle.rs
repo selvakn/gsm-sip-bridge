@@ -417,6 +417,15 @@ pub struct ServiceHealth {
     pub gm_connection_up: bool,
     /// Whether a call is in progress.
     pub busy: bool,
+    /// Whether the registration's granted lifetime has elapsed
+    /// (specs/039-at-stall-watchdog, FR-016).
+    ///
+    /// Distinct from `!registered`: the state machine can read `Registered` or
+    /// `Renewing` while the binding has quietly lapsed underneath it, which is
+    /// exactly what happened on 2026-08-16 — `can_answer` stayed true and every
+    /// dashboard agreed, for 2h45m, while the network was telling callers the
+    /// phone was switched off.
+    pub registration_expired: bool,
     /// Maintenance currently being held back for a call, if any.
     pub deferred: Option<Maintenance>,
 }
@@ -438,6 +447,7 @@ impl ServiceHealth {
     /// briefly, which is exactly when an optimistic answer would be wrong.
     pub fn can_answer(&self) -> bool {
         self.registered
+            && !self.registration_expired
             && self.attached
             && self.gm_connection_up
             && self.pbx_registered
@@ -453,9 +463,17 @@ impl ServiceHealth {
     /// surfacing the symptom over the cause would send an operator to the
     /// wrong place. The connection then ranks above `pbx_registered`, which is
     /// the far telephone-side leg (specs/028 R9).
+    ///
+    /// Expiry ranks immediately below the attachment and *above* the generic
+    /// "not registered" for the same reason: it is the more specific
+    /// diagnosis. During the 2026-08-16 outage the status reported only "not
+    /// registered", which was true but gave no hint that the lifetime had
+    /// lapsed nearly three hours earlier.
     pub fn blocked_reason(&self) -> Option<&'static str> {
         if !self.attached {
             Some("the network attachment is down")
+        } else if self.registration_expired {
+            Some("the registration has expired")
         } else if !self.registered {
             Some("not registered")
         } else if !self.gm_connection_up {
