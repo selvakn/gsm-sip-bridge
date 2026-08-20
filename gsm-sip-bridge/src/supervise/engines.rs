@@ -474,15 +474,19 @@ impl TunnelEngine for StrongswanEngine {
         }
         // Without this the loop is silent and endless: steady-state sees a
         // missing interface every 30s, calls this, and finds it missing again.
-        // The usual cause is benign and self-clearing — a previous run's
-        // namespace has not been reaped yet, so its `if_id` is still spoken
-        // for — hence the wording, which used to imply an operator had to
-        // intervene when in the common case waiting is the whole remedy.
+        //
+        // specs/041-shutdown-resource-cleanup: this used to assume the usual
+        // cause was a previous container run's namespace not yet reaped, and
+        // that waiting alone was the remedy. That stopped being the common
+        // case once a graceful stop started deleting the device explicitly
+        // and a fresh start reclaims one an ungraceful exit left behind (see
+        // epdg_iface::ensure_epdg_interface's doc comment for the full
+        // account) — reaching this mid-run now more likely means something
+        // else outside this deployment is holding the if_id.
         println!(
             "[supervise] line {}: {} could not be recreated in netns {} (if_id {} not \
-             available yet); leaving this line's SA alone and retrying next tick — \
-             after a container replacement the previous run's namespaces take a few \
-             minutes to be reaped, and this clears itself. See docs/operations.md",
+             available yet); leaving this line's SA alone and retrying next tick. \
+             See docs/operations.md",
             self.idx, self.tun_iface, self.netns, self.if_id
         );
         false

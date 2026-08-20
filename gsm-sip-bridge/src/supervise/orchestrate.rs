@@ -65,7 +65,7 @@ fn gsm_sip_bridge_bin() -> String {
 /// its own daemon — an arrangement that silently broke every line but one,
 /// because N charons in one netns all wildcard-bind UDP 500/4500 and only one
 /// of them receives. See [`SharedCharon`] for the full account.
-const SHARED_STRONGSWAN_CONF: &str = "/etc/strongswan-shared.conf";
+pub(crate) const SHARED_STRONGSWAN_CONF: &str = "/etc/strongswan-shared.conf";
 const SHARED_SWANCTL_CONF: &str = "/etc/swanctl/swanctl.conf";
 const SHARED_SWANCTL_CONF_DIR: &str = "/etc/swanctl/conf.d";
 const SHARED_CHARON_LOG: &str = "/tmp/charon.log";
@@ -275,6 +275,39 @@ fn start_vowifi_subsystem(
     let our_if_ids: std::collections::BTreeSet<u32> =
         vowifi_lines.iter().map(|l| l.strongswan_if_id).collect();
     epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
+
+    // specs/041-shutdown-resource-cleanup US2/FR-014: a run that was
+    // force-killed (rather than stopped) never got to run the steps above —
+    // its namespace, tunnel interface and veth end can all still be sitting
+    // on the host. Reclaim them too, using each line's own resolved names
+    // (a name this run's own line table could also produce is, by
+    // construction, ours — research.md R7), before this run creates
+    // anything of its own. Requires the per-line namespace directory to be
+    // visible from the host (docker-compose.yml's /var/run/netns bind
+    // mount, research.md R6); on a host without it this is a silent no-op,
+    // same as finding nothing to reclaim.
+    // Only the strongswan engine ever creates an XFRM tun device; a leftover
+    // swu-engine namespace has nothing of that kind to delete (its tunnel is
+    // a plain TUN torn down with its dialer process, not a device with a
+    // claimable if_id — the defect this whole feature exists for).
+    let is_strongswan = config.vowifi.tunnel_engine == "strongswan";
+    let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = vowifi_lines
+        .iter()
+        .map(|l| epdg_iface::ReclaimCandidate {
+            netns: l.netns.clone(),
+            tun_iface: is_strongswan.then(|| l.strongswan_tun_iface.clone()),
+            veth_host: Some(l.config.veth_sip_iface.clone()),
+            // Proof of ownership: only this deployment puts a `tun23-N`
+            // inside an `imsN`. A swu line has no such device, so it cannot
+            // prove ownership and is never reclaimed (`None` vetoes it).
+            owned_iface_marker: is_strongswan.then(|| l.strongswan_tun_iface.clone()),
+        })
+        .collect();
+    epdg_iface::reclaim_leftover_lines(
+        runner.as_ref(),
+        &reclaim_candidates,
+        epdg_iface::reclaim_leftover_enabled(),
+    );
 
     // Render the shared charon's assets once, before any line starts.
     // Every line then drops its own connection file into the shared
@@ -890,9 +923,43 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     println!("[supervise] shutting down ...");
     let state = started.lock().unwrap();
     let plan = shutdown::build_shutdown_plan(&state, &config_path_str);
-    shutdown::execute_shutdown_plan(&plan, runner.as_ref());
+    // Reserve is derived from this run's own plan rather than a fixed
+    // constant, so it stays correct for whatever line count actually
+    // started (see `release_reserve_for`).
+    let budget = shutdown::TeardownBudget::new(
+        shutdown::STOP_ALLOWANCE,
+        shutdown::release_reserve_for(&plan),
+    );
+    let outcome = shutdown::execute_shutdown_plan(&plan, runner.as_ref(), &budget);
+    report_teardown_outcome(&outcome);
 
     ExitCode::SUCCESS
+}
+
+/// Renders [`shutdown::TeardownOutcome`] per contracts/observable-contracts.md
+/// C2. Reporting only (FR-020): this never raises an alert and never changes
+/// the exit code above, on either the abandoned-step or the not-released
+/// case.
+fn report_teardown_outcome(outcome: &shutdown::TeardownOutcome) {
+    let abandoned: Vec<&str> = outcome.abandoned().collect();
+    if !abandoned.is_empty() {
+        println!(
+            "[supervise] teardown: out of time, skipping {} remaining wait(s)/flush(es) to \
+             release devices and namespaces",
+            abandoned.len()
+        );
+    }
+    let mut not_released = 0usize;
+    for (label, reason) in outcome.not_released() {
+        eprintln!("[supervise] teardown: could not release {label}: {reason}");
+        not_released += 1;
+    }
+    let released = outcome.steps.len() - abandoned.len() - not_released;
+    println!(
+        "[supervise] teardown: complete, {released} step(s) completed, {not_released} \
+         resource(s) not released, {} abandoned to the stop allowance",
+        abandoned.len()
+    );
 }
 
 /// Reads this line's IMSI: an override from `[[vowifi.line]]` if configured,
@@ -1181,7 +1248,24 @@ fn start_vowifi_line_strongswan(
              retrying (see the error above for why the interface could not be created)"
         );
     }
-    started.lock().unwrap().started_netns.push(netns.clone());
+    {
+        let mut st = started.lock().unwrap();
+        st.started_netns.push(netns.clone());
+        // Recorded here — the same point `started_netns.push` occupies —
+        // rather than after the tunnel actually establishes: a line that
+        // fails later must still be fully torn down (FR-007, spec Edge
+        // Cases "Only some lines started").
+        st.vowifi_lines.push(shutdown::StartedVowifiLine {
+            index: idx,
+            strongswan: Some(shutdown::StrongswanTeardownInfo {
+                conn_name: conn_name.clone(),
+                tun_iface: tun_iface.clone(),
+                if_id: line.strongswan_if_id,
+            }),
+            netns: netns.clone(),
+            veth_host: line.config.veth_sip_iface.clone(),
+        });
+    }
 
     let Some(imsi) = resolve_imsi(runner.as_ref(), bin, line) else {
         eprintln!("[supervise] line {idx}: FATAL: failed to read IMSI; skipping this line");
@@ -1795,7 +1879,20 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
-    started.lock().unwrap().started_netns.push(netns.clone());
+    {
+        let mut st = started.lock().unwrap();
+        st.started_netns.push(netns.clone());
+        // `strongswan: None` — this engine has no in-place terminate
+        // concept and no XFRM `if_id` (`SwuEngine::terminate` is a
+        // deliberate no-op); only its veth is a device this run must
+        // explicitly release at stop.
+        st.vowifi_lines.push(shutdown::StartedVowifiLine {
+            index: idx,
+            strongswan: None,
+            netns: netns.clone(),
+            veth_host: line.config.veth_sip_iface.clone(),
+        });
+    }
 
     let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
     start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());

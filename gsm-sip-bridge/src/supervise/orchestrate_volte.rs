@@ -6,6 +6,7 @@
 //! covered by the same `cargo test --workspace` gate, but flagging that this
 //! specific path's live-validation is still outstanding.
 
+use super::epdg_iface;
 use super::runner::{ChildSpec, CommandRunner};
 use super::shutdown::{LegacyVolteRegistration, StartedState, StartedVolteLine};
 use crate::config::AppConfig;
@@ -83,6 +84,45 @@ fn start_multiline(
         return;
     }
 
+    // specs/041-shutdown-resource-cleanup US2/FR-014: mirrors the VoWiFi
+    // reclamation in orchestrate::run — a force-killed previous run's
+    // namespace/veth can still be on the host. Run before this loop creates
+    // anything of its own, using each discovered line's own namespace/veth
+    // names (a name this run's own discovery could also produce is, by
+    // construction, ours — research.md R7). No XFRM/if_id concept here, so
+    // (unlike the VoWiFi call) there is no separate flush step to pair it
+    // with.
+    let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = manifest
+        .lines
+        .iter()
+        .map(|l| {
+            let suffix = if l.index == 0 {
+                String::new()
+            } else {
+                l.index.to_string()
+            };
+            let has_veth = !l.veth_carrier_addr.is_empty();
+            let veth_host =
+                has_veth.then(|| format!("{}{suffix}", config.volte.veth_telephony_iface));
+            epdg_iface::ReclaimCandidate {
+                netns: l.netns.clone(),
+                tun_iface: None,
+                veth_host,
+                // Proof of ownership: the carrier-side veth end this
+                // deployment creates *inside* the namespace. A line with no
+                // veth at all (the diagnostic single-`--modem` path) cannot
+                // prove ownership, so `None` vetoes reclaiming it.
+                owned_iface_marker: has_veth
+                    .then(|| format!("{}{suffix}", config.volte.veth_carrier_iface)),
+            }
+        })
+        .collect();
+    epdg_iface::reclaim_leftover_lines(
+        runner.as_ref(),
+        &reclaim_candidates,
+        epdg_iface::reclaim_leftover_enabled(),
+    );
+
     for line in &manifest.lines {
         let runner = Arc::clone(&runner);
         let bin = bin.clone();
@@ -158,6 +198,15 @@ fn start_multiline(
                 index: idx,
                 netns: netns.clone(),
                 carrier_agent_handles: Vec::new(),
+                // `None` when this line has no carrier veth pair at all —
+                // the diagnostic single-`--modem` path (`carrier_agent.rs`'s
+                // empty-address branch) never calls `ensure_volte_line_veth`
+                // below, so there is nothing here to delete at stop.
+                veth_host: if veth_carrier_addr.is_empty() {
+                    None
+                } else {
+                    Some(veth_telephony_iface.clone())
+                },
             });
         }
         drop(state);

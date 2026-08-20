@@ -83,6 +83,56 @@ pub fn classify_xfrm_dump(dump: &str, ours: &BTreeSet<u32>) -> XfrmReclaim {
 /// Does nothing unless every entry is identifiably ours; see
 /// [`classify_xfrm_dump`].
 pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
+    match classify_and_maybe_flush(runner, ours) {
+        XfrmFlushOutcome::Empty => {}
+        XfrmFlushOutcome::Flushed => println!(
+            "[supervise] clearing XFRM state left by a previous run (it keeps this \
+             deployment's if_ids claimed, which makes the per-line tunnel interfaces \
+             impossible to create)"
+        ),
+        XfrmFlushOutcome::LeftForeign => eprintln!(
+            "[supervise] found XFRM state that is not this deployment's, so it was left \
+             untouched. Clear it by hand if a line's tunnel misbehaves — see \
+             docs/operations.md. (A line reporting its if_id is already claimed is \
+             usually unrelated and self-clearing.)"
+        ),
+        XfrmFlushOutcome::Unreadable => eprintln!(
+            "[supervise] could not read the host's XFRM state, so it was left untouched. \
+             Stale SAs/policies from a previous run can degrade a line's tunnel; clear \
+             them by hand if one misbehaves — see docs/operations.md. (A line reporting \
+             its if_id is already claimed is usually unrelated and self-clearing.)"
+        ),
+    }
+}
+
+/// What [`classify_and_maybe_flush`] did, so each caller — startup's
+/// [`reclaim_stale_xfrm`] and `shutdown`'s `FlushXfrm` step — can report it in
+/// its own context-appropriate wording rather than sharing one message meant
+/// for the other's caller.
+#[derive(Debug, PartialEq, Eq)]
+pub enum XfrmFlushOutcome {
+    /// Nothing was there — no action, nothing to report.
+    Empty,
+    /// Everything present was ours; it has been flushed.
+    Flushed,
+    /// Something present was not identifiably ours; left untouched.
+    LeftForeign,
+    /// The inventory itself could not be read; left untouched (see
+    /// [`reclaim_stale_xfrm`]'s doc comment on why a failed query is never
+    /// treated as an empty one).
+    Unreadable,
+}
+
+/// Reads the host's XFRM state and policy, classifies it via
+/// [`classify_xfrm_dump`], and flushes it if and only if every entry is
+/// identifiably ours (`ours`) — the one piece of logic startup's stale-claim
+/// reclamation and stop's tunnel teardown must share exactly, since the flush
+/// itself is unfiltered (iproute2 has no `ip xfrm policy deleteall if_id N`)
+/// and the all-ours-or-nothing rule is the only safe guard around it.
+pub fn classify_and_maybe_flush(
+    runner: &dyn CommandRunner,
+    ours: &BTreeSet<u32>,
+) -> XfrmFlushOutcome {
     let dump = |args: &[&str]| -> Option<String> {
         runner
             .run(args)
@@ -102,34 +152,197 @@ pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
         dump(&["ip", "xfrm", "state"]),
         dump(&["ip", "xfrm", "policy"]),
     ) else {
-        eprintln!(
-            "[supervise] could not read the host's XFRM state, so it was left untouched. \
-             Stale SAs/policies from a previous run can degrade a line's tunnel; clear \
-             them by hand if one misbehaves — see docs/operations.md. (A line reporting \
-             its if_id is already claimed is usually unrelated and self-clearing.)"
-        );
-        return;
+        return XfrmFlushOutcome::Unreadable;
     };
     let combined = format!("{state}\n{policy}");
 
     match classify_xfrm_dump(&combined, ours) {
-        XfrmReclaim::Empty => {}
+        XfrmReclaim::Empty => XfrmFlushOutcome::Empty,
         XfrmReclaim::AllOurs => {
-            println!(
-                "[supervise] clearing XFRM state left by a previous run (it keeps this \
-                 deployment's if_ids claimed, which makes the per-line tunnel interfaces \
-                 impossible to create)"
-            );
             let _ = runner.run(&["ip", "xfrm", "policy", "flush"]);
             let _ = runner.run(&["ip", "xfrm", "state", "flush"]);
+            XfrmFlushOutcome::Flushed
         }
-        XfrmReclaim::ForeignPresent => {
+        XfrmReclaim::ForeignPresent => XfrmFlushOutcome::LeftForeign,
+    }
+}
+
+/// One namespace this deployment might have left behind from a previous,
+/// ungraceful run — everything [`reclaim_leftover_lines`] needs to release it.
+///
+/// specs/041-shutdown-resource-cleanup US2/FR-014. Bearer-agnostic: built
+/// from `LineResolutionEntry` for VoWiFi and from the VoLTE line manifest for
+/// VoLTE, both in `orchestrate`/`orchestrate_volte`.
+pub struct ReclaimCandidate {
+    pub netns: String,
+    /// `Some` for a strongswan-engine VoWiFi line only — the swu engine has
+    /// no XFRM device, and VoLTE lines route through their assigned modem
+    /// interface, not a tunnel device this run created.
+    pub tun_iface: Option<String>,
+    /// This line's host-side veth end, present for both bearers — `None`
+    /// for a VoLTE line on the diagnostic single-`--modem` path, which
+    /// never had one.
+    pub veth_host: Option<String>,
+    /// A device this deployment would have created **inside** `netns`, used
+    /// as positive proof of ownership before anything is deleted. `None`
+    /// means "cannot prove it", which vetoes reclaiming that namespace
+    /// entirely — see [`reclaim_leftover_lines`].
+    pub owned_iface_marker: Option<String>,
+}
+
+/// How long a single reclaim delete may run before it is abandoned — same
+/// bound as the stop path's `DeleteLink` step (`shutdown::
+/// DELETE_LINK_TIMEOUT_SECS`), kept as its own constant here rather than
+/// imported so this module has no reason to depend on `shutdown`'s internals.
+const RECLAIM_DELETE_TIMEOUT_SECS: u32 = 5;
+
+/// Whether the operator has opted this deployment in to reclaiming leftover
+/// namespaces (`GSM_SIP_BRIDGE_RECLAIM_LEFTOVER_NETNS=1`).
+///
+/// **Off by default, deliberately** (Greptile P1). Reclamation deletes
+/// devices and namespaces on the *host*, through the `/var/run/netns` bind
+/// mount this feature adds — a destructive capability the container simply
+/// did not have before, because it could not see host namespaces at all.
+/// Two things can own a name like `ims0`, and existence alone distinguishes
+/// neither: an unrelated host workload (closed by the ownership marker
+/// below), and a **concurrently running second instance of this
+/// deployment** — which no check available from inside our own PID namespace
+/// can rule out (`ip netns pids` cannot see another container's processes,
+/// and `flock` needs `unsafe`, which `make lint` forbids — research.md R7).
+///
+/// R7 argues a second instance cannot work anyway (fixed namespace names,
+/// fixed `if_id`s, charon wildcard-binding UDP 500/4500). That argument is
+/// about the second instance *failing to start*; it says nothing about it
+/// destroying the first one's live networking on the way, which is what this
+/// code would do. That asymmetry — a plausible operator slip costing a live
+/// line rather than a failed start — is why the destructive half is opt-in
+/// and the graceful-stop half (this feature's proven 167s→8s result) is not.
+pub fn reclaim_leftover_enabled() -> bool {
+    std::env::var("GSM_SIP_BRIDGE_RECLAIM_LEFTOVER_NETNS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Releases every leftover namespace in `candidates` that already existed on
+/// the host *before this call* — which, since this always runs before any of
+/// this run's own line setup, means "not created by this run" needs no
+/// separate check (FR-014, FR-016). A namespace not on the host is silently
+/// skipped (SC-008: a clean host pays nothing for this).
+///
+/// Reclaims a namespace only when **all** of these hold, and reports rather
+/// than acts otherwise:
+///
+/// 1. `enabled` — the operator opted in; see [`reclaim_leftover_enabled`].
+/// 2. The namespace exists on the host.
+/// 3. `owned_iface_marker` names a device that is actually **present inside
+///    that namespace**. Existence of a *name* is not ownership (Greptile
+///    P1): anything on the host could be called `ims0`, but only this
+///    deployment puts a `tun23-N` inside one. This mirrors the
+///    all-ours-or-nothing rule [`classify_xfrm_dump`] already applies to the
+///    unfiltered XFRM flush — positive identification required, anything
+///    unproven vetoes the destructive action.
+///
+/// Deliberately **not** the stop path's `TerminateIke` step: this run's own
+/// charon has not started yet, so there is no live IKE_SA to ask it to
+/// terminate through — only the abandoned device and namespace remain to
+/// give back. XFRM state is a separate concern, already handled once per
+/// caller by [`reclaim_stale_xfrm`] before this runs; that call cannot
+/// release a netdev either way (research.md R1), which is the entire reason
+/// this function exists.
+pub fn reclaim_leftover_lines(
+    runner: &dyn CommandRunner,
+    candidates: &[ReclaimCandidate],
+    enabled: bool,
+) {
+    for c in candidates {
+        let exists = runner
+            .run(&["test", "-e", &format!("/var/run/netns/{}", c.netns)])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+
+        // From here on the namespace is present, so every path must either
+        // act deliberately or say why it did not — a silent skip here reads
+        // as "clean host" and hides the reason a line is about to fail to
+        // come up.
+        let Some(marker) = &c.owned_iface_marker else {
             eprintln!(
-                "[supervise] found XFRM state that is not this deployment's, so it was left \
-                 untouched. Clear it by hand if a line's tunnel misbehaves — see \
-                 docs/operations.md. (A line reporting its if_id is already claimed is \
-                 usually unrelated and self-clearing.)"
+                "[supervise] netns {} exists but this deployment has no device it could \
+                 identify as its own inside it, so it was left untouched. If a line's \
+                 tunnel cannot be created, clear it by hand — see docs/operations.md.",
+                c.netns
             );
+            continue;
+        };
+        let ours = runner
+            .run_in_netns(&c.netns, &["ip", "link", "show", marker])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ours {
+            eprintln!(
+                "[supervise] netns {} exists but does not contain {marker}, so it is not \
+                 this deployment's and was left untouched. Something else on this host \
+                 is using that name — see docs/operations.md.",
+                c.netns
+            );
+            continue;
+        }
+        if !enabled {
+            eprintln!(
+                "[supervise] netns {} looks like a leftover from a previous run of this \
+                 deployment ({marker} is present), but reclaiming it is opt-in and not \
+                 enabled. If no second instance of this deployment is running, set \
+                 GSM_SIP_BRIDGE_RECLAIM_LEFTOVER_NETNS=1 to have it cleared \
+                 automatically — see docs/operations.md.",
+                c.netns
+            );
+            continue;
+        }
+        println!(
+            "[supervise] reclaiming netns {} left by a previous run of this deployment \
+             ({marker} present)",
+            c.netns
+        );
+        let ts = RECLAIM_DELETE_TIMEOUT_SECS.to_string();
+        if let Some(tun) = &c.tun_iface {
+            match runner.run_in_netns(&c.netns, &["timeout", &ts, "ip", "link", "del", tun]) {
+                Ok(out) if !out.status.success() => eprintln!(
+                    "[supervise] could not reclaim {tun} in netns {}: {}",
+                    c.netns,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "[supervise] could not reclaim {tun} in netns {}: {e}",
+                        c.netns
+                    )
+                }
+                _ => {}
+            }
+        }
+        if let Some(veth) = &c.veth_host {
+            match runner.run(&["timeout", &ts, "ip", "link", "del", veth]) {
+                Ok(out) if !out.status.success() => eprintln!(
+                    "[supervise] could not reclaim {veth}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => eprintln!("[supervise] could not reclaim {veth}: {e}"),
+                _ => {}
+            }
+        }
+        match runner.run(&["ip", "netns", "del", &c.netns]) {
+            Ok(out) if !out.status.success() => eprintln!(
+                "[supervise] could not delete leftover netns {}: {}",
+                c.netns,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => eprintln!(
+                "[supervise] could not delete leftover netns {}: {e}",
+                c.netns
+            ),
+            _ => {}
         }
     }
 }
@@ -242,23 +455,34 @@ pub fn ensure_epdg_interface(
             // the namespace it was *created* in (here the host's), not the one
             // it is moved to, so the previous run's `tun23-N` sitting in an
             // `imsN` namespace the kernel has not reaped yet holds the id with
-            // no XFRM state involved at all. Nothing flushes a netdev. That
-            // reap took ~2.5min every time, whatever the shutdown did —
-            // `reclaim_stale_xfrm` above, the shutdown plan's `ip netns del`,
-            // a clean exit 0, none of it made a difference. Waiting is the
-            // whole remedy, so the message says so rather than sending the
-            // operator after a leak that isn't there.
+            // no XFRM state involved at all. Nothing flushes a netdev.
+            //
+            // specs/041-shutdown-resource-cleanup: at that time nothing gave
+            // the device back either — the shutdown plan only removed the
+            // *name* (`ip netns del`), never the device — so the ~2.5min
+            // reap this message used to promise as "the whole remedy" was
+            // really just the previous container's leftover mount namespace
+            // finally expiring on its own. Two things now exist that did
+            // not then: a graceful stop deletes the device explicitly
+            // (`supervise::shutdown`'s `DeleteLink` step) before it ever
+            // gets this far, and a fresh start reclaims a still-present
+            // leftover from an *ungraceful* exit
+            // (`reclaim_leftover_lines`, called above this function).
+            // Reaching this message at all now means neither of those ran —
+            // most plausibly the previous run is still mid-teardown (wait
+            // for it) or was killed on a host where the namespace directory
+            // isn't shared with the container (docker-compose.yml's
+            // `/var/run/netns` bind mount, research.md R6) — see
+            // docs/operations.md for what to check.
             match runner.run(&[
                 "ip", "link", "add", tun_iface, "type", "xfrm", "if_id", if_id,
             ]) {
                 Ok(out) if !out.status.success() => eprintln!(
                     "[supervise] could not create {tun_iface} (xfrm if_id {if_id}): {}. \
-                     Usually this is the previous run of this container: its namespaces \
-                     take a few minutes to be reaped and its interface holds the if_id \
-                     until they are, which the kernel reports this way even though no \
-                     interface of that name is visible anywhere. It clears itself and \
-                     the line recovers on a later tick — flushing XFRM state/policy does \
-                     not speed it up. See docs/operations.md.",
+                     This if_id is claimed by an interface that still exists somewhere — \
+                     normally either the previous run's stop is still in progress, or it \
+                     was force-killed on a host where the namespace directory is not \
+                     shared with this container. See docs/operations.md.",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
                 Err(e) => {
@@ -592,5 +816,160 @@ src 2402:8100::1/128 dst ::/0
             stdout: stdout.as_bytes().to_vec(),
             stderr: vec![],
         }
+    }
+
+    // Regression tests for specs/041-shutdown-resource-cleanup US2/FR-014:
+    // reclaiming a previous, ungraceful run's leftover namespace/devices.
+
+    /// A strongswan-line candidate that can prove ownership of `ims0`.
+    fn provable_candidate() -> ReclaimCandidate {
+        ReclaimCandidate {
+            netns: "ims0".to_string(),
+            tun_iface: Some("tun23-0".to_string()),
+            veth_host: Some("veth-sip0".to_string()),
+            owned_iface_marker: Some("tun23-0".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_clean_host_with_no_leftover_namespace_triggers_no_delete_at_all() {
+        // SC-008: a clean host must pay nothing beyond the existence check
+        // itself for this reclamation to run every startup.
+        let runner = MockCommandRunner::new();
+        seed_absent(&runner, "test -e /var/run/netns/ims0");
+        reclaim_leftover_lines(&runner, &[provable_candidate()], true);
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(&"del".to_string())),
+            "nothing should be deleted when the namespace was never there"
+        );
+    }
+
+    #[test]
+    fn a_leftover_namespace_has_its_tun_veth_and_netns_all_reclaimed() {
+        let runner = MockCommandRunner::new();
+        // Unseeded probes default to success: namespace exists, and the
+        // ownership marker is present inside it.
+        reclaim_leftover_lines(&runner, &[provable_candidate()], true);
+
+        let netns_calls = runner.run_in_netns_calls.lock().unwrap();
+        assert!(netns_calls.iter().any(|(ns, c)| ns == "ims0"
+            && c.contains(&"del".to_string())
+            && c.contains(&"tun23-0".to_string())));
+
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|c| c.contains(&"del".to_string()) && c.contains(&"veth-sip0".to_string())));
+        assert!(calls.iter().any(|c| c == &["ip", "netns", "del", "ims0"]));
+    }
+
+    #[test]
+    fn a_volte_candidate_reclaims_via_its_in_namespace_veth_marker() {
+        let runner = MockCommandRunner::new();
+        reclaim_leftover_lines(
+            &runner,
+            &[ReclaimCandidate {
+                netns: "volte0".to_string(),
+                tun_iface: None,
+                veth_host: Some("veth-tel0".to_string()),
+                owned_iface_marker: Some("veth-carrier0".to_string()),
+            }],
+            true,
+        );
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|c| c.contains(&"del".to_string()) && c.contains(&"veth-tel0".to_string())));
+        assert!(calls.iter().any(|c| c == &["ip", "netns", "del", "volte0"]));
+        // No tun to delete, so no in-namespace delete is issued at all --
+        // the only in-namespace call is the ownership probe itself.
+        let netns_calls = runner.run_in_netns_calls.lock().unwrap();
+        assert!(!netns_calls
+            .iter()
+            .any(|(_, c)| c.contains(&"del".to_string())));
+    }
+
+    // --- Greptile P1: existence of a name is not ownership -----------------
+
+    #[test]
+    fn a_namespace_not_containing_our_marker_device_is_never_touched() {
+        // Someone else's `ims0` on the same host. Deleting its links and
+        // namespace would take out an unrelated workload's networking -- a
+        // capability this feature's /var/run/netns bind mount newly makes
+        // possible, so it must be positively guarded, not merely unlikely.
+        let runner = MockCommandRunner::new();
+        seed_absent(&runner, "netns:ims0:ip link show tun23-0");
+        reclaim_leftover_lines(&runner, &[provable_candidate()], true);
+
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(&"del".to_string())),
+            "a namespace we cannot prove is ours must never be deleted"
+        );
+        let netns_calls = runner.run_in_netns_calls.lock().unwrap();
+        assert!(!netns_calls
+            .iter()
+            .any(|(_, c)| c.contains(&"del".to_string())));
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_prove_ownership_at_all_is_never_reclaimed() {
+        // No marker device exists for this line (e.g. a swu-engine line, or
+        // a VoLTE line with no veth) -> nothing can identify the namespace
+        // as ours, so it is left alone rather than deleted on the strength
+        // of its name.
+        let runner = MockCommandRunner::new();
+        reclaim_leftover_lines(
+            &runner,
+            &[ReclaimCandidate {
+                netns: "volte0".to_string(),
+                tun_iface: None,
+                veth_host: None,
+                owned_iface_marker: None,
+            }],
+            true,
+        );
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(&"del".to_string())),
+            "an unprovable candidate must veto its own reclamation"
+        );
+    }
+
+    #[test]
+    fn reclamation_does_nothing_at_all_unless_explicitly_enabled() {
+        // Default-off: the destructive path stays inert even when the
+        // namespace is present AND provably ours, because nothing available
+        // from inside our own PID namespace can rule out a concurrently
+        // running second instance of this same deployment.
+        let runner = MockCommandRunner::new();
+        reclaim_leftover_lines(&runner, &[provable_candidate()], false);
+
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(&"del".to_string())),
+            "opt-out by default: nothing may be deleted without the operator opting in"
+        );
+        let netns_calls = runner.run_in_netns_calls.lock().unwrap();
+        assert!(!netns_calls
+            .iter()
+            .any(|(_, c)| c.contains(&"del".to_string())));
+    }
+
+    #[test]
+    fn every_delete_step_is_bounded() {
+        let runner = MockCommandRunner::new();
+        reclaim_leftover_lines(&runner, &[provable_candidate()], true);
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|c| c.contains(&"veth-sip0".to_string()) && c[0] == "timeout"));
+        let netns_calls = runner.run_in_netns_calls.lock().unwrap();
+        assert!(netns_calls
+            .iter()
+            .any(|(_, c)| c.contains(&"del".to_string())
+                && c.contains(&"tun23-0".to_string())
+                && c[0] == "timeout"));
     }
 }
