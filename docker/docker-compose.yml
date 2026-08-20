@@ -57,10 +57,15 @@ services:
     # state and explicitly deletes each line's tunnel/veth devices before
     # deleting its namespace — releasing the tunnel identifier a leftover
     # interface would otherwise hold hostage against the next restart (see
-    # docs/operations.md). That takes longer than Docker's 10s default; must
-    # stay >= supervise::shutdown::STOP_ALLOWANCE + headroom (research.md
-    # R8), which a contract test pins against this file.
-    stop_grace_period: 60s
+    # docs/operations.md). That takes longer than Docker's 10s default.
+    #
+    # Must stay STRICTLY GREATER than supervise::shutdown::STOP_ALLOWANCE
+    # (60s), not equal to it — the teardown budgets its own work against
+    # STOP_ALLOWANCE, so granting exactly that much leaves zero room for
+    # process startup, the final report, and container exit, and Docker
+    # would force-kill a teardown that was still inside its own budget.
+    # A contract test pins the relationship (research.md R8).
+    stop_grace_period: 90s
     volumes:
       - bridge-data:/data
       # Root-level config.toml is canonical (config.toml.example documents

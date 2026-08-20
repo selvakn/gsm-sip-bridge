@@ -249,9 +249,14 @@ and releases everything else.
   a kernel timeout.
 - **FR-015**: Reclamation on start MUST NOT touch resources that are not this
   deployment's, and MUST leave the existing behaviour for foreign encryption state
-  unchanged.
+  unchanged. A namespace is identifiable as this deployment's only by *containing a
+  device this deployment creates* — never by its name alone, which anything on the
+  host could also have chosen.
 - **FR-016**: The system MUST NOT release resources belonging to a *concurrently
   running* instance of itself; only resources of a run that has ended are eligible.
+  Since no check available from inside the container's own PID namespace can
+  establish that (see Assumptions), reclamation MUST be opt-in and default to off,
+  so the destructive path cannot run on an assumption the system cannot verify.
 
 #### Documentation
 
@@ -322,8 +327,19 @@ and releases everything else.
 - The existing all-ours-or-nothing rule for foreign encryption state is correct and is
   carried over to the stop path unchanged, rather than re-litigated here.
 - Making a run's namespaces addressable after its container is gone implies exposing
-  them at host scope. Only one instance of this deployment runs on a host, so this is
-  accepted; FR-016 covers the case where that assumption is violated.
+  them at host scope — and with it, the ability to *delete* host namespaces the
+  container previously could not even see. That is a new destructive capability, not
+  merely a new view, so it is guarded twice: reclamation acts only on a namespace
+  containing a device this deployment creates (FR-015), and only when explicitly
+  opted in (FR-016).
+- "Only one instance runs per host" is a **deployment convention, not something the
+  system can check.** The original reasoning — that a second instance could not work
+  anyway, since it would collide on namespace names, `if_id`s and charon's wildcard
+  UDP bind — is about the second instance *failing to start*; it says nothing about
+  it destroying the first one's live networking on the way there, which is what
+  unguarded reclamation would do. A stale `docker start` of an older container is
+  enough to trigger that, which is why the assumption gates the feature instead of
+  being relied upon by it.
 - A leftover namespace found at start is **deleted and recreated** rather than adopted.
   Adoption would also avoid the wait, but it would inherit whatever addresses, routes
   and stale state the previous run left inside, which is a larger and riskier change.

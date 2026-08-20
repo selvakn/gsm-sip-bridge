@@ -96,27 +96,32 @@ fn start_multiline(
         .lines
         .iter()
         .map(|l| {
-            let veth_host = if l.veth_carrier_addr.is_empty() {
-                None
+            let suffix = if l.index == 0 {
+                String::new()
             } else {
-                Some(format!(
-                    "{}{}",
-                    config.volte.veth_telephony_iface,
-                    if l.index == 0 {
-                        String::new()
-                    } else {
-                        l.index.to_string()
-                    }
-                ))
+                l.index.to_string()
             };
+            let has_veth = !l.veth_carrier_addr.is_empty();
+            let veth_host =
+                has_veth.then(|| format!("{}{suffix}", config.volte.veth_telephony_iface));
             epdg_iface::ReclaimCandidate {
                 netns: l.netns.clone(),
                 tun_iface: None,
                 veth_host,
+                // Proof of ownership: the carrier-side veth end this
+                // deployment creates *inside* the namespace. A line with no
+                // veth at all (the diagnostic single-`--modem` path) cannot
+                // prove ownership, so `None` vetoes reclaiming it.
+                owned_iface_marker: has_veth
+                    .then(|| format!("{}{suffix}", config.volte.veth_carrier_iface)),
             }
         })
         .collect();
-    epdg_iface::reclaim_leftover_lines(runner.as_ref(), &reclaim_candidates);
+    epdg_iface::reclaim_leftover_lines(
+        runner.as_ref(),
+        &reclaim_candidates,
+        epdg_iface::reclaim_leftover_enabled(),
+    );
 
     for line in &manifest.lines {
         let runner = Arc::clone(&runner);

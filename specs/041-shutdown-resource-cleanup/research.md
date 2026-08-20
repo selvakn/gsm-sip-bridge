@@ -182,12 +182,73 @@ the current run, and the single-instance constraint is documented.
 see another container's processes, so it would report "empty" for a live instance and be
 actively misleading.
 
+### R7 revised (Greptile P1, 2026-08-20): the finding above is not wrong, but it answers
+### the wrong question
+
+The reasoning holds for what it actually establishes — a second concurrent instance
+cannot *work*. It does **not** establish what this code needed, which is that a second
+instance cannot *be harmed*. Those come apart badly here: pre-feature, a mistaken second
+instance simply failed to start; post-feature, it starts by deleting the first
+instance's namespace and devices — the bind mount R6 adds is precisely what makes the
+first instance's namespaces reachable, and therefore destroyable. "It would collide
+anyway" describes the second instance's fate, not the first's.
+
+Concretely reachable on the very rig this feature was tested on, which has a stopped
+`gsm-jio-cap-old` container sitting alongside the live one: `docker start
+gsm-jio-cap-old` would have had the old container reclaim `ims0` out from under the
+running line.
+
+**Revised decision**, two independent guards:
+
+1. **Ownership is proven, not inferred from the name.** A namespace is reclaimed only if
+   it *contains* a device this deployment creates (`tun23-N` for VoWiFi, the carrier-side
+   veth for VoLTE). Anything on the host may be called `ims0`; only this deployment puts
+   a `tun23-0` inside one. Same posture as `classify_xfrm_dump`'s all-ours-or-nothing
+   rule — positive identification required, anything unproven vetoes the destructive act.
+   This closes the unrelated-workload case completely.
+2. **The destructive path is opt-in** (`GSM_SIP_BRIDGE_RECLAIM_LEFTOVER_NETNS=1`,
+   default off). Guard 1 cannot distinguish our own dead run from our own *live* sibling
+   — both contain `tun23-0` — and nothing available inside our PID namespace can. Rather
+   than act on an unverifiable assumption, the assumption becomes the operator's explicit
+   assertion.
+
+**Cost of this**: SC-007 (force-kill recovery) no longer happens by default. That is a
+real reduction in what this feature delivers out of the box, accepted deliberately —
+SC-007 was never cleanly verified anyway (see R9's force-kill section), whereas the
+graceful-stop path it is traded against is the measured 167s→8s result and is entirely
+unaffected by this change.
+
 ## R8. Sizing the stop allowance
 
 Worst case per stop, for the supported 4 lines: per-line terminate (bounded, ~3s each) +
 charon exit wait (~5s) + in-namespace agents exiting (~5s, the existing
 `KILL_CONFIRM_MAX_POLLS` bound) + flush (~1s) + two bounded link deletes per line (~5s
 each) + namespace deletes. That lands near 45s.
+
+### R8 corrected (Greptile P1, 2026-08-20): the arithmetic above was wrong twice
+
+Two sizing errors, both caught in review rather than by the live test — which never hit
+them, because the real teardown completes in well under a second and the bounds are
+worst-case ceilings that never fire:
+
+1. **The reserve understated the release phase by ~3x.** It was a flat 15s, while four
+   lines emit *eight* `DeleteLink` steps bounded at 5s each — ~40s plus namespace
+   deletes. A reserve that small lets the fallback fire believing it has time, then get
+   force-killed mid-delete, producing exactly the claimed `if_id` the fallback exists to
+   prevent. **Fix**: the reserve is now *derived from the plan*
+   (`release_reserve_for`) by summing the non-abandonable steps' own bounds, so it is
+   correct at any line count and cannot rot when `max_lines` changes.
+2. **Compose granted exactly `STOP_ALLOWANCE`, leaving zero headroom** — 60s vs 60s,
+   despite the compose comment itself saying "must stay >= STOP_ALLOWANCE + headroom".
+   The teardown budgets its own work against the whole allowance, so an equal grace
+   period means Docker can kill a teardown still inside its budget. **Fix**:
+   `stop_grace_period: 90s`, and the contract test now requires *strictly greater*
+   rather than `>=` — the old assertion permitted precisely the boundary value that was
+   set.
+
+Note the sum in the paragraph above ("near 45s") was itself already close to the 60s
+allowance before the deletes were counted properly; the corrected figures are what the
+derived reserve now computes directly rather than anyone re-deriving by hand.
 
 **Decision**: `stop_grace_period: 60s` in compose, with the teardown's own bounds sized
 so it finishes comfortably inside it.

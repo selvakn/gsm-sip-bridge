@@ -353,16 +353,39 @@ on how the previous run ended:
   releasing devices over waiting — check what it reported it could not
   release, named in a `[supervise] teardown: could not release ...` line.
 - **The previous run was force-killed, or the machine lost power.** No
-  graceful stop ran at all. On start, `supervise` looks for exactly this —
-  a namespace matching this deployment's own naming that it did not just
-  create — and reclaims it (`[supervise] reclaimed netns ... left by a
-  previous run` in the log). This needs the per-line namespace directory to
-  be visible from the host, which is what `docker-compose.yml`'s
-  `/var/run/netns` bind mount (`rshared` propagation) is for. If that mount
-  is missing, misconfigured, or the host's Docker version does not propagate
-  it the way this deployment assumes, reclamation silently finds nothing —
-  confirm with `ip netns list` **on the host** (not inside the container):
-  a namespace from a killed run should be visible there.
+  graceful stop ran at all, so nothing deleted the device. On start,
+  `supervise` can reclaim this — but **only if you opt in**, because the
+  reclamation deletes devices and a namespace on the *host*:
+
+  ```
+  GSM_SIP_BRIDGE_RECLAIM_LEFTOVER_NETNS=1
+  ```
+
+  Without it you get a log line naming the leftover and stopping there;
+  with it, `[supervise] reclaiming netns ... left by a previous run`.
+
+  **Before enabling it, be sure only one instance of this deployment runs on
+  this host.** The opt-in exists because nothing the container can check
+  from inside its own PID namespace distinguishes "my own dead run's `ims0`"
+  from "a second, *live* instance's `ims0`" — `ip netns pids` cannot see
+  another container's processes. Reclaiming while a sibling instance is live
+  would delete that instance's working tunnel out from under it. A stale
+  `docker start` of an older container is enough to cause this, so the
+  default is off.
+
+  As a second guard (independent of the flag), a namespace is only ever
+  touched when it actually contains a device this deployment would have put
+  there — `tun23-N` for a VoWiFi line, the carrier-side veth for a VoLTE
+  one. An unrelated workload's `ims0` therefore is never deleted, opt-in or
+  not; you'll see `netns ims0 exists but does not contain tun23-0, so it is
+  not this deployment's and was left untouched` instead.
+
+  Reclamation also needs the per-line namespace directory visible from the
+  host, which is what `docker-compose.yml`'s `/var/run/netns` bind mount
+  (`rshared` propagation) is for. If that mount is missing or does not
+  propagate, reclamation finds nothing — confirm with `ip netns list` **on
+  the host** (not inside the container): a namespace from a killed run
+  should be visible there.
 - **Something outside this deployment is holding it.** Genuinely rare, but
   possible — see the "held open by something a process scan misses" checks
   below.

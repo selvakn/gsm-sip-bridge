@@ -297,9 +297,17 @@ fn start_vowifi_subsystem(
             netns: l.netns.clone(),
             tun_iface: is_strongswan.then(|| l.strongswan_tun_iface.clone()),
             veth_host: Some(l.config.veth_sip_iface.clone()),
+            // Proof of ownership: only this deployment puts a `tun23-N`
+            // inside an `imsN`. A swu line has no such device, so it cannot
+            // prove ownership and is never reclaimed (`None` vetoes it).
+            owned_iface_marker: is_strongswan.then(|| l.strongswan_tun_iface.clone()),
         })
         .collect();
-    epdg_iface::reclaim_leftover_lines(runner.as_ref(), &reclaim_candidates);
+    epdg_iface::reclaim_leftover_lines(
+        runner.as_ref(),
+        &reclaim_candidates,
+        epdg_iface::reclaim_leftover_enabled(),
+    );
 
     // Render the shared charon's assets once, before any line starts.
     // Every line then drops its own connection file into the shared
@@ -915,8 +923,13 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     println!("[supervise] shutting down ...");
     let state = started.lock().unwrap();
     let plan = shutdown::build_shutdown_plan(&state, &config_path_str);
-    let budget =
-        shutdown::TeardownBudget::new(shutdown::STOP_ALLOWANCE, shutdown::STOP_RELEASE_RESERVE);
+    // Reserve is derived from this run's own plan rather than a fixed
+    // constant, so it stays correct for whatever line count actually
+    // started (see `release_reserve_for`).
+    let budget = shutdown::TeardownBudget::new(
+        shutdown::STOP_ALLOWANCE,
+        shutdown::release_reserve_for(&plan),
+    );
     let outcome = shutdown::execute_shutdown_plan(&plan, runner.as_ref(), &budget);
     report_teardown_outcome(&outcome);
 

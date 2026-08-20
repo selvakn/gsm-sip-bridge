@@ -192,11 +192,37 @@ const KILL_CONFIRM_MAX_POLLS: u32 = 20;
 /// teardown means one of the two drifted; a contract test pins the
 /// relationship (see `tests/test_shell_env_contracts.rs` and research.md R8).
 pub const STOP_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
-/// What the release steps (`DeleteLink`/`DeleteNetns`) need, reserved out of
-/// [`STOP_ALLOWANCE`] so the fallback triggers with enough of it left to
-/// still reach them (research.md R8: ~5s per delete, 4 lines, two deletes
-/// each, plus namespace deletes).
-pub const STOP_RELEASE_RESERVE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Worst-case time a single `DeleteNetns` may take. Unlike `DeleteLink` it
+/// carries no `timeout_secs` of its own (`ip netns del` unlinks a name and
+/// does not block on device teardown), but it is not free either, so the
+/// reserve budgets for it explicitly rather than assuming zero.
+const DELETE_NETNS_BUDGET_SECS: u64 = 1;
+
+/// What the non-abandonable release steps in `plan` need in the worst case —
+/// the reserve [`TeardownBudget`] holds back so the fallback still has time
+/// to reach them (FR-019).
+///
+/// **Derived from the plan, not a constant** (Greptile P1). It was a flat 15s,
+/// which silently understated reality: a four-line deployment emits eight
+/// `DeleteLink` steps bounded at [`DELETE_LINK_TIMEOUT_SECS`] each, so the
+/// true worst case is ~40s plus namespace deletes — nearly three times the
+/// reserve. A budget that under-reserves is worse than none: it lets the
+/// fallback fire "in time" and then get force-killed mid-delete anyway,
+/// leaving exactly the claimed `if_id` this feature exists to prevent.
+/// Deriving it means it stays correct when the supported line count changes,
+/// with nobody having to remember this constant exists.
+pub fn release_reserve_for(plan: &[TeardownStep]) -> std::time::Duration {
+    let secs: u64 = plan
+        .iter()
+        .map(|s| match s {
+            TeardownStep::DeleteLink { timeout_secs, .. } => u64::from(*timeout_secs),
+            TeardownStep::DeleteNetns { .. } => DELETE_NETNS_BUDGET_SECS,
+            _ => 0,
+        })
+        .sum();
+    std::time::Duration::from_secs(secs)
+}
 
 /// Builds the exact, ordered teardown step sequence for this run — pure,
 /// callable with zero real processes for testing (see `mod tests` below).
@@ -249,6 +275,16 @@ pub fn build_shutdown_plan<'a>(
     // `DeleteLink`/`FlushXfrm` steps safe. The escalating `KillChild` is
     // unconditional in the plan; signalling an already-exited process is a
     // harmless no-op at execution time.
+    //
+    // The SIGKILL gets its **own** confirming wait afterwards (Greptile P1).
+    // Without it the guarantee above held only for children that exited on
+    // the SIGTERM — precisely the ones that did *not* need escalating. A
+    // child that ignored SIGTERM would be SIGKILLed and then left racing the
+    // `DeleteLink` steps: SIGKILL is not synchronous, and until the kernel
+    // has finished reaping the process it still holds its namespace
+    // reference and its fds, which is exactly what makes an `ip link del`
+    // fail and leave the `if_id` claimed into the next run — the failure
+    // this whole feature exists to prevent.
     for h in &state.vowifi_child_handles {
         steps.push(TeardownStep::WaitForExit {
             handle: h,
@@ -257,6 +293,10 @@ pub fn build_shutdown_plan<'a>(
         steps.push(TeardownStep::KillChild {
             handle: h,
             signal: Signal::Kill,
+        });
+        steps.push(TeardownStep::WaitForExit {
+            handle: h,
+            max_polls: KILL_CONFIRM_MAX_POLLS,
         });
     }
 
@@ -1030,6 +1070,102 @@ mod tests {
             .expect("an escalating SIGKILL must exist");
         assert!(term_pos < wait_pos, "must wait after the initial SIGTERM");
         assert!(wait_pos < kill_pos, "escalation must follow the wait");
+
+        // Greptile P1: the SIGKILL needs its own confirming wait. Without
+        // one, the only children whose exit was ever confirmed are those
+        // that went down on the SIGTERM — i.e. exactly the ones that did not
+        // need escalating — while a child that ignored SIGTERM races the
+        // device deletes, still holding the namespace the kernel has not
+        // finished reaping it out of.
+        let confirm_pos = steps
+            .iter()
+            .skip(kill_pos)
+            .position(|s| matches!(s, TeardownStep::WaitForExit { handle: h, .. } if h.id() == ims_agent.id()))
+            .map(|p| p + kill_pos)
+            .expect("the escalating SIGKILL must be followed by its own confirming wait");
+        assert!(confirm_pos > kill_pos);
+    }
+
+    #[test]
+    fn every_delete_step_is_preceded_by_a_confirmed_kill_of_every_child() {
+        // The stronger form of O-2/O-3: not merely "a wait exists", but
+        // "the *last* wait for every child precedes the first delete", which
+        // is what actually makes the deletes safe.
+        let runner = MockCommandRunner::new();
+        let a = handle(&runner, 1);
+        let b = handle(&runner, 1);
+        let state = StartedState {
+            vowifi_lines: vec![strongswan_line(0, "ims0", 23)],
+            vowifi_child_handles: vec![a.clone(), b.clone()],
+            started_netns: vec!["ims0".to_string()],
+            ..Default::default()
+        };
+        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
+        let first_delete = steps
+            .iter()
+            .position(|s| matches!(s, TeardownStep::DeleteLink { .. }))
+            .unwrap();
+        for h in [&a, &b] {
+            let last_wait = steps
+                .iter()
+                .rposition(|s| matches!(s, TeardownStep::WaitForExit { handle: x, .. } if x.id() == h.id()))
+                .expect("every child must be waited for");
+            let last_kill = steps
+                .iter()
+                .rposition(
+                    |s| matches!(s, TeardownStep::KillChild { handle: x, .. } if x.id() == h.id()),
+                )
+                .unwrap();
+            assert!(last_kill < last_wait, "the final signal must be confirmed");
+            assert!(
+                last_wait < first_delete,
+                "confirm every child before deleting devices"
+            );
+        }
+    }
+
+    #[test]
+    fn the_release_reserve_covers_every_non_abandonable_bound_in_the_plan() {
+        // Greptile P1: this was a flat 15s constant while a four-line
+        // deployment's release phase is bounded at ~40s+, so the fallback
+        // could fire "in time" and still be force-killed mid-delete.
+        // Deriving it from the plan keeps it right at any line count.
+        let state = StartedState {
+            vowifi_lines: vec![
+                strongswan_line(0, "ims0", 23),
+                strongswan_line(1, "ims1", 24),
+                strongswan_line(2, "ims2", 25),
+                strongswan_line(3, "ims3", 26),
+            ],
+            started_netns: vec![
+                "ims0".to_string(),
+                "ims1".to_string(),
+                "ims2".to_string(),
+                "ims3".to_string(),
+            ],
+            ..Default::default()
+        };
+        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
+        let reserve = release_reserve_for(&steps);
+
+        let worst_case: u64 = steps
+            .iter()
+            .map(|s| match s {
+                TeardownStep::DeleteLink { timeout_secs, .. } => u64::from(*timeout_secs),
+                TeardownStep::DeleteNetns { .. } => DELETE_NETNS_BUDGET_SECS,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(reserve.as_secs(), worst_case);
+        assert!(
+            reserve.as_secs() >= 8 * u64::from(DELETE_LINK_TIMEOUT_SECS),
+            "four lines means eight bounded link deletes; reserve was {}s",
+            reserve.as_secs()
+        );
+        assert!(
+            reserve < STOP_ALLOWANCE,
+            "the reserve must still fit inside the allowance it is carved out of"
+        );
     }
 
     #[test]

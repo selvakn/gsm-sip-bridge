@@ -51,11 +51,18 @@ fn compose_declares_a_stop_grace_period_at_least_the_teardown_budget() {
         .expect("malformed stop_grace_period line");
     let declared_secs = parse_seconds(value);
 
+    // Strictly greater, not `>=` (Greptile P1). The teardown budgets its own
+    // work against the full STOP_ALLOWANCE, so granting exactly that much
+    // leaves nothing for process startup, the final report, or container
+    // exit — Docker would force-kill a teardown still inside its own budget,
+    // which is the "worse than not starting one" case FR-019 exists to
+    // avoid. The original assertion allowed exactly that, and the compose
+    // file it checked was set to precisely the boundary value it permitted.
     assert!(
-        declared_secs >= STOP_ALLOWANCE.as_secs(),
-        "docker-compose.yml's stop_grace_period ({declared_secs}s) must be at least \
-         supervise::shutdown::STOP_ALLOWANCE ({}s) — the container runtime must not be \
-         able to force-kill a teardown that is still within its own budget",
+        declared_secs > STOP_ALLOWANCE.as_secs(),
+        "docker-compose.yml's stop_grace_period ({declared_secs}s) must be strictly \
+         greater than supervise::shutdown::STOP_ALLOWANCE ({}s) — the container runtime \
+         must not be able to force-kill a teardown that is still within its own budget",
         STOP_ALLOWANCE.as_secs()
     );
 }
