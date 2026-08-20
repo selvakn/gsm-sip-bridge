@@ -250,6 +250,25 @@ Note the sum in the paragraph above ("near 45s") was itself already close to the
 allowance before the deletes were counted properly; the corrected figures are what the
 derived reserve now computes directly rather than anyone re-deriving by hand.
 
+### R8 addendum: why the delete retry is *not* in the reserve
+
+A later review round (Greptile P1, "kill confirmation remains non-gating") led to
+`DeleteLink` gaining a settle-and-retry. The obvious follow-through — reserve for two
+attempts per link — was tried and **rejected by arithmetic**: eight links × (2 × 5s +
+0.5s) ≈ 88s, which is *above* `STOP_ALLOWANCE` itself. A reserve larger than the
+allowance marks the budget exhausted before the first step ever runs, so every
+abandonable step would be skipped on every single stop — no IKE terminate, no child
+waits, ever. The fallback meant for the pathological case would become the normal path.
+
+Resolution: the reserve covers **one** attempt per link, and the retry is
+*opportunistic* — taken only while the budget still has slack. Since a real `ip link
+del` completes in milliseconds (measured: the whole 83-step teardown in under a second,
+R9), slack is present in every realistic case and the retry effectively always runs;
+under genuine exhaustion, a single best-effort delete is the correct FR-019
+prioritisation anyway. Raising the allowance to ~120s with a ~150s grace period was the
+alternative, rejected as making a wedged container take two and a half minutes to stop
+in exchange for covering a case that has never been observed.
+
 **Decision**: `stop_grace_period: 60s` in compose, with the teardown's own bounds sized
 so it finishes comfortably inside it.
 

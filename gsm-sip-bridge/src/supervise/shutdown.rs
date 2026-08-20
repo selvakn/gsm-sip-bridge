@@ -28,6 +28,12 @@ const TERMINATE_TIMEOUT_SECS: u32 = 5;
 /// the case research.md R2/R3 exists to rule out — something still
 /// referencing the device — so a stuck delete is diagnosed, not hung on.
 const DELETE_LINK_TIMEOUT_SECS: u32 = 5;
+/// How long a failed `DeleteLink` pauses before its single retry, giving the
+/// kernel a moment to finish reaping a just-SIGKILLed child whose lingering
+/// socket reference is what blocked the first attempt. Deliberately short:
+/// a normally-scheduled process is reaped in well under this, and one stuck
+/// in uninterruptible sleep will not be reaped by any wait at all.
+const DELETE_RETRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One step of container teardown. `Run`/`RunInNetns` cover the current
 /// trap's non-signal actions (`volte-cleanup`, `volte-pdn --action down`,
@@ -213,15 +219,25 @@ const DELETE_NETNS_BUDGET_SECS: u64 = 1;
 /// Deriving it means it stays correct when the supported line count changes,
 /// with nobody having to remember this constant exists.
 pub fn release_reserve_for(plan: &[TeardownStep]) -> std::time::Duration {
-    let secs: u64 = plan
-        .iter()
+    plan.iter()
         .map(|s| match s {
-            TeardownStep::DeleteLink { timeout_secs, .. } => u64::from(*timeout_secs),
-            TeardownStep::DeleteNetns { .. } => DELETE_NETNS_BUDGET_SECS,
-            _ => 0,
+            // One attempt per link. The settle-and-retry in its `execute`
+            // arm is deliberately *opportunistic* — taken only when the
+            // budget still has slack — so it does not belong in the reserve.
+            // Reserving for two pathological attempts per link would put the
+            // reserve (~88s for four lines) above STOP_ALLOWANCE itself,
+            // which would mark the budget exhausted before the first step
+            // and starve every abandonable step from the outset: no IKE
+            // terminate, no child waits, on every single stop.
+            TeardownStep::DeleteLink { timeout_secs, .. } => {
+                std::time::Duration::from_secs(u64::from(*timeout_secs))
+            }
+            TeardownStep::DeleteNetns { .. } => {
+                std::time::Duration::from_secs(DELETE_NETNS_BUDGET_SECS)
+            }
+            _ => std::time::Duration::ZERO,
         })
-        .sum();
-    std::time::Duration::from_secs(secs)
+        .sum()
 }
 
 /// Builds the exact, ordered teardown step sequence for this run — pure,
@@ -588,7 +604,10 @@ impl TeardownStep<'_> {
         )
     }
 
-    fn execute(&self, runner: &dyn CommandRunner) -> StepOutcome {
+    /// `may_retry` is whether the budget still has slack for a step to make
+    /// a second, best-effort attempt — see `DeleteLink`'s arm, the only one
+    /// that uses it.
+    fn execute(&self, runner: &dyn CommandRunner, may_retry: bool) -> StepOutcome {
         match self {
             TeardownStep::KillChild { handle, signal } => {
                 runner.signal(handle, *signal);
@@ -638,10 +657,55 @@ impl TeardownStep<'_> {
             } => {
                 let ts = timeout_secs.to_string();
                 let argv = ["timeout", ts.as_str(), "ip", "link", "del", iface.as_str()];
-                run_outcome(match netns {
-                    Some(ns) => runner.run_in_netns(ns, &argv),
-                    None => runner.run(&argv),
-                })
+                let attempt = |r: &dyn CommandRunner| match netns {
+                    Some(ns) => r.run_in_netns(ns, &argv),
+                    None => r.run(&argv),
+                };
+
+                // Retry once after a short settle (Greptile P1: "kill
+                // confirmation remains non-gating").
+                //
+                // The confirming wait before this step is best-effort by
+                // design: the budget fallback may abandon it (FR-019
+                // deliberately spends the last of the allowance on releases
+                // rather than waits), and it can time out on a child stuck
+                // in uninterruptible sleep. So this step can be reached with
+                // a SIGKILLed child not yet reaped, still holding a socket
+                // reference that makes the kernel's unregister block until
+                // the bound fires.
+                //
+                // Gating on the confirmation instead — skipping the delete
+                // when the child has not been confirmed gone — would be
+                // strictly worse: it *guarantees* the `if_id` stays claimed
+                // into the next run, which is the exact failure this whole
+                // feature exists to prevent. The delete is the thing that
+                // must happen; what it needs is tolerance, not a veto.
+                //
+                // A settle-and-retry is that tolerance, and it targets the
+                // case that is actually recoverable: a normally-scheduled
+                // process reaped moments after the SIGKILL. (A child wedged
+                // in D-state is not recoverable by any amount of waiting —
+                // that outcome is reported rather than papered over.)
+                //
+                // `may_retry` keeps it opportunistic. Reserving for two
+                // pathological attempts per link would push the reserve
+                // above the whole allowance and starve every abandonable
+                // step on every stop; instead the reserve covers one attempt
+                // and the retry is taken only while slack remains — which,
+                // since a real delete completes in milliseconds, is every
+                // realistic case. Under genuine budget exhaustion the single
+                // best-effort delete is the correct FR-019 prioritisation.
+                match run_outcome(attempt(runner)) {
+                    StepOutcome::Ok => StepOutcome::Ok,
+                    first_failure if !may_retry => first_failure,
+                    _ => {
+                        runner.sleep(DELETE_RETRY_SETTLE);
+                        // The second attempt's outcome is the one reported:
+                        // after the settle it is the more honest description
+                        // of why the resource is still held.
+                        run_outcome(attempt(runner))
+                    }
+                }
             }
             TeardownStep::FlushXfrm { ours } => {
                 use super::epdg_iface::{classify_and_maybe_flush, XfrmFlushOutcome};
@@ -689,10 +753,13 @@ pub fn execute_shutdown_plan(
     let mut outcome = TeardownOutcome::default();
     for step in steps {
         let label = step.label();
-        let result = if step.is_abandonable() && budget.exhausted() {
+        // Evaluated per step, not once up front: the budget drains as the
+        // plan runs, so a retry that had slack early may not later.
+        let exhausted = budget.exhausted();
+        let result = if step.is_abandonable() && exhausted {
             StepOutcome::Abandoned
         } else {
-            step.execute(runner)
+            step.execute(runner, !exhausted)
         };
         outcome.steps.push(StepReport {
             label,
@@ -1495,6 +1562,98 @@ mod tests {
             && c.contains(&"tun23-0".to_string())));
     }
 
+    // --- Greptile P1: the kill confirmation is not gating ------------------
+    //
+    // It cannot be: gating the delete on a confirmation that may legitimately
+    // be abandoned (budget) or time out (D-state child) would *guarantee* the
+    // if_id stays claimed, which is the failure this feature exists to
+    // prevent. The delete must still be attempted — what it gains instead is
+    // a settle-and-retry, so a child reaped moments after its SIGKILL does
+    // not cost the identifier.
+
+    fn count_netns_attempts(runner: &MockCommandRunner, netns: &str, iface: &str) -> usize {
+        runner
+            .run_in_netns_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ns, c)| {
+                ns == netns && c.contains(&"del".to_string()) && c.contains(&iface.to_string())
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_failed_device_delete_settles_and_retries_once() {
+        let runner = MockCommandRunner::new();
+        // Seed the delete itself as failing, as it would if a not-yet-reaped
+        // child still held a reference to the device.
+        runner.set_run_output("netns:ims0:timeout 5 ip link del tun23-0", failure_output());
+        let state = StartedState {
+            vowifi_lines: vec![strongswan_line(0, "ims0", 23)],
+            started_netns: vec!["ims0".to_string()],
+            ..Default::default()
+        };
+        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
+        let outcome = execute_shutdown_plan(&steps, &runner, &TeardownBudget::unbounded());
+
+        assert_eq!(
+            count_netns_attempts(&runner, "ims0", "tun23-0"),
+            2,
+            "a failed delete must be retried once after a settle"
+        );
+        assert!(
+            runner.sleeps.lock().unwrap().contains(&DELETE_RETRY_SETTLE),
+            "the retry must be preceded by the settle pause"
+        );
+        // Still failing after the retry -> reported, never silently dropped.
+        assert!(outcome
+            .not_released()
+            .any(|(label, _)| label.contains("tun23-0")));
+    }
+
+    #[test]
+    fn a_device_delete_that_succeeds_is_never_retried() {
+        let runner = MockCommandRunner::new();
+        let state = StartedState {
+            vowifi_lines: vec![strongswan_line(0, "ims0", 23)],
+            started_netns: vec!["ims0".to_string()],
+            ..Default::default()
+        };
+        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
+        execute_shutdown_plan(&steps, &runner, &TeardownBudget::unbounded());
+        assert_eq!(count_netns_attempts(&runner, "ims0", "tun23-0"), 1);
+    }
+
+    #[test]
+    fn an_exhausted_budget_still_attempts_every_delete_but_skips_the_retry() {
+        // The delete itself is never sacrificed to the budget — only its
+        // opportunistic second attempt is.
+        let runner = MockCommandRunner::new();
+        runner.set_run_output("netns:ims0:timeout 5 ip link del tun23-0", failure_output());
+        let state = StartedState {
+            vowifi_lines: vec![strongswan_line(0, "ims0", 23)],
+            started_netns: vec!["ims0".to_string()],
+            ..Default::default()
+        };
+        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
+        let exhausted = TeardownBudget::new(std::time::Duration::ZERO, std::time::Duration::ZERO);
+        execute_shutdown_plan(&steps, &runner, &exhausted);
+
+        assert_eq!(
+            count_netns_attempts(&runner, "ims0", "tun23-0"),
+            1,
+            "the delete is still attempted under budget pressure, the retry is not"
+        );
+    }
+
+    #[test]
+    fn failure_output_seeds_actually_fail() {
+        // Guards the three tests above: if `failure_output()` ever stopped
+        // registering as a failure, they would silently assert nothing.
+        assert!(!failure_output().status.success());
+    }
+
     #[test]
     fn a_generous_budget_abandons_nothing() {
         let runner = MockCommandRunner::new();
@@ -1536,6 +1695,15 @@ mod tests {
             !calls.iter().any(|c| c.contains(&"flush".to_string())),
             "foreign XFRM state must never be flushed, at stop any more than at startup"
         );
+    }
+
+    fn failure_output() -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(256), // exit code 1
+            stdout: vec![],
+            stderr: b"RTNETLINK answers: Device or resource busy".to_vec(),
+        }
     }
 
     fn success_output(stdout: &str) -> std::process::Output {
