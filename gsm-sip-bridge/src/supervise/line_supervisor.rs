@@ -189,14 +189,6 @@ pub trait TunnelEngine {
     /// out before tearing anything down. Always `false` for swu, which manages
     /// its own device and routing through the dialer.
     fn repair_default_route(&self, runner: &dyn CommandRunner) -> bool;
-    /// Whether this host still has a path toward the carrier, as
-    /// `Err(next_hop)` when it demonstrably does not.
-    ///
-    /// Gates the teardown in [`tick_steady_state`]: an unreachable P-CSCF means
-    /// nothing about *this tunnel* if the box has no uplink, and no amount of
-    /// renegotiating repairs a rebooting router. Ambiguity is `Ok(())` — failing
-    /// to determine WAN health must never disable tunnel recovery.
-    fn epdg_path_ok(&self, runner: &dyn CommandRunner) -> Result<(), String>;
     /// Fully restarts this line's primary process from scratch (strongswan:
     /// kill, clear log, remove the stale unqualified pidfile, respawn
     /// charon, `swanctl --load-all`, `swanctl --initiate`; swu: respawn the
@@ -295,21 +287,6 @@ pub enum SteadyOutcome {
     /// issued by the time this returns.
     Recovered {
         reason: DegradeReason,
-    },
-    /// The P-CSCF is unreachable, but so is the next hop toward the ePDG — this
-    /// host has no path to the carrier at all, so nothing was done to the tunnel
-    /// (specs/039-at-stall-watchdog).
-    ///
-    /// This is a *hold*, not a recovery. On 2026-08-19 a scheduled 3AM router
-    /// reboot took the WAN away for two minutes. The reachability check fired at
-    /// its 90s threshold — well before charon's own DPD, which this repo's
-    /// config measures at 2m45s — and tore down a structurally healthy CHILD_SA
-    /// that `swanctl --list-sas` still listed as established. The reinitiate
-    /// that followed could not succeed, because there was still no internet.
-    /// Tearing down an SA cannot repair a dead uplink; it can only destroy
-    /// something that was about to start working again by itself.
-    WanDown {
-        next_hop: String,
     },
 }
 
@@ -418,17 +395,6 @@ pub fn tick_steady_state(
                 reason: DegradeReason::DefaultRouteMissing,
             };
         }
-
-        // Is the carrier unreachable because this tunnel is broken, or because
-        // this box has no internet? Only the first is ours to fix. Checked here,
-        // *after* the cheap route repair and *before* any teardown, and the
-        // streak is deliberately left untouched so a WAN outage of any length
-        // never accumulates toward one: the check simply re-runs on the next
-        // tick until the uplink returns.
-        if let Err(next_hop) = engine.epdg_path_ok(runner) {
-            return SteadyOutcome::WanDown { next_hop };
-        }
-
         *unreachable_streak = unreachable_streak.saturating_add(1);
         // Derived from this loop's own cadence, so both engines wait the same
         // ~90s of real time rather than the same number of ticks.
@@ -521,10 +487,6 @@ mod tests {
         /// one specific *cause* of unreachability with its own cheap remedy.
         route_missing: RefCell<bool>,
         route_repairs: RefCell<u32>,
-        /// Whether this host has lost its uplink. The distinction that matters:
-        /// an unreachable P-CSCF with the WAN down is not this tunnel's fault
-        /// and not this tunnel's to fix.
-        wan_down: RefCell<bool>,
         established: RefCell<bool>,
         pcscf: RefCell<Option<String>>,
         alive: RefCell<bool>,
@@ -557,9 +519,6 @@ mod tests {
                 // must not silently absorb those cases.
                 route_missing: RefCell::new(false),
                 route_repairs: RefCell::new(0),
-                // Default up: every pre-existing unreachability test means "the
-                // tunnel is broken", which must still escalate.
-                wan_down: RefCell::new(false),
                 alive: RefCell::new(true),
                 health: RefCell::new(SteadyStateHealth::Ok),
                 max_attempts: None,
@@ -595,14 +554,6 @@ mod tests {
         fn reinitiate(&self, _runner: &dyn CommandRunner) {
             *self.reinitiate_calls.borrow_mut() += 1;
             self.call_order.borrow_mut().push("reinitiate");
-        }
-        fn epdg_path_ok(&self, _runner: &dyn CommandRunner) -> Result<(), String> {
-            self.call_order.borrow_mut().push("epdg_path_ok");
-            if *self.wan_down.borrow() {
-                Err("192.0.2.1".to_string())
-            } else {
-                Ok(())
-            }
         }
         fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
             if !*self.route_missing.borrow() {
@@ -999,106 +950,6 @@ mod tests {
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::StillUp
         );
-    }
-
-    #[test]
-    fn a_wan_outage_never_tears_the_tunnel_down_however_long_it_lasts() {
-        // The 2026-08-19 outage, as the cause rather than the symptom. A
-        // scheduled 3AM router reboot took the uplink away for ~2 minutes. This
-        // check fires at 3 strikes x 30s = 90s, well before charon's own DPD
-        // (dpd_delay 30s, ~2m45s to give up as measured in this repo's own
-        // swanctl config comment) — so it tore down a CHILD_SA that
-        // `swanctl --list-sas` still listed as established, and the reinitiate
-        // could not succeed because there was still no internet. A two-minute
-        // blip became a six-hour outage.
-        //
-        // Renegotiating cannot repair a rebooting router. Held indefinitely, and
-        // asserted well past the strike threshold so no amount of WAN downtime
-        // accumulates into a teardown.
-        let runner = MockCommandRunner::new();
-        let engine = FakeEngine {
-            pcscf_reachable: RefCell::new(false),
-            wan_down: RefCell::new(true),
-            ..Default::default()
-        };
-        let mut streak = 0;
-        let strikes = pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL);
-        for tick in 0..(strikes * 4) {
-            assert_eq!(
-                tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
-                SteadyOutcome::WanDown {
-                    next_hop: "192.0.2.1".to_string()
-                },
-                "tick {tick} of a WAN outage must hold, not escalate"
-            );
-        }
-        assert_eq!(*engine.terminate_calls.borrow(), 0, "no teardown");
-        assert_eq!(*engine.reinitiate_calls.borrow(), 0, "no renegotiation");
-        assert_eq!(*engine.restart_calls.borrow(), 0, "no process restart");
-        assert_eq!(
-            streak, 0,
-            "the streak must not accumulate while the uplink is down, or a long \
-             outage would tear the tunnel down the moment it came back"
-        );
-
-        // The router finishes rebooting. The tunnel was never disturbed, so the
-        // line is simply well again -- which is exactly what should have
-        // happened at 3AM.
-        *engine.wan_down.borrow_mut() = false;
-        *engine.pcscf_reachable.borrow_mut() = true;
-        assert_eq!(
-            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
-            SteadyOutcome::StillUp
-        );
-    }
-
-    #[test]
-    fn the_wan_check_runs_only_after_the_cheap_route_repair() {
-        // Ordering matters: a missing route is repairable *and* looks identical
-        // to a dead uplink from the P-CSCF's point of view. Checking the WAN
-        // first would hold indefinitely on a fault we could have fixed outright.
-        let runner = MockCommandRunner::new();
-        let engine = FakeEngine {
-            pcscf_reachable: RefCell::new(false),
-            route_missing: RefCell::new(true),
-            wan_down: RefCell::new(true),
-            ..Default::default()
-        };
-        let mut streak = 0;
-        assert_eq!(
-            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
-            SteadyOutcome::Recovered {
-                reason: DegradeReason::DefaultRouteMissing
-            },
-            "a repairable route must be repaired even while the WAN is down"
-        );
-        assert!(!engine.call_order.borrow().contains(&"epdg_path_ok"));
-    }
-
-    #[test]
-    fn an_undeterminable_wan_does_not_disable_tunnel_recovery() {
-        // `epdg_path_ok` returns Ok(()) for anything ambiguous -- no `via` in
-        // `ip route get`, unreadable output, no `ping` binary. That must leave
-        // escalation exactly as it was, or a parse quirk silently turns off
-        // recovery for a genuinely broken tunnel.
-        let runner = MockCommandRunner::new();
-        let engine = FakeEngine {
-            pcscf_reachable: RefCell::new(false),
-            wan_down: RefCell::new(false),
-            ..Default::default()
-        };
-        let mut streak = 0;
-        let strikes = pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL);
-        let mut rebuilt = false;
-        for _ in 0..strikes {
-            if let SteadyOutcome::Recovered {
-                reason: DegradeReason::PcscfUnreachable,
-            } = tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak)
-            {
-                rebuilt = true;
-            }
-        }
-        assert!(rebuilt);
     }
 
     #[test]

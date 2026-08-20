@@ -1287,7 +1287,6 @@ fn start_vowifi_line_strongswan(
         netns: netns.clone(),
         tun_iface: tun_iface.clone(),
         if_id: if_id.clone(),
-        epdg_ip: epdg_ip.clone(),
         shared: Arc::clone(ctx.shared_charon),
     };
     {
@@ -1391,18 +1390,6 @@ fn start_vowifi_line_strongswan(
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
-            }
-            line_supervisor::SteadyOutcome::WanDown { next_hop } => {
-                drop(guard);
-                // Logged every tick rather than once per episode: this is an
-                // ongoing loss of service, and one line per poll is the record
-                // that says how long it lasted. The tunnel is deliberately left
-                // alone; the check simply runs again on the next poll.
-                println!(
-                    "[supervise] line {idx}: the P-CSCF is unreachable, but so is the next hop \
-                     toward the ePDG ({next_hop}) — this host has no uplink, so the tunnel is \
-                     not being touched; re-checking on the next poll"
-                );
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
@@ -1839,18 +1826,6 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
                 drop(guard);
-            }
-            line_supervisor::SteadyOutcome::WanDown { next_hop } => {
-                drop(guard);
-                // Logged every tick rather than once per episode: this is an
-                // ongoing loss of service, and one line per poll is the record
-                // that says how long it lasted. The tunnel is deliberately left
-                // alone; the check simply runs again on the next tick.
-                println!(
-                    "[supervise] line {idx}: the P-CSCF is unreachable, but so is the next hop \
-                     toward the ePDG ({next_hop}) — this host has no uplink, so the tunnel is \
-                     not being touched; re-checking on the next poll"
-                );
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);

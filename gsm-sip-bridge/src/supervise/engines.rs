@@ -302,10 +302,6 @@ pub struct StrongswanEngine {
     /// This line's XFRM `if_id`, needed to recreate the interface after
     /// `SteadyStateHealth::TunVanished` (see `recreate_interface`).
     pub if_id: String,
-    /// The ePDG this line dials, so the supervisor can ask whether the *host*
-    /// still has a path to the carrier before tearing anything down
-    /// (see `epdg_path_ok`).
-    pub epdg_ip: String,
     pub shared: Arc<SharedCharon>,
 }
 
@@ -453,10 +449,6 @@ impl TunnelEngine for StrongswanEngine {
 
     fn reinitiate_cadence(&self) -> Option<u32> {
         Some(super::line_supervisor::STRONGSWAN_REINITIATE_EVERY)
-    }
-
-    fn epdg_path_ok(&self, runner: &dyn CommandRunner) -> Result<(), String> {
-        super::epdg_iface::epdg_path_ok(runner, &self.epdg_ip)
     }
 
     fn repair_default_route(&self, runner: &dyn CommandRunner) -> bool {
@@ -644,13 +636,6 @@ impl TunnelEngine for SwuEngine {
         // exactly as it was for this engine.
         false
     }
-
-    fn epdg_path_ok(&self, _runner: &dyn CommandRunner) -> Result<(), String> {
-        // This engine does not know its peer address here — the dialer holds it.
-        // `Ok(())` is "cannot tell", which leaves swu's escalation exactly as it
-        // was rather than gating it on a check that cannot be made.
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -819,7 +804,6 @@ mod tests {
                 netns: "ims".to_string(),
                 tun_iface: "tun23".to_string(),
                 if_id: "23".to_string(),
-                epdg_ip: "198.51.100.7".to_string(),
                 shared: shared_charon(),
             }
         }

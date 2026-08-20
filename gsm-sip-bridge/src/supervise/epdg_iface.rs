@@ -134,74 +134,6 @@ pub fn reclaim_stale_xfrm(runner: &dyn CommandRunner, ours: &BTreeSet<u32>) {
     }
 }
 
-/// Idempotently ensures netns `netns` and its pre-created XFRM interface
-/// `tun_iface` (if_id `if_id`) exist, pinned per line since
-/// specs/013-multi-card-vowifi replicates this recipe once per line rather
-/// than sharing one namespace/interface across lines.
-/// Returns whether `tun_iface` is actually present in `netns` when this
-/// returns. Callers must report `false` rather than carrying on silently: the
-/// recovery loop's whole job is to recreate a missing interface, and a
-/// recreation that cannot succeed makes it spin forever.
-/// The gateway the host would send `dest` through, from `ip route get` output.
-///
-/// `None` when the destination is on-link (no `via`) or the output cannot be
-/// read — both meaning "no next hop to test", which callers must treat as
-/// "cannot tell" rather than "broken".
-///
-/// Pure over the output so the parse is testable against real `ip` text.
-pub fn next_hop_from_route_get(output: &str) -> Option<String> {
-    // `49.44.190.250 via 192.168.100.1 dev eth0 src 192.168.100.2 uid 0`
-    let mut tokens = output.split_whitespace();
-    while let Some(tok) = tokens.next() {
-        if tok == "via" {
-            return tokens.next().map(str::to_string);
-        }
-    }
-    None
-}
-
-/// Whether this host still has a usable path toward the ePDG.
-///
-/// Answers the question that has to be asked before tearing a tunnel down: is
-/// the carrier unreachable because *this tunnel* is broken, or because this box
-/// has no internet? On 2026-08-19 the answer was the latter — a scheduled router
-/// reboot — and tearing the tunnel down over it converted a two-minute blip into
-/// a six-hour outage.
-///
-/// The ePDG itself cannot be probed directly: measured against Jio's ePDG on
-/// 2026-08-19, it drops ICMP entirely (100% loss) while the tunnel is perfectly
-/// healthy, so pinging it would report "down" always and gate recovery off
-/// permanently. What *is* testable is the next hop the host would use to reach
-/// it, which is exactly what fails when the router reboots — and because the
-/// ePDG is reached through that hop, a dead hop guarantees a dead ePDG path.
-///
-/// Returns `Err(next_hop)` only on positive evidence of a dead uplink: a next
-/// hop was identified and did not answer. Anything ambiguous — no `via`, an
-/// unreadable `ip route get`, a missing `ping` — returns `Ok(())`, because
-/// failing to determine WAN health must not silently disable tunnel recovery.
-pub fn epdg_path_ok(runner: &dyn CommandRunner, epdg_ip: &str) -> Result<(), String> {
-    let Some(out) = runner.run(&["ip", "route", "get", epdg_ip]).ok() else {
-        return Ok(());
-    };
-    if !out.status.success() {
-        return Ok(());
-    }
-    let Some(next_hop) = next_hop_from_route_get(&String::from_utf8_lossy(&out.stdout)) else {
-        return Ok(());
-    };
-    // One echo request, two-second deadline: this runs per line per tick and the
-    // hop is on the local segment, so a healthy answer is sub-millisecond.
-    let answered = runner
-        .run(&["ping", "-c", "1", "-W", "2", &next_hop])
-        .map(|o| o.status.success())
-        .unwrap_or(true); // `ping` missing or unrunnable is "cannot tell".
-    if answered {
-        Ok(())
-    } else {
-        Err(next_hop)
-    }
-}
-
 /// Whether this line's netns has a default route through its tunnel.
 ///
 /// Worth asking on its own, because a line can have a perfectly healthy
@@ -254,6 +186,14 @@ pub fn ensure_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: 
     has_default_route(runner, netns, tun_iface)
 }
 
+/// Idempotently ensures netns `netns` and its pre-created XFRM interface
+/// `tun_iface` (if_id `if_id`) exist, pinned per line since
+/// specs/013-multi-card-vowifi replicates this recipe once per line rather
+/// than sharing one namespace/interface across lines.
+/// Returns whether `tun_iface` is actually present in `netns` when this
+/// returns. Callers must report `false` rather than carrying on silently: the
+/// recovery loop's whole job is to recreate a missing interface, and a
+/// recreation that cannot succeed makes it spin forever.
 pub fn ensure_epdg_interface(
     runner: &dyn CommandRunner,
     netns: &str,
@@ -381,63 +321,6 @@ mod tests {
     // exercise the "absent" branch; success (the default) reads as "exists".
     fn seed_absent(runner: &MockCommandRunner, key: &str) {
         runner.set_run_output(key, failure_output());
-    }
-
-    #[test]
-    fn next_hop_is_read_from_real_ip_route_get_output() {
-        // Real shape from the affected Pi, where the ePDG is reached via the
-        // router that reboots at 3AM.
-        assert_eq!(
-            next_hop_from_route_get(
-                "49.44.190.250 via 192.168.100.1 dev eth0 src 192.168.100.2 uid 0 \n    cache \n"
-            ),
-            Some("192.168.100.1".to_string())
-        );
-    }
-
-    #[test]
-    fn an_on_link_destination_has_no_next_hop_to_test() {
-        // No `via`: the destination is on the local segment. That is "cannot
-        // tell", not "the uplink is down" -- returning a hop here would gate the
-        // teardown on a probe of the ePDG itself, which (measured against Jio)
-        // drops ICMP entirely even when the tunnel is perfectly healthy.
-        assert_eq!(
-            next_hop_from_route_get("10.125.208.240 dev wwan0 src 10.125.208.241 uid 0\n"),
-            None
-        );
-        assert_eq!(next_hop_from_route_get(""), None);
-        assert_eq!(next_hop_from_route_get("via"), None, "truncated output");
-    }
-
-    #[test]
-    fn a_dead_next_hop_is_the_only_thing_reported_as_a_wan_outage() {
-        // Positive evidence only. `ping` failing is a WAN outage; anything the
-        // check cannot determine must read as healthy, because failing to
-        // establish WAN health must never disable tunnel recovery.
-        let runner = MockCommandRunner::new();
-        runner.set_run_output(
-            "ip route get 198.51.100.7",
-            success_output("198.51.100.7 via 192.168.100.1 dev eth0 src 192.168.100.2 uid 0\n"),
-        );
-        runner.set_run_output("ping -c 1 -W 2 192.168.100.1", failure_output());
-        assert_eq!(
-            epdg_path_ok(&runner, "198.51.100.7"),
-            Err("192.168.100.1".to_string())
-        );
-
-        // Hop answers: the uplink is fine, so an unreachable P-CSCF really is
-        // the tunnel's problem.
-        let runner = MockCommandRunner::new();
-        runner.set_run_output(
-            "ip route get 198.51.100.7",
-            success_output("198.51.100.7 via 192.168.100.1 dev eth0 src 192.168.100.2 uid 0\n"),
-        );
-        assert_eq!(epdg_path_ok(&runner, "198.51.100.7"), Ok(()));
-
-        // Route lookup itself fails: cannot tell.
-        let runner = MockCommandRunner::new();
-        runner.set_run_output("ip route get 198.51.100.7", failure_output());
-        assert_eq!(epdg_path_ok(&runner, "198.51.100.7"), Ok(()));
     }
 
     fn ids(v: &[u32]) -> BTreeSet<u32> {
