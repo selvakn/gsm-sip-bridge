@@ -10,6 +10,19 @@ across releases.
 
 ### Fixed
 
+- **A graceful container stop left every line's tunnel `if_id` claimed,
+  costing the next restart ~2.5 minutes of silence per line.** Stop used to
+  only signal every child process and remove each line's namespace *name* —
+  never destroy the tunnel interface, which is the only thing that actually
+  releases the XFRM `if_id` it claims. The next start would then find that
+  id still held by a leftover device inside an unaddressable namespace, and
+  wait on the kernel to reap it. Stop now waits for every child, terminates
+  each line's IKE_SA, flushes this deployment's own XFRM state, and deletes
+  each line's tunnel interface and veth pair before its namespace; a
+  force-killed run's leftovers are reclaimed on the next start via a
+  namespace directory now shared with the host. VoLTE lines' veth pairs,
+  never deleted either, get the same cleanup.
+
 - **The container's DNS resolver was replaced by the carrier's whenever an
   ePDG tunnel came up.** strongSwan's `resolve` plugin was writing the
   assigned IMS DNS servers into `/etc/resolv.conf`, *replacing* the resolvers

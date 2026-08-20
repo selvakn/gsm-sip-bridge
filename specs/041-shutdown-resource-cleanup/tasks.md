@@ -116,13 +116,13 @@ was skipped and what could not be released.
 > Ordered before US2 deliberately: US2's reclamation reuses `TeardownOutcome` for its own
 > failure reporting (FR-012), and the budget protects the slice that already shipped.
 
-- [ ] T021 [US3] Add `TeardownOutcome` to `shutdown.rs` — per-step result, resources not released, steps abandoned — and return it from `execute_shutdown_plan` instead of discarding every result. Best-effort execution is unchanged: a failed step never stops the rest.
-- [ ] T022 [US3] Render the report at the call site in `orchestrate.rs:892`, using the exact markers in contracts C2. Per FR-020 this is the whole escalation: no critical alert, no change to the exit code.
-- [ ] T023 [US3] Add `TeardownBudget` (deadline + reserve) and the abandonable/release partition per data-model.md. The budget lives in the executor; the partition is a property of the plan, so O-10 is assertable without a clock.
-- [ ] T024 [US3] Implement the fallback: before each abandonable step, if `now + reserve >= deadline`, skip the remaining abandonable steps, go straight to the release steps, and record why (FR-019).
-- [ ] T025 [US3] Add tests: O-10 (dropping every abandonable step still releases every device and namespace); the fallback fires on an exhausted budget and skips waits rather than deletes; the outcome reports abandoned steps distinctly from failed ones.
-- [ ] T026 [P] [US3] Update the `could not create <tun> (xfrm if_id <id>)` message in `epdg_iface.rs:250-269`: keep the wording, drop the "it clears itself, waiting is the whole remedy" advice, which stops being true (contracts C2).
-- [ ] T027 [US3] Rewrite the "a line re-establishes its tunnel every ~30 seconds" section of `docs/operations.md:296-395` (FR-017): what stop now does, what an operator should see, what to check when a resource is reported unreleasable, and the corrected note that `if_id` refusal is still normal while the deployment is *running*.
+- [x] T021 [US3] Add `TeardownOutcome` to `shutdown.rs` — per-step result, resources not released, steps abandoned — and return it from `execute_shutdown_plan` instead of discarding every result. Best-effort execution is unchanged: a failed step never stops the rest.
+- [x] T022 [US3] Render the report at the call site in `orchestrate.rs:892`, using the exact markers in contracts C2. Per FR-020 this is the whole escalation: no critical alert, no change to the exit code.
+- [x] T023 [US3] Add `TeardownBudget` (deadline + reserve) and the abandonable/release partition per data-model.md. The budget lives in the executor; the partition is a property of the plan, so O-10 is assertable without a clock.
+- [x] T024 [US3] Implement the fallback: before each abandonable step, if `now + reserve >= deadline`, skip the remaining abandonable steps, go straight to the release steps, and record why (FR-019).
+- [x] T025 [US3] Add tests: O-10 (dropping every abandonable step still releases every device and namespace); the fallback fires on an exhausted budget and skips waits rather than deletes; the outcome reports abandoned steps distinctly from failed ones.
+- [x] T026 [P] [US3] Update the `could not create <tun> (xfrm if_id <id>)` message in `epdg_iface.rs:250-269`: keep the wording, drop the "it clears itself, waiting is the whole remedy" advice, which stops being true (contracts C2).
+- [x] T027 [US3] Rewrite the "a line re-establishes its tunnel every ~30 seconds" section of `docs/operations.md:296-395` (FR-017): what stop now does, what an operator should see, what to check when a resource is reported unreleasable, and the corrected note that `if_id` refusal is still normal while the deployment is *running*.
 
 **Checkpoint**: live-verify SC-009 and SC-010 per quickstart Phase C, including the fault
 injection.
@@ -140,10 +140,10 @@ within 30s of the SC-000 baseline and nothing from the killed run remains.
 **Blocked on T005** — if propagation cannot be made to work, this phase is dropped and
 only SC-007 is lost (plan.md, Delivery slices).
 
-- [ ] T028 [US2] Add the `- /var/run/netns:/var/run/netns:rshared` bind mount to the bridge service in `docker/docker-compose.yml` (and the cellular-internet compose if applicable), with a comment recording what it buys and the single-instance constraint (research.md R7).
-- [ ] T029 [US2] Add `reclaim_previous_run` to `gsm-sip-bridge/src/supervise/epdg_iface.rs`: enumerate host namespaces matching `ims<N>` / `volte<N>`, skip any this run created, and release each through the **same** step builder used at stop (FR-008, FR-014).
-- [ ] T030 [US2] Call it once from `orchestrate.rs` before any line setup, alongside the existing `reclaim_stale_xfrm`, and report its outcome with the C2 markers.
-- [ ] T031 [US2] Add tests: a clean host emits no steps and adds no latency (FR/SC-008); a namespace this run created is left alone (FR-016); foreign XFRM state is still left untouched with the existing message (FR-015); a leftover namespace yields exactly the stop-path steps for that line.
+- [x] T028 [US2] Add the `- /var/run/netns:/var/run/netns:rshared` bind mount to the bridge service in `docker/docker-compose.yml` (and the cellular-internet compose if applicable), with a comment recording what it buys and the single-instance constraint (research.md R7).
+- [x] T029 [US2] Add `reclaim_previous_run` to `gsm-sip-bridge/src/supervise/epdg_iface.rs`: enumerate host namespaces matching `ims<N>` / `volte<N>`, skip any this run created, and release each through the **same** step builder used at stop (FR-008, FR-014).
+- [x] T030 [US2] Call it once from `orchestrate.rs` before any line setup, alongside the existing `reclaim_stale_xfrm`, and report its outcome with the C2 markers.
+- [x] T031 [US2] Add tests: a clean host emits no steps and adds no latency (FR/SC-008); a namespace this run created is left alone (FR-016); foreign XFRM state is still left untouched with the existing message (FR-015); a leftover namespace yields exactly the stop-path steps for that line.
 
 **Checkpoint**: live-verify SC-007 per quickstart Phase C.
 
@@ -151,8 +151,8 @@ only SC-007 is lost (plan.md, Delivery slices).
 
 ## Phase 6: Polish & cross-cutting
 
-- [ ] T032 [P] Add a `RELEASE_NOTES.md` entry at the house length (see the 039 entry, trimmed in commit b90c647 for exactly this reason).
-- [ ] T033 [P] Add a `CHANGELOG.md` entry.
+- [x] T032 [P] Add a `RELEASE_NOTES.md` entry at the house length (see the 039 entry, trimmed in commit b90c647 for exactly this reason).
+- [x] T033 [P] Add a `CHANGELOG.md` entry.
 - [ ] T034 Re-run the full quickstart Phase C table end to end on the live host and record the results against SC-000…SC-010, including the before/after comparison from T002. This is the feature's acceptance evidence, not the test suite.
 - [ ] T035 Update `specs/041-shutdown-resource-cleanup/research.md` R2 with the final measured conclusion, so the next person reading `docs/operations.md` finds the evidence rather than the superseded claim.
 

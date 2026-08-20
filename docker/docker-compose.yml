@@ -67,6 +67,19 @@ services:
       # it; same file `cargo run -- --config config.toml` uses locally).
       # Override with CONFIG_HOST_PATH for an alternate config.
       - "${CONFIG_HOST_PATH:-../config.toml}:/etc/gsm-sip-bridge/config.toml:ro"
+      # specs/041-shutdown-resource-cleanup US2/FR-013: `ip netns add` binds
+      # a line's namespace into THIS container's own mount namespace by
+      # default, so it disappears with the container if that container is
+      # force-killed rather than stopped — leaving the next run (or an
+      # operator) with no name to address it by at all. Sharing this
+      # directory with the host, propagation `rshared`, keeps every
+      # namespace this or any prior run created visible and removable with
+      # plain `ip netns` on the host, and is what lets startup reclaim a
+      # killed run's leftovers instead of waiting on the kernel (research.md
+      # R6). NOT load-bearing for the graceful-stop path above — only for
+      # recovering from an *ungraceful* one; if this mount cannot be made
+      # to propagate on a given host, only that recovery path is lost.
+      - /var/run/netns:/var/run/netns:rshared
       - /dev:/dev
       - /sys:/sys:ro
     env_file:

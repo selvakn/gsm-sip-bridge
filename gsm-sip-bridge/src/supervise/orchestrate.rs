@@ -276,6 +276,31 @@ fn start_vowifi_subsystem(
         vowifi_lines.iter().map(|l| l.strongswan_if_id).collect();
     epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
 
+    // specs/041-shutdown-resource-cleanup US2/FR-014: a run that was
+    // force-killed (rather than stopped) never got to run the steps above —
+    // its namespace, tunnel interface and veth end can all still be sitting
+    // on the host. Reclaim them too, using each line's own resolved names
+    // (a name this run's own line table could also produce is, by
+    // construction, ours — research.md R7), before this run creates
+    // anything of its own. Requires the per-line namespace directory to be
+    // visible from the host (docker-compose.yml's /var/run/netns bind
+    // mount, research.md R6); on a host without it this is a silent no-op,
+    // same as finding nothing to reclaim.
+    // Only the strongswan engine ever creates an XFRM tun device; a leftover
+    // swu-engine namespace has nothing of that kind to delete (its tunnel is
+    // a plain TUN torn down with its dialer process, not a device with a
+    // claimable if_id — the defect this whole feature exists for).
+    let is_strongswan = config.vowifi.tunnel_engine == "strongswan";
+    let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = vowifi_lines
+        .iter()
+        .map(|l| epdg_iface::ReclaimCandidate {
+            netns: l.netns.clone(),
+            tun_iface: is_strongswan.then(|| l.strongswan_tun_iface.clone()),
+            veth_host: Some(l.config.veth_sip_iface.clone()),
+        })
+        .collect();
+    epdg_iface::reclaim_leftover_lines(runner.as_ref(), &reclaim_candidates);
+
     // Render the shared charon's assets once, before any line starts.
     // Every line then drops its own connection file into the shared
     // conf.d and loads the union.

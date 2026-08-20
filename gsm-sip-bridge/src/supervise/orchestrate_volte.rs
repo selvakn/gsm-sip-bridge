@@ -6,6 +6,7 @@
 //! covered by the same `cargo test --workspace` gate, but flagging that this
 //! specific path's live-validation is still outstanding.
 
+use super::epdg_iface;
 use super::runner::{ChildSpec, CommandRunner};
 use super::shutdown::{LegacyVolteRegistration, StartedState, StartedVolteLine};
 use crate::config::AppConfig;
@@ -82,6 +83,40 @@ fn start_multiline(
         );
         return;
     }
+
+    // specs/041-shutdown-resource-cleanup US2/FR-014: mirrors the VoWiFi
+    // reclamation in orchestrate::run — a force-killed previous run's
+    // namespace/veth can still be on the host. Run before this loop creates
+    // anything of its own, using each discovered line's own namespace/veth
+    // names (a name this run's own discovery could also produce is, by
+    // construction, ours — research.md R7). No XFRM/if_id concept here, so
+    // (unlike the VoWiFi call) there is no separate flush step to pair it
+    // with.
+    let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = manifest
+        .lines
+        .iter()
+        .map(|l| {
+            let veth_host = if l.veth_carrier_addr.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{}{}",
+                    config.volte.veth_telephony_iface,
+                    if l.index == 0 {
+                        String::new()
+                    } else {
+                        l.index.to_string()
+                    }
+                ))
+            };
+            epdg_iface::ReclaimCandidate {
+                netns: l.netns.clone(),
+                tun_iface: None,
+                veth_host,
+            }
+        })
+        .collect();
+    epdg_iface::reclaim_leftover_lines(runner.as_ref(), &reclaim_candidates);
 
     for line in &manifest.lines {
         let runner = Arc::clone(&runner);
