@@ -150,16 +150,25 @@ pub fn start_pcscd_with_retries(
         if !needs_vpcd {
             return Ok(handle);
         }
-        match wait_for_vpcd_ready(runner, &handle, vpcd_host, vpcd_port) {
-            ReadyOutcome::Ready => return Ok(handle),
-            outcome if attempt < PCSCD_STARTUP_ATTEMPTS => {
-                println!(
-                    "[supervise] vpcd reader not ready (attempt {attempt}/{PCSCD_STARTUP_ATTEMPTS}, {outcome:?}); retrying in {PCSCD_RESTART_DELAY:?}"
-                );
-                runner.reap(&handle);
-                runner.sleep(PCSCD_RESTART_DELAY);
-            }
-            outcome => return Err(StartPcscdError::NotReady(outcome)),
+        let outcome = wait_for_vpcd_ready(runner, &handle, vpcd_host, vpcd_port);
+        if outcome == ReadyOutcome::Ready {
+            return Ok(handle);
+        }
+        // Reaped on every failure, not just a retried one: the caller's own
+        // FATAL exit on the final attempt runs no shutdown/teardown plan at
+        // all (`orchestrate::run` returns `ExitCode::FAILURE` straight from
+        // this call), so a `TimedOut`/`DriverBindFailed` handle left
+        // unreaped here would still be alive and holding the port when the
+        // container exits — recreating the exact race this function exists
+        // to avoid, for whatever tries to start next.
+        runner.reap(&handle);
+        if attempt < PCSCD_STARTUP_ATTEMPTS {
+            println!(
+                "[supervise] vpcd reader not ready (attempt {attempt}/{PCSCD_STARTUP_ATTEMPTS}, {outcome:?}); retrying in {PCSCD_RESTART_DELAY:?}"
+            );
+            runner.sleep(PCSCD_RESTART_DELAY);
+        } else {
+            return Err(StartPcscdError::NotReady(outcome));
         }
     }
     unreachable!("loop always returns by the final attempt")
@@ -168,7 +177,7 @@ pub fn start_pcscd_with_retries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::runner::MockCommandRunner;
+    use crate::supervise::runner::{MockCommandRunner, Signal};
 
     // MOCK JUSTIFICATION (constitution Principle I): stands in for real
     // pcscd/vpcd/a real TCP listener — none available in CI. The
@@ -300,5 +309,19 @@ mod tests {
             PCSCD_STARTUP_ATTEMPTS - 1,
             "no backoff sleep after the final, already-fatal attempt"
         );
+        // Every attempt's pcscd is reaped, including the last: this function
+        // is called right before a FATAL exit that runs no shutdown/teardown
+        // plan at all, so an unreaped final attempt would leave a real
+        // process alive and holding the port for whatever starts next
+        // (github.com/selvakn/gsm-sip-bridge/issues/53's own failure mode,
+        // reintroduced).
+        let children = runner.children.lock().unwrap();
+        assert_eq!(children.len() as u32, PCSCD_STARTUP_ATTEMPTS);
+        for child in children.values() {
+            assert!(
+                child.signals_received.contains(&Signal::Term),
+                "every attempt, including the final one, must be reaped"
+            );
+        }
     }
 }
