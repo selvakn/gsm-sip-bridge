@@ -17,6 +17,13 @@ const READY_POLL_ATTEMPTS: u32 = 20;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Matches the daemon-style `sleep 5` between a pcscd exit and its respawn.
 pub const PCSCD_RESTART_DELAY: Duration = Duration::from_secs(5);
+/// How many times `start_pcscd_with_retries` will (re)spawn pcscd and wait
+/// for the vpcd reader before giving up — bounds startup at
+/// `PCSCD_STARTUP_ATTEMPTS * (READY_POLL bound + PCSCD_RESTART_DELAY)`,
+/// roughly a minute, rather than either failing on the very first hiccup or
+/// hanging forever on a genuinely misconfigured port (github.com/selvakn/
+/// gsm-sip-bridge/issues/53).
+pub const PCSCD_STARTUP_ATTEMPTS: u32 = 4;
 
 const RENDER_CONF_PATH: &str = "/etc/reader.conf.d/vpcd";
 const PCSCD_LOG_PATH: &str = "/tmp/pcscd.log";
@@ -101,6 +108,63 @@ pub fn wait_for_vpcd_ready(
     ReadyOutcome::TimedOut
 }
 
+/// Why [`start_pcscd_with_retries`] gave up. Keeps "the process never even
+/// spawned" (unrelated to the retry loop below — matches the caller's
+/// pre-existing, distinct fatal message for that case) separate from "it
+/// spawned but the vpcd reader never became ready" (the readiness-gate
+/// outcome the retries apply to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartPcscdError {
+    SpawnFailed,
+    NotReady(ReadyOutcome),
+}
+
+/// Spawns pcscd and, if `needs_vpcd`, waits for its reader to become ready —
+/// retrying the whole spawn+wait cycle up to [`PCSCD_STARTUP_ATTEMPTS`] times
+/// rather than failing on the first attempt.
+///
+/// A force-killed container's old pcscd can still be holding
+/// `vpcd_host:vpcd_port` (a host-shared port under `network_mode: host`) for
+/// a brief window after `docker kill` returns — `docker kill` signals PID 1,
+/// but the rest of that PID namespace's teardown happens asynchronously, so
+/// the very next `docker start` can race it. A single `wait_for_vpcd_ready`
+/// call has no way to tell that transient case apart from a genuinely
+/// misconfigured port, so it used to fail FATAL on the first hiccup
+/// (github.com/selvakn/gsm-sip-bridge/issues/53). Between attempts the failed
+/// pcscd is reaped (not just signalled — see [`CommandRunner::reap`]'s own
+/// doc comment on why a bare signal leaks a tracked-children entry) so the
+/// next attempt isn't contending with it for the same port.
+///
+/// `!needs_vpcd` is untouched: no readiness gate applies, so the first spawn
+/// always succeeds immediately, same as before this function existed. A
+/// spawn failure (pcscd never starts at all) is never retried here — that is
+/// a different, already-fatal condition the caller already handles.
+pub fn start_pcscd_with_retries(
+    runner: &dyn CommandRunner,
+    needs_vpcd: bool,
+    vpcd_host: &str,
+    vpcd_port: u16,
+) -> Result<ChildHandle, StartPcscdError> {
+    for attempt in 1..=PCSCD_STARTUP_ATTEMPTS {
+        let handle = spawn_pcscd(runner).ok_or(StartPcscdError::SpawnFailed)?;
+        if !needs_vpcd {
+            return Ok(handle);
+        }
+        match wait_for_vpcd_ready(runner, &handle, vpcd_host, vpcd_port) {
+            ReadyOutcome::Ready => return Ok(handle),
+            outcome if attempt < PCSCD_STARTUP_ATTEMPTS => {
+                println!(
+                    "[supervise] vpcd reader not ready (attempt {attempt}/{PCSCD_STARTUP_ATTEMPTS}, {outcome:?}); retrying in {PCSCD_RESTART_DELAY:?}"
+                );
+                runner.reap(&handle);
+                runner.sleep(PCSCD_RESTART_DELAY);
+            }
+            outcome => return Err(StartPcscdError::NotReady(outcome)),
+        }
+    }
+    unreachable!("loop always returns by the final attempt")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +243,62 @@ mod tests {
         assert_eq!(
             runner.sleeps.lock().unwrap().len() as u32,
             READY_POLL_ATTEMPTS
+        );
+    }
+
+    // start_pcscd_with_retries: "fails once, succeeds on retry" is not
+    // exercised end-to-end here — every attempt spawns pcscd with the same
+    // argv, and MockCommandRunner has no way to make one spawn's readiness
+    // differ from the next spawn of the same argv. The pieces that behavior
+    // is built from (`wait_for_vpcd_ready`'s outcomes above, and `reap`'s own
+    // conformance-tested semantics) are already covered; what's left to test
+    // here is the loop's own contract: it retries the right number of times,
+    // respects `needs_vpcd`, and returns the right error when every attempt
+    // fails.
+
+    #[test]
+    fn ready_on_first_attempt_returns_immediately_with_no_retry() {
+        let runner = MockCommandRunner::new();
+        runner.set_tcp_connect_ok("127.0.0.1", 15963, true);
+        let result = start_pcscd_with_retries(&runner, true, "127.0.0.1", 15963);
+        assert!(result.is_ok());
+        assert_eq!(runner.spawn_specs.lock().unwrap().len(), 1);
+        assert!(runner.sleeps.lock().unwrap().is_empty(), "no retry needed");
+    }
+
+    #[test]
+    fn not_needing_vpcd_skips_the_readiness_gate_entirely() {
+        let runner = MockCommandRunner::new();
+        // Deliberately never seeded ready: if `needs_vpcd = false` consulted
+        // the gate at all, this would time out instead of returning Ok
+        // immediately.
+        let result = start_pcscd_with_retries(&runner, false, "127.0.0.1", 15963);
+        assert!(result.is_ok());
+        assert_eq!(runner.spawn_specs.lock().unwrap().len(), 1);
+        assert!(runner.sleeps.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exhausts_every_attempt_before_giving_up() {
+        let runner = MockCommandRunner::new();
+        // Every pcscd spawned this way is dead on arrival, so every attempt
+        // hits `ReadyOutcome::PcscdDied` — the loop's own retry/backoff
+        // machinery is what's under test, not any one outcome variant.
+        runner.set_born_dead_if_argv_contains("pcscd");
+        let result = start_pcscd_with_retries(&runner, true, "127.0.0.1", 15963);
+        assert_eq!(
+            result,
+            Err(StartPcscdError::NotReady(ReadyOutcome::PcscdDied))
+        );
+        assert_eq!(
+            runner.spawn_specs.lock().unwrap().len() as u32,
+            PCSCD_STARTUP_ATTEMPTS,
+            "one spawn per attempt"
+        );
+        assert_eq!(
+            runner.sleeps.lock().unwrap().len() as u32,
+            PCSCD_STARTUP_ATTEMPTS - 1,
+            "no backoff sleep after the final, already-fatal attempt"
         );
     }
 }

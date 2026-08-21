@@ -211,63 +211,8 @@ fn start_vowifi_subsystem(
     }
     let _ = runner.run(&["ip", "netns", "del", "__probe"]);
 
-    if config.vowifi.tunnel_engine == "strongswan" {
-        // pcscd is shared by both kinds of line: a modem-backed line
-        // reaches its SIM through the vpcd *virtual* reader that
-        // `vowifi-usim-bridge` drives, while a `pcsc_reader` line
-        // (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader
-        // pcscd picks up straight from USB. Only the former needs
-        // vpcd, so an all-pcsc deployment must not be held hostage to
-        // a virtual reader nothing will ever connect to — provisioning
-        // it anyway made a free-standing card-reader deployment die on
-        // an unrelated vpcd port bind, and left eap-sim-pcsc iterating
-        // over empty vpcd slots ("SCardConnect: No smart card
-        // inserted") before reaching the real one.
-        let needs_vpcd = needs_vpcd_reader(vowifi_lines);
-        if needs_vpcd {
-            vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
-        }
-        let Some(pcscd_handle) = vpcd::spawn_pcscd(runner.as_ref()) else {
-            return Err("failed to start pcscd".to_string());
-        };
-        let pcscd_handle = Arc::new(pcscd_handle);
-        started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
-
-        if needs_vpcd {
-            println!(
-                "[supervise] started shared pcscd; one vpcd reader, slots from {}",
-                config.vowifi.vpcd_port
-            );
-            match vpcd::wait_for_vpcd_ready(
-                runner.as_ref(),
-                &pcscd_handle,
-                &config.vowifi.vpcd_host,
-                config.vowifi.vpcd_port,
-            ) {
-                vpcd::ReadyOutcome::Ready => println!(
-                    "[supervise] vpcd reader ready on {}:{}",
-                    config.vowifi.vpcd_host, config.vowifi.vpcd_port
-                ),
-                other => {
-                    return Err(format!(
-                        "pcscd's vpcd reader never came up on {}:{} ({other:?}). \
-                         If pcscd logged 'Address in use', another process holds that port — pick a \
-                         [vowifi].vpcd_port below the ephemeral range.",
-                        config.vowifi.vpcd_host, config.vowifi.vpcd_port
-                    ));
-                }
-            }
-        } else {
-            println!(
-                "[supervise] started shared pcscd; no vpcd reader \
-                 (all {} line(s) are card-reader-backed)",
-                vowifi_lines.len()
-            );
-        }
-    }
-
-    // Before anything creates an interface or starts charon: clear
-    // XFRM state left by a previous run of this container. It outlives
+    // Before anything creates an interface, starts charon or starts pcscd:
+    // clear XFRM state left by a previous run of this container. It outlives
     // the container and keeps these lines' if_ids claimed, which makes
     // their tunnel interfaces impossible to create — the line then
     // re-establishes its tunnel every steady-state tick, forever.
@@ -290,6 +235,18 @@ fn start_vowifi_subsystem(
     // swu-engine namespace has nothing of that kind to delete (its tunnel is
     // a plain TUN torn down with its dialer process, not a device with a
     // claimable if_id — the defect this whole feature exists for).
+    //
+    // Deliberately runs before pcscd/vpcd startup below, not after (specs/041
+    // follow-up, github.com/selvakn/gsm-sip-bridge/issues/53): a force-killed
+    // restart can leave pcscd's own port transiently unbindable, and pcscd
+    // startup used to be the very first thing this function did, so that one
+    // FATAL exit meant a force-killed run's leftovers never got reclaimed
+    // either — defeating the point of the reclamation this feature exists
+    // for on exactly the case it was built for. Reclaiming first means that
+    // even if pcscd still fails after its own retries below, this run's
+    // namespace/interface leftovers are already clean for whatever tries
+    // next (Docker's own restart policy, or a person re-running `docker
+    // start`).
     let is_strongswan = config.vowifi.tunnel_engine == "strongswan";
     let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = vowifi_lines
         .iter()
@@ -308,6 +265,69 @@ fn start_vowifi_subsystem(
         &reclaim_candidates,
         epdg_iface::reclaim_leftover_enabled(),
     );
+
+    if config.vowifi.tunnel_engine == "strongswan" {
+        // pcscd is shared by both kinds of line: a modem-backed line
+        // reaches its SIM through the vpcd *virtual* reader that
+        // `vowifi-usim-bridge` drives, while a `pcsc_reader` line
+        // (specs/023-omnikey-pcsc-vowifi) uses a real CCID reader
+        // pcscd picks up straight from USB. Only the former needs
+        // vpcd, so an all-pcsc deployment must not be held hostage to
+        // a virtual reader nothing will ever connect to — provisioning
+        // it anyway made a free-standing card-reader deployment die on
+        // an unrelated vpcd port bind, and left eap-sim-pcsc iterating
+        // over empty vpcd slots ("SCardConnect: No smart card
+        // inserted") before reaching the real one.
+        let needs_vpcd = needs_vpcd_reader(vowifi_lines);
+        if needs_vpcd {
+            vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
+            println!(
+                "[supervise] starting shared pcscd; one vpcd reader, slots from {}",
+                config.vowifi.vpcd_port
+            );
+        }
+        // Retries the whole spawn+ready cycle rather than failing on the
+        // first hiccup (github.com/selvakn/gsm-sip-bridge/issues/53): a
+        // force-killed container's old pcscd can still be holding this
+        // host-shared port (`network_mode: host`) for a brief window after
+        // `docker kill` returns, and a single attempt had no way to tell
+        // that transient race apart from a genuinely misconfigured port.
+        let pcscd_handle = match vpcd::start_pcscd_with_retries(
+            runner.as_ref(),
+            needs_vpcd,
+            &config.vowifi.vpcd_host,
+            config.vowifi.vpcd_port,
+        ) {
+            Ok(handle) => Arc::new(handle),
+            Err(vpcd::StartPcscdError::SpawnFailed) => {
+                return Err("failed to start pcscd".to_string());
+            }
+            Err(vpcd::StartPcscdError::NotReady(other)) => {
+                return Err(format!(
+                        "pcscd's vpcd reader never came up on {}:{} after {} attempt(s) ({other:?}). \
+                         If pcscd logged 'Address in use', another process holds that port — pick a \
+                         [vowifi].vpcd_port below the ephemeral range.",
+                        config.vowifi.vpcd_host,
+                        config.vowifi.vpcd_port,
+                        vpcd::PCSCD_STARTUP_ATTEMPTS
+                    ));
+            }
+        };
+        started.lock().unwrap().pcscd = Some(pcscd_handle.clone());
+
+        if needs_vpcd {
+            println!(
+                "[supervise] vpcd reader ready on {}:{}",
+                config.vowifi.vpcd_host, config.vowifi.vpcd_port
+            );
+        } else {
+            println!(
+                "[supervise] started shared pcscd; no vpcd reader \
+                 (all {} line(s) are card-reader-backed)",
+                vowifi_lines.len()
+            );
+        }
+    }
 
     // Render the shared charon's assets once, before any line starts.
     // Every line then drops its own connection file into the shared
