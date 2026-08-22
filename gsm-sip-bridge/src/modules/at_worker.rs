@@ -41,8 +41,14 @@ use std::time::{Duration, Instant};
 
 use super::at_commander::{AtResponse, ReadWrite};
 
-/// Cap on lines accumulated for one response. A modem emitting unsolicited
-/// output that never terminates must fail, not grow without limit (FR-006).
+/// Default cap on lines accumulated for one response. A modem emitting
+/// unsolicited output that never terminates must fail, not grow without limit
+/// (FR-006).
+///
+/// A *default*, not an absolute: it is sized for the request/response commands
+/// that make up almost all AT traffic, where anything past a handful of lines
+/// is a runaway. Bulk listings are the documented exception — see
+/// [`ResponseBudget`].
 const MAX_RESPONSE_LINES: usize = 256;
 /// Cap on unparsed bytes held for one response, for the same reason.
 const MAX_BUFFERED_BYTES: usize = 64 * 1024;
@@ -50,12 +56,44 @@ const MAX_BUFFERED_BYTES: usize = 64 * 1024;
 /// whole purpose is to answer "is this channel usable?" quickly.
 const RESYNC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What one command is allowed to spend before the channel is declared
+/// runaway: how many lines its response may accumulate, and how long the whole
+/// exchange may take.
+///
+/// # Why this is per-command rather than one global constant
+///
+/// The two bounds exist to catch a modem emitting output that never
+/// terminates. Sized for ordinary request/response traffic that is easy — no
+/// legitimate `AT+CSQ` runs to 256 lines or 5 seconds. But a handful of
+/// commands are *bulk listings* whose correct, healthy response is far larger
+/// than any plausible runaway, and `AT+CMGL="ALL"` is the one that bit: with
+/// 208 messages in modem storage it returned 461 lines / 46,717 bytes
+/// (measured on a live line, 2026-08-22), so every sweep aborted at line 256.
+///
+/// That failure is self-locking, which is what makes it worth a mechanism
+/// rather than a bigger constant: the SMS sweep can only delete messages it
+/// first managed to list, so once roughly 128 accumulate the listing always
+/// overflows, storage can never drain, and it grows until the network can no
+/// longer deliver to the card at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseBudget {
+    /// Lines the response may accumulate before it is treated as runaway.
+    pub max_lines: usize,
+    /// Wall-clock bound on the whole exchange. Note this bounds *wire time*
+    /// too, not just idleness: at 115200 8N1 a 46 KB response is already ~4s,
+    /// so a bulk listing needs headroom here even when the line is perfectly
+    /// healthy.
+    pub timeout: Duration,
+}
+
 /// One request to the worker. Each carries its own reply channel, so a caller
 /// that gives up simply drops the receiver and the worker discovers the
 /// abandonment when its send fails.
 pub(crate) enum Request {
     Command {
         cmd: String,
+        /// `None` means "the port's own defaults" — see [`ResponseBudget`].
+        budget: Option<ResponseBudget>,
         reply: mpsc::Sender<BridgeResult<AtResponse>>,
     },
     /// `Ok(None)` means the deadline passed with nothing buffered and nothing in
@@ -155,9 +193,29 @@ impl Session {
         }
     }
 
+    /// The bounds an ordinary command runs under: this port's configured read
+    /// timeout as the overall deadline, and the default line cap.
+    fn default_budget(&self) -> ResponseBudget {
+        ResponseBudget {
+            max_lines: MAX_RESPONSE_LINES,
+            timeout: self.timeout,
+        }
+    }
+
+    /// Write a command and collect its response under this port's default
+    /// bounds. See [`Session::send_command_within`] for a command that needs
+    /// its own.
+    pub(crate) fn send_command(&mut self, cmd: &str) -> BridgeResult<AtResponse> {
+        self.send_command_within(cmd, self.default_budget())
+    }
+
     /// Write a command and collect its response, bounded by an overall
     /// deadline rather than only a per-read one.
-    pub(crate) fn send_command(&mut self, cmd: &str) -> BridgeResult<AtResponse> {
+    pub(crate) fn send_command_within(
+        &mut self,
+        cmd: &str,
+        budget: ResponseBudget,
+    ) -> BridgeResult<AtResponse> {
         // Only after a give-up: anything in flight then is the abandoned
         // command's answer, and mistaking it for this command's is what turns
         // one timeout into a permanently off-by-one channel. On the healthy
@@ -183,7 +241,7 @@ impl Session {
         // precisely the wrong thing to do.
         tracing::trace!(target: "at", cmd = cmd, "sent");
 
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + budget.timeout;
         let mut lines = Vec::new();
         loop {
             while let Some(line) = self.take_line() {
@@ -199,13 +257,14 @@ impl Session {
                     let code = cme.parse::<u32>().unwrap_or(0);
                     return Ok(AtResponse::CmeError(code, cme.into()));
                 }
-                if lines.len() >= MAX_RESPONSE_LINES {
+                if lines.len() >= budget.max_lines {
                     // Abandoning a response mid-stream leaves the rest of it
                     // arriving behind us, so the channel must be treated as
                     // desynchronised exactly as a timeout is.
                     self.desynced = true;
                     return Err(BridgeError::Discovery(format!(
-                        "AT response exceeded {MAX_RESPONSE_LINES} lines without terminating"
+                        "AT response exceeded {} lines without terminating",
+                        budget.max_lines
                     )));
                 }
                 lines.push(line);
@@ -306,8 +365,11 @@ impl Session {
 pub(crate) fn run(mut session: Session, rx: mpsc::Receiver<Request>) {
     while let Ok(req) = rx.recv() {
         match req {
-            Request::Command { cmd, reply } => {
-                let result = session.send_command(&cmd);
+            Request::Command { cmd, budget, reply } => {
+                let result = match budget {
+                    Some(budget) => session.send_command_within(&cmd, budget),
+                    None => session.send_command(&cmd),
+                };
                 // A failed send means the caller timed out and went away. The
                 // reply is now stale, and the *next* command must not see it —
                 // which `discard_pending` guarantees on the way in.
@@ -455,6 +517,81 @@ mod tests {
         modem.write_all(flood.as_bytes()).expect("flood");
         let err = s.send_command("AT").unwrap_err();
         assert!(err.to_string().contains("without terminating"), "{err}");
+    }
+
+    #[test]
+    fn a_bulk_listing_larger_than_the_default_cap_still_completes() {
+        // The 2026-08-22 regression, in miniature. `AT+CMGL="ALL"` over a full
+        // modem store legitimately returns hundreds of lines; under the default
+        // cap it aborted at 256 every time, and because the SMS sweep can only
+        // delete what it first managed to list, storage could never drain.
+        let (mut s, mut modem) = port(Duration::from_secs(2));
+        let messages = 255;
+        let mut listing = String::new();
+        for i in 0..messages {
+            listing.push_str(&format!(
+                "+CMGL: {i},\"REC READ\",\"+919000000000\",,\"26/08/22,09:07:48+22\"\r\n"
+            ));
+            listing.push_str("body line one\r\nbody line two\r\n");
+        }
+        listing.push_str("OK\r\n");
+        assert!(
+            listing.lines().count() > MAX_RESPONSE_LINES,
+            "the fixture must actually exceed the default cap"
+        );
+        modem.write_all(listing.as_bytes()).expect("listing");
+
+        let budget = crate::sms::reader::BULK_LIST_BUDGET;
+        match s
+            .send_command_within("AT+CMGL=\"ALL\"", budget)
+            .expect("a bulk listing within its own budget must succeed")
+        {
+            AtResponse::Ok(lines) => assert_eq!(
+                lines.len(),
+                messages * 3,
+                "every header and body line must survive"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !s.desynced,
+            "a listing that terminated normally must leave the channel healthy"
+        );
+    }
+
+    #[test]
+    fn a_bulk_budget_still_bounds_a_flood_that_never_terminates() {
+        // Raising the cap for listings must not remove the bound: a modem that
+        // never sends `OK` still has to fail rather than grow without limit
+        // (FR-006). Deliberately checks the *line* bound, with a budget whose
+        // deadline is generous enough that it cannot be what fires.
+        let (mut s, mut modem) = port(Duration::from_millis(200));
+        let budget = ResponseBudget {
+            max_lines: 300,
+            timeout: Duration::from_secs(10),
+        };
+        let flood: String = (0..budget.max_lines + 50)
+            .map(|i| format!("+JUNK: {i}\r\n"))
+            .collect();
+        modem.write_all(flood.as_bytes()).expect("flood");
+        let err = s
+            .send_command_within("AT+CMGL=\"ALL\"", budget)
+            .unwrap_err();
+        assert!(err.to_string().contains("300 lines"), "{err}");
+        assert!(s.desynced);
+    }
+
+    #[test]
+    fn a_bulk_budget_does_not_relax_the_default_for_other_commands() {
+        // The budget is per-command, not a mode the channel enters: an ordinary
+        // command issued after a listing must still be caught at 256.
+        let (mut s, mut modem) = port(Duration::from_secs(2));
+        let flood: String = (0..MAX_RESPONSE_LINES + 50)
+            .map(|i| format!("+JUNK: {i}\r\n"))
+            .collect();
+        modem.write_all(flood.as_bytes()).expect("flood");
+        let err = s.send_command("AT+CSQ").unwrap_err();
+        assert!(err.to_string().contains("256 lines"), "{err}");
     }
 
     #[test]

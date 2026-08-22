@@ -760,6 +760,41 @@ mod tests {
     }
 
     #[test]
+    fn the_listing_step_fits_inside_the_watchdogs_sweep_budget() {
+        // Phase 1a is the one step a pass cannot decline: `PassBudget::room_for`
+        // guards every *later* unit of work, but the lock, the open, `AT+CMGF`
+        // and `AT+CMGL` all run before there is anything to guard. So its worst
+        // case has to fit the watchdog's budget on its own, and `CMGL` now
+        // carries a much larger deadline of its own than the port default it
+        // used to inherit (`BULK_LIST_BUDGET`, added after a 208-message store
+        // made every listing abort at 256 lines). Derived from the real
+        // constants so raising any of them fails the build instead of arming a
+        // false restart on a healthy line.
+        let open_worst = OPEN_RETRY_BASE_DELAY * (1 + 2 + 3);
+        // Excludes `at_commander::WORKER_GRACE` on each round trip, as the
+        // sibling derivations here do; the margin asserted below covers it many
+        // times over.
+        let phase_1a_worst = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT
+            + open_worst
+            + crate::modules::at_commander::DEFAULT_TIMEOUT
+            + crate::sms::reader::BULK_LIST_BUDGET.timeout;
+        let watchdog = crate::ims::agent::watchdog::Phase::SmsSweep
+            .budget()
+            .expect("the sweep is working, not resting, so it must carry a budget");
+        assert!(
+            watchdog > phase_1a_worst,
+            "the listing step's worst case {phase_1a_worst:?} must fit the watchdog's \
+             {watchdog:?}, since a pass cannot abandon it part-way"
+        );
+        let margin = watchdog.as_secs_f64() / phase_1a_worst.as_secs_f64() - 1.0;
+        assert!(
+            margin >= 0.20,
+            "only {:.0}% headroom between the listing step and the watchdog's budget; want >=20%",
+            margin * 100.0
+        );
+    }
+
+    #[test]
     fn the_per_step_budgets_cover_their_worst_legitimate_case() {
         // Recomputed from the real constants, so raising any of them fails the
         // build rather than quietly letting a pass overrun again.

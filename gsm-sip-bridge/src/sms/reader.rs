@@ -1,5 +1,6 @@
 use crate::error::{BridgeError, BridgeResult};
-use crate::modules::at_commander::{AtCommander, AtResponse};
+use crate::modules::at_commander::{AtCommander, AtResponse, ResponseBudget};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct IncomingSms {
@@ -18,6 +19,32 @@ pub fn read_sms(at: &mut AtCommander, index: u32) -> BridgeResult<IncomingSms> {
     }
 }
 
+/// What `AT+CMGL="ALL"` is allowed to spend, in place of the port's ordinary
+/// per-command bounds.
+///
+/// Both defaults are wrong for this command, and both were observed to be
+/// wrong on a live line (2026-08-22, 208 messages in storage: 461 lines,
+/// 46,717 bytes):
+///
+/// * **Lines.** Text-mode `CMGL` emits a `+CMGL:` header plus at least one
+///   body line per message, and a long or UCS2-encoded body runs to several.
+///   Storage holds up to 255 messages, so budget for every one of them being
+///   multi-line rather than for the average.
+/// * **Time.** The default deadline bounds *wire time*, not just idleness. A
+///   full store is ~56 KB, which at 115200 8N1 is close to five seconds of
+///   transmission on a perfectly healthy line — already past
+///   `DEFAULT_TIMEOUT`. The headroom here is for the modem's own paging
+///   through storage on top of that.
+///
+/// Getting either one wrong is not a slow sweep but a permanently stuck one:
+/// the sweep deletes only what it first managed to list, so a listing that
+/// always aborts means storage only ever grows. See
+/// [`crate::modules::at_commander::ResponseBudget`].
+pub const BULK_LIST_BUDGET: ResponseBudget = ResponseBudget {
+    max_lines: 4096,
+    timeout: Duration::from_secs(30),
+};
+
 /// Lists the indexes of messages already sitting in the modem's storage.
 ///
 /// Needed at startup: texts that arrived while nothing was reading the modem
@@ -25,7 +52,7 @@ pub fn read_sms(at: &mut AtCommander, index: u32) -> BridgeResult<IncomingSms> {
 /// (specs/017-volte-inbound-bridge US5).
 pub fn list_sms_indexes(at: &mut AtCommander) -> BridgeResult<Vec<u32>> {
     // 4 = all messages, read and unread, in text mode.
-    match at.send_command("AT+CMGL=\"ALL\"")? {
+    match at.send_command_within("AT+CMGL=\"ALL\"", BULK_LIST_BUDGET)? {
         AtResponse::Ok(lines) => Ok(crate::volte::sms::parse_cmgl_indexes(&lines)),
         AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
             Err(BridgeError::Sms(format!("CMGL failed: {e}")))
