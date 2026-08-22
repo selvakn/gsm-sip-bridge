@@ -1,4 +1,7 @@
 use crate::error::{BridgeError, BridgeResult};
+// Re-exported so callers name the budget through the transport they already
+// use, rather than reaching into the worker module directly.
+pub use crate::modules::at_worker::ResponseBudget;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -304,18 +307,39 @@ impl AtCommander {
     }
 
     pub fn send_command(&mut self, cmd: &str) -> BridgeResult<AtResponse> {
+        self.send(cmd, None)
+    }
+
+    /// Like [`AtCommander::send_command`], but for a command whose legitimate
+    /// response outgrows the port's default bounds — a bulk listing such as
+    /// `AT+CMGL="ALL"`. See [`ResponseBudget`] for why those bounds are
+    /// per-command, and `sms::reader::BULK_LIST_BUDGET` for the values.
+    pub fn send_command_within(
+        &mut self,
+        cmd: &str,
+        budget: ResponseBudget,
+    ) -> BridgeResult<AtResponse> {
+        self.send(cmd, Some(budget))
+    }
+
+    fn send(&mut self, cmd: &str, budget: Option<ResponseBudget>) -> BridgeResult<AtResponse> {
         record_last_at_command(cmd);
         match &mut self.transport {
-            Transport::Direct(session) => session.send_command(cmd),
+            Transport::Direct(session) => match budget {
+                Some(budget) => session.send_command_within(cmd, budget),
+                None => session.send_command(cmd),
+            },
             Transport::Worker { .. } => {
                 self.ensure_usable()?;
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 self.dispatch(
                     crate::modules::at_worker::Request::Command {
                         cmd: cmd.to_string(),
+                        budget,
                         reply: reply_tx,
                     },
                     reply_rx,
+                    budget,
                 )
             }
         }
@@ -341,6 +365,7 @@ impl AtCommander {
                 self.dispatch(
                     crate::modules::at_worker::Request::ReadLine { reply: reply_tx },
                     reply_rx,
+                    None,
                 )?
             }
         };
@@ -356,15 +381,20 @@ impl AtCommander {
     /// timeout: the worker applies that timeout internally, so under normal
     /// operation it always answers first and this outer bound only fires when
     /// the worker itself is stuck in a syscall that will not return.
+    ///
+    /// `budget` is the one the worker was handed, so the two deadlines stay in
+    /// step: a bulk listing that legitimately takes 30s must not be declared a
+    /// stuck worker after the port's ordinary 5s.
     fn dispatch<T>(
         &mut self,
         request: crate::modules::at_worker::Request,
         reply_rx: std::sync::mpsc::Receiver<BridgeResult<T>>,
+        budget: Option<ResponseBudget>,
     ) -> BridgeResult<T> {
         let Transport::Worker { tx, timeout, state } = &mut self.transport else {
             unreachable!("dispatch is only reached on the worker transport");
         };
-        let wait = *timeout + WORKER_GRACE;
+        let wait = budget.map_or(*timeout, |b| b.timeout) + WORKER_GRACE;
         let Some(tx) = tx.as_ref() else {
             *state = ChannelState::Dead;
             return Err(BridgeError::Discovery(
