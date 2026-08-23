@@ -47,12 +47,12 @@ use crate::ims::observability;
 use crate::ims::sdp;
 use crate::ims::session::{
     attempt_renewal, extract_caller, handle_notify, map_registration_error,
-    map_registration_status_code, next_backoff, start_inbound, subscribe_reg_event, to_unix,
-    Inbound,
+    map_registration_status_code, next_backoff, respond, start_inbound, subscribe_reg_event,
+    to_unix, Inbound,
 };
 use crate::ims::sip_client::{
-    build_200_ok_bye, build_200_ok_message, build_486_busy_here, build_uas_response, random_hex,
-    SipMessage, SipRequest, SipResponse, SipSink,
+    build_200_ok_bye, build_200_ok_message, build_486_busy_here, build_uas_response,
+    build_uas_response_with_headers, random_hex, SipMessage, SipRequest, SipResponse, SipSink,
 };
 use crate::ims::transport::{EpdgTransport, ImsTransport};
 use crate::ims::ImsRegisterConfig;
@@ -344,6 +344,70 @@ fn run_inner(
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
     })
+}
+
+/// Every method this UAS serves, and the exact `Allow` we state in a response.
+///
+/// One string for both so the claim and the behaviour cannot drift: each of
+/// these has an arm in [`dispatch_loop`], and anything absent from it is
+/// answered `405 Method Not Allowed` by [`unserved_method_response`] — which
+/// states this same list back, as RFC 3261 §21.4.6 requires.
+///
+/// Shorter than what a real UE sends, deliberately. `Allow` is how the network
+/// decides what it may send us, so listing `UPDATE`, `PRACK`, `INFO` and
+/// `REFER` — as this did while nothing answered them — invites mid-call
+/// requests we can only refuse. Growing the list is a matter of growing the
+/// UAS, in that order.
+const ALLOW: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, NOTIFY";
+
+/// Answers the carrier's `OPTIONS` — the keepalive a P-CSCF (and our own
+/// `ping`, in the other direction) uses to decide whether a UE is still there.
+/// Silence is indistinguishable from a UE that has gone away, and RFC 3261
+/// §11.2 wants the same `Allow` a 200 to an INVITE carries.
+fn options_response(req: &SipRequest, to_tag: &str) -> String {
+    build_uas_response_with_headers(
+        200,
+        "OK",
+        req,
+        Some(to_tag),
+        None,
+        None,
+        &[("Allow", ALLOW), ("Accept", "application/sdp")],
+    )
+}
+
+/// Answers a request this UAS does not serve.
+///
+/// Before this, anything outside [`ALLOW`] was logged and dropped. A request
+/// left unanswered is not "ignored" from the network's side — it retransmits
+/// on the RFC 3261 §17.2.1 timers and then draws its own conclusion about the
+/// endpoint, which is a worse outcome than a clear refusal and much harder to
+/// read in a capture.
+///
+/// A `CANCEL` is the exception, and gets `481` rather than `405`: the one that
+/// matters is answered inside `inbound::handle_invite`'s ring loop, so a
+/// `CANCEL` reaching here names a transaction that is already over or was
+/// never ours — the method is served, the transaction is gone (§9.2).
+fn unserved_method_response(req: &SipRequest, to_tag: &str) -> String {
+    if req.method == "CANCEL" {
+        return build_uas_response(
+            481,
+            "Call/Transaction Does Not Exist",
+            req,
+            Some(to_tag),
+            None,
+            None,
+        );
+    }
+    build_uas_response_with_headers(
+        405,
+        "Method Not Allowed",
+        req,
+        Some(to_tag),
+        None,
+        None,
+        &[("Allow", ALLOW)],
+    )
 }
 
 /// Everything the carrier-facing half needs that is not the transport itself.
@@ -1047,8 +1111,24 @@ fn dispatch_loop(
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
                 handle_message(&sink, &req, p.control_addr, p.dedupe);
             }
-            Ok((SipMessage::Request(req), _)) => {
-                tracing::info!(method = %req.method, "ignoring unsupported inbound request");
+            Ok((SipMessage::Request(req), sink)) if req.method == "OPTIONS" => {
+                tracing::debug!("received OPTIONS keepalive; answering 200 OK");
+                respond(
+                    &sink,
+                    "200 OK (OPTIONS)",
+                    &options_response(&req, &random_hex(4)),
+                );
+            }
+            Ok((SipMessage::Request(req), sink)) => {
+                tracing::info!(
+                    method = %req.method,
+                    "inbound request this UAS does not serve; refusing it explicitly"
+                );
+                respond(
+                    &sink,
+                    "response to an unserved method",
+                    &unserved_method_response(&req, &random_hex(4)),
+                );
             }
             Ok((SipMessage::Response(resp), _)) => {
                 st.handle_carrier_response(session, p, &resp);
@@ -1828,5 +1908,70 @@ mod tests {
         // attach at all — there is no legacy bearer to poll and no modem_port
         // to open.
         assert!(!wants_modem_sms_reader(true));
+    }
+
+    // ---- what this UAS serves, and what it refuses -------------------------
+
+    fn request(method: &str) -> SipRequest {
+        let raw = format!(
+            "{method} sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 3 {method}\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// The `Allow` we state and the methods the dispatch loop actually serves
+    /// are the same list, and it is the one place either is written down.
+    #[test]
+    fn allow_lists_exactly_what_the_dispatch_loop_serves() {
+        let served: Vec<&str> = ALLOW.split(", ").collect();
+        assert_eq!(
+            served,
+            vec!["INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "MESSAGE", "NOTIFY"],
+            "changing this means changing `dispatch_loop`'s arms to match"
+        );
+    }
+
+    /// A P-CSCF's keepalive must be answered, and answered with the same
+    /// capability list a session response carries — silence reads as a UE that
+    /// is no longer there.
+    #[test]
+    fn an_options_keepalive_is_answered_with_our_capabilities() {
+        let resp = options_response(&request("OPTIONS"), "totag1");
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(resp.contains(&format!("\r\nAllow: {ALLOW}\r\n")), "{resp}");
+        assert!(resp.contains("\r\nCSeq: 3 OPTIONS\r\n"), "{resp}");
+    }
+
+    /// A method we do not serve gets a refusal that names what we do serve
+    /// (RFC 3261 §21.4.6), not silence for the network to time out on.
+    #[test]
+    fn a_method_we_do_not_serve_is_refused_with_the_list_that_we_do() {
+        for method in ["UPDATE", "PRACK", "INFO", "REFER", "SUBSCRIBE"] {
+            let resp = unserved_method_response(&request(method), "totag1");
+            assert!(
+                resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+                "{method}: {resp}"
+            );
+            assert!(
+                resp.contains(&format!("\r\nAllow: {ALLOW}\r\n")),
+                "a 405 must state what is allowed — {method}: {resp}"
+            );
+        }
+    }
+
+    /// A `CANCEL` that reaches the dispatch loop is one whose INVITE is no
+    /// longer being rung — the transaction is gone, not the method unknown
+    /// (RFC 3261 §9.2). Answering `405` here would say we cannot cancel calls.
+    #[test]
+    fn a_stray_cancel_is_answered_481_not_405() {
+        let resp = unserved_method_response(&request("CANCEL"), "totag1");
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
     }
 }

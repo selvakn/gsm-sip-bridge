@@ -53,16 +53,21 @@ const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// and the carriers that tolerated its absence were being lenient, not
 /// asking for it.
 ///
-/// Known overstatement: the dispatch loop answers INVITE/BYE/ACK/NOTIFY/
-/// MESSAGE and silently ignores every other method, so this claims more than
-/// we serve. It is sent verbatim as measured — the working set was never
-/// bisected, and trimming it blind risks the fault it fixed. Making it honest
-/// means growing the UAS, not shrinking the header.
+/// `Allow` is [`super::ALLOW`], the single list of what this UAS actually
+/// serves — every method on it has a `dispatch_loop` arm, and everything else
+/// is refused `405` there. It was measured longer than that (`UPDATE`, `INFO`,
+/// `PRACK`, `REFER` too) while nothing answered those methods at all;
+/// advertising them only invited mid-call requests we could not serve.
+///
+/// `Supported` is unchanged from what was measured. Its entries are
+/// extensions, not methods, so nothing here refuses them: `100rel` governs
+/// provisional responses in a transaction this 2xx ends, `path` is a REGISTER
+/// mechanism, and `timer`'s refresh interval is negotiated by a
+/// `Session-Expires` we never send. Trimming it would change the one set of
+/// bytes a carrier is known to accept, for no behaviour we can point at —
+/// wait for a capture that asks.
 const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[
-    (
-        "Allow",
-        "INVITE, ACK, CANCEL, BYE, UPDATE, OPTIONS, INFO, PRACK, MESSAGE, REFER, NOTIFY",
-    ),
+    ("Allow", super::ALLOW),
     ("Supported", "timer, 100rel, replaces, path, gruu"),
 ];
 
