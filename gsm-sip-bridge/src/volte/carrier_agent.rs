@@ -224,6 +224,11 @@ pub(crate) fn run(
         // An inbound call is a real conversation; the whole point of this path
         // is that it sounds better than the modem-internal one.
         wideband: true,
+        // The one carrier this was measured on needs it over ePDG, where the
+        // Gm SAs are ours to install; the LTE path's are the modem's. No
+        // capture says an LTE line needs it, so it stays off here rather than
+        // being given a `[volte]` key nothing has asked for.
+        respond_on_client: false,
         answer_preference: sdp::AnswerPreference::cellular(),
         // Must equal the telephony line's `sip_leg_port`. They come from this
         // line's single derivation so they cannot drift apart.

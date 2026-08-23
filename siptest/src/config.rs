@@ -92,6 +92,14 @@ pub struct MediaConfig {
     pub recording_dir: PathBuf,
     #[serde(default = "default_true")]
     pub record: bool,
+    /// A 16-bit mono PCM WAV to transmit from the start of every call, in
+    /// place of the tone plan until it runs out (`media::wavfile`). Unset
+    /// keeps the tone plan alone, which is what every measurement here
+    /// assumes; a recording is for the human on the other end, not the
+    /// report. Validated when the daemon starts, so a bad path fails there
+    /// rather than in the middle of a call.
+    #[serde(default)]
+    pub play_file: Option<PathBuf>,
 }
 
 fn default_codec() -> String {
@@ -122,6 +130,7 @@ impl Default for MediaConfig {
             tone_plan: default_tone_plan(),
             recording_dir: default_recording_dir(),
             record: true,
+            play_file: None,
         }
     }
 }

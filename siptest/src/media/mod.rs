@@ -5,3 +5,4 @@ pub mod level;
 pub mod report;
 pub mod session;
 pub mod tone;
+pub mod wavfile;

@@ -380,6 +380,10 @@ section! {
         /// `ims::gm_ipsec::select_security_server`.
         pub gm_auth_alg: String,
         pub gm_cipher_alg: String,
+        /// Answer network-initiated requests over the client leg instead of
+        /// the socket they arrived on. See `VowifiConfig::respond_on_client`
+        /// for the measurement — leave it off unless a carrier needs it.
+        pub respond_on_client: bool,
         pub pcscf_source_path: String,
         pub control_port: u16,
         pub wideband: bool,
@@ -412,6 +416,7 @@ impl Default for RawVowifi {
             register_request_uri: "home-domain".to_string(),
             gm_auth_alg: String::new(),
             gm_cipher_alg: String::new(),
+            respond_on_client: false,
             pcscf_source_path: "/tmp/pcscf".to_string(),
             control_port: 7050,
             wideband: true,
