@@ -95,6 +95,35 @@ fn pick_rtp_port(min: u16, max: u16) -> u16 {
     min + (rand::random::<u16>() % (max - min))
 }
 
+/// The prerecorded audio for this call, resampled to the negotiated codec's
+/// rate (`[media].play_file`).
+///
+/// A read failure here is logged and the call proceeds on the tone plan: the
+/// file was already parsed once when the daemon started, so reaching this
+/// with a broken file means it changed underneath a running daemon, and
+/// dropping an outbound call to a real number over it would be the worse
+/// outcome.
+fn play_audio(
+    config: &crate::config::Config,
+    codec: crate::media::codec::CodecProfile,
+) -> Option<Arc<Vec<i16>>> {
+    let path = config.media.play_file.as_deref()?;
+    match crate::media::wavfile::load_for(path, codec.audio_hz) {
+        Ok(samples) => {
+            tracing::info!(
+                file = %path.display(),
+                seconds = samples.len() as f64 / codec.audio_hz as f64,
+                "transmitting prerecorded audio at the head of the call"
+            );
+            Some(Arc::new(samples))
+        }
+        Err(e) => {
+            tracing::error!(file = %path.display(), error = %e, "cannot play file; using the tone plan");
+            None
+        }
+    }
+}
+
 /// Places one outbound call end to end: the safety gate, the 302 dance,
 /// media, and BYE — everything US1's acceptance scenarios require. Runs
 /// synchronously on whichever thread calls it (the API layer wraps it in
@@ -265,6 +294,7 @@ pub fn execute_outbound_call(
         .then(|| recording_dir.join(format!("{}-received.wav", call_id.0)));
 
     let tone_enabled = state.config.media.tone_plan != "silence";
+    let play = play_audio(&state.config, codec);
     let stop = Arc::new(AtomicBool::new(false));
     let media_result = crate::media::session::run(
         crate::media::session::MediaSessionConfig {
@@ -275,6 +305,7 @@ pub fn execute_outbound_call(
             sent_wav_path: sent_wav_path.clone(),
             received_wav_path: received_wav_path.clone(),
             tone_enabled,
+            play: play.clone(),
         },
         stop,
     )?;
@@ -591,6 +622,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 .then(|| recording_dir.join(format!("{}-received.wav", call_id.0)));
 
             let tone_enabled = state.config.media.tone_plan != "silence";
+            let play = play_audio(&state.config, codec);
             let stop = Arc::new(AtomicBool::new(false));
             let media_result = crate::media::session::run(
                 crate::media::session::MediaSessionConfig {
@@ -601,6 +633,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                     sent_wav_path: sent_wav_path.clone(),
                     received_wav_path: received_wav_path.clone(),
                     tone_enabled,
+                    play: play.clone(),
                 },
                 stop,
             );

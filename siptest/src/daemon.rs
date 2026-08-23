@@ -34,6 +34,21 @@ pub fn run(config_path: &std::path::Path) -> std::process::ExitCode {
 }
 
 fn run_with_config(config: Config) -> SipTestResult<()> {
+    // Parsed here, at startup, so a missing or undecodable `[media].play_file`
+    // is a daemon that refuses to start — not a call to a real number that
+    // silently carries the tone plan instead of the message it was told to
+    // play. The samples themselves are re-read per call, once the codec (and
+    // so the rate to resample to) is known.
+    if let Some(path) = config.media.play_file.as_deref() {
+        let audio = crate::media::wavfile::read(path)?;
+        tracing::info!(
+            file = %path.display(),
+            sample_rate = audio.sample_rate,
+            seconds = audio.samples.len() as f64 / audio.sample_rate as f64,
+            "will transmit this recording at the head of every call"
+        );
+    }
+
     let registrar_addr = config.sip.registrar_addr()?;
     let local_ip = config.sip.local_ip.as_ref().and_then(|s| s.parse().ok());
     let sip_socket = Arc::new(SipSocket::bind(

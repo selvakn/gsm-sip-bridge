@@ -49,6 +49,7 @@ fn test_config() -> Config {
             tone_plan: "grid8".to_string(),
             recording_dir: std::env::temp_dir().join("siptest-inbound-test"),
             record: false,
+            play_file: None,
         },
         call: CallConfig {
             default_duration_secs: 1,

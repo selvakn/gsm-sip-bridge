@@ -16,7 +16,20 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let client = reqwest::blocking::Client::new();
+    // No client-side timeout. `POST /calls?wait=true` blocks for the whole
+    // call — ring time plus the call's duration — which is routinely longer
+    // than reqwest's 30s default, and that default turned a call that rang,
+    // was answered and completed into `error sending request` on the CLI
+    // while the daemon carried on regardless. The call is bounded by the
+    // daemon's own ring timeout and duration; the client has nothing better
+    // to bound it with.
+    let client = match reqwest::blocking::Client::builder().timeout(None).build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("could not build the HTTP client: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match command {
         Commands::Call {

@@ -34,15 +34,37 @@ const PTIME: Duration = Duration::from_millis(20);
 /// VoWiFi/VoLTE round trip, without growing unbounded over a long call.
 const TX_TIMELINE_CAP: usize = 64;
 
-/// The grid8 tone-plan signal (`media::tone`), or a placeholder silence when
-/// the tone plan is disabled — a pure function of `frame_index` alone; it
-/// must not read anything about what has been received.
-pub fn generate_frame(frame_index: u64, codec: &CodecProfile, tone_enabled: bool) -> Vec<i16> {
+/// What to transmit for one frame: prerecorded audio if `play` still has
+/// samples at this frame, else the grid8 tone-plan signal (`media::tone`), or
+/// silence when the tone plan is off.
+///
+/// Still a pure function of `frame_index` alone — `play` is read once before
+/// the call and never changes — which is the property that keeps `SendOnly`
+/// and `Neither` distinguishable (see this module's header). A short clip
+/// runs out mid-call and the tone plan resumes behind it, so a call that
+/// plays a message is still measurable for the rest of its duration.
+pub fn generate_frame(
+    frame_index: u64,
+    codec: &CodecProfile,
+    tone_enabled: bool,
+    play: Option<&[i16]>,
+) -> Vec<i16> {
     let n = codec.samples_per_frame;
+    let sample_index = frame_index * n as u64;
+
+    if let Some(samples) = play {
+        let start = sample_index as usize;
+        if start < samples.len() {
+            let end = (start + n).min(samples.len());
+            let mut frame = samples[start..end].to_vec();
+            frame.resize(n, 0);
+            return frame;
+        }
+    }
+
     if !tone_enabled {
         return vec![0i16; n];
     }
-    let sample_index = frame_index * n as u64;
     tone::generate(sample_index, n, codec.audio_hz)
 }
 
@@ -57,6 +79,10 @@ pub struct MediaSessionConfig {
     /// default keeps a call's audio content trivial for callers that only
     /// care about the packet-count verdict.
     pub tone_enabled: bool,
+    /// Prerecorded audio to transmit from the start of the call, already
+    /// resampled to `codec.audio_hz` (`[media].play_file`). The tone plan
+    /// resumes once it runs out.
+    pub play: Option<Arc<Vec<i16>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +151,7 @@ pub fn run(
         let sent_wav = sent_wav.clone();
         let tx_timeline = tx_timeline.clone();
         let tone_enabled = config.tone_enabled;
+        let play = config.play.clone();
         thread::spawn(move || {
             tx_loop(
                 socket,
@@ -135,6 +162,7 @@ pub fn run(
                 sent_wav,
                 tx_timeline,
                 tone_enabled,
+                play,
             )
         })
     };
@@ -227,6 +255,7 @@ fn tx_loop(
     sent_wav: Option<Arc<Mutex<WavWriter>>>,
     tx_timeline: Arc<Mutex<VecDeque<(usize, Instant)>>>,
     tone_enabled: bool,
+    play: Option<Arc<Vec<i16>>>,
 ) {
     let start = Instant::now();
     let mut seq: u16 = rand::random();
@@ -235,10 +264,18 @@ fn tx_loop(
     let mut last_symbol: Option<usize> = None;
     let mut coder = new_coder(codec);
 
-    while !stop.load(Ordering::Relaxed) {
-        let samples = generate_frame(n, &codec, tone_enabled);
+    let play = play.as_deref().map(|v| v.as_slice());
+    // The tone plan only carries meaning once the recording has finished:
+    // recording a symbol as "sent" while speech is going out instead would
+    // put a transmit time in the timeline that nothing was ever sent for,
+    // and every round-trip sample derived from it would be wrong.
+    let play_samples = play.map(|p| p.len() as u64).unwrap_or(0);
 
-        if tone_enabled {
+    while !stop.load(Ordering::Relaxed) {
+        let samples = generate_frame(n, &codec, tone_enabled, play);
+        let playing = n * (codec.samples_per_frame as u64) < play_samples;
+
+        if tone_enabled && !playing {
             let sample_index = n * codec.samples_per_frame as u64;
             let symbol = tone::symbol_index_at(sample_index, codec.audio_hz);
             if last_symbol != Some(symbol) {
@@ -369,9 +406,42 @@ mod tests {
     /// in the first place.
     #[test]
     fn transmit_stream_is_identical_regardless_of_what_was_received() {
-        let a: Vec<Vec<i16>> = (0..50).map(|n| generate_frame(n, &PCMU, true)).collect();
-        let b: Vec<Vec<i16>> = (0..50).map(|n| generate_frame(n, &PCMU, true)).collect();
+        let a: Vec<Vec<i16>> = (0..50)
+            .map(|n| generate_frame(n, &PCMU, true, None))
+            .collect();
+        let b: Vec<Vec<i16>> = (0..50)
+            .map(|n| generate_frame(n, &PCMU, true, None))
+            .collect();
         assert_eq!(a, b);
+    }
+
+    /// Prerecorded audio is transmitted from the first frame, in order, and
+    /// the tone plan takes over once it runs out — so a call that opens with
+    /// a spoken message is still measurable for the rest of its duration.
+    #[test]
+    fn prerecorded_audio_plays_first_then_the_tone_plan_resumes() {
+        let n = PCMU.samples_per_frame;
+        // A frame and a half, so the second frame is also the last and has to
+        // be padded rather than truncated.
+        let clip: Vec<i16> = (0..n + n / 2).map(|i| (i % 1000) as i16 + 1).collect();
+
+        let first = generate_frame(0, &PCMU, true, Some(&clip));
+        assert_eq!(first, clip[..n], "frame 0 is the head of the clip");
+
+        let second = generate_frame(1, &PCMU, true, Some(&clip));
+        assert_eq!(second.len(), n, "a short tail must be padded to a frame");
+        assert_eq!(second[..n / 2], clip[n..]);
+        assert!(
+            second[n / 2..].iter().all(|&s| s == 0),
+            "the pad is silence, not stale audio"
+        );
+
+        let after = generate_frame(2, &PCMU, true, Some(&clip));
+        assert_eq!(
+            after,
+            generate_frame(2, &PCMU, true, None),
+            "past the end of the clip the tone plan is unchanged"
+        );
     }
 
     #[test]
@@ -405,6 +475,7 @@ mod tests {
             sent_wav_path: None,
             received_wav_path: None,
             tone_enabled: false,
+            play: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let result = run(config, stop).unwrap();
@@ -461,6 +532,7 @@ mod tests {
             sent_wav_path: None,
             received_wav_path: None,
             tone_enabled: true,
+            play: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let result = run(config, stop).unwrap();
@@ -522,6 +594,7 @@ mod tests {
             sent_wav_path: None,
             received_wav_path: None,
             tone_enabled: true,
+            play: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let result = run(config, stop).unwrap();
