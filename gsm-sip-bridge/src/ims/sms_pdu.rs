@@ -16,6 +16,10 @@
 //! in practice), compressed user data, and reassembling a concatenated
 //! message's parts (each part is its own SIP `MESSAGE` transaction; decoded
 //! individually and labelled `part`, not buffered and joined).
+//!
+//! The other half of the module is [`build_rp_ack`], the delivery report owed
+//! back to the network for every message decoded here. The two are joined by
+//! [`DecodedSms::rp_mr`], which the report echoes.
 
 /// One decoded SMS. `sender` is the real originating number from the TPDU's
 /// TP-OA — **not** the SIP `From`, which on a real network names an IMS
@@ -28,6 +32,10 @@ pub struct DecodedSms {
     /// `Some((sequence, total))` if the UDH marked this as one part of a
     /// concatenated message — 1-indexed, as the UDH itself encodes it.
     pub part: Option<(u8, u8)>,
+    /// The envelope's RP-Message-Reference (TS 24.011 §7.3.1, octet 1),
+    /// echoed verbatim in the delivery report so the network can match the
+    /// acknowledgement to this specific delivery. See [`build_rp_ack`].
+    pub rp_mr: u8,
 }
 
 /// Top-level entry point: an RP-DATA envelope in, a readable message out.
@@ -38,22 +46,50 @@ pub fn decode_vnd_3gpp_sms(body: &[u8]) -> Result<DecodedSms, String> {
         sender: tpdu.originating_address,
         text: tpdu.text,
         part: tpdu.part,
+        rp_mr: rp.mr,
     })
+}
+
+/// The RP-ACK that acknowledges a delivered short message at the RP layer
+/// (TS 24.011 §7.3.4) — the body of the delivery report the receiver owes the
+/// network, which TS 24.341 §5.3.2.4 carries in a **new `MESSAGE` request**,
+/// not in the `200 OK` answering the inbound one. The SIP response says only
+/// that the request reached us; this says the *message* was taken.
+///
+/// The shape follows TS 24.341 Annex B.6 (table B.6-7): an RP-ACK whose
+/// RP-User-Data information element carries a TPDU of type SMS-DELIVER-REPORT.
+pub fn build_rp_ack(rp_mr: u8) -> Vec<u8> {
+    vec![
+        // RP-Message-Type-Indicator 010 = RP-ACK, MS to network
+        // (TS 24.011 table 8.4), then the echoed RP-MR.
+        0x02, rp_mr,
+        // RP-User-Data (IEI 0x41, TS 24.011 §8.2.5.3), 2 octets long,
+        // holding the shortest well-formed SMS-DELIVER-REPORT there is:
+        // first octet 0x00 is TP-MTI=00 (DELIVER-REPORT) with TP-UDHI clear,
+        // and TP-PI=0x00 declares that none of the optional TP-PID/TP-DCS/
+        // TP-UDL fields follow.
+        0x41, 0x02, 0x00, 0x00,
+    ]
 }
 
 /// The RP-DATA (network→MS) envelope: message type/reference, the SC address
 /// (unused — we want the *originator*, from the TPDU inside, not the SC that
 /// relayed it), and a length-prefixed RP-User-Data field holding the TPDU.
 struct RpData<'a> {
+    mr: u8,
     user_data: &'a [u8],
 }
 
 impl<'a> RpData<'a> {
     fn parse(buf: &'a [u8]) -> Result<Self, String> {
-        // Octet 0: RP-Message-Type-Indicator + spare bits. Octet 1:
-        // RP-Message-Reference. Both consumed but not otherwise used — the
-        // structure below (length-prefixed fields) is what we actually walk,
-        // so getting the exact MTI encoding right doesn't gate decoding.
+        // Octet 0: RP-Message-Type-Indicator + spare bits — consumed but not
+        // otherwise used, since the structure below (length-prefixed fields)
+        // is what we actually walk, so getting the exact MTI encoding right
+        // doesn't gate decoding. Octet 1: RP-Message-Reference, kept so the
+        // delivery report can echo it (`build_rp_ack`).
+        let mr = *buf
+            .get(1)
+            .ok_or("RP-DATA truncated before RP-Message-Reference")?;
         let mut pos = 2usize;
         pos = skip_length_prefixed(buf, pos, "RP-Originator-Address")?;
         pos = skip_length_prefixed(buf, pos, "RP-Destination-Address")?;
@@ -65,7 +101,7 @@ impl<'a> RpData<'a> {
         let user_data = buf
             .get(pos..pos + ud_len)
             .ok_or("RP-DATA's RP-User-Data length exceeds the buffer")?;
-        Ok(Self { user_data })
+        Ok(Self { mr, user_data })
     }
 }
 
@@ -417,7 +453,7 @@ mod tests {
         tpdu.push(text_septets.len() as u8); // TP-UDL, in septets
         tpdu.extend_from_slice(&pack_septets(&text_septets));
 
-        let mut rp = vec![0x01, 0x00]; // RP-MTI (net->MS), RP-MR
+        let mut rp = vec![0x01, 0x17]; // RP-MTI (net->MS), RP-MR
         rp.push(0); // RP-OA length (SC address) — irrelevant to this decoder
         rp.push(0); // RP-DA length — absent for MT
         rp.push(tpdu.len() as u8); // RP-UD length
@@ -427,6 +463,27 @@ mod tests {
         assert_eq!(decoded.sender, "+919876543210");
         assert_eq!(decoded.text, "Hello");
         assert_eq!(decoded.part, None);
+        // The reference the delivery report has to quote back, taken from the
+        // envelope rather than defaulted — a report carrying the wrong one
+        // acknowledges nothing.
+        assert_eq!(decoded.rp_mr, 0x17);
+    }
+
+    /// TS 24.341 Annex B.6 (table B.6-7): an RP-ACK whose RP-User-Data IE
+    /// carries an SMS-DELIVER-REPORT TPDU.
+    #[test]
+    fn builds_an_rp_ack_echoing_the_message_reference() {
+        assert_eq!(build_rp_ack(0x17), vec![0x02, 0x17, 0x41, 0x02, 0x00, 0x00]);
+    }
+
+    /// RP-MR is a full octet, so a report is routinely not valid UTF-8 — the
+    /// reason the whole send path down to the socket is bytes, never a
+    /// `String`. Pins the value that would be lost to a lossy conversion.
+    #[test]
+    fn an_rp_ack_is_not_necessarily_valid_utf8() {
+        let ack = build_rp_ack(0xB4);
+        assert_eq!(ack[1], 0xB4);
+        assert!(String::from_utf8(ack).is_err());
     }
 
     #[test]

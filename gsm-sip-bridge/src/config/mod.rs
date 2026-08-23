@@ -606,6 +606,23 @@ pub struct VowifiConfig {
     /// as one — like `register_request_uri` above, whose default moved on the
     /// same kind of evidence.
     pub respond_on_client: bool,
+    /// Acknowledge an SMS delivered over IMS at the RP layer as well as the
+    /// SIP one — TS 24.341 §5.3.2.4's delivery report, an RP-ACK carried in a
+    /// `MESSAGE` request of our own back to the IP-SM-GW. On by default:
+    /// §5.3.2.3 asks for both answers, and every real handset sends both.
+    ///
+    /// Applies to the cellular path as much as the Wi-Fi one — the procedure
+    /// is the same over either access — despite living under `[vowifi]`.
+    ///
+    /// Turn it off only to isolate a carrier that turns out to dislike the
+    /// report, and record the capture if you do: the evidence today runs the
+    /// other way. Jio delivers nothing over our registration but silent Type 0
+    /// reachability probes, which is the shape of a network that has decided
+    /// the subscriber is unreachable over IMS — and an unacknowledged short
+    /// message is how it would decide that. Vodafone/Vi delivers real SMS
+    /// without ever having received a report, so this is not a precondition
+    /// everywhere.
+    pub sms_delivery_report: bool,
     /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
     /// by `supervise::orchestrate` once this line's tunnel is up.
     ///
@@ -783,6 +800,7 @@ impl Default for VowifiConfig {
             gm_auth_alg: String::new(),
             gm_cipher_alg: String::new(),
             respond_on_client: false,
+            sms_delivery_report: true,
             pcscf_source_path: "/tmp/pcscf".to_string(),
             veth_local_addr: "10.99.0.1".to_string(),
             veth_peer_addr: "10.99.0.2".to_string(),
@@ -1141,6 +1159,17 @@ mod tests {
     fn outbound_can_be_enabled() {
         let c = parse(&format!("{MINIMAL_TOML}\n[outbound]\nenabled = true\n"));
         assert!(c.outbound.enabled);
+    }
+
+    /// On by default, unlike the carrier-quirk switches around it: TS 24.341
+    /// §5.3.2.3 asks for the report, so a deployment has to opt *out*.
+    #[test]
+    fn sms_delivery_report_is_on_unless_switched_off() {
+        assert!(parse(MINIMAL_TOML).vowifi.sms_delivery_report);
+        let off = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsms_delivery_report = false\n"
+        ));
+        assert!(!off.vowifi.sms_delivery_report);
     }
 
     // --- specs/034-alert-identity: instance name + per-line phone number ---

@@ -705,6 +705,75 @@ pub fn build_options(req: &OptionsRequest) -> String {
     )
 }
 
+/// The pieces needed to build an out-of-dialog `MESSAGE` carrying a 3GPP
+/// SMS payload — today only the SMS delivery report of TS 24.341 §5.3.2.4.
+/// Shaped after that spec's Annex B.6 table B.6-7.
+pub struct MessageRequest<'a> {
+    /// Request-URI *and* `To`: the IP-SM-GW that delivered the short message
+    /// this reports on, a full URI including its scheme.
+    pub target_uri: &'a str,
+    /// `From` and `P-Preferred-Identity` — a registered public user identity
+    /// of ours, likewise scheme-qualified.
+    pub impu: &'a str,
+    /// One `Route:` line per entry, in order: the `Service-Route` set the
+    /// registrar returned (RFC 3608), which is what carries an out-of-dialog
+    /// request through our own P-CSCF and S-CSCF rather than straight at the
+    /// target.
+    pub route_headers: &'a [String],
+    /// Sent from (`Via`) — the protected client port.
+    pub local_addr: SocketAddr,
+    /// "TCP" or "UDP".
+    pub transport: &'a str,
+    pub call_id: &'a str,
+    pub from_tag: &'a str,
+    pub branch: &'a str,
+    pub cseq: u32,
+    pub content_type: &'a str,
+    /// Arbitrary bytes, which is why this builder returns `Vec<u8>` rather
+    /// than the `String` every other builder here returns.
+    pub body: &'a [u8],
+}
+
+/// Build an out-of-dialog `MESSAGE` request (RFC 3428) with a binary body.
+///
+/// No `Contact`: a `MESSAGE` is a standalone transaction, not a dialog, so
+/// nothing in-dialog will ever follow that would need one.
+pub fn build_message(req: &MessageRequest) -> Vec<u8> {
+    let via_addr = format_sip_addr(req.local_addr);
+    let mut msg = format!(
+        "MESSAGE {target} SIP/2.0\r\n\
+         Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n",
+        target = req.target_uri,
+        transport = req.transport,
+        via_addr = via_addr,
+        branch = req.branch,
+    );
+    for route in req.route_headers {
+        msg.push_str(route);
+        msg.push_str("\r\n");
+    }
+    msg.push_str(&format!(
+        "P-Preferred-Identity: <{impu}>\r\n\
+         From: <{impu}>;tag={from_tag}\r\n\
+         To: <{target}>\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} MESSAGE\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {len}\r\n\r\n",
+        impu = req.impu,
+        target = req.target_uri,
+        from_tag = req.from_tag,
+        call_id = req.call_id,
+        cseq = req.cseq,
+        content_type = req.content_type,
+        len = req.body.len(),
+    ));
+    let mut msg = msg.into_bytes();
+    msg.extend_from_slice(req.body);
+    msg
+}
+
 enum Socket {
     Udp(UdpSocket),
     Tcp(TcpStream),
@@ -834,15 +903,34 @@ impl SipTransport {
 
     pub fn send(&mut self, message: &str) -> BridgeResult<()> {
         tracing::debug!(message = %message, "sending SIP request");
+        self.write_all(message.as_bytes())
+    }
+
+    /// [`send`](Self::send)'s counterpart for a request whose body is not
+    /// valid UTF-8 and so was never a `String` — an SMS delivery report
+    /// (TS 24.341 §5.3.2.4), whose RP-ACK carries a full-octet
+    /// RP-Message-Reference, being the one this exists for. Logged as hex,
+    /// since the usual `%message` rendering would mangle exactly the bytes
+    /// worth seeing.
+    pub fn send_bytes(&mut self, message: &[u8]) -> BridgeResult<()> {
+        tracing::debug!(
+            message = %String::from_utf8_lossy(message),
+            message_hex = %message.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "sending SIP request with a binary body"
+        );
+        self.write_all(message)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> BridgeResult<()> {
         match &mut self.socket {
             Socket::Udp(socket) => {
                 socket
-                    .send(message.as_bytes())
+                    .send(bytes)
                     .map_err(|e| BridgeError::Ims(format!("UDP send failed: {e}")))?;
             }
             Socket::Tcp(stream) => {
                 stream
-                    .write_all(message.as_bytes())
+                    .write_all(bytes)
                     .map_err(|e| BridgeError::Ims(format!("TCP send failed: {e}")))?;
             }
         };
@@ -1589,6 +1677,83 @@ mod tests {
         // No body.
         assert!(msg.contains("Content-Length: 0\r\n"));
         assert!(msg.ends_with("\r\n\r\n"));
+    }
+
+    fn a_delivery_report(body: &[u8]) -> Vec<u8> {
+        build_message(&MessageRequest {
+            target_uri: "sip:A2P@203.0.113.7;transport=udp",
+            impu: "sip:u@ims.example.org",
+            route_headers: &[
+                "Route: <sip:pcscf.example.org:7531;lr>".to_string(),
+                "Route: <sip:orig@scscf.example.org;lr>".to_string(),
+            ],
+            local_addr: "10.0.0.2:5060".parse().unwrap(),
+            transport: "TCP",
+            call_id: "call-abc",
+            from_tag: "tag123",
+            branch: "z9hG4bKdeadbeef",
+            cseq: 9,
+            content_type: "application/vnd.3gpp.sms",
+            body,
+        })
+    }
+
+    /// TS 24.341 Annex B.6 table B.6-7: the delivery report is addressed to
+    /// the IP-SM-GW, routed via the registration's `Service-Route` set, and
+    /// identifies us with a registered public user identity.
+    #[test]
+    fn build_message_addresses_the_target_and_routes_via_the_service_route() {
+        let msg = String::from_utf8(a_delivery_report(b"")).unwrap();
+        assert!(
+            msg.starts_with("MESSAGE sip:A2P@203.0.113.7;transport=udp SIP/2.0\r\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("To: <sip:A2P@203.0.113.7;transport=udp>\r\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Route: <sip:pcscf.example.org:7531;lr>\r\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Route: <sip:orig@scscf.example.org;lr>\r\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("From: <sip:u@ims.example.org>;tag=tag123\r\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("P-Preferred-Identity: <sip:u@ims.example.org>\r\n"),
+            "{msg}"
+        );
+        assert!(msg.contains("CSeq: 9 MESSAGE\r\n"), "{msg}");
+        // Not a dialog, so nothing in-dialog will follow that needs a Contact.
+        assert!(!msg.contains("Contact:"), "{msg}");
+    }
+
+    /// The whole reason this builder returns bytes: an RP-ACK's echoed
+    /// RP-Message-Reference is a full octet, so a report is routinely not
+    /// valid UTF-8. The body must survive verbatim, and `Content-Length` must
+    /// count its bytes.
+    #[test]
+    fn build_message_carries_a_binary_body_verbatim() {
+        let body = crate::ims::sms_pdu::build_rp_ack(0xB4);
+        let msg = a_delivery_report(&body);
+        let head = String::from_utf8_lossy(&msg);
+        assert!(
+            head.contains("Content-Type: application/vnd.3gpp.sms\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Content-Length: 6\r\n"), "{head}");
+        assert_eq!(&msg[msg.len() - body.len()..], &body[..]);
+        // The separator sits immediately before the body, with nothing
+        // between — a stray byte here desyncs the peer's framing.
+        assert_eq!(
+            &msg[msg.len() - body.len() - 4..msg.len() - body.len()],
+            b"\r\n\r\n"
+        );
     }
 
     #[test]

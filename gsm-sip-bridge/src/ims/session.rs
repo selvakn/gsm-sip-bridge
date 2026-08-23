@@ -15,8 +15,8 @@
 //! compile error rather than a silent difference.
 
 use super::sip_client::{
-    build_uas_response, format_sip_addr, random_hex, spawn_gm_server, GmServer, SipMessage,
-    SipRequest, SipSink,
+    build_message, build_uas_response, format_sip_addr, random_hex, spawn_gm_server, GmServer,
+    MessageRequest, SipMessage, SipRequest, SipSink,
 };
 use super::ImsRegisterConfig;
 use crate::control::protocol::RegistrationStatus;
@@ -284,12 +284,7 @@ pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession) {
     let impu = session
         .default_impu()
         .unwrap_or_else(|| format!("sip:{}", session.public_uri));
-    let route_headers: Vec<String> = session
-        .headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("Service-Route"))
-        .map(|(_, v)| format!("Route: {v}"))
-        .collect();
+    let route_headers = service_route_headers(session);
     let public_user = session
         .public_uri
         .split('@')
@@ -313,6 +308,88 @@ pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession) {
     match session.transport_mut().and_then(|t| t.send(&msg)) {
         Ok(()) => tracing::info!(impu = %impu, "sent reg-event SUBSCRIBE"),
         Err(e) => tracing::warn!(error = %e, "failed to send reg-event SUBSCRIBE"),
+    }
+}
+
+/// RFC 3608: an out-of-dialog request we originate routes via the
+/// `Service-Route` set the registrar returned, in order.
+fn service_route_headers(session: &super::RegisteredSession) -> Vec<String> {
+    session
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("Service-Route"))
+        .map(|(_, v)| format!("Route: {v}"))
+        .collect()
+}
+
+/// TS 24.341 §5.3.2.4: send the SMS delivery report for a short message
+/// delivered to us over IMS — an RP-ACK (`ims::sms_pdu::build_rp_ack`)
+/// carried in a **new `MESSAGE` request** addressed to the IP-SM-GW.
+///
+/// # Why this is not the `200 OK`
+///
+/// The `200 OK` answering the inbound `MESSAGE` is the SIP layer saying the
+/// *request* arrived. The network waits separately for the RP layer to say
+/// the *short message* was taken, and §5.3.2.3 asks for both: "generate a SIP
+/// response according to RFC 3428" **and** "create a delivery report as
+/// described in subclause 5.3.2.4". Annex B.6 shows the pair on the wire —
+/// step 5 is a bodiless `200 OK`, step 8 a separate `MESSAGE` from the UE.
+///
+/// An earlier attempt at this (branch `jio-sms-ims-investigation`) put the
+/// RP-ACK in the `200 OK`'s body instead, and concluded from the resulting
+/// silence that acknowledgement was not the problem. A gateway does not read
+/// a body off a `MESSAGE` response, so that experiment never tested what it
+/// was thought to test.
+///
+/// # Why a request rather than a response is worth something here
+///
+/// It also moves the acknowledgement onto the direction that demonstrably
+/// works. On the carrier this was written for, our REGISTER, INVITE and
+/// SUBSCRIBE all complete while our *responses* are ignored — the whole
+/// reason `vowifi.respond_on_client` exists. A report sent as a request does
+/// not depend on that defect being solved first.
+///
+/// Best-effort, like [`subscribe_reg_event`]: the `202 Accepted` comes back
+/// asynchronously on the shared transport and is handled by the dispatch
+/// loop, and a send failure costs a redelivery, which the caller's dedupe
+/// absorbs.
+pub(crate) fn send_sms_delivery_report(
+    session: &mut super::RegisteredSession,
+    ipsmgw_uri: &str,
+    rp_ack: &[u8],
+) {
+    let impu = session
+        .default_impu()
+        .unwrap_or_else(|| format!("sip:{}", session.public_uri));
+    let route_headers = service_route_headers(session);
+    let cseq = session.cseq;
+    session.cseq += 1;
+    let msg = build_message(&MessageRequest {
+        target_uri: ipsmgw_uri,
+        impu: &impu,
+        route_headers: &route_headers,
+        local_addr: session.local_addr,
+        transport: if session.use_tcp { "TCP" } else { "UDP" },
+        call_id: &random_hex(8),
+        from_tag: &random_hex(4),
+        branch: &format!("z9hG4bK{}", random_hex(6)),
+        cseq,
+        content_type: "application/vnd.3gpp.sms",
+        body: rp_ack,
+    });
+    match session.transport_mut().and_then(|t| t.send_bytes(&msg)) {
+        Ok(()) => tracing::info!(
+            ipsmgw = %ipsmgw_uri,
+            rp_ack = %rp_ack.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "sent the SMS delivery report"
+        ),
+        // Never silently swallowed: an undelivered report is exactly what
+        // makes a message centre redeliver, and it is invisible otherwise.
+        Err(e) => tracing::warn!(
+            error = %e,
+            ipsmgw = %ipsmgw_uri,
+            "failed to send the SMS delivery report; the network may redeliver this message"
+        ),
     }
 }
 
@@ -353,4 +430,26 @@ pub(crate) fn extract_caller(req: &SipRequest) -> String {
         .and_then(|rest| rest.split(['@', ';', '>']).next())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// The **whole URI** named by a header, where [`extract_caller`] wants only
+/// the user part — for addressing a new request back at whoever sent this
+/// one. RFC 3261 §20 allows either form: a `name-addr`, where the URI is
+/// inside `<...>` and any `;` after it separates *header* parameters, or a
+/// bare `addr-spec`, where a `;` belongs to the URI itself. The brackets are
+/// what tells the two apart, so they decide where the cut goes.
+///
+/// `None` for a header that is absent or names no URI at all.
+pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
+    let value = req.header(name)?.trim();
+    let uri = match value.split_once('<') {
+        Some((_, rest)) => rest.split('>').next()?,
+        // No brackets: parameters after the URI, if any, are the URI's own,
+        // so only a `,` (the next header value) can end it.
+        None => value.split(',').next()?,
+    }
+    .trim();
+    // A display name with no URI at all ("Anonymous"), or an empty header,
+    // is not something a request can be addressed to.
+    uri.contains(':').then(|| uri.to_string())
 }
