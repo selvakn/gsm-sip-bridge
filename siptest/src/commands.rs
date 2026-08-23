@@ -8,25 +8,16 @@ use serde_json::Value;
 
 use crate::cli::{Cli, Commands};
 
+/// Default reqwest timeout (30s), kept explicit for `status`: an immediate
+/// request has no legitimate reason to run long, and a stalled daemon should
+/// fail fast rather than hang the CLI forever.
+const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
     let base = match api_base(cli) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // No client-side timeout. `POST /calls?wait=true` blocks for the whole
-    // call — ring time plus the call's duration — which is routinely longer
-    // than reqwest's 30s default, and that default turned a call that rang,
-    // was answered and completed into `error sending request` on the CLI
-    // while the daemon carried on regardless. The call is bounded by the
-    // daemon's own ring timeout and duration; the client has nothing better
-    // to bound it with.
-    let client = match reqwest::blocking::Client::builder().timeout(None).build() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("could not build the HTTP client: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -37,14 +28,45 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
             duration_secs,
             codec,
             ..
-        } => call(
-            &client,
-            &base,
-            destination,
-            *duration_secs,
-            codec.as_deref(),
-        ),
-        Commands::Status => status(&client, &base),
+        } => {
+            // No client-side timeout. `POST /calls?wait=true` blocks for the
+            // whole call — ring time plus the call's duration — which is
+            // routinely longer than reqwest's 30s default, and that default
+            // turned a call that rang, was answered and completed into
+            // `error sending request` on the CLI while the daemon carried on
+            // regardless. The call is bounded by the daemon's own ring
+            // timeout and duration; the client has nothing better to bound
+            // it with. Scoped to this branch only — `status` below keeps a
+            // bounded timeout, since an immediate request stalling is a real
+            // failure the CLI should report rather than hang on forever.
+            let client = match reqwest::blocking::Client::builder().timeout(None).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("could not build the HTTP client: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            call(
+                &client,
+                &base,
+                destination,
+                *duration_secs,
+                codec.as_deref(),
+            )
+        }
+        Commands::Status => {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(STATUS_TIMEOUT)
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("could not build the HTTP client: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            status(&client, &base)
+        }
     }
 }
 

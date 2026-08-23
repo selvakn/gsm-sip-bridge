@@ -52,7 +52,12 @@ pub fn read(path: &Path) -> SipTestResult<WavAudio> {
         let body = pos + 8;
         let end = body.saturating_add(len).min(bytes.len());
         match id {
-            b"fmt " if len >= 16 => {
+            // `len >= 16` alone only proves the chunk *claims* 16 bytes; a
+            // file truncated mid-chunk can still have fewer than that
+            // actually present (`end` clamps to `bytes.len()`), and reading
+            // past `end` would index out of bounds rather than report a
+            // config error.
+            b"fmt " if len >= 16 && end - body >= 16 => {
                 let format = u16_at(&bytes, body);
                 let channels = u16_at(&bytes, body + 2);
                 let bits = u16_at(&bytes, body + 14);
@@ -68,7 +73,11 @@ pub fn read(path: &Path) -> SipTestResult<WavAudio> {
                 if bits != 16 {
                     return Err(bad(format!("{bits}-bit samples; 16-bit only")));
                 }
-                sample_rate = Some(u32_at(&bytes, body + 4));
+                let rate = u32_at(&bytes, body + 4);
+                if rate == 0 {
+                    return Err(bad("sample rate must be greater than zero".into()));
+                }
+                sample_rate = Some(rate);
             }
             b"data" => {
                 samples = Some(
@@ -195,6 +204,37 @@ mod tests {
         let path = write_temp(&stereo, "siptest-stereo.wav");
         let err = read(&path).unwrap_err().to_string();
         assert!(err.contains("channels"), "{err}");
+    }
+
+    /// A `fmt ` chunk header can claim 16 bytes (`len >= 16`) while the file
+    /// is truncated before those bytes actually exist — `end` clamps to
+    /// `bytes.len()`, so the claimed length alone is not proof the bytes are
+    /// there. Reading past `end` would index out of bounds and panic; this
+    /// must report a config error instead.
+    #[test]
+    fn a_fmt_chunk_truncated_before_its_claimed_length_is_a_config_error_not_a_panic() {
+        let mut full = wav(8000, &[1, 2], false);
+        // The `fmt ` chunk starts at byte 20 (RIFF header 12 + "fmt " 4 +
+        // length 4) and claims 16 bytes; keep only the first 10 of them, then
+        // drop everything after (the `data` chunk included).
+        full.truncate(20 + 10);
+        let path = write_temp(&full, "siptest-truncated-fmt.wav");
+        let err = read(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("no fmt chunk") || err.contains("no data chunk"),
+            "{err}"
+        );
+    }
+
+    /// A zero sample rate must be rejected at parse time, not accepted and
+    /// left to blow up `resample`'s division later — `out_len` would compute
+    /// as `usize::MAX` and the allocation would panic mid-call instead of
+    /// failing at startup with a clear cause.
+    #[test]
+    fn a_zero_sample_rate_is_a_config_error() {
+        let path = write_temp(&wav(0, &[1, 2, 3], false), "siptest-zero-rate.wav");
+        let err = read(&path).unwrap_err().to_string();
+        assert!(err.contains("sample rate"), "{err}");
     }
 
     #[test]
