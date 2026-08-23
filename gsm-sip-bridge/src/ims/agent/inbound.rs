@@ -17,9 +17,8 @@ use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
-    build_100_trying, build_180_ringing, build_200_ok_invite, build_486_busy_here,
-    build_uas_response, build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage,
-    SipRequest, SipSink,
+    build_100_trying, build_180_ringing, build_486_busy_here, build_uas_response,
+    build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -39,9 +38,26 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// What a real UE states in a session response and we never have: the methods
-/// it accepts and the extensions it understands (RFC 3261 §20.5, and the
-/// `Supported` set TS 24.229 expects of an IMS UE).
+/// What a real UE states in a session response: the methods it accepts and the
+/// extensions it understands (RFC 3261 §20.5, and the `Supported` set
+/// TS 24.229 expects of an IMS UE).
+///
+/// This is what made inbound Jio calls work. Answering with `Via`,
+/// `Record-Route`, `From`, `To`, `Call-ID`, `CSeq`, `Contact`, `Content-Type`,
+/// `Content-Length` and nothing else got every call torn down ~460 ms after
+/// the `200 OK` with `BYE Reason:SIP;cause=503;text="IO: SIP SDP Protocol
+/// Error."` — boilerplate for a response that never declared its capabilities;
+/// five distinct SDP bodies failed identically at the same timing before it
+/// landed. Sent unconditionally rather than per-carrier because a `2xx` to an
+/// INVITE is required to carry `Allow` on any network (RFC 3261 §13.3.1.4),
+/// and the carriers that tolerated its absence were being lenient, not
+/// asking for it.
+///
+/// Known overstatement: the dispatch loop answers INVITE/BYE/ACK/NOTIFY/
+/// MESSAGE and silently ignores every other method, so this claims more than
+/// we serve. It is sent verbatim as measured — the working set was never
+/// bisected, and trimming it blind risks the fault it fixed. Making it honest
+/// means growing the UAS, not shrinking the header.
 const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[
     (
         "Allow",
@@ -81,19 +97,6 @@ fn uas_contact(public_user: &str, addr: &str, transport: Option<&str>, imei: &st
 fn uas_contact_omits_transport() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GM_UAS_CONTACT_NO_TRANSPORT").is_some())
-}
-
-/// EXPERIMENT, gated on `GM_UAS_FULL_HEADERS=1`: add [`UAS_EXTRA_HEADERS`] to
-/// the `200 OK`.
-///
-/// Deliberately separate from the Contact feature tags added above, which are
-/// the stronger hypothesis (Jio *requires* them via `Accept-Contact`) and go
-/// out unconditionally. Keeping this behind a flag means the two can be tested
-/// one at a time with a restart rather than a rebuild — the discipline that
-/// killed six wrong theories on this bug in a single morning.
-fn full_uas_headers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GM_UAS_FULL_HEADERS").is_some())
 }
 
 /// Everything `handle_invite` needs that is fixed for the life of the agent.
@@ -304,19 +307,15 @@ pub(super) fn handle_invite(
                 }
             }
 
-            let response = if full_uas_headers() {
-                build_uas_response_with_headers(
-                    200,
-                    "OK",
-                    req,
-                    Some(&to_tag),
-                    Some(&contact),
-                    Some(&answer_sdp),
-                    UAS_EXTRA_HEADERS,
-                )
-            } else {
-                build_200_ok_invite(req, &to_tag, &contact, &answer_sdp)
-            };
+            let response = build_uas_response_with_headers(
+                200,
+                "OK",
+                req,
+                Some(&to_tag),
+                Some(&contact),
+                Some(&answer_sdp),
+                UAS_EXTRA_HEADERS,
+            );
             sink.send(&response)?;
 
             let stop = Arc::new(AtomicBool::new(false));
@@ -498,6 +497,40 @@ fn await_pbx_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `200 OK` answering a carrier INVITE must state what we accept.
+    /// This was the difference between an inbound Jio call that holds and one
+    /// torn down ~460 ms later with `cause=503 "SIP SDP Protocol Error"`, and
+    /// it is no longer conditional on anything, so nothing may drop it back
+    /// out of the response by accident.
+    #[test]
+    fn the_answering_response_states_our_capabilities() {
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
+
+        let resp = build_uas_response_with_headers(
+            200,
+            "OK",
+            &req,
+            Some("totag1"),
+            Some("<sip:me@10.0.0.9:5060>"),
+            Some("v=0\r\n"),
+            UAS_EXTRA_HEADERS,
+        );
+
+        assert!(
+            resp.contains("\r\nAllow: INVITE, ACK, CANCEL, BYE,"),
+            "RFC 3261 §13.3.1.4 wants Allow in a 2xx to INVITE: {resp}"
+        );
+        assert!(
+            resp.contains("\r\nSupported: "),
+            "the extensions an IMS UE states (TS 24.229): {resp}"
+        );
+    }
 
     /// Jio's inbound INVITE carries
     /// `Accept-Contact: *;require;explicit;+sip.instance="<urn:gsma:imei:...>"`
