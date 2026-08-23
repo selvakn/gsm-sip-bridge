@@ -70,33 +70,12 @@ const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[
 ///
 /// Must carry the same feature tags we registered with, not just the address.
 /// See the call site for the measurement that motivated this.
-fn uas_contact(public_user: &str, addr: &str, transport: Option<&str>, imei: &str) -> String {
-    let transport = match transport {
-        Some(t) => format!(";transport={t}"),
-        None => String::new(),
-    };
+fn uas_contact(public_user: &str, addr: &str, transport: &str, imei: &str) -> String {
     format!(
-        "<sip:{public_user}@{addr}{transport}>\
+        "<sip:{public_user}@{addr};transport={transport}>\
          ;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"\
          ;audio;+sip.instance=\"<urn:gsma:imei:{imei}>\""
     )
-}
-
-/// EXPERIMENT, gated on `GM_UAS_CONTACT_NO_TRANSPORT=1`: leave `transport=` off
-/// the Contact of a response to a network-initiated INVITE.
-///
-/// The `ACK` for our `200 OK` is a new request whose Request-URI *is* that
-/// Contact. We advertise `transport=TCP` because that is how we registered, but
-/// Jio has been measured never to open TCP toward us — it delivers every
-/// network-initiated request (INVITE, BYE) to `port_us` over UDP. If its B2BUA
-/// routes the ACK by the Contact URI verbatim, `transport=TCP` makes that ACK
-/// undeliverable, which is exactly what we see: on every failing call the SBC
-/// sends **no ACK at all** (its BYE is `CSeq: 2`) and tears the session down
-/// ~0.5 s later. Omitting the parameter lets it fall back to UDP, the only
-/// transport it actually uses in this direction.
-fn uas_contact_omits_transport() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GM_UAS_CONTACT_NO_TRANSPORT").is_some())
 }
 
 /// Everything `handle_invite` needs that is fixed for the life of the agent.
@@ -213,7 +192,7 @@ pub(super) fn handle_invite(
     let contact = uas_contact(
         &public_user,
         &format_sip_addr(session.contact_addr),
-        Some(via_transport).filter(|_| !uas_contact_omits_transport()),
+        via_transport,
         &session.imei,
     );
     // Ring the caller. The network turns this into audible ringback and keeps
@@ -542,7 +521,7 @@ mod tests {
         let c = uas_contact(
             "405800000000000",
             "10.0.0.1:41126",
-            Some("TCP"),
+            "TCP",
             "860000000000000",
         );
 
@@ -568,18 +547,22 @@ mod tests {
         );
     }
 
-    /// With the transport parameter omitted, the ACK for our `200 OK` can fall
-    /// back to UDP — the only transport Jio actually uses toward us. The feature
-    /// tags must survive, and no stray `;>` may be left behind.
+    /// The Contact states the transport we registered over, whichever that was
+    /// — it is the Request-URI of the ACK and of every in-dialog request the
+    /// network sends us, so it has to name a leg we are actually listening on.
     #[test]
-    fn omitting_the_transport_leaves_a_well_formed_contact() {
-        let c = uas_contact("405800000000000", "10.0.0.1:41126", None, "860000000000000");
+    fn the_answering_contact_names_the_transport_we_registered_over() {
+        let c = uas_contact(
+            "405800000000000",
+            "10.0.0.1:41126",
+            "UDP",
+            "860000000000000",
+        );
 
         assert!(
-            c.starts_with("<sip:405800000000000@10.0.0.1:41126>"),
-            "no transport parameter, and no dangling semicolon: {c}"
+            c.starts_with("<sip:405800000000000@10.0.0.1:41126;transport=UDP>"),
+            "the registered transport, inside the brackets: {c}"
         );
-        assert!(!c.contains("transport="), "transport must be absent: {c}");
         assert!(
             c.contains(";+sip.instance=\"<urn:gsma:imei:860000000000000>\""),
             "the required feature tags must survive: {c}"

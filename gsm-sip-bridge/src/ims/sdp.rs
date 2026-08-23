@@ -569,76 +569,10 @@ pub fn select_veth_codec(offer: &SdpOffer, wideband: bool) -> Option<&OfferedCod
     pick_offered(offer, NegotiatedCodec::Pcmu)
 }
 
-/// EXPERIMENT, gated on `GM_ANSWER_OFFER_FRAMING=1`: when the offer lists the
-/// same codec under two payload types differing only in AMR framing, take the
-/// one the *offerer* listed first instead of forcing octet-aligned.
-///
-/// Jio's mobile-terminating offer does exactly that — `104` AMR-WB
-/// bandwidth-efficient, then `110` AMR-WB `octet-align=1` — and the only reason
-/// to offer one codec twice is to let the answerer choose. Our `pick_offered`
-/// inverts that choice for a documented convenience ("purely because it's the
-/// simpler path"), so we answer `110` where every handset on the network
-/// answers `104`. Jio then ACKs and immediately sends
-/// `BYE Reason:SIP;cause=503;text="PO: SIP SDP Protocol Error."` with
-/// `carrier_rx=0` — no RTP ever arrives, consistent with a media gateway that
-/// could not instantiate the framing we asked for.
-///
-/// Gated rather than made default because Airtel and Vi are in production on
-/// the octet-aligned path and this would silently change their framing too
-/// whenever they offer both.
-fn honour_offer_framing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GM_ANSWER_OFFER_FRAMING").is_some())
-}
-
-/// AMR-WB `b=AS:` as *Jio itself* states it, captured 2026-08-15 from the
-/// `183 Session Progress` answering one of our outbound INVITEs.
-const CARRIER_AMR_WB_AS: u32 = 32;
-
-/// `a=maxptime` as Jio itself states it, from the same reference SDP. Its
-/// mobile-terminating offer asks for 240, which we echoed back; its own answer
-/// never claims more than 80.
-const CARRIER_MAXPTIME: u32 = 80;
-
-/// EXPERIMENT, gated on `GM_SDP_MATCH_CARRIER=1`: state the bandwidth and
-/// packetisation limits Jio's own SDP states, rather than the ones our
-/// arithmetic derives.
-///
-/// The reference is a real Jio-generated answer:
-///
-/// ```text
-/// b=AS:32  b=RR:2400  b=RS:800
-/// a=fmtp:96 octet-align=1;mode-set=0,1,2,3;mode-change-capability=2
-/// a=ptime:20  a=maxptime:80
-/// ```
-///
-/// Worth testing precisely because it is not invention: `b=AS:49`/`maxptime:240`
-/// were both added on speculation and neither was ever validated, and the
-/// earlier reasoning that "the failure predates `b=`, so `b=` is exonerated" was
-/// unsound — *absent* bandwidth and *overstated* bandwidth are different
-/// conditions and can fail independently.
-fn match_carrier_limits() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GM_SDP_MATCH_CARRIER").is_some())
-}
-
 /// The offer's entry for `codec`, preferring an octet-aligned payload type
 /// when the offer lists more than one (see `select_codec`).
 fn pick_offered(offer: &SdpOffer, codec: NegotiatedCodec) -> Option<&OfferedCodec> {
-    pick_offered_with(offer, codec, honour_offer_framing())
-}
-
-/// [`pick_offered`] with the framing decision passed in, so both branches are
-/// testable without touching process environment.
-fn pick_offered_with(
-    offer: &SdpOffer,
-    codec: NegotiatedCodec,
-    honour_offer_order: bool,
-) -> Option<&OfferedCodec> {
     let of_codec = || offer.offered.iter().filter(|c| c.codec == codec);
-    if honour_offer_order {
-        return of_codec().next();
-    }
     of_codec()
         .find(|c| c.is_octet_aligned())
         .or_else(|| of_codec().next())
@@ -742,13 +676,7 @@ fn build_answer_for(
         ),
     };
 
-    let maxptime_line = match maxptime.map(|mp| {
-        if match_carrier_limits() {
-            mp.min(CARRIER_MAXPTIME)
-        } else {
-            mp
-        }
-    }) {
+    let maxptime_line = match maxptime {
         Some(mp) => format!("a=maxptime:{mp}\r\n"),
         None => String::new(),
     };
@@ -764,11 +692,6 @@ fn build_answer_for(
     // 3GPP tables do. The RTCP values are the customary 3GPP defaults.
     let as_kbps = match chosen.codec {
         NegotiatedCodec::AmrNb => 41,
-        // Our arithmetic says 49; Jio's own answer says 32 (see
-        // `match_carrier_limits`). On a network that authorises a dedicated
-        // voice bearer from the negotiated bandwidth, claiming more than the
-        // network's own figure is a plausible way to be refused.
-        NegotiatedCodec::AmrWb if match_carrier_limits() => CARRIER_AMR_WB_AS,
         NegotiatedCodec::AmrWb => 49,
         NegotiatedCodec::Pcmu => 80,
         // Only ever on the internal veth link: 16-bit 16 kHz PCM is 256 kbit/s.
@@ -915,38 +838,35 @@ mod tests {
          a=fmtp:104 mode-set=0,1,2,3;mode-change-capability=2\r\n\
          a=fmtp:110 mode-set=0,1,2,3;octet-align=1; mode-change-capability=2\r\n";
 
-    /// The offerer listed the same codec twice differing only in framing, which
-    /// is how it says "pick one". Honouring that order takes `104`; the
-    /// historical convenience preference takes `110` — and `110` is what Jio
-    /// answers with `cause=503 "SIP SDP Protocol Error"`.
+    /// A carrier that offers one codec under two payload types differing only
+    /// in framing is answered on the octet-aligned one — the simpler path
+    /// through `ims::amr_rtp`, and the framing every deployment here runs on.
+    /// Answering the offer's own first choice instead was tried against this
+    /// exact offer and changed nothing (the teardown it was written for turned
+    /// out to be a response with no `Allow`/`Supported`), so the preference
+    /// stands and this locks it against a real offer rather than a synthetic
+    /// one.
     #[test]
-    fn honouring_the_offer_order_takes_the_flavour_the_carrier_listed_first() {
+    fn a_doubly_offered_codec_is_answered_on_its_octet_aligned_payload_type() {
         let offer = parse_offer(JIO_MT_OFFER).expect("Jio's real offer must parse");
 
-        let honoured = pick_offered_with(&offer, NegotiatedCodec::AmrWb, true)
-            .expect("AMR-WB is offered twice");
-        assert_eq!(honoured.payload_type, 104, "the offer's own first choice");
-        assert!(
-            !honoured.is_octet_aligned(),
-            "104 carries no octet-align=1, so the answer must not claim it"
-        );
-
-        let convenient = pick_offered_with(&offer, NegotiatedCodec::AmrWb, false)
-            .expect("AMR-WB is offered twice");
-        assert_eq!(convenient.payload_type, 110, "the octet-aligned one");
-        assert!(convenient.is_octet_aligned());
+        let chosen = pick_offered(&offer, NegotiatedCodec::AmrWb).expect("AMR-WB is offered twice");
+        assert_eq!(chosen.payload_type, 110, "the octet-aligned one");
+        assert!(chosen.is_octet_aligned());
     }
 
-    /// The gate must not disturb an offer that names one flavour only — which
-    /// is every Airtel/Vi offer seen so far, and why this is safe to land.
+    /// One flavour offered means there is nothing to prefer: take it as it is,
+    /// framing and all — every Airtel/Vi offer seen so far.
     #[test]
-    fn the_framing_gate_is_a_no_op_when_only_one_flavour_is_offered() {
+    fn a_singly_offered_codec_is_taken_as_offered() {
         let offer = offer_of(&[(96, "AMR-WB/16000")]);
-        for honour in [true, false] {
-            let chosen = pick_offered_with(&offer, NegotiatedCodec::AmrWb, honour)
-                .expect("AMR-WB is offered");
-            assert_eq!(chosen.payload_type, 96, "honour_offer_order={honour}");
-        }
+        let chosen = pick_offered(&offer, NegotiatedCodec::AmrWb).expect("AMR-WB is offered");
+        assert_eq!(chosen.payload_type, 96);
+        assert!(
+            chosen.is_octet_aligned(),
+            "the framing is read from the offer, never asserted: {:?}",
+            chosen.fmtp
+        );
     }
 
     // ---- answer-side codec preference (specs/017 T027/T035) ---------------
