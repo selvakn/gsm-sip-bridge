@@ -581,6 +581,31 @@ pub struct VowifiConfig {
     /// `ims::gm_ipsec::select_security_server`.
     pub gm_auth_alg: String,
     pub gm_cipher_alg: String,
+    /// Answer a network-initiated request (INVITE, BYE, NOTIFY, MESSAGE) over
+    /// the Gm **client** leg — `port_uc -> port_ps`, the connection we
+    /// registered over — instead of the socket the request arrived on.
+    ///
+    /// Off by default, and deliberately so: RFC 3261 §18.2.2 says a response
+    /// belongs on the transport its request came in over, and Airtel and Vi
+    /// answer correctly there today. Turning this on for them would move
+    /// every response onto a leg they have never been asked to read.
+    ///
+    /// It exists because Jio ignores responses sent from `port_us` — verified
+    /// on the wire to both of its protected ports, with the correct SPI,
+    /// monotonic ESP sequence and well-formed SIP, while it validated our ESP
+    /// on the client SA continuously. The symptom is call-independent and so
+    /// cannot be blamed on anything in our SDP: Jio simply retransmits its
+    /// INVITE every 2s, meaning not even our `100 Trying` lands. Answering on
+    /// the SA it demonstrably trusts is what made an inbound Jio call reach a
+    /// dialog at all (measured 2026-08-15, re-tested from scratch after the
+    /// `disable_policy` and compact-header fixes rather than trusted).
+    ///
+    /// TS 33.203 keys all four SAs from one `IK`, so there is no
+    /// cryptographic difference between the responses Jio accepts and the ones
+    /// it drops, and no spec basis for this. It is a carrier quirk, recorded
+    /// as one — like `register_request_uri` above, whose default moved on the
+    /// same kind of evidence.
+    pub respond_on_client: bool,
     /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
     /// by `supervise::orchestrate` once this line's tunnel is up.
     ///
@@ -757,6 +782,7 @@ impl Default for VowifiConfig {
             register_request_uri: "home-domain".to_string(),
             gm_auth_alg: String::new(),
             gm_cipher_alg: String::new(),
+            respond_on_client: false,
             pcscf_source_path: "/tmp/pcscf".to_string(),
             veth_local_addr: "10.99.0.1".to_string(),
             veth_peer_addr: "10.99.0.2".to_string(),
@@ -1859,6 +1885,18 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("vowifi.register_request_uri must be"));
+    }
+
+    #[test]
+    fn vowifi_respond_on_client_is_off_unless_asked_for() {
+        // RFC 3261 §18.2.2 puts a response on the transport its request came
+        // in over, and Airtel and Vi read it there. Only a carrier measured to
+        // ignore that — Jio — gets the other leg, and only by saying so.
+        let cfg = parse(MINIMAL_TOML);
+        assert!(!cfg.vowifi.respond_on_client);
+
+        let src = format!("{}\n[vowifi]\nrespond_on_client = true\n", MINIMAL_TOML);
+        assert!(parse(&src).vowifi.respond_on_client);
     }
 
     #[test]

@@ -237,6 +237,18 @@ register_request_uri = "home-domain"
 #   gm_cipher_alg = "aes-cbc" | "null"
 gm_auth_alg = ""
 gm_cipher_alg = ""
+# Answer network-initiated requests (INVITE, BYE, NOTIFY, MESSAGE) over the Gm
+# CLIENT leg -- port_uc -> port_ps, the connection we registered over -- rather
+# than the socket the request arrived on, which is what RFC 3261 18.2.2 asks
+# for and what every other carrier here reads.
+#   Jio    -> needs this. It ignores responses sent from port_us: verified on
+#             the wire to both of its protected ports, correct SPI, monotonic
+#             ESP sequence, well-formed SIP, while it validated our ESP on the
+#             client SA continuously. With responses on the arrival socket it
+#             just retransmits its INVITE every 2s -- not even our 100 Trying
+#             lands -- and no inbound call ever reaches a dialog.
+#   Airtel, Vi -> leave it off; both answer correctly on the arrival socket.
+respond_on_client = false
 # BASE path Agent A reads its tunnel-assigned P-CSCF address from, written by
 # the supervisor once that line's tunnel is up. The line index is appended,
 # giving /tmp/pcscf-0, /tmp/pcscf-1, ... — each line's carrier assigns its own

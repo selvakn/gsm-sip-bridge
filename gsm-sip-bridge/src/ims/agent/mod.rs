@@ -322,6 +322,7 @@ fn run_inner(
         // one well-known status port.
         status_port: crate::vowifi::AGENT_A_STATUS_PORT,
         wideband: config.wideband,
+        respond_on_client: config.respond_on_client,
         // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
         // has no attachment of its own to refresh.
         answer_preference: sdp::AnswerPreference::legacy(),
@@ -365,6 +366,10 @@ pub(crate) struct InboundParams<'a> {
     /// per-line-derived port (specs/018-volte-multi-modem).
     pub status_port: u16,
     pub wideband: bool,
+    /// Answer a network-initiated request over the Gm client leg rather than
+    /// the socket it arrived on — a carrier quirk, off everywhere but where a
+    /// capture says otherwise. See `config::VowifiConfig::respond_on_client`.
+    pub respond_on_client: bool,
     pub answer_preference: sdp::AnswerPreference,
     /// Port the telephone-side half dials for its leg. The two halves must
     /// agree; see `inbound::handle_invite`.
@@ -418,6 +423,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         control_addr,
         status_port,
         wideband,
+        respond_on_client,
         answer_preference,
         veth_sip_port,
         pre_renewal,
@@ -561,6 +567,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             control_addr,
             veth_local_ip: local_ip,
             wideband,
+            respond_on_client,
             answer_preference,
             veth_sip_port,
             pre_renewal,
@@ -845,6 +852,9 @@ struct DispatchParams<'a> {
     control_addr: SocketAddr,
     veth_local_ip: IpAddr,
     wideband: bool,
+    /// See `config::VowifiConfig::respond_on_client`; consumed by the receive
+    /// in `dispatch_loop`.
+    respond_on_client: bool,
     answer_preference: sdp::AnswerPreference,
     veth_sip_port: u16,
     pre_renewal: Option<&'a PreRenewalHook>,
@@ -951,11 +961,10 @@ fn dispatch_loop(
     place_call_rx: mpsc::Receiver<PendingPlaceCall>,
 ) -> BridgeResult<()> {
     let mut st = LoopState::new();
-    // Read once: see the `GM_RESPOND_ON_CLIENT` comment at the receive below.
-    let respond_on_client = std::env::var_os("GM_RESPOND_ON_CLIENT").is_some();
+    let respond_on_client = p.respond_on_client;
     if respond_on_client {
         tracing::warn!(
-            "GM_RESPOND_ON_CLIENT is set — answering network-initiated requests on the client leg (experimental, Jio-specific)"
+            "vowifi.respond_on_client is set — answering network-initiated requests on the client leg, not the socket they arrived on"
         );
     }
     loop {
@@ -990,30 +999,31 @@ fn dispatch_loop(
         // leaves a call's audio intact, so it is worth not killing.
         p.progress.set_busy(st.busy());
         p.progress.enter(watchdog::Phase::Idle);
-        // EXPERIMENT, gated on `GM_RESPOND_ON_CLIENT=1`: answer a
-        // network-initiated request over the *client* leg instead of the
-        // socket it arrived on.
+        // `vowifi.respond_on_client`: answer a network-initiated request over
+        // the *client* leg instead of the socket it arrived on.
         //
         // Jio ignores every response we send from `port_us` — verified on the
         // wire to both of its protected ports, with the correct SPI,
         // monotonic ESP sequence, and well-formed SIP. Yet it validates our
         // ESP on the client SA (`spi-s`) continuously, and TS 33.203 keys all
         // four SAs from one `IK`, so there is no cryptographic difference
-        // between the packets it accepts and the ones it drops. This tests
-        // the one pairing never tried: replying on the SA it demonstrably
-        // trusts. It contradicts the spec, so it stays behind an env var and
-        // must not become default — Airtel and Vi answer correctly today.
+        // between the packets it accepts and the ones it drops. Replying on
+        // the SA it demonstrably trusts is the pairing that works there.
+        //
+        // It contradicts RFC 3261 §18.2.2, so it is off unless a line's
+        // config asks for it — Airtel and Vi answer correctly on the arrival
+        // socket today.
         let received = match inbound.rx.recv_timeout(poll) {
             Ok((msg, sink)) if respond_on_client && matches!(msg, SipMessage::Request(_)) => {
                 match session.transport().and_then(|t| t.sink()) {
                     Ok(client_sink) => {
                         tracing::debug!(
-                            "GM_RESPOND_ON_CLIENT: answering on the client leg, not the arrival socket"
+                            "respond_on_client: answering on the client leg, not the arrival socket"
                         );
                         Ok((msg, client_sink))
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "GM_RESPOND_ON_CLIENT set but no client sink; using the arrival socket");
+                        tracing::warn!(error = %e, "respond_on_client is set but there is no client sink; using the arrival socket");
                         Ok((msg, sink))
                     }
                 }
