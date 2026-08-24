@@ -1,8 +1,10 @@
 # Investigation: Jio VoWiFi outbound (MO) calls always end in 480
 
 **Triaged**: 2026-08-24 · **Effort**: unknown, likely carrier-side ·
-**Status**: open, blocked on Jio (not a code defect as far as this
-investigation got)
+**Status**: open. **Not** blocked on Jio: the same SIM originates fine over
+VoLTE, so MO voice is provisioned and the "carrier limitation" reading is
+dead. Next step is running our own stack over LTE to separate an
+access-specific entitlement from a fault of ours.
 
 ## Symptom
 
@@ -111,18 +113,70 @@ Details of 4 and 5, and the `[vowifi] originating_headers` probe built to test
 them, are in
 [jio-vowifi-outbound-480-followup.md](jio-vowifi-outbound-480-followup.md).
 
-## Working conclusion
+## Working conclusion — **overturned 2026-08-24**
 
-The identical, destination-independent intercept points at an
-**account/SIM-level entitlement flag on Jio's side**: this line's VoWiFi
-registration is provisioned for MT (inbound) calls and SMS — both
-confirmed working over this same registration — but not MO (outbound)
-voice. Jio's core recognizes that at INVITE time and diverts every outbound
-attempt to a fixed announcement/intercept, independent of destination,
-before ever attempting to reach a called party.
+> The previous conclusion here was: *"an account/SIM-level entitlement flag —
+> this line is provisioned for MT and SMS but not MO voice; nothing in this
+> bridge's SIP stack can work around a service that isn't enabled."*
+>
+> **That is wrong.** This SIM places outbound calls perfectly well. See below.
 
-Nothing in this bridge's SIP stack can work around a service that isn't
-enabled for the account — this is not believed to be fixable from our side.
+## The control test: the same SIM originates fine over VoLTE
+
+Run 2026-08-24 with the bridge stopped, the modem's own IMS re-enabled
+(`AT+QCFG="ims",1` + `AT+CFUN=1,1`), and the call placed from the *module's*
+VoLTE stack instead of ours:
+
+```
++QCFG: "ims",1,1          # modem IMS enabled AND registered to Jio over LTE
++COPS: 0,0,"JIO 4G Jio",7 # E-UTRAN
+
+>>> ATD+91XXXXXXXXXX;
+  [  5.8s] CLCC voice: alerting     <- the destination handset actually rang
+  [ 10.8s] CLCC voice: active       <- answered, media up
+  [ 31.7s] NO CARRIER
+```
+
+Same SIM, same subscription, same network, same destination that our own stack
+cannot reach. It alerted and connected.
+
+**So MO voice is provisioned.** Every "the account isn't entitled" reading of
+this bug is dead, and so is "nothing in our stack can fix it".
+
+## What the difference actually is
+
+The one variable the control test changed, besides whose stack signals, is the
+**access network**:
+
+| | our stack | the modem |
+|---|---|---|
+| access | VoWiFi — ePDG/IPsec, `P-Access-Network-Info: 3GPP-WLAN` | VoLTE — LTE, E-UTRAN |
+| MT voice | works | (not tested) |
+| SMS | works | works |
+| **MO voice** | **intercepted, `480`** | **connects** |
+
+Two candidates remain, and they are cleanly separable:
+
+1. **Wi-Fi-calling outgoing is separately entitled.** MT-over-VoWiFi and
+   SMS-over-VoWiFi are allowed on this subscription, MO-over-VoWiFi is not,
+   and Jio expresses that as a TAS intercept rather than a `403`. This fits
+   every observation, including the destination independence and the generic
+   announcement.
+2. **Something in our registration or INVITE that only bites on the Wi-Fi
+   access.** Less likely after the header work above, but not excluded.
+
+## The next test separates them
+
+Run **our own stack over VoLTE** — `[volte]` instead of `[vowifi]`, which this
+repo already supports (specs/015-017, `volte-call`/`volte-bridge`) on the same
+modem and SIM. It is a config change on the Pi, not a rebuild.
+
+- Our stack originates fine over LTE → the fault is specific to the Wi-Fi
+  access, i.e. candidate 1, and the fix is a conversation with Jio, not code.
+- Our stack is intercepted over LTE too → the fault is ours, not the access,
+  and the modem's INVITE is the reference to diff against.
+
+Until that runs, "carrier limitation" is **not** a safe thing to write down.
 
 ## Where the decision is taken
 
@@ -130,8 +184,10 @@ Every capture puts a terminating application server in the path
 (`Record-Route: <sip:tn3scfx6617mw…;interface=isc>`) and the `cause=41` is
 already stamped when the 183 comes back ~220 ms later — before any destination
 is alerted, and regardless of destination, P-CSCF (three different ones seen),
-media-server IP, or header set. That is a subscriber service decision taken by
-Jio's TAS, not a protocol fault in this client.
+media-server IP, or header set. That is a service decision taken by Jio's TAS. The control test above shows
+it is *not* a decision about the subscription as a whole — the same
+subscription originates fine over LTE — so it is a decision about this call,
+this access, or this registration.
 
 ## The announcement says nothing
 
@@ -142,7 +198,7 @@ no "this service is not activated". It rules out the hope that Jio would name
 the reason, and it is consistent with either an entitlement refusal or a
 routing failure inside Jio's TAS. It does not distinguish them.
 
-## Circuit-switched comparison is not available on this line
+## Circuit-switched comparison is not available on this line (but VoLTE is)
 
 The obvious control test — place the same call with this SIM off our IMS stack
 — cannot be run on Jio. Measured on the modem 2026-08-24:
@@ -158,12 +214,13 @@ to, and the modem's own IMS stack is deliberately off (`modem-ims`, so it does
 not re-register our IMPU and tear our binding down). `ATD` therefore fails
 instantly and tells us nothing about provisioning.
 
-The only equivalent control test is to re-enable the modem's own IMS
-(`AT+QCFG="ims",1` + a module reboot) and dial from *its* VoLTE stack. That is
-genuinely decisive — same subscription, same network, a stack Jio certainly
-trusts — but it drops the ePDG tunnel and this line's registration for the
-duration, needs reverting afterwards, and toggling this setting has known
-knock-on effects on SMS. Not run unattended.
+The equivalent control test is to re-enable the modem's own IMS
+(`AT+QCFG="ims",1` + a module reboot) and dial from *its* VoLTE stack — same
+subscription, same network, a stack Jio certainly trusts. **That was run, and
+it is what overturned this document's conclusion** (see above). It costs the
+ePDG tunnel and this line's registration for ~10 minutes and needs reverting
+afterwards; the line was verified back to `state: Registered`,
+`gm_connection: up` and no SMS errors when it was.
 
 ## Next steps
 
@@ -190,8 +247,13 @@ knock-on effects on SMS. Not run unattended.
   from "our client is doing something wrong", and nothing in this document
   can distinguish those two. It needs care: the modem is carrying the live
   tunnel's USIM traffic.
-- Check whether "WiFi Calling outgoing" is a separately-toggled entitlement
-  from base VoWiFi in the Jio app / with Jio customer care for this SIM.
+- **Run our own stack over VoLTE** (`[volte]`, same modem and SIM) — the test
+  that separates "Wi-Fi-calling outgoing is not entitled" from "our INVITE is
+  at fault". Config change, no rebuild. See "The next test separates them".
+- Then, and only if that points at the access: ask Jio whether "WiFi Calling
+  outgoing" is entitled separately from base VoWiFi on this SIM. Worth asking
+  with the VoLTE result in hand, since "outgoing calls don't work" alone will
+  get the generic script.
 - If Jio confirms MO voice isn't provisioned and there's no way to enable
   it, downgrade this from "bug to fix" to "known carrier limitation" in
   `docs/todo.md` and stop pursuing it.
