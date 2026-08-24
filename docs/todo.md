@@ -126,3 +126,14 @@ Observed pending items
       "start the media session now" (RFC 3262/5009 early-media UAC
       behavior), the same asymmetry `ims::agent::origination` had to learn
       on the bridge side for this exact feature.
+- [ ] Jio VoWiFi outbound (MO) calls always end in `480` — **triaged
+      2026-08-24**: every outbound call on the Jio line reaches an MSML
+      media server, plays ~13.4s of early media, then gets `480
+      Temporarily Unavailable` — regardless of destination (confirmed
+      against two unrelated numbers, byte-identical signature). Two
+      external-review theories (missing PRACK, missing UPDATE/qos
+      preconditions, malformed `P-Access-Network-Info`) were checked
+      against the live capture and ruled out — none fit the evidence.
+      Working theory: an account/SIM entitlement gap on Jio's side (MT
+      voice + SMS provisioned, MO voice not), not a client-side defect.
+      Plan: [docs/plans/jio-vowifi-outbound-480.md](plans/jio-vowifi-outbound-480.md).
