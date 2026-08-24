@@ -133,10 +133,43 @@ is alerted, and regardless of destination, P-CSCF (three different ones seen),
 media-server IP, or header set. That is a subscriber service decision taken by
 Jio's TAS, not a protocol fault in this client.
 
+## The announcement says nothing
+
+Decoded and listened to, 2026-08-24 (`tools/rtp2wav.py` on a `veth-sip0`
+capture): *"Your call cannot be completed at the moment, please try again
+later."* Generic network boilerplate — no barring notice, no balance notice,
+no "this service is not activated". It rules out the hope that Jio would name
+the reason, and it is consistent with either an entitlement refusal or a
+routing failure inside Jio's TAS. It does not distinguish them.
+
+## Circuit-switched comparison is not available on this line
+
+The obvious control test — place the same call with this SIM off our IMS stack
+— cannot be run on Jio. Measured on the modem 2026-08-24:
+
+```
+AT+COPS?          +COPS: 0,0,"JIO 4G Jio",7      # 7 = E-UTRAN, LTE only
+AT+QCFG="ims"     +QCFG: "ims",2,0               # 2 = the modem's IMS is disabled
+ATD+91…;          OK / NO CARRIER (0.3 s)        # no attempt reaches the network
+```
+
+Jio operates no 2G/3G, so there is no circuit-switched service to fall back
+to, and the modem's own IMS stack is deliberately off (`modem-ims`, so it does
+not re-register our IMPU and tear our binding down). `ATD` therefore fails
+instantly and tells us nothing about provisioning.
+
+The only equivalent control test is to re-enable the modem's own IMS
+(`AT+QCFG="ims",1` + a module reboot) and dial from *its* VoLTE stack. That is
+genuinely decisive — same subscription, same network, a stack Jio certainly
+trusts — but it drops the ePDG tunnel and this line's registration for the
+duration, needs reverting afterwards, and toggling this setting has known
+knock-on effects on SMS. Not run unattended.
+
 ## Next steps
 
-- **Get the announcement transcribed.** It is real speech, 13.5 s of it, and
-  nobody has listened to it. Capture and decode it without a rebuild:
+- ~~**Get the announcement transcribed.**~~ Done — see above; it says
+  nothing useful. The capture recipe, kept because it is the general way to
+  hear any call on this bridge without a rebuild:
 
   ```bash
   # on the Pi, while placing a call:

@@ -2,6 +2,27 @@
 Observed pending items
 ----------------------
 
+- [ ] **RFC 4028 session refresh (`Supported: timer`) is not implemented.**
+      We never advertise `timer`, so nothing is broken today — but Jio's own
+      `183` carries `Require: timer` and `Session-Expires: 300` *unprompted*,
+      i.e. it will demand refreshes on a call that actually connects. If a
+      carrier ever gets a 2xx to us with `Require: timer`, RFC 4028 §7.4 makes
+      the refresh our obligation and a connected call would drop at the
+      session interval. Two consequences:
+      - `[vowifi] originating_headers = ["supported"]` advertises `timer` and
+        is therefore a promise this client cannot keep. It is off by default
+        and documented as a hazard; it must not be turned on for a carrier
+        whose calls connect until this is implemented.
+      - Confirmed live on Jio 2026-08-24: advertising `Supported: 100rel, timer`
+        made Jio escalate its `183` from `Require: timer` to
+        `Require: timer,100rel`, so the carrier does act on what we advertise.
+      Work: honour `Session-Expires`/`Min-SE` on the INVITE and its responses,
+      pick the refresher per §7.1, and send a re-INVITE or `UPDATE` at half the
+      interval. See
+      [docs/plans/jio-vowifi-outbound-480-followup.md](plans/jio-vowifi-outbound-480-followup.md).
+      Origin: the same "don't advertise extensions you don't implement" lesson
+      that produced the PRACK bug (`specs/037-p-early-media`).
+
 - [x] ~~Update docs about the sip listener mode~~ — README, architecture.md,
       configuration.md, observability.md, and RELEASE_NOTES.md all cover
       `[sip_server]` mode as of 8.3.0, including the four hardening fixes
