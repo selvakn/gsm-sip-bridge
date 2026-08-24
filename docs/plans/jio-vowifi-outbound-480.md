@@ -95,6 +95,22 @@ failed to match the evidence:
      per-destination compliance check wouldn't produce an identical canned
      response regardless of who's being called.
 
+4. **"The INVITE omits the MTSI headers Jio's S-CSCF keys on"** — false,
+   tested on the live line 2026-08-24. `Accept-Contact` with the MMTel ICSI,
+   `P-Preferred-Service`, the `+g.3gpp.icsi-ref` Contact feature tag,
+   `P-Preferred-Identity`, `Supported: 100rel, timer` and the full MTSI
+   `Allow` list were all sent together and the intercept was unchanged to the
+   second (183 at +226 ms with the same `cause=41`, same `msml@` contact,
+   13.60 s of the same announcement, same `480 cause=31`).
+5. **"The INVITE carries no `Security-Verify`"** — false. Our own `PRACK` and
+   `ACK` in the failing call, and the 2-minutely `OPTIONS`, are all requests
+   sent over the SA without it, and Jio's core routes and answers every one of
+   them. See the follow-up doc for the capture.
+
+Details of 4 and 5, and the `[vowifi] originating_headers` probe built to test
+them, are in
+[jio-vowifi-outbound-480-followup.md](jio-vowifi-outbound-480-followup.md).
+
 ## Working conclusion
 
 The identical, destination-independent intercept points at an
@@ -108,14 +124,41 @@ before ever attempting to reach a called party.
 Nothing in this bridge's SIP stack can work around a service that isn't
 enabled for the account — this is not believed to be fixable from our side.
 
-## Next steps (not started)
+## Where the decision is taken
 
+Every capture puts a terminating application server in the path
+(`Record-Route: <sip:tn3scfx6617mw…;interface=isc>`) and the `cause=41` is
+already stamped when the 183 comes back ~220 ms later — before any destination
+is alerted, and regardless of destination, P-CSCF (three different ones seen),
+media-server IP, or header set. That is a subscriber service decision taken by
+Jio's TAS, not a protocol fault in this client.
+
+## Next steps
+
+- **Get the announcement transcribed.** It is real speech, 13.5 s of it, and
+  nobody has listened to it. Capture and decode it without a rebuild:
+
+  ```bash
+  # on the Pi, while placing a call:
+  sudo tcpdump -i veth-sip0 -n -s 0 -w /tmp/annc.pcap udp
+  # then, locally — Agent A's transcoded L16 toward Agent B's RTP port:
+  python3 rtp2wav.py annc.pcap out.wav <agent-B-rtp-port>
+  ```
+
+  The port is in the log line `Agent B advertised a non-veth RTP address …
+  using=10.99.0.2:<port>`. L16/16000 is big-endian PCM: strip the 12-byte RTP
+  header, byte-swap, write a WAV header. (Capturing on the veth avoids
+  decoding the carrier's AMR-WB, and avoids the Gm ESP entirely.)
+  `siptest`'s own `[media].recording_dir` will **not** hold it if the softphone
+  is behind NAT from the Pi — the relayed early media never reaches it.
+- **Place an outbound call with this SIM off our IMS stack entirely** — the
+  modem's own CS/VoLTE origination (`ATD`) on the same subscription. This is
+  the one test that separates "the account is not provisioned for MO voice"
+  from "our client is doing something wrong", and nothing in this document
+  can distinguish those two. It needs care: the modem is carrying the live
+  tunnel's USIM traffic.
 - Check whether "WiFi Calling outgoing" is a separately-toggled entitlement
   from base VoWiFi in the Jio app / with Jio customer care for this SIM.
-- If reachable, get the actual text of the ~13.4s announcement (record and
-  listen to one of the `siptest` call recordings under
-  `[media].recording_dir`) — it may say outright why the call isn't going
-  through.
 - If Jio confirms MO voice isn't provisioned and there's no way to enable
   it, downgrade this from "bug to fix" to "known carrier limitation" in
   `docs/todo.md` and stop pursuing it.

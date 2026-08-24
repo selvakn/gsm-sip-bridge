@@ -387,6 +387,10 @@ section! {
         /// Whether an SMS delivered over IMS is acknowledged at the RP layer.
         /// See `VowifiConfig::sms_delivery_report`.
         pub sms_delivery_report: bool,
+        /// Optional originating (INVITE) header groups, by name. Empty (the
+        /// default) is the minimal header set every carrier here originates
+        /// on. See `config::OriginatingHeaders` for the accepted tokens.
+        pub originating_headers: Vec<String>,
         pub pcscf_source_path: String,
         pub control_port: u16,
         pub wideband: bool,
@@ -421,6 +425,7 @@ impl Default for RawVowifi {
             gm_cipher_alg: String::new(),
             respond_on_client: false,
             sms_delivery_report: true,
+            originating_headers: Vec::new(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
             control_port: 7050,
             wideband: true,

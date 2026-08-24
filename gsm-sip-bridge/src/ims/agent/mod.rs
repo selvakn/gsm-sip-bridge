@@ -642,6 +642,9 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             // the same TS 24.341 procedure over LTE as over Wi-Fi, so one
             // switch governs both rather than two that could disagree.
             sms_delivery_report: app_config.vowifi.sms_delivery_report,
+            // Read from `[vowifi]` on both paths for the same reason as
+            // `sms_delivery_report` above: one switch, not two that disagree.
+            originating_headers: app_config.vowifi.originating_headers,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
@@ -1047,6 +1050,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::sms_delivery_report`; consumed by
     /// [`acknowledge`].
     sms_delivery_report: bool,
+    /// See `config::VowifiConfig::originating_headers`; consumed by
+    /// [`origination::begin_origination`].
+    originating_headers: crate::config::OriginatingHeaders,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
     /// Publishes which phase the loop is in, so the watchdog can tell a line
@@ -1071,6 +1077,7 @@ impl DispatchParams<'_> {
             veth_local_ip: self.veth_local_ip,
             veth_sip_port: self.veth_sip_port,
             wideband: self.wideband,
+            originating_headers: self.originating_headers,
         }
     }
 }

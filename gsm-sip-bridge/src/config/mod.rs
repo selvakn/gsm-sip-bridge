@@ -519,6 +519,57 @@ impl Default for AlertsConfig {
     }
 }
 
+/// Which optional originating headers the carrier INVITE carries, one flag
+/// per `[vowifi] originating_headers` token.
+///
+/// All off by default. The minimal header set is what every carrier in
+/// production originates on, and none of these has ever been needed to place
+/// a call — they exist so a carrier that intercepts a minimal INVITE can be
+/// tested against a TS 24.229/MTSI-shaped one without a rebuild
+/// (`docs/plans/jio-vowifi-outbound-480.md`). Turn one on only with a capture
+/// that says the carrier wants it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OriginatingHeaders {
+    /// `"icsi"` — declare the call as MMTel voice, the way an MTSI UE does:
+    /// `Accept-Contact: *;+g.3gpp.icsi-ref="…mmtel";explicit;require`,
+    /// `P-Preferred-Service`, and the matching `+g.3gpp.icsi-ref` feature tag
+    /// on `Contact`. TS 24.173 §5.2/TS 24.229 §5.1.2A.1. An S-CSCF whose
+    /// initial filter criteria key MO voice on the ICSI will not match a
+    /// request that omits it.
+    pub icsi: bool,
+    /// `"preferred-identity"` — `P-Preferred-Identity` with the same public
+    /// identity already in `From` (TS 24.229 §5.1.2A.1). Only changes anything
+    /// where the registration has more than one associated URI and the network
+    /// would otherwise pick the wrong service profile.
+    pub preferred_identity: bool,
+    /// `"supported"` — `Supported: 100rel, timer`.
+    ///
+    /// **Not free**: advertising `100rel` lets the network answer with
+    /// `Require: 100rel`, which obliges us to PRACK every reliable provisional
+    /// (implemented — `origination::prack_if_required`), and advertising
+    /// `timer` obliges us to refresh the session (RFC 4028 §7.4), which is
+    /// **not** implemented. Only useful for testing whether the advertisement
+    /// itself changes how the request is routed.
+    pub supported: bool,
+    /// `"allow"` — the full method list an MTSI UE offers
+    /// (`…, PRACK, UPDATE, INFO, MESSAGE, NOTIFY, REFER`) in place of the
+    /// five-method minimum.
+    pub allow: bool,
+}
+
+impl OriginatingHeaders {
+    /// The `[vowifi] originating_headers` tokens, in the order they are
+    /// documented. Kept beside the struct so the parser and its error message
+    /// cannot disagree about what is accepted.
+    pub const TOKENS: [&'static str; 4] = ["icsi", "preferred-identity", "supported", "allow"];
+
+    /// Whether any group is on — the check `build_invite` makes before
+    /// deciding it can emit the pinned minimal header set verbatim.
+    pub fn any(&self) -> bool {
+        self.icsi || self.preferred_identity || self.supported || self.allow
+    }
+}
+
 /// Configuration for the inbound VoWiFi-to-SIP bridge (feature
 /// `011-vowifi-sip-bridge`) — a second, independent inbound call path
 /// alongside the existing circuit-switched GSM-to-SIP bridge. See
@@ -630,6 +681,15 @@ pub struct VowifiConfig {
     /// a carrier that turns out to dislike the report — and record the
     /// capture if you do, because no such carrier is known.
     pub sms_delivery_report: bool,
+    /// Extra originating (INVITE) headers a carrier's TAS may want before it
+    /// will treat the request as an MMTel voice call.
+    ///
+    /// Empty (the default) keeps the minimal header set every carrier in
+    /// production originates on today — see
+    /// `ims::call::the_originating_header_set_is_pinned`. Each entry opts one
+    /// group in; see [`OriginatingHeaders`] for what each does and
+    /// `docs/plans/jio-vowifi-outbound-480.md` for why they exist.
+    pub originating_headers: OriginatingHeaders,
     /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
     /// by `supervise::orchestrate` once this line's tunnel is up.
     ///
@@ -808,6 +868,7 @@ impl Default for VowifiConfig {
             gm_cipher_alg: String::new(),
             respond_on_client: false,
             sms_delivery_report: true,
+            originating_headers: OriginatingHeaders::default(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
             veth_local_addr: "10.99.0.1".to_string(),
             veth_peer_addr: "10.99.0.2".to_string(),
@@ -1921,6 +1982,37 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("vowifi.register_request_uri must be"));
+    }
+
+    #[test]
+    fn originating_headers_are_empty_unless_named() {
+        assert_eq!(
+            parse(MINIMAL_TOML).vowifi.originating_headers,
+            OriginatingHeaders::default()
+        );
+        assert!(!parse(MINIMAL_TOML).vowifi.originating_headers.any());
+
+        let src =
+            format!("{MINIMAL_TOML}\n[vowifi]\noriginating_headers = [\"icsi\", \"allow\"]\n");
+        let set = parse(&src).vowifi.originating_headers;
+        assert_eq!(
+            set,
+            OriginatingHeaders {
+                icsi: true,
+                allow: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A typo here silently disables the experiment it was meant to run, so
+    /// it has to fail startup rather than parse to "nothing on".
+    #[test]
+    fn an_unknown_originating_header_entry_is_rejected() {
+        let src = format!("{MINIMAL_TOML}\n[vowifi]\noriginating_headers = [\"icsi\", \"typo\"]\n");
+        let err = try_parse(&src).unwrap_err().to_string();
+        assert!(err.contains("originating_headers"), "{err}");
+        assert!(err.contains("typo"), "{err}");
     }
 
     #[test]

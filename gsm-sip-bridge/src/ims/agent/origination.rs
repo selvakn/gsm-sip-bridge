@@ -276,6 +276,8 @@ pub(super) struct OriginationSetup {
     pub(super) veth_local_ip: IpAddr,
     pub(super) veth_sip_port: u16,
     pub(super) wideband: bool,
+    /// See `config::OriginatingHeaders` — empty everywhere by default.
+    pub(super) originating_headers: crate::config::OriginatingHeaders,
 }
 
 /// Builds and sends the carrier INVITE and returns the in-flight state, or
@@ -360,6 +362,7 @@ pub(super) fn begin_origination(
         cseq: invite_cseq,
         branch: &branch,
         body: &offer,
+        originating_headers: setup.originating_headers,
     });
 
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
