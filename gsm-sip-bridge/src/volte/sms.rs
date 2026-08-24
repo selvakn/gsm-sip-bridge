@@ -1057,6 +1057,35 @@ mod tests {
         );
     }
 
+    /// The window `ims::agent::handle_message` withholds the SMS delivery
+    /// report across. A second route seeing `AcknowledgeOnly` learns nothing
+    /// about whether the first route's relay actually succeeded — and if it
+    /// then fails, recovery is the network retransmitting. Reporting delivery
+    /// on the strength of the claim alone would suppress exactly that retry,
+    /// so `is_confirmed`, not `contains`, has to gate it.
+    #[test]
+    fn a_claim_can_be_acknowledge_only_while_still_unconfirmed() {
+        let mut d = Dedupe::default();
+        let inbound = msg(MessageRoute::OverRegistration, "+91123", "hello");
+        let key = inbound.dedupe_key();
+
+        assert_eq!(decide(&mut d, &inbound), Disposition::Handle);
+        // The claimant's relay is still in flight here.
+        assert_eq!(decide(&mut d, &inbound), Disposition::AcknowledgeOnly);
+        assert!(d.contains(&key), "claimed");
+        assert!(!d.is_confirmed(&key), "but the outcome is still pending");
+
+        // That relay fails and releases the claim; the next arrival is fresh
+        // again, which is only useful if the network was left free to retry.
+        d.forget(&key);
+        assert_eq!(decide(&mut d, &inbound), Disposition::Handle);
+
+        // Once the claimant confirms, a later duplicate is safe to report.
+        d.confirm(&key);
+        assert_eq!(decide(&mut d, &inbound), Disposition::AcknowledgeOnly);
+        assert!(d.is_confirmed(&key));
+    }
+
     #[test]
     fn forgetting_an_unadmitted_key_is_a_harmless_no_op() {
         let mut d = Dedupe::default();

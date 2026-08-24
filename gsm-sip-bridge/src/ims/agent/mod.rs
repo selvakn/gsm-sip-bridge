@@ -822,6 +822,13 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> 
 /// or the modem's own storage does not keep it pending, just not recorded or
 /// forwarded again.
 ///
+/// The two acknowledgements part company on that path. The `200 OK` closes
+/// the SIP transaction either way, but the delivery report — which is what
+/// actually stops the network retrying — waits for the other side's claim to
+/// be `is_confirmed`. An admitted-but-unconfirmed claim can still fail and
+/// `forget` itself, and the retransmission we would otherwise have suppressed
+/// is exactly how that failure recovers.
+///
 /// Admission happens *before* the relay below, not after: checking
 /// `contains` early but only calling `admit` once the relay is known to have
 /// succeeded looks safer but is not — it reopens a window where this
@@ -857,6 +864,30 @@ fn handle_message(
         };
     }
 
+    // TS 23.040 §9.2.3.9: a Short Message Type 0 is the network asking "is
+    // this subscriber reachable?", not a message for anyone. The spec is
+    // explicit that it must be acknowledged and its contents discarded, so it
+    // returns here — before the dedupe, before the relay, before the store.
+    //
+    // Treating one as an ordinary text is what put a stream of identical
+    // notifications in front of the operator (Jio probes this line every
+    // couple of minutes), and made it look as though every message sent to
+    // the line arrived with the same body. It is acknowledged exactly as any
+    // other message is, delivery report included — that acknowledgement is
+    // the entire point of the probe. The only change is that nothing
+    // downstream ever hears of it.
+    //
+    // Unconditional, unlike the duplicate path above: there is no competing
+    // claim to wait on, because a probe is never relayed to anyone.
+    if decoded.as_ref().is_some_and(|d| d.is_type_zero) {
+        tracing::info!(
+            sender = %sender,
+            "silent Type 0 SMS (reachability probe); acknowledging without recording it"
+        );
+        acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+        return;
+    }
+
     let route = crate::volte::sms::MessageRoute::OverRegistration;
     tracing::info!(sender = %sender, route = route.as_str(), "received SIP MESSAGE");
 
@@ -874,8 +905,33 @@ fn handle_message(
     if disposition == crate::volte::sms::Disposition::AcknowledgeOnly {
         // Already handled via the other bearer (or a prior delivery of this
         // same MESSAGE) in this same process — the network still needs the
-        // retry stopped, but it must not be recorded or forwarded again.
-        acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+        // SIP transaction closed, but it must not be recorded or forwarded
+        // again.
+        //
+        // The delivery report is held back unless that other claim is
+        // *confirmed*. `Dedupe::admit` happens before the claimant's relay,
+        // so a claim can still be in flight — and if it fails, the claimant
+        // calls `forget` and relies on the network retransmitting to recover
+        // the message. Reporting delivery here is what stops that
+        // retransmission, so doing it on the strength of an unconfirmed claim
+        // would turn a recoverable relay failure into a lost text. That is
+        // the distinction `Dedupe::is_confirmed` exists to draw, and the one
+        // `contains`'s own docs warn about.
+        //
+        // Costs nothing when the claim does succeed: the network retries,
+        // the claim is confirmed by then, and that retry gets the report.
+        let claim_confirmed = p
+            .dedupe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_confirmed(&key);
+        acknowledge(
+            session,
+            sink,
+            req,
+            decoded.as_ref(),
+            p.sms_delivery_report && claim_confirmed,
+        );
         return;
     }
 

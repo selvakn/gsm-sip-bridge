@@ -36,6 +36,12 @@ pub struct DecodedSms {
     /// echoed verbatim in the delivery report so the network can match the
     /// acknowledgement to this specific delivery. See [`build_rp_ack`].
     pub rp_mr: u8,
+    /// A **Short Message Type 0** (TS 23.040 §9.2.3.9): a silent probe the
+    /// network sends to test whether the subscriber is reachable. It must be
+    /// acknowledged and its contents discarded — never stored, never shown.
+    /// `text` is still decoded (it costs nothing and makes the probe legible
+    /// in a trace), but a caller must not treat it as a message.
+    pub is_type_zero: bool,
 }
 
 /// Top-level entry point: an RP-DATA envelope in, a readable message out.
@@ -47,6 +53,7 @@ pub fn decode_vnd_3gpp_sms(body: &[u8]) -> Result<DecodedSms, String> {
         text: tpdu.text,
         part: tpdu.part,
         rp_mr: rp.mr,
+        is_type_zero: tpdu.is_type_zero,
     })
 }
 
@@ -124,6 +131,7 @@ struct SmsDeliverTpdu {
     originating_address: String,
     text: String,
     part: Option<(u8, u8)>,
+    is_type_zero: bool,
 }
 
 impl SmsDeliverTpdu {
@@ -145,8 +153,11 @@ impl SmsDeliverTpdu {
         pos += oa_octets;
         let originating_address = decode_address(oa_type, oa_digit_count, oa_bytes);
 
-        // TP-PID (1 octet): message-handling hints (e.g. a status report,
-        // a replace-message request) we don't act on — skip.
+        // TP-PID (1 octet). Mostly message-handling hints we don't act on
+        // (a status report, a replace-message request), but one value changes
+        // what the message *is* rather than how it renders — see
+        // `is_type_zero_pid`.
+        let pid = *buf.get(pos).ok_or("TPDU truncated before TP-PID")?;
         pos += 1;
         let dcs = *buf.get(pos).ok_or("TPDU truncated before TP-DCS")?;
         pos += 1;
@@ -165,8 +176,23 @@ impl SmsDeliverTpdu {
             originating_address,
             text,
             part,
+            is_type_zero: is_type_zero_pid(pid),
         })
     }
+}
+
+/// TS 23.040 §9.2.3.9: a TP-PID with bits 7-6 = `01` and bits 5-0 = `000000`
+/// is **Short Message Type 0** — a silent message the network uses to probe
+/// whether a subscriber is reachable. "The MS shall acknowledge receipt ...
+/// but shall discard its contents": it must be answered, and it must never be
+/// stored or shown to anyone.
+///
+/// Matched on the exact bit layout rather than `== 0x40` because the
+/// neighbouring values in that group are *not* the same thing: `0x41`-`0x47`
+/// are Replace Short Message Type 1-7, ordinary messages that do get stored
+/// (they merely supersede an earlier one from the same sender).
+fn is_type_zero_pid(pid: u8) -> bool {
+    (pid >> 6) == 0b01 && (pid & 0x3F) == 0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -233,7 +259,35 @@ fn decode_user_data(
             let fill_septets = (udh_octets * 8).div_ceil(7);
             let septets = unpack_septets(ud, udl);
             let text_septets = septets.get(fill_septets..).unwrap_or(&[]);
-            decode_gsm7(text_septets)
+            let (unpacked, bad_escape) = decode_gsm7_reporting_escapes(text_septets);
+
+            // Some senders set TP-DCS to GSM7 (7-bit packed) while putting
+            // raw, unpacked 8-bit text in TP-UD — one byte per character,
+            // TP-UDL set to that byte count as if it were a septet count.
+            // Unpacking that as real septets turns "welcome" into "wJ1 -Ä"
+            // (measured on Jio's own message-centre traffic, 2026-08-20).
+            //
+            // Length alone cannot tell the two apart: for <= 7 characters a
+            // packed stream occupies the same byte count as an unpacked one.
+            // So the test is *corroborated*, never a lone guess — the packed
+            // reading must be self-evidently broken (it decoded an escape
+            // this alphabet does not define, which a well-formed GSM7 stream
+            // never produces) AND the raw bytes must independently read as
+            // printable ASCII.
+            //
+            // Requiring the packed reading to be provably invalid is what
+            // keeps a legitimate short message safe: "ab" packs to
+            // `0x61 0x31`, which *is* all-printable ("a1"), so a
+            // printable-only test would silently corrupt it — but its packed
+            // reading decodes cleanly, so it never reaches this branch.
+            if udh_octets == 0 && bad_escape {
+                if let Some(raw) = ud.get(..udl) {
+                    if raw.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+                        return Ok((part, String::from_utf8_lossy(raw).into_owned()));
+                    }
+                }
+            }
+            unpacked
         }
         Alphabet::Ucs2 => {
             let text_bytes = ud.get(udh_octets..udl).unwrap_or(&[]);
@@ -328,6 +382,17 @@ fn unpack_septets(data: &[u8], count: usize) -> Vec<u8> {
 /// this doesn't recognise decodes as a space rather than failing the whole
 /// message — a wrong character beats losing the rest of the text over it.
 fn decode_gsm7(septets: &[u8]) -> String {
+    decode_gsm7_reporting_escapes(septets).0
+}
+
+/// [`decode_gsm7`] plus whether it met an escape the alphabet does not define.
+///
+/// A well-formed GSM7 stream only ever escapes into the handful of extension
+/// entries below, so an undefined one is evidence the bytes were never really
+/// septet-packed — which is exactly what [`decode_user_data`] needs to tell a
+/// genuine 7-bit message from a gateway's unpacked-ASCII one, without
+/// resorting to guessing from the text's content.
+fn decode_gsm7_reporting_escapes(septets: &[u8]) -> (String, bool) {
     const DEFAULT_ALPHABET: [char; 128] = [
         '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å', 'Δ', '_',
         'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', '\u{1B}', 'Æ', 'æ', 'ß', 'É', ' ', '!', '"',
@@ -339,6 +404,7 @@ fn decode_gsm7(septets: &[u8]) -> String {
         'ñ', 'ü', 'à',
     ];
     let mut out = String::with_capacity(septets.len());
+    let mut bad_escape = false;
     let mut chars = septets.iter();
     while let Some(&sep) = chars.next() {
         if sep == 0x1B {
@@ -353,13 +419,16 @@ fn decode_gsm7(septets: &[u8]) -> String {
                 0x3E => ']',
                 0x40 => '|',
                 0x65 => '€',
-                _ => ' ',
+                _ => {
+                    bad_escape = true;
+                    ' '
+                }
             });
         } else {
             out.push(DEFAULT_ALPHABET[(sep & 0x7F) as usize]);
         }
     }
-    out
+    (out, bad_escape)
 }
 
 /// TS 23.038 §6.2.2: UCS-2, i.e. big-endian UTF-16 code units. Real SMS never
@@ -467,6 +536,47 @@ mod tests {
         // envelope rather than defaulted — a report carrying the wrong one
         // acknowledges nothing.
         assert_eq!(decoded.rp_mr, 0x17);
+    }
+
+    /// TS 23.040 §9.2.3.9 vs the Replace Short Message group next to it. Only
+    /// `0x40` is the silent probe; `0x41`-`0x47` are ordinary messages that
+    /// must still be stored and shown, so an `== 0x40 & 0xF8`-style test would
+    /// silently swallow seven kinds of real text.
+    #[test]
+    fn type_zero_is_only_pid_0x40_not_the_replace_group() {
+        assert!(is_type_zero_pid(0x40));
+        for pid in 0x41..=0x47 {
+            assert!(!is_type_zero_pid(pid), "0x{pid:02x} is Replace, not Type 0");
+        }
+        assert!(!is_type_zero_pid(0x00));
+        assert!(!is_type_zero_pid(0xC0));
+    }
+
+    /// A gateway that sets TP-DCS to packed GSM7 but puts raw unpacked ASCII
+    /// in TP-UD. The packed reading of "welcome" decodes an escape the
+    /// alphabet does not define, which is the structural signal that lets the
+    /// raw bytes be trusted instead.
+    #[test]
+    fn recovers_unpacked_ascii_mislabelled_as_packed_gsm7() {
+        let raw = b"welcome";
+        let (part, text) = decode_user_data(raw, raw.len(), Alphabet::Gsm7, false).unwrap();
+        assert_eq!(part, None);
+        assert_eq!(text, "welcome");
+    }
+
+    /// The guard that keeps that recovery safe. "ab" packs to `0x61 0x31`,
+    /// whose bytes *are* all printable ASCII ("a1") — so a printable-only
+    /// test would corrupt it. Its packed reading decodes cleanly (no
+    /// undefined escape), so it must never reach the recovery branch.
+    #[test]
+    fn a_genuine_packed_message_is_never_mistaken_for_unpacked_ascii() {
+        let packed = pack_septets(&gsm7_encode("ab"));
+        assert!(
+            packed.iter().all(|&b| (0x20..=0x7E).contains(&b)),
+            "this test is only meaningful while the packed bytes look printable"
+        );
+        let (_, text) = decode_user_data(&packed, 2, Alphabet::Gsm7, false).unwrap();
+        assert_eq!(text, "ab");
     }
 
     /// TS 24.341 Annex B.6 (table B.6-7): an RP-ACK whose RP-User-Data IE

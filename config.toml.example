@@ -255,14 +255,16 @@ respond_on_client = false
 # the 200 OK says the request arrived, the report says the text was taken --
 # and every real handset sends both. Applies to VoLTE lines too; the procedure
 # does not depend on the access.
-#   Jio -> delivers nothing over our registration but silent Type 0
-#          reachability probes, which is what a network sending to a
-#          subscriber it believes is unreachable over IMS looks like. An
-#          unacknowledged short message is how it would reach that belief.
+#   Jio -> REQUIRED. Measured by A/B on a live line: with this off, a
+#          submitted SMS is never delivered -- the message centre sends only
+#          Type 0 reachability probes and holds the text, and [cs].enabled
+#          does not rescue it. Turning it on released a message stranded 12
+#          minutes earlier within 40s. A long enough unacknowledged window
+#          appears to lose texts outright, not merely delay them.
 #   Vi  -> delivers real SMS having never received a report, so this is not a
 #          precondition everywhere.
 # Turn it off only to isolate a carrier that dislikes the report -- and please
-# capture the exchange, because that would be the first evidence for it.
+# capture the exchange, because no such carrier is known.
 sms_delivery_report = true
 # BASE path Agent A reads its tunnel-assigned P-CSCF address from, written by
 # the supervisor once that line's tunnel is up. The line index is appended,

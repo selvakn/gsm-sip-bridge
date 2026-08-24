@@ -614,14 +614,19 @@ pub struct VowifiConfig {
     /// Applies to the cellular path as much as the Wi-Fi one — the procedure
     /// is the same over either access — despite living under `[vowifi]`.
     ///
-    /// Turn it off only to isolate a carrier that turns out to dislike the
-    /// report, and record the capture if you do: the evidence today runs the
-    /// other way. Jio delivers nothing over our registration but silent Type 0
-    /// reachability probes, which is the shape of a network that has decided
-    /// the subscriber is unreachable over IMS — and an unacknowledged short
-    /// message is how it would decide that. Vodafone/Vi delivers real SMS
-    /// without ever having received a report, so this is not a precondition
-    /// everywhere.
+    /// On Jio this is not optional, measured by A/B on a live line
+    /// (2026-08-24): with the report off, a submitted SMS is *never*
+    /// delivered — the message centre sends only Type 0 reachability probes
+    /// and holds the text, and `[cs].enabled` does not rescue it. Turning the
+    /// report on released a message stranded twelve minutes earlier within
+    /// 40s. One of two stranded messages never arrived at all, so a long
+    /// enough unacknowledged window appears to lose texts outright rather
+    /// than merely delay them.
+    ///
+    /// Vodafone/Vi delivers real SMS without ever having received a report,
+    /// so this is not a precondition everywhere. Turn it off only to isolate
+    /// a carrier that turns out to dislike the report — and record the
+    /// capture if you do, because no such carrier is known.
     pub sms_delivery_report: bool,
     /// Base path Agent A reads the tunnel-assigned P-CSCF address from, written
     /// by `supervise::orchestrate` once this line's tunnel is up.
