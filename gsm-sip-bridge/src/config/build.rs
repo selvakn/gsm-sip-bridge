@@ -638,6 +638,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
             raw.gm_cipher_alg
         },
         respond_on_client: raw.respond_on_client,
+        sms_delivery_report: raw.sms_delivery_report,
         pcscf_source_path: raw.pcscf_source_path,
         control_port: in_range(raw.control_port, "vowifi.control_port", 1..=65535)?,
         wideband: raw.wideband,

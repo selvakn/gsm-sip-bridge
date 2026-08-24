@@ -46,9 +46,9 @@ use crate::ims::observability;
 // call sites below read exactly as they did before the move.
 use crate::ims::sdp;
 use crate::ims::session::{
-    attempt_renewal, extract_caller, handle_notify, map_registration_error,
-    map_registration_status_code, next_backoff, respond, start_inbound, subscribe_reg_event,
-    to_unix, Inbound,
+    attempt_renewal, extract_caller, handle_notify, header_uri, map_registration_error,
+    map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
+    subscribe_reg_event, to_unix, Inbound,
 };
 use crate::ims::sip_client::{
     build_200_ok_bye, build_200_ok_message, build_486_busy_here, build_uas_response,
@@ -638,6 +638,10 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             attachment_check,
             modem_lock: modem_lock.as_ref(),
             dedupe: &dedupe,
+            // Read from `[vowifi]` on both paths deliberately: SMS-over-IP is
+            // the same TS 24.341 procedure over LTE as over Wi-Fi, so one
+            // switch governs both rather than two that could disagree.
+            sms_delivery_report: app_config.vowifi.sms_delivery_report,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
@@ -780,11 +784,21 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> 
 /// LAN/Internet reachability, whereas Agent A's netns is IMS-tunnel-only (see
 /// `ControlMessage::SmsReceived` docs).
 ///
+/// # Two acknowledgements, not one
+///
+/// A `MESSAGE` carrying 3GPP SMS-over-IP is owed two separate answers, and
+/// [`acknowledge`] sends both: the bare `200 OK` RFC 3428 asks for, saying
+/// the *request* arrived, and — as a `MESSAGE` request of its own — the
+/// delivery report of TS 24.341 §5.3.2.4, saying the *short message* was
+/// taken. See [`send_sms_delivery_report`] for why the second one cannot ride
+/// in the first's body.
+///
 /// # Hand it on before acknowledging it
 ///
 /// The acknowledgement goes out **after** the message has been handed to the
 /// half that records it, never before. This ordering is the whole safety
-/// property (specs/017 FR-026):
+/// property (specs/017 FR-026), and it now governs the delivery report too —
+/// that report, not the `200 OK`, is what stops the network retrying:
 ///
 /// - Acknowledge first, and a crash in the window between the two loses the
 ///   message outright — while the network believes it was delivered, so it
@@ -808,6 +822,13 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> 
 /// or the modem's own storage does not keep it pending, just not recorded or
 /// forwarded again.
 ///
+/// The two acknowledgements part company on that path. The `200 OK` closes
+/// the SIP transaction either way, but the delivery report — which is what
+/// actually stops the network retrying — waits for the other side's claim to
+/// be `is_confirmed`. An admitted-but-unconfirmed claim can still fail and
+/// `forget` itself, and the retransmission we would otherwise have suppressed
+/// is exactly how that failure recovers.
+///
 /// Admission happens *before* the relay below, not after: checking
 /// `contains` early but only calling `admit` once the relay is known to have
 /// succeeded looks safer but is not — it reopens a window where this
@@ -818,10 +839,10 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> 
 /// network's retransmission is treated as fresh rather than silently
 /// swallowed as a duplicate of a delivery that never actually happened.
 fn handle_message(
-    sink: &SipSink,
+    session: &mut crate::ims::RegisteredSession,
+    p: &DispatchParams,
     req: &SipRequest,
-    control_addr: SocketAddr,
-    dedupe: &Arc<Mutex<crate::volte::sms::Dedupe>>,
+    sink: &SipSink,
 ) {
     // The SIP `From` on a real network's MT SMS names an IMS core element
     // relaying the message (a carrier-internal SMSC gateway hostname), not
@@ -832,12 +853,39 @@ fn handle_message(
     let mut sender = extract_caller(req);
     let mut body = req.body.clone();
 
-    if let Some(decoded) = decode_pdu_body(req) {
-        sender = decoded.sender;
+    // Kept past the relay, not consumed by it: `rp_mr` is needed again at
+    // whichever acknowledgement point this message reaches.
+    let decoded = decode_pdu_body(req);
+    if let Some(decoded) = &decoded {
+        sender = decoded.sender.clone();
         body = match decoded.part {
             Some((seq, total)) => format!("[{seq}/{total}] {}", decoded.text),
-            None => decoded.text,
+            None => decoded.text.clone(),
         };
+    }
+
+    // TS 23.040 §9.2.3.9: a Short Message Type 0 is the network asking "is
+    // this subscriber reachable?", not a message for anyone. The spec is
+    // explicit that it must be acknowledged and its contents discarded, so it
+    // returns here — before the dedupe, before the relay, before the store.
+    //
+    // Treating one as an ordinary text is what put a stream of identical
+    // notifications in front of the operator (Jio probes this line every
+    // couple of minutes), and made it look as though every message sent to
+    // the line arrived with the same body. It is acknowledged exactly as any
+    // other message is, delivery report included — that acknowledgement is
+    // the entire point of the probe. The only change is that nothing
+    // downstream ever hears of it.
+    //
+    // Unconditional, unlike the duplicate path above: there is no competing
+    // claim to wait on, because a probe is never relayed to anyone.
+    if decoded.as_ref().is_some_and(|d| d.is_type_zero) {
+        tracing::info!(
+            sender = %sender,
+            "silent Type 0 SMS (reachability probe); acknowledging without recording it"
+        );
+        acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+        return;
     }
 
     let route = crate::volte::sms::MessageRoute::OverRegistration;
@@ -851,14 +899,39 @@ fn handle_message(
     };
     let key = inbound.dedupe_key();
     let disposition = {
-        let mut d = dedupe.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = p.dedupe.lock().unwrap_or_else(|e| e.into_inner());
         crate::volte::sms::decide(&mut d, &inbound)
     };
     if disposition == crate::volte::sms::Disposition::AcknowledgeOnly {
         // Already handled via the other bearer (or a prior delivery of this
         // same MESSAGE) in this same process — the network still needs the
-        // retry stopped, but it must not be recorded or forwarded again.
-        let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
+        // SIP transaction closed, but it must not be recorded or forwarded
+        // again.
+        //
+        // The delivery report is held back unless that other claim is
+        // *confirmed*. `Dedupe::admit` happens before the claimant's relay,
+        // so a claim can still be in flight — and if it fails, the claimant
+        // calls `forget` and relies on the network retransmitting to recover
+        // the message. Reporting delivery here is what stops that
+        // retransmission, so doing it on the strength of an unconfirmed claim
+        // would turn a recoverable relay failure into a lost text. That is
+        // the distinction `Dedupe::is_confirmed` exists to draw, and the one
+        // `contains`'s own docs warn about.
+        //
+        // Costs nothing when the claim does succeed: the network retries,
+        // the claim is confirmed by then, and that retry gets the report.
+        let claim_confirmed = p
+            .dedupe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_confirmed(&key);
+        acknowledge(
+            session,
+            sink,
+            req,
+            decoded.as_ref(),
+            p.sms_delivery_report && claim_confirmed,
+        );
         return;
     }
 
@@ -867,7 +940,7 @@ fn handle_message(
         body,
         received_at: chrono::Utc::now().to_rfc3339(),
     };
-    let relayed = match TcpStream::connect_timeout(&control_addr, CONTROL_TIMEOUT) {
+    let relayed = match TcpStream::connect_timeout(&p.control_addr, CONTROL_TIMEOUT) {
         Ok(mut control) => match write_msg(&mut control, &msg) {
             Ok(()) => true,
             Err(e) => {
@@ -885,27 +958,73 @@ fn handle_message(
         // Durably delivered now, not merely claimed — the modem sweep may be
         // waiting on exactly this distinction before it trusts this claim
         // enough to discard its own backup copy (specs/038 review follow-up).
-        dedupe
+        p.dedupe
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .confirm(&key);
-        let _ = sink.send(&build_200_ok_message(req, &random_hex(4)));
+        acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
     } else {
         // Release the admission above so the retransmission this triggers is
         // treated as fresh, not as a duplicate of a delivery that never
         // happened.
-        dedupe
+        p.dedupe
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .forget(&key);
-        // Deliberately silent toward the network: an unacknowledged MESSAGE is
-        // retransmitted, which is the recovery we want. Acknowledging one we
-        // failed to record would discard the only chance to get it back.
+        // Deliberately silent toward the network — at *both* layers: neither
+        // the `200 OK` nor the delivery report goes out. An unacknowledged
+        // MESSAGE is retransmitted, which is the recovery we want, and a
+        // delivery report saying we took a message we failed to record would
+        // discard the only chance to get it back.
         tracing::warn!(
             sender = %sender,
             "not acknowledging the MESSAGE so the network retransmits it"
         );
     }
+}
+
+/// Answer an inbound `MESSAGE` at both layers it is owed one: the SIP
+/// transaction, and — for 3GPP SMS-over-IP only — the RP layer the short
+/// message itself rides on.
+///
+/// `decoded` being `None` means a plain-text `MESSAGE` with no RP layer to
+/// acknowledge, so the `200 OK` is the whole of it. That is also the fallback
+/// when a 3GPP body failed to decode: the `200 OK` still goes out (the
+/// message was received and relayed either way), but no report claims a
+/// message we could not read, so the network is left free to retry.
+fn acknowledge(
+    session: &mut crate::ims::RegisteredSession,
+    sink: &SipSink,
+    req: &SipRequest,
+    decoded: Option<&crate::ims::sms_pdu::DecodedSms>,
+    send_delivery_report: bool,
+) {
+    respond(
+        sink,
+        "200 OK (MESSAGE)",
+        &build_200_ok_message(req, &random_hex(4)),
+    );
+
+    let Some(decoded) = decoded.filter(|_| send_delivery_report) else {
+        return;
+    };
+    // TS 24.341 §5.3.2.4 NOTE 1: the IP-SM-GW to report to is the one named
+    // in the delivered message's `P-Asserted-Identity`. Falling back to
+    // `From` is not in the spec — it is for a core that omits the asserted
+    // identity, where `From` names the same gateway (measured on Vi
+    // 2026-08-15) and reporting to it beats not reporting at all.
+    let Some(ipsmgw) = header_uri(req, "P-Asserted-Identity").or_else(|| header_uri(req, "From"))
+    else {
+        tracing::warn!(
+            "no P-Asserted-Identity or From URI on an SMS MESSAGE; cannot address a delivery report"
+        );
+        return;
+    };
+    send_sms_delivery_report(
+        session,
+        &ipsmgw,
+        &crate::ims::sms_pdu::build_rp_ack(decoded.rp_mr),
+    );
 }
 
 /// Everything the dispatch loop needs that does not change across iterations.
@@ -925,6 +1044,9 @@ struct DispatchParams<'a> {
     attachment_check: Option<&'a AttachmentHook>,
     modem_lock: Option<&'a Arc<crate::modules::modem_lock::ModemLock>>,
     dedupe: &'a Arc<Mutex<crate::volte::sms::Dedupe>>,
+    /// See `config::VowifiConfig::sms_delivery_report`; consumed by
+    /// [`acknowledge`].
+    sms_delivery_report: bool,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
     /// Publishes which phase the loop is in, so the watchdog can tell a line
@@ -1109,7 +1231,7 @@ fn dispatch_loop(
                 handle_notify(&sink, &req);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
-                handle_message(&sink, &req, p.control_addr, p.dedupe);
+                handle_message(session, p, &req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "OPTIONS" => {
                 tracing::debug!("received OPTIONS keepalive; answering 200 OK");
@@ -1824,6 +1946,58 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\nFrom: garbage\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "unknown");
+    }
+
+    fn message_with_headers(headers: &str) -> SipRequest {
+        let raw = format!(
+            "MESSAGE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// The delivery report is addressed to the IP-SM-GW named in the
+    /// delivered message's `P-Asserted-Identity` (TS 24.341 §5.3.2.4 NOTE 1),
+    /// so the *whole* URI has to survive — parameters included, since the
+    /// carrier form measured on Jio carries `;transport=udp` inside the
+    /// brackets, where it belongs to the URI rather than to the header.
+    #[test]
+    fn header_uri_keeps_the_whole_uri_from_a_bracketed_header() {
+        let req = message_with_headers(
+            "P-Asserted-Identity: <sip:A2P@203.0.113.7;transport=udp>\r\n\
+             From: <sip:gateway.ims.example>;tag=abc\r\n",
+        );
+        assert_eq!(
+            header_uri(&req, "P-Asserted-Identity").as_deref(),
+            Some("sip:A2P@203.0.113.7;transport=udp")
+        );
+        // The `;tag=abc` here is a *header* parameter, outside the brackets,
+        // and must not end up in a Request-URI.
+        assert_eq!(
+            header_uri(&req, "From").as_deref(),
+            Some("sip:gateway.ims.example")
+        );
+    }
+
+    /// Unbracketed (`addr-spec`) form: with no brackets to mark the end of the
+    /// URI, a `;` is the URI's own parameter separator and must be kept.
+    #[test]
+    fn header_uri_keeps_parameters_of_an_unbracketed_uri() {
+        let req = message_with_headers("P-Asserted-Identity: sip:ipsmgw.example;lr\r\n");
+        assert_eq!(
+            header_uri(&req, "P-Asserted-Identity").as_deref(),
+            Some("sip:ipsmgw.example;lr")
+        );
+    }
+
+    /// Nothing to address a report to: a missing header, or one carrying only
+    /// a display name. `acknowledge` logs and skips rather than sending a
+    /// request to a URI it invented.
+    #[test]
+    fn header_uri_is_none_without_a_uri() {
+        let req = message_with_headers("P-Asserted-Identity: \"Anonymous\"\r\n");
+        assert_eq!(header_uri(&req, "P-Asserted-Identity"), None);
+        assert_eq!(header_uri(&req, "X-Absent"), None);
     }
 
     /// A minimal RP-DATA + SMS-DELIVER TPDU for "Hi" from +919000000001 — same

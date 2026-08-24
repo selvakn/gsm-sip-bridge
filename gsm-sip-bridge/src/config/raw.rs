@@ -384,6 +384,9 @@ section! {
         /// the socket they arrived on. See `VowifiConfig::respond_on_client`
         /// for the measurement — leave it off unless a carrier needs it.
         pub respond_on_client: bool,
+        /// Whether an SMS delivered over IMS is acknowledged at the RP layer.
+        /// See `VowifiConfig::sms_delivery_report`.
+        pub sms_delivery_report: bool,
         pub pcscf_source_path: String,
         pub control_port: u16,
         pub wideband: bool,
@@ -417,6 +420,7 @@ impl Default for RawVowifi {
             gm_auth_alg: String::new(),
             gm_cipher_alg: String::new(),
             respond_on_client: false,
+            sms_delivery_report: true,
             pcscf_source_path: "/tmp/pcscf".to_string(),
             control_port: 7050,
             wideband: true,

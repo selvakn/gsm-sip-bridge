@@ -249,6 +249,26 @@ gm_cipher_alg = ""
 #             lands -- and no inbound call ever reaches a dialog.
 #   Airtel, Vi -> leave it off; both answer correctly on the arrival socket.
 respond_on_client = false
+# Acknowledge an SMS delivered over IMS at the 3GPP layer as well as the SIP
+# one: TS 24.341 5.3.2.4's delivery report, an RP-ACK we send back to the
+# IP-SM-GW in a MESSAGE request of our own. 5.3.2.3 asks for both answers --
+# the 200 OK says the request arrived, the report says the text was taken --
+# and every real handset sends both. Applies to VoLTE lines too; the procedure
+# does not depend on the access.
+#   Jio -> REQUIRED. Measured by A/B on a live line: with this off, a
+#          submitted SMS is never delivered -- the message centre sends only
+#          Type 0 reachability probes and holds the text, and [cs].enabled
+#          does not rescue it. Turning it on released a message stranded 12
+#          minutes earlier within 40s. Both stranded messages did eventually
+#          arrive once acknowledgement resumed (the second ~42 min after it
+#          was sent), so the failure mode is indefinite delay rather than
+#          immediate loss -- but how long the centre holds them before
+#          giving up was not measured.
+#   Vi  -> delivers real SMS having never received a report, so this is not a
+#          precondition everywhere.
+# Turn it off only to isolate a carrier that dislikes the report -- and please
+# capture the exchange, because no such carrier is known.
+sms_delivery_report = true
 # BASE path Agent A reads its tunnel-assigned P-CSCF address from, written by
 # the supervisor once that line's tunnel is up. The line index is appended,
 # giving /tmp/pcscf-0, /tmp/pcscf-1, ... — each line's carrier assigns its own
