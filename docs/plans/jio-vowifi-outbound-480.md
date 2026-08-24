@@ -1,10 +1,11 @@
 # Investigation: Jio VoWiFi outbound (MO) calls always end in 480
 
 **Triaged**: 2026-08-24 · **Effort**: unknown, likely carrier-side ·
-**Status**: open. **Not** blocked on Jio: the same SIM originates fine over
-VoLTE, so MO voice is provisioned and the "carrier limitation" reading is
-dead. Next step is running our own stack over LTE to separate an
-access-specific entitlement from a fault of ours.
+**Status**: **PARKED 2026-08-24** — see "PARKED — where this stands" below.
+Not blocked on Jio: the same SIM originates fine over VoLTE, so MO voice is
+provisioned and the "carrier limitation" reading is dead. The discriminating
+test (our own stack over LTE) is blocked on this module's firmware, and the
+line has since been moved to the modem's own IMS stack so it stays usable.
 
 ## Symptom
 
@@ -221,6 +222,119 @@ it is what overturned this document's conclusion** (see above). It costs the
 ePDG tunnel and this line's registration for ~10 minutes and needs reverting
 afterwards; the line was verified back to `state: Registered`,
 `gm_connection: up` and no SMS errors when it was.
+
+## PARKED 2026-08-24 — where this stands
+
+The investigation is parked, not closed, and the Pi has been moved to a
+working configuration (below) so the line is usable meanwhile.
+
+### What is settled
+
+| Claim | Status |
+|---|---|
+| MO voice is not provisioned on this SIM | **false** — the modem's own VoLTE stack dials it fine |
+| The announcement names the reason | **false** — generic "cannot be completed at the moment" |
+| The INVITE is missing MTSI headers Jio keys on | **false** — full ICSI/PPI/Supported/Allow set changed nothing |
+| The INVITE is missing `Security-Verify` | **false** — our PRACK/ACK/OPTIONS are routed without it |
+| The SDP offer is too minimal | **false** — Jio answered it and streamed to it |
+| A CS comparison would settle it | **not available** — Jio has no 2G/3G |
+
+What is left: MT and SMS work over VoWiFi, MO does not, and MO works over
+LTE. Either Wi-Fi-calling *outgoing* is entitled separately, or something of
+ours bites only on the Wi-Fi access.
+
+### The test that would separate them, and why it did not run
+
+Running **our own stack over `[volte]`** on the same modem is the discriminator.
+It is blocked on this hardware, at the PDN layer, before any SIP is involved:
+
+```
+ATI                 EC25EFAR06A17M4G          # an EC25, not an EC20
+AT+QNETDEVCTL?      ERROR                     # volte-pdn's bind mechanism does not exist
+AT+QNETDEVCTL=?     ERROR                     #   on this firmware at all
+AT+QCFG="usbnet"    +QCFG: "usbnet",0         # QMI/RmNet host data path
+qmicli --wds-start-network="apn=ims,..."      # every variant:
+                    QMI protocol error (79): 'PolicyMismatch'
+AT+CGACT=1,2        OK
+AT+CGPADDR=2        10.112.79.100             # the IMS PDN itself comes up fine
+```
+
+So the module *can* establish the IMS PDN — it just cannot hand it to a host
+netdev by either mechanism this repo knows. `volte/pdn.rs` uses
+`AT+QNETDEVCTL` (developed against an EC200U, which is AT-only), and QMI
+refuses a host-initiated data call on the IMS APN. Making this work means
+adding a QMI/qmimux multi-PDN attach path to `volte/pdn.rs` — an
+implementation task, not a config change.
+
+Note the trap: `volte-call`'s default `--cid 3` is the **SOS** context on this
+SIM. The IMS APN is **cid 2** (`+CGDCONT: 1 jionet, 2 ims, 3 SOS`).
+
+### A second, separate problem surfaced: the P-CSCF pool
+
+After the modem work, the ePDG stopped handing out the `10.56.156.x` P-CSCFs
+that had worked all day and began returning `56.240.169.x` (and IPv6
+`2405:200:6ae:b581:21::`), on which **TCP 5060 always times out**:
+
+```
+error: IMS error: TCP connect to 56.240.169.79:5060 failed: connection timed out
+```
+
+The tunnel is up and healthy (`tun23-0` addressed, CHILD_SA established) — only
+the P-CSCF is unreachable. Repeated `down`/`up` cycles kept landing in the same
+pool. **This is a known recurring condition on this line, not something the
+modem work caused.** Whether the `56.240.169.x` pool wants UDP was not
+determined; `use_tcp = false` was staged and reverted untested when the
+investigation was parked.
+
+### Operational lessons worth keeping
+
+- **When switching between VoWiFi / VoLTE / CS, `docker-compose down && up`,
+  never `restart`.** Stale state in the container filesystem (`/tmp/pcscf-N`,
+  the line manifest, charon's state) survives a restart and produces failures
+  that look like carrier faults. A restart is what made the line come back
+  `unhealthy` with a stale P-CSCF here.
+- **`AT+CSIM failed: 0` is the SIM falling off the bus**, not a code fault.
+  Recover with `AT+CFUN=0` then `AT+CFUN=1` on the AT port.
+- **ModemManager holds `/dev/ttyUSB0` and `/dev/ttyUSB3`** on this Pi for the
+  `wwan0` bearer. The CS discovery scan probes every port, times out on
+  ttyUSB3, marks the SIM unusable and churns the card table into a restart
+  loop. Fixed with `[discovery] excluded_ports`.
+
+## Current Pi configuration (2026-08-24)
+
+Moved to the modem's own IMS stack so the line works while this is parked:
+
+```toml
+[vowifi]
+enabled = false          # host-side VoWiFi off, so the modem may keep its own IMS
+[cs]
+enabled = true
+[discovery]
+excluded_ports = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB3"]
+```
+
+plus `AT+QCFG="ims",1` on the module (verified `+QCFG: "ims",1,1` — enabled and
+registered). `[volte]` is absent, i.e. disabled.
+
+Verified working end to end: card slot 0 `Ready` on 4G/LTE, and an outbound
+call through the bridge reported `direction: both ways, success: true`
+(1250 packets sent / 910 received, 0 loss, 441 ms median RTT).
+
+Backups on the Pi: `config.toml.bak-pre-cs-modem-ims`,
+`docker-compose.yaml.bak-pre-jio-mtsi-hdrs`.
+
+## When this is picked up again
+
+1. Get the VoWiFi tunnel onto a P-CSCF pool that answers (or determine whether
+   `56.240.169.x` needs UDP — `[vowifi] use_tcp = false`). Nothing else can be
+   tested until the line registers again.
+2. Add a QMI attach path to `volte/pdn.rs` for QMI/RmNet modules, then run our
+   stack over LTE with `--cid 2`. That is the discriminator.
+3. Only once step 2 points at the access: ask Jio whether "WiFi Calling
+   outgoing" is entitled separately on this SIM. Asking without that result
+   gets the generic script.
+
+## Superseded next steps (kept for the record)
 
 ## Next steps
 
