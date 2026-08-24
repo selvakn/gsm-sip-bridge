@@ -259,8 +259,11 @@ respond_on_client = false
 #          submitted SMS is never delivered -- the message centre sends only
 #          Type 0 reachability probes and holds the text, and [cs].enabled
 #          does not rescue it. Turning it on released a message stranded 12
-#          minutes earlier within 40s. A long enough unacknowledged window
-#          appears to lose texts outright, not merely delay them.
+#          minutes earlier within 40s. Both stranded messages did eventually
+#          arrive once acknowledgement resumed (the second ~42 min after it
+#          was sent), so the failure mode is indefinite delay rather than
+#          immediate loss -- but how long the centre holds them before
+#          giving up was not measured.
 #   Vi  -> delivers real SMS having never received a report, so this is not a
 #          precondition everywhere.
 # Turn it off only to isolate a carrier that dislikes the report -- and please

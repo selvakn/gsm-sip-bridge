@@ -619,9 +619,11 @@ pub struct VowifiConfig {
     /// delivered — the message centre sends only Type 0 reachability probes
     /// and holds the text, and `[cs].enabled` does not rescue it. Turning the
     /// report on released a message stranded twelve minutes earlier within
-    /// 40s. One of two stranded messages never arrived at all, so a long
-    /// enough unacknowledged window appears to lose texts outright rather
-    /// than merely delay them.
+    /// 40s. Both stranded messages did eventually arrive once acknowledgement
+    /// resumed — the second only ~42 minutes after it was sent, on the
+    /// message centre's own retry schedule — so the failure mode is
+    /// indefinite delay, not immediate loss. How long that holds before the
+    /// centre gives up was not measured.
     ///
     /// Vodafone/Vi delivers real SMS without ever having received a report,
     /// so this is not a precondition everywhere. Turn it off only to isolate
