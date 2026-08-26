@@ -7,7 +7,7 @@
 //! first. That wait ([`await_pbx_answer`]) is the whole reason this is not a
 //! straight-line handler.
 
-use super::call::{spawn_control_reader, ActiveCall, DialogInfo};
+use super::call::{spawn_control_reader, ActiveCall, CachedInviteAnswer, DialogInfo};
 use super::observability;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VETH_INVITE_TIMEOUT};
 use super::{unsupported_required_extensions, CONTROL_TIMEOUT};
@@ -296,7 +296,7 @@ pub(super) fn handle_invite(
             // in silence until someone picks up. Wait for Agent B to report a
             // real answer — while still watching the carrier's own signaling,
             // since the caller may give up (`CANCEL`) while it rings.
-            match await_pbx_answer(&call_id, &ctrl_rx, inbound, req, &to_tag, sink)? {
+            match await_pbx_answer(&call_id, &ctrl_rx, inbound, req, &to_tag, &contact, sink)? {
                 RingOutcome::Answered => {}
                 RingOutcome::PbxDeclined => {
                     obs.report_call_not_answered(
@@ -390,6 +390,11 @@ pub(super) fn handle_invite(
                 stop,
                 dialog: DialogInfo::from_invite(req, &to_tag, session),
                 call_id,
+                answered_invite: Some(CachedInviteAnswer {
+                    invite_cseq: req.header("CSeq").unwrap_or_default().to_string(),
+                    contact,
+                    answer_sdp,
+                }),
                 to_tag,
                 caller,
                 answered_at: Utc::now(),
@@ -449,6 +454,7 @@ fn await_pbx_answer(
     inbound: &Inbound,
     invite: &SipRequest,
     to_tag: &str,
+    contact: &str,
     sink: &SipSink,
 ) -> BridgeResult<RingOutcome> {
     let decline = |status: u16, reason: &str| {
@@ -463,7 +469,7 @@ fn await_pbx_answer(
     while Instant::now() < deadline {
         // 1. Did the caller give up while it rang? A CANCEL must be answered
         //    promptly or the network keeps retransmitting it.
-        while let Ok((msg, cancel_sink)) = inbound.rx.try_recv() {
+        while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
             let SipMessage::Request(req) = msg else {
                 continue;
             };
@@ -473,7 +479,7 @@ fn await_pbx_answer(
                 // cancels. The CANCEL is its own transaction, so it is answered
                 // on the connection it arrived on.
                 respond(
-                    &cancel_sink,
+                    &req_sink,
                     "200 OK (CANCEL)",
                     &build_uas_response(200, "OK", &req, Some(to_tag), None, None),
                 );
@@ -481,6 +487,29 @@ fn await_pbx_answer(
                 return Ok(RingOutcome::Abandoned {
                     reason: reason::CALLER_CANCELLED,
                 });
+            }
+            if req.method == "INVITE"
+                && req.header("Call-ID") == Some(call_id)
+                && req.header("CSeq") == invite.header("CSeq")
+            {
+                // RFC 3261 §17.2.1: while the server transaction is in the
+                // Proceeding state, a duplicate request gets the last
+                // provisional response resent, not silence
+                // (specs/042-dialog-transaction-identity, MT-01). The CSeq
+                // check (not just Call-ID) is what makes this a
+                // retransmission of *this* INVITE rather than some other
+                // transaction on the same dialog — RFC 3261 §12.2.2
+                // guarantees a real retransmission carries an identical
+                // CSeq, so anything else falls through unhandled below
+                // rather than being answered as if it were one (PR review,
+                // 2026-08-26).
+                tracing::info!(call_id = %call_id, "retransmitted INVITE while ringing; resending 180 Ringing");
+                respond(
+                    &req_sink,
+                    "180 Ringing (retransmit)",
+                    &build_180_ringing(&req, to_tag, contact),
+                );
+                continue;
             }
             tracing::debug!(method = %req.method, "ignoring inbound request received while ringing");
         }

@@ -83,6 +83,50 @@ pub(super) struct ActiveCall {
     /// attributes its ending through it so end-cause and success are decided by
     /// one model, not restated at each teardown site.
     pub(super) lifecycle: BridgedCall,
+    /// What's needed to resend the exact `200 OK` that answered this call's
+    /// INVITE, if a retransmission of it arrives (RFC 3261 §17.2.1;
+    /// specs/042-dialog-transaction-identity). `None` for a call this side
+    /// placed itself (UAC role, `origination.rs`) — an outbound-placed call
+    /// never had an inbound INVITE of its own to answer, so any INVITE later
+    /// naming that dialog is a modification attempt, never a retransmission.
+    pub(super) answered_invite: Option<CachedInviteAnswer>,
+}
+
+/// See [`ActiveCall::answered_invite`].
+pub(super) struct CachedInviteAnswer {
+    /// The raw `CSeq` header value of the INVITE this side answered (e.g.
+    /// `"1 INVITE"`). RFC 3261 §12.2.2 requires every subsequent in-dialog
+    /// request to carry a strictly higher CSeq, so an exact match can only be
+    /// a retransmission of this same transaction, never a fresh re-INVITE.
+    pub(super) invite_cseq: String,
+    pub(super) contact: String,
+    pub(super) answer_sdp: String,
+}
+
+/// How an inbound `INVITE` naming the call already active on this line
+/// relates to the answer already given for it (specs/042-dialog-transaction-identity,
+/// MT-01/MT-02).
+pub(super) enum InDialogInvite {
+    /// Same Call-ID, identical CSeq to the INVITE already answered.
+    RetransmittedOriginal,
+    /// Same Call-ID, anything else — a genuine re-INVITE, or any inbound
+    /// INVITE naming a call this side placed itself (which never has a
+    /// cached answer to retransmit).
+    ReInvite,
+}
+
+/// Classifies an inbound INVITE that has already been confirmed to name the
+/// active call's `Call-ID` — see [`InDialogInvite`].
+pub(super) fn classify_in_dialog_invite(
+    req: &SipRequest,
+    answered_invite: Option<&CachedInviteAnswer>,
+) -> InDialogInvite {
+    match answered_invite {
+        Some(cached) if req.header("CSeq") == Some(cached.invite_cseq.as_str()) => {
+            InDialogInvite::RetransmittedOriginal
+        }
+        _ => InDialogInvite::ReInvite,
+    }
 }
 
 /// The dialog state needed to send an in-dialog request (a `BYE`) on a call we
@@ -415,6 +459,40 @@ pub(super) fn hangup_carrier(
     }
 }
 
+/// A minimal `ActiveCall` for `agent::mod`'s dialog-identity tests
+/// (specs/042-dialog-transaction-identity) — only `call_id`, `to_tag` and
+/// `dialog.to` (the caller's original `From`) are ever inspected by what's
+/// under test; the rest exist only because the struct requires them.
+#[cfg(test)]
+pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -> ActiveCall {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let control = TcpStream::connect(addr).unwrap();
+    let (_tx, ctrl_rx) = mpsc::channel();
+    ActiveCall {
+        control,
+        ctrl_rx,
+        stop: Arc::new(AtomicBool::new(false)),
+        call_id: call_id.to_string(),
+        to_tag: to_tag.to_string(),
+        dialog: DialogInfo {
+            remote_target: "sip:caller@example.net".to_string(),
+            route_headers: Vec::new(),
+            from: String::new(),
+            to: caller_from.to_string(),
+            local_addr: addr,
+            use_tcp: true,
+            cseq: 1,
+        },
+        caller: "+919000000000".to_string(),
+        answered_at: Utc::now(),
+        answered_instant: Instant::now(),
+        meter: crate::ims::media_stats::MediaMeter::new(),
+        lifecycle: BridgedCall::new(call_id.to_string(), "+919000000000".to_string(), None),
+        answered_invite: None,
+    }
+}
+
 pub(super) fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall) {
     call.stop.store(true, Ordering::Relaxed);
     if let Err(e) = write_msg(
@@ -469,5 +547,52 @@ mod tests {
         let check = || false;
         assert!(!w.attachment_lost(0, &check));
         assert!(!w.attachment_lost(0, &check));
+    }
+
+    fn invite_with_cseq(cseq: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:x SIP/2.0\r\nCall-ID: c\r\nCSeq: {cseq} INVITE\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    fn cached_answer(invite_cseq: &str) -> CachedInviteAnswer {
+        CachedInviteAnswer {
+            invite_cseq: invite_cseq.to_string(),
+            contact: "<sip:bridge@10.0.0.1>".to_string(),
+            answer_sdp: "v=0".to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_in_dialog_invite_recognizes_an_identical_cseq_as_a_retransmission() {
+        let cached = cached_answer("1 INVITE");
+        let req = invite_with_cseq("1");
+        assert!(matches!(
+            classify_in_dialog_invite(&req, Some(&cached)),
+            InDialogInvite::RetransmittedOriginal
+        ));
+    }
+
+    #[test]
+    fn classify_in_dialog_invite_treats_a_higher_cseq_as_a_re_invite() {
+        let cached = cached_answer("1 INVITE");
+        let req = invite_with_cseq("2");
+        assert!(matches!(
+            classify_in_dialog_invite(&req, Some(&cached)),
+            InDialogInvite::ReInvite
+        ));
+    }
+
+    #[test]
+    fn classify_in_dialog_invite_treats_no_cached_answer_as_a_re_invite() {
+        // A call this side placed itself (UAC role) has no cached answer —
+        // any INVITE later naming it must never be mistaken for a retransmission.
+        let req = invite_with_cseq("1");
+        assert!(matches!(
+            classify_in_dialog_invite(&req, None),
+            InDialogInvite::ReInvite
+        ));
     }
 }
