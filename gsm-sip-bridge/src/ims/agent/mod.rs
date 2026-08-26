@@ -444,10 +444,14 @@ fn names_active_call(req: &SipRequest, active_call_id: Option<&str>) -> bool {
 /// The `tag=` parameter of a header value (RFC 3261 §19.3) — e.g. `"abc"`
 /// from `<sip:x@y>;tag=abc`. `None` if the header is absent or carries none.
 fn header_tag(value: &str) -> Option<&str> {
-    value
-        .split(';')
-        .skip(1)
-        .find_map(|p| p.trim_start().strip_prefix("tag="))
+    value.split(';').skip(1).find_map(|p| {
+        let p = p.trim_start();
+        let (name, val) = p.split_once('=')?;
+        // RFC 3261 §7.3.1: parameter names are case-insensitive (unlike the
+        // tag *value* itself, an opaque token compared byte-for-byte, so
+        // this stops at the `=` and leaves `val` untouched).
+        name.eq_ignore_ascii_case("tag").then_some(val)
+    })
 }
 
 /// Whether `req`'s `From` tag matches the caller's own tag, given the
@@ -2652,6 +2656,15 @@ mod tests {
             &request("BYE"),
             "<sip:someone-else@example.net>;tag=zzz"
         ));
+    }
+
+    /// RFC 3261 §7.3.1: parameter *names* are case-insensitive — only the
+    /// tag *value* is compared byte-for-byte (PR review, 2026-08-26).
+    #[test]
+    fn header_tag_recognizes_the_parameter_name_regardless_of_case() {
+        assert_eq!(header_tag("<sip:x@y>;TAG=abc"), Some("abc"));
+        assert_eq!(header_tag("<sip:x@y>;Tag=abc"), Some("abc"));
+        assert_eq!(header_tag("<sip:x@y>;tag=abc"), Some("abc"));
     }
 
     #[test]
