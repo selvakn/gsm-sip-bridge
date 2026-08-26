@@ -1548,6 +1548,11 @@ fn finish_origination(
         answered_instant: Instant::now(),
         meter,
         lifecycle,
+        // We placed this call ourselves — there is no inbound INVITE of our
+        // own to have answered, so any INVITE later naming this dialog is a
+        // modification attempt (`InDialogInvite::ReInvite`), never a
+        // retransmission. See `CachedInviteAnswer`'s doc comment.
+        answered_invite: None,
     })
 }
 

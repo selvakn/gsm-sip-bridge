@@ -148,12 +148,108 @@ unrelated to any batch-2 change. The `486`→`488`/`Warning` and `415`
 (SMS-06) paths weren't hit by live traffic this round (no codec mismatch or
 unsupported-body message arrived) — covered by unit tests only.
 
-## Batch 3 — transactions and dialogs (not started)
+## Batch 3 — transactions and dialogs (landed 2026-08-26, pending hardware round)
 
-- [ ] MT-01 — no server transaction layer (retransmission, ACK tracking)
-- [ ] MT-02 — a re-INVITE is treated as a second call and refused `486`
-- [ ] MT-08 — in-dialog requests are not matched to a dialog (BYE tears down
-      whichever call is active, regardless of `Call-ID`)
+Full spec/plan/tasks trail: `specs/042-dialog-transaction-identity/`. All
+three findings share one mechanism: check an inbound request's `Call-ID`
+(and, for INVITE, `CSeq`) against the single `ActiveCall` a line holds,
+rather than acting on any request just because a call happens to be active.
+No generic RFC 3261 §17 transaction table — the codebase's confirmed
+one-call-per-line architecture makes that unjustified complexity (see
+`specs/042-dialog-transaction-identity/research.md` for the full
+decision/rationale/alternatives writeup per finding).
+
+- [x] **MT-08** — in-dialog requests are not matched to a dialog (BYE tears
+      down whichever call is active, regardless of `Call-ID`).
+      **Landed**: `agent::mod::bye_response_if_unmatched` refuses `481 Call/
+      Transaction Does Not Exist` for a `BYE` that doesn't name
+      `self.active_call`'s `call_id` (RFC 3261 §12.2.2) — including a `BYE`
+      arriving with no call active at all, which previously got an
+      unconditional `200 OK` falsely implying a dialog existed.
+      `handle_carrier_bye` now checks this before `self.active_call.take()`,
+      instead of tearing the active call down unconditionally. Tests:
+      matched/mismatched/no-active-call, all three in `agent::mod::tests`.
+- [x] **MT-01** — no server transaction layer (retransmission, ACK tracking).
+      **Landed**, scoped to what the one-call-per-line architecture actually
+      needs (not a generic transaction table):
+      - `ActiveCall` gained `answered_invite: Option<CachedInviteAnswer>`
+        (`agent::call`) — `Some` for a call answered as UAS, `None` for one
+        this side placed itself. `classify_in_dialog_invite` compares an
+        inbound INVITE's `CSeq` against the cached one: an exact match can
+        only be a retransmission (RFC 3261 §12.2.2 — CSeq strictly
+        increases per dialog), anything else is a genuine re-INVITE.
+      - A retransmitted INVITE naming the call already answered gets the
+        cached `200 OK` resent verbatim (`agent::mod::handle_inbound_invite`,
+        before the busy check) instead of being reprocessed.
+      - A retransmitted INVITE while still ringing gets the same `180
+        Ringing` resent (`agent::inbound::await_pbx_answer`'s existing
+        Call-ID-matched drain loop, extended past its CANCEL-only check)
+        instead of being silently dropped.
+      - A `CANCEL` naming the active (already-answered) call now gets an
+        explicit `200 OK` on that call's own `To` tag
+        (`agent::mod::handle_carrier_cancel`/`cancel_response`) — RFC 3261
+        §9.2 requires this even though the CANCEL can no longer affect the
+        call. A `CANCEL` naming anything else still falls to the existing
+        `unserved_method_response` `481`, unchanged.
+      - An `ACK` is now checked against the active call's `Call-ID`
+        (`agent::mod::log_ack`) — a mismatch is logged (`warn!`) rather than
+        silently accepted as confirming whichever call happens to be
+        active. No SIP response exists for ACK either way, so this is
+        diagnostics-only.
+      Tests: `classify_in_dialog_invite_*` (`agent::call::tests`),
+      `names_active_call_*`, `cancel_response_*` (`agent::mod::tests`). The
+      two retransmit-resend branches (`handle_inbound_invite`'s pre-check,
+      `await_pbx_answer`'s drain loop) need a live socket/session harness
+      and are hardware-verification-only, same as the existing
+      CANCEL-during-ring code they extend.
+      **Ruled out**: a generic RFC 3261 §17 transaction-table engine
+      (transaction table, T1/T2/Timer A–K) — no evidence of concurrent
+      transactions on one line; Via-branch-based transaction identity — CSeq
+      equality is sufficient and RFC-grounded for the one thing that needed
+      it here.
+- [x] **MT-02** — a re-INVITE is treated as a second call and refused `486`.
+      **Landed**: the same pre-check that resends a retransmitted INVITE's
+      cached answer (MT-01, above) also classifies a same-Call-ID INVITE
+      with a *new* CSeq as `InDialogInvite::ReInvite`, and declines it with
+      `build_488_not_acceptable` — reusing the exact response shape already
+      established for MT-07's codec-mismatch decline — instead of falling
+      into the busy check and answering `486`. A genuinely separate,
+      unrelated second call is still refused `486`, unchanged (pinned by the
+      existing `a_second_call_is_rejected_busy_and_the_first_is_undisturbed`,
+      which uses two different Call-IDs and continues to pass unmodified).
+      **Ruled out**: actually renegotiating a call in progress (hold, codec
+      change, session timers) — genuinely out of scope, this fix is about
+      declining honestly, not about supporting the renegotiation; echoing
+      the unchanged SDP back as a silent "accept" — rejected, misrepresents
+      acceptance of a change that might be substantive; §14.2 glare — cannot
+      occur, this bridge never sends its own re-INVITE.
+
+All three: `make format && make lint && make test` clean (whole workspace,
+including test targets, clippy `-D warnings`).
+
+**Hardware-verified 2026-08-26**: rebuilt (`gsm-sip-bridge:dialog-identity`),
+redeployed, real line re-registered. One real inbound call from the user's
+phone: rang, answered by `siptest`'s auto-answer extension, transcoded
+AMR-WB (carrier) ↔ L16 (veth) — exactly the batch-1 RTP-02 relay path,
+confirming this batch's changes to `inbound.rs`'s `ActiveCall` construction
+(the new `answered_invite` field) didn't disturb it — ran ~31s with
+both-ways audio, and ended cleanly when the PBX side (`siptest`) hung up
+first (`hangup_carrier`, not the code this batch changed, but a full
+regression pass through the same `handle_inbound_invite`/`ActiveCall`
+lifecycle this batch modified). Zero errors, no panics, in Agent A's own log
+(`/tmp/ims-agent-0.out` inside the container — separate from `docker logs`,
+which only captures Agent B).
+
+Not exercised live, and not safely provokable without either carrier
+cooperation or crafting raw SIP inside the IPsec-tunnel network namespace
+against a call actually in progress (judged not worth the risk to a real
+line): a BYE with a mismatched Call-ID while a call is active (MT-08's core
+case — the no-active-call branch is safe to try between calls but wasn't
+this round), a CANCEL after the call is already answered, and a genuine
+re-INVITE (also true of MT-02, and consistent with the parent review's
+finding that no carrier here has been observed sending one). All three
+remain covered by the unit tests listed above; `specs/042-dialog-transaction-identity/quickstart.md`
+records this constraint for the next round.
 
 ## Batch 4 — honour the negotiation (not started)
 

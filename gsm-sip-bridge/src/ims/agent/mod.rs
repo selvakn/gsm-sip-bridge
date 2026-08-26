@@ -51,9 +51,9 @@ use crate::ims::session::{
     subscribe_reg_event, to_unix, Inbound,
 };
 use crate::ims::sip_client::{
-    build_200_ok_bye, build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
-    build_uas_response, build_uas_response_with_headers, random_hex, SipMessage, SipRequest,
-    SipResponse, SipSink,
+    build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
+    build_488_not_acceptable, build_uas_response, build_uas_response_with_headers, format_sip_addr,
+    random_hex, SipMessage, SipRequest, SipResponse, SipSink,
 };
 use crate::ims::transport::{EpdgTransport, ImsTransport};
 use crate::ims::ImsRegisterConfig;
@@ -70,7 +70,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use call::{handle_bye, hangup_carrier, report_answered_call_ended, ActiveCall, AttachmentWatch};
+use call::{
+    classify_in_dialog_invite, handle_bye, hangup_carrier, report_answered_call_ended, ActiveCall,
+    AttachmentWatch, InDialogInvite,
+};
 use origination::{
     begin_origination, tick_pending_origination, OriginationStatus, PendingOrigination,
 };
@@ -424,6 +427,49 @@ fn options_response(req: &SipRequest, to_tag: &str) -> String {
 /// matters is answered inside `inbound::handle_invite`'s ring loop, so a
 /// `CANCEL` reaching here names a transaction that is already over or was
 /// never ours — the method is served, the transaction is gone (§9.2).
+/// Whether `req` names the one dialog we have up — the single check MT-02
+/// (in-dialog INVITE), MT-08 (BYE), and CANCEL matching all reduce to
+/// (specs/042-dialog-transaction-identity).
+fn names_active_call(req: &SipRequest, active_call_id: Option<&str>) -> bool {
+    active_call_id.is_some_and(|id| req.header("Call-ID") == Some(id))
+}
+
+/// `None` when `req` names the one call we have up (the caller goes on to
+/// actually end it); `Some` with the `481` to send when it does not — a
+/// request naming a dialog we don't recognise (or arriving with no active
+/// call at all) is refused, not silently treated as ending whatever call
+/// happens to be active (RFC 3261 §12.2.2; specs/042-dialog-transaction-identity, MT-08).
+/// A `CANCEL` naming the one call we have up gets `200 OK` on that call's
+/// own `To` tag (RFC 3261 §9.2); anything else falls to
+/// `unserved_method_response`'s general "no such transaction" `481`.
+fn cancel_response(
+    req: &SipRequest,
+    active: Option<(&str, &str)>,
+    fallback_to_tag: &str,
+) -> String {
+    match active {
+        Some((call_id, to_tag)) if Some(call_id) == req.header("Call-ID") => {
+            build_uas_response(200, "OK", req, Some(to_tag), None, None)
+        }
+        _ => unserved_method_response(req, fallback_to_tag),
+    }
+}
+
+fn bye_response_if_unmatched(req: &SipRequest, active_call_id: Option<&str>) -> Option<String> {
+    if names_active_call(req, active_call_id) {
+        None
+    } else {
+        Some(build_uas_response(
+            481,
+            "Call/Transaction Does Not Exist",
+            req,
+            Some(&random_hex(4)),
+            None,
+            None,
+        ))
+    }
+}
+
 fn unserved_method_response(req: &SipRequest, to_tag: &str) -> String {
     if req.method == "CANCEL" {
         return build_uas_response(
@@ -1352,8 +1398,11 @@ fn dispatch_loop(
             Ok((SipMessage::Request(req), sink)) if req.method == "BYE" => {
                 st.handle_carrier_bye(p, &req, &sink);
             }
+            Ok((SipMessage::Request(req), sink)) if req.method == "CANCEL" => {
+                st.handle_carrier_cancel(&req, &sink);
+            }
             Ok((SipMessage::Request(req), _)) if req.method == "ACK" => {
-                tracing::debug!("received ACK, dialog confirmed");
+                st.log_ack(&req);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "NOTIFY" => {
                 st.handle_reg_notify(session, p, &req, &sink);
@@ -1599,6 +1648,44 @@ impl LoopState {
         req: &SipRequest,
         sink: &SipSink,
     ) {
+        // An INVITE naming the call already active on this line is never a
+        // brand-new second call — it's either a retransmission of the answer
+        // we already gave, or a genuine re-INVITE (specs/042-dialog-transaction-identity,
+        // MT-01/MT-02). Either way it must not fall into the busy check below.
+        if let Some(call) = self.active_call.as_ref() {
+            if names_active_call(req, Some(&call.call_id)) {
+                if let InDialogInvite::RetransmittedOriginal =
+                    classify_in_dialog_invite(req, call.answered_invite.as_ref())
+                {
+                    let cached = call
+                        .answered_invite
+                        .as_ref()
+                        .expect("RetransmittedOriginal only returned when Some");
+                    tracing::info!(call_id = %call.call_id, "retransmitted INVITE for an already-answered call; resending the cached 200 OK");
+                    let _ = sink.send(&build_uas_response_with_headers(
+                        200,
+                        "OK",
+                        req,
+                        Some(&call.to_tag),
+                        Some(&cached.contact),
+                        Some(&cached.answer_sdp),
+                        &[("Allow", ALLOW)],
+                    ));
+                    return;
+                }
+                // A genuine re-INVITE: we don't support renegotiating a call
+                // already in progress, but the line is not busy — say so
+                // honestly instead of claiming `486 Busy Here`
+                // (specs/042-dialog-transaction-identity, MT-02).
+                tracing::info!(call_id = %call.call_id, "declining re-INVITE: in-call session modification is not supported");
+                let _ = sink.send(&build_488_not_acceptable(
+                    req,
+                    &call.to_tag,
+                    &format_sip_addr(session.contact_addr),
+                ));
+                return;
+            }
+        }
         // An in-flight outbound origination occupies the line too (specs/029,
         // FR-011): consult whichever lifecycle exists so an inbound INVITE
         // during an attempt is refused `486` at once, through this same path,
@@ -1697,17 +1784,51 @@ impl LoopState {
     }
 
     fn handle_carrier_bye(&mut self, p: &DispatchParams, req: &SipRequest, sink: &SipSink) {
-        match self.active_call.take() {
-            Some(mut call) => {
-                // The carrier's BYE is the caller hanging up.
-                call.lifecycle.end(EndedBy::Caller);
-                report_answered_call_ended(p.obs, &call);
-                handle_bye(sink, req, call);
-                self.maintenance.release();
-            }
-            None => {
-                let _ = sink.send(&build_200_ok_bye(req, &random_hex(4)));
-            }
+        let active_call_id = self.active_call.as_ref().map(|c| c.call_id.as_str());
+        if let Some(response) = bye_response_if_unmatched(req, active_call_id) {
+            let _ = sink.send(&response);
+            return;
+        }
+        let mut call = self
+            .active_call
+            .take()
+            .expect("names_active_call matched above");
+        // The carrier's BYE is the caller hanging up.
+        call.lifecycle.end(EndedBy::Caller);
+        report_answered_call_ended(p.obs, &call);
+        handle_bye(sink, req, call);
+        self.maintenance.release();
+    }
+
+    /// A `CANCEL` naming the call already active gets `200 OK` on that
+    /// call's own `To` tag (RFC 3261 §9.2 — the CANCEL's own transaction
+    /// still needs an explicit final response, even though it can no longer
+    /// affect an already-answered INVITE). Anything else falls to
+    /// `unserved_method_response`'s general "no such transaction" `481`,
+    /// unchanged (specs/042-dialog-transaction-identity, MT-01).
+    fn handle_carrier_cancel(&self, req: &SipRequest, sink: &SipSink) {
+        let active = self
+            .active_call
+            .as_ref()
+            .map(|c| (c.call_id.as_str(), c.to_tag.as_str()));
+        let _ = sink.send(&cancel_response(req, active, &random_hex(4)));
+    }
+
+    /// An `ACK` naming the active call confirms its dialog; one naming
+    /// anything else (or arriving with no call active) is not — logged, not
+    /// silently accepted as confirming whichever call happens to be active
+    /// (specs/042-dialog-transaction-identity, MT-01). No SIP response is
+    /// ever sent for an ACK either way.
+    fn log_ack(&self, req: &SipRequest) {
+        let active_call_id = self.active_call.as_ref().map(|c| c.call_id.as_str());
+        if names_active_call(req, active_call_id) {
+            tracing::debug!(call_id = ?req.header("Call-ID"), "received ACK, dialog confirmed");
+        } else {
+            tracing::warn!(
+                call_id = ?req.header("Call-ID"),
+                active_call_id = ?active_call_id,
+                "received ACK for a Call-ID that does not match the active call (or no call is active)"
+            );
         }
     }
 
@@ -2413,6 +2534,80 @@ mod tests {
     #[test]
     fn a_stray_cancel_is_answered_481_not_405() {
         let resp = unserved_method_response(&request("CANCEL"), "totag1");
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
+    }
+
+    // ---- which call a request names (specs/042-dialog-transaction-identity) ----
+
+    #[test]
+    fn names_active_call_matches_the_same_call_id() {
+        assert!(names_active_call(&request("BYE"), Some("c1")));
+    }
+
+    #[test]
+    fn names_active_call_rejects_a_different_call_id() {
+        assert!(!names_active_call(
+            &request("BYE"),
+            Some("some-other-call-id")
+        ));
+    }
+
+    #[test]
+    fn names_active_call_is_false_with_no_active_call() {
+        assert!(!names_active_call(&request("BYE"), None));
+    }
+
+    #[test]
+    fn bye_response_if_unmatched_is_none_for_the_active_calls_own_call_id() {
+        assert!(bye_response_if_unmatched(&request("BYE"), Some("c1")).is_none());
+    }
+
+    #[test]
+    fn bye_response_if_unmatched_refuses_481_for_a_different_call_id() {
+        let resp = bye_response_if_unmatched(&request("BYE"), Some("some-other-call-id"))
+            .expect("a mismatched Call-ID must be refused");
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn cancel_response_answers_200_ok_on_the_calls_own_to_tag_when_it_names_the_active_call() {
+        let resp = cancel_response(&request("CANCEL"), Some(("c1", "our-to-tag")), "totag1");
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(resp.contains(";tag=our-to-tag"), "{resp}");
+    }
+
+    #[test]
+    fn cancel_response_falls_back_to_481_for_an_unrelated_call_id() {
+        let resp = cancel_response(
+            &request("CANCEL"),
+            Some(("some-other-call-id", "our-to-tag")),
+            "totag1",
+        );
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn cancel_response_falls_back_to_481_with_no_active_call() {
+        let resp = cancel_response(&request("CANCEL"), None, "totag1");
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn bye_response_if_unmatched_refuses_481_with_no_active_call() {
+        let resp = bye_response_if_unmatched(&request("BYE"), None)
+            .expect("a BYE with no call active must be refused, not answered as if one existed");
         assert!(
             resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
             "{resp}"
