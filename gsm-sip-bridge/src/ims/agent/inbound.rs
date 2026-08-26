@@ -10,15 +10,16 @@
 use super::call::{spawn_control_reader, ActiveCall, DialogInfo};
 use super::observability;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VETH_INVITE_TIMEOUT};
-use super::CONTROL_TIMEOUT;
+use super::{unsupported_required_extensions, CONTROL_TIMEOUT};
 use crate::control::protocol::{BridgeFailureReason, CallStatus};
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
-    build_100_trying, build_180_ringing, build_486_busy_here, build_uas_response,
-    build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
+    build_100_trying, build_180_ringing, build_420_bad_extension, build_486_busy_here,
+    build_488_not_acceptable, build_uas_response, build_uas_response_with_headers, format_sip_addr,
+    random_hex, SipMessage, SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -59,17 +60,17 @@ const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `PRACK`, `REFER` too) while nothing answered those methods at all;
 /// advertising them only invited mid-call requests we could not serve.
 ///
-/// `Supported` is unchanged from what was measured. Its entries are
-/// extensions, not methods, so nothing here refuses them: `100rel` governs
-/// provisional responses in a transaction this 2xx ends, `path` is a REGISTER
-/// mechanism, and `timer`'s refresh interval is negotiated by a
-/// `Session-Expires` we never send. Trimming it would change the one set of
-/// bytes a carrier is known to accept, for no behaviour we can point at —
-/// wait for a capture that asks.
-const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[
-    ("Allow", super::ALLOW),
-    ("Supported", "timer, 100rel, replaces, path, gruu"),
-];
+/// No `Supported` header: this used to claim `timer, 100rel, replaces, path,
+/// gruu`, none of which had any behaviour behind them — no session-refresh
+/// timer, no UAS-side reliable-provisional handling, no `replaces`/`gruu`
+/// machinery, and `path` names a REGISTER mechanism that does not even apply
+/// to a response to `INVITE`. `Supported` states extensions a caller may
+/// then invoke expecting them to work; claiming ones this UAS cannot honour
+/// is the same capability-truthfulness problem `Allow` already guards
+/// against (specs/041 conformance review, MT-10). See
+/// [`super::SUPPORTED_EXTENSIONS`] — once that grows, this constant is where
+/// its header gets added back.
+const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[("Allow", super::ALLOW)];
 
 /// The `Contact` for a response that answers a network-initiated INVITE.
 ///
@@ -121,6 +122,32 @@ pub(super) fn handle_invite(
         "inbound VoWiFi call"
     );
 
+    // RFC 3261 §8.2.2.3: a `Require` naming an extension we do not implement
+    // must refuse the whole request `420` before anything else is attempted
+    // — proceeding as if the requirement did not exist is not a conforming
+    // option (specs/041 conformance review, MT-03).
+    let unsupported = unsupported_required_extensions(req);
+    if !unsupported.is_empty() {
+        let to_tag = random_hex(4);
+        tracing::info!(
+            call_id = %call_id,
+            unsupported = %unsupported.join(", "),
+            "declining: caller requires an extension we do not implement"
+        );
+        sink.send(&build_420_bad_extension(
+            req,
+            &to_tag,
+            &unsupported.join(", "),
+        ))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
     sink.send(&build_100_trying(req))?;
 
     let offer = sdp::parse_offer(&req.body)?;
@@ -142,7 +169,15 @@ pub(super) fn handle_invite(
             offered = ?offer.offered.iter().map(|c| (c.payload_type, c.codec)).collect::<Vec<_>>(),
             "offer has no codec we can answer with; declining"
         );
-        sink.send(&build_486_busy_here(req, &random_hex(4)))?;
+        // `488`, not `486`: the line is not busy, no codec in the offer is
+        // one we can answer with — a caller redialling immediately on `486`
+        // (busy-line semantics) will hit the exact same wall (specs/041
+        // conformance review, MT-07).
+        sink.send(&build_488_not_acceptable(
+            req,
+            &random_hex(4),
+            &format_sip_addr(session.contact_addr),
+        ))?;
         obs.report_call_not_answered(
             CallStatus::Failed,
             BridgeFailureReason::BridgeSetupFailed,
@@ -510,9 +545,12 @@ mod tests {
             resp.contains("\r\nAllow: INVITE, ACK, CANCEL, BYE,"),
             "RFC 3261 §13.3.1.4 wants Allow in a 2xx to INVITE: {resp}"
         );
+        // No `Supported:` — see `UAS_EXTRA_HEADERS`'s docs (specs/041
+        // conformance review, MT-10): every extension it used to claim here
+        // (timer, 100rel, replaces, path, gruu) had no behaviour behind it.
         assert!(
-            resp.contains("\r\nSupported: "),
-            "the extensions an IMS UE states (TS 24.229): {resp}"
+            !resp.contains("\r\nSupported: "),
+            "must not claim an extension nothing here implements: {resp}"
         );
     }
 

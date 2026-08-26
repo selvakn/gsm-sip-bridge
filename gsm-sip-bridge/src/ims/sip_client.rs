@@ -492,6 +492,60 @@ pub fn build_486_busy_here(request: &SipRequest, to_tag: &str) -> String {
     build_uas_response(486, "Busy Here", request, Some(to_tag), None, None)
 }
 
+/// `488 Not Acceptable Here` — declines an inbound `INVITE` whose offer has
+/// no codec this UAS can answer with (RFC 3261 §21.4.26). Distinct from
+/// [`build_486_busy_here`]: `486` tells the network the line is occupied,
+/// which is not what happened here and drives call-forward-on-busy /
+/// busy-tone treatment on the caller's side for the wrong reason. Carries a
+/// `Warning: 304` (RFC 3261 §20.43 table: "Media type not available") so a
+/// capture states the real cause rather than leaving it to be inferred from
+/// the status code alone.
+pub fn build_488_not_acceptable(request: &SipRequest, to_tag: &str, agent: &str) -> String {
+    build_uas_response_with_headers(
+        488,
+        "Not Acceptable Here",
+        request,
+        Some(to_tag),
+        None,
+        None,
+        &[(
+            "Warning",
+            &format!("304 {agent} \"media type not available\""),
+        )],
+    )
+}
+
+/// `420 Bad Extension` — declines a request whose `Require` names an
+/// extension this UAS does not implement enough of to honour (RFC 3261
+/// §8.2.2.3, which requires the `Unsupported` header to list exactly which
+/// ones).
+pub fn build_420_bad_extension(request: &SipRequest, to_tag: &str, unsupported: &str) -> String {
+    build_uas_response_with_headers(
+        420,
+        "Bad Extension",
+        request,
+        Some(to_tag),
+        None,
+        None,
+        &[("Unsupported", unsupported)],
+    )
+}
+
+/// `415 Unsupported Media Type` — declines a request whose body this UAS
+/// cannot interpret (RFC 3261 §21.4.13 / RFC 3428 §7). `accept` is echoed
+/// back as `Accept`, stating what would have worked.
+pub fn build_415_unsupported_media(request: &SipRequest, to_tag: &str, accept: &str) -> String {
+    build_uas_response_with_headers(
+        415,
+        "Unsupported Media Type",
+        request,
+        Some(to_tag),
+        None,
+        None,
+        &[("Accept", accept)],
+    )
+}
+
 /// `200 OK` acknowledging an inbound `MESSAGE` (RFC 3428) — no body, no
 /// `Contact`: a `MESSAGE` is a standalone transaction, not a dialog, so
 /// there is no future in-dialog request that would need one.
@@ -618,6 +672,14 @@ pub fn format_sip_addr(addr: SocketAddr) -> String {
 pub fn build_register(req: &RegisterRequest) -> String {
     let via_addr = format_sip_addr(req.local_addr);
     let contact_addr = format_sip_addr(req.contact_addr);
+    // `REGISTER`/`SUBSCRIBE` beyond `UAS_ALLOW`: methods this registration
+    // itself originates, not ones `dispatch_loop` serves as a UAS, but a
+    // network-initiated `REGISTER`/`SUBSCRIBE` toward us is not a realistic
+    // request either way, so stating them costs nothing. Everything
+    // `dispatch_loop` doesn't have an arm for (`PUBLISH`, `UPDATE`, `PRACK`,
+    // `INFO`, `REFER`) used to be claimed here too, with no arm behind any of
+    // them (specs/041 conformance review, MT-10).
+    let register_allow = format!("{}, REGISTER, SUBSCRIBE", crate::ims::UAS_ALLOW);
 
     let mut msg = format!(
         "REGISTER sip:{registrar} SIP/2.0\r\n\
@@ -630,7 +692,7 @@ pub fn build_register(req: &RegisterRequest) -> String {
          Contact: <sip:{public_user}@{contact_addr};transport={transport}>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio{smsip}\
          ;+sip.instance=\"<urn:gsma:imei:{imei}>\"\r\n\
          Expires: {expires}\r\n\
-         Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER\r\n\
+         Allow: {register_allow}\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n",
         registrar = req.registrar_uri,
         transport = req.transport,
@@ -2231,6 +2293,92 @@ mod tests {
         let resp = build_486_busy_here(&req, "totag1");
         assert!(resp.starts_with("SIP/2.0 486 Busy Here\r\n"));
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// MT-07: a codec mismatch is not the same fact as a busy line, and
+    /// `486` drives call-forward-on-busy/busy-tone treatment on the caller's
+    /// side for the wrong reason. Must carry a `Warning: 304` (RFC 3261
+    /// §20.43) stating the real cause.
+    #[test]
+    fn build_488_not_acceptable_states_the_media_warning() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
+        let resp = build_488_not_acceptable(&req, "totag1", "10.0.0.9:5060");
+        assert!(resp.starts_with("SIP/2.0 488 Not Acceptable Here\r\n"));
+        assert!(
+            resp.contains("\r\nWarning: 304 10.0.0.9:5060 \"media type not available\"\r\n"),
+            "{resp}"
+        );
+        assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// RFC 3261 §8.2.2.3: refusing an unsupported `Require` must list which
+    /// extensions in `Unsupported`, not just say "no".
+    #[test]
+    fn build_420_bad_extension_lists_the_unsupported_tags() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
+        let resp = build_420_bad_extension(&req, "totag1", "100rel, precondition");
+        assert!(resp.starts_with("SIP/2.0 420 Bad Extension\r\n"));
+        assert!(
+            resp.contains("\r\nUnsupported: 100rel, precondition\r\n"),
+            "{resp}"
+        );
+    }
+
+    /// RFC 3428 §7 / RFC 3261 §21.4.13: refusing an unrenderable body must
+    /// state what would have worked, in `Accept`.
+    #[test]
+    fn build_415_unsupported_media_states_what_it_accepts() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
+        let resp =
+            build_415_unsupported_media(&req, "totag1", "application/vnd.3gpp.sms, text/plain");
+        assert!(resp.starts_with("SIP/2.0 415 Unsupported Media Type\r\n"));
+        assert!(
+            resp.contains("\r\nAccept: application/vnd.3gpp.sms, text/plain\r\n"),
+            "{resp}"
+        );
+    }
+
+    /// MT-10: a REGISTER must not claim methods `dispatch_loop` has no arm
+    /// for — `PUBLISH`/`UPDATE`/`PRACK`/`INFO`/`REFER` used to be claimed
+    /// here with nothing behind any of them.
+    #[test]
+    fn build_register_does_not_overclaim_unimplemented_methods() {
+        let msg = build_register(&RegisterRequest {
+            registrar_uri: "ims.example.net",
+            public_uri: "user@ims.example.net",
+            local_addr: "10.0.0.1:5060".parse().unwrap(),
+            contact_addr: "10.0.0.1:5061".parse().unwrap(),
+            call_id: "c1",
+            from_tag: "t1",
+            branch: "z9hG4bK1",
+            cseq: 1,
+            expires: 3600,
+            transport: "UDP",
+            authorization: None,
+            extra_headers: &[],
+            imei: "860000000000000",
+        });
+        let allow = msg
+            .lines()
+            .find(|l| l.starts_with("Allow:"))
+            .expect("REGISTER must carry an Allow header");
+        for unimplemented in ["PUBLISH", "UPDATE", "PRACK", "INFO", "REFER"] {
+            assert!(
+                !allow.contains(unimplemented),
+                "REGISTER's Allow claims {unimplemented}, which dispatch_loop has no arm for: {allow}"
+            );
+        }
+        for served in [
+            "INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "MESSAGE", "NOTIFY",
+        ] {
+            assert!(allow.contains(served), "must still claim {served}: {allow}");
+        }
     }
 
     fn sample_message() -> SipRequest {

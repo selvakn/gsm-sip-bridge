@@ -88,15 +88,65 @@ All five: `make format && make lint && make test` clean (whole workspace,
 including test targets). Not yet verified on real hardware — see the log
 below.
 
-## Batch 2 — say only what is true (not started)
+## Batch 2 — say only what is true (landed 2026-08-26, pending hardware round)
 
-- [ ] MT-03 — `Require` on an inbound request is never inspected
-- [ ] MT-10 — three different capability claims (REGISTER `Allow`, response
-      `Allow`, `Supported`), none of them agreeing
-- [ ] MT-07 — codec mismatch answered `486 Busy Here` instead of `488 Not
-      Acceptable Here`
-- [ ] SMS-06 — an unsupported `MESSAGE` body is accepted rather than refused
-      `415`
+- [x] **MT-03** — `Require` on an inbound request is never inspected.
+      **Landed**: `ims::agent::mod::unsupported_required_extensions` reads
+      every `Require` header line (not just the first) and filters against
+      `SUPPORTED_EXTENSIONS` (currently empty — see MT-10). `inbound::
+      handle_invite` checks it first, before even `100 Trying`, and declines
+      `420 Bad Extension` with `Unsupported:` listing exactly what was
+      demanded (`sip_client::build_420_bad_extension`). Tests: every tag
+      listed, a request with no `Require` is untouched, multiple `Require`
+      lines are all read.
+- [x] **MT-10** — three different capability claims (REGISTER `Allow`,
+      response `Allow`, `Supported`), none of them agreeing.
+      **Landed**: one constant, `crate::ims::UAS_ALLOW`, now backs both
+      `agent::mod::ALLOW` (a re-export) and `sip_client::build_register`'s
+      `Allow` (`UAS_ALLOW` plus `REGISTER, SUBSCRIBE`, which this bridge
+      originates itself) — REGISTER no longer claims `PUBLISH`/`UPDATE`/
+      `PRACK`/`INFO`/`REFER`, none of which `dispatch_loop` has an arm for.
+      The 2xx-to-INVITE's `Supported: timer, 100rel, replaces, path, gruu`
+      is gone entirely — none of the five had any implementation behind
+      them, and `path` doesn't even apply to a response to `INVITE`.
+      `SUPPORTED_EXTENSIONS` (empty today, feeding MT-03's `Require` gate
+      too) is where a future batch adds one back once it actually
+      implements it. Tests: REGISTER's `Allow` no longer contains any of
+      the five unimplemented methods.
+- [x] **MT-07** — codec mismatch answered `486 Busy Here` instead of `488
+      Not Acceptable Here`.
+      **Landed**: `inbound::handle_invite`'s no-acceptable-codec decline now
+      sends `sip_client::build_488_not_acceptable`, carrying `Warning: 304
+      "media type not available"` (RFC 3261 §20.43). Test: the builder
+      states the warning correctly.
+- [x] **SMS-06** — an unsupported `MESSAGE` body is accepted rather than
+      refused `415`.
+      **Landed**: `agent::mod::message_content_type_supported` accepts no
+      `Content-Type` at all (the long-standing plain-text default,
+      unchanged) or one of `application/vnd.3gpp.sms`/`text/plain`
+      (compared before any `;` parameter); anything else is refused `415`
+      with `Accept:` stating what would have worked
+      (`sip_client::build_415_unsupported_media`), checked at the very top
+      of `handle_message` before any decode/relay/dedupe work. `message/
+      cpim` unwrapping (from the original review's fix note) was left out —
+      no evidence any carrier here uses it, and it's a materially bigger
+      change than the refusal itself. Tests: both supported types (case-
+      insensitive, with a `;charset=` parameter ignored) and no header at
+      all are accepted; an unrecognised type (image/jpeg) is refused.
+
+All four: `make format && make lint && make test` clean (whole workspace).
+
+**Hardware-verified 2026-08-26**: rebuilt (`gsm-sip-bridge:mt-conformance-batch2`),
+redeployed, real line re-registered. Two real inbound calls from the user's
+phone: the first rang, was answered by the `siptest` PBX extension, ran
+~20s, ended on a normal caller hangup — no `420`, no `488`, no
+`Unsupported`, confirming Vi's live INVITE carries no `Require:` the new
+MT-03 gate would misfire on, and that removing `Supported` didn't affect
+call setup. A second attempt was abandoned by the caller before the PBX
+answered (`pbx_rejected`/caller-hangup) — ordinary call abandonment,
+unrelated to any batch-2 change. The `486`→`488`/`Warning` and `415`
+(SMS-06) paths weren't hit by live traffic this round (no codec mismatch or
+unsupported-body message arrived) — covered by unit tests only.
 
 ## Batch 3 — transactions and dialogs (not started)
 

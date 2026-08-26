@@ -84,6 +84,17 @@ const MAX_RESYNC_ATTEMPTS: u32 = 2;
 /// so it remains the VoWiFi default (FR-019: no behavioural change).
 pub const ACCESS_NETWORK_WLAN: &str = "3GPP-WLAN";
 
+/// Every method this UAS's `dispatch_loop` actually serves — the single
+/// source of truth `agent::mod`'s own `ALLOW` re-exports, and what
+/// `sip_client::build_register`'s `Allow` header is built from, so a
+/// REGISTER can no longer claim more than the dispatch loop delivers
+/// (specs/041 conformance review, MT-10). Lives here, one level up from
+/// both, because `agent::mod` (which owns the dispatch loop this describes)
+/// already imports from `sip_client` (which needs this to build REGISTER) —
+/// putting it in either would make the other reach across a boundary it
+/// doesn't otherwise cross.
+pub(crate) const UAS_ALLOW: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, NOTIFY";
+
 pub struct ImsRegisterConfig {
     pub modem_port: PathBuf,
     /// This line's SIM comes from a physical PC/SC reader
