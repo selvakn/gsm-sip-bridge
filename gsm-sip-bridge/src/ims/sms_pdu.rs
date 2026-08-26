@@ -533,22 +533,45 @@ fn decode_gsm7_reporting_escapes(septets: &[u8]) -> (String, bool) {
     (out, bad_escape)
 }
 
-/// TS 23.038 §6.2.2: UCS-2, i.e. big-endian UTF-16 code units. Real SMS never
-/// carries a surrogate pair (UCS-2 predates them), so this decodes one code
-/// unit at a time; an unpaired surrogate (from malformed input) becomes
-/// U+FFFD rather than corrupting the rest of the string.
+/// TS 23.038 §6.2.2: UCS-2, i.e. big-endian UTF-16 code units — but real
+/// handsets routinely send emoji outside the Basic Multilingual Plane as
+/// UTF-16 surrogate pairs over "UCS-2" SMS anyway, despite the strict spec
+/// predating surrogates (confirmed live 2026-08-26: every such emoji in a
+/// real inbound SMS came through as `U+FFFD` before this combined them). A
+/// high surrogate followed by a low surrogate is combined into the code point
+/// it encodes (RFC 2781 §2.2); anything else — an unpaired or lone surrogate
+/// — becomes `U+FFFD` rather than corrupting the rest of the string.
 fn decode_ucs2(bytes: &[u8]) -> String {
-    bytes
+    let units: Vec<u16> = bytes
         .chunks(2)
-        .map(|pair| {
-            let unit = match pair {
-                [hi, lo] => u16::from_be_bytes([*hi, *lo]),
-                [hi] => u16::from(*hi) << 8,
-                _ => unreachable!(),
-            };
-            char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')
+        .map(|pair| match pair {
+            [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+            [hi] => u16::from(*hi) << 8,
+            _ => unreachable!(),
         })
-        .collect()
+        .collect();
+
+    let mut out = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let unit = units[i];
+        if (0xD800..=0xDBFF).contains(&unit) {
+            if let Some(&low) = units.get(i + 1) {
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    let code =
+                        0x10000 + (u32::from(unit) - 0xD800) * 0x400 + (u32::from(low) - 0xDC00);
+                    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push('\u{FFFD}');
+        } else {
+            out.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+        }
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -760,6 +783,77 @@ mod tests {
             panic!("RP-DATA must decode to DecodedRp::Message");
         };
         assert_eq!(decoded.text, "Hi");
+    }
+
+    /// SMS-EMOJI-01 (specs/041 conformance review, found live 2026-08-26): a
+    /// real inbound SMS carrying an emoji outside the Basic Multilingual
+    /// Plane came through as `U+FFFD` because the two UTF-16 code units of
+    /// its surrogate pair were decoded independently instead of combined.
+    #[test]
+    fn decode_ucs2_reassembles_a_surrogate_pair() {
+        let bytes: Vec<u8> = "Hello 😀 world"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        assert_eq!(decode_ucs2(&bytes), "Hello 😀 world");
+    }
+
+    /// A high surrogate with no valid low surrogate after it — truncated
+    /// input, or a genuinely malformed encoder — must not panic or silently
+    /// combine with whatever follows; it becomes `U+FFFD` like any other
+    /// undecodable unit.
+    #[test]
+    fn decode_ucs2_replaces_an_unpaired_high_surrogate() {
+        // 0xD83D is the high surrogate half of an emoji pair; 0x0041 ('A')
+        // is not a valid low surrogate, so it must decode on its own.
+        let bytes = [0xD8, 0x3D, 0x00, 0x41];
+        assert_eq!(decode_ucs2(&bytes), "\u{FFFD}A");
+    }
+
+    /// A lone high surrogate at the very end of the buffer (no second unit to
+    /// even check) must not panic.
+    #[test]
+    fn decode_ucs2_replaces_a_high_surrogate_at_end_of_buffer() {
+        let bytes = [0xD8, 0x3D];
+        assert_eq!(decode_ucs2(&bytes), "\u{FFFD}");
+    }
+
+    /// A low surrogate encountered on its own (not preceded by a matching
+    /// high surrogate) is not a valid scalar value either.
+    #[test]
+    fn decode_ucs2_replaces_a_lone_low_surrogate() {
+        let bytes = [0xDC, 0x00];
+        assert_eq!(decode_ucs2(&bytes), "\u{FFFD}");
+    }
+
+    /// End-to-end: the exact shape of the real message that surfaced
+    /// SMS-EMOJI-01 — plain text either side of an astral-plane emoji,
+    /// decoded through the full RP-DATA/TPDU path, not just `decode_ucs2`
+    /// directly.
+    #[test]
+    fn decodes_a_ucs2_message_with_an_emoji() {
+        let text_bytes: Vec<u8> = "Hello world! 😀 Welcome"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+
+        let mut tpdu = vec![0x00];
+        tpdu.push(0);
+        tpdu.push(0x81);
+        tpdu.push(0x00);
+        tpdu.push(0x08); // TP-DCS: general group, UCS-2
+        tpdu.extend_from_slice(&[0u8; 7]);
+        tpdu.push(text_bytes.len() as u8);
+        tpdu.extend_from_slice(&text_bytes);
+
+        let mut rp = vec![0x01, 0x00, 0, 0];
+        rp.push(tpdu.len() as u8);
+        rp.extend_from_slice(&tpdu);
+
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
+        assert_eq!(decoded.text, "Hello world! 😀 Welcome");
     }
 
     /// Same packing algorithm as `pack_septets`, but starting `leading_zero_bits`

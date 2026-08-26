@@ -187,11 +187,16 @@ was exercised, what was observed.
 
 ### New finding from this test run
 
-- **SMS-EMOJI-01** — `decode_ucs2` (`ims/sms_pdu.rs`) doesn't reassemble
-  UTF-16 surrogate pairs, so any emoji outside the Basic Multilingual Plane
-  is dropped as `U+FFFD` rather than decoded. Confirmed live on real
-  inbound SMS from a real handset (2026-08-26). Fix: detect a high
-  surrogate (`0xD800..=0xDBFF`) followed by a low surrogate
-  (`0xDC00..=0xDFFF`) in `decode_ucs2` and combine them into the intended
-  code point (`0x10000 + (high - 0xD800) * 0x400 + (low - 0xDC00)`) instead
-  of decoding each unit alone. Not scheduled in any batch yet.
+- [x] **SMS-EMOJI-01** — `decode_ucs2` (`ims/sms_pdu.rs`) didn't reassemble
+      UTF-16 surrogate pairs, so any emoji outside the Basic Multilingual
+      Plane was dropped as `U+FFFD` rather than decoded. Confirmed live on
+      real inbound SMS from a real handset (2026-08-26).
+      **Landed 2026-08-26**: `decode_ucs2` now detects a high surrogate
+      (`0xD800..=0xDBFF`) followed by a low surrogate (`0xDC00..=0xDFFF`)
+      and combines them into the intended code point (RFC 2781 §2.2)
+      instead of decoding each unit alone; an unpaired or lone surrogate
+      still falls back to `U+FFFD` rather than corrupting the rest of the
+      string. Tests: direct `decode_ucs2` cases (a real surrogate pair, an
+      unpaired high surrogate, a high surrogate at end of buffer, a lone low
+      surrogate) plus an end-to-end TPDU-level test reproducing the exact
+      shape of the message that surfaced this.
