@@ -513,8 +513,11 @@ fn sweep_modem_storage(
             ));
         };
         let mut at = open_with_retry(modem_port)?;
-        // Text mode, or `CMGL`/`CMGR` return PDUs this path does not parse.
-        let _ = at.send_command("AT+CMGF=1")?;
+        // PDU mode: text mode (`AT+CMGF=1`) cannot represent UCS-2 or expose
+        // the UDH a concatenated message needs, and cannot decode identically
+        // to the IMS `MESSAGE` route — see `sms::reader::decode_pdu_line`'s
+        // docs (specs/041 conformance review, CS-01/CS-02).
+        let _ = at.send_command("AT+CMGF=0")?;
         crate::sms::reader::list_sms_indexes(&mut at)?
     };
     if indexes.is_empty() {

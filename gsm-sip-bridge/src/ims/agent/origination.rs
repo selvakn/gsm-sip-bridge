@@ -1280,11 +1280,16 @@ fn offered_chosen_codec(negotiated: NegotiatedCodec) -> Option<sdp::ChosenCodec>
             codec: NegotiatedCodec::Pcmu,
             payload_type: 0,
             octet_aligned: false,
+            // `build_offer` never offers `telephone-event` on this leg
+            // (specs/041 conformance review, RTP-02's sibling gap) — nothing
+            // for an answer to have echoed.
+            dtmf_payload_type: None,
         }),
         NegotiatedCodec::AmrWb => Some(sdp::ChosenCodec {
             codec: NegotiatedCodec::AmrWb,
             payload_type: 96,
             octet_aligned: true,
+            dtmf_payload_type: None,
         }),
         _ => None,
     }
@@ -1833,6 +1838,7 @@ mod tests {
                     codec: NegotiatedCodec::Pcmu,
                     payload_type: 0,
                     octet_aligned: false,
+                    dtmf_payload_type: None,
                 },
             }))
             .unwrap();
@@ -1954,6 +1960,7 @@ mod tests {
                     codec: NegotiatedCodec::Pcmu,
                     payload_type: 0,
                     octet_aligned: false,
+                    dtmf_payload_type: None,
                 },
             }))
             .unwrap();

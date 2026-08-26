@@ -70,6 +70,12 @@ pub struct ChosenCodec {
     /// (bit-packed). Not a preference we get to make — it is declared by the
     /// offer's `a=fmtp` for this payload type. Meaningless for PCMU.
     pub octet_aligned: bool,
+    /// The RFC 4733 `telephone-event` payload type this leg's answer echoed
+    /// back, if the offer included one at this codec's clock rate. `None`
+    /// when the offer carried no `telephone-event` at all — nothing this
+    /// leg's answer could echo, so nowhere a DTMF relay can put an event
+    /// even if the far leg sends one.
+    pub dtmf_payload_type: Option<u8>,
 }
 
 fn ip_addrtype(ip: IpAddr) -> &'static str {
@@ -721,6 +727,7 @@ fn build_answer_for(
             codec: chosen.codec,
             payload_type: pt,
             octet_aligned: chosen.is_octet_aligned(),
+            dtmf_payload_type: dtmf_pick.map(|(dpt, _)| *dpt),
         },
     )
 }

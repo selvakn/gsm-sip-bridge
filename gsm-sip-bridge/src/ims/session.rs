@@ -393,25 +393,175 @@ pub(crate) fn send_sms_delivery_report(
     }
 }
 
+/// One `<contact>` element's `state`/`event` attributes from a reg-event
+/// NOTIFY body (RFC 3680 §4.1 / TS 24.229 §5.1.1.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReginfoContact {
+    pub(crate) state: String,
+    pub(crate) event: String,
+}
+
+/// Every `<contact ...>` element in `body`, as its raw text — the opening
+/// tag alone when self-closing, or through the matching `</contact>`
+/// otherwise. Not a general XML parser: just enough of reginfo's shape
+/// ([`find_own_contact`]'s only caller) to isolate one element at a time so
+/// its `state`/`event` attributes can be read without another element's
+/// same-named attribute (there are none in this schema, but nothing here
+/// assumes that) getting matched first.
+fn contact_blocks(body: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel_start) = body[cursor..].find("<contact") {
+        let start = cursor + rel_start;
+        let Some(rel_tag_end) = body[start..].find('>') else {
+            break; // malformed: an opening tag that never closes
+        };
+        let tag_end = start + rel_tag_end;
+        let self_closing =
+            tag_end.checked_sub(1).and_then(|i| body.as_bytes().get(i)) == Some(&b'/');
+        let (block, next_cursor) = if self_closing {
+            (&body[start..=tag_end], tag_end + 1)
+        } else if let Some(rel_close) = body[tag_end..].find("</contact>") {
+            let close_end = tag_end + rel_close + "</contact>".len();
+            (&body[start..close_end], close_end)
+        } else {
+            (&body[start..], body.len()) // malformed: no closing tag
+        };
+        blocks.push(block);
+        cursor = next_cursor;
+        if cursor >= body.len() {
+            break;
+        }
+    }
+    blocks
+}
+
+/// The value of `name="..."` anywhere in `tag` — attribute order isn't
+/// assumed, only that the value itself contains no `"`.
+fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+fn parse_contact_attrs(block: &str) -> Option<ReginfoContact> {
+    Some(ReginfoContact {
+        state: extract_attr(block, "state")?,
+        event: extract_attr(block, "event").unwrap_or_default(),
+    })
+}
+
+/// Finds the `<contact>` element in a reg-event NOTIFY body that is *ours*,
+/// and returns its `state`/`event` attributes.
+///
+/// Matched by whether the element mentions our own IMEI — every `Contact` we
+/// register carries `+sip.instance="<urn:gsma:imei:...>"`, and a registrar's
+/// reginfo NOTIFY commonly echoes a contact's own parameters back in an
+/// `<unknown-param>` — falling back to "the only contact in the document"
+/// (the overwhelmingly common case for these lines) when there is exactly
+/// one and none mentions the IMEI at all.
+///
+/// Deliberately gives up (`None`) rather than guessing when there are
+/// multiple contacts and none can be attributed to us: acting on a
+/// *different* device's contact — Jio's own reginfo has shown a paired
+/// handset's contact alongside ours — would force a re-registration this
+/// line never needed.
+pub(crate) fn find_own_contact(body: &str, imei: &str) -> Option<ReginfoContact> {
+    let contacts = contact_blocks(body);
+    if !imei.is_empty() {
+        if let Some(block) = contacts.iter().find(|b| b.contains(imei)) {
+            return parse_contact_attrs(block);
+        }
+    }
+    match contacts.as_slice() {
+        [only] => parse_contact_attrs(only),
+        _ => None,
+    }
+}
+
+/// RFC 3680 §4.1: `state="terminated"` is only a deregistration when paired
+/// with one of these events — `expired` is our own scheduled renewal running
+/// its course, not the network dropping us, so it is deliberately excluded.
+fn contact_reports_deregistration(c: &ReginfoContact) -> bool {
+    c.state.eq_ignore_ascii_case("terminated")
+        && matches!(
+            c.event.to_ascii_lowercase().as_str(),
+            "deactivated" | "probation" | "rejected" | "unregistered"
+        )
+}
+
 /// Acknowledges a `NOTIFY` and surfaces its payload. For `Event: reg` the
 /// body is the network's reginfo XML — logged in full because it is the
 /// ground truth for whether our binding is actually active for terminating
 /// calls. The `To` header already carries our tag (it echoes our SUBSCRIBE's
 /// `From` tag), so no tag is added.
-pub(crate) fn handle_notify(sink: &SipSink, req: &SipRequest) {
+///
+/// Returns `true` when our own contact was reported deregistered — `state=
+/// "terminated"` with `event` one of `deactivated`/`probation`/`rejected`/
+/// `unregistered` (RFC 3680 §4.1) — so the caller can force an immediate
+/// re-registration. Before this, any such NOTIFY was only logged: the line
+/// would keep reporting itself `Registered` and silently receive nothing
+/// until the next scheduled renewal, up to an hour later (specs/041
+/// conformance review, MT-09).
+///
+/// This bridge always retries rather than giving up outright — the
+/// same philosophy `GmConnectionState::Failed` already follows (not
+/// terminal, keeps retrying on backoff) — so `rejected`/`unregistered` are
+/// handled the same as `deactivated`/`probation`: force a fresh attempt now,
+/// and let the existing renewal-failure backoff take over if the network
+/// really does keep refusing it.
+pub(crate) fn handle_notify(
+    session: &super::RegisteredSession,
+    sink: &SipSink,
+    req: &SipRequest,
+) -> bool {
     let _ = sink.send(&build_uas_response(200, "OK", req, None, None, None));
     let event = req.header("Event").unwrap_or("?").to_string();
     let sub_state = req.header("Subscription-State").unwrap_or("?").to_string();
-    if req.body.contains("terminated") {
+
+    let own_contact = event
+        .eq_ignore_ascii_case("reg")
+        .then(|| find_own_contact(&req.body, &session.imei))
+        .flatten();
+    let deregistered = own_contact
+        .as_ref()
+        .is_some_and(contact_reports_deregistration);
+
+    if let Some(c) = &own_contact {
+        if deregistered {
+            tracing::warn!(
+                event = %event,
+                subscription_state = %sub_state,
+                contact_state = %c.state,
+                contact_event = %c.event,
+                "reg-event NOTIFY reports our own binding was deregistered; forcing an \
+                 immediate re-registration"
+            );
+        } else {
+            tracing::info!(
+                event = %event,
+                subscription_state = %sub_state,
+                contact_state = %c.state,
+                contact_event = %c.event,
+                "received reg-event NOTIFY for our own binding"
+            );
+        }
+    } else if req.body.contains("terminated") {
+        // Either not a reg-event NOTIFY, an unparseable body, or a document
+        // with more than one contact and none attributable to us — still
+        // worth a warning, but nothing to act on with confidence.
         tracing::warn!(
             event = %event,
             subscription_state = %sub_state,
             body = %req.body,
-            "NOTIFY reports a terminated state — the network may have dropped our registration binding"
+            "NOTIFY body mentions a terminated state, but not attributably to our own contact"
         );
     } else {
         tracing::info!(event = %event, subscription_state = %sub_state, body = %req.body, "received NOTIFY");
     }
+
+    deregistered
 }
 
 /// Answers on the connection a request arrived on, logging rather than
@@ -452,4 +602,142 @@ pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
     // A display name with no URI at all ("Anonymous"), or an empty header,
     // is not something a request can be addressed to.
     uri.contains(':').then(|| uri.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single-contact reginfo document, no IMEI needed to attribute it —
+    /// the common case, and the shape of every network before Jio's paired
+    /// Apple Watch example.
+    #[test]
+    fn a_single_contact_is_treated_as_ours_without_needing_the_imei() {
+        let body = r#"<?xml version="1.0"?>
+<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="0" state="full">
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="c1" state="active" event="registered" expires="3600">
+      <uri>sip:+919000000000@10.0.0.1:5060;transport=tcp</uri>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let contact = find_own_contact(body, "860000000000000").expect("the sole contact");
+        assert_eq!(contact.state, "active");
+        assert_eq!(contact.event, "registered");
+        assert!(!contact_reports_deregistration(&contact));
+    }
+
+    /// Multiple contacts, ours identified by its `+sip.instance` IMEI —
+    /// modelled on the Jio reginfo (a paired handset's contact alongside
+    /// ours) that motivated matching by IMEI instead of always taking "the"
+    /// contact.
+    #[test]
+    fn our_contact_is_picked_out_by_imei_among_several() {
+        let body = r#"<?xml version="1.0"?>
+<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="0" state="full">
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="watch" state="active" event="registered" expires="3600">
+      <uri>sip:+919000000000@192.168.1.50:5060</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:490154203237518&gt;"</unknown-param>
+    </contact>
+    <contact id="phone" state="terminated" event="deactivated" expires="0">
+      <uri>sip:+919000000000@10.0.0.1:5060;transport=tcp</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:860000000000000&gt;"</unknown-param>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let contact = find_own_contact(body, "860000000000000").expect("our contact, by IMEI");
+        assert_eq!(contact.state, "terminated");
+        assert_eq!(contact.event, "deactivated");
+        assert!(contact_reports_deregistration(&contact));
+
+        // The other device's own binding is untouched: a NOTIFY about it must
+        // never be read as ours.
+        let watch = find_own_contact(body, "490154203237518").expect("the watch's own contact");
+        assert_eq!(watch.state, "active");
+    }
+
+    /// Several contacts and none mentioning our IMEI: give up rather than
+    /// guess. Acting on a contact that isn't ours would force a
+    /// re-registration this line never needed.
+    #[test]
+    fn multiple_unattributable_contacts_yield_none_rather_than_a_guess() {
+        let body = r#"<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="0" state="full">
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="a" state="active" event="registered" expires="3600">
+      <uri>sip:+919000000000@192.168.1.50:5060</uri>
+    </contact>
+    <contact id="b" state="terminated" event="rejected" expires="0">
+      <uri>sip:+919000000000@10.0.0.1:5060</uri>
+    </contact>
+  </registration>
+</reginfo>"#;
+        assert!(find_own_contact(body, "860000000000000").is_none());
+    }
+
+    /// A self-closing `<contact/>` (no children at all) must still parse —
+    /// RFC 3680's schema allows it, even though every real capture seen so
+    /// far carries a `<uri>` child.
+    #[test]
+    fn a_self_closing_contact_element_is_parsed() {
+        let body = r#"<reginfo><registration><contact id="c1" state="terminated" event="probation"/></registration></reginfo>"#;
+        let contact = find_own_contact(body, "").expect("the sole, self-closing contact");
+        assert_eq!(contact.state, "terminated");
+        assert_eq!(contact.event, "probation");
+        assert!(contact_reports_deregistration(&contact));
+    }
+
+    /// `expired` is our own scheduled renewal running its course, not the
+    /// network dropping us — it must not trigger the same forced
+    /// re-registration as a genuine deregistration.
+    #[test]
+    fn an_expired_event_is_not_treated_as_a_deregistration() {
+        let contact = ReginfoContact {
+            state: "terminated".to_string(),
+            event: "expired".to_string(),
+        };
+        assert!(!contact_reports_deregistration(&contact));
+    }
+
+    /// `state="active"` is never a deregistration, whatever `event` says —
+    /// the state is the gate, not just the event name.
+    #[test]
+    fn an_active_contact_is_never_a_deregistration_even_with_a_deregistration_style_event() {
+        let contact = ReginfoContact {
+            state: "active".to_string(),
+            event: "deactivated".to_string(),
+        };
+        assert!(!contact_reports_deregistration(&contact));
+    }
+
+    /// Every event RFC 3680 §4.1 pairs with `state="terminated"` to mean the
+    /// binding is genuinely gone, not just refreshed/shortened.
+    #[test]
+    fn every_deregistration_event_is_recognized() {
+        for event in ["deactivated", "probation", "rejected", "unregistered"] {
+            let contact = ReginfoContact {
+                state: "terminated".to_string(),
+                event: event.to_string(),
+            };
+            assert!(
+                contact_reports_deregistration(&contact),
+                "{event} must be recognized as a deregistration"
+            );
+        }
+    }
+
+    /// No `<contact>` element at all (an empty or unrelated body) must not
+    /// panic — it's simply nothing to attribute.
+    #[test]
+    fn a_body_with_no_contact_element_yields_none() {
+        assert!(find_own_contact("<reginfo></reginfo>", "860000000000000").is_none());
+        assert!(find_own_contact("", "860000000000000").is_none());
+    }
+
+    /// A `<contact` opening tag that never closes must not hang or panic —
+    /// this is untrusted network input.
+    #[test]
+    fn a_truncated_contact_tag_does_not_panic() {
+        assert!(find_own_contact("<reginfo><contact state=\"terminated\"", "").is_none());
+    }
 }

@@ -46,7 +46,7 @@ use crate::ims::observability;
 // call sites below read exactly as they did before the move.
 use crate::ims::sdp;
 use crate::ims::session::{
-    attempt_renewal, extract_caller, handle_notify, header_uri, map_registration_error,
+    attempt_renewal, extract_caller, header_uri, map_registration_error,
     map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
     subscribe_reg_event, to_unix, Inbound,
 };
@@ -759,7 +759,12 @@ fn run_status_listener(
 /// can't parse is still one we received, and the caller must still relay and
 /// acknowledge *something* rather than drop it (specs/017 FR-026's ordering
 /// exists precisely so a message is never silently lost).
-fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> {
+///
+/// Returns the envelope's actual [`DecodedRp`] rather than unwrapping straight
+/// to a message — an RP-ACK or RP-ERROR is not a decode failure (the bytes
+/// parse fine), but it is not a deliverable short message either, and the
+/// caller must not treat it as one.
+fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedRp> {
     let is_3gpp_sms = req
         .header("Content-Type")
         .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("application/vnd.3gpp.sms"));
@@ -858,7 +863,44 @@ fn handle_message(
 
     // Kept past the relay, not consumed by it: `rp_mr` is needed again at
     // whichever acknowledgement point this message reaches.
-    let decoded = decode_pdu_body(req);
+    //
+    // An RP-ACK or RP-ERROR is not a decode failure and not a message either
+    // — see `sms_pdu::DecodedRp`'s docs. There is nothing to relay or record
+    // for either: this bridge never submits an RP-DATA over IMS itself, so a
+    // well-behaved peer never sends them, and treating one as a message would
+    // put a "message" nobody sent in front of the operator (specs/041's
+    // sibling review, SMS-01). Acknowledge the SIP transaction and stop.
+    let decoded = match decode_pdu_body(req) {
+        Some(crate::ims::sms_pdu::DecodedRp::Message(sms)) => Some(sms),
+        Some(crate::ims::sms_pdu::DecodedRp::Ack { rp_mr }) => {
+            tracing::info!(
+                sender = %sender,
+                rp_mr,
+                "received an RP-ACK on the SMS transport; not a deliverable message"
+            );
+            respond(
+                sink,
+                "200 OK (MESSAGE, RP-ACK)",
+                &build_200_ok_message(req, &random_hex(4)),
+            );
+            return;
+        }
+        Some(crate::ims::sms_pdu::DecodedRp::Error { rp_mr, cause }) => {
+            tracing::warn!(
+                sender = %sender,
+                rp_mr,
+                cause = ?cause,
+                "received an RP-ERROR on the SMS transport; not a deliverable message"
+            );
+            respond(
+                sink,
+                "200 OK (MESSAGE, RP-ERROR)",
+                &build_200_ok_message(req, &random_hex(4)),
+            );
+            return;
+        }
+        None => None,
+    };
     if let Some(decoded) = &decoded {
         sender = decoded.sender.clone();
         body = match decoded.part {
@@ -1235,7 +1277,7 @@ fn dispatch_loop(
                 tracing::debug!("received ACK, dialog confirmed");
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "NOTIFY" => {
-                handle_notify(&sink, &req);
+                st.handle_reg_notify(session, p, &req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
                 handle_message(session, p, &req, &sink);
@@ -1587,6 +1629,30 @@ impl LoopState {
             None => {
                 let _ = sink.send(&build_200_ok_bye(req, &random_hex(4)));
             }
+        }
+    }
+
+    /// Drives the registration state off a reg-event `NOTIFY` — see
+    /// `session::handle_notify`'s docs for what makes it report a
+    /// deregistration. Reuses the exact escalation path
+    /// `ping::probe_gm_connection` already uses for a dead Gm connection
+    /// (`force_renewal`, honoured by `on_idle_tick`'s next pass) rather than
+    /// adding a second way to force a re-registration.
+    fn handle_reg_notify(
+        &mut self,
+        session: &crate::ims::RegisteredSession,
+        p: &DispatchParams,
+        req: &SipRequest,
+        sink: &SipSink,
+    ) {
+        if crate::ims::session::handle_notify(session, sink, req) {
+            self.force_renewal = true;
+            let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            guard.state = crate::ims::RegistrationState::Failed;
+            guard.last_failure = Some((
+                SystemTime::now(),
+                "reg-event NOTIFY reported our own binding deregistered".to_string(),
+            ));
         }
     }
 
@@ -2059,8 +2125,32 @@ mod tests {
 
         let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
         let decoded = decode_pdu_body(&req).expect("a 3GPP SMS body must decode");
+        let crate::ims::sms_pdu::DecodedRp::Message(decoded) = decoded else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
         assert_eq!(decoded.sender, "+919000000001");
         assert_eq!(decoded.text, "Hi");
+    }
+
+    /// An RP-ACK is well-formed and decodes without error, but it is not a
+    /// deliverable message — `handle_message` must recognise the variant and
+    /// route it away from the operator feed, never treat it as text.
+    #[test]
+    fn decode_pdu_body_recognizes_an_rp_ack_as_not_a_message() {
+        let rp_ack = vec![0x03, 0x42]; // RP-ACK, network->MS, MR=0x42
+        let mut raw = b"MESSAGE sip:x SIP/2.0\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n"
+            .to_vec();
+        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", rp_ack.len()).as_bytes());
+        raw.extend_from_slice(&rp_ack);
+
+        let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
+        assert_eq!(
+            decode_pdu_body(&req),
+            Some(crate::ims::sms_pdu::DecodedRp::Ack { rp_mr: 0x42 })
+        );
     }
 
     /// An ordinary text `MESSAGE` (no 3GPP content type) must be left alone —

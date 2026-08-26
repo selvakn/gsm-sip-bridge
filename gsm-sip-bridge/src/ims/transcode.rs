@@ -388,6 +388,7 @@ pub fn spawn_transcoding_relay(
             carrier_decoder,
             veth_encoder,
             to_veth,
+            carrier,
             veth_codec,
             "carrier->veth",
             stop_a,
@@ -401,6 +402,7 @@ pub fn spawn_transcoding_relay(
             veth_decoder,
             carrier_encoder,
             to_carrier,
+            veth_codec,
             carrier,
             "veth->carrier",
             stop,
@@ -410,11 +412,31 @@ pub fn spawn_transcoding_relay(
     Ok(())
 }
 
-/// One direction: decode `src`'s payloads to PCM, resample to the far leg's
-/// rate, and re-encode into whole `out` frames. PCM left over from a packet
-/// that didn't divide evenly into output frames (a 16 kHz AMR-WB frame is two
-/// 8 kHz PCMU packets; an 8 kHz one is half of an L16 frame) carries over to
-/// the next packet rather than being padded or dropped.
+/// How far apart (in the *destination* leg's own samples) two separate DTMF
+/// events' re-originated timestamps are placed. Real keypresses are spaced
+/// well beyond this, and the exact value doesn't matter — it only has to be
+/// nonzero so consecutive digits don't share a timestamp — so a fixed
+/// quarter-second is simpler than deriving one from RFC 4733's duration
+/// field.
+const DTMF_EVENT_TIMESTAMP_GAP_DIVISOR: u32 = 4;
+
+/// One direction: decode `src`'s audio payloads to PCM, resample to the far
+/// leg's rate, and re-encode into whole `dst_codec` frames. PCM left over
+/// from a packet that didn't divide evenly into output frames (a 16 kHz
+/// AMR-WB frame is two 8 kHz PCMU packets; an 8 kHz one is half of an L16
+/// frame) carries over to the next packet rather than being padded or
+/// dropped.
+///
+/// Not every packet on this socket is audio for `decoder`, though: an RFC
+/// 4733 `telephone-event` packet carries a DTMF digit, not audio, and a
+/// comfort-noise or otherwise-unrecognised payload type is neither. Feeding
+/// either to the audio decoder used to be exactly what happened — every DTMF
+/// digit on a transcoded call came out as an audible artefact and never
+/// reached the far leg at all (specs/041 conformance review, RTP-02). This
+/// now switches on `pkt.payload_type` first: `src_codec.payload_type` goes to
+/// the decoder as before; `src_codec.dtmf_payload_type` is forwarded to
+/// whatever event payload type `dst_codec` negotiated (the two legs need not
+/// agree on the number); anything else is dropped.
 #[allow(clippy::too_many_arguments)]
 fn relay_direction(
     src: UdpSocket,
@@ -422,13 +444,25 @@ fn relay_direction(
     mut decoder: Decoder,
     mut encoder: Encoder,
     mut resampler: Resampler,
-    out: ChosenCodec,
+    src_codec: ChosenCodec,
+    dst_codec: ChosenCodec,
     direction: &'static str,
     stop: Arc<AtomicBool>,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let frame_samples = out.codec.frame_samples();
-    let mut sender = RtpSender::new(out.payload_type);
+    let frame_samples = dst_codec.codec.frame_samples();
+    let mut sender = RtpSender::new(dst_codec.payload_type);
+    // A DTMF event gets its own RtpSender (independent seq/timestamp run) —
+    // see the loop body for why its timestamp cannot share the audio
+    // sender's clock. `None` when this leg's own answer never negotiated
+    // `telephone-event`, in which case there is nowhere to put an event even
+    // if the far leg sends one.
+    let mut dtmf_sender = dst_codec.dtmf_payload_type.map(RtpSender::new);
+    // The *source's* RTP timestamp of the DTMF event currently in progress,
+    // so repeated packets for the same keypress (which RFC 4733 sends with a
+    // fixed timestamp) reuse our own re-originated timestamp too, and only a
+    // genuinely new source timestamp — a new keypress — advances it.
+    let mut dtmf_event_source_ts: Option<u32> = None;
     let mut pending: Vec<i16> = Vec::new();
     let mut buf = [0u8; RECV_BUF];
 
@@ -442,6 +476,43 @@ fn relay_direction(
         // Count the packet only once it parses as RTP — a malformed datagram is
         // not audio that flowed, and counting it would mask a one-way call.
         super::media_stats::bump(&counter);
+
+        if Some(pkt.payload_type) == src_codec.dtmf_payload_type {
+            let Some(dtmf_sender) = dtmf_sender.as_mut() else {
+                // Nothing this leg's own answer negotiated to forward it on.
+                continue;
+            };
+            if dtmf_event_source_ts != Some(pkt.timestamp) {
+                // A new keypress: give it a fresh timestamp on our own
+                // independent DTMF stream, clearly advanced from whatever the
+                // previous event used.
+                dtmf_sender.timestamp = dtmf_sender
+                    .timestamp
+                    .wrapping_add(dst_codec.codec.sample_rate() / DTMF_EVENT_TIMESTAMP_GAP_DIVISOR);
+                dtmf_event_source_ts = Some(pkt.timestamp);
+                // Once per keypress, not per retransmitted packet — a DTMF
+                // digit that never reached the far leg used to be silently
+                // indistinguishable from one that was never pressed at all
+                // (specs/041 conformance review, RTP-02).
+                tracing::info!(
+                    direction,
+                    event = pkt.payload.first().copied(),
+                    "forwarding a DTMF keypress"
+                );
+            }
+            // 0 samples: repeated packets for one event share a timestamp: it
+            // is only bumped, above, when a new event starts.
+            if let Err(e) = dtmf_sender.send(&dst, pkt.payload, 0) {
+                tracing::warn!(error = %e, direction, "transcoding relay: DTMF forward failed");
+                return;
+            }
+            continue;
+        }
+        if pkt.payload_type != src_codec.payload_type {
+            // Comfort noise, or a payload type neither leg's answer named —
+            // not audio this decoder was built for.
+            continue;
+        }
         let Some(pcm) = decoder.decode(pkt.payload) else {
             continue;
         };
@@ -486,10 +557,19 @@ mod tests {
     use super::*;
 
     fn codec(codec: NegotiatedCodec, payload_type: u8) -> ChosenCodec {
+        codec_with_dtmf(codec, payload_type, None)
+    }
+
+    fn codec_with_dtmf(
+        codec: NegotiatedCodec,
+        payload_type: u8,
+        dtmf_payload_type: Option<u8>,
+    ) -> ChosenCodec {
         ChosenCodec {
             codec,
             payload_type,
             octet_aligned: true,
+            dtmf_payload_type,
         }
     }
 
@@ -738,5 +818,162 @@ mod tests {
             &crate::ims::media_stats::MediaMeter::new(),
         )
         .expect("8k carrier to 16k veth must resample rather than be refused");
+    }
+
+    /// RFC 4733: a `telephone-event` packet must be forwarded, re-stamped
+    /// onto the far leg's own negotiated event payload type, never handed to
+    /// the audio decoder. Before this existed every DTMF digit on a
+    /// transcoded call was decoded as if it were AMR/PCMU audio and never
+    /// reached the far leg at all (specs/041 conformance review, RTP-02).
+    #[test]
+    fn dtmf_events_are_forwarded_to_the_far_legs_own_event_payload_type() {
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        agent_b
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_transcoding_relay(
+            ims,
+            veth,
+            codec_with_dtmf(NegotiatedCodec::Pcmu, 0, Some(100)),
+            codec_with_dtmf(NegotiatedCodec::L16, 96, Some(101)),
+            stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
+        )
+        .unwrap();
+
+        // RFC 4733 §2.3: event=1 ('1'), E=0, volume=10, duration=160.
+        let digit_1 = [1u8, 10, 0, 160];
+        carrier
+            .send(&rtp::build_packet(1, 5000, 0xaaaa, 100, &digit_1))
+            .unwrap();
+
+        let mut buf = [0u8; RECV_BUF];
+        let n = agent_b
+            .recv(&mut buf)
+            .expect("the DTMF event must be forwarded, not silently dropped");
+        let (first_pt, first_ts, first_payload) = {
+            let pkt = rtp::parse_packet(&buf[..n]).unwrap();
+            (pkt.payload_type, pkt.timestamp, pkt.payload.to_vec())
+        };
+        assert_eq!(
+            first_pt, 101,
+            "must carry the veth leg's own negotiated event PT, not the carrier's"
+        );
+        assert_eq!(
+            first_payload, digit_1,
+            "the event payload is forwarded verbatim"
+        );
+
+        // A retransmission of the same event (RFC 4733 §2.5.1.1: repeated
+        // packets share one timestamp) must reuse the same output timestamp.
+        let digit_1_repeat = [1u8, 10, 0, 240];
+        carrier
+            .send(&rtp::build_packet(2, 5000, 0xaaaa, 100, &digit_1_repeat))
+            .unwrap();
+        let n = agent_b.recv(&mut buf).unwrap();
+        let repeat_ts = rtp::parse_packet(&buf[..n]).unwrap().timestamp;
+        assert_eq!(
+            repeat_ts, first_ts,
+            "repeated packets for one keypress must keep a single output timestamp"
+        );
+
+        // A genuinely new keypress (a new source timestamp) must advance it.
+        let digit_2 = [2u8, 10, 0, 160];
+        carrier
+            .send(&rtp::build_packet(3, 5320, 0xaaaa, 100, &digit_2))
+            .unwrap();
+        let n = agent_b.recv(&mut buf).unwrap();
+        let second_ts = rtp::parse_packet(&buf[..n]).unwrap().timestamp;
+        assert_ne!(
+            second_ts, first_ts,
+            "a new keypress must not reuse the previous one's timestamp"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// A leg whose own answer never negotiated `telephone-event` has nowhere
+    /// to put an event even if the far leg sends one — it must be dropped,
+    /// not fall through to the audio decoder either.
+    #[test]
+    fn dtmf_with_no_destination_event_payload_type_is_dropped_not_decoded() {
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        agent_b
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_transcoding_relay(
+            ims,
+            veth,
+            codec_with_dtmf(NegotiatedCodec::Pcmu, 0, Some(100)),
+            // The veth leg's own answer offered no telephone-event PT.
+            codec(NegotiatedCodec::L16, 96),
+            stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
+        )
+        .unwrap();
+
+        let digit_1 = [1u8, 10, 0, 160];
+        carrier
+            .send(&rtp::build_packet(1, 5000, 0xaaaa, 100, &digit_1))
+            .unwrap();
+
+        let mut buf = [0u8; RECV_BUF];
+        let err = agent_b.recv(&mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "nothing should have been forwarded: {err}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Comfort noise (or any payload type neither leg's answer named) is
+    /// neither this decoder's audio PT nor the negotiated DTMF PT — it must
+    /// be dropped rather than fed to the audio decoder as if it were speech.
+    #[test]
+    fn an_unrecognised_payload_type_is_dropped_not_decoded() {
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        agent_b
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_transcoding_relay(
+            ims,
+            veth,
+            codec_with_dtmf(NegotiatedCodec::Pcmu, 0, Some(100)),
+            codec_with_dtmf(NegotiatedCodec::L16, 96, Some(101)),
+            stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
+        )
+        .unwrap();
+
+        // Payload type 13 (a common comfort-noise convention) — not the
+        // audio PT (0) or the DTMF PT (100) this leg negotiated.
+        carrier
+            .send(&rtp::build_packet(1, 0, 0xbeef, 13, &[0xFF]))
+            .unwrap();
+
+        let mut buf = [0u8; RECV_BUF];
+        let err = agent_b.recv(&mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "nothing should have been forwarded: {err}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
     }
 }
