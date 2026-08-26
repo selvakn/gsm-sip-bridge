@@ -639,6 +639,25 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         },
         respond_on_client: raw.respond_on_client,
         sms_delivery_report: raw.sms_delivery_report,
+        originating_headers: {
+            let mut set = crate::config::OriginatingHeaders::default();
+            for token in &raw.originating_headers {
+                match token.as_str() {
+                    "icsi" => set.icsi = true,
+                    "preferred-identity" => set.preferred_identity = true,
+                    "supported" => set.supported = true,
+                    "allow" => set.allow = true,
+                    other => {
+                        return Err(BridgeError::Config(format!(
+                            "vowifi.originating_headers: unknown entry {other:?}; \
+                             accepted entries are {:?}",
+                            crate::config::OriginatingHeaders::TOKENS
+                        )))
+                    }
+                }
+            }
+            set
+        },
         pcscf_source_path: raw.pcscf_source_path,
         control_port: in_range(raw.control_port, "vowifi.control_port", 1..=65535)?,
         wideband: raw.wideband,

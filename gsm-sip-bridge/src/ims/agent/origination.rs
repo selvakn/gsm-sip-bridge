@@ -276,6 +276,8 @@ pub(super) struct OriginationSetup {
     pub(super) veth_local_ip: IpAddr,
     pub(super) veth_sip_port: u16,
     pub(super) wideband: bool,
+    /// See `config::OriginatingHeaders` — empty everywhere by default.
+    pub(super) originating_headers: crate::config::OriginatingHeaders,
 }
 
 /// Builds and sends the carrier INVITE and returns the in-flight state, or
@@ -360,6 +362,7 @@ pub(super) fn begin_origination(
         cseq: invite_cseq,
         branch: &branch,
         body: &offer,
+        originating_headers: setup.originating_headers,
     });
 
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
@@ -1277,11 +1280,16 @@ fn offered_chosen_codec(negotiated: NegotiatedCodec) -> Option<sdp::ChosenCodec>
             codec: NegotiatedCodec::Pcmu,
             payload_type: 0,
             octet_aligned: false,
+            // `build_offer` never offers `telephone-event` on this leg
+            // (specs/041 conformance review, RTP-02's sibling gap) — nothing
+            // for an answer to have echoed.
+            dtmf_payload_type: None,
         }),
         NegotiatedCodec::AmrWb => Some(sdp::ChosenCodec {
             codec: NegotiatedCodec::AmrWb,
             payload_type: 96,
             octet_aligned: true,
+            dtmf_payload_type: None,
         }),
         _ => None,
     }
@@ -1830,6 +1838,7 @@ mod tests {
                     codec: NegotiatedCodec::Pcmu,
                     payload_type: 0,
                     octet_aligned: false,
+                    dtmf_payload_type: None,
                 },
             }))
             .unwrap();
@@ -1951,6 +1960,7 @@ mod tests {
                     codec: NegotiatedCodec::Pcmu,
                     payload_type: 0,
                     octet_aligned: false,
+                    dtmf_payload_type: None,
                 },
             }))
             .unwrap();

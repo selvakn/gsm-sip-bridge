@@ -269,6 +269,22 @@ respond_on_client = false
 # Turn it off only to isolate a carrier that dislikes the report -- and please
 # capture the exchange, because no such carrier is known.
 sms_delivery_report = true
+# Optional originating (INVITE) headers, by name. Empty (the default) is the
+# minimal header set every carrier in production here places calls on. Each
+# entry opts one group in:
+#   "icsi"                -> Accept-Contact + P-Preferred-Service + a Contact
+#                            feature tag naming the MMTel voice ICSI
+#                            (TS 24.173 5.2). For a network whose S-CSCF keys
+#                            its initial filter criteria on the service id.
+#   "preferred-identity"  -> P-Preferred-Identity, same identity as From.
+#   "supported"           -> Supported: 100rel, timer. NOT free: it invites the
+#                            network to Require them, and session-timer refresh
+#                            (RFC 4028) is not implemented.
+#   "allow"               -> the full MTSI method list instead of the minimum.
+# These exist to test a carrier that intercepts a minimal INVITE without a
+# rebuild -- see docs/plans/jio-vowifi-outbound-480.md. Leave empty unless a
+# capture says the carrier wants one.
+originating_headers = []
 # BASE path Agent A reads its tunnel-assigned P-CSCF address from, written by
 # the supervisor once that line's tunnel is up. The line index is appended,
 # giving /tmp/pcscf-0, /tmp/pcscf-1, ... — each line's carrier assigns its own

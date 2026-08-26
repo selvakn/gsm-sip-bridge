@@ -242,6 +242,9 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         cseq: invite_cseq,
         branch: &branch,
         body: &offer,
+        // The standalone `ims-call` probe has no carrier config behind it;
+        // it always sends the minimal set.
+        originating_headers: crate::config::OriginatingHeaders::default(),
     });
 
     tracing::info!(callee = %cfg.callee, "sending INVITE");
@@ -671,7 +674,13 @@ pub(crate) struct InviteParts<'a> {
     pub(crate) cseq: u32,
     pub(crate) branch: &'a str,
     pub(crate) body: &'a str,
+    /// Optional MTSI-shaped headers, off everywhere by default. See
+    /// `config::OriginatingHeaders`.
+    pub(crate) originating_headers: crate::config::OriginatingHeaders,
 }
+
+/// The IMS Communication Service Identifier for MMTel voice (TS 24.173 §5.2).
+const MMTEL_ICSI: &str = "urn:urn-7:3gpp-service.ims.icsi.mmtel";
 
 pub(crate) fn build_invite(p: &InviteParts) -> String {
     let via_addr = format_sip_addr(p.local_addr);
@@ -690,18 +699,21 @@ pub(crate) fn build_invite(p: &InviteParts) -> String {
         msg.push_str(route);
         msg.push_str("\r\n");
     }
+    let opt = p.originating_headers;
+    // TS 24.229 §5.1.2A.1 / TS 24.173 §5.2: an MTSI UE tags the Contact with
+    // the MMTel ICSI so the network can tell a voice call from any other
+    // service reached through the same registration.
+    let contact_tags = if opt.icsi {
+        format!(";+g.3gpp.icsi-ref=\"{MMTEL_ICSI}\"")
+    } else {
+        String::new()
+    };
     msg.push_str(&format!(
         "From: <sip:{public_uri}>;tag={from_tag}\r\n\
          To: <sip:{callee_uri}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} INVITE\r\n\
-         Contact: <sip:{public_user}@{contact_addr};transport={transport}>\r\n\
-         Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n\
-         P-Access-Network-Info: 3GPP-WLAN\r\n\
-         User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
-         Content-Type: application/sdp\r\n\
-         Content-Length: {body_len}\r\n\r\n\
-         {body}",
+         Contact: <sip:{public_user}@{contact_addr};transport={transport}>{contact_tags}\r\n",
         public_uri = p.public_uri,
         from_tag = p.from_tag,
         callee_uri = p.callee_uri,
@@ -710,6 +722,34 @@ pub(crate) fn build_invite(p: &InviteParts) -> String {
         public_user = public_user,
         contact_addr = contact_addr,
         transport = p.via_transport,
+        contact_tags = contact_tags,
+    ));
+    if opt.preferred_identity {
+        msg.push_str(&format!("P-Preferred-Identity: <sip:{}>\r\n", p.public_uri));
+    }
+    if opt.icsi {
+        // `explicit;require` (RFC 3841 §9.2): match the callee's own service,
+        // don't merely express a preference. This is the form a real MTSI UE
+        // sends, and the form an S-CSCF's initial filter criteria match on.
+        msg.push_str(&format!(
+            "Accept-Contact: *;+g.3gpp.icsi-ref=\"{MMTEL_ICSI}\";explicit;require\r\n\
+             P-Preferred-Service: {MMTEL_ICSI}\r\n"
+        ));
+    }
+    if opt.supported {
+        msg.push_str("Supported: 100rel, timer\r\n");
+    }
+    msg.push_str(if opt.allow {
+        "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, PRACK, UPDATE, INFO, MESSAGE, NOTIFY, REFER\r\n"
+    } else {
+        "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"
+    });
+    msg.push_str(&format!(
+        "P-Access-Network-Info: 3GPP-WLAN\r\n\
+         User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {body_len}\r\n\r\n\
+         {body}",
         body_len = p.body.len(),
         body = p.body,
     ));
@@ -897,6 +937,7 @@ mod tests {
             cseq: 1,
             branch: "branch1",
             body: "v=0\r\n",
+            originating_headers: Default::default(),
         });
         assert!(msg.starts_with("INVITE sip:+919000000000@realm SIP/2.0\r\n"));
         assert!(msg.contains("Content-Length: 5\r\n"));
@@ -919,6 +960,7 @@ mod tests {
             cseq: 1,
             branch: "branch1",
             body: "v=0\r\n",
+            originating_headers: Default::default(),
         }
     }
 
@@ -942,6 +984,62 @@ mod tests {
         }
     }
 
+    /// The opt-in set from `[vowifi] originating_headers`. Every assertion
+    /// here is a header a carrier's TAS might key its service selection on;
+    /// the exact spellings are what TS 24.229/TS 24.173 and RFC 3841 ask for,
+    /// so a typo that made the carrier ignore the header would otherwise be
+    /// indistinguishable from the header not helping.
+    #[test]
+    fn the_mtsi_originating_headers_are_opt_in_and_well_formed() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let all = crate::config::OriginatingHeaders {
+            icsi: true,
+            preferred_identity: true,
+            supported: true,
+            allow: true,
+        };
+        let msg = build_invite(&InviteParts {
+            originating_headers: all,
+            ..invite_parts(addr)
+        });
+
+        for expected in [
+            "P-Preferred-Identity: <sip:+919000000001@realm>\r\n",
+            "Accept-Contact: *;+g.3gpp.icsi-ref=\"urn:urn-7:3gpp-service.ims.icsi.mmtel\";\
+             explicit;require\r\n",
+            "P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel\r\n",
+            "Supported: 100rel, timer\r\n",
+            "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, PRACK, UPDATE, INFO, \
+             MESSAGE, NOTIFY, REFER\r\n",
+            "Contact: <sip:+919000000001@1.2.3.4:5060;transport=TCP>;\
+             +g.3gpp.icsi-ref=\"urn:urn-7:3gpp-service.ims.icsi.mmtel\"\r\n",
+        ] {
+            assert!(msg.contains(expected), "missing {expected:?}: {msg}");
+        }
+        // Still exactly one Allow — the full list replaces the minimal one
+        // rather than being appended beside it.
+        assert_eq!(msg.matches("Allow:").count(), 1, "{msg}");
+    }
+
+    /// Each token is independent: turning one on must not drag the others in,
+    /// or bisecting which one a carrier wants is impossible.
+    #[test]
+    fn each_originating_header_group_is_independent() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let only_icsi = crate::config::OriginatingHeaders {
+            icsi: true,
+            ..Default::default()
+        };
+        let msg = build_invite(&InviteParts {
+            originating_headers: only_icsi,
+            ..invite_parts(addr)
+        });
+        assert!(msg.contains("Accept-Contact: *;+g.3gpp.icsi-ref="), "{msg}");
+        for absent in ["Supported:", "P-Preferred-Identity:", "PRACK"] {
+            assert!(!msg.contains(absent), "{absent} must not appear: {msg}");
+        }
+    }
+
     /// Via carries the port we send from; Contact carries the Gm protected
     /// server port the far end's BYE must reach us on.
     #[test]
@@ -961,6 +1059,7 @@ mod tests {
             cseq: 1,
             branch: "b",
             body: "",
+            originating_headers: Default::default(),
         });
         assert!(msg.contains("Via: SIP/2.0/TCP 1.2.3.4:48584;branch=b;rport\r\n"));
         assert!(msg.contains("Contact: <sip:u@1.2.3.4:48586;transport=TCP>\r\n"));
@@ -983,6 +1082,7 @@ mod tests {
             cseq: 1,
             branch: "b",
             body: "",
+            originating_headers: Default::default(),
         });
         let a_pos = msg.find("Route: <sip:a>").unwrap();
         let b_pos = msg.find("Route: <sip:b>").unwrap();
@@ -1028,6 +1128,7 @@ mod tests {
             cseq: 7,
             branch: "z9hG4bKinvitebranch",
             body: "",
+            originating_headers: Default::default(),
         });
         assert!(invite.contains("branch=z9hG4bKinvitebranch"));
         assert!(invite.contains("CSeq: 7 INVITE"));

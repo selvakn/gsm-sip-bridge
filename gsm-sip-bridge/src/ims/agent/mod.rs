@@ -46,13 +46,14 @@ use crate::ims::observability;
 // call sites below read exactly as they did before the move.
 use crate::ims::sdp;
 use crate::ims::session::{
-    attempt_renewal, extract_caller, handle_notify, header_uri, map_registration_error,
+    attempt_renewal, extract_caller, header_uri, map_registration_error,
     map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
     subscribe_reg_event, to_unix, Inbound,
 };
 use crate::ims::sip_client::{
-    build_200_ok_bye, build_200_ok_message, build_486_busy_here, build_uas_response,
-    build_uas_response_with_headers, random_hex, SipMessage, SipRequest, SipResponse, SipSink,
+    build_200_ok_bye, build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
+    build_uas_response, build_uas_response_with_headers, random_hex, SipMessage, SipRequest,
+    SipResponse, SipSink,
 };
 use crate::ims::transport::{EpdgTransport, ImsTransport};
 use crate::ims::ImsRegisterConfig;
@@ -358,7 +359,42 @@ fn run_inner(
 /// `REFER` — as this did while nothing answered them — invites mid-call
 /// requests we can only refuse. Growing the list is a matter of growing the
 /// UAS, in that order.
-const ALLOW: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, NOTIFY";
+///
+/// Re-exported from [`crate::ims::UAS_ALLOW`] rather than defined here: the
+/// REGISTER built in `sip_client::build_register` used to state a longer,
+/// separately-hardcoded list (`..., UPDATE, PRACK, INFO, ..., REFER`) than
+/// this one, so the network's picture of what we serve and what we actually
+/// serve could disagree before either side ever sent a request (specs/041
+/// conformance review, MT-10). One constant now backs both.
+const ALLOW: &str = crate::ims::UAS_ALLOW;
+
+/// Option-tags this UAS implements enough of to honour if a peer `Require`s
+/// them (RFC 3261 §8.2.2.3) and to state in a `Supported` header. Empty
+/// today: `timer`, `100rel`, `replaces`, `path` and `gruu` were previously
+/// claimed in `inbound::UAS_EXTRA_HEADERS`'s `Supported` line with no
+/// behaviour behind any of them — `timer` with no session-refresh timer,
+/// `100rel` with no UAS-side reliable-provisional handling, `replaces`/`gruu`
+/// with none of their machinery at all, and `path` naming a REGISTER
+/// mechanism this is not even a REGISTER response (specs/041 conformance
+/// review, MT-10). One list feeds both [`unsupported_required_extensions`]
+/// and whatever `Supported` header a caller gets — grown only by growing the
+/// UAS, the same rule [`ALLOW`] already states for methods.
+const SUPPORTED_EXTENSIONS: &[&str] = &[];
+
+/// Every option-tag a request's `Require` demands that is not in
+/// [`SUPPORTED_EXTENSIONS`] — RFC 3261 §8.2.2.3: a UAS that does not support
+/// one must refuse the whole request `420 Bad Extension`, listing exactly
+/// which in `Unsupported`, rather than silently proceeding as if it had. Reads
+/// every `Require` header line, not just the first — RFC 3261 doesn't forbid
+/// more than one, the same reason `SipRequest::headers_all` exists for `Via`.
+fn unsupported_required_extensions(req: &SipRequest) -> Vec<String> {
+    req.headers_all("Require")
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty() && !SUPPORTED_EXTENSIONS.contains(&tag.as_str()))
+        .collect()
+}
 
 /// Answers the carrier's `OPTIONS` — the keepalive a P-CSCF (and our own
 /// `ping`, in the other direction) uses to decide whether a UE is still there.
@@ -642,6 +678,9 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             // the same TS 24.341 procedure over LTE as over Wi-Fi, so one
             // switch governs both rather than two that could disagree.
             sms_delivery_report: app_config.vowifi.sms_delivery_report,
+            // Read from `[vowifi]` on both paths for the same reason as
+            // `sms_delivery_report` above: one switch, not two that disagree.
+            originating_headers: app_config.vowifi.originating_headers,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
@@ -756,7 +795,37 @@ fn run_status_listener(
 /// can't parse is still one we received, and the caller must still relay and
 /// acknowledge *something* rather than drop it (specs/017 FR-026's ordering
 /// exists precisely so a message is never silently lost).
-fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedSms> {
+///
+/// Returns the envelope's actual [`DecodedRp`] rather than unwrapping straight
+/// to a message — an RP-ACK or RP-ERROR is not a decode failure (the bytes
+/// parse fine), but it is not a deliverable short message either, and the
+/// caller must not treat it as one.
+/// The exhaustive set of `Content-Type`s this UAS can interpret on an
+/// inbound `MESSAGE`: the 3GPP SMS-over-IP TPDU wrapper, and plain text.
+const SUPPORTED_MESSAGE_CONTENT_TYPES: &[&str] = &["application/vnd.3gpp.sms", "text/plain"];
+
+/// Whether this UAS can interpret an inbound `MESSAGE`'s body: no
+/// `Content-Type` at all (the long-standing shape for a plain-text SMS
+/// gateway — unchanged, still treated as text), or one of
+/// [`SUPPORTED_MESSAGE_CONTENT_TYPES`] compared with any `;`-delimited
+/// parameters ignored (RFC 3261 §7.2.1: the `;` starts the parameter list,
+/// not a different media type). RFC 3428 §7 / RFC 3261 §21.4.13: a UAS that
+/// cannot render a body must refuse it `415 Unsupported Media Type`, not
+/// accept it and forward whatever a lossy text conversion of, say, a JPEG
+/// produces (specs/041 conformance review, SMS-06).
+fn message_content_type_supported(req: &SipRequest) -> bool {
+    match req.header("Content-Type") {
+        None => true,
+        Some(ct) => {
+            let media_type = ct.split(';').next().unwrap_or("").trim();
+            SUPPORTED_MESSAGE_CONTENT_TYPES
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(media_type))
+        }
+    }
+}
+
+fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedRp> {
     let is_3gpp_sms = req
         .header("Content-Type")
         .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("application/vnd.3gpp.sms"));
@@ -844,6 +913,24 @@ fn handle_message(
     req: &SipRequest,
     sink: &SipSink,
 ) {
+    if !message_content_type_supported(req) {
+        let content_type = req.header("Content-Type").unwrap_or("(none)").to_string();
+        tracing::info!(
+            content_type = %content_type,
+            "declining a MESSAGE body we cannot interpret"
+        );
+        respond(
+            sink,
+            "415 (MESSAGE)",
+            &build_415_unsupported_media(
+                req,
+                &random_hex(4),
+                &SUPPORTED_MESSAGE_CONTENT_TYPES.join(", "),
+            ),
+        );
+        return;
+    }
+
     // The SIP `From` on a real network's MT SMS names an IMS core element
     // relaying the message (a carrier-internal SMSC gateway hostname), not
     // the person who sent it — measured on Vi 2026-08-15:
@@ -855,7 +942,44 @@ fn handle_message(
 
     // Kept past the relay, not consumed by it: `rp_mr` is needed again at
     // whichever acknowledgement point this message reaches.
-    let decoded = decode_pdu_body(req);
+    //
+    // An RP-ACK or RP-ERROR is not a decode failure and not a message either
+    // — see `sms_pdu::DecodedRp`'s docs. There is nothing to relay or record
+    // for either: this bridge never submits an RP-DATA over IMS itself, so a
+    // well-behaved peer never sends them, and treating one as a message would
+    // put a "message" nobody sent in front of the operator (specs/041's
+    // sibling review, SMS-01). Acknowledge the SIP transaction and stop.
+    let decoded = match decode_pdu_body(req) {
+        Some(crate::ims::sms_pdu::DecodedRp::Message(sms)) => Some(sms),
+        Some(crate::ims::sms_pdu::DecodedRp::Ack { rp_mr }) => {
+            tracing::info!(
+                sender = %sender,
+                rp_mr,
+                "received an RP-ACK on the SMS transport; not a deliverable message"
+            );
+            respond(
+                sink,
+                "200 OK (MESSAGE, RP-ACK)",
+                &build_200_ok_message(req, &random_hex(4)),
+            );
+            return;
+        }
+        Some(crate::ims::sms_pdu::DecodedRp::Error { rp_mr, cause }) => {
+            tracing::warn!(
+                sender = %sender,
+                rp_mr,
+                cause = ?cause,
+                "received an RP-ERROR on the SMS transport; not a deliverable message"
+            );
+            respond(
+                sink,
+                "200 OK (MESSAGE, RP-ERROR)",
+                &build_200_ok_message(req, &random_hex(4)),
+            );
+            return;
+        }
+        None => None,
+    };
     if let Some(decoded) = &decoded {
         sender = decoded.sender.clone();
         body = match decoded.part {
@@ -1047,6 +1171,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::sms_delivery_report`; consumed by
     /// [`acknowledge`].
     sms_delivery_report: bool,
+    /// See `config::VowifiConfig::originating_headers`; consumed by
+    /// [`origination::begin_origination`].
+    originating_headers: crate::config::OriginatingHeaders,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
     /// Publishes which phase the loop is in, so the watchdog can tell a line
@@ -1071,6 +1198,7 @@ impl DispatchParams<'_> {
             veth_local_ip: self.veth_local_ip,
             veth_sip_port: self.veth_sip_port,
             wideband: self.wideband,
+            originating_headers: self.originating_headers,
         }
     }
 }
@@ -1228,7 +1356,7 @@ fn dispatch_loop(
                 tracing::debug!("received ACK, dialog confirmed");
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "NOTIFY" => {
-                handle_notify(&sink, &req);
+                st.handle_reg_notify(session, p, &req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
                 handle_message(session, p, &req, &sink);
@@ -1580,6 +1708,30 @@ impl LoopState {
             None => {
                 let _ = sink.send(&build_200_ok_bye(req, &random_hex(4)));
             }
+        }
+    }
+
+    /// Drives the registration state off a reg-event `NOTIFY` — see
+    /// `session::handle_notify`'s docs for what makes it report a
+    /// deregistration. Reuses the exact escalation path
+    /// `ping::probe_gm_connection` already uses for a dead Gm connection
+    /// (`force_renewal`, honoured by `on_idle_tick`'s next pass) rather than
+    /// adding a second way to force a re-registration.
+    fn handle_reg_notify(
+        &mut self,
+        session: &crate::ims::RegisteredSession,
+        p: &DispatchParams,
+        req: &SipRequest,
+        sink: &SipSink,
+    ) {
+        if crate::ims::session::handle_notify(session, sink, req) {
+            self.force_renewal = true;
+            let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            guard.state = crate::ims::RegistrationState::Failed;
+            guard.last_failure = Some((
+                SystemTime::now(),
+                "reg-event NOTIFY reported our own binding deregistered".to_string(),
+            ));
         }
     }
 
@@ -2052,8 +2204,126 @@ mod tests {
 
         let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
         let decoded = decode_pdu_body(&req).expect("a 3GPP SMS body must decode");
+        let crate::ims::sms_pdu::DecodedRp::Message(decoded) = decoded else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
         assert_eq!(decoded.sender, "+919000000001");
         assert_eq!(decoded.text, "Hi");
+    }
+
+    /// An RP-ACK is well-formed and decodes without error, but it is not a
+    /// deliverable message — `handle_message` must recognise the variant and
+    /// route it away from the operator feed, never treat it as text.
+    #[test]
+    fn decode_pdu_body_recognizes_an_rp_ack_as_not_a_message() {
+        let rp_ack = vec![0x03, 0x42]; // RP-ACK, network->MS, MR=0x42
+        let mut raw = b"MESSAGE sip:x SIP/2.0\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n"
+            .to_vec();
+        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", rp_ack.len()).as_bytes());
+        raw.extend_from_slice(&rp_ack);
+
+        let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
+        assert_eq!(
+            decode_pdu_body(&req),
+            Some(crate::ims::sms_pdu::DecodedRp::Ack { rp_mr: 0x42 })
+        );
+    }
+
+    fn invite_requiring(extensions: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n\
+             Require: {extensions}\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// MT-03: `SUPPORTED_EXTENSIONS` is empty today, so *any* `Require`
+    /// names something this UAS does not implement — every tag must come
+    /// back, not just the first.
+    #[test]
+    fn unsupported_required_extensions_lists_every_tag() {
+        let req = invite_requiring("100rel, precondition");
+        assert_eq!(
+            unsupported_required_extensions(&req),
+            vec!["100rel".to_string(), "precondition".to_string()]
+        );
+    }
+
+    /// A request with no `Require` at all has nothing to refuse.
+    #[test]
+    fn no_require_header_means_nothing_unsupported() {
+        assert!(unsupported_required_extensions(&request("INVITE")).is_empty());
+    }
+
+    /// RFC 3261 doesn't forbid more than one `Require` header line; both
+    /// must be read, the same reason `headers_all` exists for `Via`.
+    #[test]
+    fn unsupported_required_extensions_reads_every_require_line() {
+        let raw = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n\
+             Require: 100rel\r\nRequire: timer\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            unsupported_required_extensions(&req),
+            vec!["100rel".to_string(), "timer".to_string()]
+        );
+    }
+
+    fn message_with_content_type(content_type: Option<&str>) -> SipRequest {
+        let ct_line = content_type
+            .map(|ct| format!("Content-Type: {ct}\r\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            "MESSAGE sip:x SIP/2.0\r\nCall-ID: c\r\nCSeq: 1 MESSAGE\r\n{ct_line}Content-Length: 5\r\n\r\nhello"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// SMS-06: the two content types this UAS actually decodes, and the
+    /// long-standing plain-text default (no header at all), are accepted.
+    #[test]
+    fn supported_message_content_types_are_accepted() {
+        assert!(message_content_type_supported(&message_with_content_type(
+            Some("application/vnd.3gpp.sms")
+        )));
+        assert!(message_content_type_supported(&message_with_content_type(
+            Some("text/plain")
+        )));
+        assert!(message_content_type_supported(&message_with_content_type(
+            Some("TEXT/PLAIN")
+        )));
+        assert!(message_content_type_supported(&message_with_content_type(
+            None
+        )));
+    }
+
+    /// A body this UAS cannot render (a JPEG, say) must be refused, not
+    /// accepted and forwarded as whatever a lossy text conversion produces.
+    #[test]
+    fn an_unrecognised_message_content_type_is_not_supported() {
+        assert!(!message_content_type_supported(&message_with_content_type(
+            Some("image/jpeg")
+        )));
+    }
+
+    /// RFC 3261 §7.2.1: the `;` starts the parameter list, not a different
+    /// media type — a charset parameter must not make an otherwise-supported
+    /// type look unsupported.
+    #[test]
+    fn message_content_type_parameters_are_ignored() {
+        assert!(message_content_type_supported(&message_with_content_type(
+            Some("text/plain; charset=utf-8")
+        )));
     }
 
     /// An ordinary text `MESSAGE` (no 3GPP content type) must be left alone —

@@ -44,16 +44,81 @@ pub struct DecodedSms {
     pub is_type_zero: bool,
 }
 
-/// Top-level entry point: an RP-DATA envelope in, a readable message out.
-pub fn decode_vnd_3gpp_sms(body: &[u8]) -> Result<DecodedSms, String> {
-    let rp = RpData::parse(body)?;
-    let tpdu = SmsDeliverTpdu::parse(rp.user_data)?;
+/// What a 3GPP SMS-over-IP body's RP envelope actually turned out to be.
+///
+/// A `MESSAGE` on this transport is not always a deliverable short message —
+/// see [`decode_vnd_3gpp_sms`]'s docs for why the RP-Message-Type-Indicator
+/// has to be checked before the rest of the envelope is trusted to mean
+/// what `Message`'s layout assumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedRp {
+    /// RP-DATA (network→MS): an actual short message, decoded.
+    Message(DecodedSms),
+    /// RP-ACK (network→MS, TS 24.011 §7.3.3): acknowledges an RP-DATA *we*
+    /// submitted. This bridge never submits an SMS over IMS itself — it only
+    /// answers what the network delivers — so a well-behaved peer never sends
+    /// this; it exists here so a peer that does gets logged and ignored
+    /// rather than misread as a message.
+    Ack { rp_mr: u8 },
+    /// RP-ERROR (network→MS, TS 24.011 §7.3.4): the network refusing an
+    /// RP-DATA *we* submitted, with a §8.2.5.4 cause octet when present.
+    /// Same "nothing to forward" as `Ack`.
+    Error { rp_mr: u8, cause: Option<u8> },
+}
+
+/// Top-level entry point: an RP envelope in, what it actually was out.
+///
+/// # Why the RP-Message-Type-Indicator has to be checked first
+///
+/// TS 24.011 table 8.4 gives the envelope's first octet seven possible
+/// meanings — RP-DATA, RP-ACK and RP-ERROR, each in both directions — and
+/// only one of them (RP-DATA, network→MS) has the
+/// address/address/user-data-length layout [`RpData`] and
+/// [`SmsDeliverTpdu`] assume. RP-ACK and RP-ERROR (network→MS) carry no
+/// address fields at all: walking their bytes as if they were RP-DATA reads
+/// an unrelated octet (the RP-Cause length, for RP-ERROR) as an address
+/// length, desyncs everything after it, and can hand `SmsDeliverTpdu::parse`
+/// a garbled slice that occasionally still parses — producing a plausible
+/// sender and body for a "message" nobody sent. Reading the MTI first is
+/// what tells these apart before any of that walking starts.
+pub fn decode_vnd_3gpp_sms(body: &[u8]) -> Result<DecodedRp, String> {
+    match RpMessage::parse(body)? {
+        RpMessage::Data(rp) => {
+            let mut decoded = decode_sms_deliver_tpdu(rp.user_data)?;
+            decoded.rp_mr = rp.mr;
+            Ok(DecodedRp::Message(decoded))
+        }
+        RpMessage::Ack { mr } => Ok(DecodedRp::Ack { rp_mr: mr }),
+        RpMessage::Error { mr, cause } => Ok(DecodedRp::Error { rp_mr: mr, cause }),
+    }
+}
+
+/// Decodes a raw SMS-DELIVER TPDU (TS 23.040 §9.2.2.1) with no RP-layer
+/// envelope around it at all — the shape `AT+CMGR`/`AT+CMGL` PDU mode hands
+/// back (TS 27.005 §3.1: a length-prefixed SMSC-address field, stripped by
+/// the caller, then the TPDU verbatim), unlike [`decode_vnd_3gpp_sms`]'s
+/// RP-DATA-wrapped IMS `MESSAGE` body.
+///
+/// Shared so `sms::reader` (the modem-storage delivery route) decodes with
+/// the exact same TPDU parser the IMS route uses, rather than a second,
+/// weaker one built on `AT+CMGF=1` text mode (specs/041 conformance review,
+/// CS-01/CS-02): text mode cannot represent UCS-2 (comes back as a hex
+/// string) or expose the UDH a concatenated message needs, and the two
+/// routes must agree on what a message *is* or `volte::sms::Dedupe` cannot
+/// tell one delivery of the same text from the other.
+///
+/// `rp_mr` on the returned `DecodedSms` is always `0` — there is no RP layer
+/// on this path to have supplied a real one, and this route never sends a
+/// delivery report (`AT+CMGD` deleting the message from storage is its
+/// acknowledgement instead).
+pub fn decode_sms_deliver_tpdu(tpdu: &[u8]) -> Result<DecodedSms, String> {
+    let parsed = SmsDeliverTpdu::parse(tpdu)?;
     Ok(DecodedSms {
-        sender: tpdu.originating_address,
-        text: tpdu.text,
-        part: tpdu.part,
-        rp_mr: rp.mr,
-        is_type_zero: tpdu.is_type_zero,
+        sender: parsed.originating_address,
+        text: parsed.text,
+        part: parsed.part,
+        rp_mr: 0,
+        is_type_zero: parsed.is_type_zero,
     })
 }
 
@@ -79,7 +144,7 @@ pub fn build_rp_ack(rp_mr: u8) -> Vec<u8> {
     ]
 }
 
-/// The RP-DATA (network→MS) envelope: message type/reference, the SC address
+/// The RP-DATA (network→MS) envelope: message reference, the SC address
 /// (unused — we want the *originator*, from the TPDU inside, not the SC that
 /// relayed it), and a length-prefixed RP-User-Data field holding the TPDU.
 struct RpData<'a> {
@@ -87,28 +152,65 @@ struct RpData<'a> {
     user_data: &'a [u8],
 }
 
-impl<'a> RpData<'a> {
+/// One parsed RP envelope, tagged by its actual TS 24.011 table 8.4 message
+/// type — see [`decode_vnd_3gpp_sms`] for why this has to be the first thing
+/// read, before any of RP-DATA's address/length fields are assumed to be
+/// there at all.
+enum RpMessage<'a> {
+    Data(RpData<'a>),
+    Ack { mr: u8 },
+    Error { mr: u8, cause: Option<u8> },
+}
+
+impl<'a> RpMessage<'a> {
     fn parse(buf: &'a [u8]) -> Result<Self, String> {
-        // Octet 0: RP-Message-Type-Indicator + spare bits — consumed but not
-        // otherwise used, since the structure below (length-prefixed fields)
-        // is what we actually walk, so getting the exact MTI encoding right
-        // doesn't gate decoding. Octet 1: RP-Message-Reference, kept so the
-        // delivery report can echo it (`build_rp_ack`).
+        // Octet 0 bits 2-0 are the MTI (table 8.4); the upper bits are spare
+        // and not always sent as zero in practice, so they are masked off
+        // rather than compared against the whole octet.
+        let mti = buf.first().ok_or("empty RP envelope")? & 0x07;
         let mr = *buf
             .get(1)
-            .ok_or("RP-DATA truncated before RP-Message-Reference")?;
-        let mut pos = 2usize;
-        pos = skip_length_prefixed(buf, pos, "RP-Originator-Address")?;
-        pos = skip_length_prefixed(buf, pos, "RP-Destination-Address")?;
-
-        let ud_len = *buf
-            .get(pos)
-            .ok_or("RP-DATA truncated before RP-User-Data length")? as usize;
-        pos += 1;
-        let user_data = buf
-            .get(pos..pos + ud_len)
-            .ok_or("RP-DATA's RP-User-Data length exceeds the buffer")?;
-        Ok(Self { mr, user_data })
+            .ok_or("RP envelope truncated before RP-Message-Reference")?;
+        match mti {
+            // RP-DATA, network→MS (TS 24.011 §7.3.1): message reference, then
+            // originator/destination addresses, then a length-prefixed
+            // RP-User-Data field holding the TPDU.
+            1 => {
+                let mut pos = 2usize;
+                pos = skip_length_prefixed(buf, pos, "RP-Originator-Address")?;
+                pos = skip_length_prefixed(buf, pos, "RP-Destination-Address")?;
+                let ud_len = *buf
+                    .get(pos)
+                    .ok_or("RP-DATA truncated before RP-User-Data length")?
+                    as usize;
+                pos += 1;
+                let user_data = buf
+                    .get(pos..pos + ud_len)
+                    .ok_or("RP-DATA's RP-User-Data length exceeds the buffer")?;
+                Ok(RpMessage::Data(RpData { mr, user_data }))
+            }
+            // RP-ACK, network→MS (TS 24.011 §7.3.3): no address fields at
+            // all — just the message reference, and an optional RP-User-Data
+            // this bridge has no use for (it never submitted the RP-DATA
+            // being acknowledged).
+            3 => Ok(RpMessage::Ack { mr }),
+            // RP-ERROR, network→MS (TS 24.011 §7.3.4): message reference,
+            // then a length-prefixed RP-Cause element — octet 2 is the
+            // length, octet 3 the cause value (TS 24.011 §8.2.5.4);
+            // diagnostic bytes beyond it are not needed just to log the
+            // cause.
+            5 => {
+                let cause = match buf.get(2) {
+                    Some(&len) if len >= 1 => buf.get(3).copied(),
+                    _ => None,
+                };
+                Ok(RpMessage::Error { mr, cause })
+            }
+            other => Err(format!(
+                "RP message type indicator {other} is not a network-to-MS \
+                 value this bridge expects to receive"
+            )),
+        }
     }
 }
 
@@ -431,22 +533,45 @@ fn decode_gsm7_reporting_escapes(septets: &[u8]) -> (String, bool) {
     (out, bad_escape)
 }
 
-/// TS 23.038 §6.2.2: UCS-2, i.e. big-endian UTF-16 code units. Real SMS never
-/// carries a surrogate pair (UCS-2 predates them), so this decodes one code
-/// unit at a time; an unpaired surrogate (from malformed input) becomes
-/// U+FFFD rather than corrupting the rest of the string.
+/// TS 23.038 §6.2.2: UCS-2, i.e. big-endian UTF-16 code units — but real
+/// handsets routinely send emoji outside the Basic Multilingual Plane as
+/// UTF-16 surrogate pairs over "UCS-2" SMS anyway, despite the strict spec
+/// predating surrogates (confirmed live 2026-08-26: every such emoji in a
+/// real inbound SMS came through as `U+FFFD` before this combined them). A
+/// high surrogate followed by a low surrogate is combined into the code point
+/// it encodes (RFC 2781 §2.2); anything else — an unpaired or lone surrogate
+/// — becomes `U+FFFD` rather than corrupting the rest of the string.
 fn decode_ucs2(bytes: &[u8]) -> String {
-    bytes
+    let units: Vec<u16> = bytes
         .chunks(2)
-        .map(|pair| {
-            let unit = match pair {
-                [hi, lo] => u16::from_be_bytes([*hi, *lo]),
-                [hi] => u16::from(*hi) << 8,
-                _ => unreachable!(),
-            };
-            char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')
+        .map(|pair| match pair {
+            [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+            [hi] => u16::from(*hi) << 8,
+            _ => unreachable!(),
         })
-        .collect()
+        .collect();
+
+    let mut out = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let unit = units[i];
+        if (0xD800..=0xDBFF).contains(&unit) {
+            if let Some(&low) = units.get(i + 1) {
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    let code =
+                        0x10000 + (u32::from(unit) - 0xD800) * 0x400 + (u32::from(low) - 0xDC00);
+                    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push('\u{FFFD}');
+        } else {
+            out.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+        }
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -528,7 +653,9 @@ mod tests {
         rp.push(tpdu.len() as u8); // RP-UD length
         rp.extend_from_slice(&tpdu);
 
-        let decoded = decode_vnd_3gpp_sms(&rp).unwrap();
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
         assert_eq!(decoded.sender, "+919876543210");
         assert_eq!(decoded.text, "Hello");
         assert_eq!(decoded.part, None);
@@ -536,6 +663,45 @@ mod tests {
         // envelope rather than defaulted — a report carrying the wrong one
         // acknowledges nothing.
         assert_eq!(decoded.rp_mr, 0x17);
+    }
+
+    /// CS-02 (specs/041 conformance review): the IMS `MESSAGE` route
+    /// (`decode_vnd_3gpp_sms`, RP-DATA-wrapped) and the modem-storage route
+    /// (`decode_sms_deliver_tpdu`, bare TPDU — `sms::reader`) must decode the
+    /// *same* TPDU to the *same* sender and text. `volte::sms::Dedupe`'s key
+    /// is exactly `sender + body`; if the two routes ever disagreed on either
+    /// (as text mode used to, for anything outside plain GSM7), the same
+    /// real-world message delivered over both bearers would fail to collapse
+    /// and the operator would see it twice.
+    #[test]
+    fn both_delivery_routes_decode_the_same_tpdu_identically() {
+        let sender_digits = "919876543210";
+        let oa_bytes = bcd_encode(sender_digits);
+        let text_septets = gsm7_encode("Hi");
+
+        let mut tpdu = vec![0x00];
+        tpdu.push(sender_digits.len() as u8);
+        tpdu.push(0x91);
+        tpdu.extend_from_slice(&oa_bytes);
+        tpdu.push(0x00);
+        tpdu.push(0x00);
+        tpdu.extend_from_slice(&[0u8; 7]);
+        tpdu.push(text_septets.len() as u8);
+        tpdu.extend_from_slice(&pack_septets(&text_septets));
+
+        // The IMS route: this same TPDU, wrapped in an RP-DATA envelope.
+        let mut rp = vec![0x01, 0x00, 0, 0];
+        rp.push(tpdu.len() as u8);
+        rp.extend_from_slice(&tpdu);
+        let DecodedRp::Message(over_registration) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
+
+        // The modem-storage route: the bare TPDU, no RP layer at all.
+        let through_modem = decode_sms_deliver_tpdu(&tpdu).unwrap();
+
+        assert_eq!(over_registration.sender, through_modem.sender);
+        assert_eq!(over_registration.text, through_modem.text);
     }
 
     /// TS 23.040 §9.2.3.9 vs the Replace Short Message group next to it. Only
@@ -613,7 +779,81 @@ mod tests {
         rp.push(tpdu.len() as u8);
         rp.extend_from_slice(&tpdu);
 
-        assert_eq!(decode_vnd_3gpp_sms(&rp).unwrap().text, "Hi");
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
+        assert_eq!(decoded.text, "Hi");
+    }
+
+    /// SMS-EMOJI-01 (specs/041 conformance review, found live 2026-08-26): a
+    /// real inbound SMS carrying an emoji outside the Basic Multilingual
+    /// Plane came through as `U+FFFD` because the two UTF-16 code units of
+    /// its surrogate pair were decoded independently instead of combined.
+    #[test]
+    fn decode_ucs2_reassembles_a_surrogate_pair() {
+        let bytes: Vec<u8> = "Hello 😀 world"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        assert_eq!(decode_ucs2(&bytes), "Hello 😀 world");
+    }
+
+    /// A high surrogate with no valid low surrogate after it — truncated
+    /// input, or a genuinely malformed encoder — must not panic or silently
+    /// combine with whatever follows; it becomes `U+FFFD` like any other
+    /// undecodable unit.
+    #[test]
+    fn decode_ucs2_replaces_an_unpaired_high_surrogate() {
+        // 0xD83D is the high surrogate half of an emoji pair; 0x0041 ('A')
+        // is not a valid low surrogate, so it must decode on its own.
+        let bytes = [0xD8, 0x3D, 0x00, 0x41];
+        assert_eq!(decode_ucs2(&bytes), "\u{FFFD}A");
+    }
+
+    /// A lone high surrogate at the very end of the buffer (no second unit to
+    /// even check) must not panic.
+    #[test]
+    fn decode_ucs2_replaces_a_high_surrogate_at_end_of_buffer() {
+        let bytes = [0xD8, 0x3D];
+        assert_eq!(decode_ucs2(&bytes), "\u{FFFD}");
+    }
+
+    /// A low surrogate encountered on its own (not preceded by a matching
+    /// high surrogate) is not a valid scalar value either.
+    #[test]
+    fn decode_ucs2_replaces_a_lone_low_surrogate() {
+        let bytes = [0xDC, 0x00];
+        assert_eq!(decode_ucs2(&bytes), "\u{FFFD}");
+    }
+
+    /// End-to-end: the exact shape of the real message that surfaced
+    /// SMS-EMOJI-01 — plain text either side of an astral-plane emoji,
+    /// decoded through the full RP-DATA/TPDU path, not just `decode_ucs2`
+    /// directly.
+    #[test]
+    fn decodes_a_ucs2_message_with_an_emoji() {
+        let text_bytes: Vec<u8> = "Hello world! 😀 Welcome"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+
+        let mut tpdu = vec![0x00];
+        tpdu.push(0);
+        tpdu.push(0x81);
+        tpdu.push(0x00);
+        tpdu.push(0x08); // TP-DCS: general group, UCS-2
+        tpdu.extend_from_slice(&[0u8; 7]);
+        tpdu.push(text_bytes.len() as u8);
+        tpdu.extend_from_slice(&text_bytes);
+
+        let mut rp = vec![0x01, 0x00, 0, 0];
+        rp.push(tpdu.len() as u8);
+        rp.extend_from_slice(&tpdu);
+
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
+        assert_eq!(decoded.text, "Hello world! 😀 Welcome");
     }
 
     /// Same packing algorithm as `pack_septets`, but starting `leading_zero_bits`
@@ -669,7 +909,9 @@ mod tests {
         rp.push(tpdu.len() as u8);
         rp.extend_from_slice(&tpdu);
 
-        let decoded = decode_vnd_3gpp_sms(&rp).unwrap();
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
         assert_eq!(decoded.part, Some((2, 2)));
         assert_eq!(decoded.text, "part2");
     }
@@ -678,5 +920,52 @@ mod tests {
     fn truncated_input_is_an_error_not_a_panic() {
         assert!(decode_vnd_3gpp_sms(&[]).is_err());
         assert!(decode_vnd_3gpp_sms(&[0x01, 0x00, 0, 0, 200]).is_err());
+    }
+
+    /// TS 24.011 §7.3.3: an RP-ACK carries no address fields, so walking it
+    /// as RP-DATA would misread its RP-User-Data-length byte (absent here)
+    /// as an address length. Reading the MTI first must route it to `Ack`
+    /// instead, with nothing to decode as a message.
+    #[test]
+    fn an_rp_ack_is_recognized_and_not_walked_as_rp_data() {
+        // MTI=3 (RP-ACK, network->MS), MR=0x42, no RP-User-Data.
+        let rp = vec![0x03, 0x42];
+        assert_eq!(
+            decode_vnd_3gpp_sms(&rp).unwrap(),
+            DecodedRp::Ack { rp_mr: 0x42 }
+        );
+    }
+
+    /// TS 24.011 §7.3.4: an RP-ERROR carries a length-prefixed RP-Cause
+    /// element in place of RP-DATA's addresses. This is the exact envelope
+    /// shape that used to be misread as RP-DATA and could produce a
+    /// plausible-looking sender/body for a "message" that was actually a
+    /// submission failure report.
+    #[test]
+    fn an_rp_error_is_recognized_with_its_cause_and_not_walked_as_rp_data() {
+        // MTI=5 (RP-ERROR, network->MS), MR=0x07, RP-Cause length=1, cause=95
+        // (semantically incorrect message, TS 24.011 §8.2.5.4).
+        let rp = vec![0x05, 0x07, 0x01, 95];
+        assert_eq!(
+            decode_vnd_3gpp_sms(&rp).unwrap(),
+            DecodedRp::Error {
+                rp_mr: 0x07,
+                cause: Some(95)
+            }
+        );
+    }
+
+    /// An MS-to-network MTI (RP-DATA/RP-ACK/RP-ERROR submitted *by* an MS, or
+    /// RP-SMMA) has no business arriving in a MESSAGE addressed to us — it
+    /// names a direction, not just a shape, and guessing which shape it might
+    /// still fit is exactly the mistake this type-check exists to avoid.
+    #[test]
+    fn a_ms_to_network_mti_is_rejected_rather_than_guessed_at() {
+        for mti in [0u8, 2, 4, 6] {
+            assert!(
+                decode_vnd_3gpp_sms(&[mti, 0x00]).is_err(),
+                "MTI {mti} is an MS-to-network value and must not decode"
+            );
+        }
     }
 }
