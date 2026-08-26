@@ -40,7 +40,7 @@ likely to key on.
 
 ## Result: no change whatsoever
 
-Sent on tag `jio-mtsi-hdrs`, 2026-08-24 11:18 UTC, to `+919789063708`:
+Sent on tag `jio-mtsi-hdrs`, 2026-08-24 11:18 UTC, to `+919000000000`:
 
 ```
 Contact: <sip:+91…@10.252.222.88:39148;transport=TCP>;+g.3gpp.icsi-ref="urn:urn-7:3gpp-service.ims.icsi.mmtel"

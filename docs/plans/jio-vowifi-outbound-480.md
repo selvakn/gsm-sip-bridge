@@ -18,14 +18,14 @@ Three calls tested, two different destinations, one identical signature:
 
 | call_id | destination     | INVITE → 183 | 183 → 480 | final |
 |---------|------------------|-------------:|----------:|-------|
-| out-0   | +919789063708    | 298 ms       | 13.34 s   | 480   |
-| out-2   | +919789063708    | 202 ms       | 13.38 s   | 480   |
-| out-0   | +918807793613    | 87 ms        | 13.38 s   | 480   |
+| out-0   | +919000000000    | 298 ms       | 13.34 s   | 480   |
+| out-2   | +919000000000    | 202 ms       | 13.38 s   | 480   |
+| out-0   | +919000000001    | 87 ms        | 13.38 s   | 480   |
 
-(Destinations are the user's own phone and a second, unrelated number, on
-what's presumed to be a different terminating network — kept out of git
-history per this repo's no-real-numbers rule; both are placeholders here for
-"two unrelated MSISDNs, different networks, same result.")
+(Destinations were the user's own phone and a second, unrelated number, on
+what's presumed to be a different terminating network — replaced above with
+this repo's synthetic placeholders per the no-real-numbers rule; the point
+being made is "two unrelated MSISDNs, different networks, same result.")
 
 ## What the wire trace actually shows
 

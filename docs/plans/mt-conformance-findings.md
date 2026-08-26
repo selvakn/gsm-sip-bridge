@@ -222,7 +222,7 @@ was exercised, what was observed.
     GSM7-packed alphanumeric TP-OA branch, not just numeric senders)
     arrived and decoded correctly via the modem-storage route. Two SMS the
     user then sent to the line arrived with plain GSM7 text intact and the
-    sender decoded correctly as `+919789063708`, but **every emoji came
+    sender decoded correctly as `+919000000000`, but **every emoji came
     through as `U+FFFD`** (confirmed via `hex(body)`: literal `EFBFBD`
     where each emoji should be). This is `ims::sms_pdu::decode_ucs2` not
     reassembling UTF-16 surrogate pairs — real phones commonly send
