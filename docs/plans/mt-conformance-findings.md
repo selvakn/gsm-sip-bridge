@@ -163,12 +163,28 @@ decision/rationale/alternatives writeup per finding).
       down whichever call is active, regardless of `Call-ID`).
       **Landed**: `agent::mod::bye_response_if_unmatched` refuses `481 Call/
       Transaction Does Not Exist` for a `BYE` that doesn't name
-      `self.active_call`'s `call_id` (RFC 3261 §12.2.2) — including a `BYE`
+      `self.active_call`'s dialog (RFC 3261 §12.2.2) — including a `BYE`
       arriving with no call active at all, which previously got an
       unconditional `200 OK` falsely implying a dialog existed.
       `handle_carrier_bye` now checks this before `self.active_call.take()`,
       instead of tearing the active call down unconditionally. Tests:
-      matched/mismatched/no-active-call, all three in `agent::mod::tests`.
+      matched/mismatched-Call-ID/no-active-call, all three in
+      `agent::mod::tests`.
+      **PR review fix (2026-08-26)**: the first landing matched by `Call-ID`
+      alone. Greptile correctly flagged that a `BYE` reusing the active
+      call's `Call-ID` with *different* dialog tags would still match and
+      end the live call — a colliding or malformed Call-ID was enough,
+      which is not full RFC 3261 §12.2.2 dialog identity (Call-ID plus both
+      tags). Fixed with `names_active_dialog`, which additionally requires
+      the request's `To` tag to equal our own (`ActiveCall::to_tag`) and its
+      `From` tag to equal the caller's original one (`ActiveCall::dialog.to`,
+      via a new `header_tag` parser). Test:
+      `bye_response_if_unmatched_refuses_481_for_a_matching_call_id_but_different_tags`
+      — the exact scenario. `CANCEL` matching (`cancel_response`) and `ACK`
+      logging (`log_ack`) deliberately keep the looser Call-ID-only check:
+      a `CANCEL` mirrors the original INVITE's still-untagged `To` per RFC
+      3261 §9.1 and has no tag to check, and a wrongly-matched `ACK` only
+      affects a diagnostic log line, not any call state.
 - [x] **MT-01** — no server transaction layer (retransmission, ACK tracking).
       **Landed**, scoped to what the one-call-per-line architecture actually
       needs (not a generic transaction table):
@@ -197,7 +213,8 @@ decision/rationale/alternatives writeup per finding).
         active. No SIP response exists for ACK either way, so this is
         diagnostics-only.
       Tests: `classify_in_dialog_invite_*` (`agent::call::tests`),
-      `names_active_call_*`, `cancel_response_*` (`agent::mod::tests`). The
+      `names_active_call_*`, `matches_caller_tag_*`,
+      `names_active_dialog_*`, `cancel_response_*` (`agent::mod::tests`). The
       two retransmit-resend branches (`handle_inbound_invite`'s pre-check,
       `await_pbx_answer`'s drain loop) need a live socket/session harness
       and are hardware-verification-only, same as the existing
@@ -207,6 +224,22 @@ decision/rationale/alternatives writeup per finding).
       transactions on one line; Via-branch-based transaction identity — CSeq
       equality is sufficient and RFC-grounded for the one thing that needed
       it here.
+      **PR review fixes (2026-08-26)**:
+      - The `await_pbx_answer` retransmit branch matched by `Call-ID` alone,
+        so a *different* transaction on the same Call-ID (a distinct INVITE,
+        different CSeq, arriving while the original is still ringing) was
+        wrongly answered as if it were a retransmission of the original —
+        resent `180 Ringing` and left with no final response of its own.
+        Fixed by also requiring the CSeq to match the INVITE actually being
+        rung on; anything else now falls through to the pre-existing
+        log-and-drop behavior (this bridge has no better answer for that
+        case — an INVITE glare scenario already ruled out of scope above —
+        so it deliberately does nothing new rather than answering wrongly).
+      - `handle_inbound_invite`'s pre-check had the same Call-ID-only
+        exposure as MT-08's BYE bug (see there): now gated on Call-ID plus
+        `matches_caller_tag` (the caller's own tag, present on every request
+        in the dialog including the pre-answer retransmission, unlike our
+        tag which doesn't exist yet for that case).
 - [x] **MT-02** — a re-INVITE is treated as a second call and refused `486`.
       **Landed**: the same pre-check that resends a retransmitted INVITE's
       cached answer (MT-01, above) also classifies a same-Call-ID INVITE

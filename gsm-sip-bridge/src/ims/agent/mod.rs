@@ -70,6 +70,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+use call::test_active_call;
 use call::{
     classify_in_dialog_invite, handle_bye, hangup_carrier, report_answered_call_ended, ActiveCall,
     AttachmentWatch, InDialogInvite,
@@ -427,18 +429,58 @@ fn options_response(req: &SipRequest, to_tag: &str) -> String {
 /// matters is answered inside `inbound::handle_invite`'s ring loop, so a
 /// `CANCEL` reaching here names a transaction that is already over or was
 /// never ours — the method is served, the transaction is gone (§9.2).
-/// Whether `req` names the one dialog we have up — the single check MT-02
-/// (in-dialog INVITE), MT-08 (BYE), and CANCEL matching all reduce to
-/// (specs/042-dialog-transaction-identity).
+/// Whether `req` names the one call we have up, by Call-ID alone. Good
+/// enough for diagnostics that take no action either way (`log_ack`) and
+/// for `CANCEL` (which, per RFC 3261 §9.1, mirrors the original INVITE's
+/// still-untagged `To` and so never carries a tag to check) — but NOT for
+/// anything that acts on the match, where a colliding or malformed Call-ID
+/// could satisfy it without the request actually belonging to this dialog.
+/// See `matches_caller_tag`/`names_active_dialog` for those (PR review,
+/// 2026-08-26).
 fn names_active_call(req: &SipRequest, active_call_id: Option<&str>) -> bool {
     active_call_id.is_some_and(|id| req.header("Call-ID") == Some(id))
 }
 
-/// `None` when `req` names the one call we have up (the caller goes on to
-/// actually end it); `Some` with the `481` to send when it does not — a
-/// request naming a dialog we don't recognise (or arriving with no active
-/// call at all) is refused, not silently treated as ending whatever call
-/// happens to be active (RFC 3261 §12.2.2; specs/042-dialog-transaction-identity, MT-08).
+/// The `tag=` parameter of a header value (RFC 3261 §19.3) — e.g. `"abc"`
+/// from `<sip:x@y>;tag=abc`. `None` if the header is absent or carries none.
+fn header_tag(value: &str) -> Option<&str> {
+    value
+        .split(';')
+        .skip(1)
+        .find_map(|p| p.trim_start().strip_prefix("tag="))
+}
+
+/// Whether `req`'s `From` tag matches the caller's own tag, given the
+/// verbatim `From` header they sent on the INVITE that started the dialog
+/// (`ActiveCall::dialog`'s `to` field — see its doc comment). This is the
+/// half of RFC 3261 §12.2.2's dialog identity present on *every* request in
+/// the dialog, including the very first — still untagged-`To` — INVITE and
+/// any exact retransmission of it, unlike our own tag, which only exists
+/// once we've answered.
+fn matches_caller_tag(req: &SipRequest, caller_from: &str) -> bool {
+    req.header("From").and_then(header_tag) == header_tag(caller_from)
+}
+
+/// Whether `req` names the exact dialog identified by `call_id`/`our_to_tag`/
+/// `caller_from`, using the full RFC 3261 §12.2.2 identity — Call-ID plus
+/// *both* tags — rather than Call-ID alone, which a colliding or malformed
+/// Call-ID could satisfy without `req` actually belonging to this dialog
+/// (PR review, 2026-08-26: a `BYE` reusing the active call's Call-ID with
+/// different tags would otherwise still end it). Only valid once the dialog
+/// carries our tag too (i.e. after we've answered) — everything that calls
+/// this (`BYE`) only makes sense post-answer anyway; see `matches_caller_tag`
+/// for the pre-answer retransmission case, which never has our tag to check.
+fn names_active_dialog(
+    req: &SipRequest,
+    call_id: &str,
+    our_to_tag: &str,
+    caller_from: &str,
+) -> bool {
+    req.header("Call-ID") == Some(call_id)
+        && req.header("To").and_then(header_tag) == Some(our_to_tag)
+        && matches_caller_tag(req, caller_from)
+}
+
 /// A `CANCEL` naming the one call we have up gets `200 OK` on that call's
 /// own `To` tag (RFC 3261 §9.2); anything else falls to
 /// `unserved_method_response`'s general "no such transaction" `481`.
@@ -455,8 +497,15 @@ fn cancel_response(
     }
 }
 
-fn bye_response_if_unmatched(req: &SipRequest, active_call_id: Option<&str>) -> Option<String> {
-    if names_active_call(req, active_call_id) {
+/// `None` when `req` names the one call we have up (the caller goes on to
+/// actually end it); `Some` with the `481` to send when it does not — a
+/// request naming a dialog we don't recognise (or arriving with no active
+/// call at all) is refused, not silently treated as ending whatever call
+/// happens to be active (RFC 3261 §12.2.2; specs/042-dialog-transaction-identity, MT-08).
+fn bye_response_if_unmatched(req: &SipRequest, active_call: Option<&ActiveCall>) -> Option<String> {
+    let matched = active_call
+        .is_some_and(|call| names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to));
+    if matched {
         None
     } else {
         Some(build_uas_response(
@@ -1652,8 +1701,17 @@ impl LoopState {
         // brand-new second call — it's either a retransmission of the answer
         // we already gave, or a genuine re-INVITE (specs/042-dialog-transaction-identity,
         // MT-01/MT-02). Either way it must not fall into the busy check below.
+        //
+        // Checked by Call-ID plus the caller's own tag, not Call-ID alone
+        // (PR review, 2026-08-26) — a retransmission of the still-unanswered
+        // original INVITE never carries *our* tag yet, so the fuller
+        // `names_active_dialog` check (which requires it) would wrongly
+        // reject exactly the retransmission case this exists to catch; the
+        // caller's tag is present on every request in the dialog regardless.
         if let Some(call) = self.active_call.as_ref() {
-            if names_active_call(req, Some(&call.call_id)) {
+            if req.header("Call-ID") == Some(call.call_id.as_str())
+                && matches_caller_tag(req, &call.dialog.to)
+            {
                 if let InDialogInvite::RetransmittedOriginal =
                     classify_in_dialog_invite(req, call.answered_invite.as_ref())
                 {
@@ -1784,15 +1842,14 @@ impl LoopState {
     }
 
     fn handle_carrier_bye(&mut self, p: &DispatchParams, req: &SipRequest, sink: &SipSink) {
-        let active_call_id = self.active_call.as_ref().map(|c| c.call_id.as_str());
-        if let Some(response) = bye_response_if_unmatched(req, active_call_id) {
+        if let Some(response) = bye_response_if_unmatched(req, self.active_call.as_ref()) {
             let _ = sink.send(&response);
             return;
         }
         let mut call = self
             .active_call
             .take()
-            .expect("names_active_call matched above");
+            .expect("bye_response_if_unmatched returned None above, so it matched");
         // The carrier's BYE is the caller hanging up.
         call.lifecycle.end(EndedBy::Caller);
         report_answered_call_ended(p.obs, &call);
@@ -2560,15 +2617,104 @@ mod tests {
         assert!(!names_active_call(&request("BYE"), None));
     }
 
+    /// `request`'s hardcoded `From: <sip:caller@example.net>;tag=abc`, as a
+    /// standalone `dialog.to` value — what `test_active_call`'s third
+    /// argument needs to describe a call that `request(..)` itself belongs
+    /// to.
+    const REQUEST_HELPER_CALLER_FROM: &str = "<sip:caller@example.net>;tag=abc";
+
+    /// Same shape as `request`, but with a `To` tag — what every in-dialog
+    /// request (a real `BYE`, a genuine re-INVITE) carries once we've
+    /// answered, unlike `request`'s bare `To` (which models an *initial*
+    /// INVITE, or an exact retransmission of one).
+    fn in_dialog_request(method: &str, our_to_tag: &str) -> SipRequest {
+        let raw = format!(
+            "{method} sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>;tag={our_to_tag}\r\n\
+             Call-ID: c1\r\nCSeq: 3 {method}\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
     #[test]
-    fn bye_response_if_unmatched_is_none_for_the_active_calls_own_call_id() {
-        assert!(bye_response_if_unmatched(&request("BYE"), Some("c1")).is_none());
+    fn matches_caller_tag_recognizes_the_same_from_tag() {
+        assert!(matches_caller_tag(
+            &request("BYE"),
+            REQUEST_HELPER_CALLER_FROM
+        ));
+    }
+
+    #[test]
+    fn matches_caller_tag_rejects_a_different_from_tag() {
+        assert!(!matches_caller_tag(
+            &request("BYE"),
+            "<sip:someone-else@example.net>;tag=zzz"
+        ));
+    }
+
+    #[test]
+    fn names_active_dialog_requires_our_to_tag_not_just_call_id() {
+        // The exact PR-review finding: a request naming the active call's
+        // Call-ID but carrying different dialog tags must not match.
+        assert!(!names_active_dialog(
+            &request("BYE"), // bare To, no tag at all
+            "c1",
+            "our-to-tag",
+            REQUEST_HELPER_CALLER_FROM,
+        ));
+        assert!(!names_active_dialog(
+            &in_dialog_request("BYE", "some-other-to-tag"),
+            "c1",
+            "our-to-tag",
+            REQUEST_HELPER_CALLER_FROM,
+        ));
+    }
+
+    #[test]
+    fn names_active_dialog_matches_call_id_and_both_tags() {
+        assert!(names_active_dialog(
+            &in_dialog_request("BYE", "our-to-tag"),
+            "c1",
+            "our-to-tag",
+            REQUEST_HELPER_CALLER_FROM,
+        ));
+    }
+
+    #[test]
+    fn bye_response_if_unmatched_is_none_for_the_active_calls_own_dialog() {
+        let call = test_active_call("c1", "our-to-tag", REQUEST_HELPER_CALLER_FROM);
+        assert!(
+            bye_response_if_unmatched(&in_dialog_request("BYE", "our-to-tag"), Some(&call))
+                .is_none()
+        );
     }
 
     #[test]
     fn bye_response_if_unmatched_refuses_481_for_a_different_call_id() {
-        let resp = bye_response_if_unmatched(&request("BYE"), Some("some-other-call-id"))
+        let call = test_active_call(
+            "some-other-call-id",
+            "our-to-tag",
+            REQUEST_HELPER_CALLER_FROM,
+        );
+        let resp = bye_response_if_unmatched(&in_dialog_request("BYE", "our-to-tag"), Some(&call))
             .expect("a mismatched Call-ID must be refused");
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
+    }
+
+    /// The PR-review regression test: the same Call-ID as the active call,
+    /// but a `BYE` naming a different dialog (different tags) must not end
+    /// it — a colliding or malformed Call-ID alone must not be enough.
+    #[test]
+    fn bye_response_if_unmatched_refuses_481_for_a_matching_call_id_but_different_tags() {
+        let call = test_active_call("c1", "our-to-tag", REQUEST_HELPER_CALLER_FROM);
+        let resp =
+            bye_response_if_unmatched(&in_dialog_request("BYE", "not-our-to-tag"), Some(&call))
+                .expect("a Call-ID match with mismatched tags must still be refused");
         assert!(
             resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
             "{resp}"

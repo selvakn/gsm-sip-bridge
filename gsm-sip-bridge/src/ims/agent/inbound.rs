@@ -488,11 +488,21 @@ fn await_pbx_answer(
                     reason: reason::CALLER_CANCELLED,
                 });
             }
-            if req.method == "INVITE" && req.header("Call-ID") == Some(call_id) {
+            if req.method == "INVITE"
+                && req.header("Call-ID") == Some(call_id)
+                && req.header("CSeq") == invite.header("CSeq")
+            {
                 // RFC 3261 §17.2.1: while the server transaction is in the
                 // Proceeding state, a duplicate request gets the last
                 // provisional response resent, not silence
-                // (specs/042-dialog-transaction-identity, MT-01).
+                // (specs/042-dialog-transaction-identity, MT-01). The CSeq
+                // check (not just Call-ID) is what makes this a
+                // retransmission of *this* INVITE rather than some other
+                // transaction on the same dialog — RFC 3261 §12.2.2
+                // guarantees a real retransmission carries an identical
+                // CSeq, so anything else falls through unhandled below
+                // rather than being answered as if it were one (PR review,
+                // 2026-08-26).
                 tracing::info!(call_id = %call_id, "retransmitted INVITE while ringing; resending 180 Ringing");
                 respond(
                     &req_sink,

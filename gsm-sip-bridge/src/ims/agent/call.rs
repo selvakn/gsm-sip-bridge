@@ -459,6 +459,40 @@ pub(super) fn hangup_carrier(
     }
 }
 
+/// A minimal `ActiveCall` for `agent::mod`'s dialog-identity tests
+/// (specs/042-dialog-transaction-identity) — only `call_id`, `to_tag` and
+/// `dialog.to` (the caller's original `From`) are ever inspected by what's
+/// under test; the rest exist only because the struct requires them.
+#[cfg(test)]
+pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -> ActiveCall {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let control = TcpStream::connect(addr).unwrap();
+    let (_tx, ctrl_rx) = mpsc::channel();
+    ActiveCall {
+        control,
+        ctrl_rx,
+        stop: Arc::new(AtomicBool::new(false)),
+        call_id: call_id.to_string(),
+        to_tag: to_tag.to_string(),
+        dialog: DialogInfo {
+            remote_target: "sip:caller@example.net".to_string(),
+            route_headers: Vec::new(),
+            from: String::new(),
+            to: caller_from.to_string(),
+            local_addr: addr,
+            use_tcp: true,
+            cseq: 1,
+        },
+        caller: "+919000000000".to_string(),
+        answered_at: Utc::now(),
+        answered_instant: Instant::now(),
+        meter: crate::ims::media_stats::MediaMeter::new(),
+        lifecycle: BridgedCall::new(call_id.to_string(), "+919000000000".to_string(), None),
+        answered_invite: None,
+    }
+}
+
 pub(super) fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall) {
     call.stop.store(true, Ordering::Relaxed);
     if let Err(e) = write_msg(
