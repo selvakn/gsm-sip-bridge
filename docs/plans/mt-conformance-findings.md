@@ -284,12 +284,90 @@ finding that no carrier here has been observed sending one). All three
 remain covered by the unit tests listed above; `specs/042-dialog-transaction-identity/quickstart.md`
 records this constraint for the next round.
 
-## Batch 4 — honour the negotiation (not started)
+## Batch 4 — honour the negotiation (landed 2026-08-27, pending hardware round)
 
-- [ ] SDP-01 — media lines other than the first audio stream are dropped
-- [ ] SDP-02 — direction attributes (`sendonly`/`recvonly`/`inactive`) ignored
-- [ ] SDP-03 — the `m=` transport profile (`RTP/SAVP` etc.) is not checked
-- [ ] MT-05 — session timers advertised, never honoured (needs Batch 3 first)
+Full spec/plan/tasks trail: `specs/043-honour-sdp-negotiation/`. All three
+SDP findings share one mechanism: `parse_offer` (`ims::sdp`) now tracks
+every `m=` section an offer carries, not just a single flat audio one, so
+`build_answer_for` can honestly describe what happens to each of them.
+This bridge remains a single-audio-stream, plain-RTP relay by design — the
+fix is answer honesty, not new relay capability (see
+`specs/043-honour-sdp-negotiation/research.md` for the full
+decision/rationale/alternatives writeup per finding).
+
+- [x] **SDP-01** — media lines other than the first audio stream are
+      dropped.
+      **Landed**: `parse_offer` selects the **first** `m=audio` section for
+      negotiation (fixing a last-wins overwrite bug: a second `m=audio`
+      line previously replaced the first's port/codec list silently) and
+      records every other `m=` section — another audio line, video, text,
+      application, anything — as a `DeclinedMedia { kind, proto, fmts,
+      before_audio }` entry, in original order. `build_answer_for` emits
+      one `m=<kind> 0 <proto> <fmts>` line per entry (RFC 3264 §6: port `0`
+      marks a declined stream), placed before or after the negotiated
+      audio line to match the offer's own ordering. No `c=` line is added
+      per declined section — the existing session-level one already covers
+      it. Tests: the existing `PJSIP_REAL_VETH_OFFER` fixture (its trailing
+      `m=text` section previously had zero effect on the answer) now
+      asserts a declined `m=text 0 RTP/AVP 100 98` line in the right
+      position; a new two-`m=audio`-section fixture proves the first wins
+      and the second is declined, not silently overwritten.
+      **Ruled out**: actually relaying a second audio stream, video, or
+      text — this bridge is a single-audio-stream relay by design
+      (`ims::sdp`'s own header comment), and no carrier here has sent more
+      than one media section.
+- [x] **SDP-02** — direction attributes (`sendonly`/`recvonly`/`inactive`)
+      ignored.
+      **Landed**: `SdpOffer` gained `direction: MediaDirection`, parsed
+      from the negotiated audio section's own `a=sendonly`/`recvonly`/
+      `inactive`/`sendrecv` line (default `SendRecv` if absent).
+      `build_answer_for` mirrors it per RFC 3264 §6.1 instead of
+      hardcoding `a=sendrecv`: `SendOnly`→`RecvOnly`, `RecvOnly`→
+      `SendOnly`, `Inactive`→`Inactive`, `SendRecv`→`SendRecv`. Tests: one
+      case per direction value, plus confirmation that an offer with no
+      direction line (today's only real-world case) still answers
+      `sendrecv` unchanged.
+      **Ruled out**: gating the RTP relay's actual send/receive behavior on
+      the negotiated direction — signaling correctness only; no carrier
+      here has sent a non-default direction on an *initial* offer (as
+      opposed to a hold re-INVITE, which batch 3 already declines
+      outright), and building real per-direction suppression in
+      `agent::veth`/`transcode` is a materially separate, currently
+      unjustified feature.
+- [x] **SDP-03** — the `m=` transport profile (`RTP/SAVP` etc.) is not
+      checked.
+      **Landed**: `SdpOffer` gained `proto: String`, the audio section's
+      raw transport token, captured but not validated by `parse_offer`
+      itself (kept permissive, same as an unrecognized codec — the caller
+      decides). `agent::inbound::handle_invite` checks it immediately
+      after `parse_offer` succeeds, before the existing codec precheck: a
+      token other than `RTP/AVP` is declined with a new
+      `sip_client::build_488_incompatible_transport`, carrying `Warning:
+      305 ... "incompatible network protocol used"` (RFC 3261 §20.43) —
+      visibly distinct from the existing codec-mismatch `488`/`Warning:
+      304` (MT-07). Tests: the new builder states the 305 warning
+      correctly; `parse_offer` captures a non-`RTP/AVP` token (e.g.
+      `RTP/SAVP`) without erroring, unaffected codec parsing.
+- [x] **MT-05** — session timers advertised, never honoured.
+      **Confirmed resolved by prior batches — no new production code.**
+      `SUPPORTED_EXTENSIONS` has been empty since MT-10 (batch 2), so the
+      inbound side no longer advertises `timer` support at all — the
+      finding's original premise no longer holds. RFC 4028 §9 explicitly
+      permits a UAS to simply omit `Session-Expires` from its response
+      when it doesn't want the extension, which is exactly today's
+      behavior and is fully spec-legal. Building real session-timer
+      support would mean either accepting a refresh burden this bridge
+      can't fulfill (it never sends its own re-INVITE) or surviving a
+      refresh re-INVITE from the far end, which collides with batch 3's
+      now-unconditional `488` decline of every re-INVITE — reopening
+      exactly the renegotiation scope MT-02 already ruled out, for a
+      scenario no carrier here has ever sent. Test added:
+      `agent::inbound::tests::session_expires_on_the_offer_is_never_echoed_back`
+      pins this as intentional, not an open gap.
+
+All three code changes plus the MT-05 test: `make format && make lint &&
+make test` clean (whole workspace, including test targets, clippy
+`-D warnings`).
 
 ## Batch 5 — complete the media contract (not started)
 
