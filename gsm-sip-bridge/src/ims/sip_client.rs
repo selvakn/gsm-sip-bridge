@@ -515,6 +515,29 @@ pub fn build_488_not_acceptable(request: &SipRequest, to_tag: &str, agent: &str)
     )
 }
 
+/// `488 Not Acceptable Here` — declines an inbound `INVITE` whose offer
+/// names an `m=` transport profile this UAS does not implement (e.g.
+/// `RTP/SAVP`; this bridge does no SRTP). Distinct from
+/// [`build_488_not_acceptable`]'s `Warning: 304` (which means "media type,"
+/// i.e. codec, not available): this carries `Warning: 305` (RFC 3261
+/// §20.43 table: "Incompatible network protocol used"), so a capture states
+/// the real cause — the transport, not the codec list — rather than
+/// conflating the two under one warning text (specs/043 SDP-03).
+pub fn build_488_incompatible_transport(request: &SipRequest, to_tag: &str, agent: &str) -> String {
+    build_uas_response_with_headers(
+        488,
+        "Not Acceptable Here",
+        request,
+        Some(to_tag),
+        None,
+        None,
+        &[(
+            "Warning",
+            &format!("305 {agent} \"incompatible network protocol used\""),
+        )],
+    )
+}
+
 /// `420 Bad Extension` — declines a request whose `Require` names an
 /// extension this UAS does not implement enough of to honour (RFC 3261
 /// §8.2.2.3, which requires the `Unsupported` header to list exactly which
@@ -2311,6 +2334,25 @@ mod tests {
             "{resp}"
         );
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// specs/043 SDP-03: the transport-profile decline must carry a
+    /// distinct `Warning: 305`, not be conflated with the codec-mismatch
+    /// decline's `Warning: 304` above.
+    #[test]
+    fn build_488_incompatible_transport_states_the_protocol_warning() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
+        let resp = build_488_incompatible_transport(&req, "totag1", "10.0.0.9:5060");
+        assert!(resp.starts_with("SIP/2.0 488 Not Acceptable Here\r\n"));
+        assert!(
+            resp.contains(
+                "\r\nWarning: 305 10.0.0.9:5060 \"incompatible network protocol used\"\r\n"
+            ),
+            "{resp}"
+        );
+        assert!(!resp.contains("304"), "{resp}");
     }
 
     /// RFC 3261 §8.2.2.3: refusing an unsupported `Require` must list which

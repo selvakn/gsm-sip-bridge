@@ -279,6 +279,40 @@ impl OfferedCodec {
     }
 }
 
+/// What an offer's audio section stated about which way media will flow
+/// (RFC 3264 §6.1). `SendRecv` is both the default when no `a=`-level
+/// direction attribute is present, and this bridge's own long-standing
+/// unconditional answer — this type exists so the answer can start saying
+/// something else when the offer actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaDirection {
+    #[default]
+    SendRecv,
+    SendOnly,
+    RecvOnly,
+    Inactive,
+}
+
+/// One `m=` section from the offer this bridge will not negotiate — a
+/// second audio line, video, text, application, anything (specs/043
+/// SDP-01). Declined per RFC 3264 §6 by echoing it back with port `0`; no
+/// `c=` line is needed since the session-level one already covers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclinedMedia {
+    /// The media type word from the offer's `m=` line, e.g. `"video"`,
+    /// `"text"`, or `"audio"` for a duplicate audio section.
+    pub kind: String,
+    /// That section's own transport token, echoed verbatim — a declined
+    /// section's transport is not this bridge's concern.
+    pub proto: String,
+    /// That section's format-list, echoed verbatim; the port being `0` is
+    /// what marks the section declined, not the format list.
+    pub fmts: String,
+    /// Whether this section appeared before the negotiated audio section
+    /// in the offer, so the answer can reproduce the same relative order.
+    pub before_audio: bool,
+}
+
 pub struct SdpOffer {
     pub remote_rtp: SocketAddr,
     /// Recognized codecs from the offer, in `m=audio` payload-type order.
@@ -304,6 +338,17 @@ pub struct SdpOffer {
     /// AMR/AMR-WB; we only ever sent `ptime`. Echoed rather than asserted, so
     /// the answer never claims a longer packetisation than the offerer allows.
     pub maxptime: Option<u32>,
+    /// What the audio section itself stated about direction (specs/043
+    /// SDP-02) — mirrored, not copied, into the answer by `build_answer_for`.
+    pub direction: MediaDirection,
+    /// The audio section's raw `m=` transport token (e.g. `"RTP/AVP"`),
+    /// captured but not validated here — see [`DeclinedMedia`] and
+    /// specs/043 SDP-03's research.md Decision 1 for why this stays
+    /// permissive: the caller decides what an unrecognized token means.
+    pub proto: String,
+    /// Every `m=` section in the offer other than the negotiated audio one,
+    /// in original order (specs/043 SDP-01).
+    pub other_media: Vec<DeclinedMedia>,
 }
 
 /// Parse an inbound SDP offer (the inverse of `build_offer`): the connection
@@ -317,6 +362,9 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     let mut rtpmap: std::collections::HashMap<u8, (String, u32)> = std::collections::HashMap::new();
     let mut fmtp: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
     let mut maxptime: Option<u32> = None;
+    let mut proto = String::new();
+    let mut direction = MediaDirection::default();
+    let mut other_media: Vec<DeclinedMedia> = Vec::new();
 
     // An SDP body can hold several media sections, and payload-type numbers are
     // scoped to the section they appear in — the *same* number can mean
@@ -326,19 +374,43 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     // therefore only collected while inside the audio section (RFC 4566 §5.14:
     // a media section runs until the next `m=` line), or a later section's
     // rtpmap would silently redefine an audio codec out of existence.
+    //
+    // Only the *first* `m=audio` section is ever negotiated — a later one
+    // (another audio line, or a video/text/application section) is recorded
+    // as `other_media` and declined in the answer (RFC 3264 §6) rather than
+    // silently overwriting the first or being dropped with no trace
+    // (specs/043 SDP-01).
     let mut in_audio = false;
+    let mut audio_seen = false;
     let mut seen_media = false;
 
     for line in body.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("m=") {
-            in_audio = rest.starts_with("audio ");
             seen_media = true;
-            if in_audio {
+            if !audio_seen && rest.starts_with("audio ") {
+                in_audio = true;
+                audio_seen = true;
                 let mut fields = rest["audio ".len()..].split_whitespace();
                 rtp_port = fields.next().and_then(|p| p.parse().ok());
-                // Skip the "RTP/AVP" token, then collect every payload type.
-                listed_pts = fields.skip(1).filter_map(|pt| pt.parse().ok()).collect();
+                proto = fields.next().unwrap_or_default().to_string();
+                listed_pts = fields.filter_map(|pt| pt.parse().ok()).collect();
+            } else {
+                in_audio = false;
+                // "<kind> <port> <proto> <fmt-list...>" — the port is
+                // ignored: this section is declined regardless of what it
+                // asked for.
+                let mut fields = rest.split_whitespace();
+                let kind = fields.next().unwrap_or_default().to_string();
+                let _port = fields.next();
+                let section_proto = fields.next().unwrap_or_default().to_string();
+                let fmts: Vec<&str> = fields.collect();
+                other_media.push(DeclinedMedia {
+                    kind,
+                    proto: section_proto,
+                    fmts: fmts.join(" "),
+                    before_audio: !audio_seen,
+                });
             }
         } else if let Some(rest) = line.strip_prefix("c=IN ") {
             // Session-level (before any `m=`) or the audio section's own — but
@@ -379,6 +451,14 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
             if let Some(params) = parts.next() {
                 fmtp.insert(pt, params.trim().to_string());
             }
+        } else if line == "a=sendonly" {
+            direction = MediaDirection::SendOnly;
+        } else if line == "a=recvonly" {
+            direction = MediaDirection::RecvOnly;
+        } else if line == "a=inactive" {
+            direction = MediaDirection::Inactive;
+        } else if line == "a=sendrecv" {
+            direction = MediaDirection::SendRecv;
         }
     }
 
@@ -436,6 +516,9 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
         offered,
         dtmf,
         maxptime,
+        direction,
+        proto,
+        other_media,
     })
 }
 
@@ -604,12 +687,7 @@ pub fn build_answer(
             BridgeError::Ims("SDP offer has no codec this client can answer with".into())
         })?;
     Ok(build_answer_for(
-        local_ip,
-        rtp_port,
-        session_id,
-        chosen,
-        &offer.dtmf,
-        offer.maxptime,
+        local_ip, rtp_port, session_id, chosen, offer,
     ))
 }
 
@@ -626,12 +704,7 @@ pub fn build_veth_answer(
         BridgeError::Ims("veth-link SDP offer has neither L16/16000 nor PCMU".into())
     })?;
     Ok(build_answer_for(
-        local_ip,
-        rtp_port,
-        session_id,
-        chosen,
-        &offer.dtmf,
-        offer.maxptime,
+        local_ip, rtp_port, session_id, chosen, offer,
     ))
 }
 
@@ -644,11 +717,12 @@ fn build_answer_for(
     rtp_port: u16,
     session_id: u64,
     chosen: &OfferedCodec,
-    dtmf: &[(u8, u32)],
-    maxptime: Option<u32>,
+    offer: &SdpOffer,
 ) -> (String, ChosenCodec) {
     let addrtype = ip_addrtype(local_ip);
     let pt = chosen.payload_type;
+    let dtmf = &offer.dtmf;
+    let maxptime = offer.maxptime;
 
     // Keep the offer's `telephone-event` — see `SdpOffer::dtmf` for why
     // dropping it is fatal. Prefer the one whose clock rate matches the codec
@@ -704,12 +778,43 @@ fn build_answer_for(
         NegotiatedCodec::L16 => 280,
     };
 
+    // Every `m=` section the offer had other than the one negotiated above
+    // gets an explicit RFC 3264 §6 decline (port `0`) in the same relative
+    // position — never silently omitted (specs/043 SDP-01). No `c=` line is
+    // needed per declined section: the session-level one above already
+    // covers it.
+    let (mut before_lines, mut after_lines) = (String::new(), String::new());
+    for dm in &offer.other_media {
+        let line = if dm.fmts.is_empty() {
+            format!("m={} 0 {}\r\n", dm.kind, dm.proto)
+        } else {
+            format!("m={} 0 {} {}\r\n", dm.kind, dm.proto, dm.fmts)
+        };
+        if dm.before_audio {
+            before_lines.push_str(&line);
+        } else {
+            after_lines.push_str(&line);
+        }
+    }
+
+    // Mirror what the offer's audio section actually stated about
+    // direction (RFC 3264 §6.1) instead of always claiming two-way media
+    // (specs/043 SDP-02). The relay's own send/receive behavior is
+    // unchanged either way — this only affects what the answer says.
+    let direction_line = match offer.direction {
+        MediaDirection::SendOnly => "a=recvonly\r\n",
+        MediaDirection::RecvOnly => "a=sendonly\r\n",
+        MediaDirection::Inactive => "a=inactive\r\n",
+        MediaDirection::SendRecv => "a=sendrecv\r\n",
+    };
+
     let sdp = format!(
         "v=0\r\n\
          o=- {session_id} {session_id} IN {addrtype} {local_ip}\r\n\
          s=gsm-sip-bridge vowifi bridge\r\n\
          c=IN {addrtype} {local_ip}\r\n\
          t=0 0\r\n\
+         {before_lines}\
          m=audio {rtp_port} RTP/AVP {pt}{dtmf_pts}\r\n\
          b=AS:{as_kbps}\r\n\
          b=RS:800\r\n\
@@ -718,7 +823,8 @@ fn build_answer_for(
          {dtmf_lines}\
          a=ptime:20\r\n\
          {maxptime_line}\
-         a=sendrecv\r\n",
+         {direction_line}\
+         {after_lines}",
     );
 
     (
@@ -1096,6 +1202,24 @@ mod tests {
         assert_eq!(offer.offered[0].codec, NegotiatedCodec::Pcmu);
         assert_eq!(offer.offered[1].payload_type, 96);
         assert_eq!(offer.offered[1].codec, NegotiatedCodec::AmrWb);
+        assert_eq!(offer.proto, "RTP/AVP");
+    }
+
+    /// specs/043 SDP-03: `parse_offer` stays permissive on an unrecognized
+    /// transport token — it's captured, not rejected, so the caller
+    /// (`handle_invite`) can decide what an unsupported transport means,
+    /// same as it already does for an unsupported codec list.
+    #[test]
+    fn parse_offer_captures_a_non_rtp_avp_transport_without_erroring() {
+        let body =
+            "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(offer.proto, "RTP/SAVP");
+        assert_eq!(
+            offer.offered.len(),
+            1,
+            "codec parsing is unaffected by the transport token"
+        );
     }
 
     #[test]
@@ -1586,6 +1710,150 @@ mod tests {
             4000,
             "m=audio's port, not m=text's"
         );
+    }
+
+    /// specs/043 SDP-01: the `m=text` section this fixture carries must not
+    /// simply vanish from the answer — it gets an explicit RFC 3264 §6
+    /// decline, in its original position after the negotiated audio line.
+    #[test]
+    fn a_trailing_non_audio_section_is_declined_not_silently_dropped() {
+        let offer = parse_offer(PJSIP_REAL_VETH_OFFER).unwrap();
+        let (sdp, _) =
+            build_veth_answer("10.99.0.1".parse().unwrap(), 40000, 1, &offer, true).unwrap();
+        assert!(
+            sdp.contains("m=text 0 RTP/AVP 100 98\r\n"),
+            "declined text section must echo its own proto/fmt-list with port 0: {sdp}"
+        );
+        let audio_pos = sdp.find("m=audio ").expect("negotiated audio line");
+        let text_pos = sdp.find("m=text 0").expect("declined text line");
+        assert!(
+            text_pos > audio_pos,
+            "the text section came after audio in the offer, so it must too in the answer: {sdp}"
+        );
+    }
+
+    /// specs/043 SDP-01: a second `m=audio` section must not silently
+    /// overwrite the first's port/codec list (the pre-fix behavior) — the
+    /// first is what gets negotiated, and the second is declined.
+    #[test]
+    fn a_second_audio_section_is_declined_the_first_is_negotiated() {
+        let offer_body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
+             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             m=audio 40010 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+        let offer = parse_offer(offer_body).unwrap();
+        assert_eq!(
+            offer.remote_rtp.port(),
+            40000,
+            "the first m=audio section's port must win, not the second's"
+        );
+        assert_eq!(
+            offer.offered.len(),
+            1,
+            "only the first section's codec list"
+        );
+        assert_eq!(offer.offered[0].codec, NegotiatedCodec::Pcmu);
+
+        let (sdp, codec) = build_answer(
+            "10.0.0.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::Legacy,
+        )
+        .unwrap();
+        assert_eq!(codec.codec, NegotiatedCodec::Pcmu);
+        assert!(
+            sdp.contains("m=audio 0 RTP/AVP 8\r\n"),
+            "the second audio section must be declined (port 0), not negotiated: {sdp}"
+        );
+    }
+
+    /// An offer with a direction attribute in its audio section (`_dir`,
+    /// e.g. `"a=sendonly\r\n"`) that this bridge must answer with the RFC
+    /// 3264 §6.1 mirror (`_expect`, e.g. `"a=recvonly\r\n"`).
+    fn offer_with_direction(dir: &str) -> SdpOffer {
+        let body = format!(
+            "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
+             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\n{dir}a=rtpmap:0 PCMU/8000\r\n"
+        );
+        parse_offer(&body).expect("test offer must parse")
+    }
+
+    /// specs/043 SDP-02: the answer must state the mirrored direction, not
+    /// always claim two-way media regardless of what the offer said.
+    #[test]
+    fn the_answer_mirrors_a_sendonly_offer_as_recvonly() {
+        let offer = offer_with_direction("a=sendonly\r\n");
+        assert_eq!(offer.direction, MediaDirection::SendOnly);
+        let (sdp, _) = build_answer(
+            "10.0.0.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::Legacy,
+        )
+        .unwrap();
+        assert!(sdp.contains("a=recvonly\r\n"), "{sdp}");
+        assert!(!sdp.contains("a=sendrecv\r\n"), "{sdp}");
+    }
+
+    #[test]
+    fn the_answer_mirrors_a_recvonly_offer_as_sendonly() {
+        let offer = offer_with_direction("a=recvonly\r\n");
+        assert_eq!(offer.direction, MediaDirection::RecvOnly);
+        let (sdp, _) = build_answer(
+            "10.0.0.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::Legacy,
+        )
+        .unwrap();
+        assert!(sdp.contains("a=sendonly\r\n"), "{sdp}");
+    }
+
+    #[test]
+    fn the_answer_mirrors_an_inactive_offer_as_inactive() {
+        let offer = offer_with_direction("a=inactive\r\n");
+        assert_eq!(offer.direction, MediaDirection::Inactive);
+        let (sdp, _) = build_answer(
+            "10.0.0.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::Legacy,
+        )
+        .unwrap();
+        assert!(sdp.contains("a=inactive\r\n"), "{sdp}");
+    }
+
+    /// An offer stating `sendrecv` explicitly, or nothing at all, must still
+    /// answer `sendrecv` — today's only real-world case, unchanged.
+    #[test]
+    fn an_ordinary_offer_still_answers_sendrecv() {
+        for dir in ["a=sendrecv\r\n", ""] {
+            let offer = offer_with_direction(dir);
+            assert_eq!(offer.direction, MediaDirection::SendRecv);
+            let (sdp, _) = build_answer(
+                "10.0.0.1".parse().unwrap(),
+                40000,
+                1,
+                &offer,
+                false,
+                false,
+                AnswerPreference::Legacy,
+            )
+            .unwrap();
+            assert!(sdp.contains("a=sendrecv\r\n"), "{sdp}");
+        }
     }
 
     #[test]

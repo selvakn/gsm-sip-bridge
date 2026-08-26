@@ -18,8 +18,8 @@ use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_420_bad_extension, build_486_busy_here,
-    build_488_not_acceptable, build_uas_response, build_uas_response_with_headers, format_sip_addr,
-    random_hex, SipMessage, SipRequest, SipSink,
+    build_488_incompatible_transport, build_488_not_acceptable, build_uas_response,
+    build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -151,6 +151,34 @@ pub(super) fn handle_invite(
     sink.send(&build_100_trying(req))?;
 
     let offer = sdp::parse_offer(&req.body)?;
+
+    // The transport this bridge implements is plain `RTP/AVP` — no SRTP, no
+    // RTCP feedback profile. An offer naming anything else (`RTP/SAVP`, a
+    // garbage token) describes a stream we structurally cannot service;
+    // accepting its codec list while ignoring what it said about the
+    // transport would answer a protocol the offer never actually proposed.
+    // Checked before the codec precheck below: an unusable transport makes
+    // codec selection moot (specs/043 SDP-03).
+    if offer.proto != "RTP/AVP" {
+        tracing::info!(
+            call_id = %call_id,
+            proto = %offer.proto,
+            "offer's m=audio transport profile is not one we implement; declining"
+        );
+        sink.send(&build_488_incompatible_transport(
+            req,
+            &random_hex(4),
+            &format_sip_addr(session.contact_addr),
+        ))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
     // A carrier's mobile-terminating VoWiFi INVITE often offers no PCMU at
     // all (Airtel: AMR-WB+AMR-NB on some calls, AMR-NB alone on others), so
     // anything AMR gets answered and transcoded rather than declined. Uses
@@ -580,6 +608,43 @@ mod tests {
         assert!(
             !resp.contains("\r\nSupported: "),
             "must not claim an extension nothing here implements: {resp}"
+        );
+    }
+
+    /// specs/043 MT-05: an inbound INVITE offering RFC 4028 session timers
+    /// must not get them echoed back — `SUPPORTED_EXTENSIONS` being empty
+    /// (since MT-10) already means `timer` is never advertised, and RFC
+    /// 4028 §9 explicitly permits a UAS to simply omit `Session-Expires`
+    /// when it doesn't want the extension. This pins that as intentional,
+    /// already-correct behavior, not an open gap.
+    #[test]
+    fn session_expires_on_the_offer_is_never_echoed_back() {
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\n\
+                      Session-Expires: 1800;refresher=uac\r\n\
+                      Supported: timer\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
+
+        let resp = build_uas_response_with_headers(
+            200,
+            "OK",
+            &req,
+            Some("totag1"),
+            Some("<sip:me@10.0.0.9:5060>"),
+            Some("v=0\r\n"),
+            UAS_EXTRA_HEADERS,
+        );
+
+        assert!(
+            !resp.contains("Session-Expires"),
+            "must not echo a session-refresh promise nothing here honours: {resp}"
+        );
+        assert!(
+            !resp.contains("\r\nSupported: "),
+            "must not claim timer support even though the offer asked for it: {resp}"
         );
     }
 
