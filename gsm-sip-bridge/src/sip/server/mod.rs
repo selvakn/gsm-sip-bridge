@@ -189,6 +189,10 @@ fn serve(socket: UdpSocket, state: Arc<ServerState>, stop: Arc<AtomicBool>) {
                     continue;
                 };
                 if let Some(response) = handle_datagram(text, peer, &state, now) {
+                    // specs/045 MT-13: state where this request actually
+                    // arrived from, not just what its own Via claimed.
+                    let response =
+                        crate::ims::sip_client::annotate_via_received_rport(&response, peer);
                     if let Err(e) = socket.send_to(response.as_bytes(), peer) {
                         tracing::warn!(%peer, error = %e, "sip_server: failed to send response");
                     }

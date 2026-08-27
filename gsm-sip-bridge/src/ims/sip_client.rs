@@ -449,6 +449,66 @@ pub fn build_uas_response_with_headers(
     msg
 }
 
+/// RFC 3261 §18.2.1 / RFC 3581 §4: annotate a response's top `Via` with
+/// `received=`/`rport=` reflecting where the request it answers actually
+/// arrived from, when its own stated sent-by disagrees. A no-op unless
+/// `message` is a response (`SIP/2.0 <code> ...` — a request we originate
+/// starts `<METHOD> ... SIP/2.0` instead) — `received`/`rport` are only
+/// ever added by whoever *received* a request, naming its real source;
+/// self-annotating a request we're sending would be backwards.
+///
+/// Applied at the two places a response is actually written to a socket
+/// (`SipSink::send`, `sip::server::serve`) rather than threaded through
+/// every one of `build_uas_response_with_headers`'s call sites — the real
+/// peer address is only known there, and centralizing it there means two
+/// call sites, not dozens (specs/045 MT-13).
+pub fn annotate_via_received_rport(message: &str, peer: SocketAddr) -> String {
+    if !message.starts_with("SIP/2.0 ") {
+        return message.to_string();
+    }
+    let mut annotated_top_via = false;
+    let lines: Vec<String> = message
+        .split("\r\n")
+        .map(|line| {
+            if annotated_top_via {
+                return line.to_string();
+            }
+            let Some(rest) = line.strip_prefix("Via: ") else {
+                return line.to_string();
+            };
+            annotated_top_via = true;
+            match annotate_one_via(rest, peer) {
+                Some(annotated) => format!("Via: {annotated}"),
+                None => line.to_string(),
+            }
+        })
+        .collect();
+    lines.join("\r\n")
+}
+
+/// `"SIP/2.0/<transport> <sent-by>[;params]"` -> the same, with
+/// `received=`/`rport=` added/filled per RFC 3261 §18.2.1 / RFC 3581 §4.
+/// `None` if `via` isn't well-formed enough to find a sent-by in.
+fn annotate_one_via(via: &str, peer: SocketAddr) -> Option<String> {
+    let (proto_and_sentby, params) = via.split_once(';').unwrap_or((via, ""));
+    let (proto, sent_by) = proto_and_sentby.trim_end().rsplit_once(' ')?;
+    let sent_by_addr: SocketAddr = sent_by.parse().ok()?;
+
+    let mut out_params = String::new();
+    for param in params.split(';').filter(|p| !p.is_empty()) {
+        if param == "rport" || param.starts_with("rport=") {
+            out_params.push_str(&format!(";rport={}", peer.port()));
+        } else {
+            out_params.push(';');
+            out_params.push_str(param);
+        }
+    }
+    if sent_by_addr.ip() != peer.ip() {
+        out_params.push_str(&format!(";received={}", peer.ip()));
+    }
+    Some(format!("{proto} {sent_by}{out_params}"))
+}
+
 /// `100 Trying` — no `To` tag (see `build_uas_response` docs), no `Contact`.
 pub fn build_100_trying(request: &SipRequest) -> String {
     build_uas_response(100, "Trying", request, None, None, None)
@@ -1219,7 +1279,30 @@ enum SinkInner {
 }
 
 impl SipSink {
+    /// The real address this sink's messages actually go to — for UDP, the
+    /// peer captured when the sink was created (the datagram's own source,
+    /// per `spawn_gm_udp_server`'s docs); for TCP, the connection's own
+    /// peer address. Used to annotate a response's `Via` with `received=`/
+    /// `rport=` (specs/045 MT-13) — `None` only if the OS-level query
+    /// itself fails, in which case the response is sent unannotated rather
+    /// than not sent at all.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        match &*self.inner {
+            SinkInner::Tcp(stream) => stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peer_addr()
+                .ok(),
+            SinkInner::Udp(_, peer) => Some(*peer),
+        }
+    }
+
     pub fn send(&self, message: &str) -> BridgeResult<()> {
+        let message = match self.peer_addr() {
+            Some(peer) => annotate_via_received_rport(message, peer),
+            None => message.to_string(),
+        };
+        let message = message.as_str();
         tracing::debug!(message = %message, "sending SIP message");
         match &*self.inner {
             SinkInner::Tcp(stream) => stream
@@ -2501,6 +2584,43 @@ mod tests {
         let first_via = resp.find("Via: SIP/2.0/TCP 1.1.1.1").unwrap();
         let second_via = resp.find("Via: SIP/2.0/TCP 2.2.2.2").unwrap();
         assert!(first_via < second_via);
+    }
+
+    /// specs/045 MT-13: a mismatched sent-by gets `received=` naming the
+    /// real source.
+    #[test]
+    fn annotate_via_received_rport_adds_received_when_sent_by_disagrees() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(
+            annotated.contains(";received=203.0.113.9\r\n"),
+            "{annotated}"
+        );
+    }
+
+    #[test]
+    fn annotate_via_received_rport_fills_a_bare_rport() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1;rport\r\n\r\n";
+        let peer: SocketAddr = "10.1.1.1:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(annotated.contains(";rport=6001\r\n"), "{annotated}");
+        // Sent-by IP matches the peer's, so no `received=` is added.
+        assert!(!annotated.contains("received="), "{annotated}");
+    }
+
+    #[test]
+    fn annotate_via_received_rport_leaves_a_request_untouched() {
+        let req = "BYE sip:x SIP/2.0\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1;rport\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        assert_eq!(annotate_via_received_rport(req, peer), req);
+    }
+
+    #[test]
+    fn annotate_via_received_rport_leaves_an_already_matching_via_untouched() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1\r\n\r\n";
+        let peer: SocketAddr = "10.1.1.1:5067".parse().unwrap();
+        assert_eq!(annotate_via_received_rport(resp, peer), resp);
     }
 
     #[test]
