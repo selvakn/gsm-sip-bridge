@@ -39,38 +39,6 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// What a real UE states in a session response: the methods it accepts and the
-/// extensions it understands (RFC 3261 §20.5, and the `Supported` set
-/// TS 24.229 expects of an IMS UE).
-///
-/// This is what made inbound Jio calls work. Answering with `Via`,
-/// `Record-Route`, `From`, `To`, `Call-ID`, `CSeq`, `Contact`, `Content-Type`,
-/// `Content-Length` and nothing else got every call torn down ~460 ms after
-/// the `200 OK` with `BYE Reason:SIP;cause=503;text="IO: SIP SDP Protocol
-/// Error."` — boilerplate for a response that never declared its capabilities;
-/// five distinct SDP bodies failed identically at the same timing before it
-/// landed. Sent unconditionally rather than per-carrier because a `2xx` to an
-/// INVITE is required to carry `Allow` on any network (RFC 3261 §13.3.1.4),
-/// and the carriers that tolerated its absence were being lenient, not
-/// asking for it.
-///
-/// `Allow` is [`super::ALLOW`], the single list of what this UAS actually
-/// serves — every method on it has a `dispatch_loop` arm, and everything else
-/// is refused `405` there. It was measured longer than that (`UPDATE`, `INFO`,
-/// `PRACK`, `REFER` too) while nothing answered those methods at all;
-/// advertising them only invited mid-call requests we could not serve.
-///
-/// No `Supported` header: this used to claim `timer, 100rel, replaces, path,
-/// gruu`, none of which had any behaviour behind them — no session-refresh
-/// timer, no UAS-side reliable-provisional handling, no `replaces`/`gruu`
-/// machinery, and `path` names a REGISTER mechanism that does not even apply
-/// to a response to `INVITE`. `Supported` states extensions a caller may
-/// then invoke expecting them to work; claiming ones this UAS cannot honour
-/// is the same capability-truthfulness problem `Allow` already guards
-/// against (specs/041 conformance review, MT-10). See
-/// [`super::SUPPORTED_EXTENSIONS`] — once that grows, this constant is where
-/// its header gets added back.
-const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[("Allow", super::ALLOW)];
 
 /// The `Contact` for a response that answers a network-initiated INVITE.
 ///
@@ -96,6 +64,10 @@ pub(super) struct InviteContext<'a> {
     /// caller still hearing ringback (observed live, specs/017 R17).
     pub(super) veth_sip_port: u16,
     pub(super) obs: &'a observability::AgentObservability,
+    /// This line's real access-network type, stated in the `200 OK` to an
+    /// answered inbound INVITE (specs/045 MT-11) — previously omitted
+    /// entirely.
+    pub(super) access_network_info: &'a str,
 }
 
 /// Answers (or declines) one inbound carrier `INVITE`. Returns `Some` with
@@ -354,6 +326,20 @@ pub(super) fn handle_invite(
                 }
             }
 
+            // What a real UE states in a session response: the methods it
+            // accepts (RFC 3261 §20.5) and the access network it registered
+            // over. `Allow` (`super::ALLOW`) is what made inbound Jio calls
+            // work — answering without it got every call torn down ~460ms
+            // later with `BYE Reason:SIP;cause=503;text="IO: SIP SDP
+            // Protocol Error."`; RFC 3261 §13.3.1.4 requires it in a `2xx`
+            // to INVITE regardless. No `Supported` header: claiming
+            // `timer`/`100rel`/`replaces`/`path`/`gruu` with no behaviour
+            // behind any of them was the same capability-truthfulness
+            // problem `Allow` already guards against (specs/041, MT-10) —
+            // see `SUPPORTED_EXTENSIONS`. `P-Access-Network-Info` is a real
+            // per-line value (VoWiFi vs. VoLTE), not a fixed capability
+            // claim, so it's built per-call rather than a shared const
+            // (specs/045 MT-11).
             let response = build_uas_response_with_headers(
                 200,
                 "OK",
@@ -361,7 +347,10 @@ pub(super) fn handle_invite(
                 Some(&to_tag),
                 Some(&contact),
                 Some(&answer_sdp),
-                UAS_EXTRA_HEADERS,
+                &[
+                    ("Allow", super::ALLOW),
+                    ("P-Access-Network-Info", ctx.access_network_info),
+                ],
             );
             sink.send(&response)?;
 
@@ -602,16 +591,24 @@ mod tests {
             Some("totag1"),
             Some("<sip:me@10.0.0.9:5060>"),
             Some("v=0\r\n"),
-            UAS_EXTRA_HEADERS,
+            &[
+                ("Allow", super::super::ALLOW),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ],
         );
 
         assert!(
             resp.contains("\r\nAllow: INVITE, ACK, CANCEL, BYE,"),
             "RFC 3261 §13.3.1.4 wants Allow in a 2xx to INVITE: {resp}"
         );
-        // No `Supported:` — see `UAS_EXTRA_HEADERS`'s docs (specs/041
-        // conformance review, MT-10): every extension it used to claim here
-        // (timer, 100rel, replaces, path, gruu) had no behaviour behind it.
+        // specs/045 MT-11: states the line's real access-network value.
+        assert!(
+            resp.contains("\r\nP-Access-Network-Info: 3GPP-WLAN\r\n"),
+            "must state the real access network: {resp}"
+        );
+        // No `Supported:` (specs/041 conformance review, MT-10): every
+        // extension it used to claim here (timer, 100rel, replaces, path,
+        // gruu) had no behaviour behind it.
         assert!(
             !resp.contains("\r\nSupported: "),
             "must not claim an extension nothing here implements: {resp}"
@@ -642,7 +639,10 @@ mod tests {
             Some("totag1"),
             Some("<sip:me@10.0.0.9:5060>"),
             Some("v=0\r\n"),
-            UAS_EXTRA_HEADERS,
+            &[
+                ("Allow", super::super::ALLOW),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ],
         );
 
         assert!(
