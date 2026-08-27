@@ -44,9 +44,9 @@ a packetization this bridge doesn't actually use).
   test (`relay_rtp_forwards_packets_in_both_directions_until_stopped`,
   `veth.rs`) already drives real loopback sockets — the DTMF-relabel and
   SSRC-log additions are exercised the same way, with real RTP packets
-  built via `rtp::build_packet`, not mocked. `sdp.rs`'s `ptime` addition
-  follows its existing pure-function, real-string-fixture test style.
-  **PASS.**
+  built via `rtp::build_packet`, not mocked. `sdp.rs`'s ptime-honesty
+  confirmation follows its existing pure-function, real-string-fixture
+  test style. **PASS.**
 - **II. Green-on-Commit (NON-NEGOTIABLE)**: `make format && make lint &&
   make test` runs before each commit, whole workspace. **PASS** (gate
   applied at implementation time).
@@ -85,8 +85,9 @@ gsm-sip-bridge/
 │   │                   # half) — plus tests
 │   ├── transcode.rs    # relay_direction(): SSRC-change log (RTP-04,
 │   │                   # transcoding half) — plus tests
-│   ├── sdp.rs           # SdpOffer::ptime (mirrors ::maxptime exactly),
-│   │                    # build_answer_for echoes it — plus tests
+│   ├── sdp.rs           # No new field — a confirming test that the
+│   │                    # answer's ptime stays fixed regardless of the
+│   │                    # offer's own (research.md Decision 4)
 │   └── agent/
 │       ├── inbound.rs      # spawn_relay call site: thread DTMF PTs through
 │       └── origination.rs # 3 spawn_relay call sites: same
