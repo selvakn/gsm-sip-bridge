@@ -465,6 +465,10 @@ fn relay_direction(
     let mut dtmf_event_source_ts: Option<u32> = None;
     let mut pending: Vec<i16> = Vec::new();
     let mut buf = [0u8; RECV_BUF];
+    // Observability only (specs/044 RTP-04): an SSRC change is a legitimate
+    // RFC 3550 signal (a source restart), not itself an error — logged so
+    // it's visible after the fact, never a reason to drop a packet.
+    let mut last_ssrc: Option<u32> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let Some(n) = recv(&src, &mut buf, direction) else {
@@ -476,6 +480,17 @@ fn relay_direction(
         // Count the packet only once it parses as RTP — a malformed datagram is
         // not audio that flowed, and counting it would mask a one-way call.
         super::media_stats::bump(&counter);
+
+        if let Some(previous) = last_ssrc.replace(pkt.ssrc) {
+            if previous != pkt.ssrc {
+                tracing::info!(
+                    direction,
+                    previous_ssrc = previous,
+                    new_ssrc = pkt.ssrc,
+                    "RTP source SSRC changed mid-call"
+                );
+            }
+        }
 
         if Some(pkt.payload_type) == src_codec.dtmf_payload_type {
             let Some(dtmf_sender) = dtmf_sender.as_mut() else {
@@ -698,6 +713,50 @@ mod tests {
         let next = rtp::parse_packet(&buf[..n]).unwrap();
         assert_eq!(next.timestamp.wrapping_sub(first_ts), 320);
         assert_eq!(next.seq.wrapping_sub(first_seq), 1);
+
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// specs/044 RTP-04: a source SSRC change mid-call is a legitimate RFC
+    /// 3550 signal (a source restart), not a reason to drop anything — a
+    /// packet on a new SSRC must still reach the far leg exactly like any
+    /// other.
+    #[test]
+    fn a_source_ssrc_change_does_not_stop_packets_from_being_relayed() {
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        agent_b
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_transcoding_relay(
+            ims,
+            veth,
+            codec(NegotiatedCodec::Pcmu, 0),
+            codec(NegotiatedCodec::L16, 96),
+            stop.clone(),
+            &crate::ims::media_stats::MediaMeter::new(),
+        )
+        .unwrap();
+
+        let payload: Vec<u8> = (0..160).map(|i| rtp::linear_to_ulaw(i * 100)).collect();
+        carrier
+            .send(&rtp::build_packet(1, 0, 0x1111_1111, 0, &payload))
+            .unwrap();
+        let mut buf = [0u8; RECV_BUF];
+        agent_b
+            .recv(&mut buf)
+            .expect("first SSRC's packet must be relayed");
+
+        // A different SSRC — simulating a source restart.
+        carrier
+            .send(&rtp::build_packet(2, 160, 0x2222_2222, 0, &payload))
+            .unwrap();
+        let n = agent_b
+            .recv(&mut buf)
+            .expect("a packet on a new SSRC must still be relayed, not dropped");
+        assert_eq!(rtp::parse_packet(&buf[..n]).unwrap().payload.len(), 320 * 2);
 
         stop.store(true, Ordering::Relaxed);
     }
