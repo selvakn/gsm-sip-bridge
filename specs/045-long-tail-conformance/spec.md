@@ -33,6 +33,14 @@ existing logic.
   cross-message buffer keyed by sender/reference/total with its own
   eviction policy — today's decoder is stateless by design, one message in,
   one message out.
+- **SMS-07** (national-language shift tables) was attempted and then
+  deferred mid-implementation: the mechanism (recognizing which table an
+  offer selects) is small, but the part that actually fixes what a person
+  reads is the table *data* itself (TS 23.038 Annex A's character
+  mappings), which is not something to ship from memory without a
+  verifiable source — an incorrect mapping would silently decode real text
+  to the wrong characters, worse than today's honest, already-documented
+  gap.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -93,11 +101,9 @@ no carrier here has been observed sending most of these shapes yet.
 **Independent Test**: Feed a TPDU whose type is not SMS-DELIVER (e.g. an
 SMS-STATUS-REPORT) and confirm it is recognized as such rather than
 misread as a delivered message. Feed a message using a message-waiting
-UCS2 coding group and confirm it decodes as UCS2, not GSM7. Feed a message
-using a national-language shift table and confirm its characters decode
-correctly rather than falling back to the default table. Feed a TPDU that
-fails to decode over IMS and confirm an RP-ERROR is sent back rather than
-the raw undecoded bytes being relayed as if they were text.
+UCS2 coding group and confirm it decodes as UCS2, not GSM7. Feed a TPDU
+that fails to decode over IMS and confirm an RP-ERROR is sent back rather
+than the raw undecoded bytes being relayed as if they were text.
 
 **Acceptance Scenarios**:
 
@@ -107,9 +113,6 @@ the raw undecoded bytes being relayed as if they were text.
 2. **Given** a message using a message-waiting-indication coding group
    that specifies UCS2, **When** it is decoded, **Then** its text decodes
    as UCS2.
-3. **Given** a message using a national-language single-shift or
-   locking-shift table, **When** it is decoded, **Then** the characters
-   that table defines decode correctly.
 4. **Given** an inbound IMS `MESSAGE` whose body fails to decode as a
    3GPP SMS TPDU, **When** this bridge responds at the RP layer, **Then**
    it sends an RP-ERROR rather than relaying the undecoded bytes as if
@@ -206,9 +209,6 @@ than scanned as if it were.
   it is not one.
 - **FR-006**: A message using a message-waiting-indication coding group
   that specifies UCS2 MUST decode as UCS2.
-- **FR-007**: A message using a national-language single-shift or
-  locking-shift table MUST decode the characters that table defines
-  correctly, rather than falling back to the default GSM 7-bit table.
 - **FR-008**: An inbound IMS `MESSAGE` whose body fails to decode as a
   3GPP SMS TPDU MUST receive an RP-ERROR rather than being relayed as
   plain text.
@@ -263,7 +263,7 @@ than scanned as if it were.
   resolution shape as MT-05.
 - No carrier or device this bridge currently operates against has been
   observed sending most of the specific shapes this feature fixes
-  (a message-waiting UCS2 DCS, a national-language table, a non-SMS-DELIVER
-  TPDU, a non-SDP INVITE body) — these are correctness/interoperability
-  fixes for gaps that haven't caused a live incident yet, matching the
-  posture already taken for this review's other least-observed findings.
+  (a message-waiting UCS2 DCS, a non-SMS-DELIVER TPDU, a non-SDP INVITE
+  body) — these are correctness/interoperability fixes for gaps that
+  haven't caused a live incident yet, matching the posture already taken
+  for this review's other least-observed findings.

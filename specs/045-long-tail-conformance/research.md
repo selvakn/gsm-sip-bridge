@@ -6,6 +6,9 @@ resolved every finding's exact current state and mechanism.
 
 ## Decision 1: MT-06, SDP-04, SMS-05 are deferred — each needs a new subsystem
 
+(A fourth finding, SMS-07, was also deferred, but for a different reason —
+not a new subsystem, but unverifiable table data. See Decision 8.)
+
 **Decision**: Not attempted in this feature. Recorded in
 `docs/plans/mt-conformance-findings.md` as deferred, matching RTP-01's
 treatment in batch 5.
@@ -203,31 +206,38 @@ down — decoding UCS2 bytes as if they were GSM7 septets.
   The alphabet fix is the part that actually changes what text a person
   reads; the rest stays documented as out of scope, same as before.
 
-## Decision 8: SMS-07 — implement the national-language shift tables, not just document the gap
+## Decision 8: SMS-07 is deferred too — reversed mid-implementation
 
-**Decision**: `sms_pdu.rs` gains the national-language single-shift and
-locking-shift tables (TS 23.038 §6.2.1.2/6.2.1.3, Annex A) actually used
-in practice — recognizing the UDH IEs that select them (`0x24`
-single-shift, `0x25` locking-shift, TS 23.040 §9.2.3.24.10/.24.11,
-currently silently skipped by the UDH walker's catch-all) and decoding
-`0x1B`-escaped septets through the selected table instead of always the
-default extension table.
+**Decision**: Not attempted in this feature after all, despite the
+original plan to implement it. Recorded as deferred alongside MT-06/
+SDP-04/SMS-05, not `[x]` or `[-]`.
 
-**Rationale**: The module's own doc comment already flags this as a known
-gap ("vanishingly rare in practice"), and the escape-handling code has a
-concrete, if narrow, failure mode today: an escape sequence a national
-table defines but the default table doesn't hits the `_ => { bad_escape
-= true; ' ' }` arm, decoded as a literal space — and enough of those can
-even mislead the "is this actually unpacked ASCII" recovery heuristic
-elsewhere in the same file. Each TPDU carries its own table-selection IE,
-so this is resolvable within one decode call — no cross-message state
-needed, unlike SMS-05.
+**Rationale**: The mechanism half (recognizing the UDH IEs that select a
+national table — `0x24` single-shift, `0x25` locking-shift, TS 23.040
+§9.2.3.24.10/.24.11, currently silently skipped) is genuinely small. The
+part that actually fixes what a person reads is the table *data* itself
+(TS 23.038 Annex A's character mappings for Turkish/Spanish/Portuguese),
+and that data is not something to transcribe from memory with confidence
+high enough to ship — an incorrect mapping would silently decode real
+text to the *wrong* characters, which is a worse outcome than today's
+already-honest, already-documented gap (falls back to the default table,
+described as "vanishingly rare in practice" in this module's own header).
+Shipping unverified table data would be exactly the kind of defect this
+whole review exists to eliminate, introduced by this review itself.
+Implementing the recognition half alone, with no correct table behind
+it, would only add a code path with nothing verified to connect it to —
+not a meaningful improvement over the status quo.
 
-**Scope boundary**: only the language tables with real-world traffic
-justifying them (per TS 23.038 Annex A — Turkish, Spanish/Portuguese) are
-added, not the full generic table-selection mechanism for every locale
-TS 23.038 defines. Extending to more tables later is adding table data,
-not new mechanism.
+**Alternatives considered**:
+- Add IE recognition only (log that a national table was requested,
+  still decode with the default table) — rejected: doesn't fix what a
+  person reads, and adds surface area for a table selection nothing acts
+  on correctly yet.
+- Transcribe the Annex A tables from memory now — rejected: real risk of
+  a wrong mapping, which is worse than the current, correctly-described
+  gap. This is the kind of data this project has consistently sourced
+  from real captured traffic or a verifiable spec text (e.g. the UCS2
+  emoji fix, SMS-EMOJI-01) rather than recollection.
 
 ## Decision 9: CS-03/CS-04 — small, independent fixes in the two circuit-switched code paths
 

@@ -54,7 +54,7 @@ annotations all reflect reality; existing response-builder tests
 
 ---
 
-## Phase 2: User Story 2 - SMS decoding handles specific wire shapes (SMS-02, SMS-03, SMS-04, SMS-07, Priority: P2)
+## Phase 2: User Story 2 - SMS decoding handles specific wire shapes (SMS-02, SMS-03, SMS-04, Priority: P2)
 
 - [ ] T011 [US2] In `gsm-sip-bridge/src/ims/sms_pdu.rs`: add
       `TpduMessageType` (`Deliver`/`SubmitReport`/`StatusReport`/`Reserved`,
@@ -85,15 +85,11 @@ annotations all reflect reality; existing response-builder tests
       `0xF0` branch (SMS-04).
 - [ ] T017 [P] [US2] Test: a DCS in `0xE0`-`0xEF` with bit 2 set decodes as
       UCS2, not GSM7.
-- [ ] T018 [US2] In `gsm-sip-bridge/src/ims/sms_pdu.rs`: recognize the
-      national-language single-shift (`0x24`) and locking-shift (`0x25`)
-      UDH IEs (currently silently skipped by the UDH walker's catch-all),
-      add the corresponding TS 23.038 Annex A table(s) for the languages
-      with real-world traffic (Turkish, Spanish/Portuguese), and decode
-      `0x1B`-escaped septets through the selected table instead of always
-      the default extension table (SMS-07).
-- [ ] T019 [P] [US2] Test: a message using a national-language shift table
-      decodes its defined characters correctly.
+- [x] ~~T018/T019 (SMS-07)~~ — deferred mid-implementation, not done. The
+      mechanism (recognizing the `0x24`/`0x25` UDH IEs) is small, but
+      shipping without verified TS 23.038 Annex A table data risks
+      decoding real text to the *wrong* characters — worse than today's
+      honest, already-documented gap. See `research.md` Decision 8.
 
 **Checkpoint**: Every TPDU shape this bridge might receive is recognized
 correctly; a decode failure gets an RP-ERROR, never a raw-bytes relay.
@@ -134,9 +130,9 @@ correctly; a decode failure gets an RP-ERROR, never a raw-bytes relay.
 ## Phase 4: Polish & Cross-Cutting
 
 - [ ] T027 Update `docs/plans/mt-conformance-findings.md`: mark
-      MT-04/MT-11/MT-12/MT-13/SDP-05/SMS-02/SMS-03/SMS-04/SMS-07/CS-03/CS-04
+      MT-04/MT-11/MT-12/MT-13/SDP-05/SMS-02/SMS-03/SMS-04/CS-03/CS-04
       `[x]` with "Landed" writeups matching batches 1-5's style; record
-      MT-06/SDP-04/SMS-05 as explicitly deferred (not `[x]`, not `[-]`),
+      MT-06/SDP-04/SMS-05/SMS-07 as explicitly deferred (not `[x]`, not `[-]`),
       pointing at this feature's `research.md` Decision 1.
 - [ ] T028 Add one entry to `RELEASE_NOTES.md` under `## Unreleased`.
 - [ ] T029 `make format && make lint && make test` (whole workspace,
@@ -153,5 +149,5 @@ sequencing, matching Constitution Principle III. Within Phase 1, T001-T002
 (MT-12) and T003-T006 (MT-11) touch `session.rs`/`inbound.rs` but
 different functions; T007-T010 (MT-13) is fully independent (`sip_client.rs`
 + `sip/server/mod.rs`). Within Phase 2, T011-T015 (SMS-02/03) must land
-before T016-T019 (SMS-04/07) only in the sense that they touch the same
+before T016-T017 (SMS-04) only in the sense that they touch the same
 file — no functional dependency. Phase 4 depends on Phases 1-3.
