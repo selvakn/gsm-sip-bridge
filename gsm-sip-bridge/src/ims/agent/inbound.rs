@@ -17,9 +17,10 @@ use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
-    build_100_trying, build_180_ringing, build_420_bad_extension, build_486_busy_here,
-    build_488_incompatible_transport, build_488_not_acceptable, build_uas_response,
-    build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
+    build_100_trying, build_180_ringing, build_415_unsupported_media, build_420_bad_extension,
+    build_486_busy_here, build_488_incompatible_transport, build_488_not_acceptable,
+    build_uas_response, build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage,
+    SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -68,6 +69,25 @@ pub(super) struct InviteContext<'a> {
     /// answered inbound INVITE (specs/045 MT-11) — previously omitted
     /// entirely.
     pub(super) access_network_info: &'a str,
+}
+
+/// Whether this UAS can interpret an inbound INVITE's body as SDP: no
+/// `Content-Type` at all (the long-standing implicit assumption — an
+/// offerless INVITE, RFC 3261 §14.2/RFC 3264 §3, is a separate,
+/// deliberately out-of-scope finding, specs/045 SDP-04), or
+/// `application/sdp` compared with any `;`-delimited parameters ignored.
+/// Anything else — including `multipart/mixed` — is declined rather than
+/// scanned as if it were bare SDP text (specs/045 SDP-05).
+fn invite_content_type_supported(req: &SipRequest) -> bool {
+    match req.header("Content-Type") {
+        None => true,
+        Some(ct) => ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/sdp"),
+    }
 }
 
 /// Answers (or declines) one inbound carrier `INVITE`. Returns `Some` with
@@ -121,6 +141,35 @@ pub(super) fn handle_invite(
     }
 
     sink.send(&build_100_trying(req))?;
+
+    // specs/045 SDP-05: `req.body` was handed to `parse_offer` completely
+    // unconditionally — whatever the `Content-Type` said, or didn't say.
+    // `parse_offer`'s line-scanner has no concept of MIME structure, so a
+    // multipart body's boundary/part-header lines are silently skipped as
+    // unrecognized and its SDP part's `m=`/`c=`/`a=` lines are
+    // indistinguishable, to that scanner, from a bare SDP body's own —
+    // which is why a well-formed multipart body could parse "by accident"
+    // and a malformed one could misfire in stranger ways. Same posture
+    // already established for `MESSAGE` bodies (SMS-06,
+    // `message_content_type_supported`): decline what isn't recognized
+    // instead of guessing at it.
+    if !invite_content_type_supported(req) {
+        let content_type = req.header("Content-Type").unwrap_or("(none)").to_string();
+        let to_tag = random_hex(4);
+        tracing::info!(
+            call_id = %call_id,
+            content_type = %content_type,
+            "declining: INVITE body is not one we can interpret as SDP"
+        );
+        sink.send(&build_415_unsupported_media(req, &to_tag, "application/sdp"))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
+        return Ok(None);
+    }
 
     let offer = sdp::parse_offer(&req.body)?;
 
@@ -570,6 +619,47 @@ fn await_pbx_answer(
 mod tests {
     use super::*;
 
+    fn invite_with_content_type(content_type: Option<&str>) -> SipRequest {
+        let ct_line = content_type
+            .map(|ct| format!("Content-Type: {ct}\r\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n{ct_line}Content-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// specs/045 SDP-05: `application/sdp`, and no `Content-Type` at all
+    /// (today's long-standing implicit assumption), are both accepted.
+    #[test]
+    fn supported_invite_content_types_are_accepted() {
+        assert!(invite_content_type_supported(&invite_with_content_type(
+            Some("application/sdp")
+        )));
+        assert!(invite_content_type_supported(&invite_with_content_type(
+            Some("APPLICATION/SDP")
+        )));
+        assert!(invite_content_type_supported(&invite_with_content_type(
+            None
+        )));
+    }
+
+    /// A `multipart/mixed` (or any other unrecognized) body must be
+    /// declined, not scanned as if it were bare SDP text.
+    #[test]
+    fn an_unrecognised_invite_content_type_is_not_supported() {
+        assert!(!invite_content_type_supported(&invite_with_content_type(
+            Some("multipart/mixed; boundary=abc")
+        )));
+        assert!(!invite_content_type_supported(&invite_with_content_type(
+            Some("application/isup")
+        )));
+    }
+
     /// The `200 OK` answering a carrier INVITE must state what we accept.
     /// This was the difference between an inbound Jio call that holds and one
     /// torn down ~460 ms later with `cause=503 "SIP SDP Protocol Error"`, and
@@ -652,6 +742,54 @@ mod tests {
         assert!(
             !resp.contains("\r\nSupported: "),
             "must not claim timer support even though the offer asked for it: {resp}"
+        );
+    }
+
+    /// specs/045 MT-04: `100rel` (RFC 3262 reliable provisionals) is never
+    /// advertised on any UAS response — `SUPPORTED_EXTENSIONS` being empty
+    /// (since MT-10) already covers this, the same way it covers `timer`
+    /// (MT-05) — and a caller `Require`ing it is still declined `420`
+    /// (MT-03's existing gate) rather than silently accepted. No new
+    /// behavior; this pins both as already correct.
+    #[test]
+    fn the_answering_response_never_advertises_100rel() {
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
+
+        let resp = build_uas_response_with_headers(
+            200,
+            "OK",
+            &req,
+            Some("totag1"),
+            Some("<sip:me@10.0.0.9:5060>"),
+            Some("v=0\r\n"),
+            &[
+                ("Allow", super::super::ALLOW),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ],
+        );
+        assert!(
+            !resp.contains("\r\nSupported: "),
+            "must not advertise 100rel (or anything else): {resp}"
+        );
+
+        let requiring_100rel = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKtwo\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c2\r\nCSeq: 1 INVITE\r\n\
+                      Require: 100rel\r\nContent-Length: 0\r\n\r\n";
+        let (req2, _) = SipRequest::try_parse(requiring_100rel.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::super::unsupported_required_extensions(&req2),
+            vec!["100rel".to_string()],
+            "Require: 100rel must still be declined, not silently honoured"
         );
     }
 
