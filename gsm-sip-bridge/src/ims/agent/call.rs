@@ -309,6 +309,28 @@ pub(super) fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlM
 /// row, and `active_calls` back to 0 — shared by every path that can end an
 /// `ActiveCall` (carrier `BYE`, PBX-originated `CallEnded`, Agent B's
 /// control connection dropping mid-call).
+///
+/// **Known, accepted staleness** (specs/046-rtcp-reporting, PR #66 review):
+/// every caller sets `call.stop` immediately before calling this, but the
+/// relay and RTCP threads that publish `call.meter`/`call.rtcp`'s shared
+/// state are never joined — only signaled — so a report or packet still
+/// being processed at the moment of this call is not reflected here. The
+/// window is bounded to roughly one `RELAY_POLL_INTERVAL`/
+/// `REPORT_POLL_INTERVAL` (200ms) of trailing local packets, or one RTCP
+/// report interval of far-end data. Closing it fully would mean every relay
+/// spawn function (`spawn_relay`, `spawn_transcoding_relay`,
+/// `rtcp::spawn_report_loop` — none of which return a `JoinHandle` today)
+/// growing one, `ActiveCall` storing them, and every one of this function's
+/// three call sites joining them first — a structural change to
+/// long-established, heavily call-tested relay-spawning code (predating
+/// this feature) for a benefit bounded to the tail of one diagnostic log
+/// line and a few histogram observations. `call.meter`'s own
+/// `carrier_rx`/`pbx_rx` counts have had this identical characteristic
+/// since specs/016-volte-calls, five conformance-review batches before
+/// this one, with no prior finding raised against it — RTP-01 extends the
+/// same pattern to two more values rather than introducing a new one.
+/// Deliberately not fixed here; revisit only if it is ever shown to matter
+/// in practice (e.g. a short call whose tail carried a real quality drop).
 pub(super) fn report_answered_call_ended(
     obs: &observability::AgentObservability,
     call: &ActiveCall,

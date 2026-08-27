@@ -129,6 +129,21 @@ RTCP thread that US1 has to build anyway.
   obstacle batch 5 identified. The RTCP thread sidesteps it by *being* the
   socket's owner.
 
+**Follow-up (PR #66 review)**: this same not-joining-threads decision has
+a second-order consequence Greptile's review caught twice: because
+`report_answered_call_ended` signals `stop` but never joins the relay/
+RTCP threads, the "final" figures it logs and reports as metrics can miss
+whatever those threads process in the following ~200ms. Reordering to
+signal `stop` before reading (landed in the PR) narrows this window but
+cannot close it without joining — which is exactly what this Decision
+already rejected, for the same reason (a join on `end_call_attachment_lost`
+in particular risks blocking on a socket whose peer is already gone).
+Documented as a permanent, deliberate trade-off on
+`agent::call::report_answered_call_ended`'s own doc comment rather than
+fixed, on the same reasoning as above: `MediaMeter`'s `carrier_rx`/
+`pbx_rx` have had this identical characteristic since specs/016, five
+batches before this one, with no prior finding against it.
+
 ---
 
 ## Decision 3: One RTCP thread per call, owning the socket, doing all four jobs
