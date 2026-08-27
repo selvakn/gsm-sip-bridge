@@ -1469,6 +1469,38 @@ mod tests {
         assert!(!sdp.contains("maxptime"));
     }
 
+    /// specs/044 SDP-06: an offer's own `a=ptime` describes what *it*
+    /// intends to send, not a request for what our answer should claim —
+    /// unlike `maxptime` (a received-side upper bound this bridge already
+    /// respects by always framing at 20ms, so echoing it is a true
+    /// statement), always answering `a=ptime:20` is already honest: this
+    /// bridge's own framing is fixed at 20ms
+    /// (`NegotiatedCodec::frame_samples`'s own doc), not adjustable per
+    /// offer. Echoing the offer's `ptime` into our own answer instead would
+    /// be the opposite fix — claiming a packetisation we don't actually
+    /// use. Confirmed here rather than changed: an offer requesting a
+    /// non-default `ptime` must not change what our answer states.
+    #[test]
+    fn the_answer_always_states_its_own_true_20ms_ptime_regardless_of_the_offers() {
+        let body = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                     m=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:40\r\n";
+        let offer = parse_offer(body).unwrap();
+        let (sdp, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::legacy(),
+        )
+        .unwrap();
+        assert!(
+            sdp.contains("a=ptime:20\r\n"),
+            "must state our own true framing, not the offer's requested one: {sdp}"
+        );
+    }
+
     #[test]
     fn an_offer_without_telephone_event_is_answered_without_one() {
         let body = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
