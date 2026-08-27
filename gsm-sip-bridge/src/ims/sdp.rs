@@ -363,7 +363,8 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     let mut fmtp: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
     let mut maxptime: Option<u32> = None;
     let mut proto = String::new();
-    let mut direction = MediaDirection::default();
+    let mut session_direction = MediaDirection::default();
+    let mut audio_direction: Option<MediaDirection> = None;
     let mut other_media: Vec<DeclinedMedia> = Vec::new();
 
     // An SDP body can hold several media sections, and payload-type numbers are
@@ -421,6 +422,26 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
                     conn_ip = addr_str.parse().ok();
                 }
             }
+        } else if let Some(dir) = match line {
+            "a=sendonly" => Some(MediaDirection::SendOnly),
+            "a=recvonly" => Some(MediaDirection::RecvOnly),
+            "a=inactive" => Some(MediaDirection::Inactive),
+            "a=sendrecv" => Some(MediaDirection::SendRecv),
+            _ => None,
+        } {
+            // RFC 4566 §5.14: a session-level direction attribute (before
+            // any `m=` line) applies to every media section that doesn't
+            // state its own — recognized here regardless of the `!in_audio`
+            // guard below, which only gates attributes that are meaningless
+            // outside a media section (rtpmap/fmtp/maxptime). A direction
+            // attribute under some *other*, later media section is neither
+            // session-level nor the audio section's own, and is correctly
+            // ignored (specs/043 SDP-02, PR review 2026-08-27).
+            if in_audio {
+                audio_direction = Some(dir);
+            } else if !seen_media {
+                session_direction = dir;
+            }
         } else if !in_audio {
             continue;
         } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
@@ -451,16 +472,13 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
             if let Some(params) = parts.next() {
                 fmtp.insert(pt, params.trim().to_string());
             }
-        } else if line == "a=sendonly" {
-            direction = MediaDirection::SendOnly;
-        } else if line == "a=recvonly" {
-            direction = MediaDirection::RecvOnly;
-        } else if line == "a=inactive" {
-            direction = MediaDirection::Inactive;
-        } else if line == "a=sendrecv" {
-            direction = MediaDirection::SendRecv;
         }
     }
+
+    // The audio section's own direction attribute overrides the
+    // session-level one if both are present (RFC 4566 §5.14); absent
+    // either, the default is `SendRecv`.
+    let direction = audio_direction.unwrap_or(session_direction);
 
     let conn_ip = conn_ip
         .ok_or_else(|| BridgeError::Ims("SDP offer missing c= connection address".into()))?;
@@ -1854,6 +1872,40 @@ mod tests {
             .unwrap();
             assert!(sdp.contains("a=sendrecv\r\n"), "{sdp}");
         }
+    }
+
+    /// PR review, 2026-08-27: a direction attribute placed at *session*
+    /// level (before any `m=` line, RFC 4566 §5.14) applies to the audio
+    /// section too when the section states none of its own — the
+    /// `!in_audio` guard must not skip it just because it comes before the
+    /// first `m=` line.
+    #[test]
+    fn a_session_level_direction_applies_to_the_audio_section() {
+        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
+             t=0 0\r\na=sendonly\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(offer.direction, MediaDirection::SendOnly);
+        let (sdp, _) = build_answer(
+            "10.0.0.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            false,
+            false,
+            AnswerPreference::Legacy,
+        )
+        .unwrap();
+        assert!(sdp.contains("a=recvonly\r\n"), "{sdp}");
+    }
+
+    /// The audio section's own direction attribute overrides a session-level
+    /// one when both are present (RFC 4566 §5.14).
+    #[test]
+    fn the_audio_sections_own_direction_overrides_the_session_level_one() {
+        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
+             t=0 0\r\na=sendonly\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=inactive\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(offer.direction, MediaDirection::Inactive);
     }
 
     #[test]
