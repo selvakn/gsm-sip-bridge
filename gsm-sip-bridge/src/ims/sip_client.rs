@@ -449,6 +449,95 @@ pub fn build_uas_response_with_headers(
     msg
 }
 
+/// RFC 3261 §18.2.1 / RFC 3581 §4: annotate a response's top `Via` with
+/// `received=`/`rport=` reflecting where the request it answers actually
+/// arrived from, when its own stated sent-by disagrees. A no-op unless
+/// `message` is a response (`SIP/2.0 <code> ...` — a request we originate
+/// starts `<METHOD> ... SIP/2.0` instead) — `received`/`rport` are only
+/// ever added by whoever *received* a request, naming its real source;
+/// self-annotating a request we're sending would be backwards.
+///
+/// Applied at the two places a response is actually written to a socket
+/// (`SipSink::send`, `sip::server::serve`) rather than threaded through
+/// every one of `build_uas_response_with_headers`'s call sites — the real
+/// peer address is only known there, and centralizing it there means two
+/// call sites, not dozens (specs/045 MT-13).
+pub fn annotate_via_received_rport(message: &str, peer: SocketAddr) -> String {
+    if !message.starts_with("SIP/2.0 ") {
+        return message.to_string();
+    }
+    let mut annotated_top_via = false;
+    let lines: Vec<String> = message
+        .split("\r\n")
+        .map(|line| {
+            if annotated_top_via {
+                return line.to_string();
+            }
+            let Some(rest) = line.strip_prefix("Via: ") else {
+                return line.to_string();
+            };
+            annotated_top_via = true;
+            match annotate_one_via(rest, peer) {
+                Some(annotated) => format!("Via: {annotated}"),
+                None => line.to_string(),
+            }
+        })
+        .collect();
+    lines.join("\r\n")
+}
+
+/// `"SIP/2.0/<transport> <sent-by>[;params]"` -> the same, with
+/// `received=`/`rport=` added/filled per RFC 3261 §18.2.1 / RFC 3581 §4.
+/// `None` if `via` isn't well-formed enough to find a sent-by in.
+fn annotate_one_via(via: &str, peer: SocketAddr) -> Option<String> {
+    let (proto_and_sentby, params) = via.split_once(';').unwrap_or((via, ""));
+    let (proto, sent_by) = proto_and_sentby.trim_end().rsplit_once(' ')?;
+
+    let mut out_params = String::new();
+    for param in params.split(';').filter(|p| !p.is_empty()) {
+        if param == "rport" || param.starts_with("rport=") {
+            out_params.push_str(&format!(";rport={}", peer.port()));
+        } else {
+            out_params.push(';');
+            out_params.push_str(param);
+        }
+    }
+    // `received=` whenever the sent-by's own host doesn't literally match
+    // the real source (RFC 3261 §18.2.1) — a plain string comparison, not a
+    // DNS resolution this bridge has no reason to perform. A hostname
+    // sent-by can never textually equal a numeric peer address, so it
+    // always gets `received=` too, the same as a genuinely mismatched IP
+    // (PR review, 2026-08-27 — corrects an earlier fix that skipped
+    // `received=` entirely for anything that wasn't itself a valid IP,
+    // missing exactly the hostname case this is meant to cover).
+    if sent_by_host(sent_by) != peer.ip().to_string() {
+        out_params.push_str(&format!(";received={}", peer.ip()));
+    }
+    Some(format!("{proto} {sent_by}{out_params}"))
+}
+
+/// Just the host portion of a Via sent-by (`"host[:port]"`), for a literal
+/// string comparison against the real source address — not address
+/// resolution, so a hostname is returned as-is (and, being a hostname,
+/// will simply never match a numeric peer address, correctly always
+/// getting `received=`).
+fn sent_by_host(sent_by: &str) -> &str {
+    if let Some(rest) = sent_by.strip_prefix('[') {
+        // Bracketed IPv6 (RFC 3261's own grammar for it): host ends at `]`.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // A hostname or IPv4 has at most one colon (its optional ":port"). An
+    // unbracketed IPv6 literal is malformed per RFC 3261's sent-by grammar
+    // (brackets are required specifically to disambiguate from a port) —
+    // handled safely here anyway: more than one colon means there's no way
+    // to tell which one would be a port separator, so the whole string is
+    // kept as the host rather than guessing.
+    match sent_by.matches(':').count() {
+        1 => sent_by.split(':').next().unwrap_or(sent_by),
+        _ => sent_by,
+    }
+}
+
 /// `100 Trying` — no `To` tag (see `build_uas_response` docs), no `Contact`.
 pub fn build_100_trying(request: &SipRequest) -> String {
     build_uas_response(100, "Trying", request, None, None, None)
@@ -511,6 +600,29 @@ pub fn build_488_not_acceptable(request: &SipRequest, to_tag: &str, agent: &str)
         &[(
             "Warning",
             &format!("304 {agent} \"media type not available\""),
+        )],
+    )
+}
+
+/// `488 Not Acceptable Here` — declines an inbound `INVITE` whose offer
+/// names an `m=` transport profile this UAS does not implement (e.g.
+/// `RTP/SAVP`; this bridge does no SRTP). Distinct from
+/// [`build_488_not_acceptable`]'s `Warning: 304` (which means "media type,"
+/// i.e. codec, not available): this carries `Warning: 305` (RFC 3261
+/// §20.43 table: "Incompatible network protocol used"), so a capture states
+/// the real cause — the transport, not the codec list — rather than
+/// conflating the two under one warning text (specs/043 SDP-03).
+pub fn build_488_incompatible_transport(request: &SipRequest, to_tag: &str, agent: &str) -> String {
+    build_uas_response_with_headers(
+        488,
+        "Not Acceptable Here",
+        request,
+        Some(to_tag),
+        None,
+        None,
+        &[(
+            "Warning",
+            &format!("305 {agent} \"incompatible network protocol used\""),
         )],
     )
 }
@@ -1196,7 +1308,30 @@ enum SinkInner {
 }
 
 impl SipSink {
+    /// The real address this sink's messages actually go to — for UDP, the
+    /// peer captured when the sink was created (the datagram's own source,
+    /// per `spawn_gm_udp_server`'s docs); for TCP, the connection's own
+    /// peer address. Used to annotate a response's `Via` with `received=`/
+    /// `rport=` (specs/045 MT-13) — `None` only if the OS-level query
+    /// itself fails, in which case the response is sent unannotated rather
+    /// than not sent at all.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        match &*self.inner {
+            SinkInner::Tcp(stream) => stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peer_addr()
+                .ok(),
+            SinkInner::Udp(_, peer) => Some(*peer),
+        }
+    }
+
     pub fn send(&self, message: &str) -> BridgeResult<()> {
+        let message = match self.peer_addr() {
+            Some(peer) => annotate_via_received_rport(message, peer),
+            None => message.to_string(),
+        };
+        let message = message.as_str();
         tracing::debug!(message = %message, "sending SIP message");
         match &*self.inner {
             SinkInner::Tcp(stream) => stream
@@ -2313,6 +2448,25 @@ mod tests {
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
+    /// specs/043 SDP-03: the transport-profile decline must carry a
+    /// distinct `Warning: 305`, not be conflated with the codec-mismatch
+    /// decline's `Warning: 304` above.
+    #[test]
+    fn build_488_incompatible_transport_states_the_protocol_warning() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
+        let resp = build_488_incompatible_transport(&req, "totag1", "10.0.0.9:5060");
+        assert!(resp.starts_with("SIP/2.0 488 Not Acceptable Here\r\n"));
+        assert!(
+            resp.contains(
+                "\r\nWarning: 305 10.0.0.9:5060 \"incompatible network protocol used\"\r\n"
+            ),
+            "{resp}"
+        );
+        assert!(!resp.contains("304"), "{resp}");
+    }
+
     /// RFC 3261 §8.2.2.3: refusing an unsupported `Require` must list which
     /// extensions in `Unsupported`, not just say "no".
     #[test]
@@ -2459,6 +2613,76 @@ mod tests {
         let first_via = resp.find("Via: SIP/2.0/TCP 1.1.1.1").unwrap();
         let second_via = resp.find("Via: SIP/2.0/TCP 2.2.2.2").unwrap();
         assert!(first_via < second_via);
+    }
+
+    /// specs/045 MT-13: a mismatched sent-by gets `received=` naming the
+    /// real source.
+    #[test]
+    fn annotate_via_received_rport_adds_received_when_sent_by_disagrees() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(
+            annotated.contains(";received=203.0.113.9\r\n"),
+            "{annotated}"
+        );
+    }
+
+    #[test]
+    fn annotate_via_received_rport_fills_a_bare_rport() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1;rport\r\n\r\n";
+        let peer: SocketAddr = "10.1.1.1:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(annotated.contains(";rport=6001\r\n"), "{annotated}");
+        // Sent-by IP matches the peer's, so no `received=` is added.
+        assert!(!annotated.contains("received="), "{annotated}");
+    }
+
+    /// PR review, 2026-08-27: a hostname sent-by (legal per RFC 3261's
+    /// `sent-by = host [":" port]`) can't be compared to the peer's IP, so
+    /// `received=` must be skipped — but `rport` doesn't depend on that
+    /// comparison at all and must still be filled.
+    #[test]
+    fn annotate_via_received_rport_fills_rport_even_with_a_hostname_sent_by() {
+        let resp =
+            "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP pcscf.example.net:5067;branch=b1;rport\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(annotated.contains(";rport=6001;"), "{annotated}");
+        // PR review, 2026-08-27: a hostname can never textually match a
+        // numeric peer address, so it correctly always gets `received=`
+        // too — this bridge does no DNS resolution to decide otherwise.
+        assert!(
+            annotated.contains(";received=203.0.113.9\r\n"),
+            "{annotated}"
+        );
+    }
+
+    /// A sent-by with no port at all (legal — `sent-by = host [":" port]`)
+    /// must still be comparable for `received=`.
+    #[test]
+    fn annotate_via_received_rport_compares_a_portless_sent_by() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1;branch=b1\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(
+            annotated.contains(";received=203.0.113.9\r\n"),
+            "{annotated}"
+        );
+    }
+
+    #[test]
+    fn annotate_via_received_rport_leaves_a_request_untouched() {
+        let req = "BYE sip:x SIP/2.0\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1;rport\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        assert_eq!(annotate_via_received_rport(req, peer), req);
+    }
+
+    #[test]
+    fn annotate_via_received_rport_leaves_an_already_matching_via_untouched() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1:5067;branch=b1\r\n\r\n";
+        let peer: SocketAddr = "10.1.1.1:5067".parse().unwrap();
+        assert_eq!(annotate_via_received_rport(resp, peer), resp);
     }
 
     #[test]

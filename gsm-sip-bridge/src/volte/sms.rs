@@ -518,6 +518,13 @@ fn sweep_modem_storage(
         // to the IMS `MESSAGE` route — see `sms::reader::decode_pdu_line`'s
         // docs (specs/041 conformance review, CS-01/CS-02).
         let _ = at.send_command("AT+CMGF=0")?;
+        // specs/045 CS-03: explicitly assert the new-message storage policy
+        // (route class 2 SMS to `<mem>` storage, no other URC-based
+        // routing) rather than relying on whatever the modem's own
+        // power-on default happens to be — this sweep depends entirely on
+        // messages actually landing in storage to poll. Parity with the
+        // legacy multi-card pool's own init (`modules::worker::ModuleWorker::open`).
+        let _ = at.send_command("AT+CNMI=2,1,0,0,0")?;
         crate::sms::reader::list_sms_indexes(&mut at)?
     };
     if indexes.is_empty() {

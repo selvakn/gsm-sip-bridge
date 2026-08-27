@@ -728,7 +728,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection.
     let mut inbound = start_inbound(&session)?;
-    subscribe_reg_event(&mut session);
+    subscribe_reg_event(&mut session, &reg_cfg.access_network_info);
 
     // What the registrar actually granted, not what we asked for: renewing on
     // the requested value would leave a window where the binding has lapsed
@@ -1077,6 +1077,71 @@ fn handle_message(
             );
             return;
         }
+        // specs/045 SMS-02: the RP-DATA was fine, but its TPDU isn't
+        // SMS-DELIVER (an SMS-SUBMIT-REPORT or SMS-STATUS-REPORT) —
+        // recognized, not garbled, and still owed an RP-ACK (the RP-DATA
+        // itself was received), never relayed as text.
+        Some(crate::ims::sms_pdu::DecodedRp::UnsupportedTpdu { rp_mr, kind }) => {
+            tracing::info!(
+                sender = %sender,
+                rp_mr,
+                kind = ?kind,
+                "received a non-SMS-DELIVER TPDU on the SMS transport; not a deliverable message"
+            );
+            respond(
+                sink,
+                "200 OK (MESSAGE, non-deliver TPDU)",
+                &build_200_ok_message(req, &random_hex(4)),
+            );
+            // The RP-DATA envelope itself was still received (just not a
+            // deliverable message) — it still owes the network an RP-ACK,
+            // the same as a genuinely decoded message would (PR review,
+            // 2026-08-27). Without this the network never sees the RP layer
+            // acknowledged and retains or retries the RP-DATA.
+            if let Some(ipsmgw) =
+                header_uri(req, "P-Asserted-Identity").or_else(|| header_uri(req, "From"))
+            {
+                send_sms_delivery_report(
+                    session,
+                    &ipsmgw,
+                    &crate::ims::sms_pdu::build_rp_ack(rp_mr),
+                );
+            } else {
+                tracing::warn!(
+                    "no P-Asserted-Identity or From URI on an SMS MESSAGE; cannot address an RP-ACK"
+                );
+            }
+            return;
+        }
+        // specs/045 SMS-03: the TPDU claimed to be SMS-DELIVER but couldn't
+        // be decoded — a genuine failure, so an RP-ERROR is owed instead of
+        // an RP-ACK, and req.body must never be relayed as if it were text.
+        Some(crate::ims::sms_pdu::DecodedRp::Undecodable { rp_mr }) => {
+            tracing::warn!(
+                sender = %sender,
+                rp_mr,
+                "could not decode a TPDU claiming to be SMS-DELIVER; reporting RP-ERROR"
+            );
+            respond(
+                sink,
+                "200 OK (MESSAGE, undecodable TPDU)",
+                &build_200_ok_message(req, &random_hex(4)),
+            );
+            if let Some(ipsmgw) =
+                header_uri(req, "P-Asserted-Identity").or_else(|| header_uri(req, "From"))
+            {
+                send_sms_delivery_report(
+                    session,
+                    &ipsmgw,
+                    &crate::ims::sms_pdu::build_rp_error(rp_mr, None),
+                );
+            } else {
+                tracing::warn!(
+                    "no P-Asserted-Identity or From URI on an SMS MESSAGE; cannot address an RP-ERROR"
+                );
+            }
+            return;
+        }
         None => None,
     };
     if let Some(decoded) = &decoded {
@@ -1289,6 +1354,7 @@ impl DispatchParams<'_> {
             answer_preference: self.answer_preference,
             veth_sip_port: self.veth_sip_port,
             obs: self.obs,
+            access_network_info: &self.reg_cfg.access_network_info,
         }
     }
 
@@ -2169,7 +2235,7 @@ impl LoopState {
                 self.force_renewal = false;
                 self.gm_conn = crate::ims::GmConnectionState::Up;
                 p.obs.set_gm_connection_up(true);
-                subscribe_reg_event(session);
+                subscribe_reg_event(session, &p.reg_cfg.access_network_info);
             }
             Err(e) => {
                 tracing::warn!(
@@ -2249,6 +2315,7 @@ mod tests {
             from_tag: "tag1",
             cseq: 7,
             expires: 3600,
+            access_network_info: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01",
         });
         assert!(msg
             .starts_with("SUBSCRIBE sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org SIP/2.0"));
@@ -2263,6 +2330,11 @@ mod tests {
         // Contact carries the protected server port, Via the client port.
         assert!(msg.contains("Contact: <sip:404940965025744@1.2.3.4:48586;transport=TCP>\r\n"));
         assert!(msg.contains("Via: SIP/2.0/TCP 1.2.3.4:48584;"));
+        // specs/045 MT-11: states the real access-network value, not a
+        // hardcoded one.
+        assert!(msg.contains(
+            "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01\r\n"
+        ));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
@@ -2280,6 +2352,29 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\nFrom: garbage\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "unknown");
+    }
+
+    /// specs/045 MT-12: a trusted network element's `P-Asserted-Identity`
+    /// wins over the caller-supplied `From` when both are present — measured
+    /// on real carrier traffic where the two legitimately differ (an SMSC
+    /// gateway's own hostname in `From`, the real subscriber in P-Asserted-Identity).
+    #[test]
+    fn extract_caller_prefers_p_asserted_identity_over_from() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: <sip:gateway.ims.example>;tag=abc\r\n\
+                    P-Asserted-Identity: <sip:+919000000000@ims.example>\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000000");
+    }
+
+    #[test]
+    fn extract_caller_falls_back_to_from_when_no_asserted_identity() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: <sip:+919000000001@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000001");
     }
 
     fn message_with_headers(headers: &str) -> SipRequest {
@@ -2411,6 +2506,54 @@ mod tests {
         assert_eq!(
             decode_pdu_body(&req),
             Some(crate::ims::sms_pdu::DecodedRp::Ack { rp_mr: 0x42 })
+        );
+    }
+
+    /// specs/045 SMS-02: a TPDU that isn't SMS-DELIVER must be recognized as
+    /// such, never fall through to `handle_message`'s raw-bytes-as-text path.
+    #[test]
+    fn decode_pdu_body_recognizes_a_non_deliver_tpdu_as_not_a_message() {
+        // RP-DATA (MTI=1), MR=0x11, no addresses, one-byte TPDU with
+        // TP-MTI=10 (SMS-STATUS-REPORT).
+        let rp = vec![0x01, 0x11, 0x00, 0x00, 0x01, 0b10];
+        let mut raw = b"MESSAGE sip:x SIP/2.0\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n"
+            .to_vec();
+        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", rp.len()).as_bytes());
+        raw.extend_from_slice(&rp);
+
+        let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
+        assert_eq!(
+            decode_pdu_body(&req),
+            Some(crate::ims::sms_pdu::DecodedRp::UnsupportedTpdu {
+                rp_mr: 0x11,
+                kind: crate::ims::sms_pdu::TpduMessageType::StatusReport,
+            })
+        );
+    }
+
+    /// specs/045 SMS-03: a TPDU claiming SMS-DELIVER but too short to parse
+    /// must be recognized as undecodable, never fall through to
+    /// `handle_message`'s raw-bytes-as-text path.
+    #[test]
+    fn decode_pdu_body_recognizes_a_truncated_deliver_tpdu_as_undecodable() {
+        // RP-DATA (MTI=1), MR=0x13, no addresses, one-byte TPDU with
+        // TP-MTI=00 (SMS-DELIVER) and nothing else.
+        let rp = vec![0x01, 0x13, 0x00, 0x00, 0x01, 0x00];
+        let mut raw = b"MESSAGE sip:x SIP/2.0\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n"
+            .to_vec();
+        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", rp.len()).as_bytes());
+        raw.extend_from_slice(&rp);
+
+        let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
+        assert_eq!(
+            decode_pdu_body(&req),
+            Some(crate::ims::sms_pdu::DecodedRp::Undecodable { rp_mr: 0x13 })
         );
     }
 

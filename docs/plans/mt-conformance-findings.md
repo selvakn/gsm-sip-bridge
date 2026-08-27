@@ -284,39 +284,339 @@ finding that no carrier here has been observed sending one). All three
 remain covered by the unit tests listed above; `specs/042-dialog-transaction-identity/quickstart.md`
 records this constraint for the next round.
 
-## Batch 4 — honour the negotiation (not started)
+## Batch 4 — honour the negotiation (landed 2026-08-27, pending hardware round)
 
-- [ ] SDP-01 — media lines other than the first audio stream are dropped
-- [ ] SDP-02 — direction attributes (`sendonly`/`recvonly`/`inactive`) ignored
-- [ ] SDP-03 — the `m=` transport profile (`RTP/SAVP` etc.) is not checked
-- [ ] MT-05 — session timers advertised, never honoured (needs Batch 3 first)
+Full spec/plan/tasks trail: `specs/043-honour-sdp-negotiation/`. All three
+SDP findings share one mechanism: `parse_offer` (`ims::sdp`) now tracks
+every `m=` section an offer carries, not just a single flat audio one, so
+`build_answer_for` can honestly describe what happens to each of them.
+This bridge remains a single-audio-stream, plain-RTP relay by design — the
+fix is answer honesty, not new relay capability (see
+`specs/043-honour-sdp-negotiation/research.md` for the full
+decision/rationale/alternatives writeup per finding).
 
-## Batch 5 — complete the media contract (not started)
+- [x] **SDP-01** — media lines other than the first audio stream are
+      dropped.
+      **Landed**: `parse_offer` selects the **first** `m=audio` section for
+      negotiation (fixing a last-wins overwrite bug: a second `m=audio`
+      line previously replaced the first's port/codec list silently) and
+      records every other `m=` section — another audio line, video, text,
+      application, anything — as a `DeclinedMedia { kind, proto, fmts,
+      before_audio }` entry, in original order. `build_answer_for` emits
+      one `m=<kind> 0 <proto> <fmts>` line per entry (RFC 3264 §6: port `0`
+      marks a declined stream), placed before or after the negotiated
+      audio line to match the offer's own ordering. No `c=` line is added
+      per declined section — the existing session-level one already covers
+      it. Tests: the existing `PJSIP_REAL_VETH_OFFER` fixture (its trailing
+      `m=text` section previously had zero effect on the answer) now
+      asserts a declined `m=text 0 RTP/AVP 100 98` line in the right
+      position; a new two-`m=audio`-section fixture proves the first wins
+      and the second is declined, not silently overwritten.
+      **Ruled out**: actually relaying a second audio stream, video, or
+      text — this bridge is a single-audio-stream relay by design
+      (`ims::sdp`'s own header comment), and no carrier here has sent more
+      than one media section.
+- [x] **SDP-02** — direction attributes (`sendonly`/`recvonly`/`inactive`)
+      ignored.
+      **Landed**: `SdpOffer` gained `direction: MediaDirection`, parsed
+      from the negotiated audio section's own `a=sendonly`/`recvonly`/
+      `inactive`/`sendrecv` line (default `SendRecv` if absent).
+      `build_answer_for` mirrors it per RFC 3264 §6.1 instead of
+      hardcoding `a=sendrecv`: `SendOnly`→`RecvOnly`, `RecvOnly`→
+      `SendOnly`, `Inactive`→`Inactive`, `SendRecv`→`SendRecv`. Tests: one
+      case per direction value, plus confirmation that an offer with no
+      direction line (today's only real-world case) still answers
+      `sendrecv` unchanged.
+      **Ruled out**: gating the RTP relay's actual send/receive behavior on
+      the negotiated direction — signaling correctness only; no carrier
+      here has sent a non-default direction on an *initial* offer (as
+      opposed to a hold re-INVITE, which batch 3 already declines
+      outright), and building real per-direction suppression in
+      `agent::veth`/`transcode` is a materially separate, currently
+      unjustified feature.
+- [x] **SDP-03** — the `m=` transport profile (`RTP/SAVP` etc.) is not
+      checked.
+      **Landed**: `SdpOffer` gained `proto: String`, the audio section's
+      raw transport token, captured but not validated by `parse_offer`
+      itself (kept permissive, same as an unrecognized codec — the caller
+      decides). `agent::inbound::handle_invite` checks it immediately
+      after `parse_offer` succeeds, before the existing codec precheck: a
+      token other than `RTP/AVP` is declined with a new
+      `sip_client::build_488_incompatible_transport`, carrying `Warning:
+      305 ... "incompatible network protocol used"` (RFC 3261 §20.43) —
+      visibly distinct from the existing codec-mismatch `488`/`Warning:
+      304` (MT-07). Tests: the new builder states the 305 warning
+      correctly; `parse_offer` captures a non-`RTP/AVP` token (e.g.
+      `RTP/SAVP`) without erroring, unaffected codec parsing.
+- [x] **MT-05** — session timers advertised, never honoured.
+      **Confirmed resolved by prior batches — no new production code.**
+      `SUPPORTED_EXTENSIONS` has been empty since MT-10 (batch 2), so the
+      inbound side no longer advertises `timer` support at all — the
+      finding's original premise no longer holds. RFC 4028 §9 explicitly
+      permits a UAS to simply omit `Session-Expires` from its response
+      when it doesn't want the extension, which is exactly today's
+      behavior and is fully spec-legal. Building real session-timer
+      support would mean either accepting a refresh burden this bridge
+      can't fulfill (it never sends its own re-INVITE) or surviving a
+      refresh re-INVITE from the far end, which collides with batch 3's
+      now-unconditional `488` decline of every re-INVITE — reopening
+      exactly the renegotiation scope MT-02 already ruled out, for a
+      scenario no carrier here has ever sent. Test added:
+      `agent::inbound::tests::session_expires_on_the_offer_is_never_echoed_back`
+      pins this as intentional, not an open gap.
 
-- [ ] RTP-01 — no RTCP sent or received, while its bandwidth is declared
-- [ ] RTP-03 — pass-through relay forwards telephone-event under the wrong PT
-- [ ] RTP-04 — no SSRC continuity check on receive
-- [ ] SDP-06 — `a=rtcp` and the offer's `ptime` are discarded
+All three code changes plus the MT-05 test: `make format && make lint &&
+make test` clean (whole workspace, including test targets, clippy
+`-D warnings`).
 
-## Batch 6 — the long tail (not started)
+**Hardware-verified 2026-08-27**: rebuilt (`gsm-sip-bridge:honour-sdp-negotiation`),
+redeployed, real line re-registered. One real inbound call from the user's
+phone: rang, answered, negotiated AMR-WB (carrier) transcoded to L16
+(veth) — the same batch-1 RTP-02 relay path — with `media="both-ways"`
+(586 carrier-side / 754 veth-side RX packets) and a clean `caller_hangup`
+after ~15s. Zero errors, warnings, or panics in Agent A's own log
+(`/tmp/ims-agent-0.out`). This exercises the ordinary path (one audio
+section, no direction attribute, `RTP/AVP`) end-to-end through the
+restructured `parse_offer`/`build_answer_for` — confirms no regression.
 
-- [ ] MT-04 — `100rel` advertised but not served as a UAS
-- [ ] MT-06 — preconditions are not implemented
-- [ ] MT-11 — no `P-Access-Network-Info` on responses; SUBSCRIBE hardcodes
-      Wi-Fi
-- [ ] MT-12 — caller identity read from `From` alone, not
-      `P-Asserted-Identity`/`Privacy`
-- [ ] MT-13 — echoed `Via` gains no `received`/`rport`
-- [ ] SDP-04 — an INVITE without an offer is rejected instead of answered
-      with our own offer
-- [ ] SDP-05 — multipart bodies are parsed by accident
-- [ ] SMS-02 — TP-MTI never checked; every TPDU read as SMS-DELIVER
-- [ ] SMS-03 — no RP-ERROR path
-- [ ] SMS-04 — message-waiting/message-class DCS groups misread
-- [ ] SMS-05 — concatenated messages labelled, not reassembled
-- [ ] SMS-07 — national-language shift tables unimplemented
-- [ ] CS-03 — no `AT+CNMI` policy asserted
-- [ ] CS-04 — `+CMGR` header split on commas (not quote-aware)
+Not exercised live, and not something a real handset or this project's
+carriers have been observed sending: an offer with an extra media
+section, a non-default direction attribute, or an unsupported transport
+profile — the three new decline paths this batch adds. All three remain
+covered by unit tests only (`specs/043-honour-sdp-negotiation/quickstart.md`
+records this constraint), consistent with the same posture batch 3 took
+for its own low-probability live scenarios.
+
+## Batch 5 — complete the media contract (landed 2026-08-27, pending hardware round)
+
+Full spec/plan/tasks trail: `specs/044-complete-media-contract/`.
+RTP-01 and SDP-06's `a=rtcp` half are **deferred** (see below), not
+landed — reduced scope by explicit decision partway through this batch's
+planning, once research showed real RTCP needs call-wide state (send-side
+octet counts, an exposed/stable SSRC, a per-call timer with live socket
+access, a synchronous teardown hook) that exists nowhere in this codebase
+today, across all three relay call sites and both relay implementations —
+a materially larger and riskier undertaking than anything else in this
+review so far.
+
+- [ ] **RTP-01** — no RTCP sent or received, while its bandwidth is
+      declared. **Deferred, not landed** — see
+      `specs/044-complete-media-contract/research.md` Decision 1 for the
+      full reasoning. Removing the `b=RS:`/`b=RR:` declaration was also
+      considered and rejected: it would trade the RTP-01 gap for a
+      regression against the TS 26.114 §6.2.10 mandate those lines exist
+      to satisfy. Tracked here as its own future feature, to be scoped
+      properly (new sockets, octet counters, SSRC persistence, teardown
+      hooks) rather than bolted onto this batch.
+- [x] **RTP-03** — pass-through relay forwards telephone-event under the
+      wrong PT.
+      **Landed**: `agent::veth::forward` now reads each packet's payload
+      type via the existing `rtp::parse_packet` (already used identically
+      by the transcoding relay) and relabels a DTMF packet to the
+      *destination* leg's own negotiated `telephone-event` payload type
+      when it differs from the *source* leg's — rewriting only the
+      payload-type byte (marker bit preserved), since the RFC 4733 event
+      payload itself needs no re-origination the way the transcoding
+      relay's own DTMF path needs one. Threaded through
+      `spawn_relay`/`relay_rtp` and all four call sites (`agent/inbound.rs`,
+      `agent/veth.rs`, `agent/origination.rs` ×3), reusing
+      `ChosenCodec::dtmf_payload_type` from batch 1's RTP-02 fix. Tests: a
+      differing-PT keypress is relabeled; a matching-PT keypress and an
+      ordinary audio packet both pass through byte-for-byte unchanged.
+- [x] **RTP-04** — no SSRC continuity check on receive.
+      **Landed**, as observability only (see FR-005 in the spec): both
+      relay implementations (`agent::veth::forward`, the pass-through
+      path; `transcode::relay_direction`, the transcoding path) now log
+      when a stream's SSRC changes mid-call, identifying the direction and
+      old/new value — a legitimate RFC 3550 source-restart signal, never a
+      reason to drop a packet or interrupt the call. Nothing in either
+      relay's logic depended on SSRC continuity to function, so there was
+      no existing behavior to fix, only visibility to add. Tests: a
+      mid-stream SSRC change on each relay path still delivers every
+      packet; a stream's first packet is never itself logged as a change.
+- [x] **SDP-06** — `a=rtcp` and the offer's `ptime` are discarded.
+      **Split**: the `a=rtcp` half is deferred alongside RTP-01 (it exists
+      only to support RTP-01 — an explicit RTCP port has nothing to
+      consume without real RTCP). The `ptime` half **landed**, but not as
+      originally planned: the intended fix (echo the offer's `ptime` into
+      the answer, mirroring `maxptime`) turned out, on inspection, to be
+      wrong — an offer's `ptime` describes what *the offer's own owner*
+      intends to send, not a request for our answer to match, and this
+      bridge's own packetization is a fixed, codec-level constant
+      (`NegotiatedCodec::frame_samples`, unconditionally 20ms). Echoing a
+      different offered value would have made the answer state a
+      packetization we don't actually use — the same class of bug this
+      whole review exists to eliminate, introduced anew. **Resolution**:
+      confirmed via test that the answer always states its own true 20ms
+      framing regardless of what any given offer's `ptime` says; no
+      `SdpOffer` field added, no `build_answer_for` change.
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`).
+
+**Hardware-verified 2026-08-27**: rebuilt (`gsm-sip-bridge:complete-media-contract`),
+redeployed, real line re-registered. One real inbound call from the
+user's phone: rang, answered, negotiated AMR-WB (carrier) transcoded to
+L16 (veth) — the transcoding relay path, which carries this batch's
+RTP-04 SSRC-logging addition — with `media="both-ways"` (416 carrier-side
+/ 748 veth-side RX packets) and a clean `caller_hangup` after ~15s. Zero
+errors, warnings, or panics in Agent A's own log, and — correctly — no
+spurious "SSRC changed" log line for this single continuous stream,
+confirming the new logging stays silent on the ordinary case rather than
+false-positiving.
+
+Not exercised live: RTP-03's pass-through DTMF relabel and RTP-04's
+pass-through-path SSRC logging both live in `agent::veth::forward`, which
+only runs when both legs negotiate the *same* audio codec (PCMU) — this
+call negotiated AMR-WB and took the transcoding path instead, same as
+most real calls on this line historically. No DTMF was pressed this
+round either. All three remain covered by unit tests only, consistent
+with prior batches' treatment of scenarios that need a specific offer
+shape no carrier here has been observed producing.
+
+## Batch 6 — the long tail (landed 2026-08-27, pending hardware round)
+
+Full spec/plan/tasks trail: `specs/045-long-tail-conformance/`. Four
+findings — MT-06, SDP-04, SMS-05, SMS-07 — are **deferred**, not landed;
+see below.
+
+- [x] **MT-04** — `100rel` advertised but not served as a UAS.
+      **Confirmed resolved by prior batches — no new code.** Same
+      resolution shape as MT-05 (batch 4): `SUPPORTED_EXTENSIONS` has been
+      empty since MT-10, so the inbound side no longer advertises
+      `100rel` at all, and it never marks a provisional reliable (only
+      plain `100`/`180`/`200`), so there is no PRACK obligation for a
+      caller to serve in the first place. `Require: 100rel` is still
+      declined `420` by MT-03's existing gate. Test added:
+      `agent::inbound::tests::the_answering_response_never_advertises_100rel`.
+- [x] **MT-11** — no `P-Access-Network-Info` on responses; SUBSCRIBE
+      hardcodes Wi-Fi.
+      **Landed**: `ImsRegisterConfig::access_network_info` was already
+      computed correctly per line (VoWiFi: `3GPP-WLAN`; VoLTE: a real
+      E-UTRAN value from the serving cell) and used for REGISTER, but
+      never reached the reg-event SUBSCRIBE or the `200 OK` to an
+      answered inbound INVITE. `session::SubscribeParts` gained
+      `access_network_info`, echoed by `build_subscribe` in place of the
+      hardcoded literal; `agent::inbound`'s per-call header list (was a
+      shared `UAS_EXTRA_HEADERS` const) now carries the same real value
+      into the INVITE's `200 OK`.
+- [x] **MT-12** — caller identity read from `From` alone, not
+      `P-Asserted-Identity`/`Privacy`.
+      **Landed**: `session::extract_caller` now prefers
+      `P-Asserted-Identity` (RFC 3325 — a trusted network element vouching
+      for the caller) when present, falling back to `From` unchanged when
+      absent. Used only for this bridge's own internal attribution (logs,
+      CDRs, SMS sender fields), never re-presented to a third party, so
+      `Privacy`'s onward-signaling withholding obligation doesn't apply
+      here.
+- [x] **MT-13** — echoed `Via` gains no `received`/`rport`.
+      **Landed**: a new `sip_client::annotate_via_received_rport` adds
+      `received=`/fills `rport=` per RFC 3261 §18.2.1 / RFC 3581 §4,
+      applied at the two actual places a response reaches a socket
+      (`SipSink::send`, `sip::server::serve`'s `send_to`) rather than
+      threaded through `build_uas_response_with_headers`'s ~39 call sites
+      — the real peer address is only known at the transport boundary,
+      and centralizing it there touches two call sites instead of dozens.
+      A no-op on anything that isn't a response, so it can't misfire on a
+      request this bridge originates.
+- [x] **SDP-05** — multipart bodies are parsed by accident.
+      **Landed**, scoped to what the review actually found: `req.body`
+      went to `sdp::parse_offer` completely unconditionally, whatever
+      `Content-Type` said or didn't say. `parse_offer`'s line-scanner has
+      no concept of MIME structure, so a multipart body's real SDP part
+      could parse "by accident," while a malformed one could misfire in
+      stranger ways (a lossy-UTF8-decoded binary sibling part producing
+      spurious `m=`-prefixed "lines"). `agent::inbound::handle_invite` now
+      declines anything other than `application/sdp` or no `Content-Type`
+      (today's implicit assumption), same posture already established for
+      `MESSAGE` bodies (SMS-06). **Ruled out**: actually parsing
+      `multipart/mixed` — no evidence any carrier here sends it, and
+      `ims::sdp`'s own header comment already commits it to "minimal ...
+      not a general-purpose SDP library."
+- [x] **SMS-02** — TP-MTI never checked; every TPDU read as SMS-DELIVER.
+      **Landed**: `DecodedRp` gains `UnsupportedTpdu { rp_mr, kind }` — a
+      TPDU whose own TP-MTI says SMS-SUBMIT-REPORT or SMS-STATUS-REPORT is
+      now recognized before ever being walked with the SMS-DELIVER field
+      layout, the same class of bug already fixed one layer up at the RP
+      envelope (SMS-01). The RP-DATA itself was still received, so it's
+      still owed a plain `200 OK`/RP-ACK, never relayed as a message.
+- [x] **SMS-03** — no RP-ERROR path.
+      **Landed**, alongside SMS-02: `DecodedRp::Undecodable { rp_mr }` (a
+      TPDU that claimed SMS-DELIVER but couldn't parse) is now
+      distinguished from `UnsupportedTpdu`, and gets a genuine RP-ERROR
+      (new `sms_pdu::build_rp_error`, mirroring `build_rp_ack`'s shape)
+      sent as a delivery report — instead of `handle_message` silently
+      relaying `req.body` as if it were plain text.
+- [x] **SMS-04** — message-waiting/message-class DCS groups misread.
+      **Landed**, the concretely-wrong half: `Alphabet::from_dcs`'s
+      `0xE0`-`0xEF` group (Message Waiting Indication, Store, UCS2 per
+      TS 23.038 §4) was falling through to the GSM7 default, garbling
+      real UCS2 text — added as its own branch, unconditionally UCS2 (not
+      a per-bit selector, confirmed against a live decode test after an
+      initial wrong assumption about the bit convention). The sibling
+      Discard/Store-GSM7 groups (`0xC0`/`0xD0`) were already correct via
+      the same fallback and are unaffected. Message class extraction
+      itself remains out of scope — nothing downstream consumes it.
+- [x] **CS-03** — no `AT+CNMI` policy asserted.
+      **Landed**: `volte::sms::sweep_modem_storage` now sends
+      `AT+CNMI=2,1,0,0,0` alongside its existing `AT+CMGF=0`, parity with
+      the legacy multi-card pool's own init sequence
+      (`modules::worker::ModuleWorker::open`), which already asserts the
+      same policy. Not unit-tested — requires a real serial device, same
+      constraint as the rest of this sweep's AT-command sequencing;
+      verified via the hardware round below.
+- [x] **CS-04** — `+CMGR` header split on commas (not quote-aware).
+      **Landed**: `modules::worker::parse_sms_response`'s naive
+      `line.split(',')` — correct today only by coincidence of field
+      order (the `<scts>`/`<alpha>` fields with their own internal commas
+      sit *after* the one field this function reads) — replaced with a
+      quote-aware splitter respecting `"..."` boundaries.
+
+**Deferred, not landed** (recorded here so the doc doesn't imply either
+"done" or "won't ever do" — see `specs/045-long-tail-conformance/research.md`
+Decision 1 and Decision 8 for the full reasoning):
+
+- [ ] **MT-06** — preconditions are not implemented. Needs new SDP-level
+      QoS attribute parsing and a bearer-readiness state machine; the
+      header-level behavior (declining `Require: precondition`) is already
+      correct via MT-03's existing gate.
+- [ ] **SDP-04** — an INVITE without an offer is rejected instead of
+      answered with our own offer. Needs new pending-call state deferring
+      RTP-socket setup and codec selection from INVITE time to ACK time —
+      comparable in scope to RTP-01 (batch 5).
+- [ ] **SMS-05** — concatenated messages labelled, not reassembled. Needs
+      a cross-message buffer keyed by sender/reference/total with its own
+      eviction policy; today's decoder is stateless by design.
+- [ ] **SMS-07** — national-language shift tables unimplemented. Attempted
+      and reversed mid-implementation: the mechanism (recognizing the UDH
+      IEs that select a table) is small, but the part that fixes decoded
+      text is TS 23.038 Annex A's character-table data, which is not
+      something to ship from memory without a verifiable source — a wrong
+      mapping would silently decode real text to the wrong characters,
+      worse than today's honest, already-documented gap.
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`).
+
+**Hardware-verified 2026-08-27**: rebuilt (`gsm-sip-bridge:long-tail-conformance`),
+redeployed, real line re-registered. One real inbound call from the
+user's phone: rang, answered, negotiated AMR-WB (carrier) transcoded to
+L16 (veth), `media="both-ways"` (82 carrier-side / 462 veth-side RX
+packets), clean `caller_hangup`. Zero errors, warnings, or panics in
+Agent A's own log around the call.
+
+The modem-storage SMS sweep (CS-03's `AT+CNMI` addition) could not be
+exercised this round — it's failing to open `/dev/ttyUSB0` at all
+(`discovery error: failed to open serial /dev/ttyUSB0: No such file or
+directory`), a pre-existing USB-re-enumeration quirk on this host (see
+project memory: a stale `modem_port` after re-enumeration), unrelated to
+this batch's code — the failure is at the serial-port-open step, before
+any AT command (old or new) is ever sent. MT-11/MT-12/MT-13/SDP-05
+weren't independently exercisable live either (an ordinary real call
+doesn't provide a mismatched `P-Asserted-Identity`, a non-default `Via`
+sent-by, or a non-SDP body to test against) — all remain covered by unit
+tests only, consistent with this review's established posture for its
+least-observed findings.
 
 ## Hardware test log
 

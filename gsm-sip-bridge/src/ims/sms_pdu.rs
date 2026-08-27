@@ -64,6 +64,41 @@ pub enum DecodedRp {
     /// RP-DATA *we* submitted, with a §8.2.5.4 cause octet when present.
     /// Same "nothing to forward" as `Ack`.
     Error { rp_mr: u8, cause: Option<u8> },
+    /// specs/045 SMS-02: the RP-DATA envelope was fine, but the TPDU inside
+    /// it isn't SMS-DELIVER (its own TP-MTI says SMS-SUBMIT-REPORT or
+    /// SMS-STATUS-REPORT) — recognized, not garbled, and not a deliverable
+    /// message either. Same "nothing to forward" treatment as `Ack`/`Error`;
+    /// the RP-DATA itself was still received, so the caller still owes an
+    /// RP-ACK, not an RP-ERROR.
+    UnsupportedTpdu { rp_mr: u8, kind: TpduMessageType },
+    /// specs/045 SMS-03: the TPDU claimed to be SMS-DELIVER but its bytes
+    /// don't parse as one (truncated/malformed) — a genuine decode
+    /// failure, unlike `UnsupportedTpdu`. The caller sends an RP-ERROR
+    /// instead of relaying `req.body` as if it were text.
+    Undecodable { rp_mr: u8 },
+}
+
+/// TS 23.040 §9.2.3.1, SC→MS direction (the only direction this bridge
+/// ever receives a TPDU in): the first octet's low 2 bits (TP-MTI) say what
+/// shape the rest of the TPDU is — only `Deliver` has the TP-OA/TP-PID/
+/// TP-DCS/TP-SCTS/TP-UDL layout `SmsDeliverTpdu` assumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpduMessageType {
+    Deliver,
+    SubmitReport,
+    StatusReport,
+    Reserved,
+}
+
+impl TpduMessageType {
+    fn from_first_octet(first_octet: u8) -> Self {
+        match first_octet & 0x03 {
+            0b00 => Self::Deliver,
+            0b01 => Self::SubmitReport,
+            0b10 => Self::StatusReport,
+            _ => Self::Reserved,
+        }
+    }
 }
 
 /// Top-level entry point: an RP envelope in, what it actually was out.
@@ -84,9 +119,29 @@ pub enum DecodedRp {
 pub fn decode_vnd_3gpp_sms(body: &[u8]) -> Result<DecodedRp, String> {
     match RpMessage::parse(body)? {
         RpMessage::Data(rp) => {
-            let mut decoded = decode_sms_deliver_tpdu(rp.user_data)?;
-            decoded.rp_mr = rp.mr;
-            Ok(DecodedRp::Message(decoded))
+            // Classified before ever calling into the SMS-DELIVER walker
+            // (specs/045 SMS-02): a non-Deliver TPDU is recognized, not
+            // garbled — the RP-DATA itself was still received, so it still
+            // gets an RP-ACK (via `UnsupportedTpdu`), just never a decoded
+            // message.
+            let kind = rp
+                .user_data
+                .first()
+                .map(|&b| TpduMessageType::from_first_octet(b))
+                .unwrap_or(TpduMessageType::Reserved);
+            if kind != TpduMessageType::Deliver {
+                return Ok(DecodedRp::UnsupportedTpdu { rp_mr: rp.mr, kind });
+            }
+            match decode_sms_deliver_tpdu(rp.user_data) {
+                Ok(mut decoded) => {
+                    decoded.rp_mr = rp.mr;
+                    Ok(DecodedRp::Message(decoded))
+                }
+                // specs/045 SMS-03: TP-MTI already confirmed SMS-DELIVER, so
+                // this is a genuine malformation, not a recognized-other
+                // type — the caller sends an RP-ERROR, not an RP-ACK.
+                Err(_) => Ok(DecodedRp::Undecodable { rp_mr: rp.mr }),
+            }
         }
         RpMessage::Ack { mr } => Ok(DecodedRp::Ack { rp_mr: mr }),
         RpMessage::Error { mr, cause } => Ok(DecodedRp::Error { rp_mr: mr, cause }),
@@ -141,6 +196,29 @@ pub fn build_rp_ack(rp_mr: u8) -> Vec<u8> {
         // and TP-PI=0x00 declares that none of the optional TP-PID/TP-DCS/
         // TP-UDL fields follow.
         0x41, 0x02, 0x00, 0x00,
+    ]
+}
+
+/// The RP-ERROR that reports a TPDU this bridge received but could not
+/// decode (TS 24.011 §7.3.4) — the delivery-report counterpart to
+/// [`build_rp_ack`] for a genuine decode failure (specs/045 SMS-03), sent
+/// the same way (a new `MESSAGE` request, TS 24.341 §5.3.2.4) instead of
+/// silently relaying the undecoded bytes as if they were text.
+///
+/// `cause` is the TS 24.011 Annex E RP-Cause value when a specific one
+/// applies; `111` ("unspecified error cause") is used otherwise — this
+/// bridge's decoder reports *that* a TPDU didn't parse, not a granular
+/// reason code for every possible way it could fail.
+pub fn build_rp_error(rp_mr: u8, cause: Option<u8>) -> Vec<u8> {
+    vec![
+        // RP-Message-Type-Indicator 100 = RP-ERROR, MS to network
+        // (TS 24.011 table 8.4), then the echoed RP-MR.
+        0x04,
+        rp_mr,
+        // RP-Cause (TS 24.011 §8.2.5.4): a length-value element (no IEI,
+        // unlike RP-User-Data) — length 1, then the cause octet.
+        0x01,
+        cause.unwrap_or(111),
     ]
 }
 
@@ -239,6 +317,16 @@ struct SmsDeliverTpdu {
 impl SmsDeliverTpdu {
     fn parse(buf: &[u8]) -> Result<Self, String> {
         let first_octet = *buf.first().ok_or("empty TPDU")?;
+        // specs/045 SMS-02: only SMS-DELIVER (TP-MTI 00) has the
+        // TP-OA/TP-PID/TP-DCS/TP-SCTS/TP-UDL layout the rest of this
+        // function assumes — walking an SMS-SUBMIT-REPORT or
+        // SMS-STATUS-REPORT the same way desyncs every field after the
+        // first octet, the same class of bug already fixed one layer up at
+        // the RP envelope (SMS-01).
+        let mti = TpduMessageType::from_first_octet(first_octet);
+        if mti != TpduMessageType::Deliver {
+            return Err(format!("TPDU is {mti:?}, not SMS-DELIVER"));
+        }
         // TS 23.040 §9.2.3.23: bit 6 = TP-UDHI (a User Data Header is
         // present, prepended to TP-UD).
         let udhi = (first_octet & 0x40) != 0;
@@ -297,7 +385,7 @@ fn is_type_zero_pid(pid: u8) -> bool {
     (pid >> 6) == 0b01 && (pid & 0x3F) == 0
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Alphabet {
     Gsm7,
     Octet,
@@ -305,11 +393,11 @@ enum Alphabet {
 }
 
 impl Alphabet {
-    /// TS 23.038 §4: only the two coding-scheme groups real MT traffic
-    /// overwhelmingly uses. Anything else (compressed, national-language
-    /// shift tables, message-waiting indication groups) falls back to GSM7 —
-    /// wrong for genuinely rare encodings, but never a crash, and right for
-    /// the vast majority of real messages.
+    /// TS 23.038 §4: the coding-scheme groups real MT traffic uses.
+    /// Compressed user data and the two Discard/Store-GSM7 message-waiting
+    /// groups (`0xC0`-`0xDF`) fall back to GSM7 — the fallback happens to be
+    /// correct for those two, unlike the Store-UCS2 group below, which was
+    /// wrong until specs/045 SMS-04.
     fn from_dcs(dcs: u8) -> Self {
         if dcs & 0xC0 == 0x00 {
             // General Data Coding group: bits 3-2 select the alphabet.
@@ -326,6 +414,15 @@ impl Alphabet {
             } else {
                 Alphabet::Gsm7
             }
+        } else if dcs & 0xF0 == 0xE0 {
+            // specs/045 SMS-04: Message Waiting Indication group, Store
+            // Message, UCS2 (TS 23.038 §4 table) — the whole `0xE0`-`0xEF`
+            // nibble means UCS2 unconditionally, the same way `0xD0`-`0xDF`
+            // (its GSM7 sibling, already correct via the fallback below)
+            // means GSM7 unconditionally. Unlike that sibling, this one was
+            // concretely wrong before this fix — decoded as GSM7 regardless,
+            // garbling real UCS2 text.
+            Alphabet::Ucs2
         } else {
             Alphabet::Gsm7
         }
@@ -785,6 +882,42 @@ mod tests {
         assert_eq!(decoded.text, "Hi");
     }
 
+    /// specs/045 SMS-04: DCS `0xE8` is Message Waiting Indication (Store),
+    /// bit 2 set — UCS2, per TS 23.038 §4. Before this fix it fell through
+    /// to the default-GSM7 branch and garbled the text the same way plain
+    /// UCS2 (DCS `0x08`) would have before UCS2 support existed at all.
+    #[test]
+    fn decodes_message_waiting_indication_ucs2_text() {
+        let text_bytes: Vec<u8> = "Hi".encode_utf16().flat_map(u16::to_be_bytes).collect();
+
+        let mut tpdu = vec![0x00];
+        tpdu.push(0); // TP-OA length 0
+        tpdu.push(0x81);
+        tpdu.push(0x00); // TP-PID
+        tpdu.push(0xE8); // TP-DCS: message waiting indication, Store, UCS2
+        tpdu.extend_from_slice(&[0u8; 7]);
+        tpdu.push(text_bytes.len() as u8);
+        tpdu.extend_from_slice(&text_bytes);
+
+        let mut rp = vec![0x01, 0x00, 0, 0];
+        rp.push(tpdu.len() as u8);
+        rp.extend_from_slice(&tpdu);
+
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
+        assert_eq!(decoded.text, "Hi");
+    }
+
+    /// The sibling Discard/Store-GSM7 groups (`0xC0`/`0xD0`) were already
+    /// correct (GSM7 is both the fallback and the spec answer) — pinned so
+    /// the new `0xE0` branch above can't regress them.
+    #[test]
+    fn message_waiting_indication_gsm7_groups_are_unaffected() {
+        assert_eq!(Alphabet::from_dcs(0xC0), Alphabet::Gsm7);
+        assert_eq!(Alphabet::from_dcs(0xD0), Alphabet::Gsm7);
+    }
+
     /// SMS-EMOJI-01 (specs/041 conformance review, found live 2026-08-26): a
     /// real inbound SMS carrying an emoji outside the Basic Multilingual
     /// Plane came through as `U+FFFD` because the two UTF-16 code units of
@@ -967,5 +1100,68 @@ mod tests {
                 "MTI {mti} is an MS-to-network value and must not decode"
             );
         }
+    }
+
+    /// One well-formed RP-DATA envelope (MTI=1) wrapping `tpdu` — the shape
+    /// `decode_vnd_3gpp_sms`'s `RpMessage::Data` arm expects, with no
+    /// originator/destination address (both length 0).
+    fn rp_data(mr: u8, tpdu: &[u8]) -> Vec<u8> {
+        let mut rp = vec![0x01, mr, 0x00, 0x00, tpdu.len() as u8];
+        rp.extend_from_slice(tpdu);
+        rp
+    }
+
+    /// specs/045 SMS-02: an SMS-STATUS-REPORT (TP-MTI=10) inside an
+    /// otherwise well-formed RP-DATA must be recognized as such, not walked
+    /// with the SMS-DELIVER field layout — the RP-DATA itself was received,
+    /// so it's still owed an RP-ACK (`UnsupportedTpdu`, not `Undecodable`).
+    #[test]
+    fn a_status_report_tpdu_is_recognized_not_misread_as_deliver() {
+        let rp = rp_data(0x11, &[0b10]); // TP-MTI=10 (StatusReport)
+        assert_eq!(
+            decode_vnd_3gpp_sms(&rp).unwrap(),
+            DecodedRp::UnsupportedTpdu {
+                rp_mr: 0x11,
+                kind: TpduMessageType::StatusReport,
+            }
+        );
+    }
+
+    /// A submit-report TPDU gets the same treatment.
+    #[test]
+    fn a_submit_report_tpdu_is_recognized_not_misread_as_deliver() {
+        let rp = rp_data(0x12, &[0b01]); // TP-MTI=01 (SubmitReport)
+        assert_eq!(
+            decode_vnd_3gpp_sms(&rp).unwrap(),
+            DecodedRp::UnsupportedTpdu {
+                rp_mr: 0x12,
+                kind: TpduMessageType::SubmitReport,
+            }
+        );
+    }
+
+    /// specs/045 SMS-03: a TPDU that claims to be SMS-DELIVER (TP-MTI=00)
+    /// but is truncated before its own fields end must be recognized as a
+    /// genuine failure (`Undecodable`, owed an RP-ERROR) — distinct from
+    /// `UnsupportedTpdu`, which is never a decode failure.
+    #[test]
+    fn a_truncated_deliver_tpdu_is_undecodable_not_unsupported() {
+        let rp = rp_data(0x13, &[0x00]); // TP-MTI=00, nothing after it
+        assert_eq!(
+            decode_vnd_3gpp_sms(&rp).unwrap(),
+            DecodedRp::Undecodable { rp_mr: 0x13 }
+        );
+    }
+
+    #[test]
+    fn build_rp_error_states_the_given_cause() {
+        let rp = build_rp_error(0x20, Some(95));
+        assert_eq!(rp, vec![0x04, 0x20, 0x01, 95]);
+    }
+
+    #[test]
+    fn build_rp_error_falls_back_to_unspecified_when_no_cause_is_known() {
+        let rp = build_rp_error(0x21, None);
+        assert_eq!(rp, vec![0x04, 0x21, 0x01, 111]);
     }
 }

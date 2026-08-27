@@ -17,9 +17,10 @@ use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
-    build_100_trying, build_180_ringing, build_420_bad_extension, build_486_busy_here,
-    build_488_not_acceptable, build_uas_response, build_uas_response_with_headers, format_sip_addr,
-    random_hex, SipMessage, SipRequest, SipSink,
+    build_100_trying, build_180_ringing, build_415_unsupported_media, build_420_bad_extension,
+    build_486_busy_here, build_488_incompatible_transport, build_488_not_acceptable,
+    build_uas_response, build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage,
+    SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -38,39 +39,6 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// How often, while ringing, to check the control channel and the carrier's
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// What a real UE states in a session response: the methods it accepts and the
-/// extensions it understands (RFC 3261 §20.5, and the `Supported` set
-/// TS 24.229 expects of an IMS UE).
-///
-/// This is what made inbound Jio calls work. Answering with `Via`,
-/// `Record-Route`, `From`, `To`, `Call-ID`, `CSeq`, `Contact`, `Content-Type`,
-/// `Content-Length` and nothing else got every call torn down ~460 ms after
-/// the `200 OK` with `BYE Reason:SIP;cause=503;text="IO: SIP SDP Protocol
-/// Error."` — boilerplate for a response that never declared its capabilities;
-/// five distinct SDP bodies failed identically at the same timing before it
-/// landed. Sent unconditionally rather than per-carrier because a `2xx` to an
-/// INVITE is required to carry `Allow` on any network (RFC 3261 §13.3.1.4),
-/// and the carriers that tolerated its absence were being lenient, not
-/// asking for it.
-///
-/// `Allow` is [`super::ALLOW`], the single list of what this UAS actually
-/// serves — every method on it has a `dispatch_loop` arm, and everything else
-/// is refused `405` there. It was measured longer than that (`UPDATE`, `INFO`,
-/// `PRACK`, `REFER` too) while nothing answered those methods at all;
-/// advertising them only invited mid-call requests we could not serve.
-///
-/// No `Supported` header: this used to claim `timer, 100rel, replaces, path,
-/// gruu`, none of which had any behaviour behind them — no session-refresh
-/// timer, no UAS-side reliable-provisional handling, no `replaces`/`gruu`
-/// machinery, and `path` names a REGISTER mechanism that does not even apply
-/// to a response to `INVITE`. `Supported` states extensions a caller may
-/// then invoke expecting them to work; claiming ones this UAS cannot honour
-/// is the same capability-truthfulness problem `Allow` already guards
-/// against (specs/041 conformance review, MT-10). See
-/// [`super::SUPPORTED_EXTENSIONS`] — once that grows, this constant is where
-/// its header gets added back.
-const UAS_EXTRA_HEADERS: &[(&str, &str)] = &[("Allow", super::ALLOW)];
 
 /// The `Contact` for a response that answers a network-initiated INVITE.
 ///
@@ -96,6 +64,29 @@ pub(super) struct InviteContext<'a> {
     /// caller still hearing ringback (observed live, specs/017 R17).
     pub(super) veth_sip_port: u16,
     pub(super) obs: &'a observability::AgentObservability,
+    /// This line's real access-network type, stated in the `200 OK` to an
+    /// answered inbound INVITE (specs/045 MT-11) — previously omitted
+    /// entirely.
+    pub(super) access_network_info: &'a str,
+}
+
+/// Whether this UAS can interpret an inbound INVITE's body as SDP: no
+/// `Content-Type` at all (the long-standing implicit assumption — an
+/// offerless INVITE, RFC 3261 §14.2/RFC 3264 §3, is a separate,
+/// deliberately out-of-scope finding, specs/045 SDP-04), or
+/// `application/sdp` compared with any `;`-delimited parameters ignored.
+/// Anything else — including `multipart/mixed` — is declined rather than
+/// scanned as if it were bare SDP text (specs/045 SDP-05).
+fn invite_content_type_supported(req: &SipRequest) -> bool {
+    match req.header("Content-Type") {
+        None => true,
+        Some(ct) => ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/sdp"),
+    }
 }
 
 /// Answers (or declines) one inbound carrier `INVITE`. Returns `Some` with
@@ -150,7 +141,68 @@ pub(super) fn handle_invite(
 
     sink.send(&build_100_trying(req))?;
 
+    // specs/045 SDP-05: `req.body` was handed to `parse_offer` completely
+    // unconditionally — whatever the `Content-Type` said, or didn't say.
+    // `parse_offer`'s line-scanner has no concept of MIME structure, so a
+    // multipart body's boundary/part-header lines are silently skipped as
+    // unrecognized and its SDP part's `m=`/`c=`/`a=` lines are
+    // indistinguishable, to that scanner, from a bare SDP body's own —
+    // which is why a well-formed multipart body could parse "by accident"
+    // and a malformed one could misfire in stranger ways. Same posture
+    // already established for `MESSAGE` bodies (SMS-06,
+    // `message_content_type_supported`): decline what isn't recognized
+    // instead of guessing at it.
+    if !invite_content_type_supported(req) {
+        let content_type = req.header("Content-Type").unwrap_or("(none)").to_string();
+        let to_tag = random_hex(4);
+        tracing::info!(
+            call_id = %call_id,
+            content_type = %content_type,
+            "declining: INVITE body is not one we can interpret as SDP"
+        );
+        sink.send(&build_415_unsupported_media(
+            req,
+            &to_tag,
+            "application/sdp",
+        ))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
     let offer = sdp::parse_offer(&req.body)?;
+
+    // The transport this bridge implements is plain `RTP/AVP` — no SRTP, no
+    // RTCP feedback profile. An offer naming anything else (`RTP/SAVP`, a
+    // garbage token) describes a stream we structurally cannot service;
+    // accepting its codec list while ignoring what it said about the
+    // transport would answer a protocol the offer never actually proposed.
+    // Checked before the codec precheck below: an unusable transport makes
+    // codec selection moot (specs/043 SDP-03).
+    if offer.proto != "RTP/AVP" {
+        tracing::info!(
+            call_id = %call_id,
+            proto = %offer.proto,
+            "offer's m=audio transport profile is not one we implement; declining"
+        );
+        sink.send(&build_488_incompatible_transport(
+            req,
+            &random_hex(4),
+            &format_sip_addr(session.contact_addr),
+        ))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
     // A carrier's mobile-terminating VoWiFi INVITE often offers no PCMU at
     // all (Airtel: AMR-WB+AMR-NB on some calls, AMR-NB alone on others), so
     // anything AMR gets answered and transcoded rather than declined. Uses
@@ -326,6 +378,20 @@ pub(super) fn handle_invite(
                 }
             }
 
+            // What a real UE states in a session response: the methods it
+            // accepts (RFC 3261 §20.5) and the access network it registered
+            // over. `Allow` (`super::ALLOW`) is what made inbound Jio calls
+            // work — answering without it got every call torn down ~460ms
+            // later with `BYE Reason:SIP;cause=503;text="IO: SIP SDP
+            // Protocol Error."`; RFC 3261 §13.3.1.4 requires it in a `2xx`
+            // to INVITE regardless. No `Supported` header: claiming
+            // `timer`/`100rel`/`replaces`/`path`/`gruu` with no behaviour
+            // behind any of them was the same capability-truthfulness
+            // problem `Allow` already guards against (specs/041, MT-10) —
+            // see `SUPPORTED_EXTENSIONS`. `P-Access-Network-Info` is a real
+            // per-line value (VoWiFi vs. VoLTE), not a fixed capability
+            // claim, so it's built per-call rather than a shared const
+            // (specs/045 MT-11).
             let response = build_uas_response_with_headers(
                 200,
                 "OK",
@@ -333,7 +399,10 @@ pub(super) fn handle_invite(
                 Some(&to_tag),
                 Some(&contact),
                 Some(&answer_sdp),
-                UAS_EXTRA_HEADERS,
+                &[
+                    ("Allow", super::ALLOW),
+                    ("P-Access-Network-Info", ctx.access_network_info),
+                ],
             );
             sink.send(&response)?;
 
@@ -357,7 +426,14 @@ pub(super) fn handle_invite(
                 )?;
             } else {
                 // Both legs speak PCMU: forward the payloads untouched.
-                spawn_relay(ims_rtp_socket, veth.rtp_socket, stop.clone(), &meter);
+                spawn_relay(
+                    ims_rtp_socket,
+                    veth.rtp_socket,
+                    stop.clone(),
+                    &meter,
+                    chosen.dtmf_payload_type,
+                    veth.codec.dtmf_payload_type,
+                );
             }
             // Both sides of Agent A's bridge, so a one-way-audio or
             // lost-your-wideband report can be read straight off the log: what
@@ -546,6 +622,47 @@ fn await_pbx_answer(
 mod tests {
     use super::*;
 
+    fn invite_with_content_type(content_type: Option<&str>) -> SipRequest {
+        let ct_line = content_type
+            .map(|ct| format!("Content-Type: {ct}\r\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n{ct_line}Content-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// specs/045 SDP-05: `application/sdp`, and no `Content-Type` at all
+    /// (today's long-standing implicit assumption), are both accepted.
+    #[test]
+    fn supported_invite_content_types_are_accepted() {
+        assert!(invite_content_type_supported(&invite_with_content_type(
+            Some("application/sdp")
+        )));
+        assert!(invite_content_type_supported(&invite_with_content_type(
+            Some("APPLICATION/SDP")
+        )));
+        assert!(invite_content_type_supported(&invite_with_content_type(
+            None
+        )));
+    }
+
+    /// A `multipart/mixed` (or any other unrecognized) body must be
+    /// declined, not scanned as if it were bare SDP text.
+    #[test]
+    fn an_unrecognised_invite_content_type_is_not_supported() {
+        assert!(!invite_content_type_supported(&invite_with_content_type(
+            Some("multipart/mixed; boundary=abc")
+        )));
+        assert!(!invite_content_type_supported(&invite_with_content_type(
+            Some("application/isup")
+        )));
+    }
+
     /// The `200 OK` answering a carrier INVITE must state what we accept.
     /// This was the difference between an inbound Jio call that holds and one
     /// torn down ~460 ms later with `cause=503 "SIP SDP Protocol Error"`, and
@@ -567,19 +684,115 @@ mod tests {
             Some("totag1"),
             Some("<sip:me@10.0.0.9:5060>"),
             Some("v=0\r\n"),
-            UAS_EXTRA_HEADERS,
+            &[
+                ("Allow", super::super::ALLOW),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ],
         );
 
         assert!(
             resp.contains("\r\nAllow: INVITE, ACK, CANCEL, BYE,"),
             "RFC 3261 §13.3.1.4 wants Allow in a 2xx to INVITE: {resp}"
         );
-        // No `Supported:` — see `UAS_EXTRA_HEADERS`'s docs (specs/041
-        // conformance review, MT-10): every extension it used to claim here
-        // (timer, 100rel, replaces, path, gruu) had no behaviour behind it.
+        // specs/045 MT-11: states the line's real access-network value.
+        assert!(
+            resp.contains("\r\nP-Access-Network-Info: 3GPP-WLAN\r\n"),
+            "must state the real access network: {resp}"
+        );
+        // No `Supported:` (specs/041 conformance review, MT-10): every
+        // extension it used to claim here (timer, 100rel, replaces, path,
+        // gruu) had no behaviour behind it.
         assert!(
             !resp.contains("\r\nSupported: "),
             "must not claim an extension nothing here implements: {resp}"
+        );
+    }
+
+    /// specs/043 MT-05: an inbound INVITE offering RFC 4028 session timers
+    /// must not get them echoed back — `SUPPORTED_EXTENSIONS` being empty
+    /// (since MT-10) already means `timer` is never advertised, and RFC
+    /// 4028 §9 explicitly permits a UAS to simply omit `Session-Expires`
+    /// when it doesn't want the extension. This pins that as intentional,
+    /// already-correct behavior, not an open gap.
+    #[test]
+    fn session_expires_on_the_offer_is_never_echoed_back() {
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\n\
+                      Session-Expires: 1800;refresher=uac\r\n\
+                      Supported: timer\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
+
+        let resp = build_uas_response_with_headers(
+            200,
+            "OK",
+            &req,
+            Some("totag1"),
+            Some("<sip:me@10.0.0.9:5060>"),
+            Some("v=0\r\n"),
+            &[
+                ("Allow", super::super::ALLOW),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ],
+        );
+
+        assert!(
+            !resp.contains("Session-Expires"),
+            "must not echo a session-refresh promise nothing here honours: {resp}"
+        );
+        assert!(
+            !resp.contains("\r\nSupported: "),
+            "must not claim timer support even though the offer asked for it: {resp}"
+        );
+    }
+
+    /// specs/045 MT-04: `100rel` (RFC 3262 reliable provisionals) is never
+    /// advertised on any UAS response — `SUPPORTED_EXTENSIONS` being empty
+    /// (since MT-10) already covers this, the same way it covers `timer`
+    /// (MT-05) — and a caller `Require`ing it is still declined `420`
+    /// (MT-03's existing gate) rather than silently accepted. No new
+    /// behavior; this pins both as already correct.
+    #[test]
+    fn the_answering_response_never_advertises_100rel() {
+        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
+
+        let resp = build_uas_response_with_headers(
+            200,
+            "OK",
+            &req,
+            Some("totag1"),
+            Some("<sip:me@10.0.0.9:5060>"),
+            Some("v=0\r\n"),
+            &[
+                ("Allow", super::super::ALLOW),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ],
+        );
+        assert!(
+            !resp.contains("\r\nSupported: "),
+            "must not advertise 100rel (or anything else): {resp}"
+        );
+
+        let requiring_100rel = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKtwo\r\n\
+                      From: <sip:caller@example.net>;tag=abc\r\n\
+                      To: <sip:me@example.net>\r\n\
+                      Call-ID: c2\r\nCSeq: 1 INVITE\r\n\
+                      Require: 100rel\r\nContent-Length: 0\r\n\r\n";
+        let (req2, _) = SipRequest::try_parse(requiring_100rel.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::super::unsupported_required_extensions(&req2),
+            vec!["100rel".to_string()],
+            "Require: 100rel must still be declined, not silently honoured"
         );
     }
 
