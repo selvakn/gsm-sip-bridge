@@ -492,7 +492,6 @@ pub fn annotate_via_received_rport(message: &str, peer: SocketAddr) -> String {
 fn annotate_one_via(via: &str, peer: SocketAddr) -> Option<String> {
     let (proto_and_sentby, params) = via.split_once(';').unwrap_or((via, ""));
     let (proto, sent_by) = proto_and_sentby.trim_end().rsplit_once(' ')?;
-    let sent_by_addr: SocketAddr = sent_by.parse().ok()?;
 
     let mut out_params = String::new();
     for param in params.split(';').filter(|p| !p.is_empty()) {
@@ -503,10 +502,43 @@ fn annotate_one_via(via: &str, peer: SocketAddr) -> Option<String> {
             out_params.push_str(param);
         }
     }
-    if sent_by_addr.ip() != peer.ip() {
-        out_params.push_str(&format!(";received={}", peer.ip()));
+    // `received=` only when the sent-by's own host is actually comparable
+    // to an IP (PR review, 2026-08-27): a hostname sent-by (legal per RFC
+    // 3261's `sent-by = host [":" port]`) can't be compared this way, and
+    // guessing would risk a wrong annotation — `rport` above doesn't need
+    // this at all, so it's still filled either way.
+    if let Some(ip) = sent_by_host_ip(sent_by) {
+        if ip != peer.ip() {
+            out_params.push_str(&format!(";received={}", peer.ip()));
+        }
     }
     Some(format!("{proto} {sent_by}{out_params}"))
+}
+
+/// The IP a Via's sent-by names, if it names one at all — `"host[:port]"`,
+/// where `host` may be a bare IPv4/IPv6 address (IPv6 optionally
+/// bracketed) or a hostname. `None` for a hostname: there's nothing to
+/// compare it against without a DNS lookup this bridge has no reason to
+/// perform just to annotate a response.
+fn sent_by_host_ip(sent_by: &str) -> Option<IpAddr> {
+    if let Ok(addr) = sent_by.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+    if let Ok(ip) = sent_by.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    // "host:port" where `host` isn't directly a `SocketAddr` above (bracketed
+    // IPv6 host is handled by `SocketAddr` already; this covers a bare IPv4
+    // host with a trailing port that for some reason didn't parse as one, or
+    // a hostname, which correctly still falls through to `None` below).
+    let (host, port) = sent_by.rsplit_once(':')?;
+    if !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
 }
 
 /// `100 Trying` — no `To` tag (see `build_uas_response` docs), no `Contact`.
@@ -2607,6 +2639,36 @@ mod tests {
         assert!(annotated.contains(";rport=6001\r\n"), "{annotated}");
         // Sent-by IP matches the peer's, so no `received=` is added.
         assert!(!annotated.contains("received="), "{annotated}");
+    }
+
+    /// PR review, 2026-08-27: a hostname sent-by (legal per RFC 3261's
+    /// `sent-by = host [":" port]`) can't be compared to the peer's IP, so
+    /// `received=` must be skipped — but `rport` doesn't depend on that
+    /// comparison at all and must still be filled.
+    #[test]
+    fn annotate_via_received_rport_fills_rport_even_with_a_hostname_sent_by() {
+        let resp =
+            "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP pcscf.example.net:5067;branch=b1;rport\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(annotated.contains(";rport=6001\r\n"), "{annotated}");
+        assert!(
+            !annotated.contains("received="),
+            "a hostname can't be compared to the peer's IP: {annotated}"
+        );
+    }
+
+    /// A sent-by with no port at all (legal — `sent-by = host [":" port]`)
+    /// must still be comparable for `received=`.
+    #[test]
+    fn annotate_via_received_rport_compares_a_portless_sent_by() {
+        let resp = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.1.1.1;branch=b1\r\n\r\n";
+        let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
+        let annotated = annotate_via_received_rport(resp, peer);
+        assert!(
+            annotated.contains(";received=203.0.113.9\r\n"),
+            "{annotated}"
+        );
     }
 
     #[test]
