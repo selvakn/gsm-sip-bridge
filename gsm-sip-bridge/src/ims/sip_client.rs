@@ -502,43 +502,40 @@ fn annotate_one_via(via: &str, peer: SocketAddr) -> Option<String> {
             out_params.push_str(param);
         }
     }
-    // `received=` only when the sent-by's own host is actually comparable
-    // to an IP (PR review, 2026-08-27): a hostname sent-by (legal per RFC
-    // 3261's `sent-by = host [":" port]`) can't be compared this way, and
-    // guessing would risk a wrong annotation — `rport` above doesn't need
-    // this at all, so it's still filled either way.
-    if let Some(ip) = sent_by_host_ip(sent_by) {
-        if ip != peer.ip() {
-            out_params.push_str(&format!(";received={}", peer.ip()));
-        }
+    // `received=` whenever the sent-by's own host doesn't literally match
+    // the real source (RFC 3261 §18.2.1) — a plain string comparison, not a
+    // DNS resolution this bridge has no reason to perform. A hostname
+    // sent-by can never textually equal a numeric peer address, so it
+    // always gets `received=` too, the same as a genuinely mismatched IP
+    // (PR review, 2026-08-27 — corrects an earlier fix that skipped
+    // `received=` entirely for anything that wasn't itself a valid IP,
+    // missing exactly the hostname case this is meant to cover).
+    if sent_by_host(sent_by) != peer.ip().to_string() {
+        out_params.push_str(&format!(";received={}", peer.ip()));
     }
     Some(format!("{proto} {sent_by}{out_params}"))
 }
 
-/// The IP a Via's sent-by names, if it names one at all — `"host[:port]"`,
-/// where `host` may be a bare IPv4/IPv6 address (IPv6 optionally
-/// bracketed) or a hostname. `None` for a hostname: there's nothing to
-/// compare it against without a DNS lookup this bridge has no reason to
-/// perform just to annotate a response.
-fn sent_by_host_ip(sent_by: &str) -> Option<IpAddr> {
-    if let Ok(addr) = sent_by.parse::<SocketAddr>() {
-        return Some(addr.ip());
+/// Just the host portion of a Via sent-by (`"host[:port]"`), for a literal
+/// string comparison against the real source address — not address
+/// resolution, so a hostname is returned as-is (and, being a hostname,
+/// will simply never match a numeric peer address, correctly always
+/// getting `received=`).
+fn sent_by_host(sent_by: &str) -> &str {
+    if let Some(rest) = sent_by.strip_prefix('[') {
+        // Bracketed IPv6 (RFC 3261's own grammar for it): host ends at `]`.
+        return rest.split(']').next().unwrap_or(rest);
     }
-    if let Ok(ip) = sent_by.parse::<IpAddr>() {
-        return Some(ip);
+    // A hostname or IPv4 has at most one colon (its optional ":port"). An
+    // unbracketed IPv6 literal is malformed per RFC 3261's sent-by grammar
+    // (brackets are required specifically to disambiguate from a port) —
+    // handled safely here anyway: more than one colon means there's no way
+    // to tell which one would be a port separator, so the whole string is
+    // kept as the host rather than guessing.
+    match sent_by.matches(':').count() {
+        1 => sent_by.split(':').next().unwrap_or(sent_by),
+        _ => sent_by,
     }
-    // "host:port" where `host` isn't directly a `SocketAddr` above (bracketed
-    // IPv6 host is handled by `SocketAddr` already; this covers a bare IPv4
-    // host with a trailing port that for some reason didn't parse as one, or
-    // a hostname, which correctly still falls through to `None` below).
-    let (host, port) = sent_by.rsplit_once(':')?;
-    if !port.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse()
-        .ok()
 }
 
 /// `100 Trying` — no `To` tag (see `build_uas_response` docs), no `Contact`.
@@ -2651,10 +2648,13 @@ mod tests {
             "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP pcscf.example.net:5067;branch=b1;rport\r\n\r\n";
         let peer: SocketAddr = "203.0.113.9:6001".parse().unwrap();
         let annotated = annotate_via_received_rport(resp, peer);
-        assert!(annotated.contains(";rport=6001\r\n"), "{annotated}");
+        assert!(annotated.contains(";rport=6001;"), "{annotated}");
+        // PR review, 2026-08-27: a hostname can never textually match a
+        // numeric peer address, so it correctly always gets `received=`
+        // too — this bridge does no DNS resolution to decide otherwise.
         assert!(
-            !annotated.contains("received="),
-            "a hostname can't be compared to the peer's IP: {annotated}"
+            annotated.contains(";received=203.0.113.9\r\n"),
+            "{annotated}"
         );
     }
 
