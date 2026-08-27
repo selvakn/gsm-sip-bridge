@@ -213,10 +213,12 @@ pub fn build_rp_error(rp_mr: u8, cause: Option<u8>) -> Vec<u8> {
     vec![
         // RP-Message-Type-Indicator 100 = RP-ERROR, MS to network
         // (TS 24.011 table 8.4), then the echoed RP-MR.
-        0x04, rp_mr,
+        0x04,
+        rp_mr,
         // RP-Cause (TS 24.011 §8.2.5.4): a length-value element (no IEI,
         // unlike RP-User-Data) — length 1, then the cause octet.
-        0x01, cause.unwrap_or(111),
+        0x01,
+        cause.unwrap_or(111),
     ]
 }
 

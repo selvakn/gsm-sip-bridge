@@ -40,7 +40,6 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-
 /// The `Contact` for a response that answers a network-initiated INVITE.
 ///
 /// Must carry the same feature tags we registered with, not just the address.
@@ -161,7 +160,11 @@ pub(super) fn handle_invite(
             content_type = %content_type,
             "declining: INVITE body is not one we can interpret as SDP"
         );
-        sink.send(&build_415_unsupported_media(req, &to_tag, "application/sdp"))?;
+        sink.send(&build_415_unsupported_media(
+            req,
+            &to_tag,
+            "application/sdp",
+        ))?;
         obs.report_call_not_answered(
             CallStatus::Failed,
             BridgeFailureReason::BridgeSetupFailed,

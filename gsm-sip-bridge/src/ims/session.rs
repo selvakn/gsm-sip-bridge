@@ -286,7 +286,10 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
 /// silent. Best-effort: the SUBSCRIBE's own response and the NOTIFYs arrive
 /// asynchronously on the shared transport and are handled by
 /// `dispatch_loop`, and a send failure only costs us that visibility.
-pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession, access_network_info: &str) {
+pub(crate) fn subscribe_reg_event(
+    session: &mut super::RegisteredSession,
+    access_network_info: &str,
+) {
     let impu = session
         .default_impu()
         .unwrap_or_else(|| format!("sip:{}", session.public_uri));
