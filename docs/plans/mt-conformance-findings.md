@@ -454,6 +454,26 @@ review so far.
 All landed code: `make format && make lint && make test` clean (whole
 workspace, including test targets, clippy `-D warnings`).
 
+**Hardware-verified 2026-08-27**: rebuilt (`gsm-sip-bridge:complete-media-contract`),
+redeployed, real line re-registered. One real inbound call from the
+user's phone: rang, answered, negotiated AMR-WB (carrier) transcoded to
+L16 (veth) — the transcoding relay path, which carries this batch's
+RTP-04 SSRC-logging addition — with `media="both-ways"` (416 carrier-side
+/ 748 veth-side RX packets) and a clean `caller_hangup` after ~15s. Zero
+errors, warnings, or panics in Agent A's own log, and — correctly — no
+spurious "SSRC changed" log line for this single continuous stream,
+confirming the new logging stays silent on the ordinary case rather than
+false-positiving.
+
+Not exercised live: RTP-03's pass-through DTMF relabel and RTP-04's
+pass-through-path SSRC logging both live in `agent::veth::forward`, which
+only runs when both legs negotiate the *same* audio codec (PCMU) — this
+call negotiated AMR-WB and took the transcoding path instead, same as
+most real calls on this line historically. No DTMF was pressed this
+round either. All three remain covered by unit tests only, consistent
+with prior batches' treatment of scenarios that need a specific offer
+shape no carrier here has been observed producing.
+
 ## Batch 6 — the long tail (not started)
 
 - [ ] MT-04 — `100rel` advertised but not served as a UAS
