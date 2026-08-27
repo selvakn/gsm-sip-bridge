@@ -387,12 +387,72 @@ covered by unit tests only (`specs/043-honour-sdp-negotiation/quickstart.md`
 records this constraint), consistent with the same posture batch 3 took
 for its own low-probability live scenarios.
 
-## Batch 5 — complete the media contract (not started)
+## Batch 5 — complete the media contract (landed 2026-08-27, pending hardware round)
 
-- [ ] RTP-01 — no RTCP sent or received, while its bandwidth is declared
-- [ ] RTP-03 — pass-through relay forwards telephone-event under the wrong PT
-- [ ] RTP-04 — no SSRC continuity check on receive
-- [ ] SDP-06 — `a=rtcp` and the offer's `ptime` are discarded
+Full spec/plan/tasks trail: `specs/044-complete-media-contract/`.
+RTP-01 and SDP-06's `a=rtcp` half are **deferred** (see below), not
+landed — reduced scope by explicit decision partway through this batch's
+planning, once research showed real RTCP needs call-wide state (send-side
+octet counts, an exposed/stable SSRC, a per-call timer with live socket
+access, a synchronous teardown hook) that exists nowhere in this codebase
+today, across all three relay call sites and both relay implementations —
+a materially larger and riskier undertaking than anything else in this
+review so far.
+
+- [ ] **RTP-01** — no RTCP sent or received, while its bandwidth is
+      declared. **Deferred, not landed** — see
+      `specs/044-complete-media-contract/research.md` Decision 1 for the
+      full reasoning. Removing the `b=RS:`/`b=RR:` declaration was also
+      considered and rejected: it would trade the RTP-01 gap for a
+      regression against the TS 26.114 §6.2.10 mandate those lines exist
+      to satisfy. Tracked here as its own future feature, to be scoped
+      properly (new sockets, octet counters, SSRC persistence, teardown
+      hooks) rather than bolted onto this batch.
+- [x] **RTP-03** — pass-through relay forwards telephone-event under the
+      wrong PT.
+      **Landed**: `agent::veth::forward` now reads each packet's payload
+      type via the existing `rtp::parse_packet` (already used identically
+      by the transcoding relay) and relabels a DTMF packet to the
+      *destination* leg's own negotiated `telephone-event` payload type
+      when it differs from the *source* leg's — rewriting only the
+      payload-type byte (marker bit preserved), since the RFC 4733 event
+      payload itself needs no re-origination the way the transcoding
+      relay's own DTMF path needs one. Threaded through
+      `spawn_relay`/`relay_rtp` and all four call sites (`agent/inbound.rs`,
+      `agent/veth.rs`, `agent/origination.rs` ×3), reusing
+      `ChosenCodec::dtmf_payload_type` from batch 1's RTP-02 fix. Tests: a
+      differing-PT keypress is relabeled; a matching-PT keypress and an
+      ordinary audio packet both pass through byte-for-byte unchanged.
+- [x] **RTP-04** — no SSRC continuity check on receive.
+      **Landed**, as observability only (see FR-005 in the spec): both
+      relay implementations (`agent::veth::forward`, the pass-through
+      path; `transcode::relay_direction`, the transcoding path) now log
+      when a stream's SSRC changes mid-call, identifying the direction and
+      old/new value — a legitimate RFC 3550 source-restart signal, never a
+      reason to drop a packet or interrupt the call. Nothing in either
+      relay's logic depended on SSRC continuity to function, so there was
+      no existing behavior to fix, only visibility to add. Tests: a
+      mid-stream SSRC change on each relay path still delivers every
+      packet; a stream's first packet is never itself logged as a change.
+- [x] **SDP-06** — `a=rtcp` and the offer's `ptime` are discarded.
+      **Split**: the `a=rtcp` half is deferred alongside RTP-01 (it exists
+      only to support RTP-01 — an explicit RTCP port has nothing to
+      consume without real RTCP). The `ptime` half **landed**, but not as
+      originally planned: the intended fix (echo the offer's `ptime` into
+      the answer, mirroring `maxptime`) turned out, on inspection, to be
+      wrong — an offer's `ptime` describes what *the offer's own owner*
+      intends to send, not a request for our answer to match, and this
+      bridge's own packetization is a fixed, codec-level constant
+      (`NegotiatedCodec::frame_samples`, unconditionally 20ms). Echoing a
+      different offered value would have made the answer state a
+      packetization we don't actually use — the same class of bug this
+      whole review exists to eliminate, introduced anew. **Resolution**:
+      confirmed via test that the answer always states its own true 20ms
+      framing regardless of what any given offer's `ptime` says; no
+      `SdpOffer` field added, no `build_answer_for` change.
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`).
 
 ## Batch 6 — the long tail (not started)
 
