@@ -728,7 +728,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection.
     let mut inbound = start_inbound(&session)?;
-    subscribe_reg_event(&mut session);
+    subscribe_reg_event(&mut session, &reg_cfg.access_network_info);
 
     // What the registrar actually granted, not what we asked for: renewing on
     // the requested value would leave a window where the binding has lapsed
@@ -1289,6 +1289,7 @@ impl DispatchParams<'_> {
             answer_preference: self.answer_preference,
             veth_sip_port: self.veth_sip_port,
             obs: self.obs,
+            access_network_info: &self.reg_cfg.access_network_info,
         }
     }
 
@@ -2169,7 +2170,7 @@ impl LoopState {
                 self.force_renewal = false;
                 self.gm_conn = crate::ims::GmConnectionState::Up;
                 p.obs.set_gm_connection_up(true);
-                subscribe_reg_event(session);
+                subscribe_reg_event(session, &p.reg_cfg.access_network_info);
             }
             Err(e) => {
                 tracing::warn!(
@@ -2249,6 +2250,7 @@ mod tests {
             from_tag: "tag1",
             cseq: 7,
             expires: 3600,
+            access_network_info: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01",
         });
         assert!(msg
             .starts_with("SUBSCRIBE sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org SIP/2.0"));
@@ -2263,6 +2265,11 @@ mod tests {
         // Contact carries the protected server port, Via the client port.
         assert!(msg.contains("Contact: <sip:404940965025744@1.2.3.4:48586;transport=TCP>\r\n"));
         assert!(msg.contains("Via: SIP/2.0/TCP 1.2.3.4:48584;"));
+        // specs/045 MT-11: states the real access-network value, not a
+        // hardcoded one.
+        assert!(msg.contains(
+            "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01\r\n"
+        ));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
@@ -2280,6 +2287,29 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\nFrom: garbage\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "unknown");
+    }
+
+    /// specs/045 MT-12: a trusted network element's `P-Asserted-Identity`
+    /// wins over the caller-supplied `From` when both are present — measured
+    /// on real carrier traffic where the two legitimately differ (an SMSC
+    /// gateway's own hostname in `From`, the real subscriber in P-Asserted-Identity).
+    #[test]
+    fn extract_caller_prefers_p_asserted_identity_over_from() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: <sip:gateway.ims.example>;tag=abc\r\n\
+                    P-Asserted-Identity: <sip:+919000000000@ims.example>\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000000");
+    }
+
+    #[test]
+    fn extract_caller_falls_back_to_from_when_no_asserted_identity() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: <sip:+919000000001@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000001");
     }
 
     fn message_with_headers(headers: &str) -> SipRequest {

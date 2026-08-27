@@ -230,6 +230,11 @@ pub(crate) struct SubscribeParts<'a> {
     pub(crate) from_tag: &'a str,
     pub(crate) cseq: u32,
     pub(crate) expires: u32,
+    /// This line's real access-network type (`ImsRegisterConfig::access_network_info`
+    /// — `"3GPP-WLAN"` for VoWiFi, a real E-UTRAN value for VoLTE), echoed
+    /// into `P-Access-Network-Info` instead of a hardcoded value
+    /// (specs/045 MT-11).
+    pub(crate) access_network_info: &'a str,
 }
 
 pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
@@ -257,7 +262,7 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
          Event: reg\r\n\
          Expires: {expires}\r\n\
          Accept: application/reginfo+xml\r\n\
-         P-Access-Network-Info: 3GPP-WLAN\r\n\
+         P-Access-Network-Info: {access_network_info}\r\n\
          Content-Length: 0\r\n\r\n",
         impu = p.impu,
         from_tag = p.from_tag,
@@ -267,6 +272,7 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
         contact_addr = contact_addr,
         transport = p.via_transport,
         expires = p.expires,
+        access_network_info = p.access_network_info,
     ));
     msg
 }
@@ -280,7 +286,7 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
 /// silent. Best-effort: the SUBSCRIBE's own response and the NOTIFYs arrive
 /// asynchronously on the shared transport and are handled by
 /// `dispatch_loop`, and a send failure only costs us that visibility.
-pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession) {
+pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession, access_network_info: &str) {
     let impu = session
         .default_impu()
         .unwrap_or_else(|| format!("sip:{}", session.public_uri));
@@ -304,6 +310,7 @@ pub(crate) fn subscribe_reg_event(session: &mut super::RegisteredSession) {
         from_tag: &random_hex(4),
         cseq,
         expires: super::DEFAULT_EXPIRES,
+        access_network_info,
     });
     match session.transport_mut().and_then(|t| t.send(&msg)) {
         Ok(()) => tracing::info!(impu = %impu, "sent reg-event SUBSCRIBE"),
@@ -574,12 +581,30 @@ pub(crate) fn respond(sink: &SipSink, what: &str, message: &str) {
     }
 }
 
-pub(crate) fn extract_caller(req: &SipRequest) -> String {
-    req.header("From")
+/// The user part of a header's URI, the same shape `extract_caller` has
+/// always used for `From` — extracted here so `P-Asserted-Identity` can be
+/// read with the exact same parsing (specs/045 MT-12).
+fn header_user_part(req: &SipRequest, name: &str) -> Option<String> {
+    req.header(name)
         .and_then(|f| f.split("sip:").nth(1))
         .and_then(|rest| rest.split(['@', ';', '>']).next())
-        .unwrap_or("unknown")
-        .to_string()
+        .map(str::to_string)
+}
+
+/// The caller's identity for this bridge's own internal attribution (logs,
+/// CDRs, SMS sender fields) — never re-presented to any third party, so
+/// RFC 3325 §9.1's `Privacy` withholding obligation (which governs onward
+/// signaling) does not apply to this use.
+///
+/// Prefers `P-Asserted-Identity` (RFC 3325 §9.1: a trusted network element
+/// vouching for the caller) over `From` (caller-supplied, unverified) when
+/// both are present — measured on real carrier traffic where the two can
+/// legitimately differ. Falls back to `From` when no asserted identity is
+/// present, exactly as before (specs/045 MT-12).
+pub(crate) fn extract_caller(req: &SipRequest) -> String {
+    header_user_part(req, "P-Asserted-Identity")
+        .or_else(|| header_user_part(req, "From"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The **whole URI** named by a header, where [`extract_caller`] wants only

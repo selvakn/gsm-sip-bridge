@@ -56,7 +56,7 @@ pub fn probe_inbound(
     // notification arriving proves the network can reach us, which is what
     // makes a subsequent *absent* INVITE meaningful evidence.
     let inbound = start_inbound(&session)?;
-    subscribe_reg_event(&mut session);
+    subscribe_reg_event(&mut session, &cfg.access_network_info);
     match session.gm_server_addr() {
         Some(addr) => tracing::info!(
             %addr,
