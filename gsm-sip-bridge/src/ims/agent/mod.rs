@@ -1093,6 +1093,24 @@ fn handle_message(
                 "200 OK (MESSAGE, non-deliver TPDU)",
                 &build_200_ok_message(req, &random_hex(4)),
             );
+            // The RP-DATA envelope itself was still received (just not a
+            // deliverable message) — it still owes the network an RP-ACK,
+            // the same as a genuinely decoded message would (PR review,
+            // 2026-08-27). Without this the network never sees the RP layer
+            // acknowledged and retains or retries the RP-DATA.
+            if let Some(ipsmgw) =
+                header_uri(req, "P-Asserted-Identity").or_else(|| header_uri(req, "From"))
+            {
+                send_sms_delivery_report(
+                    session,
+                    &ipsmgw,
+                    &crate::ims::sms_pdu::build_rp_ack(rp_mr),
+                );
+            } else {
+                tracing::warn!(
+                    "no P-Asserted-Identity or From URI on an SMS MESSAGE; cannot address an RP-ACK"
+                );
+            }
             return;
         }
         // specs/045 SMS-03: the TPDU claimed to be SMS-DELIVER but couldn't
