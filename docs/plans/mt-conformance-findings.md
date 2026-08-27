@@ -474,25 +474,129 @@ round either. All three remain covered by unit tests only, consistent
 with prior batches' treatment of scenarios that need a specific offer
 shape no carrier here has been observed producing.
 
-## Batch 6 — the long tail (not started)
+## Batch 6 — the long tail (landed 2026-08-27, pending hardware round)
 
-- [ ] MT-04 — `100rel` advertised but not served as a UAS
-- [ ] MT-06 — preconditions are not implemented
-- [ ] MT-11 — no `P-Access-Network-Info` on responses; SUBSCRIBE hardcodes
-      Wi-Fi
-- [ ] MT-12 — caller identity read from `From` alone, not
-      `P-Asserted-Identity`/`Privacy`
-- [ ] MT-13 — echoed `Via` gains no `received`/`rport`
-- [ ] SDP-04 — an INVITE without an offer is rejected instead of answered
-      with our own offer
-- [ ] SDP-05 — multipart bodies are parsed by accident
-- [ ] SMS-02 — TP-MTI never checked; every TPDU read as SMS-DELIVER
-- [ ] SMS-03 — no RP-ERROR path
-- [ ] SMS-04 — message-waiting/message-class DCS groups misread
-- [ ] SMS-05 — concatenated messages labelled, not reassembled
-- [ ] SMS-07 — national-language shift tables unimplemented
-- [ ] CS-03 — no `AT+CNMI` policy asserted
-- [ ] CS-04 — `+CMGR` header split on commas (not quote-aware)
+Full spec/plan/tasks trail: `specs/045-long-tail-conformance/`. Four
+findings — MT-06, SDP-04, SMS-05, SMS-07 — are **deferred**, not landed;
+see below.
+
+- [x] **MT-04** — `100rel` advertised but not served as a UAS.
+      **Confirmed resolved by prior batches — no new code.** Same
+      resolution shape as MT-05 (batch 4): `SUPPORTED_EXTENSIONS` has been
+      empty since MT-10, so the inbound side no longer advertises
+      `100rel` at all, and it never marks a provisional reliable (only
+      plain `100`/`180`/`200`), so there is no PRACK obligation for a
+      caller to serve in the first place. `Require: 100rel` is still
+      declined `420` by MT-03's existing gate. Test added:
+      `agent::inbound::tests::the_answering_response_never_advertises_100rel`.
+- [x] **MT-11** — no `P-Access-Network-Info` on responses; SUBSCRIBE
+      hardcodes Wi-Fi.
+      **Landed**: `ImsRegisterConfig::access_network_info` was already
+      computed correctly per line (VoWiFi: `3GPP-WLAN`; VoLTE: a real
+      E-UTRAN value from the serving cell) and used for REGISTER, but
+      never reached the reg-event SUBSCRIBE or the `200 OK` to an
+      answered inbound INVITE. `session::SubscribeParts` gained
+      `access_network_info`, echoed by `build_subscribe` in place of the
+      hardcoded literal; `agent::inbound`'s per-call header list (was a
+      shared `UAS_EXTRA_HEADERS` const) now carries the same real value
+      into the INVITE's `200 OK`.
+- [x] **MT-12** — caller identity read from `From` alone, not
+      `P-Asserted-Identity`/`Privacy`.
+      **Landed**: `session::extract_caller` now prefers
+      `P-Asserted-Identity` (RFC 3325 — a trusted network element vouching
+      for the caller) when present, falling back to `From` unchanged when
+      absent. Used only for this bridge's own internal attribution (logs,
+      CDRs, SMS sender fields), never re-presented to a third party, so
+      `Privacy`'s onward-signaling withholding obligation doesn't apply
+      here.
+- [x] **MT-13** — echoed `Via` gains no `received`/`rport`.
+      **Landed**: a new `sip_client::annotate_via_received_rport` adds
+      `received=`/fills `rport=` per RFC 3261 §18.2.1 / RFC 3581 §4,
+      applied at the two actual places a response reaches a socket
+      (`SipSink::send`, `sip::server::serve`'s `send_to`) rather than
+      threaded through `build_uas_response_with_headers`'s ~39 call sites
+      — the real peer address is only known at the transport boundary,
+      and centralizing it there touches two call sites instead of dozens.
+      A no-op on anything that isn't a response, so it can't misfire on a
+      request this bridge originates.
+- [x] **SDP-05** — multipart bodies are parsed by accident.
+      **Landed**, scoped to what the review actually found: `req.body`
+      went to `sdp::parse_offer` completely unconditionally, whatever
+      `Content-Type` said or didn't say. `parse_offer`'s line-scanner has
+      no concept of MIME structure, so a multipart body's real SDP part
+      could parse "by accident," while a malformed one could misfire in
+      stranger ways (a lossy-UTF8-decoded binary sibling part producing
+      spurious `m=`-prefixed "lines"). `agent::inbound::handle_invite` now
+      declines anything other than `application/sdp` or no `Content-Type`
+      (today's implicit assumption), same posture already established for
+      `MESSAGE` bodies (SMS-06). **Ruled out**: actually parsing
+      `multipart/mixed` — no evidence any carrier here sends it, and
+      `ims::sdp`'s own header comment already commits it to "minimal ...
+      not a general-purpose SDP library."
+- [x] **SMS-02** — TP-MTI never checked; every TPDU read as SMS-DELIVER.
+      **Landed**: `DecodedRp` gains `UnsupportedTpdu { rp_mr, kind }` — a
+      TPDU whose own TP-MTI says SMS-SUBMIT-REPORT or SMS-STATUS-REPORT is
+      now recognized before ever being walked with the SMS-DELIVER field
+      layout, the same class of bug already fixed one layer up at the RP
+      envelope (SMS-01). The RP-DATA itself was still received, so it's
+      still owed a plain `200 OK`/RP-ACK, never relayed as a message.
+- [x] **SMS-03** — no RP-ERROR path.
+      **Landed**, alongside SMS-02: `DecodedRp::Undecodable { rp_mr }` (a
+      TPDU that claimed SMS-DELIVER but couldn't parse) is now
+      distinguished from `UnsupportedTpdu`, and gets a genuine RP-ERROR
+      (new `sms_pdu::build_rp_error`, mirroring `build_rp_ack`'s shape)
+      sent as a delivery report — instead of `handle_message` silently
+      relaying `req.body` as if it were plain text.
+- [x] **SMS-04** — message-waiting/message-class DCS groups misread.
+      **Landed**, the concretely-wrong half: `Alphabet::from_dcs`'s
+      `0xE0`-`0xEF` group (Message Waiting Indication, Store, UCS2 per
+      TS 23.038 §4) was falling through to the GSM7 default, garbling
+      real UCS2 text — added as its own branch, unconditionally UCS2 (not
+      a per-bit selector, confirmed against a live decode test after an
+      initial wrong assumption about the bit convention). The sibling
+      Discard/Store-GSM7 groups (`0xC0`/`0xD0`) were already correct via
+      the same fallback and are unaffected. Message class extraction
+      itself remains out of scope — nothing downstream consumes it.
+- [x] **CS-03** — no `AT+CNMI` policy asserted.
+      **Landed**: `volte::sms::sweep_modem_storage` now sends
+      `AT+CNMI=2,1,0,0,0` alongside its existing `AT+CMGF=0`, parity with
+      the legacy multi-card pool's own init sequence
+      (`modules::worker::ModuleWorker::open`), which already asserts the
+      same policy. Not unit-tested — requires a real serial device, same
+      constraint as the rest of this sweep's AT-command sequencing;
+      verified via the hardware round below.
+- [x] **CS-04** — `+CMGR` header split on commas (not quote-aware).
+      **Landed**: `modules::worker::parse_sms_response`'s naive
+      `line.split(',')` — correct today only by coincidence of field
+      order (the `<scts>`/`<alpha>` fields with their own internal commas
+      sit *after* the one field this function reads) — replaced with a
+      quote-aware splitter respecting `"..."` boundaries.
+
+**Deferred, not landed** (recorded here so the doc doesn't imply either
+"done" or "won't ever do" — see `specs/045-long-tail-conformance/research.md`
+Decision 1 and Decision 8 for the full reasoning):
+
+- [ ] **MT-06** — preconditions are not implemented. Needs new SDP-level
+      QoS attribute parsing and a bearer-readiness state machine; the
+      header-level behavior (declining `Require: precondition`) is already
+      correct via MT-03's existing gate.
+- [ ] **SDP-04** — an INVITE without an offer is rejected instead of
+      answered with our own offer. Needs new pending-call state deferring
+      RTP-socket setup and codec selection from INVITE time to ACK time —
+      comparable in scope to RTP-01 (batch 5).
+- [ ] **SMS-05** — concatenated messages labelled, not reassembled. Needs
+      a cross-message buffer keyed by sender/reference/total with its own
+      eviction policy; today's decoder is stateless by design.
+- [ ] **SMS-07** — national-language shift tables unimplemented. Attempted
+      and reversed mid-implementation: the mechanism (recognizing the UDH
+      IEs that select a table) is small, but the part that fixes decoded
+      text is TS 23.038 Annex A's character-table data, which is not
+      something to ship from memory without a verifiable source — a wrong
+      mapping would silently decode real text to the wrong characters,
+      worse than today's honest, already-documented gap.
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`).
 
 ## Hardware test log
 
