@@ -134,10 +134,22 @@ pub(super) fn spawn_relay(
     veth: UdpSocket,
     stop: Arc<AtomicBool>,
     meter: &crate::ims::media_stats::MediaMeter,
+    carrier_dtmf_pt: Option<u8>,
+    veth_dtmf_pt: Option<u8>,
 ) {
     let carrier_rx = meter.carrier_rx_counter();
     let pbx_rx = meter.pbx_rx_counter();
-    std::thread::spawn(move || relay_rtp(carrier, veth, stop, carrier_rx, pbx_rx));
+    std::thread::spawn(move || {
+        relay_rtp(
+            carrier,
+            veth,
+            stop,
+            carrier_rx,
+            pbx_rx,
+            carrier_dtmf_pt,
+            veth_dtmf_pt,
+        )
+    });
 }
 
 /// Relays raw UDP payloads bidirectionally between `a` and `b` (both
@@ -148,12 +160,19 @@ pub(super) fn spawn_relay(
 /// always PCMU too — so the wire bytes (RTP header included: SSRC,
 /// sequence, timestamp all stay whatever the real source generated) are
 /// already correct for the other side without modification.
+///
+/// The one exception is DTMF (specs/044 RTP-03): each leg's own SDP answer
+/// picks its `telephone-event` payload type independently, so "both legs
+/// agree" never held for it the way it does for the audio codec — see
+/// `forward`'s own relabeling.
 pub fn relay_rtp(
     carrier: UdpSocket,
     veth: UdpSocket,
     stop: Arc<AtomicBool>,
     carrier_rx: Arc<std::sync::atomic::AtomicU64>,
     pbx_rx: Arc<std::sync::atomic::AtomicU64>,
+    carrier_dtmf_pt: Option<u8>,
+    veth_dtmf_pt: Option<u8>,
 ) {
     let (carrier2, veth2, stop2) = match (carrier.try_clone(), veth.try_clone()) {
         (Ok(a2), Ok(b2)) => (a2, b2, stop.clone()),
@@ -169,23 +188,88 @@ pub fn relay_rtp(
     // thread counts downlink from the carrier, the veth→carrier thread counts
     // uplink from the telephone leg. Read together at teardown, they are the
     // FR-017 both-ways verdict.
-    let h1 = std::thread::spawn(move || forward(carrier, veth2, stop, carrier_rx));
-    let h2 = std::thread::spawn(move || forward(veth, carrier2, stop2, pbx_rx));
+    let h1 = std::thread::spawn(move || {
+        forward(
+            carrier,
+            veth2,
+            stop,
+            carrier_rx,
+            carrier_dtmf_pt,
+            veth_dtmf_pt,
+            "carrier->veth",
+        )
+    });
+    let h2 = std::thread::spawn(move || {
+        forward(
+            veth,
+            carrier2,
+            stop2,
+            pbx_rx,
+            veth_dtmf_pt,
+            carrier_dtmf_pt,
+            "veth->carrier",
+        )
+    });
     let _ = h1.join();
     let _ = h2.join();
 }
 
+/// Relabels a DTMF packet from `src_dtmf_pt` to `dst_dtmf_pt` before
+/// forwarding, when the two legs negotiated different payload types for
+/// `telephone-event` (specs/044 RTP-03) — the receiving leg would
+/// otherwise get a payload type it never agreed DTMF would use. Only the
+/// payload-type byte (offset 1, low 7 bits — the marker bit in the high
+/// bit is preserved) changes; the RFC 4733 event payload itself is
+/// identical regardless of which leg's codec is in use, so no
+/// re-origination (fresh SSRC/timestamp run) is needed the way the
+/// transcoding relay's DTMF path needs one.
+fn relabel_dtmf_payload_type(buf: &mut [u8], dst_dtmf_pt: u8) {
+    if buf.len() > 1 {
+        buf[1] = (buf[1] & 0x80) | (dst_dtmf_pt & 0x7f);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn forward(
     src: UdpSocket,
     dst: UdpSocket,
     stop: Arc<AtomicBool>,
     counter: Arc<std::sync::atomic::AtomicU64>,
+    src_dtmf_pt: Option<u8>,
+    dst_dtmf_pt: Option<u8>,
+    direction: &'static str,
 ) {
     let mut buf = [0u8; 2048];
+    // Observability only (specs/044 RTP-04): an SSRC change is a legitimate
+    // RFC 3550 signal (a source restart), not itself an error — logged so
+    // it's visible after the fact, never a reason to drop a packet or stop
+    // relaying.
+    let mut last_ssrc: Option<u32> = None;
     while !stop.load(Ordering::Relaxed) {
         match src.recv(&mut buf) {
             Ok(n) => {
                 crate::ims::media_stats::bump(&counter);
+                if let Some(pkt) = crate::ims::rtp::parse_packet(&buf[..n]) {
+                    let ssrc = pkt.ssrc;
+                    let payload_type = pkt.payload_type;
+                    if let Some(previous) = last_ssrc.replace(ssrc) {
+                        if previous != ssrc {
+                            tracing::info!(
+                                direction,
+                                previous_ssrc = previous,
+                                new_ssrc = ssrc,
+                                "RTP source SSRC changed mid-call"
+                            );
+                        }
+                    }
+                    if Some(payload_type) == src_dtmf_pt {
+                        if let Some(dst_pt) = dst_dtmf_pt {
+                            if Some(dst_pt) != src_dtmf_pt {
+                                relabel_dtmf_payload_type(&mut buf[..n], dst_pt);
+                            }
+                        }
+                    }
+                }
                 let _ = dst.send(&buf[..n]);
             }
             Err(e)
@@ -230,7 +314,9 @@ mod tests {
         let carrier_rx = meter.carrier_rx_counter();
         let pbx_rx = meter.pbx_rx_counter();
         let handle = std::thread::spawn(move || {
-            relay_rtp(ims_side, veth_side, stop_clone, carrier_rx, pbx_rx)
+            relay_rtp(
+                ims_side, veth_side, stop_clone, carrier_rx, pbx_rx, None, None,
+            )
         });
 
         // ims_peer -> ims_side -> (relay) -> veth_side -> veth_peer
@@ -261,5 +347,134 @@ mod tests {
             meter.verdict(crate::ims::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT),
             crate::ims::media_stats::DirectionVerdict::BothWays
         );
+    }
+
+    /// A connected loopback pair standing in for one relay direction's
+    /// `src`/`dst`, plus the peer sockets that stand in for the real
+    /// endpoints on either side of `forward`.
+    fn connected_pair() -> (UdpSocket, UdpSocket) {
+        let a = loopback_socket();
+        let b = loopback_socket();
+        a.connect(b.local_addr().unwrap()).unwrap();
+        b.connect(a.local_addr().unwrap()).unwrap();
+        (a, b)
+    }
+
+    fn run_forward_once(
+        src_dtmf_pt: Option<u8>,
+        dst_dtmf_pt: Option<u8>,
+        packet: &[u8],
+    ) -> Vec<u8> {
+        let (src_recv, src_send) = connected_pair();
+        let (dst_send, dst_recv) = connected_pair();
+        // Without a real relay_rtp() wrapping this call, nothing else sets a
+        // read timeout — forward()'s own `while !stop.load(...)` re-check
+        // only happens between recv() calls, so a src that never receives
+        // another packet would otherwise block forever, past `stop` being set.
+        src_recv
+            .set_read_timeout(Some(RELAY_POLL_INTERVAL))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handle = std::thread::spawn(move || {
+            forward(
+                src_recv,
+                dst_send,
+                stop_clone,
+                counter,
+                src_dtmf_pt,
+                dst_dtmf_pt,
+                "test",
+            )
+        });
+        src_send.send(packet).unwrap();
+        dst_recv
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let n = dst_recv.recv(&mut buf).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// specs/044 RTP-03: a DTMF packet relayed toward a leg that negotiated
+    /// a *different* telephone-event payload type must arrive relabeled to
+    /// that leg's own — otherwise it names a payload type the receiver
+    /// never agreed DTMF would use.
+    #[test]
+    fn a_dtmf_packet_is_relabeled_to_the_destination_legs_own_payload_type() {
+        let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 101, &[9, 0, 0, 160]);
+        let forwarded = run_forward_once(Some(101), Some(96), &packet);
+        assert_eq!(
+            forwarded[1] & 0x7f,
+            96,
+            "must be relabeled to the destination's own DTMF payload type"
+        );
+        assert_eq!(
+            forwarded[1] & 0x80,
+            packet[1] & 0x80,
+            "the marker bit must survive relabeling"
+        );
+        assert_eq!(
+            &forwarded[12..],
+            &packet[12..],
+            "the DTMF payload itself is untouched"
+        );
+    }
+
+    /// When both legs happen to negotiate the same DTMF payload type, there
+    /// is nothing to relabel — the packet must pass through byte-for-byte.
+    #[test]
+    fn a_dtmf_packet_is_unchanged_when_both_legs_agree_on_the_payload_type() {
+        let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 101, &[9, 0, 0, 160]);
+        let forwarded = run_forward_once(Some(101), Some(101), &packet);
+        assert_eq!(forwarded, packet);
+    }
+
+    /// An ordinary audio packet must never be relabeled, regardless of what
+    /// DTMF payload types either leg negotiated.
+    #[test]
+    fn an_audio_packet_is_never_relabeled() {
+        let packet = crate::ims::rtp::build_packet(1, 8000, 0xAAAA, 0, &[0u8; 160]);
+        let forwarded = run_forward_once(Some(101), Some(96), &packet);
+        assert_eq!(forwarded, packet);
+    }
+
+    /// specs/044 RTP-04: an SSRC change mid-stream must never cause a
+    /// packet to be dropped — only the DTMF-relabeling and (separately
+    /// logged) SSRC-continuity checks read the packet; forwarding must be
+    /// unaffected either way.
+    #[test]
+    fn a_packet_with_a_new_ssrc_is_still_forwarded() {
+        let first = crate::ims::rtp::build_packet(1, 8000, 0x1111, 0, &[0u8; 160]);
+        let second = crate::ims::rtp::build_packet(2, 8160, 0x2222, 0, &[1u8; 160]);
+
+        let (src_recv, src_send) = connected_pair();
+        let (dst_send, dst_recv) = connected_pair();
+        src_recv
+            .set_read_timeout(Some(RELAY_POLL_INTERVAL))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handle = std::thread::spawn(move || {
+            forward(src_recv, dst_send, stop_clone, counter, None, None, "test")
+        });
+
+        src_send.send(&first).unwrap();
+        src_send.send(&second).unwrap();
+        dst_recv
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let n1 = dst_recv.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], &first[..]);
+        let n2 = dst_recv.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], &second[..]);
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
     }
 }

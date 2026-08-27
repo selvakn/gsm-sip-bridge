@@ -385,7 +385,14 @@ pub(super) fn handle_invite(
                 )?;
             } else {
                 // Both legs speak PCMU: forward the payloads untouched.
-                spawn_relay(ims_rtp_socket, veth.rtp_socket, stop.clone(), &meter);
+                spawn_relay(
+                    ims_rtp_socket,
+                    veth.rtp_socket,
+                    stop.clone(),
+                    &meter,
+                    chosen.dtmf_payload_type,
+                    veth.codec.dtmf_payload_type,
+                );
             }
             // Both sides of Agent A's bridge, so a one-way-audio or
             // lost-your-wideband report can be read straight off the log: what

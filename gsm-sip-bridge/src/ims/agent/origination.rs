@@ -1113,6 +1113,8 @@ pub(super) fn tick_pending_origination(
                                             veth_sock_clone,
                                             stop.clone(),
                                             &meter,
+                                            chosen.dtmf_payload_type,
+                                            veth_result.codec.dtmf_payload_type,
                                         );
                                         true
                                     };
@@ -1386,7 +1388,14 @@ fn finish_origination(
                         &new_meter,
                     )
                 } else {
-                    spawn_relay(rtp_socket, veth_sock, new_stop.clone(), &new_meter);
+                    spawn_relay(
+                        rtp_socket,
+                        veth_sock,
+                        new_stop.clone(),
+                        &new_meter,
+                        final_chosen.dtmf_payload_type,
+                        veth_codec.dtmf_payload_type,
+                    );
                     Ok(())
                 };
                 if let Err(e) = relay_result {
@@ -1500,7 +1509,14 @@ fn finish_origination(
                     &meter,
                 )
             } else {
-                spawn_relay(rtp_socket, veth.rtp_socket, stop.clone(), &meter);
+                spawn_relay(
+                    rtp_socket,
+                    veth.rtp_socket,
+                    stop.clone(),
+                    &meter,
+                    chosen.dtmf_payload_type,
+                    veth.codec.dtmf_payload_type,
+                );
                 Ok(())
             };
             if let Err(e) = relay_result {
