@@ -371,9 +371,6 @@ pub(super) fn report_answered_call_ended(
             verdict.diagnosis()
         );
     }
-    if call.rtcp.is_none() {
-        obs.report_rtcp_unavailable();
-    }
     if let Some(fe) = &far_end_reports {
         obs.report_media_quality(
             crate::control::protocol::QualitySource::Remote,

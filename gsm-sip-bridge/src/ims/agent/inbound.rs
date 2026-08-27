@@ -500,6 +500,13 @@ pub(super) fn handle_invite(
                         call_id = %call_id,
                         "no RTCP endpoint obtained for this call; proceeding without RTCP"
                     );
+                    // Reported here, at the moment binding actually failed
+                    // (tier 3) — not inferred later from `ActiveCall.rtcp`
+                    // being `None` at teardown, which is equally true of an
+                    // originated call that was never in RTCP's scope to
+                    // begin with (FR-023) and would otherwise inflate this
+                    // metric on every successful outbound call.
+                    obs.report_rtcp_unavailable();
                 }
             }
 
