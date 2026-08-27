@@ -1105,6 +1105,11 @@ pub(super) fn tick_pending_origination(
                                             veth_result.codec,
                                             stop.clone(),
                                             &meter,
+                                            // Originated calls are out of
+                                            // scope for RTCP reporting
+                                            // (specs/046-rtcp-reporting
+                                            // FR-023).
+                                            None,
                                         )
                                         .is_ok()
                                     } else {
@@ -1115,6 +1120,11 @@ pub(super) fn tick_pending_origination(
                                             &meter,
                                             chosen.dtmf_payload_type,
                                             veth_result.codec.dtmf_payload_type,
+                                            // Originated calls are out of
+                                            // scope for RTCP reporting
+                                            // (specs/046-rtcp-reporting
+                                            // FR-023).
+                                            None,
                                         );
                                         true
                                     };
@@ -1386,6 +1396,9 @@ fn finish_origination(
                         veth_codec,
                         new_stop.clone(),
                         &new_meter,
+                        // Originated calls are out of scope for RTCP
+                        // reporting (specs/046-rtcp-reporting FR-023).
+                        None,
                     )
                 } else {
                     spawn_relay(
@@ -1395,6 +1408,9 @@ fn finish_origination(
                         &new_meter,
                         final_chosen.dtmf_payload_type,
                         veth_codec.dtmf_payload_type,
+                        // Originated calls are out of scope for RTCP
+                        // reporting (specs/046-rtcp-reporting FR-023).
+                        None,
                     );
                     Ok(())
                 };
@@ -1507,6 +1523,9 @@ fn finish_origination(
                     veth.codec,
                     stop.clone(),
                     &meter,
+                    // Originated calls are out of scope for RTCP reporting
+                    // (specs/046-rtcp-reporting FR-023).
+                    None,
                 )
             } else {
                 spawn_relay(
@@ -1516,6 +1535,9 @@ fn finish_origination(
                     &meter,
                     chosen.dtmf_payload_type,
                     veth.codec.dtmf_payload_type,
+                    // Originated calls are out of scope for RTCP reporting
+                    // (specs/046-rtcp-reporting FR-023).
+                    None,
                 );
                 Ok(())
             };
@@ -1569,6 +1591,10 @@ fn finish_origination(
         // modification attempt (`InDialogInvite::ReInvite`), never a
         // retransmission. See `CachedInviteAnswer`'s doc comment.
         answered_invite: None,
+        // The originated-call path is out of scope for RTCP reporting
+        // (specs/046-rtcp-reporting FR-023) — only the carrier leg of
+        // answered (terminating) calls carries an RTCP endpoint.
+        rtcp: None,
     })
 }
 

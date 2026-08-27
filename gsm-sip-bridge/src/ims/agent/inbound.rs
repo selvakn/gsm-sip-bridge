@@ -7,7 +7,7 @@
 //! first. That wait ([`await_pbx_answer`]) is the whole reason this is not a
 //! straight-line handler.
 
-use super::call::{spawn_control_reader, ActiveCall, CachedInviteAnswer, DialogInfo};
+use super::call::{spawn_control_reader, ActiveCall, CachedInviteAnswer, DialogInfo, RtcpHandle};
 use super::observability;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VETH_INVITE_TIMEOUT};
 use super::{unsupported_required_extensions, CONTROL_TIMEOUT};
@@ -24,7 +24,7 @@ use crate::ims::sip_client::{
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -317,15 +317,37 @@ pub(super) fn handle_invite(
                 BridgeError::Ims("timed out waiting for Agent B's veth call".into())
             })??;
 
-            let ims_rtp_socket = UdpSocket::bind((session.local_addr.ip(), 0))
-                .map_err(|e| BridgeError::Ims(format!("IMS RTP socket bind failed: {e}")))?;
-            let ims_rtp_port = ims_rtp_socket
-                .local_addr()
-                .map_err(|e| BridgeError::Ims(format!("IMS RTP local_addr failed: {e}")))?
-                .port();
+            // specs/046-rtcp-reporting: binds the carrier RTP socket and,
+            // where possible, its RTCP companion in one call — RTP+1 by
+            // convention (tier 1, the common case, leaving the answer
+            // unchanged), an ephemeral declared port (tier 2), or no RTCP
+            // at all (tier 3: media still proceeds, per SC-006). See
+            // `ims::rtcp::bind_rtp_and_rtcp`'s own doc for the full
+            // rationale.
+            let crate::ims::rtcp::RtpRtcpBind {
+                rtp_socket: ims_rtp_socket,
+                rtp_port: ims_rtp_port,
+                rtcp: rtcp_endpoint,
+            } = crate::ims::rtcp::bind_rtp_and_rtcp(session.local_addr.ip())
+                .map_err(|e| BridgeError::Ims(format!("IMS RTP/RTCP bind failed: {e}")))?;
             ims_rtp_socket
                 .connect(offer.remote_rtp)
                 .map_err(|e| BridgeError::Ims(format!("IMS RTP connect failed: {e}")))?;
+
+            // FR-014/015/016: only the port form of the offer's own
+            // `a=rtcp` is honoured, and only when it parsed to something
+            // usable — otherwise the RTP+1-derived convention already
+            // reflected in `rtcp_endpoint`'s own port stands.
+            let declared_rtcp_port =
+                rtcp_endpoint.as_ref().and_then(
+                    |(_, port, declared)| {
+                        if *declared {
+                            Some(*port)
+                        } else {
+                            None
+                        }
+                    },
+                );
 
             let session_id: u64 = rand::random::<u32>() as u64;
             // Re-runs the same selection as the `precheck` above and so lands
@@ -340,6 +362,7 @@ pub(super) fn handle_invite(
                 amr_safe::is_available(),
                 ctx.wideband,
                 ctx.answer_preference,
+                declared_rtcp_port,
             )?;
 
             // Do NOT answer yet. The PBX extension is only ringing; our
@@ -411,6 +434,15 @@ pub(super) fn handle_invite(
             // both-ways or one-way (FR-017) — the same guard the outbound path
             // applies, here on the shared inbound bridge both transports use.
             let meter = crate::ims::media_stats::MediaMeter::new();
+
+            // specs/046-rtcp-reporting: shared send/receive/far-end state
+            // for this call's RTCP thread — `None` only on tier 3 (no
+            // RTCP endpoint obtained), in which case media still proceeds
+            // exactly as before this feature (SC-006).
+            let rtcp_bundle = rtcp_endpoint
+                .is_some()
+                .then(crate::ims::rtcp::CarrierRtcpBundle::new);
+
             let transcoding = chosen.codec != veth.codec.codec;
             if transcoding {
                 // The two legs speak different codecs (or the same codec at
@@ -423,6 +455,7 @@ pub(super) fn handle_invite(
                     veth.codec,
                     stop.clone(),
                     &meter,
+                    rtcp_bundle.clone(),
                 )?;
             } else {
                 // Both legs speak PCMU: forward the payloads untouched.
@@ -433,8 +466,51 @@ pub(super) fn handle_invite(
                     &meter,
                     chosen.dtmf_payload_type,
                     veth.codec.dtmf_payload_type,
+                    rtcp_bundle.clone(),
                 );
             }
+
+            // The per-call RTCP thread itself (US1/US2/US5): sends
+            // periodic reports on the cadence `b=RS:` declares, reads the
+            // far end's, and sends a BYE on hangup — all from a thread
+            // that owns its own socket, so no teardown call site changes
+            // (research.md Decision 2). Honours the offer's own `a=rtcp`
+            // when it names one (FR-015), falling back to the RTP+1
+            // convention otherwise (FR-016).
+            match (rtcp_endpoint, rtcp_bundle.clone()) {
+                (Some((rtcp_socket, _port, _declared)), Some(bundle)) => {
+                    let remote_rtcp = SocketAddr::new(
+                        offer.remote_rtp.ip(),
+                        offer
+                            .rtcp
+                            .unwrap_or_else(|| offer.remote_rtp.port().saturating_add(1)),
+                    );
+                    crate::ims::rtcp::spawn_report_loop(
+                        rtcp_socket,
+                        remote_rtcp,
+                        offer.remote_rtp.ip(),
+                        bundle,
+                        chosen.codec.sample_rate(),
+                        format!("gsm-sip-bridge-{call_id}"),
+                        stop.clone(),
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        call_id = %call_id,
+                        "no RTCP endpoint obtained for this call; proceeding without RTCP"
+                    );
+                }
+            }
+
+            // Read at teardown for this call's far-end and own receive
+            // quality (specs/046-rtcp-reporting). `None` alongside
+            // `rtcp_bundle` above.
+            let rtcp_handle = rtcp_bundle.as_ref().map(|b| RtcpHandle {
+                far_end: b.far_end.clone(),
+                receive: b.receive.clone(),
+                clock_rate: chosen.codec.sample_rate(),
+            });
             // Both sides of Agent A's bridge, so a one-way-audio or
             // lost-your-wideband report can be read straight off the log: what
             // the carrier negotiated, and what goes over the veth to Agent B.
@@ -477,6 +553,7 @@ pub(super) fn handle_invite(
                 answered_instant: Instant::now(),
                 meter,
                 lifecycle,
+                rtcp: rtcp_handle,
             }))
         }
         ControlMessage::BridgeFailed {

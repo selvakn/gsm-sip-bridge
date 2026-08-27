@@ -19,7 +19,7 @@ use chrono::Utc;
 use std::io::BufReader;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Answers "is the network attachment still up?" during a call, so a call whose
@@ -90,6 +90,25 @@ pub(super) struct ActiveCall {
     /// never had an inbound INVITE of its own to answer, so any INVITE later
     /// naming that dialog is a modification attempt, never a retransmission.
     pub(super) answered_invite: Option<CachedInviteAnswer>,
+    /// Shared state with this call's per-call RTCP thread (specs/046
+    /// RTP-01), read at teardown for the far end's and this side's own
+    /// media-quality figures. `None` when the call has no RTCP endpoint at
+    /// all — either tier 3 (no port could be obtained) or a call outside
+    /// this feature's scope (FR-023: only the carrier leg of *answered*
+    /// calls carries one; an outbound-placed call never does).
+    pub(super) rtcp: Option<RtcpHandle>,
+}
+
+/// See [`ActiveCall::rtcp`]. Holds only what teardown needs to *read* — the
+/// RTCP thread itself owns the socket and the send-side accounting, and
+/// exits on its own once it observes `ActiveCall::stop` (research.md
+/// Decision 2: no teardown call site needs to change for this).
+pub(super) struct RtcpHandle {
+    pub(super) far_end: Arc<Mutex<crate::ims::rtcp::FarEndQuality>>,
+    pub(super) receive: Arc<Mutex<crate::ims::media_stats::ReceiveTracker>>,
+    /// The carrier leg's clock rate, needed to convert `receive`'s jitter
+    /// (in RTP timestamp units) into a duration at read time.
+    pub(super) clock_rate: u32,
 }
 
 /// See [`ActiveCall::answered_invite`].
@@ -297,11 +316,45 @@ pub(super) fn report_answered_call_ended(
     let verdict = call
         .meter
         .verdict(crate::ims::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT);
+
+    // specs/046-rtcp-reporting: the far end's own view of this call
+    // (FR-006/007/008/009) and this side's own receive quality on the
+    // carrier leg (FR-011/012/013) — both absent (`None`) on a call with
+    // no RTCP endpoint (tier 3) or where the relevant side never reported
+    // anything, distinct from a defaulted zero.
+    let far_end_reports = call
+        .rtcp
+        .as_ref()
+        .and_then(|r| r.far_end.lock().ok())
+        .filter(|fe| fe.reports_received > 0)
+        .map(|fe| *fe);
+    let receive_stats = call.rtcp.as_ref().and_then(|r| {
+        r.receive
+            .lock()
+            .ok()
+            .map(|t| t.stats(r.clock_rate))
+            .filter(|s| s.received_packets > 0 || s.lost_packets > 0)
+    });
+
     tracing::info!(
         call_id = %call.call_id,
         media = verdict.as_str(),
         carrier_rx = call.meter.carrier_rx(),
         pbx_rx = call.meter.pbx_rx(),
+        far_end_reported = far_end_reports.is_some(),
+        far_end_fraction_lost = far_end_reports.as_ref().and_then(|fe| fe.fraction_lost),
+        far_end_jitter_ms = far_end_reports
+            .as_ref()
+            .and_then(|fe| fe.jitter)
+            .map(|j| j.as_secs_f64() * 1000.0),
+        round_trip_ms = far_end_reports
+            .as_ref()
+            .and_then(|fe| fe.round_trip)
+            .map(|j| j.as_secs_f64() * 1000.0),
+        local_received_packets = receive_stats.map(|s| s.received_packets),
+        local_lost_packets = receive_stats.map(|s| s.lost_packets),
+        local_reordered_packets = receive_stats.map(|s| s.reordered_packets),
+        local_jitter_ms = receive_stats.map(|s| s.jitter.as_secs_f64() * 1000.0),
         // The lifecycle model's own account of the call: who ended it and the
         // status it derives from the same media verdict. Logged so the model
         // that drives admission and teardown is auditable against the metric
@@ -316,6 +369,27 @@ pub(super) fn report_answered_call_ended(
             media = verdict.as_str(),
             "answered call did not carry audio both ways: {}",
             verdict.diagnosis()
+        );
+    }
+    if call.rtcp.is_none() {
+        obs.report_rtcp_unavailable();
+    }
+    if let Some(fe) = &far_end_reports {
+        obs.report_media_quality(
+            crate::control::protocol::QualitySource::Remote,
+            fe.fraction_lost
+                .map(|f| f as f64 / 255.0 * 100.0)
+                .unwrap_or(0.0),
+            fe.jitter.map(|j| j.as_secs_f64()).unwrap_or(0.0),
+            fe.round_trip.map(|r| r.as_secs_f64()),
+        );
+    }
+    if let Some(s) = &receive_stats {
+        obs.report_media_quality(
+            crate::control::protocol::QualitySource::Local,
+            s.loss_percent(),
+            s.jitter.as_secs_f64(),
+            None,
         );
     }
     obs.report_call_answered_and_ended(
@@ -490,6 +564,7 @@ pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -
         meter: crate::ims::media_stats::MediaMeter::new(),
         lifecycle: BridgedCall::new(call_id.to_string(), "+919000000000".to_string(), None),
         answered_invite: None,
+        rtcp: None,
     }
 }
 
