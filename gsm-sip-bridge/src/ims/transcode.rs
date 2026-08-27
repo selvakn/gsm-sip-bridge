@@ -468,7 +468,9 @@ fn relay_direction(
     // Observability only (specs/044 RTP-04): an SSRC change is a legitimate
     // RFC 3550 signal (a source restart), not itself an error — logged so
     // it's visible after the fact, never a reason to drop a packet.
-    let mut last_ssrc: Option<u32> = None;
+    // Rate-limited by `SsrcTracker` so a peer alternating SSRC every packet
+    // can't turn this into a log line per packet (PR review, 2026-08-27).
+    let mut ssrc_tracker = rtp::SsrcTracker::new();
 
     while !stop.load(Ordering::Relaxed) {
         let Some(n) = recv(&src, &mut buf, direction) else {
@@ -481,15 +483,13 @@ fn relay_direction(
         // not audio that flowed, and counting it would mask a one-way call.
         super::media_stats::bump(&counter);
 
-        if let Some(previous) = last_ssrc.replace(pkt.ssrc) {
-            if previous != pkt.ssrc {
-                tracing::info!(
-                    direction,
-                    previous_ssrc = previous,
-                    new_ssrc = pkt.ssrc,
-                    "RTP source SSRC changed mid-call"
-                );
-            }
+        if let Some((previous, new)) = ssrc_tracker.note_and_should_log(pkt.ssrc) {
+            tracing::info!(
+                direction,
+                previous_ssrc = previous,
+                new_ssrc = new,
+                "RTP source SSRC changed mid-call"
+            );
         }
 
         if Some(pkt.payload_type) == src_codec.dtmf_payload_type {

@@ -100,6 +100,59 @@ pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket<'_>> {
     })
 }
 
+/// How often one direction's SSRC-change log can fire, at most (specs/044
+/// RTP-04, PR review 2026-08-27). A change is a legitimate RFC 3550 signal
+/// (a source restart) worth surfacing, but a peer alternating SSRC every
+/// packet — a bug or something worse — must not be able to turn that into
+/// one log line (and its synchronous I/O) per media packet for the rest of
+/// the call.
+const SSRC_CHANGE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tracks one relay direction's most recently seen SSRC, so a relay can
+/// notice a mid-stream change without logging every single instance of one.
+pub struct SsrcTracker {
+    last: Option<u32>,
+    last_logged_at: Option<std::time::Instant>,
+}
+
+impl SsrcTracker {
+    pub fn new() -> Self {
+        Self {
+            last: None,
+            last_logged_at: None,
+        }
+    }
+
+    /// Records `ssrc` as this stream's latest value. Returns
+    /// `Some((previous, ssrc))` only when it's worth logging: a genuine
+    /// change (never the stream's first packet) that hasn't already been
+    /// reported within [`SSRC_CHANGE_LOG_INTERVAL`] — a peer flapping
+    /// between two SSRCs every packet reports at most once per interval,
+    /// not once per packet.
+    pub fn note_and_should_log(&mut self, ssrc: u32) -> Option<(u32, u32)> {
+        let previous = self.last.replace(ssrc)?;
+        if previous == ssrc {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let should_log = match self.last_logged_at {
+            Some(at) => now.duration_since(at) >= SSRC_CHANGE_LOG_INTERVAL,
+            None => true,
+        };
+        if !should_log {
+            return None;
+        }
+        self.last_logged_at = Some(now);
+        Some((previous, ssrc))
+    }
+}
+
+impl Default for SsrcTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// ITU-T G.711 μ-law encode: 16-bit linear PCM -> 8-bit μ-law. Sign +
 /// magnitude, `BIAS`-shifted then floating-point-like segment (3-bit
 /// exponent) + mantissa (4 bits) encoded, inverted for transmission (the
@@ -232,6 +285,49 @@ fn write_wav_header<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// specs/044 RTP-04, PR review 2026-08-27: the very first packet on a
+    /// stream must never be reported as a change — there is nothing prior
+    /// to compare it against.
+    #[test]
+    fn ssrc_tracker_does_not_report_the_first_packet() {
+        let mut t = SsrcTracker::new();
+        assert_eq!(t.note_and_should_log(0x1111), None);
+    }
+
+    #[test]
+    fn ssrc_tracker_reports_a_genuine_change() {
+        let mut t = SsrcTracker::new();
+        t.note_and_should_log(0x1111);
+        assert_eq!(t.note_and_should_log(0x2222), Some((0x1111, 0x2222)));
+    }
+
+    #[test]
+    fn ssrc_tracker_does_not_report_an_unchanged_ssrc() {
+        let mut t = SsrcTracker::new();
+        t.note_and_should_log(0x1111);
+        assert_eq!(t.note_and_should_log(0x1111), None);
+    }
+
+    /// A peer alternating SSRC every packet must not turn into one log
+    /// line per packet — only the first change within the rate-limit
+    /// window is reported.
+    #[test]
+    fn ssrc_tracker_rate_limits_rapid_alternation() {
+        let mut t = SsrcTracker::new();
+        t.note_and_should_log(0x1111);
+        assert_eq!(
+            t.note_and_should_log(0x2222),
+            Some((0x1111, 0x2222)),
+            "the first change is reported"
+        );
+        assert_eq!(
+            t.note_and_should_log(0x1111),
+            None,
+            "an immediate second change is rate-limited"
+        );
+        assert_eq!(t.note_and_should_log(0x2222), None, "still rate-limited");
+    }
 
     #[test]
     fn build_and_parse_packet_roundtrips_header_fields() {

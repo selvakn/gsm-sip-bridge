@@ -243,8 +243,10 @@ fn forward(
     // Observability only (specs/044 RTP-04): an SSRC change is a legitimate
     // RFC 3550 signal (a source restart), not itself an error — logged so
     // it's visible after the fact, never a reason to drop a packet or stop
-    // relaying.
-    let mut last_ssrc: Option<u32> = None;
+    // relaying. Rate-limited by `SsrcTracker` so a peer alternating SSRC
+    // every packet can't turn this into a log line per packet (PR review,
+    // 2026-08-27).
+    let mut ssrc_tracker = crate::ims::rtp::SsrcTracker::new();
     while !stop.load(Ordering::Relaxed) {
         match src.recv(&mut buf) {
             Ok(n) => {
@@ -252,15 +254,13 @@ fn forward(
                 if let Some(pkt) = crate::ims::rtp::parse_packet(&buf[..n]) {
                     let ssrc = pkt.ssrc;
                     let payload_type = pkt.payload_type;
-                    if let Some(previous) = last_ssrc.replace(ssrc) {
-                        if previous != ssrc {
-                            tracing::info!(
-                                direction,
-                                previous_ssrc = previous,
-                                new_ssrc = ssrc,
-                                "RTP source SSRC changed mid-call"
-                            );
-                        }
+                    if let Some((previous, new)) = ssrc_tracker.note_and_should_log(ssrc) {
+                        tracing::info!(
+                            direction,
+                            previous_ssrc = previous,
+                            new_ssrc = new,
+                            "RTP source SSRC changed mid-call"
+                        );
                     }
                     if Some(payload_type) == src_dtmf_pt {
                         if let Some(dst_pt) = dst_dtmf_pt {
