@@ -598,6 +598,26 @@ Decision 1 and Decision 8 for the full reasoning):
 All landed code: `make format && make lint && make test` clean (whole
 workspace, including test targets, clippy `-D warnings`).
 
+**Hardware-verified 2026-08-27**: rebuilt (`gsm-sip-bridge:long-tail-conformance`),
+redeployed, real line re-registered. One real inbound call from the
+user's phone: rang, answered, negotiated AMR-WB (carrier) transcoded to
+L16 (veth), `media="both-ways"` (82 carrier-side / 462 veth-side RX
+packets), clean `caller_hangup`. Zero errors, warnings, or panics in
+Agent A's own log around the call.
+
+The modem-storage SMS sweep (CS-03's `AT+CNMI` addition) could not be
+exercised this round — it's failing to open `/dev/ttyUSB0` at all
+(`discovery error: failed to open serial /dev/ttyUSB0: No such file or
+directory`), a pre-existing USB-re-enumeration quirk on this host (see
+project memory: a stale `modem_port` after re-enumeration), unrelated to
+this batch's code — the failure is at the serial-port-open step, before
+any AT command (old or new) is ever sent. MT-11/MT-12/MT-13/SDP-05
+weren't independently exercisable live either (an ordinary real call
+doesn't provide a mismatched `P-Asserted-Identity`, a non-default `Via`
+sent-by, or a non-SDP body to test against) — all remain covered by unit
+tests only, consistent with this review's established posture for its
+least-observed findings.
+
 ## Hardware test log
 
 Real-hardware verification runs on the local test rig (`test/`, see its
