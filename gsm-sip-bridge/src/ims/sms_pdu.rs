@@ -383,7 +383,7 @@ fn is_type_zero_pid(pid: u8) -> bool {
     (pid >> 6) == 0b01 && (pid & 0x3F) == 0
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Alphabet {
     Gsm7,
     Octet,
@@ -391,11 +391,11 @@ enum Alphabet {
 }
 
 impl Alphabet {
-    /// TS 23.038 §4: only the two coding-scheme groups real MT traffic
-    /// overwhelmingly uses. Anything else (compressed, national-language
-    /// shift tables, message-waiting indication groups) falls back to GSM7 —
-    /// wrong for genuinely rare encodings, but never a crash, and right for
-    /// the vast majority of real messages.
+    /// TS 23.038 §4: the coding-scheme groups real MT traffic uses.
+    /// Compressed user data and the two Discard/Store-GSM7 message-waiting
+    /// groups (`0xC0`-`0xDF`) fall back to GSM7 — the fallback happens to be
+    /// correct for those two, unlike the Store-UCS2 group below, which was
+    /// wrong until specs/045 SMS-04.
     fn from_dcs(dcs: u8) -> Self {
         if dcs & 0xC0 == 0x00 {
             // General Data Coding group: bits 3-2 select the alphabet.
@@ -412,6 +412,15 @@ impl Alphabet {
             } else {
                 Alphabet::Gsm7
             }
+        } else if dcs & 0xF0 == 0xE0 {
+            // specs/045 SMS-04: Message Waiting Indication group, Store
+            // Message, UCS2 (TS 23.038 §4 table) — the whole `0xE0`-`0xEF`
+            // nibble means UCS2 unconditionally, the same way `0xD0`-`0xDF`
+            // (its GSM7 sibling, already correct via the fallback below)
+            // means GSM7 unconditionally. Unlike that sibling, this one was
+            // concretely wrong before this fix — decoded as GSM7 regardless,
+            // garbling real UCS2 text.
+            Alphabet::Ucs2
         } else {
             Alphabet::Gsm7
         }
@@ -869,6 +878,42 @@ mod tests {
             panic!("RP-DATA must decode to DecodedRp::Message");
         };
         assert_eq!(decoded.text, "Hi");
+    }
+
+    /// specs/045 SMS-04: DCS `0xE8` is Message Waiting Indication (Store),
+    /// bit 2 set — UCS2, per TS 23.038 §4. Before this fix it fell through
+    /// to the default-GSM7 branch and garbled the text the same way plain
+    /// UCS2 (DCS `0x08`) would have before UCS2 support existed at all.
+    #[test]
+    fn decodes_message_waiting_indication_ucs2_text() {
+        let text_bytes: Vec<u8> = "Hi".encode_utf16().flat_map(u16::to_be_bytes).collect();
+
+        let mut tpdu = vec![0x00];
+        tpdu.push(0); // TP-OA length 0
+        tpdu.push(0x81);
+        tpdu.push(0x00); // TP-PID
+        tpdu.push(0xE8); // TP-DCS: message waiting indication, Store, UCS2
+        tpdu.extend_from_slice(&[0u8; 7]);
+        tpdu.push(text_bytes.len() as u8);
+        tpdu.extend_from_slice(&text_bytes);
+
+        let mut rp = vec![0x01, 0x00, 0, 0];
+        rp.push(tpdu.len() as u8);
+        rp.extend_from_slice(&tpdu);
+
+        let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
+            panic!("RP-DATA must decode to DecodedRp::Message");
+        };
+        assert_eq!(decoded.text, "Hi");
+    }
+
+    /// The sibling Discard/Store-GSM7 groups (`0xC0`/`0xD0`) were already
+    /// correct (GSM7 is both the fallback and the spec answer) — pinned so
+    /// the new `0xE0` branch above can't regress them.
+    #[test]
+    fn message_waiting_indication_gsm7_groups_are_unaffected() {
+        assert_eq!(Alphabet::from_dcs(0xC0), Alphabet::Gsm7);
+        assert_eq!(Alphabet::from_dcs(0xD0), Alphabet::Gsm7);
     }
 
     /// SMS-EMOJI-01 (specs/041 conformance review, found live 2026-08-26): a
