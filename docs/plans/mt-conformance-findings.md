@@ -369,6 +369,24 @@ All three code changes plus the MT-05 test: `make format && make lint &&
 make test` clean (whole workspace, including test targets, clippy
 `-D warnings`).
 
+**Hardware-verified 2026-08-27**: rebuilt (`gsm-sip-bridge:honour-sdp-negotiation`),
+redeployed, real line re-registered. One real inbound call from the user's
+phone: rang, answered, negotiated AMR-WB (carrier) transcoded to L16
+(veth) — the same batch-1 RTP-02 relay path — with `media="both-ways"`
+(586 carrier-side / 754 veth-side RX packets) and a clean `caller_hangup`
+after ~15s. Zero errors, warnings, or panics in Agent A's own log
+(`/tmp/ims-agent-0.out`). This exercises the ordinary path (one audio
+section, no direction attribute, `RTP/AVP`) end-to-end through the
+restructured `parse_offer`/`build_answer_for` — confirms no regression.
+
+Not exercised live, and not something a real handset or this project's
+carriers have been observed sending: an offer with an extra media
+section, a non-default direction attribute, or an unsupported transport
+profile — the three new decline paths this batch adds. All three remain
+covered by unit tests only (`specs/043-honour-sdp-negotiation/quickstart.md`
+records this constraint), consistent with the same posture batch 3 took
+for its own low-probability live scenarios.
+
 ## Batch 5 — complete the media contract (not started)
 
 - [ ] RTP-01 — no RTCP sent or received, while its bandwidth is declared
