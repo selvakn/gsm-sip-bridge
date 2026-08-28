@@ -802,11 +802,16 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
             QosStatusType::Remote => {
                 // This bridge's own segment (once inverted to `Local`).
                 // There is no real reservation delay on this bridge's
-                // media relay, so it is always already met — see spec.md
-                // "Why this exists".
+                // media relay, so whatever direction(s) the offer asked
+                // for are always already met — see spec.md "Why this
+                // exists". Reported as exactly the requested direction,
+                // not unconditionally `sendrecv`: the relay's own
+                // capability is always full-duplex, but the answer
+                // confirms what was asked, not more than was asked
+                // (Greptile review, PR #68).
                 answer_lines.push(QosAnswerLine {
                     status_type: QosStatusType::Local,
-                    met: QosDirection::SendRecv,
+                    met: line.direction,
                     confirm: matches!(
                         line.strength,
                         QosStrength::Mandatory | QosStrength::Optional
@@ -821,10 +826,11 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
                     return PreconditionVerdict::Decline;
                 }
                 // Reports only what this bridge itself can attest to —
-                // never the offerer's contribution.
+                // never the offerer's contribution — and only for the
+                // requested direction, same reasoning as `Remote` above.
                 answer_lines.push(QosAnswerLine {
                     status_type: QosStatusType::E2e,
-                    met: QosDirection::SendRecv,
+                    met: line.direction,
                     confirm: false,
                 });
             }
@@ -2586,6 +2592,38 @@ mod tests {
         .unwrap();
         assert!(sdp.contains("a=curr:qos local sendrecv\r\n"));
         assert!(sdp.contains("a=conf:qos local sendrecv\r\n"));
+    }
+
+    /// PR #68 Greptile review: a directional precondition (`recv` only)
+    /// must be answered with exactly that direction, not unconditionally
+    /// `sendrecv` — this bridge's relay is always full-duplex, but the
+    /// answer must confirm what was asked, never claim more than was
+    /// asked.
+    #[test]
+    fn a_recv_only_precondition_is_confirmed_recv_not_sendrecv() {
+        let offer = offer_with_precondition("remote", "mandatory", "recv");
+        assert_eq!(
+            precondition_verdict(&offer),
+            PreconditionVerdict::Proceed(vec![QosAnswerLine {
+                status_type: QosStatusType::Local,
+                met: QosDirection::Recv,
+                confirm: true,
+            }])
+        );
+        let (sdp, _) = build_answer(
+            "10.0.0.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::Legacy,
+            None,
+        )
+        .unwrap();
+        assert!(sdp.contains("a=curr:qos local recv\r\n"));
+        assert!(sdp.contains("a=conf:qos local recv\r\n"));
+        assert!(!sdp.contains("local sendrecv"), "must not overclaim: {sdp}");
     }
 
     #[test]
