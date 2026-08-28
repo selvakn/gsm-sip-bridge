@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/047-offerless-invite-sms-reassembly/plan.md`.
+`specs/048-sdp-qos-preconditions/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

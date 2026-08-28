@@ -385,17 +385,23 @@ fn run_inner(
 const ALLOW: &str = crate::ims::UAS_ALLOW;
 
 /// Option-tags this UAS implements enough of to honour if a peer `Require`s
-/// them (RFC 3261 §8.2.2.3) and to state in a `Supported` header. Empty
-/// today: `timer`, `100rel`, `replaces`, `path` and `gruu` were previously
-/// claimed in `inbound::UAS_EXTRA_HEADERS`'s `Supported` line with no
-/// behaviour behind any of them — `timer` with no session-refresh timer,
-/// `100rel` with no UAS-side reliable-provisional handling, `replaces`/`gruu`
-/// with none of their machinery at all, and `path` naming a REGISTER
-/// mechanism this is not even a REGISTER response (specs/041 conformance
-/// review, MT-10). One list feeds both [`unsupported_required_extensions`]
-/// and whatever `Supported` header a caller gets — grown only by growing the
+/// them (RFC 3261 §8.2.2.3) and to state in a `Supported` header.
+/// `timer`, `100rel`, `replaces`, `path` and `gruu` stay absent: they were
+/// previously claimed in `inbound::UAS_EXTRA_HEADERS`'s `Supported` line
+/// with no behaviour behind any of them — `timer` with no session-refresh
+/// timer, `100rel` with no UAS-side reliable-provisional handling,
+/// `replaces`/`gruu` with none of their machinery at all, and `path`
+/// naming a REGISTER mechanism this is not even a REGISTER response
+/// (specs/041 conformance review, MT-10). `precondition` is real, if
+/// bounded: this UAS honours RFC 3312 QoS preconditions on its own
+/// segment (no real reservation delay to wait on) but still declines what
+/// it cannot honestly confirm without a synchronization mechanism it
+/// doesn't implement (specs/048 MT-06) — advertising it is no longer a
+/// promise this bridge can't keep, the same bar MT-10 set for every other
+/// tag here. One list feeds both [`unsupported_required_extensions`] and
+/// whatever `Supported` header a caller gets — grown only by growing the
 /// UAS, the same rule [`ALLOW`] already states for methods.
-const SUPPORTED_EXTENSIONS: &[&str] = &[];
+const SUPPORTED_EXTENSIONS: &[&str] = &["precondition"];
 
 /// Every option-tag a request's `Require` demands that is not in
 /// [`SUPPORTED_EXTENSIONS`] — RFC 3261 §8.2.2.3: a UAS that does not support
@@ -2804,15 +2810,28 @@ mod tests {
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
-    /// MT-03: `SUPPORTED_EXTENSIONS` is empty today, so *any* `Require`
-    /// names something this UAS does not implement — every tag must come
-    /// back, not just the first.
+    /// MT-03: `SUPPORTED_EXTENSIONS` covers only `precondition` today, so
+    /// any `Require` naming something else must still come back — every
+    /// unrecognized tag, not just the first.
     #[test]
     fn unsupported_required_extensions_lists_every_tag() {
-        let req = invite_requiring("100rel, precondition");
+        let req = invite_requiring("100rel, gruu");
         assert_eq!(
             unsupported_required_extensions(&req),
-            vec!["100rel".to_string(), "precondition".to_string()]
+            vec!["100rel".to_string(), "gruu".to_string()]
+        );
+    }
+
+    /// specs/048 MT-06: `precondition` is genuinely supported (bounded —
+    /// see `SUPPORTED_EXTENSIONS`'s doc comment), so `Require:
+    /// precondition` alone must not be listed as unsupported — while an
+    /// unrelated tag combined with it still is.
+    #[test]
+    fn precondition_is_no_longer_listed_as_unsupported() {
+        assert!(unsupported_required_extensions(&invite_requiring("precondition")).is_empty());
+        assert_eq!(
+            unsupported_required_extensions(&invite_requiring("100rel, precondition")),
+            vec!["100rel".to_string()]
         );
     }
 

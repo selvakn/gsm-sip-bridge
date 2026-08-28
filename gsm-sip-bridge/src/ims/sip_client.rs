@@ -643,6 +643,30 @@ pub fn build_420_bad_extension(request: &SipRequest, to_tag: &str, unsupported: 
     )
 }
 
+/// `580 Precondition Failure` — declines an inbound `INVITE` whose offer
+/// names an `e2e`-status-type SDP QoS precondition (RFC 3312) at
+/// `mandatory` strength. Distinct from [`build_420_bad_extension`]:
+/// `precondition` genuinely is a supported extension by the time this is
+/// reached (specs/048 MT-06), so `420` ("this UAS does not implement the
+/// extension at all") would misstate what actually happened. RFC 3312
+/// §6.2: "If a UAS determines that it is not capable of, or is not
+/// willing to support, one or more mandatory preconditions requested by
+/// the offerer, it MUST reject the offer with a 580 (Precondition
+/// Failure) response." No body is required on the decline (§6.2 makes an
+/// `a=curr` body optional) — kept header-only, matching every other
+/// decline in this file.
+pub fn build_580_precondition_failure(request: &SipRequest, to_tag: &str) -> String {
+    build_uas_response_with_headers(
+        580,
+        "Precondition Failure",
+        request,
+        Some(to_tag),
+        None,
+        None,
+        &[],
+    )
+}
+
 /// `415 Unsupported Media Type` — declines a request whose body this UAS
 /// cannot interpret (RFC 3261 §21.4.13 / RFC 3428 §7). `accept` is echoed
 /// back as `Accept`, stating what would have worked.
@@ -2479,6 +2503,24 @@ mod tests {
         assert!(
             resp.contains("\r\nUnsupported: 100rel, precondition\r\n"),
             "{resp}"
+        );
+    }
+
+    /// specs/048 MT-06 / RFC 3312 §6.2: an `e2e`-mandatory precondition
+    /// this bridge cannot honestly confirm gets `580`, not `420` —
+    /// `precondition` is a genuinely supported extension by this point, so
+    /// `420` ("not implemented at all") would misstate what happened. No
+    /// body is required on the decline.
+    #[test]
+    fn build_580_precondition_failure_needs_no_body() {
+        let (req, _) = SipRequest::try_parse(SAMPLE_INVITE.as_bytes())
+            .unwrap()
+            .unwrap();
+        let resp = build_580_precondition_failure(&req, "totag1");
+        assert!(resp.starts_with("SIP/2.0 580 Precondition Failure\r\n"));
+        assert!(
+            resp.ends_with("Content-Length: 0\r\n\r\n"),
+            "the decline needs no SDP body: {resp}"
         );
     }
 

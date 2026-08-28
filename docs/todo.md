@@ -158,3 +158,19 @@ Observed pending items
       Working theory: an account/SIM entitlement gap on Jio's side (MT
       voice + SMS provisioned, MO voice not), not a client-side defect.
       Plan: [docs/plans/jio-vowifi-outbound-480.md](plans/jio-vowifi-outbound-480.md).
+- [ ] Multi part SMS - combine them and discord notify
+- [ ] Explore if caller identity can carry the name as well in the vowifi / volte stacks
+- [ ] **SMS-07** — national-language shift tables unimplemented (TS 23.038
+      Annex A). Attempted and reversed mid-implementation during batch 6
+      (specs/045-long-tail-conformance): the mechanism (recognizing the UDH
+      IEs that select a national-language locking/single shift table) is
+      small, but the part that fixes decoded text is Annex A's character-
+      table data itself, which was not shipped from memory without a
+      verifiable source — a wrong mapping would silently decode real text
+      to the wrong characters, worse than today's honest, already-
+      documented gap. Planned for implementation soon; when picked back up,
+      source the Annex A tables from the actual 3GPP TS 23.038 spec text
+      (not recalled/approximated), and pin a decode test against a known-
+      good vector before touching the general decode path.
+      See docs/plans/mt-conformance-findings.md batch 6 for the original
+      finding and the reversed attempt.

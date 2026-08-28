@@ -575,10 +575,10 @@ see below.
 "done" or "won't ever do" — see `specs/045-long-tail-conformance/research.md`
 Decision 1 and Decision 8 for the full reasoning):
 
-- [ ] **MT-06** — preconditions are not implemented. Needs new SDP-level
-      QoS attribute parsing and a bearer-readiness state machine; the
-      header-level behavior (declining `Require: precondition`) is already
-      correct via MT-03's existing gate.
+- [x] **MT-06** — preconditions are not implemented. **Landed**
+      (`specs/048-sdp-qos-preconditions/`) — turned out narrower than this
+      note assumed once RFC 3312's segmented model was applied precisely;
+      see that feature's own entry below.
 - [x] **SDP-04** — an INVITE without an offer is rejected instead of
       answered with our own offer. **Landed in batch 8**
       (`specs/047-offerless-invite-sms-reassembly/`) — turned out smaller
@@ -593,7 +593,8 @@ Decision 1 and Decision 8 for the full reasoning):
       text is TS 23.038 Annex A's character-table data, which is not
       something to ship from memory without a verifiable source — a wrong
       mapping would silently decode real text to the wrong characters,
-      worse than today's honest, already-documented gap.
+      worse than today's honest, already-documented gap. Tracked as an
+      active backlog item in `docs/todo.md` rather than left deferred here.
 
 All landed code: `make format && make lint && make test` clean (whole
 workspace, including test targets, clippy `-D warnings`).
@@ -920,6 +921,67 @@ sending an offerless INVITE to this line across any prior hardware round
 in this whole review, so that path stays unit-test-only this round,
 consistent with every prior batch's treatment of its own least-observed
 scenarios.
+
+## MT-06 — SDP QoS preconditions (landed 2026-08-28, hardware round is regression-only)
+
+Full spec/plan/tasks trail: `specs/048-sdp-qos-preconditions/`. Deferred
+in batch 6 (`specs/045-long-tail-conformance/research.md` Decision 1) as
+needing "new SDP-level QoS attribute parsing and a bearer-readiness state
+machine." Turned out narrower: RFC 3312's segmented model means this
+bridge's own segment has no real reservation delay, so it can be confirmed
+inline, synchronously, in the same `200 OK` — no `UPDATE`, no `100rel`, no
+state machine.
+
+- [x] **MT-06** — `Require: precondition` no longer blanket-declines every
+      offer that carries it. **Landed**: `"precondition"` was added to
+      `SUPPORTED_EXTENSIONS` (`gsm-sip-bridge/src/ims/agent/mod.rs`),
+      moving the accept/decline decision from the `Require` header alone
+      to the offer's actual `a=des:qos` content, evaluated in a new
+      `sdp::precondition_verdict`. This bridge's own segment — the offer's
+      `remote` status type, which RFC 3312 §4 defines as inverting to
+      `local` in the answer — is confirmed immediately (`a=curr`/`a=conf`
+      lines), since the media relay has no reservation delay to wait on.
+      An `e2e`-status-type line at `mandatory` strength still declines the
+      call (now `580 Precondition Failure`, RFC 3312 §6.2, rather than the
+      old blanket `420` — more specific, since `precondition` is genuinely
+      supported by this point). The offerer's own segment (the offer's
+      `local` status type, inverting to `remote`) is never asserted over —
+      only mirrored through unaltered if the offer itself reported a
+      current status.
+
+      **Correction worth recording**: the first spec draft had the RFC
+      3312 `local`/`remote` relativity backwards (assumed from memory,
+      not verified) — fixed by fetching the actual RFC text before
+      writing the plan, the same discipline SMS-07's deferral already
+      established for unverifiable protocol/table data. See
+      `specs/048-sdp-qos-preconditions/research.md` Decision 1.
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`).
+
+**Hardware round is regression-only, by design** — recorded in this
+feature's own Clarifications, not a gap: `agent::inbound::handle_invite`
+(where this logic lives) only ever receives INVITEs that arrive over the
+carrier's own Gm/IPsec tunnel, so only the carrier itself can trigger this
+code path, and no carrier reachable here has ever sent
+`Require: precondition`. The precondition-handling logic itself is
+verified by unit/fixture tests only (`sdp.rs`'s `precondition_verdict`
+suite, `agent/mod.rs`'s `SUPPORTED_EXTENSIONS` tests,
+`sip_client.rs`'s `build_580_precondition_failure` test) — the hardware
+round instead confirms an ordinary real inbound call (no preconditions)
+still connects and bridges cleanly on the new build.
+
+**Hardware-verified 2026-08-28**: rebuilt
+(`gsm-sip-bridge:sdp-qos-preconditions`), redeployed to the `test/` rig,
+tunnel re-established (one IKE re-init mid-session, recovered
+automatically — the pre-existing tunnel-instability behavior already
+documented elsewhere, unrelated to this feature), `vowifi_registered=1`.
+One real inbound call from the user's phone: rang, answered, media active
+on both legs (carrier leg negotiated G722, veth leg L16), clean
+`caller_hangup` after ~13s. Zero errors, warnings, or panics. As expected,
+the offer carried no `a=des:qos` lines — this confirms no regression on
+the ordinary path, not the new precondition-handling logic itself, which
+remains unit-test-only per the Clarifications above.
 
 ## Hardware test log
 

@@ -19,8 +19,8 @@ use crate::ims::session::{extract_caller, respond, Inbound};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_415_unsupported_media, build_420_bad_extension,
     build_486_busy_here, build_488_incompatible_transport, build_488_not_acceptable,
-    build_uas_response, build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage,
-    SipRequest, SipSink,
+    build_580_precondition_failure, build_uas_response, build_uas_response_with_headers,
+    format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -197,7 +197,10 @@ pub(super) fn handle_invite(
     // offer, in the 2xx, and the caller answers it in the ACK). Handled by
     // its own branch, entirely separate from `parse_offer`'s error path,
     // so a *genuinely* malformed non-empty body still gets today's
-    // existing behavior unchanged.
+    // existing behavior unchanged. specs/048 MT-06, research.md Decision
+    // 5: this branch returns before `parse_offer`/`precondition_verdict`
+    // ever run, so an offerless INVITE naturally has zero `a=des:qos`
+    // lines to act on — no special-case interaction needed.
     if req.body.trim().is_empty() {
         return handle_offerless_invite(
             session, req, sink, inbound, ctx, &call_id, &caller, started_at,
@@ -224,6 +227,27 @@ pub(super) fn handle_invite(
             &random_hex(4),
             &format_sip_addr(session.contact_addr),
         ))?;
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            &caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
+    // specs/048 MT-06: `Require: precondition` no longer blanket-declines
+    // on its own (`precondition` is in `SUPPORTED_EXTENSIONS`) — whether
+    // this offer's precondition content is honourable depends on what it
+    // actually asked for. Checked before the codec precheck below, same
+    // reasoning as the transport check above: an unconfirmable `e2e`
+    // precondition makes codec selection moot.
+    if sdp::precondition_verdict(&offer) == sdp::PreconditionVerdict::Decline {
+        tracing::info!(
+            call_id = %call_id,
+            "offer requires an e2e QoS precondition we cannot honestly confirm; declining"
+        );
+        sink.send(&build_580_precondition_failure(req, &random_hex(4)))?;
         obs.report_call_not_answered(
             CallStatus::Failed,
             BridgeFailureReason::BridgeSetupFailed,
