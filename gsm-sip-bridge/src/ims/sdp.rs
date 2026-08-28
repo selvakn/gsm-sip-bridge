@@ -794,6 +794,22 @@ pub enum PreconditionVerdict {
 /// the offer's `Local` status type (inverted to `Remote`, mirrored not
 /// asserted — User Story 3); `E2e` is not relative and, at `mandatory`
 /// strength, cannot be unilaterally confirmed (User Story 2).
+/// RFC 3312 §4/§5.2: `send`/`recv` are relative to whoever generated the
+/// SDP, exactly like `local`/`remote` (research.md Decision 1) — the
+/// offerer's "send" (offerer→answerer) is the answerer's "recv", and vice
+/// versa. `SendRecv`/`None` are direction-symmetric and pass through
+/// unchanged. Every offer-relative direction this bridge carries into its
+/// own answer must go through this, or the answer names the wrong half of
+/// an asymmetric precondition (Greptile review, PR #68).
+fn invert_qos_direction(direction: QosDirection) -> QosDirection {
+    match direction {
+        QosDirection::Send => QosDirection::Recv,
+        QosDirection::Recv => QosDirection::Send,
+        QosDirection::SendRecv => QosDirection::SendRecv,
+        QosDirection::None => QosDirection::None,
+    }
+}
+
 pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
     let mut answer_lines = Vec::new();
 
@@ -808,10 +824,12 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
                 // not unconditionally `sendrecv`: the relay's own
                 // capability is always full-duplex, but the answer
                 // confirms what was asked, not more than was asked
-                // (Greptile review, PR #68).
+                // (Greptile review, PR #68) — and the direction itself
+                // must invert (`invert_qos_direction`), same as the
+                // status-type already does.
                 answer_lines.push(QosAnswerLine {
                     status_type: QosStatusType::Local,
-                    met: line.direction,
+                    met: invert_qos_direction(line.direction),
                     confirm: matches!(
                         line.strength,
                         QosStrength::Mandatory | QosStrength::Optional
@@ -827,10 +845,12 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
                 }
                 // Reports only what this bridge itself can attest to —
                 // never the offerer's contribution — and only for the
-                // requested direction, same reasoning as `Remote` above.
+                // requested direction, inverted the same as `Remote`
+                // above (the tag relativity rule isn't specific to
+                // segment lines).
                 answer_lines.push(QosAnswerLine {
                     status_type: QosStatusType::E2e,
-                    met: line.direction,
+                    met: invert_qos_direction(line.direction),
                     confirm: false,
                 });
             }
@@ -843,13 +863,14 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
     }
 
     // The offerer's own self-reported current status (User Story 3):
-    // mirrored through inverted (`Local`→`Remote`), never a value this
-    // bridge computed.
+    // mirrored through inverted — both the status-type (`Local`→`Remote`)
+    // and the direction (`invert_qos_direction`) — never a value this
+    // bridge computed itself.
     for status in &offer.offerer_curr {
         if status.status_type == QosStatusType::Local {
             answer_lines.push(QosAnswerLine {
                 status_type: QosStatusType::Remote,
-                met: status.met,
+                met: invert_qos_direction(status.met),
                 confirm: false,
             });
         }
@@ -2594,19 +2615,25 @@ mod tests {
         assert!(sdp.contains("a=conf:qos local sendrecv\r\n"));
     }
 
-    /// PR #68 Greptile review: a directional precondition (`recv` only)
-    /// must be answered with exactly that direction, not unconditionally
-    /// `sendrecv` — this bridge's relay is always full-duplex, but the
-    /// answer must confirm what was asked, never claim more than was
-    /// asked.
+    /// PR #68 Greptile review, round 1: a directional precondition
+    /// (`recv` only) must be answered with a bounded direction, not
+    /// unconditionally `sendrecv` — this bridge's relay is always
+    /// full-duplex, but the answer must confirm what was asked, never
+    /// claim more than was asked.
+    ///
+    /// PR #68 Greptile review, round 2: `send`/`recv` are relative to
+    /// whoever generated the SDP, exactly like `local`/`remote` (RFC 3312
+    /// §4/§5.2, research.md Decision 1) — the offer's `recv` (the
+    /// offerer's own receive direction) is the *answerer's* `send`
+    /// direction for that same physical flow, not the answerer's `recv`.
     #[test]
-    fn a_recv_only_precondition_is_confirmed_recv_not_sendrecv() {
+    fn a_recv_only_precondition_is_confirmed_as_send_in_the_answer() {
         let offer = offer_with_precondition("remote", "mandatory", "recv");
         assert_eq!(
             precondition_verdict(&offer),
             PreconditionVerdict::Proceed(vec![QosAnswerLine {
                 status_type: QosStatusType::Local,
-                met: QosDirection::Recv,
+                met: QosDirection::Send,
                 confirm: true,
             }])
         );
@@ -2621,9 +2648,48 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(sdp.contains("a=curr:qos local recv\r\n"));
-        assert!(sdp.contains("a=conf:qos local recv\r\n"));
+        assert!(sdp.contains("a=curr:qos local send\r\n"));
+        assert!(sdp.contains("a=conf:qos local send\r\n"));
         assert!(!sdp.contains("local sendrecv"), "must not overclaim: {sdp}");
+        assert!(
+            !sdp.contains("local recv"),
+            "must invert, not copy, the offer's direction"
+        );
+    }
+
+    /// The complementary case: the offer's `send` inverts to the
+    /// answer's `recv`.
+    #[test]
+    fn a_send_only_precondition_is_confirmed_as_recv_in_the_answer() {
+        let offer = offer_with_precondition("remote", "mandatory", "send");
+        assert_eq!(
+            precondition_verdict(&offer),
+            PreconditionVerdict::Proceed(vec![QosAnswerLine {
+                status_type: QosStatusType::Local,
+                met: QosDirection::Recv,
+                confirm: true,
+            }])
+        );
+    }
+
+    /// User Story 3's mirroring must invert direction too, not just
+    /// status-type: the offerer's own `a=curr:qos local send` becomes
+    /// `a=curr:qos remote recv` in the answer, not `remote send`.
+    #[test]
+    fn the_offerers_own_segment_mirroring_inverts_direction_too() {
+        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
+             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=des:qos mandatory local send\r\n\
+             a=curr:qos local send\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(
+            precondition_verdict(&offer),
+            PreconditionVerdict::Proceed(vec![QosAnswerLine {
+                status_type: QosStatusType::Remote,
+                met: QosDirection::Recv,
+                confirm: false,
+            }])
+        );
     }
 
     #[test]

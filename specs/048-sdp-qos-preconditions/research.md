@@ -154,6 +154,21 @@ specs/043 already models as `MediaDirection`); on `a=curr`/`a=conf` it is a
 must not be conflated in code or naming; see `data-model.md`'s
 `QosStatus` vs. `QosDesired` split.
 
+**Correction (PR #68 Greptile review, round 2)**: `send`/`recv` invert
+between offer and answer exactly like `local`/`remote` — Decision 1's own
+quoted RFC 3312 §4 text already says so ("the tags 'send', 'recv',
+'local' and 'remote' represent the point of view of the entity
+generating the SDP description"), but the first implementation of this
+feature only applied that inversion to the status-type, carrying the
+direction token straight through unswapped. `sdp::invert_qos_direction`
+now applies the same `send`↔`recv` swap (`sendrecv`/`none` are
+direction-symmetric and pass through unchanged) everywhere an
+offer-relative direction crosses into the answer — the `Remote`/`E2e`
+branches of `precondition_verdict` and the offerer's-own-segment
+mirroring loop alike. A second instance of the same lesson Decision 1
+already recorded once: a quoted primary source doesn't help if only half
+of what it says gets applied.
+
 ## All landed code
 
 `make format && make lint && make test` (whole workspace, clippy

@@ -86,14 +86,21 @@ enum PreconditionVerdict {
 `a=curr:qos`/`a=conf:qos` lines — one per offer precondition/status line
 that produces an answer line, per the rules in `research.md` Decisions 1-2:
 
+`<dir>` in the "Offer line" column is offer-relative; `<dir'>` in the
+"Answer line(s)" column is `invert_qos_direction(<dir>)` — `send`↔`recv`
+swapped, `sendrecv`/`none` unchanged (RFC 3312 §4/§5.2: `send`/`recv` are
+relative to whoever generated the SDP, exactly like `local`/`remote` —
+PR #68 Greptile review round 2, after round 1 caught the direction being
+dropped entirely and this round caught it being carried over unswapped).
+
 | Offer line | Answer line(s) produced |
 |---|---|
-| `a=des:qos <mandatory\|optional> remote <dir>` | `a=curr:qos local <dir>` (this bridge's segment, always immediately met for the *requested* direction — see PR #68 Greptile review: never overclaims `sendrecv` when less was asked) + `a=conf:qos local <dir>` |
-| `a=des:qos <none\|failure\|unknown> remote <dir>` | `a=curr:qos local <dir>` only — strength doesn't ask for confirmation |
+| `a=des:qos <mandatory\|optional> remote <dir>` | `a=curr:qos local <dir'>` (this bridge's segment, always immediately met for the *requested* direction, never overclaiming `sendrecv` when less was asked) + `a=conf:qos local <dir'>` |
+| `a=des:qos <none\|failure\|unknown> remote <dir>` | `a=curr:qos local <dir'>` only — strength doesn't ask for confirmation |
 | `a=des:qos <mandatory> e2e <dir>` | none — `Decline` instead (Decision 2) |
-| `a=des:qos <optional\|none\|failure\|unknown> e2e <dir>` | `a=curr:qos e2e <dir>` — reports what this bridge can attest to for the requested direction; never claims the far side's contribution, never claims more than was asked |
-| `a=des:qos <any> local <dir>` (offerer's own segment) | none directly; if the offer also carried `a=curr:qos local <status>`, mirror it through as `a=curr:qos remote <status>` (User Story 3) — otherwise nothing emitted |
-| `a=curr:qos local <status>` (offerer's self-report, no matching `a=des`) | mirrored through as `a=curr:qos remote <status>`, same as above |
+| `a=des:qos <optional\|none\|failure\|unknown> e2e <dir>` | `a=curr:qos e2e <dir'>` — reports what this bridge can attest to for the requested direction; never claims the far side's contribution, never claims more than was asked |
+| `a=des:qos <any> local <dir>` (offerer's own segment) | none directly; if the offer also carried `a=curr:qos local <status>`, mirror it through as `a=curr:qos remote <status'>` (User Story 3) — otherwise nothing emitted |
+| `a=curr:qos local <status>` (offerer's self-report, no matching `a=des`) | mirrored through as `a=curr:qos remote <status'>`, same as above |
 
 ## Relationship to the spec's Key Entities
 
