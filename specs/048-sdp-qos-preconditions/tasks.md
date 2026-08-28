@@ -19,7 +19,7 @@ branches.
 
 ## Phase 1: Foundational (blocking prerequisite for all three user stories)
 
-- [ ] T001 In `gsm-sip-bridge/src/ims/sdp.rs`: add `QosStatusType`
+- [x] T001 In `gsm-sip-bridge/src/ims/sdp.rs`: add `QosStatusType`
       (`E2e`/`Local`/`Remote`), `QosStrength`
       (`Mandatory`/`Optional`/`None`/`Failure`/`Unknown`), `QosDirection`
       (`None`/`Send`/`Recv`/`SendRecv`), `QosDesired` (`strength`,
@@ -29,7 +29,7 @@ branches.
       `offerer_curr: Vec<QosStatus>`. All status types are stored
       **offer-relative, unswapped** — inversion happens only where the
       answer is built (research.md Decision 1).
-- [ ] T002 In `gsm-sip-bridge/src/ims/sdp.rs`'s `parse_offer`: parse every
+- [x] T002 In `gsm-sip-bridge/src/ims/sdp.rs`'s `parse_offer`: parse every
       `a=des:qos <strength> <status-type> <direction>` line in the
       selected audio section into `preconditions`, and every
       `a=curr:qos <status-type> <direction>` line into `offerer_curr`, in
@@ -38,7 +38,7 @@ branches.
       parse (research.md Decision 6, same permissive posture as `proto`).
       `parse_offer` must not newly fail on any offer that parsed
       successfully before this change.
-- [ ] T003 Fix the `Ok(SdpOffer { ... })` construction in `parse_offer` and
+- [x] T003 Fix the `Ok(SdpOffer { ... })` construction in `parse_offer` and
       any other exhaustive `SdpOffer { .. }` literals in `sdp.rs`'s test
       module for the two new fields.
 
@@ -59,7 +59,7 @@ call being refused.
 `Require: precondition` → call is not declined for the extension; answer's
 SDP contains `a=curr:qos local sendrecv` + `a=conf:qos local sendrecv`.
 
-- [ ] T004 [US1] In `gsm-sip-bridge/src/ims/sdp.rs`: add
+- [x] T004 [US1] In `gsm-sip-bridge/src/ims/sdp.rs`: add
       `PreconditionVerdict` (`Proceed(Vec<QosAnswerLine>)` / `Decline`) and
       `QosAnswerLine`, plus a `precondition_verdict(&SdpOffer) ->
       PreconditionVerdict` function implementing the table in
@@ -67,11 +67,11 @@ SDP contains `a=curr:qos local sendrecv` + `a=conf:qos local sendrecv`.
       (any strength) produces a `local`-tagged `a=curr:qos sendrecv`
       answer line, plus a `local`-tagged `a=conf:qos` line when the
       line's strength is `mandatory` or `optional`.
-- [ ] T005 [US1] In `gsm-sip-bridge/src/ims/sdp.rs`'s `build_answer_for`:
+- [x] T005 [US1] In `gsm-sip-bridge/src/ims/sdp.rs`'s `build_answer_for`:
       thread the offer's `precondition_verdict`'s `Proceed` answer lines
       through, appending each as its own `a=curr:qos`/`a=conf:qos\r\n`
       line after the existing `m=audio`/direction lines.
-- [ ] T006 [P] [US1] Tests in `sdp.rs`'s `tests` module: a `remote`
+- [x] T006 [P] [US1] Tests in `sdp.rs`'s `tests` module: a `remote`
       `mandatory` line produces both `a=curr`/`a=conf`; a `remote`
       `optional` line produces both; a `remote` line with
       `none`/`failure`/`unknown` strength produces `a=curr` only (no
@@ -99,22 +99,22 @@ Precondition Failure`.
 `Require: precondition` → `580 Precondition Failure`, no answer body.
 Same offer with `optional` instead of `mandatory` → call proceeds.
 
-- [ ] T007 [US2] In `gsm-sip-bridge/src/ims/sip_client.rs`: add
+- [x] T007 [US2] In `gsm-sip-bridge/src/ims/sip_client.rs`: add
       `build_580_precondition_failure(request, to_tag) -> String`,
       mirroring `build_420_bad_extension`/`build_488_not_acceptable`'s
       header-only decline shape (RFC 3312 §6.2 — no body required).
-- [ ] T008 [US2] In `gsm-sip-bridge/src/ims/agent/mod.rs`: add
+- [x] T008 [US2] In `gsm-sip-bridge/src/ims/agent/mod.rs`: add
       `"precondition"` to `SUPPORTED_EXTENSIONS`. Update its doc comment's
       enumeration of placeholder-only tags to note `precondition` is now a
       real (bounded) capability, not a placeholder.
-- [ ] T009 [US2] In `gsm-sip-bridge/src/ims/sdp.rs`'s
+- [x] T009 [US2] In `gsm-sip-bridge/src/ims/sdp.rs`'s
       `precondition_verdict`: an `e2e`-status-type line at `mandatory`
       strength makes the whole verdict `Decline`, regardless of what other
       lines are present. An `e2e` line at any other strength contributes a
       `QosAnswerLine` reporting `e2e` status from this bridge's own
       segment alone (never claiming the offerer's contribution — research.md
       Decision 2/data-model.md's table).
-- [ ] T010 [US2] In `gsm-sip-bridge/src/ims/agent/inbound.rs`'s
+- [x] T010 [US2] In `gsm-sip-bridge/src/ims/agent/inbound.rs`'s
       `handle_invite`: immediately after the existing `offer.proto ==
       "RTP/AVP"` check and before the codec-selection precheck, call
       `sdp::precondition_verdict(&offer)`; on `Decline`, send
@@ -124,7 +124,7 @@ Same offer with `optional` instead of `mandatory` → call proceeds.
       declines. On `Proceed`, carry the answer lines through to wherever
       `build_answer`/`build_veth_answer` is eventually called for this
       call.
-- [ ] T011 [P] [US2] Tests: `agent/mod.rs` — `Require: precondition` alone
+- [x] T011 [P] [US2] Tests: `agent/mod.rs` — `Require: precondition` alone
       is no longer in `unsupported_required_extensions`'s output, while
       `Require: 100rel, precondition` still lists only `100rel` as
       unsupported. `sdp.rs` — `precondition_verdict` returns `Decline` for
@@ -152,7 +152,7 @@ through inverted (`local`→`remote`) in the answer, unaltered.
 plus a matching `a=curr:qos local none` → answer's SDP contains
 `a=curr:qos remote none` (mirrored, not invented); call proceeds.
 
-- [ ] T012 [US3] In `gsm-sip-bridge/src/ims/sdp.rs`'s
+- [x] T012 [US3] In `gsm-sip-bridge/src/ims/sdp.rs`'s
       `precondition_verdict`: for each `local`-status-type entry in
       `offer.preconditions`, if `offer.offerer_curr` has a matching
       `local`-status-type `a=curr:qos` line, emit it through as a
@@ -160,7 +160,7 @@ plus a matching `a=curr:qos local none` → answer's SDP contains
       offer stated — never a value this bridge computes. If no matching
       `a=curr:qos local` line exists in the offer, emit nothing for that
       line (no invented default either).
-- [ ] T013 [P] [US3] Tests in `sdp.rs`: an offer with a `local`-status-type
+- [x] T013 [P] [US3] Tests in `sdp.rs`: an offer with a `local`-status-type
       `a=des:qos` line and a matching `a=curr:qos local none` produces
       `a=curr:qos remote none` in the answer, byte-identical to the
       offer's own claim; an offer with a `local`-status-type `a=des:qos`
@@ -175,25 +175,25 @@ end.
 
 ## Phase 5: Polish & Cross-Cutting
 
-- [ ] T014 [P] In `gsm-sip-bridge/src/ims/agent/inbound.rs`'s test module:
+- [x] T014 [P] In `gsm-sip-bridge/src/ims/agent/inbound.rs`'s test module:
       add a confirming test that an offerless INVITE (empty body) carrying
       `Require: precondition` still proceeds through
       `handle_offerless_invite` unaffected — no `a=des:qos` lines exist to
       act on, so it takes the same path as today (research.md Decision 5,
       spec Edge Cases).
-- [ ] T015 Update `docs/plans/mt-conformance-findings.md`: mark MT-06
+- [x] T015 Update `docs/plans/mt-conformance-findings.md`: mark MT-06
       `[x]` (moving it out of the "Deferred, not landed" list, matching
       how SDP-04/SMS-05 were moved out in batch 8's writeup), with a
       "Landed" description citing the RFC 3312 §4 local/remote-inversion
       correction, the `580` response code choice (§6.2), and the
       regression-only hardware-verification note.
-- [ ] T016 Add one entry to `RELEASE_NOTES.md` under `## Unreleased`
+- [x] T016 Add one entry to `RELEASE_NOTES.md` under `## Unreleased`
       describing the user-facing change: an inbound call requiring SDP QoS
       preconditions on its own segment now connects instead of being
       refused; a call requiring end-to-end preconditions this bridge
       cannot confirm is still declined, now with `580 Precondition
       Failure` instead of `420 Bad Extension`.
-- [ ] T017 `make format && make lint && make test` (whole workspace,
+- [x] T017 `make format && make lint && make test` (whole workspace,
       clippy `-D warnings`) — must be clean before any commit, per
       `CLAUDE.md`.
 - [ ] T018 Hardware round on the `test/` docker rig per `quickstart.md`
