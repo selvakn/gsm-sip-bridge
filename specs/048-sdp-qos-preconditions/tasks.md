@@ -196,7 +196,7 @@ end.
 - [x] T017 `make format && make lint && make test` (whole workspace,
       clippy `-D warnings`) — must be clean before any commit, per
       `CLAUDE.md`.
-- [ ] T018 Hardware round on the `test/` docker rig per `quickstart.md`
+- [x] T018 Hardware round on the `test/` docker rig per `quickstart.md`
       (**regression-only**, per spec Clarifications): rebuild/retag,
       redeploy to the real Pi, re-register the real line, drive one
       ordinary real inbound call (no preconditions involved) and confirm

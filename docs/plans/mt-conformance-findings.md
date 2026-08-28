@@ -971,6 +971,18 @@ suite, `agent/mod.rs`'s `SUPPORTED_EXTENSIONS` tests,
 round instead confirms an ordinary real inbound call (no preconditions)
 still connects and bridges cleanly on the new build.
 
+**Hardware-verified 2026-08-28**: rebuilt
+(`gsm-sip-bridge:sdp-qos-preconditions`), redeployed to the `test/` rig,
+tunnel re-established (one IKE re-init mid-session, recovered
+automatically — the pre-existing tunnel-instability behavior already
+documented elsewhere, unrelated to this feature), `vowifi_registered=1`.
+One real inbound call from the user's phone: rang, answered, media active
+on both legs (carrier leg negotiated G722, veth leg L16), clean
+`caller_hangup` after ~13s. Zero errors, warnings, or panics. As expected,
+the offer carried no `a=des:qos` lines — this confirms no regression on
+the ordinary path, not the new precondition-handling logic itself, which
+remains unit-test-only per the Clarifications above.
+
 ## Hardware test log
 
 Real-hardware verification runs on the local test rig (`test/`, see its
