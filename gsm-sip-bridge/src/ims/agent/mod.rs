@@ -1254,18 +1254,18 @@ fn handle_message(
     let mut completed_part: Option<crate::ims::sms_pdu::ConcatPart> = None;
     if let Some(part) = decoded.as_ref().and_then(|d| d.part) {
         let text = decoded.as_ref().map(|d| d.text.clone()).unwrap_or_default();
-        let (outcome, flushed) = p
+        // If admitting this part forces an *other*, unrelated buffer out
+        // (capacity eviction, or a detected reference reuse —
+        // `Reassembly::admit_part`'s own docs), that buffer's content is
+        // queued inside `Reassembly` itself for retried delivery — see
+        // `flush_expired_reassembly`/`LoopState::on_idle_tick`, which
+        // drains the same queue this could have just added to. Nothing to
+        // do with it here.
+        let outcome = p
             .reassembly
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .admit_part(&sender, &part, &text);
-        // An *unrelated* buffer's already-acknowledged parts, forced out by
-        // admitting this one (capacity eviction, or a detected reference
-        // reuse — `Reassembly::admit_part`'s own docs). Delivered
-        // regardless of what this part's own outcome turns out to be.
-        for (flushed_sender, sequence, total, flushed_text) in flushed {
-            deliver_flushed_part(p, &flushed_sender, sequence, total, &flushed_text);
-        }
         match outcome {
             crate::volte::sms::PartOutcome::Pending => {
                 // Still missing at least one part. FR-012: acknowledge this
@@ -1366,24 +1366,34 @@ fn handle_message(
     }
 }
 
-/// Delivers one already-acknowledged, individually-labelled multi-part SMS
-/// part — a [`crate::volte::sms::FlushedParts`] entry, whether it came from
-/// [`crate::volte::sms::Reassembly::take_expired`] or from `admit_part`'s
-/// own eviction/reference-reuse flush — exactly the shape the pre-existing
-/// `Malformed` fallback already delivers, just reached a different way.
+/// Attempts one already-acknowledged, individually-labelled delivery for a
+/// part sitting in `p.reassembly`'s retry queue (`Reassembly::
+/// ready_for_delivery`'s shape) — whether it's there from capacity
+/// eviction, a detected reference reuse, or ordinary expiry, all queued the
+/// same way. Returns whether it actually succeeded, so the caller
+/// (`flush_expired_reassembly`) knows whether to dequeue it or leave it for
+/// the next retry — this attempt is deliberately **not** the only one: a
+/// transient control-channel failure here used to lose the content outright
+/// (code review finding, 2026-08-28); now it just stays queued and tries
+/// again next `on_idle_tick` (~1s later).
 ///
-/// Also settles that part's own `Dedupe` claim: `confirm` on success,
+/// Also settles that part's own `Dedupe` claim on success: `confirm`,
 /// mirroring the ordinary single-part success path, so the modem-storage
 /// route's cross-route coordination (`wait_for_resolution`) can finally
 /// treat it as safe to discard its own backup — which, before this part
-/// was flushed, it correctly could not (code review finding, 2026-08-28:
-/// see [`crate::volte::sms::PartOutcome::Pending`]'s docs for the bug this
-/// closes). `forget` on failure, the same as every other delivery-failure
-/// path in this module, so a network retransmission of just this part is
-/// treated as fresh rather than permanently suppressed by a delivery that
-/// never actually happened — the label is reconstructed identically to how
+/// was flushed, it correctly could not (a separate, earlier code-review
+/// finding, 2026-08-28: see [`crate::volte::sms::PartOutcome::Pending`]'s
+/// docs). No `Dedupe` action on failure — the claim stays exactly as it
+/// was, since this attempt changed nothing durable; the next retry decides
+/// its fate, not this one. The label is reconstructed identically to how
 /// it was first computed, so the dedupe key matches.
-fn deliver_flushed_part(p: &DispatchParams, sender: &str, sequence: u8, total: u8, text: &str) {
+fn deliver_flushed_part(
+    p: &DispatchParams,
+    sender: &str,
+    sequence: u8,
+    total: u8,
+    text: &str,
+) -> bool {
     let body = format!("[{sequence}/{total}] {text}");
     let key = crate::volte::sms::InboundMessage {
         route: crate::volte::sms::MessageRoute::OverRegistration,
@@ -1410,69 +1420,61 @@ fn deliver_flushed_part(p: &DispatchParams, sender: &str, sequence: u8, total: u
                     total,
                     "delivered an already-buffered multi-part message's held part individually"
                 );
+                true
             }
             Err(e) => {
-                // Unlike a fresh part's own delivery failure, this content
-                // is genuinely gone from *this* buffer now (already
-                // removed by `take_expired`/eviction before this was
-                // called) and no SIP-level retransmission will recover it
-                // — the network already got its RP-ACK/200 OK for this
-                // part back when it first arrived (FR-012). `forget` is
-                // still correct, not futile: it gives the modem-storage
-                // route's own independent backup copy of this exact part
-                // (if one exists — CS-02's cross-route scenario) one more
-                // chance to deliver it via that other bearer, instead of
-                // leaving that route stuck polling a claim this buffer can
-                // never confirm.
-                p.dedupe
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .forget(&key);
                 tracing::warn!(
                     sender = %sender,
                     sequence,
                     total,
                     error = %e,
-                    "failed to deliver a buffered multi-part message's held part; it is lost \
-                     from this buffer (the part itself was already acknowledged to the network \
-                     at receipt time, so no retransmission of it will arrive here again)"
+                    "failed to deliver a buffered multi-part message's held part; still queued, \
+                     will retry next idle tick"
                 );
+                false
             }
         },
         Err(e) => {
-            p.dedupe
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .forget(&key);
             tracing::warn!(
                 sender = %sender,
                 sequence,
                 total,
                 error = %e,
                 "failed to reach the control channel to deliver a buffered multi-part message's \
-                 held part; it is lost from this buffer (already acknowledged to the network at \
-                 receipt time)"
+                 held part; still queued, will retry next idle tick"
             );
+            false
         }
     }
 }
 
-/// Flushes every multi-part SMS part that has been sitting in
-/// `p.reassembly` past its 3-minute bound (`REASSEMBLY_TIMEOUT`/
-/// `take_expired`'s own shape — FR-013/SC-004), via [`deliver_flushed_part`].
+/// Advances `p.reassembly`'s retry queue by one `LoopState::on_idle_tick`
+/// step: moves anything newly past [`REASSEMBLY_TIMEOUT`] into the queue
+/// (FR-013/SC-004), then attempts delivery for everything currently queued
+/// — new and previously-retried alike — dequeuing only what actually
+/// succeeds via [`deliver_flushed_part`].
 ///
 /// Called from `LoopState::on_idle_tick`, which — unlike the modem-storage
 /// sweep thread this was originally (and wrongly) placed in — runs for
 /// every line regardless of whether it has a modem to sweep (code review
 /// finding, 2026-08-28).
 fn flush_expired_reassembly(p: &DispatchParams) {
-    let expired = p
+    p.reassembly
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .expire_due(std::time::Instant::now());
+    let ready = p
         .reassembly
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .take_expired(std::time::Instant::now());
-    for (sender, sequence, total, text) in expired {
-        deliver_flushed_part(p, &sender, sequence, total, &text);
+        .ready_for_delivery();
+    for (id, sender, sequence, total, text) in ready {
+        if deliver_flushed_part(p, &sender, sequence, total, &text) {
+            p.reassembly
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mark_flush_delivered(id);
+        }
     }
 }
 

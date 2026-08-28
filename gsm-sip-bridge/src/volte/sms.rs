@@ -258,17 +258,25 @@ pub enum PartOutcome {
     Malformed,
 }
 
-/// One already-acknowledged part that must be delivered *now*, individually
-/// and labelled — the same shape and the same reason [`Reassembly::
-/// take_expired`]'s results are delivered: `(sender, sequence, total,
-/// text)`. Returned alongside a [`PartOutcome`] by [`Reassembly::
-/// admit_part`] when admitting the new part forced an *other*, unrelated
-/// buffer out — capacity eviction, or a detected reference reuse (see that
-/// method's own docs) — never silently, since every part in it was already
-/// acknowledged to the network and cannot be recovered by a retransmission
-/// (code review finding, 2026-08-28: the original eviction path dropped
-/// these outright).
-pub type FlushedParts = Vec<(String, u8, u8, String)>;
+/// One part sitting in [`Reassembly`]'s retry queue: content some buffer
+/// gave up (capacity eviction, a detected reference reuse, or ordinary
+/// [`REASSEMBLY_TIMEOUT`] expiry) that must be delivered, and — unlike a
+/// one-shot attempt — is **not** forgotten if that attempt fails. It stays
+/// queued for the next retry (`LoopState::on_idle_tick`'s own ~1s cadence)
+/// until [`Reassembly::mark_flush_delivered`] confirms it actually got out
+/// (code review finding, 2026-08-28: the original design removed this
+/// content from `Reassembly` at the moment of eviction/expiry and made a
+/// single delivery attempt — a transient control-channel failure at that
+/// exact moment lost it permanently, with the network's own retransmission
+/// unable to help, since it had already been acknowledged).
+#[derive(Debug, Clone)]
+struct QueuedFlush {
+    id: u64,
+    sender: String,
+    sequence: u8,
+    total: u8,
+    text: String,
+}
 
 /// Buffers the parts of one or more multi-part text messages until each
 /// completes or [`REASSEMBLY_TIMEOUT`] elapses (specs/047-offerless-invite-
@@ -292,10 +300,16 @@ pub struct Reassembly {
     buffers: std::collections::HashMap<ReassemblyKey, PartialMessage>,
     /// Oldest-first eviction order, mirroring `Dedupe`'s `VecDeque` — a
     /// capacity overrun evicts the longest-untouched identity, not
-    /// necessarily the most naturally-expired one (that's `take_expired`'s
+    /// necessarily the most naturally-expired one (that's `expire_due`'s
     /// job on the normal path; this is only the backstop against a flood).
     order: VecDeque<ReassemblyKey>,
     capacity: usize,
+    /// Content that has left a `PartialMessage` buffer (eviction, reference
+    /// reuse, or expiry) and is waiting to actually be delivered — see
+    /// [`QueuedFlush`]'s own docs for why this exists as a retried queue
+    /// rather than a one-shot return value.
+    pending: Vec<QueuedFlush>,
+    next_pending_id: u64,
 }
 
 impl Default for Reassembly {
@@ -310,20 +324,19 @@ impl Reassembly {
             buffers: std::collections::HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
+            pending: Vec::new(),
+            next_pending_id: 0,
         }
     }
 
-    /// Admits one part of a multi-part message. Returns the [`PartOutcome`]
-    /// for *this* part, plus any [`FlushedParts`] some *other*,
-    /// already-acknowledged buffer was forced to give up as a side effect
-    /// of admitting this one (capacity eviction, or a detected reference
-    /// reuse — see below) — empty in the overwhelmingly common case where
-    /// neither happens. The caller must delivery both: the outcome per
-    /// [`PartOutcome`]'s own docs, and every entry in the flushed list
-    /// individually and labelled, exactly like [`Self::take_expired`]'s
-    /// results (code review finding, 2026-08-28: the original version
-    /// evicted silently, losing already-acknowledged content no
-    /// retransmission could recover).
+    /// Admits one part of a multi-part message. See [`PartOutcome`] for
+    /// what each result means and what the caller must do next. If
+    /// admitting this part forces an *other*, unrelated buffer out
+    /// (capacity eviction, or a detected reference reuse — see below),
+    /// that buffer's own content is queued for retried delivery — see
+    /// [`Self::ready_for_delivery`] — never dropped (code review finding,
+    /// 2026-08-28: the original version evicted silently, losing
+    /// already-acknowledged content no retransmission could recover).
     ///
     /// Re-admitting an already-held `sequence` with the *same* text is a
     /// harmless no-op that still correctly reports `Complete` if the set is
@@ -337,31 +350,24 @@ impl Reassembly {
     /// part landing on an already-filled position with *different* text
     /// than what's there cannot be a retransmission (Decision 9's
     /// idempotent-retry case requires identical text), so it is treated as
-    /// exactly that: the old buffer is flushed (into the returned
-    /// [`FlushedParts`]) and a fresh one started for the new part. This
-    /// catches the corrupting case — a hybrid message silently combining
-    /// text from two senders' messages — but is not a complete detector:
-    /// two messages sharing an identity whose parts happen to land on
-    /// disjoint positions (no position ever gets conflicting text) cannot
-    /// be told apart from the PDU alone; TS 23.040 gives a receiver no
-    /// stronger signal to work with. Recorded as a residue, not silently
-    /// assumed impossible.
-    pub fn admit_part(
-        &mut self,
-        sender: &str,
-        part: &ConcatPart,
-        text: &str,
-    ) -> (PartOutcome, FlushedParts) {
+    /// exactly that: the old buffer is queued for delivery and a fresh one
+    /// started for the new part. This catches the corrupting case — a
+    /// hybrid message silently combining text from two senders' messages —
+    /// but is not a complete detector: two messages sharing an identity
+    /// whose parts happen to land on disjoint positions (no position ever
+    /// gets conflicting text) cannot be told apart from the PDU alone;
+    /// TS 23.040 gives a receiver no stronger signal to work with.
+    /// Recorded as a residue, not silently assumed impossible.
+    pub fn admit_part(&mut self, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
         if part.total == 0 || part.sequence == 0 || part.sequence > part.total {
-            return (PartOutcome::Malformed, Vec::new());
+            return PartOutcome::Malformed;
         }
 
         let key: ReassemblyKey = (sender.to_string(), part.reference);
-        let mut flushed = Vec::new();
 
         if let Some(existing) = self.buffers.get(&key) {
             if existing.total != part.total {
-                return (PartOutcome::Malformed, Vec::new());
+                return PartOutcome::Malformed;
             }
             if existing
                 .parts
@@ -369,7 +375,7 @@ impl Reassembly {
                 .is_some_and(|t| t != text)
             {
                 if let Some(old) = self.buffers.remove(&key) {
-                    flushed.extend(Self::flatten(sender, old));
+                    self.enqueue_pending(sender, old);
                 }
                 self.order.retain(|k| k != &key);
             }
@@ -380,7 +386,7 @@ impl Reassembly {
                 if let Some(evicted_key) = self.order.pop_front() {
                     if let Some(evicted) = self.buffers.remove(&evicted_key) {
                         let (evicted_sender, _) = &evicted_key;
-                        flushed.extend(Self::flatten(evicted_sender, evicted));
+                        self.enqueue_pending(evicted_sender, evicted);
                     }
                 }
             }
@@ -402,12 +408,11 @@ impl Reassembly {
         buffer.parts.insert(part.sequence, text.to_string());
         buffer.last_updated = Instant::now();
 
-        let outcome = if buffer.parts.len() == buffer.total as usize {
+        if buffer.parts.len() == buffer.total as usize {
             PartOutcome::Complete(buffer.parts.values().cloned().collect::<Vec<_>>().join(""))
         } else {
             PartOutcome::Pending
-        };
-        (outcome, flushed)
+        }
     }
 
     /// Clears a completed message's buffer entry — call this, and only
@@ -424,12 +429,13 @@ impl Reassembly {
         self.order.retain(|k| k != &key);
     }
 
-    /// Removes and returns every part of every buffered message whose most
-    /// recent part is older than [`REASSEMBLY_TIMEOUT`] — one
-    /// `(sender, sequence, total, text)` tuple per still-held part, the
-    /// shape the existing per-part `ControlMessage::SmsReceived` send
-    /// already expects (FR-013/SC-004).
-    pub fn take_expired(&mut self, now: Instant) -> FlushedParts {
+    /// Moves every buffered message whose most recent part is older than
+    /// [`REASSEMBLY_TIMEOUT`] into the retry queue (FR-013/SC-004). Call
+    /// this, then [`Self::ready_for_delivery`], once per
+    /// `LoopState::on_idle_tick` — the two are separate so a caller that
+    /// only wants to drain already-queued retries (nothing new expired
+    /// this tick) can skip the scan.
+    pub fn expire_due(&mut self, now: Instant) {
         let expired_keys: Vec<ReassemblyKey> = self
             .buffers
             .iter()
@@ -439,26 +445,49 @@ impl Reassembly {
             .map(|(k, _)| k.clone())
             .collect();
 
-        let mut out = Vec::new();
         for key in expired_keys {
             if let Some(buf) = self.buffers.remove(&key) {
                 let (sender, _reference) = &key;
-                out.extend(Self::flatten(sender, buf));
+                self.enqueue_pending(sender, buf);
             }
             self.order.retain(|k| k != &key);
         }
-        out
     }
 
-    /// One buffered message's held parts, as the `(sender, sequence, total,
-    /// text)` shape every flush path (`take_expired`, capacity eviction,
-    /// reference-reuse eviction) delivers individually and labelled.
-    fn flatten(sender: &str, msg: PartialMessage) -> FlushedParts {
-        let total = msg.total;
-        msg.parts
-            .into_iter()
-            .map(|(seq, text)| (sender.to_string(), seq, total, text))
+    /// A snapshot of every part currently queued for delivery — from
+    /// capacity eviction, reference reuse, or [`Self::expire_due`] — without
+    /// removing anything. The caller attempts delivery for each and calls
+    /// [`Self::mark_flush_delivered`] only for the ones that actually
+    /// succeeded; anything left is retried on the next call, naturally
+    /// self-healing a transient control-channel failure within one
+    /// `on_idle_tick` cycle (~1s) instead of losing the content outright
+    /// (code review finding, 2026-08-28).
+    pub fn ready_for_delivery(&self) -> Vec<(u64, String, u8, u8, String)> {
+        self.pending
+            .iter()
+            .map(|p| (p.id, p.sender.clone(), p.sequence, p.total, p.text.clone()))
             .collect()
+    }
+
+    /// Removes one entry from the retry queue — call this, and only this,
+    /// once its delivery has actually succeeded.
+    pub fn mark_flush_delivered(&mut self, id: u64) {
+        self.pending.retain(|p| p.id != id);
+    }
+
+    /// Moves one buffered message's held parts into the retry queue.
+    fn enqueue_pending(&mut self, sender: &str, msg: PartialMessage) {
+        let total = msg.total;
+        for (seq, text) in msg.parts {
+            self.next_pending_id += 1;
+            self.pending.push(QueuedFlush {
+                id: self.next_pending_id,
+                sender: sender.to_string(),
+                sequence: seq,
+                total,
+                text,
+            });
+        }
     }
 }
 
@@ -1383,13 +1412,18 @@ mod tests {
         }
     }
 
-    /// Asserts admitting this part flushed no *other* buffer as a side
-    /// effect (capacity eviction / reference-reuse — see `admit_part`'s own
-    /// docs), and returns just the outcome — what every test below except
-    /// the ones specifically targeting eviction/reuse cares about.
+    /// Asserts admitting this part queued nothing for retried delivery as a
+    /// side effect (capacity eviction / reference-reuse — see
+    /// `admit_part`'s own docs), and returns just the outcome — what every
+    /// test below except the ones specifically targeting eviction/reuse
+    /// cares about.
     fn admit(r: &mut Reassembly, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
-        let (outcome, flushed) = r.admit_part(sender, part, text);
-        assert!(flushed.is_empty(), "unexpected flush: {flushed:?}");
+        let outcome = r.admit_part(sender, part, text);
+        assert!(
+            r.ready_for_delivery().is_empty(),
+            "unexpected queued flush: {:?}",
+            r.ready_for_delivery()
+        );
         outcome
     }
 
@@ -1512,31 +1546,90 @@ mod tests {
     }
 
     #[test]
-    fn take_expired_leaves_a_fresh_buffer_untouched() {
+    fn expire_due_leaves_a_fresh_buffer_untouched() {
         let mut r = Reassembly::default();
         admit(&mut r, "+91123", &concat(1, 1, 2), "A");
-        assert!(r.take_expired(Instant::now()).is_empty());
+        r.expire_due(Instant::now());
+        assert!(r.ready_for_delivery().is_empty());
     }
 
     #[test]
-    fn take_expired_flushes_every_held_part_past_the_bound() {
+    fn expire_due_queues_every_held_part_past_the_bound_for_delivery() {
         let mut r = Reassembly::default();
         admit(&mut r, "+91123", &concat(1, 1, 3), "A");
         admit(&mut r, "+91123", &concat(1, 2, 3), "B");
         let past_deadline = Instant::now() + REASSEMBLY_TIMEOUT + Duration::from_secs(1);
-        let mut flushed = r.take_expired(past_deadline);
-        flushed.sort_by_key(|(_, seq, _, _)| *seq);
+        r.expire_due(past_deadline);
+        let mut ready = r.ready_for_delivery();
+        ready.sort_by_key(|(_, _, seq, _, _)| *seq);
+        let without_ids: Vec<_> = ready
+            .into_iter()
+            .map(|(_, sender, seq, total, text)| (sender, seq, total, text))
+            .collect();
         assert_eq!(
-            flushed,
+            without_ids,
             vec![
                 ("+91123".to_string(), 1, 3, "A".to_string()),
                 ("+91123".to_string(), 2, 3, "B".to_string()),
             ]
         );
-        // Cleared — a second call finds nothing left to flush.
-        assert!(r
-            .take_expired(past_deadline + REASSEMBLY_TIMEOUT)
-            .is_empty());
+        // Still queued — expiring again finds nothing new (the buffer is
+        // already gone), and what's already queued is untouched by
+        // `expire_due` itself.
+        r.expire_due(past_deadline + REASSEMBLY_TIMEOUT);
+        assert_eq!(r.ready_for_delivery().len(), 2);
+    }
+
+    #[test]
+    fn mark_flush_delivered_dequeues_only_the_confirmed_entry() {
+        let mut r = Reassembly::default();
+        let part_b = concat(1, 2, 2);
+        admit(&mut r, "+91123", &concat(1, 1, 2), "A");
+        assert_eq!(
+            admit(&mut r, "+91123", &part_b, "B"),
+            PartOutcome::Complete("AB".to_string())
+        );
+        // Delivered successfully, per the ordinary `Complete` path — clears
+        // this buffer so it's not still sitting in `buffers` (and therefore
+        // outside `expire_due`'s concern) below, isolating this test to the
+        // one buffer that's actually still incomplete.
+        r.mark_delivered("+91123", &part_b);
+        // Completes instantly (total 1), but — unlike +91123/1's above —
+        // is never `mark_delivered`, so it's still sitting in `buffers`
+        // when `expire_due` runs below.
+        admit(&mut r, "+91002", &concat(1, 1, 1), "solo");
+        let past_deadline = Instant::now() + REASSEMBLY_TIMEOUT + Duration::from_secs(1);
+        r.expire_due(past_deadline);
+        let ready = r.ready_for_delivery();
+        assert_eq!(
+            ready.len(),
+            1,
+            "+91123/ref1 was cleared by mark_delivered above; only +91002/ref1 remained to expire"
+        );
+        let (id, ..) = ready[0].clone();
+        r.mark_flush_delivered(id);
+        assert!(r.ready_for_delivery().is_empty());
+        // A retry attempt for an already-delivered id is a harmless no-op.
+        r.mark_flush_delivered(id);
+    }
+
+    #[test]
+    fn a_failed_delivery_attempt_leaves_the_entry_queued_for_retry() {
+        // Simulates `flush_expired_reassembly`'s own contract: a caller
+        // that fails to deliver must NOT call `mark_flush_delivered` — the
+        // entry then survives for the next `on_idle_tick` (code review
+        // finding, 2026-08-28: the original one-shot design lost this
+        // content outright on a transient control-channel failure).
+        let mut r = Reassembly::default();
+        admit(&mut r, "+91123", &concat(1, 1, 1), "solo");
+        r.expire_due(Instant::now() + REASSEMBLY_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(r.ready_for_delivery().len(), 1);
+        // ... delivery attempt fails, caller does nothing ...
+        assert_eq!(
+            r.ready_for_delivery().len(),
+            1,
+            "still queued — nothing removed it"
+        );
     }
 
     #[test]
@@ -1589,25 +1682,39 @@ mod tests {
         );
     }
 
+    /// `ready_for_delivery`'s entries without the opaque retry-queue id —
+    /// what these tests actually care about asserting on.
+    fn queued_without_ids(r: &Reassembly) -> Vec<(String, u8, u8, String)> {
+        let mut ready = r.ready_for_delivery();
+        ready.sort_by_key(|(_, _, seq, _, _)| *seq);
+        ready
+            .into_iter()
+            .map(|(_, sender, seq, total, text)| (sender, seq, total, text))
+            .collect()
+    }
+
     #[test]
-    fn capacity_eviction_flushes_rather_than_drops_the_oldest_identity() {
+    fn capacity_eviction_queues_rather_than_drops_the_oldest_identity() {
         // code review finding, 2026-08-28: the original eviction path
         // silently dropped the oldest buffer's already-acknowledged
-        // content. It must now come back as `FlushedParts` for the caller
-        // to deliver, the same as an expired buffer's would.
+        // content. It must now be queued for retried delivery, the same as
+        // an expired buffer's would be.
         let mut r = Reassembly::new(2);
         admit(&mut r, "+91001", &concat(1, 1, 2), "a");
         admit(&mut r, "+91002", &concat(1, 1, 2), "b");
         // Third distinct identity evicts the first (+91001/ref 1) — its one
-        // held part must come back flushed, not vanish.
-        let (_, flushed) = r.admit_part("+91003", &concat(1, 1, 2), "c");
-        assert_eq!(flushed, vec![("+91001".to_string(), 1, 2, "a".to_string())]);
+        // held part must be queued, not vanish.
+        r.admit_part("+91003", &concat(1, 1, 2), "c");
+        assert_eq!(
+            queued_without_ids(&r),
+            vec![("+91001".to_string(), 1, 2, "a".to_string())]
+        );
         // Re-admitting +91001 starts a fresh buffer, not a completion —
         // still at capacity (buffers now holds +91002/+91003), so this
-        // necessarily flushes +91002 in turn; that's expected, not this
-        // test's own concern (`admit`'s no-flush assertion would wrongly
+        // necessarily queues +91002 in turn; that's expected, not this
+        // test's own concern (`admit`'s no-queue assertion would wrongly
         // fail here, so this uses `admit_part` directly).
-        let (outcome, _) = r.admit_part("+91001", &concat(1, 2, 2), "a2");
+        let outcome = r.admit_part("+91001", &concat(1, 2, 2), "a2");
         assert_eq!(
             outcome,
             PartOutcome::Pending,
@@ -1623,20 +1730,18 @@ mod tests {
         // landing on an already-filled position with genuinely different
         // text (not a retransmission, which would carry identical text —
         // see the idempotent-retry test above) must not silently overwrite
-        // or blend into the old message; the old message's held parts come
-        // back as `FlushedParts` for individual delivery, and the new part
-        // starts a fresh buffer under the same identity.
+        // or blend into the old message; the old message's held parts are
+        // queued for individual delivery, and the new part starts a fresh
+        // buffer under the same identity.
         let mut r = Reassembly::default();
         admit(&mut r, "+91123", &concat(1, 1, 3), "old-part-one ");
         admit(&mut r, "+91123", &concat(1, 2, 3), "old-part-two");
         // A new, unrelated message reuses reference 1 (same total, by
         // coincidence) — its own first part lands on position 1, where the
         // old message's genuinely different text already sits.
-        let (outcome, flushed) = r.admit_part("+91123", &concat(1, 1, 3), "new-message");
-        let mut flushed = flushed;
-        flushed.sort_by_key(|(_, seq, _, _)| *seq);
+        let outcome = r.admit_part("+91123", &concat(1, 1, 3), "new-message");
         assert_eq!(
-            flushed,
+            queued_without_ids(&r),
             vec![
                 ("+91123".to_string(), 1, 3, "old-part-one ".to_string()),
                 ("+91123".to_string(), 2, 3, "old-part-two".to_string()),
@@ -1654,13 +1759,13 @@ mod tests {
         // The sibling case to the test above: identical text at an
         // already-held position is the ordinary idempotent-retry path
         // (already covered by `re_admitting_an_already_held_sequence_...`
-        // above), not a reuse — pinned here specifically to confirm no
-        // flush happens on the *unchanged*-text path, only on a genuine
+        // above), not a reuse — pinned here specifically to confirm nothing
+        // is queued on the *unchanged*-text path, only on a genuine
         // mismatch.
         let mut r = Reassembly::default();
         admit(&mut r, "+91123", &concat(1, 1, 2), "A");
-        let (outcome, flushed) = r.admit_part("+91123", &concat(1, 1, 2), "A");
-        assert!(flushed.is_empty());
+        let outcome = r.admit_part("+91123", &concat(1, 1, 2), "A");
+        assert!(r.ready_for_delivery().is_empty());
         assert_eq!(outcome, PartOutcome::Pending);
     }
 

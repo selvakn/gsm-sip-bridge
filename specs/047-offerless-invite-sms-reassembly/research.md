@@ -220,14 +220,32 @@ new free function in `agent::mod`, not a method, since it needs only
 `&DispatchParams` — first thing, unconditionally, before any of the
 function's own early returns (Gm probe skipped while busy, renewal not
 due, deferred, backed off, ...) could otherwise skip it. It calls
-`Reassembly::take_expired(now)`, which returns every buffered entry whose
-`last_updated` is older than the 3-minute bound, removed from the buffer,
-and delivers each still-held part individually and labelled — exactly the
-shape today's per-part behavior already uses, and identical to what
-`Malformed` already falls back to in `handle_message`. No new thread, no
-new timer — the same "the existing wakeup already doubles as the clock"
-reasoning RTCP batch 7's Decision 3 used for its own report cadence, just
-anchored to the wakeup that's actually universal.
+`Reassembly::expire_due(now)`, moving every buffered entry whose
+`last_updated` is older than the 3-minute bound into `Reassembly`'s own
+retry queue (see the **second revision** immediately below), then attempts
+delivery for everything currently queued. No new thread, no new timer —
+the same "the existing wakeup already doubles as the clock" reasoning RTCP
+batch 7's Decision 3 used for its own report cadence, just anchored to the
+wakeup that's actually universal.
+
+**Revised again (Greptile review, 2026-08-28, second round)** — the
+version above (and the matching fix for capacity eviction/reference
+reuse, Decisions recorded in `data-model.md`'s `PartOutcome` section)
+still made only a *single* delivery attempt per flushed part, having
+already removed it from `Reassembly` first. A transient control-channel
+failure at that exact moment lost the content permanently — the same
+failure shape the original eviction bug had, just narrowed to one unlucky
+moment instead of removed. Fixed by giving `Reassembly` a small internal
+retry queue (`QueuedFlush`, `pending: Vec<QueuedFlush>`): `expire_due`,
+capacity eviction, and reference-reuse all move their content into it
+rather than returning it directly; `on_idle_tick` drains it via a
+non-destructive `ready_for_delivery()` snapshot and only dequeues an
+entry (`mark_flush_delivered`) once its delivery actually succeeds — a
+failed attempt leaves it queued for the next ~1s tick, self-healing
+instead of losing the content on the first try. This is the same
+peek-then-confirm shape `PartOutcome::Complete`/`mark_delivered` already
+established for the ordinary completion path, applied consistently to
+every other way a buffer's content leaves `Reassembly`.
 
 **Alternatives considered**: a dedicated reassembly-expiry thread.
 Rejected outright as the one thing this decision exists to avoid — a

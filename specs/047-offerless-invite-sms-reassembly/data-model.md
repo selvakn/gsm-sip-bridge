@@ -47,21 +47,9 @@ over different routes).
 | `total` | `u8` | from the first part seen; every later part for this key must agree, or the mismatch makes the message `Malformed` (FR-016) |
 | `parts` | map `seq (u8) → text (String)` | sparse — only positions actually received |
 | `rp_mr` per part *not* stored here | — | the per-part delivery ack (FR-012/Decision 10) happens at admission time, before/independent of this struct, so it never needs to be replayed later |
-| `last_updated` | `Instant` | reset on every admitted part (including a duplicate re-admission of an already-held seq — see Decision 9's retry note); what `take_expired` compares against the 3-minute bound (`SC-004`/FR-013) |
+| `last_updated` | `Instant` | reset on every admitted part (including a duplicate re-admission of an already-held seq — see Decision 9's retry note); what `expire_due` compares against the 3-minute bound (`SC-004`/FR-013) |
 
-### `PartOutcome` and `FlushedParts` (what `admit_part` returns)
-
-`admit_part` returns `(PartOutcome, FlushedParts)` — the outcome for the
-part just admitted, plus any *other*, unrelated buffer's already-
-acknowledged parts that admitting this one forced out (capacity eviction,
-or a detected reference reuse — both below). `FlushedParts` is the same
-`Vec<(String, u8, u8, String)>` shape `take_expired` returns, and is empty
-in the overwhelmingly common case where neither happens (code review
-finding, 2026-08-28: the original design let eviction drop this content
-silently instead of returning it for delivery — see the Reference reuse
-sub-entry in `docs/plans/mt-conformance-findings.md`'s batch 8 entry for
-the fuller writeup, corrected here alongside `Pending`'s own confirm-timing
-fix).
+### `PartOutcome` (what `admit_part` returns)
 
 | Variant | Meaning | Caller's action |
 | --- | --- | --- |
@@ -69,12 +57,16 @@ fix).
 | `Pending` | still missing at least one position | ack this part now regardless (FR-012); nothing forwarded yet. **Must not** be treated as durably delivered (no `Dedupe::confirm`) — it is sitting only in this process's memory until it either completes or is flushed |
 | `Malformed` | `total == 0`, or this part's `seq` is `0` or `> total`, or this part's `total` disagrees with an already-buffered value for the same key | fall back to today's existing per-part delivery (FR-016) — the individual, still-labelled text, exactly as before this feature |
 
-Every `FlushedParts` entry (from eviction, reference reuse, or
-`take_expired`) is delivered individually and labelled, via the shared
-`deliver_flushed_part` helper — which is also where the correct
-`Dedupe::confirm`/`forget` now happens for that content, since only an
-actual successful delivery (not mere buffering) makes it safe for the
-modem-storage route to treat its own backup copy as redundant.
+If admitting a part forces an *other*, unrelated buffer out (capacity
+eviction, or a detected reference reuse — see below), `admit_part` does
+**not** return that content directly — it moves into `Reassembly`'s own
+retry queue instead (see `QueuedFlush` below). This is a second-round
+correction (code review finding, 2026-08-28, round 1; Greptile finding,
+round 2): the first fix had `admit_part` return the flushed content for a
+single, immediate, one-shot delivery attempt, which lost the content
+outright on a transient control-channel failure — no different from the
+eviction-drops-content bug it was meant to close, just with the loss
+window narrowed to one unlucky moment instead of removed.
 
 **Reference reuse**: TS 23.040 does not guarantee a concatenation
 reference is globally unique (an 8-bit reference wraps at 256), so two
@@ -83,7 +75,7 @@ one buffer's lifetime. A part landing on an already-filled position with
 *different* text than what's held there cannot be a retransmission
 (identical text is the ordinary idempotent-retry case, see below) — it is
 treated as the old message being superseded: the old buffer's held parts
-go into `FlushedParts`, and a fresh buffer starts for the new part. This
+are queued for delivery, and a fresh buffer starts for the new part. This
 is a partial mitigation, not a complete detector: two colliding messages
 whose parts happen to land on disjoint positions (no position ever sees
 conflicting text) cannot be told apart from the PDU alone — recorded as a
@@ -99,17 +91,31 @@ see the same `seq` twice is the retry-after-failed-delivery path above,
 where re-admitting the identical text at the identical position is a
 no-op that still correctly reports `Complete`.
 
-### Expiry (`take_expired`)
+### `QueuedFlush` and the retry queue (`Reassembly::pending`)
 
-Called once per `LoopState::on_idle_tick` (research.md Decision 8, revised
-2026-08-28 — not the modem-storage sweep thread, which does not exist on a
-`pcsc_reader` line), not on a dedicated timer. Removes and returns every
-entry whose `last_updated` is
-older than the fixed 3-minute bound, each as `(sender, seq, total, text)`
-per still-held part — the shape the existing per-part
-`ControlMessage::SmsReceived` send already expects, so expiry-flush reuses
-that exact call, one send per surviving part, same as `Malformed`'s
-fallback.
+Every path that gives up on a buffer without an ordinary `Complete`
+delivery — capacity eviction, reference reuse, or `expire_due`'s 3-minute
+timeout — moves its held parts into one shared internal queue instead of
+handing them to the caller for a single attempt. Each entry carries a
+small monotonic `id` (`u64`) so a caller can acknowledge exactly the ones
+that succeeded without disturbing the rest.
+
+| Method | Effect |
+| --- | --- |
+| `expire_due(now)` | scans `buffers` for anything past `REASSEMBLY_TIMEOUT`, moves it into the queue. Does not touch already-queued entries. |
+| `ready_for_delivery()` | a non-destructive snapshot of everything currently queued — `(id, sender, sequence, total, text)` per entry. Safe to call repeatedly; nothing is removed. |
+| `mark_flush_delivered(id)` | removes one entry — call only once its delivery has actually succeeded. |
+
+The caller (`agent::mod::flush_expired_reassembly`, driven by
+`LoopState::on_idle_tick`, ~1s cadence) calls `expire_due` then
+`ready_for_delivery` every tick, attempts delivery for each entry, and
+`mark_flush_delivered`s only the ones that succeeded. Anything left stays
+queued and is retried the next tick — a transient control-channel failure
+self-heals within about a second instead of losing the content on the
+first attempt. `Dedupe`'s claim for a still-queued (not yet delivered)
+entry is deliberately left untouched on a failed attempt (no `forget`) to
+avoid racing the modem-storage route into independently relaying the same
+content while this bridge's own retry is about to succeed.
 
 ## Changed existing type: `DecodedSms.part`
 
@@ -144,6 +150,11 @@ modem AT+CMGL (CS)  ──┘                              │    labelled-if-no
                                     │
                     Pending ──ack, hold── / ──Complete/Malformed── deliver
                                     │
-                         (sweep-thread) take_expired
+                    eviction / reference reuse / expire_due
+                          → Reassembly's retry queue
+                                    │
+                       (on_idle_tick, ~1s) ready_for_delivery
                           → per-part fallback delivery
+                          → mark_flush_delivered on success,
+                            else retried next tick
 ```

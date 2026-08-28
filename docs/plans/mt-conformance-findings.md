@@ -845,11 +845,9 @@ finding.
       - Capacity eviction (`admit_part`, at 64 concurrently-buffered
         identities) silently dropped the oldest buffer's already-network-
         acknowledged parts — content no retransmission could recover,
-        same failure shape `take_expired` exists to avoid, just reached
-        via a flood instead of a timeout. Fixed: `admit_part` now returns
-        `FlushedParts` alongside its `PartOutcome` — populated whenever
-        admitting the new part forces an *other* buffer out — and the
-        caller delivers those exactly like `take_expired`'s own results.
+        same failure shape the expiry path exists to avoid, just reached
+        via a flood instead of a timeout. Fixed (see the second-round
+        redesign below for the final shape this took).
       - Two unrelated multi-part messages that happen to share
         `(sender, reference, total)` — legal per TS 23.040, which does not
         guarantee global reference uniqueness (an 8-bit reference wraps at
@@ -859,18 +857,40 @@ finding.
         landing on an already-held position with *different* text than
         what's buffered there (identical text remains the ordinary
         idempotent-retry no-op) is now treated as reference reuse — the
-        old buffer flushes via the same `FlushedParts` mechanism, and a
-        fresh buffer starts for the new part. Recorded as a partial fix,
-        not a complete one: two colliding messages whose parts happen to
-        land on disjoint positions (no position ever sees conflicting
-        text) remain undetectable from the PDU alone — TS 23.040 gives a
-        receiver no stronger signal to work with, and `Reassembly::
-        admit_part`'s own docs record this residue explicitly.
+        old buffer's parts are queued for delivery, and a fresh buffer
+        starts for the new part. Recorded as a partial fix, not a complete
+        one: two colliding messages whose parts happen to land on disjoint
+        positions (no position ever sees conflicting text) remain
+        undetectable from the PDU alone — TS 23.040 gives a receiver no
+        stronger signal to work with, and `Reassembly::admit_part`'s own
+        docs record this residue explicitly.
+      **Greptile re-review finding (2026-08-28, second round)**: the fix
+      above for eviction/reference-reuse still made only a single delivery
+      attempt for the flushed content, immediately removed from
+      `Reassembly` first — a transient control-channel failure at that
+      exact moment lost it permanently, the same class of bug the
+      `Pending`-confirm fix above had already closed for a different code
+      path. **Redesigned**: `Reassembly` now owns a small retry queue.
+      Eviction, reference reuse, and ordinary 3-minute expiry all move
+      their content into it (`enqueue_pending`) instead of returning it
+      directly; `admit_part` goes back to returning a bare `PartOutcome` —
+      nothing for `handle_message` to do with an eviction/reuse side
+      effect any more, it happens entirely inside `Reassembly`.
+      `LoopState::on_idle_tick` drains the queue every ~1s
+      (`ready_for_delivery`, a non-destructive snapshot) and only dequeues
+      an entry once its delivery actually succeeds
+      (`mark_flush_delivered`) — a failed attempt leaves it queued,
+      self-healing within about a second instead of losing the content on
+      the first transient failure. `Dedupe`'s own claim is left untouched
+      on a failed retry attempt (not `forget`ten) to avoid racing the
+      modem-storage route into relaying the same content independently
+      while this bridge's own retry is about to succeed.
 
 All landed code: `make format && make lint && make test` clean (whole
-workspace, including test targets, clippy `-D warnings`): 1395 lib tests
+workspace, including test targets, clippy `-D warnings`): 1397 lib tests
 plus every integration test suite, zero failures — re-verified after every
-fix above (two code-review rounds).
+fix above (three review rounds: the original code-review pass, and two
+Greptile rounds).
 
 **Not yet hardware-verified** — this batch has not been rebuilt and run
 against the real EC20 line. `specs/047-offerless-invite-sms-reassembly/quickstart.md`
