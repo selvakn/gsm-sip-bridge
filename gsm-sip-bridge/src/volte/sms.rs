@@ -241,7 +241,13 @@ pub enum PartOutcome {
     /// [`Reassembly::mark_delivered`].
     Complete(String),
     /// Still missing at least one part. The caller must still acknowledge
-    /// this part to the network now (FR-012) — only forwarding waits.
+    /// this part to the network now (FR-012) — only forwarding waits, and
+    /// only once (see `admit_part`'s docs) — this part has **not** been
+    /// durably delivered anywhere else yet, and the caller must not treat
+    /// it as such (code review finding, 2026-08-28: a caller that marked a
+    /// `Pending` part as cross-route-confirmed let the modem-storage sweep
+    /// delete its own backup of a part sitting only in this in-memory
+    /// buffer).
     Pending,
     /// This part's own numbers make correct reassembly impossible: a
     /// `total` of `0`, a `sequence` of `0` or greater than `total`, or a
@@ -251,6 +257,18 @@ pub enum PartOutcome {
     /// message a carrier or handset stated inconsistently.
     Malformed,
 }
+
+/// One already-acknowledged part that must be delivered *now*, individually
+/// and labelled — the same shape and the same reason [`Reassembly::
+/// take_expired`]'s results are delivered: `(sender, sequence, total,
+/// text)`. Returned alongside a [`PartOutcome`] by [`Reassembly::
+/// admit_part`] when admitting the new part forced an *other*, unrelated
+/// buffer out — capacity eviction, or a detected reference reuse (see that
+/// method's own docs) — never silently, since every part in it was already
+/// acknowledged to the network and cannot be recovered by a retransmission
+/// (code review finding, 2026-08-28: the original eviction path dropped
+/// these outright).
+pub type FlushedParts = Vec<(String, u8, u8, String)>;
 
 /// Buffers the parts of one or more multi-part text messages until each
 /// completes or [`REASSEMBLY_TIMEOUT`] elapses (specs/047-offerless-invite-
@@ -295,23 +313,75 @@ impl Reassembly {
         }
     }
 
-    /// Admits one part of a multi-part message. See [`PartOutcome`] for
-    /// what each result means and what the caller must do next.
+    /// Admits one part of a multi-part message. Returns the [`PartOutcome`]
+    /// for *this* part, plus any [`FlushedParts`] some *other*,
+    /// already-acknowledged buffer was forced to give up as a side effect
+    /// of admitting this one (capacity eviction, or a detected reference
+    /// reuse — see below) — empty in the overwhelmingly common case where
+    /// neither happens. The caller must delivery both: the outcome per
+    /// [`PartOutcome`]'s own docs, and every entry in the flushed list
+    /// individually and labelled, exactly like [`Self::take_expired`]'s
+    /// results (code review finding, 2026-08-28: the original version
+    /// evicted silently, losing already-acknowledged content no
+    /// retransmission could recover).
     ///
-    /// Re-admitting an already-held `sequence` with the same text is a
+    /// Re-admitting an already-held `sequence` with the *same* text is a
     /// harmless no-op that still correctly reports `Complete` if the set is
     /// otherwise full — the retry-after-failed-delivery path
     /// `mark_delivered`'s own docs describe.
-    pub fn admit_part(&mut self, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
+    ///
+    /// **Reference reuse**: TS 23.040 does not guarantee a concatenation
+    /// reference is unique beyond one sender's own bookkeeping — an 8-bit
+    /// reference wraps at 256, and two unrelated messages can legitimately
+    /// share `(sender, reference, total)` within one buffer's lifetime. A
+    /// part landing on an already-filled position with *different* text
+    /// than what's there cannot be a retransmission (Decision 9's
+    /// idempotent-retry case requires identical text), so it is treated as
+    /// exactly that: the old buffer is flushed (into the returned
+    /// [`FlushedParts`]) and a fresh one started for the new part. This
+    /// catches the corrupting case — a hybrid message silently combining
+    /// text from two senders' messages — but is not a complete detector:
+    /// two messages sharing an identity whose parts happen to land on
+    /// disjoint positions (no position ever gets conflicting text) cannot
+    /// be told apart from the PDU alone; TS 23.040 gives a receiver no
+    /// stronger signal to work with. Recorded as a residue, not silently
+    /// assumed impossible.
+    pub fn admit_part(
+        &mut self,
+        sender: &str,
+        part: &ConcatPart,
+        text: &str,
+    ) -> (PartOutcome, FlushedParts) {
         if part.total == 0 || part.sequence == 0 || part.sequence > part.total {
-            return PartOutcome::Malformed;
+            return (PartOutcome::Malformed, Vec::new());
         }
 
         let key: ReassemblyKey = (sender.to_string(), part.reference);
+        let mut flushed = Vec::new();
+
+        if let Some(existing) = self.buffers.get(&key) {
+            if existing.total != part.total {
+                return (PartOutcome::Malformed, Vec::new());
+            }
+            if existing
+                .parts
+                .get(&part.sequence)
+                .is_some_and(|t| t != text)
+            {
+                if let Some(old) = self.buffers.remove(&key) {
+                    flushed.extend(Self::flatten(sender, old));
+                }
+                self.order.retain(|k| k != &key);
+            }
+        }
+
         if !self.buffers.contains_key(&key) {
             if self.buffers.len() >= self.capacity {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.buffers.remove(&evicted);
+                if let Some(evicted_key) = self.order.pop_front() {
+                    if let Some(evicted) = self.buffers.remove(&evicted_key) {
+                        let (evicted_sender, _) = &evicted_key;
+                        flushed.extend(Self::flatten(evicted_sender, evicted));
+                    }
                 }
             }
             self.buffers.insert(
@@ -325,22 +395,19 @@ impl Reassembly {
             self.order.push_back(key.clone());
         }
 
-        let Some(buffer) = self.buffers.get_mut(&key) else {
-            // Unreachable: just inserted or already present above.
-            return PartOutcome::Malformed;
-        };
-        if buffer.total != part.total {
-            return PartOutcome::Malformed;
-        }
+        let buffer = self
+            .buffers
+            .get_mut(&key)
+            .expect("just inserted or already present above");
         buffer.parts.insert(part.sequence, text.to_string());
         buffer.last_updated = Instant::now();
 
-        if buffer.parts.len() == buffer.total as usize {
-            let joined = buffer.parts.values().cloned().collect::<Vec<_>>().join("");
-            PartOutcome::Complete(joined)
+        let outcome = if buffer.parts.len() == buffer.total as usize {
+            PartOutcome::Complete(buffer.parts.values().cloned().collect::<Vec<_>>().join(""))
         } else {
             PartOutcome::Pending
-        }
+        };
+        (outcome, flushed)
     }
 
     /// Clears a completed message's buffer entry — call this, and only
@@ -362,7 +429,7 @@ impl Reassembly {
     /// `(sender, sequence, total, text)` tuple per still-held part, the
     /// shape the existing per-part `ControlMessage::SmsReceived` send
     /// already expects (FR-013/SC-004).
-    pub fn take_expired(&mut self, now: Instant) -> Vec<(String, u8, u8, String)> {
+    pub fn take_expired(&mut self, now: Instant) -> FlushedParts {
         let expired_keys: Vec<ReassemblyKey> = self
             .buffers
             .iter()
@@ -375,14 +442,23 @@ impl Reassembly {
         let mut out = Vec::new();
         for key in expired_keys {
             if let Some(buf) = self.buffers.remove(&key) {
-                let (sender, _reference) = key.clone();
-                for (seq, text) in buf.parts {
-                    out.push((sender.clone(), seq, buf.total, text));
-                }
+                let (sender, _reference) = &key;
+                out.extend(Self::flatten(sender, buf));
             }
             self.order.retain(|k| k != &key);
         }
         out
+    }
+
+    /// One buffered message's held parts, as the `(sender, sequence, total,
+    /// text)` shape every flush path (`take_expired`, capacity eviction,
+    /// reference-reuse eviction) delivers individually and labelled.
+    fn flatten(sender: &str, msg: PartialMessage) -> FlushedParts {
+        let total = msg.total;
+        msg.parts
+            .into_iter()
+            .map(|(seq, text)| (sender.to_string(), seq, total, text))
+            .collect()
     }
 }
 
@@ -1307,19 +1383,29 @@ mod tests {
         }
     }
 
+    /// Asserts admitting this part flushed no *other* buffer as a side
+    /// effect (capacity eviction / reference-reuse — see `admit_part`'s own
+    /// docs), and returns just the outcome — what every test below except
+    /// the ones specifically targeting eviction/reuse cares about.
+    fn admit(r: &mut Reassembly, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
+        let (outcome, flushed) = r.admit_part(sender, part, text);
+        assert!(flushed.is_empty(), "unexpected flush: {flushed:?}");
+        outcome
+    }
+
     #[test]
     fn completes_once_every_part_has_arrived_regardless_of_order() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(7, 2, 3), "second "),
+            admit(&mut r, "+91123", &concat(7, 2, 3), "second "),
             PartOutcome::Pending
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(7, 3, 3), "third"),
+            admit(&mut r, "+91123", &concat(7, 3, 3), "third"),
             PartOutcome::Pending
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(7, 1, 3), "first "),
+            admit(&mut r, "+91123", &concat(7, 1, 3), "first "),
             PartOutcome::Complete("first second third".to_string())
         );
     }
@@ -1328,19 +1414,19 @@ mod tests {
     fn two_concurrent_same_sender_same_total_messages_never_cross_contaminate() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 1, 2), "A1"),
+            admit(&mut r, "+91123", &concat(1, 1, 2), "A1"),
             PartOutcome::Pending
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(2, 1, 2), "B1"),
+            admit(&mut r, "+91123", &concat(2, 1, 2), "B1"),
             PartOutcome::Pending
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 2, 2), "A2"),
+            admit(&mut r, "+91123", &concat(1, 2, 2), "A2"),
             PartOutcome::Complete("A1A2".to_string())
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(2, 2, 2), "B2"),
+            admit(&mut r, "+91123", &concat(2, 2, 2), "B2"),
             PartOutcome::Complete("B1B2".to_string())
         );
     }
@@ -1349,7 +1435,7 @@ mod tests {
     fn a_total_of_zero_is_malformed() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 1, 0), "x"),
+            admit(&mut r, "+91123", &concat(1, 1, 0), "x"),
             PartOutcome::Malformed
         );
     }
@@ -1358,7 +1444,7 @@ mod tests {
     fn a_sequence_of_zero_is_malformed() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 0, 3), "x"),
+            admit(&mut r, "+91123", &concat(1, 0, 3), "x"),
             PartOutcome::Malformed
         );
     }
@@ -1367,7 +1453,7 @@ mod tests {
     fn a_sequence_beyond_the_total_is_malformed() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 4, 3), "x"),
+            admit(&mut r, "+91123", &concat(1, 4, 3), "x"),
             PartOutcome::Malformed
         );
     }
@@ -1376,11 +1462,11 @@ mod tests {
     fn a_total_disagreeing_with_an_already_buffered_value_is_malformed() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 1, 3), "x"),
+            admit(&mut r, "+91123", &concat(1, 1, 3), "x"),
             PartOutcome::Pending
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 2, 4), "y"),
+            admit(&mut r, "+91123", &concat(1, 2, 4), "y"),
             PartOutcome::Malformed
         );
     }
@@ -1389,11 +1475,11 @@ mod tests {
     fn re_admitting_an_already_held_sequence_is_a_harmless_no_op_that_still_reports_complete() {
         let mut r = Reassembly::default();
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 1, 2), "A"),
+            admit(&mut r, "+91123", &concat(1, 1, 2), "A"),
             PartOutcome::Pending
         );
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 2, 2), "B"),
+            admit(&mut r, "+91123", &concat(1, 2, 2), "B"),
             PartOutcome::Complete("AB".to_string())
         );
         // Simulates a network retransmission of the triggering (last) part
@@ -1401,7 +1487,7 @@ mod tests {
         // (`mark_delivered` was never called), so re-admitting reaches
         // `Complete` again without the first part being resent.
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 2, 2), "B"),
+            admit(&mut r, "+91123", &concat(1, 2, 2), "B"),
             PartOutcome::Complete("AB".to_string())
         );
     }
@@ -1411,7 +1497,7 @@ mod tests {
         let mut r = Reassembly::default();
         let part = concat(1, 1, 1);
         assert_eq!(
-            r.admit_part("+91123", &part, "solo"),
+            admit(&mut r, "+91123", &part, "solo"),
             PartOutcome::Complete("solo".to_string())
         );
         r.mark_delivered("+91123", &part);
@@ -1420,7 +1506,7 @@ mod tests {
         // it starts a fresh buffer rather than instantly "completing" on
         // one part.
         assert_eq!(
-            r.admit_part("+91123", &concat(1, 1, 2), "new-first"),
+            admit(&mut r, "+91123", &concat(1, 1, 2), "new-first"),
             PartOutcome::Pending
         );
     }
@@ -1428,15 +1514,15 @@ mod tests {
     #[test]
     fn take_expired_leaves_a_fresh_buffer_untouched() {
         let mut r = Reassembly::default();
-        r.admit_part("+91123", &concat(1, 1, 2), "A");
+        admit(&mut r, "+91123", &concat(1, 1, 2), "A");
         assert!(r.take_expired(Instant::now()).is_empty());
     }
 
     #[test]
     fn take_expired_flushes_every_held_part_past_the_bound() {
         let mut r = Reassembly::default();
-        r.admit_part("+91123", &concat(1, 1, 3), "A");
-        r.admit_part("+91123", &concat(1, 2, 3), "B");
+        admit(&mut r, "+91123", &concat(1, 1, 3), "A");
+        admit(&mut r, "+91123", &concat(1, 2, 3), "B");
         let past_deadline = Instant::now() + REASSEMBLY_TIMEOUT + Duration::from_secs(1);
         let mut flushed = r.take_expired(past_deadline);
         flushed.sort_by_key(|(_, seq, _, _)| *seq);
@@ -1493,25 +1579,89 @@ mod tests {
 
         // Reassembly combines the two distinct parts into exactly one
         // deliverable message.
-        assert_eq!(r.admit_part(sender, &part1, "hello "), PartOutcome::Pending);
         assert_eq!(
-            r.admit_part(sender, &part2, "world"),
+            admit(&mut r, sender, &part1, "hello "),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            admit(&mut r, sender, &part2, "world"),
             PartOutcome::Complete("hello world".to_string())
         );
     }
 
     #[test]
-    fn capacity_eviction_drops_the_oldest_identity_under_a_flood() {
+    fn capacity_eviction_flushes_rather_than_drops_the_oldest_identity() {
+        // code review finding, 2026-08-28: the original eviction path
+        // silently dropped the oldest buffer's already-acknowledged
+        // content. It must now come back as `FlushedParts` for the caller
+        // to deliver, the same as an expired buffer's would.
         let mut r = Reassembly::new(2);
-        r.admit_part("+91001", &concat(1, 1, 2), "a");
-        r.admit_part("+91002", &concat(1, 1, 2), "b");
-        // Third distinct identity evicts the first (+91001/ref 1).
-        r.admit_part("+91003", &concat(1, 1, 2), "c");
+        admit(&mut r, "+91001", &concat(1, 1, 2), "a");
+        admit(&mut r, "+91002", &concat(1, 1, 2), "b");
+        // Third distinct identity evicts the first (+91001/ref 1) — its one
+        // held part must come back flushed, not vanish.
+        let (_, flushed) = r.admit_part("+91003", &concat(1, 1, 2), "c");
+        assert_eq!(flushed, vec![("+91001".to_string(), 1, 2, "a".to_string())]);
+        // Re-admitting +91001 starts a fresh buffer, not a completion —
+        // still at capacity (buffers now holds +91002/+91003), so this
+        // necessarily flushes +91002 in turn; that's expected, not this
+        // test's own concern (`admit`'s no-flush assertion would wrongly
+        // fail here, so this uses `admit_part` directly).
+        let (outcome, _) = r.admit_part("+91001", &concat(1, 2, 2), "a2");
         assert_eq!(
-            r.admit_part("+91001", &concat(1, 2, 2), "a2"),
+            outcome,
             PartOutcome::Pending,
             "the evicted identity starts a fresh buffer, not a completion"
         );
+    }
+
+    #[test]
+    fn a_part_with_different_text_at_an_already_held_position_is_treated_as_reference_reuse() {
+        // code review finding, 2026-08-28: TS 23.040 does not guarantee a
+        // reference is globally unique — two unrelated messages can
+        // legitimately collide on `(sender, reference, total)`. A part
+        // landing on an already-filled position with genuinely different
+        // text (not a retransmission, which would carry identical text —
+        // see the idempotent-retry test above) must not silently overwrite
+        // or blend into the old message; the old message's held parts come
+        // back as `FlushedParts` for individual delivery, and the new part
+        // starts a fresh buffer under the same identity.
+        let mut r = Reassembly::default();
+        admit(&mut r, "+91123", &concat(1, 1, 3), "old-part-one ");
+        admit(&mut r, "+91123", &concat(1, 2, 3), "old-part-two");
+        // A new, unrelated message reuses reference 1 (same total, by
+        // coincidence) — its own first part lands on position 1, where the
+        // old message's genuinely different text already sits.
+        let (outcome, flushed) = r.admit_part("+91123", &concat(1, 1, 3), "new-message");
+        let mut flushed = flushed;
+        flushed.sort_by_key(|(_, seq, _, _)| *seq);
+        assert_eq!(
+            flushed,
+            vec![
+                ("+91123".to_string(), 1, 3, "old-part-one ".to_string()),
+                ("+91123".to_string(), 2, 3, "old-part-two".to_string()),
+            ]
+        );
+        assert_eq!(
+            outcome,
+            PartOutcome::Pending,
+            "the new message starts fresh, not complete on one part reused into a 3-part total"
+        );
+    }
+
+    #[test]
+    fn a_retransmission_with_identical_text_is_not_mistaken_for_reference_reuse() {
+        // The sibling case to the test above: identical text at an
+        // already-held position is the ordinary idempotent-retry path
+        // (already covered by `re_admitting_an_already_held_sequence_...`
+        // above), not a reuse — pinned here specifically to confirm no
+        // flush happens on the *unchanged*-text path, only on a genuine
+        // mismatch.
+        let mut r = Reassembly::default();
+        admit(&mut r, "+91123", &concat(1, 1, 2), "A");
+        let (outcome, flushed) = r.admit_part("+91123", &concat(1, 1, 2), "A");
+        assert!(flushed.is_empty());
+        assert_eq!(outcome, PartOutcome::Pending);
     }
 
     // ---- wait_for_resolution (specs/038 review follow-up) ------------------

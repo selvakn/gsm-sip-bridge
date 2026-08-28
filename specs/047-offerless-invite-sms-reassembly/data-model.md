@@ -49,13 +49,45 @@ over different routes).
 | `rp_mr` per part *not* stored here | — | the per-part delivery ack (FR-012/Decision 10) happens at admission time, before/independent of this struct, so it never needs to be replayed later |
 | `last_updated` | `Instant` | reset on every admitted part (including a duplicate re-admission of an already-held seq — see Decision 9's retry note); what `take_expired` compares against the 3-minute bound (`SC-004`/FR-013) |
 
-### `PartOutcome` (what `admit_part` returns)
+### `PartOutcome` and `FlushedParts` (what `admit_part` returns)
+
+`admit_part` returns `(PartOutcome, FlushedParts)` — the outcome for the
+part just admitted, plus any *other*, unrelated buffer's already-
+acknowledged parts that admitting this one forced out (capacity eviction,
+or a detected reference reuse — both below). `FlushedParts` is the same
+`Vec<(String, u8, u8, String)>` shape `take_expired` returns, and is empty
+in the overwhelmingly common case where neither happens (code review
+finding, 2026-08-28: the original design let eviction drop this content
+silently instead of returning it for delivery — see the Reference reuse
+sub-entry in `docs/plans/mt-conformance-findings.md`'s batch 8 entry for
+the fuller writeup, corrected here alongside `Pending`'s own confirm-timing
+fix).
 
 | Variant | Meaning | Caller's action |
 | --- | --- | --- |
 | `Complete(String)` | every position `1..=total` now present | join in order, deliver as one message (Decision 9), **do not** clear the buffer entry until that delivery actually succeeds — mirrors `Dedupe::confirm`/`forget`'s retry-safety shape, so a delivery failure followed by the network's own retransmission of just the triggering part can re-reach `Complete` without needing every other part re-sent |
-| `Pending` | still missing at least one position | ack this part now regardless (FR-012); nothing forwarded yet |
+| `Pending` | still missing at least one position | ack this part now regardless (FR-012); nothing forwarded yet. **Must not** be treated as durably delivered (no `Dedupe::confirm`) — it is sitting only in this process's memory until it either completes or is flushed |
 | `Malformed` | `total == 0`, or this part's `seq` is `0` or `> total`, or this part's `total` disagrees with an already-buffered value for the same key | fall back to today's existing per-part delivery (FR-016) — the individual, still-labelled text, exactly as before this feature |
+
+Every `FlushedParts` entry (from eviction, reference reuse, or
+`take_expired`) is delivered individually and labelled, via the shared
+`deliver_flushed_part` helper — which is also where the correct
+`Dedupe::confirm`/`forget` now happens for that content, since only an
+actual successful delivery (not mere buffering) makes it safe for the
+modem-storage route to treat its own backup copy as redundant.
+
+**Reference reuse**: TS 23.040 does not guarantee a concatenation
+reference is globally unique (an 8-bit reference wraps at 256), so two
+unrelated messages can legally share `(sender, reference, total)` within
+one buffer's lifetime. A part landing on an already-filled position with
+*different* text than what's held there cannot be a retransmission
+(identical text is the ordinary idempotent-retry case, see below) — it is
+treated as the old message being superseded: the old buffer's held parts
+go into `FlushedParts`, and a fresh buffer starts for the new part. This
+is a partial mitigation, not a complete detector: two colliding messages
+whose parts happen to land on disjoint positions (no position ever sees
+conflicting text) cannot be told apart from the PDU alone — recorded as a
+residue, not silently assumed handled.
 
 **Explicit non-goal**: `PartOutcome` does not need a `Duplicate` variant of
 its own. A part physically retransmitted by the network is already caught

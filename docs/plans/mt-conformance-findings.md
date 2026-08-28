@@ -702,6 +702,17 @@ actually sends RTCP receiver reports back is unknown until that round
 runs, and is flagged there as itself a finding to record either way, not
 an assumption to build on.
 
+**Greptile review fix (2026-08-28, found while reviewing batch 8's PR —
+this branch had not yet been merged, so both were reviewed together)**:
+`fraction_lost`'s RFC 3550 §6.4.1 conversion used `* 255.0`/`/ 255.0`
+instead of `* 256.0`/`/ 256.0` on both the encode side
+(`ims::rtcp::build_report`) and the decode/display side
+(`agent::call`'s end-of-call `report_media_quality` for the far end's own
+report) — the field is explicitly defined as the loss fraction times 256,
+not 255. Every nonzero loss reading was off by a small, consistent
+relative amount in both directions. Fixed in both places for internal
+consistency, not just the one Greptile's inline comment flagged.
+
 ## Batch 8 — offerless call answering and multi-part SMS reassembly (landed 2026-08-28, pending hardware round)
 
 Full spec/plan/tasks/research trail:
@@ -816,11 +827,50 @@ finding.
       `LoopState::on_idle_tick`, which every line runs unconditionally
       (both call and idle cadence), fixing the gap and, incidentally,
       tightening the flush latency from ~20s to ~1s.
+      **Greptile review fixes (2026-08-28)**: three further findings on
+      the PR, all in `Reassembly`/`handle_message`, none caught by the
+      first code-review pass above:
+      - The `Pending` branch called `Dedupe::confirm` on a part that had
+        only been buffered in this process's memory, not durably
+        delivered anywhere — `confirm`'s actual contract (see `Dedupe`'s
+        own docs) is specifically the modem-storage route's signal that
+        it's safe to discard its own backup copy of a message. A part
+        buffered via IMS and (wrongly) confirmed could have its modem-side
+        backup deleted by the other route's cross-route coordination,
+        then be permanently lost if this process crashed, or if the
+        eventual expiry-flush itself later failed. Fixed: `confirm` now
+        happens only where a delivery genuinely succeeded — the existing
+        `Complete` path, and a new shared `deliver_flushed_part` helper
+        used by every flush path below.
+      - Capacity eviction (`admit_part`, at 64 concurrently-buffered
+        identities) silently dropped the oldest buffer's already-network-
+        acknowledged parts — content no retransmission could recover,
+        same failure shape `take_expired` exists to avoid, just reached
+        via a flood instead of a timeout. Fixed: `admit_part` now returns
+        `FlushedParts` alongside its `PartOutcome` — populated whenever
+        admitting the new part forces an *other* buffer out — and the
+        caller delivers those exactly like `take_expired`'s own results.
+      - Two unrelated multi-part messages that happen to share
+        `(sender, reference, total)` — legal per TS 23.040, which does not
+        guarantee global reference uniqueness (an 8-bit reference wraps at
+        256) — would silently blend: a new message's part landing on an
+        already-filled position combined into the old message's text
+        instead of being recognized as a different message. Fixed:
+        landing on an already-held position with *different* text than
+        what's buffered there (identical text remains the ordinary
+        idempotent-retry no-op) is now treated as reference reuse — the
+        old buffer flushes via the same `FlushedParts` mechanism, and a
+        fresh buffer starts for the new part. Recorded as a partial fix,
+        not a complete one: two colliding messages whose parts happen to
+        land on disjoint positions (no position ever sees conflicting
+        text) remain undetectable from the PDU alone — TS 23.040 gives a
+        receiver no stronger signal to work with, and `Reassembly::
+        admit_part`'s own docs record this residue explicitly.
 
 All landed code: `make format && make lint && make test` clean (whole
-workspace, including test targets, clippy `-D warnings`): 1393 lib tests
-plus every integration test suite, zero failures — re-verified after both
-code-review fixes above.
+workspace, including test targets, clippy `-D warnings`): 1395 lib tests
+plus every integration test suite, zero failures — re-verified after every
+fix above (two code-review rounds).
 
 **Not yet hardware-verified** — this batch has not been rebuilt and run
 against the real EC20 line. `specs/047-offerless-invite-sms-reassembly/quickstart.md`
