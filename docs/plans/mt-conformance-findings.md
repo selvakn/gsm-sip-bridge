@@ -593,7 +593,8 @@ Decision 1 and Decision 8 for the full reasoning):
       text is TS 23.038 Annex A's character-table data, which is not
       something to ship from memory without a verifiable source — a wrong
       mapping would silently decode real text to the wrong characters,
-      worse than today's honest, already-documented gap.
+      worse than today's honest, already-documented gap. Tracked as an
+      active backlog item in `docs/todo.md` rather than left deferred here.
 
 All landed code: `make format && make lint && make test` clean (whole
 workspace, including test targets, clippy `-D warnings`).
