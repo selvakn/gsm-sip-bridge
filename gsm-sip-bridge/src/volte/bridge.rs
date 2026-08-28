@@ -323,6 +323,11 @@ fn run_line(
     // the same message delivered over both the registration and the modem
     // must collapse to one (specs/038-reliable-sms-delivery).
     let dedupe = std::sync::Arc::new(std::sync::Mutex::new(super::sms::Dedupe::default()));
+    // specs/047-offerless-invite-sms-reassembly (SMS-05): shared with
+    // `carrier_agent::run` below, the same way `dedupe` is. Expiry is
+    // flushed from `LoopState::on_idle_tick` (which runs unconditionally
+    // for every line), not this sweep thread.
+    let reassembly = std::sync::Arc::new(std::sync::Mutex::new(super::sms::Reassembly::default()));
     let control_addr = SocketAddr::new(LOOPBACK, line.control_port);
 
     // The circuit-switched SMS route (FR-036): the carrier may deliver a text
@@ -357,6 +362,7 @@ fn run_line(
             app_config,
             modem_lock.clone(),
             dedupe.clone(),
+            reassembly.clone(),
             Some(pbx_registered.clone()),
             &progress,
         );

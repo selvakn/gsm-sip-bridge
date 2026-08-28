@@ -122,7 +122,7 @@ fn decode_pdu_line(hex: &str, index: u32) -> BridgeResult<IncomingSms> {
     let decoded = crate::ims::sms_pdu::decode_sms_deliver_tpdu(tpdu)
         .map_err(|e| BridgeError::Sms(format!("could not decode PDU for index {index}: {e}")))?;
     let body = match decoded.part {
-        Some((seq, total)) => format!("[{seq}/{total}] {}", decoded.text),
+        Some(part) => format!("[{}/{}] {}", part.sequence, part.total, decoded.text),
         None => decoded.text,
     };
     Ok(IncomingSms {

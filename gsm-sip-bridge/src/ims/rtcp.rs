@@ -866,7 +866,11 @@ fn build_report(bundle: &CarrierRtcpBundle, clock_rate: u32, cname: &str) -> Vec
         )
         .map(|(ssrc, (stats, highest_seq))| ReportBlock {
             ssrc,
-            fraction_lost: ((stats.loss_percent() / 100.0).clamp(0.0, 1.0) * 255.0) as u8,
+            // RFC 3550 §6.4.1: "equivalent to taking the integer part after
+            // multiplying the loss fraction by 256" — 256, not 255 (code
+            // review finding, 2026-08-28, caught alongside the symmetric
+            // error on the decode side in `agent::call`).
+            fraction_lost: ((stats.loss_percent() / 100.0).clamp(0.0, 1.0) * 256.0) as u8,
             cumulative_lost: stats.lost_packets as i32,
             highest_seq,
             jitter: (stats.jitter.as_secs_f64() * clock_rate as f64).round() as u32,

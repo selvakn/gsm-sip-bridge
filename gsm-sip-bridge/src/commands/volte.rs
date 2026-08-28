@@ -1164,6 +1164,13 @@ pub(crate) fn handle_volte_carrier_agent_command(
     // the same message delivered over both the registration and the modem
     // must collapse to one (specs/038-reliable-sms-delivery).
     let dedupe = std::sync::Arc::new(std::sync::Mutex::new(crate::volte::sms::Dedupe::default()));
+    // specs/047-offerless-invite-sms-reassembly (SMS-05): shared with
+    // `carrier_agent::run` below, the same way `dedupe` is. Expiry is
+    // flushed from `LoopState::on_idle_tick` (which runs unconditionally
+    // for every line), not this sweep thread.
+    let reassembly = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::volte::sms::Reassembly::default(),
+    ));
     {
         let modem_port = modem_port.clone();
         let lock = modem_lock.clone();
@@ -1200,7 +1207,15 @@ pub(crate) fn handle_volte_carrier_agent_command(
     let progress = crate::ims::agent::watchdog::register(std::sync::Arc::new(
         crate::ims::agent::watchdog::Progress::new("volte-dispatch"),
     ));
-    crate::volte::carrier_agent::run(&line, &app_config, modem_lock, dedupe, None, &progress);
+    crate::volte::carrier_agent::run(
+        &line,
+        &app_config,
+        modem_lock,
+        dedupe,
+        reassembly,
+        None,
+        &progress,
+    );
 
     eprintln!(
         "volte-carrier-agent: line {} ({}) stopped",

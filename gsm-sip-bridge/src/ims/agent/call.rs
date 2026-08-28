@@ -396,8 +396,11 @@ pub(super) fn report_answered_call_ended(
     if let Some(fe) = &far_end_reports {
         obs.report_media_quality(
             crate::control::protocol::QualitySource::Remote,
+            // RFC 3550 §6.4.1: the field is a fraction of 256, not 255 (PR
+            // review finding, 2026-08-28 — every nonzero remote-loss
+            // reading was overstated ~0.4% relative).
             fe.fraction_lost
-                .map(|f| f as f64 / 255.0 * 100.0)
+                .map(|f| f as f64 / 256.0 * 100.0)
                 .unwrap_or(0.0),
             fe.jitter.map(|j| j.as_secs_f64()).unwrap_or(0.0),
             fe.round_trip.map(|r| r.as_secs_f64()),

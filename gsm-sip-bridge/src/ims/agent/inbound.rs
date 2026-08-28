@@ -40,6 +40,22 @@ const RING_TIMEOUT: Duration = Duration::from_secs(50);
 /// signaling. Bounds how fast a caller's `CANCEL` gets answered.
 const RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// specs/047-offerless-invite-sms-reassembly (SDP-04): how long, after
+/// answering an offerless INVITE with our own offer, to wait for the
+/// caller's `ACK` to carry their answer before giving up on the call.
+///
+/// Deliberately much shorter than [`RING_TIMEOUT`] — that bound is for a
+/// *human* decision (whether to pick up the PBX extension); this one is for
+/// a protocol-transaction-scale event. RFC 3261 §13.3.1.4 requires the ACK
+/// as the very next thing on the wire once the caller's stack processes our
+/// `2xx`, and §17.1.1.3's Timer H (32s) is the outer bound anything in this
+/// codebase should ever wait for one. This bridge is not itself running
+/// that timer (no server-transaction layer exists here — specs/042's own
+/// scoping decision), so this is a plain, independent bound serving the
+/// same purpose: don't wait forever for something the protocol says arrives
+/// almost immediately.
+const OFFERLESS_ACK_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// The `Contact` for a response that answers a network-initiated INVITE.
 ///
 /// Must carry the same feature tags we registered with, not just the address.
@@ -71,12 +87,13 @@ pub(super) struct InviteContext<'a> {
 }
 
 /// Whether this UAS can interpret an inbound INVITE's body as SDP: no
-/// `Content-Type` at all (the long-standing implicit assumption — an
-/// offerless INVITE, RFC 3261 §14.2/RFC 3264 §3, is a separate,
-/// deliberately out-of-scope finding, specs/045 SDP-04), or
-/// `application/sdp` compared with any `;`-delimited parameters ignored.
-/// Anything else — including `multipart/mixed` — is declined rather than
-/// scanned as if it were bare SDP text (specs/045 SDP-05).
+/// `Content-Type` at all (the long-standing implicit assumption — this is
+/// also what an offerless INVITE looks like, RFC 3261 §14.2/RFC 3264 §3,
+/// handled by [`handle_invite`]'s own empty-body branch rather than here;
+/// specs/047-offerless-invite-sms-reassembly SDP-04), or `application/sdp`
+/// compared with any `;`-delimited parameters ignored. Anything else —
+/// including `multipart/mixed` — is declined rather than scanned as if it
+/// were bare SDP text (specs/045 SDP-05).
 fn invite_content_type_supported(req: &SipRequest) -> bool {
     match req.header("Content-Type") {
         None => true,
@@ -172,6 +189,19 @@ pub(super) fn handle_invite(
             started_at,
         );
         return Ok(None);
+    }
+
+    // specs/047-offerless-invite-sms-reassembly (SDP-04), research.md
+    // Decision 1: an INVITE with no body at all is not a malformed offer —
+    // it is a different, legal RFC 3264 §3 case (the answerer states the
+    // offer, in the 2xx, and the caller answers it in the ACK). Handled by
+    // its own branch, entirely separate from `parse_offer`'s error path,
+    // so a *genuinely* malformed non-empty body still gets today's
+    // existing behavior unchanged.
+    if req.body.trim().is_empty() {
+        return handle_offerless_invite(
+            session, req, sink, inbound, ctx, &call_id, &caller, started_at,
+        );
     }
 
     let offer = sdp::parse_offer(&req.body)?;
@@ -583,6 +613,370 @@ pub(super) fn handle_invite(
     }
 }
 
+/// Answers an inbound INVITE that carried no media description at all
+/// (specs/047-offerless-invite-sms-reassembly, SDP-04) — RFC 3261 §14.2/RFC
+/// 3264 §3: the answerer (this bridge) states its own offer in the `2xx`,
+/// and the caller's device answers it in the `ACK`.
+///
+/// Deliberately a separate function rather than woven into [`handle_invite`]
+/// as more branches: the two paths diverge at exactly one point (what goes
+/// in the `200 OK`, and what has to happen before the media path can start)
+/// but share every other mechanism — ringing, the Agent B control exchange,
+/// `await_pbx_answer`, and the relay/`ActiveCall` construction at the end —
+/// by calling the same functions `handle_invite` already calls, not by
+/// duplicating what they do.
+///
+/// **Scope note (FR-002a)**: the offer this sends carries audio codecs
+/// only — no `telephone-event` (DTMF) and no RTCP, because
+/// [`sdp::build_offer`] (reused as-is from the origination path,
+/// research.md Decision 2) has never offered either. A deliberate,
+/// recorded residue, not an oversight.
+///
+/// Eight parameters: `#[allow]` rather than a bundling struct, since this
+/// is a single-call-site internal helper — `handle_invite`'s own single
+/// branch — not a shared/growing surface the way the relay functions
+/// `#[allow(clippy::too_many_arguments)]` elsewhere in this codebase are
+/// (plan.md's own Constitution Check called out exactly this trade-off).
+#[allow(clippy::too_many_arguments)]
+fn handle_offerless_invite(
+    session: &crate::ims::RegisteredSession,
+    req: &SipRequest,
+    sink: &SipSink,
+    inbound: &Inbound,
+    ctx: &InviteContext,
+    call_id: &str,
+    caller: &str,
+    started_at: chrono::DateTime<Utc>,
+) -> BridgeResult<Option<ActiveCall>> {
+    let obs = ctx.obs;
+    tracing::info!(call_id = %call_id, caller = %caller, "inbound INVITE carries no offer; will answer with our own");
+
+    // `veth_wideband` normally comes from the offer's own codec precheck —
+    // there is no offer yet here, so it falls back to this line's own
+    // general preference instead (research.md Decision 5), the same signal
+    // `sdp::CodecOffer::preferring_wideband` below uses for what we're about
+    // to offer the carrier.
+    let veth_wideband = ctx.wideband;
+    let veth_rx = spawn_veth_uas_listener(ctx.veth_local_ip, ctx.veth_sip_port, veth_wideband)?;
+
+    let to_tag = random_hex(4);
+    let public_user = session
+        .public_uri
+        .split('@')
+        .next()
+        .unwrap_or(&session.public_uri)
+        .to_string();
+    let via_transport = if session.use_tcp { "TCP" } else { "UDP" };
+    let contact = uas_contact(
+        &public_user,
+        &format_sip_addr(session.contact_addr),
+        via_transport,
+        &session.imei,
+    );
+    sink.send(&build_180_ringing(req, &to_tag, &contact))?;
+
+    let mut control = TcpStream::connect_timeout(&ctx.control_addr, CONTROL_TIMEOUT)
+        .map_err(|e| BridgeError::Ims(format!("failed to reach Agent B control channel: {e}")))?;
+    write_msg(
+        &mut control,
+        &ControlMessage::IncomingCall {
+            call_id: call_id.to_string(),
+            caller: caller.to_string(),
+        },
+    )
+    .map_err(BridgeError::Ims)?;
+    let ctrl_rx = spawn_control_reader(
+        control
+            .try_clone()
+            .map_err(|e| BridgeError::Ims(format!("control connection clone failed: {e}")))?,
+    );
+    let reply = ctrl_rx
+        .recv_timeout(CONTROL_TIMEOUT)
+        .map_err(|_| BridgeError::Ims("timed out waiting for Agent B to place its legs".into()))?;
+
+    let ControlMessage::BridgeReady { .. } = reply else {
+        // `BridgeFailed` or anything unexpected: identical handling to
+        // `handle_invite`'s own match on this same reply.
+        return match reply {
+            ControlMessage::BridgeFailed {
+                reason: fail_reason,
+                ..
+            } => {
+                tracing::info!(call_id = %call_id, reason = %fail_reason, "Agent B could not bridge the call, declining");
+                sink.send(&build_486_busy_here(req, &random_hex(4)))?;
+                obs.report_call_not_answered(
+                    CallStatus::Failed,
+                    observability::map_bridge_failure_reason(&fail_reason),
+                    caller,
+                    started_at,
+                );
+                Ok(None)
+            }
+            other => Err(BridgeError::Ims(format!(
+                "unexpected control-channel reply to IncomingCall: {other:?}"
+            ))),
+        };
+    };
+
+    let veth = veth_rx
+        .recv_timeout(VETH_INVITE_TIMEOUT)
+        .map_err(|_| BridgeError::Ims("timed out waiting for Agent B's veth call".into()))??;
+
+    // No far-end offer to bind against yet — a plain RTP port is enough.
+    // No RTCP endpoint is bound on this path (FR-002a): there is nothing to
+    // declare it against yet, and RTCP itself is out of scope here.
+    let ims_rtp_socket = std::net::UdpSocket::bind((session.local_addr.ip(), 0))
+        .map_err(|e| BridgeError::Ims(format!("IMS RTP bind failed: {e}")))?;
+    let ims_rtp_port = ims_rtp_socket
+        .local_addr()
+        .map_err(|e| BridgeError::Ims(format!("IMS RTP local_addr failed: {e}")))?
+        .port();
+
+    let session_id: u64 = rand::random::<u32>() as u64;
+    let our_offer = sdp::build_offer(
+        session.local_addr.ip(),
+        ims_rtp_port,
+        session_id,
+        sdp::CodecOffer::preferring_wideband(ctx.wideband && amr_safe::is_available()),
+    );
+
+    match await_pbx_answer(call_id, &ctrl_rx, inbound, req, &to_tag, &contact, sink)? {
+        RingOutcome::Answered => {}
+        RingOutcome::PbxDeclined => {
+            obs.report_call_not_answered(
+                CallStatus::Missed,
+                BridgeFailureReason::PbxDeclined,
+                caller,
+                started_at,
+            );
+            return Ok(None);
+        }
+        RingOutcome::Abandoned { reason } => {
+            let _ = write_msg(
+                &mut control,
+                &ControlMessage::CallEnded {
+                    call_id: call_id.to_string(),
+                    reason: reason.to_string(),
+                },
+            );
+            obs.report_call_not_answered(
+                CallStatus::Missed,
+                observability::map_bridge_failure_reason(reason),
+                caller,
+                started_at,
+            );
+            return Ok(None);
+        }
+    }
+
+    let response = build_uas_response_with_headers(
+        200,
+        "OK",
+        req,
+        Some(&to_tag),
+        Some(&contact),
+        Some(&our_offer),
+        &[
+            ("Allow", super::ALLOW),
+            ("P-Access-Network-Info", ctx.access_network_info),
+        ],
+    );
+    sink.send(&response)?;
+
+    // specs/047-offerless-invite-sms-reassembly, research.md Decision 3:
+    // the same drain-loop shape `await_pbx_answer` already uses, watching
+    // for the one thing this wait cares about — the caller's `ACK` naming
+    // this exact dialog (RFC 3261 §12.2.2: Call-ID plus both tags —
+    // `names_active_dialog`, reused from `agent::mod` unchanged) — and
+    // ignoring everything else, same posture `await_pbx_answer` already
+    // has for an irrelevant method.
+    //
+    // A `BYE` naming this dialog is *not* one of the things safely ignored,
+    // unlike an unrelated method: RFC 3261 §12.1.1 confirms this dialog the
+    // moment we sent the `2xx` above, before the caller's own `ACK` — so a
+    // caller that answers and immediately hangs up (or never actually
+    // intended to complete the offer/answer) can legitimately `BYE` it
+    // before its `ACK` ever arrives. Left unanswered, that `BYE` is simply
+    // retransmitted by the network until this wait times out and this
+    // bridge sends its *own*, redundant `BYE` for a dialog already ended
+    // from the other side (code review finding, 2026-08-28).
+    let deadline = Instant::now() + OFFERLESS_ACK_TIMEOUT;
+    let mut ack_body: Option<String> = None;
+    let mut caller_bye = false;
+    'wait_for_ack: while Instant::now() < deadline {
+        while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
+            let SipMessage::Request(candidate) = msg else {
+                continue;
+            };
+            let this_dialog = super::names_active_dialog(
+                &candidate,
+                call_id,
+                &to_tag,
+                req.header("From").unwrap_or_default(),
+            );
+            if candidate.method == "ACK" && this_dialog {
+                ack_body = Some(candidate.body.clone());
+                break 'wait_for_ack;
+            }
+            if candidate.method == "BYE" && this_dialog {
+                tracing::info!(call_id = %call_id, "caller ended the offerless call before its ACK arrived");
+                respond(
+                    &req_sink,
+                    "200 OK (BYE, offerless pre-ACK)",
+                    &build_uas_response(200, "OK", &candidate, Some(&to_tag), None, None),
+                );
+                caller_bye = true;
+                break 'wait_for_ack;
+            }
+            tracing::debug!(method = %candidate.method, "ignoring inbound request while awaiting the offerless call's ACK");
+        }
+        std::thread::sleep(RING_POLL_INTERVAL);
+    }
+
+    if caller_bye {
+        // The far end already ended this dialog — echoing our own `BYE`
+        // back at it would be answering a call that no longer exists from
+        // its perspective. Just tell Agent B and report the outcome.
+        let _ = write_msg(
+            &mut control,
+            &ControlMessage::CallEnded {
+                call_id: call_id.to_string(),
+                reason: reason::CALLER_CANCELLED.to_string(),
+            },
+        );
+        obs.report_call_not_answered(
+            CallStatus::Missed,
+            observability::map_bridge_failure_reason(reason::CALLER_CANCELLED),
+            caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
+    let teardown = |reason: &str, control: &mut TcpStream| {
+        let bye = DialogInfo::from_invite(req, &to_tag, session).build_bye_for(call_id);
+        let _ = sink.send(&bye);
+        let _ = write_msg(
+            control,
+            &ControlMessage::CallEnded {
+                call_id: call_id.to_string(),
+                reason: reason.to_string(),
+            },
+        );
+        tracing::info!(call_id = %call_id, reason, "offerless call answered but not completed; tore it down");
+    };
+
+    let Some(ack_body) = ack_body else {
+        // research.md Decision 4: no automatic 2xx retransmission exists in
+        // this codebase's transaction-lite design, so a `BYE` — not a
+        // second final response — is the honest way to end a dialog whose
+        // ACK never arrived (FR-006/SC-002).
+        teardown("offerless_ack_timeout", &mut control);
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            caller,
+            started_at,
+        );
+        return Ok(None);
+    };
+
+    let answer = sdp::parse_answer(&ack_body);
+    let chosen = answer
+        .as_ref()
+        .ok()
+        .and_then(|a| sdp::offered_chosen_codec(a.codec));
+    let (Ok(answer), Some(chosen)) = (answer, chosen) else {
+        // FR-005/SC-002: the caller's device answered with something this
+        // bridge cannot service — end the call explicitly, never silently.
+        teardown("offerless_ack_incompatible", &mut control);
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            caller,
+            started_at,
+        );
+        return Ok(None);
+    };
+
+    if let Err(e) = ims_rtp_socket.connect(answer.remote_rtp) {
+        tracing::warn!(call_id = %call_id, error = %e, "offerless call: IMS RTP connect failed");
+        teardown("offerless_rtp_connect_failed", &mut control);
+        obs.report_call_not_answered(
+            CallStatus::Failed,
+            BridgeFailureReason::BridgeSetupFailed,
+            caller,
+            started_at,
+        );
+        return Ok(None);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let meter = crate::ims::media_stats::MediaMeter::new();
+
+    let transcoding = chosen.codec != veth.codec.codec;
+    if transcoding {
+        crate::ims::transcode::spawn_transcoding_relay(
+            ims_rtp_socket,
+            veth.rtp_socket,
+            chosen,
+            veth.codec,
+            stop.clone(),
+            &meter,
+            None,
+        )?;
+    } else {
+        spawn_relay(
+            ims_rtp_socket,
+            veth.rtp_socket,
+            stop.clone(),
+            &meter,
+            chosen.dtmf_payload_type,
+            veth.codec.dtmf_payload_type,
+            None,
+        );
+    }
+
+    tracing::info!(
+        call_id = %call_id,
+        carrier_codec = chosen.codec.name(),
+        carrier_sample_rate = chosen.codec.sample_rate(),
+        carrier_payload_type = chosen.payload_type,
+        carrier_octet_aligned = chosen.octet_aligned,
+        veth_codec = veth.codec.codec.name(),
+        veth_sample_rate = veth.codec.codec.sample_rate(),
+        transcoding,
+        offerless = true,
+        "call answered and bridged"
+    );
+
+    let mut lifecycle = BridgedCall::new(call_id.to_string(), caller.to_string(), None);
+    lifecycle.advance_to(CallStage::Answering);
+    lifecycle.advance_to(CallStage::PbxRinging);
+    lifecycle.advance_to(CallStage::Bridged);
+
+    Ok(Some(ActiveCall {
+        control,
+        ctrl_rx,
+        stop,
+        dialog: DialogInfo::from_invite(req, &to_tag, session),
+        call_id: call_id.to_string(),
+        answered_invite: Some(CachedInviteAnswer {
+            invite_cseq: req.header("CSeq").unwrap_or_default().to_string(),
+            contact,
+            answer_sdp: our_offer,
+        }),
+        to_tag,
+        caller: caller.to_string(),
+        answered_at: Utc::now(),
+        answered_instant: Instant::now(),
+        meter,
+        lifecycle,
+        // FR-002a: no RTCP on the offerless path.
+        rtcp: None,
+    }))
+}
+
 /// Why we stopped ringing. The carrier has already been sent its final
 /// response in every case; the distinction is whether **Agent B** still needs
 /// telling — if it does and we don't, the PBX extension keeps ringing at
@@ -733,6 +1127,60 @@ mod tests {
         assert!(invite_content_type_supported(&invite_with_content_type(
             None
         )));
+    }
+
+    fn invite_with_body(body: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n\
+             Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// specs/047-offerless-invite-sms-reassembly (SDP-04), T018: an INVITE
+    /// with no body at all — RFC 3261 §14.2/RFC 3264 §3's offerless case —
+    /// is what `handle_invite` routes to `handle_offerless_invite` instead
+    /// of `sdp::parse_offer`. The branch condition itself
+    /// (`req.body.trim().is_empty()`) is a one-line check with no
+    /// `handle_invite`-level unit-test seam (the function needs a live
+    /// control-channel/veth-listener socket this codebase's test suite
+    /// doesn't stand up — see quickstart.md), so it is pinned directly
+    /// here, the same granularity this module's other pure predicates
+    /// (`invite_content_type_supported`) are already tested at.
+    #[test]
+    fn an_invite_with_no_body_is_recognized_as_offerless() {
+        let offerless = invite_with_content_type(None);
+        assert!(offerless.body.trim().is_empty());
+
+        // Content-Length: 0 but an explicit Content-Type still counts as
+        // offerless — RFC 3264 §3 cares about the body's presence, not
+        // whether a header claimed a type for a body that isn't there.
+        let empty_typed_body = invite_with_body("");
+        assert!(empty_typed_body.body.trim().is_empty());
+
+        // Whitespace-only is not a real offer either — RFC 4566's grammar
+        // has no such thing as a body that is only line endings.
+        let whitespace_only = invite_with_body("\r\n\r\n");
+        assert!(whitespace_only.body.trim().is_empty());
+    }
+
+    /// specs/047-offerless-invite-sms-reassembly (SDP-04), T019: the
+    /// regression guard for SC-005/FR-007 — an ordinary INVITE that already
+    /// states its media must never take the new offerless branch. Pinned at
+    /// the same branch-condition level as the test above, since that
+    /// condition is the entire routing decision (research.md Decision 1).
+    #[test]
+    fn an_invite_with_a_real_offer_is_not_recognized_as_offerless() {
+        let ordinary = invite_with_body(
+            "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        );
+        assert!(!ordinary.body.trim().is_empty());
     }
 
     /// A `multipart/mixed` (or any other unrecognized) body must be
