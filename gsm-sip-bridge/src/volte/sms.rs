@@ -308,6 +308,28 @@ pub struct Reassembly {
     /// reuse, or expiry) and is waiting to actually be delivered — see
     /// [`QueuedFlush`]'s own docs for why this exists as a retried queue
     /// rather than a one-shot return value.
+    ///
+    /// **In-memory only, by design, not an oversight** (Greptile finding,
+    /// 2026-08-28, third round): like every other piece of this bridge's
+    /// state — `ActiveCall`, registration status, `Dedupe`'s own
+    /// admitted-but-unconfirmed claims — nothing here survives a process
+    /// restart or crash. A part already acknowledged to the network that is
+    /// still queued here at the moment of a restart is lost, with no
+    /// SIP-level retransmission able to recover it (the ack already went
+    /// out). specs/047-offerless-invite-sms-reassembly's own spec (see its
+    /// Assumptions section) named and accepted exactly this trade-off
+    /// *before* implementation started, for the same reason nothing else in
+    /// this single-subscriber bridge persists across a restart either:
+    /// adding disk durability for this one queue, while every other piece
+    /// of in-flight state (including the rest of `Reassembly` itself — an
+    /// incomplete buffer *not yet* queued has the identical exposure) stays
+    /// memory-only, would be new, asymmetric infrastructure this codebase
+    /// has nowhere else, to close a compound, narrow window: the control
+    /// channel must be down *and* the process must crash or restart *during
+    /// that specific outage*. Retrying every ~1s (`on_idle_tick`) already
+    /// keeps the window as narrow as a transient failure allows; what's
+    /// left is the same class of risk a crash mid-call or mid-registration
+    /// already carries, not a new one.
     pending: Vec<QueuedFlush>,
     next_pending_id: u64,
 }

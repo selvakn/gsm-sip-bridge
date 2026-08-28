@@ -885,11 +885,30 @@ finding.
       on a failed retry attempt (not `forget`ten) to avoid racing the
       modem-storage route into relaying the same content independently
       while this bridge's own retry is about to succeed.
+      **Greptile re-review finding (2026-08-28, third round) — declined,
+      documented**: the retry queue above is in-memory only, so a process
+      restart or crash while the control channel is down *and* something
+      is still queued loses that content, with no SIP-level
+      retransmission able to recover it (the network already got its ack).
+      Correctly identified, and deliberately not fixed: this batch's own
+      spec (`spec.md`'s Assumptions) named and accepted exactly this
+      trade-off *before* implementation started, for the same reason
+      nothing else in this single-subscriber bridge survives a restart —
+      not `ActiveCall`, not registration state, not `Dedupe`'s own
+      admitted-but-unconfirmed claims, not even an ordinary (not yet
+      queued) `Reassembly` buffer holding an incomplete message. Adding
+      disk durability for only this one queue would be new, asymmetric
+      infrastructure this codebase has nowhere else, to close a narrow,
+      compound window (the control channel down *and* a crash/restart
+      landing inside that specific outage) — not a materially different
+      risk than a crash mid-call or mid-registration already carries here.
+      Documented directly on `Reassembly::pending`'s own field, not just
+      in this note.
 
 All landed code: `make format && make lint && make test` clean (whole
 workspace, including test targets, clippy `-D warnings`): 1397 lib tests
 plus every integration test suite, zero failures — re-verified after every
-fix above (three review rounds: the original code-review pass, and two
+fix above (three review rounds: the original code-review pass, and three
 Greptile rounds).
 
 **Not yet hardware-verified** — this batch has not been rebuilt and run
