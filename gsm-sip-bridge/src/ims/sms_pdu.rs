@@ -21,6 +21,24 @@
 //! back to the network for every message decoded here. The two are joined by
 //! [`DecodedSms::rp_mr`], which the report echoes.
 
+/// A concatenation UDH's own fields (TS 23.040 §9.2.3.24.1): which
+/// multi-part message this part belongs to (`reference`, scoped to the
+/// sender — not globally unique), its 1-indexed position (`sequence`), and
+/// how many parts the message has in total (`total`).
+///
+/// `reference` is carried as `u16` regardless of which concatenation IEI
+/// produced it (`0x00`: an 8-bit reference; `0x08`: 16-bit) so both fit one
+/// field — specs/047-offerless-invite-sms-reassembly (SMS-05) needs this
+/// value to tell apart two multi-part messages in flight at once from the
+/// same sender with the same total part count, which `sequence`/`total`
+/// alone cannot do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcatPart {
+    pub reference: u16,
+    pub sequence: u8,
+    pub total: u8,
+}
+
 /// One decoded SMS. `sender` is the real originating number from the TPDU's
 /// TP-OA — **not** the SIP `From`, which on a real network names an IMS
 /// network element (an SMSC gateway's own hostname), not the person who sent
@@ -29,9 +47,9 @@
 pub struct DecodedSms {
     pub sender: String,
     pub text: String,
-    /// `Some((sequence, total))` if the UDH marked this as one part of a
-    /// concatenated message — 1-indexed, as the UDH itself encodes it.
-    pub part: Option<(u8, u8)>,
+    /// `Some(...)` if the UDH marked this as one part of a concatenated
+    /// message.
+    pub part: Option<ConcatPart>,
     /// The envelope's RP-Message-Reference (TS 24.011 §7.3.1, octet 1),
     /// echoed verbatim in the delivery report so the network can match the
     /// acknowledgement to this specific delivery. See [`build_rp_ack`].
@@ -310,7 +328,7 @@ fn skip_length_prefixed(buf: &[u8], pos: usize, field: &str) -> Result<usize, St
 struct SmsDeliverTpdu {
     originating_address: String,
     text: String,
-    part: Option<(u8, u8)>,
+    part: Option<ConcatPart>,
     is_type_zero: bool,
 }
 
@@ -444,7 +462,7 @@ fn decode_user_data(
     udl: usize,
     alphabet: Alphabet,
     udhi: bool,
-) -> Result<(Option<(u8, u8)>, String), String> {
+) -> Result<(Option<ConcatPart>, String), String> {
     let (part, udh_octets) = if udhi {
         let udhl = *ud.first().ok_or("TP-UDHI set but TP-UD is empty")? as usize;
         let udh = ud.get(1..1 + udhl).ok_or("UDH length exceeds TP-UD")?;
@@ -505,15 +523,33 @@ fn decode_user_data(
 /// (8-bit reference) and `0x08` (16-bit reference). Any other IE
 /// (national-language shift tables, port addressing, ...) is skipped —
 /// this only exists to label multi-part messages, not to act on every IE.
-fn parse_concatenation_udh(udh: &[u8]) -> Option<(u8, u8)> {
+///
+/// specs/047-offerless-invite-sms-reassembly (SMS-05): the reference
+/// (`ie[0]` for the 8-bit IEI, `ie[0..2]` big-endian for the 16-bit one) is
+/// now kept, not discarded — reassembly needs it to tell apart two
+/// concurrent multi-part messages from the same sender with the same total
+/// part count.
+fn parse_concatenation_udh(udh: &[u8]) -> Option<ConcatPart> {
     let mut pos = 0;
     while pos + 1 < udh.len() {
         let iei = udh[pos];
         let ie_len = udh[pos + 1] as usize;
         let ie = udh.get(pos + 2..pos + 2 + ie_len)?;
         match iei {
-            0x00 if ie.len() >= 3 => return Some((ie[2], ie[1])),
-            0x08 if ie.len() >= 4 => return Some((ie[3], ie[2])),
+            0x00 if ie.len() >= 3 => {
+                return Some(ConcatPart {
+                    reference: ie[0] as u16,
+                    total: ie[1],
+                    sequence: ie[2],
+                })
+            }
+            0x08 if ie.len() >= 4 => {
+                return Some(ConcatPart {
+                    reference: u16::from_be_bytes([ie[0], ie[1]]),
+                    total: ie[2],
+                    sequence: ie[3],
+                })
+            }
             _ => {}
         }
         pos += 2 + ie_len;
@@ -1045,7 +1081,14 @@ mod tests {
         let DecodedRp::Message(decoded) = decode_vnd_3gpp_sms(&rp).unwrap() else {
             panic!("RP-DATA must decode to DecodedRp::Message");
         };
-        assert_eq!(decoded.part, Some((2, 2)));
+        assert_eq!(
+            decoded.part,
+            Some(ConcatPart {
+                reference: 0xAA,
+                sequence: 2,
+                total: 2,
+            })
+        );
         assert_eq!(decoded.text, "part2");
     }
 

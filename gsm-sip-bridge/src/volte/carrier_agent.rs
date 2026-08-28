@@ -69,6 +69,7 @@ pub(crate) fn run(
     app_config: &AppConfig,
     modem_lock: Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: Arc<Mutex<super::sms::Dedupe>>,
+    reassembly: Arc<Mutex<super::sms::Reassembly>>,
     pbx_registered: Option<Arc<AtomicBool>>,
     progress: &Arc<crate::ims::agent::watchdog::Progress>,
 ) {
@@ -237,6 +238,7 @@ pub(crate) fn run(
         attachment_check: Some(&attachment_check),
         modem_lock: Some(modem_lock),
         dedupe,
+        reassembly,
         pbx_registered,
         app_config,
         progress: Arc::clone(progress),

@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/046-rtcp-reporting/plan.md`.
+`specs/047-offerless-invite-sms-reassembly/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

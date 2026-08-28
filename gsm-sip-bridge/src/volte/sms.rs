@@ -45,6 +45,7 @@
 //! The same reasoning applies to clearing a message from the modem's storage.
 
 use crate::error::BridgeResult;
+use crate::ims::sms_pdu::ConcatPart;
 use crate::modules::at_commander::AtCommander;
 use crate::vowifi::control::{write_msg, ControlMessage};
 use std::collections::VecDeque;
@@ -198,6 +199,190 @@ impl Dedupe {
     pub fn forget(&mut self, key: &str) {
         self.seen.retain(|k| k != key);
         self.confirmed.remove(key);
+    }
+}
+
+/// How long an incomplete multi-part message is held before this bridge
+/// gives up on the rest of its parts ever arriving (specs/047-offerless-
+/// invite-sms-reassembly, SMS-05, FR-013/SC-004 — fixed at 3 minutes via
+/// `/speckit-clarify`, 2026-08-28).
+pub const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How many concurrently in-flight multi-part-message identities to track at
+/// once — mirrors [`Dedupe`]'s own bound (64): a single-subscriber bridge
+/// has no realistic need for more, and a fixed cap keeps a flood of distinct
+/// identities from growing this unboundedly between sweep passes.
+const REASSEMBLY_CAPACITY: usize = 64;
+
+/// One multi-part message's identity: the sender plus the concatenation
+/// UDH's own reference value (TS 23.040 §9.2.3.24.1) — **not** the claimed
+/// total part count, which lives in [`PartialMessage`] instead and is
+/// checked for consistency against it (see [`PartOutcome::Malformed`]).
+/// Two different total counts for the same `(sender, reference)` are a
+/// malformed message, not two different messages.
+type ReassemblyKey = (String, u16);
+
+/// The parts of one multi-part message received so far.
+#[derive(Debug, Clone)]
+struct PartialMessage {
+    total: u8,
+    /// Sparse — only the positions actually received. `BTreeMap` so
+    /// `PartOutcome::Complete`'s join can walk `1..=total` in order without
+    /// a separate sort.
+    parts: std::collections::BTreeMap<u8, String>,
+    last_updated: Instant,
+}
+
+/// What happened when a part was handed to [`Reassembly::admit_part`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartOutcome {
+    /// Every position `1..=total` is now present, joined in order. The
+    /// buffer entry is **not** cleared by this outcome alone — see
+    /// [`Reassembly::mark_delivered`].
+    Complete(String),
+    /// Still missing at least one part. The caller must still acknowledge
+    /// this part to the network now (FR-012) — only forwarding waits.
+    Pending,
+    /// This part's own numbers make correct reassembly impossible: a
+    /// `total` of `0`, a `sequence` of `0` or greater than `total`, or a
+    /// `total` that disagrees with an already-buffered value for this same
+    /// `(sender, reference)`. The caller falls back to today's existing
+    /// per-part delivery (FR-016) — reassembly makes no attempt to guess a
+    /// message a carrier or handset stated inconsistently.
+    Malformed,
+}
+
+/// Buffers the parts of one or more multi-part text messages until each
+/// completes or [`REASSEMBLY_TIMEOUT`] elapses (specs/047-offerless-invite-
+/// sms-reassembly, SMS-05).
+///
+/// Shared, via `Arc<Mutex<_>>`, the same way [`Dedupe`] already is between
+/// the IMS `MESSAGE` route and the modem-storage sweep route — see that
+/// type's own docs for why both routes must agree. Unlike `Dedupe`,
+/// `Reassembly` today is only ever written to by the IMS route: wiring the
+/// modem-storage route into it as well is deliberately deferred (recorded
+/// in `docs/plans/mt-conformance-findings.md`'s batch 8 entry) rather than
+/// woven into `sweep_modem_storage`'s own already-intricate cross-route
+/// claim/relay/confirm logic (`wait_for_resolution` and friends) in this
+/// pass — the modem route keeps delivering per-part today, unaffected and
+/// unregressed, which is the same posture RTP-01's FR-023a took for its own
+/// out-of-scope call path. The type is still shared cross-route (the field
+/// stays `pub` and is still constructed once and threaded to both routes'
+/// setup) so that residue is a follow-up wiring change, not a redesign.
+#[derive(Debug)]
+pub struct Reassembly {
+    buffers: std::collections::HashMap<ReassemblyKey, PartialMessage>,
+    /// Oldest-first eviction order, mirroring `Dedupe`'s `VecDeque` — a
+    /// capacity overrun evicts the longest-untouched identity, not
+    /// necessarily the most naturally-expired one (that's `take_expired`'s
+    /// job on the normal path; this is only the backstop against a flood).
+    order: VecDeque<ReassemblyKey>,
+    capacity: usize,
+}
+
+impl Default for Reassembly {
+    fn default() -> Self {
+        Self::new(REASSEMBLY_CAPACITY)
+    }
+}
+
+impl Reassembly {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buffers: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Admits one part of a multi-part message. See [`PartOutcome`] for
+    /// what each result means and what the caller must do next.
+    ///
+    /// Re-admitting an already-held `sequence` with the same text is a
+    /// harmless no-op that still correctly reports `Complete` if the set is
+    /// otherwise full — the retry-after-failed-delivery path
+    /// `mark_delivered`'s own docs describe.
+    pub fn admit_part(&mut self, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
+        if part.total == 0 || part.sequence == 0 || part.sequence > part.total {
+            return PartOutcome::Malformed;
+        }
+
+        let key: ReassemblyKey = (sender.to_string(), part.reference);
+        if !self.buffers.contains_key(&key) {
+            if self.buffers.len() >= self.capacity {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.buffers.remove(&evicted);
+                }
+            }
+            self.buffers.insert(
+                key.clone(),
+                PartialMessage {
+                    total: part.total,
+                    parts: std::collections::BTreeMap::new(),
+                    last_updated: Instant::now(),
+                },
+            );
+            self.order.push_back(key.clone());
+        }
+
+        let Some(buffer) = self.buffers.get_mut(&key) else {
+            // Unreachable: just inserted or already present above.
+            return PartOutcome::Malformed;
+        };
+        if buffer.total != part.total {
+            return PartOutcome::Malformed;
+        }
+        buffer.parts.insert(part.sequence, text.to_string());
+        buffer.last_updated = Instant::now();
+
+        if buffer.parts.len() == buffer.total as usize {
+            let joined = buffer.parts.values().cloned().collect::<Vec<_>>().join("");
+            PartOutcome::Complete(joined)
+        } else {
+            PartOutcome::Pending
+        }
+    }
+
+    /// Clears a completed message's buffer entry — call this, and only
+    /// this, once the `Complete` message's actual delivery
+    /// (`ControlMessage::SmsReceived`) has succeeded. Mirrors
+    /// `Dedupe::confirm`'s shape: leaving the entry in place on a delivery
+    /// failure means a network retransmission of just the triggering part
+    /// (the only one `Dedupe::forget` un-suppresses) still finds every
+    /// other part already held, and `admit_part` correctly reports
+    /// `Complete` again without needing the whole message re-sent.
+    pub fn mark_delivered(&mut self, sender: &str, part: &ConcatPart) {
+        let key: ReassemblyKey = (sender.to_string(), part.reference);
+        self.buffers.remove(&key);
+        self.order.retain(|k| k != &key);
+    }
+
+    /// Removes and returns every part of every buffered message whose most
+    /// recent part is older than [`REASSEMBLY_TIMEOUT`] — one
+    /// `(sender, sequence, total, text)` tuple per still-held part, the
+    /// shape the existing per-part `ControlMessage::SmsReceived` send
+    /// already expects (FR-013/SC-004).
+    pub fn take_expired(&mut self, now: Instant) -> Vec<(String, u8, u8, String)> {
+        let expired_keys: Vec<ReassemblyKey> = self
+            .buffers
+            .iter()
+            .filter(|(_, buf)| {
+                now.saturating_duration_since(buf.last_updated) >= REASSEMBLY_TIMEOUT
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut out = Vec::new();
+        for key in expired_keys {
+            if let Some(buf) = self.buffers.remove(&key) {
+                let (sender, _reference) = key.clone();
+                for (seq, text) in buf.parts {
+                    out.push((sender.clone(), seq, buf.total, text));
+                }
+            }
+            self.order.retain(|k| k != &key);
+        }
+        out
     }
 }
 
@@ -1110,6 +1295,223 @@ mod tests {
         // message records how it arrived.
         assert_eq!(MessageRoute::OverRegistration.as_str(), "registration");
         assert_eq!(MessageRoute::ThroughModem.as_str(), "modem");
+    }
+
+    // ---- Reassembly (specs/047-offerless-invite-sms-reassembly, SMS-05) ----
+
+    fn concat(reference: u16, sequence: u8, total: u8) -> ConcatPart {
+        ConcatPart {
+            reference,
+            sequence,
+            total,
+        }
+    }
+
+    #[test]
+    fn completes_once_every_part_has_arrived_regardless_of_order() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(7, 2, 3), "second "),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(7, 3, 3), "third"),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(7, 1, 3), "first "),
+            PartOutcome::Complete("first second third".to_string())
+        );
+    }
+
+    #[test]
+    fn two_concurrent_same_sender_same_total_messages_never_cross_contaminate() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 1, 2), "A1"),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(2, 1, 2), "B1"),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 2, 2), "A2"),
+            PartOutcome::Complete("A1A2".to_string())
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(2, 2, 2), "B2"),
+            PartOutcome::Complete("B1B2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_total_of_zero_is_malformed() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 1, 0), "x"),
+            PartOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn a_sequence_of_zero_is_malformed() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 0, 3), "x"),
+            PartOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn a_sequence_beyond_the_total_is_malformed() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 4, 3), "x"),
+            PartOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn a_total_disagreeing_with_an_already_buffered_value_is_malformed() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 1, 3), "x"),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 2, 4), "y"),
+            PartOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn re_admitting_an_already_held_sequence_is_a_harmless_no_op_that_still_reports_complete() {
+        let mut r = Reassembly::default();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 1, 2), "A"),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 2, 2), "B"),
+            PartOutcome::Complete("AB".to_string())
+        );
+        // Simulates a network retransmission of the triggering (last) part
+        // after a failed delivery — the entry was never cleared
+        // (`mark_delivered` was never called), so re-admitting reaches
+        // `Complete` again without the first part being resent.
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 2, 2), "B"),
+            PartOutcome::Complete("AB".to_string())
+        );
+    }
+
+    #[test]
+    fn mark_delivered_clears_the_entry_so_a_later_reference_reuse_starts_fresh() {
+        let mut r = Reassembly::default();
+        let part = concat(1, 1, 1);
+        assert_eq!(
+            r.admit_part("+91123", &part, "solo"),
+            PartOutcome::Complete("solo".to_string())
+        );
+        r.mark_delivered("+91123", &part);
+        // A brand-new message could legally reuse the same reference later
+        // (TS 23.040 doesn't guarantee global uniqueness) — after clearing,
+        // it starts a fresh buffer rather than instantly "completing" on
+        // one part.
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 1, 2), "new-first"),
+            PartOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn take_expired_leaves_a_fresh_buffer_untouched() {
+        let mut r = Reassembly::default();
+        r.admit_part("+91123", &concat(1, 1, 2), "A");
+        assert!(r.take_expired(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn take_expired_flushes_every_held_part_past_the_bound() {
+        let mut r = Reassembly::default();
+        r.admit_part("+91123", &concat(1, 1, 3), "A");
+        r.admit_part("+91123", &concat(1, 2, 3), "B");
+        let past_deadline = Instant::now() + REASSEMBLY_TIMEOUT + Duration::from_secs(1);
+        let mut flushed = r.take_expired(past_deadline);
+        flushed.sort_by_key(|(_, seq, _, _)| *seq);
+        assert_eq!(
+            flushed,
+            vec![
+                ("+91123".to_string(), 1, 3, "A".to_string()),
+                ("+91123".to_string(), 2, 3, "B".to_string()),
+            ]
+        );
+        // Cleared — a second call finds nothing left to flush.
+        assert!(r
+            .take_expired(past_deadline + REASSEMBLY_TIMEOUT)
+            .is_empty());
+    }
+
+    #[test]
+    fn dedupe_and_reassembly_compose_two_parts_into_one_delivery_not_two() {
+        // specs/047-offerless-invite-sms-reassembly (SMS-05), T011: the two
+        // layers `handle_message` actually wires together — `Dedupe`
+        // keyed on each part's own labelled body (so a retransmission of
+        // *one* part is still individually suppressed), `Reassembly` keyed
+        // on the message's real identity (so the two *distinct* parts
+        // still combine into one delivery). This is the property
+        // `handle_message` itself has no cheap unit-test seam for (it
+        // needs a live socket/control-channel harness — the same
+        // constraint this project's prior batches recorded for their own
+        // full-request-handler paths), so it is pinned here at the two
+        // pure layers instead.
+        let mut d = Dedupe::default();
+        let mut r = Reassembly::default();
+        let sender = "+91123";
+        let part1 = concat(9, 1, 2);
+        let part2 = concat(9, 2, 2);
+        let body1 = format!("[{}/{}] {}", part1.sequence, part1.total, "hello ");
+        let body2 = format!("[{}/{}] {}", part2.sequence, part2.total, "world");
+
+        // Each part is its own dedupe identity — never collapsed into the
+        // other.
+        assert_eq!(
+            decide(&mut d, &msg(MessageRoute::OverRegistration, sender, &body1)),
+            Disposition::Handle
+        );
+        assert_eq!(
+            decide(&mut d, &msg(MessageRoute::OverRegistration, sender, &body2)),
+            Disposition::Handle
+        );
+        // A retransmission of part 1 alone is still individually
+        // suppressed, unaffected by part 2 having arrived.
+        assert_eq!(
+            decide(&mut d, &msg(MessageRoute::OverRegistration, sender, &body1)),
+            Disposition::AcknowledgeOnly
+        );
+
+        // Reassembly combines the two distinct parts into exactly one
+        // deliverable message.
+        assert_eq!(r.admit_part(sender, &part1, "hello "), PartOutcome::Pending);
+        assert_eq!(
+            r.admit_part(sender, &part2, "world"),
+            PartOutcome::Complete("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_drops_the_oldest_identity_under_a_flood() {
+        let mut r = Reassembly::new(2);
+        r.admit_part("+91001", &concat(1, 1, 2), "a");
+        r.admit_part("+91002", &concat(1, 1, 2), "b");
+        // Third distinct identity evicts the first (+91001/ref 1).
+        r.admit_part("+91003", &concat(1, 1, 2), "c");
+        assert_eq!(
+            r.admit_part("+91001", &concat(1, 2, 2), "a2"),
+            PartOutcome::Pending,
+            "the evicted identity starts a fresh buffer, not a completion"
+        );
     }
 
     // ---- wait_for_resolution (specs/038 review follow-up) ------------------

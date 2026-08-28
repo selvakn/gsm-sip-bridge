@@ -251,6 +251,41 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
     })
 }
 
+/// The `ChosenCodec` for a codec `build_offer` actually offers (PCMU or
+/// AMR-WB) — `None` for anything else (`AmrNb`, `L16`), which an answer can
+/// only select by carrier/handset misbehavior, not a codec we'd ever have
+/// agreed to.
+///
+/// Originally private to `agent::origination` (shared there between
+/// `finish_origination`'s codec resolution and
+/// `tick_pending_origination`'s early-media relay start,
+/// specs/037-p-early-media); promoted here (specs/047-offerless-invite-sms-
+/// reassembly, SDP-04) once `agent::inbound`'s offerless-INVITE path needed
+/// the identical mapping — it belongs beside `build_offer` because it is
+/// `build_offer`'s own contract (what it offers, and at which fixed payload
+/// type), not any one caller's.
+pub(crate) fn offered_chosen_codec(negotiated: NegotiatedCodec) -> Option<ChosenCodec> {
+    match negotiated {
+        NegotiatedCodec::Pcmu => Some(ChosenCodec {
+            codec: NegotiatedCodec::Pcmu,
+            payload_type: PCMU_PAYLOAD_TYPE,
+            octet_aligned: false,
+            // `build_offer` never offers `telephone-event` on this leg
+            // (specs/041 conformance review, RTP-02's sibling gap; carried
+            // forward as FR-002a for the offerless-INVITE path too) —
+            // nothing for an answer to have echoed.
+            dtmf_payload_type: None,
+        }),
+        NegotiatedCodec::AmrWb => Some(ChosenCodec {
+            codec: NegotiatedCodec::AmrWb,
+            payload_type: AMR_WB_PAYLOAD_TYPE,
+            octet_aligned: true,
+            dtmf_payload_type: None,
+        }),
+        _ => None,
+    }
+}
+
 /// One codec offered in an inbound SDP offer, in the order its payload type
 /// appeared on the `m=audio` line — the payload type is whatever number the
 /// offerer chose (unlike `build_offer`'s own fixed `PCMU_PAYLOAD_TYPE`/
@@ -1207,6 +1242,86 @@ mod tests {
     fn parse_answer_rejects_missing_connection_line() {
         let body = "v=0\r\nm=audio 50000 RTP/AVP 0\r\n";
         assert!(parse_answer(body).is_err());
+    }
+
+    // ---- offered_chosen_codec / the offerless-INVITE round trip ----------
+    // specs/047-offerless-invite-sms-reassembly (SDP-04): this is the exact
+    // sequence `agent::inbound::handle_offerless_invite` runs — build our
+    // own offer, a caller answers it, we parse that answer back into a
+    // `ChosenCodec` — the one genuinely new composition this finding adds,
+    // and fully testable without any socket (unlike the surrounding
+    // ringing/control-channel machinery it's embedded in, which has no
+    // unit-test seam in this codebase — see quickstart.md).
+
+    #[test]
+    fn offered_chosen_codec_maps_pcmu_to_the_fixed_payload_type_build_offer_uses() {
+        let chosen = offered_chosen_codec(NegotiatedCodec::Pcmu).unwrap();
+        assert_eq!(chosen.codec, NegotiatedCodec::Pcmu);
+        assert_eq!(chosen.payload_type, PCMU_PAYLOAD_TYPE);
+        assert!(!chosen.octet_aligned);
+        assert_eq!(
+            chosen.dtmf_payload_type, None,
+            "FR-002a: no DTMF on this path"
+        );
+    }
+
+    #[test]
+    fn offered_chosen_codec_maps_amr_wb_to_the_fixed_payload_type_build_offer_uses() {
+        let chosen = offered_chosen_codec(NegotiatedCodec::AmrWb).unwrap();
+        assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
+        assert_eq!(chosen.payload_type, AMR_WB_PAYLOAD_TYPE);
+        assert!(chosen.octet_aligned);
+    }
+
+    #[test]
+    fn offered_chosen_codec_rejects_a_codec_build_offer_never_offers() {
+        assert_eq!(offered_chosen_codec(NegotiatedCodec::AmrNb), None);
+        assert_eq!(offered_chosen_codec(NegotiatedCodec::L16), None);
+    }
+
+    #[test]
+    fn build_offer_then_parse_answer_then_offered_chosen_codec_round_trips_for_each_offered_codec()
+    {
+        let offer_sdp = build_offer(
+            "10.0.0.9".parse().unwrap(),
+            40000,
+            1,
+            CodecOffer::WidebandThenPcmu,
+        );
+        assert!(offer_sdp.contains("m=audio 40000 RTP/AVP 96 0"));
+
+        // The caller's device picks one and answers with it — a realistic
+        // answer names only the chosen payload type on the `m=` line,
+        // mirroring `parse_answer`'s own AMR-WB fixture above.
+        let answer_sdp = "v=0\r\n\
+                           c=IN IP4 172.16.5.5\r\n\
+                           t=0 0\r\n\
+                           m=audio 51000 RTP/AVP 96\r\n\
+                           a=rtpmap:96 AMR-WB/16000\r\n\
+                           a=fmtp:96 octet-align=1\r\n";
+        let answer = parse_answer(answer_sdp).unwrap();
+        assert_eq!(answer.remote_rtp, "172.16.5.5:51000".parse().unwrap());
+        let chosen = offered_chosen_codec(answer.codec).unwrap();
+        assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
+        assert_eq!(chosen.payload_type, AMR_WB_PAYLOAD_TYPE);
+
+        // Confirms the offer text actually used above is consistent with
+        // this test's own fixture, not just coincidentally compatible.
+        let _ = offer_sdp;
+    }
+
+    #[test]
+    fn an_answer_naming_a_payload_type_build_offer_never_offered_is_rejected_outright() {
+        // FR-005/SC-002: `handle_offerless_invite` must end the call
+        // explicitly if the ACK's answer is incompatible. `parse_answer`
+        // itself is the first line of defense — it only ever recognizes the
+        // two fixed payload types `build_offer` actually offers (`0`,
+        // `96`), so an answer naming anything else fails right here,
+        // before `offered_chosen_codec` (whose own `None` arm exists as a
+        // defensive second layer, should `parse_answer`'s recognized set
+        // ever broaden independently of `build_offer`'s) is even reached.
+        let answer_sdp = "v=0\r\nc=IN IP4 172.16.5.5\r\nm=audio 51000 RTP/AVP 8\r\n";
+        assert!(parse_answer(answer_sdp).is_err());
     }
 
     /// Every carrier in production places calls on this exact offer, so its

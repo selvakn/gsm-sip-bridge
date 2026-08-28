@@ -296,6 +296,16 @@ fn run_inner(
     // modem's own SMS storage — a `pcsc_reader` line has no AT port to
     // protect and no cellular bearer to poll.
     let dedupe = Arc::new(Mutex::new(crate::volte::sms::Dedupe::default()));
+    // specs/047-offerless-invite-sms-reassembly (SMS-05): shared with
+    // `handle_message` (via `InboundParams` below) the same way `dedupe`
+    // already is — `admit_part` there is what actually populates this.
+    // Expiry is flushed from `LoopState::on_idle_tick`, not the modem sweep
+    // below — that thread only exists when `wants_modem_sms_reader` is true
+    // (never on a `pcsc_reader` line), while every line runs the idle tick
+    // (code review finding, 2026-08-28: the original design assumed the
+    // sweep "runs unconditionally, once per line," which is false for that
+    // line type).
+    let reassembly = Arc::new(Mutex::new(crate::volte::sms::Reassembly::default()));
     let modem_lock = if wants_modem_sms_reader(config.pcsc_reader) {
         let lock = Arc::new(crate::modules::modem_lock::ModemLock::new());
         let modem_port = PathBuf::from(&config.modem_port);
@@ -342,6 +352,7 @@ fn run_inner(
         // only for a `pcsc_reader` line, which has no AT port at all.
         modem_lock,
         dedupe,
+        reassembly,
         // Wi-Fi Agent A cannot see Agent B's PBX registration (separate
         // processes), so it does not gate on it.
         pbx_registered: None,
@@ -589,6 +600,11 @@ pub(crate) struct InboundParams<'a> {
     /// line has one, unlike `modem_lock`, which only exists where there is an
     /// AT port to protect.
     pub dedupe: Arc<Mutex<crate::volte::sms::Dedupe>>,
+    /// specs/047-offerless-invite-sms-reassembly (SMS-05): buffers a
+    /// multi-part message's parts until every part has arrived or it times
+    /// out. Shared the same way `dedupe` is, for the same reason — see
+    /// `Reassembly`'s own docs.
+    pub reassembly: Arc<Mutex<crate::volte::sms::Reassembly>>,
     /// Whether the telephone-side half holds the PBX registration the outbound
     /// bridge leg needs — shared from that half (cellular only; the two halves
     /// are one process there). `None` on the Wi-Fi path, where health does not
@@ -629,6 +645,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         attachment_check,
         modem_lock,
         dedupe,
+        reassembly,
         pbx_registered,
         app_config,
         progress,
@@ -773,6 +790,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             attachment_check,
             modem_lock: modem_lock.as_ref(),
             dedupe: &dedupe,
+            reassembly: &reassembly,
             // Read from `[vowifi]` on both paths deliberately: SMS-over-IP is
             // the same TS 24.341 procedure over LTE as over Wi-Fi, so one
             // switch governs both rather than two that could disagree.
@@ -1147,7 +1165,7 @@ fn handle_message(
     if let Some(decoded) = &decoded {
         sender = decoded.sender.clone();
         body = match decoded.part {
-            Some((seq, total)) => format!("[{seq}/{total}] {}", decoded.text),
+            Some(part) => format!("[{}/{}] {}", part.sequence, part.total, decoded.text),
             None => decoded.text.clone(),
         };
     }
@@ -1223,6 +1241,54 @@ fn handle_message(
         return;
     }
 
+    // specs/047-offerless-invite-sms-reassembly (SMS-05): a multi-part
+    // message's individual part is buffered here rather than relayed
+    // immediately, and only forwarded — combined, in order — once every
+    // part has arrived. `decoded.part` is `None` for an ordinary
+    // single-part message (or a plain-text MESSAGE with no RP layer at
+    // all), which falls straight through to the pre-existing send below,
+    // unchanged (SC-005/FR-015). `key` above was computed from this part's
+    // own labelled `body` before this block runs, so `Dedupe` keeps
+    // deduplicating at the per-part level regardless of what reassembly
+    // does with it (data-model.md's explicit non-goal note).
+    let mut completed_part: Option<crate::ims::sms_pdu::ConcatPart> = None;
+    if let Some(part) = decoded.as_ref().and_then(|d| d.part) {
+        let text = decoded.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+        let outcome = p
+            .reassembly
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit_part(&sender, &part, &text);
+        match outcome {
+            crate::volte::sms::PartOutcome::Pending => {
+                // Still missing at least one part. FR-012: acknowledge this
+                // part to the network now, exactly as promptly as a
+                // single-part message is today — only forwarding waits.
+                tracing::info!(
+                    sender = %sender,
+                    sequence = part.sequence,
+                    total = part.total,
+                    "buffered one part of a multi-part message; not yet complete"
+                );
+                p.dedupe
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .confirm(&key);
+                acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+                return;
+            }
+            crate::volte::sms::PartOutcome::Complete(joined) => {
+                body = joined;
+                completed_part = Some(part);
+            }
+            crate::volte::sms::PartOutcome::Malformed => {
+                // Fall back to today's existing per-part labelled delivery
+                // (FR-016) — `body` already holds the `[seq/total] text`
+                // shape computed above.
+            }
+        }
+    }
+
     let msg = ControlMessage::SmsReceived {
         sender: sender.clone(),
         body,
@@ -1250,6 +1316,16 @@ fn handle_message(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .confirm(&key);
+        if let Some(part) = completed_part {
+            // Only now — mirrors `Dedupe::confirm` immediately above, and
+            // for the identical reason: nothing may treat this multi-part
+            // message as safe to discard until its actual delivery
+            // succeeded, not merely completed reassembly.
+            p.reassembly
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mark_delivered(&sender, &part);
+        }
         acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
     } else {
         // Release the admission above so the retransmission this triggers is
@@ -1259,6 +1335,13 @@ fn handle_message(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .forget(&key);
+        // `completed_part`'s `Reassembly` entry is deliberately left in
+        // place on this failure path (no `mark_delivered` call) — see that
+        // method's own docs: the network's retransmission of just the
+        // triggering part (the one `Dedupe::forget` above just
+        // un-suppressed) will re-admit into a buffer that still holds every
+        // other part, and correctly reach `Complete` again without needing
+        // the whole message resent.
         // Deliberately silent toward the network — at *both* layers: neither
         // the `200 OK` nor the delivery report goes out. An unacknowledged
         // MESSAGE is retransmitted, which is the recovery we want, and a
@@ -1268,6 +1351,65 @@ fn handle_message(
             sender = %sender,
             "not acknowledging the MESSAGE so the network retransmits it"
         );
+    }
+}
+
+/// Delivers every multi-part SMS part that has been sitting in
+/// `p.reassembly` past its 3-minute bound, individually and labelled
+/// (`REASSEMBLY_TIMEOUT`/`take_expired`'s own shape — FR-013/SC-004) —
+/// exactly the fallback `Malformed` already uses in `handle_message`, just
+/// reached via a timeout instead of a bad UDH.
+///
+/// Called from `LoopState::on_idle_tick`, which — unlike the modem-storage
+/// sweep thread this was originally (and wrongly) placed in — runs for
+/// every line regardless of whether it has a modem to sweep (code review
+/// finding, 2026-08-28).
+fn flush_expired_reassembly(p: &DispatchParams) {
+    let expired = p
+        .reassembly
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_expired(std::time::Instant::now());
+    for (sender, sequence, total, text) in expired {
+        let body = format!("[{sequence}/{total}] {text}");
+        let msg = ControlMessage::SmsReceived {
+            sender: sender.clone(),
+            body,
+            received_at: chrono::Utc::now().to_rfc3339(),
+        };
+        match TcpStream::connect_timeout(&p.control_addr, CONTROL_TIMEOUT) {
+            Ok(mut control) => match write_msg(&mut control, &msg) {
+                Ok(()) => {
+                    tracing::info!(
+                        sender = %sender,
+                        sequence,
+                        total,
+                        "delivered an incomplete multi-part message's held part after it expired"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        sender = %sender,
+                        sequence,
+                        total,
+                        error = %e,
+                        "failed to deliver an expired multi-part message's held part; it is lost \
+                         from this buffer (the part itself was already acknowledged to the \
+                         network at receipt time, so no retransmission will recover it)"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    sender = %sender,
+                    sequence,
+                    total,
+                    error = %e,
+                    "failed to reach the control channel to deliver an expired multi-part \
+                     message's held part; it is lost from this buffer"
+                );
+            }
+        }
     }
 }
 
@@ -1332,6 +1474,9 @@ struct DispatchParams<'a> {
     attachment_check: Option<&'a AttachmentHook>,
     modem_lock: Option<&'a Arc<crate::modules::modem_lock::ModemLock>>,
     dedupe: &'a Arc<Mutex<crate::volte::sms::Dedupe>>,
+    /// specs/047-offerless-invite-sms-reassembly (SMS-05) — see
+    /// `InboundParams::reassembly`.
+    reassembly: &'a Arc<Mutex<crate::volte::sms::Reassembly>>,
     /// See `config::VowifiConfig::sms_delivery_report`; consumed by
     /// [`acknowledge`].
     sms_delivery_report: bool,
@@ -2054,13 +2199,25 @@ impl LoopState {
     }
 
     /// Idle wake-up: nothing arrived within the poll interval. Runs Gm
-    /// liveness and, if it is due, the registration renewal.
+    /// liveness, the multi-part-SMS reassembly expiry flush, and, if it is
+    /// due, the registration renewal.
     fn on_idle_tick(
         &mut self,
         session: &mut crate::ims::RegisteredSession,
         inbound: &mut Inbound,
         p: &DispatchParams,
     ) -> BridgeResult<()> {
+        // specs/047-offerless-invite-sms-reassembly (SMS-05, FR-013/SC-004):
+        // this is the periodic wakeup `Reassembly`'s expiry clock actually
+        // needs — every line calls `on_idle_tick` regardless of line type,
+        // unlike the modem-storage sweep thread, which is never spawned at
+        // all on a `pcsc_reader` line (code review finding, 2026-08-28: the
+        // original design put this flush in the sweep thread on the mistaken
+        // assumption that it "runs unconditionally, once per line"). Placed
+        // first, unconditionally, so no early `return` later in this
+        // function (renewal not due, deferred, backed off, ...) can skip it.
+        flush_expired_reassembly(p);
+
         // Gm connection liveness (specs/028) runs here, on the idle path, only
         // when no call is in progress — a live call proves the connection by
         // itself and its own signaling must not be disturbed (FR-006). An

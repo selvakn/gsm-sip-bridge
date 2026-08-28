@@ -579,13 +579,14 @@ Decision 1 and Decision 8 for the full reasoning):
       QoS attribute parsing and a bearer-readiness state machine; the
       header-level behavior (declining `Require: precondition`) is already
       correct via MT-03's existing gate.
-- [ ] **SDP-04** — an INVITE without an offer is rejected instead of
-      answered with our own offer. Needs new pending-call state deferring
-      RTP-socket setup and codec selection from INVITE time to ACK time —
-      comparable in scope to RTP-01 (batch 5).
-- [ ] **SMS-05** — concatenated messages labelled, not reassembled. Needs
-      a cross-message buffer keyed by sender/reference/total with its own
-      eviction policy; today's decoder is stateless by design.
+- [x] **SDP-04** — an INVITE without an offer is rejected instead of
+      answered with our own offer. **Landed in batch 8**
+      (`specs/047-offerless-invite-sms-reassembly/`) — turned out smaller
+      than this note assumed; see that batch's own entry below.
+- [x] **SMS-05** — concatenated messages labelled, not reassembled. **Landed
+      in batch 8** (`specs/047-offerless-invite-sms-reassembly/`), with one
+      deliberate residue (the modem-storage delivery route is not yet wired
+      into reassembly) — see that batch's own entry below.
 - [ ] **SMS-07** — national-language shift tables unimplemented. Attempted
       and reversed mid-implementation: the mechanism (recognizing the UDH
       IEs that select a table) is small, but the part that fixes decoded
@@ -700,6 +701,136 @@ records the verification plan; in particular, whether the carrier
 actually sends RTCP receiver reports back is unknown until that round
 runs, and is flagged there as itself a finding to record either way, not
 an assumption to build on.
+
+## Batch 8 — offerless call answering and multi-part SMS reassembly (landed 2026-08-28, pending hardware round)
+
+Full spec/plan/tasks/research trail:
+`specs/047-offerless-invite-sms-reassembly/`. Closes the two findings
+batch 6 deferred as "comparable in scope to RTP-01" — both turned out
+materially smaller once research checked how much of the needed state
+already existed elsewhere in the codebase; see that batch's own
+`research.md` for the full decision/rationale/alternatives writeup per
+finding.
+
+- [x] **SDP-04** — an INVITE without an offer is rejected instead of
+      answered with our own offer. **Landed**: `agent::inbound::
+      handle_invite` now recognizes an empty body (RFC 3261 §14.2/RFC 3264
+      §3) before it ever reaches `sdp::parse_offer`, and routes to a new
+      `handle_offerless_invite`. That function reuses `sdp::build_offer`/
+      `sdp::parse_answer` **verbatim** — the exact functions
+      `agent::origination` already exercises on every outbound call this
+      bridge places — rather than any new SDP-building code: our own offer
+      goes out in the `200 OK`, and the caller's device answers it in the
+      `ACK`, awaited via a bounded drain loop over `inbound.rx` reusing the
+      same shape `await_pbx_answer`'s existing CANCEL/retransmit handling
+      already uses (a new `OFFERLESS_ACK_TIMEOUT`, 4s — a
+      protocol-transaction-scale bound, distinct from the human-scale
+      `RING_TIMEOUT`). A matching ACK with a compatible answer proceeds
+      through the same RTP-connect/relay-spawn/`ActiveCall` construction
+      the ordinary path already uses; an ACK that never arrives, or names
+      an incompatible codec, ends the call with a `BYE` built from the
+      already-available `DialogInfo::from_invite` (this codebase has no
+      server-transaction layer to retract an already-sent `2xx`, so a `BYE`
+      is the honest recovery, not a second final response) plus
+      `ControlMessage::CallEnded` to Agent B — never a silently-connected
+      or indefinitely-ringing call. `origination.rs`'s private
+      `offered_chosen_codec` helper was promoted to `pub(crate)` in
+      `ims::sdp` (beside `build_offer`, since the mapping is that
+      function's own contract) and shared by both call sites instead of
+      duplicated. Tests: the round trip (`build_offer` → a synthetic
+      answer → `parse_answer` → `offered_chosen_codec`) for both offered
+      codecs, an unrecognized answer rejected outright, the empty-body
+      branch condition itself (including a `Content-Length: 0` and a
+      whitespace-only body), and the regression guard that an ordinary
+      offer-carrying INVITE is untouched.
+      **Recorded scope cut — FR-002a**: the offer this path sends carries
+      audio codecs only, no `telephone-event` (DTMF) and no RTCP, because
+      `build_offer` has never offered either on the origination path it
+      already serves, and extending it was judged real new work with no
+      evidence any carrier or handset here has ever sent an offerless
+      INVITE at all yet. The same class of documented residue RTP-01's
+      FR-023a already established precedent for, not a silent gap.
+      **Code-review fix (2026-08-28)**: the ACK-wait drain loop originally
+      recognized only an `ACK`, silently ignoring anything else — including
+      a `BYE`. RFC 3261 §12.1.1 confirms a UAS-side dialog the moment the
+      `2xx` is sent, *before* the caller's own `ACK`, so a caller that
+      answers the offer and immediately hangs up can legitimately `BYE`
+      this dialog before its `ACK` ever arrives; left unanswered, that
+      `BYE` would sit unacknowledged (inviting a retransmission storm)
+      until the wait timed out and this bridge sent its own, redundant
+      `BYE` back at a dialog the far end had already ended. Fixed: the
+      drain loop now also matches a `BYE` naming this exact dialog, answers
+      it `200 OK`, and skips this bridge's own teardown `BYE` in that case
+      — Agent B is still told `CallEnded` and the outcome still reported,
+      just without an extra, misdirected `BYE` of this bridge's own.
+- [x] **SMS-05** — concatenated messages labelled, not reassembled.
+      **Landed**: a prerequisite fix first — `ims::sms_pdu::
+      parse_concatenation_udh` was already reading the concatenation UDH's
+      reference value (TS 23.040 §9.2.3.24.1) and discarding it; it now
+      returns a `ConcatPart { reference, sequence, total }`, threaded
+      through `DecodedSms.part` and every call site that matched the old
+      bare tuple. A new `volte::sms::Reassembly` (a near-structural twin of
+      the existing `Dedupe`, sharing its `Arc<Mutex<_>>` pattern) buffers a
+      multi-part message's parts, keyed on `(sender, reference)` with
+      `total` checked for consistency rather than folded into the key —
+      `admit_part` reports `Complete`/`Pending`/`Malformed`, and a
+      `Complete` result is only cleared once its actual delivery succeeds
+      (`mark_delivered`), mirroring `Dedupe::confirm`/`forget`'s own
+      retry-safety shape so a failed send can recover from just the
+      network's retransmission of the triggering part. `handle_message`
+      (the IMS `MESSAGE` route) now runs a part through `Reassembly` between
+      the existing `Dedupe` check and the `ControlMessage::SmsReceived`
+      send: `Pending` acknowledges the part immediately without forwarding
+      anything yet (FR-012 — the network's delivery confirmation never
+      waits on reassembly); `Complete` forwards the joined text as one
+      message; `Malformed` falls back to today's existing per-part labelled
+      delivery. Expiry (`take_expired`, fixed at 3 minutes — the one
+      `/speckit-clarify` question this batch's spec needed) piggybacks on
+      `LoopState::on_idle_tick`'s existing ~1s wakeup rather than a new
+      timer, flushing any held part individually, the same way a malformed
+      message already falls back. 12 new unit tests for `Reassembly` alone
+      (completion regardless of arrival order, two concurrent same-sender
+      messages never cross-contaminating, every malformed-input case,
+      idempotent retry, capacity eviction, expiry at/under/over the bound)
+      plus one composing it with `Dedupe` to pin the property
+      `handle_message` actually depends on.
+      **Recorded scope cut**: the modem-storage (circuit-switched) delivery
+      route is not yet wired into `Reassembly` — `sweep_modem_storage`
+      still delivers a multi-part message's parts individually, unchanged,
+      rather than calling `admit_part`. Wiring it in would mean weaving new
+      state through that route's own already-intricate cross-route claim/
+      relay/confirm coordination (`wait_for_resolution` and the rest of
+      specs/038's reliable-delivery machinery) — judged a separate, riskier
+      change from this batch's core scope rather than something to fold in
+      un-reviewed. The IMS `MESSAGE` route — the one `quickstart.md` can
+      actually verify live — is fully wired.
+      **Code-review fix (2026-08-28)**: the first landing put the expiry
+      flush in `run_modem_reader`'s own sweep loop, on the premise
+      (research.md Decision 8) that "this thread's own wakeup already
+      doubles as `Reassembly`'s expiry clock" — true only for a line with
+      a real modem. `wants_modem_sms_reader` never spawns that thread at
+      all for a `pcsc_reader` line, so a multi-part message buffered via
+      `handle_message` on such a line would never expire, only ever evicted
+      by `Reassembly`'s 64-entry capacity bound under an unrelated flood —
+      silently violating FR-013/SC-004 for that line type. Moved to
+      `LoopState::on_idle_tick`, which every line runs unconditionally
+      (both call and idle cadence), fixing the gap and, incidentally,
+      tightening the flush latency from ~20s to ~1s.
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`): 1393 lib tests
+plus every integration test suite, zero failures — re-verified after both
+code-review fixes above.
+
+**Not yet hardware-verified** — this batch has not been rebuilt and run
+against the real EC20 line. `specs/047-offerless-invite-sms-reassembly/quickstart.md`
+records the verification plan: SMS-05 is directly live-testable (send a
+long text from the user's own phone and confirm it arrives joined, not
+fragmented); SDP-04 is not — no carrier or device has been observed
+sending an offerless INVITE to this line across any prior hardware round
+in this whole review, so that path stays unit-test-only this round,
+consistent with every prior batch's treatment of its own least-observed
+scenarios.
 
 ## Hardware test log
 
