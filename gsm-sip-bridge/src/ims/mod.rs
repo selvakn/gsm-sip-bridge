@@ -39,6 +39,7 @@ mod gm_ipsec;
 pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
+mod rtcp;
 /// `pub` rather than private: `siptest` (specs/037-siptest-softphone,
 /// research.md R1) reuses RTP framing, the μ-law codec and the WAV writer
 /// rather than re-implementing them — the reasoning `digest` and

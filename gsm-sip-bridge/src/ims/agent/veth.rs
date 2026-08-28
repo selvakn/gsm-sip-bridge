@@ -136,6 +136,7 @@ pub(super) fn spawn_relay(
     meter: &crate::ims::media_stats::MediaMeter,
     carrier_dtmf_pt: Option<u8>,
     veth_dtmf_pt: Option<u8>,
+    rtcp: Option<crate::ims::rtcp::CarrierRtcpBundle>,
 ) {
     let carrier_rx = meter.carrier_rx_counter();
     let pbx_rx = meter.pbx_rx_counter();
@@ -148,6 +149,7 @@ pub(super) fn spawn_relay(
             pbx_rx,
             carrier_dtmf_pt,
             veth_dtmf_pt,
+            rtcp,
         )
     });
 }
@@ -165,6 +167,7 @@ pub(super) fn spawn_relay(
 /// picks its `telephone-event` payload type independently, so "both legs
 /// agree" never held for it the way it does for the audio codec — see
 /// `forward`'s own relabeling.
+#[allow(clippy::too_many_arguments)]
 pub fn relay_rtp(
     carrier: UdpSocket,
     veth: UdpSocket,
@@ -173,6 +176,7 @@ pub fn relay_rtp(
     pbx_rx: Arc<std::sync::atomic::AtomicU64>,
     carrier_dtmf_pt: Option<u8>,
     veth_dtmf_pt: Option<u8>,
+    rtcp: Option<crate::ims::rtcp::CarrierRtcpBundle>,
 ) {
     let (carrier2, veth2, stop2) = match (carrier.try_clone(), veth.try_clone()) {
         (Ok(a2), Ok(b2)) => (a2, b2, stop.clone()),
@@ -183,6 +187,13 @@ pub fn relay_rtp(
     };
     let _ = carrier.set_read_timeout(Some(RELAY_POLL_INTERVAL));
     let _ = veth.set_read_timeout(Some(RELAY_POLL_INTERVAL));
+
+    // Which role each direction plays for RTCP (specs/046-rtcp-reporting):
+    // carrier→veth *receives* from the carrier, veth→carrier *sends*
+    // toward it. `None` on a call outside RTCP's scope (FR-023) or one
+    // that landed on tier 3 (no RTCP endpoint obtained).
+    let receiver_role = rtcp.as_ref().map(|b| b.receiver_role());
+    let sender_role = rtcp.as_ref().map(|b| b.sender_role());
 
     // Each direction counts what it *receives* at its source: the carrier→veth
     // thread counts downlink from the carrier, the veth→carrier thread counts
@@ -197,6 +208,7 @@ pub fn relay_rtp(
             carrier_dtmf_pt,
             veth_dtmf_pt,
             "carrier->veth",
+            receiver_role,
         )
     });
     let h2 = std::thread::spawn(move || {
@@ -208,6 +220,7 @@ pub fn relay_rtp(
             veth_dtmf_pt,
             carrier_dtmf_pt,
             "veth->carrier",
+            sender_role,
         )
     });
     let _ = h1.join();
@@ -238,6 +251,7 @@ fn forward(
     src_dtmf_pt: Option<u8>,
     dst_dtmf_pt: Option<u8>,
     direction: &'static str,
+    rtcp: Option<crate::ims::rtcp::RelayRtcpRole>,
 ) {
     let mut buf = [0u8; 2048];
     // Observability only (specs/044 RTP-04): an SSRC change is a legitimate
@@ -247,6 +261,11 @@ fn forward(
     // every packet can't turn this into a log line per packet (PR review,
     // 2026-08-27).
     let mut ssrc_tracker = crate::ims::rtp::SsrcTracker::new();
+    // Only meaningful when `rtcp` is `Receiver` — the pass-through relay
+    // only ever carries PCMU (module doc above), so its clock rate is
+    // fixed rather than threaded through as another parameter.
+    let media_start = std::time::Instant::now();
+    let clock_rate = crate::ims::sdp::NegotiatedCodec::Pcmu.sample_rate();
     while !stop.load(Ordering::Relaxed) {
         match src.recv(&mut buf) {
             Ok(n) => {
@@ -261,6 +280,28 @@ fn forward(
                             new_ssrc = new,
                             "RTP source SSRC changed mid-call"
                         );
+                    }
+                    match &rtcp {
+                        Some(crate::ims::rtcp::RelayRtcpRole::Receiver {
+                            tracker,
+                            ssrc: last_ssrc,
+                        }) => {
+                            if let Ok(mut t) = tracker.lock() {
+                                t.on_packet(
+                                    pkt.seq,
+                                    pkt.timestamp,
+                                    media_start.elapsed(),
+                                    clock_rate,
+                                );
+                            }
+                            if let Ok(mut s) = last_ssrc.lock() {
+                                *s = Some(ssrc);
+                            }
+                        }
+                        Some(crate::ims::rtcp::RelayRtcpRole::Sender(acc)) => {
+                            acc.record_sent(ssrc, pkt.payload.len() as u64, pkt.timestamp);
+                        }
+                        None => {}
                     }
                     if Some(payload_type) == src_dtmf_pt {
                         if let Some(dst_pt) = dst_dtmf_pt {
@@ -315,7 +356,7 @@ mod tests {
         let pbx_rx = meter.pbx_rx_counter();
         let handle = std::thread::spawn(move || {
             relay_rtp(
-                ims_side, veth_side, stop_clone, carrier_rx, pbx_rx, None, None,
+                ims_side, veth_side, stop_clone, carrier_rx, pbx_rx, None, None, None,
             )
         });
 
@@ -386,6 +427,7 @@ mod tests {
                 src_dtmf_pt,
                 dst_dtmf_pt,
                 "test",
+                None,
             )
         });
         src_send.send(packet).unwrap();
@@ -460,7 +502,9 @@ mod tests {
         let stop_clone = stop.clone();
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = std::thread::spawn(move || {
-            forward(src_recv, dst_send, stop_clone, counter, None, None, "test")
+            forward(
+                src_recv, dst_send, stop_clone, counter, None, None, "test", None,
+            )
         });
 
         src_send.send(&first).unwrap();

@@ -333,6 +333,7 @@ pub fn spawn_transcoding_relay(
     veth_codec: ChosenCodec,
     stop: Arc<AtomicBool>,
     meter: &super::media_stats::MediaMeter,
+    rtcp: Option<super::rtcp::CarrierRtcpBundle>,
 ) -> BridgeResult<()> {
     if carrier.codec == NegotiatedCodec::Pcmu && veth_codec.codec == NegotiatedCodec::Pcmu {
         return Err(BridgeError::Ims(
@@ -380,6 +381,12 @@ pub fn spawn_transcoding_relay(
     // thread counts uplink from the telephone leg.
     let carrier_rx = meter.carrier_rx_counter();
     let pbx_rx = meter.pbx_rx_counter();
+    // Which role each direction plays for RTCP (specs/046-rtcp-reporting):
+    // carrier→veth *receives* from the carrier, veth→carrier *sends*
+    // toward it. `None` on a call outside RTCP's scope (FR-023) or one
+    // that landed on tier 3 (no RTCP endpoint obtained).
+    let receiver_role = rtcp.as_ref().map(|b| b.receiver_role());
+    let sender_role = rtcp.as_ref().map(|b| b.sender_role());
     let stop_a = stop.clone();
     std::thread::spawn(move || {
         relay_direction(
@@ -393,6 +400,7 @@ pub fn spawn_transcoding_relay(
             "carrier->veth",
             stop_a,
             carrier_rx,
+            receiver_role,
         )
     });
     std::thread::spawn(move || {
@@ -407,6 +415,7 @@ pub fn spawn_transcoding_relay(
             "veth->carrier",
             stop,
             pbx_rx,
+            sender_role,
         )
     });
     Ok(())
@@ -449,8 +458,12 @@ fn relay_direction(
     direction: &'static str,
     stop: Arc<AtomicBool>,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    rtcp: Option<super::rtcp::RelayRtcpRole>,
 ) {
     let frame_samples = dst_codec.codec.frame_samples();
+    // Only meaningful when `rtcp` is `Receiver`.
+    let media_start = std::time::Instant::now();
+    let clock_rate = src_codec.codec.sample_rate();
     let mut sender = RtpSender::new(dst_codec.payload_type);
     // A DTMF event gets its own RtpSender (independent seq/timestamp run) —
     // see the loop body for why its timestamp cannot share the audio
@@ -482,6 +495,20 @@ fn relay_direction(
         // Count the packet only once it parses as RTP — a malformed datagram is
         // not audio that flowed, and counting it would mask a one-way call.
         super::media_stats::bump(&counter);
+
+        // specs/046-rtcp-reporting: every received packet counts toward
+        // sequence continuity and jitter regardless of payload type — a
+        // DTMF event legitimately shares the audio stream's sequence-number
+        // space (RFC 4733), so excluding it here would read as a spurious
+        // gap on every keypress.
+        if let Some(super::rtcp::RelayRtcpRole::Receiver { tracker, ssrc }) = &rtcp {
+            if let Ok(mut t) = tracker.lock() {
+                t.on_packet(pkt.seq, pkt.timestamp, media_start.elapsed(), clock_rate);
+            }
+            if let Ok(mut s) = ssrc.lock() {
+                *s = Some(pkt.ssrc);
+            }
+        }
 
         if let Some((previous, new)) = ssrc_tracker.note_and_should_log(pkt.ssrc) {
             tracing::info!(
@@ -538,9 +565,18 @@ fn relay_direction(
             let Some(payload) = encoder.encode(&frame) else {
                 continue;
             };
+            // Captured before `send()` advances them — this is the identity
+            // and RTP timestamp actually going out on this packet
+            // (specs/046-rtcp-reporting FR-002b: the transcoding path
+            // reports under its own minted SSRC).
+            let (send_ssrc, send_ts) = (sender.ssrc, sender.timestamp);
+            let payload_len = payload.len();
             if let Err(e) = sender.send(&dst, &payload, frame_samples as u32) {
                 tracing::warn!(error = %e, direction, "transcoding relay: send failed");
                 return;
+            }
+            if let Some(super::rtcp::RelayRtcpRole::Sender(acc)) = &rtcp {
+                acc.record_sent(send_ssrc, payload_len as u64, send_ts);
             }
         }
     }
@@ -677,6 +713,7 @@ mod tests {
             codec(NegotiatedCodec::L16, 96),
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .unwrap();
 
@@ -737,6 +774,7 @@ mod tests {
             codec(NegotiatedCodec::L16, 96),
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .unwrap();
 
@@ -779,6 +817,7 @@ mod tests {
             codec(NegotiatedCodec::L16, 96),
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .unwrap();
 
@@ -854,6 +893,7 @@ mod tests {
             codec(NegotiatedCodec::Pcmu, 0),
             Arc::new(AtomicBool::new(false)),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .is_err());
     }
@@ -875,6 +915,7 @@ mod tests {
             codec(NegotiatedCodec::L16, 96),
             stop,
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .expect("8k carrier to 16k veth must resample rather than be refused");
     }
@@ -900,6 +941,7 @@ mod tests {
             codec_with_dtmf(NegotiatedCodec::L16, 96, Some(101)),
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .unwrap();
 
@@ -974,6 +1016,7 @@ mod tests {
             codec(NegotiatedCodec::L16, 96),
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .unwrap();
 
@@ -1014,6 +1057,7 @@ mod tests {
             codec_with_dtmf(NegotiatedCodec::L16, 96, Some(101)),
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
+            None,
         )
         .unwrap();
 

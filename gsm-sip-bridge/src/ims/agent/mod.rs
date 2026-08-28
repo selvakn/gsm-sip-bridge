@@ -66,7 +66,7 @@ use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1619,6 +1619,13 @@ impl LoopState {
         // Attribute it before reporting; Agent B's own reason string still
         // drives the BYE for the finer detail.
         call.lifecycle.end(EndedBy::Pbx);
+        // Signal every relay/RTCP thread to stop *before* reading the
+        // figures they publish — `hangup_carrier` below sets this too, but
+        // only after the report already ran, which meant every call's
+        // "final" quality snapshot was taken while those threads were
+        // still live and could still be updating it (Greptile review,
+        // PR #66). Idempotent: setting it twice is harmless.
+        call.stop.store(true, Ordering::Relaxed);
         report_answered_call_ended(p.obs, &call);
         hangup_carrier(session, inbound, call, &end_reason);
         // The call is over; any maintenance held for it may now run.
@@ -1648,6 +1655,9 @@ impl LoopState {
              (not a caller hangup) — FR-011"
         );
         call.lifecycle.end(EndedBy::AttachmentLost);
+        // See the matching comment in `handle_pbx_hangup` — stop the media/
+        // RTCP threads before reading what they published, not after.
+        call.stop.store(true, Ordering::Relaxed);
         report_answered_call_ended(p.obs, &call);
         call::end_call_attachment_lost(session, call);
         self.maintenance.release();
@@ -1922,6 +1932,9 @@ impl LoopState {
             .expect("bye_response_if_unmatched returned None above, so it matched");
         // The carrier's BYE is the caller hanging up.
         call.lifecycle.end(EndedBy::Caller);
+        // See the matching comment in `handle_pbx_hangup` — stop the media/
+        // RTCP threads before reading what they published, not after.
+        call.stop.store(true, Ordering::Relaxed);
         report_answered_call_ended(p.obs, &call);
         handle_bye(sink, req, call);
         self.maintenance.release();

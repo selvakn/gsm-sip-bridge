@@ -4,6 +4,16 @@
 use crate::error::{BridgeError, BridgeResult};
 use std::net::{IpAddr, SocketAddr};
 
+/// The RTCP bandwidth this bridge's answer declares for active senders
+/// (`b=RS:`) and other receivers (`b=RR:`) — TS 26.114 §6.2.10's customary
+/// 3GPP defaults, in **bits per second** (RFC 3556 §2: unlike `b=AS:`,
+/// these two are not in kilobits/second). specs/046-rtcp-reporting's
+/// report cadence (`ims::rtcp::ReportSchedule`) derives its interval from
+/// [`RTCP_SR_BANDWIDTH_BPS`] so the declaration and the actual send rate
+/// agree by construction (FR-004).
+pub(crate) const RTCP_SR_BANDWIDTH_BPS: u32 = 800;
+pub(crate) const RTCP_RR_BANDWIDTH_BPS: u32 = 2400;
+
 const PCMU_PAYLOAD_TYPE: u8 = 0;
 /// Dynamic payload type (RFC 3551 §6: 96-127 range) chosen for AMR-WB —
 /// arbitrary but must match between the `a=rtpmap`/`a=fmtp` lines here and
@@ -349,6 +359,17 @@ pub struct SdpOffer {
     /// Every `m=` section in the offer other than the negotiated audio one,
     /// in original order (specs/043 SDP-01).
     pub other_media: Vec<DeclinedMedia>,
+    /// The audio section's explicit RTCP port (RFC 3605 `a=rtcp:<port>`),
+    /// when it names one. `None` on a missing, zero, or unparseable value —
+    /// parsed permissively, in keeping with this module's established
+    /// posture (see `proto` above): a bad value falls back to the RTP+1
+    /// convention (specs/046-rtcp-reporting FR-016) rather than failing the
+    /// offer. Only the port form is read; RFC 3605's optional address form
+    /// is not — the peer address is already known from the media
+    /// negotiation, and honouring a *different* address for RTCP would
+    /// contradict this bridge's own RTCP source-trust boundary
+    /// (`ims::rtcp::SourceGuard`).
+    pub rtcp: Option<u16>,
 }
 
 /// Parse an inbound SDP offer (the inverse of `build_offer`): the connection
@@ -363,6 +384,7 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     let mut fmtp: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
     let mut maxptime: Option<u32> = None;
     let mut proto = String::new();
+    let mut rtcp_port: Option<u16> = None;
     let mut session_direction = MediaDirection::default();
     let mut audio_direction: Option<MediaDirection> = None;
     let mut other_media: Vec<DeclinedMedia> = Vec::new();
@@ -463,6 +485,17 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
             rtpmap.insert(pt, (name.to_ascii_uppercase(), rate));
         } else if let Some(rest) = line.strip_prefix("a=maxptime:") {
             maxptime = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("a=rtcp:") {
+            // RFC 3605 §2.1: "<port>[ <nettype> <addrtype> <address>]" —
+            // only the port is read (see `SdpOffer::rtcp`'s doc comment).
+            // A missing, non-numeric, or zero value is not an error: it
+            // just means there's nothing to override the RTP+1 convention
+            // with (specs/046-rtcp-reporting FR-016).
+            rtcp_port = rest
+                .split_whitespace()
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .filter(|&p| p != 0);
         } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
             // "<pt> <params>"
             let mut parts = rest.splitn(2, ' ');
@@ -537,6 +570,7 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
         direction,
         proto,
         other_media,
+        rtcp: rtcp_port,
     })
 }
 
@@ -691,6 +725,7 @@ fn pick_offered(offer: &SdpOffer, codec: NegotiatedCodec) -> Option<&OfferedCode
 /// offer we can neither decode nor pass through isn't answerable. Returns the
 /// SDP body and the codec it selected, so the caller doesn't have to re-parse
 /// its own answer to know which one won.
+#[allow(clippy::too_many_arguments)]
 pub fn build_answer(
     local_ip: IpAddr,
     rtp_port: u16,
@@ -699,18 +734,27 @@ pub fn build_answer(
     amr_available: bool,
     wideband: bool,
     preference: AnswerPreference,
+    declared_rtcp_port: Option<u16>,
 ) -> BridgeResult<(String, ChosenCodec)> {
     let chosen =
         select_codec_with(offer, amr_available, wideband, preference).ok_or_else(|| {
             BridgeError::Ims("SDP offer has no codec this client can answer with".into())
         })?;
     Ok(build_answer_for(
-        local_ip, rtp_port, session_id, chosen, offer,
+        local_ip,
+        rtp_port,
+        session_id,
+        chosen,
+        offer,
+        declared_rtcp_port,
     ))
 }
 
 /// Build an SDP answer to Agent B's veth-link `offer`, choosing one codec per
-/// `select_veth_codec`.
+/// `select_veth_codec`. Never declares an `a=rtcp` port — RTCP reporting is
+/// scoped to the carrier leg only (specs/046-rtcp-reporting FR-023); this
+/// leg's `b=RS:`/`b=RR:` declaration stays unbacked, a deliberate residue
+/// recorded there as FR-023a, not an oversight here.
 pub fn build_veth_answer(
     local_ip: IpAddr,
     rtp_port: u16,
@@ -722,7 +766,7 @@ pub fn build_veth_answer(
         BridgeError::Ims("veth-link SDP offer has neither L16/16000 nor PCMU".into())
     })?;
     Ok(build_answer_for(
-        local_ip, rtp_port, session_id, chosen, offer,
+        local_ip, rtp_port, session_id, chosen, offer, None,
     ))
 }
 
@@ -730,12 +774,20 @@ pub fn build_veth_answer(
 /// payload-type number (RFC 3264 §6.1) and — for AMR — its own `a=fmtp`
 /// parameters verbatim rather than asserting our own: they describe how the
 /// *offerer* frames what it sends, which is not ours to change.
+///
+/// `declared_rtcp_port` states an explicit `a=rtcp:` (RFC 3605) only when
+/// `Some` — the tier-2 case from `ims::rtcp::bind_rtp_and_rtcp` where the
+/// RTP+1 convention wasn't available. `None` (tier 1's convention, or tier
+/// 3's no-RTCP-at-all) leaves the answer exactly as it was before this
+/// feature (specs/046-rtcp-reporting contract C-1.1/C-1.2/C-1.3) — the
+/// `b=AS:`/`b=RS:`/`b=RR:` lines below are unconditional either way.
 fn build_answer_for(
     local_ip: IpAddr,
     rtp_port: u16,
     session_id: u64,
     chosen: &OfferedCodec,
     offer: &SdpOffer,
+    declared_rtcp_port: Option<u16>,
 ) -> (String, ChosenCodec) {
     let addrtype = ip_addrtype(local_ip);
     let pt = chosen.payload_type;
@@ -826,6 +878,10 @@ fn build_answer_for(
         MediaDirection::SendRecv => "a=sendrecv\r\n",
     };
 
+    let rtcp_line = match declared_rtcp_port {
+        Some(port) => format!("a=rtcp:{port}\r\n"),
+        None => String::new(),
+    };
     let sdp = format!(
         "v=0\r\n\
          o=- {session_id} {session_id} IN {addrtype} {local_ip}\r\n\
@@ -834,9 +890,10 @@ fn build_answer_for(
          t=0 0\r\n\
          {before_lines}\
          m=audio {rtp_port} RTP/AVP {pt}{dtmf_pts}\r\n\
+         {rtcp_line}\
          b=AS:{as_kbps}\r\n\
-         b=RS:800\r\n\
-         b=RR:2400\r\n\
+         b=RS:{RTCP_SR_BANDWIDTH_BPS}\r\n\
+         b=RR:{RTCP_RR_BANDWIDTH_BPS}\r\n\
          {rtpmap_line}\
          {dtmf_lines}\
          a=ptime:20\r\n\
@@ -1279,6 +1336,7 @@ mod tests {
             true,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrWb);
@@ -1315,6 +1373,7 @@ mod tests {
             true,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
@@ -1347,6 +1406,7 @@ mod tests {
             true,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrNb);
@@ -1386,6 +1446,7 @@ mod tests {
             true,
             true,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(chosen.codec, NegotiatedCodec::AmrWb);
@@ -1415,6 +1476,7 @@ mod tests {
             true,
             true,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert!(sdp.contains("b=AS:49\r\n"), "AMR-WB rate, got: {sdp}");
@@ -1426,6 +1488,99 @@ mod tests {
             first_b < first_a,
             "b= must precede a= per RFC 4566 §5, got: {sdp}"
         );
+    }
+
+    // ---- specs/046-rtcp-reporting ---------------------------------------
+
+    #[test]
+    fn a_tier_one_or_tier_three_answer_is_byte_identical_to_no_rtcp_at_all() {
+        // Contract C-1.1/C-1.2/C-1.3: the answer must be exactly what it
+        // was before this feature whenever `declared_rtcp_port` is `None`
+        // (RTP+1 succeeded, or no RTCP endpoint could be obtained at all)
+        // — this is the common-path regression guard, and this project has
+        // already been burned once by a silent SDP answer change (see
+        // `SdpOffer::dtmf`'s own doc comment).
+        let offer = offer_of(&[(0, "PCMU/8000")]);
+        let (with_none, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            false,
+            AnswerPreference::legacy(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !with_none.contains("a=rtcp:"),
+            "no a=rtcp line when no port is declared, got: {with_none}"
+        );
+        assert!(with_none.contains("b=RS:800\r\n"));
+        assert!(with_none.contains("b=RR:2400\r\n"));
+    }
+
+    #[test]
+    fn a_tier_two_answer_adds_exactly_one_declared_rtcp_line() {
+        let offer = offer_of(&[(0, "PCMU/8000")]);
+        let (with_declared, _) = build_answer(
+            "10.0.0.2".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            false,
+            AnswerPreference::legacy(),
+            Some(40001),
+        )
+        .unwrap();
+        assert_eq!(
+            with_declared.matches("a=rtcp:").count(),
+            1,
+            "exactly one a=rtcp line, got: {with_declared}"
+        );
+        assert!(with_declared.contains("a=rtcp:40001\r\n"));
+        // Still unconditional (FR-017/FR-022) regardless of tier.
+        assert!(with_declared.contains("b=RS:800\r\n"));
+        assert!(with_declared.contains("b=RR:2400\r\n"));
+    }
+
+    #[test]
+    fn build_veth_answer_never_declares_an_rtcp_port() {
+        // FR-023a: the internal veth leg keeps its own unbacked b=RS/b=RR
+        // declaration and never gains an a=rtcp line — RTCP reporting is
+        // scoped to the carrier leg only.
+        let offer = offer_of(&[(0, "PCMU/8000")]);
+        let (sdp, _) =
+            build_veth_answer("10.0.0.2".parse().unwrap(), 40000, 1, &offer, false).unwrap();
+        assert!(!sdp.contains("a=rtcp:"));
+    }
+
+    #[test]
+    fn parse_offer_reads_an_explicit_rtcp_port() {
+        let body = "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                    m=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                    a=rtcp:30001\r\n";
+        let offer = parse_offer(body).unwrap();
+        assert_eq!(offer.rtcp, Some(30001));
+    }
+
+    #[test]
+    fn parse_offer_treats_a_zero_or_unparseable_rtcp_port_as_absent() {
+        for line in ["a=rtcp:0\r\n", "a=rtcp:notaport\r\n", "a=rtcp:\r\n"] {
+            let body = format!(
+                "v=0\r\nc=IN IP4 10.0.0.1\r\n\
+                 m=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n{line}"
+            );
+            let offer = parse_offer(&body).unwrap();
+            assert_eq!(offer.rtcp, None, "line {line:?} must not yield a port");
+        }
+    }
+
+    #[test]
+    fn parse_offer_with_no_rtcp_line_leaves_it_absent() {
+        let offer = offer_of(&[(0, "PCMU/8000")]);
+        assert_eq!(offer.rtcp, None);
     }
 
     #[test]
@@ -1448,6 +1603,7 @@ mod tests {
             true,
             true,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert!(sdp.contains("a=maxptime:240\r\n"), "got: {sdp}");
@@ -1464,6 +1620,7 @@ mod tests {
             false,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert!(!sdp.contains("maxptime"));
@@ -1493,6 +1650,7 @@ mod tests {
             false,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1516,6 +1674,7 @@ mod tests {
             false,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert!(sdp.contains("m=audio 40000 RTP/AVP 0\r\n"));
@@ -1538,6 +1697,7 @@ mod tests {
             false,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .is_err());
     }
@@ -1570,6 +1730,7 @@ mod tests {
             true,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::Pcmu);
@@ -1593,6 +1754,7 @@ mod tests {
             true,
             false,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrWb);
@@ -1614,6 +1776,7 @@ mod tests {
             false,
             false,
             AnswerPreference::legacy(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -1631,6 +1794,7 @@ mod tests {
             true,
             false,
             AnswerPreference::legacy(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -1650,6 +1814,7 @@ mod tests {
             true,
             true,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrWb);
@@ -1670,6 +1835,7 @@ mod tests {
             true,
             true,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::Pcmu);
@@ -1690,6 +1856,7 @@ mod tests {
             true,
             true,
             AnswerPreference::legacy(),
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::AmrNb);
@@ -1811,6 +1978,7 @@ mod tests {
             false,
             false,
             AnswerPreference::Legacy,
+            None,
         )
         .unwrap();
         assert_eq!(codec.codec, NegotiatedCodec::Pcmu);
@@ -1845,6 +2013,7 @@ mod tests {
             false,
             false,
             AnswerPreference::Legacy,
+            None,
         )
         .unwrap();
         assert!(sdp.contains("a=recvonly\r\n"), "{sdp}");
@@ -1863,6 +2032,7 @@ mod tests {
             false,
             false,
             AnswerPreference::Legacy,
+            None,
         )
         .unwrap();
         assert!(sdp.contains("a=sendonly\r\n"), "{sdp}");
@@ -1880,6 +2050,7 @@ mod tests {
             false,
             false,
             AnswerPreference::Legacy,
+            None,
         )
         .unwrap();
         assert!(sdp.contains("a=inactive\r\n"), "{sdp}");
@@ -1900,6 +2071,7 @@ mod tests {
                 false,
                 false,
                 AnswerPreference::Legacy,
+                None,
             )
             .unwrap();
             assert!(sdp.contains("a=sendrecv\r\n"), "{sdp}");
@@ -1925,6 +2097,7 @@ mod tests {
             false,
             false,
             AnswerPreference::Legacy,
+            None,
         )
         .unwrap();
         assert!(sdp.contains("a=recvonly\r\n"), "{sdp}");

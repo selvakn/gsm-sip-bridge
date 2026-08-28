@@ -399,15 +399,13 @@ today, across all three relay call sites and both relay implementations —
 a materially larger and riskier undertaking than anything else in this
 review so far.
 
-- [ ] **RTP-01** — no RTCP sent or received, while its bandwidth is
-      declared. **Deferred, not landed** — see
-      `specs/044-complete-media-contract/research.md` Decision 1 for the
-      full reasoning. Removing the `b=RS:`/`b=RR:` declaration was also
-      considered and rejected: it would trade the RTP-01 gap for a
-      regression against the TS 26.114 §6.2.10 mandate those lines exist
-      to satisfy. Tracked here as its own future feature, to be scoped
-      properly (new sockets, octet counters, SSRC persistence, teardown
-      hooks) rather than bolted onto this batch.
+- [x] **RTP-01** — no RTCP sent or received, while its bandwidth is
+      declared. **Deferred out of batch 5** — see
+      `specs/044-complete-media-contract/research.md` Decision 1.
+      **Landed in batch 7** (`specs/046-rtcp-reporting/`), scoped by
+      explicit decision to the **carrier-facing leg of answered calls
+      only** — see that batch's own entry below for what shipped and what
+      remains a deliberate residue (FR-023a).
 - [x] **RTP-03** — pass-through relay forwards telephone-event under the
       wrong PT.
       **Landed**: `agent::veth::forward` now reads each packet's payload
@@ -435,9 +433,10 @@ review so far.
       mid-stream SSRC change on each relay path still delivers every
       packet; a stream's first packet is never itself logged as a change.
 - [x] **SDP-06** — `a=rtcp` and the offer's `ptime` are discarded.
-      **Split**: the `a=rtcp` half is deferred alongside RTP-01 (it exists
-      only to support RTP-01 — an explicit RTCP port has nothing to
-      consume without real RTCP). The `ptime` half **landed**, but not as
+      **Split**: the `a=rtcp` half was deferred alongside RTP-01 out of
+      batch 5 (an explicit RTCP port had nothing to consume without real
+      RTCP) and **landed in batch 7** alongside it — see that batch's own
+      entry below. The `ptime` half **landed** here in batch 5, but not as
       originally planned: the intended fix (echo the offer's `ptime` into
       the answer, mirroring `maxptime`) turned out, on inspection, to be
       wrong — an offer's `ptime` describes what *the offer's own owner*
@@ -617,6 +616,90 @@ doesn't provide a mismatched `P-Asserted-Identity`, a non-default `Via`
 sent-by, or a non-SDP body to test against) — all remain covered by unit
 tests only, consistent with this review's established posture for its
 least-observed findings.
+
+## Batch 7 — RTCP reporting on the carrier leg (landed 2026-08-27, pending hardware round)
+
+Full spec/plan/tasks trail: `specs/046-rtcp-reporting/`. Closes the two
+findings batch 5 deferred, scoped by explicit decision during
+`/speckit-clarify` to the **carrier-facing leg of answered calls only**
+(FR-023) — the internal veth leg and the originated-call path are
+untouched, both deliberately, both recorded rather than silently
+implied closed.
+
+- [x] **RTP-01** — no RTCP sent or received, while its bandwidth is
+      declared. **Landed**: a new `ims::rtcp` module implements RFC 3550
+      SR/RR/SDES/BYE build and parse, a two-party report cadence derived
+      from the declared `b=RS:800` (no member counting or timer
+      reconsideration — FR-004b), and a per-call thread that sends
+      periodic compound reports, reads the far end's, and sends a BYE on
+      teardown. Two findings from batch 5's own deferral note turned out
+      cheaper than expected on inspection (`research.md` Decisions 2 and
+      3): no teardown call site needed to change at all — the RTCP thread
+      owns its socket and sends its own BYE on observing the shared `stop`
+      flag, after the caller has already returned — and no new timer was
+      needed, since the thread's existing socket read-timeout already
+      doubles as its clock. `ims::media_stats` gained `SendAccounting`
+      (cumulative packets/octets/SSRC toward the carrier, mirroring
+      `MediaMeter`'s existing per-counter design) and a
+      `highest_extended_seq` accessor on the pre-existing `ReceiveTracker`
+      — reused as-is otherwise, unifying US2's "far end's view" and US3's
+      "our own receive quality" onto the codebase's one existing,
+      already-tested loss/jitter implementation instead of a second one.
+      Both relay implementations (`agent::veth::forward` pass-through,
+      `transcode::relay_direction` transcoding) publish into the same
+      per-call bundle, so a call takes either path with identical RTCP
+      behaviour. Figures reach both the existing end-of-call log line and
+      a new `ObservedEvent::MediaQuality`/`RtcpUnavailable` pair on the
+      control protocol, feeding three new Prometheus histograms/counter
+      (`gsm_sip_bridge_rtp_loss_percent`, `..._jitter_seconds`,
+      `..._round_trip_seconds`, `..._rtcp_unavailable_total`).
+      **One correction made during implementation**: the plan's own tasks
+      described routing the far end's report *only* from a Receiver
+      Report, treating a Sender Report as ignorable. That would have
+      silently missed the report block on any real two-way call where the
+      carrier is also transmitting audio (and therefore sending its own
+      SR, not an RR) — RFC 3550 places receiver info in either packet
+      type. Fixed to route a report block addressed to this bridge's own
+      SSRC out of *either* wrapper; a dedicated test
+      (`handle_inbound_item_routes_a_matching_block_from_either_sr_or_rr`)
+      pins it.
+      **Ruled out**: RFC 3550 §6.3's full multiparty scheduling (member
+      counting, timer reconsideration) — every session here is two-party
+      by construction; precise per-interval `fraction_lost`/LSR/DLSR in
+      the report block this bridge *sends* — approximated honestly
+      (cumulative loss fraction, `lsr=0` meaning "not yet correlated",
+      both legal RFC 3550 values) rather than either fabricated or built
+      out with full symmetric SR-tracking, which the finding's actual
+      conformance obligation doesn't require.
+- [x] **SDP-06** (`a=rtcp` half) — an offer's explicit RTCP port
+      attribute was discarded. **Landed**: `SdpOffer` gained
+      `rtcp: Option<u16>`, parsed permissively (a missing, zero, or
+      unparseable value falls back to the RTP+1 convention rather than
+      erroring the offer). The answer's own RTCP port follows a three-tier
+      strategy — RTP+1 by convention (the answer stays byte-identical to
+      before this feature — pinned by
+      `a_tier_one_or_tier_three_answer_is_byte_identical_to_no_rtcp_at_all`,
+      guarding against the exact class of SDP-answer regression this
+      project has been burned by before), an ephemeral port declared via
+      `a=rtcp:` when RTP+1 isn't available, or no RTCP at all with the
+      shortfall surfaced as a warning and a metric rather than an altered
+      answer (resolving a contradiction the spec's own first draft had
+      between "don't claim RTCP you can't provide" and "the `b=` lines
+      never change" — the clarification session caught it before planning
+      started).
+
+All landed code: `make format && make lint && make test` clean (whole
+workspace, including test targets, clippy `-D warnings`). 44 new unit
+tests across `ims::rtcp` (25), `ims::sdp` (6 new), `ims::media_stats` (3
+new), plus the existing relay/call-site tests extended in place rather
+than duplicated.
+
+**Not yet hardware-verified** — this batch has not been rebuilt and run
+against the real EC20 line. `specs/046-rtcp-reporting/quickstart.md`
+records the verification plan; in particular, whether the carrier
+actually sends RTCP receiver reports back is unknown until that round
+runs, and is flagged there as itself a finding to record either way, not
+an assumption to build on.
 
 ## Hardware test log
 

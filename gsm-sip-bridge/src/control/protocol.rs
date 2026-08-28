@@ -192,6 +192,36 @@ pub enum ObservedEvent {
     OutboundAttempt {
         outcome: OutboundAttemptOutcome,
     },
+    /// A call's RTCP-derived or receive-side media quality, for one
+    /// `source` (specs/046-rtcp-reporting FR-008a). Sent once per source
+    /// at call teardown, never per-report — the label set stays a closed
+    /// enum with no per-call value (`source` only), per this type's own
+    /// cardinality rule stated above.
+    MediaQuality {
+        source: QualitySource,
+        loss_percent: f64,
+        jitter_seconds: f64,
+        /// `None` when not derivable for this source (e.g. `Local` never
+        /// has one — round-trip time is inherently a property of what the
+        /// *far end* reported about us).
+        round_trip_seconds: Option<f64>,
+    },
+    /// A call proceeded with no RTCP endpoint obtainable at all (tier 3 of
+    /// `ims::rtcp::bind_rtp_and_rtcp`) — media still carried the call
+    /// (specs/046-rtcp-reporting SC-006), but this is the visibility
+    /// FR-017a requires so that shortfall doesn't read as a healthy,
+    /// silently RTCP-less bridge.
+    RtcpUnavailable,
+}
+
+/// Whose view of the call [`ObservedEvent::MediaQuality`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualitySource {
+    /// This bridge's own measurement of what it received from the carrier.
+    Local,
+    /// What the carrier's own RTCP reports said it received from us.
+    Remote,
 }
 
 /// Mirrors `sip::outbound::OutboundOutcome`'s label set exactly

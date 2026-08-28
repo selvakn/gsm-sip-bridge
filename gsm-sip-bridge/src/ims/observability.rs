@@ -174,6 +174,33 @@ impl AgentObservability {
         }
     }
 
+    /// Reports one source's media-quality figures for a just-ended call
+    /// (specs/046-rtcp-reporting FR-008a) — call once per source that
+    /// actually has something to report; a source that never produced any
+    /// figures (the far end never sent RTCP, or no media was received at
+    /// all) is simply not reported, rather than reported as zero (FR-009's
+    /// "never reported" distinction, carried through to the metrics
+    /// surface as well as the log line).
+    pub fn report_media_quality(
+        &self,
+        source: crate::control::protocol::QualitySource,
+        loss_percent: f64,
+        jitter_seconds: f64,
+        round_trip_seconds: Option<f64>,
+    ) {
+        self.push(vec![ObservedEvent::MediaQuality {
+            source,
+            loss_percent,
+            jitter_seconds,
+            round_trip_seconds,
+        }]);
+    }
+
+    /// A call proceeded with no RTCP endpoint obtainable at all (FR-017a).
+    pub fn report_rtcp_unavailable(&self) {
+        self.push(vec![ObservedEvent::RtcpUnavailable]);
+    }
+
     fn insert_call_row(
         &self,
         caller: &str,

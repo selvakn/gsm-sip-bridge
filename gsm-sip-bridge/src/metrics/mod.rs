@@ -502,6 +502,62 @@ pub static OBSERVABILITY_EVENTS_DROPPED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// --- RTCP-derived media quality (specs/046-rtcp-reporting, RTP-01) --------
+
+/// Loss percentage per call, labelled by `source` (`"local"`: this
+/// bridge's own measurement of the carrier leg; `"remote"`: what the
+/// carrier's own RTCP reports said it observed of us) — never per-call or
+/// per-caller, keeping cardinality bounded the same way every other
+/// `ObservedEvent` variant already does (see that type's own doc comment).
+pub static RTP_LOSS_PERCENT: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "gsm_sip_bridge_rtp_loss_percent",
+        "RTCP-reported or locally-measured packet loss percentage per call",
+        &["module", "source"],
+        vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+    )
+    .unwrap()
+});
+
+pub static RTP_JITTER_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "gsm_sip_bridge_rtp_jitter_seconds",
+        "RFC 3550 interarrival jitter per call, RTCP-reported or locally measured",
+        &["module", "source"],
+        vec![0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+    )
+    .unwrap()
+});
+
+/// No `source` label: round-trip time is inherently the far end's report
+/// about us, not something this bridge separately measures of itself.
+pub static RTP_ROUND_TRIP_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "gsm_sip_bridge_rtp_round_trip_seconds",
+        "RTCP-derived round-trip time per call, where the far end's reports allow deriving one",
+        &["module"],
+        vec![0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+    )
+    .unwrap()
+});
+
+/// A call that proceeded with no RTCP endpoint at all (tier 3 of
+/// `ims::rtcp::bind_rtp_and_rtcp`) — media still carried the call (SC-006),
+/// but the conformance obligation this feature closes went unmet for that
+/// one call. Should stay at or near zero; a rising rate means the RTP+1
+/// convention and the ephemeral-port fallback are both failing routinely,
+/// which is itself worth alerting on.
+pub static RTCP_UNAVAILABLE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_rtcp_unavailable_total",
+            "Calls that proceeded with no RTCP endpoint obtainable at all"
+        ),
+        &["module"]
+    )
+    .unwrap()
+});
+
 pub fn register_build_info() {
     BUILD_INFO
         .with_label_values(&[

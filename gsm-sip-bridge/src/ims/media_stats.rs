@@ -9,9 +9,9 @@
 //! without a modem, a SIM or a carrier — unusually for this project, and the
 //! reason the plan front-loads it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Counts RTP packets in each direction of a bridged call's carrier leg so a
 /// call that ended can be judged both-ways or one-way (FR-017) — the same
@@ -64,6 +64,82 @@ impl MediaMeter {
     /// `ReceiveOnly`.
     pub fn verdict(&self, threshold_percent: u8) -> DirectionVerdict {
         verdict(self.pbx_rx(), self.carrier_rx(), threshold_percent)
+    }
+}
+
+/// Send-side accounting for RTCP sender reports (specs/046-rtcp-reporting,
+/// RTP-01): cumulative packets/octets actually transmitted toward the
+/// carrier, plus the most recently sent RTP timestamp and when it was
+/// observed, published by whichever relay direction is doing the sending.
+/// Lock-free on the hot path, mirroring [`MediaMeter`]'s own
+/// `Arc<AtomicU64>`-per-counter shape — the same concurrent-writer,
+/// occasional-reader problem, with an SSRC and a timestamp anchor added.
+#[derive(Clone, Default)]
+pub struct SendAccounting {
+    packets: Arc<AtomicU64>,
+    octets: Arc<AtomicU64>,
+    ssrc: Arc<AtomicU32>,
+    /// `false` until the first packet is sent — `0` is itself a legal
+    /// SSRC, so it can't double as "unset" (specs/046 FR-005/C-2.7).
+    ssrc_known: Arc<AtomicBool>,
+    last_rtp: Arc<Mutex<Option<(u32, Instant)>>>,
+}
+
+/// A consistent read of [`SendAccounting`] at one moment — never returned
+/// before the first packet has been sent (see `ssrc_known` above).
+#[derive(Debug, Clone, Copy)]
+pub struct SendSnapshot {
+    pub packets: u64,
+    pub octets: u64,
+    pub ssrc: u32,
+    pub last_rtp_timestamp: u32,
+    pub last_rtp_at: Instant,
+}
+
+impl SendAccounting {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one packet actually sent toward the carrier. `ssrc` is
+    /// whatever identity is really on that packet — a bridge-minted one on
+    /// the transcoding path, the forwarded source's own on the
+    /// pass-through path (specs/046 FR-002b) — so it may legitimately
+    /// change between calls to this method; the latest value always wins,
+    /// which is what lets a mid-call source restart (FR-002a) show up
+    /// correctly in the next report. `payload_octets` excludes the RTP
+    /// header, per RFC 3550 §6.4.1's own definition of a sender's octet
+    /// count.
+    pub fn record_sent(&self, ssrc: u32, payload_octets: u64, rtp_timestamp: u32) {
+        self.packets.fetch_add(1, Ordering::Relaxed);
+        self.octets.fetch_add(payload_octets, Ordering::Relaxed);
+        self.ssrc.store(ssrc, Ordering::Relaxed);
+        self.ssrc_known.store(true, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_rtp.lock() {
+            *last = Some((rtp_timestamp, Instant::now()));
+        }
+    }
+
+    /// `None` until the first [`Self::record_sent`] — there is no source
+    /// identity yet to report a sender report under (FR-005/C-2.7), so the
+    /// caller should send a receiver report instead.
+    pub fn snapshot(&self) -> Option<SendSnapshot> {
+        if !self.ssrc_known.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (last_rtp_timestamp, last_rtp_at) = self
+            .last_rtp
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or((0, Instant::now()));
+        Some(SendSnapshot {
+            packets: self.packets.load(Ordering::Relaxed),
+            octets: self.octets.load(Ordering::Relaxed),
+            ssrc: self.ssrc.load(Ordering::Relaxed),
+            last_rtp_timestamp,
+            last_rtp_at,
+        })
     }
 }
 
@@ -270,6 +346,16 @@ impl ReceiveTracker {
             },
         }
     }
+
+    /// RFC 3550 §6.4.1's own "extended highest sequence number received" —
+    /// cycles in the upper 16 bits, the highest sequence number seen in
+    /// the lower 16, which is exactly what this tracker's internal
+    /// extended counter already is. `None` before the first packet
+    /// (specs/046-rtcp-reporting: needed for the receiver block this
+    /// bridge includes in its own outgoing RTCP).
+    pub fn highest_extended_seq(&self) -> Option<u32> {
+        self.base_extended.map(|_| self.highest_extended as u32)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +364,42 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    // ---- send accounting -----------------------------------------------
+
+    #[test]
+    fn snapshot_is_none_before_anything_is_sent() {
+        let acc = SendAccounting::new();
+        assert!(acc.snapshot().is_none());
+    }
+
+    #[test]
+    fn two_sends_accumulate_both_counters() {
+        let acc = SendAccounting::new();
+        acc.record_sent(0xAAAA, 160, 320);
+        acc.record_sent(0xAAAA, 160, 640);
+        let snap = acc.snapshot().unwrap();
+        assert_eq!(snap.packets, 2);
+        assert_eq!(snap.octets, 320);
+        assert_eq!(snap.ssrc, 0xAAAA);
+        assert_eq!(snap.last_rtp_timestamp, 640);
+    }
+
+    #[test]
+    fn ssrc_updates_to_whatever_was_most_recently_sent() {
+        // The pass-through path publishes the *observed* SSRC on every
+        // packet, so a mid-call source restart must show up immediately
+        // (specs/046 FR-002a) rather than sticking to the first value seen.
+        let acc = SendAccounting::new();
+        acc.record_sent(1, 100, 0);
+        acc.record_sent(2, 100, 100);
+        let snap = acc.snapshot().unwrap();
+        assert_eq!(snap.ssrc, 2);
+        assert_eq!(
+            snap.packets, 2,
+            "counts must not reset across an SSRC change"
+        );
     }
 
     // ---- media meter -------------------------------------------------------
@@ -501,5 +623,15 @@ mod tests {
 
         assert_eq!(s, ReceiveStats::default());
         assert_eq!(s.loss_percent(), 0.0);
+    }
+
+    #[test]
+    fn highest_extended_seq_is_none_before_any_packet_then_tracks_the_highest_seen() {
+        let mut t = ReceiveTracker::new();
+        assert_eq!(t.highest_extended_seq(), None);
+        for i in [0u16, 1, 2, 5, 4] {
+            t.on_packet(i, 0, ms(0), 0);
+        }
+        assert_eq!(t.highest_extended_seq(), Some(5));
     }
 }

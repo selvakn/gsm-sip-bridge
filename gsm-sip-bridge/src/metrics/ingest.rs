@@ -13,7 +13,7 @@ use crate::alerts::discord::DiscordClient;
 use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKind};
 use crate::config::AlertsConfig;
 use crate::control::protocol::{
-    AgentKind, AgentReport, AgentState, CallStatus, ObservedEvent, SmsOutcome,
+    AgentKind, AgentReport, AgentState, CallStatus, ObservedEvent, QualitySource, SmsOutcome,
 };
 use crate::metrics;
 use std::collections::HashMap;
@@ -603,6 +603,33 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
         ObservedEvent::OutboundAttempt { outcome } => {
             metrics::OUTBOUND_ATTEMPTS_TOTAL
                 .with_label_values(&[outcome.as_str()])
+                .inc();
+        }
+        ObservedEvent::MediaQuality {
+            source,
+            loss_percent,
+            jitter_seconds,
+            round_trip_seconds,
+        } => {
+            let source_str = match source {
+                QualitySource::Local => "local",
+                QualitySource::Remote => "remote",
+            };
+            metrics::RTP_LOSS_PERCENT
+                .with_label_values(&[module_id, source_str])
+                .observe(*loss_percent);
+            metrics::RTP_JITTER_SECONDS
+                .with_label_values(&[module_id, source_str])
+                .observe(*jitter_seconds);
+            if let Some(rtt) = round_trip_seconds {
+                metrics::RTP_ROUND_TRIP_SECONDS
+                    .with_label_values(&[module_id])
+                    .observe(*rtt);
+            }
+        }
+        ObservedEvent::RtcpUnavailable => {
+            metrics::RTCP_UNAVAILABLE_TOTAL
+                .with_label_values(&[module_id])
                 .inc();
         }
     }
