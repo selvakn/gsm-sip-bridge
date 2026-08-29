@@ -35,14 +35,14 @@ dependencies = [
 
 [[package]]
 name = "amr-safe"
-version = "8.15.0"
+version = "8.15.1"
 dependencies = [
  "amr-sys",
 ]
 
 [[package]]
 name = "amr-sys"
-version = "8.15.0"
+version = "8.15.1"
 dependencies = [
  "pkg-config",
 ]
@@ -693,7 +693,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gsm-sip-bridge"
-version = "8.15.0"
+version = "8.15.1"
 dependencies = [
  "alsa",
  "amr-safe",
@@ -1415,7 +1415,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pjsua-safe"
-version = "8.15.0"
+version = "8.15.1"
 dependencies = [
  "libc",
  "pjsua-sys",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "pjsua-sys"
-version = "8.15.0"
+version = "8.15.1"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -1961,7 +1961,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siptest"
-version = "8.15.0"
+version = "8.15.1"
 dependencies = [
  "axum",
  "clap",

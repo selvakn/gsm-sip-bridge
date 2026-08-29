@@ -5,6 +5,8 @@
      "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
+## v8.15.1
+
 - **An inbound call routed to a PBX/trunk with no fixed extension configured now identifies which line it came in on, not who called.** `[bridge].sip_destination` empty used to dial the *external caller's own number* at the PBX as its DID-passthrough fallback — useless for telling lines apart on a deployment where several GSM lines share one SIP trunk. It now dials *this line's own* SIM-read number instead (falling back to the caller's DID only when no SIM number is known yet); the caller's identity is unaffected, since it already reaches the PBX separately via `P-Asserted-Identity`/`X-GSM-Caller-ID`. SIP server mode has no per-line Request-URI to repurpose this way (the destination there must stay the registered phone's real contact), so it instead gets a new `P-Called-Party-ID` header carrying the line's number. Applies to both the circuit-switched and VoWiFi/VoLTE inbound paths. No configuration change.
 
 ## v8.15.0
