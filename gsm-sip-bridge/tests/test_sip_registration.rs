@@ -140,12 +140,27 @@ fn test_sip_bridge_registers_normally_when_cs_enabled_is_left_at_default() {
     assert_eq!(bridge.state, RegistrationState::Registered);
 }
 
+/// With no line number known yet (e.g. the SIM's `AT+CNUM` has not resolved),
+/// there is nothing else to dial but the caller's own DID.
 #[test]
-fn test_compute_destination_uri_did_passthrough() {
+fn test_compute_destination_uri_falls_back_to_caller_did_with_no_line_number() {
     let config = test_config();
     let bridge = SipBridge::new(&config);
-    let uri = bridge.compute_destination_uri("+15551234567").unwrap();
+    let uri = bridge.compute_destination_uri("+15551234567", "").unwrap();
     assert_eq!(uri, "sip:15551234567@127.0.0.1:5060");
+}
+
+/// Empty `sip_destination` means DID passthrough — but of *this line's own*
+/// number, not the caller's, so a PBX fed by several GSM lines can tell them
+/// apart.
+#[test]
+fn test_compute_destination_uri_passes_the_lines_own_number_through() {
+    let config = test_config();
+    let bridge = SipBridge::new(&config);
+    let uri = bridge
+        .compute_destination_uri("+15551234567", "+919000000009")
+        .unwrap();
+    assert_eq!(uri, "sip:919000000009@127.0.0.1:5060");
 }
 
 #[test]
@@ -168,7 +183,9 @@ sip_destination = "100"
 
     let config = load_config(f.path()).unwrap();
     let bridge = SipBridge::new(&config);
-    let uri = bridge.compute_destination_uri("+15559999999").unwrap();
+    let uri = bridge
+        .compute_destination_uri("+15559999999", "+919000000009")
+        .unwrap();
     assert_eq!(uri, "sip:100@pbx.local:5060");
 }
 
@@ -231,7 +248,7 @@ fn server_mode_has_no_destination_until_a_phone_registers() {
     bridge.register().expect("server mode must start");
 
     let err = bridge
-        .compute_destination_uri("+15551234567")
+        .compute_destination_uri("+15551234567", "")
         .expect_err("nothing is registered yet");
     assert!(err.contains("1001"), "got: {err}");
 
@@ -281,7 +298,7 @@ password = "s3cret"
              {inbound}"
         );
         assert!(
-            bridge.compute_destination_uri("+15551234567").is_err(),
+            bridge.compute_destination_uri("+15551234567", "").is_err(),
             "and it must not claim it can route a call: {inbound}"
         );
     }

@@ -352,7 +352,11 @@ impl SipBridge {
     ///
     /// Fallible because in server mode the phone may not be registered — the
     /// PBX case still cannot fail.
-    pub fn compute_destination_uri(&self, caller_did: &str) -> Result<String, String> {
+    pub fn compute_destination_uri(
+        &self,
+        caller_did: &str,
+        line_number: &str,
+    ) -> Result<String, String> {
         let target = match &self.bindings {
             Some(bindings) => target::CallTarget::RegisteredPhone {
                 bindings,
@@ -374,6 +378,7 @@ impl SipBridge {
                 server: &self.config.server,
                 port: self.config.port,
                 sip_destination: &self.config.sip_destination,
+                line_number,
             },
         };
         target.uri_for(caller_did, std::time::Instant::now())
@@ -421,7 +426,12 @@ impl SipBridge {
         Ok(())
     }
 
-    pub fn make_call(&mut self, dest_uri: &str, gsm_caller_id: &str) -> Result<(), String> {
+    pub fn make_call(
+        &mut self,
+        dest_uri: &str,
+        gsm_caller_id: &str,
+        line_number: &str,
+    ) -> Result<(), String> {
         // `active_call` is one field for the whole bridge, not one per
         // modem — a pre-existing simplification (predates spec 025) that a
         // true multi-modem-concurrent-call design would need to revisit on
@@ -471,6 +481,23 @@ impl SipBridge {
             pai_value = format!("\"{}\" <tel:{}>", gsm_caller_id, gsm_caller_id);
             headers.push(("P-Asserted-Identity", &pai_value));
             headers.push(("X-GSM-Caller-ID", gsm_caller_id));
+        }
+
+        // SIP server mode has no per-line Request-URI to carry this line's
+        // own number the way trunk mode's PBX-destination fallback does —
+        // the destination there is always the registered phone's real
+        // contact, since that is what actually routes the INVITE to it. So
+        // the multi-line-identification signal moves to a header instead:
+        // `P-Called-Party-ID` is the header ITSPs/PBXes already use for "the
+        // DID that was actually dialled" when several numbers ring the same
+        // phone.
+        let pcpid_value;
+        if self.bindings.is_some() && !line_number.is_empty() {
+            pcpid_value = format!(
+                "<{}>",
+                self.config.sip_server.caller_identity_uri(line_number)
+            );
+            headers.push(("P-Called-Party-ID", &pcpid_value));
         }
 
         let call = Call::make(account, dest_uri, None, &headers).map_err(|e| format!("{e}"))?;
@@ -713,7 +740,7 @@ mod tests {
         let mut bridge = SipBridge::new(&config);
         bridge.active_call = Some(Call::from_id(1, CallState::Confirmed));
 
-        let result = bridge.make_call("sip:1234@example.com", "+15551234567");
+        let result = bridge.make_call("sip:1234@example.com", "+15551234567", "");
 
         assert_eq!(
             result,

@@ -410,6 +410,16 @@ impl CardPool {
         caller_id: String,
         audio_device: String,
     ) {
+        // This line's own SIM-read number (specs/034-alert-identity's
+        // `alert_phone`, reused here): lets a PBX fed by several GSM lines
+        // through one SIP trunk tell which line an inbound call arrived on,
+        // independently of who the external caller is.
+        let line_number = slots
+            .values()
+            .find(|s| s.module.id == module_id)
+            .and_then(|s| s.alert_phone())
+            .unwrap_or_default();
+
         if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
             state.has_active_call = true;
         }
@@ -424,7 +434,10 @@ impl CardPool {
         }
 
         // In SIP server mode this fails when the phone is not registered.
-        let dest_uri = match self.sip_bridge.compute_destination_uri(&caller_id) {
+        let dest_uri = match self
+            .sip_bridge
+            .compute_destination_uri(&caller_id, &line_number)
+        {
             Ok(uri) => uri,
             Err(e) => {
                 tracing::warn!(
@@ -444,6 +457,7 @@ impl CardPool {
         tracing::info!(
             module = %module_id,
             caller = %caller_id,
+            line = %line_number,
             dest = %dest_uri,
             audio = %audio_device,
             "bridging GSM call to SIP"
@@ -458,7 +472,10 @@ impl CardPool {
             return;
         }
 
-        if let Err(e) = self.sip_bridge.make_call(&dest_uri, &caller_id) {
+        if let Err(e) = self
+            .sip_bridge
+            .make_call(&dest_uri, &caller_id, &line_number)
+        {
             tracing::error!(
                 module = %module_id,
                 error = %e,
