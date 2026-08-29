@@ -1667,6 +1667,7 @@ fn handle_connection(
         &caller,
         leg_addr,
         leg_port,
+        line_msisdn.unwrap_or(""),
     ) {
         Ok((mut pbx_call, mut veth_call)) => {
             write_msg(
@@ -1970,11 +1971,12 @@ fn bridge_call(
     caller: &str,
     leg_addr: &str,
     leg_port: u16,
+    line_number: &str,
 ) -> BridgeResult<(Call, Call)> {
     // Resolved before either leg is placed: in SIP server mode there may be no
     // phone registered, and finding that out after answering the carrier would
     // leave the caller connected to nothing.
-    let pbx_uri = telephony_dest_uri(config, bindings, caller)?;
+    let pbx_uri = telephony_dest_uri(config, bindings, caller, line_number)?;
 
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
@@ -1982,6 +1984,17 @@ fn bridge_call(
         pai_value = format!("\"{caller}\" <tel:{caller}>");
         headers.push(("P-Asserted-Identity", &pai_value));
         headers.push(("X-GSM-Caller-ID", caller));
+    }
+
+    // SIP server mode has no per-line Request-URI to carry `line_number`
+    // the way the PBX-destination fallback above does (the destination
+    // there is always the registered phone's real contact) — see
+    // `crate::sip::SipBridge::make_call`'s identical `P-Called-Party-ID`
+    // header for the circuit-switched side of this same rule.
+    let pcpid_value;
+    if bindings.is_some() && !line_number.is_empty() {
+        pcpid_value = format!("<{}>", config.sip_server.caller_identity_uri(line_number));
+        headers.push(("P-Called-Party-ID", &pcpid_value));
     }
 
     // SIP server mode: same reasoning as `crate::sip::SipBridge::make_call`
@@ -2038,13 +2051,15 @@ fn bridge_call(
 /// circuit-switched bridge via `crate::sip::target::CallTarget`.
 ///
 /// With a PBX: empty `[bridge].sip_destination` means DID passthrough (dial
-/// the caller's own number at the PBX), otherwise the configured fixed
-/// extension. In SIP server mode: the registered phone's own contact, which is
-/// the only case that can fail.
+/// this line's own number — `line_number`, the `[[vowifi.line]].msisdn` —
+/// at the PBX, so a PBX fed by several lines can tell them apart),
+/// otherwise the configured fixed extension. In SIP server mode: the
+/// registered phone's own contact, which is the only case that can fail.
 fn telephony_dest_uri(
     config: &AppConfig,
     bindings: Option<&Arc<crate::sip::server::BindingStore>>,
     caller_did: &str,
+    line_number: &str,
 ) -> BridgeResult<String> {
     let target = match bindings {
         Some(bindings) => crate::sip::target::CallTarget::RegisteredPhone {
@@ -2055,6 +2070,7 @@ fn telephony_dest_uri(
             server: &config.sip.server,
             port: config.sip.port,
             sip_destination: &config.bridge.sip_destination,
+            line_number,
         },
     };
     target

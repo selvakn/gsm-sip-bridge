@@ -16,9 +16,14 @@ pub enum CallTarget<'a> {
     Pbx {
         server: &'a str,
         port: u16,
-        /// Empty means DID passthrough: dial the caller's own number at the
-        /// PBX. Otherwise a fixed extension.
+        /// Empty means DID passthrough: dial this line's own number
+        /// (`line_number`) at the PBX, so a PBX fed by several GSM lines can
+        /// tell them apart. Otherwise a fixed extension.
         sip_destination: &'a str,
+        /// This line's own MSISDN (read from the SIM). Only consulted when
+        /// `sip_destination` is empty; falls back to `caller_did` if this is
+        /// also empty (no usable SIM number yet).
+        line_number: &'a str,
     },
     /// An IP phone registered to this bridge's own registrar.
     RegisteredPhone {
@@ -39,11 +44,14 @@ impl CallTarget<'_> {
                 server,
                 port,
                 sip_destination,
+                line_number,
             } => {
-                let raw_dest = if sip_destination.is_empty() {
-                    caller_did
-                } else {
+                let raw_dest = if !sip_destination.is_empty() {
                     sip_destination
+                } else if !line_number.is_empty() {
+                    line_number
+                } else {
+                    caller_did
                 };
                 let dest = raw_dest.trim_start_matches('+');
                 Ok(format!("sip:{dest}@{server}:{port}"))
@@ -68,17 +76,37 @@ mod tests {
     use std::time::Duration;
 
     fn pbx(sip_destination: &str) -> CallTarget<'_> {
+        pbx_line(sip_destination, "")
+    }
+
+    fn pbx_line<'a>(sip_destination: &'a str, line_number: &'a str) -> CallTarget<'a> {
         CallTarget::Pbx {
             server: "pbx.example.com",
             port: 5060,
             sip_destination,
+            line_number,
         }
     }
 
-    /// Pins the pre-existing behaviour this enum absorbed: an empty
-    /// `sip_destination` dials the caller's own number at the PBX.
+    /// An empty `sip_destination` dials *this line's own number* at the
+    /// PBX — the point being that a PBX fed by several GSM lines can tell
+    /// which one a call came in on, even though every line shares one SIP
+    /// trunk registration.
     #[test]
-    fn an_empty_destination_passes_the_callers_did_through() {
+    fn an_empty_destination_passes_the_lines_own_number_through() {
+        assert_eq!(
+            pbx_line("", "919000000009")
+                .uri_for("15551234567", Instant::now())
+                .unwrap(),
+            "sip:919000000009@pbx.example.com:5060"
+        );
+    }
+
+    /// With no configured extension and no SIM number read yet, there is
+    /// nothing else to dial but the caller's own number — better than a URI
+    /// with an empty user part.
+    #[test]
+    fn an_empty_destination_falls_back_to_the_callers_did_with_no_line_number() {
         assert_eq!(
             pbx("").uri_for("15551234567", Instant::now()).unwrap(),
             "sip:15551234567@pbx.example.com:5060"
@@ -86,17 +114,20 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_destination_overrides_the_callers_did() {
+    fn a_configured_destination_overrides_the_lines_own_number() {
         assert_eq!(
-            pbx("200").uri_for("15551234567", Instant::now()).unwrap(),
+            pbx_line("200", "919000000009")
+                .uri_for("15551234567", Instant::now())
+                .unwrap(),
             "sip:200@pbx.example.com:5060"
         );
     }
 
     /// A `+`-prefixed number is not a valid SIP user part here, and stripping
-    /// it is behaviour the PBX side has always had.
+    /// it is behaviour the PBX side has always had — for every source that
+    /// can feed the user part.
     #[test]
-    fn a_leading_plus_is_stripped_from_either_source() {
+    fn a_leading_plus_is_stripped_from_any_source() {
         assert_eq!(
             pbx("").uri_for("+15551234567", Instant::now()).unwrap(),
             "sip:15551234567@pbx.example.com:5060"
@@ -104,6 +135,12 @@ mod tests {
         assert_eq!(
             pbx("+200").uri_for("15551234567", Instant::now()).unwrap(),
             "sip:200@pbx.example.com:5060"
+        );
+        assert_eq!(
+            pbx_line("", "+919000000009")
+                .uri_for("15551234567", Instant::now())
+                .unwrap(),
+            "sip:919000000009@pbx.example.com:5060"
         );
     }
 
