@@ -3,6 +3,61 @@
 **Triaged**: 2026-08-06 · **Effort**: hardware verification only, no code
 expected · **Origin**: `docs/todo.md` item 2
 
+**UPDATED 2026-09-04.** A first pass here found the legacy
+`[volte].bridge_inbound=false` path (the default) has no route to outbound at
+all — `orchestrate_volte::start_legacy_registration` spawns only
+`volte-register`, no Agent A control listener, no Agent B/registrar. That is
+real, but it turned out to be the whole story only for that one path: with
+`[volte].bridge_inbound=true`, `orchestrate_volte::start_multiline` already
+spawns `volte-bridge`, which reuses VoWiFi's exact `run_telephony_side`
+(registrar, `run_outbound_listener`, everything) — no dispatcher needed
+building. The real bug was narrower: `RuntimeLine` had no `status_port`
+field, so `try_place_on_line` connected to VoWiFi's fixed port on every line,
+which is wrong for VoLTE's per-line-derived ports. **Fixed** — see
+`docs/todo.md` item 2's second 2026-09-04 note for the full trace and the
+files touched.
+
+**Still open**: live end-to-end confirmation. The fixed build's
+`volte-bridge --modem` diagnostic path got as far as the registrar/dispatcher
+genuinely attempting the VoLTE line, but IMS registration itself was blocked
+by an unrelated PDN-routing issue on that test host (RA not accepted — see
+`docs/operations.md`'s "attached but unusable" section) before Agent A ever
+opened its status listener. Re-run once a session doesn't hit that routing
+issue.
+
+## Revised plan
+
+1. Use `[volte].bridge_inbound=true` (not `volte-register`/legacy mode) — the
+   legacy path has no outbound route by design; don't re-test it for this.
+2. Fastest path to a clean signal: the single-`--modem` diagnostic invocation
+   (`gsm-sip-bridge volte-bridge --modem <port> --iface <net-iface>
+   --pcscf-source-path <file>`, run directly — bypasses
+   `supervise`/`orchestrate_volte`/netns). Needs `[vowifi].enabled=false` in
+   config (both to avoid the RFC 5626 IMPU conflict and because VoWiFi's own
+   `run_telephony_side` would otherwise also try to bind `[sip_server]`'s
+   port), `[outbound].enabled=true`, `[sip_server].enabled=true` with an
+   account (never `1001` if a real handset might hold it), and `[sip].server`
+   *removed* (mutually exclusive with `[sip_server].enabled` — FATAL at
+   startup otherwise). Prime `/tmp/pcscf-<line>` first with a real VoWiFi run
+   on the same SIM, same container instance (`docker compose restart`, never
+   recreate, to keep the file).
+3. Once Agent A completes IMS registration (watch for `registration accepted`
+   and its status listener binding — `ss -tlnp` on the per-line status port,
+   `LOOPBACK_STATUS_PORT + index*4`), register `siptest` (account `1002`) and
+   place a real call. `require = "packets"` is enough — an answered call with
+   RTP flowing both ways, the far end doesn't need to speak.
+4. Confirm via `gsm_sip_bridge_outbound_attempts_total{outcome="placed"}` and
+   the `siptest call` report exiting 0.
+5. Revert config/image, confirm VoWiFi `Registered`/`gm_connection: up` again.
+6. Only then close `docs/todo.md` item 2 and `specs/025-outbound-calling/tasks.md`
+   T050e, recording the outcome the way T023/T033/T072 did.
+
+Production-topology verification (`supervise` + real per-line netns, the
+actual deployment shape) is a separate, higher-effort follow-up once the
+diagnostic path above has passed — see `docs/todo.md` item 2 for why that's
+lower priority (the diagnostic path already proves the fix; production-topology
+netns/veth issues, if any, would be a different, unrelated bug).
+
 ## Why this is still open
 
 `specs/025-outbound-calling` shipped outbound calling for every path (CS,

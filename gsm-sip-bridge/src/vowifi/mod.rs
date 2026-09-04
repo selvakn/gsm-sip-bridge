@@ -139,6 +139,13 @@ pub(crate) struct RuntimeLine {
     /// `volte::bridge::LOOPBACK_SIP_PORT` over loopback for the cellular one,
     /// which is the only thing that differs between them here.
     pub sip_leg_port: u16,
+    /// Port on `veth_local_addr` where Agent A's status/`PlaceCall` listener
+    /// answers (`try_place_on_line`, `print_status`). [`AGENT_A_STATUS_PORT`]
+    /// for every Wi-Fi line — safe to repeat because each line has its own
+    /// netns. VoLTE lines share a port space instead, so each gets its own
+    /// derived port (`volte::discovery::status_port`) — this field is what
+    /// carries that difference; do not fall back to the constant here.
+    pub status_port: u16,
     /// specs/034-alert-identity: this line's configured `[[vowifi.line]].msisdn`
     /// (resolved from the override that pinned it), shown when forwarding this
     /// line's SMS to Discord. `None` ⇒ the forward's phone field renders
@@ -175,6 +182,7 @@ fn runtime_lines_from_resolution(resolution: &discovery::LineResolution) -> Vec<
             veth_peer_addr: l.veth_peer_addr.clone(),
             control_port: l.control_port,
             sip_leg_port: VETH_SIP_PORT,
+            status_port: AGENT_A_STATUS_PORT,
             // specs/034-alert-identity: the msisdn of the `[[vowifi.line]]`
             // override that pinned this line (auto-discovered lines have none).
             msisdn: l.configured_msisdn(),
@@ -953,7 +961,7 @@ fn try_place_on_line(
     destination: &str,
     call: &mut Call,
 ) -> PlaceCallOutcome {
-    let addr = match format!("{}:{}", line.veth_local_addr, AGENT_A_STATUS_PORT).parse() {
+    let addr = match format!("{}:{}", line.veth_local_addr, line.status_port).parse() {
         Ok(a) => a,
         Err(e) => return PlaceCallOutcome::Unavailable(format!("invalid address: {e}")),
     };
@@ -2143,7 +2151,7 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
         let mut line_ok = true;
 
         println!("  VoWiFi registration (Agent A):");
-        match query_status(&format!("{}:{AGENT_A_STATUS_PORT}", line.veth_local_addr)) {
+        match query_status(&format!("{}:{}", line.veth_local_addr, line.status_port)) {
             Ok(ControlMessage::RegistrationStatusReply {
                 state,
                 registered_at,
@@ -2299,6 +2307,41 @@ mod tests {
             format_expires_in(Some(1_786_878_275), 1_786_888_027),
             "-9752s (LAPSED)"
         );
+    }
+
+    /// Companion to `volte::bridge`'s `to_runtime_line_carries_the_real_status_port_not_a_default`:
+    /// the VoWiFi side of the same `RuntimeLine` field must keep using the
+    /// fixed `AGENT_A_STATUS_PORT` — safe here only because every VoWiFi line
+    /// has its own netns, unlike VoLTE's shared port space.
+    #[test]
+    fn runtime_lines_from_resolution_uses_the_fixed_agent_a_status_port() {
+        let entry = discovery::LineResolutionEntry {
+            index: 0,
+            card_id: "ec20-test".to_string(),
+            modem_port: "/dev/ttyUSB0".to_string(),
+            netns: "ims-0".to_string(),
+            control_port: 7050,
+            veth_local_addr: "10.99.0.1".to_string(),
+            veth_peer_addr: "10.99.0.2".to_string(),
+            vpcd_port: 0,
+            strongswan_if_id: 0,
+            strongswan_tun_iface: String::new(),
+            pcscf_source_path: "/tmp/pcscf".to_string(),
+            mcc: "404".to_string(),
+            mnc: "43".to_string(),
+            pcsc_reader: false,
+            configured_identifier: None,
+            msisdn: None,
+            config: VowifiConfig::default(),
+        };
+        let resolution = discovery::LineResolution {
+            circuit_switched_excluded_ports: Vec::new(),
+            lines: vec![entry],
+            failed: Vec::new(),
+        };
+        let lines = runtime_lines_from_resolution(&resolution);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].status_port, AGENT_A_STATUS_PORT);
     }
 
     #[test]

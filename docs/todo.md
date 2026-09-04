@@ -24,11 +24,55 @@ Observed pending items
       that produced the PRACK bug (`specs/037-p-early-media`).
 
 - [ ] Outbounds calls via the GSM (PC / VoLTE / VoWIFI), from pbx as well as sip client
-      — **triaged 2026-08-06**: CS, VoWiFi, and PC/SC are audio-verified on real
-      hardware (specs/025-outbound-calling T023/T072/T073); VoLTE specifically has
-      never been independently exercised for *outbound* calling (T050e left this
-      deliberately open). Believed to work — shares `ims::agent`'s origination code
-      with VoWiFi — but unconfirmed. Plan: [docs/plans/volte-outbound-verification.md](plans/volte-outbound-verification.md).
+      — **triaged 2026-08-06, re-triaged 2026-09-04 (twice)**: CS, VoWiFi, and
+      PC/SC are audio-verified on real hardware (specs/025-outbound-calling
+      T023/T072/T073); VoLTE specifically has never been independently
+      exercised for *outbound* calling (T050e left this deliberately open).
+
+      **2026-09-04, first pass — corrected below, kept for the record.** A
+      live-test attempt against the *legacy* `[volte].bridge_inbound=false`
+      path (the default) found nothing listening on SIP port 5060 and
+      concluded the SIP-facing outbound dispatcher was missing for VoLTE
+      entirely. That conclusion was too broad — it only holds for the legacy
+      path.
+
+      **2026-09-04, second pass — the real shape of the gap.** With
+      `[volte].bridge_inbound=true`, `orchestrate_volte::start_multiline`
+      already spawns `volte-bridge`, which unconditionally calls the *same*
+      `vowifi::run_telephony_side` function VoWiFi's Agent B uses — including
+      `run_outbound_listener` and the `[sip_server]` registrar. VoLTE's
+      carrier-agent process is the same `ims::agent::serve_inbound` Agent A
+      code VoWiFi uses too. So the dispatcher is already shared and already
+      runs for VoLTE; nothing needed building. The actual bug: `RuntimeLine`
+      (the struct `try_place_on_line` iterates over) had no `status_port`
+      field, so `try_place_on_line` connected to VoWiFi's fixed
+      `AGENT_A_STATUS_PORT` (5071) on every line — correct for VoWiFi (each
+      line has its own netns), wrong for VoLTE (a per-line-derived port,
+      5076/5080/5084/…, since VoLTE lines share one port space). **Fixed**:
+      added `RuntimeLine.status_port`, threaded through both the VoWiFi
+      (`runtime_lines_from_resolution`) and VoLTE (`BridgeLine::to_runtime_line`,
+      new) construction sites, and `try_place_on_line`/`print_status` now use
+      it instead of the constant. New regression tests in both files. Legacy
+      `bridge_inbound=false` still has no outbound path by design (registers
+      only) — outbound calling over VoLTE requires `bridge_inbound=true`,
+      matching how VoWiFi already couples "answers inbound" with "dispatchable
+      outbound."
+
+      **Live-verified, partially**: local Vodafone/EC200U rig, the fixed
+      build's `volte-bridge --modem` diagnostic path. Confirmed live: the
+      `[sip_server]` registrar and Agent B's control listener came up, a
+      `siptest`-registered phone's dial-out was redirected and reached
+      `run_outbound_listener`, which attempted dispatch to the VoLTE line
+      (previously this whole path never existed under `bridge_inbound=false`,
+      which is what the first pass actually tested). Could not get all the way
+      to a confirmed `PlaceCall` round-trip on this host session: IMS PDN
+      attach succeeded but the carrier's router advertisement was never
+      accepted (`routed=false`, `docs/operations.md`'s documented "attached
+      but unusable" failure mode) — this is a separate, pre-existing routing
+      issue, not caused by this fix, and it blocks IMS registration (and thus
+      Agent A ever opening its status listener) regardless. T050e stays open
+      pending a session where that routing issue isn't present. Plan (updated
+      to match): [docs/plans/volte-outbound-verification.md](plans/volte-outbound-verification.md).
 - [ ] `siptest` (specs/037-siptest-softphone) has no unified dialog engine —
       T026/T037 in that spec's task list. Registration runs as a blocking
       function in its own background thread, outbound calls run
