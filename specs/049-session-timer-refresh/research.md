@@ -143,12 +143,25 @@ this one path would be disproportionate — but unlike those, losing this
 one message actively tears a live call down, which earns it this bounded,
 best-effort resend. Each attempt is a fresh request (new `CSeq`/branch),
 not a byte-identical retransmission, which needs no new machinery: it
-reuses the same `SendNow`/`on_sent` path a first attempt already takes,
-and a response naming an earlier attempt's `CSeq` is already ignored by
-`on_response`'s existing mismatch discipline. Separately, `on_response`
-now ignores a provisional (`status < 200`) rather than treating it as a
-failure — the first implementation would fail the whole refresh on a
-`100 Trying` that a later 2xx should have resolved.
+reuses the same `SendNow`/`on_sent` path a first attempt already takes.
+
+The first pass at this tracked only the *latest* attempt's `CSeq`,
+discarding a response to any earlier one as a "mismatch" — a second
+Greptile review pass on the retry mechanism itself caught this: a late
+response to the *original* attempt is a real, valid answer, not a stale
+one, and dropping it could end a call the carrier had already agreed to
+keep alive (e.g. original sent, retry sent, then the original's 2xx
+finally arrives — discarding it and losing the retry too would wrongly
+tear the call down despite the carrier having actually answered).
+`AwaitingResponse` now tracks `first_cseq..=latest_cseq`, the whole range
+of attempts still outstanding, and a response naming any `CSeq` in that
+range settles the cycle — `PingState`'s single-pending-cseq discipline
+doesn't extend cleanly to a phase with more than one attempt in flight at
+once, so this feature's own state needed its own, wider rule instead of
+reusing that precedent verbatim. Separately, `on_response` ignores a
+provisional (`status < 200`) rather than treating it as a failure — the
+first implementation would fail the whole refresh on a `100 Trying` that
+a later 2xx should have resolved.
 
 ## Decision 5: Where this lives in the existing state machine
 

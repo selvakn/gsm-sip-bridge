@@ -2360,16 +2360,19 @@ impl LoopState {
         }
         // specs/049: is this the response to our own sent session-timer
         // refresh? Matched by Call-ID + CSeq, same discipline as
-        // `PingState::on_response` — a response naming a different `cseq`
-        // (a superseded/mismatched refresh) is left for `refresh.on_response`
-        // itself to ignore.
+        // `PingState::on_response` — a response naming a `cseq` outside
+        // every attempt this refresh has outstanding (a superseded or not
+        // yet sent refresh) is left for `refresh.on_response` itself to
+        // ignore. `cseq` can name *any* outstanding attempt, not just the
+        // latest resend (second greptile PR #74 review pass) —
+        // `is_awaiting_response` covers the whole range.
         if let Some(call) = &mut self.active_call {
             let matches_dialog = resp.header("Call-ID") == Some(call.call_id.as_str());
             let resp_cseq = resp.header("CSeq").and_then(parse_cseq_number);
             if let (true, Some(refresh), Some(cseq)) =
                 (matches_dialog, &mut call.session_refresh, resp_cseq)
             {
-                if refresh.awaiting_response_cseq() == Some(cseq) {
+                if refresh.is_awaiting_response(cseq) {
                     refresh.on_response(cseq, resp.status, Instant::now());
                     return;
                 }

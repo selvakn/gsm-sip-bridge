@@ -38,13 +38,18 @@ enum RefreshPhase {
     /// refresher == Uac: no refresh in flight; send one once `due_at` passes.
     WaitingToSend { due_at: Instant },
     /// refresher == Uac: a refresh was sent; waiting for its response.
-    /// `sent_at` is fixed at the first attempt (the overall ceiling);
-    /// `last_attempt_at`/`attempts` track up to
-    /// `MAX_SESSION_REFRESH_ATTEMPTS` bounded resends in between, at
-    /// `SESSION_REFRESH_RETRY_INTERVAL` apart — a single lost datagram
-    /// must not end an otherwise-healthy call (PR #74 review).
+    /// `sent_at`/`first_cseq` are fixed at the first attempt (the overall
+    /// ceiling and the low end of the outstanding range); `latest_cseq`/
+    /// `last_attempt_at`/`attempts` track up to `MAX_SESSION_REFRESH_ATTEMPTS`
+    /// bounded resends in between, at `SESSION_REFRESH_RETRY_INTERVAL`
+    /// apart — a single lost datagram must not end an otherwise-healthy
+    /// call (PR #74 review). A response naming *any* `CSeq` in
+    /// `first_cseq..=latest_cseq` settles the cycle, not just the latest —
+    /// a late response to an earlier attempt is still a real, valid answer
+    /// (PR #74 review, second pass).
     AwaitingResponse {
-        cseq: u32,
+        first_cseq: u32,
+        latest_cseq: u32,
         sent_at: Instant,
         last_attempt_at: Instant,
         attempts: u8,
@@ -86,17 +91,25 @@ pure — takes `now` as a parameter so tests never sleep, exactly like
 ## Mutators (mirror `PingState::on_sent`/`on_response`)
 
 - `on_sent(&mut self, cseq: u32, now: Instant)` — from `WaitingToSend`:
-  `AwaitingResponse { cseq, sent_at: now, last_attempt_at: now, attempts: 1 }`
+  `AwaitingResponse { first_cseq: cseq, latest_cseq: cseq, sent_at: now, last_attempt_at: now, attempts: 1 }`
   (first attempt). From `AwaitingResponse` (a bounded resend): keeps the
-  original `sent_at`, bumps `attempts`, updates `last_attempt_at` and
-  `cseq` — the overall ceiling never moves just because a retry went out.
+  original `sent_at`/`first_cseq`, bumps `attempts`, updates
+  `last_attempt_at` and `latest_cseq` — the overall ceiling never moves,
+  and every earlier attempt stays a valid answer, just because a retry
+  went out.
+- `is_awaiting_response(&self, cseq: u32) -> bool` — whether `cseq` falls
+  in `first_cseq..=latest_cseq` while `phase` is `AwaitingResponse`; how
+  `handle_carrier_response` decides a response belongs to this refresh at
+  all before handing it to `on_response`.
 - `on_response(&mut self, cseq: u32, status: u16, now: Instant)` — only
-  acts if `phase` is `AwaitingResponse { cseq: c, .. }` with `c == cseq`
-  (a response to a superseded/mismatched refresh is ignored, same
-  discipline `PingState::on_response` already applies) and `status >= 200`
-  (a provisional like `100 Trying` is not a verdict on the transaction —
-  PR #74 review); `status` 2xx → `WaitingToSend { due_at: now + interval/2 }`
-  (armed for the *next* cycle); any other final response → `Failed`.
+  acts if `is_awaiting_response(cseq)` (a response to a cycle already
+  resolved, or not yet started, is ignored, same discipline
+  `PingState::on_response` applies to its single pending value — widened
+  here to a range since more than one attempt can be outstanding at once,
+  PR #74 review second pass) and `status >= 200` (a provisional like
+  `100 Trying` is not a verdict on the transaction — PR #74 review);
+  `status` 2xx → `WaitingToSend { due_at: now + interval/2 }` (armed for
+  the *next* cycle); any other final response → `Failed`.
 - `on_send_failed(&mut self)` — `AwaitingResponse`/`WaitingToSend` →
   `Failed` directly, for when the `send()` call itself errors (no
   transaction was ever created to time out).

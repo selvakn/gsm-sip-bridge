@@ -93,8 +93,17 @@ pub(super) enum RefreshPhase {
     /// `SESSION_REFRESH_RESPONSE_TIMEOUT` counts down from);
     /// `last_attempt_at`/`attempts` track the bounded resends in between
     /// (greptile PR #74 review — see `SESSION_REFRESH_RETRY_INTERVAL`).
+    /// Each resend is a fresh, monotonically-increasing `CSeq` rather than
+    /// a byte-identical retransmission (research.md Decision 4's
+    /// correction), so `first_cseq..=latest_cseq` is the whole range of
+    /// still-meaningful outstanding attempts — a response naming *any* of
+    /// them settles this refresh cycle, not just the most recent one
+    /// (second greptile PR #74 review pass: a late response to an earlier
+    /// attempt is a real, valid answer, not a stale one, and dropping it
+    /// could end a call the carrier had already agreed to keep alive).
     AwaitingResponse {
-        cseq: u32,
+        first_cseq: u32,
+        latest_cseq: u32,
         sent_at: Instant,
         last_attempt_at: Instant,
         attempts: u8,
@@ -184,13 +193,20 @@ impl SessionRefreshState {
         self.refresher
     }
 
-    /// The `CSeq` of a refresh this bridge sent and is still waiting on a
-    /// response for, if any — how `handle_carrier_response` matches an
-    /// incoming response back to it.
-    pub(super) fn awaiting_response_cseq(&self) -> Option<u32> {
+    /// Whether `cseq` names one of this refresh's still-outstanding
+    /// attempts — how `handle_carrier_response` decides whether an
+    /// incoming response belongs to this refresh at all, before handing it
+    /// to `on_response`. Any attempt in the range, not just the latest
+    /// (second greptile PR #74 review pass): a late response to an earlier
+    /// resend is still a real, valid answer.
+    pub(super) fn is_awaiting_response(&self, cseq: u32) -> bool {
         match self.phase {
-            RefreshPhase::AwaitingResponse { cseq, .. } => Some(cseq),
-            _ => None,
+            RefreshPhase::AwaitingResponse {
+                first_cseq,
+                latest_cseq,
+                ..
+            } => (first_cseq..=latest_cseq).contains(&cseq),
+            _ => false,
         }
     }
 
@@ -255,19 +271,22 @@ impl SessionRefreshState {
     /// Record that a refresh with `cseq` just went out at `now` — either
     /// the first attempt (from `WaitingToSend`) or a bounded resend of a
     /// still-unanswered one (from `AwaitingResponse`, greptile PR #74
-    /// review), which keeps the original `sent_at` so the overall
-    /// `SESSION_REFRESH_RESPONSE_TIMEOUT` ceiling is unaffected by retries.
+    /// review), which keeps the original `sent_at`/`first_cseq` so the
+    /// overall `SESSION_REFRESH_RESPONSE_TIMEOUT` ceiling and every
+    /// earlier attempt both stay live, unaffected by a later retry.
     pub(super) fn on_sent(&mut self, cseq: u32, now: Instant) {
-        let sent_at = match self.phase {
-            RefreshPhase::AwaitingResponse { sent_at, .. } => sent_at,
-            _ => now,
-        };
-        let attempts = match self.phase {
-            RefreshPhase::AwaitingResponse { attempts, .. } => attempts.saturating_add(1),
-            _ => 1,
+        let (first_cseq, sent_at, attempts) = match self.phase {
+            RefreshPhase::AwaitingResponse {
+                first_cseq,
+                sent_at,
+                attempts,
+                ..
+            } => (first_cseq, sent_at, attempts.saturating_add(1)),
+            _ => (cseq, now, 1),
         };
         self.phase = RefreshPhase::AwaitingResponse {
-            cseq,
+            first_cseq,
+            latest_cseq: cseq,
             sent_at,
             last_attempt_at: now,
             attempts,
@@ -281,17 +300,19 @@ impl SessionRefreshState {
     }
 
     /// A response to our own sent refresh arrived. Ignored (state
-    /// unchanged) if it doesn't match the in-flight refresh's `cseq` — a
-    /// late response to a superseded refresh must not revive a call
-    /// already resolved on this dialog, mirroring
-    /// `PingState::on_response`'s identical discipline. A provisional
-    /// (`status < 200`, e.g. a `100 Trying`) is not a verdict on the
-    /// transaction at all (greptile PR #74 review) — it leaves the phase
-    /// in `AwaitingResponse` unchanged, still waiting for the eventual
-    /// final response.
+    /// unchanged) if `cseq` names none of this refresh's outstanding
+    /// attempts (`is_awaiting_response`) — a response to a cycle already
+    /// resolved (or not yet started) must not revive/pre-empt it, mirroring
+    /// `PingState::on_response`'s identical discipline; a response to
+    /// *any* still-outstanding attempt — the latest resend or an earlier
+    /// one answered late — settles this cycle (second greptile PR #74
+    /// review pass). A provisional (`status < 200`, e.g. a `100 Trying`)
+    /// is not a verdict on the transaction at all — it leaves the phase in
+    /// `AwaitingResponse` unchanged, still waiting for the eventual final
+    /// response.
     pub(super) fn on_response(&mut self, cseq: u32, status: u16, now: Instant) {
-        if let RefreshPhase::AwaitingResponse { cseq: pending, .. } = self.phase {
-            if pending != cseq || status < 200 {
+        if self.is_awaiting_response(cseq) {
+            if status < 200 {
                 return;
             }
             self.phase = if (200..300).contains(&status) {
@@ -516,16 +537,43 @@ mod tests {
     }
 
     #[test]
-    fn on_response_ignores_a_mismatched_cseq() {
-        // Mirrors PingState::on_response's identical discipline: a late
-        // response to a superseded refresh must not revive this one.
+    fn a_late_response_to_an_earlier_attempt_still_resolves_it() {
+        // Second greptile PR #74 review pass: a retry uses a fresh CSeq,
+        // but the carrier's answer to the *original* attempt is still a
+        // real, valid answer if it arrives late — it must not be discarded
+        // just because a retry has since gone out under a newer CSeq.
+        let now = Instant::now();
+        let mut state = SessionRefreshState::from_2xx(Some("300;refresher=uac"), now).unwrap();
+        state.on_sent(1, now);
+        let retried_at = now + SESSION_REFRESH_RETRY_INTERVAL;
+        state.on_sent(2, retried_at);
+        let late_original_response_at = retried_at + Duration::from_millis(500);
+        state.on_response(1, 200, late_original_response_at);
+        assert_eq!(
+            state.phase,
+            RefreshPhase::WaitingToSend {
+                due_at: late_original_response_at + Duration::from_secs(150)
+            }
+        );
+    }
+
+    #[test]
+    fn on_response_ignores_a_cseq_outside_every_outstanding_attempt() {
+        // Mirrors PingState::on_response's identical discipline: a
+        // response naming a cseq this refresh never sent (neither the
+        // one outstanding attempt, nor any earlier one) must not revive
+        // or resolve it.
         let now = Instant::now();
         let mut state = SessionRefreshState::from_2xx(Some("300;refresher=uac"), now).unwrap();
         state.on_sent(1, now);
         state.on_response(2, 200, now);
         assert!(matches!(
             state.phase,
-            RefreshPhase::AwaitingResponse { cseq: 1, .. }
+            RefreshPhase::AwaitingResponse {
+                first_cseq: 1,
+                latest_cseq: 1,
+                ..
+            }
         ));
     }
 
