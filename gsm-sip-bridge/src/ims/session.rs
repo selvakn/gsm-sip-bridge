@@ -610,47 +610,53 @@ pub(crate) fn extract_caller(req: &SipRequest) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Undoes RFC 3261 §25.1 `quoted-pair` escaping (`\X` means the literal
-/// character `X`) on the *contents* of a `quoted-string` — i.e. `value` with
-/// its surrounding `"..."` already stripped. Without this,
-/// [`header_display_name`] would hand back the wire-level escapes verbatim,
-/// and [`escape_display_name`] would then escape them a *second* time when
-/// this bridge builds its own quoted-string around the name — turning a
-/// caller's `"Doe \"Junior\""` into literal backslashes on the far end.
-fn unescape_quoted_pairs(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(escaped) = chars.next() {
-                out.push(escaped);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// A header's RFC 3261 `name-addr` display name — the quoted-string (unescaped
-/// per [`unescape_quoted_pairs`]) or unquoted token part before the `<...>` —
-/// or `None` for a bare `addr-spec` (no display name at all), an empty one
-/// (`""`, or `<...>` with nothing before it), or one containing a bare CR/LF
-/// (never legitimate inside a header value; rejected here rather than passed
-/// on to become a header-injection vector in whatever onward request
-/// re-presents it). Unlike [`extract_caller`], absence is a real, common
-/// outcome here (confirmed live: the Nokia SBC's `X-P-Asserted-Identity`
-/// carries no display name at all) and must not collapse to a placeholder
-/// string a caller could plausibly send as their actual name.
+/// A header's RFC 3261 `name-addr` display name — the quoted-string
+/// (unescaped) or unquoted token part before the URI's own `<...>` — or
+/// `None` for a bare `addr-spec` (no display name at all), an empty one
+/// (`""`, or `<...>` with nothing before it), an unterminated quoted-string,
+/// or one containing a bare CR/LF (never legitimate inside a header value;
+/// rejected here rather than passed on to become a header-injection vector
+/// in whatever onward request re-presents it).
+///
+/// Deliberately does **not** locate the URI with a plain `split_once('<')`:
+/// RFC 3261's `qdtext` excludes only `"` and `\`, not `<`, so a quoted
+/// display name may legitimately contain one (`"Doe <Junior>" <sip:...>`) —
+/// splitting on the first `<` anywhere in the value would cut the name in
+/// half. A quoted-string's own closing quote (tracking `\`-escapes, so an
+/// escaped `\"` doesn't end it early) is what actually marks where the
+/// display name ends; only a *bare* token, which the grammar forbids from
+/// containing `<` at all, may use the character itself as the boundary.
+///
+/// Unlike [`extract_caller`], absence is a real, common outcome here
+/// (confirmed live: the Nokia SBC's `X-P-Asserted-Identity` carries no
+/// display name at all) and must not collapse to a placeholder string a
+/// caller could plausibly send as their actual name.
 fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
-    let value = req.header(name)?;
-    let (display, _) = value.split_once('<')?;
-    let display = display.trim();
-    let display = match display.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        Some(quoted) => unescape_quoted_pairs(quoted),
-        None => display.to_string(),
+    let value = req.header(name)?.trim_start();
+    let display = if let Some(rest) = value.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
+                closed = true;
+                break;
+            } else {
+                out.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        out
+    } else {
+        let (token, _) = value.split_once('<')?;
+        token.trim().to_string()
     };
-    let display = display.trim().to_string();
     (!display.is_empty() && !display.contains(['\r', '\n'])).then_some(display)
 }
 
@@ -693,18 +699,22 @@ pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
 /// other SIP list headers use — splitting on `,` alone missed a
 /// spec-conformant `Privacy: header;id`; `,` is still accepted too, as a
 /// harmless tolerance for a sender that gets this wrong.
+///
+/// Checks **every** `Privacy` header field (`headers_all`, not `header`):
+/// RFC 3261 §7.3.1 makes repeated header fields with the same name
+/// equivalent to one comma-separated field, so `id`/`user` placed in a
+/// second `Privacy:` line is exactly as binding as one in the first, and
+/// `header`'s "first match only" would silently miss it.
+///
 /// Checked separately from — not folded into — [`extract_caller_name`]
 /// itself, so a caller can still log/attribute the name internally while
 /// withholding it from onward signaling, the same split `extract_caller`'s
 /// own doc comment draws for the number.
 pub(crate) fn caller_identity_is_private(req: &SipRequest) -> bool {
-    req.header("Privacy")
-        .map(|v| {
-            v.split([';', ',']).any(|p| {
-                p.trim().eq_ignore_ascii_case("id") || p.trim().eq_ignore_ascii_case("user")
-            })
-        })
-        .unwrap_or(false)
+    req.headers_all("Privacy").iter().any(|v| {
+        v.split([';', ','])
+            .any(|p| p.trim().eq_ignore_ascii_case("id") || p.trim().eq_ignore_ascii_case("user"))
+    })
 }
 
 /// Escapes a caller-supplied display name for safe embedding inside a SIP

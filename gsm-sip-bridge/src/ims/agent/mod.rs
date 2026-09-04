@@ -2743,6 +2743,20 @@ mod tests {
         assert_eq!(escape_display_name(&name), "Doe \\\"Junior\\\"");
     }
 
+    /// Regression: a quoted display name may legally contain a literal `<`
+    /// (RFC 3261's `qdtext` excludes only `"` and `\`) — the URI's own `<...>`
+    /// must be found by tracking the quoted-string's closing quote, not by
+    /// splitting on the first `<` anywhere in the header value.
+    #[test]
+    fn extract_caller_name_handles_a_literal_angle_bracket_inside_the_quotes() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Doe <Junior>\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000000");
+        assert_eq!(extract_caller_name(&req), Some("Doe <Junior>".to_string()));
+    }
+
     #[test]
     fn caller_identity_is_private_matches_case_insensitively() {
         let raw = "INVITE sip:x SIP/2.0\r\n\
@@ -2781,6 +2795,21 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\n\
                     From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
                     Privacy: header;id\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(caller_identity_is_private(&req));
+    }
+
+    /// Regression: RFC 3261 §7.3.1 makes repeated header fields with the
+    /// same name equivalent to one comma-separated field — `id`/`user` in a
+    /// *second* `Privacy:` line is exactly as binding as one in the first.
+    /// `req.header` (singular, first-match-only) would miss this.
+    #[test]
+    fn caller_identity_is_private_checks_every_repeated_privacy_field() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Privacy: none\r\n\
+                    Privacy: id\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert!(caller_identity_is_private(&req));
