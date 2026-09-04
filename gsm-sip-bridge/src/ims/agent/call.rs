@@ -8,11 +8,13 @@
 //! report the call the same way.
 
 use super::observability;
+use super::session_refresh::SessionRefreshState;
 use crate::ims::lifecycle::BridgedCall;
 use crate::ims::session::respond;
 use crate::ims::session::Inbound;
 use crate::ims::sip_client::{
-    build_200_ok_bye, build_bye, random_hex, ByeRequest, SipRequest, SipSink,
+    build_200_ok_bye, build_bye, build_update, random_hex, ByeRequest, SipRequest, SipSink,
+    UpdateRequest,
 };
 use crate::vowifi::control::{read_msg, reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -97,6 +99,12 @@ pub(super) struct ActiveCall {
     /// this feature's scope (FR-023: only the carrier leg of *answered*
     /// calls carries one; an outbound-placed call never does).
     pub(super) rtcp: Option<RtcpHandle>,
+    /// RFC 4028 session-timer refresh state (specs/049), set once from the
+    /// outbound call's `200 OK`. `None` for every inbound-answered call
+    /// (this feature is UAC-leg-only) and for an outbound call whose
+    /// `200 OK` carried no `Session-Expires` (no obligation, today's
+    /// behavior unchanged).
+    pub(super) session_refresh: Option<SessionRefreshState>,
 }
 
 /// See [`ActiveCall::rtcp`]. Holds only what teardown needs to *read* — the
@@ -276,6 +284,27 @@ impl DialogInfo {
             call_id,
             cseq: self.cseq,
             branch: &format!("z9hG4bK{}", random_hex(6)),
+        })
+    }
+
+    /// This bridge's own RFC 4028 session-timer refresh `UPDATE`
+    /// (specs/049). Increments `self.cseq` — so a later `build_bye_for`
+    /// always picks a strictly higher `CSeq` than any refresh already sent
+    /// (RFC 3261 §12.2.1.1) — and returns the request built with the new
+    /// value.
+    pub(super) fn build_update_for(&mut self, call_id: &str, session_expires: &str) -> String {
+        self.cseq += 1;
+        build_update(&UpdateRequest {
+            request_uri: &self.remote_target,
+            route_headers: &self.route_headers,
+            via_transport: if self.use_tcp { "TCP" } else { "UDP" },
+            local_addr: self.local_addr,
+            from: &self.from,
+            to: &self.to,
+            call_id,
+            cseq: self.cseq,
+            branch: &format!("z9hG4bK{}", random_hex(6)),
+            session_expires,
         })
     }
 }
@@ -478,30 +507,34 @@ impl AttachmentWatch {
     }
 }
 
-/// Ends a call because the network attachment was lost mid-call (FR-011).
+/// Ends a call this side decided, on its own, must end — originally FR-011's
+/// attachment loss, now shared with specs/049's session-timer-refresh
+/// failure (a different `reason`, identical shape).
 ///
 /// The same coordinated teardown as a carrier `BYE` — stop the relay, tell
 /// Agent B over the control channel so it drops the PBX leg — plus a
-/// best-effort `BYE` toward the carrier. That `BYE` will usually not arrive
-/// (the attachment it would travel over is the thing that died), but sending it
-/// costs nothing and closes the dialog on any path that survived.
-pub(super) fn end_call_attachment_lost(
+/// best-effort `BYE` toward the carrier. For attachment loss that `BYE`
+/// will usually not arrive (the attachment it would travel over is the
+/// thing that died), but sending it costs nothing and closes the dialog on
+/// any path that survived.
+pub(super) fn end_call_best_effort(
     session: &mut crate::ims::RegisteredSession,
     mut call: ActiveCall,
+    reason: &str,
 ) {
     call.stop.store(true, Ordering::Relaxed);
     if let Err(e) = write_msg(
         &mut call.control,
         &ControlMessage::CallEnded {
             call_id: call.call_id.clone(),
-            reason: reason::ATTACHMENT_LOST.to_string(),
+            reason: reason.to_string(),
         },
     ) {
-        tracing::warn!(call_id = %call.call_id, error = %e, "failed to notify Agent B of the attachment-loss teardown");
+        tracing::warn!(call_id = %call.call_id, error = %e, "failed to notify Agent B of the teardown");
     }
     let bye = call.dialog.build_bye_for(&call.call_id);
     let _ = session.transport_mut().and_then(|t| t.send(&bye));
-    tracing::info!(call_id = %call.call_id, reason = reason::ATTACHMENT_LOST, "call ended");
+    tracing::info!(call_id = %call.call_id, reason, "call ended");
 }
 
 /// Tells the carrier the call is over after the PBX side hangs up first.
@@ -587,6 +620,7 @@ pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -
         lifecycle: BridgedCall::new(call_id.to_string(), "+919000000000".to_string(), None),
         answered_invite: None,
         rtcp: None,
+        session_refresh: None,
     }
 }
 

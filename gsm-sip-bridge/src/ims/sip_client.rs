@@ -745,6 +745,59 @@ pub fn build_bye(req: &ByeRequest) -> String {
     msg
 }
 
+/// Everything needed to send this bridge's own RFC 4028 session-timer
+/// refresh (specs/049) on a call it placed. Same dialog-role shape as
+/// [`ByeRequest`] — this bridge is the UAC on this dialog, so `request_uri`
+/// is the carrier's own `Contact`, not the original callee URI.
+pub struct UpdateRequest<'a> {
+    pub request_uri: &'a str,
+    pub route_headers: &'a [String],
+    pub via_transport: &'a str,
+    pub local_addr: SocketAddr,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub call_id: &'a str,
+    pub cseq: u32,
+    pub branch: &'a str,
+    /// The `Session-Expires` value to restate on this refresh (RFC 4028
+    /// §7.4: `"<interval>;refresher=uac"` when this bridge is refreshing).
+    pub session_expires: &'a str,
+}
+
+/// A body-less `UPDATE`, per RFC 4028 §7.4: "It is RECOMMENDED that the
+/// UPDATE request not contain an offer." `Supported: timer` is required on
+/// any request using the extension (RFC 4028 §7.1).
+pub fn build_update(req: &UpdateRequest) -> String {
+    let via_addr = format_sip_addr(req.local_addr);
+    let mut msg = format!(
+        "UPDATE {request_uri} SIP/2.0\r\n\
+         Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n",
+        request_uri = req.request_uri,
+        transport = req.via_transport,
+        branch = req.branch,
+    );
+    for route in req.route_headers {
+        msg.push_str(route);
+        msg.push_str("\r\n");
+    }
+    msg.push_str(&format!(
+        "From: {from}\r\n\
+         To: {to}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} UPDATE\r\n\
+         Supported: timer\r\n\
+         Session-Expires: {session_expires}\r\n\
+         Content-Length: 0\r\n\r\n",
+        from = req.from,
+        to = req.to,
+        call_id = req.call_id,
+        cseq = req.cseq,
+        session_expires = req.session_expires,
+    ));
+    msg
+}
+
 /// Everything needed to build a REGISTER request.
 pub struct RegisterRequest<'a> {
     pub registrar_uri: &'a str,
@@ -2388,6 +2441,28 @@ mod tests {
         assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
         assert!(resp.contains("CSeq: 2 BYE\r\n"));
         assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_update_is_body_less_and_states_the_session_expires_value() {
+        let local_addr: SocketAddr = "10.0.0.9:5060".parse().unwrap();
+        let msg = build_update(&UpdateRequest {
+            request_uri: "sip:carrier@10.1.1.1:5060",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr,
+            from: "<sip:+919000000000@ims.example>;tag=fromtag",
+            to: "<sip:+919000000001@ims.example>;tag=totag",
+            call_id: "call-1",
+            cseq: 3,
+            branch: "z9hG4bKabc123",
+            session_expires: "300;refresher=uac",
+        });
+        assert!(msg.starts_with("UPDATE sip:carrier@10.1.1.1:5060 SIP/2.0\r\n"));
+        assert!(msg.contains("CSeq: 3 UPDATE\r\n"));
+        assert!(msg.contains("Supported: timer\r\n"));
+        assert!(msg.contains("Session-Expires: 300;refresher=uac\r\n"));
+        assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
     #[test]

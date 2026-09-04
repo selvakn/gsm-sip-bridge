@@ -23,6 +23,7 @@
 //! | Placing an outbound call | [`origination`] |
 //! | A bridged call's state and every way it ends | [`call`] |
 //! | Gm connection liveness and repair | [`ping`] |
+//! | RFC 4028 session-timer refresh on a placed call | [`session_refresh`] |
 //! | The veth link to Agent B, and the RTP relay | [`veth`] |
 //! | The `probe-inbound` diagnostic | [`probe`] |
 
@@ -31,6 +32,7 @@ mod inbound;
 mod origination;
 mod ping;
 mod probe;
+mod session_refresh;
 mod veth;
 pub(crate) mod watchdog;
 
@@ -80,6 +82,7 @@ use origination::{
     begin_origination, tick_pending_origination, OriginationStatus, PendingOrigination,
 };
 use ping::{parse_cseq_number, probe_gm_connection, PingState};
+use session_refresh::{RefreshVerdict, Refresher};
 
 pub(crate) use call::AttachmentHook;
 pub use probe::{probe_inbound, InboundProbeReport};
@@ -1676,6 +1679,9 @@ fn dispatch_loop(
         if st.handle_attachment_loss(session, p) {
             continue;
         }
+        if st.handle_session_refresh(session, inbound, p) {
+            continue;
+        }
         st.advance_origination(session, p);
         if st.handle_place_call_request(session, p, &place_call_rx) {
             continue;
@@ -1749,6 +1755,9 @@ fn dispatch_loop(
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
                 handle_message(session, p, &req, &sink);
+            }
+            Ok((SipMessage::Request(req), sink)) if req.method == "UPDATE" => {
+                st.handle_carrier_update(&req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "OPTIONS" => {
                 tracing::debug!("received OPTIONS keepalive; answering 200 OK");
@@ -1880,10 +1889,104 @@ impl LoopState {
         // RTCP threads before reading what they published, not after.
         call.stop.store(true, Ordering::Relaxed);
         report_answered_call_ended(p.obs, &call);
-        call::end_call_attachment_lost(session, call);
+        call::end_call_best_effort(session, call, reason::ATTACHMENT_LOST);
         self.maintenance.release();
         self.watch = AttachmentWatch::default();
         true
+    }
+
+    /// specs/049: drive an active call's RFC 4028 session-timer refresh
+    /// forward one tick — send this bridge's own refresh once due
+    /// (`refresher == Uac`), and end the call if a refresh cycle fails in
+    /// either direction (a sent refresh that got no valid response, or the
+    /// carrier's own refresh never arriving in time). A call with no
+    /// `session_refresh` at all (no `Session-Expires` on its `200 OK`, or
+    /// an inbound-answered call) is untouched — the common case today.
+    fn handle_session_refresh(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        inbound: &Inbound,
+        p: &DispatchParams,
+    ) -> bool {
+        let Some(call) = &mut self.active_call else {
+            return false;
+        };
+        let Some(refresh) = &mut call.session_refresh else {
+            return false;
+        };
+        match refresh.verdict(Instant::now()) {
+            RefreshVerdict::Idle => false,
+            RefreshVerdict::SendNow => {
+                let session_expires = refresh.refresh_header_value();
+                let req = call
+                    .dialog
+                    .build_update_for(&call.call_id, &session_expires);
+                match session.transport_mut().and_then(|t| t.send(&req)) {
+                    Ok(()) => refresh.on_sent(call.dialog.cseq, Instant::now()),
+                    Err(e) => {
+                        tracing::warn!(call_id = %call.call_id, error = %e, "outbound: failed to send session-timer refresh");
+                        refresh.on_send_failed();
+                    }
+                }
+                false
+            }
+            RefreshVerdict::Overdue => {
+                let mut call = self.active_call.take().expect("just matched Some");
+                tracing::warn!(
+                    call_id = %call.call_id,
+                    "ending call: RFC 4028 session-timer refresh failed or was never \
+                     received in time (specs/049)"
+                );
+                call.lifecycle.end(EndedBy::SessionTimerExpired);
+                call.stop.store(true, Ordering::Relaxed);
+                report_answered_call_ended(p.obs, &call);
+                hangup_carrier(session, inbound, call, reason::SESSION_TIMER_EXPIRED);
+                self.maintenance.release();
+                true
+            }
+        }
+    }
+
+    /// specs/049, User Story 2: accept the carrier's own in-dialog session
+    /// refresh instead of rejecting it — the only case `UPDATE` is served
+    /// at all today. Anything else (no active call, a different dialog, a
+    /// body carrying an SDP offer, or arriving while this bridge itself
+    /// holds the refresher role) falls through to the same decline this
+    /// bridge has always sent an `UPDATE` (FR-007: this must never weaken
+    /// the separate, pre-existing re-INVITE decline in
+    /// `handle_inbound_invite`, which this method does not touch).
+    fn handle_carrier_update(&mut self, req: &SipRequest, sink: &SipSink) {
+        let accepts = self.active_call.as_ref().is_some_and(|call| {
+            req.header("Call-ID") == Some(call.call_id.as_str())
+                && req.body.trim().is_empty()
+                && call
+                    .session_refresh
+                    .as_ref()
+                    .is_some_and(|r| r.refresher() == Refresher::Uas)
+        });
+        if accepts {
+            let call = self
+                .active_call
+                .as_mut()
+                .expect("just matched Some in `accepts`");
+            call.session_refresh
+                .as_mut()
+                .expect("just matched Some in `accepts`")
+                .on_peer_refresh(Instant::now());
+            let _ = sink.send(&build_uas_response_with_headers(
+                200,
+                "OK",
+                req,
+                Some(&call.to_tag),
+                None,
+                None,
+                &[("Supported", "timer")],
+            ));
+            tracing::info!(call_id = %call.call_id, "accepted the carrier's own session-timer refresh");
+            return;
+        }
+        tracing::debug!("declining UPDATE: not a matching in-dialog session refresh");
+        let _ = sink.send(&unserved_method_response(req, &random_hex(4)));
     }
 
     /// Advance an outbound origination that is mid-flight (specs/029): watch
@@ -2245,6 +2348,23 @@ impl LoopState {
                 self.maintenance.release();
             }
             return;
+        }
+        // specs/049: is this the response to our own sent session-timer
+        // refresh? Matched by Call-ID + CSeq, same discipline as
+        // `PingState::on_response` — a response naming a different `cseq`
+        // (a superseded/mismatched refresh) is left for `refresh.on_response`
+        // itself to ignore.
+        if let Some(call) = &mut self.active_call {
+            let matches_dialog = resp.header("Call-ID") == Some(call.call_id.as_str());
+            let resp_cseq = resp.header("CSeq").and_then(parse_cseq_number);
+            if let (true, Some(refresh), Some(cseq)) =
+                (matches_dialog, &mut call.session_refresh, resp_cseq)
+            {
+                if refresh.awaiting_response_cseq() == Some(cseq) {
+                    refresh.on_response(cseq, resp.status, Instant::now());
+                    return;
+                }
+            }
         }
         // Is this the answer to our Gm keepalive? Any final response counts as
         // proof the client connection carries signaling — even a 4xx/5xx: the
@@ -3213,6 +3333,148 @@ mod tests {
             "{resp}"
         );
     }
+
+    // ---- RFC 4028 session-timer refresh (specs/049) ----
+
+    /// A real UDP "peer" so `handle_carrier_update`'s response can actually
+    /// be sent and read back, mirroring `origination.rs`'s own
+    /// `session_with_reachable_transport` fixture pattern.
+    fn udp_sink_pair() -> (SipSink, std::net::UdpSocket) {
+        let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap();
+        (transport.sink().unwrap(), peer)
+    }
+
+    fn recv_response(peer: &std::net::UdpSocket) -> String {
+        let mut buf = [0u8; 4096];
+        let (n, _) = peer.recv_from(&mut buf).expect("expected a response");
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    fn active_call_with_refresh(refresher: &str) -> ActiveCall {
+        let mut call = test_active_call("c1", "our-to-tag", REQUEST_HELPER_CALLER_FROM);
+        call.session_refresh = Some(
+            session_refresh::SessionRefreshState::from_2xx(
+                Some(&format!("300;refresher={refresher}")),
+                Instant::now(),
+            )
+            .expect("Session-Expires present"),
+        );
+        call
+    }
+
+    #[test]
+    fn handle_carrier_update_accepts_a_matching_body_less_refresh_when_carrier_is_the_refresher() {
+        let mut st = LoopState::new();
+        st.active_call = Some(active_call_with_refresh("uas"));
+        let (sink, peer) = udp_sink_pair();
+
+        st.handle_carrier_update(&in_dialog_request("UPDATE", "our-to-tag"), &sink);
+
+        let resp = recv_response(&peer);
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        let refresh = st
+            .active_call
+            .as_ref()
+            .unwrap()
+            .session_refresh
+            .as_ref()
+            .unwrap();
+        // Re-armed for another full cycle, not left overdue.
+        assert_eq!(refresh.verdict(Instant::now()), RefreshVerdict::Idle);
+    }
+
+    #[test]
+    fn handle_carrier_update_declines_a_body_carrying_update() {
+        // FR-007: an UPDATE attempting real SDP renegotiation must not be
+        // accepted just because it names the active dialog.
+        let mut st = LoopState::new();
+        st.active_call = Some(active_call_with_refresh("uas"));
+        let (sink, peer) = udp_sink_pair();
+        let body = "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n";
+        let raw = format!(
+            "UPDATE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>;tag=our-to-tag\r\n\
+             Call-ID: c1\r\nCSeq: 3 UPDATE\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let req = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0;
+
+        st.handle_carrier_update(&req, &sink);
+
+        let resp = recv_response(&peer);
+        assert!(
+            resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn handle_carrier_update_declines_a_different_call_id() {
+        let mut st = LoopState::new();
+        st.active_call = Some(active_call_with_refresh("uas"));
+        let (sink, peer) = udp_sink_pair();
+        let mut req = in_dialog_request("UPDATE", "our-to-tag");
+        req.headers.retain(|(k, _)| k != "Call-ID");
+        req.headers
+            .push(("Call-ID".to_string(), "some-other-call".to_string()));
+
+        st.handle_carrier_update(&req, &sink);
+
+        let resp = recv_response(&peer);
+        assert!(
+            resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn handle_carrier_update_declines_when_this_bridge_holds_the_refresher_role() {
+        // The carrier isn't on refresh duty in this case (refresher == Uac)
+        // — its own UPDATE here isn't a refresh this bridge is waiting on.
+        let mut st = LoopState::new();
+        st.active_call = Some(active_call_with_refresh("uac"));
+        let (sink, peer) = udp_sink_pair();
+
+        st.handle_carrier_update(&in_dialog_request("UPDATE", "our-to-tag"), &sink);
+
+        let resp = recv_response(&peer);
+        assert!(
+            resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn handle_carrier_update_declines_with_no_active_call() {
+        let mut st = LoopState::new();
+        let (sink, peer) = udp_sink_pair();
+
+        st.handle_carrier_update(&in_dialog_request("UPDATE", "our-to-tag"), &sink);
+
+        let resp = recv_response(&peer);
+        assert!(
+            resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+            "{resp}"
+        );
+    }
+
+    // `handle_session_refresh`'s own send/overdue branches need a real
+    // `RegisteredSession` *and* `Inbound` (for `hangup_carrier`'s
+    // reconnect-retry path) — `Inbound` has no test constructor available
+    // outside `ims::session` (its `tx` field is private there), the same
+    // reason `handle_attachment_loss`/`handle_pbx_hangup` (structurally
+    // identical "needs session+inbound" methods) have no direct unit test
+    // here either. Its actual decision logic is the pure
+    // `SessionRefreshState::verdict` state machine, fully covered in
+    // `session_refresh.rs`'s own tests — the same split
+    // `AttachmentWatch::attachment_lost` already uses for
+    // `handle_attachment_loss`.
 
     // ---- which call a request names (specs/042-dialog-transaction-identity) ----
 

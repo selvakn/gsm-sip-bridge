@@ -10,6 +10,7 @@
 //! message; everything here is the state they are applied against.
 
 use super::call::{ActiveCall, DialogInfo};
+use super::session_refresh;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VethUasResult, VETH_INVITE_TIMEOUT};
 use crate::error::BridgeResult;
 use crate::ims::lifecycle::{BridgedCall, CallStage};
@@ -208,6 +209,11 @@ pub(super) struct PendingOrigination {
     /// refused with "no VoWiFi/VoLTE line available".
     abandoned: bool,
     pub(super) lifecycle: BridgedCall,
+    /// RFC 4028 session-timer refresh state (specs/049), set from the real
+    /// `200 OK`'s `Session-Expires` header — `None` until then, and `None`
+    /// afterward too if that header was absent (no obligation). Carried
+    /// through to `finish_origination`'s `ActiveCall`.
+    session_refresh: Option<session_refresh::SessionRefreshState>,
 }
 
 /// The waits the old `originate_and_bridge` blocked on, now explicit states.
@@ -433,6 +439,7 @@ pub(super) fn begin_origination(
         ringing_relayed: false,
         abandoned: false,
         lifecycle,
+        session_refresh: None,
     })
 }
 
@@ -913,6 +920,17 @@ impl PendingOrigination {
             session,
         );
 
+        // specs/049: read the RFC 4028 session-timer obligation off the
+        // real 200 OK — purely reactive, regardless of whether this
+        // bridge's own INVITE advertised `Supported: timer` (it never
+        // does by default; `[vowifi] originating_headers` is unchanged by
+        // this feature). `None` when the carrier's response carries no
+        // `Session-Expires` at all — no obligation, today's behavior.
+        self.session_refresh = session_refresh::SessionRefreshState::from_2xx(
+            resp.header("Session-Expires"),
+            Instant::now(),
+        );
+
         // specs/037-p-early-media: reuse the listener a provisional already
         // spawned, *if* it's still usable. Its `VETH_INVITE_TIMEOUT` clock
         // started back at the provisional, not now — on a carrier like Jio
@@ -1300,6 +1318,7 @@ fn finish_origination(
         mut lifecycle,
         early_relay,
         early_veth_socket,
+        session_refresh,
         ..
     } = p;
     let mut control = control;
@@ -1570,6 +1589,7 @@ fn finish_origination(
         // (specs/046-rtcp-reporting FR-023) — only the carrier leg of
         // answered (terminating) calls carries an RTCP endpoint.
         rtcp: None,
+        session_refresh,
     })
 }
 
@@ -1659,6 +1679,7 @@ mod tests {
             ringing_relayed: false,
             abandoned: false,
             lifecycle,
+            session_refresh: None,
         };
         (p, ctrl_tx)
     }
@@ -1820,6 +1841,89 @@ mod tests {
             matches!(veth_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "expected a fresh, still-pending veth listener, not the stale failed one"
         );
+    }
+
+    /// A `200 OK` fixture identical in shape to
+    /// `stale_early_veth_failure_falls_back_to_a_fresh_listener_at_200_ok`'s,
+    /// but with a `Session-Expires` header — specs/049.
+    fn ok_response_with_session_expires(
+        call_id: &str,
+        session_expires: Option<&str>,
+    ) -> SipResponse {
+        let mut headers = vec![
+            ("Call-ID".to_string(), call_id.to_string()),
+            ("CSeq".to_string(), "1 INVITE".to_string()),
+            (
+                "To".to_string(),
+                "<sip:9000000001@example.test>;tag=totag".to_string(),
+            ),
+        ];
+        if let Some(se) = session_expires {
+            headers.push(("Session-Expires".to_string(), se.to_string()));
+        }
+        SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        }
+    }
+
+    fn session_with_reachable_transport() -> crate::ims::RegisteredSession {
+        let mut session = test_session();
+        let dummy_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(dummy_peer.local_addr().unwrap(), false)
+                .unwrap();
+        session.transport = Some(transport);
+        session
+    }
+
+    #[test]
+    fn the_200_ok_session_expires_header_is_captured_with_refresher_uac() {
+        let call_id = "out-timer-1";
+        let (control, _server) = control_pair();
+        let mut session = session_with_reachable_transport();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let resp = ok_response_with_session_expires(call_id, Some("300;refresher=uac"));
+        let _ = p.on_carrier_response(&resp, &mut session);
+
+        let refresh = p
+            .session_refresh
+            .as_ref()
+            .expect("Session-Expires was present on the 200 OK");
+        assert_eq!(refresh.refresher(), session_refresh::Refresher::Uac);
+    }
+
+    #[test]
+    fn a_session_expires_with_no_refresher_param_defaults_to_uac() {
+        // research.md Decision 2: a non-compliant 200 OK (RFC 4028 §9
+        // requires the UAS to set `refresher`) defensively defaults to
+        // this bridge taking on the duty itself.
+        let call_id = "out-timer-2";
+        let (control, _server) = control_pair();
+        let mut session = session_with_reachable_transport();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let resp = ok_response_with_session_expires(call_id, Some("300"));
+        let _ = p.on_carrier_response(&resp, &mut session);
+
+        let refresh = p.session_refresh.as_ref().expect("Session-Expires present");
+        assert_eq!(refresh.refresher(), session_refresh::Refresher::Uac);
+    }
+
+    #[test]
+    fn no_session_expires_header_leaves_no_refresh_obligation() {
+        let call_id = "out-timer-3";
+        let (control, _server) = control_pair();
+        let mut session = session_with_reachable_transport();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let resp = ok_response_with_session_expires(call_id, None);
+        let _ = p.on_carrier_response(&resp, &mut session);
+
+        assert!(p.session_refresh.is_none());
     }
 
     /// Regression test for the root cause behind "signaling paired and

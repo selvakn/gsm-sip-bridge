@@ -636,6 +636,12 @@ pub(super) fn handle_invite(
                 meter,
                 lifecycle,
                 rtcp: rtcp_handle,
+                // Inbound-answered calls are out of scope for RFC 4028
+                // session-timer refresh (specs/049, FR-011) — this bridge
+                // never advertises `Supported: timer` on its own `200 OK`
+                // (`agent::mod::SUPPORTED_EXTENSIONS`), so no such call
+                // ever has a refresh obligation.
+                session_refresh: None,
             }))
         }
         ControlMessage::BridgeFailed {
@@ -1020,6 +1026,10 @@ fn handle_offerless_invite(
         lifecycle,
         // FR-002a: no RTCP on the offerless path.
         rtcp: None,
+        // See the matching comment at this file's other `ActiveCall`
+        // construction site — inbound-answered calls are out of scope for
+        // specs/049 (FR-011).
+        session_refresh: None,
     }))
 }
 

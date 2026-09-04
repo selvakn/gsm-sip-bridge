@@ -239,6 +239,11 @@ pub mod reason {
     pub const CARRIER_REJECTED: &str = "carrier_rejected";
     /// `CallFailed`: no final response before giving up.
     pub const CARRIER_TIMEOUT: &str = "carrier_timeout";
+    /// RFC 4028 session-timer refresh failed, or was never received from
+    /// the carrier in time (specs/049) — distinct from
+    /// [`ATTACHMENT_LOST`]/[`TRANSPORT_ERROR`] so it is diagnosable after
+    /// the fact rather than looking like an ordinary hangup.
+    pub const SESSION_TIMER_EXPIRED: &str = "session_timer_expired";
 }
 
 /// Read one newline-terminated JSON `ControlMessage` from `reader`, blocking
