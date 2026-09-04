@@ -200,20 +200,8 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
     // `veth_carrier_addr`/`veth_telephony_addr` (the diagnostic single-`--modem`
     // path — research.md R7) falls back to `LOOPBACK`, exactly as before this
     // feature.
-    let telephony_lines: Vec<crate::vowifi::RuntimeLine> = lines
-        .iter()
-        .map(|l| crate::vowifi::RuntimeLine {
-            index: l.settings_index(),
-            card_id: l.card_id.clone(),
-            veth_local_addr: non_empty_or_loopback(&l.veth_carrier_addr),
-            veth_peer_addr: non_empty_or_loopback(&l.veth_telephony_addr),
-            control_port: l.control_port,
-            sip_leg_port: l.sip_leg_port,
-            // specs/034-alert-identity: the VoLTE line's configured MSISDN,
-            // shown when forwarding this line's SMS to Discord.
-            msisdn: l.msisdn.clone().filter(|m| !m.is_empty()),
-        })
-        .collect();
+    let telephony_lines: Vec<crate::vowifi::RuntimeLine> =
+        lines.iter().map(BridgeLine::to_runtime_line).collect();
 
     // Whether the telephone-side half has the PBX registration the outbound
     // bridge leg needs. All halves are threads here, so they share it directly:
@@ -396,6 +384,26 @@ impl BridgeLine {
     /// telephony `RuntimeLine`, which never relies on it for addressing.
     fn settings_index(&self) -> u32 {
         ((self.status_port - LOOPBACK_STATUS_PORT) / super::discovery::LINE_PORT_STRIDE) as u32
+    }
+
+    /// This line as far as the shared telephony half (`vowifi::RuntimeLine`)
+    /// needs to know — every field here must be carried through explicitly;
+    /// there's no `..Default::default()` to quietly drop one (this is exactly
+    /// how `status_port` went missing before it existed on `RuntimeLine`: the
+    /// literal just didn't set it, and nothing caught that at compile time).
+    fn to_runtime_line(&self) -> crate::vowifi::RuntimeLine {
+        crate::vowifi::RuntimeLine {
+            index: self.settings_index(),
+            card_id: self.card_id.clone(),
+            veth_local_addr: non_empty_or_loopback(&self.veth_carrier_addr),
+            veth_peer_addr: non_empty_or_loopback(&self.veth_telephony_addr),
+            control_port: self.control_port,
+            sip_leg_port: self.sip_leg_port,
+            status_port: self.status_port,
+            // specs/034-alert-identity: the VoLTE line's configured MSISDN,
+            // shown when forwarding this line's SMS to Discord.
+            msisdn: self.msisdn.clone().filter(|m| !m.is_empty()),
+        }
     }
 }
 
@@ -628,6 +636,35 @@ mod tests {
                 assert_ne!(a, b, "this service's own ports must not collide either");
             }
         }
+    }
+
+    /// Regression test for the bug this was written to catch: `status_port`
+    /// was computed correctly on every `BridgeLine` (it's what
+    /// `settings_index` itself derives the line index from — see that
+    /// method's doc comment) but the `RuntimeLine` literal that used to live
+    /// inline in `run_inner` never set it, so every VoLTE line's `PlaceCall`
+    /// attempt connected to the wrong port. `to_runtime_line` must carry it
+    /// through unchanged.
+    #[test]
+    fn to_runtime_line_carries_the_real_status_port_not_a_default() {
+        let line = BridgeLine {
+            card_id: "ec20-test".to_string(),
+            settings: super::super::VolteSettings::default(),
+            msisdn: None,
+            sip_leg_port: LOOPBACK_SIP_PORT,
+            control_port: LOOPBACK_CONTROL_PORT,
+            status_port: LOOPBACK_STATUS_PORT + super::super::discovery::LINE_PORT_STRIDE,
+            netns: String::new(),
+            veth_carrier_addr: String::new(),
+            veth_telephony_addr: String::new(),
+        };
+        let runtime = line.to_runtime_line();
+        assert_eq!(runtime.status_port, line.status_port);
+        assert_ne!(
+            runtime.status_port,
+            crate::vowifi::AGENT_A_STATUS_PORT,
+            "must not fall back to VoWiFi's fixed port"
+        );
     }
 
     #[test]
