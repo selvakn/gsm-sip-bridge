@@ -122,6 +122,33 @@ exact feature area.
   technically permits it) — no carrier has been observed changing it
   mid-call, and building renegotiation support speculatively repeats the
   same over-building Decision 1/3 already reject.
+- The carrier's stated interval is floored to RFC 4028 §9's own stated
+  minimum: *"This minimum interval MUST NOT be lower than 90 seconds."*
+  This bridge never gets a chance to enforce that floor through the normal
+  `Min-SE`/`422` negotiation (the call is already answered by the time
+  `Session-Expires` is read), so an implausibly short value is clamped up
+  to 90s rather than honoured verbatim — spec.md's own Edge Cases already
+  required this ("the bridge must not attempt refreshes on an interval so
+  short it can't reasonably keep up"); the first implementation missed it
+  (PR #74 Greptile review).
+
+**Correction (PR #74 Greptile review)**: a refresh this bridge sent is now
+resent up to `MAX_SESSION_REFRESH_ATTEMPTS` (3) times, `SESSION_REFRESH_RETRY_INTERVAL`
+(3s) apart, all still within the original `SESSION_REFRESH_RESPONSE_TIMEOUT`
+ceiling — the first implementation sent exactly once and let a single lost
+datagram end an otherwise-healthy call. This bridge implements no SIP
+transaction-layer retransmission anywhere else (`BYE`/`PRACK`/`ACK` are all
+fire-and-forget too), so building full RFC 3261 timers here purely for
+this one path would be disproportionate — but unlike those, losing this
+one message actively tears a live call down, which earns it this bounded,
+best-effort resend. Each attempt is a fresh request (new `CSeq`/branch),
+not a byte-identical retransmission, which needs no new machinery: it
+reuses the same `SendNow`/`on_sent` path a first attempt already takes,
+and a response naming an earlier attempt's `CSeq` is already ignored by
+`on_response`'s existing mismatch discipline. Separately, `on_response`
+now ignores a provisional (`status < 200`) rather than treating it as a
+failure — the first implementation would fail the whole refresh on a
+`100 Trying` that a later 2xx should have resolved.
 
 ## Decision 5: Where this lives in the existing state machine
 
@@ -157,6 +184,15 @@ already does exactly what a session-timer-caused end needs (notify Agent B
 over the control channel, best-effort `BYE` to the carrier); only its
 hardcoded reason string needed to become a parameter, since FR-012 needs a
 distinct reason from `ATTACHMENT_LOST`.
+
+**Correction (PR #74 Greptile review)**: "names the active call's dialog"
+above was implemented as a bare `Call-ID` comparison, which does not
+actually establish dialog membership — a stale, cross-dialog, or
+coincidentally-matching `Call-ID` could still reset the refresh deadline.
+Fixed to reuse `names_active_dialog` (`agent/mod.rs`), the same
+Call-ID-plus-both-tags check `bye_response_if_unmatched` already applies
+to a `BYE`, rather than inventing a second, weaker notion of "names this
+call" for `UPDATE`.
 
 ## Decision 6: Observability (FR-012) — a new `EndedBy`/`reason` pair, not a bespoke log line
 

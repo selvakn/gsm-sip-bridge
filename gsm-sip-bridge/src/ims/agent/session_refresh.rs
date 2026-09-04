@@ -22,6 +22,29 @@ use std::time::{Duration, Instant};
 /// not an RFC-specified one.
 pub(super) const SESSION_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// RFC 4028 §9's own stated floor: "This minimum interval MUST NOT be
+/// lower than 90 seconds."
+const MIN_SESSION_INTERVAL: Duration = Duration::from_secs(90);
+
+/// How often a refresh this bridge sent is resent while no response has
+/// arrived, within [`SESSION_REFRESH_RESPONSE_TIMEOUT`]'s overall ceiling.
+/// This bridge implements no SIP transaction-layer retransmission anywhere
+/// (BYE/PRACK/ACK are all fire-and-forget too) — but unlike those, a lost
+/// refresh here ends an otherwise-healthy call (greptile PR #74 review), so
+/// this one path gets a bounded, best-effort resend rather than staking an
+/// active call on a single UDP datagram. Each attempt is a fresh request
+/// (new `CSeq`/branch, not a byte-identical retransmission) — simpler than
+/// reconstructing RFC 3261's retransmission semantics, and harmless here
+/// since [`SessionRefreshState::on_response`] already ignores a response
+/// naming any `CSeq` other than the most recent attempt's.
+const SESSION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Caps how many times a single refresh cycle is retried before
+/// [`SESSION_REFRESH_RESPONSE_TIMEOUT`]'s own ceiling would end it anyway
+/// — belt-and-suspenders against a pathologically small response timeout
+/// ever configured in the future.
+const MAX_SESSION_REFRESH_ATTEMPTS: u8 = 3;
+
 /// Who performs refreshes for a dialog (RFC 4028 §7.1's `refresher`
 /// parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +89,16 @@ pub(super) enum RefreshPhase {
     /// passes (RFC 4028 §7.2/§9: half the session interval).
     WaitingToSend { due_at: Instant },
     /// `refresher == Uac`: a refresh was sent; waiting for its response.
-    AwaitingResponse { cseq: u32, sent_at: Instant },
+    /// `sent_at` is fixed at the *first* attempt (what
+    /// `SESSION_REFRESH_RESPONSE_TIMEOUT` counts down from);
+    /// `last_attempt_at`/`attempts` track the bounded resends in between
+    /// (greptile PR #74 review — see `SESSION_REFRESH_RETRY_INTERVAL`).
+    AwaitingResponse {
+        cseq: u32,
+        sent_at: Instant,
+        last_attempt_at: Instant,
+        attempts: u8,
+    },
     /// `refresher == Uac`: the sent refresh's response was a failure (a
     /// non-2xx final, or the `send()` call itself errored) — resolved to
     /// `Overdue` on the very next `verdict()` check. A distinct variant
@@ -84,7 +116,9 @@ pub(super) enum RefreshPhase {
 pub(super) enum RefreshVerdict {
     /// Nothing to do this tick.
     Idle,
-    /// `refresher == Uac`, `due_at` has passed: send a refresh now.
+    /// `refresher == Uac`: either `due_at` has passed (first attempt) or a
+    /// prior attempt's response is overdue for a resend — send a refresh
+    /// now either way; `on_sent` tells the two cases apart.
     SendNow,
     /// The refresh cycle has failed (our own refresh's timeout/failure) or
     /// the carrier never refreshed in time — end the call. One verdict for
@@ -115,7 +149,14 @@ impl SessionRefreshState {
         if delta == 0 {
             return None;
         }
-        let interval = Duration::from_secs(u64::from(delta));
+        // RFC 4028 §9: "This minimum interval MUST NOT be lower than 90
+        // seconds." This bridge never gets to negotiate that floor itself
+        // (the call is already answered by the time this value is read),
+        // so an implausibly short value is floored rather than honoured
+        // verbatim (spec.md Edge Cases; greptile PR #74 review) — refusing
+        // to attempt refreshes at a sub-floor interval it can't reasonably
+        // sustain, without dropping the obligation entirely.
+        let interval = Duration::from_secs(u64::from(delta)).max(MIN_SESSION_INTERVAL);
         // research.md Decision 2: an explicit `refresher` param is used
         // exactly as stated (RFC 4028 §7.2). A response that carries
         // `Session-Expires` but omits `refresher` is non-compliant (§9
@@ -153,6 +194,18 @@ impl SessionRefreshState {
         }
     }
 
+    /// The deadline this bridge is waiting for the carrier's own refresh
+    /// before (`refresher == Uas` only) — test-only, to prove a declined
+    /// `UPDATE` never resets it (`agent::mod`'s own tests, greptile PR #74
+    /// review).
+    #[cfg(test)]
+    pub(super) fn peer_deadline(&self) -> Option<Instant> {
+        match self.phase {
+            RefreshPhase::WaitingForPeer { deadline } => Some(deadline),
+            _ => None,
+        }
+    }
+
     /// The `Session-Expires` value this bridge sends on its own refresh
     /// `UPDATE` (`refresher == Uac` only — RFC 4028 §7.4: "RECOMMENDED
     /// that the refresher parameter be set to 'uac' if the element
@@ -172,9 +225,18 @@ impl SessionRefreshState {
                     RefreshVerdict::Idle
                 }
             }
-            RefreshPhase::AwaitingResponse { sent_at, .. } => {
+            RefreshPhase::AwaitingResponse {
+                sent_at,
+                last_attempt_at,
+                attempts,
+                ..
+            } => {
                 if now.duration_since(sent_at) >= SESSION_REFRESH_RESPONSE_TIMEOUT {
                     RefreshVerdict::Overdue
+                } else if attempts < MAX_SESSION_REFRESH_ATTEMPTS
+                    && now.duration_since(last_attempt_at) >= SESSION_REFRESH_RETRY_INTERVAL
+                {
+                    RefreshVerdict::SendNow
                 } else {
                     RefreshVerdict::Idle
                 }
@@ -190,9 +252,26 @@ impl SessionRefreshState {
         }
     }
 
-    /// Record that a refresh with `cseq` just went out at `now`.
+    /// Record that a refresh with `cseq` just went out at `now` — either
+    /// the first attempt (from `WaitingToSend`) or a bounded resend of a
+    /// still-unanswered one (from `AwaitingResponse`, greptile PR #74
+    /// review), which keeps the original `sent_at` so the overall
+    /// `SESSION_REFRESH_RESPONSE_TIMEOUT` ceiling is unaffected by retries.
     pub(super) fn on_sent(&mut self, cseq: u32, now: Instant) {
-        self.phase = RefreshPhase::AwaitingResponse { cseq, sent_at: now };
+        let sent_at = match self.phase {
+            RefreshPhase::AwaitingResponse { sent_at, .. } => sent_at,
+            _ => now,
+        };
+        let attempts = match self.phase {
+            RefreshPhase::AwaitingResponse { attempts, .. } => attempts.saturating_add(1),
+            _ => 1,
+        };
+        self.phase = RefreshPhase::AwaitingResponse {
+            cseq,
+            sent_at,
+            last_attempt_at: now,
+            attempts,
+        };
     }
 
     /// The `send()` call for a refresh itself errored — no transaction was
@@ -205,10 +284,14 @@ impl SessionRefreshState {
     /// unchanged) if it doesn't match the in-flight refresh's `cseq` — a
     /// late response to a superseded refresh must not revive a call
     /// already resolved on this dialog, mirroring
-    /// `PingState::on_response`'s identical discipline.
+    /// `PingState::on_response`'s identical discipline. A provisional
+    /// (`status < 200`, e.g. a `100 Trying`) is not a verdict on the
+    /// transaction at all (greptile PR #74 review) — it leaves the phase
+    /// in `AwaitingResponse` unchanged, still waiting for the eventual
+    /// final response.
     pub(super) fn on_response(&mut self, cseq: u32, status: u16, now: Instant) {
         if let RefreshPhase::AwaitingResponse { cseq: pending, .. } = self.phase {
-            if pending != cseq {
+            if pending != cseq || status < 200 {
                 return;
             }
             self.phase = if (200..300).contains(&status) {
@@ -279,6 +362,20 @@ mod tests {
     }
 
     #[test]
+    fn from_2xx_floors_an_implausibly_short_interval_to_the_rfc_minimum() {
+        // greptile PR #74 review: RFC 4028 S9's own 90s floor, applied
+        // defensively since this bridge never gets to negotiate it (the
+        // call is already answered by the time this value is read).
+        let now = Instant::now();
+        let state = SessionRefreshState::from_2xx(Some("1;refresher=uac"), now).unwrap();
+        assert_eq!(state.refresh_header_value(), "90;refresher=uac");
+        let RefreshPhase::WaitingToSend { due_at } = state.phase else {
+            panic!("expected WaitingToSend");
+        };
+        assert_eq!(due_at, now + Duration::from_secs(45));
+    }
+
+    #[test]
     fn from_2xx_defaults_to_uac_when_no_refresher_param_is_present() {
         // research.md Decision 2: a non-compliant response gets the
         // defensive default, not treated as "no obligation".
@@ -321,17 +418,100 @@ mod tests {
 
     #[test]
     fn awaiting_response_becomes_overdue_only_past_its_timeout() {
+        // A retry is due well before the overall ceiling (see the
+        // dedicated retry tests below); this test pins the ceiling itself,
+        // exhausting every retry attempt along the way so the ceiling — not
+        // a stray retry — is what's under test at the end.
         let now = Instant::now();
         let mut state = SessionRefreshState::from_2xx(Some("300;refresher=uac"), now).unwrap();
         state.on_sent(1, now);
         assert_eq!(state.verdict(now), RefreshVerdict::Idle);
+        let mut cseq = 1;
+        let mut t = now;
+        while t + SESSION_REFRESH_RETRY_INTERVAL < now + SESSION_REFRESH_RESPONSE_TIMEOUT {
+            t += SESSION_REFRESH_RETRY_INTERVAL;
+            if state.verdict(t) == RefreshVerdict::SendNow {
+                cseq += 1;
+                state.on_sent(cseq, t);
+            }
+        }
         assert_eq!(
-            state.verdict(now + SESSION_REFRESH_RESPONSE_TIMEOUT - Duration::from_secs(1)),
-            RefreshVerdict::Idle
+            state.verdict(now + SESSION_REFRESH_RESPONSE_TIMEOUT - Duration::from_millis(1)),
+            RefreshVerdict::Idle,
+            "not overdue a moment before the ceiling, however many retries happened"
         );
         assert_eq!(
             state.verdict(now + SESSION_REFRESH_RESPONSE_TIMEOUT),
             RefreshVerdict::Overdue
+        );
+    }
+
+    #[test]
+    fn a_stalled_response_is_resent_at_the_retry_interval() {
+        // greptile PR #74 review: a single lost refresh must not end an
+        // otherwise-healthy call — this bridge resends before giving up.
+        let now = Instant::now();
+        let mut state = SessionRefreshState::from_2xx(Some("300;refresher=uac"), now).unwrap();
+        state.on_sent(1, now);
+        assert_eq!(
+            state.verdict(now + SESSION_REFRESH_RETRY_INTERVAL - Duration::from_millis(1)),
+            RefreshVerdict::Idle
+        );
+        assert_eq!(
+            state.verdict(now + SESSION_REFRESH_RETRY_INTERVAL),
+            RefreshVerdict::SendNow
+        );
+    }
+
+    #[test]
+    fn resending_keeps_the_original_deadline_not_a_fresh_one() {
+        // The retry ceiling is anchored to the *first* attempt's `sent_at`
+        // — a resend must not let a stalled peer extend the call's grace
+        // period indefinitely by never quite answering. Checked exactly at
+        // the original ceiling: `verdict`'s ceiling check runs before its
+        // retry check, so this holds regardless of whether another retry
+        // would otherwise also be due at that instant.
+        let now = Instant::now();
+        let mut state = SessionRefreshState::from_2xx(Some("300;refresher=uac"), now).unwrap();
+        state.on_sent(1, now);
+        state.on_sent(2, now + SESSION_REFRESH_RETRY_INTERVAL);
+        assert_eq!(
+            state.verdict(now + SESSION_REFRESH_RESPONSE_TIMEOUT),
+            RefreshVerdict::Overdue,
+            "the resend must not have pushed the ceiling out from the first attempt's sent_at"
+        );
+    }
+
+    #[test]
+    fn retries_stop_once_the_attempt_cap_is_reached() {
+        let now = Instant::now();
+        let mut state = SessionRefreshState::from_2xx(Some("3600;refresher=uac"), now).unwrap();
+        state.on_sent(1, now);
+        let mut t = now;
+        for cseq in 2..=MAX_SESSION_REFRESH_ATTEMPTS as u32 {
+            t += SESSION_REFRESH_RETRY_INTERVAL;
+            assert_eq!(state.verdict(t), RefreshVerdict::SendNow);
+            state.on_sent(cseq, t);
+        }
+        // Every attempt spent; a long session interval keeps the overall
+        // ceiling from being the reason nothing more is sent.
+        t += SESSION_REFRESH_RETRY_INTERVAL;
+        assert_eq!(state.verdict(t), RefreshVerdict::Idle);
+    }
+
+    #[test]
+    fn a_response_matching_the_latest_retry_cseq_still_resolves_it() {
+        let now = Instant::now();
+        let mut state = SessionRefreshState::from_2xx(Some("300;refresher=uac"), now).unwrap();
+        state.on_sent(1, now);
+        let retried_at = now + SESSION_REFRESH_RETRY_INTERVAL;
+        state.on_sent(2, retried_at);
+        state.on_response(2, 200, retried_at);
+        assert_eq!(
+            state.phase,
+            RefreshPhase::WaitingToSend {
+                due_at: retried_at + Duration::from_secs(150)
+            }
         );
     }
 

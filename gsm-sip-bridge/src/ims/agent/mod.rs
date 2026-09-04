@@ -1897,11 +1897,14 @@ impl LoopState {
 
     /// specs/049: drive an active call's RFC 4028 session-timer refresh
     /// forward one tick — send this bridge's own refresh once due
-    /// (`refresher == Uac`), and end the call if a refresh cycle fails in
-    /// either direction (a sent refresh that got no valid response, or the
-    /// carrier's own refresh never arriving in time). A call with no
-    /// `session_refresh` at all (no `Session-Expires` on its `200 OK`, or
-    /// an inbound-answered call) is untouched — the common case today.
+    /// (`refresher == Uac`, resent a bounded number of times if
+    /// unanswered — `SessionRefreshState`'s own `verdict`/`on_sent` decide
+    /// when, this method just reacts to `SendNow` either way), and end the
+    /// call if a refresh cycle fails in either direction (every resend
+    /// exhausted with no valid response, or the carrier's own refresh
+    /// never arriving in time). A call with no `session_refresh` at all (no
+    /// `Session-Expires` on its `200 OK`, or an inbound-answered call) is
+    /// untouched — the common case today.
     fn handle_session_refresh(
         &mut self,
         session: &mut crate::ims::RegisteredSession,
@@ -1956,8 +1959,14 @@ impl LoopState {
     /// the separate, pre-existing re-INVITE decline in
     /// `handle_inbound_invite`, which this method does not touch).
     fn handle_carrier_update(&mut self, req: &SipRequest, sink: &SipSink) {
+        // Call-ID alone does not establish dialog membership (greptile PR
+        // #74 review) — `names_active_dialog` additionally requires both
+        // dialog tags, the same check `bye_response_if_unmatched` already
+        // applies to a `BYE`, so a stale, cross-dialog, or unrelated
+        // body-less `UPDATE` sharing this call's Call-ID cannot reset the
+        // refresh deadline.
         let accepts = self.active_call.as_ref().is_some_and(|call| {
-            req.header("Call-ID") == Some(call.call_id.as_str())
+            names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to)
                 && req.body.trim().is_empty()
                 && call
                     .session_refresh
@@ -3430,6 +3439,46 @@ mod tests {
         assert!(
             resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
             "{resp}"
+        );
+    }
+
+    #[test]
+    fn handle_carrier_update_declines_a_matching_call_id_with_the_wrong_dialog_tags() {
+        // greptile PR #74 review: Call-ID alone does not establish dialog
+        // membership — a stale/unrelated UPDATE sharing this call's
+        // Call-ID but naming different dialog tags must not reset the
+        // refresh deadline.
+        let mut st = LoopState::new();
+        st.active_call = Some(active_call_with_refresh("uas"));
+        let original_deadline = st
+            .active_call
+            .as_ref()
+            .unwrap()
+            .session_refresh
+            .as_ref()
+            .unwrap()
+            .peer_deadline()
+            .unwrap();
+        let (sink, peer) = udp_sink_pair();
+
+        st.handle_carrier_update(&in_dialog_request("UPDATE", "some-other-to-tag"), &sink);
+
+        let resp = recv_response(&peer);
+        assert!(
+            resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+            "{resp}"
+        );
+        assert_eq!(
+            st.active_call
+                .as_ref()
+                .unwrap()
+                .session_refresh
+                .as_ref()
+                .unwrap()
+                .peer_deadline()
+                .unwrap(),
+            original_deadline,
+            "an unmatched dialog must not reset the refresh deadline"
         );
     }
 
