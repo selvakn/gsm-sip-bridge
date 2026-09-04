@@ -676,19 +676,31 @@ fn record_call_end(
     }
 }
 
+/// How many times [`set_pdu_sms_mode`] retries `AT+CMGF=0` before giving up
+/// and logging an error — a modem fresh off the preceding `AT+CLIP=1` has
+/// occasionally been seen to answer the very next command with a stray or
+/// desynced reply, which a single attempt would misreport as a real
+/// failure to enter PDU mode.
+const CMGF_SET_ATTEMPTS: u32 = 3;
+const CMGF_SET_RETRY_DELAY: Duration = Duration::from_millis(300);
+
 /// `AT+CMGF=0`, switching SMS handling to PDU mode — see `open`'s call site
-/// for why a failure here is logged as an error rather than swallowed like
-/// this file's other best-effort setup commands.
+/// for why a failure here (even after retrying) is logged as an error
+/// rather than swallowed like this file's other best-effort setup commands.
 fn set_pdu_sms_mode(at: &mut AtCommander, module_id: &str) {
-    match at.send_command("AT+CMGF=0") {
-        Ok(AtResponse::Ok(_)) => {}
-        _ => {
-            tracing::error!(
-                module = %module_id,
-                "AT+CMGF=0 (PDU mode) failed; inbound SMS on this line will not decode correctly"
-            );
+    for attempt in 0..CMGF_SET_ATTEMPTS {
+        if matches!(at.send_command("AT+CMGF=0"), Ok(AtResponse::Ok(_))) {
+            return;
+        }
+        if attempt + 1 < CMGF_SET_ATTEMPTS {
+            std::thread::sleep(CMGF_SET_RETRY_DELAY);
         }
     }
+    tracing::error!(
+        module = %module_id,
+        attempts = CMGF_SET_ATTEMPTS,
+        "AT+CMGF=0 (PDU mode) failed after retrying; inbound SMS on this line will not decode correctly"
+    );
 }
 
 fn route_audio_to_usb(at: &mut AtCommander, module_id: &str) {

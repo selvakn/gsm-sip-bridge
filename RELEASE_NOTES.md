@@ -5,7 +5,7 @@
      "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
-- **A text message received on the plain circuit-switched line (no VoWiFi/VoLTE) now decodes correctly instead of showing raw hex for non-ASCII text and a garbled sender.** This route read `AT+CMGR` in text mode (`AT+CMGF=1`) with its own small parser, which never decoded anything — per TS 27.005 §3.1, when a message's DCS doesn't match the terminal's default character set, the modem hands back both the body and a non-plain-numeric sender as hex-encoded UCS-2, and that hex was forwarded to Discord/storage verbatim. v8.15.0 already fixed this for the IMS/VoWiFi `MESSAGE` route and the VoLTE modem-storage sweep by switching them to PDU mode through a shared TPDU decoder; this route now does the same, reusing that decoder instead of its own incomplete one. Live-reproduced on a Jio line running circuit-switched only. No configuration change.
+- **Circuit-switched SMS decoding** -- A text message received on the plain circuit-switched line (no VoWiFi/VoLTE) now decodes correctly instead of showing raw hex for non-ASCII text and a garbled sender, by switching that route to the same PDU-mode decoder v8.15.0 already gave the IMS/VoWiFi and VoLTE routes.
 
 ## v8.15.1
 
