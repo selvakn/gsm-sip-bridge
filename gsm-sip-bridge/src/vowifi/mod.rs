@@ -29,6 +29,7 @@ use crate::control::protocol::{
     AgentKind, AgentState, ObservedEvent, OutboundAttemptOutcome, SmsOutcome,
 };
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::session::escape_display_name;
 use crate::modules::discovery::lines_file_path;
 use crate::observability::reporter::Reporter;
 use crate::sms;
@@ -1993,7 +1994,10 @@ fn bridge_call(
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
     if !caller.is_empty() {
-        let display = caller_name.unwrap_or(caller);
+        // `escape_display_name`: `display` (a carrier-supplied CNAP name, when
+        // present) must not be embedded raw inside this quoted-string — an
+        // unescaped `"` would break out of it and corrupt the header.
+        let display = escape_display_name(caller_name.unwrap_or(caller));
         pai_value = format!("\"{display}\" <tel:{caller}>");
         headers.push(("P-Asserted-Identity", &pai_value));
         headers.push(("X-GSM-Caller-ID", caller));
@@ -2038,7 +2042,11 @@ fn bridge_call(
             } else {
                 caller
             };
-            if let Err(e) = account.set_identity(&id_uri, display) {
+            // `set_identity` wraps this in its own quoted-string; a
+            // carrier-supplied CNAP name could otherwise carry a `"` that
+            // breaks out of it (`escape_display_name`).
+            let display = escape_display_name(display);
+            if let Err(e) = account.set_identity(&id_uri, &display) {
                 tracing::warn!(
                     error = %e,
                     "sip_server: failed to set this call's caller identity; \

@@ -612,25 +612,34 @@ pub(crate) fn extract_caller(req: &SipRequest) -> String {
 
 /// A header's RFC 3261 `name-addr` display name — the quoted (or unquoted
 /// token) part before the `<...>` — or `None` for a bare `addr-spec` (no
-/// display name at all) or an empty one (`""`, or `<...>` with nothing
-/// before it). Unlike [`extract_caller`], absence is a real, common outcome
-/// here (confirmed live: the Nokia SBC's `X-P-Asserted-Identity` carries no
-/// display name at all) and must not collapse to a placeholder string a
-/// caller could plausibly send as their actual name.
+/// display name at all), an empty one (`""`, or `<...>` with nothing before
+/// it), or one containing a bare CR/LF (never legitimate inside a header
+/// value; rejected here rather than passed on to become a header-injection
+/// vector in whatever onward request re-presents it). Unlike
+/// [`extract_caller`], absence is a real, common outcome here (confirmed
+/// live: the Nokia SBC's `X-P-Asserted-Identity` carries no display name at
+/// all) and must not collapse to a placeholder string a caller could
+/// plausibly send as their actual name.
 fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
     let value = req.header(name)?;
     let (display, _) = value.split_once('<')?;
     let display = display.trim().trim_matches('"').trim();
-    (!display.is_empty()).then(|| display.to_string())
+    (!display.is_empty() && !display.contains(['\r', '\n'])).then(|| display.to_string())
 }
 
 /// The caller's display name — CNAP/CLI name delivery (confirmed live
 /// 2026-09-03: Indian carriers send this unprompted, no negotiation
-/// needed), for re-presenting to the PBX/SIP-server side. Same
-/// `P-Asserted-Identity`-first-then-`From` precedence as [`extract_caller`],
-/// since the two headers name the same party and a network-asserted display
-/// name is just as trustworthy as the network-asserted number it comes
-/// with.
+/// needed), for re-presenting to the PBX/SIP-server side.
+///
+/// Reads the *same* header [`extract_caller`] actually sourced the number
+/// from — checked via `header_user_part`'s own success, not merely whether
+/// `P-Asserted-Identity` is present — rather than independently preferring
+/// PAI's name and falling back to `From`'s. A carrier's `From` can name a
+/// different party than its `P-Asserted-Identity` (an SMSC gateway, e.g.);
+/// pairing a from-derived name with a PAI-derived number would present a
+/// name that does not belong to that number. When the sourced header has no
+/// display name of its own, this returns `None` rather than reaching into
+/// the *other* header for one.
 ///
 /// Callers of this function MUST also check
 /// [`caller_identity_is_private`] before re-presenting the result onward —
@@ -639,19 +648,43 @@ fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
 /// caller is headed for a PBX or handset display, which is exactly the
 /// onward signaling `Privacy` governs.
 pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
-    header_display_name(req, "P-Asserted-Identity").or_else(|| header_display_name(req, "From"))
+    let source = if header_user_part(req, "P-Asserted-Identity").is_some() {
+        "P-Asserted-Identity"
+    } else {
+        "From"
+    };
+    header_display_name(req, source)
 }
 
 /// RFC 3323/3325: `Privacy: id` or `Privacy: user` on the inbound request
 /// means the caller's asserted identity must not be re-presented past a
-/// trust boundary. Checked separately from — not folded into —
-/// [`extract_caller_name`] itself, so a caller can still log/attribute the
-/// name internally while withholding it from onward signaling, the same
-/// split `extract_caller`'s own doc comment draws for the number.
+/// trust boundary. Token comparison is case-insensitive per RFC 3261 §7.3.1
+/// (header field values built from tokens are case-insensitive unless the
+/// grammar says otherwise, and `Privacy`'s `priv-value` is such a token).
+/// Checked separately from — not folded into — [`extract_caller_name`]
+/// itself, so a caller can still log/attribute the name internally while
+/// withholding it from onward signaling, the same split `extract_caller`'s
+/// own doc comment draws for the number.
 pub(crate) fn caller_identity_is_private(req: &SipRequest) -> bool {
     req.header("Privacy")
-        .map(|v| v.split(',').any(|p| matches!(p.trim(), "id" | "user")))
+        .map(|v| {
+            v.split(',').any(|p| {
+                p.trim().eq_ignore_ascii_case("id") || p.trim().eq_ignore_ascii_case("user")
+            })
+        })
         .unwrap_or(false)
+}
+
+/// Escapes a caller-supplied display name for safe embedding inside a SIP
+/// `quoted-string` (RFC 3261 §25.1: `qdtext` excludes `"` and `\`, so both
+/// must be `quoted-pair`-escaped — `\"` / `\\`). Without this, a name
+/// containing either character breaks out of the quotes when this bridge
+/// builds its own `P-Asserted-Identity`/`From` around it, producing
+/// malformed syntax a strict endpoint may reject or misparse.
+/// [`header_display_name`] has already rejected embedded CR/LF, so this
+/// only needs to handle the two `quoted-string`-special characters.
+pub(crate) fn escape_display_name(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The **whole URI** named by a header, where [`extract_caller`] wants only

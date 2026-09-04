@@ -804,6 +804,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             // Read from `[vowifi]` on both paths for the same reason as
             // `sms_delivery_report` above: one switch, not two that disagree.
             originating_headers: app_config.vowifi.originating_headers,
+            respect_caller_privacy: app_config.vowifi.respect_caller_privacy,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
@@ -1554,6 +1555,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::originating_headers`; consumed by
     /// [`origination::begin_origination`].
     originating_headers: crate::config::OriginatingHeaders,
+    /// See `config::VowifiConfig::respect_caller_privacy`; consumed by
+    /// [`inbound::caller_name_for_onward_signaling`].
+    respect_caller_privacy: bool,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
     /// Publishes which phase the loop is in, so the watchdog can tell a line
@@ -1571,6 +1575,7 @@ impl DispatchParams<'_> {
             veth_sip_port: self.veth_sip_port,
             obs: self.obs,
             access_network_info: &self.reg_cfg.access_network_info,
+            respect_caller_privacy: self.respect_caller_privacy,
         }
     }
 
@@ -2514,7 +2519,9 @@ impl LoopState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ims::session::{caller_identity_is_private, extract_caller_name};
+    use crate::ims::session::{
+        caller_identity_is_private, escape_display_name, extract_caller_name,
+    };
     // These moved to `ims::session` in the FR-019 extraction; the tests that
     // cover them stay here, exercising the same implementation.
     use crate::ims::session::{build_subscribe, SubscribeParts};
@@ -2667,6 +2674,65 @@ mod tests {
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller_name(&req), None);
+    }
+
+    /// Regression: `P-Asserted-Identity` names one party (no display name of
+    /// its own) and `From` names a *different* one (an SMSC gateway relay,
+    /// e.g., with a display name). `extract_caller` sources the number from
+    /// PAI; `extract_caller_name` must stick to that same header rather than
+    /// independently falling through to `From`'s name — otherwise the onward
+    /// leg would present a name that does not belong to the asserted number.
+    #[test]
+    fn extract_caller_name_does_not_mix_identity_sources() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Gateway Relay\" <sip:gateway.ims.example>;tag=abc\r\n\
+                    P-Asserted-Identity: <sip:+919000000000@ims.example>\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000000");
+        assert_eq!(extract_caller_name(&req), None);
+    }
+
+    #[test]
+    fn extract_caller_name_rejects_an_embedded_crlf() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Evil\r\nX-Injected: yes\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        // The malformed header likely fails to parse as a single header at
+        // all; either way, no display name containing a raw CR/LF may ever
+        // come out the other end.
+        if let Some((req, _)) = SipRequest::try_parse(raw.as_bytes()).unwrap() {
+            if let Some(name) = extract_caller_name(&req) {
+                assert!(!name.contains(['\r', '\n']));
+            }
+        }
+    }
+
+    #[test]
+    fn escape_display_name_escapes_backslash_and_quote() {
+        assert_eq!(
+            escape_display_name(r#"Firstname "Nickname" Lastname"#),
+            r#"Firstname \"Nickname\" Lastname"#
+        );
+        assert_eq!(escape_display_name(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn escape_display_name_leaves_an_ordinary_name_unchanged() {
+        assert_eq!(
+            escape_display_name("Firstname Lastname"),
+            "Firstname Lastname"
+        );
+    }
+
+    #[test]
+    fn caller_identity_is_private_matches_case_insensitively() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Privacy: ID\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(caller_identity_is_private(&req));
     }
 
     #[test]

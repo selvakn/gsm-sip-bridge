@@ -681,6 +681,17 @@ pub struct VowifiConfig {
     /// a carrier that turns out to dislike the report — and record the
     /// capture if you do, because no such carrier is known.
     pub sms_delivery_report: bool,
+    /// Whether an inbound `Privacy: id`/`user` withholds the caller's CNAP
+    /// name (`ims::session::caller_identity_is_private`) from the PBX/
+    /// SIP-server leg — RFC 3325 §9.1's withholding obligation for onward
+    /// signaling. On by default: the number itself was already presented
+    /// unconditionally before this bridge learned to forward the name at
+    /// all, so honouring `Privacy` on the new signal is the conservative
+    /// default. Turn off only for a deployment where the onward leg is
+    /// already fully trusted (e.g. an internal PBX no caller-facing party
+    /// ever sees) and always showing the real name is preferred over
+    /// honouring a carrier's withholding request.
+    pub respect_caller_privacy: bool,
     /// Extra originating (INVITE) headers a carrier's TAS may want before it
     /// will treat the request as an MMTel voice call.
     ///
@@ -868,6 +879,7 @@ impl Default for VowifiConfig {
             gm_cipher_alg: String::new(),
             respond_on_client: false,
             sms_delivery_report: true,
+            respect_caller_privacy: true,
             originating_headers: OriginatingHeaders::default(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
             veth_local_addr: "10.99.0.1".to_string(),
@@ -1238,6 +1250,18 @@ mod tests {
             "{MINIMAL_TOML}\n[vowifi]\nsms_delivery_report = false\n"
         ));
         assert!(!off.vowifi.sms_delivery_report);
+    }
+
+    /// On by default: RFC 3325 §9.1's withholding obligation is the
+    /// conservative default for a signal this bridge only just learned to
+    /// forward at all.
+    #[test]
+    fn respect_caller_privacy_is_on_unless_switched_off() {
+        assert!(parse(MINIMAL_TOML).vowifi.respect_caller_privacy);
+        let off = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nrespect_caller_privacy = false\n"
+        ));
+        assert!(!off.vowifi.respect_caller_privacy);
     }
 
     // --- specs/034-alert-identity: instance name + per-line phone number ---

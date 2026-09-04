@@ -98,11 +98,11 @@ Observed pending items
       Live-verified both paths: a real inbound call from a second (Jio) line
       to the local rig, captured with `RUST_LOG=...sip_client=trace` plus a
       `tcpdump`/`tshark` capture of the outbound PBX-leg INVITE, showed
-      `P-Asserted-Identity: "Selvakumar Natesan" <tel:+919486073281>` and
-      `X-GSM-Caller-Name: Selvakumar Natesan` (previously the number on
+      `P-Asserted-Identity: "Firstname Lastname" <tel:+919000000000>` and
+      `X-GSM-Caller-Name: Firstname Lastname` (previously the number on
       both). With `[sip_server]` enabled and `siptest` registered as the
       ringing account, the same call's `GET /calls` reported
-      `From: "Selvakumar Natesan" <sip:+919486073281@...>` — the registered
+      `From: "Firstname Lastname" <sip:+919000000000@...>` — the registered
       phone now sees the real name.
 
       No spam-indication field exists in the wire capture (no `Identity`/

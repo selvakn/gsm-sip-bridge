@@ -86,6 +86,8 @@ pub(super) struct InviteContext<'a> {
     /// answered inbound INVITE (specs/045 MT-11) — previously omitted
     /// entirely.
     pub(super) access_network_info: &'a str,
+    /// See `config::VowifiConfig::respect_caller_privacy`.
+    pub(super) respect_caller_privacy: bool,
 }
 
 /// Whether this UAS can interpret an inbound INVITE's body as SDP: no
@@ -110,10 +112,14 @@ fn invite_content_type_supported(req: &SipRequest) -> bool {
 
 /// The caller's display name, suitable for re-presenting to Agent B/the PBX
 /// — unlike `extract_caller_name` alone, this also honours RFC 3325 §9.1
-/// `Privacy: id`/`user` on the inbound INVITE by withholding the name
-/// (`None`) rather than passing it onward.
-fn caller_name_for_onward_signaling(req: &SipRequest) -> Option<String> {
-    if caller_identity_is_private(req) {
+/// `Privacy: id`/`user` on the inbound INVITE (when `respect_caller_privacy`,
+/// `config::VowifiConfig::respect_caller_privacy`, says to) by withholding
+/// the name (`None`) rather than passing it onward.
+fn caller_name_for_onward_signaling(
+    req: &SipRequest,
+    respect_caller_privacy: bool,
+) -> Option<String> {
+    if respect_caller_privacy && caller_identity_is_private(req) {
         None
     } else {
         extract_caller_name(req)
@@ -367,7 +373,7 @@ pub(super) fn handle_invite(
         &ControlMessage::IncomingCall {
             call_id: call_id.clone(),
             caller: caller.clone(),
-            caller_name: caller_name_for_onward_signaling(req),
+            caller_name: caller_name_for_onward_signaling(req, ctx.respect_caller_privacy),
         },
     )
     .map_err(BridgeError::Ims)?;
@@ -721,7 +727,7 @@ fn handle_offerless_invite(
         &ControlMessage::IncomingCall {
             call_id: call_id.to_string(),
             caller: caller.to_string(),
-            caller_name: caller_name_for_onward_signaling(req),
+            caller_name: caller_name_for_onward_signaling(req, ctx.respect_caller_privacy),
         },
     )
     .map_err(BridgeError::Ims)?;
@@ -1139,6 +1145,50 @@ fn await_pbx_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn invite_with_headers(headers: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             {headers}Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    #[test]
+    fn onward_signaling_withholds_the_name_when_privacy_id_is_present_and_respected() {
+        let req = invite_with_headers(
+            "From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+             Privacy: id\r\n",
+        );
+        assert_eq!(caller_name_for_onward_signaling(&req, true), None);
+    }
+
+    /// The new `[vowifi].respect_caller_privacy` escape hatch — off means a
+    /// carrier's `Privacy` request no longer withholds the name from the
+    /// onward leg (the number was never withheld either way).
+    #[test]
+    fn onward_signaling_forwards_the_name_despite_privacy_id_when_not_respected() {
+        let req = invite_with_headers(
+            "From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+             Privacy: id\r\n",
+        );
+        assert_eq!(
+            caller_name_for_onward_signaling(&req, false),
+            Some("Firstname Lastname".to_string())
+        );
+    }
+
+    #[test]
+    fn onward_signaling_forwards_the_name_when_no_privacy_header_is_present() {
+        let req = invite_with_headers(
+            "From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n",
+        );
+        assert_eq!(
+            caller_name_for_onward_signaling(&req, true),
+            Some("Firstname Lastname".to_string())
+        );
+    }
 
     fn invite_with_content_type(content_type: Option<&str>) -> SipRequest {
         let ct_line = content_type
