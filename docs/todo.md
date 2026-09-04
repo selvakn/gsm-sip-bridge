@@ -23,56 +23,60 @@ Observed pending items
       Origin: the same "don't advertise extensions you don't implement" lesson
       that produced the PRACK bug (`specs/037-p-early-media`).
 
-- [ ] Outbounds calls via the GSM (PC / VoLTE / VoWIFI), from pbx as well as sip client
-      — **triaged 2026-08-06, re-triaged 2026-09-04 (twice)**: CS, VoWiFi, and
-      PC/SC are audio-verified on real hardware (specs/025-outbound-calling
-      T023/T072/T073); VoLTE specifically has never been independently
-      exercised for *outbound* calling (T050e left this deliberately open).
+- [x] ~~Outbounds calls via the GSM (PC / VoLTE / VoWIFI), from pbx as well as
+      sip client~~ — **triaged 2026-08-06; closed 2026-09-04.** CS, VoWiFi, and
+      PC/SC were already audio-verified on real hardware
+      (specs/025-outbound-calling T023/T072/T073); VoLTE was the last
+      unverified path (T050e left this deliberately open) and is now done.
 
-      **2026-09-04, first pass — corrected below, kept for the record.** A
-      live-test attempt against the *legacy* `[volte].bridge_inbound=false`
-      path (the default) found nothing listening on SIP port 5060 and
-      concluded the SIP-facing outbound dispatcher was missing for VoLTE
-      entirely. That conclusion was too broad — it only holds for the legacy
-      path.
-
-      **2026-09-04, second pass — the real shape of the gap.** With
+      **What was actually wrong** (found across two passes the same day — the
+      first pass's "no dispatcher exists for VoLTE at all" was too broad, see
+      `specs/025-outbound-calling/tasks.md` T050e for that history): with
       `[volte].bridge_inbound=true`, `orchestrate_volte::start_multiline`
-      already spawns `volte-bridge`, which unconditionally calls the *same*
-      `vowifi::run_telephony_side` function VoWiFi's Agent B uses — including
-      `run_outbound_listener` and the `[sip_server]` registrar. VoLTE's
-      carrier-agent process is the same `ims::agent::serve_inbound` Agent A
-      code VoWiFi uses too. So the dispatcher is already shared and already
-      runs for VoLTE; nothing needed building. The actual bug: `RuntimeLine`
-      (the struct `try_place_on_line` iterates over) had no `status_port`
-      field, so `try_place_on_line` connected to VoWiFi's fixed
-      `AGENT_A_STATUS_PORT` (5071) on every line — correct for VoWiFi (each
-      line has its own netns), wrong for VoLTE (a per-line-derived port,
-      5076/5080/5084/…, since VoLTE lines share one port space). **Fixed**:
-      added `RuntimeLine.status_port`, threaded through both the VoWiFi
-      (`runtime_lines_from_resolution`) and VoLTE (`BridgeLine::to_runtime_line`,
-      new) construction sites, and `try_place_on_line`/`print_status` now use
-      it instead of the constant. New regression tests in both files. Legacy
-      `bridge_inbound=false` still has no outbound path by design (registers
-      only) — outbound calling over VoLTE requires `bridge_inbound=true`,
-      matching how VoWiFi already couples "answers inbound" with "dispatchable
-      outbound."
+      already spawns `volte-bridge`, which calls the *same*
+      `vowifi::run_telephony_side` function VoWiFi's Agent B uses — registrar,
+      `run_outbound_listener`, everything. The dispatcher was never missing;
+      the actual bug was that `RuntimeLine` (what `try_place_on_line` iterates
+      over) had no `status_port` field, so every VoLTE line's `PlaceCall`
+      dialed VoWiFi's fixed `AGENT_A_STATUS_PORT` (5071) instead of its own
+      per-line-derived port (5076/5080/5084/…). **Fixed**: added
+      `RuntimeLine.status_port`, threaded through the VoWiFi and VoLTE
+      (`BridgeLine::to_runtime_line`, new) construction sites, used by
+      `try_place_on_line`/`print_status`. New regression tests. Outbound
+      calling over VoLTE requires `[volte].bridge_inbound=true` (the legacy
+      registration-only default still has no route to outbound, by design).
 
-      **Live-verified, partially**: local Vodafone/EC200U rig, the fixed
-      build's `volte-bridge --modem` diagnostic path. Confirmed live: the
-      `[sip_server]` registrar and Agent B's control listener came up, a
-      `siptest`-registered phone's dial-out was redirected and reached
-      `run_outbound_listener`, which attempted dispatch to the VoLTE line
-      (previously this whole path never existed under `bridge_inbound=false`,
-      which is what the first pass actually tested). Could not get all the way
-      to a confirmed `PlaceCall` round-trip on this host session: IMS PDN
-      attach succeeded but the carrier's router advertisement was never
-      accepted (`routed=false`, `docs/operations.md`'s documented "attached
-      but unusable" failure mode) — this is a separate, pre-existing routing
-      issue, not caused by this fix, and it blocks IMS registration (and thus
-      Agent A ever opening its status listener) regardless. T050e stays open
-      pending a session where that routing issue isn't present. Plan (updated
-      to match): [docs/plans/volte-outbound-verification.md](plans/volte-outbound-verification.md).
+      **A second, unrelated bug found and fixed along the way**: the same
+      live-verification session hit "IMS PDN attached but the carrier's router
+      advertisement was never accepted" (`routed=false`). Root cause: `AT+QNETDEVCTL=1,<cid>,1`
+      (`volte::pdn::bring_up`) — the command that actually makes the host
+      interface transition and regain carrier — is only issued when the modem
+      doesn't already report that context bound (`AT+QNETDEVCTL?`). A prior
+      session's `volte-register` run left context 3 marked bound on the modem
+      without a clean detach, so the next attach silently skipped the rebind
+      and the interface never got a fresh carrier/DAD/RA cycle — persistent
+      across retries and process restarts, since the retry loop calls
+      `attach()` again but the modem-side binding doesn't self-clear. Not a
+      code bug (no fix needed) — `gsm-sip-bridge volte-pdn --action down`
+      clears it (issues the unbind), confirmed via a raw `AT+QNETDEVCTL?`
+      probe showing `0,0,0,0` before and after. Recorded in case it recurs:
+      `docs/operations.md`'s "Symptom: attached but nothing works" section
+      already documents the check (`AT+QNETDEVCTL?`), just not this specific
+      stale-binding cause.
+
+      **Live-verified, full pass, 2026-09-04**: local Vodafone/EC200U rig,
+      `volte-bridge --modem` diagnostic path (fixed build), `[sip_server]`
+      mode, a `siptest`-registered phone dialing out. Real IMS registration
+      (`REGISTER response status=200`), real outbound INVITE to the carrier
+      (100 → 183 → 180 → 200 OK), real bidirectional audio — `siptest`
+      reported `direction: both ways`, `success: true`, AMR-WB↔L16
+      transcoding relay running both directions. Corroborated independently by
+      the daemon's own logs (`call media verdict media="both-ways"
+      carrier_rx=843 pbx_rx=921 ... outcome="answered"`) and metrics
+      (`gsm_sip_bridge_outbound_attempts_total{outcome="placed"} 1`,
+      `gsm_sip_bridge_calls_total{status="answered",transport="volte"} 1`,
+      `gsm_sip_bridge_volte_registered 1`). Config/image reverted afterward;
+      VoWiFi confirmed `Registered`/`gm_connection: up` again.
 - [ ] `siptest` (specs/037-siptest-softphone) has no unified dialog engine —
       T026/T037 in that spec's task list. Registration runs as a blocking
       function in its own background thread, outbound calls run
