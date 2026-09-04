@@ -122,7 +122,13 @@ impl ModuleWorker {
         // terminal charset, which nothing here ever decoded) and can't
         // decode identically to every other inbound route — see
         // `sms::reader::decode_pdu_line`'s docs and specs/045's SMS-04.
-        at.send_command("AT+CMGF=0").ok();
+        // Unlike the other best-effort setup commands here, a failure of
+        // this one is not survivable: `handle_cmti` unconditionally hands
+        // every AT+CMGR response to the PDU decoder, so a modem stuck in
+        // text mode would have its SMS silently misdecoded (or fail to
+        // decode) instead of merely losing a nice-to-have (review finding,
+        // PR #73) — logged as an error, not swallowed by `.ok()`.
+        set_pdu_sms_mode(&mut at, &module.id);
         at.send_command("AT+CNMI=2,1,0,0,0").ok();
         at.send_command("AT+CREG=1").ok();
         at.send_command("AT+CEREG=1").ok();
@@ -666,6 +672,21 @@ fn record_call_end(
         };
         if let Err(e) = store_tx.send(StoreCommand::InsertCall(record)) {
             tracing::error!(error = %e, "failed to send call record to store");
+        }
+    }
+}
+
+/// `AT+CMGF=0`, switching SMS handling to PDU mode — see `open`'s call site
+/// for why a failure here is logged as an error rather than swallowed like
+/// this file's other best-effort setup commands.
+fn set_pdu_sms_mode(at: &mut AtCommander, module_id: &str) {
+    match at.send_command("AT+CMGF=0") {
+        Ok(AtResponse::Ok(_)) => {}
+        _ => {
+            tracing::error!(
+                module = %module_id,
+                "AT+CMGF=0 (PDU mode) failed; inbound SMS on this line will not decode correctly"
+            );
         }
     }
 }
