@@ -116,7 +116,13 @@ impl ModuleWorker {
 
         at.send_command("ATE0").ok();
         at.send_command("AT+CLIP=1").ok();
-        at.send_command("AT+CMGF=1").ok();
+        // PDU mode, not text mode: text mode cannot represent UCS-2 (TS
+        // 27.005 §3.1 falls back to hex-encoding both the body and a
+        // non-plain-numeric `<oa>` when the message's DCS doesn't match the
+        // terminal charset, which nothing here ever decoded) and can't
+        // decode identically to every other inbound route — see
+        // `sms::reader::decode_pdu_line`'s docs and specs/045's SMS-04.
+        at.send_command("AT+CMGF=0").ok();
         at.send_command("AT+CNMI=2,1,0,0,0").ok();
         at.send_command("AT+CREG=1").ok();
         at.send_command("AT+CEREG=1").ok();
@@ -433,12 +439,14 @@ impl ModuleWorker {
             return;
         };
 
-        let cmd = format!("AT+CMGR={idx}");
-        match self.at.send_command(&cmd) {
-            Ok(AtResponse::Ok(lines)) => {
-                tracing::debug!(module = %self.module.id, index = idx, lines = ?lines, "SMS read");
+        // PDU-mode read, decoded through the same parser every other inbound
+        // route uses (`crate::ims::sms_pdu`, via `crate::sms::reader`) rather
+        // than a second, incomplete text-mode parser of this route's own —
+        // see `open`'s `AT+CMGF=0` comment for why text mode isn't safe here.
+        match crate::sms::reader::read_sms(&mut self.at, idx) {
+            Ok(sms) => {
+                tracing::debug!(module = %self.module.id, index = idx, sender = %sms.sender, "SMS read");
 
-                let (sender, body) = parse_sms_response(&lines);
                 let received_at = Utc::now().to_rfc3339();
 
                 // specs/034-alert-identity: read the number off the card that
@@ -451,8 +459,8 @@ impl ModuleWorker {
 
                 let _ = self.event_tx.send(BridgeEvent::SmsReceived {
                     module_id: self.module.id.clone(),
-                    sender,
-                    body,
+                    sender: sms.sender,
+                    body: sms.body,
                     received_at,
                     phone_number: self.phone_number.clone(),
                 });
@@ -462,12 +470,6 @@ impl ModuleWorker {
                 // (specs/006-sms-discord-forward).
                 let del_cmd = format!("AT+CMGD={idx}");
                 self.at.send_command(&del_cmd).ok();
-            }
-            Ok(AtResponse::Error(e)) => {
-                tracing::warn!(module = %self.module.id, error = %e, "failed to read SMS");
-            }
-            Ok(AtResponse::CmeError(code, msg)) => {
-                tracing::warn!(module = %self.module.id, code = code, error = %msg, "failed to read SMS");
             }
             Err(e) => {
                 tracing::warn!(module = %self.module.id, error = %e, "failed to read SMS");
@@ -714,85 +716,9 @@ fn set_eec_mode(at: &mut AtCommander, module_id: &str, mode: u32) {
     }
 }
 
-fn parse_sms_response(lines: &[String]) -> (String, String) {
-    let mut sender = "unknown".to_string();
-    let mut body = String::new();
-
-    for (i, line) in lines.iter().enumerate() {
-        if line.starts_with("+CMGR:") {
-            let parts = split_respecting_quotes(line, ',');
-            if parts.len() >= 2 {
-                sender = parts[1].trim().trim_matches('"').to_string();
-            }
-            if i + 1 < lines.len() {
-                body = lines[i + 1..].join("\n");
-            }
-            break;
-        }
-    }
-
-    (sender, body)
-}
-
-/// Splits `line` on `sep`, except inside `"..."` — TS 27.005 §3.1's
-/// `+CMGR`/`+CMGL` response fields include quoted values (`<scts>`'s own
-/// comma-containing timestamp, a SIM-phonebook `<alpha>` name) that a plain
-/// `str::split` would wrongly treat as field boundaries, shifting every
-/// later field's attribution (specs/045 CS-04).
-fn split_respecting_quotes(line: &str, sep: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut in_quotes = false;
-    let mut start = 0;
-    for (i, c) in line.char_indices() {
-        if c == '"' {
-            in_quotes = !in_quotes;
-        } else if c == sep && !in_quotes {
-            parts.push(&line[start..i]);
-            start = i + c.len_utf8();
-        }
-    }
-    parts.push(&line[start..]);
-    parts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// specs/045 CS-04: `<scts>` is itself a quoted field containing a
-    /// comma ("26/08/22,09:07:48+22") — a naive `split(',')` would shift
-    /// every field after `<oa>` by one, though `sender` (`parts[1]`)
-    /// happens to survive today only because it comes before `<scts>` in
-    /// field order.
-    #[test]
-    fn parse_sms_response_is_unaffected_by_a_comma_inside_a_quoted_field() {
-        let lines = vec![
-            "+CMGR: \"REC UNREAD\",\"+919000000000\",,\"26/08/22,09:07:48+22\"".to_string(),
-            "hello".to_string(),
-        ];
-        let (sender, body) = parse_sms_response(&lines);
-        assert_eq!(sender, "+919000000000");
-        assert_eq!(body, "hello");
-    }
-
-    /// A quoted `<alpha>` field (a SIM-phonebook name) containing a comma
-    /// must not shift `sender`'s attribution either.
-    #[test]
-    fn parse_sms_response_is_unaffected_by_a_comma_inside_an_alpha_field() {
-        let lines = vec![
-            "+CMGR: \"REC READ\",\"+919000000001\",\"Doe, John\",\"26/08/22,09:07:48+22\""
-                .to_string(),
-            "hi".to_string(),
-        ];
-        let (sender, _) = parse_sms_response(&lines);
-        assert_eq!(sender, "+919000000001");
-    }
-
-    #[test]
-    fn split_respecting_quotes_keeps_a_quoted_comma_intact() {
-        let parts = split_respecting_quotes("a,\"b,c\",d", ',');
-        assert_eq!(parts, vec!["a", "\"b,c\"", "d"]);
-    }
 
     /// Mock stream for `AtCommander`, mirroring `at_commander`'s own private
     /// `MockStream`: reads from a fixed byte buffer, discards writes.
