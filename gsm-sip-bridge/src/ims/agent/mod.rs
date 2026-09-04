@@ -2514,6 +2514,7 @@ impl LoopState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ims::session::{caller_identity_is_private, extract_caller_name};
     // These moved to `ims::session` in the FR-019 extraction; the tests that
     // cover them stay here, exercising the same implementation.
     use crate::ims::session::{build_subscribe, SubscribeParts};
@@ -2616,6 +2617,95 @@ mod tests {
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert_eq!(extract_caller(&req), "+919000000001");
+    }
+
+    /// Confirmed live 2026-09-03: an Indian carrier's inbound INVITE already
+    /// carries CNAP as the P-Asserted-Identity display name, unprompted.
+    #[test]
+    fn extract_caller_name_reads_the_quoted_display_name_from_p_asserted_identity() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example;user=phone>;tag=abc\r\n\
+                    P-Asserted-Identity: \"Firstname Lastname\" <tel:+919000000000;cpc=ordinary>\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            extract_caller_name(&req),
+            Some("Firstname Lastname".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_caller_name_falls_back_to_from_when_no_asserted_identity() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            extract_caller_name(&req),
+            Some("Firstname Lastname".to_string())
+        );
+    }
+
+    /// Confirmed live: the Nokia SBC's `X-P-Asserted-Identity` and a bare
+    /// `P-Asserted-Identity`/`From` with no quoted name at all are both real
+    /// cases — must be `None`, never a placeholder like `extract_caller`'s
+    /// `"unknown"`, since a caller could plausibly be named that.
+    #[test]
+    fn extract_caller_name_is_none_when_neither_header_has_a_display_name() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    P-Asserted-Identity: <sip:+919000000000@ims.example>\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller_name(&req), None);
+    }
+
+    #[test]
+    fn extract_caller_name_is_none_for_an_empty_quoted_name() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller_name(&req), None);
+    }
+
+    #[test]
+    fn caller_identity_is_private_matches_privacy_id() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Privacy: id\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(caller_identity_is_private(&req));
+    }
+
+    #[test]
+    fn caller_identity_is_private_matches_privacy_user_among_multiple_values() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Privacy: header, user\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(caller_identity_is_private(&req));
+    }
+
+    #[test]
+    fn caller_identity_is_private_is_false_when_privacy_header_absent() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(!caller_identity_is_private(&req));
+    }
+
+    #[test]
+    fn caller_identity_is_private_is_false_for_privacy_none() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Privacy: none\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(!caller_identity_is_private(&req));
     }
 
     fn message_with_headers(headers: &str) -> SipRequest {

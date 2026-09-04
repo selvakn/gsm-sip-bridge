@@ -15,7 +15,9 @@ use crate::control::protocol::{BridgeFailureReason, CallStatus};
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
-use crate::ims::session::{extract_caller, respond, Inbound};
+use crate::ims::session::{
+    caller_identity_is_private, extract_caller, extract_caller_name, respond, Inbound,
+};
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_415_unsupported_media, build_420_bad_extension,
     build_486_busy_here, build_488_incompatible_transport, build_488_not_acceptable,
@@ -103,6 +105,18 @@ fn invite_content_type_supported(req: &SipRequest) -> bool {
             .unwrap_or("")
             .trim()
             .eq_ignore_ascii_case("application/sdp"),
+    }
+}
+
+/// The caller's display name, suitable for re-presenting to Agent B/the PBX
+/// — unlike `extract_caller_name` alone, this also honours RFC 3325 §9.1
+/// `Privacy: id`/`user` on the inbound INVITE by withholding the name
+/// (`None`) rather than passing it onward.
+fn caller_name_for_onward_signaling(req: &SipRequest) -> Option<String> {
+    if caller_identity_is_private(req) {
+        None
+    } else {
+        extract_caller_name(req)
     }
 }
 
@@ -353,6 +367,7 @@ pub(super) fn handle_invite(
         &ControlMessage::IncomingCall {
             call_id: call_id.clone(),
             caller: caller.clone(),
+            caller_name: caller_name_for_onward_signaling(req),
         },
     )
     .map_err(BridgeError::Ims)?;
@@ -706,6 +721,7 @@ fn handle_offerless_invite(
         &ControlMessage::IncomingCall {
             call_id: call_id.to_string(),
             caller: caller.to_string(),
+            caller_name: caller_name_for_onward_signaling(req),
         },
     )
     .map_err(BridgeError::Ims)?;

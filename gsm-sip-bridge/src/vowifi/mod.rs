@@ -1616,8 +1616,12 @@ fn handle_connection(
     let mut writer = stream;
 
     let msg = read_msg(&mut reader).map_err(BridgeError::Ims)?;
-    let (call_id, caller) = match msg {
-        ControlMessage::IncomingCall { call_id, caller } => (call_id, caller),
+    let (call_id, caller, caller_name) = match msg {
+        ControlMessage::IncomingCall {
+            call_id,
+            caller,
+            caller_name,
+        } => (call_id, caller, caller_name),
         ControlMessage::StatusQuery => {
             let calls = recent_calls
                 .lock()
@@ -1665,6 +1669,7 @@ fn handle_connection(
         call_placement_lock,
         config,
         &caller,
+        caller_name.as_deref(),
         leg_addr,
         leg_port,
         line_msisdn.unwrap_or(""),
@@ -1969,6 +1974,7 @@ fn bridge_call(
     call_placement_lock: &Mutex<()>,
     config: &AppConfig,
     caller: &str,
+    caller_name: Option<&str>,
     leg_addr: &str,
     leg_port: u16,
     line_number: &str,
@@ -1978,12 +1984,22 @@ fn bridge_call(
     // leave the caller connected to nothing.
     let pbx_uri = telephony_dest_uri(config, bindings, caller, line_number)?;
 
+    // Falls back to the number itself when the carrier sent no CNAP name (or
+    // it was withheld by `Privacy`) — unchanged from before this field
+    // existed (confirmed live 2026-09-03: Indian carriers send CNAP as the
+    // `From`/`P-Asserted-Identity` display name, unprompted).
+    let caller_name = caller_name.filter(|n| !n.is_empty());
+
     let mut headers: Vec<(&str, &str)> = Vec::new();
     let pai_value;
     if !caller.is_empty() {
-        pai_value = format!("\"{caller}\" <tel:{caller}>");
+        let display = caller_name.unwrap_or(caller);
+        pai_value = format!("\"{display}\" <tel:{caller}>");
         headers.push(("P-Asserted-Identity", &pai_value));
         headers.push(("X-GSM-Caller-ID", caller));
+        if let Some(name) = caller_name {
+            headers.push(("X-GSM-Caller-Name", name));
+        }
     }
 
     // SIP server mode has no per-line Request-URI to carry `line_number`
@@ -2015,7 +2031,9 @@ fn bridge_call(
             .unwrap_or_else(|e| e.into_inner());
         if bindings.is_some() {
             let id_uri = config.sip_server.caller_identity_uri(caller);
-            let display = if caller.is_empty() {
+            let display = if let Some(name) = caller_name {
+                name
+            } else if caller.is_empty() {
                 config.sip.display_name.as_str()
             } else {
                 caller

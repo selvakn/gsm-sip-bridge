@@ -24,7 +24,17 @@ pub enum ControlMessage {
     /// Agent A → Agent B. Sent the moment an inbound `INVITE` is parsed;
     /// Agent A blocks its own SIP response to the carrier until it gets a
     /// `BridgeReady`/`BridgeFailed` reply.
-    IncomingCall { call_id: String, caller: String },
+    IncomingCall {
+        call_id: String,
+        caller: String,
+        /// The carrier's CNAP display name (confirmed live 2026-09-03: sent
+        /// unprompted in `From`/`P-Asserted-Identity`), already withheld by
+        /// Agent A when the INVITE carried `Privacy: id`/`user`. `None` when
+        /// absent or withheld. `#[serde(default)]` so a message from an
+        /// older Agent A that omits it still parses.
+        #[serde(default)]
+        caller_name: Option<String>,
+    },
     /// Either direction. Whichever agent sees its own leg drop first sends
     /// this; the receiver tears its side down and does not echo it back.
     /// Agent A → Agent B when the carrier sends a `BYE` (or the caller
@@ -273,8 +283,23 @@ mod tests {
         let msg = ControlMessage::IncomingCall {
             call_id: "a1b2c3".to_string(),
             caller: "+919000000000".to_string(),
+            caller_name: Some("Firstname Lastname".to_string()),
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn incoming_call_with_no_name_from_an_older_peer_parses() {
+        // A message serialised without `caller_name` (an older Agent A)
+        // must still deserialise, defaulting the field to `None`.
+        let older = r#"{"event":"incoming_call","call_id":"a1b2c3","caller":"+919000000000"}"#;
+        let parsed: ControlMessage = serde_json::from_str(older).unwrap();
+        match parsed {
+            ControlMessage::IncomingCall { caller_name, .. } => {
+                assert_eq!(caller_name, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -450,11 +475,12 @@ mod tests {
         let msg = ControlMessage::IncomingCall {
             call_id: "a1b2c3".to_string(),
             caller: "+919000000000".to_string(),
+            caller_name: Some("Firstname Lastname".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"event":"incoming_call","call_id":"a1b2c3","caller":"+919000000000"}"#
+            r#"{"event":"incoming_call","call_id":"a1b2c3","caller":"+919000000000","caller_name":"Firstname Lastname"}"#
         );
     }
 
@@ -463,7 +489,8 @@ mod tests {
         assert_eq!(
             ControlMessage::IncomingCall {
                 call_id: "x".to_string(),
-                caller: "y".to_string()
+                caller: "y".to_string(),
+                caller_name: None,
             }
             .call_id(),
             Some("x")
@@ -501,6 +528,7 @@ mod tests {
             &ControlMessage::IncomingCall {
                 call_id: "1".to_string(),
                 caller: "c".to_string(),
+                caller_name: None,
             },
         )
         .unwrap();

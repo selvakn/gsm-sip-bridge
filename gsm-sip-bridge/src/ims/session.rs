@@ -610,6 +610,50 @@ pub(crate) fn extract_caller(req: &SipRequest) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// A header's RFC 3261 `name-addr` display name — the quoted (or unquoted
+/// token) part before the `<...>` — or `None` for a bare `addr-spec` (no
+/// display name at all) or an empty one (`""`, or `<...>` with nothing
+/// before it). Unlike [`extract_caller`], absence is a real, common outcome
+/// here (confirmed live: the Nokia SBC's `X-P-Asserted-Identity` carries no
+/// display name at all) and must not collapse to a placeholder string a
+/// caller could plausibly send as their actual name.
+fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
+    let value = req.header(name)?;
+    let (display, _) = value.split_once('<')?;
+    let display = display.trim().trim_matches('"').trim();
+    (!display.is_empty()).then(|| display.to_string())
+}
+
+/// The caller's display name — CNAP/CLI name delivery (confirmed live
+/// 2026-09-03: Indian carriers send this unprompted, no negotiation
+/// needed), for re-presenting to the PBX/SIP-server side. Same
+/// `P-Asserted-Identity`-first-then-`From` precedence as [`extract_caller`],
+/// since the two headers name the same party and a network-asserted display
+/// name is just as trustworthy as the network-asserted number it comes
+/// with.
+///
+/// Callers of this function MUST also check
+/// [`caller_identity_is_private`] before re-presenting the result onward —
+/// unlike `extract_caller` (internal attribution only, RFC 3325 §9.1's
+/// withholding obligation doesn't apply), a name reaching this function's
+/// caller is headed for a PBX or handset display, which is exactly the
+/// onward signaling `Privacy` governs.
+pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
+    header_display_name(req, "P-Asserted-Identity").or_else(|| header_display_name(req, "From"))
+}
+
+/// RFC 3323/3325: `Privacy: id` or `Privacy: user` on the inbound request
+/// means the caller's asserted identity must not be re-presented past a
+/// trust boundary. Checked separately from — not folded into —
+/// [`extract_caller_name`] itself, so a caller can still log/attribute the
+/// name internally while withholding it from onward signaling, the same
+/// split `extract_caller`'s own doc comment draws for the number.
+pub(crate) fn caller_identity_is_private(req: &SipRequest) -> bool {
+    req.header("Privacy")
+        .map(|v| v.split(',').any(|p| matches!(p.trim(), "id" | "user")))
+        .unwrap_or(false)
+}
+
 /// The **whole URI** named by a header, where [`extract_caller`] wants only
 /// the user part — for addressing a new request back at whoever sent this
 /// one. RFC 3261 §20 allows either form: a `name-addr`, where the URI is
