@@ -2725,6 +2725,24 @@ mod tests {
         );
     }
 
+    /// Regression: `extract_caller_name` must not double-escape a name that
+    /// was already `quoted-pair`-escaped on the wire — the extraction has to
+    /// undo the wire-level escaping so `escape_display_name` (applied later,
+    /// when this bridge builds its own header around the name) escapes it
+    /// exactly once.
+    #[test]
+    fn extract_caller_name_unescapes_wire_level_quoted_pairs() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Doe \\\"Junior\\\"\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        let name = extract_caller_name(&req).expect("a display name");
+        assert_eq!(name, "Doe \"Junior\"");
+        // Re-escaping the unescaped name for outbound use must produce
+        // exactly one level of escaping, matching what was on the wire.
+        assert_eq!(escape_display_name(&name), "Doe \\\"Junior\\\"");
+    }
+
     #[test]
     fn caller_identity_is_private_matches_case_insensitively() {
         let raw = "INVITE sip:x SIP/2.0\r\n\
@@ -2750,6 +2768,19 @@ mod tests {
         let raw = "INVITE sip:x SIP/2.0\r\n\
                     From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
                     Privacy: header, user\r\n\
+                    Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert!(caller_identity_is_private(&req));
+    }
+
+    /// Regression: RFC 3323 §4.2's `Privacy-hdr` grammar separates multiple
+    /// `priv-value`s with `;`, not `,` — a comma-only split missed this
+    /// spec-conformant form entirely.
+    #[test]
+    fn caller_identity_is_private_matches_a_semicolon_delimited_value() {
+        let raw = "INVITE sip:x SIP/2.0\r\n\
+                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example>;tag=abc\r\n\
+                    Privacy: header;id\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
         assert!(caller_identity_is_private(&req));

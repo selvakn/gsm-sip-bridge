@@ -610,21 +610,48 @@ pub(crate) fn extract_caller(req: &SipRequest) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// A header's RFC 3261 `name-addr` display name — the quoted (or unquoted
-/// token) part before the `<...>` — or `None` for a bare `addr-spec` (no
-/// display name at all), an empty one (`""`, or `<...>` with nothing before
-/// it), or one containing a bare CR/LF (never legitimate inside a header
-/// value; rejected here rather than passed on to become a header-injection
-/// vector in whatever onward request re-presents it). Unlike
-/// [`extract_caller`], absence is a real, common outcome here (confirmed
-/// live: the Nokia SBC's `X-P-Asserted-Identity` carries no display name at
-/// all) and must not collapse to a placeholder string a caller could
-/// plausibly send as their actual name.
+/// Undoes RFC 3261 §25.1 `quoted-pair` escaping (`\X` means the literal
+/// character `X`) on the *contents* of a `quoted-string` — i.e. `value` with
+/// its surrounding `"..."` already stripped. Without this,
+/// [`header_display_name`] would hand back the wire-level escapes verbatim,
+/// and [`escape_display_name`] would then escape them a *second* time when
+/// this bridge builds its own quoted-string around the name — turning a
+/// caller's `"Doe \"Junior\""` into literal backslashes on the far end.
+fn unescape_quoted_pairs(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A header's RFC 3261 `name-addr` display name — the quoted-string (unescaped
+/// per [`unescape_quoted_pairs`]) or unquoted token part before the `<...>` —
+/// or `None` for a bare `addr-spec` (no display name at all), an empty one
+/// (`""`, or `<...>` with nothing before it), or one containing a bare CR/LF
+/// (never legitimate inside a header value; rejected here rather than passed
+/// on to become a header-injection vector in whatever onward request
+/// re-presents it). Unlike [`extract_caller`], absence is a real, common
+/// outcome here (confirmed live: the Nokia SBC's `X-P-Asserted-Identity`
+/// carries no display name at all) and must not collapse to a placeholder
+/// string a caller could plausibly send as their actual name.
 fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
     let value = req.header(name)?;
     let (display, _) = value.split_once('<')?;
-    let display = display.trim().trim_matches('"').trim();
-    (!display.is_empty() && !display.contains(['\r', '\n'])).then(|| display.to_string())
+    let display = display.trim();
+    let display = match display.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(quoted) => unescape_quoted_pairs(quoted),
+        None => display.to_string(),
+    };
+    let display = display.trim().to_string();
+    (!display.is_empty() && !display.contains(['\r', '\n'])).then_some(display)
 }
 
 /// The caller's display name — CNAP/CLI name delivery (confirmed live
@@ -661,6 +688,11 @@ pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
 /// trust boundary. Token comparison is case-insensitive per RFC 3261 §7.3.1
 /// (header field values built from tokens are case-insensitive unless the
 /// grammar says otherwise, and `Privacy`'s `priv-value` is such a token).
+/// RFC 3323 §4.2's grammar (`Privacy-hdr = "Privacy" HCOLON priv-value
+/// *(";" priv-value)`) separates multiple values with `;`, not the `,` most
+/// other SIP list headers use — splitting on `,` alone missed a
+/// spec-conformant `Privacy: header;id`; `,` is still accepted too, as a
+/// harmless tolerance for a sender that gets this wrong.
 /// Checked separately from — not folded into — [`extract_caller_name`]
 /// itself, so a caller can still log/attribute the name internally while
 /// withholding it from onward signaling, the same split `extract_caller`'s
@@ -668,7 +700,7 @@ pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
 pub(crate) fn caller_identity_is_private(req: &SipRequest) -> bool {
     req.header("Privacy")
         .map(|v| {
-            v.split(',').any(|p| {
+            v.split([';', ',']).any(|p| {
                 p.trim().eq_ignore_ascii_case("id") || p.trim().eq_ignore_ascii_case("user")
             })
         })
