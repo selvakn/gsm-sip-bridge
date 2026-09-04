@@ -74,7 +74,42 @@ Observed pending items
       voice + SMS provisioned, MO voice not), not a client-side defect.
       Plan: [docs/plans/jio-vowifi-outbound-480.md](plans/jio-vowifi-outbound-480.md).
 - [ ] Multi part SMS - combine them and discord notify
-- [ ] Explore if caller identity can carry the name as well in the vowifi / volte stacks
+- [x] ~~Explore if caller identity can carry the name as well in the vowifi /
+      volte stacks~~ — **implemented and live-verified 2026-09-03.** Indian
+      carriers already send the TRAI-mandated CNAP name unprompted, as the
+      SIP display-name on `From`/`P-Asserted-Identity` — confirmed on a real
+      inbound VoWiFi INVITE. The bridge was discarding it
+      (`ims::session::extract_caller` kept only the URI's user part), so both
+      onward legs showed the number, or the number repeated as the "name".
+
+      Added `ims::session::extract_caller_name` (same PAI-then-From
+      precedence as `extract_caller`) and `caller_identity_is_private`
+      (RFC 3325 `Privacy: id`/`user` withholding); carried the name Agent A →
+      Agent B via a new `ControlMessage::IncomingCall.caller_name` field
+      (`#[serde(default)]` for wire compatibility); `vowifi::bridge_call` now
+      puts it in the `P-Asserted-Identity` display name (was the number
+      repeated) plus a new `X-GSM-Caller-Name` header, and it's what
+      `Account::set_identity` shows as the `From` display name in
+      SIP-server mode. Falls back to today's number-only behavior when a
+      carrier sends no name. Covers VoWiFi and VoLTE (shared
+      `ims::agent`/`bridge_call` path); circuit-switched is unaffected —
+      `+CLIP`'s `<alpha>` field is a modem phonebook match, not network CNAP.
+
+      Live-verified both paths: a real inbound call from a second (Jio) line
+      to the local rig, captured with `RUST_LOG=...sip_client=trace` plus a
+      `tcpdump`/`tshark` capture of the outbound PBX-leg INVITE, showed
+      `P-Asserted-Identity: "Firstname Lastname" <tel:+919000000000>` and
+      `X-GSM-Caller-Name: Firstname Lastname` (previously the number on
+      both). With `[sip_server]` enabled and `siptest` registered as the
+      ringing account, the same call's `GET /calls` reported
+      `From: "Firstname Lastname" <sip:+919000000000@...>` — the registered
+      phone now sees the real name.
+
+      No spam-indication field exists in the wire capture (no `Identity`/
+      RFC 8224, no `verstat`, no vendor `X-` header) — India runs no
+      STIR/SHAKEN; TRAI's anti-spam design is CNAP itself, plus the `140`-
+      prefix telemarketing/`1600`-prefix transactional numbering convention,
+      already available in the calling number this bridge extracts.
 - [ ] **SMS-07** — national-language shift tables unimplemented (TS 23.038
       Annex A). Attempted and reversed mid-implementation during batch 6
       (specs/045-long-tail-conformance): the mechanism (recognizing the UDH

@@ -269,6 +269,11 @@ respond_on_client = false
 # Turn it off only to isolate a carrier that dislikes the report -- and please
 # capture the exchange, because no such carrier is known.
 sms_delivery_report = true
+# Whether an inbound Privacy: id/user withholds the caller's CNAP name from
+# the PBX/SIP-server leg (RFC 3325 Sec9.1). The caller's number is unaffected
+# either way. Turn off only for a deployment where the onward leg is already
+# fully trusted and showing the real name always is preferred.
+respect_caller_privacy = true
 # Optional originating (INVITE) headers, by name. Empty (the default) is the
 # minimal header set every carrier in production here places calls on. Each
 # entry opts one group in:

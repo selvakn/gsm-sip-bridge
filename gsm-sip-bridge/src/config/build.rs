@@ -639,6 +639,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         },
         respond_on_client: raw.respond_on_client,
         sms_delivery_report: raw.sms_delivery_report,
+        respect_caller_privacy: raw.respect_caller_privacy,
         originating_headers: {
             let mut set = crate::config::OriginatingHeaders::default();
             for token in &raw.originating_headers {
