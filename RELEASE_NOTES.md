@@ -1,10 +1,8 @@
 # Release Notes
 
-<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time -- publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.16.0
 
+- **Caller ID name (CNAP) on inbound calls** -- An inbound VoWiFi/VoLTE call now carries the caller's network-supplied display name to the PBX and SIP-server legs, not just their number. Indian carriers already send the TRAI-mandated CNAP name unprompted on the inbound INVITE's `From`/`P-Asserted-Identity`; this bridge now forwards it via `P-Asserted-Identity`'s display name and a new `X-GSM-Caller-Name` header on the PBX trunk leg, and as the `From` display name for a SIP-server-mode handset. A caller's `Privacy: id`/`user` request withholds the name from the onward leg by default (`[vowifi].respect_caller_privacy`, RFC 3325); falls back to today's number-only behavior when a carrier sends no name. Circuit-switched calls are unaffected (`+CLIP` carries no network name).
 - **RFC 4028 session-timer refresh** -- An outbound call whose carrier requires session-timer refresh on a call that connects is now kept alive instead of silently dropping. This bridge still never advertises `Supported: timer` on its own outbound INVITEs (`[vowifi] originating_headers` unchanged) — but a carrier's `200 OK` carrying `Session-Expires`, unprompted, is now honoured: this bridge sends its own periodic refresh when the carrier assigns it that role, or accepts the carrier's own in-dialog refresh when the carrier keeps it. A refresh that fails, in either direction, now ends the call cleanly with a distinct, diagnosable reason instead of the call silently dropping at the session interval with no explanation. No carrier reachable during development has ever been observed requiring this on a call that connects, so verification is unit-tested only — see `specs/049-session-timer-refresh`.
 - **Circuit-switched SMS decoding** -- A text message received on the plain circuit-switched line (no VoWiFi/VoLTE) now decodes correctly instead of showing raw hex for non-ASCII text and a garbled sender, by switching that route to the same PDU-mode decoder v8.15.0 already gave the IMS/VoWiFi and VoLTE routes.
 
