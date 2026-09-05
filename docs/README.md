@@ -43,13 +43,6 @@ Kept for the reasoning and findings, not as how-to guides.
 | [audio-tuning-log.md](audio-tuning-log.md) | Running log of modem/SIP audio parameter changes and their outcomes |
 
 Per-feature specs, plans, and task breakdowns live under
-[`specs/`](../specs/) — most recently `026-disable-circuit-switched` for
-turning the circuit-switched call path off entirely on VoWiFi/VoLTE-only
-deployments, `025-outbound-calling` for placing calls out through the
-mobile network on request, `024-sip-server-mode` for the bridge acting as
-the SIP server itself, `023-omnikey-pcsc-vowifi` for PC/SC
-card-reader-backed VoWiFi lines, `015-volte-host-ims` through
-`020-volte-line-netns` for the host-side VoLTE bridge (registration, calls,
-inbound bridging, multi-modem, per-line network isolation), and
-`011-vowifi-sip-bridge` through `014-vowifi-metrics-restore` for the VoWiFi
-work.
+[`specs/`](../specs/), one numbered directory per feature in the order it was
+built. [RELEASE_NOTES.md](../RELEASE_NOTES.md) says what each one changed for
+an operator.

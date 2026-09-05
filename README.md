@@ -1,18 +1,259 @@
 # GSM-SIP Bridge
 
-Bridge incoming cellular calls to a SIP extension over VoIP. When someone
-dials the GSM number, the system auto-answers and routes audio
-bidirectionally to a SIP/PBX destination — however the carrier delivers
-the call: over the circuit-switched network (via Quectel EC20 modules),
-over VoWiFi/IMS (via a built-in ePDG tunnel), or over VoLTE (via the
-bridge's own IMS registration on the LTE data path). VoWiFi and VoLTE
-both scale to multiple SIMs concurrently, each its own isolated line.
-Incoming SMS messages are persisted to a local database and optionally
-forwarded to Discord, alongside configurable Discord alerts for other
-critical operational events (modem/SIM failure, registration or tunnel
-loss, missed calls).
+Bridges cellular calls to SIP/VoIP in both directions.
+
+**Inbound**: the bridge answers a call placed to the SIM's number and connects
+the audio to a SIP destination. The call can arrive circuit-switched over a
+Quectel modem, over VoWiFi through a built-in ePDG tunnel, or over VoLTE
+through the bridge's own IMS registration on the LTE data PDN.
+
+**Outbound** (opt-in): a PBX, or an IP phone registered to the bridge, dials out
+through the first idle line on any of those three paths.
+
+VoWiFi and VoLTE support several SIMs at once, one line per SIM.
 
 **Language**: Rust | **Platform**: Linux (amd64, arm64) | **Releases**: [RELEASE_NOTES.md](RELEASE_NOTES.md)
+
+> ⚠️ **Educational and personal/hobbyist use only.** Bridging cellular calls to
+> VoIP is regulated in most countries and may breach your carrier's terms. Read
+> the [full disclaimer](#disclaimer) first.
+
+## Features
+
+### Calls
+
+- Inbound calls are answered automatically on all three paths. The caller hears
+  ringback while the SIP side rings.
+- Outbound calling is off by default (`[outbound].enabled`). A PBX INVITE, or an
+  INVITE from a phone registered to the bridge, is placed on the first idle
+  line. There is no dial plan and no allow-list; the destination is dialed as
+  given. See [docs/architecture.md](docs/architecture.md#outbound-calling).
+- An inbound call carries the receiving line's own number to the SIP side: as
+  `P-Called-Party-ID` in SIP server mode, or as the Request-URI when
+  `[bridge].sip_destination` is empty. The caller's number is sent separately in
+  `P-Asserted-Identity` and `X-GSM-Caller-ID`.
+
+### Call paths
+
+- **Circuit-switched**: GSM voice over a Quectel EC20's USB serial and USB audio
+  interfaces. `[cs].enabled = false` disables the path and its modem probing.
+- **VoWiFi**: IKEv2/IPsec ePDG tunnel (strongSwan), IMS-AKA registration, Gm
+  IPsec. AMR-WB to G.722, wideband end to end. Discovers every VoWiFi-capable
+  SIM and runs one tunnel and registration per line. Off by default.
+- **VoLTE**: the bridge runs its own IMS registration over the modem's LTE data
+  PDN instead of using the modem's internal voice stack. One line per modem,
+  each in its own network namespace. Off by default.
+
+### Hardware
+
+| Device | Circuit-switched | VoWiFi | VoLTE |
+|---|---|---|---|
+| Quectel EC20 | yes | yes | yes |
+| Quectel EC200 / EC200U | no (no audio output) | yes | yes |
+| PC/SC card reader (e.g. OmniKey AG 3x21) | no | yes | no |
+
+A card reader holds the SIM with no modem present; the SIM reaches the carrier
+over the host's own network. See
+[docs/supported-hardware.md](docs/supported-hardware.md) and
+[docs/omnikey-pcsc-vowifi.md](docs/omnikey-pcsc-vowifi.md).
+
+### IMS/SIP stack
+
+The bridge implements SIP, SDP, RTP and the 3GPP SMS layers itself instead of
+re-bridging audio the modem has already decoded.
+
+- Decodes and re-encodes carrier media: AMR-NB and AMR-WB, RFC 4867 framing,
+  both octet-aligned and bandwidth-efficient. Most carriers offer no G.711.
+- SDP: direction attributes and per-media sections are answered as offered.
+  Offerless INVITEs, locally-confirmable QoS preconditions (RFC 3312) and
+  RFC 4028 session timers are supported.
+- RTCP per RFC 3550 on the carrier leg. Carrier-reported loss, jitter and
+  round-trip are logged per call and exported as metrics.
+- DTMF (RFC 4733) is forwarded across transcoding, and re-stamped when the two
+  legs negotiate different payload types.
+- SMS over IMS per TS 23.040 and TS 24.011, including the TS 24.341 delivery
+  report (RP-ACK) that some carriers require before they deliver messages.
+- In-dialog requests are matched against the call they name.
+
+### SMS, alerts and storage
+
+- Incoming SMS is read on all three paths, both over the IMS registration and by
+  sweeping the modem's own storage. Both routes share one PDU decoder,
+  duplicates are suppressed, and multi-part messages are reassembled. The bridge
+  does not send SMS.
+- SQLite store: calls (caller ID, line, duration, outcome), SMS, card slots and
+  per-slot network mode. sqlite-web is included for read-only browsing.
+- Discord webhooks: SMS as embeds, plus alerts for module/SIM lifecycle,
+  registration loss, tunnel failure, missed calls, line discovery failure and Gm
+  connection loss. Each has its own enable flag, threshold and webhook override,
+  and sends a recovery notice when the condition clears.
+- Prometheus metrics endpoint and a Grafana dashboard. See
+  [docs/observability.md](docs/observability.md).
+
+### Operation
+
+- Recovery: USB disconnects and registration loss are handled per card with
+  exponential backoff. Modem commands have deadlines, and a watchdog restarts a
+  line that stops making progress. A nightly restart cycle runs by default. A
+  serial port that hangs the kernel driver is quarantined after three timeouts.
+- SIP side: register to a PBX as a trunk, or set `[sip_server].enabled` and have
+  phones register to the bridge directly.
+- Control CLI over a Unix socket: `card list`, `card restart`, `card set-mode`,
+  `card get-mode`. The per-slot mode (`2g`/`3g`/`4g`/`auto`) persists across
+  restarts. `vowifi-status` and `volte-status` report line health.
+- Audio tuning: `lan`/`wan` latency profiles, ALSA and jitter buffer sizes,
+  modem gain, echo canceller, SCHED_FIFO thread priority.
+- No `unsafe` in the application binary. FFI is confined to the
+  `pjsua-sys`/`pjsua-safe` and `amr-sys`/`amr-safe` crates.
+
+## How it works
+
+```mermaid
+flowchart LR
+    Carrier["Carrier network<br/>(GSM + IMS core)"]
+    Modem["Quectel modem(s)<br/>or PC/SC reader"]
+    Server["Bridge server<br/>(gsm-sip-bridge)"]
+    SIP["SIP PBX, or the<br/>bridge's own registrar<br/>(sip_server)"]
+    Phone["IP phone /<br/>softphone"]
+
+    Carrier <-->|"circuit-switched voice"| Modem
+    Modem <-->|"USB (serial + audio)"| Server
+    Carrier <-->|"VoWiFi (IKEv2/IPsec ePDG tunnel)"| Server
+    Carrier <-->|"VoLTE (IMS over the LTE data PDN)"| Server
+    Server <-->|"SIP + RTP"| SIP
+    SIP <--> Phone
+```
+
+The carrier decides which path delivers a given call. A trunk holds a single
+binding, so only one component may own the SIP registration: the
+circuit-switched daemon normally, or the VoWiFi/VoLTE telephony agent when
+either of those is enabled.
+
+Outbound calls originate in two ways: a PBX INVITE to the trunk, or an INVITE
+from a registered phone, which the registrar redirects (302) to the dial-out
+port. Both are placed on the first idle line in that process's own pool.
+
+There are two SIP-side topologies, and either works with any call path:
+
+- **PBX trunk** (default). The bridge registers to an external PBX, whose
+  inbound routes pick the destination.
+- **SIP server** (`[sip_server].enabled`). Phones REGISTER to the bridge and it
+  rings the configured account. No PBX is needed.
+
+With VoWiFi or VoLTE enabled the bridge runs as several processes: one
+carrier-facing agent per line in its own network namespace, one telephony-side
+process holding the PBX registration, and a supervisor that builds the
+namespaces and veth pairs and tears them down on exit.
+
+See [docs/architecture.md](docs/architecture.md) for the crate layout, the three
+call flows, the audio pipeline and outbound line selection.
+
+## Quick start (Docker Compose)
+
+Requires Docker with the Compose plugin and at least one supported modem or card
+reader. A modem needs one-time setup first (enable USB audio, disable
+ModemManager): see [docs/supported-hardware.md](docs/supported-hardware.md).
+
+```bash
+git clone <repo-url> && cd gsm-sip-bridge/docker
+cp ../config.toml.example config.toml   # edit with your SIP/PBX details
+cat > .env <<EOF
+SIP_PASSWORD=yourpassword
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+EOF
+docker compose up -d
+```
+
+This starts the full stack:
+
+| Service | URL | Purpose |
+|---|---|---|
+| gsm-sip-bridge | `http://localhost:9091/metrics` | Bridge + metrics endpoint |
+| Prometheus | `http://localhost:9090` | Metrics collection and querying |
+| Grafana | `http://localhost:3000` | Dashboards (admin/admin) |
+| sqlite-web | `http://localhost:8088` | Browse call and SMS database (read-only) |
+
+The container runs `privileged` with `/dev` bind-mounted, for USB device and
+ALSA access. It defaults to `network_mode: host` for the SIP/RTP media path.
+Update with `docker compose pull && docker compose up -d`.
+
+### Image variants
+
+| Variant | Tags | Contains | Use when |
+|---|---|---|---|
+| slim (default) | `:<version>`, `:latest` | strongSwan VoWiFi engine only | Almost always: the default `[vowifi].tunnel_engine = "strongswan"` path |
+| full (on demand) | `:<version>-swu` | strongSwan plus the legacy SWu/Python engine | Only if you must run `[vowifi].tunnel_engine = "swu"` |
+
+The slim image omits the Python interpreter and the vendored SWu-IKEv2 dialer,
+saving about 72 MB. Configuring the `swu` engine on it aborts at startup with a
+message naming the `-swu` image. The full image is published on demand, not on
+every release. Build either locally with `make docker-build` or
+`make docker-build-swu`.
+
+## Configuration
+
+A single TOML file; see `config.toml.example`. Parsing is strict, so an unknown
+key aborts startup and names the offending key. The minimum:
+
+```toml
+[sip]
+server = "pbx.example.com"
+username = "bridge-account"
+password = "env:SIP_PASSWORD"    # secrets support env:VAR_NAME syntax
+
+[bridge]
+# sip_destination = "599"        # empty = route by the line's own number via PBX inbound rules
+
+[sms]
+discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
+
+[vowifi]
+enabled = false                  # opt-in VoWiFi bridge
+[volte]
+enabled = false                  # opt-in host-side VoLTE bridge
+[outbound]
+enabled = false                  # opt-in dial-out over the mobile network
+```
+
+[docs/configuration.md](docs/configuration.md) documents every section and key,
+including audio tuning (`[audio]`, `[modem_audio]`), card recovery
+(`[resilience]`), port discovery (`[discovery]`), the restart cycle
+(`[scheduled_restart]`), the alert categories, and the full
+`[vowifi]`/`[volte]`/`[sip_server]` reference.
+
+[`sample_configs/`](sample_configs/README.md) has a ready-to-copy config per
+deployment shape, plus notification snippets to merge into any of them.
+
+## Documentation
+
+| | |
+|---|---|
+| **Getting started** | [Supported hardware & setup](docs/supported-hardware.md) · [Configuration reference](docs/configuration.md) · [Sample configs](sample_configs/README.md) |
+| **Running it** | [Operations runbook & troubleshooting](docs/operations.md#troubleshooting) · [Metrics & dashboards](docs/observability.md) |
+| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [PC/SC card-reader VoWiFi lines](docs/omnikey-pcsc-vowifi.md) · [Host-side VoLTE operations](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy)](docs/ec20-volte-setup.md) |
+| **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) · [Config migrations](docs/migrating-config-reorg.md) |
+
+The runbook's [troubleshooting section](docs/operations.md#troubleshooting)
+covers missing `ttyUSB` devices, a missing audio device, SIP registration
+failures, choppy audio and cards stuck in recovery.
+
+[docs/README.md](docs/README.md) is the full index, including design notes.
+`docs/` is mirrored to this repository's GitHub wiki on every push to `main`.
+
+## Building from Source
+
+```bash
+sudo apt install build-essential pkg-config clang libclang-dev \
+  libasound2-dev libusb-1.0-0-dev libpjproject-dev uuid-dev libssl-dev
+cp config.toml.example config.toml
+export SIP_PASSWORD=yourpassword
+make build && make test && make run
+```
+
+Details, Makefile targets, and the pre-commit checklist:
+[docs/development.md](docs/development.md).
+
+<a id="disclaimer"></a>
 
 ## ⚠️ Disclaimer
 
@@ -51,212 +292,6 @@ The VoWiFi/IMS path bundles IPsec/IKEv2 encryption (via strongSwan).
 Importing, exporting, or using this software may be subject to
 encryption import/export control laws in your country — it is your
 responsibility to comply with them.
-
-## Highlights
-
-- **GSM-to-SIP call bridging** — auto-answers incoming GSM calls on EC20 modules and bridges audio to a SIP extension, with comfort ringback while the extension rings.
-- **VoWiFi-to-SIP bridging** — answers calls the carrier delivers over Wi-Fi Calling: an IKEv2/IPsec ePDG tunnel (strongSwan), IMS-AKA registration with Gm IPsec, and wideband (AMR-WB → G.722) audio end-to-end. Auto-discovers every VoWiFi-capable SIM and runs one tunnel/registration per line concurrently. Optional; disabled by default. A line's SIM can come from a modem (the default) or directly from a physical PC/SC reader (e.g. OmniKey AG 3x21) with no modem at all — see [docs/omnikey-pcsc-vowifi.md](docs/omnikey-pcsc-vowifi.md).
-- **Host-side VoLTE-to-SIP bridging** — the bridge performs its own IMS registration and call signalling over the cellular LTE data path, instead of delegating to the modem's internal voice stack and re-bridging its already-decoded audio — bringing codec, jitter handling, and media fully under the bridge's control. Auto-discovers every VoLTE-capable modem, runs each as its own network-namespace-isolated line, and bridges answered calls to the same SIP destination as the other two paths. Optional; disabled by default.
-- **Multi-module support** — auto-detects all connected EC20s, assigns stable IMEI-keyed slots that survive restarts and re-plugs, and handles concurrent calls independently.
-- **Self-healing** — detects USB disconnects and network registration loss, recovers each card independently with exponential backoff, and runs a preventive scheduled nightly modem restart cycle.
-- **DID passthrough** — forwards the GSM caller's number as the SIP DID (`P-Asserted-Identity`, `X-GSM-Caller-ID`), so PBX inbound routes decide the destination.
-- **Optional built-in SIP server** — `[sip_server].enabled` turns the bridge itself into the SIP server for small sites with no PBX: IP phones REGISTER directly to it, and any of the call paths rings the registered phone. Off by default. See [docs/architecture.md](docs/architecture.md#two-sip-side-topologies).
-- **Outbound calling** — `[outbound].enabled` lets the PBX (or a registered SIP server mode phone) dial out through whichever line is idle — circuit-switched, VoWiFi, or VoLTE, in whatever order the modules were discovered, no path preference. Off by default. See [docs/architecture.md](docs/architecture.md#outbound-calling).
-- **Circuit-switched path can be turned off entirely** — `[cs].enabled = false` on a VoWiFi/VoLTE-only deployment stops the circuit-switched daemon's modem discovery, periodic rescan, and AT traffic outright, instead of it probing modems in the background for a call path that will never carry a call. On by default (existing deployments are unaffected). See [docs/configuration.md](docs/configuration.md#cs).
-- **CLI card management** — `card list` / `restart` / `set-mode` / `get-mode` against the running daemon over a Unix socket, with persisted per-slot network mode preferences (`2g`/`3g`/`4g`/`auto`).
-- **SMS capture** — persists all incoming SMS to SQLite and posts rich-embed notifications to a Discord webhook.
-- **Critical-event alerting** — configurable Discord alerts for modem/SIM lifecycle failure, IMS/SIP registration loss, VoWiFi tunnel failure, and missed calls, each with its own on/off switch, threshold, and webhook override; alerts once past the system's own auto-recovery, with a matching recovery notice.
-- **Call logging** — every incoming call recorded with caller ID, module, duration, and outcome.
-- **Observability** — Prometheus metrics endpoint and a pre-provisioned Grafana dashboard.
-- **Tunable audio pipeline** — `lan`/`wan` latency profiles, ALSA buffer and jitter-buffer controls, modem gain/echo-canceller settings, real-time thread scheduling.
-- **Memory safety** — zero `unsafe` in the application binary; all FFI confined to the `pjsua-sys`/`pjsua-safe` crates with documented invariants.
-
-## How it works
-
-The carrier decides how a given call is delivered: over the
-circuit-switched network to an EC20 module, over VoWiFi through the
-ePDG tunnel, or over VoLTE through the bridge's own IMS registration on
-the LTE data path. Either way it becomes a SIP call — to a PBX, or
-directly to an IP phone if there's no PBX in the deployment (below). See
-[docs/architecture.md](docs/architecture.md) for the crate layout, all
-three call flows in detail, and the audio pipeline.
-
-### With a PBX (the default)
-
-```mermaid
-flowchart LR
-    Phone["Caller"]
-    Carrier["Carrier network<br/>(GSM + IMS core)"]
-    EC20["Quectel EC20<br/>modules (1..N)"]
-    Server["Bridge server<br/>(gsm-sip-bridge)"]
-    PBX["SIP PBX<br/>(Asterisk / FreePBX)"]
-    IPPhone["IP Phone /<br/>Softphone"]
-
-    Phone <--> Carrier
-    Carrier <-->|"GSM voice (CS)"| EC20
-    EC20 <-->|"USB<br/>(Serial + Audio)"| Server
-    Carrier <-->|"VoWiFi<br/>(IKEv2/IPsec ePDG tunnel)"| Server
-    Carrier <-->|"VoLTE<br/>(IMS over the LTE data PDN)"| Server
-    Server <-->|"SIP + RTP"| PBX
-    PBX <-->|"SIP + RTP"| IPPhone
-```
-
-The bridge registers to the PBX as a trunk; inbound mobile calls are
-INVITEd to it and routed by its own dial plan. With `[outbound].enabled`,
-the PBX can also place calls back out onto the mobile network through the
-bridge.
-
-### Without a PBX — the bridge as the SIP server
-
-`[sip_server].enabled` turns the bridge itself into the SIP server: IP
-phones REGISTER directly to it, and any of the three carrier paths rings
-whichever account is configured — no separate telephone system anywhere
-in the deployment.
-
-```mermaid
-flowchart LR
-    Carrier["Carrier network<br/>(GSM + IMS core)"]
-    Server["Bridge server<br/>(gsm-sip-bridge)"]
-    IPPhone["IP Phone /<br/>Softphone"]
-
-    Carrier <-->|"CS / VoWiFi / VoLTE"| Server
-    IPPhone -->|"REGISTER"| Server
-    Server -->|"INVITE + RTP"| IPPhone
-    IPPhone -->|"INVITE (dial out),<br/>[outbound].enabled"| Server
-```
-
-Off by default, and inbound-only unless `[outbound].enabled` is also set. See
-[docs/architecture.md#two-sip-side-topologies](docs/architecture.md#two-sip-side-topologies)
-and [docs/architecture.md#outbound-calling](docs/architecture.md#outbound-calling)
-for the full design, and
-[docs/configuration.md](docs/configuration.md#sip_server) for the setting
-reference.
-
-## Quick Start (Docker Compose)
-
-Requires Docker with the Compose plugin and one or more Quectel EC20 USB
-modems. **First time?** Each module needs one-time preparation (enable USB
-audio, disable ModemManager) — see
-[docs/supported-hardware.md](docs/supported-hardware.md).
-
-```bash
-git clone <repo-url> && cd gsm-sip-bridge/docker
-cp ../config.toml.example config.toml   # edit with your SIP/PBX details
-cat > .env <<EOF
-SIP_PASSWORD=yourpassword
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-EOF
-docker compose up -d
-```
-
-This starts the full stack:
-
-| Service | URL | Purpose |
-|---|---|---|
-| gsm-sip-bridge | `http://localhost:9091/metrics` | Bridge + metrics endpoint |
-| Prometheus | `http://localhost:9090` | Metrics collection and querying |
-| Grafana | `http://localhost:3000` | Dashboards (admin/admin) |
-| sqlite-web | `http://localhost:8088` | Browse call and SMS database (read-only) |
-
-The container runs `privileged` with `/dev` bind-mounted, to access USB
-devices and ALSA audio. It also defaults to `network_mode: host` for the
-SIP/RTP media path — that part is independent of device access. To update
-later:
-
-```bash
-docker compose pull && docker compose up -d
-```
-
-### Image variants: slim (default) vs. full/SWu
-
-The published image comes in two variants, sharing one name and distinguished
-by tag:
-
-| Variant | Tags | Contains | Use when |
-|---|---|---|---|
-| **slim** (default) | `:<version>`, `:latest` | strongSwan VoWiFi engine only | Almost always — this is the default `[vowifi].tunnel_engine = "strongswan"` path |
-| **full** (on demand) | `:<version>-swu` | strongSwan **plus** the legacy SWu/Python engine | Only if you must run `[vowifi].tunnel_engine = "swu"` |
-
-The slim image drops the Python interpreter, its dependency tree, and the
-vendored SWu-IKEv2 dialer (~72 MB, over 60% of the old image). If you configure
-the `swu` engine on the slim image, the bridge **fails fast at startup** with a
-message pointing you to the `-swu` image.
-
-The full image is **not** published on every release — it is built on demand by
-the "Publish SWu (full) Docker Image" GitHub Actions workflow (or by pushing a
-`v<version>-swu` tag). To build either locally:
-
-```bash
-make docker-build       # slim (default)
-make docker-build-swu   # full, includes the SWu/Python engine
-```
-
-The SWu engine's code stays in the binary and in CI in both variants; only the
-image payload differs (see specs/033-slim-optional-swu-image).
-
-## Configuration
-
-A single TOML file (see `config.toml.example`). The minimum that matters:
-
-```toml
-[sip]
-server = "pbx.example.com"
-username = "bridge-account"
-password = "env:SIP_PASSWORD"    # secrets support env:VAR_NAME syntax
-
-[bridge]
-# sip_destination = "599"        # empty = route by caller DID via PBX inbound rules
-
-[sms]
-discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
-
-[vowifi]
-enabled = false                  # opt-in Wi-Fi Calling bridge — see docs
-
-[volte]
-enabled = false                  # opt-in host-side VoLTE bridge — see docs
-```
-
-Every section and key — including audio tuning (`[audio]`), card recovery
-(`[resilience]`), the scheduled restart cycle (`[scheduled_restart]`), and
-the full `[vowifi]`/`[volte]` reference — is documented in
-[docs/configuration.md](docs/configuration.md).
-
-Complete, ready-to-copy configs for common deployment shapes (plain
-circuit-switched, single-line VoWiFi, host-side VoLTE, PC/SC card-reader
-VoWiFi, multi-line VoWiFi) live in
-[`sample_configs/`](sample_configs/README.md).
-
-## Documentation
-
-| | |
-|---|---|
-| **Getting started** | [Supported hardware & setup](docs/supported-hardware.md) · [Configuration reference](docs/configuration.md) |
-| **Running it** | [Operations runbook & troubleshooting](docs/operations.md) · [Metrics & dashboards](docs/observability.md) |
-| **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [PC/SC card-reader VoWiFi lines (no modem)](docs/omnikey-pcsc-vowifi.md) · [Host-side VoLTE bridge (operations)](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy path)](docs/ec20-volte-setup.md) |
-| **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |
-
-The full index, including design notes and engineering history, is at
-[docs/README.md](docs/README.md).
-
-## Building from Source
-
-```bash
-sudo apt install build-essential pkg-config clang libclang-dev \
-  libasound2-dev libusb-1.0-0-dev libpjproject-dev uuid-dev libssl-dev
-cp config.toml.example config.toml
-export SIP_PASSWORD=yourpassword
-make build && make test && make run
-```
-
-Details, Makefile targets, and the pre-commit checklist:
-[docs/development.md](docs/development.md).
-
-## Troubleshooting
-
-Common issues — no `ttyUSB` devices, missing audio device, SIP
-registration failures, choppy audio, cards stuck in recovery — are covered
-in the runbook: [docs/operations.md](docs/operations.md#troubleshooting).
 
 ## Community
 

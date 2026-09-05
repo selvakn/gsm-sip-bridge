@@ -13,7 +13,7 @@ For the v4.1.x -> v5.0.0 migration, see docs/migrating-from-v4.1.x.md."#;
 #[command(
     name = "gsm-sip-bridge",
     version,
-    about = "Bridges incoming GSM calls on Quectel EC20 modules to a SIP extension.",
+    about = "Bridges cellular calls and SIP/VoIP in both directions, over GSM, VoWiFi, or VoLTE.",
     after_long_help = AFTER_LONG_HELP
 )]
 pub struct Cli {

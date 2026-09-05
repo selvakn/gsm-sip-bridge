@@ -482,8 +482,8 @@ lock_path = "/tmp/volte-registration.lock"
 #   - listen_port and [sip].local_port are two separate SIP endpoints and
 #     cannot share one UDP port. Both default to 5060, so you must move
 #     [sip].local_port (e.g. to 5062) and leave 5060 for the phones.
-#   - Inbound only. A phone cannot dial out through the mobile network; the
-#     attempt is refused with 403.
+#   - Inbound only by default: a phone dialing out through the mobile network
+#     is refused with 403 unless [outbound] below is also enabled.
 #   - Exactly ONE account rings. Others may register but are never called.
 #   - No NAT between phone and bridge — this targets a single-site LAN.
 
