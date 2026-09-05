@@ -43,3 +43,5 @@ mutants-out/
 samples/
 
 /config-bak/
+
+.aide.yaml
