@@ -89,6 +89,10 @@ pub enum EndedBy {
     RegistrationLost,
     /// We could not set the bridge up at all.
     SetupFailed,
+    /// RFC 4028 session-timer refresh failed or was never received in time
+    /// (specs/049) — distinct from every other cause so it is diagnosable
+    /// after the fact, rather than looking like an ordinary hangup.
+    SessionTimerExpired,
 }
 
 impl EndedBy {
@@ -99,6 +103,7 @@ impl EndedBy {
             EndedBy::AttachmentLost => "attachment_lost",
             EndedBy::RegistrationLost => "registration_lost",
             EndedBy::SetupFailed => "bridge_setup_failed",
+            EndedBy::SessionTimerExpired => "session_timer_expired",
         }
     }
 
@@ -115,6 +120,7 @@ impl EndedBy {
             EndedBy::AttachmentLost => reason::ATTACHMENT_LOST,
             EndedBy::RegistrationLost => reason::TRANSPORT_ERROR,
             EndedBy::SetupFailed => reason::VETH_LEG_FAILED,
+            EndedBy::SessionTimerExpired => reason::SESSION_TIMER_EXPIRED,
         }
     }
 }
@@ -611,13 +617,22 @@ mod tests {
         // string `EndedBy::as_str` records, for every cause both carry. If
         // these ever diverged, a call's history row and the control-channel
         // teardown would disagree about why it ended.
-        for e in [EndedBy::Caller, EndedBy::Pbx, EndedBy::AttachmentLost] {
+        for e in [
+            EndedBy::Caller,
+            EndedBy::Pbx,
+            EndedBy::AttachmentLost,
+            EndedBy::SessionTimerExpired,
+        ] {
             assert_eq!(e.control_reason(), e.as_str(), "{e:?}");
         }
         // And the control reason is always one the reason vocabulary defines.
         assert_eq!(
             EndedBy::AttachmentLost.control_reason(),
             reason::ATTACHMENT_LOST
+        );
+        assert_eq!(
+            EndedBy::SessionTimerExpired.control_reason(),
+            reason::SESSION_TIMER_EXPIRED
         );
     }
 

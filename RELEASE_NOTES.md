@@ -5,6 +5,7 @@
      "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
+- **RFC 4028 session-timer refresh** -- An outbound call whose carrier requires session-timer refresh on a call that connects is now kept alive instead of silently dropping. This bridge still never advertises `Supported: timer` on its own outbound INVITEs (`[vowifi] originating_headers` unchanged) — but a carrier's `200 OK` carrying `Session-Expires`, unprompted, is now honoured: this bridge sends its own periodic refresh when the carrier assigns it that role, or accepts the carrier's own in-dialog refresh when the carrier keeps it. A refresh that fails, in either direction, now ends the call cleanly with a distinct, diagnosable reason instead of the call silently dropping at the session interval with no explanation. No carrier reachable during development has ever been observed requiring this on a call that connects, so verification is unit-tested only — see `specs/049-session-timer-refresh`.
 - **Circuit-switched SMS decoding** -- A text message received on the plain circuit-switched line (no VoWiFi/VoLTE) now decodes correctly instead of showing raw hex for non-ASCII text and a garbled sender, by switching that route to the same PDU-mode decoder v8.15.0 already gave the IMS/VoWiFi and VoLTE routes.
 
 ## v8.15.1

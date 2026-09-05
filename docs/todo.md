@@ -2,26 +2,46 @@
 Observed pending items
 ----------------------
 
-- [ ] **RFC 4028 session refresh (`Supported: timer`) is not implemented.**
-      We never advertise `timer`, so nothing is broken today — but Jio's own
-      `183` carries `Require: timer` and `Session-Expires: 300` *unprompted*,
-      i.e. it will demand refreshes on a call that actually connects. If a
-      carrier ever gets a 2xx to us with `Require: timer`, RFC 4028 §7.4 makes
-      the refresh our obligation and a connected call would drop at the
-      session interval. Two consequences:
-      - `[vowifi] originating_headers = ["supported"]` advertises `timer` and
-        is therefore a promise this client cannot keep. It is off by default
-        and documented as a hazard; it must not be turned on for a carrier
-        whose calls connect until this is implemented.
-      - Confirmed live on Jio 2026-08-24: advertising `Supported: 100rel, timer`
-        made Jio escalate its `183` from `Require: timer` to
-        `Require: timer,100rel`, so the carrier does act on what we advertise.
-      Work: honour `Session-Expires`/`Min-SE` on the INVITE and its responses,
-      pick the refresher per §7.1, and send a re-INVITE or `UPDATE` at half the
-      interval. See
-      [docs/plans/jio-vowifi-outbound-480-followup.md](plans/jio-vowifi-outbound-480-followup.md).
-      Origin: the same "don't advertise extensions you don't implement" lesson
-      that produced the PRACK bug (`specs/037-p-early-media`).
+- [x] ~~RFC 4028 session refresh (`Supported: timer`) is not implemented.~~
+      — **implemented 2026-09-04, specs/049-session-timer-refresh.** The
+      outbound (UAC) leg's `200 OK` handling (`agent/origination.rs`) now
+      reads `Session-Expires` regardless of what this bridge itself
+      advertised (`[vowifi] originating_headers` stays unchanged, off by
+      default — purely reactive), resolves the refresher role per RFC 4028
+      §7.2 (an explicit `refresher` param used as-is; a non-compliant
+      response that omits it defensively defaults to this bridge itself,
+      guaranteeing the call survives either way), and either sends this
+      bridge's own periodic `UPDATE` refresh at half the interval (§7.4) or
+      accepts the carrier's own in-dialog `UPDATE` refresh — a new, small,
+      pure state machine (`agent/session_refresh.rs`, mirroring
+      `agent/ping.rs`'s `PingState` shape) drives both directions, hooked
+      into the dispatch loop the same way `handle_attachment_loss` already
+      is. A failed refresh, in either direction, ends the call with a
+      distinct, diagnosable `EndedBy::SessionTimerExpired` /
+      `reason::SESSION_TIMER_EXPIRED` rather than a silent drop at the
+      interval.
+
+      **Scope decisions** (see `specs/049-session-timer-refresh/research.md`
+      for the full rationale, each grounded in the actual RFC 4028 text,
+      not recalled from memory): refresh transport is `UPDATE` only, both
+      directions — no re-INVITE-based refresh is built, since RFC 4028 §7.4
+      itself recommends `UPDATE` over re-INVITE and a bodyless `UPDATE`
+      avoids touching this bridge's SDP offer/answer machinery entirely. A
+      failed refresh (timeout or any non-2xx) is fatal on the first
+      attempt — no per-response-code retry ladder, since no carrier
+      reachable here has ever required `timer` on a call that actually
+      connects (Jio's `183` still never reaches `200 OK` — the "kept open"
+      disposition below is now moot, since the feature was built ahead of
+      either of its two original triggers, at the user's explicit
+      request).
+
+      **Verification**: fixture-driven unit tests throughout (`cargo test`
+      — the state machine, the new `UPDATE` builder, the `200 OK`
+      capture, and the dispatch-loop accept/decline paths), plus a
+      regression-only hardware round — no carrier reachable here has ever
+      sent `Session-Expires` on a connecting call, so, like specs/048's
+      MT-06, the new logic itself cannot be exercised live regardless of
+      effort spent trying (`specs/049-session-timer-refresh/quickstart.md`).
 
 - [x] ~~Outbounds calls via the GSM (PC / VoLTE / VoWIFI), from pbx as well as
       sip client~~ — **triaged 2026-08-06; closed 2026-09-04.** CS, VoWiFi, and
