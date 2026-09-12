@@ -150,6 +150,15 @@ pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RENEWAL_HEADROOM: Duration = Duration::from_secs(300);
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
+/// How many consecutive renewal failures this agent absorbs in-process before
+/// exiting and letting the supervisor recover the line.
+///
+/// Spans the whole backoff ladder — 5 + 10 + 20 + 40 + 80 = 155s of retrying —
+/// so an ordinary carrier or attachment blip is ridden out in-process, while a
+/// fault that is still there after two and a half minutes reaches the only
+/// component that can do anything about it. See
+/// [`LoopState::schedule_renewal_retry`] for why exiting is the recovery.
+const MAX_CONSECUTIVE_RENEWAL_FAILURES: u32 = 6;
 
 /// Work that must succeed before a renewal is worth attempting.
 ///
@@ -1631,6 +1640,11 @@ struct LoopState {
     reconnect_attempts: u32,
     force_renewal: bool,
     gm_conn: crate::ims::GmConnectionState,
+    /// Consecutive failed renewal attempts, reset by any renewal that
+    /// succeeds. Bounds how long this agent keeps a dead registration to
+    /// itself instead of exiting into `supervise::sim_recovery` — see
+    /// [`Self::schedule_renewal_retry`].
+    consecutive_renewal_failures: u32,
 }
 
 impl LoopState {
@@ -1646,6 +1660,7 @@ impl LoopState {
             reconnect_attempts: 0,
             force_renewal: false,
             gm_conn: crate::ims::GmConnectionState::Up,
+            consecutive_renewal_failures: 0,
         }
     }
 
@@ -1654,6 +1669,61 @@ impl LoopState {
     /// on this transport (specs/029).
     fn busy(&self) -> bool {
         self.active_call.is_some() || self.origination.is_some()
+    }
+
+    /// Records one failed renewal attempt: puts the next one on the backoff
+    /// ladder, and reports whether the in-process retry budget is now spent.
+    /// `Err` here ends `dispatch_loop`, and with it the process.
+    ///
+    /// # Why a failing renewal must eventually exit
+    ///
+    /// [`supervise::sim_recovery`](crate::supervise::sim_recovery) owns the
+    /// only remedy for a USIM that has dropped off the modem bus
+    /// (`AT+CFUN=0` → `AT+CFUN=1`), and it is driven entirely by *agent
+    /// exits*: it classifies each finished run from that run's log and
+    /// power-cycles the SIM after `CSIM_FAIL_THRESHOLD` consecutive
+    /// `AT+CSIM failed` exits. An agent that retries in-process forever is
+    /// therefore invisible to it, and the remedy is never applied however
+    /// long the fault lasts.
+    ///
+    /// The startup path has always exited on exactly this failure
+    /// (`run_inner`'s `register_session` returns `Err`), so recovery worked
+    /// there and only there. Renewal retried instead, which left the two
+    /// paths silently asymmetric: a SIM present at startup and lost later was
+    /// unrecoverable without a human.
+    ///
+    /// That is not hypothetical. On a live line on 2026-09-11 the SIM dropped
+    /// off the bus at 16:59; every renewal from then on failed with
+    /// `AT+CSIM failed: 0`; this loop retried 309 times over 10h12m, pinned at
+    /// `RETRY_MAX_BACKOFF`, until the container was restarted by hand. The
+    /// remedy was three minutes away the whole time.
+    ///
+    /// Exiting is safe here by construction: `on_idle_tick` has already
+    /// deferred this renewal through [`MaintenancePolicy`] if a call is in
+    /// progress, so no live call is ever cut short by it.
+    /// A renewal succeeded: the registration is live again, so the backoff
+    /// ladder and the retry budget both start over. The counterpart to
+    /// [`Self::schedule_renewal_retry`] — kept next to it so the two can't
+    /// drift, since a budget that was spent but never cleared would exit the
+    /// agent on the first blip after an hour of healthy renewals.
+    fn on_renewal_success(&mut self) {
+        self.backoff = RETRY_INITIAL_BACKOFF;
+        self.consecutive_renewal_failures = 0;
+        self.next_renewal_attempt = None;
+    }
+
+    fn schedule_renewal_retry(&mut self) -> BridgeResult<()> {
+        self.next_renewal_attempt = Some(Instant::now() + self.backoff);
+        self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
+        self.consecutive_renewal_failures += 1;
+        if self.consecutive_renewal_failures >= MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            return Err(BridgeError::Ims(format!(
+                "registration renewal failed {} times in a row; exiting so the supervisor can \
+                 recover this line",
+                self.consecutive_renewal_failures
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2531,9 +2601,7 @@ impl LoopState {
                     ));
                     drop(guard);
                     p.obs.set_registered(false);
-                    self.next_renewal_attempt = Some(Instant::now() + self.backoff);
-                    self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
-                    return Ok(());
+                    return self.schedule_renewal_retry();
                 }
             },
             None => None,
@@ -2568,9 +2636,7 @@ impl LoopState {
                     };
                     p.obs.set_gm_connection_up(false);
                 }
-                self.next_renewal_attempt = Some(Instant::now() + self.backoff);
-                self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
-                return Ok(());
+                return self.schedule_renewal_retry();
             }
         }
         match attempt_renewal(p.reg_cfg) {
@@ -2592,8 +2658,7 @@ impl LoopState {
                 // (the hook above), so the attachment is up.
                 guard.attached = true;
                 drop(guard);
-                self.backoff = RETRY_INITIAL_BACKOFF;
-                self.next_renewal_attempt = None;
+                self.on_renewal_success();
                 tracing::info!(granted_expires_secs = granted, "registration renewed");
                 p.obs
                     .report_registration_attempt(RegistrationStatus::Success);
@@ -2640,8 +2705,7 @@ impl LoopState {
                 // Not a blocking sleep: the loop keeps dispatching inbound SIP
                 // every iteration in the meantime (see `next_renewal_attempt`'s
                 // doc comment).
-                self.next_renewal_attempt = Some(Instant::now() + self.backoff);
-                self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
+                return self.schedule_renewal_retry();
             }
         }
         Ok(())
@@ -3697,6 +3761,110 @@ mod tests {
         assert!(
             resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
             "{resp}"
+        );
+    }
+
+    /// A renewal that keeps failing has to end the process eventually, because
+    /// `supervise::sim_recovery`'s SIM power-cycle is driven entirely by agent
+    /// *exits*: an agent that retries in-process forever never reaches the one
+    /// component that can fix it. On 2026-09-11 a SIM dropped off the modem bus
+    /// at 16:59 and this loop retried 309 times across 10h12m — pinned at
+    /// `RETRY_MAX_BACKOFF`, the line dead the whole time — with the remedy about
+    /// three minutes away.
+    #[test]
+    fn a_persistently_failing_renewal_exits_instead_of_retrying_forever() {
+        // Pinned before anything loops on it. Every assertion below is phrased
+        // in terms of `MAX_CONSECUTIVE_RENEWAL_FAILURES`, so they would all
+        // hold just as well for a budget of `u32::MAX` — which is precisely
+        // the unbounded retry this exists to prevent. A budget that is finite
+        // and small is the fix; the rest of the test only checks it is spent
+        // correctly.
+        assert!(
+            (2..=10).contains(&MAX_CONSECUTIVE_RENEWAL_FAILURES),
+            "the retry budget must stay finite and small, not {MAX_CONSECUTIVE_RENEWAL_FAILURES}"
+        );
+        let mut st = LoopState::new();
+        // Everything below the budget stays in-process, on the backoff ladder,
+        // so an ordinary blip is still ridden out rather than restarted through.
+        for n in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            assert!(
+                st.schedule_renewal_retry().is_ok(),
+                "failure {n} of {MAX_CONSECUTIVE_RENEWAL_FAILURES} should still retry in-process"
+            );
+            assert!(
+                st.next_renewal_attempt.is_some(),
+                "retry {n} was not scheduled"
+            );
+        }
+        let err = st
+            .schedule_renewal_retry()
+            .expect_err("the retry budget is spent; the agent must exit for the supervisor");
+        // The reason travels in the message: it is what a human reads in
+        // `docker logs` beside the supervisor's restart line.
+        assert!(
+            err.to_string()
+                .contains("exiting so the supervisor can recover"),
+            "{err}"
+        );
+    }
+
+    /// The budget is *consecutive* failures, not lifetime ones. A line that
+    /// renews healthily for hours and then hits one blip must not inherit a
+    /// spent counter and exit on it.
+    #[test]
+    fn a_successful_renewal_clears_the_failure_budget() {
+        let mut st = LoopState::new();
+        for _ in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            st.schedule_renewal_retry().expect("still below the budget");
+        }
+        st.on_renewal_success();
+        assert_eq!(st.consecutive_renewal_failures, 0);
+        // The backoff ladder restarts with it, so the next episode gets the
+        // full 155s of in-process retrying rather than resuming at the cap.
+        assert_eq!(st.backoff, RETRY_INITIAL_BACKOFF);
+        assert_eq!(st.next_renewal_attempt, None);
+        // And the whole budget is available again.
+        for _ in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            st.schedule_renewal_retry()
+                .expect("the budget was cleared by the successful renewal");
+        }
+        assert!(st.schedule_renewal_retry().is_err());
+    }
+
+    /// The budget has to span the whole backoff ladder, or it would exit while
+    /// the retries were still getting cheaper — restarting the agent over a
+    /// blip the in-process retry was about to absorb. Recomputed from the real
+    /// constants so raising `RETRY_MAX_BACKOFF` fails here rather than silently
+    /// turning this into a restart generator.
+    #[test]
+    fn the_retry_budget_spans_the_whole_backoff_ladder() {
+        // Bound the walk before taking it, for the same reason the exit test
+        // does: an unbounded budget would otherwise be "checked" by four
+        // billion iterations that all pass.
+        assert!(
+            (2..=10).contains(&MAX_CONSECUTIVE_RENEWAL_FAILURES),
+            "the retry budget must stay finite and small, not {MAX_CONSECUTIVE_RENEWAL_FAILURES}"
+        );
+        let mut backoff = RETRY_INITIAL_BACKOFF;
+        let mut spent = Duration::ZERO;
+        for _ in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            spent += backoff;
+            backoff = next_backoff(backoff, RETRY_MAX_BACKOFF);
+        }
+        assert_eq!(
+            backoff, RETRY_MAX_BACKOFF,
+            "the ladder should be fully climbed"
+        );
+        assert!(
+            spent >= Duration::from_secs(150),
+            "only {spent:?} of in-process retrying before exiting"
+        );
+        // And the ceiling, which is the half that actually encodes the fix: a
+        // renewal that keeps failing has to reach the supervisor in minutes.
+        // The incident this came from spent 10h12m here.
+        assert!(
+            spent <= Duration::from_secs(600),
+            "{spent:?} of in-process retrying is long enough to be the old bug again"
         );
     }
 }
