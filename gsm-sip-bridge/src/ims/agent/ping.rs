@@ -177,6 +177,24 @@ pub(super) fn probe_gm_connection(
     reconnect_attempts: &mut u32,
     force_renewal: &mut bool,
 ) {
+    // An escalation is already pending. The renewal path owns the recovery
+    // from here and throttles its own retries on `backoff`, so probing again
+    // on every 1s idle tick cannot help: the client transport this would
+    // rebuild is precisely what the pending re-registration replaces
+    // wholesale. What it does instead is charge one failed send, one
+    // unbounded increment of `reconnect_attempts`, and two WARN lines to
+    // every second the fault lasts.
+    //
+    // A SIM that dropped off the modem bus on 2026-09-11 held that state for
+    // ten hours: 36,588 escalations of a re-registration that was already
+    // pending, `attempts` counted up into the tens of thousands and reported
+    // that way in status, and 15 MB of log — roughly 36 MB/day — for one
+    // fault. `reconnect_attempts` is only cleared by a *successful* renewal,
+    // so nothing in the episode could have stopped it.
+    if *force_renewal {
+        return;
+    }
+
     let now = Instant::now();
 
     // Listener half (R4): its accept loop dying is invisible to the client
