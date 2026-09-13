@@ -16,6 +16,9 @@ transport = "udp"              # udp, tcp, or tls
 local_port = 5060
 display_name = "GSM Bridge"
 tls_verify = "strict"          # strict or skip
+# Only needed when phones/PBX reach this bridge over a routed network (e.g.
+# Tailscale) rather than the same LAN segment — see docs/configuration.md.
+# public_addr = "100.111.26.23"
 
 [bridge]
 sip_destination = ""           # empty = DID passthrough, or fixed extension e.g. "100"
