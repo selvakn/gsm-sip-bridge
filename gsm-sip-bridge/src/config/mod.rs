@@ -2720,13 +2720,18 @@ password = "s3cret"
         );
     }
 
+    /// The SIP transport `pjsua-safe::Endpoint::create` builds is IPv4-only
+    /// (`PJSIP_TRANSPORT_UDP`/`_TCP`/`_TLS`, never the `_UDP6`/`_TCP6`/`_TLS6`
+    /// variants) — an IPv6 `public_addr` would be advertised in
+    /// Contact/Via/SDP with no matching IPv6 socket actually listening,
+    /// breaking registration and every call rather than fixing anything.
     #[test]
-    fn public_addr_accepts_an_ipv6_literal() {
-        let cfg = parse(&format!("{MINIMAL_TOML}\npublic_addr = \"::1\"\n"));
-        assert_eq!(
-            cfg.sip.public_addr,
-            Some("::1".parse::<std::net::IpAddr>().unwrap())
-        );
+    fn public_addr_rejects_an_ipv6_literal() {
+        let err = try_parse(&format!("{MINIMAL_TOML}\npublic_addr = \"::1\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip.public_addr"), "got: {err}");
+        assert!(err.contains("IPv4-only"), "got: {err}");
     }
 
     #[test]

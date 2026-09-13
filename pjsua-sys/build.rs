@@ -7,6 +7,11 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PJSUA_SYS_BINDINGS");
+    // Without this, setting LIBCLANG_PATH yourself after a first build (to
+    // override the auto-detection above, or to work around a warning it
+    // printed) would silently do nothing — Cargo has no other reason to
+    // re-run this script and would keep serving the cached bindings.rs.
+    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let bindings_path = out_dir.join("bindings.rs");
@@ -189,16 +194,24 @@ fn prefer_system_libclang() {
     }
 }
 
-/// Directories a distro package manager installs `libclang-N.so*` into.
-/// Deliberately does not search `PATH`-derived / user-local toolchain
-/// locations (Homebrew, a manually built LLVM, ...) — those are exactly
-/// what this exists to route around.
+/// Directories a distro *package manager* installs `libclang-N.so*` into.
+///
+/// Deliberately excludes `/usr/local/lib`: that is precisely where a
+/// manually built/installed LLVM (`make install`, a self-built PJSIP's own
+/// toolchain, ...) lands too, on the same footing as the `~/.linuxbrew`
+/// case this whole mechanism exists to route around. Restricting to actual
+/// package-manager paths is a real guarantee, not a heuristic — there is no
+/// reliable way to *validate and retry* a different candidate instead: once
+/// one `libclang` has been `dlopen`'d in this process, `clang-sys` does not
+/// pick up a later `LIBCLANG_PATH` change for a subsequent `bindgen::Builder`
+/// call, so getting the right candidate before the *first* attempt is the
+/// only option a single build-script invocation has (verified empirically;
+/// see the PR discussion this comment was added from).
 fn system_lib_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
         PathBuf::from("/usr/lib/aarch64-linux-gnu"),
         PathBuf::from("/usr/lib"),
-        PathBuf::from("/usr/local/lib"),
     ];
     if let Ok(entries) = fs::read_dir("/usr/lib") {
         for entry in entries.flatten() {

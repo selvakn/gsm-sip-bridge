@@ -83,33 +83,54 @@ fn forbid_in_server_mode(is_set: bool, key: &str, because: &str) -> BridgeResult
     Ok(())
 }
 
-/// Resolves `[sip].public_addr` to a concrete `IpAddr`, exactly once, here at
-/// config-build (process-startup) time — never later, and never again. An IP
-/// literal is used directly with no DNS query; a hostname is resolved via
-/// the OS resolver, taking its first result. Either way the *resolved* value
-/// is what every PJSIP transport/account config downstream ever sees —
-/// `pjsua-safe` has no `[sip].public_addr` string to re-resolve, by
-/// construction, which is what keeps a hostname here from ever costing a
-/// blocking DNS lookup in the call-answering path (`Account::set_identity`
-/// rebuilds its config on every inbound SIP-server-mode call — see
-/// `specs/050-sip-public-addr/research.md` Decision 2, and `2a04eae`, the
-/// unrelated bug this must not reintroduce a variant of).
+/// Resolves `[sip].public_addr` to a concrete IPv4 `IpAddr`, exactly once,
+/// here at config-build (process-startup) time — never later, and never
+/// again. An IP literal is used directly with no DNS query; a hostname is
+/// resolved via the OS resolver, taking its first IPv4 result (skipping any
+/// IPv6 ones — see below). Either way the *resolved* value is what every
+/// PJSIP transport/account config downstream ever sees — `pjsua-safe` has no
+/// `[sip].public_addr` string to re-resolve, by construction, which is what
+/// keeps a hostname here from ever costing a blocking DNS lookup in the
+/// call-answering path (`Account::set_identity` rebuilds its config on every
+/// inbound SIP-server-mode call — see `specs/050-sip-public-addr/
+/// research.md` Decision 2, and `2a04eae`, the unrelated bug this must not
+/// reintroduce a variant of).
+///
+/// IPv4-only is deliberate, not an oversight: `pjsua-safe::Endpoint::create`
+/// only ever creates `PJSIP_TRANSPORT_UDP`/`_TCP`/`_TLS` — the IPv4 transport
+/// variants, never `_UDP6`/`_TCP6`/`_TLS6` — so an IPv6 `public_addr` would
+/// be advertised in Contact/Via/SDP with no matching IPv6 signaling socket
+/// actually listening, breaking registration and every call. Rejecting it
+/// here, at config load, turns that into a clear startup error instead of
+/// silent broken SIP.
 fn resolve_public_addr(value: &str) -> BridgeResult<std::net::IpAddr> {
     if let Ok(ip) = value.parse::<std::net::IpAddr>() {
-        return Ok(ip);
+        return require_ipv4(ip, value);
     }
     use std::net::ToSocketAddrs;
-    (value, 0u16)
+    let resolved = (value, 0u16)
         .to_socket_addrs()
         .ok()
-        .and_then(|mut addrs| addrs.next())
-        .map(|addr| addr.ip())
-        .ok_or_else(|| {
-            BridgeError::Config(format!(
-                "field sip.public_addr {value:?} is not a valid IP address and \
-                 could not be resolved as a hostname"
-            ))
-        })
+        .and_then(|addrs| addrs.map(|addr| addr.ip()).find(std::net::IpAddr::is_ipv4));
+    resolved.ok_or_else(|| {
+        BridgeError::Config(format!(
+            "field sip.public_addr {value:?} is not a valid IPv4 address and \
+             could not be resolved to one (this bridge's SIP transport is \
+             IPv4-only; an IPv6-only hostname cannot be used here)"
+        ))
+    })
+}
+
+fn require_ipv4(ip: std::net::IpAddr, original: &str) -> BridgeResult<std::net::IpAddr> {
+    if ip.is_ipv4() {
+        Ok(ip)
+    } else {
+        Err(BridgeError::Config(format!(
+            "field sip.public_addr {original:?} is an IPv6 address, but this \
+             bridge's SIP transport is IPv4-only — advertising it would \
+             break registration and calls rather than fix them"
+        )))
+    }
 }
 
 fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {

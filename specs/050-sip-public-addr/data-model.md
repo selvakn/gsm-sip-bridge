@@ -12,7 +12,7 @@ through.
 
 | Layer | Type | Field | Notes |
 |---|---|---|---|
-| Raw TOML (`gsm-sip-bridge/src/config/raw.rs`) | `RawSip` | `public_addr: Option<String>` | New field, alongside `display_name: Option<String>` (same optional-string shape). Default `None`. Accepts an IP literal or a hostname, exactly as typed in `[sip]`. |
+| Raw TOML (`gsm-sip-bridge/src/config/raw.rs`) | `RawSip` | `public_addr: Option<String>` | New field, alongside `display_name: Option<String>` (same optional-string shape). Default `None`. Accepts an IPv4 literal or a hostname, exactly as typed in `[sip]`. |
 | Validated config (`gsm-sip-bridge/src/config/mod.rs`) | `SipConfig` | `public_addr: Option<std::net::IpAddr>` | Built by `build_sip` (`build.rs`). Already-resolved — a hostname in the raw string never reaches this type as a string; only the resolved IP does. `None` means "unconfigured," preserving today's `pj_gethostip()`-driven default behavior (FR-005). |
 | PJSIP transport config (`pjsua-safe/src/endpoint.rs`) | `EndpointConfig` | `public_addr: Option<std::net::IpAddr>` | Carried into `Endpoint::create`, applied to `tp_cfg.public_addr` (SIP signaling: Contact/Via). Also retained on `Endpoint` itself so `Account::register`/`Account::local` can read it. |
 | PJSIP account (`pjsua-safe/src/account.rs`) | `Account` (new private field) | `public_addr: Option<std::net::IpAddr>` | Cached at construction (`register`/`local`) from the owning `Endpoint`. Re-applied to `acc_cfg.rtp_cfg.public_addr` on every account-config rebuild this crate performs, including `set_identity` — the one call site with no `Endpoint` reference to re-read from. |
@@ -21,15 +21,22 @@ through.
 
 - Absent (`None` after TOML parse) → valid, no resolution attempted,
   `SipConfig.public_addr = None`.
-- Present and parses as `std::net::IpAddr` → valid, used directly, no DNS
-  resolution performed (Decision 2).
+- Present and parses as `std::net::IpAddr`:
+  - IPv4 → valid, used directly, no DNS resolution performed (Decision 2).
+  - IPv6 → **rejected**. `pjsua-safe::Endpoint::create` only ever builds the
+    IPv4 SIP transport variants (`PJSIP_TRANSPORT_UDP`/`_TCP`/`_TLS`), never
+    `_UDP6`/`_TCP6`/`_TLS6`, so an IPv6 address here would be advertised in
+    Contact/Via/SDP with no matching IPv6 socket listening — config load
+    fails with `BridgeError::Config` naming `sip.public_addr` rather than
+    shipping that mismatch.
 - Present, not an IP literal → resolved via `std::net::ToSocketAddrs`
-  exactly once, at config-build time:
-  - Resolves to at least one address → valid; the first resolved address
+  exactly once, at config-build time, keeping only IPv4 results:
+  - Resolves to at least one IPv4 address → valid; the first such address
     becomes `SipConfig.public_addr` (`Some(ip)`).
-  - Fails to resolve (NXDOMAIN, resolver error, empty result) → config load
-    fails with `BridgeError::Config`, naming `sip.public_addr` and the
-    offending value — the bridge does not start (FR-006, SC-005).
+  - Resolves only to IPv6 addresses, or fails to resolve at all (NXDOMAIN,
+    resolver error, empty result) → config load fails with
+    `BridgeError::Config`, naming `sip.public_addr` and the offending
+    value — the bridge does not start (FR-006, SC-005).
 
 ### Lifecycle
 

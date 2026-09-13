@@ -12,8 +12,10 @@ implementation required.
 | `[sip].public_addr` value | Startup outcome |
 |---|---|
 | Absent (field omitted) | Starts normally; behavior identical to before this feature |
-| A valid IPv4/IPv6 literal (e.g. `100.111.26.23`) | Starts normally; no DNS resolution performed |
-| A hostname that resolves (e.g. a Tailscale MagicDNS name) | Starts normally; resolved exactly once during startup |
+| A valid IPv4 literal (e.g. `100.111.26.23`) | Starts normally; no DNS resolution performed |
+| A valid IPv6 literal (e.g. `::1`) | Fails to start; error names `sip.public_addr` and explains the SIP transport is IPv4-only |
+| A hostname that resolves to at least one IPv4 address (e.g. a Tailscale MagicDNS name) | Starts normally; resolved exactly once during startup, the first IPv4 result used |
+| A hostname that resolves only to IPv6 addresses | Fails to start; treated the same as a hostname that fails to resolve at all |
 | A hostname that fails to resolve (NXDOMAIN, resolver error) | Fails to start; error names `sip.public_addr` and the offending value |
 | An empty string or otherwise unparseable value | Fails to start; error names `sip.public_addr` and the offending value |
 

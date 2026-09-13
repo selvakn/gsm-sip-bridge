@@ -285,7 +285,7 @@ address and audio flows both ways.
   matching how `[sip].local_port` and `[sip].transport` already apply,
   rather than being scoped per-account — the SIP-server registrar and the
   outbound trunk share the same `Endpoint` in this bridge's architecture.
-- The configured value is accepted as a plain address string — an IP
+- The configured value is accepted as a plain address string — an IPv4
   literal or a resolvable hostname (e.g. a Tailscale MagicDNS name) —
   matching how the existing `[sip].server` setting is already handled,
   rather than being restricted to IPv4-literal syntax only. A hostname is
@@ -293,6 +293,15 @@ address and audio flows both ways.
   reused thereafter (Clarifications, FR-008) — never re-resolved from the
   call path, so this cannot reintroduce the per-call blocking-DNS class of
   bug `2a04eae` fixed.
+- IPv6 is out of scope and rejected at config load, not silently accepted:
+  `pjsua-safe::Endpoint::create` only ever builds the IPv4 SIP transport
+  variants (`PJSIP_TRANSPORT_UDP`/`_TCP`/`_TLS`), never `_UDP6`/`_TCP6`/
+  `_TLS6`, so an IPv6 `public_addr` would be advertised in Contact/Via/SDP
+  with no matching IPv6 socket listening — breaking registration and every
+  call rather than fixing anything. A hostname that resolves only to IPv6
+  addresses is treated the same as one that fails to resolve at all
+  (FR-006). Extending the SIP transport itself to support IPv6 is a
+  separate feature, not part of this one.
 - No environment-variable-based configuration path is introduced. The
   community-submitted patch's `SIP_PUBLIC_ADDR` env var is superseded by a
   proper `[sip]`-section field, consistent with every other bridge setting.
