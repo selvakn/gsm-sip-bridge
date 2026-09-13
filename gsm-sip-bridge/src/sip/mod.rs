@@ -53,6 +53,8 @@ struct SipBridgeConfig {
     local_port: u16,
     display_name: String,
     tls_verify: TlsVerify,
+    /// `[sip].public_addr` — see `specs/050-sip-public-addr/`.
+    public_addr: Option<std::net::IpAddr>,
     /// Whether this circuit-switched bridge owns the telephony-facing SIP
     /// identity at all.
     ///
@@ -104,6 +106,7 @@ impl SipBridge {
             local_port: config.sip.local_port,
             display_name: config.sip.display_name.clone(),
             tls_verify: config.sip.tls_verify.clone(),
+            public_addr: config.sip.public_addr,
             // Defer the trunk to the VoLTE inbound bridge or the VoWiFi bridge
             // when either is active, so the same account is not registered
             // from two places at once. `config.cs.enabled` (specs/026-
@@ -294,6 +297,7 @@ impl SipBridge {
             tx_level: self.config.tx_level,
             snd_rec_latency_ms: self.config.snd_rec_latency_ms,
             snd_play_latency_ms: self.config.snd_play_latency_ms,
+            public_addr: self.config.public_addr,
         }
     }
 

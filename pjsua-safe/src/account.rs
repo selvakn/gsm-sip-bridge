@@ -21,6 +21,12 @@ pub struct Account {
     // status instead (see `is_registered`), so the flag is not authoritative.
     #[allow(dead_code)]
     registered: bool,
+    // Cached from the owning `Endpoint` at construction time so
+    // `set_identity` (no `Endpoint` reference of its own) can re-apply it on
+    // every account-config rebuild, not just this one — see
+    // `specs/050-sip-public-addr/`. Only read in the linked build.
+    #[allow(dead_code)]
+    public_addr: Option<std::net::IpAddr>,
     #[cfg(feature = "pjsip-linked")]
     account_id: i32,
 }
@@ -62,6 +68,19 @@ impl Account {
                 acc_cfg.cred_info[0].scheme = pjsua_sys::pj_str(scheme_cstr.as_ptr() as *mut std::os::raw::c_char);
                 acc_cfg.cred_info[0].data_type = 0; // plain text
 
+                // Advertise the endpoint's configured public address in this
+                // account's RTP media config too — `rtp_cfg` is a separate
+                // `pjsua_transport_config` from the SIP transport's own, so
+                // setting it on the transport (`Endpoint::create`) alone does
+                // not cover SDP. See `specs/050-sip-public-addr/`.
+                let public_addr = _endpoint.public_addr();
+                let public_addr_cstr =
+                    public_addr.map(|ip| CString::new(ip.to_string()).unwrap());
+                if let Some(ref addr_cstr) = public_addr_cstr {
+                    acc_cfg.rtp_cfg.public_addr =
+                        pjsua_sys::pj_str(addr_cstr.as_ptr() as *mut std::os::raw::c_char);
+                }
+
                 let mut acc_id: pjsua_sys::pjsua_acc_id = -1;
                 let status = pjsua_sys::pjsua_acc_add(&acc_cfg, 1, &mut acc_id);
                 if status != crate::error::PJ_SUCCESS {
@@ -73,6 +92,7 @@ impl Account {
                 return Ok(Self {
                     config,
                     registered: true,
+                    public_addr,
                     account_id: acc_id,
                 });
             }
@@ -88,6 +108,7 @@ impl Account {
             Ok(Self {
                 config,
                 registered: true,
+                public_addr: _endpoint.public_addr(),
             })
         }
     }
@@ -138,6 +159,16 @@ impl Account {
                 // neither of which this account will ever meet.
                 acc_cfg.cred_count = 0;
 
+                // See the identical block in `register` — same reasoning,
+                // same requirement (`specs/050-sip-public-addr/`).
+                let public_addr = _endpoint.public_addr();
+                let public_addr_cstr =
+                    public_addr.map(|ip| CString::new(ip.to_string()).unwrap());
+                if let Some(ref addr_cstr) = public_addr_cstr {
+                    acc_cfg.rtp_cfg.public_addr =
+                        pjsua_sys::pj_str(addr_cstr.as_ptr() as *mut std::os::raw::c_char);
+                }
+
                 let mut acc_id: pjsua_sys::pjsua_acc_id = -1;
                 let status = pjsua_sys::pjsua_acc_add(&acc_cfg, 1, &mut acc_id);
                 if status != crate::error::PJ_SUCCESS {
@@ -153,6 +184,7 @@ impl Account {
                     // it — `pjsua_acc_set_registration(id, 0)` on an account
                     // with no reg_uri is meaningless at best.
                     registered: false,
+                    public_addr,
                     account_id: acc_id,
                 });
             }
@@ -168,6 +200,7 @@ impl Account {
             Ok(Self {
                 config,
                 registered: false,
+                public_addr: _endpoint.public_addr(),
             })
         }
     }
@@ -200,6 +233,20 @@ impl Account {
                 .map_err(|_| PjsipError::AccountRegister("identity contains a NUL byte".into()))?;
             acc_cfg.id = pjsua_sys::pj_str(id_cstr.as_ptr() as *mut std::os::raw::c_char);
             acc_cfg.cred_count = 0;
+
+            // `pjsua_acc_config_default` above zeroes `rtp_cfg.public_addr`
+            // along with everything else not explicitly re-set here — without
+            // this, the address `register`/`local` applied at construction
+            // is silently dropped the moment this method runs (the bug this
+            // feature exists to fix: `specs/050-sip-public-addr/`,
+            // GitHub issue #77). Re-apply the cached address every time.
+            let public_addr_cstr = self
+                .public_addr
+                .map(|ip| CString::new(ip.to_string()).unwrap());
+            if let Some(ref addr_cstr) = public_addr_cstr {
+                acc_cfg.rtp_cfg.public_addr =
+                    pjsua_sys::pj_str(addr_cstr.as_ptr() as *mut std::os::raw::c_char);
+            }
 
             let status = pjsua_sys::pjsua_acc_modify(self.account_id, &acc_cfg);
             if status != crate::error::PJ_SUCCESS {

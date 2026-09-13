@@ -19,6 +19,7 @@ fn ep_config(local_port: u16, clock_rate: u32) -> EndpointConfig {
         tx_level: 1.0,
         snd_rec_latency_ms: 150,
         snd_play_latency_ms: 150,
+        public_addr: None,
     }
 }
 

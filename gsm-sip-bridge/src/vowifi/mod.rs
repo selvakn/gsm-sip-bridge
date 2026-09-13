@@ -286,6 +286,7 @@ pub(crate) fn run_telephony_side(
         tx_level: 1.0,
         snd_rec_latency_ms: config.audio.snd_rec_latency_ms,
         snd_play_latency_ms: config.audio.snd_play_latency_ms,
+        public_addr: config.sip.public_addr,
     };
     let endpoint = Endpoint::create(ep_config)
         .map_err(|e| BridgeError::Ims(format!("PJSIP endpoint creation failed: {e}")))?;

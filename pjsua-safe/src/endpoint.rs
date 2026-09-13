@@ -122,6 +122,13 @@ pub struct EndpointConfig {
     pub snd_rec_latency_ms: u32,
     /// ALSA playback (SIP→GSM) ring-buffer depth in ms, applied to `pjsua_media_config.snd_play_latency`.
     pub snd_play_latency_ms: u32,
+    /// Address to advertise in SIP signaling (the transport's Contact/Via)
+    /// and, via every `Account` this endpoint creates, in SDP for RTP
+    /// media — instead of PJSIP's own `pj_gethostip()`-based discovery,
+    /// which resolves to a private, host-internal address under Docker
+    /// host networking. `None` preserves that default discovery unchanged.
+    /// Already resolved (never a hostname) — see `specs/050-sip-public-addr/`.
+    pub public_addr: Option<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +161,6 @@ unsafe fn pj_str_to_string(s: &pjsua_sys::pj_str_t) -> String { // SAFETY: calle
 }
 
 pub struct Endpoint {
-    #[allow(dead_code)]
     config: EndpointConfig,
     started: bool,
 }
@@ -224,6 +230,20 @@ impl Endpoint {
                 pjsua_sys::pjsua_transport_config_default(&mut tp_cfg);
                 tp_cfg.port = config.local_port as u32;
 
+                // Advertise a configured routable address (Tailscale/VPN,
+                // etc.) instead of leaving PJSIP's own `pj_gethostip()`
+                // discovery to pick the host's private default-route
+                // address — see `specs/050-sip-public-addr/`. `addr_cstr`
+                // must outlive `pjsua_transport_create` below, since
+                // `tp_cfg.public_addr` only borrows its bytes.
+                let public_addr_cstr = config
+                    .public_addr
+                    .map(|ip| std::ffi::CString::new(ip.to_string()).unwrap());
+                if let Some(ref addr_cstr) = public_addr_cstr {
+                    tp_cfg.public_addr =
+                        pjsua_sys::pj_str(addr_cstr.as_ptr() as *mut std::os::raw::c_char);
+                }
+
                 let tp_type = match config.transport {
                     TransportType::Udp => pjsua_sys::pjsip_transport_type_e_PJSIP_TRANSPORT_UDP,
                     TransportType::Tcp => pjsua_sys::pjsip_transport_type_e_PJSIP_TRANSPORT_TCP,
@@ -267,6 +287,14 @@ impl Endpoint {
 
     pub fn is_started(&self) -> bool {
         self.started
+    }
+
+    /// The address this endpoint's transport advertises, if configured —
+    /// read by `Account::register`/`Account::local` to apply the same
+    /// address to each account's own RTP media config
+    /// (`specs/050-sip-public-addr/`).
+    pub(crate) fn public_addr(&self) -> Option<std::net::IpAddr> {
+        self.config.public_addr
     }
 
     /// Pops the oldest not-yet-claimed incoming call, if any, as

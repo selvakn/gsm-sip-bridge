@@ -27,6 +27,7 @@ The bridge reads a single TOML configuration file specified via `--config`.
 | `local_port` | integer | 5060 | Fixed local port |
 | `display_name` | string | username | Callee display |
 | `tls_verify` | enum | `strict` | `strict` or `skip` |
+| `public_addr` | string | *(unset)* | IPv4 literal or hostname to advertise in SIP signaling (Contact/Via) and SDP, instead of letting PJSIP's own address discovery pick one — needed when the PBX/phones reach this bridge only over a routed network (e.g. Tailscale) under `network_mode: host`, where the discovered address is otherwise a private, unroutable one and calls connect with no audio in either direction. A hostname is resolved once, at startup, to its first IPv4 result; an IPv6 value or an unresolvable/IPv6-only hostname fails startup rather than starting with broken audio (this bridge's SIP transport is IPv4-only). |
 
 ### `[bridge]`
 
@@ -500,6 +501,9 @@ password = "env:SIP_PASSWORD"
 transport = "tls"
 tls_verify = "strict"
 display_name = "GSM Bridge"
+# Only needed when phones/PBX reach this bridge over a routed network
+# (e.g. Tailscale) rather than the same LAN segment:
+# public_addr = "100.111.26.23"
 
 [bridge]
 sip_destination = ""

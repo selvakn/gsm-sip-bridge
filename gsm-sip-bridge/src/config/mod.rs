@@ -41,6 +41,12 @@ pub struct SipConfig {
     pub local_port: u16,
     pub display_name: String,
     pub tls_verify: TlsVerify,
+    /// Address this bridge advertises in SIP signaling (Contact/Via) and in
+    /// SDP for RTP media, instead of letting PJSIP's own address discovery
+    /// pick one. `None` (the default) preserves today's behavior. Already
+    /// resolved — a `[sip].public_addr` hostname is resolved once, here at
+    /// config-build time, never later (`specs/050-sip-public-addr/`).
+    pub public_addr: Option<std::net::IpAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -2693,6 +2699,64 @@ password = "s3cret"
             .unwrap_err()
             .to_string();
         assert!(err.contains("sip.server"), "got: {err}");
+    }
+
+    // ------------------------------------------------- [sip].public_addr ----
+    // specs/050-sip-public-addr
+
+    #[test]
+    fn public_addr_absent_by_default() {
+        assert_eq!(parse(MINIMAL_TOML).sip.public_addr, None);
+    }
+
+    #[test]
+    fn public_addr_accepts_an_ip_literal_with_no_resolution() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\npublic_addr = \"100.111.26.23\"\n"
+        ));
+        assert_eq!(
+            cfg.sip.public_addr,
+            Some("100.111.26.23".parse::<std::net::IpAddr>().unwrap())
+        );
+    }
+
+    /// The SIP transport `pjsua-safe::Endpoint::create` builds is IPv4-only
+    /// (`PJSIP_TRANSPORT_UDP`/`_TCP`/`_TLS`, never the `_UDP6`/`_TCP6`/`_TLS6`
+    /// variants) — an IPv6 `public_addr` would be advertised in
+    /// Contact/Via/SDP with no matching IPv6 socket actually listening,
+    /// breaking registration and every call rather than fixing anything.
+    #[test]
+    fn public_addr_rejects_an_ipv6_literal() {
+        let err = try_parse(&format!("{MINIMAL_TOML}\npublic_addr = \"::1\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip.public_addr"), "got: {err}");
+        assert!(err.contains("IPv4-only"), "got: {err}");
+    }
+
+    #[test]
+    fn public_addr_empty_string_fails_fast_naming_the_field() {
+        let err = try_parse(&format!("{MINIMAL_TOML}\npublic_addr = \"\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip.public_addr"), "got: {err}");
+    }
+
+    /// A hostname that cannot possibly resolve (`.invalid` is reserved by
+    /// RFC 2606 for exactly this) must fail config load the same way a
+    /// syntactically malformed value does — never silently fall back to
+    /// unset addressing (FR-006, SC-005). If sandbox/CI DNS behavior ever
+    /// makes `.invalid` resolve (some captive-portal resolvers hijack
+    /// NXDOMAIN), this test's premise breaks along with it — see
+    /// `research.md` Decision 5.
+    #[test]
+    fn public_addr_hostname_that_cannot_resolve_fails_fast_naming_the_field() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\npublic_addr = \"not-a-real-host.invalid\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sip.public_addr"), "got: {err}");
     }
 
     #[test]
