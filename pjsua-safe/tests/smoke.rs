@@ -13,6 +13,7 @@ fn lan_ep_config(local_port: u16) -> EndpointConfig {
         tx_level: 1.0,
         snd_rec_latency_ms: 150,
         snd_play_latency_ms: 150,
+        public_addr: None,
     }
 }
 
@@ -30,6 +31,7 @@ fn test_endpoint_create_stub_mode() {
         tx_level: 1.0,
         snd_rec_latency_ms: 150,
         snd_play_latency_ms: 150,
+        public_addr: None,
     };
     let ep = Endpoint::create(config).unwrap();
     assert!(ep.is_started());

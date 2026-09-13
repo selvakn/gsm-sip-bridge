@@ -10,6 +10,25 @@ across releases.
 
 ### Fixed
 
+- **A SIP client reachable only over a routed network (Tailscale, or any
+  VPN/mesh) under `network_mode: host` got complete silence in both
+  directions on every call, even though registration, ringing, and
+  answering all worked normally.** Neither the SIP transport nor any
+  account's RTP media config ever set PJSIP's `public_addr`, so
+  `create_rtp_rtcp_sock()` fell back to `pj_gethostip()`'s default-route
+  candidate — a private, host-internal address — for both the SDP `c=`
+  line and the Contact/Via headers. A remote softphone was told to send
+  its RTP to an address it couldn't route to, so its outbound audio never
+  arrived; with no inbound RTP, PJSIP's symmetric-RTP latching never
+  triggered either. Reported in
+  [#77](https://github.com/selvakn/gsm-sip-bridge/issues/77). A new
+  optional `[sip].public_addr` setting (IP literal or hostname, resolved
+  once at startup) now flows into the SIP transport and every PJSIP
+  account-config rebuild this bridge performs — including
+  `Account::set_identity`'s inbound caller-ID rewrite in SIP-server mode,
+  which previously reset any address not re-applied there on every single
+  inbound call. Deployments that leave the setting unset are unaffected.
+
 - **A graceful container stop left every line's tunnel `if_id` claimed,
   costing the next restart ~2.5 minutes of silence per line.** Stop used to
   only signal every child process and remove each line's namespace *name* —

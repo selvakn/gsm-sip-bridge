@@ -83,6 +83,35 @@ fn forbid_in_server_mode(is_set: bool, key: &str, because: &str) -> BridgeResult
     Ok(())
 }
 
+/// Resolves `[sip].public_addr` to a concrete `IpAddr`, exactly once, here at
+/// config-build (process-startup) time — never later, and never again. An IP
+/// literal is used directly with no DNS query; a hostname is resolved via
+/// the OS resolver, taking its first result. Either way the *resolved* value
+/// is what every PJSIP transport/account config downstream ever sees —
+/// `pjsua-safe` has no `[sip].public_addr` string to re-resolve, by
+/// construction, which is what keeps a hostname here from ever costing a
+/// blocking DNS lookup in the call-answering path (`Account::set_identity`
+/// rebuilds its config on every inbound SIP-server-mode call — see
+/// `specs/050-sip-public-addr/research.md` Decision 2, and `2a04eae`, the
+/// unrelated bug this must not reintroduce a variant of).
+fn resolve_public_addr(value: &str) -> BridgeResult<std::net::IpAddr> {
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Ok(ip);
+    }
+    use std::net::ToSocketAddrs;
+    (value, 0u16)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .map(|addr| addr.ip())
+        .ok_or_else(|| {
+            BridgeError::Config(format!(
+                "field sip.public_addr {value:?} is not a valid IP address and \
+                 could not be resolved as a hostname"
+            ))
+        })
+}
+
 fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
     if server.enabled {
         forbid_in_server_mode(
@@ -163,6 +192,12 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         }
     });
 
+    let public_addr = raw
+        .public_addr
+        .as_deref()
+        .map(resolve_public_addr)
+        .transpose()?;
+
     Ok(SipConfig {
         server: raw.server,
         port: in_range(raw.port, "sip.port", 1..=65535)?,
@@ -172,6 +207,7 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         transport,
         local_port: in_range(raw.local_port, "sip.local_port", 1..=65535)?,
         tls_verify,
+        public_addr,
     })
 }
 

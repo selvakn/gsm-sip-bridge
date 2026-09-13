@@ -84,6 +84,11 @@ section! {
         /// `Default` because it depends on another field.
         pub display_name: Option<String>,
         pub tls_verify: String,
+        /// Absent means "advertise whatever PJSIP's own address discovery
+        /// picks" (today's behavior). An IP literal or a hostname; a
+        /// hostname is resolved once, at config-build time — see
+        /// `specs/050-sip-public-addr/`.
+        pub public_addr: Option<String>,
     }
 }
 
@@ -98,6 +103,7 @@ impl Default for RawSip {
             local_port: 5060,
             display_name: None,
             tls_verify: "strict".to_string(),
+            public_addr: None,
         }
     }
 }
