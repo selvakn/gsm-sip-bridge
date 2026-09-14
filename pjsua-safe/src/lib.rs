@@ -10,6 +10,7 @@ pub use account::{Account, AccountConfig, RegistrationListener};
 pub use audio_media_port::{AudioMediaPort, MediaPortHandle};
 pub use call::{Call, CallState, CallStateListener, SlotId};
 pub use endpoint::{
-    ensure_pjsip_thread, take_call_disconnected, CodecInfo, Endpoint, EndpointConfig, TransportType,
+    ensure_pjsip_thread, take_call_disconnected, unwatch_call_disconnect, watch_call_disconnect,
+    CodecInfo, Endpoint, EndpointConfig, TransportType,
 };
 pub use error::PjsipError;

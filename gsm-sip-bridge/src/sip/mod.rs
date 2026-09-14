@@ -511,6 +511,7 @@ impl SipBridge {
             gsm_caller = %gsm_caller_id,
             "SIP outbound call initiated"
         );
+        pjsua_safe::watch_call_disconnect(call.call_id());
         self.active_call = Some(call);
         Ok(())
     }
@@ -614,6 +615,7 @@ impl SipBridge {
         self.set_sound_device(alsa_device)?;
         call.answer(200).map_err(|e| format!("{e}"))?;
         tracing::info!(call_id = call.call_id(), "outbound call accepted");
+        pjsua_safe::watch_call_disconnect(call.call_id());
         self.active_call = Some(call);
         Ok(())
     }
@@ -646,6 +648,10 @@ impl SipBridge {
             }
         }
         self.active_call = None;
+        // Stop watching this call_id — a later, unrelated call may reuse
+        // the same small pjsua call_id, and must not read as an instant
+        // disconnect of itself (see `watch_call_disconnect`'s doc comment).
+        pjsua_safe::unwatch_call_disconnect();
     }
 
     pub fn unregister(&mut self) {

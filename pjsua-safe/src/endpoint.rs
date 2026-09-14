@@ -2,35 +2,54 @@ use crate::error::PjsipError;
 #[cfg(feature = "pjsip-linked")]
 use crate::error::PJ_SUCCESS;
 use crate::log_bridge;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "pjsip-linked")]
-use std::sync::atomic::{AtomicI32, AtomicU64};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(feature = "pjsip-linked")]
 use std::sync::{LazyLock, Mutex};
 
 #[cfg(feature = "pjsip-linked")]
 static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// `call_id`s PJSIP has reported entering `DISCONNECTED` state that
-/// `take_call_disconnected` hasn't been asked about yet. Bounded, unlike
-/// `INCOMING_CALLS`: every call this process's UAS handlers refuse and
-/// answer immediately also disconnects here, and nothing ever polls for
-/// *those* `call_id`s — an unbounded queue would leak one entry per
-/// refusal for the life of the process. Capacity is generous relative to
-/// call volume between two consumer polls; the oldest (presumably already
-/// missed) entry is dropped on overflow rather than growing forever.
+/// The single `call_id` `take_call_disconnected` currently cares about, or
+/// `-1` for "none". `on_call_state_cb` records a disconnect only for this
+/// exact `call_id`, ignoring every other call's teardown outright.
 ///
+/// Chosen over queueing every disconnected `call_id` (gh#79 review, P1):
+/// this process's only consumer (`SipBridge`) ever watches at most one call
+/// at a time (`active_call`), so a bounded queue's overflow eviction could
+/// still drop the one entry that matters — e.g. a burst of refused
+/// dial-out attempts between two polls pushing the real call's own
+/// disconnect out the front before anyone reads it. Recording only the
+/// watched call in the first place makes that impossible: there is nothing
+/// else in the "queue" to evict it.
+static WATCHED_CALL_ID: AtomicI32 = AtomicI32::new(-1);
+/// Whether `WATCHED_CALL_ID`'s call has disconnected since the watch was
+/// set (`watch_call_disconnect`) or last consumed (`take_call_disconnected`).
+static WATCHED_CALL_DISCONNECTED: AtomicBool = AtomicBool::new(false);
+
 /// Replaces a single process-global "did *any* call disconnect" bool
 /// (gsm-sip-bridge#79): that couldn't distinguish an unrelated call's
 /// teardown — e.g. a second dial-out refused while a real call is bridged
-/// — from the peer of the one call a consumer actually cares about, so
-/// any disconnect at all wrongly signalled every consumer, including one
-/// watching a real, still-live bridged call.
-#[cfg(feature = "pjsip-linked")]
-static DISCONNECTED_CALLS: LazyLock<Mutex<std::collections::VecDeque<i32>>> =
-    LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
-#[cfg(feature = "pjsip-linked")]
-const DISCONNECTED_CALLS_CAPACITY: usize = 16;
+/// — from the peer of the one call a consumer actually cares about, so any
+/// disconnect at all wrongly signalled every consumer, including one
+/// watching a real, still-live bridged call. Start watching `call_id`,
+/// clearing any previously-recorded disconnect (a stale flag left over
+/// from whatever this `call_id` slot last watched must not read as "already
+/// disconnected" for the new call).
+pub fn watch_call_disconnect(call_id: i32) {
+    WATCHED_CALL_ID.store(call_id, Ordering::Release);
+    WATCHED_CALL_DISCONNECTED.store(false, Ordering::Release);
+}
+
+/// Stop watching for a disconnect — call once the watched call has ended by
+/// any other means (this process hanging it up itself), so a *later,
+/// unrelated* call that happens to reuse the same small `call_id` doesn't
+/// read as an instant disconnect of itself.
+pub fn unwatch_call_disconnect() {
+    WATCHED_CALL_ID.store(-1, Ordering::Release);
+    WATCHED_CALL_DISCONNECTED.store(false, Ordering::Release);
+}
 
 /// Maps a call's `pjsua_call_id` to the peer call it should be
 /// conference-bridged to, for the two-call bridging used by the inbound
@@ -96,27 +115,16 @@ static AUDIO_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "pjsip-linked")]
 static CONF_TX_LEVEL_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
 
-/// Whether `call_id` has disconnected since the last time this was asked
-/// about it. Only consumes a matching entry — an unrelated call's
-/// disconnect (e.g. a refused dial-out) stays queued for whoever, if
-/// anyone, is actually watching that `call_id` (see `DISCONNECTED_CALLS`).
+/// Whether `call_id` has disconnected since it was last watched
+/// (`watch_call_disconnect`) or asked about. `call_id` must match
+/// `WATCHED_CALL_ID` — an unrelated call's disconnect is never recorded at
+/// all (see `WATCHED_CALL_ID`), so this can only ever answer for whichever
+/// single call the caller is actually watching.
 pub fn take_call_disconnected(call_id: i32) -> bool {
-    #[cfg(feature = "pjsip-linked")]
-    {
-        let mut q = DISCONNECTED_CALLS.lock().unwrap_or_else(|e| e.into_inner());
-        match q.iter().position(|&id| id == call_id) {
-            Some(pos) => {
-                q.remove(pos);
-                true
-            }
-            None => false,
-        }
+    if WATCHED_CALL_ID.load(Ordering::Acquire) != call_id {
+        return false;
     }
-    #[cfg(not(feature = "pjsip-linked"))]
-    {
-        let _ = call_id;
-        false
-    }
+    WATCHED_CALL_DISCONNECTED.swap(false, Ordering::AcqRel)
 }
 
 /// The conference bridge's clock rate, in Hz, as configured by the endpoint
@@ -928,13 +936,9 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
                 );
             }
 
-            tracing::info!(call_id, "SIP peer disconnected");
-            {
-                let mut q = DISCONNECTED_CALLS.lock().unwrap_or_else(|e| e.into_inner());
-                if q.len() >= DISCONNECTED_CALLS_CAPACITY {
-                    q.pop_front();
-                }
-                q.push_back(call_id);
+            if call_id == WATCHED_CALL_ID.load(Ordering::Acquire) {
+                tracing::info!(call_id, "SIP peer disconnected");
+                WATCHED_CALL_DISCONNECTED.store(true, Ordering::Release);
             }
         }
         _ => {}
