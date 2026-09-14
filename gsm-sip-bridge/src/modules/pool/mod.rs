@@ -211,6 +211,12 @@ impl CardPool {
         let mut outbound_poll = tokio::time::interval(Duration::from_millis(200));
         outbound_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Unlike `outbound_poll`, not gated on `[outbound].enabled` — this
+        // covers the original inbound GSM-to-SIP call direction too, which
+        // exists regardless of whether outbound dialing is on (gh#79).
+        let mut sip_peer_poll = tokio::time::interval(Duration::from_millis(200));
+        sip_peer_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         self.recompute_next_scheduled_at();
 
         loop {
@@ -234,6 +240,9 @@ impl CardPool {
                     if let Some((call, destination)) = self.sip_bridge.poll_outbound_request() {
                         self.handle_outbound_request(call, destination, &mut slots).await;
                     }
+                }
+                _ = sip_peer_poll.tick() => {
+                    self.poll_sip_peer_disconnect(&mut slots);
                 }
                 _ = tokio::time::sleep_until(earliest_wakeup) => {
                     self.on_timer_tick(

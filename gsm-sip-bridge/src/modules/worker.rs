@@ -207,26 +207,6 @@ impl ModuleWorker {
                 }
             };
 
-            if pjsua_safe::is_sip_peer_disconnected()
-                && (self.card.state == CardState::Bridged
-                    || self.card.state == CardState::Answering)
-            {
-                tracing::info!(module = %self.module.id, "SIP peer disconnected, hanging up GSM");
-                let _ = self.at.hangup();
-                record_call_end(
-                    &self.module.id,
-                    &self.event_tx,
-                    &self.store_tx,
-                    &mut self.call_ctx,
-                    "answered",
-                    self.phone_number.as_deref(),
-                );
-                self.card.state = CardState::Idle;
-                metrics::ACTIVE_CALLS
-                    .with_label_values(&[&self.module.id, "cs"])
-                    .set(0.0);
-            }
-
             let trimmed = line.trim().to_string();
             if trimmed.is_empty() {
                 continue;
@@ -333,6 +313,26 @@ impl ModuleWorker {
                     "failed",
                     self.phone_number.as_deref(),
                 );
+                false
+            }
+            ModuleCmd::SipPeerHangup => {
+                if self.card.state == CardState::Bridged || self.card.state == CardState::Answering
+                {
+                    tracing::info!(module = %self.module.id, "SIP peer disconnected, hanging up GSM");
+                    let _ = self.at.hangup();
+                    record_call_end(
+                        &self.module.id,
+                        &self.event_tx,
+                        &self.store_tx,
+                        &mut self.call_ctx,
+                        "answered",
+                        self.phone_number.as_deref(),
+                    );
+                    self.card.state = CardState::Idle;
+                    metrics::ACTIVE_CALLS
+                        .with_label_values(&[&self.module.id, "cs"])
+                        .set(0.0);
+                }
                 false
             }
         }

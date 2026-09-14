@@ -30,10 +30,10 @@ impl CardPool {
     ///
     /// Teardown needs no new code here: `ModuleCmd::Dial`
     /// (`apply_dial_cmd`) already sets `card.state = Answering` on success,
-    /// which is exactly the state the existing SIP-peer-disconnect check in
-    /// the module worker and the existing `BridgeEvent::Hangup` handling
-    /// (both written for the inbound-call direction) already watch —
-    /// reused here unmodified in the other direction.
+    /// which is exactly the state `ModuleCmd::SipPeerHangup`'s handler and
+    /// the existing `BridgeEvent::Hangup` handling (both written for the
+    /// inbound-call direction) already watch — reused here unmodified in
+    /// the other direction.
     pub(super) async fn handle_outbound_request(
         &mut self,
         call: Call,
@@ -491,6 +491,21 @@ impl CardPool {
                 .inc();
         }
     }
+
+    /// Polled every tick, unconditionally (unlike `outbound_poll`, which is
+    /// gated on `[outbound].enabled`) — this covers the original inbound
+    /// GSM-to-SIP direction too, not just outbound dial-outs (gh#79).
+    /// Scoped to this bridge's own `active_call` via
+    /// `SipBridge::active_call_peer_disconnected`, so an unrelated call
+    /// disconnecting (e.g. a second dial-out refused while this one is
+    /// active) no longer wrongly tears down a real, still-live call.
+    pub(super) fn poll_sip_peer_disconnect(&mut self, slots: &mut HashMap<u32, SlotState>) {
+        if !self.sip_bridge.active_call_peer_disconnected() {
+            return;
+        }
+        self.sip_bridge.hangup_active_call();
+        signal_sip_peer_hangup(slots);
+    }
 }
 
 /// Frees a slot claimed by `claim_idle_cs_slot` when the dial did not end up
@@ -512,9 +527,104 @@ fn hang_up_unbridged_call(slots: &mut HashMap<u32, SlotState>, module_id: &str) 
     }
 }
 
+/// Frees the slot whose call is bridged to `SipBridge::active_call` and
+/// tells its worker to hang up the real GSM call. Unlike
+/// `hang_up_unbridged_call`, the SIP peer ending first is a normal call
+/// end, not a failure — `ModuleCmd::SipPeerHangup` records it as
+/// `"answered"`, matching the outcome `hang_up_unbridged_call`'s `"failed"`
+/// deliberately does not.
+fn signal_sip_peer_hangup(slots: &mut HashMap<u32, SlotState>) {
+    if let Some(state) = slots.values_mut().find(|s| s.has_active_call) {
+        state.has_active_call = false;
+        if let Some(cmd_tx) = &state.cmd_tx {
+            let _ = cmd_tx.send(ModuleCmd::SipPeerHangup);
+        }
+    }
+}
+
 /// The "slot N not found" error every control command returns for an
 /// out-of-range slot, verbatim as before — three call sites had their own copy.
 fn unknown_slot(slots: &HashMap<u32, SlotState>, slot: u32) -> String {
     let max = slots.keys().max().copied().unwrap_or(0);
     format!("slot {slot} not found; valid slots: 0..={max}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::at_commander::NetworkType;
+    use crate::modules::discovery::DiscoveredModule;
+    use crate::modules::slot::LifecycleState;
+    use std::path::PathBuf;
+
+    fn slot_state(
+        module_id: &str,
+        has_active_call: bool,
+    ) -> (SlotState, crossbeam_channel::Receiver<ModuleCmd>) {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        (
+            SlotState {
+                slot: 0,
+                module: DiscoveredModule {
+                    id: module_id.to_string(),
+                    serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
+                    audio_device: String::new(),
+                    usb_serial: String::new(),
+                },
+                imei: String::new(),
+                phone_number: String::new(),
+                network_type: NetworkType::Unknown,
+                network_mode: None,
+                lifecycle: LifecycleState::Ready,
+                retry_count: 0,
+                next_retry_at: None,
+                cmd_tx: Some(cmd_tx),
+                has_active_call,
+            },
+            cmd_rx,
+        )
+    }
+
+    /// gh#79: the SIP peer of the currently bridged call disconnecting must
+    /// hang up *that* call's own GSM line — never an unrelated idle one —
+    /// and must record it as a normal call end (`SipPeerHangup`), not the
+    /// `"failed"` outcome `hang_up_unbridged_call`'s `ModuleCmd::Hangup` is
+    /// for.
+    #[test]
+    fn signal_sip_peer_hangup_targets_only_the_bridged_slot() {
+        let mut slots = HashMap::new();
+        let (idle_state, idle_rx) = slot_state("card0", false);
+        let (bridged_state, bridged_rx) = slot_state("card1", true);
+        slots.insert(0, idle_state);
+        slots.insert(1, bridged_state);
+
+        signal_sip_peer_hangup(&mut slots);
+
+        assert!(!slots[&1].has_active_call, "the bridged slot must be freed");
+        assert!(
+            !slots[&0].has_active_call,
+            "an already-idle slot must stay idle"
+        );
+        assert!(
+            idle_rx.try_recv().is_err(),
+            "an unrelated idle slot must receive no command at all"
+        );
+        assert!(
+            matches!(bridged_rx.try_recv(), Ok(ModuleCmd::SipPeerHangup)),
+            "the bridged slot must be told to hang up as SipPeerHangup, not Hangup"
+        );
+    }
+
+    #[test]
+    fn signal_sip_peer_hangup_is_a_no_op_when_nothing_is_bridged() {
+        let mut slots = HashMap::new();
+        let (idle_state, idle_rx) = slot_state("card0", false);
+        slots.insert(0, idle_state);
+
+        // Must not panic despite no slot having `has_active_call`.
+        signal_sip_peer_hangup(&mut slots);
+
+        assert!(!slots[&0].has_active_call);
+        assert!(idle_rx.try_recv().is_err());
+    }
 }

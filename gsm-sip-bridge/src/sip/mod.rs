@@ -608,8 +608,8 @@ impl SipBridge {
     /// to `alsa_device` the same way `set_sound_device` already does for
     /// the inbound-mobile-call direction, and stores it as the (sole)
     /// active call so the existing SIP-peer-disconnected/hangup plumbing
-    /// (`pjsua_safe::is_sip_peer_disconnected`, `hangup_active_call`) covers
-    /// it with no new teardown path.
+    /// (`active_call_peer_disconnected`, `hangup_active_call`) covers it
+    /// with no new teardown path.
     pub fn accept_outbound(&mut self, mut call: Call, alsa_device: &str) -> Result<(), String> {
         self.set_sound_device(alsa_device)?;
         call.answer(200).map_err(|e| format!("{e}"))?;
@@ -625,6 +625,18 @@ impl SipBridge {
         if let Err(e) = call.answer(code) {
             tracing::warn!(error = %e, code, "failed to send outbound refusal");
         }
+    }
+
+    /// Whether this bridge's own active call's peer has disconnected —
+    /// scoped to `active_call`'s own `call_id` via
+    /// `pjsua_safe::take_call_disconnected` (gh#79: an older process-global
+    /// "did *any* pjsua call disconnect" signal couldn't tell this real,
+    /// live call apart from an unrelated one also ending, e.g. a second
+    /// dial-out refused while this call is active).
+    pub fn active_call_peer_disconnected(&self) -> bool {
+        self.active_call
+            .as_ref()
+            .is_some_and(|call| pjsua_safe::take_call_disconnected(call.call_id()))
     }
 
     pub fn hangup_active_call(&mut self) {
