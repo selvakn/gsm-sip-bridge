@@ -511,7 +511,6 @@ impl SipBridge {
             gsm_caller = %gsm_caller_id,
             "SIP outbound call initiated"
         );
-        pjsua_safe::watch_call_disconnect(call.call_id());
         self.active_call = Some(call);
         Ok(())
     }
@@ -615,7 +614,6 @@ impl SipBridge {
         self.set_sound_device(alsa_device)?;
         call.answer(200).map_err(|e| format!("{e}"))?;
         tracing::info!(call_id = call.call_id(), "outbound call accepted");
-        pjsua_safe::watch_call_disconnect(call.call_id());
         self.active_call = Some(call);
         Ok(())
     }
@@ -630,15 +628,20 @@ impl SipBridge {
     }
 
     /// Whether this bridge's own active call's peer has disconnected —
-    /// scoped to `active_call`'s own `call_id` via
-    /// `pjsua_safe::take_call_disconnected` (gh#79: an older process-global
-    /// "did *any* pjsua call disconnect" signal couldn't tell this real,
-    /// live call apart from an unrelated one also ending, e.g. a second
-    /// dial-out refused while this call is active).
+    /// asks PJSIP directly for `active_call`'s own current state
+    /// (`Call::poll_state`, the same mechanism `vowifi::service_active_outbound_call`
+    /// already uses) rather than watching for a one-shot event. gh#79: an
+    /// older process-global "did *any* pjsua call disconnect" bool couldn't
+    /// tell this real, live call apart from an unrelated one also ending
+    /// (e.g. a second dial-out refused while this call is active); an
+    /// event-based per-call-id fix for that replaced it here briefly but
+    /// had its own races (install-after-start, a non-atomic clear-then-set)
+    /// — polling the call's actual state instead has none, since there is
+    /// no event to miss in the first place.
     pub fn active_call_peer_disconnected(&self) -> bool {
         self.active_call
             .as_ref()
-            .is_some_and(|call| pjsua_safe::take_call_disconnected(call.call_id()))
+            .is_some_and(|call| call.poll_state() == CallState::Disconnected)
     }
 
     pub fn hangup_active_call(&mut self) {
@@ -648,10 +651,6 @@ impl SipBridge {
             }
         }
         self.active_call = None;
-        // Stop watching this call_id — a later, unrelated call may reuse
-        // the same small pjsua call_id, and must not read as an instant
-        // disconnect of itself (see `watch_call_disconnect`'s doc comment).
-        pjsua_safe::unwatch_call_disconnect();
     }
 
     pub fn unregister(&mut self) {
