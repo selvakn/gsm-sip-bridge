@@ -65,4 +65,10 @@ pub(crate) enum ModuleCmd {
     /// modem stays on a real, live call while `SlotState` reports it idle
     /// and eligible for a second dial.
     Hangup,
+    /// The SIP side of this line's bridged call disconnected first — hang
+    /// up the real GSM call behind it and record it as a normal, answered
+    /// call end (gh#79). Distinct from `Hangup`, which records `"failed"`
+    /// for the "never actually got bridged" case; this call *was* bridged
+    /// and simply ended.
+    SipPeerHangup,
 }

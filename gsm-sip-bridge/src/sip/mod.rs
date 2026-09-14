@@ -608,8 +608,8 @@ impl SipBridge {
     /// to `alsa_device` the same way `set_sound_device` already does for
     /// the inbound-mobile-call direction, and stores it as the (sole)
     /// active call so the existing SIP-peer-disconnected/hangup plumbing
-    /// (`pjsua_safe::is_sip_peer_disconnected`, `hangup_active_call`) covers
-    /// it with no new teardown path.
+    /// (`active_call_peer_disconnected`, `hangup_active_call`) covers it
+    /// with no new teardown path.
     pub fn accept_outbound(&mut self, mut call: Call, alsa_device: &str) -> Result<(), String> {
         self.set_sound_device(alsa_device)?;
         call.answer(200).map_err(|e| format!("{e}"))?;
@@ -625,6 +625,23 @@ impl SipBridge {
         if let Err(e) = call.answer(code) {
             tracing::warn!(error = %e, code, "failed to send outbound refusal");
         }
+    }
+
+    /// Whether this bridge's own active call's peer has disconnected —
+    /// asks PJSIP directly for `active_call`'s own current state
+    /// (`Call::poll_state`, the same mechanism `vowifi::service_active_outbound_call`
+    /// already uses) rather than watching for a one-shot event. gh#79: an
+    /// older process-global "did *any* pjsua call disconnect" bool couldn't
+    /// tell this real, live call apart from an unrelated one also ending
+    /// (e.g. a second dial-out refused while this call is active); an
+    /// event-based per-call-id fix for that replaced it here briefly but
+    /// had its own races (install-after-start, a non-atomic clear-then-set)
+    /// — polling the call's actual state instead has none, since there is
+    /// no event to miss in the first place.
+    pub fn active_call_peer_disconnected(&self) -> bool {
+        self.active_call
+            .as_ref()
+            .is_some_and(|call| call.poll_state() == CallState::Disconnected)
     }
 
     pub fn hangup_active_call(&mut self) {

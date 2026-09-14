@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicI32, AtomicU64};
 #[cfg(feature = "pjsip-linked")]
 use std::sync::{LazyLock, Mutex};
 
-static SIP_PEER_DISCONNECTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "pjsip-linked")]
 static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -75,10 +74,6 @@ static AUDIO_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 // Set once at endpoint creation and read in the media-state callback.
 #[cfg(feature = "pjsip-linked")]
 static CONF_TX_LEVEL_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
-
-pub fn is_sip_peer_disconnected() -> bool {
-    SIP_PEER_DISCONNECTED.swap(false, Ordering::AcqRel)
-}
 
 /// The conference bridge's clock rate, in Hz, as configured by the endpoint
 /// that created it. Read by the ringback tone generator, whose port PJMEDIA
@@ -888,9 +883,6 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
                     "call ended with no sound-device audio samples (expected for a paired bridge call)"
                 );
             }
-
-            tracing::info!(call_id, "SIP peer disconnected, signaling GSM hangup");
-            SIP_PEER_DISCONNECTED.store(true, Ordering::Release);
         }
         _ => {}
     }
