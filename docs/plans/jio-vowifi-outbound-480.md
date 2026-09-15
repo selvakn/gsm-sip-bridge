@@ -29,19 +29,21 @@ bisected down to the bare token; see the two sections below.)
 
 ### Live result, `pi@192.168.100.2` (ec20-11), 2026-09-15
 
-Two calls to `+918807793613` (this repo's own Vodafone VoWiFi test line) with
-only that one header changed:
+Two calls to `+919000000000` (this repo's own Vodafone VoWiFi test line,
+synthetic placeholder per the no-real-numbers rule) with only that one
+header changed:
 
 | | every previous attempt (any header set) | `ieee80211-pani` |
 |---|---|---|
-| 183 `Contact` | `<sip:msml@...>` | `<sip:+918807793613;rn=4101;npdi@...>` — a real NP dip |
+| 183 `Contact` | `<sip:msml@...>` | `<sip:+919000000000;rn=4101;npdi@...>` — a real NP dip |
 | 183 `Server`/media | `application/msml+xml` capable, "media server session" SDP | `Alcatel-Lucent 5060 MGC-8` MGC, real PCMU media |
 | Alerting | none — straight to canned IVR | genuine `180 Ringing` |
 | Final response | `480`, `Reason: cause=41 "temporary failure"`, ~13.6s after INVITE | call 1: caller-side CANCEL at 40s (own timeout, still ringing); call 2: `480`, `Reason: cause=31 "Normal, unspecified"`, ~20s of real ringing, **because nothing was configured to answer it on the receiving end** |
 
 The second call's `480 cause=31` is not a carrier block — confirmed by the
 receiving side's own log, the Vodafone bridge on this host:
-`incoming VoWiFi call signaled by Agent A ... caller=+919486073281`, followed
+`incoming VoWiFi call signaled by Agent A ... caller=+919000000001` (the Jio
+line's own number, synthetic placeholder), followed
 by `PBX leg never answered; declining, reason="pbx_rejected"` (nothing was
 registered to answer at the test PBX). The call reached the real destination
 network; it just wasn't picked up.
