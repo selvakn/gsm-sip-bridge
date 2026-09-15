@@ -2,10 +2,38 @@
 
 **Raised**: 2026-08-24 · **Tested on the live Jio line**: 2026-08-24 ·
 **Parent**: [docs/plans/jio-vowifi-outbound-480.md](jio-vowifi-outbound-480.md)
+— **now RESOLVED**, by a header not covered here (`ieee80211-pani`); see the
+parent doc's "RESOLVED" section.
 
-**Verdict: all five gaps are ruled out.** Four were built and sent to Jio on
-one call; the fifth was disproved from the same capture without building it.
-The 183/480 intercept is unchanged, to the second.
+**Verdict on the five gaps below: all ruled out.** Four were built and sent
+to Jio on one call; the fifth was disproved from the same capture without
+building it. The 183/480 intercept is unchanged, to the second.
+
+## A sixth gap, raised by issue #81 and also tried: `+sip.instance`/`;audio`
+
+[Issue #81](https://github.com/selvakn/gsm-sip-bridge/issues/81) proposed
+that the outbound `Contact` was missing `+sip.instance="<urn:gsma:imei:…>"`
+and `;audio` — the same instance ID this line already sends on `REGISTER`
+(RFC 5626 §4.2) and on the UAS `Contact` for inbound calls. That asymmetry is
+real (MO origination was the one request omitting it), so it was built as
+`originating_headers = ["instance"]` and tried on its own, 2026-09-14.
+
+**No effect.** Byte-identical intercept: `183` at +226ms with
+`Contact: <sip:msml@...>` and `Reason: cause=41`, ~13.6s of the same IVR,
+`480 cause=31` — matching gap 4's "full MTSI INVITE" result below to the
+second. Kept as a config token (`"instance"`) for a day while the
+`P-Access-Network-Info` fix below was still being isolated, then **removed
+from the shipped code** once that fix was confirmed and this investigation
+closed — it's a real signaling asymmetry (RFC 5626 §4.2), just not the one
+that mattered here, and this repo doesn't keep speculative config surface
+around once the actual answer is known.
+
+The rest of issue #81's diagnosis didn't hold up either: URL-encoding the
+ICSI URN's colons is unnecessary (the value is already a quoted-string, so
+RFC 3261 doesn't require it), and the hardcoded India-MCC geofencing headers
+it proposed were a dead end for the reasons this doc's parent already gives
+— but see the parent doc's "RESOLVED" section for the part of that theory
+that *did* hold up once tested literally.
 
 ## What was proposed
 
