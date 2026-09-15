@@ -1,9 +1,6 @@
 # Release Notes
 
-<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.17.1
 
 - **Every outbound (MO) VoWiFi call on Jio was intercepted by a carrier announcement server and torn down after about 13 seconds, regardless of destination.** The call was routed to Jio's MSML system ("your call cannot be completed at the moment, please try again later") and ended with `480 Temporarily Unavailable` — a subscriber-service decision made by Jio's network, not a protocol gap on this bridge's side, and independent of every other INVITE header this bridge could vary. Reported in [#81](https://github.com/selvakn/gsm-sip-bridge/issues/81). The intercept turned out to key on the `P-Access-Network-Info` header's access-type token: this bridge always sent `3GPP-WLAN`, and Jio's network only routes the call through when it instead sees `IEEE-802.11` — no other parameter on that header matters. Every outbound INVITE now sends `IEEE-802.11`; verified against real Jio and Vodafone lines, both placing full, answered, two-way-audio calls.
 - **In SIP server mode, dialing a second call while one is already answered and bridged could silently drop the active call instead of just refusing the second one.** A softphone attempt to place a second call while busy is correctly refused, but the refusal itself made that (unrelated) call disconnect on PJSIP's side — and the bridge's "hang up the GSM leg when the SIP peer disconnects" signal was a single process-wide flag with no notion of *which* call disconnected, so the refused call's own teardown was indistinguishable from the real, active call's peer hanging up. The real call's GSM leg was hung up in its place. Reported in [#79](https://github.com/selvakn/gsm-sip-bridge/issues/79). The signal is now scoped to the specific call actually being watched, so an unrelated call ending (a refusal, or anything else) no longer affects a real, still-live call.
