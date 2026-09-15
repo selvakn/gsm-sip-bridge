@@ -10,6 +10,19 @@ across releases.
 
 ### Fixed
 
+- **Inbound Jio VoWiFi calls were torn down by the network moments after
+  being answered, with `cause=503 "SDP Protocol Error"`, whenever the call
+  was routed through one of Jio's Alcatel-Lucent border elements.** The
+  error text is boilerplate and had nothing to do with the SDP: those
+  elements validate the `Allow` header on the `200 OK` and reject an answer
+  that does not claim `UPDATE`. Bisected live to that one method (0/12 calls
+  connected without it, 12/12 with it; substituting `PRACK` at the same list
+  length failed again). Responses to an inbound INVITE now advertise
+  `UPDATE` via `ims::UAS_INVITE_ALLOW`; every other response still states
+  only the methods this UAS actually serves. Supersedes the earlier
+  conclusion in `docs/jio-lucent-sbc-sdp-protocol-error.md` that the failure
+  was a carrier-side media bug with no fix on this side.
+
 - **A SIP client reachable only over a routed network (Tailscale, or any
   VPN/mesh) under `network_mode: host` got complete silence in both
   directions on every call, even though registration, ringing, and
