@@ -92,19 +92,20 @@ pub(super) struct InviteContext<'a> {
 
 /// The capability headers on a `200 OK` that answers an inbound INVITE.
 ///
-/// One function, because there are two paths here that answer one (the
-/// ordinary path and the offerless-INVITE path) and they have already drifted
-/// apart once, expensively: `5277765` dropped `Supported` from them and every
-/// inbound Jio call failed for three weeks (`a38f725`). A third site,
-/// `agent::mod`'s resend of a cached answer to a retransmitted INVITE, builds
-/// its own response and must be kept in step by hand — it is the one this
-/// project has missed twice now.
+/// `pub(super)`, not private: three sites answer an inbound INVITE (the
+/// ordinary path and the offerless-INVITE path here, plus `agent::mod`'s
+/// resend of a cached answer to a retransmitted INVITE), and they have
+/// already drifted apart once, expensively — `5277765` dropped `Supported`
+/// from two of them and every inbound Jio call failed for three weeks
+/// (`a38f725`). Routing all three through one function is what keeps that
+/// from happening a third time; building the header list by hand at any one
+/// site is the mistake this exists to rule out.
 ///
 /// Every header here is carrier-interop boilerplate rather than a promise:
 /// `Supported: timer` without session-refresh (RFC 4028 §9 permits it), and
 /// [`crate::ims::UAS_INVITE_ALLOW`]'s `UPDATE` without an implementation. See
 /// that constant for the measurement that made it necessary.
-fn uas_answer_headers(access_network_info: &str) -> [(&str, &str); 3] {
+pub(super) fn uas_answer_headers(access_network_info: &str) -> [(&str, &str); 3] {
     [
         ("Allow", crate::ims::UAS_INVITE_ALLOW),
         ("Supported", "timer, 100rel, replaces, path, gruu"),

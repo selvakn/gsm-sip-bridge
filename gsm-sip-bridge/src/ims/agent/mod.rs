@@ -2206,15 +2206,13 @@ impl LoopState {
                         Some(&call.to_tag),
                         Some(&cached.contact),
                         Some(&cached.answer_sdp),
-                        // The same capability claim the original answer
-                        // carried — see `inbound::uas_answer_headers` and
-                        // `ims::UAS_INVITE_ALLOW`. A resend that downgraded it
-                        // would re-open exactly the teardown the original
-                        // avoided.
-                        &[
-                            ("Allow", crate::ims::UAS_INVITE_ALLOW),
-                            ("Supported", "timer, 100rel, replaces, path, gruu"),
-                        ],
+                        // The same shared header set the original answer was
+                        // built with (`inbound::uas_answer_headers`) — not a
+                        // hand-copied subset of it. A resend that dropped or
+                        // fell out of step with even one of these headers
+                        // would re-open exactly the teardown they exist to
+                        // avoid (Greptile review, PR #85).
+                        &inbound::uas_answer_headers(&p.reg_cfg.access_network_info),
                     ));
                     return;
                 }
