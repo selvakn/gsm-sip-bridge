@@ -397,22 +397,18 @@ fn run_inner(
 const ALLOW: &str = crate::ims::UAS_ALLOW;
 
 /// Option-tags this UAS implements enough of to honour if a peer `Require`s
-/// them (RFC 3261 §8.2.2.3) and to state in a `Supported` header.
-/// `timer`, `100rel`, `replaces`, `path` and `gruu` stay absent: they were
-/// previously claimed in `inbound::UAS_EXTRA_HEADERS`'s `Supported` line
-/// with no behaviour behind any of them — `timer` with no session-refresh
-/// timer, `100rel` with no UAS-side reliable-provisional handling,
-/// `replaces`/`gruu` with none of their machinery at all, and `path`
-/// naming a REGISTER mechanism this is not even a REGISTER response
-/// (specs/041 conformance review, MT-10). `precondition` is real, if
-/// bounded: this UAS honours RFC 3312 QoS preconditions on its own
-/// segment (no real reservation delay to wait on) but still declines what
-/// it cannot honestly confirm without a synchronization mechanism it
-/// doesn't implement (specs/048 MT-06) — advertising it is no longer a
-/// promise this bridge can't keep, the same bar MT-10 set for every other
-/// tag here. One list feeds both [`unsupported_required_extensions`] and
-/// whatever `Supported` header a caller gets — grown only by growing the
-/// UAS, the same rule [`ALLOW`] already states for methods.
+/// them (RFC 3261 §8.2.2.3) — feeds only [`unsupported_required_extensions`],
+/// not the literal `Supported` header text on the 2xx-to-INVITE response
+/// (that's `inbound.rs`'s own hardcoded string; see the note there,
+/// specs/050). `precondition` is real, if bounded: this UAS honours RFC
+/// 3312 QoS preconditions on its own segment (no real reservation delay to
+/// wait on) but still declines what it cannot honestly confirm without a
+/// synchronization mechanism it doesn't implement (specs/048 MT-06).
+/// `timer`/`100rel`/`replaces`/`path`/`gruu` stay absent from *this* list —
+/// nothing here implements Require-time behaviour for any of them — even
+/// though `inbound.rs` states them in `Supported` anyway as carrier-interop
+/// boilerplate Jio's IMS core requires (specs/050); a caller `Require`ing
+/// any of them is still declined `420` by this list unchanged.
 const SUPPORTED_EXTENSIONS: &[&str] = &["precondition"];
 
 /// Every option-tag a request's `Require` demands that is not in
@@ -2210,7 +2206,10 @@ impl LoopState {
                         Some(&call.to_tag),
                         Some(&cached.contact),
                         Some(&cached.answer_sdp),
-                        &[("Allow", ALLOW)],
+                        &[
+                            ("Allow", ALLOW),
+                            ("Supported", "timer, 100rel, replaces, path, gruu"),
+                        ],
                     ));
                     return;
                 }

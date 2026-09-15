@@ -1,5 +1,12 @@
 # Release Notes
 
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **An inbound Jio VoWiFi call could ring, get answered, and then be torn down by the network within a second or two, every time.** A prior cleanup (`5277765`) dropped the `Supported` header from this bridge's `200 OK` to an inbound INVITE on RFC-purism grounds ("don't claim capabilities you don't implement"), verified only against Vi/Vodafone. Jio's network requires that header regardless of whether any real behaviour backs it — its absence reliably produced `BYE Reason:SIP;cause=503;text="IO: SIP SDP Protocol Error."` moments after the answer. Restored on all three places this bridge builds a successful response to an inbound INVITE (the normal path, the offerless-INVITE path, and the retransmitted-original-INVITE resend of a cached answer). Live-verified against a real Jio line. See `docs/jio-lucent-sbc-sdp-protocol-error.md` for the fuller investigation, including a separate, still-open carrier-side failure mode this fix does not address.
+
 ## v8.17.1
 
 - **Every outbound (MO) VoWiFi call on Jio was intercepted by a carrier announcement server and torn down after about 13 seconds, regardless of destination.** The call was routed to Jio's MSML system ("your call cannot be completed at the moment, please try again later") and ended with `480 Temporarily Unavailable` — a subscriber-service decision made by Jio's network, not a protocol gap on this bridge's side, and independent of every other INVITE header this bridge could vary. Reported in [#81](https://github.com/selvakn/gsm-sip-bridge/issues/81). The intercept turned out to key on the `P-Access-Network-Info` header's access-type token: this bridge always sent `3GPP-WLAN`, and Jio's network only routes the call through when it instead sees `IEEE-802.11` — no other parameter on that header matters. Every outbound INVITE now sends `IEEE-802.11`; verified against real Jio and Vodafone lines, both placing full, answered, two-way-audio calls.

@@ -482,14 +482,18 @@ pub(super) fn handle_invite(
             // work — answering without it got every call torn down ~460ms
             // later with `BYE Reason:SIP;cause=503;text="IO: SIP SDP
             // Protocol Error."`; RFC 3261 §13.3.1.4 requires it in a `2xx`
-            // to INVITE regardless. No `Supported` header: claiming
-            // `timer`/`100rel`/`replaces`/`path`/`gruu` with no behaviour
-            // behind any of them was the same capability-truthfulness
-            // problem `Allow` already guards against (specs/041, MT-10) —
-            // see `SUPPORTED_EXTENSIONS`. `P-Access-Network-Info` is a real
-            // per-line value (VoWiFi vs. VoLTE), not a fixed capability
-            // claim, so it's built per-call rather than a shared const
-            // (specs/045 MT-11).
+            // to INVITE regardless. `Supported` was dropped in `5277765`
+            // (specs/041, MT-10) on "capability truthfulness" grounds —
+            // hardware-verified only against Vi, which doesn't care either
+            // way — and that reintroduced the *exact* `cause=503 "IO: SIP
+            // SDP Protocol Error"` teardown on the Jio line (live-verified
+            // 2026-09-15, four separate calls, always ~0.5-2.5s after this
+            // `200 OK`): Jio's IMS core requires it regardless of whether
+            // this UAS implements any behaviour behind it. Restored
+            // unconditionally — Vi's own prior test showed no downside.
+            // `P-Access-Network-Info` is a real per-line value (VoWiFi vs.
+            // VoLTE), not a fixed capability claim, so it's built per-call
+            // rather than a shared const (specs/045 MT-11).
             let response = build_uas_response_with_headers(
                 200,
                 "OK",
@@ -499,6 +503,7 @@ pub(super) fn handle_invite(
                 Some(&answer_sdp),
                 &[
                     ("Allow", super::ALLOW),
+                    ("Supported", "timer, 100rel, replaces, path, gruu"),
                     ("P-Access-Network-Info", ctx.access_network_info),
                 ],
             );
@@ -830,6 +835,7 @@ fn handle_offerless_invite(
         Some(&our_offer),
         &[
             ("Allow", super::ALLOW),
+            ("Supported", "timer, 100rel, replaces, path, gruu"),
             ("P-Access-Network-Info", ctx.access_network_info),
         ],
     );
@@ -1299,7 +1305,11 @@ mod tests {
     /// This was the difference between an inbound Jio call that holds and one
     /// torn down ~460 ms later with `cause=503 "SIP SDP Protocol Error"`, and
     /// it is no longer conditional on anything, so nothing may drop it back
-    /// out of the response by accident.
+    /// out of the response by accident. `Supported` is pinned here too
+    /// (specs/050, reversing MT-10): dropping it was hardware-verified only
+    /// against Vi, and live-verified 2026-09-15 to reintroduce this exact
+    /// `cause=503` teardown on the Jio line — Jio's IMS core requires it
+    /// regardless of whether this UAS implements any behaviour behind it.
     #[test]
     fn the_answering_response_states_our_capabilities() {
         let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
@@ -1318,6 +1328,7 @@ mod tests {
             Some("v=0\r\n"),
             &[
                 ("Allow", super::super::ALLOW),
+                ("Supported", "timer, 100rel, replaces, path, gruu"),
                 ("P-Access-Network-Info", "3GPP-WLAN"),
             ],
         );
@@ -1326,26 +1337,23 @@ mod tests {
             resp.contains("\r\nAllow: INVITE, ACK, CANCEL, BYE,"),
             "RFC 3261 §13.3.1.4 wants Allow in a 2xx to INVITE: {resp}"
         );
+        assert!(
+            resp.contains("\r\nSupported: timer, 100rel, replaces, path, gruu\r\n"),
+            "Jio's IMS core requires this even with no behaviour behind it: {resp}"
+        );
         // specs/045 MT-11: states the line's real access-network value.
         assert!(
             resp.contains("\r\nP-Access-Network-Info: 3GPP-WLAN\r\n"),
             "must state the real access network: {resp}"
         );
-        // No `Supported:` (specs/041 conformance review, MT-10): every
-        // extension it used to claim here (timer, 100rel, replaces, path,
-        // gruu) had no behaviour behind it.
-        assert!(
-            !resp.contains("\r\nSupported: "),
-            "must not claim an extension nothing here implements: {resp}"
-        );
     }
 
     /// specs/043 MT-05: an inbound INVITE offering RFC 4028 session timers
-    /// must not get them echoed back — `SUPPORTED_EXTENSIONS` being empty
-    /// (since MT-10) already means `timer` is never advertised, and RFC
-    /// 4028 §9 explicitly permits a UAS to simply omit `Session-Expires`
-    /// when it doesn't want the extension. This pins that as intentional,
-    /// already-correct behavior, not an open gap.
+    /// must not get its `Session-Expires` echoed back — this UAS never
+    /// implements the session-refresh role, and RFC 4028 §9 explicitly
+    /// permits a UAS to simply omit `Session-Expires` when it doesn't want
+    /// the extension. `Supported: timer` is stated anyway (specs/050): that
+    /// header is carrier-interop boilerplate, not a promise to refresh.
     #[test]
     fn session_expires_on_the_offer_is_never_echoed_back() {
         let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
@@ -1366,6 +1374,7 @@ mod tests {
             Some("v=0\r\n"),
             &[
                 ("Allow", super::super::ALLOW),
+                ("Supported", "timer, 100rel, replaces, path, gruu"),
                 ("P-Access-Network-Info", "3GPP-WLAN"),
             ],
         );
@@ -1374,44 +1383,15 @@ mod tests {
             !resp.contains("Session-Expires"),
             "must not echo a session-refresh promise nothing here honours: {resp}"
         );
-        assert!(
-            !resp.contains("\r\nSupported: "),
-            "must not claim timer support even though the offer asked for it: {resp}"
-        );
     }
 
-    /// specs/045 MT-04: `100rel` (RFC 3262 reliable provisionals) is never
-    /// advertised on any UAS response — `SUPPORTED_EXTENSIONS` being empty
-    /// (since MT-10) already covers this, the same way it covers `timer`
-    /// (MT-05) — and a caller `Require`ing it is still declined `420`
-    /// (MT-03's existing gate) rather than silently accepted. No new
-    /// behavior; this pins both as already correct.
+    /// specs/045 MT-04: `100rel` (RFC 3262 reliable provisionals) is stated
+    /// in `Supported` as carrier-interop boilerplate (specs/050) but never
+    /// backed by real behaviour — a caller `Require`ing it is still
+    /// declined `420` (MT-03's existing gate) rather than silently
+    /// accepted.
     #[test]
-    fn the_answering_response_never_advertises_100rel() {
-        let invite = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
-                      Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
-                      From: <sip:caller@example.net>;tag=abc\r\n\
-                      To: <sip:me@example.net>\r\n\
-                      Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = SipRequest::try_parse(invite.as_bytes()).unwrap().unwrap();
-
-        let resp = build_uas_response_with_headers(
-            200,
-            "OK",
-            &req,
-            Some("totag1"),
-            Some("<sip:me@10.0.0.9:5060>"),
-            Some("v=0\r\n"),
-            &[
-                ("Allow", super::super::ALLOW),
-                ("P-Access-Network-Info", "3GPP-WLAN"),
-            ],
-        );
-        assert!(
-            !resp.contains("\r\nSupported: "),
-            "must not advertise 100rel (or anything else): {resp}"
-        );
-
+    fn a_required_100rel_is_still_declined_despite_the_boilerplate_supported() {
         let requiring_100rel = "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
                       Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKtwo\r\n\
                       From: <sip:caller@example.net>;tag=abc\r\n\
