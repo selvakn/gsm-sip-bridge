@@ -1,11 +1,12 @@
 # Jio inbound VoWiFi: Lucent SBC rewrite breaks the call (`cause=503 "SDP Protocol Error"`)
 
 **Status: root-caused to Jio's own network, not this bridge's code.** Two
-real, separate bugs were found and fixed along the way (see below), but the
-dominant failure mode is a carrier-side session-border element that reliably
-breaks the call whenever it touches it. No further code change on our side
-is known to help; retrying (and hoping for a route that avoids it) is the
-only current workaround.
+real, separate bugs were found along the way — one fixed in this change,
+one still open (see below) — but the dominant failure mode is a
+carrier-side session-border element that reliably breaks the call whenever
+it touches it. No further code change on our side is known to help;
+retrying (and hoping for a route that avoids it) is the only current
+workaround.
 
 Investigated live against pi@192.168.100.2, the real Jio VoWiFi line
 (`[[vowifi.line]]` `msisdn = "9000000000"`), 2026-09-15.
@@ -32,26 +33,30 @@ The bridge's own media accounting (`gsm_sip_bridge::ims::agent::call`,
 nothing back from the carrier (`carrier_rx` 0–6 packets) before the BYE
 arrives.
 
-## Two real bugs fixed along the way
+## Two real bugs found along the way
 
-These were genuine, reproducible defects and are worth keeping fixed even
-though they turned out not to be the main story:
+One genuine, reproducible defect is fixed by this change; a second remains
+open. Neither turned out to be the main story:
 
-1. **Missing `Supported` header (regression).** Commit `5277765`
-   ("stop claiming capabilities this UAS doesn't have", 2026-08-26) dropped
-   `Supported: timer, 100rel, replaces, path, gruu` from the inbound
-   INVITE's `200 OK`, on RFC-purism grounds, and was hardware-verified only
-   against Vi/Vodafone. Jio's network requires this header regardless of
-   whether we implement any behaviour behind it — its absence produced the
-   `"IO: SIP SDP Protocol Error"` teardown 100% of the time (4/4 calls
-   captured pre-fix). Restored in `gsm-sip-bridge/src/ims/agent/inbound.rs`
-   (both the main and offerless-INVITE `200 OK` build sites). See
+1. **Missing `Supported` header (regression) — fixed here.** Commit
+   `5277765` ("stop claiming capabilities this UAS doesn't have",
+   2026-08-26) dropped `Supported: timer, 100rel, replaces, path, gruu`
+   from the inbound INVITE's `200 OK`, on RFC-purism grounds, and was
+   hardware-verified only against Vi/Vodafone. Jio's network requires this
+   header regardless of whether we implement any behaviour behind it — its
+   absence produced the `"IO: SIP SDP Protocol Error"` teardown 100% of the
+   time (4/4 calls captured pre-fix). Restored on all three places this
+   bridge builds a successful `200 OK` to an inbound INVITE
+   (`gsm-sip-bridge/src/ims/agent/inbound.rs`'s main and offerless-INVITE
+   paths, plus `ims/agent/mod.rs`'s retransmitted-original-INVITE resend of
+   the cached answer — easy to miss since it rebuilds the response
+   separately from the other two). See
    [[jio-uas-responses-never-reach-carrier]] memory for the original
    2026-08-15 discovery of this same requirement.
 
-   **Not yet committed** — applied locally and deployed to the Jio Pi as
-   image tag `jio-supported-hdr-fix` for live testing. `make format` /
-   `make lint` / `make test` all pass against the change.
+   Live-verified on the Jio Pi (image tag `jio-supported-hdr-fix`) before
+   this PR landed the change; `make format` / `make lint` / `make test`
+   all pass.
 
 2. **Rapid-redial teardown race (still open, separate issue).**
    `pjsua-safe`'s `Call::hangup()` (`pjsua-safe/src/call.rs:175`) fires

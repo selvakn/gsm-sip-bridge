@@ -2206,7 +2206,10 @@ impl LoopState {
                         Some(&call.to_tag),
                         Some(&cached.contact),
                         Some(&cached.answer_sdp),
-                        &[("Allow", ALLOW)],
+                        &[
+                            ("Allow", ALLOW),
+                            ("Supported", "timer, 100rel, replaces, path, gruu"),
+                        ],
                     ));
                     return;
                 }
