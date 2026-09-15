@@ -96,6 +96,43 @@ pub const ACCESS_NETWORK_WLAN: &str = "3GPP-WLAN";
 /// doesn't otherwise cross.
 pub(crate) const UAS_ALLOW: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, NOTIFY";
 
+/// The `Allow` on a response to a **network-initiated INVITE** — [`UAS_ALLOW`]
+/// plus `UPDATE`, which this UAS does not implement.
+///
+/// The one deliberate lie in this bridge's signaling, and it is load-bearing:
+/// Jio's Alcatel-Lucent border elements validate the advertised method set on
+/// the `200 OK` and tear the answered call down within milliseconds of the
+/// `ACK` when `UPDATE` is absent, reporting it as
+/// `Reason: SIP;cause=503;text="IO: SIP SDP Protocol Error."` — a text that has
+/// nothing to do with the SDP body.
+///
+/// Bisected on a live Jio line, 2026-09-15 — 13 calls without `UPDATE` and 12
+/// with it, every one of them routed through a Lucent element:
+///
+/// | `Allow` sent | outcome |
+/// |---|---|
+/// | [`UAS_ALLOW`] | 0/12 — all `503 "SDP Protocol Error"` |
+/// | `UAS_ALLOW` + `PRACK, UPDATE, INFO, REFER` | 4/4 answered |
+/// | `UAS_ALLOW` + `PRACK, UPDATE` | 3/3 answered |
+/// | `UAS_ALLOW` + `UPDATE` | 3/3 answered |
+/// | `UAS_ALLOW` + `PRACK` (same length, one token different) | 0/1 — failed |
+/// | `UAS_INVITE_ALLOW`, as shipped | 2/2 answered |
+///
+/// So it is `UPDATE` specifically, not the list's length and not MMTel methods
+/// in general. Jio never actually *sends* an `UPDATE` — the whole capture
+/// contains only INVITE/ACK/BYE — so nothing behind the claim is exercised;
+/// one arriving anyway still draws the honest `405` (with [`UAS_ALLOW`]) that
+/// `agent::method_not_allowed` has always sent.
+///
+/// **Do not "clean this up" to match what the dispatch loop serves.** That is
+/// exactly what `5277765` did to the `Supported` header on RFC-purism grounds,
+/// on a change verified only against Vi/Vodafone, and it cost three weeks of
+/// every inbound Jio call failing (`a38f725`). This is the third capability
+/// header on this carrier found to be checked but never exercised. See
+/// `docs/jio-lucent-sbc-sdp-protocol-error.md`.
+pub(crate) const UAS_INVITE_ALLOW: &str =
+    "INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, MESSAGE, NOTIFY";
+
 pub struct ImsRegisterConfig {
     pub modem_port: PathBuf,
     /// This line's SIM comes from a physical PC/SC reader

@@ -90,6 +90,29 @@ pub(super) struct InviteContext<'a> {
     pub(super) respect_caller_privacy: bool,
 }
 
+/// The capability headers on a `200 OK` that answers an inbound INVITE.
+///
+/// `pub(super)`, not private: three sites answer an inbound INVITE (the
+/// ordinary path and the offerless-INVITE path here, plus `agent::mod`'s
+/// resend of a cached answer to a retransmitted INVITE), and they have
+/// already drifted apart once, expensively — `5277765` dropped `Supported`
+/// from two of them and every inbound Jio call failed for three weeks
+/// (`a38f725`). Routing all three through one function is what keeps that
+/// from happening a third time; building the header list by hand at any one
+/// site is the mistake this exists to rule out.
+///
+/// Every header here is carrier-interop boilerplate rather than a promise:
+/// `Supported: timer` without session-refresh (RFC 4028 §9 permits it), and
+/// [`crate::ims::UAS_INVITE_ALLOW`]'s `UPDATE` without an implementation. See
+/// that constant for the measurement that made it necessary.
+pub(super) fn uas_answer_headers(access_network_info: &str) -> [(&str, &str); 3] {
+    [
+        ("Allow", crate::ims::UAS_INVITE_ALLOW),
+        ("Supported", "timer, 100rel, replaces, path, gruu"),
+        ("P-Access-Network-Info", access_network_info),
+    ]
+}
+
 /// Whether this UAS can interpret an inbound INVITE's body as SDP: no
 /// `Content-Type` at all (the long-standing implicit assumption — this is
 /// also what an offerless INVITE looks like, RFC 3261 §14.2/RFC 3264 §3,
@@ -501,11 +524,7 @@ pub(super) fn handle_invite(
                 Some(&to_tag),
                 Some(&contact),
                 Some(&answer_sdp),
-                &[
-                    ("Allow", super::ALLOW),
-                    ("Supported", "timer, 100rel, replaces, path, gruu"),
-                    ("P-Access-Network-Info", ctx.access_network_info),
-                ],
+                &uas_answer_headers(ctx.access_network_info),
             );
             sink.send(&response)?;
 
@@ -833,11 +852,7 @@ fn handle_offerless_invite(
         Some(&to_tag),
         Some(&contact),
         Some(&our_offer),
-        &[
-            ("Allow", super::ALLOW),
-            ("Supported", "timer, 100rel, replaces, path, gruu"),
-            ("P-Access-Network-Info", ctx.access_network_info),
-        ],
+        &uas_answer_headers(ctx.access_network_info),
     );
     sink.send(&response)?;
 
@@ -1345,6 +1360,50 @@ mod tests {
         assert!(
             resp.contains("\r\nP-Access-Network-Info: 3GPP-WLAN\r\n"),
             "must state the real access network: {resp}"
+        );
+    }
+
+    /// The `200 OK` to an inbound INVITE must claim `UPDATE`. Bisected on a
+    /// live Jio line 2026-09-15: without it, every call routed through one of
+    /// Jio's Lucent border elements was torn down within milliseconds of the
+    /// `ACK` with `cause=503 "SDP Protocol Error"`; with it, 10/10 answered.
+    /// Swapping `UPDATE` for `PRACK` — same list length — failed again, so it
+    /// is this token specifically. See `ims::UAS_INVITE_ALLOW`.
+    #[test]
+    fn the_answer_claims_update_even_though_this_uas_does_not_serve_it() {
+        let headers = uas_answer_headers("3GPP-WLAN");
+        let allow = headers
+            .iter()
+            .find(|(n, _)| *n == "Allow")
+            .expect("an answer always states Allow")
+            .1;
+        assert!(
+            allow.split(", ").any(|m| m == "UPDATE"),
+            "Jio tears the call down without it: {allow}"
+        );
+        assert!(
+            !super::super::ALLOW.contains("UPDATE"),
+            "the dispatch loop's own list stays honest; only the answer lies"
+        );
+        // Everything else the answer claims is unchanged.
+        assert_eq!(
+            headers,
+            [
+                ("Allow", crate::ims::UAS_INVITE_ALLOW),
+                ("Supported", "timer, 100rel, replaces, path, gruu"),
+                ("P-Access-Network-Info", "3GPP-WLAN"),
+            ]
+        );
+    }
+
+    /// The claim is scoped to answers. A `405` to a method we really don't
+    /// serve — including an `UPDATE` that takes the claim up — must not repeat
+    /// it, or the refusal would contradict itself.
+    #[test]
+    fn the_update_claim_does_not_leak_into_the_honest_method_list() {
+        assert_eq!(
+            super::super::ALLOW,
+            "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, NOTIFY"
         );
     }
 
