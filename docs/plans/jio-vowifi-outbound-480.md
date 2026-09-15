@@ -1,7 +1,141 @@
 # Investigation: Jio VoWiFi outbound (MO) calls always end in 480
 
 **Triaged**: 2026-08-24 · **Effort**: unknown, likely carrier-side ·
-**Status**: **PARKED 2026-08-24** — see "PARKED — where this stands" below.
+**Status**: **RESOLVED 2026-09-15** — see "RESOLVED — the P-Access-Network-Info
+access-type token" below. Superseded by that section; "PARKED" and everything
+under it is kept for the record of what was ruled out and why.
+
+## RESOLVED 2026-09-15 — the P-Access-Network-Info access-type token
+
+Prompted by [issue #81](https://github.com/selvakn/gsm-sip-bridge/issues/81),
+whose specific proposed diagnosis and fix did not survive scrutiny (see
+`jio-vowifi-outbound-480-followup.md`'s new section) but whose broader claim —
+DoT WiFi-calling geofencing — pointed at a header this investigation had
+reasoned about but never literally sent.
+
+**Theory 3 below** ruled out geofencing by testing the pinned
+`P-Access-Network-Info: 3GPP-WLAN` and reasoning that its grammar has no
+`wlan-node-id`/`country` subfield. That reasoning is correct for the
+`3GPP-WLAN` access-type token — but `IEEE-802.11` is a *separate* access-type
+token in TS 24.229's grammar, the one GSMA IR.51 pairs with
+`i-wlan-node-id`/`country`, and it was never tried.
+
+Added `[vowifi] originating_headers = ["ieee80211-pani"]` (`ims::call`'s
+`build_invite`): sends `P-Access-Network-Info: IEEE-802.11` instead of the
+pinned `3GPP-WLAN`. Nothing else about the INVITE changed. (First tried with
+the full GSMA IR.51 form —
+`IEEE-802.11;i-wlan-node-id=000000000000;network-provided;country=IN` — then
+bisected down to the bare token; see the two sections below.)
+
+### Live result, `pi@192.168.100.2` (ec20-11), 2026-09-15
+
+Two calls to `+919000000000` (this repo's own Vodafone VoWiFi test line,
+synthetic placeholder per the no-real-numbers rule) with only that one
+header changed:
+
+| | every previous attempt (any header set) | `ieee80211-pani` |
+|---|---|---|
+| 183 `Contact` | `<sip:msml@...>` | `<sip:+919000000000;rn=4101;npdi@...>` — a real NP dip |
+| 183 `Server`/media | `application/msml+xml` capable, "media server session" SDP | `Alcatel-Lucent 5060 MGC-8` MGC, real PCMU media |
+| Alerting | none — straight to canned IVR | genuine `180 Ringing` |
+| Final response | `480`, `Reason: cause=41 "temporary failure"`, ~13.6s after INVITE | call 1: caller-side CANCEL at 40s (own timeout, still ringing); call 2: `480`, `Reason: cause=31 "Normal, unspecified"`, ~20s of real ringing, **because nothing was configured to answer it on the receiving end** |
+
+The second call's `480 cause=31` is not a carrier block — confirmed by the
+receiving side's own log, the Vodafone bridge on this host:
+`incoming VoWiFi call signaled by Agent A ... caller=+919000000001` (the Jio
+line's own number, synthetic placeholder), followed
+by `PBX leg never answered; declining, reason="pbx_rejected"` (nothing was
+registered to answer at the test PBX). The call reached the real destination
+network; it just wasn't picked up.
+
+**A third call, with a real answering endpoint** (`[sip_server]` mode on the
+Vodafone-side test rig, `siptest` auto-answering, `country=IN` still
+present) **connected end to end**: Jio side logged `outbound: final INVITE
+response call_id=out-0 status=200 reason=OK`; `siptest`'s own report:
+`direction: both ways`, `1000 packets sent / 999 received`, `0% loss`,
+`success: true`.
+
+Reproducible (2/2 non-intercepted on two different P-CSCFs from the same
+pool, vs. 10+ consistent MSML intercepts across many different P-CSCFs in
+every prior attempt with or without other header changes) — this is the
+carrier keying its TAS decision on this one access-type token, not routing
+noise.
+
+### Control test: is `country=IN` load-bearing?
+
+Rebuilt with `;country=IN` dropped from the `ieee80211-pani` string (just
+`IEEE-802.11;i-wlan-node-id=000000000000;network-provided`), same live line,
+full answering endpoint in place from the start this time. **Answered on the
+first attempt**: `final INVITE response call_id=out-0 status=200 reason=OK`;
+`siptest`: `direction: both ways`, `1000/999 packets`, `0% loss`,
+`success: true`. No retry needed, unlike the `country=IN` run above.
+
+So `country=IN` is not load-bearing — Jio's TAS keys on the `IEEE-802.11`
+access-type token itself (vs. the pinned `3GPP-WLAN`), not on the `country`
+parameter.
+
+### Minimal-form bisection: is any parameter load-bearing?
+
+Kept dropping. Rebuilt with `i-wlan-node-id=000000000000;network-provided`
+dropped too — just the bare access-type token, `P-Access-Network-Info:
+IEEE-802.11`, no parameters at all. Same live line, full answering endpoint
+already in place. **Answered on the first attempt**, same as the previous
+step: `final INVITE response call_id=out-0 status=200 reason=OK`; `siptest`:
+`direction: both ways`, `1000/999 packets`, `0% loss`, `success: true`.
+
+So none of the GSMA IR.51 WiFi-calling parameters are load-bearing either —
+Jio's TAS keys purely on the access-type token name (`IEEE-802.11` vs. the
+pinned `3GPP-WLAN`), not on anything that follows it. The shipped string is
+the bare token: `IEEE-802.11`. It was an unverified claim about the SIM's
+actual location/AP anyway, and the fix works without asserting any of it.
+
+### Second carrier: Vodafone outbound, unaffected
+
+Before shipping `IEEE-802.11` as the unconditional default (below), tested
+outbound (MO) calling on this repo's own Vodafone VoWiFi line
+(`test/config.toml`, `/dev/ttyUSB0`) to a real PSTN destination, both ways:
+
+- **Baseline** (`3GPP-WLAN`, the previous pinned default): `100`→`183`→`183`→
+  `183`→`180 Ringing`→`200 OK`, answered, `direction: both ways`, `0% loss`.
+- **`IEEE-802.11`**: identical shape — `100`→`183`→`183`→`180 Ringing`→
+  `200 OK`, answered, `direction: both ways`, `0% loss`. Confirmed via
+  `RUST_LOG=...,gsm_sip_bridge::ims::sip_client=trace` that the outbound
+  INVITE actually carried `P-Access-Network-Info: IEEE-802.11` (REGISTER
+  still correctly sends `3GPP-WLAN` — untouched by this change, as designed).
+
+2/2 carriers tested: Jio requires `IEEE-802.11` (blocked on `3GPP-WLAN`);
+Vodafone is unaffected either way. No evidence `3GPP-WLAN` is needed
+anywhere, so it's no longer sent by this codebase at all — see
+"Recommendation".
+
+### Recommendation — shipped as the unconditional default, not an opt-in
+
+`P-Access-Network-Info: IEEE-802.11` is now sent on every outbound INVITE,
+unconditionally — `3GPP-WLAN` and the `ieee80211-pani`/`[vowifi]
+originating_headers` opt-in token that carried it during this investigation
+are both gone from the code. No config change is needed on any deployment.
+
+Two things tried during this investigation were deliberately **not** kept
+in the shipped code, despite being architecturally sound:
+
+- The `;country=IN` and `i-wlan-node-id`/`network-provided` parameters
+  (bisected out above — asserting a false claim about the SIM's actual
+  location/AP for no measured benefit).
+- The `"instance"` token (`+sip.instance="<urn:gsma:imei:…>"` + `;audio` on
+  the outbound `Contact`, closing a real RFC 5626 §4.2 asymmetry with what
+  `REGISTER` and the inbound UAS `Contact` already send) — proposed by
+  issue #81, built, and tested live against Jio 2026-09-14: **no effect**,
+  byte-identical intercept with or without it (see
+  `jio-vowifi-outbound-480-followup.md`). Removed rather than kept
+  opt-in, since it wasn't part of what actually fixed this and this
+  investigation is done.
+
+If a future carrier needs either of these, the way to find out is the same
+as it was for `ieee80211-pani`: a live capture, not by re-adding the
+config knob speculatively.
+
+## PARKED 2026-08-24 (superseded, kept for the record)
+
 Not blocked on Jio: the same SIM originates fine over VoLTE, so MO voice is
 provisioned and the "carrier limitation" reading is dead. The discriminating
 test (our own stack over LTE) is blocked on this module's firmware, and the
@@ -83,7 +217,11 @@ failed to match the evidence:
    `conf:` — nothing). There is no precondition negotiation happening for an
    UPDATE to complete.
 3. **"Missing/malformed `P-Access-Network-Info` (DoT WiFi-calling
-   geofencing)"** — false, on two grounds:
+   geofencing)"** — **narrower than stated, and the narrow form was live
+   2026-09-15: see "RESOLVED" above.** This ruled out the pinned `3GPP-WLAN`
+   access-type token specifically; `IEEE-802.11` (a distinct token in the
+   same grammar) was never tried and turned out to be exactly what Jio keys
+   on. The two grounds below are correct as written, for `3GPP-WLAN`:
    - The header sent (`P-Access-Network-Info: 3GPP-WLAN`) is identical to
      what every successful REGISTER on this line sends, and REGISTER always
      succeeds. TS 24.229 §7.2A.4's grammar for the `3GPP-WLAN` access-type

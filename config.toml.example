@@ -278,8 +278,12 @@ sms_delivery_report = true
 # fully trusted and showing the real name always is preferred.
 respect_caller_privacy = true
 # Optional originating (INVITE) headers, by name. Empty (the default) is the
-# minimal header set every carrier in production here places calls on. Each
-# entry opts one group in:
+# minimal header set every carrier in production here places calls on --
+# except P-Access-Network-Info, which is unconditionally "IEEE-802.11"
+# (live-verified 2026-09-15 on Jio, where it fixes the outbound (MO)
+# 480/MSML intercept, and on Vodafone, where it's a no-op vs. the previous
+# pinned "3GPP-WLAN" -- see docs/plans/jio-vowifi-outbound-480.md). Each
+# entry below opts one more group in:
 #   "icsi"                -> Accept-Contact + P-Preferred-Service + a Contact
 #                            feature tag naming the MMTel voice ICSI
 #                            (TS 24.173 5.2). For a network whose S-CSCF keys

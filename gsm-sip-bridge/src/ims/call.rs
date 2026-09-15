@@ -744,8 +744,16 @@ pub(crate) fn build_invite(p: &InviteParts) -> String {
     } else {
         "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"
     });
+    // TS 24.229's P-Access-Network-Info grammar treats "IEEE-802.11" and
+    // "3GPP-WLAN" as distinct access-type tokens; "3GPP-WLAN" was the
+    // previous pinned default here. Live-verified 2026-09-15 on two
+    // carriers: "IEEE-802.11" fixes Jio's outbound (MO) 480/MSML intercept
+    // (bisected down to the bare token — no parameter is load-bearing) and
+    // is unchanged on Vodafone (identical 183/180/200 accept-and-ring
+    // shape, same as "3GPP-WLAN"). See `docs/plans/jio-vowifi-outbound-480.md`'s
+    // "RESOLVED" section.
     msg.push_str(&format!(
-        "P-Access-Network-Info: 3GPP-WLAN\r\n\
+        "P-Access-Network-Info: IEEE-802.11\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
          Content-Type: application/sdp\r\n\
          Content-Length: {body_len}\r\n\r\n\
@@ -979,7 +987,16 @@ mod tests {
             msg.contains("Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"),
             "{msg}"
         );
-        for absent in ["Supported:", "P-Preferred-Identity:", "Accept-Contact:"] {
+        assert!(
+            msg.contains("P-Access-Network-Info: IEEE-802.11\r\n"),
+            "{msg}"
+        );
+        for absent in [
+            "Supported:",
+            "P-Preferred-Identity:",
+            "Accept-Contact:",
+            "3GPP-WLAN",
+        ] {
             assert!(!msg.contains(absent), "{absent} must not appear: {msg}");
         }
     }
