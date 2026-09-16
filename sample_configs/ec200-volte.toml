@@ -23,6 +23,15 @@ enabled = true
 # it makes this modem EXCLUSIVE to this path: the circuit-switched daemon
 # will not drive it, so it has no CS fallback whenever this path is down.
 bridge_inbound = true
+# Default is "pcscf". Set "home-domain" for a carrier whose P-CSCF
+# loop-detects the address form pre-challenge (confirmed: Jio, over VoWiFi;
+# see docs/operations.md#register-request-uri-form).
+# register_request_uri = "home-domain"
+# Jio ignores responses not sent on the Gm client leg; without this an
+# inbound call never connects on the caller's side. Defaults to true, since
+# every carrier tested so far tolerates it. Set false for one proven to need
+# the normal RFC 3261 behaviour instead.
+# respond_on_client = false
 
 # Optional: pin to a known modem. Omit [[volte.line]] entirely for
 # auto-discovery (cid 3, apn "ims", P-CSCF auto-discovered).

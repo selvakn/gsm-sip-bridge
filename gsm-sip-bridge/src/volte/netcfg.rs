@@ -345,6 +345,65 @@ pub fn solicit_router(iface: &str) -> BridgeResult<()> {
     Ok(())
 }
 
+/// Configures an IPv4-only PDN's host interface via DHCP.
+///
+/// Quectel's ECM/RNDIS-mode data interface — the MAC-named `enx*` adapter
+/// `AT+QNETDEVCTL` binds the host to — hands out the assigned IPv4 address
+/// through its own embedded DHCP relay, not through a static read the way
+/// the IPv6 path above installs the `AT+CGPADDR` address directly. There is
+/// no RA/DAD dance to wait out here: `udhcpc` blocks until it has a lease (or
+/// gives up) and applies the address, netmask and gateway itself via
+/// `/usr/share/udhcpc/default.script`, matching what a real DHCP client on
+/// this link would do.
+///
+/// (The QMI/rmnet cellular-internet sidecar's data interface is a different
+/// USB mode and gets its address from `qmicli --wds-get-current-settings`
+/// instead — the two are not interchangeable.)
+///
+/// `AT+QNETDEVCTL` binds the PDN but leaves the host netdev administratively
+/// **down** — confirmed on hardware, `ip link show` reports `state DOWN`
+/// right after a successful bind. `udhcpc` cannot raise a link itself, and on
+/// a down interface it blocks indefinitely rather than failing fast, wedging
+/// the calling thread (and, since that thread still holds the AT port open,
+/// every other AT user behind it) forever. So this brings the link up first,
+/// and wraps `udhcpc` in `timeout` as a hard backstop even so — matching the
+/// same defensive pattern `docker/cellular-internet` uses.
+pub fn dhcp_configure(iface: &str) -> BridgeResult<bool> {
+    run_step(
+        &NetStep::Link {
+            iface: iface.to_string(),
+            up: true,
+        },
+        true,
+    )?;
+    if !wait_for_carrier(iface, std::time::Duration::from_secs(10)) {
+        tracing::warn!(iface, "no carrier before requesting a DHCP lease");
+    }
+    let out = Command::new("timeout")
+        .args([
+            "20", "udhcpc", "-i", iface,
+            // `-n`: exit (rather than background) if no lease is obtained.
+            // `-q`: quit after a lease is obtained, once the script has applied it.
+            "-n", "-q",
+        ])
+        .output()
+        .map_err(|e| BridgeError::Ims(format!("failed to spawn `udhcpc`: {e}")))?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    has_default_route_v4(iface)
+}
+
+/// True when an IPv4 default route exists via this interface — the IPv4
+/// counterpart to `has_default_route`.
+pub fn has_default_route_v4(iface: &str) -> BridgeResult<bool> {
+    let out = Command::new("ip")
+        .args(["-4", "route", "show", "default", "dev", iface])
+        .output()
+        .map_err(|e| BridgeError::Ims(format!("failed to spawn `ip route show`: {e}")))?;
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
 /// Global-scope IPv6 addresses currently on the interface.
 pub fn global_addresses(iface: &str) -> BridgeResult<Vec<Ipv6Addr>> {
     let out = Command::new("ip")

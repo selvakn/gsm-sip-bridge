@@ -784,6 +784,16 @@ fn build_volte(raw: RawVolte) -> BridgeResult<VolteConfig> {
         bridge_inbound: raw.bridge_inbound,
         max_lines: in_range(raw.max_lines, "volte.max_lines", 1..=64)?,
         line_overrides,
+        register_request_uri: {
+            if raw.register_request_uri != "pcscf" && raw.register_request_uri != "home-domain" {
+                return Err(BridgeError::Config(format!(
+                    "volte.register_request_uri must be \"pcscf\" or \"home-domain\", got {:?}",
+                    raw.register_request_uri
+                )));
+            }
+            raw.register_request_uri
+        },
+        respond_on_client: raw.respond_on_client,
         ..d
     })
 }

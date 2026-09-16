@@ -230,7 +230,8 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
     );
 
     let mut global_addresses = Vec::new();
-    let mut routed = false;
+    let mut routed_v6 = false;
+    let mut routed_v4 = false;
     if !settings.iface.is_empty() {
         if let Some(assigned) = brought_up.pdn.ipv6 {
             // FR-024. Without this the PDN is bound but unusable — the
@@ -259,9 +260,10 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
             netcfg::solicit_router(&settings.iface)?;
             // The default route, not the address, is what proves the RA was
             // accepted — we installed the address ourselves.
-            routed = netcfg::wait_for_router(&settings.iface, std::time::Duration::from_secs(15))?;
+            routed_v6 =
+                netcfg::wait_for_router(&settings.iface, std::time::Duration::from_secs(15))?;
             global_addresses = netcfg::global_addresses(&settings.iface)?;
-            if !routed {
+            if !routed_v6 {
                 tracing::warn!(
                     iface = %settings.iface,
                     "the interface is configured but no default route appeared; \
@@ -269,10 +271,29 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
                      PDN is attached but cannot carry traffic"
                 );
             }
-        } else {
-            tracing::warn!("the PDN has no IPv6 address; skipping host interface configuration");
+        }
+        if brought_up.pdn.ipv4.is_some() {
+            // Confirmed on Jio (2026-09-16): the PDN can come up IPv4-only,
+            // or dual-stack with an IPv4 P-CSCF — either way the ECM/RNDIS
+            // adapter hands out its IPv4 address over its own DHCP relay
+            // rather than through a static AT+CGPADDR read, independently of
+            // whatever the IPv6 branch above did — see `netcfg::dhcp_configure`,
+            // which also brings the link up itself.
+            routed_v4 = netcfg::dhcp_configure(&settings.iface)?;
+            if !routed_v4 {
+                tracing::warn!(
+                    iface = %settings.iface,
+                    "DHCP did not yield a default route; the PDN is attached but cannot carry traffic"
+                );
+            }
+        }
+        if brought_up.pdn.ipv4.is_none() && brought_up.pdn.ipv6.is_none() {
+            tracing::warn!(
+                "the PDN has no address of either family; skipping host interface configuration"
+            );
         }
     }
+    let routed = routed_v6 || routed_v4;
 
     // Attached-but-unroutable is not "up": see research.md R10.
     crate::metrics::VOLTE_PDN_UP.set(if routed { 1.0 } else { 0.0 });
