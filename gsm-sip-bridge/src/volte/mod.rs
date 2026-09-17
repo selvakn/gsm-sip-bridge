@@ -310,10 +310,24 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
 
 /// Releases the IMS PDN and reverts host configuration (FR-005).
 pub fn detach(settings: &VolteSettings, restore_cid: Option<u8>) -> BridgeResult<()> {
-    if !settings.iface.is_empty() {
-        netcfg::teardown(&settings.iface)?;
-    }
     let mut at = AtCommander::open(Path::new(&settings.modem_port))?;
+    if !settings.iface.is_empty() {
+        // Only flush IPv4 if *this* PDN actually had an IPv4 address — the
+        // interface is shared with the modem's non-IMS context, which may
+        // have its own, still-needed IPv4 lease that was never touched by an
+        // IPv6-only attach() (dual-stack-with-only-IPv6-configured is not a
+        // real case: attach() DHCPs whenever the PDN reports an IPv4
+        // address at all). Unknown (PDN already gone) reads as "don't
+        // flush" — a stale lease left behind by *this* attach either never
+        // existed or is also cleared by `dhcp_configure`'s own pre-flush on
+        // the next attach, whereas flushing a family we can't confirm is
+        // ours risks erasing the restored context's real connectivity.
+        let flush_v4 = pdn::read_pdn(&mut at, settings.cid, &settings.apn)
+            .ok()
+            .flatten()
+            .is_some_and(|pdn| pdn.ipv4.is_some());
+        netcfg::teardown(&settings.iface, flush_v4)?;
+    }
     pdn::tear_down(&mut at, settings.cid, restore_cid)?;
     crate::metrics::VOLTE_PDN_UP.set(0.0);
     tracing::info!(cid = settings.cid, "IMS PDN released");

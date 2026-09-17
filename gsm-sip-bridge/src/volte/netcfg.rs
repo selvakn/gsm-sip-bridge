@@ -115,23 +115,28 @@ pub fn configure_steps(iface: &str, assigned: Ipv6Addr) -> Vec<NetStep> {
 
 /// Steps that revert `configure_steps`, for teardown (FR-005).
 ///
-/// Unconditionally flushes both families: teardown doesn't know whether this
-/// PDN was the IPv6 (`configure`) or IPv4 (`dhcp_configure`) path, and an
-/// empty flush on the family that was never used is a harmless no-op. Without
-/// the IPv4 half, `detach()`'s restore of the previous (non-IMS) context
-/// leaves that context's interface still carrying the IMS lease's address and
-/// default route.
-pub fn teardown_steps(iface: &str) -> Vec<NetStep> {
-    vec![
-        NetStep::FlushV6 {
+/// `flush_v4` must be true only when *this* attachment actually configured
+/// IPv4 (`dhcp_configure` ran, i.e. the PDN had an IPv4 address) — the
+/// interface is shared with the modem's non-IMS context, which may carry its
+/// own, still-needed IPv4 lease that an IPv6-only IMS attach never touched.
+/// Flushing it unconditionally left the *restored* non-IMS context without
+/// IPv4 connectivity on exactly that carrier (confirmed: an IPv6-only PDN,
+/// e.g. Vodafone). IPv6 has no such caller-supplied guard: every VoLTE
+/// deployment to date is IPv6 or dual-stack, so the IPv6 half has always
+/// been the family this attach actually owns.
+pub fn teardown_steps(iface: &str, flush_v4: bool) -> Vec<NetStep> {
+    let mut steps = vec![NetStep::FlushV6 {
+        iface: iface.to_string(),
+    }];
+    if flush_v4 {
+        steps.push(NetStep::FlushV4Addr {
             iface: iface.to_string(),
-        },
-        NetStep::FlushV4Addr {
+        });
+        steps.push(NetStep::FlushV4Route {
             iface: iface.to_string(),
-        },
-        NetStep::FlushV4Route {
-            iface: iface.to_string(),
-        },
+        });
+    }
+    steps.extend([
         // Back to the kernel default so the interface behaves normally if it
         // is later rebound to a non-IMS context.
         NetStep::Sysctl {
@@ -143,7 +148,8 @@ pub fn teardown_steps(iface: &str) -> Vec<NetStep> {
             iface: iface.to_string(),
             up: false,
         },
-    ]
+    ]);
+    steps
 }
 
 impl NetStep {
@@ -259,9 +265,10 @@ pub fn configure(iface: &str, assigned: Ipv6Addr) -> BridgeResult<()> {
 }
 
 /// Reverts the interface configuration. Best-effort throughout: teardown must
-/// not fail on a half-configured interface.
-pub fn teardown(iface: &str) -> BridgeResult<()> {
-    for step in teardown_steps(iface) {
+/// not fail on a half-configured interface. See `teardown_steps` for what
+/// `flush_v4` guards.
+pub fn teardown(iface: &str, flush_v4: bool) -> BridgeResult<()> {
+    for step in teardown_steps(iface, flush_v4) {
         run_step(&step, true)?;
     }
     Ok(())
@@ -409,10 +416,12 @@ pub fn solicit_router(iface: &str) -> BridgeResult<()> {
 /// same defensive pattern `docker/cellular-internet` uses.
 ///
 /// Flushes any IPv4 address/route already on `iface` before requesting a
-/// lease, and `teardown_steps` flushes both again on the way out — a lease
-/// from a previous attach the carrier agent crashed before tearing down
-/// would otherwise survive, and its leftover default route would read as
-/// proof the *new* PDN is routed rather than the old one never having left.
+/// lease — a lease from a previous attach the carrier agent crashed before
+/// tearing down would otherwise survive, and its leftover default route
+/// would read as proof the *new* PDN is routed rather than the old one never
+/// having left. `detach()` flushes it again on the way out, via
+/// `netcfg::teardown`'s `flush_v4` (guarded there, unlike here, since
+/// `dhcp_configure` running at all already means this attach owns IPv4).
 pub fn dhcp_configure(iface: &str) -> BridgeResult<bool> {
     run_step(
         &NetStep::Link {
@@ -620,7 +629,7 @@ mod tests {
 
     #[test]
     fn teardown_restores_the_kernel_default_address_generation() {
-        let steps = teardown_steps("eth0");
+        let steps = teardown_steps("eth0", false);
 
         assert!(steps.iter().any(|s| matches!(
             s,
@@ -629,18 +638,26 @@ mod tests {
     }
 
     #[test]
-    fn teardown_also_flushes_ipv4_address_and_routes() {
+    fn teardown_flushes_ipv4_address_and_routes_only_when_asked() {
         // A DHCP-configured (dhcp_configure) IPv4-only PDN needs the same
         // cleanup the IPv6 path gets — otherwise detach()'s restore of the
         // previous non-IMS context inherits the IMS lease's address/route.
-        let steps = teardown_steps("eth0");
-
+        // But an IPv6-only attach must NOT flush IPv4: the interface is
+        // shared with the modem's non-IMS context, which may have its own
+        // still-needed IPv4 lease this attach never touched.
+        let steps = teardown_steps("eth0", true);
         assert!(steps
             .iter()
             .any(|s| matches!(s, NetStep::FlushV4Addr { iface } if iface == "eth0")));
         assert!(steps
             .iter()
             .any(|s| matches!(s, NetStep::FlushV4Route { iface } if iface == "eth0")));
+
+        let steps = teardown_steps("eth0", false);
+        assert!(!steps.iter().any(|s| matches!(
+            s,
+            NetStep::FlushV4Addr { .. } | NetStep::FlushV4Route { .. }
+        )));
     }
 
     #[test]
