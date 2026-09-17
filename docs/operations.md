@@ -641,22 +641,110 @@ modem's internal IMS stack. `volte-register` refuses to start while a
 testing this), and `supervise` refuses to start at all if both sections are
 enabled.
 
-### The P-CSCF usually has to be captured, not discovered
+### The VoWiFi priming dance: capturing a P-CSCF for VoLTE
 
-On the tested carrier (Vodafone India) **no automatic mechanism yields a
-P-CSCF**: DHCPv6 replies but carries no RFC 3319 SIP-server options, the router
-advertisement carries none, and no usable resolver is offered. `volte-discover`
-reports this per-method rather than failing opaquely — an empty result there is
-the expected outcome, not a fault.
+Every Indian carrier tested so far (Jio, Vodafone) publishes **no P-CSCF over
+any host-reachable LTE mechanism** — not DHCPv6, not the router advertisement,
+not DNS, and (on the EC200U firmware this was tested against,
+`EC200UCNAAR03A12M08`) not even `AT+CGCONTRDP`'s own P-CSCF fields, which the
+firmware truncates away before they'd ever appear. `volte-discover --iface
+<ifname>` reports every method's outcome individually rather than failing
+opaquely — an empty result across the board is the expected outcome on these
+carriers, not a fault in the probe. See the "Why nothing else works" section
+below before re-investigating this; it's been checked thoroughly.
 
-The working route is to let the VoWiFi/ePDG path capture one: each line writes
-the address it learned from the IKEv2 config payload to
-`[vowifi].pcscf_source_path` with its line index appended (`/tmp/pcscf-0`,
-`/tmp/pcscf-1`, ...). `volte-register` reads whichever file
-`[volte].pcscf_source_path` names — `/tmp/pcscf-0` by default, i.e. VoWiFi line
-0. So running VoWiFi once on the SIM primes the LTE path; with several VoWiFi
-lines, point it at the one whose carrier you want, since each line's P-CSCF
-comes from its own network. `--pcscf` overrides everything.
+**Crucially, this isn't just "the discovery command finds nothing" — the live
+registration path (`volte-register` / `bridge_inbound`) never runs that
+discovery chain at all.** It only ever tries two things, in order: an explicit
+override (`[[volte.line]].pcscf` or `--pcscf`), then the file named by
+`[volte].pcscf_source_path`. If neither has an address, the line simply cannot
+register. `volte-discover` is a diagnostic for characterizing what a *new*
+carrier offers — it is not wired into anything that actually runs.
+
+The one thing that reliably works is letting the VoWiFi/ePDG path capture the
+address once, from the IKEv2 config payload, and handing that to VoLTE. That's
+the "dance": bring VoWiFi up just long enough to capture it, then switch to
+VoLTE and never touch VoWiFi again (they can't run together anyway — see
+above).
+
+#### Step by step
+
+1. **Prime.** Set `[vowifi].enabled = true` with a `[[vowifi.line]]` for the
+   modem, and `[volte].enabled = false`. Start (or restart) the container and
+   wait for the tunnel to come up — watch the logs for:
+
+   ```
+   [supervise] line 0: tunnel UP. P-CSCF: <address>
+   ```
+
+   Each VoWiFi line writes the address it learned to
+   `[vowifi].pcscf_source_path` with its line index appended — `/tmp/pcscf-0`,
+   `/tmp/pcscf-1`, ... (base `/tmp/pcscf`). Confirm it landed:
+
+   ```bash
+   docker exec <bridge-ctr> cat /tmp/pcscf-0
+   ```
+
+2. **Switch.** Set `[vowifi].enabled = false` and `[volte].enabled = true`
+   (plus `bridge_inbound = true` for inbound calls). **Restart the container
+   in place — do not recreate it.** `docker compose restart` (or a bare
+   `docker restart <ctr>`) reuses the same container filesystem, so
+   `/tmp/pcscf-0` survives; `docker compose up -d --force-recreate`, `down` +
+   `up`, or any path that replaces the container wipes `/tmp` and destroys the
+   capture, forcing you to redo step 1. This is the single most common way
+   this dance goes wrong — a stale/missing capture after a recreate reads
+   exactly like a carrier-side registration failure, not a self-inflicted
+   config-reload artifact.
+
+3. **Verify.** `[volte].pcscf_source_path` defaults to `/tmp/pcscf-0` (VoWiFi
+   line 0), so no further config is needed for the single-line case. Confirm
+   over the logs (`connected to P-CSCF`, then a `200 OK` REGISTER response) or
+   the metrics endpoint:
+
+   ```bash
+   curl -s localhost:9091/metrics | grep -E 'volte_(pdn_up|registered)'
+   ```
+
+With several VoWiFi lines, point `[volte].pcscf_source_path` at the specific
+line's file for the carrier you want — each line's P-CSCF comes from its own
+network, so there's no single "the" address to default to across lines.
+`--pcscf` (CLI) / `[[volte.line]].pcscf` (config) overrides everything above
+and skips the file lookup entirely.
+
+#### Making it permanent
+
+The captured address rarely changes for a given SIM/carrier in practice, so
+once you've primed it once you can skip repeating the dance on every
+deployment: pin it directly with `[[volte.line]].pcscf = "<captured
+address>"`. This survives any container recreate, at the cost of needing a
+manual update (redo the dance once) if the carrier ever reassigns its P-CSCF.
+
+#### Why nothing else works (don't re-investigate this)
+
+Checked directly against Jio on the EC200U, `EC200UCNAAR03A12M08` firmware:
+
+- `AT+CGCONTRDP=<cid>` truncates to 7 fields — the P-CSCF-discovery fields
+  (TS 27.007's fields 8/9) are simply absent from the response, not just
+  empty.
+- `AT+CGDCONT=?`'s test-command response likewise lacks the
+  P-CSCF-discovery/IM-CN-signalling-flag parameters.
+- No QMI on this modem at all (AT-only), so the QMI/rmnet
+  `docker/cellular-internet` sidecar's WDS-based approach doesn't apply here.
+- `AT+QIMSCFG?` returns empty.
+- Jio's own IMS DNS server (`49.45.0.1`) is unreachable over the IMS PDN
+  itself.
+- The modem's DHCP (both the IPv6 RA-based path and the IPv4
+  `dhcp_configure` path for an IPv4-only PDN) offers no SIP-server option.
+- Forcing `AT+QCFG="ims",1` (network-controlled → forced-on) doesn't unlock
+  any of the above either — the gap is the firmware's AT surface, not a
+  disabled feature flag.
+
+NAS PCO almost certainly carries the P-CSCF in the network's own signalling
+(the bearer negotiates QCI 5, IMS's usual QoS class) — the firmware just
+doesn't expose it over any AT command this modem implements. A firmware
+update exposing TS 27.007's CGCONTRDP P-CSCF fields would make the existing
+`probe_pco` in `volte::pcscf` work completely unchanged; nothing in the
+discovery code itself needs to be rewritten if that ever happens.
 
 ### REGISTER Request-URI form
 
