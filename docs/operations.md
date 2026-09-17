@@ -658,6 +658,28 @@ the address it learned from the IKEv2 config payload to
 lines, point it at the one whose carrier you want, since each line's P-CSCF
 comes from its own network. `--pcscf` overrides everything.
 
+### REGISTER Request-URI form
+
+`[volte].register_request_uri` mirrors `[vowifi].register_request_uri`
+(`"home-domain"` default, or `"pcscf"`) — the LTE access reaches the same
+P-CSCF as VoWiFi, over a different bearer, so a carrier whose P-CSCF
+loop-detects the address form there (Jio: `483 Too Many Hops`/`403
+Forbidden`, before any challenge) needs the same fix here. Defaults to
+`"home-domain"` — TS 24.229 §5.1.1.2's mandated form, confirmed working on
+Jio (required) and Vodafone (verified harmless). Set `"pcscf"` explicitly
+for a deployment that needs the old literal-address form instead.
+
+### Responses on the client leg (`[volte].respond_on_client`)
+
+Mirrors `[vowifi].respond_on_client`. The host-side LTE path installs its own
+Gm IPsec SAs, same as the ePDG path, so Jio's refusal of responses sent from
+`port_us` applies here too. Without it an inbound Jio call *looks* answered on
+our side but never is on Jio's: the INVITE keeps being retransmitted, the
+caller's phone keeps ringing after the PBX picks up, our BYE gets `481`, and no
+RTP ever arrives (`media="send-only" carrier_rx=0`). Defaults to `true` —
+confirmed required on Jio and harmless on Vodafone. Set it `false` for a
+carrier proven to need RFC 3261 §18.2.2's normal behaviour instead.
+
 ### Symptom: attached but nothing works
 
 `volte-pdn --action up` reports `routable: NO — no default route`.
@@ -673,6 +695,16 @@ means something upstream failed — check that the interface has carrier and tha
 Note that "attached" and "usable" are different states: the assigned address is
 installed by the bridge regardless, so **the default route — not the presence
 of an address — is what proves the RA was accepted**.
+
+This whole RA dance is IPv6-specific. An **IPv4-only PDN** (confirmed on Jio,
+2026-09-16 — the same modem gave Vodafone an IPv6-only bearer) is a different
+code path: the ECM/RNDIS `enx*` adapter `AT+QNETDEVCTL` binds to hands out its
+IPv4 address through its own embedded DHCP relay, not through a static
+`AT+CGPADDR` read, so `attach()` runs a one-shot `udhcpc` instead
+(`netcfg::dhcp_configure`). No `AT+CGPADDR`-derived address is installed
+manually in this case — DHCP owns address, netmask and route together. If
+`udhcpc` fails to get a lease, the PDN is attached-but-unrouted the same way a
+rejected RA leaves the IPv6 path.
 
 ### Symptom: general connectivity through the modem disappears
 

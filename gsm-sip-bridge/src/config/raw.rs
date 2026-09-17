@@ -482,6 +482,12 @@ section! {
         pub lock_path: String,
         pub bridge_inbound: bool,
         pub max_lines: u32,
+        /// Same accepted values and same rationale as
+        /// `RawVowifi::register_request_uri` — the LTE access is subject to
+        /// the same P-CSCF loop-detection rejection VoWiFi hit on Jio.
+        pub register_request_uri: String,
+        /// Same meaning as `RawVowifi::respond_on_client`.
+        pub respond_on_client: bool,
         /// `[[volte.line]]` — see [`RawVowifi::line`] on the naming.
         pub line: Vec<RawVolteLine>,
     }
@@ -496,6 +502,14 @@ impl Default for RawVolte {
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
             max_lines: 8,
+            // Confirmed on both Jio and Vodafone (2026-09-17): the home-domain
+            // form works everywhere it's been tested, same as `[vowifi]`. Set
+            // "pcscf" for a deployment that needs the old address form.
+            register_request_uri: "home-domain".to_string(),
+            // Confirmed on both Jio and Vodafone (2026-09-16): required on
+            // Jio, harmless on Vodafone. Set `false` for a carrier proven to
+            // need RFC 3261 §18.2.2's normal behaviour instead.
+            respond_on_client: true,
             line: Vec::new(),
         }
     }

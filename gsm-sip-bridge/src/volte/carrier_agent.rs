@@ -151,9 +151,10 @@ pub(crate) fn run(
         // Names the serving cell, so the network can apply the right policy
         // and an operator can tell which radio a call actually used.
         access_network_info: super::read_access_network_info(&line.settings.modem_port),
-        // The LTE path keeps the P-CSCF-address request line it has always
-        // used; only the VoWiFi side has a carrier needing the other form.
-        register_uri_home_domain: false,
+        // `[volte].register_request_uri` — the LTE access reaches the same
+        // P-CSCF as VoWiFi, so a carrier that loop-detects the address form
+        // there (Jio) needs the same home-domain form here.
+        register_uri_home_domain: app_config.volte.register_request_uri == "home-domain",
         gm_auth_alg: None,
         gm_cipher_alg: None,
     };
@@ -225,11 +226,9 @@ pub(crate) fn run(
         // An inbound call is a real conversation; the whole point of this path
         // is that it sounds better than the modem-internal one.
         wideband: true,
-        // The one carrier this was measured on needs it over ePDG, where the
-        // Gm SAs are ours to install; the LTE path's are the modem's. No
-        // capture says an LTE line needs it, so it stays off here rather than
-        // being given a `[volte]` key nothing has asked for.
-        respond_on_client: false,
+        // `[volte].respond_on_client`. This path installs its own Gm SAs just
+        // like the ePDG one, so Jio's refusal of `port_us` responses applies.
+        respond_on_client: app_config.volte.respond_on_client,
         answer_preference: sdp::AnswerPreference::cellular(),
         // Must equal the telephony line's `sip_leg_port`. They come from this
         // line's single derivation so they cannot drift apart.

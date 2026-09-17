@@ -958,6 +958,27 @@ pub struct VolteConfig {
     /// of inheriting them from the `[volte]` base. Empty (the default) means
     /// every line is fully auto-discovered with the base settings.
     pub line_overrides: Vec<VolteLineOverride>,
+    /// Which URI goes in the REGISTER request line, over the LTE access —
+    /// the counterpart to `VowifiConfig::register_request_uri`, same accepted
+    /// values and same underlying network behaviour (it is the same P-CSCF,
+    /// reached over a different bearer). Jio rejects the P-CSCF-address form
+    /// pre-challenge on VoWiFi and over LTE alike.
+    ///
+    /// Defaults to `"home-domain"` (2026-09-17), matching `[vowifi]`'s
+    /// default and TS 24.229 §5.1.1.2 — confirmed working on both Jio (where
+    /// it's required) and Vodafone (where it was merely verified harmless).
+    /// Set `"pcscf"` for a deployment that needs the old address form.
+    pub register_request_uri: String,
+    /// Answer network-initiated requests over the Gm client leg — the LTE
+    /// counterpart to `VowifiConfig::respond_on_client`, same carrier quirk.
+    /// The host-side LTE path installs its own Gm IPsec SAs exactly as the
+    /// ePDG path does, so Jio drops responses from `port_us` here too: without
+    /// this, Jio retransmits the INVITE, never sees our 200 OK, keeps the
+    /// caller ringing, answers our BYE with 481, and never sends media.
+    /// Defaults to `true` (2026-09-16): confirmed required on Jio and
+    /// harmless on Vodafone. Set `false` for a carrier proven to need
+    /// RFC 3261 §18.2.2's normal behaviour instead.
+    pub respond_on_client: bool,
     /// Base network namespace name for a line's carrier-facing half
     /// (specs/020-volte-line-netns). Line 0 uses this unindexed; later lines
     /// append their index — the LTE analogue of `[vowifi].netns`, on a
@@ -1024,6 +1045,8 @@ impl Default for VolteConfig {
             bridge_inbound: false,
             max_lines: 8,
             line_overrides: Vec::new(),
+            register_request_uri: "home-domain".to_string(),
+            respond_on_client: true,
             netns: "volte".to_string(),
             veth_carrier_iface: "veth-volte-ims".to_string(),
             veth_telephony_iface: "veth-volte-sip".to_string(),
@@ -2055,6 +2078,46 @@ password = "pass"
 
         let src = format!("{}\n[vowifi]\nrespond_on_client = true\n", MINIMAL_TOML);
         assert!(parse(&src).vowifi.respond_on_client);
+    }
+
+    #[test]
+    fn volte_respond_on_client_is_on_by_default() {
+        // Confirmed required on Jio and harmless on Vodafone (2026-09-16) —
+        // unlike [vowifi], where only Jio needs it, this one defaults on.
+        let cfg = parse(MINIMAL_TOML);
+        assert!(cfg.volte.respond_on_client);
+
+        let src = format!("{}\n[volte]\nrespond_on_client = false\n", MINIMAL_TOML);
+        assert!(!parse(&src).volte.respond_on_client);
+    }
+
+    #[test]
+    fn volte_register_request_uri_defaults_to_home_domain() {
+        // Matches [vowifi]'s default — TS 24.229 §5.1.1.2's mandated form,
+        // confirmed working on both Jio (required) and Vodafone (verified
+        // harmless) over the LTE access.
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.volte.register_request_uri, "home-domain");
+
+        let src = format!(
+            "{}\n[volte]\nregister_request_uri = \"pcscf\"\n",
+            MINIMAL_TOML
+        );
+        assert_eq!(parse(&src).volte.register_request_uri, "pcscf");
+    }
+
+    #[test]
+    fn volte_register_request_uri_rejects_unknown_value() {
+        let src = format!(
+            "{}\n[volte]\nregister_request_uri = \"realm\"\n",
+            MINIMAL_TOML
+        );
+        let result = try_parse(&src).map(|c| c.volte);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("volte.register_request_uri must be"));
     }
 
     #[test]

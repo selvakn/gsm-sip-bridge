@@ -1733,7 +1733,7 @@ fn dispatch_loop(
     let respond_on_client = p.respond_on_client;
     if respond_on_client {
         tracing::warn!(
-            "vowifi.respond_on_client is set — answering network-initiated requests on the client leg, not the socket they arrived on"
+            "respond_on_client is set — answering network-initiated requests on the client leg, not the socket they arrived on"
         );
     }
     loop {

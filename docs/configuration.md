@@ -338,6 +338,8 @@ infrastructure with no config knob at all.
 | `pcscf_source_path` | string | `/tmp/pcscf-0` | Which VoWiFi line's captured P-CSCF to borrow over LTE. Names **one specific line** — `[vowifi].pcscf_source_path` is a base with the line index appended, and each line's address comes from its own carrier, so there is no single "the" address to pick up. Change the suffix to use a different line |
 | `status_path` | string | `/tmp/volte-registration-status` | Where `volte-register` publishes registration state for `volte-status` |
 | `lock_path` | string | `/tmp/volte-registration.lock` | Lock file preventing two concurrent VoLTE registrations on one SIM |
+| `register_request_uri` | enum | `home-domain` | Same meaning and accepted values as `[vowifi]`'s field above — the LTE access reaches the same P-CSCF as VoWiFi, over a different bearer, so the same Jio loop-detection rejection applies here too. Confirmed working on Jio (required) and Vodafone (verified harmless). Set `pcscf` for a deployment that needs the old literal-address form |
+| `respond_on_client` | boolean | `true` | Same meaning as `[vowifi]`'s field above — this path installs its own Gm IPsec SAs just like the ePDG one, so Jio's refusal of responses sent from `port_us` applies here too. Unlike `[vowifi]`, defaults on: confirmed required on Jio and harmless on Vodafone. Set `false` for a carrier proven to need RFC 3261 §18.2.2's normal behaviour instead |
 
 #### `[[volte.line]]`
 
