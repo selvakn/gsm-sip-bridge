@@ -303,6 +303,13 @@ pub struct StrongswanEngine {
     /// `SteadyStateHealth::TunVanished` (see `recreate_interface`).
     pub if_id: String,
     pub shared: Arc<SharedCharon>,
+    /// Bounds the establish-time loop, unlike a real persistent line, which
+    /// retries indefinitely (`None`, the value every persistent-line call
+    /// site passes). specs/080-volte-pcscf-auto-prime's transient priming
+    /// capture is the one caller that sets this: a one-shot attempt inside
+    /// an operator-watched startup sequence needs an actual deadline rather
+    /// than retrying forever.
+    pub max_establish_attempts: Option<u32>,
 }
 
 impl StrongswanEngine {
@@ -444,7 +451,7 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn max_establish_attempts(&self) -> Option<u32> {
-        None
+        self.max_establish_attempts
     }
 
     fn reinitiate_cadence(&self) -> Option<u32> {
@@ -809,6 +816,7 @@ mod tests {
                 tun_iface: "tun23".to_string(),
                 if_id: "23".to_string(),
                 shared: shared_charon(),
+                max_establish_attempts: None,
             }
         }
 

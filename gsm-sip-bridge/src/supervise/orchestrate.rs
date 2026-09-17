@@ -66,14 +66,20 @@ fn gsm_sip_bridge_bin() -> String {
 /// because N charons in one netns all wildcard-bind UDP 500/4500 and only one
 /// of them receives. See [`SharedCharon`] for the full account.
 pub(crate) const SHARED_STRONGSWAN_CONF: &str = "/etc/strongswan-shared.conf";
-const SHARED_SWANCTL_CONF: &str = "/etc/swanctl/swanctl.conf";
-const SHARED_SWANCTL_CONF_DIR: &str = "/etc/swanctl/conf.d";
-const SHARED_CHARON_LOG: &str = "/tmp/charon.log";
-const SHARED_VICI_SOCKET: &str = "/var/run/charon.vici";
+pub(super) const SHARED_SWANCTL_CONF: &str = "/etc/swanctl/swanctl.conf";
+pub(super) const SHARED_SWANCTL_CONF_DIR: &str = "/etc/swanctl/conf.d";
+pub(super) const SHARED_CHARON_LOG: &str = "/tmp/charon.log";
+pub(super) const SHARED_VICI_SOCKET: &str = "/var/run/charon.vici";
 /// Overwritten at startup from the resolved line set — the osmocom P-CSCF
 /// plugin enables its attribute request per *connection name*, so the image's
 /// static copy cannot know them. See `render::render_pcscf_plugin_conf`.
-const PCSCF_PLUGIN_CONF: &str = "/etc/strongswan.d/charon/p-cscf.conf";
+///
+/// `pub(super)`: specs/080-volte-pcscf-auto-prime's transient priming capture
+/// (`orchestrate_prime`) renders this too, for its own one-off connection —
+/// this is a real charon process reading a real, single, host-wide file, not
+/// something `SharedCharon`'s per-instance paths can isolate (see that
+/// feature's research.md R2).
+pub(super) const PCSCF_PLUGIN_CONF: &str = "/etc/strongswan.d/charon/p-cscf.conf";
 
 /// specs/027-discover-retry-health: how long `spawn_discover_retry` keeps
 /// re-checking a configured line that was missing on the first `discover`
@@ -109,16 +115,21 @@ fn vowifi_conn_name(idx: u32) -> String {
 /// what actually varies per call (which line, which PLMN, which namespace) —
 /// the latter is what a reader needs to see at a call site, and it was buried
 /// among the former.
-struct LineStartup<'a> {
-    runner: &'a Arc<dyn CommandRunner>,
-    bin: &'a str,
-    config_path: &'a str,
-    config: &'a AppConfig,
-    started: &'a Arc<Mutex<StartedState>>,
-    shutting_down: &'a Arc<RwLock<bool>>,
-    alert_ctx: Option<&'a AlertContext>,
+///
+/// `pub(super)`: specs/080-volte-pcscf-auto-prime's transient priming
+/// capture (`orchestrate_prime`) constructs one of these for its own
+/// synthetic, one-off line, reusing `prepare_vowifi_line`/
+/// `establish_line_tunnel` exactly as a real persistent line does.
+pub(super) struct LineStartup<'a> {
+    pub(super) runner: &'a Arc<dyn CommandRunner>,
+    pub(super) bin: &'a str,
+    pub(super) config_path: &'a str,
+    pub(super) config: &'a AppConfig,
+    pub(super) started: &'a Arc<Mutex<StartedState>>,
+    pub(super) shutting_down: &'a Arc<RwLock<bool>>,
+    pub(super) alert_ctx: Option<&'a AlertContext>,
     /// The charon daemon every strongswan-engine line shares.
-    shared_charon: &'a Arc<SharedCharon>,
+    pub(super) shared_charon: &'a Arc<SharedCharon>,
 }
 
 /// Starts the whole inbound VoWiFi-to-SIP bridge for a non-empty, already
@@ -1182,14 +1193,20 @@ fn check_pcsc_engine_compatibility(
     Ok(())
 }
 
-/// One VoWiFi line's full startup — 1:1 port of `start_line_strongswan`/
-/// `start_line_swu`'s shared prelude (modem presence, IMS mode reconcile,
-/// mcc/mnc derivation), then dispatches to the engine-specific rest.
-fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
+/// Shared prelude for one VoWiFi line — 1:1 port of `start_line_strongswan`/
+/// `start_line_swu`'s common opening (modem presence, IMS mode reconcile,
+/// mcc/mnc derivation). Extracted (specs/080-volte-pcscf-auto-prime) so the
+/// transient priming capture (`orchestrate_prime`) can run exactly this same
+/// prelude for its own synthetic line, instead of duplicating it. `None` on
+/// any fatal step, already logged at the point of failure — same behavior as
+/// before this was a separate function.
+pub(super) fn prepare_vowifi_line(
+    ctx: &LineStartup,
+    line: &LineResolutionEntry,
+) -> Option<(String, String)> {
     let runner = ctx.runner;
     let bin = ctx.bin;
     let config_path = ctx.config_path;
-    let config = ctx.config;
     let idx = line.index;
     let modem = line.modem_port.clone();
     if line.pcsc_reader {
@@ -1202,7 +1219,7 @@ fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
 
         if !std::path::Path::new(&modem).exists() {
             eprintln!("[supervise] line {idx}: FATAL: modem port {modem} not present in container; skipping this line");
-            return;
+            return None;
         }
 
         if runner
@@ -1213,12 +1230,23 @@ fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
             eprintln!(
                 "[supervise] line {idx}: FATAL: could not reconcile modem IMS mode; skipping this line"
             );
-            return;
+            return None;
         }
     }
 
     let Some((mcc, mnc)) = resolve_mcc_mnc(runner.as_ref(), bin, line) else {
         eprintln!("[supervise] line {idx}: FATAL: could not derive MCC/MNC; skipping this line");
+        return None;
+    };
+
+    Some((mcc, mnc))
+}
+
+/// One VoWiFi line's full startup — dispatches to the engine-specific rest
+/// after `prepare_vowifi_line`'s shared prelude.
+fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
+    let config = ctx.config;
+    let Some((mcc, mnc)) = prepare_vowifi_line(ctx, line) else {
         return;
     };
 
@@ -1229,12 +1257,39 @@ fn start_vowifi_line(ctx: &LineStartup, line: &LineResolutionEntry) {
     }
 }
 
-fn start_vowifi_line_strongswan(
+/// The shared handle a line's USIM bridge process is tracked through — held
+/// by its own supervision thread and, for a persistent line, also handed to
+/// `start_line_tail` for per-incident recovery.
+pub(super) type UsimHolder = Arc<Mutex<Option<Arc<ChildHandle>>>>;
+
+/// Brings up this line's ePDG tunnel far enough to receive a P-CSCF from the
+/// IKE_AUTH config payload — resolves the ePDG address, creates the netns +
+/// XFRM tun interface, resolves the IMSI, renders and loads this line's
+/// swanctl connection, spawns its USIM bridge (unless `pcsc_reader`), ensures
+/// the shared charon is running, initiates the connection, and waits for
+/// `Established`.
+///
+/// Extracted from `start_vowifi_line_strongswan` (specs/080-volte-pcscf-
+/// auto-prime) so the transient priming capture (`orchestrate_prime`) can
+/// call exactly this same sequence for its own synthetic line, with its own
+/// `ctx` (its own local `started`/`shutting_down`, so nothing it does is
+/// visible to the container-wide shutdown plan) and a bounded
+/// `max_establish_attempts` — every persistent-line call site keeps passing
+/// `None` (unbounded), so this is a pure extraction with no behavior change
+/// for them.
+///
+/// Returns `None` on any fatal step (already logged at the point of
+/// failure), or `Some((pcscf, usim_holder))` — `usim_holder` is returned
+/// because a persistent line's caller still needs it afterward, for
+/// `start_line_tail`'s per-incident USIM recovery.
+#[allow(clippy::too_many_lines)]
+pub(super) fn establish_line_tunnel(
     ctx: &LineStartup,
     line: &LineResolutionEntry,
     mcc: &str,
     mnc: &str,
-) {
+    max_establish_attempts: Option<u32>,
+) -> Option<(String, UsimHolder)> {
     let runner = ctx.runner;
     let bin = ctx.bin;
     let config_path = ctx.config_path;
@@ -1258,7 +1313,7 @@ fn start_vowifi_line_strongswan(
         eprintln!(
             "[supervise] line {idx}: FATAL: could not resolve ePDG address; skipping this line"
         );
-        return;
+        return None;
     };
 
     if !epdg_iface::ensure_epdg_interface(runner.as_ref(), &netns, &tun_iface, &if_id) {
@@ -1289,7 +1344,7 @@ fn start_vowifi_line_strongswan(
 
     let Some(imsi) = resolve_imsi(runner.as_ref(), bin, line) else {
         eprintln!("[supervise] line {idx}: FATAL: failed to read IMSI; skipping this line");
-        return;
+        return None;
     };
 
     // No per-line strongswan.conf / swanctl top conf any more: both belong to
@@ -1392,6 +1447,7 @@ fn start_vowifi_line_strongswan(
         tun_iface: tun_iface.clone(),
         if_id: if_id.clone(),
         shared: Arc::clone(ctx.shared_charon),
+        max_establish_attempts,
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1405,7 +1461,7 @@ fn start_vowifi_line_strongswan(
         let guard = shutting_down.read().unwrap();
         if *guard {
             println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
-            return;
+            return None;
         }
         // Idempotent across lines: whichever line reaches this first spawns
         // the daemon and is handed the handle to register for shutdown; every
@@ -1420,7 +1476,7 @@ fn start_vowifi_line_strongswan(
         eprintln!(
             "[supervise] line {idx}: FATAL: shared charon is not running; skipping this line"
         );
-        return;
+        return None;
     }
 
     // Load the union of every line's connection file, then initiate only this
@@ -1448,18 +1504,59 @@ fn start_vowifi_line_strongswan(
                 eprintln!("[supervise] line {idx}: FATAL: charon exited before establishing the tunnel; skipping this line");
                 break None;
             }
-            line_supervisor::EstablishOutcome::FatalTimedOut => break None, // unreachable for strongswan
+            // Reachable now that a caller can bound the attempt count
+            // (specs/080-volte-pcscf-auto-prime's transient priming capture)
+            // — still unreachable for every persistent-line call site, which
+            // passes `max_establish_attempts: None`.
+            line_supervisor::EstablishOutcome::FatalTimedOut => {
+                eprintln!(
+                    "[supervise] line {idx}: FATAL: gave up after {attempt} attempt(s) without establishing; skipping this line"
+                );
+                break None;
+            }
             line_supervisor::EstablishOutcome::StillEstablishing => {
                 runner.sleep(line_supervisor::ESTABLISH_POLL_INTERVAL);
             }
         }
     };
-    let Some(pcscf) = pcscf else { return };
+
+    pcscf.map(|p| (p, usim_holder))
+}
+
+fn start_vowifi_line_strongswan(
+    ctx: &LineStartup,
+    line: &LineResolutionEntry,
+    mcc: &str,
+    mnc: &str,
+) {
+    let runner = ctx.runner;
+    let started = ctx.started;
+    let shutting_down = ctx.shutting_down;
+    let idx = line.index;
+    let netns = line.netns.clone();
+
+    let Some((pcscf, usim_holder)) = establish_line_tunnel(ctx, line, mcc, mnc, None) else {
+        return;
+    };
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
     start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
+
+    // Rebuilt rather than threaded out of `establish_line_tunnel`: a plain
+    // value struct over `ctx.shared_charon` (an `Arc`, cheap to re-derive),
+    // and the steady-state loop below needs the exact same identifiers that
+    // function already used to initiate this connection.
+    let engine = StrongswanEngine {
+        idx,
+        conn_name: vowifi_conn_name(idx),
+        netns: netns.clone(),
+        tun_iface: line.strongswan_tun_iface.clone(),
+        if_id: line.strongswan_if_id.to_string(),
+        shared: Arc::clone(ctx.shared_charon),
+        max_establish_attempts: None,
+    };
 
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
