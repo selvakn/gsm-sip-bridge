@@ -309,25 +309,38 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
 }
 
 /// Releases the IMS PDN and reverts host configuration (FR-005).
+///
+/// Host-side interface cleanup runs even when the AT port cannot be opened
+/// (modem missing, resetting, or held by another process) — it used to run
+/// unconditionally before `flush_v4`'s family check needed an open port to
+/// answer, and a modem that cannot be reached is exactly when stale host
+/// state is most likely to otherwise linger. Only the AT-level PDN release
+/// actually needs the port, so that failure is what gets propagated.
 pub fn detach(settings: &VolteSettings, restore_cid: Option<u8>) -> BridgeResult<()> {
-    let mut at = AtCommander::open(Path::new(&settings.modem_port))?;
+    let mut at_result = AtCommander::open(Path::new(&settings.modem_port));
+
     if !settings.iface.is_empty() {
         // Only flush IPv4 if *this* PDN actually had an IPv4 address — the
         // interface is shared with the modem's non-IMS context, which may
         // have its own, still-needed IPv4 lease that was never touched by an
         // IPv6-only attach() (dual-stack-with-only-IPv6-configured is not a
         // real case: attach() DHCPs whenever the PDN reports an IPv4
-        // address at all). Unknown (PDN already gone) reads as "don't
-        // flush" — a stale lease left behind by *this* attach either never
-        // existed or is also cleared by `dhcp_configure`'s own pre-flush on
-        // the next attach, whereas flushing a family we can't confirm is
-        // ours risks erasing the restored context's real connectivity.
-        let flush_v4 = pdn::read_pdn(&mut at, settings.cid, &settings.apn)
+        // address at all). Unreadable (AT port down, or PDN already gone)
+        // reads as "don't flush" — a stale lease left behind by *this*
+        // attach either never existed or is also cleared by
+        // `dhcp_configure`'s own pre-flush on the next attach, whereas
+        // flushing a family we can't confirm is ours risks erasing the
+        // restored context's real connectivity.
+        let flush_v4 = at_result
+            .as_mut()
             .ok()
+            .and_then(|at| pdn::read_pdn(at, settings.cid, &settings.apn).ok())
             .flatten()
             .is_some_and(|pdn| pdn.ipv4.is_some());
         netcfg::teardown(&settings.iface, flush_v4)?;
     }
+
+    let mut at = at_result?;
     pdn::tear_down(&mut at, settings.cid, restore_cid)?;
     crate::metrics::VOLTE_PDN_UP.set(0.0);
     tracing::info!(cid = settings.cid, "IMS PDN released");
