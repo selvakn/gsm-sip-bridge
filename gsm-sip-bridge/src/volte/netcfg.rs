@@ -42,6 +42,14 @@ pub enum NetStep {
     AddLinkLocal { iface: String, addr: Ipv6Addr },
     /// `ip -6 addr add <addr>/128 dev <iface>`
     AddGlobal { iface: String, addr: Ipv6Addr },
+    /// `ip -4 addr flush dev <iface>` — the IPv4 counterpart to `FlushV6`,
+    /// for a DHCP-configured (`dhcp_configure`) IPv4-only PDN.
+    FlushV4Addr { iface: String },
+    /// `ip -4 route flush dev <iface>`. A default route DHCP installed is
+    /// not automatically removed by `FlushV4Addr` — it names a gateway, not
+    /// the flushed local address — so it has to go separately, or a stale
+    /// route from a torn-down PDN reads as proof the next one is routed.
+    FlushV4Route { iface: String },
 }
 
 /// The exact sequence that took the reference hardware from "bound but dead"
@@ -106,9 +114,22 @@ pub fn configure_steps(iface: &str, assigned: Ipv6Addr) -> Vec<NetStep> {
 }
 
 /// Steps that revert `configure_steps`, for teardown (FR-005).
+///
+/// Unconditionally flushes both families: teardown doesn't know whether this
+/// PDN was the IPv6 (`configure`) or IPv4 (`dhcp_configure`) path, and an
+/// empty flush on the family that was never used is a harmless no-op. Without
+/// the IPv4 half, `detach()`'s restore of the previous (non-IMS) context
+/// leaves that context's interface still carrying the IMS lease's address and
+/// default route.
 pub fn teardown_steps(iface: &str) -> Vec<NetStep> {
     vec![
         NetStep::FlushV6 {
+            iface: iface.to_string(),
+        },
+        NetStep::FlushV4Addr {
+            iface: iface.to_string(),
+        },
+        NetStep::FlushV4Route {
             iface: iface.to_string(),
         },
         // Back to the kernel default so the interface behaves normally if it
@@ -167,6 +188,22 @@ impl NetStep {
                 s("addr"),
                 s("add"),
                 format!("{addr}/128"),
+                s("dev"),
+                iface.clone(),
+            ],
+            NetStep::FlushV4Addr { iface } => vec![
+                s("ip"),
+                s("-4"),
+                s("addr"),
+                s("flush"),
+                s("dev"),
+                iface.clone(),
+            ],
+            NetStep::FlushV4Route { iface } => vec![
+                s("ip"),
+                s("-4"),
+                s("route"),
+                s("flush"),
                 s("dev"),
                 iface.clone(),
             ],
@@ -354,7 +391,9 @@ pub fn solicit_router(iface: &str) -> BridgeResult<()> {
 /// no RA/DAD dance to wait out here: `udhcpc` blocks until it has a lease (or
 /// gives up) and applies the address, netmask and gateway itself via
 /// `/usr/share/udhcpc/default.script`, matching what a real DHCP client on
-/// this link would do.
+/// this link would do. That script ships with Alpine's base `busybox`
+/// package (confirmed on the production `docker/Dockerfile` image, not just
+/// dev tooling) — no extra runtime package is needed for it to exist.
 ///
 /// (The QMI/rmnet cellular-internet sidecar's data interface is a different
 /// USB mode and gets its address from `qmicli --wds-get-current-settings`
@@ -368,6 +407,12 @@ pub fn solicit_router(iface: &str) -> BridgeResult<()> {
 /// every other AT user behind it) forever. So this brings the link up first,
 /// and wraps `udhcpc` in `timeout` as a hard backstop even so — matching the
 /// same defensive pattern `docker/cellular-internet` uses.
+///
+/// Flushes any IPv4 address/route already on `iface` before requesting a
+/// lease, and `teardown_steps` flushes both again on the way out — a lease
+/// from a previous attach the carrier agent crashed before tearing down
+/// would otherwise survive, and its leftover default route would read as
+/// proof the *new* PDN is routed rather than the old one never having left.
 pub fn dhcp_configure(iface: &str) -> BridgeResult<bool> {
     run_step(
         &NetStep::Link {
@@ -379,6 +424,21 @@ pub fn dhcp_configure(iface: &str) -> BridgeResult<bool> {
     if !wait_for_carrier(iface, std::time::Duration::from_secs(10)) {
         tracing::warn!(iface, "no carrier before requesting a DHCP lease");
     }
+    // A prior attach's lease can still be sitting on the interface if the
+    // carrier agent crashed before `detach()` ran its teardown — clear it so
+    // a stale route can never be mistaken for proof this attach is routed.
+    run_step(
+        &NetStep::FlushV4Addr {
+            iface: iface.to_string(),
+        },
+        true,
+    )?;
+    run_step(
+        &NetStep::FlushV4Route {
+            iface: iface.to_string(),
+        },
+        true,
+    )?;
     let out = Command::new("timeout")
         .args([
             "20", "udhcpc", "-i", iface,
@@ -566,6 +626,39 @@ mod tests {
             s,
             NetStep::Sysctl { knob, value, .. } if knob == "addr_gen_mode" && value == "0"
         )));
+    }
+
+    #[test]
+    fn teardown_also_flushes_ipv4_address_and_routes() {
+        // A DHCP-configured (dhcp_configure) IPv4-only PDN needs the same
+        // cleanup the IPv6 path gets — otherwise detach()'s restore of the
+        // previous non-IMS context inherits the IMS lease's address/route.
+        let steps = teardown_steps("eth0");
+
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, NetStep::FlushV4Addr { iface } if iface == "eth0")));
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, NetStep::FlushV4Route { iface } if iface == "eth0")));
+    }
+
+    #[test]
+    fn flush_v4_steps_render_to_the_expected_argv() {
+        assert_eq!(
+            NetStep::FlushV4Addr {
+                iface: "eth0".to_string()
+            }
+            .argv(),
+            vec!["ip", "-4", "addr", "flush", "dev", "eth0"]
+        );
+        assert_eq!(
+            NetStep::FlushV4Route {
+                iface: "eth0".to_string()
+            }
+            .argv(),
+            vec!["ip", "-4", "route", "flush", "dev", "eth0"]
+        );
     }
 
     #[test]
