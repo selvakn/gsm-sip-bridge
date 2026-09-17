@@ -502,9 +502,10 @@ impl Default for RawVolte {
             lock_path: "/tmp/volte-registration.lock".to_string(),
             bridge_inbound: false,
             max_lines: 8,
-            // Preserves the pre-existing hardcoded behaviour for anyone
-            // already running [volte] — opt into "home-domain" explicitly.
-            register_request_uri: "pcscf".to_string(),
+            // Confirmed on both Jio and Vodafone (2026-09-17): the home-domain
+            // form works everywhere it's been tested, same as `[vowifi]`. Set
+            // "pcscf" for a deployment that needs the old address form.
+            register_request_uri: "home-domain".to_string(),
             // Confirmed on both Jio and Vodafone (2026-09-16): required on
             // Jio, harmless on Vodafone. Set `false` for a carrier proven to
             // need RFC 3261 §18.2.2's normal behaviour instead.

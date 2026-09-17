@@ -661,14 +661,13 @@ comes from its own network. `--pcscf` overrides everything.
 ### REGISTER Request-URI form
 
 `[volte].register_request_uri` mirrors `[vowifi].register_request_uri`
-(`"pcscf"` default, or `"home-domain"`) — the LTE access reaches the same
+(`"home-domain"` default, or `"pcscf"`) — the LTE access reaches the same
 P-CSCF as VoWiFi, over a different bearer, so a carrier whose P-CSCF
 loop-detects the address form there (Jio: `483 Too Many Hops`/`403
-Forbidden`, before any challenge) needs the same fix here. Unlike `[vowifi]`,
-the default stays `"pcscf"` rather than switching to `"home-domain"` — no
-`[volte]` deployment had hit this until it was found on Jio, so the old
-behaviour is preserved for everyone else. Set `"home-domain"` explicitly for
-a carrier known to need it.
+Forbidden`, before any challenge) needs the same fix here. Defaults to
+`"home-domain"` — TS 24.229 §5.1.1.2's mandated form, confirmed working on
+Jio (required) and Vodafone (verified harmless). Set `"pcscf"` explicitly
+for a deployment that needs the old literal-address form instead.
 
 ### Responses on the client leg (`[volte].respond_on_client`)
 

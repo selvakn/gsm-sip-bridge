@@ -23,10 +23,11 @@ enabled = true
 # it makes this modem EXCLUSIVE to this path: the circuit-switched daemon
 # will not drive it, so it has no CS fallback whenever this path is down.
 bridge_inbound = true
-# Default is "pcscf". Set "home-domain" for a carrier whose P-CSCF
-# loop-detects the address form pre-challenge (confirmed: Jio, over VoWiFi;
-# see docs/operations.md#register-request-uri-form).
-# register_request_uri = "home-domain"
+# Defaults to "home-domain" — TS 24.229 §5.1.1.2's mandated form, confirmed
+# working on Jio (required) and Vodafone (verified harmless). Set "pcscf" for
+# a deployment that needs the old literal-address form instead (see
+# docs/operations.md#register-request-uri-form).
+# register_request_uri = "pcscf"
 # Jio ignores responses not sent on the Gm client leg; without this an
 # inbound call never connects on the caller's side. Defaults to true, since
 # every carrier tested so far tolerates it. Set false for one proven to need

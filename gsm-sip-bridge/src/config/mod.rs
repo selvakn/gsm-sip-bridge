@@ -962,13 +962,12 @@ pub struct VolteConfig {
     /// the counterpart to `VowifiConfig::register_request_uri`, same accepted
     /// values and same underlying network behaviour (it is the same P-CSCF,
     /// reached over a different bearer). Jio rejects the P-CSCF-address form
-    /// pre-challenge on VoWiFi; nothing has proven the LTE access is treated
-    /// differently, but no VoLTE deployment had hit the case until now.
+    /// pre-challenge on VoWiFi and over LTE alike.
     ///
-    /// Defaults to `"pcscf"`, unlike `[vowifi]`'s `"home-domain"` default —
-    /// this preserves the exact request line every existing `[volte]`
-    /// deployment already registers with. Set `"home-domain"` for a carrier
-    /// known to need it (Jio).
+    /// Defaults to `"home-domain"` (2026-09-17), matching `[vowifi]`'s
+    /// default and TS 24.229 §5.1.1.2 — confirmed working on both Jio (where
+    /// it's required) and Vodafone (where it was merely verified harmless).
+    /// Set `"pcscf"` for a deployment that needs the old address form.
     pub register_request_uri: String,
     /// Answer network-initiated requests over the Gm client leg — the LTE
     /// counterpart to `VowifiConfig::respond_on_client`, same carrier quirk.
@@ -1046,7 +1045,7 @@ impl Default for VolteConfig {
             bridge_inbound: false,
             max_lines: 8,
             line_overrides: Vec::new(),
-            register_request_uri: "pcscf".to_string(),
+            register_request_uri: "home-domain".to_string(),
             respond_on_client: true,
             netns: "volte".to_string(),
             veth_carrier_iface: "veth-volte-ims".to_string(),
@@ -2093,17 +2092,18 @@ password = "pass"
     }
 
     #[test]
-    fn volte_register_request_uri_defaults_to_pcscf() {
-        // Unlike [vowifi], no [volte] deployment had hit the Jio loop-
-        // detection bug until now, so the old request line stays the default.
+    fn volte_register_request_uri_defaults_to_home_domain() {
+        // Matches [vowifi]'s default — TS 24.229 §5.1.1.2's mandated form,
+        // confirmed working on both Jio (required) and Vodafone (verified
+        // harmless) over the LTE access.
         let cfg = parse(MINIMAL_TOML);
-        assert_eq!(cfg.volte.register_request_uri, "pcscf");
+        assert_eq!(cfg.volte.register_request_uri, "home-domain");
 
         let src = format!(
-            "{}\n[volte]\nregister_request_uri = \"home-domain\"\n",
+            "{}\n[volte]\nregister_request_uri = \"pcscf\"\n",
             MINIMAL_TOML
         );
-        assert_eq!(parse(&src).volte.register_request_uri, "home-domain");
+        assert_eq!(parse(&src).volte.register_request_uri, "pcscf");
     }
 
     #[test]
