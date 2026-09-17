@@ -47,28 +47,24 @@ use std::sync::{Arc, Mutex, RwLock};
 /// enough that a caller's own retry cadence (FR-008) gets a turn instead.
 const MAX_ESTABLISH_ATTEMPTS: u32 = 120;
 
-/// Runs `discover` and returns its first line, if any — priming always uses
-/// the first discovered line (FR-002b), matching `[volte].pcscf_source_path`
-/// already being one shared value for every VoLTE line regardless of which
-/// modem produced it (research.md R5).
-fn discover_priming_line(
-    runner: &dyn CommandRunner,
-    bin: &str,
-    config_path: &str,
-) -> Result<LineResolutionEntry, String> {
-    match runner.run(&[bin, "--config", config_path, "discover"]) {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            return Err(format!(
-                "priming: 'discover' exited with {:?}",
-                o.status.code()
-            ))
-        }
-        Err(e) => return Err(format!("priming: could not run 'discover': {e}")),
-    }
-    let lines_file = crate::modules::discovery::lines_file_path();
-    let resolution = crate::vowifi::discovery::read_line_resolution(&lines_file)
-        .map_err(|e| format!("priming: could not read line resolution: {e}"))?;
+/// Resolves a candidate line and returns the first one, if any — priming
+/// always uses the first discovered line (FR-002b), matching
+/// `[volte].pcscf_source_path` already being one shared value for every
+/// VoLTE line regardless of which modem produced it (research.md R5).
+///
+/// Calls `commands::discover::resolve_vowifi_lines` directly, in-process —
+/// **not** the `discover` subcommand, and deliberately not through
+/// `CommandRunner` at all. Confirmed live on the Vodafone rig
+/// (2026-09-17): the `discover` subcommand's own `[vowifi].enabled` gate
+/// (in `handle_discover_command`, not in the resolution logic itself) means
+/// it always reports zero lines whenever `[vowifi].enabled` is false — which
+/// is *always* true here, per the mutual-exclusion guarantee this module's
+/// own doc comment describes. Going through the subcommand can therefore
+/// never work for priming; the underlying resolver has to be called
+/// directly, bypassing that gate.
+fn discover_priming_line(config: &AppConfig) -> Result<LineResolutionEntry, String> {
+    let resolution = crate::commands::discover::resolve_vowifi_lines(config)
+        .map_err(|e| format!("priming: {e}"))?;
     resolution.lines.into_iter().next().ok_or_else(|| {
         "priming: no usable modem/SIM found (no AT-capable modem with a ready SIM, or all \
          candidates are already serving the circuit-switched bridge)"
@@ -134,7 +130,7 @@ pub fn prime_pcscf(
         ));
     }
 
-    let line = discover_priming_line(runner.as_ref(), bin, config_path)?;
+    let line = discover_priming_line(config)?;
 
     prime_with_line(runner, bin, config_path, config, &line)
 }
@@ -350,22 +346,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fails_cleanly_when_discover_finds_no_line() {
-        let mock = Arc::new(MockCommandRunner::new());
-        // No `discover` output queued at all — the mock's default `run`
-        // behavior for an un-stubbed argv is success with empty output, so
-        // `read_line_resolution` on a nonexistent/empty lines file is what
-        // actually drives this to "no usable modem/SIM found".
-        let runner: Arc<dyn CommandRunner> = mock.clone();
-        let config = test_config();
-
-        let err = prime_pcscf(runner, "gsm-sip-bridge", "/tmp/cfg.toml", &config).unwrap_err();
-
-        assert!(err.contains("priming"), "got: {err}");
-        assert!(
-            mock.spawn_specs.lock().unwrap().is_empty(),
-            "no charon/pcscd/usim-bridge should ever be spawned when there is no line to prime"
-        );
-    }
+    // `prime_pcscf` itself (as opposed to `prime_with_line`, tested above)
+    // is deliberately NOT unit tested here: `discover_priming_line` calls
+    // the real modem scanner directly, not through `CommandRunner` (see its
+    // own doc comment for why), so `prime_pcscf`'s behavior legitimately
+    // depends on whatever hardware is actually attached to the machine
+    // running the test — confirmed live on the Vodafone rig (2026-09-17),
+    // where an earlier version of this test that assumed "no modem present"
+    // instead found the real modem and proceeded to (mock-)spawn pcscd,
+    // failing the assertion that nothing gets spawned. That is exactly the
+    // "hardware not available in CI" situation the constitution's mocking
+    // carve-out exists for, in reverse: hardware *is* available here, so a
+    // test asserting its absence is not a fact about this code, it's a fact
+    // about this machine. `ensure_pcscf_primed_with` in `orchestrate_volte.rs`
+    // is where the decision logic around `prime_pcscf` is actually tested,
+    // with the call itself injected.
 }

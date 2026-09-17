@@ -45,74 +45,13 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
         tracing::info!("[vowifi].enabled is false — discovery still runs for the circuit-switched pool, but no VoWiFi lines are resolved");
         crate::vowifi::discovery::LineResolution::default()
     } else {
-        let overrides = crate::vowifi::discovery::effective_line_overrides(&config.vowifi);
-        // A device with several AT-capable interfaces means an override's
-        // named port isn't necessarily the one the plain first-match probe
-        // would settle on (found live-testing an EC200 that answers AT on
-        // more than one ttyUSB) — pass every configured port as a
-        // preference so probing tries it first on that device.
-        let preferred_ports: Vec<std::path::PathBuf> = overrides
-            .iter()
-            .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
-            .collect();
-        // The one scan allowed to *repair* an unreadable SIM rather than
-        // just report it (specs/027-discover-retry-health): `discover` is
-        // one-shot and runs before any line carries traffic, so an
-        // `AT+CFUN` cycle here can't interrupt a call the way it could on
-        // `scan_modules`' ongoing rescans — see `SimRecovery`.
-        let mut policy = crate::modules::discovery::DiscoveryPolicy::new(config.discovery.clone());
-        let modems = match crate::modules::discovery::scan_all_preferring_with_sim_recovery(
-            &preferred_ports,
-            crate::modules::discovery::SimRecovery::CfunCycleOnUnreadable,
-            &mut policy,
-        ) {
-            Ok(m) => m,
+        match resolve_vowifi_lines(&config) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("error: modem discovery failed: {e}");
+                eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
-        };
-        let assignment = crate::vowifi::discovery::RoleAssignment::from_probed(
-            &modems,
-            &overrides,
-            config.cs.enabled,
-        );
-        let mut result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
-        // specs/027-discover-retry-health follow-up: pre-derive whatever
-        // identity (imsi/imei/mcc/mnc) each resolved modem line doesn't
-        // already have pinned, while this is still the only process
-        // touching the modem — see `enrich_resolved_line_identity`'s doc
-        // comment for the AT-port race this closes.
-        for line in &mut result.lines {
-            crate::vowifi::discovery::enrich_resolved_line_identity(line);
         }
-        // specs/027-discover-retry-health FR-001: a configured override
-        // that matched no probed device at all (never even enumerated on
-        // the USB bus) is invisible to `resolve_lines` — it only sees
-        // candidates that made it into `assignment.vowifi`. Merge those in
-        // too, so every `discover` pass — not just a future retry —
-        // reports a missing configured line immediately.
-        result
-            .failed
-            .extend(crate::vowifi::discovery::unmatched_overrides(
-                &overrides, &modems,
-            ));
-        for failed in &result.failed {
-            tracing::error!(
-                card_id = %failed.card_id,
-                reason = %failed.reason,
-                "VoWiFi line discovery: modem not usable as a line"
-            );
-        }
-        if result.lines.is_empty() {
-            // The spec's clarification: degrade, don't fail — the caller
-            // (`supervise::orchestrate`) still starts the circuit-switched daemon.
-            tracing::error!(
-                "[vowifi].enabled is true but no usable VoWiFi line was discovered; \
-                 the VoWiFi subsystem will not start this run"
-            );
-        }
-        crate::vowifi::discovery::LineResolution::from_result(&assignment.vowifi, &result)
     };
 
     if let Err(e) = write_line_resolution(&out_path, &resolution) {
@@ -123,6 +62,88 @@ pub(crate) fn handle_discover_command(args: &crate::cli::DiscoverArgs, cli: &Cli
         print!("{}", render_discover_shell_env(&resolution));
     }
     ExitCode::SUCCESS
+}
+
+/// The scan + VoWiFi role assignment/line-table resolution `discover` runs
+/// when `[vowifi].enabled`. Extracted (specs/080-volte-pcscf-auto-prime) so
+/// the transient priming capture (`supervise::orchestrate_prime`) can call it
+/// directly, in-process, bypassing the `[vowifi].enabled` gate above — that
+/// gate lives here, in the CLI wrapper, not in the resolution logic itself,
+/// and priming always runs in exactly the situation where `[vowifi].enabled`
+/// is false (the mutual-exclusion check in `supervise::orchestrate::run`
+/// guarantees it whenever `[volte].enabled` is being started at all), so a
+/// caller going through the real `discover` subcommand can never get a line
+/// out of it — confirmed live on the Vodafone rig: `discover` logged "no
+/// VoWiFi lines are resolved" and priming failed with "no usable modem/SIM
+/// found" every cycle, because it was going through this exact gate.
+pub fn resolve_vowifi_lines(
+    config: &crate::config::AppConfig,
+) -> Result<crate::vowifi::discovery::LineResolution, String> {
+    let overrides = crate::vowifi::discovery::effective_line_overrides(&config.vowifi);
+    // A device with several AT-capable interfaces means an override's
+    // named port isn't necessarily the one the plain first-match probe
+    // would settle on (found live-testing an EC200 that answers AT on
+    // more than one ttyUSB) — pass every configured port as a
+    // preference so probing tries it first on that device.
+    let preferred_ports: Vec<std::path::PathBuf> = overrides
+        .iter()
+        .filter_map(|o| o.modem_port.as_deref().map(std::path::PathBuf::from))
+        .collect();
+    // The one scan allowed to *repair* an unreadable SIM rather than
+    // just report it (specs/027-discover-retry-health): `discover` is
+    // one-shot and runs before any line carries traffic, so an
+    // `AT+CFUN` cycle here can't interrupt a call the way it could on
+    // `scan_modules`' ongoing rescans — see `SimRecovery`.
+    let mut policy = crate::modules::discovery::DiscoveryPolicy::new(config.discovery.clone());
+    let modems = crate::modules::discovery::scan_all_preferring_with_sim_recovery(
+        &preferred_ports,
+        crate::modules::discovery::SimRecovery::CfunCycleOnUnreadable,
+        &mut policy,
+    )
+    .map_err(|e| format!("modem discovery failed: {e}"))?;
+    let assignment = crate::vowifi::discovery::RoleAssignment::from_probed(
+        &modems,
+        &overrides,
+        config.cs.enabled,
+    );
+    let mut result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
+    // specs/027-discover-retry-health follow-up: pre-derive whatever
+    // identity (imsi/imei/mcc/mnc) each resolved modem line doesn't
+    // already have pinned, while this is still the only process
+    // touching the modem — see `enrich_resolved_line_identity`'s doc
+    // comment for the AT-port race this closes.
+    for line in &mut result.lines {
+        crate::vowifi::discovery::enrich_resolved_line_identity(line);
+    }
+    // specs/027-discover-retry-health FR-001: a configured override
+    // that matched no probed device at all (never even enumerated on
+    // the USB bus) is invisible to `resolve_lines` — it only sees
+    // candidates that made it into `assignment.vowifi`. Merge those in
+    // too, so every `discover` pass — not just a future retry —
+    // reports a missing configured line immediately.
+    result
+        .failed
+        .extend(crate::vowifi::discovery::unmatched_overrides(
+            &overrides, &modems,
+        ));
+    for failed in &result.failed {
+        tracing::error!(
+            card_id = %failed.card_id,
+            reason = %failed.reason,
+            "VoWiFi line discovery: modem not usable as a line"
+        );
+    }
+    if result.lines.is_empty() {
+        // The spec's clarification: degrade, don't fail — the caller decides
+        // what "no usable line" means for it (a persistent [vowifi] run
+        // skips the subsystem; a priming attempt reports a failure and
+        // relies on its own retry cadence).
+        tracing::error!("no usable VoWiFi-capable line was discovered from this scan");
+    }
+    Ok(crate::vowifi::discovery::LineResolution::from_result(
+        &assignment.vowifi,
+        &result,
+    ))
 }
 
 pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {

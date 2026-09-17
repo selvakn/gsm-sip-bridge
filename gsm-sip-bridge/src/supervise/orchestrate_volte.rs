@@ -34,19 +34,38 @@ fn ensure_pcscf_primed(
     config: &AppConfig,
     override_addr: Option<&str>,
 ) -> bool {
-    if crate::volte::pcscf::pcscf_is_available(
+    ensure_pcscf_primed_with(
         std::path::Path::new(&config.volte.pcscf_source_path),
         override_addr,
-    ) {
+        || super::orchestrate_prime::prime_pcscf(Arc::clone(runner), bin, config_path, config),
+    )
+}
+
+/// The decision `ensure_pcscf_primed` makes, with the actual capture attempt
+/// injected as a closure rather than called directly.
+///
+/// Split out live, on the Vodafone rig (2026-09-17): `prime_pcscf`'s
+/// discovery step calls the real modem scanner directly, not through
+/// `CommandRunner` (see `orchestrate_prime::discover_priming_line`'s doc
+/// comment for why it has to). That makes `prime_pcscf` itself untestable
+/// without real hardware — exactly the "hardware not available in CI"
+/// situation the constitution's mocking carve-out exists for — but this
+/// decision (skip vs. attempt-and-report-false) doesn't need `prime_pcscf`
+/// to actually run to be tested; it only needs to know whether it *was*
+/// called.
+fn ensure_pcscf_primed_with(
+    cache_path: &std::path::Path,
+    override_addr: Option<&str>,
+    attempt_prime: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    if crate::volte::pcscf::pcscf_is_available(cache_path, override_addr) {
         return true;
     }
     println!(
         "[supervise] priming: no usable P-CSCF yet for VoLTE; capturing one via a transient \
          VoWiFi tunnel before proceeding"
     );
-    if let Err(e) =
-        super::orchestrate_prime::prime_pcscf(Arc::clone(runner), bin, config_path, config)
-    {
+    if let Err(e) = attempt_prime() {
         eprintln!("[supervise] priming failed: {e}");
     }
     false
@@ -532,90 +551,55 @@ fn ensure_volte_line_veth(
 
 #[cfg(test)]
 mod tests {
-    use super::super::runner::MockCommandRunner;
     use super::*;
-
-    fn test_config() -> AppConfig {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[sip]\nserver = \"sip.example.com\"\nusername = \"user\"\npassword = \"pass\"\n",
-        )
-        .unwrap();
-        crate::config::load_config(&path).unwrap()
-    }
 
     /// specs/080-volte-pcscf-auto-prime User Story 3: an explicit override
     /// must skip priming entirely — no `discover`/charon/pcscd activity —
     /// regardless of what (if anything) is at the cache path.
     #[test]
     fn an_override_skips_priming_entirely() {
-        let mock = Arc::new(MockCommandRunner::new());
-        let runner: Arc<dyn CommandRunner> = mock.clone();
-        let config = test_config();
-
-        let primed = ensure_pcscf_primed(
-            &runner,
-            "gsm-sip-bridge",
-            "/tmp/cfg.toml",
-            &config,
+        let primed = ensure_pcscf_primed_with(
+            std::path::Path::new("/nonexistent/pcscf"),
             Some("2402:8100::1"),
+            || panic!("an override must short-circuit before any priming activity"),
         );
 
         assert!(primed);
-        assert!(
-            mock.run_calls.lock().unwrap().is_empty(),
-            "an override must short-circuit before any priming activity"
-        );
     }
 
     /// specs/080-volte-pcscf-auto-prime User Story 3: a valid pre-existing
     /// cache must likewise skip priming entirely.
     #[test]
     fn a_valid_cache_skips_priming_entirely() {
-        let mock = Arc::new(MockCommandRunner::new());
-        let runner: Arc<dyn CommandRunner> = mock.clone();
-        let mut config = test_config();
         let cache = std::env::temp_dir().join(format!("pcscf-wiring-valid-{}", std::process::id()));
         std::fs::write(&cache, "2402:8100::5\n").unwrap();
-        config.volte.pcscf_source_path = cache.to_string_lossy().to_string();
 
-        let primed = ensure_pcscf_primed(&runner, "gsm-sip-bridge", "/tmp/cfg.toml", &config, None);
+        let primed = ensure_pcscf_primed_with(&cache, None, || {
+            panic!("a valid cache must short-circuit before any priming activity")
+        });
 
         assert!(primed);
-        assert!(
-            mock.run_calls.lock().unwrap().is_empty(),
-            "a valid cache must short-circuit before any priming activity"
-        );
         std::fs::remove_file(&cache).ok();
     }
 
     /// specs/080-volte-pcscf-auto-prime User Story 1: no override and no
-    /// cache must trigger exactly one priming attempt (visible here as the
-    /// `discover` subcommand `prime_pcscf` runs first) and report "not yet
-    /// primed" so the caller's own retry loop tries again.
+    /// cache must trigger exactly one priming attempt and report "not yet
+    /// primed" so the caller's own retry loop tries again. The actual
+    /// capture is injected here — see `ensure_pcscf_primed_with`'s doc
+    /// comment for why `prime_pcscf` itself can't be driven from a plain
+    /// unit test.
     #[test]
     fn missing_cache_and_no_override_triggers_one_priming_attempt() {
-        let mock = Arc::new(MockCommandRunner::new());
-        let runner: Arc<dyn CommandRunner> = mock.clone();
-        let mut config = test_config();
-        config.volte.pcscf_source_path = std::env::temp_dir()
-            .join(format!("pcscf-wiring-missing-{}", std::process::id()))
-            .to_string_lossy()
-            .to_string();
+        let attempted = std::cell::Cell::new(false);
 
-        let primed = ensure_pcscf_primed(&runner, "gsm-sip-bridge", "/tmp/cfg.toml", &config, None);
+        let primed =
+            ensure_pcscf_primed_with(std::path::Path::new("/nonexistent/pcscf"), None, || {
+                attempted.set(true);
+                Err("simulated failure".to_string())
+            });
 
         assert!(!primed, "must report not-yet-primed so the caller retries");
-        assert!(
-            mock.run_calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|argv| argv.iter().any(|a| a == "discover")),
-            "must have attempted priming (discover is prime_pcscf's first step)"
-        );
+        assert!(attempted.get(), "must have attempted priming exactly once");
     }
 
     /// specs/080-volte-pcscf-auto-prime User Story 2: this is the exact same
@@ -624,23 +608,18 @@ mod tests {
     /// corrupt (not just missing) cache must be treated identically.
     #[test]
     fn a_corrupt_cache_is_treated_exactly_like_a_missing_one() {
-        let mock = Arc::new(MockCommandRunner::new());
-        let runner: Arc<dyn CommandRunner> = mock.clone();
-        let mut config = test_config();
         let cache =
             std::env::temp_dir().join(format!("pcscf-wiring-corrupt-{}", std::process::id()));
         std::fs::write(&cache, "not-an-address").unwrap();
-        config.volte.pcscf_source_path = cache.to_string_lossy().to_string();
+        let attempted = std::cell::Cell::new(false);
 
-        let primed = ensure_pcscf_primed(&runner, "gsm-sip-bridge", "/tmp/cfg.toml", &config, None);
+        let primed = ensure_pcscf_primed_with(&cache, None, || {
+            attempted.set(true);
+            Err("simulated failure".to_string())
+        });
 
         assert!(!primed);
-        assert!(mock
-            .run_calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|argv| argv.iter().any(|a| a == "discover")));
+        assert!(attempted.get());
         std::fs::remove_file(&cache).ok();
     }
 }
