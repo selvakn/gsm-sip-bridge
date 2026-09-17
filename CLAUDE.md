@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/050-sip-public-addr/plan.md`.
+`specs/080-volte-pcscf-auto-prime/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
