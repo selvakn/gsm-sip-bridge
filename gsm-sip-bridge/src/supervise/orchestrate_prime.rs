@@ -47,29 +47,63 @@ use std::sync::{Arc, Mutex, RwLock};
 /// enough that a caller's own retry cadence (FR-008) gets a turn instead.
 const MAX_ESTABLISH_ATTEMPTS: u32 = 120;
 
-/// Resolves a candidate line and returns the first one, if any — priming
-/// always uses the first discovered line (FR-002b), matching
-/// `[volte].pcscf_source_path` already being one shared value for every
-/// VoLTE line regardless of which modem produced it (research.md R5).
+/// Resolves the one modem `[volte]` itself would pick as its own line 0
+/// (`crate::volte::discovery::resolve_volte_lines` — the exact selection
+/// `volte-discover-lines` runs), then builds the VoWiFi-shaped
+/// [`LineResolutionEntry`] priming needs for *that* modem, ignoring
+/// `[cs].enabled` (Greptile PR #87 review, finding 1).
 ///
-/// Calls `commands::discover::resolve_vowifi_lines` directly, in-process —
-/// **not** the `discover` subcommand, and deliberately not through
-/// `CommandRunner` at all. Confirmed live on the Vodafone rig
-/// (2026-09-17): the `discover` subcommand's own `[vowifi].enabled` gate
-/// (in `handle_discover_command`, not in the resolution logic itself) means
-/// it always reports zero lines whenever `[vowifi].enabled` is false — which
-/// is *always* true here, per the mutual-exclusion guarantee this module's
-/// own doc comment describes. Going through the subcommand can therefore
-/// never work for priming; the underlying resolver has to be called
-/// directly, bypassing that gate.
+/// Reusing VoWiFi's own resolver un-modified (`resolve_vowifi_lines`, the
+/// original approach) picks whichever modem *it* considers eligible, which is
+/// a materially different candidate set than VoLTE's: `[cs].enabled` (true by
+/// default) reserves every unpinned audio-capable modem for the
+/// circuit-switched pool, excluding it from VoWiFi's pool entirely — so on
+/// the single most common deployment shape (one audio-capable modem,
+/// `[cs].enabled` left at its default), VoWiFi's resolver reports zero
+/// candidates while VoLTE's own would happily use that exact modem, and
+/// priming retried forever. On a mixed-modem system it could instead capture
+/// a P-CSCF for a *different* SIM/carrier than the one VoLTE is actually
+/// registering. Forcing `cs_enabled = false` for this one-off resolution is
+/// safe: priming's tunnel is transient and fully torn down (`tear_down`,
+/// below) before any real line — VoWiFi or circuit-switched — starts, so it
+/// never actually contends with a real reservation.
+///
+/// Calls `commands::discover::scan_for_line_resolution`/
+/// `resolve_vowifi_lines_from_modems` directly, in-process — **not** the
+/// `discover` subcommand, and deliberately not through `CommandRunner` at
+/// all. Confirmed live on the Vodafone rig (2026-09-17): the `discover`
+/// subcommand's own `[vowifi].enabled` gate (in `handle_discover_command`,
+/// not in the resolution logic itself) means it always reports zero lines
+/// whenever `[vowifi].enabled` is false — which is *always* true here, per
+/// the mutual-exclusion guarantee this module's own doc comment describes.
+/// Going through the subcommand can therefore never work for priming; the
+/// underlying resolver has to be called directly, bypassing that gate.
 fn discover_priming_line(config: &AppConfig) -> Result<LineResolutionEntry, String> {
-    let resolution = crate::commands::discover::resolve_vowifi_lines(config)
+    let modems = crate::commands::discover::scan_for_line_resolution(config)
         .map_err(|e| format!("priming: {e}"))?;
-    resolution.lines.into_iter().next().ok_or_else(|| {
-        "priming: no usable modem/SIM found (no AT-capable modem with a ready SIM, or all \
-         candidates are already serving the circuit-switched bridge)"
-            .to_string()
-    })
+
+    let volte_line = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte)
+        .lines
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            "priming: no usable modem/SIM found for VoLTE (no AT-capable modem with a ready SIM)"
+                .to_string()
+        })?;
+
+    let resolution =
+        crate::commands::discover::resolve_vowifi_lines_from_modems(&modems, config, false);
+    resolution
+        .lines
+        .into_iter()
+        .find(|l| l.card_id == volte_line.card_id)
+        .ok_or_else(|| {
+            format!(
+                "priming: could not prepare {} (the modem VoLTE selected as its own line) as a \
+                 VoWiFi-shaped line for capture — see the discovery errors above",
+                volte_line.card_id
+            )
+        })
 }
 
 /// Renders the one-line equivalent of `start_vowifi_subsystem`'s shared
@@ -119,6 +153,7 @@ pub fn prime_pcscf(
     bin: &str,
     config_path: &str,
     config: &AppConfig,
+    real_shutting_down: &Arc<RwLock<bool>>,
 ) -> Result<(), String> {
     if config.vowifi.tunnel_engine != "strongswan" {
         return Err(format!(
@@ -132,7 +167,7 @@ pub fn prime_pcscf(
 
     let line = discover_priming_line(config)?;
 
-    prime_with_line(runner, bin, config_path, config, &line)
+    prime_with_line(runner, bin, config_path, config, &line, real_shutting_down)
 }
 
 /// The rest of one priming attempt, given an already-resolved line —
@@ -146,6 +181,7 @@ pub(super) fn prime_with_line(
     config_path: &str,
     config: &AppConfig,
     line: &LineResolutionEntry,
+    real_shutting_down: &Arc<RwLock<bool>>,
 ) -> Result<(), String> {
     // Local to this one attempt — never the real, container-wide
     // StartedState/shutting-down flag. Setting the real flag would begin a
@@ -207,6 +243,7 @@ pub(super) fn prime_with_line(
         shutting_down: &shutting_down,
         alert_ctx: None,
         shared_charon: &shared_charon,
+        real_shutting_down: Some(real_shutting_down),
     };
 
     let Some((mcc, mnc)) = prepare_vowifi_line(&ctx, line) else {
@@ -277,7 +314,15 @@ mod tests {
         let mock = Arc::new(MockCommandRunner::new());
         let runner: Arc<dyn CommandRunner> = mock.clone();
 
-        let err = prime_pcscf(runner, "gsm-sip-bridge", "/tmp/cfg.toml", &config).unwrap_err();
+        let real_shutting_down = Arc::new(RwLock::new(false));
+        let err = prime_pcscf(
+            runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &real_shutting_down,
+        )
+        .unwrap_err();
 
         assert!(err.contains("strongswan"), "got: {err}");
         assert!(
@@ -327,9 +372,17 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let line = priming_line();
+        let real_shutting_down = Arc::new(RwLock::new(false));
 
-        let err =
-            prime_with_line(runner, "gsm-sip-bridge", "/tmp/cfg.toml", &config, &line).unwrap_err();
+        let err = prime_with_line(
+            runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &line,
+            &real_shutting_down,
+        )
+        .unwrap_err();
 
         assert!(err.contains("priming"), "got: {err}");
         assert!(
@@ -344,6 +397,49 @@ mod tests {
             !std::path::Path::new(&config.volte.pcscf_source_path).exists(),
             "a failed attempt must never write a cache file"
         );
+    }
+
+    /// Greptile PR #87 review, finding 2: a real (container-wide) shutdown
+    /// that lands while a priming attempt is polling for its tunnel must not
+    /// be left to run out its own several-minute ceiling — it must abandon
+    /// the attempt within one poll interval and still run its own local
+    /// teardown, exactly like any other establish failure.
+    #[test]
+    fn a_real_shutdown_mid_establish_abandons_the_attempt_and_still_tears_down() {
+        let mock = Arc::new(MockCommandRunner::new());
+        let runner: Arc<dyn CommandRunner> = mock.clone();
+        let mut config = test_config();
+        config.volte.pcscf_source_path = std::env::temp_dir()
+            .join("pcscf-prime-test-real-shutdown")
+            .to_string_lossy()
+            .to_string();
+        let line = priming_line();
+        // Already true before the attempt starts — the establish loop must
+        // check this before its very first `tick_establishing`, not just
+        // between sleeps, so this test never needs to drive a real
+        // multi-iteration poll.
+        let real_shutting_down = Arc::new(RwLock::new(true));
+
+        let err = prime_with_line(
+            runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &line,
+            &real_shutting_down,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("priming"), "got: {err}");
+        assert!(
+            mock.children
+                .lock()
+                .unwrap()
+                .values()
+                .any(|c| !c.signals_received.is_empty()),
+            "teardown must still run for an attempt abandoned due to real shutdown"
+        );
+        assert!(!std::path::Path::new(&config.volte.pcscf_source_path).exists());
     }
 
     // `prime_pcscf` itself (as opposed to `prime_with_line`, tested above)

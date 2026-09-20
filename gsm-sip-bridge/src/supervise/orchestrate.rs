@@ -130,6 +130,17 @@ pub(super) struct LineStartup<'a> {
     pub(super) alert_ctx: Option<&'a AlertContext>,
     /// The charon daemon every strongswan-engine line shares.
     pub(super) shared_charon: &'a Arc<SharedCharon>,
+    /// The real, container-wide shutdown flag — distinct from `shutting_down`
+    /// above for callers whose `shutting_down` is a local, per-attempt flag
+    /// rather than the real one (`orchestrate_prime`'s transient priming
+    /// capture; see its own doc comment for why it can't just use the real
+    /// flag there). `establish_line_tunnel`'s establish-loop polls this, when
+    /// present, so a real shutdown can abort a stuck attempt within one poll
+    /// interval instead of running out its own several-minute ceiling
+    /// (Greptile PR #87 review, finding 2). `None` for every persistent-line
+    /// call site, which already passes the real flag as `shutting_down`
+    /// itself, so a second copy here would be redundant.
+    pub(super) real_shutting_down: Option<&'a Arc<RwLock<bool>>>,
 }
 
 /// Starts the whole inbound VoWiFi-to-SIP bridge for a non-empty, already
@@ -399,6 +410,7 @@ fn start_vowifi_subsystem(
                     shutting_down: &shutting_down,
                     alert_ctx: alert_ctx.as_ref(),
                     shared_charon: &shared_charon,
+                    real_shutting_down: None,
                 },
                 &line,
             );
@@ -774,6 +786,21 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // (and therefore nothing it might still register) at snapshot time.
     let shutting_down = Arc::new(RwLock::new(false));
 
+    // specs/080-volte-pcscf-auto-prime (Greptile PR #87 review, finding 2):
+    // held for the duration of one priming attempt
+    // (`orchestrate_volte::ensure_pcscf_primed`), so this function can wait
+    // for it to be released below, right after setting `shutting_down`,
+    // before building the real shutdown plan. Priming necessarily runs
+    // against its own local `StartedState`/`shutting_down` (see
+    // `orchestrate_prime`'s doc comment for why), so its pcscd/charon/
+    // netns/XFRM resources are invisible to the real plan built from the
+    // real `started` below — without this wait, a shutdown that lands
+    // mid-attempt could see the real plan (and then the process itself)
+    // complete before priming's own teardown has run, abandoning those
+    // resources. A poisoned lock (priming panicked mid-attempt) must not
+    // block shutdown forever, so its `Result` is discarded either way.
+    let priming_activity = Arc::new(Mutex::new(()));
+
     // --- 1. Discover once, up front (specs/013-multi-card-vowifi) ---------
     // Resolved BEFORE the circuit-switched daemon supervisor starts below —
     // see this function's own comment below on why (both would
@@ -927,6 +954,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
             config.clone(),
             Arc::clone(&started),
             Arc::clone(&shutting_down),
+            Arc::clone(&priming_activity),
         );
     } else {
         println!("[supervise] [volte].enabled is not true — VoLTE not started");
@@ -950,6 +978,14 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // StartedState that the snapshot below won't already see, and any loop
     // that reads the flag afterward will see `true` and skip spawning.
     *shutting_down.write().unwrap() = true;
+
+    // See `priming_activity`'s own doc comment above: block until any
+    // in-flight priming attempt has released it (having run its own local
+    // teardown) before this function's plan — built from `started` alone —
+    // is the only teardown that runs. Acquired then dropped immediately —
+    // waiting for the lock to become available is the entire point, there
+    // is nothing to hold it for afterward.
+    drop(priming_activity.lock());
 
     println!("[supervise] shutting down ...");
     let state = started.lock().unwrap();
@@ -1497,6 +1533,12 @@ pub(super) fn establish_line_tunnel(
     let mut attempt = 0u32;
     let mut stuck = false;
     let pcscf = loop {
+        if ctx.real_shutting_down.is_some_and(|f| *f.read().unwrap()) {
+            println!(
+                "[supervise] line {idx}: real shutdown requested; abandoning establish attempt"
+            );
+            break None;
+        }
         match line_supervisor::tick_establishing(&engine, runner.as_ref(), &mut attempt, &mut stuck)
         {
             line_supervisor::EstablishOutcome::Established { pcscf } => break Some(pcscf),
@@ -2579,6 +2621,7 @@ mod tests {
                 shutting_down: &shutting_down,
                 alert_ctx: None,
                 shared_charon: &shared_charon,
+                real_shutting_down: None,
             },
             &line,
         );
@@ -2621,6 +2664,7 @@ mod tests {
                 shutting_down: &shutting_down,
                 alert_ctx: None,
                 shared_charon: &shared_charon,
+                real_shutting_down: None,
             },
             &line,
             &line.mcc.clone(),
@@ -2666,6 +2710,7 @@ mod tests {
                 shutting_down: &shutting_down2,
                 alert_ctx: None,
                 shared_charon: &shared_charon2,
+                real_shutting_down: None,
             },
             &modem,
             &modem.mcc.clone(),

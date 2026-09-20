@@ -33,11 +33,28 @@ fn ensure_pcscf_primed(
     config_path: &str,
     config: &AppConfig,
     override_addr: Option<&str>,
+    shutting_down: &Arc<RwLock<bool>>,
+    priming_activity: &Arc<Mutex<()>>,
 ) -> bool {
     ensure_pcscf_primed_with(
         std::path::Path::new(&config.volte.pcscf_source_path),
         override_addr,
-        || super::orchestrate_prime::prime_pcscf(Arc::clone(runner), bin, config_path, config),
+        || {
+            // Held for the whole attempt (specs/080-volte-pcscf-auto-prime,
+            // Greptile PR #87 review, finding 2) — `orchestrate::run`'s
+            // shutdown sequence waits for this same lock right after setting
+            // the real `shutting_down` flag, so it never builds/executes the
+            // real teardown plan while this attempt's own local one (below,
+            // in `prime_with_line`) is still in flight.
+            let _guard = priming_activity.lock();
+            super::orchestrate_prime::prime_pcscf(
+                Arc::clone(runner),
+                bin,
+                config_path,
+                config,
+                shutting_down,
+            )
+        },
     )
 }
 
@@ -65,10 +82,13 @@ fn ensure_pcscf_primed_with(
         "[supervise] priming: no usable P-CSCF yet for VoLTE; capturing one via a transient \
          VoWiFi tunnel before proceeding"
     );
-    if let Err(e) = attempt_prime() {
-        eprintln!("[supervise] priming failed: {e}");
+    match attempt_prime() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[supervise] priming failed: {e}");
+            false
+        }
     }
-    false
 }
 
 /// Entry point, called from `orchestrate::run` when `[volte].enabled`.
@@ -79,11 +99,28 @@ pub fn start(
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
     shutting_down: Arc<RwLock<bool>>,
+    priming_activity: Arc<Mutex<()>>,
 ) {
     if config.volte.bridge_inbound {
-        start_multiline(runner, bin, config_path, config, started, shutting_down);
+        start_multiline(
+            runner,
+            bin,
+            config_path,
+            config,
+            started,
+            shutting_down,
+            priming_activity,
+        );
     } else {
-        start_legacy_registration(runner, bin, config_path, config, started, shutting_down);
+        start_legacy_registration(
+            runner,
+            bin,
+            config_path,
+            config,
+            started,
+            shutting_down,
+            priming_activity,
+        );
     }
 }
 
@@ -97,6 +134,7 @@ fn start_multiline(
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
     shutting_down: Arc<RwLock<bool>>,
+    priming_activity: Arc<Mutex<()>>,
 ) {
     println!(
         "[supervise] [volte].enabled + bridge_inbound — answering inbound calls over LTE (auto-discovering modems, up to {} line(s))",
@@ -146,13 +184,34 @@ fn start_multiline(
     // (research.md R5), so there is nothing to gain from re-checking per
     // line. No enclosing retry loop exists at this scope, so this loop uses
     // the same 15s cadence directly rather than introducing a new one.
+    //
+    // Runs synchronously on `orchestrate::run`'s own thread, *before* it
+    // reaches `wait_for_signal()` — so a real shutdown signal that arrives
+    // during this loop's very first (up to ~4-minute) priming attempt has
+    // no installed handler to catch it yet, and the OS's default
+    // disposition (terminate) applies regardless of `real_shutting_down`
+    // plumbing (Greptile PR #87 review, finding 2's remaining edge: fixing
+    // it fully would mean moving this pre-flight off the main thread, which
+    // changes this path's "no per-line thread starts before a P-CSCF is
+    // ready" ordering guarantee — left as a known gap rather than done
+    // partially here). Every attempt *after* the first one runs with the
+    // signal handler already installed, where `ensure_pcscf_primed`'s
+    // `real_shutting_down`/`priming_activity` plumbing does apply.
     {
         let override_addr = manifest
             .lines
             .first()
             .filter(|l| !l.pcscf.is_empty())
             .map(|l| l.pcscf.as_str());
-        while !ensure_pcscf_primed(&runner, &bin, &config_path, &config, override_addr) {
+        while !ensure_pcscf_primed(
+            &runner,
+            &bin,
+            &config_path,
+            &config,
+            override_addr,
+            &shutting_down,
+            &priming_activity,
+        ) {
             if *shutting_down.read().unwrap() {
                 return;
             }
@@ -391,11 +450,11 @@ fn start_legacy_registration(
     config: AppConfig,
     started: Arc<Mutex<StartedState>>,
     shutting_down: Arc<RwLock<bool>>,
+    priming_activity: Arc<Mutex<()>>,
 ) {
     println!("[supervise] [volte].enabled — starting host-side IMS over LTE (resolving one line from config)");
     std::thread::spawn(move || loop {
-        let guard = shutting_down.read().unwrap();
-        if *guard {
+        if *shutting_down.read().unwrap() {
             return;
         }
 
@@ -405,15 +464,37 @@ fn start_legacy_registration(
         // sleep-and-retry, so no new retry/backoff concept is introduced.
         // FR-002b: always the first configured line's override, matching
         // the shared cache path itself always being line 0's default.
+        //
+        // Deliberately called with no read guard held: `ensure_pcscf_primed`
+        // passes this same `shutting_down` lock down into priming's own
+        // establish-loop check (Greptile PR #87 review, finding 2), and
+        // `std::sync::RwLock` does not guarantee recursive read locks are
+        // deadlock-free against a concurrent writer — holding a guard here
+        // across that call risked a real deadlock against `orchestrate::
+        // run`'s shutdown sequence taking the write lock. The guard below,
+        // around the actual spawn-then-register sequence, is unaffected —
+        // this call never runs inside it.
         let override_addr = config
             .volte
             .line_overrides
             .first()
             .and_then(|o| o.pcscf.as_deref());
-        if !ensure_pcscf_primed(&runner, &bin, &config_path, &config, override_addr) {
-            drop(guard);
+        if !ensure_pcscf_primed(
+            &runner,
+            &bin,
+            &config_path,
+            &config,
+            override_addr,
+            &shutting_down,
+            &priming_activity,
+        ) {
             runner.sleep(Duration::from_secs(15));
             continue;
+        }
+
+        let guard = shutting_down.read().unwrap();
+        if *guard {
+            return;
         }
 
         match runner.spawn(ChildSpec::new([
@@ -600,6 +681,20 @@ mod tests {
 
         assert!(!primed, "must report not-yet-primed so the caller retries");
         assert!(attempted.get(), "must have attempted priming exactly once");
+    }
+
+    /// A priming attempt that succeeds must report `true` immediately, not
+    /// `false` — the caller must not pay its own 15s retry-sleep on a cold
+    /// start that just worked (Greptile PR #87 review).
+    #[test]
+    fn a_successful_priming_attempt_reports_primed_without_delay() {
+        let primed =
+            ensure_pcscf_primed_with(std::path::Path::new("/nonexistent/pcscf"), None, || Ok(()));
+
+        assert!(
+            primed,
+            "a successful attempt must not fall through to a retry sleep"
+        );
     }
 
     /// specs/080-volte-pcscf-auto-prime User Story 2: this is the exact same
