@@ -92,6 +92,24 @@ const DISCOVER_RETRY_WINDOW: Duration = Duration::from_secs(180);
 /// line is still missing.
 const DISCOVER_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Ceiling on how long shutdown waits for `priming_activity` to free up
+/// (Greptile PR #87 review, fourth finding: "Startup Can Block Shutdown").
+/// `volte-discover-lines`, `modem-ims` reconciliation, and netns/veth setup
+/// are plain blocking subprocess/AT calls with no deadline of their own, so
+/// an unconditional wait on this lock could stall the *entire*
+/// graceful-shutdown sequence indefinitely if one of them hung — worse than
+/// not waiting at all, since `STOP_ALLOWANCE` below would then never even
+/// start. Bounded instead, matching this module's own `STOP_ALLOWANCE`-
+/// budgeted philosophy: whatever hasn't registered into `started` by the
+/// time this gives up is left for the next boot's leftover-reclaim
+/// (`reclaim_leftover_lines`/`reclaim_stale_xfrm`) to sweep up — the same
+/// backstop already relied on for a force-killed run. Comfortably under
+/// `STOP_ALLOWANCE` (60s) so the real teardown plan still gets nearly all of
+/// it even in the worst case, and the combined worst case (this timeout plus
+/// `STOP_ALLOWANCE`) stays under `docker-compose.yml`'s `stop_grace_period`
+/// (90s).
+const PRIMING_ACTIVITY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// This line's swanctl connection and child name.
 ///
 /// Unique per line because every line's connection lives in one shared charon:
@@ -787,9 +805,10 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     let shutting_down = Arc::new(RwLock::new(false));
 
     // specs/080-volte-pcscf-auto-prime (Greptile PR #87 review, finding 2):
-    // held for the duration of one priming attempt
-    // (`orchestrate_volte::ensure_pcscf_primed`), so this function can wait
-    // for it to be released below, right after setting `shutting_down`,
+    // held for the duration of one priming attempt, or (for `start_multiline`)
+    // its entire background-thread body (see `orchestrate_volte`'s own
+    // comments), so this function can wait — bounded, see
+    // `PRIMING_ACTIVITY_SHUTDOWN_TIMEOUT` below — for it to be released
     // before building the real shutdown plan. Priming necessarily runs
     // against its own local `StartedState`/`shutting_down` (see
     // `orchestrate_prime`'s doc comment for why), so its pcscd/charon/
@@ -797,8 +816,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // real `started` below — without this wait, a shutdown that lands
     // mid-attempt could see the real plan (and then the process itself)
     // complete before priming's own teardown has run, abandoning those
-    // resources. A poisoned lock (priming panicked mid-attempt) must not
-    // block shutdown forever, so its `Result` is discarded either way.
+    // resources.
     let priming_activity = Arc::new(Mutex::new(()));
 
     // --- 1. Discover once, up front (specs/013-multi-card-vowifi) ---------
@@ -979,13 +997,9 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // that reads the flag afterward will see `true` and skip spawning.
     *shutting_down.write().unwrap() = true;
 
-    // See `priming_activity`'s own doc comment above: block until any
-    // in-flight priming attempt has released it (having run its own local
-    // teardown) before this function's plan — built from `started` alone —
-    // is the only teardown that runs. Acquired then dropped immediately —
-    // waiting for the lock to become available is the entire point, there
-    // is nothing to hold it for afterward.
-    drop(priming_activity.lock());
+    // See `priming_activity`'s own and `PRIMING_ACTIVITY_SHUTDOWN_TIMEOUT`'s
+    // doc comments above.
+    wait_for_priming_activity(&priming_activity, PRIMING_ACTIVITY_SHUTDOWN_TIMEOUT);
 
     println!("[supervise] shutting down ...");
     let state = started.lock().unwrap();
@@ -1001,6 +1015,33 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     report_teardown_outcome(&outcome);
 
     ExitCode::SUCCESS
+}
+
+/// Waits for `lock` to become free (or poisoned), but no longer than
+/// `timeout` (Greptile PR #87 review, fourth finding: "Startup Can Block
+/// Shutdown" — see [`PRIMING_ACTIVITY_SHUTDOWN_TIMEOUT`]'s own doc comment
+/// for why this must be bounded rather than a plain blocking `lock()`).
+/// Polls with `try_lock()` rather than a timed-lock primitive: `std::sync::
+/// Mutex` has no such API, and a 100ms poll is more than fine resolution for
+/// a budget measured in seconds.
+fn wait_for_priming_activity(lock: &Mutex<()>, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "[supervise] shutdown: priming/VoLTE-startup activity still in flight \
+                         after {timeout:?}; proceeding with teardown anyway (see next boot's \
+                         leftover-reclaim)"
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }
 
 /// Renders [`shutdown::TeardownOutcome`] per contracts/observable-contracts.md
@@ -2102,6 +2143,68 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Greptile PR #87 review, fourth finding: an already-free lock must not
+    /// incur any of the poll-and-sleep overhead.
+    #[test]
+    fn wait_for_priming_activity_returns_immediately_when_free() {
+        let lock = Mutex::new(());
+        let start = std::time::Instant::now();
+
+        wait_for_priming_activity(&lock, Duration::from_secs(30));
+
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "must not wait at all for an uncontended lock"
+        );
+    }
+
+    /// The core of the fix: a lock held forever (a hung subprocess call,
+    /// concretely) must not block shutdown past the configured timeout.
+    #[test]
+    fn wait_for_priming_activity_gives_up_after_the_timeout() {
+        let lock = Arc::new(Mutex::new(()));
+        let guard = lock.lock().unwrap();
+        // Held by this thread for the whole test — never released — so the
+        // only way `wait_for_priming_activity` returns is by timing out.
+        let held = Arc::clone(&lock);
+        let start = std::time::Instant::now();
+
+        wait_for_priming_activity(&held, Duration::from_millis(300));
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "must wait out the full timeout, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not wait meaningfully longer than the timeout, got {elapsed:?}"
+        );
+        drop(guard);
+    }
+
+    /// A panic mid-attempt (poisoning the lock) must not block shutdown
+    /// either — treated exactly like an already-free lock.
+    #[test]
+    fn wait_for_priming_activity_returns_immediately_on_a_poisoned_lock() {
+        let lock = Arc::new(Mutex::new(()));
+        let poisoner = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("deliberately poisoning the lock for this test");
+        })
+        .join();
+        assert!(lock.is_poisoned());
+        let start = std::time::Instant::now();
+
+        wait_for_priming_activity(&lock, Duration::from_secs(30));
+
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "must not wait at all for a poisoned lock"
+        );
+    }
 
     #[test]
     fn sim_alert_transition_fires_failure_once_on_give_up() {
