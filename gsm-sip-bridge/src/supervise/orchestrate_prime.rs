@@ -50,34 +50,37 @@ const MAX_ESTABLISH_ATTEMPTS: u32 = 120;
 /// Resolves the one modem `[volte]` itself would pick as its own line 0
 /// (`crate::volte::discovery::resolve_volte_lines` — the exact selection
 /// `volte-discover-lines` runs), then builds the VoWiFi-shaped
-/// [`LineResolutionEntry`] priming needs for *that* modem, ignoring
-/// `[cs].enabled` (Greptile PR #87 review, finding 1).
+/// [`LineResolutionEntry`] priming needs for *that* modem directly
+/// (`crate::vowifi::discovery::resolve_single_line`), never through
+/// `resolve_lines`'s `[vowifi].max_lines`/pin-priority membership tiers
+/// (Greptile PR #87 review, findings 1 and its mixed-modem follow-up).
 ///
-/// Reusing VoWiFi's own resolver un-modified (`resolve_vowifi_lines`, the
-/// original approach) picks whichever modem *it* considers eligible, which is
-/// a materially different candidate set than VoLTE's: `[cs].enabled` (true by
-/// default) reserves every unpinned audio-capable modem for the
-/// circuit-switched pool, excluding it from VoWiFi's pool entirely — so on
-/// the single most common deployment shape (one audio-capable modem,
-/// `[cs].enabled` left at its default), VoWiFi's resolver reports zero
+/// Two separate reasons `resolve_lines` (VoWiFi's real, persistent-line
+/// resolver) is the wrong tool here, both found live-reviewing this PR:
+/// `[cs].enabled` (true by default) reserves every unpinned audio-capable
+/// modem for the circuit-switched pool, so on the single most common
+/// deployment shape (one audio-capable modem) VoWiFi's resolver reports zero
 /// candidates while VoLTE's own would happily use that exact modem, and
-/// priming retried forever. On a mixed-modem system it could instead capture
-/// a P-CSCF for a *different* SIM/carrier than the one VoLTE is actually
-/// registering. Forcing `cs_enabled = false` for this one-off resolution is
-/// safe: priming's tunnel is transient and fully torn down (`tear_down`,
-/// below) before any real line — VoWiFi or circuit-switched — starts, so it
-/// never actually contends with a real reservation.
+/// priming retried forever; separately, on a mixed-modem system a *different*
+/// modem pinned to every available `[vowifi].max_lines` slot (or a
+/// `pcsc_reader` line) can consume the whole budget and exclude the
+/// VoLTE-selected modem even with `[cs].enabled = false`. `resolve_single_line`
+/// sidesteps both: it derives one modem's line resources directly, with no
+/// budget or pin tier to lose to — safe because priming's tunnel is
+/// transient and fully torn down (`tear_down`, below) before any real line,
+/// VoWiFi or circuit-switched, starts, so it never actually contends with a
+/// real reservation.
 ///
-/// Calls `commands::discover::scan_for_line_resolution`/
-/// `resolve_vowifi_lines_from_modems` directly, in-process — **not** the
-/// `discover` subcommand, and deliberately not through `CommandRunner` at
-/// all. Confirmed live on the Vodafone rig (2026-09-17): the `discover`
-/// subcommand's own `[vowifi].enabled` gate (in `handle_discover_command`,
-/// not in the resolution logic itself) means it always reports zero lines
-/// whenever `[vowifi].enabled` is false — which is *always* true here, per
-/// the mutual-exclusion guarantee this module's own doc comment describes.
-/// Going through the subcommand can therefore never work for priming; the
-/// underlying resolver has to be called directly, bypassing that gate.
+/// Calls `commands::discover::scan_for_line_resolution` directly, in-process
+/// — **not** the `discover` subcommand, and deliberately not through
+/// `CommandRunner` at all. Confirmed live on the Vodafone rig (2026-09-17):
+/// the `discover` subcommand's own `[vowifi].enabled` gate (in
+/// `handle_discover_command`, not in the resolution logic itself) means it
+/// always reports zero lines whenever `[vowifi].enabled` is false — which is
+/// *always* true here, per the mutual-exclusion guarantee this module's own
+/// doc comment describes. Going through the subcommand can therefore never
+/// work for priming; the underlying scan has to be called directly, bypassing
+/// that gate.
 fn discover_priming_line(config: &AppConfig) -> Result<LineResolutionEntry, String> {
     let modems = crate::commands::discover::scan_for_line_resolution(config)
         .map_err(|e| format!("priming: {e}"))?;
@@ -91,19 +94,21 @@ fn discover_priming_line(config: &AppConfig) -> Result<LineResolutionEntry, Stri
                 .to_string()
         })?;
 
-    let resolution =
-        crate::commands::discover::resolve_vowifi_lines_from_modems(&modems, config, false);
-    resolution
-        .lines
-        .into_iter()
-        .find(|l| l.card_id == volte_line.card_id)
+    let modem = modems
+        .iter()
+        .find(|m| m.card_id == volte_line.card_id)
         .ok_or_else(|| {
             format!(
-                "priming: could not prepare {} (the modem VoLTE selected as its own line) as a \
-                 VoWiFi-shaped line for capture — see the discovery errors above",
+                "priming: internal error — VoLTE selected modem {} but it is missing from the \
+                 scan that just produced it",
                 volte_line.card_id
             )
-        })
+        })?;
+
+    Ok(crate::vowifi::discovery::resolve_single_line(
+        modem,
+        &config.vowifi,
+    ))
 }
 
 /// Renders the one-line equivalent of `start_vowifi_subsystem`'s shared

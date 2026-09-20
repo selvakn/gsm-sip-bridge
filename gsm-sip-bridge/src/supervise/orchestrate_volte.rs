@@ -136,308 +136,314 @@ fn start_multiline(
     shutting_down: Arc<RwLock<bool>>,
     priming_activity: Arc<Mutex<()>>,
 ) {
-    println!(
+    // Entirely on a background thread (Greptile PR #87 review, finding 2's
+    // remaining edge): `volte-discover-lines` and, especially, the priming
+    // pre-flight loop below (up to ~4 minutes per attempt) used to run
+    // synchronously on `orchestrate::run`'s own thread, *before* it reached
+    // `wait_for_signal()` — so a real shutdown signal arriving during any of
+    // this had no installed handler to catch it yet, and the OS's default
+    // disposition (terminate) applied regardless of `real_shutting_down`/
+    // `priming_activity` plumbing. Spawning immediately, mirroring every
+    // other subsystem's own startup convention (`start_vowifi_subsystem`
+    // returns right after spawning each line's own thread), lets `run()`
+    // reach `wait_for_signal()` right away, so that plumbing applies to
+    // every priming attempt, including the very first.
+    std::thread::spawn(move || {
+        println!(
         "[supervise] [volte].enabled + bridge_inbound — answering inbound calls over LTE (auto-discovering modems, up to {} line(s))",
         config.volte.max_lines
     );
 
-    let status = runner.run(&[
-        &bin,
-        "--config",
-        &config_path,
-        "volte-discover-lines",
-        "--restore-cid-path",
-        VOLTE_RESTORE_CID_PATH,
-    ]);
-    match status {
-        Ok(o) if o.status.success() => {}
-        _ => {
-            eprintln!("[supervise] FATAL: 'volte-discover-lines' failed — see error above");
-            return;
+        let status = runner.run(&[
+            &bin,
+            "--config",
+            &config_path,
+            "volte-discover-lines",
+            "--restore-cid-path",
+            VOLTE_RESTORE_CID_PATH,
+        ]);
+        match status {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("[supervise] FATAL: 'volte-discover-lines' failed — see error above");
+                return;
+            }
         }
-    }
 
-    let manifest_path = crate::volte::discovery::manifest_path();
-    let manifest = match crate::volte::discovery::read_manifest(&manifest_path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("[supervise] FATAL: could not read VoLTE line manifest: {e}");
-            return;
-        }
-    };
-    println!(
-        "[supervise] volte-discover-lines: VOLTE_LINE_COUNT={}",
-        manifest.lines.len()
-    );
+        let manifest_path = crate::volte::discovery::manifest_path();
+        let manifest = match crate::volte::discovery::read_manifest(&manifest_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[supervise] FATAL: could not read VoLTE line manifest: {e}");
+                return;
+            }
+        };
+        println!(
+            "[supervise] volte-discover-lines: VOLTE_LINE_COUNT={}",
+            manifest.lines.len()
+        );
 
-    if manifest.lines.is_empty() {
-        eprintln!(
+        if manifest.lines.is_empty() {
+            eprintln!(
             "[supervise] PROMINENT ERROR: [volte].enabled + bridge_inbound is true but no usable VoLTE \
              line was discovered — the VoLTE subsystem will NOT start this run."
         );
-        return;
-    }
-
-    // specs/080-volte-pcscf-auto-prime FR-001/FR-002b/FR-005/FR-008: a
-    // one-time pre-flight, unlike the legacy path's per-retry-iteration
-    // check — every discovered line already shares this one cache path
-    // (research.md R5), so there is nothing to gain from re-checking per
-    // line. No enclosing retry loop exists at this scope, so this loop uses
-    // the same 15s cadence directly rather than introducing a new one.
-    //
-    // Runs synchronously on `orchestrate::run`'s own thread, *before* it
-    // reaches `wait_for_signal()` — so a real shutdown signal that arrives
-    // during this loop's very first (up to ~4-minute) priming attempt has
-    // no installed handler to catch it yet, and the OS's default
-    // disposition (terminate) applies regardless of `real_shutting_down`
-    // plumbing (Greptile PR #87 review, finding 2's remaining edge: fixing
-    // it fully would mean moving this pre-flight off the main thread, which
-    // changes this path's "no per-line thread starts before a P-CSCF is
-    // ready" ordering guarantee — left as a known gap rather than done
-    // partially here). Every attempt *after* the first one runs with the
-    // signal handler already installed, where `ensure_pcscf_primed`'s
-    // `real_shutting_down`/`priming_activity` plumbing does apply.
-    {
-        let override_addr = manifest
-            .lines
-            .first()
-            .filter(|l| !l.pcscf.is_empty())
-            .map(|l| l.pcscf.as_str());
-        while !ensure_pcscf_primed(
-            &runner,
-            &bin,
-            &config_path,
-            &config,
-            override_addr,
-            &shutting_down,
-            &priming_activity,
-        ) {
-            if *shutting_down.read().unwrap() {
-                return;
-            }
-            runner.sleep(Duration::from_secs(15));
+            return;
         }
-    }
 
-    // specs/041-shutdown-resource-cleanup US2/FR-014: mirrors the VoWiFi
-    // reclamation in orchestrate::run — a force-killed previous run's
-    // namespace/veth can still be on the host. Run before this loop creates
-    // anything of its own, using each discovered line's own namespace/veth
-    // names (a name this run's own discovery could also produce is, by
-    // construction, ours — research.md R7). No XFRM/if_id concept here, so
-    // (unlike the VoWiFi call) there is no separate flush step to pair it
-    // with.
-    let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = manifest
-        .lines
-        .iter()
-        .map(|l| {
-            let suffix = if l.index == 0 {
-                String::new()
-            } else {
-                l.index.to_string()
-            };
-            let has_veth = !l.veth_carrier_addr.is_empty();
-            let veth_host =
-                has_veth.then(|| format!("{}{suffix}", config.volte.veth_telephony_iface));
-            epdg_iface::ReclaimCandidate {
-                netns: l.netns.clone(),
-                tun_iface: None,
-                veth_host,
-                // Proof of ownership: the carrier-side veth end this
-                // deployment creates *inside* the namespace. A line with no
-                // veth at all (the diagnostic single-`--modem` path) cannot
-                // prove ownership, so `None` vetoes reclaiming it.
-                owned_iface_marker: has_veth
-                    .then(|| format!("{}{suffix}", config.volte.veth_carrier_iface)),
-            }
-        })
-        .collect();
-    epdg_iface::reclaim_leftover_lines(
-        runner.as_ref(),
-        &reclaim_candidates,
-        epdg_iface::reclaim_leftover_enabled(),
-    );
-
-    for line in &manifest.lines {
-        let runner = Arc::clone(&runner);
-        let bin = bin.clone();
-        let config_path = config_path.clone();
-        let started = Arc::clone(&started);
-        let shutting_down = Arc::clone(&shutting_down);
-        let idx = line.index;
-        let card_id = line.card_id.clone();
-        let modem_port = line.modem_port.clone();
-        let netns = line.netns.clone();
-        let veth_carrier_addr = line.veth_carrier_addr.clone();
-        let veth_telephony_addr = line.veth_telephony_addr.clone();
-        let veth_carrier_iface = format!(
-            "{}{}",
-            config.volte.veth_carrier_iface,
-            if idx == 0 {
-                String::new()
-            } else {
-                idx.to_string()
-            }
-        );
-        let veth_telephony_iface = format!(
-            "{}{}",
-            config.volte.veth_telephony_iface,
-            if idx == 0 {
-                String::new()
-            } else {
-                idx.to_string()
-            }
-        );
-
-        println!("[supervise] volte line {idx} ({card_id}): netns={netns}");
-
-        // Modem's own IMS/VoLTE stack reconciliation — must run before
-        // anything else touches this modem (research.md of
-        // specs/020-volte-line-netns).
-        if runner
-            .run(&[
-                &bin,
-                "--config",
-                &config_path,
-                "modem-ims",
-                "--modem",
-                &modem_port,
-            ])
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
+        // specs/080-volte-pcscf-auto-prime FR-001/FR-002b/FR-005/FR-008: a
+        // one-time pre-flight, unlike the legacy path's per-retry-iteration
+        // check — every discovered line already shares this one cache path
+        // (research.md R5), so there is nothing to gain from re-checking per
+        // line. No enclosing retry loop exists at this scope, so this loop uses
+        // the same 15s cadence directly rather than introducing a new one.
+        //
+        // Now runs on this function's own background thread (see the
+        // `std::thread::spawn` this whole body is wrapped in, above), not
+        // `orchestrate::run`'s — so `real_shutting_down`/`priming_activity`
+        // apply to every attempt here, including the first.
         {
-            eprintln!("[supervise] volte line {idx}: FATAL: could not reconcile modem IMS mode; skipping this line");
-            continue;
+            let override_addr = manifest
+                .lines
+                .first()
+                .filter(|l| !l.pcscf.is_empty())
+                .map(|l| l.pcscf.as_str());
+            while !ensure_pcscf_primed(
+                &runner,
+                &bin,
+                &config_path,
+                &config,
+                override_addr,
+                &shutting_down,
+                &priming_activity,
+            ) {
+                if *shutting_down.read().unwrap() {
+                    return;
+                }
+                runner.sleep(Duration::from_secs(15));
+            }
         }
 
-        if !ensure_volte_line_netns(runner.as_ref(), &netns, &line.iface) {
-            eprintln!("[supervise] volte line {idx}: FATAL: interface {} not present in container; skipping this line", line.iface);
-            continue;
-        }
-        if !veth_carrier_addr.is_empty() {
-            ensure_volte_line_veth(
-                runner.as_ref(),
-                &veth_telephony_iface,
-                &veth_carrier_iface,
-                &netns,
-                &veth_telephony_addr,
-                &veth_carrier_addr,
-            );
-        }
-
-        started.lock().unwrap().started_netns.push(netns.clone());
-        let mut state = started.lock().unwrap();
-        let entry = state.volte_lines.iter_mut().find(|l| l.index == idx);
-        if entry.is_none() {
-            state.volte_lines.push(StartedVolteLine {
-                index: idx,
-                netns: netns.clone(),
-                carrier_agent_handles: Vec::new(),
-                // `None` when this line has no carrier veth pair at all —
-                // the diagnostic single-`--modem` path (`carrier_agent.rs`'s
-                // empty-address branch) never calls `ensure_volte_line_veth`
-                // below, so there is nothing here to delete at stop.
-                veth_host: if veth_carrier_addr.is_empty() {
-                    None
+        // specs/041-shutdown-resource-cleanup US2/FR-014: mirrors the VoWiFi
+        // reclamation in orchestrate::run — a force-killed previous run's
+        // namespace/veth can still be on the host. Run before this loop creates
+        // anything of its own, using each discovered line's own namespace/veth
+        // names (a name this run's own discovery could also produce is, by
+        // construction, ours — research.md R7). No XFRM/if_id concept here, so
+        // (unlike the VoWiFi call) there is no separate flush step to pair it
+        // with.
+        let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = manifest
+            .lines
+            .iter()
+            .map(|l| {
+                let suffix = if l.index == 0 {
+                    String::new()
                 } else {
-                    Some(veth_telephony_iface.clone())
-                },
+                    l.index.to_string()
+                };
+                let has_veth = !l.veth_carrier_addr.is_empty();
+                let veth_host =
+                    has_veth.then(|| format!("{}{suffix}", config.volte.veth_telephony_iface));
+                epdg_iface::ReclaimCandidate {
+                    netns: l.netns.clone(),
+                    tun_iface: None,
+                    veth_host,
+                    // Proof of ownership: the carrier-side veth end this
+                    // deployment creates *inside* the namespace. A line with no
+                    // veth at all (the diagnostic single-`--modem` path) cannot
+                    // prove ownership, so `None` vetoes reclaiming it.
+                    owned_iface_marker: has_veth
+                        .then(|| format!("{}{suffix}", config.volte.veth_carrier_iface)),
+                }
+            })
+            .collect();
+        epdg_iface::reclaim_leftover_lines(
+            runner.as_ref(),
+            &reclaim_candidates,
+            epdg_iface::reclaim_leftover_enabled(),
+        );
+
+        for line in &manifest.lines {
+            let runner = Arc::clone(&runner);
+            let bin = bin.clone();
+            let config_path = config_path.clone();
+            let started = Arc::clone(&started);
+            let shutting_down = Arc::clone(&shutting_down);
+            let idx = line.index;
+            let card_id = line.card_id.clone();
+            let modem_port = line.modem_port.clone();
+            let netns = line.netns.clone();
+            let veth_carrier_addr = line.veth_carrier_addr.clone();
+            let veth_telephony_addr = line.veth_telephony_addr.clone();
+            let veth_carrier_iface = format!(
+                "{}{}",
+                config.volte.veth_carrier_iface,
+                if idx == 0 {
+                    String::new()
+                } else {
+                    idx.to_string()
+                }
+            );
+            let veth_telephony_iface = format!(
+                "{}{}",
+                config.volte.veth_telephony_iface,
+                if idx == 0 {
+                    String::new()
+                } else {
+                    idx.to_string()
+                }
+            );
+
+            println!("[supervise] volte line {idx} ({card_id}): netns={netns}");
+
+            // Modem's own IMS/VoLTE stack reconciliation — must run before
+            // anything else touches this modem (research.md of
+            // specs/020-volte-line-netns).
+            if runner
+                .run(&[
+                    &bin,
+                    "--config",
+                    &config_path,
+                    "modem-ims",
+                    "--modem",
+                    &modem_port,
+                ])
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
+            {
+                eprintln!("[supervise] volte line {idx}: FATAL: could not reconcile modem IMS mode; skipping this line");
+                continue;
+            }
+
+            if !ensure_volte_line_netns(runner.as_ref(), &netns, &line.iface) {
+                eprintln!("[supervise] volte line {idx}: FATAL: interface {} not present in container; skipping this line", line.iface);
+                continue;
+            }
+            if !veth_carrier_addr.is_empty() {
+                ensure_volte_line_veth(
+                    runner.as_ref(),
+                    &veth_telephony_iface,
+                    &veth_carrier_iface,
+                    &netns,
+                    &veth_telephony_addr,
+                    &veth_carrier_addr,
+                );
+            }
+
+            started.lock().unwrap().started_netns.push(netns.clone());
+            let mut state = started.lock().unwrap();
+            let entry = state.volte_lines.iter_mut().find(|l| l.index == idx);
+            if entry.is_none() {
+                state.volte_lines.push(StartedVolteLine {
+                    index: idx,
+                    netns: netns.clone(),
+                    carrier_agent_handles: Vec::new(),
+                    // `None` when this line has no carrier veth pair at all —
+                    // the diagnostic single-`--modem` path (`carrier_agent.rs`'s
+                    // empty-address branch) never calls `ensure_volte_line_veth`
+                    // below, so there is nothing here to delete at stop.
+                    veth_host: if veth_carrier_addr.is_empty() {
+                        None
+                    } else {
+                        Some(veth_telephony_iface.clone())
+                    },
+                });
+            }
+            drop(state);
+
+            println!("[supervise] volte line {idx}: starting volte-carrier-agent (netns {netns}), supervised...");
+            std::thread::spawn(move || loop {
+                let guard = shutting_down.read().unwrap();
+                if *guard {
+                    return;
+                }
+                match runner.spawn(ChildSpec::new([
+                    "ip",
+                    "netns",
+                    "exec",
+                    &netns,
+                    &bin,
+                    "--config",
+                    &config_path,
+                    "volte-carrier-agent",
+                    "--line",
+                    &idx.to_string(),
+                ])) {
+                    Ok(handle) => {
+                        // Shared: this loop polls liveness, the shutdown plan
+                        // signals the same child from another thread.
+                        let handle = std::sync::Arc::new(handle);
+                        let mut state = started.lock().unwrap();
+                        if let Some(entry) = state.volte_lines.iter_mut().find(|l| l.index == idx) {
+                            entry.carrier_agent_handles.push(handle.clone());
+                        }
+                        drop(state);
+                        drop(guard);
+                        // Poll is_alive() rather than block on wait(): a real
+                        // Greptile finding (mirroring the one already fixed on
+                        // the vowifi-usim-bridge holder — see runner.rs) caught
+                        // that RealCommandRunner::wait() removes the handle from
+                        // the tracked table BEFORE blocking, which silently
+                        // discards the shutdown plan's later `KillChild` signal
+                        // to this exact handle (stored in
+                        // `carrier_agent_handles` for that purpose) for the
+                        // process's entire lifetime.
+                        while runner.is_alive(&handle) {
+                            runner.sleep(Duration::from_secs(1));
+                        }
+                        println!("[supervise] volte line {idx}: volte-carrier-agent exited; restarting in 15s");
+                    }
+                    Err(e) => {
+                        drop(guard);
+                        eprintln!(
+                        "[supervise] volte line {idx}: failed to spawn volte-carrier-agent: {e}"
+                    )
+                    }
+                }
+                runner.sleep(Duration::from_secs(15));
             });
         }
-        drop(state);
 
-        println!("[supervise] volte line {idx}: starting volte-carrier-agent (netns {netns}), supervised...");
+        if started.lock().unwrap().volte_lines.is_empty() {
+            eprintln!(
+            "[supervise] PROMINENT ERROR: every VoLTE line failed to start (see FATAL lines above) — the \
+             VoLTE subsystem will NOT start this run."
+        );
+            return;
+        }
+
+        println!("[supervise] starting volte-bridge (default netns, one shared process for all VoLTE lines), supervised...");
         std::thread::spawn(move || loop {
             let guard = shutting_down.read().unwrap();
             if *guard {
                 return;
             }
             match runner.spawn(ChildSpec::new([
-                "ip",
-                "netns",
-                "exec",
-                &netns,
-                &bin,
+                bin.as_str(),
                 "--config",
-                &config_path,
-                "volte-carrier-agent",
-                "--line",
-                &idx.to_string(),
+                config_path.as_str(),
+                "volte-bridge",
             ])) {
                 Ok(handle) => {
-                    // Shared: this loop polls liveness, the shutdown plan
-                    // signals the same child from another thread.
                     let handle = std::sync::Arc::new(handle);
-                    let mut state = started.lock().unwrap();
-                    if let Some(entry) = state.volte_lines.iter_mut().find(|l| l.index == idx) {
-                        entry.carrier_agent_handles.push(handle.clone());
-                    }
-                    drop(state);
+                    started.lock().unwrap().volte_bridge_supervisor = Some(handle.clone());
                     drop(guard);
-                    // Poll is_alive() rather than block on wait(): a real
-                    // Greptile finding (mirroring the one already fixed on
-                    // the vowifi-usim-bridge holder — see runner.rs) caught
-                    // that RealCommandRunner::wait() removes the handle from
-                    // the tracked table BEFORE blocking, which silently
-                    // discards the shutdown plan's later `KillChild` signal
-                    // to this exact handle (stored in
-                    // `carrier_agent_handles` for that purpose) for the
-                    // process's entire lifetime.
+                    // See the volte-carrier-agent loop above: poll is_alive(),
+                    // don't block on wait(), so this handle (which the shutdown
+                    // plan signals via `volte_bridge_supervisor`) stays
+                    // signalable for as long as the process is actually alive.
                     while runner.is_alive(&handle) {
                         runner.sleep(Duration::from_secs(1));
                     }
-                    println!("[supervise] volte line {idx}: volte-carrier-agent exited; restarting in 15s");
+                    println!("[supervise] volte-bridge exited; restarting in 15s");
                 }
                 Err(e) => {
                     drop(guard);
-                    eprintln!(
-                        "[supervise] volte line {idx}: failed to spawn volte-carrier-agent: {e}"
-                    )
+                    eprintln!("[supervise] failed to spawn volte-bridge: {e}")
                 }
             }
             runner.sleep(Duration::from_secs(15));
         });
-    }
-
-    if started.lock().unwrap().volte_lines.is_empty() {
-        eprintln!(
-            "[supervise] PROMINENT ERROR: every VoLTE line failed to start (see FATAL lines above) — the \
-             VoLTE subsystem will NOT start this run."
-        );
-        return;
-    }
-
-    println!("[supervise] starting volte-bridge (default netns, one shared process for all VoLTE lines), supervised...");
-    std::thread::spawn(move || loop {
-        let guard = shutting_down.read().unwrap();
-        if *guard {
-            return;
-        }
-        match runner.spawn(ChildSpec::new([
-            bin.as_str(),
-            "--config",
-            config_path.as_str(),
-            "volte-bridge",
-        ])) {
-            Ok(handle) => {
-                let handle = std::sync::Arc::new(handle);
-                started.lock().unwrap().volte_bridge_supervisor = Some(handle.clone());
-                drop(guard);
-                // See the volte-carrier-agent loop above: poll is_alive(),
-                // don't block on wait(), so this handle (which the shutdown
-                // plan signals via `volte_bridge_supervisor`) stays
-                // signalable for as long as the process is actually alive.
-                while runner.is_alive(&handle) {
-                    runner.sleep(Duration::from_secs(1));
-                }
-                println!("[supervise] volte-bridge exited; restarting in 15s");
-            }
-            Err(e) => {
-                drop(guard);
-                eprintln!("[supervise] failed to spawn volte-bridge: {e}")
-            }
-        }
-        runner.sleep(Duration::from_secs(15));
     });
 }
 

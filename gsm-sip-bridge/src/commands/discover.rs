@@ -80,18 +80,18 @@ pub fn resolve_vowifi_lines(
     config: &crate::config::AppConfig,
 ) -> Result<crate::vowifi::discovery::LineResolution, String> {
     let modems = scan_for_line_resolution(config)?;
-    Ok(resolve_vowifi_lines_from_modems(
-        &modems,
-        config,
-        config.cs.enabled,
-    ))
+    Ok(resolve_vowifi_lines_from_modems(&modems, config))
 }
 
 /// The shared modem scan behind [`resolve_vowifi_lines`] and
 /// `orchestrate_prime::discover_priming_line` (specs/080-volte-pcscf-auto-prime)
-/// — a modem is only ever scanned once per resolution, regardless of how many
-/// role assignments (VoWiFi's, or priming's own VoLTE-target one) get derived
-/// from the result afterward.
+/// — a modem is only ever scanned once per resolution, regardless of what
+/// gets derived from the result afterward (VoWiFi's own role-assigned line
+/// table, or priming's own VoLTE-target modem via
+/// `crate::vowifi::discovery::resolve_single_line`, which does not call this
+/// scan's other half below at all — see `orchestrate_prime`'s own doc
+/// comment for why routing priming through `resolve_lines`'s VoWiFi-capacity
+/// rules is wrong regardless of `[cs].enabled`).
 pub fn scan_for_line_resolution(
     config: &crate::config::AppConfig,
 ) -> Result<Vec<crate::modules::discovery::ProbedModem>, String> {
@@ -126,22 +126,20 @@ pub fn scan_for_line_resolution(
     .map_err(|e| format!("modem discovery failed: {e}"))
 }
 
-/// The post-scan half of [`resolve_vowifi_lines`], parameterized on
-/// `cs_enabled` rather than always reading it from `config.cs.enabled`:
-/// priming (specs/080-volte-pcscf-auto-prime) needs to resolve the *same*
-/// modem `[volte]` itself would pick as a VoWiFi-shaped line for the transient
-/// capture tunnel, and must not let `[cs].enabled` (true by default) exclude
-/// it — priming tears its tunnel all the way down before any real line
-/// starts, so it never actually contends with a real circuit-switched
-/// reservation the way a persistent `[vowifi]` line would.
+/// The post-scan half of [`resolve_vowifi_lines`]: VoWiFi's own role
+/// assignment and `[vowifi].max_lines`/pin-priority line-table resolution,
+/// separated out purely so [`scan_for_line_resolution`]'s one scan can feed
+/// it without re-scanning.
 pub fn resolve_vowifi_lines_from_modems(
     modems: &[crate::modules::discovery::ProbedModem],
     config: &crate::config::AppConfig,
-    cs_enabled: bool,
 ) -> crate::vowifi::discovery::LineResolution {
     let overrides = crate::vowifi::discovery::effective_line_overrides(&config.vowifi);
-    let assignment =
-        crate::vowifi::discovery::RoleAssignment::from_probed(modems, &overrides, cs_enabled);
+    let assignment = crate::vowifi::discovery::RoleAssignment::from_probed(
+        modems,
+        &overrides,
+        config.cs.enabled,
+    );
     let mut result = crate::vowifi::discovery::resolve_lines(&assignment, &config.vowifi);
     // specs/027-discover-retry-health follow-up: pre-derive whatever
     // identity (imsi/imei/mcc/mnc) each resolved modem line doesn't
@@ -343,106 +341,4 @@ pub fn render_discover_shell_env(resolution: &crate::vowifi::discovery::LineReso
         arr(resolution.circuit_switched_excluded_ports.iter().cloned())
     );
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::modules::discovery::{ProbedModem, SimStatus};
-    use std::path::PathBuf;
-
-    fn test_config() -> crate::config::AppConfig {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[sip]\nserver = \"sip.example.com\"\nusername = \"user\"\npassword = \"pass\"\n",
-        )
-        .unwrap();
-        load_config(&path).unwrap()
-    }
-
-    fn ready_audio_modem(card_id: &str, port: &str) -> ProbedModem {
-        ProbedModem {
-            card_id: card_id.to_string(),
-            model: "EC20",
-            usb_serial: card_id.to_string(),
-            has_audio_capability: true,
-            audio_device: None,
-            net_device: None,
-            at_port: Some(PathBuf::from(port)),
-            sim_status: Some(SimStatus::Ready {
-                imsi: "1".to_string(),
-            }),
-        }
-    }
-
-    /// Greptile PR #87 review, finding 1: on the single most common VoLTE
-    /// deployment shape — one audio-capable modem, `[cs].enabled` left at its
-    /// default `true`, no `[vowifi]` overrides at all — VoWiFi's own resolver
-    /// (`cs_enabled = true`) must exclude the modem (it's reserved for the
-    /// circuit-switched pool), while priming's forced `cs_enabled = false`
-    /// call must still resolve it, and to the very same `card_id`
-    /// `resolve_volte_lines` picks as VoLTE's own line 0.
-    #[test]
-    fn forcing_cs_enabled_false_recovers_the_modem_the_real_resolver_excludes() {
-        let modems = vec![ready_audio_modem("ec20-AAAAAA", "/dev/ttyUSB0")];
-        let mut config = test_config();
-        config.cs.enabled = true;
-        config.volte.enabled = true;
-
-        let excluded = resolve_vowifi_lines_from_modems(&modems, &config, true);
-        assert!(
-            excluded.lines.is_empty(),
-            "cs_enabled=true must still reserve the only modem for the CS pool"
-        );
-
-        let recovered = resolve_vowifi_lines_from_modems(&modems, &config, false);
-        assert_eq!(recovered.lines.len(), 1);
-
-        let volte_line = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte)
-            .lines
-            .into_iter()
-            .next()
-            .expect("VoLTE must pick this modem as its own line 0");
-        assert_eq!(recovered.lines[0].card_id, volte_line.card_id);
-    }
-
-    /// Mixed-modem case: priming must target the exact modem VoLTE picked as
-    /// line 0, not merely "any modem VoWiFi could see once cs_enabled is
-    /// forced off" — the first candidate in card-id order happens to differ
-    /// from VoLTE's pinned choice here, so a naive `.next()` would silently
-    /// cache the P-CSCF for the wrong SIM.
-    #[test]
-    fn recovers_the_same_modem_volte_pinned_even_when_it_sorts_second() {
-        let modems = vec![
-            ready_audio_modem("ec20-AAAAAA", "/dev/ttyUSB0"),
-            ready_audio_modem("ec20-ZZZZZZ", "/dev/ttyUSB1"),
-        ];
-        let mut config = test_config();
-        config.cs.enabled = true;
-        config.volte.enabled = true;
-        config.volte.line_overrides = vec![crate::config::VolteLineOverride {
-            modem_serial: Some("ec20-ZZZZZZ".to_string()),
-            ..Default::default()
-        }];
-        config.volte.max_lines = 1;
-
-        let volte_line = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte)
-            .lines
-            .into_iter()
-            .next()
-            .expect("the pinned modem must win the single available slot");
-        assert_eq!(volte_line.card_id, "ec20-ZZZZZZ");
-
-        let recovered = resolve_vowifi_lines_from_modems(&modems, &config, false);
-        let matched = recovered
-            .lines
-            .iter()
-            .find(|l| l.card_id == volte_line.card_id);
-        assert!(
-            matched.is_some(),
-            "the vowifi-shaped resolution must still contain VoLTE's pinned modem"
-        );
-    }
 }
