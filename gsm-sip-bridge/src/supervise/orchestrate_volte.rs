@@ -27,6 +27,20 @@ const VOLTE_RESTORE_CID_PATH: &str = "/run/volte-restore-cid";
 /// Extracted into its own function, rather than inlined at each call site,
 /// specifically so it is unit-testable without spinning up either call
 /// site's background thread/loop.
+///
+/// Does **not** touch `priming_activity` itself (Greptile PR #87 review,
+/// third finding: "detached startup races shutdown") — the two callers hold
+/// it over materially different scopes. `start_legacy_registration` locks it
+/// narrowly, around just this call, since a priming failure there falls
+/// through to that loop's own 15s sleep-and-retry with nothing else to
+/// protect in between. `start_multiline` locks it once, for its *entire*
+/// background-thread body (discovery, this pre-flight loop, and every
+/// line's netns/veth/manifest-state creation) — a P-CSCF already being
+/// available makes this function return `true` on its very first,
+/// near-instant call, without ever creating anything itself, so a lock taken
+/// only around this call would leave every one of that thread's *other*
+/// resource-creating steps unsynchronized with a real shutdown's snapshot of
+/// `started`, exactly the gap Greptile found.
 fn ensure_pcscf_primed(
     runner: &Arc<dyn CommandRunner>,
     bin: &str,
@@ -34,19 +48,11 @@ fn ensure_pcscf_primed(
     config: &AppConfig,
     override_addr: Option<&str>,
     shutting_down: &Arc<RwLock<bool>>,
-    priming_activity: &Arc<Mutex<()>>,
 ) -> bool {
     ensure_pcscf_primed_with(
         std::path::Path::new(&config.volte.pcscf_source_path),
         override_addr,
         || {
-            // Held for the whole attempt (specs/080-volte-pcscf-auto-prime,
-            // Greptile PR #87 review, finding 2) — `orchestrate::run`'s
-            // shutdown sequence waits for this same lock right after setting
-            // the real `shutting_down` flag, so it never builds/executes the
-            // real teardown plan while this attempt's own local one (below,
-            // in `prime_with_line`) is still in flight.
-            let _guard = priming_activity.lock();
             super::orchestrate_prime::prime_pcscf(
                 Arc::clone(runner),
                 bin,
@@ -149,6 +155,18 @@ fn start_multiline(
     // reach `wait_for_signal()` right away, so that plumbing applies to
     // every priming attempt, including the very first.
     std::thread::spawn(move || {
+        // Held for this entire closure, not just the priming call below
+        // (Greptile PR #87 review, third finding: "detached startup races
+        // shutdown") — `orchestrate::run`'s shutdown sequence waits on this
+        // same lock right after setting the real `shutting_down` flag, so it
+        // never snapshots `started` (to build its teardown plan) while this
+        // thread is still discovering lines, priming, or creating any
+        // line's netns/veth. A cache hit makes the priming loop below return
+        // on its very first, near-instant check — without this guard around
+        // the *whole* closure, everything after that point (every line's
+        // resource creation) would still race an in-flight shutdown
+        // snapshot unsynchronized.
+        let _priming_activity_guard = priming_activity.lock();
         println!(
         "[supervise] [volte].enabled + bridge_inbound — answering inbound calls over LTE (auto-discovering modems, up to {} line(s))",
         config.volte.max_lines
@@ -200,8 +218,9 @@ fn start_multiline(
         //
         // Now runs on this function's own background thread (see the
         // `std::thread::spawn` this whole body is wrapped in, above), not
-        // `orchestrate::run`'s — so `real_shutting_down`/`priming_activity`
-        // apply to every attempt here, including the first.
+        // `orchestrate::run`'s — so `real_shutting_down` aborts a stuck
+        // attempt here too, including the first, and `priming_activity`
+        // (held for the whole closure, above) already covers this loop.
         {
             let override_addr = manifest
                 .lines
@@ -215,7 +234,6 @@ fn start_multiline(
                 &config,
                 override_addr,
                 &shutting_down,
-                &priming_activity,
             ) {
                 if *shutting_down.read().unwrap() {
                     return;
@@ -480,20 +498,32 @@ fn start_legacy_registration(
         // run`'s shutdown sequence taking the write lock. The guard below,
         // around the actual spawn-then-register sequence, is unaffected —
         // this call never runs inside it.
+        //
+        // `priming_activity` is locked narrowly, right here, around just
+        // this call — unlike `start_multiline`, which holds it for its
+        // entire background-thread body (see that function's own comment):
+        // this path's only other resource-creating step is the
+        // `volte-register` spawn below, which `started.legacy_volte_
+        // registration` already only ever records from this same thread, so
+        // there is nothing else in this loop a real shutdown's `started`
+        // snapshot needs protecting from.
         let override_addr = config
             .volte
             .line_overrides
             .first()
             .and_then(|o| o.pcscf.as_deref());
-        if !ensure_pcscf_primed(
-            &runner,
-            &bin,
-            &config_path,
-            &config,
-            override_addr,
-            &shutting_down,
-            &priming_activity,
-        ) {
+        let primed = {
+            let _guard = priming_activity.lock();
+            ensure_pcscf_primed(
+                &runner,
+                &bin,
+                &config_path,
+                &config,
+                override_addr,
+                &shutting_down,
+            )
+        };
+        if !primed {
             runner.sleep(Duration::from_secs(15));
             continue;
         }
