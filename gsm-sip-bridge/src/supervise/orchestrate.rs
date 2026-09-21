@@ -1308,6 +1308,7 @@ pub(super) fn establish_line_tunnel(
     let config = ctx.config;
     let started = ctx.started;
     let shutting_down = ctx.shutting_down;
+    let real_shutting_down = ctx.real_shutting_down;
     let idx = line.index;
     let modem = line.modem_port.clone();
     let netns = line.netns.clone();
@@ -1336,6 +1337,17 @@ pub(super) fn establish_line_tunnel(
         );
     }
     {
+        // Held across this registration purely so a real shutdown's write-
+        // lock acquisition on `shutting_down`/`real_shutting_down` can never
+        // proceed while it is in flight — this line's netns/tun iface were
+        // already created above regardless, so there is nothing to gate,
+        // only something to synchronize (the same reasoning as the two
+        // spawn-then-register sections below, which do gate on it — this
+        // one runs unconditionally, matching how a failed `ensure_epdg_
+        // interface` above still gets recorded so teardown can still find
+        // it).
+        let guard = shutting_down.read().unwrap();
+        let real_guard = real_shutting_down.map(|f| f.read().unwrap());
         let mut st = started.lock().unwrap();
         st.started_netns.push(netns.clone());
         // Recorded here — the same point `started_netns.push` occupies —
@@ -1352,6 +1364,9 @@ pub(super) fn establish_line_tunnel(
             netns: netns.clone(),
             veth_host: line.config.veth_sip_iface.clone(),
         });
+        drop(st);
+        drop(guard);
+        drop(real_guard);
     }
 
     let Some(imsi) = resolve_imsi(runner.as_ref(), bin, line) else {
@@ -1403,9 +1418,24 @@ pub(super) fn establish_line_tunnel(
         let usim_holder = Arc::clone(&usim_holder);
         let started = Arc::clone(started);
         let shutting_down = Arc::clone(shutting_down);
+        let real_shutting_down = real_shutting_down.cloned();
         std::thread::spawn(move || loop {
             let guard = shutting_down.read().unwrap();
             if *guard {
+                return;
+            }
+            // `shutting_down` above is priming's own *local* flag when this
+            // is a transient priming capture (`orchestrate_prime`), so a
+            // real container shutdown's write-lock acquisition never waits
+            // on `guard` for it. Held alongside it, when present, so the
+            // real one is covered too — `None` (and therefore a no-op) for
+            // every persistent-line call site, which already passes the
+            // real flag as `shutting_down` itself (Greptile PR #87 review,
+            // same class of gap as "Detached Startup Races Shutdown", found
+            // for `start_multiline`'s own loop; closed here too since this
+            // function is priming's only other resource-registering path).
+            let real_guard = real_shutting_down.as_ref().map(|f| f.read().unwrap());
+            if real_guard.as_deref().is_some_and(|v| *v) {
                 return;
             }
             match runner.spawn(ChildSpec::new([
@@ -1425,6 +1455,7 @@ pub(super) fn establish_line_tunnel(
                     *usim_holder.lock().unwrap() = Some(h.clone());
                     started.lock().unwrap().vowifi_child_handles.push(h.clone());
                     drop(guard);
+                    drop(real_guard);
                     // Poll is_alive() rather than blocking on wait(): a real
                     // review finding caught that RealCommandRunner::wait()
                     // removes the handle from the tracked table BEFORE
@@ -1445,6 +1476,7 @@ pub(super) fn establish_line_tunnel(
                 }
                 Err(e) => {
                     drop(guard);
+                    drop(real_guard);
                     eprintln!("[supervise] line {idx}: failed to spawn vowifi-usim-bridge: {e}")
                 }
             }
@@ -1472,6 +1504,14 @@ pub(super) fn establish_line_tunnel(
         // case, just at a different call site.
         let guard = shutting_down.read().unwrap();
         if *guard {
+            println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
+            return None;
+        }
+        // See the USIM-bridge thread's own comment above for why this is
+        // also needed alongside `guard`, not a replacement for it: `None`
+        // (a no-op) for every persistent-line call site.
+        let real_guard = real_shutting_down.map(|f| f.read().unwrap());
+        if real_guard.as_deref().is_some_and(|v| *v) {
             println!("[supervise] line {idx}: shutting down before startup finished; abandoning");
             return None;
         }
