@@ -505,6 +505,22 @@ pub fn probe_epdg_cache(path: &std::path::Path) -> MethodResult {
     }
 }
 
+/// Whether VoLTE already has a usable P-CSCF address, without needing to
+/// capture one (specs/080-volte-pcscf-auto-prime FR-001/FR-005): an explicit
+/// override always wins, otherwise the cache at `cache_path` must actually
+/// parse as an address — missing, empty, and corrupt all count the same as
+/// "not available" here (`probe_epdg_cache`'s `Failed`/`NoResult` both yield
+/// `None` from `.found()`), since all three mean the same thing to a caller
+/// deciding whether to run the capture procedure: it hasn't been done yet.
+pub fn pcscf_is_available(cache_path: &std::path::Path, override_addr: Option<&str>) -> bool {
+    if let Some(addr) = override_addr {
+        if addr.parse::<IpAddr>().is_ok() {
+            return true;
+        }
+    }
+    probe_epdg_cache(cache_path).found().is_some()
+}
+
 // ---------------------------------------------------------------------------
 // DNS
 // ---------------------------------------------------------------------------
@@ -818,6 +834,68 @@ mod tests {
         std::fs::write(&path, "not-an-address").unwrap();
 
         assert!(matches!(probe_epdg_cache(&path), MethodResult::Failed(_)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pcscf_is_available_prefers_a_valid_override_without_touching_the_filesystem() {
+        // /nonexistent proves the override short-circuits before any file
+        // read is attempted — a missing cache must not matter when an
+        // override is present (specs/080-volte-pcscf-auto-prime FR-001).
+        assert!(pcscf_is_available(
+            std::path::Path::new("/nonexistent/pcscf"),
+            Some("2402:8100::1")
+        ));
+    }
+
+    #[test]
+    fn pcscf_is_available_ignores_an_unparseable_override_and_falls_back_to_the_cache() {
+        let path = std::env::temp_dir().join(format!("epdg-avail-fallback-{}", std::process::id()));
+        std::fs::write(&path, "2402:8100::5\n").unwrap();
+
+        assert!(pcscf_is_available(&path, Some("not-an-address")));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pcscf_is_available_true_for_a_valid_cache_with_no_override() {
+        let path = std::env::temp_dir().join(format!("epdg-avail-valid-{}", std::process::id()));
+        std::fs::write(&path, "2402:8100::5\n").unwrap();
+
+        assert!(pcscf_is_available(&path, None));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pcscf_is_available_false_for_a_missing_cache_with_no_override() {
+        assert!(!pcscf_is_available(
+            std::path::Path::new("/nonexistent/pcscf"),
+            None
+        ));
+    }
+
+    #[test]
+    fn pcscf_is_available_false_for_an_empty_cache_with_no_override() {
+        let path = std::env::temp_dir().join(format!("epdg-avail-empty-{}", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+
+        assert!(!pcscf_is_available(&path, None));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pcscf_is_available_false_for_a_corrupt_cache_with_no_override() {
+        // Corrupt (Failed) and missing/empty (NoResult) must be treated
+        // identically here — both mean "capture hasn't happened yet"
+        // (specs/080-volte-pcscf-auto-prime User Story 2 scenario 2).
+        let path = std::env::temp_dir().join(format!("epdg-avail-corrupt-{}", std::process::id()));
+        std::fs::write(&path, "not-an-address").unwrap();
+
+        assert!(!pcscf_is_available(&path, None));
+
         std::fs::remove_file(&path).ok();
     }
 

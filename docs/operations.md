@@ -657,17 +657,53 @@ below before re-investigating this; it's been checked thoroughly.
 registration path (`volte-register` / `bridge_inbound`) never runs that
 discovery chain at all.** It only ever tries two things, in order: an explicit
 override (`[[volte.line]].pcscf` or `--pcscf`), then the file named by
-`[volte].pcscf_source_path`. If neither has an address, the line simply cannot
-register. `volte-discover` is a diagnostic for characterizing what a *new*
-carrier offers — it is not wired into anything that actually runs.
+`[volte].pcscf_source_path`. `volte-discover` is a diagnostic for
+characterizing what a *new* carrier offers — it is not wired into anything
+that actually runs.
 
 The one thing that reliably works is letting the VoWiFi/ePDG path capture the
-address once, from the IKEv2 config payload, and handing that to VoLTE. That's
-the "dance": bring VoWiFi up just long enough to capture it, then switch to
-VoLTE and never touch VoWiFi again (they can't run together anyway — see
-above).
+address once, from the IKEv2 config payload, and handing that to VoLTE.
 
-#### Step by step
+#### It's automatic now (specs/080-volte-pcscf-auto-prime)
+
+As of that feature, `supervise` does this for you. When `[volte].enabled =
+true` and neither an override nor a valid cache file is present, it borrows
+`discover`'s modem-discovery output, brings that line's ePDG tunnel up just
+long enough to capture the P-CSCF from the IKE_AUTH config payload, writes it
+to `[volte].pcscf_source_path`, and tears the transient tunnel back down —
+all before attempting VoLTE registration, in the same boot, with no operator
+step. Watch the logs for:
+
+```
+[supervise] priming: no usable P-CSCF yet for VoLTE; capturing one via a transient VoWiFi tunnel before proceeding
+[supervise] priming: captured P-CSCF <address>, wrote it to /tmp/pcscf-0
+```
+
+If priming fails (no usable modem/SIM, or the tunnel doesn't establish), that
+failure is reported distinctly from a carrier-side VoLTE registration failure
+(`priming failed: ...`), and retried on the same cadence VoLTE's own startup
+already uses elsewhere — no manual intervention needed there either.
+
+A deployment that already has a usable address — an explicit override, or a
+capture from a previous boot still sitting at the cache path — sees none of
+this: priming is skipped entirely, with no added startup activity. This also
+means the manual dance's biggest failure mode (a container recreate wiping
+the capture) is no longer an operator problem: the next boot just notices the
+cache is gone and re-primes on its own.
+
+This only ever runs as part of `supervise`'s own startup sequence, never for
+a standalone `volte-register`/`volte-listen`/`volte-call` invocation — those
+keep the manual behavior below. It also never runs when `[vowifi].enabled` is
+persistently `true`: the mutual-exclusion check further down this document
+still applies unchanged, and priming only ever acts as a transient, internal
+substitute for that persistent registration, never alongside it.
+
+#### The manual dance (still available, and how the automatic version works internally)
+
+Useful for troubleshooting, for a standalone CLI diagnostic session, or on a
+`[vowifi].tunnel_engine = "swu"` deployment (priming only supports the
+default `strongswan` engine): bring VoWiFi up just long enough to capture the
+address, then switch to VoLTE.
 
 1. **Prime.** Set `[vowifi].enabled = true` with a `[[vowifi.line]]` for the
    modem, and `[volte].enabled = false`. Start (or restart) the container and
@@ -691,10 +727,8 @@ above).
    `docker restart <ctr>`) reuses the same container filesystem, so
    `/tmp/pcscf-0` survives; `docker compose up -d --force-recreate`, `down` +
    `up`, or any path that replaces the container wipes `/tmp` and destroys the
-   capture, forcing you to redo step 1. This is the single most common way
-   this dance goes wrong — a stale/missing capture after a recreate reads
-   exactly like a carrier-side registration failure, not a self-inflicted
-   config-reload artifact.
+   capture, forcing you to redo step 1. (This is exactly the failure mode the
+   automatic version above no longer needs an operator for.)
 
 3. **Verify.** `[volte].pcscf_source_path` defaults to `/tmp/pcscf-0` (VoWiFi
    line 0), so no further config is needed for the single-line case. Confirm
@@ -707,17 +741,20 @@ above).
 
 With several VoWiFi lines, point `[volte].pcscf_source_path` at the specific
 line's file for the carrier you want — each line's P-CSCF comes from its own
-network, so there's no single "the" address to default to across lines.
-`--pcscf` (CLI) / `[[volte.line]].pcscf` (config) overrides everything above
-and skips the file lookup entirely.
+network, so there's no single "the" address to default to across lines. The
+automatic version always uses the first discovered line for this same
+reason: every VoLTE line already reads this one shared path today, regardless
+of which modem captured it. `--pcscf` (CLI) / `[[volte.line]].pcscf` (config)
+overrides everything above and skips the file lookup (and automatic priming)
+entirely.
 
 #### Making it permanent
 
 The captured address rarely changes for a given SIM/carrier in practice, so
-once you've primed it once you can skip repeating the dance on every
-deployment: pin it directly with `[[volte.line]].pcscf = "<captured
-address>"`. This survives any container recreate, at the cost of needing a
-manual update (redo the dance once) if the carrier ever reassigns its P-CSCF.
+you can pin it directly with `[[volte.line]].pcscf = "<captured address>"`.
+This survives any container recreate and also opts a deployment out of
+automatic priming entirely (an override always wins), at the cost of needing
+a manual update if the carrier ever reassigns its P-CSCF.
 
 #### Why nothing else works (don't re-investigate this)
 

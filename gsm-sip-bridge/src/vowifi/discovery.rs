@@ -451,6 +451,24 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     }
 }
 
+/// Builds the [`LineResolutionEntry`] for exactly one already-selected modem,
+/// deriving its per-line resources the same way [`resolve_lines`] does for a
+/// persistent line, but without competing for `[vowifi].max_lines` or losing
+/// to a pinned/pcsc line's priority tier.
+///
+/// For VoLTE's transient priming capture (specs/080-volte-pcscf-auto-prime):
+/// the target modem is already chosen by VoLTE's own selection
+/// (`crate::volte::discovery::resolve_volte_lines`), which competes for a
+/// completely separate `[volte].max_lines` budget. Routing it back through
+/// `resolve_lines` made it compete for `[vowifi].max_lines` too — a real
+/// deployment can pin a *different* modem (or a `pcsc_reader` line) to every
+/// available VoWiFi slot, which excluded the VoLTE-selected modem from the
+/// resolution and made priming fail forever even though that modem is
+/// perfectly usable (Greptile PR #87 review, second finding).
+pub fn resolve_single_line(modem: &ProbedModem, base: &VowifiConfig) -> LineResolutionEntry {
+    LineResolutionEntry::from(&resolve_one_line(0, modem, base))
+}
+
 /// Deterministically derives a syntactically valid IMEI (TS 23.003 Annex A
 /// Luhn check digit) for a `pcsc_reader` line's `+sip.instance` Contact
 /// parameter — there's no modem to read a real one from via `AT+CGSN`.
@@ -1501,6 +1519,42 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Greptile PR #87 review, second finding: a pinned modem consuming the
+    /// entire `[vowifi].max_lines` budget must not be able to exclude a
+    /// *different*, already-selected modem from [`resolve_single_line`] —
+    /// unlike [`resolve_lines`], it never competes for that budget at all.
+    #[test]
+    fn resolve_single_line_ignores_max_lines_and_pin_priority() {
+        let pinned = ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1");
+        let target = ready_modem("ec20-ZZZZZZ", "/dev/ttyUSB1", false, "2");
+        let base = VowifiConfig {
+            max_lines: 1,
+            line_overrides: vec![VowifiLineOverride {
+                modem_serial: Some(pinned.card_id.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Sanity: under `resolve_lines`, the pinned modem's own tier fills
+        // the entire budget, excluding the target modem.
+        let assignment = RoleAssignment {
+            circuit_switched: vec![],
+            vowifi: vec![pinned.clone(), target.clone()],
+        };
+        let via_resolve_lines = resolve_lines(&assignment, &base);
+        assert!(
+            via_resolve_lines
+                .lines
+                .iter()
+                .all(|l| l.card_id != target.card_id),
+            "sanity check: the pinned modem must consume the whole max_lines=1 budget"
+        );
+
+        let entry = resolve_single_line(&target, &base);
+        assert_eq!(entry.card_id, target.card_id);
     }
 
     /// specs/026-disable-circuit-switched, greptile P1: an explicit
