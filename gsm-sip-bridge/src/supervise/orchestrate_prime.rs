@@ -146,16 +146,32 @@ fn render_shared_charon_assets(runner: &dyn CommandRunner, line: &LineResolution
 ///
 /// `started` is the real, container-wide `StartedState` (Greptile PR #87
 /// review, finding 2's follow-up — see [`prime_with_line`]'s own doc comment
-/// for why it is no longer a local, throwaway one), so after tearing down,
-/// this also clears exactly the fields this attempt populated: neither a
-/// later real shutdown nor this attempt's own next retry (on failure) should
-/// see stale entries for resources already torn down above. Unconditionally
-/// safe: priming always runs before any real VoWiFi/VoLTE line starts (the
+/// for why it is no longer a local, throwaway one) — but the plan built
+/// below is deliberately scoped to a *synthetic* `StartedState` containing
+/// only the four fields priming itself ever populates, never a raw clone of
+/// the real one (Greptile PR #87 review, sixth finding: "Priming Stops The
+/// Main Daemon" — the circuit-switched daemon supervisor always starts
+/// before VoLTE and lives in that same shared struct, so a raw clone's
+/// teardown plan included a `KillChild` step for it on every single priming
+/// attempt, successful or not). After tearing down, this also clears those
+/// same fields back out of the real `started`: neither a later real
+/// shutdown nor this attempt's own next retry (on failure) should see stale
+/// entries for resources already torn down above. Unconditionally safe:
+/// priming always runs before any real VoWiFi/VoLTE line starts (the
 /// mutual-exclusion guarantee in `orchestrate::run`), so these fields are
 /// never shared with anything else concurrently.
 fn tear_down(runner: &dyn CommandRunner, started: &Arc<Mutex<StartedState>>, config_path: &str) {
-    let snapshot = started.lock().unwrap().clone();
-    let steps = shutdown::build_shutdown_plan(&snapshot, config_path);
+    let scoped = {
+        let real = started.lock().unwrap();
+        StartedState {
+            pcscd: real.pcscd.clone(),
+            vowifi_child_handles: real.vowifi_child_handles.clone(),
+            started_netns: real.started_netns.clone(),
+            vowifi_lines: real.vowifi_lines.clone(),
+            ..StartedState::default()
+        }
+    };
+    let steps = shutdown::build_shutdown_plan(&scoped, config_path);
     let _ = shutdown::execute_shutdown_plan(&steps, runner, &TeardownBudget::unbounded());
 
     let mut state = started.lock().unwrap();
@@ -454,6 +470,67 @@ mod tests {
                 && state.vowifi_lines.is_empty(),
             "the real, shared StartedState must be left exactly as it was found — no phantom \
              entries for a failed attempt's already-torn-down resources"
+        );
+    }
+
+    /// Greptile PR #87 review, sixth finding: "Priming Stops The Main
+    /// Daemon" — the circuit-switched daemon supervisor always starts before
+    /// VoLTE and lives in the same shared `StartedState` priming now
+    /// registers its own resources into. A teardown plan built from a raw
+    /// clone of that whole structure would include a `KillChild` step for
+    /// the daemon on every single priming attempt, successful or not — this
+    /// proves it does not, regardless of what else is already sitting in the
+    /// shared state when priming runs.
+    #[test]
+    fn tear_down_never_touches_resources_it_did_not_itself_create() {
+        let mock = Arc::new(MockCommandRunner::new());
+        mock.set_born_dead_if_argv_contains("charon");
+        let runner: Arc<dyn CommandRunner> = mock.clone();
+        let mut config = test_config();
+        config.volte.pcscf_source_path = std::env::temp_dir()
+            .join("pcscf-prime-test-daemon-untouched")
+            .to_string_lossy()
+            .to_string();
+        let line = priming_line();
+        let daemon_handle = Arc::new(
+            mock.spawn(super::super::runner::ChildSpec::new(["true"]))
+                .unwrap(),
+        );
+        let started = Arc::new(Mutex::new(StartedState {
+            daemon_supervisor: Some(daemon_handle.clone()),
+            ..StartedState::default()
+        }));
+        let real_shutting_down = Arc::new(RwLock::new(false));
+
+        let _ = prime_with_line(
+            runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &line,
+            &started,
+            &real_shutting_down,
+        );
+
+        assert!(
+            mock.children
+                .lock()
+                .unwrap()
+                .get(&daemon_handle.id())
+                .expect("the daemon's own handle must still be tracked")
+                .signals_received
+                .is_empty(),
+            "priming's own teardown must never signal a resource it did not create"
+        );
+        assert_eq!(
+            started
+                .lock()
+                .unwrap()
+                .daemon_supervisor
+                .as_ref()
+                .map(Arc::as_ptr),
+            Some(Arc::as_ptr(&daemon_handle)),
+            "an unrelated field in the shared StartedState must be left untouched"
         );
     }
 
