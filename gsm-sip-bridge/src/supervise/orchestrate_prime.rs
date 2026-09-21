@@ -143,10 +143,26 @@ fn render_shared_charon_assets(runner: &dyn CommandRunner, line: &LineResolution
 /// teardown code. Best-effort: called on both the success and failure
 /// paths, so whatever partially started before a failure is still cleaned
 /// up.
+///
+/// `started` is the real, container-wide `StartedState` (Greptile PR #87
+/// review, finding 2's follow-up — see [`prime_with_line`]'s own doc comment
+/// for why it is no longer a local, throwaway one), so after tearing down,
+/// this also clears exactly the fields this attempt populated: neither a
+/// later real shutdown nor this attempt's own next retry (on failure) should
+/// see stale entries for resources already torn down above. Unconditionally
+/// safe: priming always runs before any real VoWiFi/VoLTE line starts (the
+/// mutual-exclusion guarantee in `orchestrate::run`), so these fields are
+/// never shared with anything else concurrently.
 fn tear_down(runner: &dyn CommandRunner, started: &Arc<Mutex<StartedState>>, config_path: &str) {
     let snapshot = started.lock().unwrap().clone();
     let steps = shutdown::build_shutdown_plan(&snapshot, config_path);
     let _ = shutdown::execute_shutdown_plan(&steps, runner, &TeardownBudget::unbounded());
+
+    let mut state = started.lock().unwrap();
+    state.pcscd = None;
+    state.vowifi_child_handles.clear();
+    state.started_netns.clear();
+    state.vowifi_lines.clear();
 }
 
 /// Runs one priming attempt end to end: discover a line, bring its tunnel
@@ -158,6 +174,7 @@ pub fn prime_pcscf(
     bin: &str,
     config_path: &str,
     config: &AppConfig,
+    started: &Arc<Mutex<StartedState>>,
     real_shutting_down: &Arc<RwLock<bool>>,
 ) -> Result<(), String> {
     if config.vowifi.tunnel_engine != "strongswan" {
@@ -172,7 +189,15 @@ pub fn prime_pcscf(
 
     let line = discover_priming_line(config)?;
 
-    prime_with_line(runner, bin, config_path, config, &line, real_shutting_down)
+    prime_with_line(
+        runner,
+        bin,
+        config_path,
+        config,
+        &line,
+        started,
+        real_shutting_down,
+    )
 }
 
 /// The rest of one priming attempt, given an already-resolved line —
@@ -180,20 +205,35 @@ pub fn prime_pcscf(
 /// every other per-line function in `orchestrate.rs` already is: by handing
 /// it a `LineResolutionEntry` built by the test, bypassing the `discover`
 /// subprocess and its real (non-`CommandRunner`-mediated) lines file.
+///
+/// `started` is the real, container-wide `StartedState` — **not** a local,
+/// throwaway one (Greptile PR #87 review, finding 2, second round: a local
+/// one made this attempt's pcscd/charon/netns/XFRM resources invisible to
+/// the real shutdown plan, which is built from this exact structure). Safe
+/// to share: priming always runs before any real VoWiFi/VoLTE line starts
+/// (the mutual-exclusion guarantee in `orchestrate::run`), so the specific
+/// fields this attempt touches (`pcscd`, `vowifi_child_handles`,
+/// `started_netns`, `vowifi_lines`) are always empty beforehand, and
+/// [`tear_down`] clears them again afterward — this attempt never actually
+/// collides with anything else reading or writing the same structure.
+/// `shutting_down` stays local, unlike `started`: it exists purely to stop
+/// this attempt's own transient background thread (the USIM bridge's retry
+/// loop) once this one attempt concludes, a signal with no meaning to
+/// anything outside this function — using the real flag for that would
+/// falsely tell the rest of the process a full container shutdown was under
+/// way. `real_shutting_down` (passed separately) is how this attempt
+/// actually observes a genuine one, read-only, to abandon an in-flight
+/// establish promptly instead of running out its own several-minute
+/// ceiling.
 pub(super) fn prime_with_line(
     runner: Arc<dyn CommandRunner>,
     bin: &str,
     config_path: &str,
     config: &AppConfig,
     line: &LineResolutionEntry,
+    started: &Arc<Mutex<StartedState>>,
     real_shutting_down: &Arc<RwLock<bool>>,
 ) -> Result<(), String> {
-    // Local to this one attempt — never the real, container-wide
-    // StartedState/shutting-down flag. Setting the real flag would begin a
-    // full container shutdown; a priming attempt must never do that, and
-    // must never be visible to the real shutdown plan either (it tears
-    // itself down synchronously, below, well before this function returns).
-    let started = Arc::new(Mutex::new(StartedState::default()));
     let shutting_down = Arc::new(RwLock::new(false));
 
     // Same reasoning as `start_vowifi_subsystem`'s own reclaim step: a
@@ -244,7 +284,7 @@ pub(super) fn prime_with_line(
         bin,
         config_path,
         config,
-        started: &started,
+        started,
         shutting_down: &shutting_down,
         alert_ctx: None,
         shared_charon: &shared_charon,
@@ -252,7 +292,7 @@ pub(super) fn prime_with_line(
     };
 
     let Some((mcc, mnc)) = prepare_vowifi_line(&ctx, line) else {
-        tear_down(runner.as_ref(), &started, config_path);
+        tear_down(runner.as_ref(), started, config_path);
         return Err(
             "priming: could not prepare the discovered line (modem/PLMN issue — see the \
                      error above)"
@@ -288,7 +328,7 @@ pub(super) fn prime_with_line(
         ),
     };
 
-    tear_down(runner.as_ref(), &started, config_path);
+    tear_down(runner.as_ref(), started, config_path);
 
     outcome
 }
@@ -319,12 +359,14 @@ mod tests {
         let mock = Arc::new(MockCommandRunner::new());
         let runner: Arc<dyn CommandRunner> = mock.clone();
 
+        let started = Arc::new(Mutex::new(StartedState::default()));
         let real_shutting_down = Arc::new(RwLock::new(false));
         let err = prime_pcscf(
             runner,
             "gsm-sip-bridge",
             "/tmp/cfg.toml",
             &config,
+            &started,
             &real_shutting_down,
         )
         .unwrap_err();
@@ -377,6 +419,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let line = priming_line();
+        let started = Arc::new(Mutex::new(StartedState::default()));
         let real_shutting_down = Arc::new(RwLock::new(false));
 
         let err = prime_with_line(
@@ -385,6 +428,7 @@ mod tests {
             "/tmp/cfg.toml",
             &config,
             &line,
+            &started,
             &real_shutting_down,
         )
         .unwrap_err();
@@ -401,6 +445,15 @@ mod tests {
         assert!(
             !std::path::Path::new(&config.volte.pcscf_source_path).exists(),
             "a failed attempt must never write a cache file"
+        );
+        let state = started.lock().unwrap();
+        assert!(
+            state.pcscd.is_none()
+                && state.vowifi_child_handles.is_empty()
+                && state.started_netns.is_empty()
+                && state.vowifi_lines.is_empty(),
+            "the real, shared StartedState must be left exactly as it was found — no phantom \
+             entries for a failed attempt's already-torn-down resources"
         );
     }
 
@@ -419,6 +472,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let line = priming_line();
+        let started = Arc::new(Mutex::new(StartedState::default()));
         // Already true before the attempt starts — the establish loop must
         // check this before its very first `tick_establishing`, not just
         // between sleeps, so this test never needs to drive a real
@@ -431,6 +485,7 @@ mod tests {
             "/tmp/cfg.toml",
             &config,
             &line,
+            &started,
             &real_shutting_down,
         )
         .unwrap_err();
