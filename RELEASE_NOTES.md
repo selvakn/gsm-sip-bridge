@@ -1,9 +1,6 @@
 # Release Notes
 
-<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.18.0
 
 - **Automatic VoLTE P-CSCF priming** -- VoLTE registration no longer needs the manual "priming dance" (temporarily enabling `[vowifi]`, restarting, copying the captured address into `[[volte.line]].pcscf`, then restarting again) to obtain a P-CSCF address. When no cached or explicitly-configured P-CSCF is available, the bridge now opens a transient VoWiFi tunnel in-process, captures the address from the IKE_AUTH exchange, tears the tunnel back down, and proceeds with VoLTE registration — all within one boot, with no manual `[vowifi]` toggling or container restart. An existing cache or `pcscf` override still skips this entirely, at no extra startup cost. Live-verified on real Vodafone (EC20) and Jio (EC25) hardware. See `docs/operations.md`.
 
