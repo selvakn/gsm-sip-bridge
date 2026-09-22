@@ -987,16 +987,20 @@ pub struct VolteConfig {
     pub respond_on_client: bool,
     /// Acknowledge an SMS delivered over this registration at the RP layer —
     /// the LTE counterpart to `VowifiConfig::sms_delivery_report`, same
-    /// TS 24.341 §5.3.2.4 procedure and same default (`true`): the access
-    /// bearer is irrelevant to an SMS-over-IP delivery report. Kept as its
-    /// own key rather than shared from `[vowifi]` so a VoLTE-only deployment
-    /// (no `[vowifi]` section at all) has a switch of its own, and so the two
-    /// accesses can diverge if a carrier is ever found that needs them to.
+    /// TS 24.341 §5.3.2.4 procedure: the access bearer is irrelevant to an
+    /// SMS-over-IP delivery report. Settable independently as its own
+    /// `[volte]` key, but when that key is absent this **inherits
+    /// `[vowifi].sms_delivery_report`** rather than defaulting to `true` on
+    /// its own — a config written before `[volte]` had this key already
+    /// relied on the `[vowifi]` value governing VoLTE too (both paths read
+    /// the same shared dispatcher), so an upgrade must not silently flip
+    /// VoLTE's behaviour back to the default. See `build::build_volte`.
     pub sms_delivery_report: bool,
     /// Whether an inbound `Privacy: id`/`user` withholds the caller's CNAP
     /// name from the PBX/SIP-server leg — the LTE counterpart to
-    /// `VowifiConfig::respect_caller_privacy`, same RFC 3325 §9.1 obligation
-    /// and same default (`true`). Kept separate for the same reason as
+    /// `VowifiConfig::respect_caller_privacy`, same RFC 3325 §9.1 obligation.
+    /// Inherits `[vowifi].respect_caller_privacy` when the `[volte]` key is
+    /// absent, for the same upgrade-compatibility reason as
     /// `sms_delivery_report` above.
     pub respect_caller_privacy: bool,
     /// Base network namespace name for a line's carrier-facing half
@@ -2113,8 +2117,8 @@ password = "pass"
         assert!(!parse(&src).volte.respond_on_client);
     }
 
-    /// [volte]'s own copy of `[vowifi].sms_delivery_report` — same default,
-    /// independently switchable.
+    /// [volte]'s own copy of `[vowifi].sms_delivery_report` — same default
+    /// when neither section says anything, independently switchable when set.
     #[test]
     fn volte_sms_delivery_report_is_on_unless_switched_off() {
         assert!(parse(MINIMAL_TOML).volte.sms_delivery_report);
@@ -2122,12 +2126,34 @@ password = "pass"
             "{MINIMAL_TOML}\n[volte]\nsms_delivery_report = false\n"
         ));
         assert!(!off.volte.sms_delivery_report);
-        // Independent of [vowifi]'s copy.
+        // Setting it under [volte] does not touch [vowifi]'s own copy.
         assert!(off.vowifi.sms_delivery_report);
     }
 
+    /// Upgrade compatibility (code review finding, greptile 2026-09-23): a
+    /// config written before `[volte]` had this key already relied on
+    /// `[vowifi].sms_delivery_report` governing VoLTE too (both paths shared
+    /// one dispatcher reading it). An absent `[volte]` key must keep meaning
+    /// that, not silently revert to `VolteConfig::default()`'s `true`.
+    #[test]
+    fn volte_sms_delivery_report_inherits_vowifis_value_when_unset() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsms_delivery_report = false\n"
+        ));
+        assert!(!cfg.vowifi.sms_delivery_report);
+        assert!(!cfg.volte.sms_delivery_report);
+
+        // An explicit [volte] key still overrides the inherited value.
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsms_delivery_report = false\n[volte]\nsms_delivery_report = true\n"
+        ));
+        assert!(!cfg.vowifi.sms_delivery_report);
+        assert!(cfg.volte.sms_delivery_report);
+    }
+
     /// [volte]'s own copy of `[vowifi].respect_caller_privacy` — same
-    /// default, independently switchable.
+    /// default when neither section says anything, independently switchable
+    /// when set.
     #[test]
     fn volte_respect_caller_privacy_is_on_unless_switched_off() {
         assert!(parse(MINIMAL_TOML).volte.respect_caller_privacy);
@@ -2135,8 +2161,26 @@ password = "pass"
             "{MINIMAL_TOML}\n[volte]\nrespect_caller_privacy = false\n"
         ));
         assert!(!off.volte.respect_caller_privacy);
-        // Independent of [vowifi]'s copy.
+        // Setting it under [volte] does not touch [vowifi]'s own copy.
         assert!(off.vowifi.respect_caller_privacy);
+    }
+
+    /// Upgrade compatibility — same reasoning as
+    /// `volte_sms_delivery_report_inherits_vowifis_value_when_unset`.
+    #[test]
+    fn volte_respect_caller_privacy_inherits_vowifis_value_when_unset() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nrespect_caller_privacy = false\n"
+        ));
+        assert!(!cfg.vowifi.respect_caller_privacy);
+        assert!(!cfg.volte.respect_caller_privacy);
+
+        // An explicit [volte] key still overrides the inherited value.
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nrespect_caller_privacy = false\n[volte]\nrespect_caller_privacy = true\n"
+        ));
+        assert!(!cfg.vowifi.respect_caller_privacy);
+        assert!(cfg.volte.respect_caller_privacy);
     }
 
     #[test]

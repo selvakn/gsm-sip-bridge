@@ -489,11 +489,17 @@ section! {
         /// Same meaning as `RawVowifi::respond_on_client`.
         pub respond_on_client: bool,
         /// Same meaning as `RawVowifi::sms_delivery_report` — SMS-over-IP's
-        /// RP-layer ack does not depend on the access.
-        pub sms_delivery_report: bool,
+        /// RP-layer ack does not depend on the access. `None` distinguishes
+        /// "not configured" from "explicitly true/false": a config written
+        /// before this key existed already relied on `[vowifi]`'s value
+        /// governing VoLTE too, so an absent `[volte]` key inherits it
+        /// instead of silently reverting to a hardcoded default.
+        pub sms_delivery_report: Option<bool>,
         /// Same meaning as `RawVowifi::respect_caller_privacy` — the RFC 3325
         /// `Privacy` header is a SIP/IMS-layer signal, not an access one.
-        pub respect_caller_privacy: bool,
+        /// `None` inherits `[vowifi]`'s value for the same reason as
+        /// `sms_delivery_report` above.
+        pub respect_caller_privacy: Option<bool>,
         /// `[[volte.line]]` — see [`RawVowifi::line`] on the naming.
         pub line: Vec<RawVolteLine>,
     }
@@ -516,8 +522,8 @@ impl Default for RawVolte {
             // Jio, harmless on Vodafone. Set `false` for a carrier proven to
             // need RFC 3261 §18.2.2's normal behaviour instead.
             respond_on_client: true,
-            sms_delivery_report: true,
-            respect_caller_privacy: true,
+            sms_delivery_report: None,
+            respect_caller_privacy: None,
             line: Vec::new(),
         }
     }

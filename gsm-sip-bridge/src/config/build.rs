@@ -746,7 +746,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
     })
 }
 
-fn build_volte(raw: RawVolte) -> BridgeResult<VolteConfig> {
+fn build_volte(raw: RawVolte, vowifi: &VowifiConfig) -> BridgeResult<VolteConfig> {
     let mut line_overrides = Vec::with_capacity(raw.line.len());
     for (i, l) in raw.line.into_iter().enumerate() {
         // `AT+CGDCONT=0` is not a context an operator can attach.
@@ -794,8 +794,16 @@ fn build_volte(raw: RawVolte) -> BridgeResult<VolteConfig> {
             raw.register_request_uri
         },
         respond_on_client: raw.respond_on_client,
-        sms_delivery_report: raw.sms_delivery_report,
-        respect_caller_privacy: raw.respect_caller_privacy,
+        // Absent means "not configured", not "explicitly true": a config
+        // written before [volte] had its own key already relied on
+        // [vowifi]'s value governing VoLTE too, so it must keep meaning that
+        // on upgrade rather than silently reverting to VolteConfig::default().
+        sms_delivery_report: raw
+            .sms_delivery_report
+            .unwrap_or(vowifi.sms_delivery_report),
+        respect_caller_privacy: raw
+            .respect_caller_privacy
+            .unwrap_or(vowifi.respect_caller_privacy),
         ..d
     })
 }
@@ -1064,7 +1072,7 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
     // shape as `build_alerts(raw.alerts, &sms)` above.
     let sip_server = build_sip_server(raw.sip_server)?;
     let vowifi = build_vowifi(raw.vowifi)?;
-    let volte = build_volte(raw.volte)?;
+    let volte = build_volte(raw.volte, &vowifi)?;
     // Cross-section, so it runs once all three exist rather than inside any one
     // of their builders.
     check_sip_server_port_ownership(&sip_server, &vowifi, &volte)?;
