@@ -794,6 +794,8 @@ fn build_volte(raw: RawVolte) -> BridgeResult<VolteConfig> {
             raw.register_request_uri
         },
         respond_on_client: raw.respond_on_client,
+        sms_delivery_report: raw.sms_delivery_report,
+        respect_caller_privacy: raw.respect_caller_privacy,
         ..d
     })
 }

@@ -668,8 +668,10 @@ pub struct VowifiConfig {
     /// `MESSAGE` request of our own back to the IP-SM-GW. On by default:
     /// §5.3.2.3 asks for both answers, and every real handset sends both.
     ///
-    /// Applies to the cellular path as much as the Wi-Fi one — the procedure
-    /// is the same over either access — despite living under `[vowifi]`.
+    /// The procedure is the same over the cellular access as over Wi-Fi —
+    /// see `VolteConfig::sms_delivery_report`, VoLTE's own copy of this
+    /// switch, kept separate so a VoWiFi-only or VoLTE-only reader is never
+    /// left wondering whether the other section's key affects them.
     ///
     /// On Jio this is not optional, measured by A/B on a live line
     /// (2026-08-24): with the report off, a submitted SMS is *never*
@@ -697,6 +699,10 @@ pub struct VowifiConfig {
     /// already fully trusted (e.g. an internal PBX no caller-facing party
     /// ever sees) and always showing the real name is preferred over
     /// honouring a carrier's withholding request.
+    ///
+    /// The `Privacy` header is a SIP/IMS-layer signal, not an access one —
+    /// see `VolteConfig::respect_caller_privacy`, VoLTE's own copy, kept
+    /// separate for the same reason as `sms_delivery_report` above.
     pub respect_caller_privacy: bool,
     /// Extra originating (INVITE) headers a carrier's TAS may want before it
     /// will treat the request as an MMTel voice call.
@@ -979,6 +985,20 @@ pub struct VolteConfig {
     /// harmless on Vodafone. Set `false` for a carrier proven to need
     /// RFC 3261 §18.2.2's normal behaviour instead.
     pub respond_on_client: bool,
+    /// Acknowledge an SMS delivered over this registration at the RP layer —
+    /// the LTE counterpart to `VowifiConfig::sms_delivery_report`, same
+    /// TS 24.341 §5.3.2.4 procedure and same default (`true`): the access
+    /// bearer is irrelevant to an SMS-over-IP delivery report. Kept as its
+    /// own key rather than shared from `[vowifi]` so a VoLTE-only deployment
+    /// (no `[vowifi]` section at all) has a switch of its own, and so the two
+    /// accesses can diverge if a carrier is ever found that needs them to.
+    pub sms_delivery_report: bool,
+    /// Whether an inbound `Privacy: id`/`user` withholds the caller's CNAP
+    /// name from the PBX/SIP-server leg — the LTE counterpart to
+    /// `VowifiConfig::respect_caller_privacy`, same RFC 3325 §9.1 obligation
+    /// and same default (`true`). Kept separate for the same reason as
+    /// `sms_delivery_report` above.
+    pub respect_caller_privacy: bool,
     /// Base network namespace name for a line's carrier-facing half
     /// (specs/020-volte-line-netns). Line 0 uses this unindexed; later lines
     /// append their index — the LTE analogue of `[vowifi].netns`, on a
@@ -1047,6 +1067,8 @@ impl Default for VolteConfig {
             line_overrides: Vec::new(),
             register_request_uri: "home-domain".to_string(),
             respond_on_client: true,
+            sms_delivery_report: true,
+            respect_caller_privacy: true,
             netns: "volte".to_string(),
             veth_carrier_iface: "veth-volte-ims".to_string(),
             veth_telephony_iface: "veth-volte-sip".to_string(),
@@ -2089,6 +2111,32 @@ password = "pass"
 
         let src = format!("{}\n[volte]\nrespond_on_client = false\n", MINIMAL_TOML);
         assert!(!parse(&src).volte.respond_on_client);
+    }
+
+    /// [volte]'s own copy of `[vowifi].sms_delivery_report` — same default,
+    /// independently switchable.
+    #[test]
+    fn volte_sms_delivery_report_is_on_unless_switched_off() {
+        assert!(parse(MINIMAL_TOML).volte.sms_delivery_report);
+        let off = parse(&format!(
+            "{MINIMAL_TOML}\n[volte]\nsms_delivery_report = false\n"
+        ));
+        assert!(!off.volte.sms_delivery_report);
+        // Independent of [vowifi]'s copy.
+        assert!(off.vowifi.sms_delivery_report);
+    }
+
+    /// [volte]'s own copy of `[vowifi].respect_caller_privacy` — same
+    /// default, independently switchable.
+    #[test]
+    fn volte_respect_caller_privacy_is_on_unless_switched_off() {
+        assert!(parse(MINIMAL_TOML).volte.respect_caller_privacy);
+        let off = parse(&format!(
+            "{MINIMAL_TOML}\n[volte]\nrespect_caller_privacy = false\n"
+        ));
+        assert!(!off.volte.respect_caller_privacy);
+        // Independent of [vowifi]'s copy.
+        assert!(off.vowifi.respect_caller_privacy);
     }
 
     #[test]

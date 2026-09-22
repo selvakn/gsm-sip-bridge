@@ -488,6 +488,12 @@ section! {
         pub register_request_uri: String,
         /// Same meaning as `RawVowifi::respond_on_client`.
         pub respond_on_client: bool,
+        /// Same meaning as `RawVowifi::sms_delivery_report` — SMS-over-IP's
+        /// RP-layer ack does not depend on the access.
+        pub sms_delivery_report: bool,
+        /// Same meaning as `RawVowifi::respect_caller_privacy` — the RFC 3325
+        /// `Privacy` header is a SIP/IMS-layer signal, not an access one.
+        pub respect_caller_privacy: bool,
         /// `[[volte.line]]` — see [`RawVowifi::line`] on the naming.
         pub line: Vec<RawVolteLine>,
     }
@@ -510,6 +516,8 @@ impl Default for RawVolte {
             // Jio, harmless on Vodafone. Set `false` for a carrier proven to
             // need RFC 3261 §18.2.2's normal behaviour instead.
             respond_on_client: true,
+            sms_delivery_report: true,
+            respect_caller_privacy: true,
             line: Vec::new(),
         }
     }
