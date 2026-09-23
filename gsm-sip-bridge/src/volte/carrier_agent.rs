@@ -229,6 +229,8 @@ pub(crate) fn run(
         // `[volte].respond_on_client`. This path installs its own Gm SAs just
         // like the ePDG one, so Jio's refusal of `port_us` responses applies.
         respond_on_client: app_config.volte.respond_on_client,
+        sms_delivery_report: app_config.volte.sms_delivery_report,
+        respect_caller_privacy: app_config.volte.respect_caller_privacy,
         answer_preference: sdp::AnswerPreference::cellular(),
         // Must equal the telephony line's `sip_leg_port`. They come from this
         // line's single derivation so they cannot drift apart.

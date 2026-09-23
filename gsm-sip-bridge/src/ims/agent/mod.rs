@@ -351,6 +351,8 @@ fn run_inner(
         status_port: crate::vowifi::AGENT_A_STATUS_PORT,
         wideband: config.wideband,
         respond_on_client: config.respond_on_client,
+        sms_delivery_report: config.sms_delivery_report,
+        respect_caller_privacy: config.respect_caller_privacy,
         // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
         // has no attachment of its own to refresh.
         answer_preference: sdp::AnswerPreference::legacy(),
@@ -594,6 +596,14 @@ pub(crate) struct InboundParams<'a> {
     /// the socket it arrived on — a carrier quirk, off everywhere but where a
     /// capture says otherwise. See `config::VowifiConfig::respond_on_client`.
     pub respond_on_client: bool,
+    /// See `config::VowifiConfig::sms_delivery_report` /
+    /// `config::VolteConfig::sms_delivery_report` — each caller supplies its
+    /// own section's copy, same as `respond_on_client` above.
+    pub sms_delivery_report: bool,
+    /// See `config::VowifiConfig::respect_caller_privacy` /
+    /// `config::VolteConfig::respect_caller_privacy` — each caller supplies
+    /// its own section's copy, same as `respond_on_client` above.
+    pub respect_caller_privacy: bool,
     pub answer_preference: sdp::AnswerPreference,
     /// Port the telephone-side half dials for its leg. The two halves must
     /// agree; see `inbound::handle_invite`.
@@ -653,6 +663,8 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         status_port,
         wideband,
         respond_on_client,
+        sms_delivery_report,
+        respect_caller_privacy,
         answer_preference,
         veth_sip_port,
         pre_renewal,
@@ -805,14 +817,14 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             modem_lock: modem_lock.as_ref(),
             dedupe: &dedupe,
             reassembly: &reassembly,
-            // Read from `[vowifi]` on both paths deliberately: SMS-over-IP is
-            // the same TS 24.341 procedure over LTE as over Wi-Fi, so one
-            // switch governs both rather than two that could disagree.
-            sms_delivery_report: app_config.vowifi.sms_delivery_report,
-            // Read from `[vowifi]` on both paths for the same reason as
-            // `sms_delivery_report` above: one switch, not two that disagree.
+            sms_delivery_report,
+            // Still read from `[vowifi]` on both paths deliberately, unlike
+            // `sms_delivery_report`/`respect_caller_privacy`: no carrier has
+            // ever needed a non-default header set on the VoLTE path, so
+            // giving it its own copy would be a config knob with no evidence
+            // behind it.
             originating_headers: app_config.vowifi.originating_headers,
-            respect_caller_privacy: app_config.vowifi.respect_caller_privacy,
+            respect_caller_privacy,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,

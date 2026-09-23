@@ -256,8 +256,9 @@ respond_on_client = false
 # one: TS 24.341 5.3.2.4's delivery report, an RP-ACK we send back to the
 # IP-SM-GW in a MESSAGE request of our own. 5.3.2.3 asks for both answers --
 # the 200 OK says the request arrived, the report says the text was taken --
-# and every real handset sends both. Applies to VoLTE lines too; the procedure
-# does not depend on the access.
+# and every real handset sends both. [volte] below has its own settable copy
+# of this switch, which inherits this value when not itself set -- so a
+# config already relying on this switch governing VoLTE keeps doing so.
 #   Jio -> REQUIRED. Measured by A/B on a live line: with this off, a
 #          submitted SMS is never delivered -- the message centre sends only
 #          Type 0 reachability probes and holds the text, and [cs].enabled
@@ -274,8 +275,10 @@ respond_on_client = false
 sms_delivery_report = true
 # Whether an inbound Privacy: id/user withholds the caller's CNAP name from
 # the PBX/SIP-server leg (RFC 3325 Sec9.1). The caller's number is unaffected
-# either way. Turn off only for a deployment where the onward leg is already
-# fully trusted and showing the real name always is preferred.
+# either way. [volte] below has its own settable copy of this switch, which
+# inherits this value when not itself set. Turn off only for a deployment
+# where the onward leg is already fully trusted and showing the real name
+# always is preferred.
 respect_caller_privacy = true
 # Optional originating (INVITE) headers, by name. Empty (the default) is the
 # minimal header set every carrier in production here places calls on --
@@ -445,6 +448,16 @@ max_lines = 8
 pcscf_source_path = "/tmp/pcscf-0"
 status_path = "/tmp/volte-registration-status"
 lock_path = "/tmp/volte-registration.lock"
+# Same meaning as [vowifi]'s field of the same name above. Settable
+# independently, but when commented out/absent this INHERITS [vowifi]'s
+# value instead of defaulting to true on its own -- so a config that already
+# relies on [vowifi].sms_delivery_report governing VoLTE keeps doing so.
+# Shown here set explicitly (matching [vowifi]'s own default) only for
+# documentation; a VoLTE-only deployment with no [vowifi] section gets true.
+sms_delivery_report = true
+# Same meaning as [vowifi]'s field of the same name above, and the same
+# inherits-when-absent behaviour as sms_delivery_report just above.
+respect_caller_privacy = true
 
 # --- Per-line configuration --------------------------------------------
 # Omit entirely for full auto-discovery: every SIM-ready modem becomes its
