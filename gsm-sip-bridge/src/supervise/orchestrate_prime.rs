@@ -47,6 +47,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// One line's priming result: its `card_id` paired with the outcome.
+type LineOutcome = (String, Result<(), String>);
+
 /// Bounds the establish-time loop for a priming attempt (research.md R3):
 /// unlike a real persistent line, priming is a one-shot action inside an
 /// operator-watched startup sequence and must not block it indefinitely on
@@ -94,24 +97,29 @@ const MAX_ESTABLISH_ATTEMPTS: u32 = 120;
 ///
 /// A `card_id` in `needed_card_ids` that no longer appears among currently-
 /// discovered VoLTE lines (e.g. its modem vanished between the manifest scan
-/// and this call) is silently absent from the result rather than an error —
-/// the caller's own per-line retry loop keeps that line waiting for its own
-/// cache to appear, exactly as it would for any other priming failure.
+/// and this call) is reported back in the second element of the returned
+/// tuple rather than as an error for the whole pass — the caller turns each
+/// one into a distinct, logged failure outcome for that `card_id`, exactly
+/// as it would for any other priming failure, so the line's own retry loop
+/// keeps waiting for its cache to appear without the operator losing
+/// visibility into why.
 fn discover_priming_lines(
     config: &AppConfig,
     needed_card_ids: &BTreeSet<String>,
-) -> Result<Vec<LineResolutionEntry>, String> {
+) -> Result<(Vec<LineResolutionEntry>, Vec<String>), String> {
     let modems = crate::commands::discover::scan_for_line_resolution(config)
         .map_err(|e| format!("priming: {e}"))?;
 
     let volte_lines = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte).lines;
 
     let mut result = Vec::new();
+    let mut found_card_ids = BTreeSet::new();
     let mut pass_index: u32 = 0;
     for volte_line in &volte_lines {
         if !needed_card_ids.contains(&volte_line.card_id) {
             continue;
         }
+        found_card_ids.insert(volte_line.card_id.clone());
         let Some(modem) = modems.iter().find(|m| m.card_id == volte_line.card_id) else {
             return Err(format!(
                 "priming: internal error — VoLTE selected modem {} but it is missing from the \
@@ -127,7 +135,21 @@ fn discover_priming_lines(
         pass_index += 1;
     }
 
-    Ok(result)
+    Ok((result, missing_card_ids(needed_card_ids, &found_card_ids)))
+}
+
+/// Every `card_id` present in `needed` but absent from `found` — pulled out
+/// of `discover_priming_lines` as a pure function purely so this specific
+/// piece of logic (which `card_id`s get their own reported failure instead
+/// of vanishing silently) is unit-testable without going through the real,
+/// hardware-dependent modem scan that function itself is not further tested
+/// against (see this module's own test-module note on that).
+fn missing_card_ids(needed: &BTreeSet<String>, found: &BTreeSet<String>) -> Vec<String> {
+    needed
+        .iter()
+        .filter(|c| !found.contains(*c))
+        .cloned()
+        .collect()
 }
 
 /// Resolves the single line the legacy, single-line VoLTE path
@@ -270,11 +292,12 @@ fn tear_down(runner: &dyn CommandRunner, started: &Arc<Mutex<StartedState>>, con
 /// come back `Err` — this function makes exactly one attempt per line and
 /// returns.
 ///
-/// Returns one `(card_id, outcome)` pair per line actually found and
-/// attempted — never a single pass/fail verdict for the whole pass, since
-/// one line's failure must never obscure another's success (FR-005). A
-/// `card_id` that could not be discovered at all is not present in the
-/// result (see `discover_priming_lines`'s own doc comment).
+/// Returns one `(card_id, outcome)` pair per `card_id` in `needed_card_ids`
+/// — never a single pass/fail verdict for the whole pass, since one line's
+/// failure must never obscure another's success (FR-005). A `card_id` that
+/// could not be discovered at all still gets its own `Err` outcome (see
+/// `discover_priming_lines`'s own doc comment), so every needed line is
+/// accounted for and logged by the caller.
 pub fn prime_pass(
     runner: Arc<dyn CommandRunner>,
     bin: &str,
@@ -283,7 +306,7 @@ pub fn prime_pass(
     needed_card_ids: &BTreeSet<String>,
     started: &Arc<Mutex<StartedState>>,
     real_shutting_down: &Arc<RwLock<bool>>,
-) -> Vec<(String, Result<(), String>)> {
+) -> Vec<LineOutcome> {
     if needed_card_ids.is_empty() {
         return Vec::new();
     }
@@ -302,8 +325,8 @@ pub fn prime_pass(
             .collect();
     }
 
-    let lines = match discover_priming_lines(config, needed_card_ids) {
-        Ok(lines) => lines,
+    let (lines, missing) = match discover_priming_lines(config, needed_card_ids) {
+        Ok(v) => v,
         Err(e) => {
             return needed_card_ids
                 .iter()
@@ -311,8 +334,18 @@ pub fn prime_pass(
                 .collect()
         }
     };
+    let mut missing_outcomes: Vec<LineOutcome> = missing
+        .into_iter()
+        .map(|c| {
+            let msg = format!(
+                "priming: line {c}: needed but not found in this pass's VoLTE line selection \
+                 (modem may have dropped out — will retry next pass)"
+            );
+            (c, Err(msg))
+        })
+        .collect();
     if lines.is_empty() {
-        return Vec::new();
+        return missing_outcomes;
     }
 
     let targets: Vec<PrimeTarget> = lines
@@ -326,7 +359,7 @@ pub fn prime_pass(
         })
         .collect();
 
-    prime_lines(
+    let mut outcomes = prime_lines(
         runner,
         bin,
         config_path,
@@ -334,7 +367,9 @@ pub fn prime_pass(
         &targets,
         started,
         real_shutting_down,
-    )
+    );
+    outcomes.append(&mut missing_outcomes);
+    outcomes
 }
 
 /// Runs one priming attempt for the legacy, single-line VoLTE path
@@ -385,6 +420,20 @@ pub fn prime_legacy_line(
         })
 }
 
+/// Turns a joined per-line thread's result into its `LineOutcome`, keeping
+/// `card_id` attributed to the right line even when the thread panicked —
+/// `card_id` is captured by the caller *before* the thread is spawned
+/// specifically so it survives a panic inside the thread, rather than
+/// falling back to an unattributable placeholder.
+fn join_outcome(card_id: String, joined: std::thread::Result<LineOutcome>) -> LineOutcome {
+    joined.unwrap_or_else(|_| {
+        (
+            card_id,
+            Err("priming: a line's establish thread panicked".to_string()),
+        )
+    })
+}
+
 /// The rest of one priming pass, given already-resolved lines — separated
 /// from `prime_pass` so it is directly testable the same way every other
 /// per-line function in `orchestrate.rs` already is: by handing it
@@ -419,7 +468,7 @@ fn prime_lines(
     targets: &[PrimeTarget],
     started: &Arc<Mutex<StartedState>>,
     real_shutting_down: &Arc<RwLock<bool>>,
-) -> Vec<(String, Result<(), String>)> {
+) -> Vec<LineOutcome> {
     // Same reasoning as `start_vowifi_subsystem`'s own reclaim step: a
     // previous pass killed mid-flight (e.g. the whole `supervise` process
     // was itself killed) can leave this pass's if_ids/netns/veths claimed
@@ -480,10 +529,14 @@ fn prime_lines(
     // rather than the real, container-wide flag.
     let shutting_down = Arc::new(RwLock::new(false));
 
-    let handles: Vec<std::thread::JoinHandle<(String, Result<(), String>)>> = targets
+    let handles: Vec<(String, std::thread::JoinHandle<LineOutcome>)> = targets
         .iter()
         .map(|t| (t.line.clone(), t.cache_path.clone()))
         .map(|(line, cache_path)| {
+            // Captured before the thread is spawned so a panic inside it
+            // still lets the join fallback below attribute the failure to
+            // the right line instead of reporting it as "<unknown>".
+            let card_id_for_panic = line.card_id.clone();
             let runner = Arc::clone(&runner);
             let bin = bin.to_string();
             let config_path = config_path.to_string();
@@ -493,7 +546,7 @@ fn prime_lines(
             let shared_charon = Arc::clone(&shared_charon);
             let real_shutting_down = Arc::clone(real_shutting_down);
 
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 let card_id = line.card_id.clone();
                 let ctx = LineStartup {
                     runner: &runner,
@@ -548,20 +601,14 @@ fn prime_lines(
                         )),
                     ),
                 }
-            })
+            });
+            (card_id_for_panic, handle)
         })
         .collect();
 
-    let outcomes: Vec<(String, Result<(), String>)> = handles
+    let outcomes: Vec<LineOutcome> = handles
         .into_iter()
-        .map(|h| {
-            h.join().unwrap_or_else(|_| {
-                (
-                    "<unknown>".to_string(),
-                    Err("priming: a line's establish thread panicked".to_string()),
-                )
-            })
-        })
+        .map(|(card_id, h)| join_outcome(card_id, h.join()))
         .collect();
 
     // Stop every line's own background thread (each USIM bridge's retry
@@ -581,6 +628,49 @@ mod tests {
     use super::super::runner::MockCommandRunner;
     use super::*;
     use crate::config::AppConfig;
+
+    #[test]
+    fn missing_card_ids_reports_a_needed_line_absent_from_this_passs_selection() {
+        let needed: BTreeSet<String> =
+            ["ec20-AAAAAA".to_string(), "ec20-BBBBBB".to_string()].into();
+        let found: BTreeSet<String> = ["ec20-AAAAAA".to_string()].into();
+
+        assert_eq!(
+            missing_card_ids(&needed, &found),
+            vec!["ec20-BBBBBB".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_card_ids_is_empty_when_every_needed_line_was_found() {
+        let needed: BTreeSet<String> = ["ec20-AAAAAA".to_string()].into();
+        let found = needed.clone();
+
+        assert!(missing_card_ids(&needed, &found).is_empty());
+    }
+
+    #[test]
+    fn join_outcome_passes_through_a_successful_threads_own_outcome() {
+        let joined: std::thread::Result<LineOutcome> = Ok(("ec20-AAAAAA".to_string(), Ok(())));
+
+        let (card_id, outcome) = join_outcome("ec20-AAAAAA".to_string(), joined);
+
+        assert_eq!(card_id, "ec20-AAAAAA");
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn join_outcome_attributes_a_panicked_threads_failure_to_its_own_card_id() {
+        let joined: std::thread::Result<LineOutcome> = Err(Box::new(()));
+
+        let (card_id, outcome) = join_outcome("ec20-BBBBBB".to_string(), joined);
+
+        assert_eq!(
+            card_id, "ec20-BBBBBB",
+            "a panic must not lose which line it belongs to"
+        );
+        assert!(outcome.is_err());
+    }
 
     fn test_config() -> AppConfig {
         let dir = tempfile::tempdir().unwrap();
