@@ -753,20 +753,27 @@ address, then switch to VoLTE.
 
 With several VoWiFi lines and `[volte].bridge_inbound = true` (the
 auto-discovered, multi-line VoLTE path), each VoLTE line resolves its own
-address in three tiers (specs/081-multi-carrier-pcscf): an explicit
+address in two tiers (specs/081-multi-carrier-pcscf): an explicit
 `[[volte.line]].pcscf` override, then that line's own `card_id`-keyed cache
 (`<[volte].pcscf_source_path>-<card_id>`, written automatically by the
-multi-carrier priming pass above), then the legacy, unkeyed
-`[volte].pcscf_source_path` file as a last-resort fallback — this fallback
-tier is what keeps a single-line deployment's existing configuration working
-unchanged; a genuinely multi-carrier fleet should rely on the per-`card_id`
-tier (automatic) rather than pointing the legacy shared file at any one
-line's file by hand, since only one line can ever "win" that shared value.
+multi-carrier priming pass above). The legacy, unkeyed
+`[volte].pcscf_source_path` file is **not** consulted here, deliberately: in
+a multi-line deployment that file is never safely any one line's own
+address — it could be another line's leftover capture, or (on a fleet
+upgraded from a pre-081, single-line-only deployment) a single stale
+capture from back when only the first discovered line was ever primed.
+Falling back to it would silently reintroduce the shared-address-across-
+carriers bug specs/081 exists to close. A line whose per-`card_id` cache
+isn't populated yet just waits for the next priming pass, same as any other
+unconfigured line.
+
 For the single-line, non-`bridge_inbound` path, nothing has changed: it
 still resolves the one line's address from `[volte].pcscf_source_path`
-directly, no `card_id` involved. `--pcscf` (CLI) / `[[volte.line]].pcscf`
-(config) overrides everything above and skips the file lookup (and automatic
-priming) entirely, for whichever line it's set on.
+directly (a genuine three-tier resolution there: override, then that one
+file, with no `card_id` involved at all, since there's only one line to
+ever mean). `--pcscf` (CLI) / `[[volte.line]].pcscf` (config) overrides
+everything above and skips the file lookup (and automatic priming)
+entirely, for whichever line it's set on.
 
 #### Making it permanent
 

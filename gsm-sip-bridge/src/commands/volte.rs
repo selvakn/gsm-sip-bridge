@@ -852,9 +852,13 @@ fn volte_bridge_single_line(
         .clone()
         .unwrap_or_else(|| crate::volte::bridge::DEFAULT_CARD_ID.to_string());
     let explicit = args.pcscf.map(|a| a.to_string());
-    let Some(pcscf) =
-        resolve_line_pcscf(explicit, args.pcscf_port, &args.pcscf_source_path, &card_id)
-    else {
+    let Some(pcscf) = resolve_line_pcscf(
+        explicit,
+        args.pcscf_port,
+        &args.pcscf_source_path,
+        &card_id,
+        true, // the genuinely single-line path: this file IS this line's own address
+    ) else {
         return Err(format!(
             "[discovering-pcscf] no P-CSCF address available: none passed with --pcscf, and \
              nothing usable in {} or its per-line cache. The VoWiFi path writes one file per \
@@ -913,12 +917,13 @@ pub(crate) fn volte_bridge_manifest_lines(
             pcscf_port,
             &volte.pcscf_source_path,
             &entry.card_id,
+            false, // multi-line: the unkeyed path could be another line's address
         ) else {
             tracing::error!(
                 card_id = %entry.card_id,
                 pcscf_source_path = %volte.pcscf_source_path,
                 "no P-CSCF available for this line: none configured, and nothing usable at \
-                 this line's own per-line cache or the legacy pcscf_source_path. The priming \
+                 this line's own per-line cache. The priming \
                  pass writes one file per line, keyed by card_id — point \
                  [volte].pcscf_source_path at a specific line's file, or wait for the next \
                  priming pass to run. Skipping this line"
@@ -1129,6 +1134,7 @@ pub(crate) fn handle_volte_carrier_agent_command(
         args.pcscf_port,
         &app_config.volte.pcscf_source_path,
         &entry.card_id,
+        false, // multi-line: the unkeyed path could be another line's address
     ) else {
         eprintln!(
             "volte-carrier-agent: line {}: no P-CSCF available (none configured and none \
@@ -1241,11 +1247,23 @@ pub(crate) fn handle_volte_carrier_agent_command(
 /// fallback every single-line/already-pinned deployment already relies on,
 /// so this tier alone reproduces exactly today's pre-081 behavior. `None`
 /// when none of the three is available.
+/// `allow_legacy_fallback` gates the third, unkeyed-`source_path` tier —
+/// **only** the genuinely single-line path (`volte_bridge_single_line`,
+/// `[volte].bridge_inbound = false`) may pass `true`. For any multi-line
+/// caller, that file is not necessarily *this* line's address at all: it
+/// may be another line's address left over from a previous priming pass,
+/// or — on a fleet upgraded from a pre-081 deployment — a single stale
+/// capture from back when only the first discovered line was ever primed.
+/// Treating it as "this line's own address" there would silently
+/// reintroduce the exact shared-address-across-carriers bug specs/081-
+/// multi-carrier-pcscf exists to close (Greptile PR #89 review, "Shared
+/// Cache Defeats Isolation").
 fn resolve_line_pcscf(
     explicit: Option<String>,
     pcscf_port: u16,
     source_path: &str,
     card_id: &str,
+    allow_legacy_fallback: bool,
 ) -> Option<std::net::SocketAddr> {
     if let Some(addr) = explicit {
         if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
@@ -1255,6 +1273,9 @@ fn resolve_line_pcscf(
     let per_line_cache = crate::volte::pcscf::per_line_cache_path(source_path, card_id);
     if let Some(ip) = crate::volte::pcscf::probe_epdg_cache(&per_line_cache).found() {
         return Some(std::net::SocketAddr::new(ip, pcscf_port));
+    }
+    if !allow_legacy_fallback {
+        return None;
     }
     let legacy_cache = std::path::PathBuf::from(source_path);
     crate::volte::pcscf::probe_epdg_cache(&legacy_cache)
@@ -1341,6 +1362,7 @@ mod resolve_line_pcscf_tests {
             5060,
             "/nonexistent/pcscf-base",
             "ec20-AAAAAA",
+            true,
         );
 
         assert_eq!(addr.unwrap().ip().to_string(), "2402:8100::1");
@@ -1355,7 +1377,7 @@ mod resolve_line_pcscf_tests {
         std::fs::write(&base, "2402:8100::9\n").unwrap();
         std::fs::write(&per_line, "2402:8100::1\n").unwrap();
 
-        let addr = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA");
+        let addr = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA", true);
 
         assert_eq!(addr.unwrap().ip().to_string(), "2402:8100::1");
 
@@ -1364,15 +1386,40 @@ mod resolve_line_pcscf_tests {
     }
 
     #[test]
-    fn falls_back_to_the_legacy_shared_file_when_no_per_line_cache_exists() {
+    fn falls_back_to_the_legacy_shared_file_when_no_per_line_cache_exists_and_fallback_is_allowed()
+    {
         let base =
             std::env::temp_dir().join(format!("resolve-line-pcscf-tier3-{}", std::process::id()));
         let base_str = base.to_string_lossy().to_string();
         std::fs::write(&base, "2402:8100::9\n").unwrap();
 
-        let addr = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA");
+        let addr = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA", true);
 
         assert_eq!(addr.unwrap().ip().to_string(), "2402:8100::9");
+
+        std::fs::remove_file(&base).ok();
+    }
+
+    /// Greptile PR #89 review, "Shared Cache Defeats Isolation": a
+    /// multi-line caller (`allow_legacy_fallback: false`) must never treat
+    /// the unkeyed, legacy file as this line's own address — even when it
+    /// parses and exists — since in a multi-line deployment it could be a
+    /// stale capture belonging to a different line or a pre-081 fleet.
+    #[test]
+    fn multi_line_callers_never_fall_back_to_the_legacy_shared_file() {
+        let base = std::env::temp_dir().join(format!(
+            "resolve-line-pcscf-no-fallback-{}",
+            std::process::id()
+        ));
+        let base_str = base.to_string_lossy().to_string();
+        std::fs::write(&base, "2402:8100::9\n").unwrap();
+
+        let addr = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA", false);
+
+        assert!(
+            addr.is_none(),
+            "a multi-line caller must not resolve to the legacy shared file's address"
+        );
 
         std::fs::remove_file(&base).ok();
     }
@@ -1389,8 +1436,8 @@ mod resolve_line_pcscf_tests {
         std::fs::write(&line_a, "2402:8100::1\n").unwrap();
         std::fs::write(&line_b, "2402:8100::2\n").unwrap();
 
-        let addr_a = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA");
-        let addr_b = resolve_line_pcscf(None, 5060, &base_str, "ec20-BBBBBB");
+        let addr_a = resolve_line_pcscf(None, 5060, &base_str, "ec20-AAAAAA", true);
+        let addr_b = resolve_line_pcscf(None, 5060, &base_str, "ec20-BBBBBB", true);
 
         assert_eq!(addr_a.unwrap().ip().to_string(), "2402:8100::1");
         assert_eq!(addr_b.unwrap().ip().to_string(), "2402:8100::2");
@@ -1401,7 +1448,13 @@ mod resolve_line_pcscf_tests {
 
     #[test]
     fn none_when_nothing_is_available_anywhere() {
-        let addr = resolve_line_pcscf(None, 5060, "/nonexistent/pcscf-base-none", "ec20-AAAAAA");
+        let addr = resolve_line_pcscf(
+            None,
+            5060,
+            "/nonexistent/pcscf-base-none",
+            "ec20-AAAAAA",
+            true,
+        );
 
         assert!(addr.is_none());
     }

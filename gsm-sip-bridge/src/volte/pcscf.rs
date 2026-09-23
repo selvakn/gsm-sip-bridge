@@ -541,20 +541,29 @@ pub fn per_line_cache_path(base: &str, card_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{base}-{card_id}"))
 }
 
-/// Whether a specific line already has a usable P-CSCF address, under the
-/// same three-tier precedence `commands::volte::resolve_line_pcscf` resolves
-/// an actual address with (research.md R2): (1) an explicit override, (2)
-/// this line's own `card_id`-keyed cache, (3) the legacy, unkeyed `base`
-/// file. A pure boolean sibling of that function — used wherever a caller
-/// only needs to decide *whether* to prime a line, not resolve the address
-/// itself (e.g. deciding which manifest lines belong in the next priming
-/// pass, specs/081-multi-carrier-pcscf FR-002/FR-007).
+/// Whether a specific line already has a usable P-CSCF address: (1) an
+/// explicit override, (2) this line's own `card_id`-keyed cache. A pure
+/// boolean sibling of `commands::volte::resolve_line_pcscf` — used wherever
+/// a caller only needs to decide *whether* to prime a line, not resolve the
+/// address itself (e.g. deciding which manifest lines belong in the next
+/// priming pass, specs/081-multi-carrier-pcscf FR-002/FR-007).
+///
+/// Deliberately **not** three-tier: every caller of this function is a
+/// multi-line (`bridge_inbound = true`) one, for which the legacy, unkeyed
+/// `base` file is never safely this line's own address — it could be
+/// another line's leftover capture, or a single stale file from a fleet
+/// upgraded from a pre-081, single-line-only deployment. Treating it as
+/// available here would make `lines_needing_priming` (its only caller
+/// besides the per-line gate) wrongly believe every line already has an
+/// address and skip priming entirely, silently reintroducing the exact
+/// shared-address-across-carriers bug this feature exists to close
+/// (Greptile PR #89 review, "Shared Cache Defeats Isolation"). The
+/// genuinely single-line path (`[volte].bridge_inbound = false`) uses
+/// `pcscf_is_available` directly instead, where the unkeyed file legitimately
+/// *is* that one line's own address.
 pub fn line_pcscf_is_available(base: &str, card_id: &str, override_addr: Option<&str>) -> bool {
     let per_line_cache = per_line_cache_path(base, card_id);
-    if pcscf_is_available(&per_line_cache, override_addr) {
-        return true;
-    }
-    pcscf_is_available(std::path::Path::new(base), None)
+    pcscf_is_available(&per_line_cache, override_addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -951,15 +960,20 @@ mod tests {
         std::fs::remove_file(&per_line).ok();
     }
 
+    /// Greptile PR #89 review, "Shared Cache Defeats Isolation": the legacy,
+    /// unkeyed file must never satisfy a multi-line caller's availability
+    /// check — every caller of `line_pcscf_is_available` is multi-line, and
+    /// treating a stray legacy file as "this line already has an address"
+    /// would skip priming for it entirely.
     #[test]
-    fn line_pcscf_is_available_true_for_the_legacy_shared_file_only() {
+    fn line_pcscf_is_available_false_for_the_legacy_shared_file_alone() {
         let base = std::env::temp_dir()
             .join(format!("line-avail-legacy-{}", std::process::id()))
             .to_string_lossy()
             .to_string();
         std::fs::write(&base, "2402:8100::9\n").unwrap();
 
-        assert!(line_pcscf_is_available(&base, "ec20-AAAAAA", None));
+        assert!(!line_pcscf_is_available(&base, "ec20-AAAAAA", None));
 
         std::fs::remove_file(&base).ok();
     }
