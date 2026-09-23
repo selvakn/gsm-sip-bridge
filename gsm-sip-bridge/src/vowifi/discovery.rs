@@ -456,8 +456,9 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
 /// persistent line, but without competing for `[vowifi].max_lines` or losing
 /// to a pinned/pcsc line's priority tier.
 ///
-/// For VoLTE's transient priming capture (specs/080-volte-pcscf-auto-prime):
-/// the target modem is already chosen by VoLTE's own selection
+/// For VoLTE's transient priming capture
+/// (specs/080-volte-pcscf-auto-prime, specs/081-multi-carrier-pcscf): the
+/// target modem is already chosen by VoLTE's own selection
 /// (`crate::volte::discovery::resolve_volte_lines`), which competes for a
 /// completely separate `[volte].max_lines` budget. Routing it back through
 /// `resolve_lines` made it compete for `[vowifi].max_lines` too — a real
@@ -465,8 +466,23 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
 /// available VoWiFi slot, which excluded the VoLTE-selected modem from the
 /// resolution and made priming fail forever even though that modem is
 /// perfectly usable (Greptile PR #87 review, second finding).
-pub fn resolve_single_line(modem: &ProbedModem, base: &VowifiConfig) -> LineResolutionEntry {
-    LineResolutionEntry::from(&resolve_one_line(0, modem, base))
+///
+/// `index` is a **pass-local** index (specs/081-multi-carrier-pcscf
+/// research.md R4), not the modem's real VoLTE line index and not used for
+/// the captured address's cache filename (that is keyed by `card_id` via
+/// `volte::pcscf::per_line_cache_path`, unaffected by this index). It exists
+/// solely so that priming more than one line in the same pass derives
+/// collision-free resources (netns, tunnel interface, XFRM if_id, veth
+/// addresses, vpcd port) for each: caller assigns 0..N densely across only
+/// the lines in that one pass. A single-line pass (or specs/080's original
+/// one-line-at-a-time priming) always passes `0`, identical to this
+/// function's previous hardcoded behavior.
+pub fn resolve_single_line(
+    modem: &ProbedModem,
+    base: &VowifiConfig,
+    index: u32,
+) -> LineResolutionEntry {
+    LineResolutionEntry::from(&resolve_one_line(index, modem, base))
 }
 
 /// Deterministically derives a syntactically valid IMEI (TS 23.003 Annex A
@@ -1553,8 +1569,31 @@ mod tests {
             "sanity check: the pinned modem must consume the whole max_lines=1 budget"
         );
 
-        let entry = resolve_single_line(&target, &base);
+        let entry = resolve_single_line(&target, &base, 0);
         assert_eq!(entry.card_id, target.card_id);
+    }
+
+    /// specs/081-multi-carrier-pcscf research.md R4: priming more than one
+    /// line in the same concurrent pass must derive collision-free
+    /// resources for each — the same non-collision guarantee
+    /// `resolve_lines_two_lines_derive_distinct_resources` already proves
+    /// for real, persistent lines, now proven for `resolve_single_line`'s
+    /// explicit pass-local index too.
+    #[test]
+    fn resolve_single_line_at_distinct_indices_derives_distinct_resources() {
+        let modem_a = ready_modem("ec20-AAAAAA", "/dev/ttyUSB0", false, "1");
+        let modem_b = ready_modem("ec20-BBBBBB", "/dev/ttyUSB1", false, "2");
+        let base = VowifiConfig::default();
+
+        let a = resolve_single_line(&modem_a, &base, 0);
+        let b = resolve_single_line(&modem_b, &base, 1);
+
+        assert_ne!(a.netns, b.netns);
+        assert_ne!(a.strongswan_tun_iface, b.strongswan_tun_iface);
+        assert_ne!(a.strongswan_if_id, b.strongswan_if_id);
+        assert_ne!(a.veth_local_addr, b.veth_local_addr);
+        assert_ne!(a.veth_peer_addr, b.veth_peer_addr);
+        assert_ne!(a.vpcd_port, b.vpcd_port);
     }
 
     /// specs/026-disable-circuit-switched, greptile P1: an explicit

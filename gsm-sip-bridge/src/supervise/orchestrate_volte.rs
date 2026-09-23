@@ -49,7 +49,7 @@ fn ensure_pcscf_primed(
         std::path::Path::new(&config.volte.pcscf_source_path),
         override_addr,
         || {
-            super::orchestrate_prime::prime_pcscf(
+            super::orchestrate_prime::prime_legacy_line(
                 Arc::clone(runner),
                 bin,
                 config_path,
@@ -92,6 +92,35 @@ fn ensure_pcscf_primed_with(
             false
         }
     }
+}
+
+/// Every `card_id` in `card_ids` that still lacks a usable P-CSCF address
+/// (specs/081-multi-carrier-pcscf FR-002/FR-007), under the same three-tier
+/// precedence `resolve_line_pcscf`/`line_pcscf_is_available` use elsewhere:
+/// an explicit override (from `overrides`, keyed by `card_id`) always wins,
+/// otherwise this line's own per-`card_id` cache or the legacy shared file.
+///
+/// Split out from the priming coordinator thread specifically so this
+/// decision — which lines belong in the next pass — is testable without
+/// spinning that thread or mocking `volte-discover-lines`/the manifest
+/// subprocess chain, the same rationale `ensure_pcscf_primed_with`'s own
+/// doc comment gives for its own extraction.
+fn lines_needing_priming(
+    config: &AppConfig,
+    card_ids: &[String],
+    overrides: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    card_ids
+        .iter()
+        .filter(|card_id| {
+            !crate::volte::pcscf::line_pcscf_is_available(
+                &config.volte.pcscf_source_path,
+                card_id,
+                overrides.get(*card_id).map(String::as_str),
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 /// Entry point, called from `orchestrate::run` when `[volte].enabled`.
@@ -174,37 +203,69 @@ fn start_multiline(
             return;
         }
 
-        // specs/080-volte-pcscf-auto-prime FR-001/FR-002b/FR-005/FR-008: a
-        // one-time pre-flight, unlike the legacy path's per-retry-iteration
-        // check — every discovered line already shares this one cache path
-        // (research.md R5), so there is nothing to gain from re-checking per
-        // line. No enclosing retry loop exists at this scope, so this loop uses
-        // the same 15s cadence directly rather than introducing a new one.
-        //
-        // Now runs on this function's own background thread (see the
-        // `std::thread::spawn` this whole body is wrapped in, above), not
-        // `orchestrate::run`'s — so `real_shutting_down` aborts a stuck
-        // attempt here too, including the first.
+        // specs/081-multi-carrier-pcscf FR-002/FR-002b/FR-005/FR-009: every
+        // manifest line that lacks a usable address (its own explicit
+        // override, its own per-`card_id` cache, or the legacy shared file
+        // — `line_pcscf_is_available`, research.md R2) is primed together
+        // in one concurrent pass (research.md R3), not just the first
+        // discovered line. This coordinator runs on its own background
+        // thread, separate from the per-line spawn loop below, and retries
+        // whichever lines are still missing after each pass on the
+        // existing 15s cadence — but it never blocks that spawn loop: each
+        // line's own thread (further down) independently polls for its own
+        // address and proceeds the instant it appears, regardless of what
+        // this coordinator is still doing for any other line (FR-005).
+        // Only one `prime_pass` call is ever in flight at a time (this
+        // single thread), avoiding two concurrent passes fighting over the
+        // one shared charon/pcscd a pass uses (research.md R3/R6).
         {
-            let override_addr = manifest
+            let runner = Arc::clone(&runner);
+            let bin = bin.clone();
+            let config_path = config_path.clone();
+            let config = config.clone();
+            let started = Arc::clone(&started);
+            let shutting_down = Arc::clone(&shutting_down);
+            let card_ids: Vec<String> = manifest.lines.iter().map(|l| l.card_id.clone()).collect();
+            let overrides: std::collections::HashMap<String, String> = manifest
                 .lines
-                .first()
+                .iter()
                 .filter(|l| !l.pcscf.is_empty())
-                .map(|l| l.pcscf.as_str());
-            while !ensure_pcscf_primed(
-                &runner,
-                &bin,
-                &config_path,
-                &config,
-                override_addr,
-                &started,
-                &shutting_down,
-            ) {
+                .map(|l| (l.card_id.clone(), l.pcscf.clone()))
+                .collect();
+
+            std::thread::spawn(move || loop {
+                if *shutting_down.read().unwrap() {
+                    return;
+                }
+                let needed = lines_needing_priming(&config, &card_ids, &overrides);
+                if needed.is_empty() {
+                    return;
+                }
+                println!(
+                    "[supervise] priming: no usable P-CSCF yet for {} line(s); capturing via a \
+                     transient VoWiFi tunnel before those lines register",
+                    needed.len()
+                );
+                let outcomes = super::orchestrate_prime::prime_pass(
+                    Arc::clone(&runner),
+                    &bin,
+                    &config_path,
+                    &config,
+                    &needed,
+                    &started,
+                    &shutting_down,
+                );
+                for (card_id, outcome) in &outcomes {
+                    match outcome {
+                        Ok(()) => println!("[supervise] priming: line {card_id}: succeeded"),
+                        Err(e) => eprintln!("[supervise] priming: line {card_id}: failed: {e}"),
+                    }
+                }
                 if *shutting_down.read().unwrap() {
                     return;
                 }
                 runner.sleep(Duration::from_secs(15));
-            }
+            });
         }
 
         // specs/041-shutdown-resource-cleanup US2/FR-014: mirrors the VoWiFi
@@ -354,11 +415,38 @@ fn start_multiline(
             drop(state);
             drop(guard);
 
+            // specs/081-multi-carrier-pcscf FR-005/FR-009: this line's own
+            // gate, checked fresh on every loop iteration (so a restart
+            // after the carrier agent exits re-checks too, though in
+            // practice the address never regresses once captured). Reuses
+            // this same thread — already one per line, already retrying on
+            // this exact cadence — rather than a new synchronization
+            // primitive (research.md R5): a line whose address isn't ready
+            // yet (still being primed, or its own priming attempt failed
+            // and the coordinator above hasn't retried it yet) simply waits
+            // here, never blocking or being blocked by any other line.
+            let pcscf_source_path_for_gate = config.volte.pcscf_source_path.clone();
+            let override_addr_for_gate = if line.pcscf.is_empty() {
+                None
+            } else {
+                Some(line.pcscf.clone())
+            };
+            let card_id_for_gate = card_id.clone();
+
             println!("[supervise] volte line {idx}: starting volte-carrier-agent (netns {netns}), supervised...");
             std::thread::spawn(move || loop {
                 let guard = shutting_down.read().unwrap();
                 if *guard {
                     return;
+                }
+                if !crate::volte::pcscf::line_pcscf_is_available(
+                    &pcscf_source_path_for_gate,
+                    &card_id_for_gate,
+                    override_addr_for_gate.as_deref(),
+                ) {
+                    drop(guard);
+                    runner.sleep(Duration::from_secs(15));
+                    continue;
                 }
                 match runner.spawn(ChildSpec::new([
                     "ip",
@@ -729,5 +817,153 @@ mod tests {
         assert!(!primed);
         assert!(attempted.get());
         std::fs::remove_file(&cache).ok();
+    }
+
+    fn test_config_with_pcscf_base(base: &str) -> AppConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sip]\nserver = \"sip.example.com\"\nusername = \"user\"\npassword = \"pass\"\n",
+        )
+        .unwrap();
+        let mut config = crate::config::load_config(&path).unwrap();
+        config.volte.pcscf_source_path = base.to_string();
+        config
+    }
+
+    /// specs/081-multi-carrier-pcscf FR-002/FR-002b/User Story 1: a fully
+    /// unconfigured, multi-carrier fleet must have every one of its lines
+    /// come back as needing priming — not just the first.
+    #[test]
+    fn every_unconfigured_line_needs_priming() {
+        let base = std::env::temp_dir()
+            .join(format!("lines-needing-priming-none-{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let config = test_config_with_pcscf_base(&base);
+        let card_ids = vec!["ec20-AAAAAA".to_string(), "ec20-BBBBBB".to_string()];
+
+        let needed = lines_needing_priming(&config, &card_ids, &Default::default());
+
+        assert_eq!(
+            needed,
+            ["ec20-AAAAAA", "ec20-BBBBBB"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+    }
+
+    /// specs/081-multi-carrier-pcscf User Story 3/SC-003: a line with an
+    /// explicit override, or a line whose own per-line cache is already
+    /// valid, must never appear in the needed set — only the genuinely
+    /// unconfigured line should.
+    #[test]
+    fn already_available_lines_are_excluded_mixed_carrier_fleet() {
+        let base = std::env::temp_dir()
+            .join(format!(
+                "lines-needing-priming-mixed-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let config = test_config_with_pcscf_base(&base);
+        let primed_cache = crate::volte::pcscf::per_line_cache_path(&base, "ec20-CACHED");
+        std::fs::write(&primed_cache, "2402:8100::5\n").unwrap();
+
+        let card_ids = vec![
+            "ec20-PINNED".to_string(),
+            "ec20-CACHED".to_string(),
+            "ec20-UNCONFIGURED".to_string(),
+        ];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("ec20-PINNED".to_string(), "2402:8100::1".to_string());
+
+        let needed = lines_needing_priming(&config, &card_ids, &overrides);
+
+        assert_eq!(
+            needed,
+            ["ec20-UNCONFIGURED"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+
+        std::fs::remove_file(&primed_cache).ok();
+    }
+
+    /// A fleet-topology change (research.md R1) must never make a
+    /// still-valid line reappear as needing priming just because a
+    /// *different* card_id was added to the manifest — the check is keyed
+    /// by `card_id`, not position.
+    #[test]
+    fn adding_a_new_line_does_not_disturb_an_already_primed_ones_status() {
+        let base = std::env::temp_dir()
+            .join(format!(
+                "lines-needing-priming-topology-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let config = test_config_with_pcscf_base(&base);
+        let existing_cache = crate::volte::pcscf::per_line_cache_path(&base, "ec20-EXISTING");
+        std::fs::write(&existing_cache, "2402:8100::9\n").unwrap();
+
+        let before =
+            lines_needing_priming(&config, &["ec20-EXISTING".to_string()], &Default::default());
+        assert!(before.is_empty());
+
+        // A new modem (`ec20-AAAAAA`, sorting before `ec20-EXISTING`) joins
+        // the fleet — same config, same cache, one more card_id.
+        let after = lines_needing_priming(
+            &config,
+            &["ec20-AAAAAA".to_string(), "ec20-EXISTING".to_string()],
+            &Default::default(),
+        );
+
+        assert_eq!(
+            after,
+            ["ec20-AAAAAA"].into_iter().map(String::from).collect()
+        );
+
+        std::fs::remove_file(&existing_cache).ok();
+    }
+
+    /// specs/081-multi-carrier-pcscf User Story 2 scenario 1: a redeploy
+    /// that wipes every line's cache in a mixed-carrier fleet must bring
+    /// every line back into the needed set, exactly like first-time setup —
+    /// no special-casing for "this used to work."
+    #[test]
+    fn every_line_needs_repriming_after_its_cache_is_wiped() {
+        let base = std::env::temp_dir()
+            .join(format!(
+                "lines-needing-priming-wiped-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let config = test_config_with_pcscf_base(&base);
+        let card_ids = vec!["ec20-AAAAAA".to_string(), "ec20-BBBBBB".to_string()];
+        let cache_a = crate::volte::pcscf::per_line_cache_path(&base, "ec20-AAAAAA");
+        let cache_b = crate::volte::pcscf::per_line_cache_path(&base, "ec20-BBBBBB");
+        std::fs::write(&cache_a, "2402:8100::1\n").unwrap();
+        std::fs::write(&cache_b, "2402:8100::2\n").unwrap();
+
+        assert!(lines_needing_priming(&config, &card_ids, &Default::default()).is_empty());
+
+        // Simulate a redeploy that wipes /tmp.
+        std::fs::remove_file(&cache_a).ok();
+        std::fs::remove_file(&cache_b).ok();
+
+        let needed = lines_needing_priming(&config, &card_ids, &Default::default());
+
+        assert_eq!(
+            needed,
+            ["ec20-AAAAAA", "ec20-BBBBBB"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
     }
 }
