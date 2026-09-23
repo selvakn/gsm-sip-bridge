@@ -664,32 +664,44 @@ that actually runs.
 The one thing that reliably works is letting the VoWiFi/ePDG path capture the
 address once, from the IKEv2 config payload, and handing that to VoLTE.
 
-#### It's automatic now (specs/080-volte-pcscf-auto-prime)
+#### It's automatic now (specs/080-volte-pcscf-auto-prime, specs/081-multi-carrier-pcscf)
 
-As of that feature, `supervise` does this for you. When `[volte].enabled =
-true` and neither an override nor a valid cache file is present, it borrows
-`discover`'s modem-discovery output, brings that line's ePDG tunnel up just
-long enough to capture the P-CSCF from the IKE_AUTH config payload, writes it
-to `[volte].pcscf_source_path`, and tears the transient tunnel back down —
-all before attempting VoLTE registration, in the same boot, with no operator
-step. Watch the logs for:
+As of specs/080, `supervise` does this for you. When `[volte].enabled = true`
+and neither an override nor a valid cache file is present for a line, it
+borrows `discover`'s modem-discovery output, brings that line's ePDG tunnel
+up just long enough to capture the P-CSCF from the IKE_AUTH config payload,
+writes it to a cache, and tears the transient tunnel back down — all before
+attempting VoLTE registration, in the same boot, with no operator step.
+
+specs/081 extends this from "the first discovered line only" to **every
+line that needs it**, primed concurrently, each into its own cache file
+keyed by that line's `card_id` (not its position in the discovery order —
+see "With several VoWiFi lines" below): `[volte].pcscf_source_path`
+`-<card_id>`, e.g. `/tmp/pcscf-0-ec20-ABCDEF`. A mixed-carrier fleet (one
+Jio-carrying modem, one Vodafone-carrying modem, say) now primes both lines
+on its own, each ending up with its own carrier's address — no manual
+per-carrier step, no risk of one line silently reusing another carrier's
+address. Watch the logs for:
 
 ```
-[supervise] priming: no usable P-CSCF yet for VoLTE; capturing one via a transient VoWiFi tunnel before proceeding
-[supervise] priming: captured P-CSCF <address>, wrote it to /tmp/pcscf-0
+[supervise] priming: no usable P-CSCF yet for 2 line(s); capturing via a transient VoWiFi tunnel before those lines register
+[supervise] priming: line ec20-ABCDEF: succeeded
+[supervise] priming: line ec20-123456: succeeded
 ```
 
-If priming fails (no usable modem/SIM, or the tunnel doesn't establish), that
-failure is reported distinctly from a carrier-side VoLTE registration failure
-(`priming failed: ...`), and retried on the same cadence VoLTE's own startup
-already uses elsewhere — no manual intervention needed there either.
+If priming fails for a line (no usable modem/SIM, or the tunnel doesn't
+establish), that line's failure is reported distinctly, attributed to that
+specific line, and retried independently on the same cadence VoLTE's own
+startup already uses elsewhere — a failing line never blocks or delays a
+line that already succeeded, and no manual intervention is needed for either.
 
-A deployment that already has a usable address — an explicit override, or a
-capture from a previous boot still sitting at the cache path — sees none of
-this: priming is skipped entirely, with no added startup activity. This also
-means the manual dance's biggest failure mode (a container recreate wiping
-the capture) is no longer an operator problem: the next boot just notices the
-cache is gone and re-primes on its own.
+A line that already has a usable address — an explicit override, or a
+capture from a previous boot still sitting at its own cache path — sees none
+of this: priming is skipped for that line entirely, with no added startup
+activity, regardless of what other lines in the same deployment need. This
+also means the manual dance's biggest failure mode (a container recreate
+wiping the capture) is no longer an operator problem: the next boot just
+notices which lines' caches are gone and re-primes exactly those.
 
 This only ever runs as part of `supervise`'s own startup sequence, never for
 a standalone `volte-register`/`volte-listen`/`volte-call` invocation — those
@@ -739,14 +751,22 @@ address, then switch to VoLTE.
    curl -s localhost:9091/metrics | grep -E 'volte_(pdn_up|registered)'
    ```
 
-With several VoWiFi lines, point `[volte].pcscf_source_path` at the specific
-line's file for the carrier you want — each line's P-CSCF comes from its own
-network, so there's no single "the" address to default to across lines. The
-automatic version always uses the first discovered line for this same
-reason: every VoLTE line already reads this one shared path today, regardless
-of which modem captured it. `--pcscf` (CLI) / `[[volte.line]].pcscf` (config)
-overrides everything above and skips the file lookup (and automatic priming)
-entirely.
+With several VoWiFi lines and `[volte].bridge_inbound = true` (the
+auto-discovered, multi-line VoLTE path), each VoLTE line resolves its own
+address in three tiers (specs/081-multi-carrier-pcscf): an explicit
+`[[volte.line]].pcscf` override, then that line's own `card_id`-keyed cache
+(`<[volte].pcscf_source_path>-<card_id>`, written automatically by the
+multi-carrier priming pass above), then the legacy, unkeyed
+`[volte].pcscf_source_path` file as a last-resort fallback — this fallback
+tier is what keeps a single-line deployment's existing configuration working
+unchanged; a genuinely multi-carrier fleet should rely on the per-`card_id`
+tier (automatic) rather than pointing the legacy shared file at any one
+line's file by hand, since only one line can ever "win" that shared value.
+For the single-line, non-`bridge_inbound` path, nothing has changed: it
+still resolves the one line's address from `[volte].pcscf_source_path`
+directly, no `card_id` involved. `--pcscf` (CLI) / `[[volte.line]].pcscf`
+(config) overrides everything above and skips the file lookup (and automatic
+priming) entirely, for whichever line it's set on.
 
 #### Making it permanent
 

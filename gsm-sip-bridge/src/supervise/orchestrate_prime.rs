@@ -1,30 +1,37 @@
-//! Transient VoWiFi capture used to prime `[volte].pcscf_source_path`
-//! (specs/080-volte-pcscf-auto-prime) — the in-process replacement for
-//! docs/operations.md's manual "VoWiFi priming dance" (enable `[vowifi]`,
-//! restart, confirm a capture file appeared, flip back to `[volte]`,
-//! restart again).
+//! Transient VoWiFi capture used to prime VoLTE's per-line P-CSCF caches
+//! (specs/080-volte-pcscf-auto-prime, generalized to multiple, concurrently-
+//! primed lines by specs/081-multi-carrier-pcscf) — the in-process
+//! replacement for docs/operations.md's manual "VoWiFi priming dance"
+//! (enable `[vowifi]`, restart, confirm a capture file appeared, flip back
+//! to `[volte]`, restart again), now run for every VoLTE line that needs it
+//! in one pass instead of only the first discovered line.
 //!
-//! [`prime_pcscf`] borrows exactly one line from `discover`'s existing
-//! modem-discovery output, brings its ePDG tunnel up far enough to receive a
-//! P-CSCF from the IKE_AUTH config payload — reusing
-//! [`super::orchestrate::prepare_vowifi_line`] and
-//! [`super::orchestrate::establish_line_tunnel`] unchanged, the exact
-//! sequence a real, persistent `[vowifi]` line already uses on real
-//! hardware — writes the address to `[volte].pcscf_source_path`, and tears
-//! the transient line all the way back down using the same, already-
-//! hardware-exercised [`shutdown::build_shutdown_plan`] /
-//! [`shutdown::execute_shutdown_plan`] the container's own shutdown uses,
-//! scoped to a [`StartedState`] containing only this one line.
+//! [`prime_pass`] resolves every VoLTE line named in `needed_card_ids` from
+//! `discover`'s modem-discovery output, brings all of their ePDG tunnels up
+//! *concurrently*, sharing one charon instance the same way the real,
+//! persistent multi-line VoWiFi subsystem
+//! (`super::orchestrate::start_vowifi_subsystem`) already does for N
+//! simultaneous real lines (specs/081-multi-carrier-pcscf research.md R3) —
+//! reusing [`super::orchestrate::prepare_vowifi_line`] and
+//! [`super::orchestrate::establish_line_tunnel`] unchanged, exactly as
+//! specs/080's single-line version did — writes each line's captured
+//! address to *that line's own* per-`card_id` cache
+//! (`volte::pcscf::per_line_cache_path`, research.md R1), and tears every
+//! transient line all the way back down using the same, already-hardware-
+//! exercised [`shutdown::build_shutdown_plan`] / [`shutdown::
+//! execute_shutdown_plan`] the container's own shutdown uses, scoped to a
+//! [`StartedState`] containing only the lines this pass started.
 //!
 //! Never runs when `[vowifi].enabled` is persistently true — `orchestrate`'s
 //! own mutual-exclusion FATAL check already guarantees that whenever
 //! `[volte].enabled` is being started at all, `[vowifi]` is not (see
 //! `orchestrate::run`).
 //!
-//! This is the one thing in this feature that has not run against real
-//! hardware: see specs/080-volte-pcscf-auto-prime/quickstart.md's final
-//! section for exactly what still needs a live-hardware pass before this is
-//! fully trusted in production.
+//! The multi-line concurrency this module adds has not run against real,
+//! simultaneous multi-carrier hardware: see
+//! specs/081-multi-carrier-pcscf/quickstart.md's "Real-hardware validation
+//! still needed" section for exactly what still needs a live rig pass
+//! before this is fully trusted in production.
 
 use super::engines::SharedCharon;
 use super::orchestrate::{
@@ -36,6 +43,7 @@ use super::shutdown::{self, StartedState, TeardownBudget};
 use super::{epdg_iface, vpcd};
 use crate::config::AppConfig;
 use crate::vowifi::discovery::LineResolutionEntry;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -44,44 +52,95 @@ use std::sync::{Arc, Mutex, RwLock};
 /// operator-watched startup sequence and must not block it indefinitely on
 /// a single stuck attempt. `ESTABLISH_POLL_INTERVAL` is 2s, so this is a
 /// ~4-minute ceiling — generous enough for a slow ePDG negotiation, bounded
-/// enough that a caller's own retry cadence (FR-008) gets a turn instead.
+/// enough that a caller's own retry cadence (FR-009) gets a turn instead.
 const MAX_ESTABLISH_ATTEMPTS: u32 = 120;
 
-/// Resolves the one modem `[volte]` itself would pick as its own line 0
-/// (`crate::volte::discovery::resolve_volte_lines` — the exact selection
-/// `volte-discover-lines` runs), then builds the VoWiFi-shaped
-/// [`LineResolutionEntry`] priming needs for *that* modem directly
-/// (`crate::vowifi::discovery::resolve_single_line`), never through
+/// Resolves the [`LineResolutionEntry`] for every VoLTE line named in
+/// `needed_card_ids`, each at a distinct **pass-local** index
+/// (specs/081-multi-carrier-pcscf research.md R4) — 0..N across only the
+/// lines actually being primed in this call, unrelated to any line's real
+/// VoLTE index or its `card_id`-keyed cache filename.
+///
+/// Resolves the *set* of VoLTE-usable modems the same way
+/// `crate::volte::discovery::resolve_volte_lines` (the exact selection
+/// `volte-discover-lines` runs) does, then builds each requested line's
+/// VoWiFi-shaped [`LineResolutionEntry`] directly via
+/// `crate::vowifi::discovery::resolve_single_line`, never through
 /// `resolve_lines`'s `[vowifi].max_lines`/pin-priority membership tiers
-/// (Greptile PR #87 review, findings 1 and its mixed-modem follow-up).
+/// (Greptile PR #87 review, findings 1 and its mixed-modem follow-up, from
+/// specs/080's single-line version — the same reasoning applies per line
+/// here).
 ///
 /// Two separate reasons `resolve_lines` (VoWiFi's real, persistent-line
-/// resolver) is the wrong tool here, both found live-reviewing this PR:
-/// `[cs].enabled` (true by default) reserves every unpinned audio-capable
-/// modem for the circuit-switched pool, so on the single most common
-/// deployment shape (one audio-capable modem) VoWiFi's resolver reports zero
-/// candidates while VoLTE's own would happily use that exact modem, and
-/// priming retried forever; separately, on a mixed-modem system a *different*
-/// modem pinned to every available `[vowifi].max_lines` slot (or a
-/// `pcsc_reader` line) can consume the whole budget and exclude the
-/// VoLTE-selected modem even with `[cs].enabled = false`. `resolve_single_line`
-/// sidesteps both: it derives one modem's line resources directly, with no
-/// budget or pin tier to lose to — safe because priming's tunnel is
-/// transient and fully torn down (`tear_down`, below) before any real line,
-/// VoWiFi or circuit-switched, starts, so it never actually contends with a
-/// real reservation.
+/// resolver) is the wrong tool here: `[cs].enabled` (true by default)
+/// reserves every unpinned audio-capable modem for the circuit-switched
+/// pool, so VoWiFi's own resolver can report zero candidates for a modem
+/// VoLTE's own resolver would happily use; separately, a *different* modem
+/// pinned to every available `[vowifi].max_lines` slot can exclude a
+/// VoLTE-selected modem even with `[cs].enabled = false`.
+/// `resolve_single_line` sidesteps both: it derives each modem's line
+/// resources directly, with no budget or pin tier to lose to — safe because
+/// every priming tunnel is transient and fully torn down (`tear_down`,
+/// below) before any real line, VoWiFi or circuit-switched, starts, so it
+/// never actually contends with a real reservation.
 ///
 /// Calls `commands::discover::scan_for_line_resolution` directly, in-process
 /// — **not** the `discover` subcommand, and deliberately not through
-/// `CommandRunner` at all. Confirmed live on the Vodafone rig (2026-09-17):
-/// the `discover` subcommand's own `[vowifi].enabled` gate (in
-/// `handle_discover_command`, not in the resolution logic itself) means it
-/// always reports zero lines whenever `[vowifi].enabled` is false — which is
-/// *always* true here, per the mutual-exclusion guarantee this module's own
-/// doc comment describes. Going through the subcommand can therefore never
-/// work for priming; the underlying scan has to be called directly, bypassing
-/// that gate.
-fn discover_priming_line(config: &AppConfig) -> Result<LineResolutionEntry, String> {
+/// `CommandRunner` at all, for the same reason specs/080's version had to:
+/// the `discover` subcommand's own `[vowifi].enabled` gate always reports
+/// zero lines whenever `[vowifi].enabled` is false, which is *always* true
+/// here (the mutual-exclusion guarantee this module's own doc comment
+/// describes).
+///
+/// A `card_id` in `needed_card_ids` that no longer appears among currently-
+/// discovered VoLTE lines (e.g. its modem vanished between the manifest scan
+/// and this call) is silently absent from the result rather than an error —
+/// the caller's own per-line retry loop keeps that line waiting for its own
+/// cache to appear, exactly as it would for any other priming failure.
+fn discover_priming_lines(
+    config: &AppConfig,
+    needed_card_ids: &BTreeSet<String>,
+) -> Result<Vec<LineResolutionEntry>, String> {
+    let modems = crate::commands::discover::scan_for_line_resolution(config)
+        .map_err(|e| format!("priming: {e}"))?;
+
+    let volte_lines = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte).lines;
+
+    let mut result = Vec::new();
+    let mut pass_index: u32 = 0;
+    for volte_line in &volte_lines {
+        if !needed_card_ids.contains(&volte_line.card_id) {
+            continue;
+        }
+        let Some(modem) = modems.iter().find(|m| m.card_id == volte_line.card_id) else {
+            return Err(format!(
+                "priming: internal error — VoLTE selected modem {} but it is missing from the \
+                 scan that just produced it",
+                volte_line.card_id
+            ));
+        };
+        result.push(crate::vowifi::discovery::resolve_single_line(
+            modem,
+            &config.vowifi,
+            pass_index,
+        ));
+        pass_index += 1;
+    }
+
+    Ok(result)
+}
+
+/// Resolves the single line the legacy, single-line VoLTE path
+/// (`orchestrate_volte::start_legacy_registration`, `[volte].bridge_inbound
+/// = false`) primes — the exact same modem `discover_priming_line`
+/// (specs/080-volte-pcscf-auto-prime's original, singular version) always
+/// picked: VoLTE's own first-selected line, at pass-local index 0.
+///
+/// This path is unaffected by specs/081-multi-carrier-pcscf's per-`card_id`
+/// caching (that only applies to the `bridge_inbound` manifest path) — it
+/// keeps writing to the literal, unkeyed `[volte].pcscf_source_path`, so a
+/// legacy single-line deployment's behavior is unchanged by this feature.
+fn discover_first_volte_line(config: &AppConfig) -> Result<LineResolutionEntry, String> {
     let modems = crate::commands::discover::scan_for_line_resolution(config)
         .map_err(|e| format!("priming: {e}"))?;
 
@@ -108,15 +167,18 @@ fn discover_priming_line(config: &AppConfig) -> Result<LineResolutionEntry, Stri
     Ok(crate::vowifi::discovery::resolve_single_line(
         modem,
         &config.vowifi,
+        0,
     ))
 }
 
-/// Renders the one-line equivalent of `start_vowifi_subsystem`'s shared
-/// charon assets: `PCSCF_PLUGIN_CONF` must list this line's connection name
-/// *before* charon starts (`PCSCF_PLUGIN_CONF`'s own doc comment), and the
-/// swanctl top conf must point at the directory `establish_line_tunnel`
-/// writes this line's connection file into.
-fn render_shared_charon_assets(runner: &dyn CommandRunner, line: &LineResolutionEntry) {
+/// Renders the shared charon's assets for this pass's lines:
+/// `PCSCF_PLUGIN_CONF` must list every line's connection name *before*
+/// charon starts (`PCSCF_PLUGIN_CONF`'s own doc comment), and the swanctl
+/// top conf must point at the directory `establish_line_tunnel` writes each
+/// line's connection file into — the exact pattern
+/// `start_vowifi_subsystem` already uses for N real, persistent lines
+/// (research.md R3), scoped here to just the lines this pass is priming.
+fn render_shared_charon_assets(runner: &dyn CommandRunner, targets: &[PrimeTarget]) {
     let _ = runner.write_file(
         Path::new(SHARED_STRONGSWAN_CONF),
         &super::render::render_strongswan_conf(SHARED_VICI_SOCKET, SHARED_CHARON_LOG),
@@ -131,35 +193,54 @@ fn render_shared_charon_assets(runner: &dyn CommandRunner, line: &LineResolution
         Path::new(SHARED_SWANCTL_CONF),
         &super::render::render_swanctl_top_conf(SHARED_SWANCTL_CONF_DIR),
     );
-    let conn_name = format!("ims{}", line.index);
+    let conn_names: Vec<String> = targets
+        .iter()
+        .map(|t| format!("ims{}", t.line.index))
+        .collect();
     let _ = runner.write_file(
         Path::new(PCSCF_PLUGIN_CONF),
-        &super::render::render_pcscf_plugin_conf(&[conn_name]),
+        &super::render::render_pcscf_plugin_conf(&conn_names),
     );
 }
 
-/// Tears down exactly what this priming attempt started, using the same
-/// machinery the container's own shutdown uses (research.md R3) — never new
-/// teardown code. Best-effort: called on both the success and failure
-/// paths, so whatever partially started before a failure is still cleaned
-/// up.
+/// One line to prime, paired with exactly where its captured address should
+/// be written. Plain data rather than a callback so it stays trivially
+/// `Send` across each line's own establish thread.
+///
+/// The multi-line pass (`prime_pass`) always pairs a line with its own
+/// `card_id`-keyed path (`volte::pcscf::per_line_cache_path`, research.md
+/// R1). The legacy single-line path (`prime_legacy_line`) pairs its one
+/// line with the literal, unkeyed `[volte].pcscf_source_path` instead —
+/// unaffected by this feature, matching its pre-081 behavior exactly.
+struct PrimeTarget {
+    line: LineResolutionEntry,
+    cache_path: std::path::PathBuf,
+}
+
+/// Tears down exactly what this priming pass started, using the same
+/// machinery the container's own shutdown uses (research.md R6) — never new
+/// teardown code. Best-effort: called once, after every line in the pass
+/// has concluded (success or failure), so whatever any of them partially
+/// started is still cleaned up.
 ///
 /// `started` is the real, container-wide `StartedState` (Greptile PR #87
-/// review, finding 2's follow-up — see [`prime_with_line`]'s own doc comment
-/// for why it is no longer a local, throwaway one) — but the plan built
-/// below is deliberately scoped to a *synthetic* `StartedState` containing
-/// only the four fields priming itself ever populates, never a raw clone of
-/// the real one (Greptile PR #87 review, sixth finding: "Priming Stops The
-/// Main Daemon" — the circuit-switched daemon supervisor always starts
-/// before VoLTE and lives in that same shared struct, so a raw clone's
-/// teardown plan included a `KillChild` step for it on every single priming
-/// attempt, successful or not). After tearing down, this also clears those
+/// review, finding 2's follow-up — carried from specs/080's single-line
+/// version) — but the plan built below is deliberately scoped to a
+/// *synthetic* `StartedState` containing only the four fields priming ever
+/// populates, never a raw clone of the real one (Greptile PR #87 review,
+/// sixth finding: "Priming Stops The Main Daemon" — the circuit-switched
+/// daemon supervisor lives in that same shared struct, so a raw clone's
+/// teardown plan would include a `KillChild` step for it on every priming
+/// pass, successful or not). After tearing down, this also clears those
 /// same fields back out of the real `started`: neither a later real
-/// shutdown nor this attempt's own next retry (on failure) should see stale
+/// shutdown nor this pass's own next retry (on failure) should see stale
 /// entries for resources already torn down above. Unconditionally safe:
 /// priming always runs before any real VoWiFi/VoLTE line starts (the
 /// mutual-exclusion guarantee in `orchestrate::run`), so these fields are
-/// never shared with anything else concurrently.
+/// never shared with anything else concurrently — including across the
+/// several lines *this* pass itself primes at once, since every one of
+/// them writes into the same four `Vec`-shaped fields via ordinary
+/// `Mutex`-guarded pushes, never overwriting another line's entry.
 fn tear_down(runner: &dyn CommandRunner, started: &Arc<Mutex<StartedState>>, config_path: &str) {
     let scoped = {
         let real = started.lock().unwrap();
@@ -181,11 +262,88 @@ fn tear_down(runner: &dyn CommandRunner, started: &Arc<Mutex<StartedState>>, con
     state.vowifi_lines.clear();
 }
 
-/// Runs one priming attempt end to end: discover a line, bring its tunnel
-/// up, write the captured address to `[volte].pcscf_source_path`, tear the
-/// line back down. Callers (see `orchestrate_volte`) supply their own retry
-/// cadence — this function makes exactly one attempt and returns.
-pub fn prime_pcscf(
+/// Runs one priming pass end to end for every `card_id` in `needed_card_ids`:
+/// discover each line, bring every tunnel up *concurrently* sharing one
+/// charon instance, write each success to that line's own per-`card_id`
+/// cache, tear every line back down together. Callers (see
+/// `orchestrate_volte`) supply their own retry cadence for whichever lines
+/// come back `Err` — this function makes exactly one attempt per line and
+/// returns.
+///
+/// Returns one `(card_id, outcome)` pair per line actually found and
+/// attempted — never a single pass/fail verdict for the whole pass, since
+/// one line's failure must never obscure another's success (FR-005). A
+/// `card_id` that could not be discovered at all is not present in the
+/// result (see `discover_priming_lines`'s own doc comment).
+pub fn prime_pass(
+    runner: Arc<dyn CommandRunner>,
+    bin: &str,
+    config_path: &str,
+    config: &AppConfig,
+    needed_card_ids: &BTreeSet<String>,
+    started: &Arc<Mutex<StartedState>>,
+    real_shutting_down: &Arc<RwLock<bool>>,
+) -> Vec<(String, Result<(), String>)> {
+    if needed_card_ids.is_empty() {
+        return Vec::new();
+    }
+
+    if config.vowifi.tunnel_engine != "strongswan" {
+        let msg = format!(
+            "priming requires [vowifi].tunnel_engine = \"strongswan\" (the default) to capture \
+             a P-CSCF; this deployment configures {:?}, which priming does not support — supply \
+             an explicit [[volte.line]].pcscf, or run the manual VoWiFi dance once \
+             (docs/operations.md)",
+            config.vowifi.tunnel_engine
+        );
+        return needed_card_ids
+            .iter()
+            .map(|c| (c.clone(), Err(msg.clone())))
+            .collect();
+    }
+
+    let lines = match discover_priming_lines(config, needed_card_ids) {
+        Ok(lines) => lines,
+        Err(e) => {
+            return needed_card_ids
+                .iter()
+                .map(|c| (c.clone(), Err(e.clone())))
+                .collect()
+        }
+    };
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let targets: Vec<PrimeTarget> = lines
+        .into_iter()
+        .map(|line| {
+            let cache_path = crate::volte::pcscf::per_line_cache_path(
+                &config.volte.pcscf_source_path,
+                &line.card_id,
+            );
+            PrimeTarget { line, cache_path }
+        })
+        .collect();
+
+    prime_lines(
+        runner,
+        bin,
+        config_path,
+        config,
+        &targets,
+        started,
+        real_shutting_down,
+    )
+}
+
+/// Runs one priming attempt for the legacy, single-line VoLTE path
+/// (`[volte].bridge_inbound = false`) — the pre-081 behavior, unaffected by
+/// per-`card_id` caching: discovers VoLTE's own first-selected line
+/// (`discover_first_volte_line`) and writes its captured address to the
+/// literal, unkeyed `[volte].pcscf_source_path`, exactly as
+/// specs/080-volte-pcscf-auto-prime's original `prime_pcscf` did.
+pub fn prime_legacy_line(
     runner: Arc<dyn CommandRunner>,
     bin: &str,
     config_path: &str,
@@ -203,150 +361,219 @@ pub fn prime_pcscf(
         ));
     }
 
-    let line = discover_priming_line(config)?;
+    let line = discover_first_volte_line(config)?;
+    let target = PrimeTarget {
+        line,
+        cache_path: std::path::PathBuf::from(&config.volte.pcscf_source_path),
+    };
 
-    prime_with_line(
+    let outcomes = prime_lines(
         runner,
         bin,
         config_path,
         config,
-        &line,
+        &[target],
         started,
         real_shutting_down,
-    )
+    );
+    outcomes
+        .into_iter()
+        .next()
+        .map(|(_, outcome)| outcome)
+        .unwrap_or_else(|| {
+            Err("priming: internal error — no outcome for the legacy line".to_string())
+        })
 }
 
-/// The rest of one priming attempt, given an already-resolved line —
-/// separated from `prime_pcscf` so it is directly testable the same way
-/// every other per-line function in `orchestrate.rs` already is: by handing
-/// it a `LineResolutionEntry` built by the test, bypassing the `discover`
-/// subprocess and its real (non-`CommandRunner`-mediated) lines file.
+/// The rest of one priming pass, given already-resolved lines — separated
+/// from `prime_pass` so it is directly testable the same way every other
+/// per-line function in `orchestrate.rs` already is: by handing it
+/// `LineResolutionEntry` values built by the test, bypassing the `discover`
+/// subprocess and its real (non-`CommandRunner`-mediated) modem scan.
 ///
 /// `started` is the real, container-wide `StartedState` — **not** a local,
-/// throwaway one (Greptile PR #87 review, finding 2, second round: a local
-/// one made this attempt's pcscd/charon/netns/XFRM resources invisible to
-/// the real shutdown plan, which is built from this exact structure). Safe
-/// to share: priming always runs before any real VoWiFi/VoLTE line starts
-/// (the mutual-exclusion guarantee in `orchestrate::run`), so the specific
-/// fields this attempt touches (`pcscd`, `vowifi_child_handles`,
-/// `started_netns`, `vowifi_lines`) are always empty beforehand, and
-/// [`tear_down`] clears them again afterward — this attempt never actually
-/// collides with anything else reading or writing the same structure.
-/// `shutting_down` stays local, unlike `started`: it exists purely to stop
-/// this attempt's own transient background thread (the USIM bridge's retry
-/// loop) once this one attempt concludes, a signal with no meaning to
-/// anything outside this function — using the real flag for that would
-/// falsely tell the rest of the process a full container shutdown was under
-/// way. `real_shutting_down` (passed separately) is how this attempt
-/// actually observes a genuine one, read-only, to abandon an in-flight
-/// establish promptly instead of running out its own several-minute
-/// ceiling.
-pub(super) fn prime_with_line(
+/// throwaway one, for the same reason specs/080's single-line version
+/// needed it: the real shutdown plan is built from this exact structure.
+/// Safe to share, including across this pass's own several concurrent
+/// lines: priming always runs before any real VoWiFi/VoLTE line starts
+/// (the mutual-exclusion guarantee in `orchestrate::run`), the four fields
+/// this pass touches (`pcscd`, `vowifi_child_handles`, `started_netns`,
+/// `vowifi_lines`) are always empty beforehand, every line only ever
+/// *pushes* into the `Vec`-shaped ones (never overwrites), and
+/// [`tear_down`] clears them again afterward.
+///
+/// `shutting_down` is local to this pass (shared across every line in it,
+/// unlike `started`): it exists purely to stop this pass's own transient
+/// background threads (each line's USIM bridge retry loop) once every line
+/// has concluded, a signal with no meaning to anything outside this
+/// function — using the real flag for that would falsely tell the rest of
+/// the process a full container shutdown was under way.
+/// `real_shutting_down` (passed separately) is how every line actually
+/// observes a genuine one, read-only, to abandon an in-flight establish
+/// promptly instead of running out its own several-minute ceiling.
+fn prime_lines(
     runner: Arc<dyn CommandRunner>,
     bin: &str,
     config_path: &str,
     config: &AppConfig,
-    line: &LineResolutionEntry,
+    targets: &[PrimeTarget],
     started: &Arc<Mutex<StartedState>>,
     real_shutting_down: &Arc<RwLock<bool>>,
-) -> Result<(), String> {
-    let shutting_down = Arc::new(RwLock::new(false));
-
+) -> Vec<(String, Result<(), String>)> {
     // Same reasoning as `start_vowifi_subsystem`'s own reclaim step: a
-    // previous priming attempt killed mid-flight (e.g. the whole `supervise`
-    // process was itself killed) can leave this if_id/netns/veth claimed on
-    // the host. Reclaim them before creating anything of our own.
-    let mut our_if_ids = std::collections::BTreeSet::new();
-    our_if_ids.insert(line.strongswan_if_id);
+    // previous pass killed mid-flight (e.g. the whole `supervise` process
+    // was itself killed) can leave this pass's if_ids/netns/veths claimed
+    // on the host. Reclaim them all, up front, before creating anything of
+    // our own.
+    let our_if_ids: BTreeSet<u32> = targets.iter().map(|t| t.line.strongswan_if_id).collect();
     epdg_iface::reclaim_stale_xfrm(runner.as_ref(), &our_if_ids);
+    let reclaim_candidates: Vec<epdg_iface::ReclaimCandidate> = targets
+        .iter()
+        .map(|t| epdg_iface::ReclaimCandidate {
+            netns: t.line.netns.clone(),
+            tun_iface: Some(t.line.strongswan_tun_iface.clone()),
+            veth_host: Some(t.line.config.veth_sip_iface.clone()),
+            owned_iface_marker: Some(t.line.strongswan_tun_iface.clone()),
+        })
+        .collect();
     epdg_iface::reclaim_leftover_lines(
         runner.as_ref(),
-        &[epdg_iface::ReclaimCandidate {
-            netns: line.netns.clone(),
-            tun_iface: Some(line.strongswan_tun_iface.clone()),
-            veth_host: Some(line.config.veth_sip_iface.clone()),
-            owned_iface_marker: Some(line.strongswan_tun_iface.clone()),
-        }],
+        &reclaim_candidates,
         epdg_iface::reclaim_leftover_enabled(),
     );
 
-    let needs_vpcd = !line.pcsc_reader;
+    // One shared pcscd for the whole pass, matching `start_vowifi_subsystem`
+    // exactly: `render_vpcd_reader_conf`'s one conf entry already serves up
+    // to 8 slots from `[vowifi].vpcd_port` upward (its own doc comment), and
+    // every priming line's own `vpcd_port` — derived from its pass-local
+    // index (research.md R4) — falls within that range by construction.
+    let needs_vpcd = targets.iter().any(|t| !t.line.pcsc_reader);
     if needs_vpcd {
-        vpcd::write_vpcd_reader_conf(runner.as_ref(), line.vpcd_port);
+        vpcd::write_vpcd_reader_conf(runner.as_ref(), config.vowifi.vpcd_port);
     }
     let pcscd_handle = match vpcd::start_pcscd_with_retries(
         runner.as_ref(),
         needs_vpcd,
         &config.vowifi.vpcd_host,
-        line.vpcd_port,
+        config.vowifi.vpcd_port,
     ) {
         Ok(h) => Arc::new(h),
         Err(e) => {
-            return Err(format!("priming: pcscd/vpcd did not become ready: {e:?}"));
+            let msg = format!("priming: pcscd/vpcd did not become ready: {e:?}");
+            return targets
+                .iter()
+                .map(|t| (t.line.card_id.clone(), Err(msg.clone())))
+                .collect();
         }
     };
     started.lock().unwrap().pcscd = Some(pcscd_handle);
 
-    render_shared_charon_assets(runner.as_ref(), line);
-
+    render_shared_charon_assets(runner.as_ref(), targets);
     let shared_charon = Arc::new(SharedCharon::new(
         SHARED_STRONGSWAN_CONF.to_string(),
         SHARED_SWANCTL_CONF.to_string(),
         std::path::PathBuf::from(SHARED_CHARON_LOG),
     ));
 
-    let ctx = LineStartup {
-        runner: &runner,
-        bin,
-        config_path,
-        config,
-        started,
-        shutting_down: &shutting_down,
-        alert_ctx: None,
-        shared_charon: &shared_charon,
-        real_shutting_down: Some(real_shutting_down),
-    };
+    // One local flag shared by every line's own USIM-bridge thread in this
+    // pass — see this function's own doc comment for why it must be local
+    // rather than the real, container-wide flag.
+    let shutting_down = Arc::new(RwLock::new(false));
 
-    let Some((mcc, mnc)) = prepare_vowifi_line(&ctx, line) else {
-        tear_down(runner.as_ref(), started, config_path);
-        return Err(
-            "priming: could not prepare the discovered line (modem/PLMN issue — see the \
-                     error above)"
-                .to_string(),
-        );
-    };
+    let handles: Vec<std::thread::JoinHandle<(String, Result<(), String>)>> = targets
+        .iter()
+        .map(|t| (t.line.clone(), t.cache_path.clone()))
+        .map(|(line, cache_path)| {
+            let runner = Arc::clone(&runner);
+            let bin = bin.to_string();
+            let config_path = config_path.to_string();
+            let config = config.clone();
+            let started = Arc::clone(started);
+            let shutting_down = Arc::clone(&shutting_down);
+            let shared_charon = Arc::clone(&shared_charon);
+            let real_shutting_down = Arc::clone(real_shutting_down);
 
-    let result = establish_line_tunnel(&ctx, line, &mcc, &mnc, Some(MAX_ESTABLISH_ATTEMPTS));
+            std::thread::spawn(move || {
+                let card_id = line.card_id.clone();
+                let ctx = LineStartup {
+                    runner: &runner,
+                    bin: &bin,
+                    config_path: &config_path,
+                    config: &config,
+                    started: &started,
+                    shutting_down: &shutting_down,
+                    alert_ctx: None,
+                    shared_charon: &shared_charon,
+                    real_shutting_down: Some(&real_shutting_down),
+                };
 
-    // Stop this attempt's own background threads (the USIM bridge's retry
+                let Some((mcc, mnc)) = prepare_vowifi_line(&ctx, &line) else {
+                    return (
+                        card_id,
+                        Err(
+                            "priming: could not prepare the discovered line (modem/PLMN issue \
+                             — see the error above)"
+                                .to_string(),
+                        ),
+                    );
+                };
+
+                let result =
+                    establish_line_tunnel(&ctx, &line, &mcc, &mnc, Some(MAX_ESTABLISH_ATTEMPTS));
+
+                match result {
+                    Some((pcscf, _usim_holder)) => {
+                        let write_result = std::fs::write(&cache_path, &pcscf).map_err(|e| {
+                            format!(
+                                "priming: line {card_id}: captured {pcscf} but could not write \
+                                 it to {}: {e}",
+                                cache_path.display()
+                            )
+                        });
+                        match &write_result {
+                            Ok(()) => println!(
+                                "[supervise] priming: line {card_id}: captured P-CSCF {pcscf}, \
+                                 wrote it to {}",
+                                cache_path.display()
+                            ),
+                            Err(e) => eprintln!("[supervise] priming: {e}"),
+                        }
+                        (card_id, write_result)
+                    }
+                    None => (
+                        card_id.clone(),
+                        Err(format!(
+                            "priming: line {card_id}: the tunnel did not establish (see the \
+                             error above for which step failed)"
+                        )),
+                    ),
+                }
+            })
+        })
+        .collect();
+
+    let outcomes: Vec<(String, Result<(), String>)> = handles
+        .into_iter()
+        .map(|h| {
+            h.join().unwrap_or_else(|_| {
+                (
+                    "<unknown>".to_string(),
+                    Err("priming: a line's establish thread panicked".to_string()),
+                )
+            })
+        })
+        .collect();
+
+    // Stop every line's own background thread (each USIM bridge's retry
     // loop) *before* tearing down: `tear_down`'s `KillChild` step only stops
-    // the current process — without this, that loop would just spawn a
-    // replacement a few seconds later, right as we delete the netns it
-    // needs. This is the local, attempt-scoped flag, never the real one.
+    // the current process — without this, those loops would just spawn
+    // replacements a few seconds later, right as we delete the netns they
+    // need. This is the local, pass-scoped flag, never the real one.
     *shutting_down.write().unwrap() = true;
-
-    let outcome = match result {
-        Some((pcscf, _usim_holder)) => {
-            let write_result = std::fs::write(&config.volte.pcscf_source_path, &pcscf)
-                .map_err(|e| format!("priming: captured {pcscf} but could not write it: {e}"));
-            match &write_result {
-                Ok(()) => println!(
-                    "[supervise] priming: captured P-CSCF {pcscf}, wrote it to {}",
-                    config.volte.pcscf_source_path
-                ),
-                Err(e) => eprintln!("[supervise] priming: {e}"),
-            }
-            write_result
-        }
-        None => Err(
-            "priming: the tunnel did not establish (see the error above for which step failed)"
-                .to_string(),
-        ),
-    };
 
     tear_down(runner.as_ref(), started, config_path);
 
-    outcome
+    outcomes
 }
 
 #[cfg(test)]
@@ -365,7 +592,29 @@ mod tests {
         .unwrap();
         let mut config = crate::config::load_config(&path).unwrap();
         config.vowifi.epdg_ip = Some("192.0.2.1".to_string());
+        // Isolated per test (and distinct from the real default
+        // `/tmp/pcscf-0`), so `per_line_cache_path`-derived assertions never
+        // collide with another test or a stale file left by an earlier run.
+        config.volte.pcscf_source_path = std::env::temp_dir()
+            .join(format!("pcscf-prime-test-{}", uuid_like_suffix()))
+            .to_string_lossy()
+            .to_string();
         config
+    }
+
+    /// A cheap, dependency-free unique-enough suffix for test-local temp
+    /// paths — this crate has no `uuid` dependency, and a std-only source
+    /// (thread id + a monotonic counter) is sufficient to keep concurrently
+    /// run tests from colliding on the same file.
+    fn uuid_like_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{:?}-{}-{}",
+            std::thread::current().id(),
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     #[test]
@@ -377,17 +626,20 @@ mod tests {
 
         let started = Arc::new(Mutex::new(StartedState::default()));
         let real_shutting_down = Arc::new(RwLock::new(false));
-        let err = prime_pcscf(
+        let needed: BTreeSet<String> = ["card0".to_string()].into_iter().collect();
+        let outcomes = prime_pass(
             runner,
             "gsm-sip-bridge",
             "/tmp/cfg.toml",
             &config,
+            &needed,
             &started,
             &real_shutting_down,
-        )
-        .unwrap_err();
+        );
 
-        assert!(err.contains("strongswan"), "got: {err}");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, "card0");
+        assert!(outcomes[0].1.as_ref().unwrap_err().contains("strongswan"));
         assert!(
             mock.run_calls.lock().unwrap().is_empty(),
             "must bail before even running 'discover'"
@@ -397,25 +649,33 @@ mod tests {
     /// A minimal, otherwise-viable line — mirrors the `LineResolutionEntry`
     /// literals `orchestrate.rs`'s own tests already build to exercise
     /// `start_vowifi_line_strongswan` directly, bypassing `discover`.
-    fn priming_line() -> LineResolutionEntry {
+    fn priming_line(index: u32, card_id: &str, if_id: u32, vpcd_port: u16) -> LineResolutionEntry {
         LineResolutionEntry {
-            index: 0,
-            card_id: "card0".to_string(),
-            modem_port: "/dev/ttyUSB2".to_string(),
-            netns: "ims".to_string(),
+            index,
+            card_id: card_id.to_string(),
+            modem_port: format!("/dev/ttyUSB{index}"),
+            netns: format!("ims{index}"),
             control_port: 0,
-            veth_local_addr: "169.254.10.2".to_string(),
-            veth_peer_addr: "169.254.10.1".to_string(),
-            vpcd_port: 35963,
-            strongswan_if_id: 23,
-            strongswan_tun_iface: "tun23".to_string(),
-            pcscf_source_path: "/tmp/pcscf-prime-test".to_string(),
+            veth_local_addr: format!("169.254.{index}.2"),
+            veth_peer_addr: format!("169.254.{index}.1"),
+            vpcd_port,
+            strongswan_if_id: if_id,
+            strongswan_tun_iface: format!("tun{if_id}"),
+            pcscf_source_path: format!("/tmp/pcscf-prime-test-{index}"),
             mcc: "404".to_string(),
             mnc: "043".to_string(),
             pcsc_reader: false,
             configured_identifier: None,
             msisdn: None,
-            config: crate::config::VowifiConfig::default(),
+            // Bypasses `resolve_imsi`'s `vowifi-imsi` subprocess call, which
+            // MockCommandRunner would otherwise answer with an empty-but-
+            // successful output (no IMSI parsed, so the line would bail
+            // before ever reaching the establish loop this module's tests
+            // care about).
+            config: crate::config::VowifiConfig {
+                imsi_override: Some("404430123456789".to_string()),
+                ..Default::default()
+            },
         }
     }
 
@@ -429,26 +689,30 @@ mod tests {
         let mock = Arc::new(MockCommandRunner::new());
         mock.set_born_dead_if_argv_contains("charon");
         let runner: Arc<dyn CommandRunner> = mock.clone();
-        let mut config = test_config();
-        config.volte.pcscf_source_path = std::env::temp_dir()
-            .join("pcscf-prime-test-out")
-            .to_string_lossy()
-            .to_string();
-        let line = priming_line();
+        let config = test_config();
+        let line = priming_line(0, "card0", 23, 35963);
+        let cache_path =
+            crate::volte::pcscf::per_line_cache_path(&config.volte.pcscf_source_path, "card0");
+        let target = PrimeTarget {
+            line,
+            cache_path: cache_path.clone(),
+        };
         let started = Arc::new(Mutex::new(StartedState::default()));
         let real_shutting_down = Arc::new(RwLock::new(false));
 
-        let err = prime_with_line(
+        let outcomes = prime_lines(
             runner,
             "gsm-sip-bridge",
             "/tmp/cfg.toml",
             &config,
-            &line,
+            &[target],
             &started,
             &real_shutting_down,
-        )
-        .unwrap_err();
+        );
 
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, "card0");
+        let err = outcomes[0].1.as_ref().unwrap_err();
         assert!(err.contains("priming"), "got: {err}");
         assert!(
             mock.children
@@ -459,7 +723,7 @@ mod tests {
             "teardown must have signaled at least the pcscd child, even on a failed attempt"
         );
         assert!(
-            !std::path::Path::new(&config.volte.pcscf_source_path).exists(),
+            !cache_path.exists(),
             "a failed attempt must never write a cache file"
         );
         let state = started.lock().unwrap();
@@ -473,25 +737,102 @@ mod tests {
         );
     }
 
+    /// specs/081-multi-carrier-pcscf User Story 1/FR-005: one line's early
+    /// failure must never prevent, or corrupt the outcome of, another line
+    /// concurrently primed in the same pass.
+    ///
+    /// A genuine *successful* establish cannot be driven in this mock at
+    /// all — confirmed live while writing this test: `SharedCharon::
+    /// spawn_locked` unconditionally truncates the charon log
+    /// (`engines.rs`, `runner.write_file(&self.charon_log, "")`) the moment
+    /// it spawns the (mocked, no real process) charon daemon, so a
+    /// pre-seeded "established" log line can never survive to be read by
+    /// `tick_establishing` — the same "no real charon/EAP-AKA in CI" gap
+    /// this module's own doc comment already flags. So instead of proving
+    /// one line *succeeds* alongside another's failure, this proves the
+    /// narrower, still load-bearing property a regression here would break
+    /// first: one line failing fast (an absent modem port, caught by
+    /// `prepare_vowifi_line`'s existence check before it ever touches
+    /// charon) does not short-circuit the pass and skip the other line, and
+    /// each line's own outcome is attributed correctly — never the other
+    /// line's error, never silently dropped.
+    #[test]
+    fn one_lines_failure_does_not_prevent_or_corrupt_another_lines_outcome() {
+        let mock = Arc::new(MockCommandRunner::new());
+        let runner: Arc<dyn CommandRunner> = mock.clone();
+        let config = test_config();
+        mock.set_tcp_connect_ok(&config.vowifi.vpcd_host, config.vowifi.vpcd_port, true);
+        let mut failing = priming_line(1, "card-failing", 24, 35964);
+        failing.modem_port = "/dev/ttyUSB-nonexistent-for-this-test".to_string();
+        let healthy = priming_line(0, "card-healthy", 23, 35963);
+        let healthy_cache = crate::volte::pcscf::per_line_cache_path(
+            &config.volte.pcscf_source_path,
+            "card-healthy",
+        );
+        let failing_cache = crate::volte::pcscf::per_line_cache_path(
+            &config.volte.pcscf_source_path,
+            "card-failing",
+        );
+        let targets = vec![
+            PrimeTarget {
+                line: healthy,
+                cache_path: healthy_cache.clone(),
+            },
+            PrimeTarget {
+                line: failing,
+                cache_path: failing_cache.clone(),
+            },
+        ];
+        let started = Arc::new(Mutex::new(StartedState::default()));
+        let real_shutting_down = Arc::new(RwLock::new(false));
+
+        let outcomes = prime_lines(
+            runner,
+            "gsm-sip-bridge",
+            "/tmp/cfg.toml",
+            &config,
+            &targets,
+            &started,
+            &real_shutting_down,
+        );
+
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "the failing line's early return must not skip attempting the other line"
+        );
+        let by_card: std::collections::HashMap<_, _> = outcomes.into_iter().collect();
+        let failing_err = by_card["card-failing"].as_ref().unwrap_err();
+        assert!(
+            failing_err.contains("could not prepare"),
+            "got: {failing_err}"
+        );
+        let healthy_err = by_card["card-healthy"].as_ref().unwrap_err();
+        assert!(
+            !healthy_err.contains("could not prepare"),
+            "the healthy line's own outcome must never be the failing line's error: {healthy_err}"
+        );
+        assert!(!healthy_cache.exists());
+        assert!(!failing_cache.exists());
+    }
+
     /// Greptile PR #87 review, sixth finding: "Priming Stops The Main
     /// Daemon" — the circuit-switched daemon supervisor always starts before
     /// VoLTE and lives in the same shared `StartedState` priming now
     /// registers its own resources into. A teardown plan built from a raw
     /// clone of that whole structure would include a `KillChild` step for
-    /// the daemon on every single priming attempt, successful or not — this
-    /// proves it does not, regardless of what else is already sitting in the
-    /// shared state when priming runs.
+    /// the daemon on every pass, successful or not — this proves it does
+    /// not, regardless of how many lines a pass primes at once.
     #[test]
     fn tear_down_never_touches_resources_it_did_not_itself_create() {
         let mock = Arc::new(MockCommandRunner::new());
         mock.set_born_dead_if_argv_contains("charon");
         let runner: Arc<dyn CommandRunner> = mock.clone();
-        let mut config = test_config();
-        config.volte.pcscf_source_path = std::env::temp_dir()
-            .join("pcscf-prime-test-daemon-untouched")
-            .to_string_lossy()
-            .to_string();
-        let line = priming_line();
+        let config = test_config();
+        let line = priming_line(0, "card0", 23, 35963);
+        let cache_path =
+            crate::volte::pcscf::per_line_cache_path(&config.volte.pcscf_source_path, "card0");
+        let target = PrimeTarget { line, cache_path };
         let daemon_handle = Arc::new(
             mock.spawn(super::super::runner::ChildSpec::new(["true"]))
                 .unwrap(),
@@ -502,12 +843,12 @@ mod tests {
         }));
         let real_shutting_down = Arc::new(RwLock::new(false));
 
-        let _ = prime_with_line(
+        let _ = prime_lines(
             runner,
             "gsm-sip-bridge",
             "/tmp/cfg.toml",
             &config,
-            &line,
+            &[target],
             &started,
             &real_shutting_down,
         );
@@ -535,38 +876,41 @@ mod tests {
     }
 
     /// Greptile PR #87 review, finding 2: a real (container-wide) shutdown
-    /// that lands while a priming attempt is polling for its tunnel must not
+    /// that lands while a priming pass is polling for its tunnel(s) must not
     /// be left to run out its own several-minute ceiling — it must abandon
-    /// the attempt within one poll interval and still run its own local
-    /// teardown, exactly like any other establish failure.
+    /// every in-flight line within one poll interval and still run its own
+    /// local teardown, exactly like any other establish failure.
     #[test]
-    fn a_real_shutdown_mid_establish_abandons_the_attempt_and_still_tears_down() {
+    fn a_real_shutdown_mid_establish_abandons_every_line_and_still_tears_down() {
         let mock = Arc::new(MockCommandRunner::new());
         let runner: Arc<dyn CommandRunner> = mock.clone();
-        let mut config = test_config();
-        config.volte.pcscf_source_path = std::env::temp_dir()
-            .join("pcscf-prime-test-real-shutdown")
-            .to_string_lossy()
-            .to_string();
-        let line = priming_line();
+        let config = test_config();
+        let line = priming_line(0, "card0", 23, 35963);
+        let cache_path =
+            crate::volte::pcscf::per_line_cache_path(&config.volte.pcscf_source_path, "card0");
+        let target = PrimeTarget {
+            line,
+            cache_path: cache_path.clone(),
+        };
         let started = Arc::new(Mutex::new(StartedState::default()));
-        // Already true before the attempt starts — the establish loop must
+        // Already true before the pass starts — the establish loop must
         // check this before its very first `tick_establishing`, not just
         // between sleeps, so this test never needs to drive a real
         // multi-iteration poll.
         let real_shutting_down = Arc::new(RwLock::new(true));
 
-        let err = prime_with_line(
+        let outcomes = prime_lines(
             runner,
             "gsm-sip-bridge",
             "/tmp/cfg.toml",
             &config,
-            &line,
+            &[target],
             &started,
             &real_shutting_down,
-        )
-        .unwrap_err();
+        );
 
+        assert_eq!(outcomes.len(), 1);
+        let err = outcomes[0].1.as_ref().unwrap_err();
         assert!(err.contains("priming"), "got: {err}");
         assert!(
             mock.children
@@ -574,24 +918,20 @@ mod tests {
                 .unwrap()
                 .values()
                 .any(|c| !c.signals_received.is_empty()),
-            "teardown must still run for an attempt abandoned due to real shutdown"
+            "teardown must still run for a pass abandoned due to real shutdown"
         );
-        assert!(!std::path::Path::new(&config.volte.pcscf_source_path).exists());
+        assert!(!cache_path.exists());
     }
 
-    // `prime_pcscf` itself (as opposed to `prime_with_line`, tested above)
-    // is deliberately NOT unit tested here: `discover_priming_line` calls
-    // the real modem scanner directly, not through `CommandRunner` (see its
-    // own doc comment for why), so `prime_pcscf`'s behavior legitimately
-    // depends on whatever hardware is actually attached to the machine
-    // running the test — confirmed live on the Vodafone rig (2026-09-17),
-    // where an earlier version of this test that assumed "no modem present"
-    // instead found the real modem and proceeded to (mock-)spawn pcscd,
-    // failing the assertion that nothing gets spawned. That is exactly the
-    // "hardware not available in CI" situation the constitution's mocking
-    // carve-out exists for, in reverse: hardware *is* available here, so a
-    // test asserting its absence is not a fact about this code, it's a fact
-    // about this machine. `ensure_pcscf_primed_with` in `orchestrate_volte.rs`
-    // is where the decision logic around `prime_pcscf` is actually tested,
-    // with the call itself injected.
+    // `prime_pass` itself (as opposed to `prime_lines`, tested above) is
+    // deliberately NOT further unit tested for its `discover_priming_lines`
+    // step: that step calls the real modem scanner directly, not through
+    // `CommandRunner` (see its own doc comment for why), so its behavior
+    // legitimately depends on whatever hardware is actually attached to the
+    // machine running the test — the same "hardware not available in CI"
+    // situation the constitution's mocking carve-out exists for, in
+    // reverse, that specs/080's original single-line version already
+    // documented. The per-line gating/resolution decision logic around it
+    // (which `card_id`s end up in `needed_card_ids` at all) is tested in
+    // `orchestrate_volte.rs` instead, with the call itself injected.
 }
