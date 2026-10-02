@@ -272,7 +272,7 @@ pub fn execute_outbound_call(
     let dialog = outcome
         .dialog
         .expect("answered outcome always carries a confirmed dialog");
-    call.peer_uri = format!("sip:{}@{}", dialog.to_user, dialog.remote_target);
+    call.peer_uri = format!("sip:{}@{}", dialog.target_user, dialog.remote_target);
 
     let sdp_answer = outcome
         .sdp_answer

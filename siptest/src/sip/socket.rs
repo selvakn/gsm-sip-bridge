@@ -136,6 +136,7 @@ impl SipSocket {
         &self,
         call_id: &str,
         cseq: u32,
+        method: &str,
         timeout: Duration,
     ) -> SipTestResult<Option<SipResponse>> {
         let deadline = Instant::now() + timeout;
@@ -146,7 +147,9 @@ impl SipSocket {
             .unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(pos) = guard.iter().position(|r| {
-                r.header("Call-ID") == Some(call_id) && response_cseq_number(r) == Some(cseq)
+                r.header("Call-ID") == Some(call_id)
+                    && response_cseq(r)
+                        .is_some_and(|(n, m)| n == cseq && m.eq_ignore_ascii_case(method))
             }) {
                 return Ok(guard.remove(pos));
             }
@@ -208,10 +211,12 @@ impl Drop for SipSocket {
     }
 }
 
-/// The leading number of a `CSeq` header (`"2 INVITE"` -> `Some(2)`), or
-/// `None` if the header is missing or malformed.
-fn response_cseq_number(resp: &SipResponse) -> Option<u32> {
-    resp.header("CSeq")?.split_whitespace().next()?.parse().ok()
+/// A `CSeq` header as `(number, method)` (`"2 INVITE"` -> `Some((2, "INVITE"))`),
+/// or `None` if the header is missing or malformed.
+fn response_cseq(resp: &SipResponse) -> Option<(u32, &str)> {
+    let mut parts = resp.header("CSeq")?.split_whitespace();
+    let number = parts.next()?.parse().ok()?;
+    Some((number, parts.next()?))
 }
 
 fn reader_loop(socket: Arc<UdpSocket>, inbox: Arc<Inbox>, stop: Arc<AtomicBool>) {
@@ -286,6 +291,39 @@ mod tests {
         );
     }
 
+    /// A CANCEL shares its INVITE's CSeq number; its reply must not be taken
+    /// for the INVITE's own final response (or the other way round).
+    #[test]
+    fn a_response_is_matched_on_the_cseq_method_too() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let b = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        b.send(
+            a.local_addr(),
+            "SIP/2.0 200 OK\r\nCall-ID: c\r\nCSeq: 1 CANCEL\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        assert!(a
+            .recv_response("c", 1, "INVITE", Duration::from_millis(300))
+            .unwrap()
+            .is_none());
+        let cancel = a
+            .recv_response("c", 1, "CANCEL", Duration::from_secs(2))
+            .unwrap()
+            .expect("still queued for its owner");
+        assert_eq!(cancel.status, 200);
+    }
+
     #[test]
     fn responses_and_requests_are_demultiplexed_into_separate_queues() {
         use gsm_sip_bridge::ims::sip_client::{build_options, OptionsRequest};
@@ -323,7 +361,7 @@ mod tests {
 
         // a's response queue must still be empty — nothing crossed over.
         assert!(a
-            .recv_response("call1", 1, Duration::from_millis(50))
+            .recv_response("call1", 1, "OPTIONS", Duration::from_millis(50))
             .unwrap()
             .is_none());
 
@@ -334,7 +372,7 @@ mod tests {
         )
         .unwrap();
         let resp = a
-            .recv_response("call1", 1, Duration::from_secs(2))
+            .recv_response("call1", 1, "OPTIONS", Duration::from_secs(2))
             .unwrap()
             .expect("expected a to receive the 200 OK");
         assert_eq!(resp.status, 200);
@@ -374,14 +412,14 @@ mod tests {
         .unwrap();
 
         let resp = a
-            .recv_response("our-call", 1, Duration::from_secs(2))
+            .recv_response("our-call", 1, "INVITE", Duration::from_secs(2))
             .unwrap()
             .expect("expected our-call's response even though it wasn't first in the queue");
         assert_eq!(resp.header("Call-ID"), Some("our-call"));
 
         // The other transaction's response is still there, waiting for it.
         let other = a
-            .recv_response("someone-elses-call", 1, Duration::from_secs(2))
+            .recv_response("someone-elses-call", 1, "REGISTER", Duration::from_secs(2))
             .unwrap()
             .expect("the other transaction's response must not have been consumed or dropped");
         assert_eq!(other.header("Call-ID"), Some("someone-elses-call"));
@@ -425,16 +463,16 @@ mod tests {
         .unwrap();
 
         let resp = a
-            .recv_response("redirected-call", 2, Duration::from_secs(2))
+            .recv_response("redirected-call", 2, "INVITE", Duration::from_secs(2))
             .unwrap()
             .expect("expected CSeq 2's response despite CSeq 1's stale one sharing the Call-ID");
         assert_eq!(resp.status, 200);
-        assert_eq!(response_cseq_number(&resp), Some(2));
+        assert_eq!(response_cseq(&resp), Some((2, "INVITE")));
 
         // CSeq 1's stale response is still there, not silently consumed by
         // the CSeq-2 waiter above.
         let stale = a
-            .recv_response("redirected-call", 1, Duration::from_secs(2))
+            .recv_response("redirected-call", 1, "INVITE", Duration::from_secs(2))
             .unwrap()
             .expect("CSeq 1's response must not have been consumed by the CSeq-2 waiter");
         assert_eq!(stale.status, 302);
