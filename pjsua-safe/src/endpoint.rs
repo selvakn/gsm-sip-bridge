@@ -178,6 +178,14 @@ impl Endpoint {
                 cfg.cb.on_call_media_state = Some(on_call_media_state_cb);
                 cfg.cb.on_call_state = Some(on_call_state_cb);
                 cfg.cb.on_incoming_call = Some(on_incoming_call_cb);
+                // RFC 4028 session timers off (neither offered nor accepted).
+                // PJSUA's default is OPTIONAL: a phone whose INVITE offers
+                // `Session-Expires` makes pjsua the timer's other half, and a
+                // missed refresh makes pjsua BYE a healthy call on its own —
+                // indistinguishable in the logs from the phone hanging up.
+                // The carrier leg's own timer is handled by Agent A
+                // (`ims::agent::session_refresh`), not by this stack.
+                cfg.use_timer = pjsua_sys::pjsua_sip_timer_use_PJSUA_SIP_TIMER_INACTIVE;
 
                 let mut log_cfg: pjsua_sys::pjsua_logging_config = std::mem::zeroed();
                 pjsua_sys::pjsua_logging_config_default(&mut log_cfg);
@@ -822,11 +830,58 @@ unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid ac
         .push_back((acc_id, call_id, source_addr));
 }
 
+/// Classifies the PJSIP event that delivered a call's DISCONNECTED state, for
+/// the "SIP call disconnected" log line: the event kind plus the SIP message
+/// it carried — a request method (`rx_msg BYE` = the peer hung up; `tx_msg BYE`
+/// = we did, e.g. a pjsua-initiated timeout) or a response code.
+#[cfg(feature = "pjsip-linked")]
+unsafe fn disconnect_trigger(event: *const pjsua_sys::pjsip_event) -> String {
+    // SAFETY: event is null or the library-owned event passed to on_call_state, valid for the callback
+    if event.is_null() {
+        return "none".to_string();
+    }
+    let ev = &*event;
+    let (kind, rdata, tdata) = if ev.type_ == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_TSX_STATE {
+        let t = &ev.body.tsx_state;
+        (t.type_, t.src.rdata, t.src.tdata)
+    } else {
+        (ev.type_, ev.body.rx_msg.rdata, ev.body.tx_msg.tdata)
+    };
+    let msg = if kind == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_RX_MSG && !rdata.is_null() {
+        (*rdata).msg_info.msg
+    } else if kind == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_TX_MSG && !tdata.is_null() {
+        (*tdata).msg
+    } else {
+        std::ptr::null_mut()
+    };
+    if msg.is_null() {
+        return trigger_name(kind).to_string();
+    }
+    let what = if (*msg).type_ == pjsua_sys::pjsip_msg_type_e_PJSIP_REQUEST_MSG {
+        pj_str_to_string(&(*msg).line.req.method.name)
+    } else {
+        (*msg).line.status.code.to_string()
+    };
+    format!("{} {what}", trigger_name(kind))
+}
+
+#[cfg(any(feature = "pjsip-linked", test))]
+fn trigger_name(kind: u32) -> &'static str {
+    use pjsua_sys::*;
+    match kind {
+        k if k == pjsip_event_id_e_PJSIP_EVENT_TIMER => "timer",
+        k if k == pjsip_event_id_e_PJSIP_EVENT_TX_MSG => "tx_msg",
+        k if k == pjsip_event_id_e_PJSIP_EVENT_RX_MSG => "rx_msg",
+        k if k == pjsip_event_id_e_PJSIP_EVENT_TRANSPORT_ERROR => "transport_error",
+        _ => "other",
+    }
+}
+
 #[cfg(feature = "pjsip-linked")]
 #[rustfmt::skip]
 unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_id after init; stack call_info writable; event is library-managed
     call_id: pjsua_sys::pjsua_call_id,
-    _event: *mut pjsua_sys::pjsip_event,
+    event: *mut pjsua_sys::pjsip_event,
 ) {
     let mut info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
     let status = pjsua_sys::pjsua_call_get_info(call_id, &mut info);
@@ -850,6 +905,21 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
         }
         s if s == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED => {
             stop_ringback_tone();
+
+            // Why the dialog ended: PJSIP's last status (a BYE we or the peer
+            // sent, a 408 from an unanswered request, a 4xx/5xx final
+            // response…) and which kind of event delivered it. Without this
+            // "phone leg hung up" cannot be told apart from pjsua ending the
+            // call itself (ACK/session-timer/transport timeout).
+            tracing::info!(
+                call_id,
+                last_status = info.last_status,
+                last_status_text = %pj_str_to_string(&info.last_status_text),
+                connect_secs = info.connect_duration.sec,
+                total_secs = info.total_duration.sec,
+                trigger = %disconnect_trigger(event),
+                "SIP call disconnected",
+            );
 
             {
                 let mut pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
@@ -973,4 +1043,23 @@ unsafe fn stop_ringback_tone() { // SAFETY: Complements start_ringback_tone; con
     RINGBACK_PORT = std::ptr::null_mut();
     RINGBACK_ACTIVE.store(false, Ordering::Release);
     tracing::info!("ringback tone stopped");
+}
+
+#[cfg(test)]
+mod disconnect_trigger_tests {
+    use super::trigger_name;
+    use pjsua_sys::*;
+
+    #[test]
+    fn event_kinds_map_to_the_names_the_log_line_uses() {
+        assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_TIMER), "timer");
+        assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_TX_MSG), "tx_msg");
+        assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_RX_MSG), "rx_msg");
+        assert_eq!(
+            trigger_name(pjsip_event_id_e_PJSIP_EVENT_TRANSPORT_ERROR),
+            "transport_error"
+        );
+        assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_UNKNOWN), "other");
+        assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_USER), "other");
+    }
 }
