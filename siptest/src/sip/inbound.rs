@@ -97,13 +97,17 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 /// Handles a request encountered while waiting for something else (a CANCEL,
-/// an ACK): a second concurrent INVITE gets busied out (FR-017), an OPTIONS
-/// keepalive gets answered, anything else is ignored.
-pub fn handle_stray(socket: &SipSocket, req: &SipRequest, peer: SocketAddr) {
+/// an ACK) during the call whose `Call-ID` is `current_call_id`: a *second*
+/// concurrent INVITE gets busied out (FR-017), an OPTIONS keepalive gets
+/// answered, anything else is ignored. A retransmission of the INVITE already
+/// being handled is also ignored — answering it `486` would end the very call
+/// it duplicates.
+pub fn handle_stray(socket: &SipSocket, req: &SipRequest, peer: SocketAddr, current_call_id: &str) {
     match req.method.as_str() {
         "OPTIONS" => {
             let _ = socket.send(peer, &build_options_ok(req));
         }
+        "INVITE" if req.header("Call-ID") == Some(current_call_id) => {}
         "INVITE" => {
             let _ = socket.send(peer, &build_busy(req));
         }
@@ -131,7 +135,7 @@ pub fn wait_or_cancel(socket: &SipSocket, call_id: &str, duration: Duration) -> 
                 if req.method == "CANCEL" && req.header("Call-ID") == Some(call_id) {
                     return WaitOutcome::Cancelled(req);
                 }
-                handle_stray(socket, &req, peer);
+                handle_stray(socket, &req, peer, call_id);
             }
             _ => continue,
         }
@@ -156,7 +160,7 @@ pub fn wait_for_ack(socket: &SipSocket, call_id: &str, resend: impl Fn()) -> boo
                 if req.method == "INVITE" && req.header("Call-ID") == Some(call_id) {
                     resend();
                 } else {
-                    handle_stray(socket, &req, peer);
+                    handle_stray(socket, &req, peer, call_id);
                 }
             }
             Ok(None) => {
@@ -204,6 +208,37 @@ mod tests {
             body: String::new(),
             body_bytes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_retransmitted_invite_is_ignored_but_a_different_call_is_busied() {
+        let a = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let b = SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap();
+        let duplicate = canned_request("INVITE", &[]); // Call-ID inbound-call-1
+        handle_stray(&a, &duplicate, b.local_addr(), "inbound-call-1");
+        assert!(
+            b.recv_response("inbound-call-1", 1, "INVITE", Duration::from_millis(300))
+                .unwrap()
+                .is_none(),
+            "a retransmission must not be answered"
+        );
+
+        handle_stray(&a, &duplicate, b.local_addr(), "some-other-call");
+        let busy = b
+            .recv_response("inbound-call-1", 1, "INVITE", Duration::from_secs(2))
+            .unwrap()
+            .expect("a second concurrent call is busied out");
+        assert_eq!(busy.status, 486);
     }
 
     #[test]

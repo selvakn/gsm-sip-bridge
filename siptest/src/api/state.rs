@@ -67,6 +67,17 @@ impl CallRegistry {
         None
     }
 
+    /// Admits `call` unless one is already in progress, atomically — the
+    /// check and the insert happen under the caller's single lock, so two
+    /// concurrent requests cannot both be admitted.
+    pub fn try_reserve(&mut self, call: Call) -> bool {
+        if self.active().is_some() {
+            return false;
+        }
+        self.upsert(call);
+        true
+    }
+
     pub fn lookup(&self, id: &CallId) -> Lookup {
         if let Some(call) = self.calls.get(id) {
             Lookup::Found(Box::new(call.clone()))
@@ -188,6 +199,29 @@ mod tests {
             end_reason: None,
             report: None,
         }
+    }
+
+    fn live_call(id: &str, direction: Direction) -> Call {
+        Call {
+            direction,
+            state: CallState::Inviting,
+            ..dummy_call(id)
+        }
+    }
+
+    /// Outbound and inbound admission share this one reservation, so whichever
+    /// asks second is refused — neither can slip past the other's check.
+    #[test]
+    fn a_second_call_of_either_direction_is_not_admitted_while_one_is_active() {
+        let mut reg = CallRegistry::new(10);
+        assert!(reg.try_reserve(live_call("out-1", Direction::Outbound)));
+        assert!(!reg.try_reserve(live_call("in-1", Direction::Inbound)));
+        assert!(!reg.try_reserve(live_call("out-2", Direction::Outbound)));
+        assert_eq!(reg.active().map(|c| c.id.0), Some("out-1".to_string()));
+
+        // Once it ends, the slot is free again — for either direction.
+        reg.upsert(dummy_call("out-1"));
+        assert!(reg.try_reserve(live_call("in-1", Direction::Inbound)));
     }
 
     #[test]

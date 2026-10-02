@@ -93,6 +93,23 @@ pub struct LevelStats {
     pub silent_frame_pct: f64,
 }
 
+/// How many tone symbols a call of `duration` should carry: none if the tone
+/// plan is off, and none while prerecorded audio (`play_samples` at
+/// `audio_hz`) is playing — the tone plan is suppressed until it ends, so the
+/// far end can only be expected to return what was actually sent.
+fn expected_tone_symbols(
+    duration: Duration,
+    tone_enabled: bool,
+    play_samples: u64,
+    audio_hz: u32,
+) -> u64 {
+    if !tone_enabled {
+        return 0;
+    }
+    let play_ms = (play_samples * 1000).div_ceil(audio_hz.max(1) as u64);
+    (duration.as_millis() as u64).saturating_sub(play_ms) / tone::SYMBOL_MS
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ToneStats {
     pub tx_symbols_sent: u64,
@@ -235,7 +252,12 @@ pub fn run(
             )
         });
     tone.tx_symbols_sent = tx_timeline.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
-    tone.expected_symbols = (config.duration.as_millis() as u64) / tone::SYMBOL_MS;
+    tone.expected_symbols = expected_tone_symbols(
+        config.duration,
+        config.tone_enabled,
+        config.play.as_ref().map_or(0, |p| p.len() as u64),
+        config.codec.audio_hz,
+    );
 
     Ok(MediaSessionResult {
         sent_packets: sent_packets.load(Ordering::Relaxed),
@@ -418,6 +440,18 @@ mod tests {
     /// Prerecorded audio is transmitted from the first frame, in order, and
     /// the tone plan takes over once it runs out — so a call that opens with
     /// a spoken message is still measurable for the rest of its duration.
+    #[test]
+    fn expected_symbols_exclude_playback_and_vanish_with_the_tone_plan() {
+        let ten_s = Duration::from_secs(10);
+        assert_eq!(expected_tone_symbols(ten_s, true, 0, 8000), 100);
+        // 3 s of audio at 8 kHz leaves 7 s of tone.
+        assert_eq!(expected_tone_symbols(ten_s, true, 24_000, 8000), 70);
+        // Audio longer than the call leaves none.
+        assert_eq!(expected_tone_symbols(ten_s, true, 160_000, 8000), 0);
+        // No tone plan: nothing to expect back, however long the call.
+        assert_eq!(expected_tone_symbols(ten_s, false, 0, 8000), 0);
+    }
+
     #[test]
     fn prerecorded_audio_plays_first_then_the_tone_plan_resumes() {
         let n = PCMU.samples_per_frame;

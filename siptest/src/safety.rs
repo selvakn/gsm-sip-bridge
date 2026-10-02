@@ -113,6 +113,11 @@ impl CallAttemptHistory {
                 return Some((min_interval - since).as_secs().max(1));
             }
         }
+        if max_per_hour == 0 {
+            // A cap of zero admits nothing — fail closed, like the empty
+            // allow-list, instead of underflowing the window lookup below.
+            return Some(WINDOW.as_secs());
+        }
         if self.attempts.len() as u32 >= max_per_hour {
             if let Some(&oldest) = self.attempts.iter().rev().nth(max_per_hour as usize - 1) {
                 let elapsed = now.duration_since(oldest);
@@ -213,5 +218,19 @@ mod tests {
         assert!(policy
             .check("+919000000000", &history, t0 + Duration::from_secs(3601))
             .is_ok());
+    }
+
+    #[test]
+    fn a_zero_hourly_cap_admits_nothing_instead_of_underflowing() {
+        let policy = SafetyPolicy {
+            allowed_destinations: vec!["+919000000000".into()],
+            min_call_interval_secs: 0,
+            max_calls_per_hour: 0,
+        };
+        let history = CallAttemptHistory::new();
+        assert!(matches!(
+            policy.check("+919000000000", &history, Instant::now()),
+            Err(SafetyRefusal::RateLimited { .. })
+        ));
     }
 }
