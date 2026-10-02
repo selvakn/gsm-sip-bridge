@@ -14,8 +14,8 @@ pub struct AccountConfig {
 /// off per account because the account-level default (OPTIONAL) is not
 /// inherited from `pjsua_config` — see `Endpoint::create`.
 #[cfg(feature = "pjsip-linked")]
-unsafe fn default_acc_config(acc_cfg: &mut pjsua_sys::pjsua_acc_config) {
-    // SAFETY: acc_cfg is a valid, writable pjsua_acc_config
+#[rustfmt::skip]
+unsafe fn default_acc_config(acc_cfg: &mut pjsua_sys::pjsua_acc_config) { // SAFETY: acc_cfg is a valid, writable pjsua_acc_config
     pjsua_sys::pjsua_acc_config_default(acc_cfg);
     acc_cfg.use_timer = pjsua_sys::pjsua_sip_timer_use_PJSUA_SIP_TIMER_INACTIVE;
 }

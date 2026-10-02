@@ -835,8 +835,8 @@ unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid ac
 /// it carried — a request method (`rx_msg BYE` = the peer hung up; `tx_msg BYE`
 /// = we did, e.g. a pjsua-initiated timeout) or a response code.
 #[cfg(feature = "pjsip-linked")]
-unsafe fn disconnect_trigger(event: *const pjsua_sys::pjsip_event) -> String {
-    // SAFETY: event is null or the library-owned event passed to on_call_state, valid for the callback
+#[rustfmt::skip]
+unsafe fn disconnect_trigger(event: *const pjsua_sys::pjsip_event) -> String { // SAFETY: event is null or the library-owned event passed to on_call_state, valid for the callback
     if event.is_null() {
         return "none".to_string();
     }
