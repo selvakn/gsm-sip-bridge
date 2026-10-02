@@ -333,6 +333,16 @@ fn siptest_places_a_call_through_the_proxy_and_carries_bothways_audio() {
         outcome.final_status
     );
     assert_eq!(outcome.redirect_port, None, "no redirect in proxy mode");
+    assert!(
+        outcome.invite_to_180_ms.is_some(),
+        "the relayed 180 must be timed"
+    );
+    // The stub's Contact is `sip:agentb@...`: in-dialog requests use that
+    // user, not the dialled number.
+    assert_eq!(
+        outcome.dialog.as_ref().map(|d| d.target_user.as_str()),
+        Some("agentb")
+    );
     // The ACK/BYE target is the stub's own Contact, not the registrar.
     assert_eq!(
         outcome.remote_target.map(|a| a.port()),
@@ -370,6 +380,71 @@ fn siptest_places_a_call_through_the_proxy_and_carries_bothways_audio() {
     if let Some(dialog) = &outcome.dialog {
         siptest::sip::outbound::send_bye(&sip_socket, dialog).expect("BYE goes direct");
     }
+}
+
+/// A proxied call nobody answers must be CANCELled when siptest gives up, or
+/// the dial-out account keeps ringing for a caller who has left.
+#[test]
+fn siptest_cancels_a_proxied_call_it_gives_up_on() {
+    let account = UdpSocket::bind("127.0.0.1:0").unwrap();
+    account
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let registrar_addr = registrar_socket.local_addr().unwrap();
+    let _registrar = Registrar::start_on_with_outbound(
+        registrar_socket,
+        &server_config(),
+        OutboundDial {
+            port: account.local_addr().unwrap().port(),
+            mode: SipServerDialMode::Proxy,
+        },
+    )
+    .expect("start registrar");
+
+    let sip_socket =
+        SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
+    let reg_config = RegistrationConfig {
+        registrar_addr,
+        registrar_host: REALM.to_string(),
+        aor_user: USER.to_string(),
+        realm: REALM.to_string(),
+        password: Secret::new(PASSWORD.to_string()),
+        expires: 300,
+    };
+    let mut creds = RegistrationCredentials {
+        cseq: 0,
+        call_id: "reg-call-id-cancel".to_string(),
+        from_tag: "reg-from-tag-cancel".to_string(),
+        cached_nonce: None,
+        nc: 0,
+    };
+    register(&sip_socket, &reg_config, &mut creds).unwrap();
+
+    let outcome = siptest::sip::outbound::place_call(
+        &sip_socket,
+        registrar_addr,
+        REALM,
+        USER,
+        "+919000000000",
+        PCMU,
+        0,
+        Duration::from_secs(1),
+    )
+    .expect("place_call should not error");
+    assert!(!outcome.answered);
+
+    let mut buf = [0u8; 4096];
+    let mut methods = Vec::new();
+    while let Ok((n, _)) = account.recv_from(&mut buf) {
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        methods.push(text.split(' ').next().unwrap_or("").to_string());
+        if methods.last().map(String::as_str) == Some("CANCEL") {
+            break;
+        }
+    }
+    assert_eq!(methods, ["INVITE", "CANCEL"], "got: {methods:?}");
 }
 
 /// T081: `resolve_codec("g722")` is not just a library-level lookup — its

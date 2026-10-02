@@ -49,6 +49,10 @@ pub struct ConfirmedDialog {
     pub to_user: String,
     pub to_host: String,
     pub remote_target: SocketAddr,
+    /// The user part of the peer's `Contact` — the Request-URI for in-dialog
+    /// requests (RFC 3261 §12.2.1.1). Distinct from `to_user`, the dialled
+    /// number the `To` header keeps.
+    pub target_user: String,
     pub next_cseq: u32,
 }
 
@@ -97,10 +101,28 @@ pub fn place_call(
         cseq: 1,
         sdp_body: &offer,
     });
+    let invite1_sent_at = Instant::now();
     socket.send(registrar_addr, &invite1)?;
 
-    let resp1 = wait_final_response(socket, &call_id, 1, ring_timeout)?;
+    let (resp1, ringing_ms) =
+        wait_final_response(socket, &call_id, 1, ring_timeout, invite1_sent_at)?;
     let Some(resp1) = resp1 else {
+        // In proxy mode this INVITE is live at the dial-out account; without
+        // a CANCEL it keeps ringing and may connect a carrier call to a caller
+        // who has given up. (Harmless in redirect mode: the registrar answers
+        // a CANCEL it never relayed.)
+        let _ = send_cancel(
+            socket,
+            registrar_addr,
+            &request_uri,
+            from_user,
+            registrar_host,
+            destination,
+            &call_id,
+            &from_tag,
+            &branch1,
+            1,
+        );
         return Ok(timeout_outcome());
     };
 
@@ -109,12 +131,13 @@ pub fn place_call(
     if resp1.status == 200 {
         let sdp_answer = sdp::parse_answer(&resp1.body)?;
         let to_tag = extract_to_tag(&resp1).unwrap_or_default();
-        let ack_target = resp1
+        // The ACK's Request-URI is the peer's own Contact (RFC 3261 §12.2.1.1),
+        // not the dialled number — an endpoint may route on the Contact user.
+        let (target_user, ack_target) = resp1
             .header("Contact")
             .and_then(parse_contact_uri)
-            .map(|(_, addr)| addr)
-            .unwrap_or(registrar_addr);
-        let ack_ruri = format!("sip:{destination}@{ack_target}");
+            .unwrap_or_else(|| (destination.to_string(), registrar_addr));
+        let ack_ruri = format!("sip:{target_user}@{ack_target}");
         let ack2xx = build_ack_2xx(&Ack2xxParams {
             request_uri: &ack_ruri,
             local_addr: socket.local_addr(),
@@ -134,7 +157,7 @@ pub fn place_call(
             final_status: 200,
             redirect_contact: None,
             redirect_port: None,
-            invite_to_180_ms: None,
+            invite_to_180_ms: ringing_ms,
             invite_to_200_ms: Some(start.elapsed().as_millis() as u64),
             remote_target: Some(ack_target),
             sdp_answer: Some(sdp_answer),
@@ -148,6 +171,7 @@ pub fn place_call(
                 to_user: destination.to_string(),
                 to_host: registrar_host.to_string(),
                 remote_target: ack_target,
+                target_user,
                 next_cseq: 2,
             }),
         });
@@ -277,6 +301,7 @@ pub fn place_call(
                     to_user: redirect_user.clone(),
                     to_host: registrar_host.to_string(),
                     remote_target: ack_target,
+                    target_user: redirect_user.clone(),
                     next_cseq: 3,
                 };
                 return Ok(OutboundCallOutcome {
@@ -316,7 +341,7 @@ pub fn place_call(
 /// written for.
 pub fn send_bye(socket: &SipSocket, dialog: &ConfirmedDialog) -> SipTestResult<()> {
     use gsm_sip_bridge::ims::sip_client::{build_bye, ByeRequest};
-    let request_uri = format!("sip:{}@{}", dialog.to_user, dialog.remote_target);
+    let request_uri = format!("sip:{}@{}", dialog.target_user, dialog.remote_target);
     let branch = new_branch();
     let from = format!(
         "<sip:{}@{}>;tag={}",
@@ -413,17 +438,23 @@ fn wait_final_response(
     call_id: &str,
     cseq: u32,
     timeout: Duration,
-) -> SipTestResult<Option<SipResponse>> {
+    sent_at: Instant,
+) -> SipTestResult<(Option<SipResponse>, Option<u64>)> {
     let deadline = Instant::now() + timeout;
+    let mut ringing_ms = None;
     loop {
         if Instant::now() >= deadline {
-            return Ok(None);
+            return Ok((None, ringing_ms));
         }
         if let Some(resp) = socket.recv_response(call_id, cseq, RESPONSE_POLL)? {
             if resp.status >= 200 {
-                return Ok(Some(resp));
+                return Ok((Some(resp), ringing_ms));
             }
-            // provisional (1xx) — keep waiting for the final response.
+            // provisional (1xx) — keep waiting for the final response, noting
+            // when it first rang.
+            if matches!(resp.status, 180 | 183) && ringing_ms.is_none() {
+                ringing_ms = Some(sent_at.elapsed().as_millis() as u64);
+            }
         }
     }
 }
