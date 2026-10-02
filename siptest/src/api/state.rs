@@ -67,6 +67,17 @@ impl CallRegistry {
         None
     }
 
+    /// Admits `call` unless one is already in progress, atomically — the
+    /// check and the insert happen under the caller's single lock, so two
+    /// concurrent requests cannot both be admitted.
+    pub fn try_reserve(&mut self, call: Call) -> bool {
+        if self.active().is_some() {
+            return false;
+        }
+        self.upsert(call);
+        true
+    }
+
     pub fn lookup(&self, id: &CallId) -> Lookup {
         if let Some(call) = self.calls.get(id) {
             Lookup::Found(Box::new(call.clone()))

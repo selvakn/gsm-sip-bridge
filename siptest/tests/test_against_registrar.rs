@@ -506,7 +506,9 @@ fn siptest_offers_g722_on_the_wire_when_the_g722_codec_is_selected() {
     )
     .expect("place_call should not error");
 
-    assert!(outcome.answered, "expected the stub UAS to answer");
+    // The stub answers PCMU to this G.722 offer, which siptest now reports as a
+    // negotiation failure; what this test is about is the offer on the wire.
+    assert_eq!(outcome.refusal_reason, Some("codec_mismatch"));
 
     let offer = stub
         .last_offer
@@ -932,5 +934,74 @@ fn a_contact_with_uri_parameters_still_routes_the_ack_and_bye_to_the_account() {
         uas.wait_for("BYE"),
         "BYE missed the account: {:?}",
         uas.seen()
+    );
+}
+
+/// An answer in a different codec than offered is a negotiation failure, said
+/// as such — and the call is hung up, not left connected.
+#[test]
+fn an_answer_in_a_codec_we_did_not_offer_fails_the_call_and_hangs_up() {
+    let uas = ScriptedUas::start(Behavior::ParamContact); // answers PCMU (PT 0)
+    let (_registrar, socket, registrar_addr) = proxy_rig(&uas);
+
+    let outcome = siptest::sip::outbound::place_call(
+        &socket,
+        registrar_addr,
+        REALM,
+        USER,
+        "+919000000000",
+        resolve_codec("g722").unwrap(),
+        0,
+        Duration::from_secs(5),
+    )
+    .expect("place_call should not error");
+
+    assert!(!outcome.answered);
+    assert_eq!(outcome.refusal_reason, Some("codec_mismatch"));
+    assert!(outcome.dialog.is_none(), "the call is already hung up");
+    assert!(uas.wait_for("BYE"), "never hung up: {:?}", uas.seen());
+}
+
+/// De-registering must answer the registrar's digest challenge: an
+/// authenticating registrar ignores an unauthenticated `Expires: 0`, so the
+/// binding used to survive a "deregister".
+#[test]
+fn deregistering_actually_removes_the_binding_from_an_authenticating_registrar() {
+    let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let registrar_addr = registrar_socket.local_addr().unwrap();
+    let registrar = Registrar::start_on(registrar_socket, &server_config()).unwrap();
+    let sip_socket =
+        SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
+    let reg_config = RegistrationConfig {
+        registrar_addr,
+        registrar_host: REALM.to_string(),
+        aor_user: USER.to_string(),
+        realm: REALM.to_string(),
+        password: Secret::new(PASSWORD.to_string()),
+        expires: 300,
+    };
+    let mut creds = RegistrationCredentials {
+        cseq: 0,
+        call_id: "reg-call-id-dereg".to_string(),
+        from_tag: "reg-from-tag-dereg".to_string(),
+        cached_nonce: None,
+        nc: 0,
+    };
+    register(&sip_socket, &reg_config, &mut creds).unwrap();
+    let now = std::time::Instant::now();
+    assert!(registrar.bindings().get_live(USER, now).is_some());
+
+    let status =
+        siptest::sip::registration::deregister(&sip_socket, &reg_config, &mut creds).unwrap();
+    assert_eq!(
+        status.state,
+        siptest::sip::registration::RegState::Unregistered
+    );
+    assert!(
+        registrar
+            .bindings()
+            .get_live(USER, std::time::Instant::now())
+            .is_none(),
+        "the binding survived the de-registration"
     );
 }

@@ -148,6 +148,7 @@ pub fn place_call(
             &ctx,
             &resp1,
             Answer {
+                offered_pt: codec.pt,
                 to_user: destination,
                 cseq: 1,
                 fallback: None,
@@ -238,6 +239,7 @@ pub fn place_call(
             &ctx,
             &resp2,
             Answer {
+                offered_pt: codec.pt,
                 to_user: &redirect_user,
                 cseq: 2,
                 fallback: Some((redirect_user.clone(), redirect_addr)),
@@ -394,6 +396,8 @@ fn confirm_2xx(
 }
 
 struct Answer<'a> {
+    /// The payload type we offered; the answer must use it.
+    offered_pt: u8,
     to_user: &'a str,
     cseq: u32,
     fallback: Option<(String, SocketAddr)>,
@@ -410,6 +414,24 @@ fn answered_outcome(
 ) -> SipTestResult<OutboundCallOutcome> {
     let sdp_answer = sdp::parse_answer(&resp.body)?;
     let dialog = confirm_2xx(ctx, resp, answer.to_user, answer.cseq, answer.fallback)?;
+    if sdp_answer.payload_type != answer.offered_pt {
+        // siptest would send PT n and discard the far end's PT m, so the call
+        // would read as a media fault instead of the negotiation failure it
+        // is. Hang it up and say so.
+        let _ = send_bye(ctx.socket, &dialog);
+        return Ok(OutboundCallOutcome {
+            answered: false,
+            final_status: resp.status,
+            redirect_contact: answer.redirect.as_ref().map(|(c, _)| c.clone()),
+            redirect_port: answer.redirect.as_ref().map(|(_, p)| *p),
+            invite_to_180_ms: answer.ringing_ms,
+            invite_to_200_ms: Some(answer.start.elapsed().as_millis() as u64),
+            remote_target: Some(dialog.remote_target),
+            sdp_answer: Some(sdp_answer),
+            refusal_reason: Some("codec_mismatch"),
+            dialog: None,
+        });
+    }
     let (redirect_contact, redirect_port) = match answer.redirect {
         Some((contact, port)) => (Some(contact), Some(port)),
         None => (None, None),

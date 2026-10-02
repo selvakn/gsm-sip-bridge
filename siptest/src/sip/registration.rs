@@ -77,7 +77,20 @@ pub fn register(
     cfg: &RegistrationConfig,
     creds: &mut RegistrationCredentials,
 ) -> SipTestResult<RegistrationStatus> {
-    let mut expires = cfg.expires;
+    register_with_expires(socket, cfg, creds, cfg.expires)
+}
+
+/// [`register`] asking for `expires` seconds instead of the configured lease.
+/// `0` removes the binding (RFC 3261 §10.2.2) and, on `200`, reports
+/// [`RegState::Unregistered`].
+pub fn register_with_expires(
+    socket: &SipSocket,
+    cfg: &RegistrationConfig,
+    creds: &mut RegistrationCredentials,
+    expires: u32,
+) -> SipTestResult<RegistrationStatus> {
+    let mut expires = expires;
+    let deregistering = expires == 0;
     let mut authorization: Option<String> = None;
     let mut already_authorized = false;
 
@@ -104,6 +117,9 @@ pub fn register(
             })?;
 
         match resp.status {
+            200 if deregistering => {
+                return Ok(RegistrationStatus::default());
+            }
             200 => {
                 let granted = resp
                     .header("Expires")
@@ -185,24 +201,14 @@ fn failed(status: u16, reason: &str) -> RegistrationStatus {
     }
 }
 
-/// De-registers with `Expires: 0`, best-effort — used on clean shutdown.
+/// De-registers (`Expires: 0`), answering the registrar's digest challenge like
+/// any other REGISTER — an authenticating registrar ignores an unauthenticated
+/// one, which would leave the binding in place. Returns the registrar's verdict:
+/// [`RegState::Unregistered`] on `200`, a failure status otherwise.
 pub fn deregister(
     socket: &SipSocket,
     cfg: &RegistrationConfig,
     creds: &mut RegistrationCredentials,
-) {
-    creds.cseq += 1;
-    let branch = new_branch();
-    let msg = build_register(&RegisterParams {
-        registrar_host: &cfg.registrar_host,
-        aor_user: &cfg.aor_user,
-        local_addr: socket.local_addr(),
-        call_id: &creds.call_id,
-        from_tag: &creds.from_tag,
-        branch: &branch,
-        cseq: creds.cseq,
-        expires: 0,
-        authorization: None,
-    });
-    let _ = socket.send(cfg.registrar_addr, &msg);
+) -> SipTestResult<RegistrationStatus> {
+    register_with_expires(socket, cfg, creds, 0)
 }

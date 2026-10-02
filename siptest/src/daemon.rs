@@ -215,15 +215,38 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
         nc: 0,
     };
 
+    let mut attempted = false;
     while !stop.load(Ordering::Relaxed) {
+        // After the first attempt, `Unregistered` can only mean an explicit
+        // deregistration (`POST /registration/deregister`): stay out of the
+        // registrar until someone registers again, instead of undoing it at
+        // the next refresh.
+        if attempted
+            && state
+                .registration
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .state
+                == registration::RegState::Unregistered
+        {
+            sleep_unless_stopped(&stop, Duration::from_secs(2));
+            continue;
+        }
+        attempted = true;
         match registration::register(&state.sip_socket, &cfg, &mut creds) {
-            Ok(status) => {
+            Ok(mut status) => {
                 let registered = status.state == registration::RegState::Registered;
                 let expires = status.granted_expires;
-                {
+                let failures = {
                     let mut reg = state.registration.lock().unwrap_or_else(|e| e.into_inner());
+                    // `register` reports one failed attempt; the running
+                    // count is ours to keep, or the backoff never advances.
+                    status.consecutive_failures =
+                        failures_after(reg.consecutive_failures, registered);
+                    let failures = status.consecutive_failures;
                     *reg = status;
-                }
+                    failures
+                };
                 state
                     .counters
                     .lock()
@@ -239,12 +262,10 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
                         Duration::from_secs(refresh_interval_secs(expires) as u64),
                     );
                 } else {
-                    let failures = state
-                        .registration
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .consecutive_failures;
-                    sleep_unless_stopped(&stop, Duration::from_secs(backoff_secs(failures)));
+                    sleep_unless_stopped(
+                        &stop,
+                        Duration::from_secs(backoff_secs(failures.saturating_sub(1))),
+                    );
                 }
             }
             Err(e) => {
@@ -254,12 +275,24 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .errors += 1;
-                sleep_unless_stopped(&stop, Duration::from_secs(5));
+                let failures = {
+                    let mut reg = state.registration.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.state = registration::RegState::Failed;
+                    reg.last_status = Some((0, e.to_string()));
+                    reg.consecutive_failures = failures_after(reg.consecutive_failures, false);
+                    reg.consecutive_failures
+                };
+                sleep_unless_stopped(
+                    &stop,
+                    Duration::from_secs(backoff_secs(failures.saturating_sub(1))),
+                );
             }
         }
     }
 
-    registration::deregister(&state.sip_socket, &cfg, &mut creds);
+    if let Err(e) = registration::deregister(&state.sip_socket, &cfg, &mut creds) {
+        tracing::warn!(error = %e, "could not deregister on shutdown");
+    }
 }
 
 fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
@@ -281,8 +314,20 @@ fn refresh_interval_secs(granted_expires: Option<u32>) -> u32 {
     granted_expires.map(|e| (e / 2).max(30)).unwrap_or(60)
 }
 
-/// The documented backoff ladder for consecutive registration failures —
-/// 2/4/8/16/30s, holding at 30s past the fourth failure.
+/// The running failure count after one more attempt: reset by a success,
+/// otherwise one more than before. (`register` itself only knows about the one
+/// attempt it made.)
+fn failures_after(previous: u32, registered: bool) -> u32 {
+    if registered {
+        0
+    } else {
+        previous.saturating_add(1)
+    }
+}
+
+/// The documented backoff ladder — 2/4/8/16/30s, holding at 30s — indexed by
+/// how many failures came *before* the one being waited out (so the first
+/// failure waits `backoff_secs(0)` = 2s).
 fn backoff_secs(consecutive_failures: u32) -> u64 {
     [2u64, 4, 8, 16, 30]
         .get(consecutive_failures.min(4) as usize)
@@ -311,6 +356,24 @@ mod tests {
             refresh_interval_secs(None),
             60,
             "no granted Expires falls back to a fixed 60s"
+        );
+    }
+
+    /// The waits a registrar that keeps refusing us produces, driven through
+    /// the same two functions the loop uses.
+    #[test]
+    fn repeated_failures_walk_the_whole_backoff_ladder() {
+        let mut failures = 0;
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            failures = failures_after(failures, false);
+            waits.push(backoff_secs(failures.saturating_sub(1)));
+        }
+        assert_eq!(waits, [2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(
+            failures_after(failures, true),
+            0,
+            "success resets the count"
         );
     }
 

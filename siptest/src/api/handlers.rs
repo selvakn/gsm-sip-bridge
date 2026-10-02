@@ -467,17 +467,26 @@ pub async fn force_deregister(State(state): State<AppState>) -> Response {
             .registration_creds
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::sip::registration::deregister(
+        let status = crate::sip::registration::deregister(
             &state.sip_socket,
             &state.registration_config,
             &mut creds,
-        );
-        *state.registration.lock().unwrap_or_else(|e| e.into_inner()) =
-            crate::sip::registration::RegistrationStatus::default();
+        )?;
+        // Only what the registrar confirmed is recorded: a refused
+        // de-registration leaves the binding — and the status — as it was.
+        if status.state != crate::sip::registration::RegState::Unregistered {
+            return Err(SipTestError::Config(format!(
+                "the registrar refused the de-registration: {:?}",
+                status.last_status
+            )));
+        }
+        *state.registration.lock().unwrap_or_else(|e| e.into_inner()) = status;
+        Ok::<_, SipTestError>(())
     })
     .await;
     match result {
-        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Ok(Err(e)) => error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "internal_error"})),

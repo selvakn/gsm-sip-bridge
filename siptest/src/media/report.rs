@@ -69,6 +69,8 @@ pub struct RoundTripStats {
 pub struct ToneReport {
     pub plan: &'static str,
     pub tx_symbols_sent: u64,
+    /// How many symbols the far end was expected to send back.
+    pub expected_symbols: u64,
     pub rx_symbols_detected: u64,
     pub rx_symbol_error_pct: f64,
     pub detected: bool,
@@ -99,6 +101,7 @@ impl From<&ToneStats> for ToneReport {
         Self {
             plan: "grid8",
             tx_symbols_sent: s.tx_symbols_sent,
+            expected_symbols: s.expected_symbols,
             rx_symbols_detected: s.rx_symbols_detected,
             rx_symbol_error_pct,
             detected: s.rx_symbols_detected > 0,
@@ -259,7 +262,7 @@ impl CallReport {
                     "not detected"
                 },
                 t.rx_symbols_detected,
-                self.media.sent_packets, // best-effort context; exact expected count lives server-side
+                t.expected_symbols,
                 t.rx_symbol_error_pct,
                 match &t.round_trip_delay_ms {
                     Some(r) => format!(

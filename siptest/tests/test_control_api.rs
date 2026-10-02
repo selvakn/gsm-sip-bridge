@@ -561,3 +561,92 @@ async fn an_unknown_call_id_is_not_found_and_an_evicted_one_is_gone() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+/// A call that fails before it connects must not leave itself `Inviting`: that
+/// state refuses every later call (`409`) and busies out every inbound one
+/// until the daemon restarts. `+91*` admits `+91abc`, which `place_call` then
+/// refuses as an invalid destination — the exit that used to leak the entry.
+#[tokio::test]
+async fn a_call_that_fails_early_does_not_wedge_the_daemon() {
+    let mut config = test_config();
+    config.safety.allowed_destinations = vec!["+91*".to_string()];
+    config.call.ring_timeout_secs = 1;
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let state = build_state(config, sip_socket, true);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let bad = client
+        .post(format!("{base}/calls"))
+        .json(&serde_json::json!({"destination": "+91abc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let status: serde_json::Value = client
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        status["active_call"].is_null(),
+        "the failed call is still active: {status}"
+    );
+
+    let next = client
+        .post(format!("{base}/calls"))
+        .json(&serde_json::json!({"destination": "+919000000000"}))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        next.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a later call was refused as already in progress"
+    );
+}
+
+/// Two simultaneous `POST /calls` must admit exactly one.
+#[tokio::test]
+async fn two_concurrent_calls_admit_exactly_one() {
+    let mut config = test_config();
+    config.safety.allowed_destinations = vec!["+919000000000".to_string()];
+    config.call.ring_timeout_secs = 2;
+    let sip_socket = Arc::new(
+        SipSocket::bind(
+            Some("127.0.0.1".parse().unwrap()),
+            0,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let state = build_state(config, sip_socket, true);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let post = || {
+        client
+            .post(format!("{base}/calls"))
+            .json(&serde_json::json!({"destination": "+919000000000"}))
+            .send()
+    };
+    let (a, b) = tokio::join!(post(), post());
+    let mut statuses = [a.unwrap().status(), b.unwrap().status()];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [reqwest::StatusCode::ACCEPTED, reqwest::StatusCode::CONFLICT],
+        "exactly one call may be admitted"
+    );
+}

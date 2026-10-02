@@ -163,12 +163,25 @@ pub fn execute_outbound_call(
     {
         return Err(SipTestError::NotRegistered);
     }
-    if state
+    let call_id = state.next_call_id();
+    let call = Call {
+        id: call_id.clone(),
+        direction: Direction::Outbound,
+        state: CallState::Inviting,
+        peer: destination.clone(),
+        peer_uri: String::new(),
+        caller_id: CallerId::default(),
+        started_at: now,
+        end_reason: None,
+        report: None,
+    };
+    // Check-and-reserve in one critical section: two concurrent requests can
+    // no longer both see "no active call" and both place one.
+    if !state
         .calls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .active()
-        .is_some()
+        .try_reserve(call.clone())
     {
         return Err(SipTestError::CallInProgress);
     }
@@ -183,39 +196,91 @@ pub fn execute_outbound_call(
         .unwrap_or_else(|e| e.into_inner())
         .calls_placed += 1;
 
-    let call_id = state.next_call_id();
     let rtp_port = pick_rtp_port(
         state.config.media.rtp_port_min,
         state.config.media.rtp_port_max,
     );
-
-    let mut call = Call {
-        id: call_id.clone(),
-        direction: Direction::Outbound,
-        state: CallState::Inviting,
-        peer: destination.clone(),
-        peer_uri: String::new(),
-        caller_id: CallerId::default(),
-        started_at: now,
-        end_reason: None,
-        report: None,
-    };
-    state
-        .calls
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .upsert(call.clone());
     state.events.publish(
         "call_state",
         serde_json::json!({"call_id": call_id.0, "state": "inviting", "destination": destination}),
     );
 
+    // From here every exit — an error, an early `?`, a panic — must leave the
+    // registry and the far end tidy; `OutboundRun`'s `Drop` guarantees it.
+    let mut run = OutboundRun {
+        state,
+        call,
+        dialog: None,
+        failure: None,
+        done: false,
+    };
+    match drive_outbound(
+        state,
+        &mut run,
+        &destination,
+        duration,
+        ring_timeout,
+        codec,
+        rtp_port,
+    ) {
+        Ok(()) => {
+            run.done = true;
+            Ok(run.call.clone())
+        }
+        Err(e) => {
+            run.failure = Some(e.to_string());
+            Err(e)
+        }
+    }
+}
+
+/// An outbound call that has been admitted and must be finished one way or
+/// another. If it is dropped without `done` — `place_call` or the media
+/// session returned an error, or something panicked — it hangs up a confirmed
+/// dialog and records the call as failed, instead of leaving it `Inviting`
+/// forever (which would refuse every later call and busy out every inbound
+/// one until the daemon restarts).
+struct OutboundRun<'a> {
+    state: &'a SharedState,
+    call: Call,
+    dialog: Option<outbound::ConfirmedDialog>,
+    failure: Option<String>,
+    done: bool,
+}
+
+impl Drop for OutboundRun<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(dialog) = &self.dialog {
+            let _ = outbound::send_bye(&self.state.sip_socket, dialog);
+        }
+        self.call.state = CallState::Ended;
+        self.call.end_reason = Some(EndReason::Failed {
+            detail: self.failure.take().unwrap_or_else(|| "aborted".to_string()),
+        });
+        finish(self.state, self.call.id.clone(), self.call.clone());
+    }
+}
+
+fn drive_outbound(
+    state: &SharedState,
+    run: &mut OutboundRun,
+    destination: &str,
+    duration: Duration,
+    ring_timeout: Duration,
+    codec: crate::media::codec::CodecProfile,
+    rtp_port: u16,
+) -> SipTestResult<()> {
+    let call_id = run.call.id.clone();
+    let call = &mut run.call;
     let outcome = outbound::place_call(
         &state.sip_socket,
         state.bridge_registrar,
         &state.config.sip.realm,
         &state.config.sip.username,
-        &destination,
+        destination,
         codec,
         rtp_port,
         ring_timeout,
@@ -265,13 +330,15 @@ pub fn execute_outbound_call(
             },
         ));
         finish(state, call_id, call.clone());
-        return Ok(call);
+        run.done = true;
+        return Ok(());
     }
 
     call.state = CallState::Answered;
     let dialog = outcome
         .dialog
         .expect("answered outcome always carries a confirmed dialog");
+    run.dialog = Some(dialog.clone());
     call.peer_uri = format!("sip:{}@{}", dialog.target_user, dialog.remote_target);
 
     let sdp_answer = outcome
@@ -345,7 +412,8 @@ pub fn execute_outbound_call(
     call.end_reason = Some(EndReason::DurationElapsed);
 
     finish(state, call_id, call.clone());
-    Ok(call)
+    run.done = true;
+    Ok(())
 }
 
 /// Handles one inbound INVITE end to end: `100`, caller-ID capture, `180`,
@@ -475,6 +543,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
     let _ = state
         .sip_socket
         .send(peer, &build_180_ringing(&req, &to_tag, &our_contact));
+    let invite_to_180_ms = start.elapsed().as_millis() as u64;
 
     let policy = *state
         .inbound_policy
@@ -593,6 +662,7 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 );
             };
             send_200();
+            let invite_to_200_ms = start.elapsed().as_millis() as u64;
 
             let acked =
                 crate::sip::inbound::wait_for_ack(&state.sip_socket, &call_id_hdr, send_200);
@@ -662,8 +732,8 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
                 media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT,
             );
             let signalling = SignallingTimings {
-                invite_to_180_ms: Some(start.elapsed().as_millis() as u64),
-                invite_to_200_ms: Some(start.elapsed().as_millis() as u64),
+                invite_to_180_ms: Some(invite_to_180_ms),
+                invite_to_200_ms: Some(invite_to_200_ms),
                 answer_to_first_rtp_ms: None,
                 final_status: Some(200),
             };
