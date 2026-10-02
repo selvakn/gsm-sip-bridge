@@ -10,6 +10,16 @@ pub struct AccountConfig {
     pub display_name: String,
 }
 
+/// `pjsua_acc_config_default` plus this bridge's defaults. Session timers are
+/// off per account because the account-level default (OPTIONAL) is not
+/// inherited from `pjsua_config` — see `Endpoint::create`.
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe fn default_acc_config(acc_cfg: &mut pjsua_sys::pjsua_acc_config) { // SAFETY: acc_cfg is a valid, writable pjsua_acc_config
+    pjsua_sys::pjsua_acc_config_default(acc_cfg);
+    acc_cfg.use_timer = pjsua_sys::pjsua_sip_timer_use_PJSUA_SIP_TIMER_INACTIVE;
+}
+
 pub trait RegistrationListener: Send + Sync {
     fn on_registration_state(&self, is_registered: bool, status_code: u16);
 }
@@ -44,7 +54,7 @@ impl Account {
             unsafe // SAFETY: PJSIP initialized; acc_cfg and pj_str sources live until pjsua_acc_add returns
             {
                 let mut acc_cfg: pjsua_sys::pjsua_acc_config = std::mem::zeroed();
-                pjsua_sys::pjsua_acc_config_default(&mut acc_cfg);
+                default_acc_config(&mut acc_cfg);
 
                 let id_str = format!(
                     "\"{}\" <sip:{}@{}:{}>",
@@ -148,7 +158,7 @@ impl Account {
             unsafe // SAFETY: PJSIP initialized; acc_cfg and pj_str sources live until pjsua_acc_add returns
             {
                 let mut acc_cfg: pjsua_sys::pjsua_acc_config = std::mem::zeroed();
-                pjsua_sys::pjsua_acc_config_default(&mut acc_cfg);
+                default_acc_config(&mut acc_cfg);
 
                 let id_str = format!("\"{display_name}\" <{id_uri}>");
                 let id_cstr = CString::new(id_str).unwrap();
@@ -226,7 +236,7 @@ impl Account {
         unsafe // SAFETY: PJSIP initialized; acc_cfg and pj_str sources live until pjsua_acc_modify returns
         {
             let mut acc_cfg: pjsua_sys::pjsua_acc_config = std::mem::zeroed();
-            pjsua_sys::pjsua_acc_config_default(&mut acc_cfg);
+            default_acc_config(&mut acc_cfg);
 
             let id_str = format!("\"{display_name}\" <{id_uri}>");
             let id_cstr = CString::new(id_str)
