@@ -13,8 +13,8 @@ use std::net::UdpSocket;
 use std::time::Duration;
 
 use gsm_sip_bridge::config::secret::Secret;
-use gsm_sip_bridge::config::{SipServerAccount, SipServerConfig};
-use gsm_sip_bridge::sip::server::Registrar;
+use gsm_sip_bridge::config::{SipServerAccount, SipServerConfig, SipServerDialMode};
+use gsm_sip_bridge::sip::server::{OutboundDial, Registrar};
 
 const REALM: &str = "test-realm";
 const USER: &str = "1001";
@@ -55,13 +55,52 @@ impl Harness {
         Self::finish(registrar)
     }
 
-    /// A registrar with `[outbound].enabled` (spec 025) — a registered
-    /// phone's INVITE is redirected rather than refused.
+    /// A registrar with `[outbound].enabled` in redirect mode (spec 025) — a
+    /// registered phone's INVITE is redirected rather than refused.
     fn with_outbound() -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
-        let registrar =
-            Registrar::start_on_with_outbound(socket, &config(), 5062).expect("start registrar");
+        let registrar = Registrar::start_on_with_outbound(
+            socket,
+            &config(),
+            OutboundDial {
+                port: 5062,
+                mode: SipServerDialMode::Redirect,
+            },
+        )
+        .expect("start registrar");
         Self::finish(registrar)
+    }
+
+    /// A registrar in proxy mode, plus a socket standing in for the pjsua
+    /// dial-out account that relayed requests are sent to.
+    fn with_proxy() -> (Self, UdpSocket) {
+        let account = UdpSocket::bind("127.0.0.1:0").expect("bind dial-out account");
+        account
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("account timeout");
+        let port = account.local_addr().expect("account addr").port();
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
+        let registrar = Registrar::start_on_with_outbound(
+            socket,
+            &config(),
+            OutboundDial {
+                port,
+                mode: SipServerDialMode::Proxy,
+            },
+        )
+        .expect("start registrar");
+        (Self::finish(registrar), account)
+    }
+
+    /// Reads the phone socket, or `None` after `wait` of silence.
+    fn try_recv(&self, wait: Duration) -> Option<String> {
+        self.phone.set_read_timeout(Some(wait)).expect("timeout");
+        let mut buf = [0u8; 8192];
+        let got = self.phone.recv(&mut buf).ok();
+        self.phone
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        got.map(|n| String::from_utf8_lossy(&buf[..n]).into_owned())
     }
 
     fn finish(registrar: Registrar) -> Self {
@@ -670,6 +709,163 @@ fn a_registered_phones_call_is_redirected_when_outbound_is_enabled() {
     assert!(contact.contains("sip:+919000000000@"), "got: {contact}");
     assert!(!contact.contains(&format!("sip:{USER}@")), "got: {contact}");
     assert!(contact.contains(":5062"), "got: {contact}");
+}
+
+/// Receives one datagram on the stand-in dial-out account.
+fn recv_at(account: &UdpSocket) -> (String, std::net::SocketAddr) {
+    let mut buf = [0u8; 8192];
+    let (n, from) = account.recv_from(&mut buf).expect("account got nothing");
+    (String::from_utf8_lossy(&buf[..n]).into_owned(), from)
+}
+
+/// Proxy mode: a registered phone's INVITE reaches the dial-out account with
+/// the relay's own Via on top, Max-Forwards decremented and the Request-URI
+/// untouched — and the phone gets no answer from the registrar itself.
+#[test]
+fn proxy_mode_relays_a_registered_phones_invite() {
+    let (h, account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+
+    h.phone
+        .send(non_register("INVITE").as_bytes())
+        .expect("send");
+    let (relayed, _) = recv_at(&account);
+
+    assert!(
+        relayed.starts_with("INVITE sip:+919000000000@bridge SIP/2.0\r\n"),
+        "got: {relayed}"
+    );
+    let vias: Vec<&str> = relayed.lines().filter(|l| l.starts_with("Via:")).collect();
+    assert_eq!(vias.len(), 2, "got: {relayed}");
+    assert!(vias[0].contains("127.0.0.1:") && vias[0].contains("branch=z9hG4bK-rl"));
+    assert!(
+        vias[1].contains("192.168.1.50:5060"),
+        "phone's Via kept below"
+    );
+    assert!(relayed.contains("Max-Forwards: 69"), "got: {relayed}");
+    assert!(
+        h.try_recv(Duration::from_millis(300)).is_none(),
+        "the registrar must not answer a relayed INVITE itself"
+    );
+}
+
+/// Responses come back through the relay with its Via removed, to the phone.
+#[test]
+fn proxy_mode_passes_responses_back_without_the_relay_via() {
+    let (h, account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+    h.phone
+        .send(non_register("INVITE").as_bytes())
+        .expect("send");
+    let (relayed, relay_addr) = recv_at(&account);
+    let relay_via = relayed
+        .lines()
+        .find(|l| l.starts_with("Via:"))
+        .expect("relay Via")
+        .to_string();
+
+    let ringing = format!(
+        "SIP/2.0 180 Ringing\r\n{relay_via}\r\n\
+         Via: SIP/2.0/UDP 192.168.1.50:5060;branch=z9hG4bKx\r\n\
+         From: <sip:{USER}@bridge>;tag=phone-tag\r\nTo: <sip:someone@bridge>;tag=u\r\n\
+         Call-ID: other-call\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+    );
+    account
+        .send_to(ringing.as_bytes(), relay_addr)
+        .expect("send");
+
+    let got = h
+        .try_recv(Duration::from_secs(5))
+        .expect("phone got no 180");
+    assert_status(&got, 180);
+    let vias: Vec<&str> = got.lines().filter(|l| l.starts_with("Via:")).collect();
+    assert_eq!(vias.len(), 1, "relay Via must be stripped: {got}");
+    assert!(vias[0].contains("z9hG4bKx"));
+}
+
+/// A response for a branch the relay never issued is dropped, not forwarded.
+#[test]
+fn proxy_mode_drops_a_response_for_an_unknown_branch() {
+    let (h, account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+    h.phone
+        .send(non_register("INVITE").as_bytes())
+        .expect("send");
+    let (_, relay_addr) = recv_at(&account);
+
+    let stray = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 127.0.0.1:1;branch=z9hG4bK-rl-nope\r\n\
+                 CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+    account.send_to(stray.as_bytes(), relay_addr).expect("send");
+    assert!(h.try_recv(Duration::from_millis(400)).is_none());
+}
+
+/// CANCEL and the ACK for a non-2xx share the INVITE's relayed branch.
+#[test]
+fn proxy_mode_relays_cancel_and_non_2xx_ack_on_the_invites_branch() {
+    let (h, account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+    h.phone
+        .send(non_register("INVITE").as_bytes())
+        .expect("send");
+    let (invite, _) = recv_at(&account);
+    let branch_of = |m: &str| {
+        m.lines()
+            .find(|l| l.starts_with("Via:"))
+            .and_then(|l| l.split("branch=").nth(1))
+            .map(|b| b.split(';').next().unwrap_or(b).to_string())
+            .expect("branch")
+    };
+
+    h.phone
+        .send(non_register("CANCEL").as_bytes())
+        .expect("send");
+    let (cancel, _) = recv_at(&account);
+    assert!(cancel.starts_with("CANCEL "), "got: {cancel}");
+    assert_eq!(branch_of(&cancel), branch_of(&invite));
+
+    h.phone.send(non_register("ACK").as_bytes()).expect("send");
+    let (ack, _) = recv_at(&account);
+    assert!(ack.starts_with("ACK "), "got: {ack}");
+    assert_eq!(branch_of(&ack), branch_of(&invite));
+}
+
+/// A CANCEL for nothing the relay forwarded is answered 481, not relayed.
+#[test]
+fn proxy_mode_answers_a_stray_cancel_with_481() {
+    let (h, account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+    assert_status(&h.round_trip(&non_register("CANCEL")), 481);
+    account
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
+    let mut buf = [0u8; 64];
+    assert!(
+        account.recv_from(&mut buf).is_err(),
+        "nothing may be relayed"
+    );
+}
+
+/// An unregistered peer is still refused in proxy mode, and nothing is relayed.
+#[test]
+fn proxy_mode_still_refuses_an_unregistered_peer() {
+    let (h, account) = Harness::with_proxy();
+    assert_status(&h.round_trip(&non_register("INVITE")), 403);
+    account
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
+    let mut buf = [0u8; 64];
+    assert!(
+        account.recv_from(&mut buf).is_err(),
+        "nothing may be relayed"
+    );
+}
+
+#[test]
+fn proxy_mode_refuses_an_exhausted_max_forwards_with_483() {
+    let (h, _account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+    let invite = non_register("INVITE").replace("Contact:", "Max-Forwards: 0\r\nContact:");
+    assert_status(&h.round_trip(&invite), 483);
 }
 
 /// An unregistered peer gets no redirect even with `[outbound].enabled` —

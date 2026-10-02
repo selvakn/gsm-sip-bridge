@@ -104,3 +104,21 @@ VoWiFi/VoLTE-only.
 Unchanged from existing call handling (FR-013): either leg hanging up tears
 down the other, using the same code path an inbound call's teardown already
 uses — this feature does not introduce a second teardown implementation.
+
+## Addendum: proxy mode for SIP server phones
+
+`[outbound].sip_server_dial_mode` (default `proxy`; `redirect` keeps the
+original behaviour above). A PJSIP-based handset (Telephone.app) ACKs the
+`302` and ends the call without ever re-INVITEing — confirmed by packet
+capture — so the default is now a relay: the registrar forwards the phone's
+`INVITE` (own `Via` on top, `Max-Forwards` decremented, everything else
+untouched) to the dial-out account (`sip::server::relay`), and passes the
+account's responses back with the relay `Via` stripped. CANCEL and the ACK
+for a non-2xx final response are relayed on the same branch. No
+Record-Route: the account's `200 OK` `Contact` points the phone straight at
+it, so BYE, re-INVITE and media bypass the registrar. The dial-out account
+trusts the relay's source address as well as live phone bindings
+(`BindingStore::is_trusted_dialout_source`); the relay only forwards
+INVITEs already matched to a live binding. Residual risk: a host on the same
+L2 segment that spoofs the relay's `IP:port` bypasses the binding check — the
+same trust class as the existing source-address check.

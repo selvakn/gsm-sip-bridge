@@ -431,6 +431,7 @@ left entirely to the PBX's dial plan, network access controls, and
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch. Off by default |
+| `sip_server_dial_mode` | string | `"proxy"` | How a phone registered in `[sip_server]` mode reaches the dial-out account. `"proxy"`: the registrar relays the phone's `INVITE` itself (no Record-Route — once answered, BYE and media go directly between phone and bridge); works with every handset, including PJSIP-based softphones such as Telephone.app that treat a `302` as a failed call. `"redirect"`: the registrar answers `302 Moved Temporarily` and the phone must re-`INVITE` the dial-out port (`[sip].local_port`) — only for handsets known to follow redirects. Ignored in PBX trunk mode |
 
 ### `[discovery]`
 

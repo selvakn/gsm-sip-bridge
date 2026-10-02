@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod bindings;
+mod relay;
 
 pub use bindings::{Binding, BindingStore};
 
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::config::SipServerConfig;
+use crate::config::{SipServerConfig, SipServerDialMode};
 use crate::ims::sip_client::{build_uas_response_with_headers, random_hex, SipRequest};
 
 /// How long the socket blocks before the loop takes an idle tick. Short enough
@@ -49,10 +50,20 @@ const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER";
 /// instead (spec 024, FR-022).
 pub type RegistrarObserver = Box<dyn Fn(u32, bool) + Send + Sync>;
 
-/// A running registrar. Dropping it stops the thread.
+/// The dial-out account a registered phone's INVITE is sent to, and how
+/// (`[outbound]`, spec 025).
+#[derive(Clone, Copy, Debug)]
+pub struct OutboundDial {
+    /// The pjsua dial-out account's UDP port (`[sip].local_port`).
+    pub port: u16,
+    pub mode: SipServerDialMode,
+}
+
+/// A running registrar. Dropping it stops its threads.
 pub struct Registrar {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    relay_handle: Option<std::thread::JoinHandle<()>>,
     bindings: Arc<BindingStore>,
     local_addr: SocketAddr,
 }
@@ -70,19 +81,19 @@ impl Registrar {
     /// [`start`](Self::start) with an observer for hosts that cannot export the
     /// registrar's gauges themselves — see [`RegistrarObserver`].
     ///
-    /// `outbound_local_port`: `Some(port)` when `[outbound].enabled` — a
-    /// registered phone's INVITE is redirected to
-    /// `sip:{destination}@{listen_addr}:{port}` (spec 025; the *dialed*
-    /// destination, not the phone's own AOR — see the `"INVITE"` branch's
-    /// own comment in `handle_datagram` for why) instead of refused with
-    /// `403`. `None` reproduces spec 024's behaviour exactly (FR-017).
+    /// `outbound`: `Some` when `[outbound].enabled` — a registered phone's
+    /// INVITE is relayed to the dial-out account (`Proxy`), or redirected to
+    /// `sip:{destination}@{listen_addr}:{port}` (`Redirect`; spec 025 — the
+    /// *dialed* destination, not the phone's own AOR, see the `"INVITE"`
+    /// branch's own comment in `handle_datagram` for why) instead of refused
+    /// with `403`. `None` reproduces spec 024's behaviour exactly (FR-017).
     pub fn start_observed(
         config: &SipServerConfig,
-        outbound_local_port: Option<u16>,
+        outbound: Option<OutboundDial>,
         observer: Option<RegistrarObserver>,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind((config.listen_addr.as_str(), config.listen_port))?;
-        Self::start_on_observed(socket, config, outbound_local_port, observer)
+        Self::start_on_observed(socket, config, outbound, observer)
     }
 
     /// [`start`](Self::start) on an already-bound socket. Tests bind
@@ -92,19 +103,19 @@ impl Registrar {
     }
 
     /// [`start_on`](Self::start_on) with outbound calling enabled — see
-    /// [`start_observed`](Self::start_observed)'s `outbound_local_port`.
+    /// [`start_observed`](Self::start_observed)'s `outbound`.
     pub fn start_on_with_outbound(
         socket: UdpSocket,
         config: &SipServerConfig,
-        outbound_local_port: u16,
+        outbound: OutboundDial,
     ) -> std::io::Result<Self> {
-        Self::start_on_observed(socket, config, Some(outbound_local_port), None)
+        Self::start_on_observed(socket, config, Some(outbound), None)
     }
 
     fn start_on_observed(
         socket: UdpSocket,
         config: &SipServerConfig,
-        outbound_local_port: Option<u16>,
+        outbound: Option<OutboundDial>,
         observer: Option<RegistrarObserver>,
     ) -> std::io::Result<Self> {
         socket.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -112,11 +123,24 @@ impl Registrar {
 
         let bindings = Arc::new(BindingStore::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let relay = match outbound {
+            Some(OutboundDial {
+                port,
+                mode: SipServerDialMode::Proxy,
+            }) => {
+                let (host, wildcard) = dial_out_host(config);
+                let relay = Arc::new(relay::Relay::bind(host, port, wildcard)?);
+                bindings.set_relay_source(relay.source());
+                Some(relay)
+            }
+            _ => None,
+        };
         let state = Arc::new(ServerState {
             config: config.clone(),
             nonces: auth::NonceStore::new(Duration::from_secs(config.nonce_lifetime_sec)),
             bindings: Arc::clone(&bindings),
-            outbound_local_port,
+            outbound,
+            relay: relay.clone(),
             observer,
         });
 
@@ -128,6 +152,19 @@ impl Registrar {
             "sip_server: registrar listening"
         );
 
+        let relay_handle = match relay {
+            Some(relay) => {
+                let out = socket.try_clone()?;
+                let relay_stop = Arc::clone(&stop);
+                Some(
+                    std::thread::Builder::new()
+                        .name("sip-registrar-relay".to_string())
+                        .spawn(move || relay.run(&out, &relay_stop))?,
+                )
+            }
+            None => None,
+        };
+
         let loop_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("sip-registrar".to_string())
@@ -136,6 +173,7 @@ impl Registrar {
         Ok(Self {
             stop,
             handle: Some(handle),
+            relay_handle,
             bindings,
             local_addr,
         })
@@ -155,7 +193,10 @@ impl Registrar {
     /// Signals the serve loop and waits for it to finish.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
+        for handle in [self.handle.take(), self.relay_handle.take()]
+            .into_iter()
+            .flatten()
+        {
             if handle.join().is_err() {
                 tracing::warn!("sip_server: registrar thread panicked during shutdown");
             }
@@ -173,9 +214,23 @@ struct ServerState {
     config: SipServerConfig,
     nonces: auth::NonceStore,
     bindings: Arc<BindingStore>,
-    /// `Some(port)` when `[outbound].enabled` — see `start_observed`.
-    outbound_local_port: Option<u16>,
+    /// `Some` when `[outbound].enabled` — see `start_observed`.
+    outbound: Option<OutboundDial>,
+    /// Present only for `SipServerDialMode::Proxy`.
+    relay: Option<Arc<relay::Relay>>,
     observer: Option<RegistrarObserver>,
+}
+
+/// The host a phone's dial-out reaches the dial-out account on, and whether the
+/// registrar's own `listen_addr` was a wildcard. A wildcard means "every
+/// interface", not a routable host — so the realm stands in, the same
+/// substitution `SipServerConfig::identity_uri` applies to the ring target's
+/// own identity (spec 024).
+fn dial_out_host(config: &SipServerConfig) -> (&str, bool) {
+    match config.listen_addr.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => (config.realm.as_str(), true),
+        _ => (config.listen_addr.as_str(), false),
+    }
 }
 
 fn serve(socket: UdpSocket, state: Arc<ServerState>, stop: Arc<AtomicBool>) {
@@ -276,7 +331,7 @@ fn handle_datagram(
         // that can actually accept the call and place the mobile leg —
         // never any phone regardless of registration, which would let an
         // unauthenticated peer probe for a dial-out primitive.
-        "INVITE" => match state.outbound_local_port {
+        "INVITE" => match state.outbound.map(|o| o.port) {
             Some(local_port) => match state.bindings.find_by_source(peer, now) {
                 Some(binding) => match uri_user(&request.request_uri) {
                     // Carries the *destination*, not the phone's own AOR
@@ -296,16 +351,31 @@ fn handle_datagram(
                     // Putting the real destination directly in the
                     // Contact makes this work regardless of what the
                     // retry's To header ends up being.
+                    Some(destination) if state.relay.is_some() => {
+                        // Proxy mode: hand the INVITE to the dial-out account
+                        // ourselves rather than trusting the handset to follow
+                        // a 3xx (see `relay`'s module doc). The relay thread
+                        // carries the responses back, so no answer here.
+                        let relay = state.relay.as_ref().expect("guarded above");
+                        match relay.forward_invite(text, peer, now) {
+                            Ok(()) => {
+                                tracing::info!(%peer, aor = %binding.aor, %destination, "sip_server: relaying a registered phone's dial-out attempt");
+                                crate::metrics::SIP_SERVER_REQUESTS_TOTAL
+                                    .with_label_values(&["INVITE", "relayed"])
+                                    .inc();
+                                return None;
+                            }
+                            Err(relay::RelayError::TooManyHops) => {
+                                Response::new(483, "Too Many Hops")
+                            }
+                            Err(relay::RelayError::Malformed) => Response::new(400, "Bad Request"),
+                            Err(relay::RelayError::Unreachable) => {
+                                Response::new(503, "Service Unavailable")
+                            }
+                        }
+                    }
                     Some(destination) => {
-                        // A wildcard `listen_addr` (the default) means "every
-                        // interface", not a routable host — same substitution
-                        // `SipServerConfig::identity_uri` already applies to the
-                        // ring target's own identity, reused here for the same
-                        // reason (spec 024).
-                        let host = match state.config.listen_addr.parse::<std::net::IpAddr>() {
-                            Ok(ip) if ip.is_unspecified() => state.config.realm.as_str(),
-                            _ => state.config.listen_addr.as_str(),
-                        };
+                        let (host, _) = dial_out_host(&state.config);
                         let contact = format!("sip:{destination}@{host}:{local_port}");
                         tracing::info!(%peer, aor = %binding.aor, %destination, %contact, "sip_server: redirecting a registered phone's dial-out attempt");
                         Response::new(302, "Moved Temporarily").with_contact(contact)
@@ -339,8 +409,25 @@ fn handle_datagram(
             }
         },
         "SUBSCRIBE" => Response::new(489, "Bad Event"),
-        // ACK is hop-by-hop for a 4xx we sent; it is never answered.
-        "ACK" => return None,
+        // CANCEL of a relayed INVITE: pjsua answers it (and the INVITE with
+        // 487) and the relay thread passes both back, so nothing is said here.
+        "CANCEL" if state.relay.is_some() => {
+            let relay = state.relay.as_ref().expect("guarded above");
+            match relay.forward_in_transaction(text, peer, now) {
+                Ok(true) => return None,
+                Ok(false) => Response::new(481, "Call/Transaction Does Not Exist"),
+                Err(relay::RelayError::Unreachable) => Response::new(503, "Service Unavailable"),
+                Err(_) => Response::new(400, "Bad Request"),
+            }
+        }
+        // ACK is hop-by-hop for a 4xx we sent; it is never answered. When the
+        // INVITE it closes was relayed, the dial-out account is waiting for it.
+        "ACK" => {
+            if let Some(relay) = &state.relay {
+                let _ = relay.forward_in_transaction(text, peer, now);
+            }
+            return None;
+        }
         _ => Response::new(405, "Method Not Allowed").with_header("Allow", ALLOW),
     };
 

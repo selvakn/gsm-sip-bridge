@@ -457,3 +457,8 @@ as outstanding work; do not implement them.
 5. **STOP and VALIDATE** on real hardware before continuing
 6. From there, US2 (same-process)/US3/US4/US5/Polish as before — US4 is now
    independently reachable at any point since it doesn't depend on Phase 3
+
+## Addendum (2026-10-02): proxy mode for SIP-server phones
+
+- **Real bug, fixed — a PJSIP-based handset (Telephone.app) never follows the registrar's `302`**: a packet capture showed it ACK the 302 and end the call; no INVITE ever reached the dial-out port. **Fixed**: `[outbound].sip_server_dial_mode = "proxy"` (new default) makes the registrar relay the INVITE to the dial-out account (`sip/server/relay.rs`, no Record-Route); `"redirect"` keeps the original behaviour. The dial-out account's source check now goes through `BindingStore::is_trusted_dialout_source` (live phone *or* the relay's source). Contract updated in `contracts/sip-dialout.md`.
+- Tests: relay/CANCEL/ACK/483/481/403/unknown-branch cases in `tests/test_sip_server_registrar.rs`; config + trust unit tests. Live-verified on the local rig with Telephone.app (call placed over VoWiFi, clean hangup). CANCEL-during-ringing and redirect mode are covered by tests only.

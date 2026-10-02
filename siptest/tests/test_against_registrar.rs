@@ -18,11 +18,11 @@ use std::thread;
 use std::time::Duration;
 
 use gsm_sip_bridge::config::secret::Secret;
-use gsm_sip_bridge::config::{SipServerAccount, SipServerConfig};
+use gsm_sip_bridge::config::{SipServerAccount, SipServerConfig, SipServerDialMode};
 use gsm_sip_bridge::ims::sip_client::{
     build_100_trying, build_180_ringing, build_200_ok_invite, parse_datagram, SipMessage,
 };
-use gsm_sip_bridge::sip::server::Registrar;
+use gsm_sip_bridge::sip::server::{OutboundDial, Registrar};
 
 use siptest::media::codec::{resolve_codec, PCMU};
 use siptest::sip::registration::{register, RegistrationConfig, RegistrationCredentials};
@@ -162,9 +162,15 @@ fn siptest_registers_places_a_call_through_a_302_redirect_and_carries_bothways_a
 
     let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let registrar_addr = registrar_socket.local_addr().unwrap();
-    let _registrar =
-        Registrar::start_on_with_outbound(registrar_socket, &server_config(), stub.sip_port)
-            .expect("start registrar");
+    let _registrar = Registrar::start_on_with_outbound(
+        registrar_socket,
+        &server_config(),
+        OutboundDial {
+            port: stub.sip_port,
+            mode: SipServerDialMode::Redirect,
+        },
+    )
+    .expect("start registrar");
 
     let sip_socket =
         SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
@@ -276,9 +282,15 @@ fn siptest_offers_g722_on_the_wire_when_the_g722_codec_is_selected() {
 
     let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let registrar_addr = registrar_socket.local_addr().unwrap();
-    let _registrar =
-        Registrar::start_on_with_outbound(registrar_socket, &server_config(), stub.sip_port)
-            .expect("start registrar");
+    let _registrar = Registrar::start_on_with_outbound(
+        registrar_socket,
+        &server_config(),
+        OutboundDial {
+            port: stub.sip_port,
+            mode: SipServerDialMode::Redirect,
+        },
+    )
+    .expect("start registrar");
 
     let sip_socket =
         SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
@@ -350,9 +362,15 @@ fn an_invite_from_a_different_socket_than_the_registered_one_is_refused() {
 
     let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let registrar_addr = registrar_socket.local_addr().unwrap();
-    let _registrar =
-        Registrar::start_on_with_outbound(registrar_socket, &server_config(), stub.sip_port)
-            .expect("start registrar");
+    let _registrar = Registrar::start_on_with_outbound(
+        registrar_socket,
+        &server_config(),
+        OutboundDial {
+            port: stub.sip_port,
+            mode: SipServerDialMode::Redirect,
+        },
+    )
+    .expect("start registrar");
 
     let registering_socket =
         SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
