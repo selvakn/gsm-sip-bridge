@@ -452,11 +452,20 @@ pub fn execute_inbound_call(state: &SharedState, req: SipRequest, peer: SocketAd
         end_reason: None,
         report: None,
     };
-    state
+    // The listener's own "no active call" check is only a fast path: an
+    // outbound call can reserve the slot between that check and here, so
+    // admission is decided atomically, by the same reservation outbound uses.
+    if !state
         .calls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .upsert(call.clone());
+        .try_reserve(call.clone())
+    {
+        let _ = state
+            .sip_socket
+            .send(peer, &crate::sip::inbound::build_busy(&req));
+        return;
+    }
     state
         .counters
         .lock()

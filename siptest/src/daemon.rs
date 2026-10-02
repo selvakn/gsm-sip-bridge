@@ -207,20 +207,22 @@ async fn shutdown_signal() {
 }
 
 fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc<AtomicBool>) {
-    let mut creds = RegistrationCredentials {
-        cseq: 0,
-        call_id: crate::sip::message::new_tag(),
-        from_tag: crate::sip::message::new_tag(),
-        cached_nonce: None,
-        nc: 0,
-    };
-
     let mut attempted = false;
     while !stop.load(Ordering::Relaxed) {
+        // The same credentials the control API uses (`/registration/*`): one
+        // lock serialises every REGISTER this process sends, so a refresh in
+        // flight can neither land after an explicit deregistration nor have
+        // its result recorded over it.
+        let mut creds = state
+            .registration_creds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // After the first attempt, `Unregistered` can only mean an explicit
         // deregistration (`POST /registration/deregister`): stay out of the
         // registrar until someone registers again, instead of undoing it at
-        // the next refresh.
+        // the next refresh. Checked *under the lock* — a deregistration that
+        // finished while this thread waited for it must be seen.
         if attempted
             && state
                 .registration
@@ -229,11 +231,13 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
                 .state
                 == registration::RegState::Unregistered
         {
+            drop(creds);
             sleep_unless_stopped(&stop, Duration::from_secs(2));
             continue;
         }
         attempted = true;
-        match registration::register(&state.sip_socket, &cfg, &mut creds) {
+
+        let wait = match registration::register(&state.sip_socket, &cfg, &mut creds) {
             Ok(mut status) => {
                 let registered = status.state == registration::RegState::Registered;
                 let expires = status.granted_expires;
@@ -257,15 +261,9 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
                     serde_json::json!({"registered": registered, "granted_expires": expires}),
                 );
                 if registered {
-                    sleep_unless_stopped(
-                        &stop,
-                        Duration::from_secs(refresh_interval_secs(expires) as u64),
-                    );
+                    Duration::from_secs(refresh_interval_secs(expires) as u64)
                 } else {
-                    sleep_unless_stopped(
-                        &stop,
-                        Duration::from_secs(backoff_secs(failures.saturating_sub(1))),
-                    );
+                    Duration::from_secs(backoff_secs(failures.saturating_sub(1)))
                 }
             }
             Err(e) => {
@@ -282,14 +280,17 @@ fn registration_loop(state: Arc<SharedState>, cfg: RegistrationConfig, stop: Arc
                     reg.consecutive_failures = failures_after(reg.consecutive_failures, false);
                     reg.consecutive_failures
                 };
-                sleep_unless_stopped(
-                    &stop,
-                    Duration::from_secs(backoff_secs(failures.saturating_sub(1))),
-                );
+                Duration::from_secs(backoff_secs(failures.saturating_sub(1)))
             }
-        }
+        };
+        drop(creds);
+        sleep_unless_stopped(&stop, wait);
     }
 
+    let mut creds = state
+        .registration_creds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Err(e) = registration::deregister(&state.sip_socket, &cfg, &mut creds) {
         tracing::warn!(error = %e, "could not deregister on shutdown");
     }
