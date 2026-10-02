@@ -1,10 +1,17 @@
 # Release Notes
 
-<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+<!-- Rename the "## Unreleased" heading to the real "## vX.Y.Z" at release
      time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
      "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
+## v8.19.0
+
+- **SIP server mode now proxies a phone's dial-out call instead of redirecting it** -- A handset registered in `[sip_server]` mode used to get a `302 Moved Temporarily` pointing at the dial-out port and was expected to re-`INVITE` there. Many handsets, notably PJSIP-based softphones such as Telephone.app, treat a `302` as a failed call. The registrar now relays the phone's `INVITE` itself (plus its `CANCEL` and the ACK for a non-2xx final response) to the dial-out account, with no `Record-Route`, so once answered the `BYE` and media go straight between phone and bridge. New `[outbound].sip_server_dial_mode = "proxy" | "redirect"`, defaulting to `"proxy"`; set `"redirect"` to keep the old behaviour for handsets known to follow redirects. Ignored in PBX trunk mode. See `docs/configuration.md`.
+- **`siptest` call lifecycle, registration and inbound hardening** -- A round of correctness fixes to the SIP test client, so its results can be trusted when diagnosing a bridge: outbound and inbound calls are admitted atomically, with a guard that ends the call and hangs up on any exit path (no leaked call slots); a codec mismatch between offer and answer is detected; registration failure counts and backoff are fixed; deregistration answers the digest challenge, and registration is serialised under a single lock; inbound calls send realistic `180`/`200` timings and handle a retransmitted `INVITE`; a late `200 OK` after a `CANCEL` is handled, `Contact` parsing is stricter, and responses are matched by method so a `CANCEL`'s reply is never mistaken for the `INVITE`'s; `max_calls_per_hour = 0` now fails closed instead of meaning unlimited; and the expected DTMF tone-symbol count it reports is now honest.
+- **A SIP-mode call that ends unexpectedly now says why.** A call dropped about 36 seconds in was logged only as "phone leg hung up", which cannot tell the phone sending a `BYE` apart from PJSIP ending the dialog itself (missed ACK, session timer, transport timeout). The log now records a `SIP call disconnected` line with the final status, connect and total seconds, and the exact event and SIP message that triggered it (e.g. `rx_msg BYE`).
+- **PJSIP's own RFC 4028 session timers are now off on the phone-facing side.** They are disabled on the endpoint and on every account (including the per-inbound-call identity rewrite). A peer sending `Require: timer` is therefore now refused with `420 Bad Extension` rather than accepted. The carrier leg's own session-refresh handling (v8.16.0) is unaffected.
+- **`[volte]` has its own `sms_delivery_report` and `respect_caller_privacy`** -- Previously only `[vowifi]` carried these, though the shared inbound path applied them to VoLTE too. Both now exist under `[volte]`; when the `[volte]` key is absent it inherits `[vowifi]`'s value, so no existing deployment changes behaviour on upgrade.
 - **Multi-carrier VoLTE P-CSCF priming** -- A `bridge_inbound` deployment with modems on different carriers no longer shares one P-CSCF cache across every line. Each VoLTE line now captures and resolves its own carrier's address, keyed by that modem's stable `card_id`, primed concurrently with every other line that needs it — no manual per-carrier step, and one line's failure never blocks or delays another that already succeeded. Single-line and already-pinned deployments are unaffected. See `docs/operations.md`.
 
 ## v8.18.0
