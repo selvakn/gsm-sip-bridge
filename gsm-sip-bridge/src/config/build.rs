@@ -1018,8 +1018,23 @@ fn check_sip_server_port_ownership(
 /// `[sip_server]`, there is no cross-section fact `config::build` can check
 /// (circuit-switched modems are discovered at runtime, not declared here).
 fn build_outbound(raw: RawOutbound) -> BridgeResult<OutboundConfig> {
+    let sip_server_dial_mode = match raw
+        .sip_server_dial_mode
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "proxy" => SipServerDialMode::Proxy,
+        "redirect" => SipServerDialMode::Redirect,
+        other => {
+            return Err(BridgeError::Config(format!(
+                "outbound.sip_server_dial_mode must be \"proxy\" or \"redirect\", got \"{other}\""
+            )))
+        }
+    };
     Ok(OutboundConfig {
         enabled: raw.enabled,
+        sip_server_dial_mode,
     })
 }
 

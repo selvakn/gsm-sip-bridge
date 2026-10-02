@@ -337,18 +337,21 @@ pub(crate) fn run_telephony_side(
                     Vec::new(),
                 );
             });
-        let outbound_local_port = config.outbound.enabled.then_some(local_port);
-        let registrar = crate::sip::server::Registrar::start_observed(
-            server,
-            outbound_local_port,
-            Some(observer),
-        )
-        .map_err(|e| {
-            BridgeError::Ims(format!(
-                "SIP registrar could not listen on {}:{}: {e}",
-                server.listen_addr, server.listen_port
-            ))
-        })?;
+        let outbound = config
+            .outbound
+            .enabled
+            .then_some(crate::sip::server::OutboundDial {
+                port: local_port,
+                mode: config.outbound.sip_server_dial_mode,
+            });
+        let registrar =
+            crate::sip::server::Registrar::start_observed(server, outbound, Some(observer))
+                .map_err(|e| {
+                    BridgeError::Ims(format!(
+                        "SIP registrar could not listen on {}:{}: {e}",
+                        server.listen_addr, server.listen_port
+                    ))
+                })?;
         let bindings = registrar.bindings();
         let id_uri = server.identity_uri();
         let account = Account::local(&endpoint, &id_uri, &config.sip.display_name)
@@ -717,9 +720,9 @@ fn run_outbound_listener(
         // call at all (found in review; see this function's own doc
         // comment on `bindings`/`trunk_source_ips`).
         let trusted = match bindings {
-            Some(bindings) => bindings
-                .find_by_source(source_addr, std::time::Instant::now())
-                .is_some(),
+            Some(bindings) => {
+                bindings.is_trusted_dialout_source(source_addr, std::time::Instant::now())
+            }
             None => trunk_source_ips.contains(&source_addr.ip()),
         };
         if !trusted {

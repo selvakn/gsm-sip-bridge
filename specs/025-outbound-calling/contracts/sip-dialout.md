@@ -104,3 +104,31 @@ VoWiFi/VoLTE-only.
 Unchanged from existing call handling (FR-013): either leg hanging up tears
 down the other, using the same code path an inbound call's teardown already
 uses — this feature does not introduce a second teardown implementation.
+
+## Addendum: proxy mode for SIP server phones
+
+`[outbound].sip_server_dial_mode` (default `proxy`; `redirect` keeps the
+original behaviour above). A PJSIP-based handset (Telephone.app) ACKs the
+`302` and ends the call without ever re-INVITEing — confirmed by packet
+capture — so the default is now a relay: the registrar forwards the phone's
+`INVITE` (own `Via` on top, `Max-Forwards` decremented, everything else
+untouched) to the dial-out account (`sip::server::relay`), and passes the
+account's responses back with the relay `Via` stripped. CANCEL and the ACK
+for a non-2xx final response are relayed on the same branch. No
+Record-Route: the account's `200 OK` `Contact` points the phone straight at
+it, so BYE, re-INVITE and media bypass the registrar. The dial-out account
+trusts the relay's source address as well as live phone bindings
+(`BindingStore::is_trusted_dialout_source`); the relay only forwards
+INVITEs already matched to a live binding. Residual risk: a host on the same
+L2 segment that spoofs the relay's `IP:port` bypasses the binding check — the
+same trust class as the existing source-address check.
+
+Review follow-ups (PR #93): with a wildcard `listen_addr` the relay reaches the
+dial-out account on whichever local address routes to the phone (no realm
+DNS lookup, so an unresolvable realm cannot block startup); the relay socket
+follows the listen address's family and IPv6 `Via` hosts are bracketed; a
+relayed transaction lives 180 s from the last provisional response (RFC 3261
+Timer C), 64 s after a 2xx and 32 s after a 3xx–6xx, so a long ring still
+delivers its `200 OK`; the compact `v:` Via form is accepted; responses are
+accepted only from the address the request was sent to. `siptest`'s
+`place_call` now also completes a call answered directly by the relay.

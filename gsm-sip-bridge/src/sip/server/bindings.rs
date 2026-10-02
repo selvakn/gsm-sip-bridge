@@ -5,7 +5,7 @@
 //! refresh timer after a restart, which is what SIP registration already
 //! guarantees (spec 024).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -51,6 +51,16 @@ impl Binding {
 #[derive(Debug, Default)]
 pub struct BindingStore {
     inner: Mutex<HashMap<String, Binding>>,
+    /// Addresses the registrar's dial-out relay has sent from — see
+    /// [`is_trusted_dialout_source`](Self::is_trusted_dialout_source). More
+    /// than one when the registrar listens on a wildcard: the source IP is
+    /// whichever local address routes to the phone.
+    relay_sources: Mutex<HashSet<std::net::SocketAddr>>,
+}
+
+/// IPv4-mapped IPv6 addresses compared as the IPv4 they stand for.
+fn canonical(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 impl BindingStore {
@@ -114,6 +124,26 @@ impl BindingStore {
             .cloned()
     }
 
+    /// Records an address the registrar's dial-out relay sends from.
+    pub fn add_relay_source(&self, addr: std::net::SocketAddr) {
+        self.relay_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(canonical(addr));
+    }
+
+    /// Whether a dial-out INVITE arriving at the dial-out account from `addr`
+    /// comes from somewhere the registrar vouches for: either a live phone
+    /// directly (redirect mode), or the registrar's own relay (proxy mode),
+    /// which only forwards INVITEs it has already matched to a live binding.
+    pub fn is_trusted_dialout_source(&self, addr: std::net::SocketAddr, now: Instant) -> bool {
+        self.relay_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&canonical(addr))
+            || self.find_by_source(addr, now).is_some()
+    }
+
     /// Drops expired entries and returns how many remain live.
     ///
     /// Only exists so the gauges and logs report the truth — correctness does
@@ -144,6 +174,26 @@ mod tests {
             expires_at,
             user_agent: None,
         }
+    }
+
+    #[test]
+    fn the_relay_source_is_trusted_only_once_set_and_only_for_that_address() {
+        let store = BindingStore::new();
+        let now = Instant::now();
+        let relay: std::net::SocketAddr = "10.0.0.1:6000".parse().unwrap();
+        let phone: std::net::SocketAddr = "192.168.1.50:5060".parse().unwrap();
+        store.upsert(binding("1001", now + Duration::from_secs(60)));
+
+        assert!(!store.is_trusted_dialout_source(relay, now), "unset");
+        store.add_relay_source(relay);
+        assert!(store.is_trusted_dialout_source(relay, now));
+        assert!(store.is_trusted_dialout_source(phone, now), "live phone");
+        let other: std::net::SocketAddr = "10.0.0.1:6001".parse().unwrap();
+        assert!(!store.is_trusted_dialout_source(other, now), "wrong port");
+        assert!(
+            !store.is_trusted_dialout_source(phone, now + Duration::from_secs(61)),
+            "expired phone"
+        );
     }
 
     /// Every expiry rule is driven by a caller-supplied `now`, so the whole

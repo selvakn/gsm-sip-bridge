@@ -87,6 +87,7 @@ struct SipBridgeConfig {
     /// `[outbound].enabled` (spec 025) — passed to the registrar so a
     /// registered phone's INVITE is redirected instead of refused.
     outbound_enabled: bool,
+    sip_server_dial_mode: crate::config::SipServerDialMode,
     /// `[cs].enabled` (specs/026-disable-circuit-switched) — carried
     /// separately from `owns_sip_side` purely so `register()`'s skip log can
     /// name the actual reason (FR-009b) instead of always blaming
@@ -140,6 +141,7 @@ impl SipBridge {
             snd_play_latency_ms: config.audio.snd_play_latency_ms,
             rt_audio_prio: config.modem_audio.rt_audio_prio,
             outbound_enabled: config.outbound.enabled,
+            sip_server_dial_mode: config.outbound.sip_server_dial_mode,
             cs_enabled: config.cs.enabled,
         };
 
@@ -317,18 +319,20 @@ impl SipBridge {
 
         // Bind before anything else can fail: a port clash here is the most
         // likely startup problem, and the operator needs it named plainly.
-        let outbound_local_port = self
+        let outbound = self
             .config
             .outbound_enabled
-            .then_some(self.config.local_port);
-        let registrar =
-            Registrar::start_observed(&server, outbound_local_port, None).map_err(|e| {
-                self.state = RegistrationState::Failed;
-                format!(
-                    "SIP registrar could not listen on {}:{}: {e}",
-                    server.listen_addr, server.listen_port
-                )
-            })?;
+            .then_some(crate::sip::server::OutboundDial {
+                port: self.config.local_port,
+                mode: self.config.sip_server_dial_mode,
+            });
+        let registrar = Registrar::start_observed(&server, outbound, None).map_err(|e| {
+            self.state = RegistrationState::Failed;
+            format!(
+                "SIP registrar could not listen on {}:{}: {e}",
+                server.listen_addr, server.listen_port
+            )
+        })?;
 
         // The identity the handset sees calls arrive from, so it must name the
         // bridge as the phone knows it — the registrar's own address.
@@ -539,9 +543,9 @@ impl SipBridge {
         // registrar's own redirect decision makes); in trunk mode, it must
         // be the configured PBX itself.
         let trusted = match &self.bindings {
-            Some(bindings) => bindings
-                .find_by_source(source_addr, std::time::Instant::now())
-                .is_some(),
+            Some(bindings) => {
+                bindings.is_trusted_dialout_source(source_addr, std::time::Instant::now())
+            }
             None => self.trunk_source_ips.contains(&source_addr.ip()),
         };
         if !trusted {

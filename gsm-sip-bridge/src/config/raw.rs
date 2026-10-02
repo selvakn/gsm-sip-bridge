@@ -612,9 +612,21 @@ section! {
     /// registered in `[sip_server]` mode (spec 025). Off by default. No
     /// allow-list, no path preference, no per-line configuration: enabling it
     /// is the only operator-visible decision (spec 025 Clarifications).
-    #[derive(Default)]
     pub struct RawOutbound {
         pub enabled: bool,
+        /// `"proxy"` (default) or `"redirect"` — how a `[sip_server]` phone's
+        /// dial-out INVITE reaches the dial-out account. See
+        /// `config::SipServerDialMode`.
+        pub sip_server_dial_mode: String,
+    }
+}
+
+impl Default for RawOutbound {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sip_server_dial_mode: "proxy".to_string(),
+        }
     }
 }
 

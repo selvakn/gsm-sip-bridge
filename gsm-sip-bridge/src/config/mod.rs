@@ -154,6 +154,21 @@ impl SipServerConfig {
 #[derive(Clone, Debug, Default)]
 pub struct OutboundConfig {
     pub enabled: bool,
+    pub sip_server_dial_mode: SipServerDialMode,
+}
+
+/// How a phone registered in `[sip_server]` mode reaches the dial-out
+/// account when it INVITEs (`[outbound].sip_server_dial_mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SipServerDialMode {
+    /// The registrar relays the INVITE to the dial-out account itself and
+    /// passes the responses back. Works with every handset — including those
+    /// (e.g. PJSIP-based softphones) that treat a `302` as a failed call.
+    #[default]
+    Proxy,
+    /// The registrar answers `302 Moved Temporarily` and the handset is
+    /// expected to re-INVITE the dial-out account. Spec 025's original design.
+    Redirect,
 }
 
 /// The opt-out switch for the circuit-switched call path (specs/026-
@@ -1288,6 +1303,26 @@ mod tests {
     fn outbound_disabled_by_default() {
         let c = parse(MINIMAL_TOML);
         assert!(!c.outbound.enabled, "must be opt-in (FR-001)");
+    }
+
+    #[test]
+    fn sip_server_dial_mode_defaults_to_proxy_and_accepts_redirect() {
+        let c = parse(MINIMAL_TOML);
+        assert_eq!(c.outbound.sip_server_dial_mode, SipServerDialMode::Proxy);
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[outbound]\nsip_server_dial_mode = \"redirect\"\n"
+        ));
+        assert_eq!(c.outbound.sip_server_dial_mode, SipServerDialMode::Redirect);
+    }
+
+    #[test]
+    fn an_unknown_sip_server_dial_mode_is_rejected() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[outbound]\nsip_server_dial_mode = \"bridge\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sip_server_dial_mode"), "got: {err}");
     }
 
     #[test]
