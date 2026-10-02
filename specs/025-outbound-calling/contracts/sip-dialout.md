@@ -122,3 +122,13 @@ trusts the relay's source address as well as live phone bindings
 INVITEs already matched to a live binding. Residual risk: a host on the same
 L2 segment that spoofs the relay's `IP:port` bypasses the binding check — the
 same trust class as the existing source-address check.
+
+Review follow-ups (PR #93): with a wildcard `listen_addr` the relay reaches the
+dial-out account on whichever local address routes to the phone (no realm
+DNS lookup, so an unresolvable realm cannot block startup); the relay socket
+follows the listen address's family and IPv6 `Via` hosts are bracketed; a
+relayed transaction lives 180 s from the last provisional response (RFC 3261
+Timer C), 64 s after a 2xx and 32 s after a 3xx–6xx, so a long ring still
+delivers its `200 OK`; the compact `v:` Via form is accepted; responses are
+accepted only from the address the request was sent to. `siptest`'s
+`place_call` now also completes a call answered directly by the relay.

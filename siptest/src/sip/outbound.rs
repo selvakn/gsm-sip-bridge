@@ -1,4 +1,5 @@
-//! Outbound call signalling: INVITE, the registrar's `302` redirect to
+//! Outbound call signalling: INVITE, then either the registrar's relayed
+//! answer (proxy mode, the bridge's default) or its `302` redirect to
 //! whichever port is actually hosting the telephony agent, ACK, and the
 //! re-INVITE that follows (contracts/sip-flows.md C-2).
 //!
@@ -102,6 +103,55 @@ pub fn place_call(
     let Some(resp1) = resp1 else {
         return Ok(timeout_outcome());
     };
+
+    // Proxy mode (the bridge's default): the registrar relayed the INVITE, so
+    // this *is* the dial-out account's answer and the dialog already exists.
+    if resp1.status == 200 {
+        let sdp_answer = sdp::parse_answer(&resp1.body)?;
+        let to_tag = extract_to_tag(&resp1).unwrap_or_default();
+        let ack_target = resp1
+            .header("Contact")
+            .and_then(parse_contact_uri)
+            .map(|(_, addr)| addr)
+            .unwrap_or(registrar_addr);
+        let ack_ruri = format!("sip:{destination}@{ack_target}");
+        let ack2xx = build_ack_2xx(&Ack2xxParams {
+            request_uri: &ack_ruri,
+            local_addr: socket.local_addr(),
+            from_user,
+            from_host: registrar_host,
+            to_user: destination,
+            to_host: registrar_host,
+            to_tag: &to_tag,
+            call_id: &call_id,
+            from_tag: &from_tag,
+            branch: &new_branch(),
+            cseq: 1,
+        });
+        socket.send(ack_target, &ack2xx)?;
+        return Ok(OutboundCallOutcome {
+            answered: true,
+            final_status: 200,
+            redirect_contact: None,
+            redirect_port: None,
+            invite_to_180_ms: None,
+            invite_to_200_ms: Some(start.elapsed().as_millis() as u64),
+            remote_target: Some(ack_target),
+            sdp_answer: Some(sdp_answer),
+            refusal_reason: None,
+            dialog: Some(ConfirmedDialog {
+                call_id: call_id.clone(),
+                from_tag: from_tag.clone(),
+                to_tag,
+                from_user: from_user.to_string(),
+                from_host: registrar_host.to_string(),
+                to_user: destination.to_string(),
+                to_host: registrar_host.to_string(),
+                remote_target: ack_target,
+                next_cseq: 2,
+            }),
+        });
+    }
 
     if resp1.status != 302 {
         return Ok(refusal_outcome(resp1.status, &resp1.reason));

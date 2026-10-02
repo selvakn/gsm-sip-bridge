@@ -127,12 +127,11 @@ impl Registrar {
             Some(OutboundDial {
                 port,
                 mode: SipServerDialMode::Proxy,
-            }) => {
-                let (host, wildcard) = dial_out_host(config);
-                let relay = Arc::new(relay::Relay::bind(host, port, wildcard)?);
-                bindings.set_relay_source(relay.source());
-                Some(relay)
-            }
+            }) => Some(Arc::new(relay::Relay::bind(
+                &config.listen_addr,
+                port,
+                Arc::clone(&bindings),
+            )?)),
             _ => None,
         };
         let state = Arc::new(ServerState {
@@ -221,15 +220,15 @@ struct ServerState {
     observer: Option<RegistrarObserver>,
 }
 
-/// The host a phone's dial-out reaches the dial-out account on, and whether the
-/// registrar's own `listen_addr` was a wildcard. A wildcard means "every
-/// interface", not a routable host — so the realm stands in, the same
+/// The host a redirected phone is sent to. A wildcard `listen_addr` means
+/// "every interface", not a routable host — so the realm stands in, the same
 /// substitution `SipServerConfig::identity_uri` applies to the ring target's
-/// own identity (spec 024).
-fn dial_out_host(config: &SipServerConfig) -> (&str, bool) {
+/// own identity (spec 024). Proxy mode does not need this: it routes by the
+/// phone's own address and never resolves the realm.
+fn dial_out_host(config: &SipServerConfig) -> &str {
     match config.listen_addr.parse::<std::net::IpAddr>() {
-        Ok(ip) if ip.is_unspecified() => (config.realm.as_str(), true),
-        _ => (config.listen_addr.as_str(), false),
+        Ok(ip) if ip.is_unspecified() => config.realm.as_str(),
+        _ => config.listen_addr.as_str(),
     }
 }
 
@@ -375,7 +374,7 @@ fn handle_datagram(
                         }
                     }
                     Some(destination) => {
-                        let (host, _) = dial_out_host(&state.config);
+                        let host = dial_out_host(&state.config);
                         let contact = format!("sip:{destination}@{host}:{local_port}");
                         tracing::info!(%peer, aor = %binding.aor, %destination, %contact, "sip_server: redirecting a registered phone's dial-out attempt");
                         Response::new(302, "Moved Temporarily").with_contact(contact)

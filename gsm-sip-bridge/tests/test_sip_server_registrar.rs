@@ -92,6 +92,31 @@ impl Harness {
         (Self::finish(registrar), account)
     }
 
+    /// Proxy mode with a wildcard `listen_addr` and a realm that cannot be
+    /// resolved: the relay must route by the phone's address, not the realm.
+    fn with_proxy_on_wildcard_and_unresolvable_realm() -> (Self, UdpSocket) {
+        let account = UdpSocket::bind("127.0.0.1:0").expect("bind dial-out account");
+        account
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("account timeout");
+        let port = account.local_addr().expect("account addr").port();
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
+        let mut cfg = config();
+        cfg.listen_addr = "0.0.0.0".to_string();
+        // REALM (`test-realm`) is not resolvable on any host; the digest
+        // exchange needs it unchanged.
+        let registrar = Registrar::start_on_with_outbound(
+            socket,
+            &cfg,
+            OutboundDial {
+                port,
+                mode: SipServerDialMode::Proxy,
+            },
+        )
+        .expect("an unresolvable realm must not stop the registrar starting");
+        (Self::finish(registrar), account)
+    }
+
     /// Reads the phone socket, or `None` after `wait` of silence.
     fn try_recv(&self, wait: Duration) -> Option<String> {
         self.phone.set_read_timeout(Some(wait)).expect("timeout");
@@ -747,6 +772,28 @@ fn proxy_mode_relays_a_registered_phones_invite() {
         h.try_recv(Duration::from_millis(300)).is_none(),
         "the registrar must not answer a relayed INVITE itself"
     );
+}
+
+#[test]
+fn proxy_mode_works_on_a_wildcard_listen_address_with_an_unresolvable_realm() {
+    let (h, account) = Harness::with_proxy_on_wildcard_and_unresolvable_realm();
+    h.register_ok(1, "call-1");
+    h.phone
+        .send(non_register("INVITE").as_bytes())
+        .expect("send");
+    let (relayed, _) = recv_at(&account);
+    assert!(relayed.starts_with("INVITE "), "got: {relayed}");
+}
+
+/// A phone using the compact `v:` Via form is relayed, not refused as malformed.
+#[test]
+fn proxy_mode_relays_an_invite_with_a_compact_via() {
+    let (h, account) = Harness::with_proxy();
+    h.register_ok(1, "call-1");
+    let invite = non_register("INVITE").replace("Via:", "v:");
+    h.phone.send(invite.as_bytes()).expect("send");
+    let (relayed, _) = recv_at(&account);
+    assert!(relayed.starts_with("INVITE "), "got: {relayed}");
 }
 
 /// Responses come back through the relay with its Via removed, to the phone.

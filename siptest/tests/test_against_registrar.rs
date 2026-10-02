@@ -272,6 +272,106 @@ fn siptest_registers_places_a_call_through_a_302_redirect_and_carries_bothways_a
     }
 }
 
+/// The default (proxy) path, end to end: siptest INVITEs the real registrar,
+/// which relays to the stub UAS; the answer and a direct ACK/BYE follow with
+/// the registrar out of the dialog, and audio flows both ways. Covers what the
+/// `302` test above does for redirect mode.
+#[test]
+fn siptest_places_a_call_through_the_proxy_and_carries_bothways_audio() {
+    let stub = StubUas::start();
+
+    let registrar_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let registrar_addr = registrar_socket.local_addr().unwrap();
+    let _registrar = Registrar::start_on_with_outbound(
+        registrar_socket,
+        &server_config(),
+        OutboundDial {
+            port: stub.sip_port,
+            mode: SipServerDialMode::Proxy,
+        },
+    )
+    .expect("start registrar");
+
+    let sip_socket =
+        SipSocket::bind(Some("127.0.0.1".parse().unwrap()), 0, registrar_addr).unwrap();
+    let reg_config = RegistrationConfig {
+        registrar_addr,
+        registrar_host: REALM.to_string(),
+        aor_user: USER.to_string(),
+        realm: REALM.to_string(),
+        password: Secret::new(PASSWORD.to_string()),
+        expires: 300,
+    };
+    let mut creds = RegistrationCredentials {
+        cseq: 0,
+        call_id: "reg-call-id-proxy".to_string(),
+        from_tag: "reg-from-tag-proxy".to_string(),
+        cached_nonce: None,
+        nc: 0,
+    };
+    let status = register(&sip_socket, &reg_config, &mut creds).unwrap();
+    assert_eq!(
+        status.state,
+        siptest::sip::registration::RegState::Registered
+    );
+
+    let outcome = siptest::sip::outbound::place_call(
+        &sip_socket,
+        registrar_addr,
+        REALM,
+        USER,
+        "+919000000000",
+        PCMU,
+        0,
+        Duration::from_secs(5),
+    )
+    .expect("place_call should not error");
+
+    assert!(
+        outcome.answered,
+        "expected the relayed answer: {:?}",
+        outcome.final_status
+    );
+    assert_eq!(outcome.redirect_port, None, "no redirect in proxy mode");
+    // The ACK/BYE target is the stub's own Contact, not the registrar.
+    assert_eq!(
+        outcome.remote_target.map(|a| a.port()),
+        Some(stub.sip_port),
+        "the dialog must go direct to the dial-out account"
+    );
+    let sdp_answer = outcome.sdp_answer.as_ref().expect("SDP answer");
+    assert_eq!(sdp_answer.remote_rtp.port(), stub.rtp_port);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let result = siptest::media::session::run(
+        siptest::media::session::MediaSessionConfig {
+            local_rtp: "127.0.0.1:0".parse().unwrap(),
+            remote_rtp: sdp_answer.remote_rtp,
+            codec: PCMU,
+            duration: Duration::from_millis(600),
+            sent_wav_path: None,
+            received_wav_path: None,
+            tone_enabled: false,
+            play: None,
+        },
+        stop,
+    )
+    .unwrap();
+    let verdict = gsm_sip_bridge::ims::media_stats::verdict(
+        result.sent_packets,
+        result.receive_stats.received_packets,
+        gsm_sip_bridge::ims::media_stats::DEFAULT_ONE_WAY_THRESHOLD_PERCENT,
+    );
+    assert_eq!(
+        verdict,
+        gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays
+    );
+
+    if let Some(dialog) = &outcome.dialog {
+        siptest::sip::outbound::send_bye(&sip_socket, dialog).expect("BYE goes direct");
+    }
+}
+
 /// T081: `resolve_codec("g722")` is not just a library-level lookup — its
 /// result is what actually goes out on the wire. Places a real call through
 /// the real registrar's 302 dance and asserts the INVITE the stub UAS
