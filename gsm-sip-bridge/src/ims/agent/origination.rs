@@ -551,9 +551,13 @@ impl PendingOrigination {
             "outbound: carrier answered despite CANCEL; sending ACK then BYE to hang up"
         );
         let to_header = resp.header("To").unwrap_or(&self.callee_uri).to_string();
+        let remote_target = super::call::uac_remote_target(resp)
+            .unwrap_or_else(|| format!("sip:{}", self.callee_uri));
+        let request_uri = remote_target.strip_prefix("sip:").unwrap_or(&remote_target);
+        let route_set = super::call::uac_route_set(resp, &self.route_headers);
         let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
+            request_uri,
+            route_headers: &route_set,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
             public_uri: &session.origination_identity(),
@@ -565,8 +569,8 @@ impl PendingOrigination {
         });
         let _ = session.transport_mut().and_then(|t| t.send(&ack));
         let bye = crate::ims::call::build_bye(&crate::ims::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
+            request_uri,
+            route_headers: &route_set,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
             public_uri: &session.origination_identity(),
@@ -891,10 +895,18 @@ impl PendingOrigination {
             return OriginationStatus::Ended;
         }
 
+        // RFC 3261 §13.2.2.4: the ACK to a 2xx is an in-dialog request, so it
+        // goes to the 2xx's Contact via the Record-Route set — not the dialled
+        // URI via the registration Service-Route (issue #97: Jio never matched
+        // that ACK and tore the call down at Timer H, ~32 s).
+        let remote_target = super::call::uac_remote_target(resp)
+            .unwrap_or_else(|| format!("sip:{}", self.callee_uri));
+        let route_set = super::call::uac_route_set(resp, &self.route_headers);
         let ack_branch = format!("z9hG4bK{}", random_hex(6));
         let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
+            // `build_in_dialog_request` adds the scheme itself.
+            request_uri: remote_target.strip_prefix("sip:").unwrap_or(&remote_target),
+            route_headers: &route_set,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
             public_uri: &session.origination_identity(),
@@ -912,7 +924,7 @@ impl PendingOrigination {
 
         let dialog = DialogInfo::from_uac_response(
             resp,
-            self.route_headers.clone(),
+            route_set,
             &self.callee_uri,
             &session.origination_identity(),
             &self.from_tag,
