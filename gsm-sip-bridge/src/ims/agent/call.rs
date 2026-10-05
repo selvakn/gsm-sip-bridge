@@ -184,19 +184,10 @@ impl DialogInfo {
         // the wrong target is still better than never hanging up at all.
         let remote_target = invite
             .header("Contact")
-            .and_then(|c| {
-                let start = c.find('<')? + 1;
-                let end = c[start..].find('>')? + start;
-                Some(c[start..end].to_string())
-            })
+            .and_then(contact_uri)
             .unwrap_or_else(|| invite.request_uri.clone());
 
-        let route_headers: Vec<String> = invite
-            .headers_all("Record-Route")
-            .iter()
-            .rev()
-            .map(|v| format!("Route: {v}"))
-            .collect();
+        let route_headers = reversed_route_set(&invite.headers_all("Record-Route"));
 
         let from = match invite.header("To") {
             Some(to) if to.contains(";tag=") => to.to_string(),
@@ -631,19 +622,48 @@ pub(super) fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall)
     tracing::info!(call_id = %call.call_id, "call ended");
 }
 
+/// The URI of a `Contact` header value (RFC 3261 §20.10): the `<...>` form,
+/// or — when the URI carries no params or commas — the bare addr-spec form,
+/// whose trailing `;params` belong to the header, not the URI. `None` when
+/// nothing usable is there.
+fn contact_uri(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(start) = value.find('<') {
+        let end = value[start..].find('>')? + start;
+        return Some(value[start + 1..end].to_string());
+    }
+    let bare = value.split(';').next()?.trim();
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
 /// The remote target of a UAC dialog: the URI inside the 2xx's `Contact`
 /// (RFC 3261 §12.1.2). `None` when the response carries no usable Contact.
 pub(super) fn uac_remote_target(resp: &crate::ims::sip_client::SipResponse) -> Option<String> {
-    let c = resp.header("Contact")?;
-    let start = c.find('<')? + 1;
-    let end = c[start..].find('>')? + start;
-    Some(c[start..end].to_string())
+    let target = contact_uri(resp.header("Contact")?);
+    if target.is_none() {
+        tracing::warn!(
+            "2xx Contact is unparsable; in-dialog requests fall back to the dialled URI"
+        );
+    }
+    target
 }
 
-/// The dialog route set a UAC builds from a 2xx (RFC 3261 §12.1.2): the
-/// `Record-Route` entries in *reverse* order. Falls back to `service_route`
-/// (the registration's Service-Route the INVITE was routed with) when the
-/// response records no route at all.
+/// A route set from `Record-Route` header values, in reverse order (RFC 3261
+/// §12.1.2 for a UAC, §12.1.1 for a UAS) — whether the entries arrive as
+/// separate headers or comma-joined in one. Empty when none were recorded.
+pub(super) fn reversed_route_set(record_routes: &[&str]) -> Vec<String> {
+    record_routes
+        .iter()
+        .flat_map(|v| split_route_list(v))
+        .rev()
+        .map(|v| format!("Route: {v}"))
+        .collect()
+}
+
+/// The dialog route set a UAC builds from a 2xx: its `Record-Route` entries
+/// reversed, falling back to `service_route` (the registration's
+/// Service-Route the INVITE was routed with) when the response records no
+/// route at all.
 ///
 /// Jio's P-CSCF record-routes with a `b2bdlg=` dialog token and only matches
 /// an ACK that carries it; an ACK sent via the Service-Route is dropped, the
@@ -653,18 +673,12 @@ pub(super) fn uac_route_set(
     resp: &crate::ims::sip_client::SipResponse,
     service_route: &[String],
 ) -> Vec<String> {
-    let mut entries: Vec<&str> = Vec::new();
-    for value in resp.headers_all("Record-Route") {
-        entries.extend(split_route_list(value));
+    let set = reversed_route_set(&resp.headers_all("Record-Route"));
+    if set.is_empty() {
+        service_route.to_vec()
+    } else {
+        set
     }
-    if entries.is_empty() {
-        return service_route.to_vec();
-    }
-    entries
-        .into_iter()
-        .rev()
-        .map(|v| format!("Route: {v}"))
-        .collect()
 }
 
 /// Split one `Record-Route` header value on the commas that separate
@@ -717,6 +731,19 @@ mod tests {
             Some("sip:user@192.0.2.1:6000;b2bdlg=abc")
         );
         assert_eq!(uac_remote_target(&resp_with(&[])), None);
+    }
+
+    #[test]
+    fn contact_uri_handles_the_bare_addr_spec_form() {
+        assert_eq!(
+            contact_uri("sip:user@192.0.2.1:6000;transport=tcp").as_deref(),
+            Some("sip:user@192.0.2.1:6000")
+        );
+        assert_eq!(
+            contact_uri("\"Bob\" <sip:user@192.0.2.1>;q=1").as_deref(),
+            Some("sip:user@192.0.2.1")
+        );
+        assert_eq!(contact_uri("  "), None);
     }
 
     #[test]
@@ -779,7 +806,7 @@ mod tests {
         let target = uac_remote_target(&r).unwrap();
         let routes = uac_route_set(&r, &["Route: <sip:scscf.example.test;lr>".to_string()]);
         let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
-            request_uri: target.strip_prefix("sip:").unwrap_or(&target),
+            request_uri: &target,
             route_headers: &routes,
             via_transport: "TCP",
             local_addr: "10.0.0.2:5060".parse().unwrap(),
