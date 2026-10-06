@@ -187,7 +187,7 @@ impl DialogInfo {
             .and_then(contact_uri)
             .unwrap_or_else(|| invite.request_uri.clone());
 
-        let route_headers = reversed_route_set(&invite.headers_all("Record-Route"));
+        let route_headers = route_set_in_order(&invite.headers_all("Record-Route"));
 
         let from = match invite.header("To") {
             Some(to) if to.contains(";tag=") => to.to_string(),
@@ -648,14 +648,14 @@ pub(super) fn uac_remote_target(resp: &crate::ims::sip_client::SipResponse) -> O
     target
 }
 
-/// A route set from `Record-Route` header values, in reverse order (RFC 3261
-/// §12.1.2 for a UAC, §12.1.1 for a UAS) — whether the entries arrive as
-/// separate headers or comma-joined in one. Empty when none were recorded.
-pub(super) fn reversed_route_set(record_routes: &[&str]) -> Vec<String> {
+/// `Record-Route` header values as `Route` headers, in the order received —
+/// whether the entries arrive as separate headers or comma-joined in one.
+/// A UAS keeps this order (RFC 3261 §12.1.1); a UAC reverses it
+/// ([`uac_route_set`], §12.1.2).
+pub(super) fn route_set_in_order(record_routes: &[&str]) -> Vec<String> {
     record_routes
         .iter()
         .flat_map(|v| split_route_list(v))
-        .rev()
         .map(|v| format!("Route: {v}"))
         .collect()
 }
@@ -673,7 +673,8 @@ pub(super) fn uac_route_set(
     resp: &crate::ims::sip_client::SipResponse,
     service_route: &[String],
 ) -> Vec<String> {
-    let set = reversed_route_set(&resp.headers_all("Record-Route"));
+    let mut set = route_set_in_order(&resp.headers_all("Record-Route"));
+    set.reverse();
     if set.is_empty() {
         service_route.to_vec()
     } else {
@@ -682,12 +683,24 @@ pub(super) fn uac_route_set(
 }
 
 /// Split one `Record-Route` header value on the commas that separate
-/// entries, ignoring commas inside `<...>` (a URI may contain them).
+/// entries, ignoring commas inside `<...>` (a URI may contain them) or inside
+/// a quoted display name (`"Bob, Smith" <sip:...>`, with `\"` escapes).
 fn split_route_list(value: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let (mut depth, mut start) = (0usize, 0usize);
+    let (mut quoted, mut escaped) = (false, false);
     for (i, ch) in value.char_indices() {
+        if quoted {
+            match (escaped, ch) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
         match ch {
+            '"' => quoted = true,
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -782,6 +795,28 @@ mod tests {
     fn uac_route_set_falls_back_to_service_route_without_record_route() {
         let svc = vec!["Route: <sip:scscf.example.test;lr>".to_string()];
         assert_eq!(uac_route_set(&resp_with(&[]), &svc), svc);
+    }
+
+    #[test]
+    fn split_route_list_ignores_commas_inside_quoted_display_names() {
+        assert_eq!(
+            split_route_list(r#""Bob, Smith" <sip:a;lr>, "Q \" , x" <sip:b;lr>"#),
+            vec![r#""Bob, Smith" <sip:a;lr>"#, r#""Q \" , x" <sip:b;lr>"#]
+        );
+    }
+
+    /// A UAS keeps the received Record-Route order (RFC 3261 §12.1.1); only
+    /// a UAC reverses it.
+    #[test]
+    fn route_set_in_order_keeps_the_received_order() {
+        assert_eq!(
+            route_set_in_order(&["<sip:a;lr>, <sip:b;lr>", "<sip:c;lr>"]),
+            vec![
+                "Route: <sip:a;lr>".to_string(),
+                "Route: <sip:b;lr>".to_string(),
+                "Route: <sip:c;lr>".to_string(),
+            ]
+        );
     }
 
     #[test]

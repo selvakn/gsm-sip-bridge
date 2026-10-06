@@ -1919,6 +1919,69 @@ mod tests {
         );
     }
 
+    /// A `200 OK` that races our CANCEL is ACKed then BYEd: both go to the
+    /// Contact via the recorded routes, the ACK on its own fresh branch and
+    /// the BYE on a higher CSeq.
+    #[test]
+    fn racing_answer_acks_and_byes_via_contact_and_record_route() {
+        let call_id = "out-97-race";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        session.transport = Some(
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap(),
+        );
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+        p.route_headers = vec!["Route: <sip:scscf.example.test;lr>".to_string()];
+        let invite_branch = p.branch.clone();
+
+        let resp = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+                (
+                    "Record-Route".to_string(),
+                    "<sip:192.0.2.1:6000;lr;b2bdlg=abc>".to_string(),
+                ),
+                (
+                    "Contact".to_string(),
+                    "<sip:405000000000001@192.0.2.1:6000;b2bdlg=abc>".to_string(),
+                ),
+            ],
+            body: String::new(),
+        };
+        p.ack_and_bye_racing_answer(&mut session, &resp);
+
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).expect("ACK was not sent");
+        let ack = String::from_utf8_lossy(&buf[..n]).to_string();
+        let n = peer.recv(&mut buf).expect("BYE was not sent");
+        let bye = String::from_utf8_lossy(&buf[..n]).to_string();
+
+        let target = "sip:405000000000001@192.0.2.1:6000;b2bdlg=abc SIP/2.0\r\n";
+        assert!(ack.starts_with(&format!("ACK {target}")), "{ack}");
+        assert!(bye.starts_with(&format!("BYE {target}")), "{bye}");
+        for msg in [&ack, &bye] {
+            assert!(msg.contains("Route: <sip:192.0.2.1:6000;lr;b2bdlg=abc>\r\n"));
+            assert!(!msg.contains("scscf.example.test"), "{msg}");
+        }
+        assert!(
+            !ack.contains(&format!("branch={invite_branch};")),
+            "2xx ACK must not reuse the INVITE branch: {ack}"
+        );
+        assert!(ack.contains("CSeq: 1 ACK"), "{ack}");
+        assert!(bye.contains("CSeq: 2 BYE"), "{bye}");
+    }
+
     /// A `200 OK` fixture identical in shape to
     /// `stale_early_veth_failure_falls_back_to_a_fresh_listener_at_200_ok`'s,
     /// but with a `Session-Expires` header — specs/049.
