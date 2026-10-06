@@ -530,6 +530,148 @@ pub fn ensure_epdg_interface(
         .unwrap_or(false)
 }
 
+/// The virtual cable between one VoWiFi line's namespace and the host: the
+/// host end (`veth_sip`) carries the address Agent B binds its control channel
+/// to, the namespace end (`veth_ims`) is the line's gateway toward it.
+pub struct LineVeth<'a> {
+    pub netns: &'a str,
+    pub veth_sip: &'a str,
+    pub veth_ims: &'a str,
+    /// Host-end address with prefix, e.g. `10.99.0.2/30`.
+    pub sip_addr: &'a str,
+    /// Namespace-end address with prefix, e.g. `10.99.0.1/30`.
+    pub ims_addr: &'a str,
+}
+
+impl LineVeth<'_> {
+    /// Both ends exist, are administratively up, and carry their address.
+    ///
+    /// "Up" matters as much as the address: the final `ip link set up` is the
+    /// last setup step, so a failure there leaves both addresses installed on
+    /// down links. Judging health by address alone would then skip the repair
+    /// that would retry exactly that step, every tick, forever.
+    pub fn is_present(&self, runner: &dyn CommandRunner) -> bool {
+        let host_ok = runner
+            .run(&["ip", "-o", "addr", "show", "dev", self.veth_sip])
+            .map(|o| o.status.success() && stdout_has(&o, self.sip_addr))
+            .unwrap_or(false)
+            && runner
+                .run(&["ip", "-o", "link", "show", "dev", self.veth_sip])
+                .map(|o| o.status.success() && link_is_up(&String::from_utf8_lossy(&o.stdout)))
+                .unwrap_or(false);
+        host_ok
+            && runner
+                .run_in_netns(
+                    self.netns,
+                    &["ip", "-o", "addr", "show", "dev", self.veth_ims],
+                )
+                .map(|o| o.status.success() && stdout_has(&o, self.ims_addr))
+                .unwrap_or(false)
+            && runner
+                .run_in_netns(
+                    self.netns,
+                    &["ip", "-o", "link", "show", "dev", self.veth_ims],
+                )
+                .map(|o| o.status.success() && link_is_up(&String::from_utf8_lossy(&o.stdout)))
+                .unwrap_or(false)
+    }
+}
+
+fn stdout_has(o: &std::process::Output, needle: &str) -> bool {
+    String::from_utf8_lossy(&o.stdout).contains(needle)
+}
+
+/// Whether `ip -o link show` output carries the administrative `UP` flag
+/// (`<BROADCAST,MULTICAST,UP,LOWER_UP>`). `UP` is set by `ip link set up`
+/// even with no carrier, which is the state a veth is in until its peer is.
+fn link_is_up(line: &str) -> bool {
+    line.split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .is_some_and(|(flags, _)| flags.split(',').any(|f| f == "UP"))
+}
+
+/// Turns one command's outcome into `Err("<step>: <stderr>")` so the caller
+/// can say *which* step failed and why, which the original unchecked
+/// sequence never could (issue #96: the veth was missing and nothing in the
+/// log said so).
+fn check_step(out: std::io::Result<std::process::Output>, step: &str) -> Result<(), String> {
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "{step}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("{step}: {e}")),
+    }
+}
+
+/// Idempotently builds the veth pair for one VoWiFi line, then confirms it.
+///
+/// Every step used to be `let _ = ...`, and the pair was built exactly once,
+/// right after the tunnel first came up. One failure there — a leftover name,
+/// a namespace in an odd state straight after a restart — left the host
+/// address unbound for good: Agent B retried its bind forever and the
+/// supervisor never looked again (#96). Safe to call on every tick; when the
+/// pair is already healthy it only issues the cheap `ip addr replace`s.
+///
+/// Returns the first failing step, or a verification failure if the commands
+/// all "succeeded" but an end still lacks its address.
+pub fn ensure_line_veth(runner: &dyn CommandRunner, v: &LineVeth<'_>) -> Result<(), String> {
+    let ims_end_present = runner
+        .run_in_netns(v.netns, &["ip", "link", "show", v.veth_ims])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let host_end_present = runner
+        .run(&["ip", "link", "show", v.veth_sip])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // A host end whose peer is gone is a husk from a previous run; adding the
+    // pair again would fail with "File exists", so clear it first.
+    let mut host_end_present = host_end_present;
+    if !ims_end_present && host_end_present {
+        let _ = runner.run(&["ip", "link", "delete", v.veth_sip]);
+        host_end_present = false;
+    }
+    if !host_end_present {
+        check_step(
+            runner.run(&[
+                "ip", "link", "add", v.veth_sip, "type", "veth", "peer", "name", v.veth_ims,
+                "netns", v.netns,
+            ]),
+            "ip link add (veth pair)",
+        )?;
+    }
+    check_step(
+        runner.run(&["ip", "addr", "replace", v.sip_addr, "dev", v.veth_sip]),
+        "ip addr replace (host end)",
+    )?;
+    check_step(
+        runner.run(&["ip", "link", "set", v.veth_sip, "up"]),
+        "ip link set up (host end)",
+    )?;
+    check_step(
+        runner.run_in_netns(
+            v.netns,
+            &["ip", "addr", "replace", v.ims_addr, "dev", v.veth_ims],
+        ),
+        "ip addr replace (namespace end)",
+    )?;
+    check_step(
+        runner.run_in_netns(v.netns, &["ip", "link", "set", v.veth_ims, "up"]),
+        "ip link set up (namespace end)",
+    )?;
+
+    if v.is_present(runner) {
+        Ok(())
+    } else {
+        Err(format!(
+            "verification: {} / {} in {} still lack their addresses",
+            v.veth_sip, v.veth_ims, v.netns
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,5 +1113,157 @@ src 2402:8100::1/128 dst ::/0
             .any(|(_, c)| c.contains(&"del".to_string())
                 && c.contains(&"tun23-0".to_string())
                 && c[0] == "timeout"));
+    }
+
+    // Regression tests for issue #96: the per-line veth was built once,
+    // unchecked, and never looked at again.
+
+    const VETH: LineVeth<'static> = LineVeth {
+        netns: "ims0",
+        veth_sip: "veth-sip0",
+        veth_ims: "veth-ims0",
+        sip_addr: "10.99.0.2/30",
+        ims_addr: "10.99.0.1/30",
+    };
+    const ADD_KEY: &str = "ip link add veth-sip0 type veth peer name veth-ims0 netns ims0";
+
+    const LINK_UP: &str = "5: veth-sip0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n";
+    const LINK_DOWN: &str = "5: veth-sip0: <BROADCAST,MULTICAST> mtu 1500 state DOWN\n";
+
+    fn seed_veth_addresses(runner: &MockCommandRunner) {
+        runner.set_run_output("ip -o link show dev veth-sip0", success_output(LINK_UP));
+        runner.set_netns_output(
+            "ims0",
+            &["ip", "-o", "link", "show", "dev", "veth-ims0"],
+            LINK_UP,
+        );
+        runner.set_run_output(
+            "ip -o addr show dev veth-sip0",
+            success_output("5: veth-sip0    inet 10.99.0.2/30 scope global veth-sip0\n"),
+        );
+        runner.set_netns_output(
+            "ims0",
+            &["ip", "-o", "addr", "show", "dev", "veth-ims0"],
+            "4: veth-ims0    inet 10.99.0.1/30 scope global veth-ims0\n",
+        );
+    }
+
+    fn adds(runner: &MockCommandRunner) -> usize {
+        runner
+            .run_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.join(" ") == ADD_KEY)
+            .count()
+    }
+
+    #[test]
+    fn a_healthy_pair_is_confirmed_without_being_recreated() {
+        let runner = MockCommandRunner::new();
+        seed_veth_addresses(&runner);
+        assert_eq!(ensure_line_veth(&runner, &VETH), Ok(()));
+        assert_eq!(adds(&runner), 0, "an existing pair must not be re-added");
+        let calls = runner.run_calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains(&"delete".to_string())));
+    }
+
+    #[test]
+    fn a_missing_pair_is_created() {
+        let runner = MockCommandRunner::new();
+        seed_absent(&runner, "ip link show veth-sip0");
+        seed_absent(&runner, "netns:ims0:ip link show veth-ims0");
+        seed_veth_addresses(&runner);
+        assert_eq!(ensure_line_veth(&runner, &VETH), Ok(()));
+        assert_eq!(adds(&runner), 1);
+    }
+
+    #[test]
+    fn a_host_end_with_no_peer_is_deleted_then_recreated() {
+        let runner = MockCommandRunner::new();
+        // Host end present (mock default), namespace end absent.
+        seed_absent(&runner, "netns:ims0:ip link show veth-ims0");
+        seed_veth_addresses(&runner);
+        assert_eq!(ensure_line_veth(&runner, &VETH), Ok(()));
+        let calls = runner.run_calls.lock().unwrap();
+        let del = calls
+            .iter()
+            .position(|c| c.join(" ") == "ip link delete veth-sip0")
+            .expect("husk must be deleted");
+        let add = calls
+            .iter()
+            .position(|c| c.join(" ") == ADD_KEY)
+            .expect("pair must be re-added");
+        assert!(del < add);
+    }
+
+    #[test]
+    fn a_failed_add_reports_the_step_and_stderr() {
+        let runner = MockCommandRunner::new();
+        seed_absent(&runner, "ip link show veth-sip0");
+        seed_absent(&runner, "netns:ims0:ip link show veth-ims0");
+        let mut out = failure_output();
+        out.stderr = b"RTNETLINK answers: File exists\n".to_vec();
+        runner.set_run_output(ADD_KEY, out);
+        let err = ensure_line_veth(&runner, &VETH).unwrap_err();
+        assert!(err.contains("ip link add"), "{err}");
+        assert!(err.contains("File exists"), "{err}");
+    }
+
+    #[test]
+    fn commands_that_succeed_but_leave_no_address_fail_verification() {
+        let runner = MockCommandRunner::new();
+        // Every command defaults to success, but the address never shows up.
+        runner.set_run_output("ip -o addr show dev veth-sip0", success_output(""));
+        let err = ensure_line_veth(&runner, &VETH).unwrap_err();
+        assert!(err.starts_with("verification"), "{err}");
+    }
+
+    #[test]
+    fn presence_needs_both_ends_addressed() {
+        let runner = MockCommandRunner::new();
+        seed_veth_addresses(&runner);
+        assert!(VETH.is_present(&runner));
+
+        let host_only = MockCommandRunner::new();
+        host_only.set_run_output("ip -o link show dev veth-sip0", success_output(LINK_UP));
+        host_only.set_run_output(
+            "ip -o addr show dev veth-sip0",
+            success_output("inet 10.99.0.2/30"),
+        );
+        seed_absent(&host_only, "netns:ims0:ip -o addr show dev veth-ims0");
+        assert!(!VETH.is_present(&host_only));
+
+        let gone = MockCommandRunner::new();
+        seed_absent(&gone, "ip -o addr show dev veth-sip0");
+        assert!(!VETH.is_present(&gone));
+    }
+
+    #[test]
+    fn addressed_but_down_links_are_not_present() {
+        // Greptile #101: a failed final `ip link set up` leaves both
+        // addresses installed on down links; that must still read as broken.
+        let host_down = MockCommandRunner::new();
+        seed_veth_addresses(&host_down);
+        host_down.set_run_output("ip -o link show dev veth-sip0", success_output(LINK_DOWN));
+        assert!(!VETH.is_present(&host_down));
+
+        let ns_down = MockCommandRunner::new();
+        seed_veth_addresses(&ns_down);
+        ns_down.set_netns_output(
+            "ims0",
+            &["ip", "-o", "link", "show", "dev", "veth-ims0"],
+            LINK_DOWN,
+        );
+        assert!(!VETH.is_present(&ns_down));
+    }
+
+    #[test]
+    fn link_is_up_reads_only_the_flag_list() {
+        assert!(link_is_up("2: x: <BROADCAST,UP,LOWER_UP> mtu 1 state UP"));
+        assert!(!link_is_up("2: x: <NO-CARRIER,BROADCAST> mtu 1 state DOWN"));
+        // `state UP` outside the flags must not count.
+        assert!(!link_is_up("2: x: <BROADCAST> mtu 1 state UP"));
+        assert!(!link_is_up(""));
     }
 }

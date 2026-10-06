@@ -1355,6 +1355,12 @@ const CONTROL_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// enough that a genuinely misconfigured address stays visible without filling
 /// the log while waiting for a slow carrier's tunnel.
 const CONTROL_BIND_LOG_EVERY: u32 = 15;
+/// Consecutive bind failures between louder `error!` reports once a line has
+/// waited far longer than any carrier's tunnel takes (150 × 2s ≈ 5 min). The
+/// retry itself never stops — the supervisor rebuilds a missing veth on its
+/// own (#96) — but a line stuck this long needs a human-visible signal rather
+/// than one more routine warning.
+const CONTROL_BIND_ESCALATE_EVERY: u32 = 150;
 
 /// Binds this line's control channel, retrying until it succeeds.
 ///
@@ -1398,7 +1404,17 @@ fn bind_with_retry<T, E: std::fmt::Display>(
                 return bound;
             }
             Err(e) => {
-                if attempt.is_multiple_of(CONTROL_BIND_LOG_EVERY) {
+                if attempt > 0 && attempt.is_multiple_of(CONTROL_BIND_ESCALATE_EVERY) {
+                    tracing::error!(
+                        card_id = %card_id,
+                        addr = %addr,
+                        error = %e,
+                        attempt,
+                        "control channel still not bindable after a long wait. Check the \
+                         reported bind error; if the address is unavailable, check the \
+                         `[supervise] line N` log for `veth setup failed` / `veth missing`"
+                    );
+                } else if attempt.is_multiple_of(CONTROL_BIND_LOG_EVERY) {
                     tracing::warn!(
                         card_id = %card_id,
                         addr = %addr,
@@ -2724,6 +2740,31 @@ mod tests {
         assert_eq!(bound, "listener");
         assert_eq!(attempts, 4, "must keep retrying, not give up on the first");
         assert_eq!(slept.len(), 3, "one sleep between each failed attempt");
+    }
+
+    #[test]
+    fn control_bind_keeps_retrying_past_the_escalation_threshold() {
+        // The louder error at CONTROL_BIND_ESCALATE_EVERY is a report, never a
+        // give-up: a veth the supervisor rebuilds late (#96) must still be
+        // picked up by the same loop.
+        let needed = CONTROL_BIND_ESCALATE_EVERY * 2 + 1;
+        let mut attempts = 0;
+        let bound = bind_with_retry(
+            "pcsc0",
+            "10.99.0.2:7050",
+            Duration::from_millis(1),
+            || {
+                attempts += 1;
+                if attempts <= needed {
+                    Err("Address not available (os error 99)")
+                } else {
+                    Ok("listener")
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(bound, "listener");
+        assert_eq!(attempts, needed + 1);
     }
 
     #[test]
