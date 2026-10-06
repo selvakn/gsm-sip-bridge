@@ -242,6 +242,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         cseq: invite_cseq,
         branch: &branch,
         body: &offer,
+        security_verify: session.security_verify(),
         // The standalone `ims-call` probe has no carrier config behind it;
         // it always sends the minimal set.
         originating_headers: crate::config::OriginatingHeaders::default(),
@@ -677,6 +678,9 @@ pub(crate) struct InviteParts<'a> {
     /// Optional MTSI-shaped headers, off everywhere by default. See
     /// `config::OriginatingHeaders`.
     pub(crate) originating_headers: crate::config::OriginatingHeaders,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub(crate) security_verify: Option<&'a str>,
 }
 
 /// The IMS Communication Service Identifier for MMTel voice (TS 24.173 §5.2).
@@ -752,6 +756,15 @@ pub(crate) fn build_invite(p: &InviteParts) -> String {
     // is unchanged on Vodafone (identical 183/180/200 accept-and-ring
     // shape, same as "3GPP-WLAN"). See `docs/plans/jio-vowifi-outbound-480.md`'s
     // "RESOLVED" section.
+    if let Some(sv) = p.security_verify {
+        // RFC 3329 §2.3.1 / TS 24.229 §5.1.1.5.1: the verify echo travels
+        // with both option tags, so the P-CSCF and the far end must honor it.
+        msg.push_str(&format!(
+            "Require: sec-agree\r\n\
+             Proxy-Require: sec-agree\r\n\
+             Security-Verify: {sv}\r\n"
+        ));
+    }
     msg.push_str(&format!(
         "P-Access-Network-Info: IEEE-802.11\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
@@ -961,11 +974,30 @@ mod tests {
             branch: "branch1",
             body: "v=0\r\n",
             originating_headers: Default::default(),
+            security_verify: None,
         });
         assert!(msg.starts_with("INVITE sip:+919000000000@realm SIP/2.0\r\n"));
         assert!(msg.contains("Content-Length: 5\r\n"));
         assert!(msg.ends_with("v=0\r\n"));
         assert!(msg.contains("CSeq: 1 INVITE"));
+    }
+
+    #[test]
+    fn build_invite_carries_security_verify_only_when_negotiated() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let mut parts = invite_parts(addr);
+        let plain = build_invite(&parts);
+        assert!(!plain.contains("Security-Verify") && !plain.contains("sec-agree"));
+        parts.security_verify = Some("ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=1");
+        let msg = build_invite(&parts);
+        assert!(
+            msg.contains("Security-Verify: ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=1\r\n"),
+            "{msg}"
+        );
+        assert!(msg.contains("Require: sec-agree\r\n"), "{msg}");
+        assert!(msg.contains("Proxy-Require: sec-agree\r\n"), "{msg}");
+        // Header section, not the SDP body.
+        assert!(msg.find("Security-Verify").unwrap() < msg.find("\r\n\r\n").unwrap());
     }
 
     fn invite_parts(addr: std::net::SocketAddr) -> InviteParts<'static> {
@@ -984,6 +1016,7 @@ mod tests {
             branch: "branch1",
             body: "v=0\r\n",
             originating_headers: Default::default(),
+            security_verify: None,
         }
     }
 
@@ -1032,6 +1065,7 @@ mod tests {
         };
         let msg = build_invite(&InviteParts {
             originating_headers: all,
+            security_verify: None,
             ..invite_parts(addr)
         });
 
@@ -1064,6 +1098,7 @@ mod tests {
         };
         let msg = build_invite(&InviteParts {
             originating_headers: only_icsi,
+            security_verify: None,
             ..invite_parts(addr)
         });
         assert!(msg.contains("Accept-Contact: *;+g.3gpp.icsi-ref="), "{msg}");
@@ -1092,6 +1127,7 @@ mod tests {
             branch: "b",
             body: "",
             originating_headers: Default::default(),
+            security_verify: None,
         });
         assert!(msg.contains("Via: SIP/2.0/TCP 1.2.3.4:48584;branch=b;rport\r\n"));
         assert!(msg.contains("Contact: <sip:u@1.2.3.4:48586;transport=TCP>\r\n"));
@@ -1115,6 +1151,7 @@ mod tests {
             branch: "b",
             body: "",
             originating_headers: Default::default(),
+            security_verify: None,
         });
         let a_pos = msg.find("Route: <sip:a>").unwrap();
         let b_pos = msg.find("Route: <sip:b>").unwrap();
@@ -1186,6 +1223,7 @@ mod tests {
             branch: "z9hG4bKinvitebranch",
             body: "",
             originating_headers: Default::default(),
+            security_verify: None,
         });
         assert!(invite.contains("branch=z9hG4bKinvitebranch"));
         assert!(invite.contains("CSeq: 7 INVITE"));

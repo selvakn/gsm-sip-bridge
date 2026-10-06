@@ -369,6 +369,7 @@ pub(super) fn begin_origination(
         branch: &branch,
         body: &offer,
         originating_headers: setup.originating_headers,
+        security_verify: session.security_verify(),
     });
 
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
@@ -1637,6 +1638,7 @@ mod tests {
             use_tcp: true,
             cseq: 2,
             gm_state: None,
+            security_verify: None,
             xfrm_proto: "esp",
             status: 200,
             reason: "OK".to_string(),

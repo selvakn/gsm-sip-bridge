@@ -386,6 +386,7 @@ pub(crate) fn send_sms_delivery_report(
         cseq,
         content_type: "application/vnd.3gpp.sms",
         body: rp_ack,
+        security_verify: session.security_verify(),
     });
     match session.transport_mut().and_then(|t| t.send_bytes(&msg)) {
         Ok(()) => tracing::info!(
