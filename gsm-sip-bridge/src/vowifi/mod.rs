@@ -1410,10 +1410,9 @@ fn bind_with_retry<T, E: std::fmt::Display>(
                         addr = %addr,
                         error = %e,
                         attempt,
-                        "control channel still not bindable after a long wait: this line's \
-                         veth was never brought up. Check the `[supervise] line N` log for \
-                         `veth setup failed` / `veth missing`, and `ip -d link` on the host \
-                         and inside the line's netns"
+                        "control channel still not bindable after a long wait. Check the \
+                         reported bind error; if the address is unavailable, check the \
+                         `[supervise] line N` log for `veth setup failed` / `veth missing`"
                     );
                 } else if attempt.is_multiple_of(CONTROL_BIND_LOG_EVERY) {
                     tracing::warn!(

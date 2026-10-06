@@ -544,26 +544,50 @@ pub struct LineVeth<'a> {
 }
 
 impl LineVeth<'_> {
-    /// Both ends exist and carry their address. An address can only be
-    /// listed on a device that exists, so this covers presence too.
+    /// Both ends exist, are administratively up, and carry their address.
+    ///
+    /// "Up" matters as much as the address: the final `ip link set up` is the
+    /// last setup step, so a failure there leaves both addresses installed on
+    /// down links. Judging health by address alone would then skip the repair
+    /// that would retry exactly that step, every tick, forever.
     pub fn is_present(&self, runner: &dyn CommandRunner) -> bool {
         let host_ok = runner
             .run(&["ip", "-o", "addr", "show", "dev", self.veth_sip])
-            .map(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(self.sip_addr)
-            })
-            .unwrap_or(false);
+            .map(|o| o.status.success() && stdout_has(&o, self.sip_addr))
+            .unwrap_or(false)
+            && runner
+                .run(&["ip", "-o", "link", "show", "dev", self.veth_sip])
+                .map(|o| o.status.success() && link_is_up(&String::from_utf8_lossy(&o.stdout)))
+                .unwrap_or(false);
         host_ok
             && runner
                 .run_in_netns(
                     self.netns,
                     &["ip", "-o", "addr", "show", "dev", self.veth_ims],
                 )
-                .map(|o| {
-                    o.status.success() && String::from_utf8_lossy(&o.stdout).contains(self.ims_addr)
-                })
+                .map(|o| o.status.success() && stdout_has(&o, self.ims_addr))
+                .unwrap_or(false)
+            && runner
+                .run_in_netns(
+                    self.netns,
+                    &["ip", "-o", "link", "show", "dev", self.veth_ims],
+                )
+                .map(|o| o.status.success() && link_is_up(&String::from_utf8_lossy(&o.stdout)))
                 .unwrap_or(false)
     }
+}
+
+fn stdout_has(o: &std::process::Output, needle: &str) -> bool {
+    String::from_utf8_lossy(&o.stdout).contains(needle)
+}
+
+/// Whether `ip -o link show` output carries the administrative `UP` flag
+/// (`<BROADCAST,MULTICAST,UP,LOWER_UP>`). `UP` is set by `ip link set up`
+/// even with no carrier, which is the state a veth is in until its peer is.
+fn link_is_up(line: &str) -> bool {
+    line.split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .is_some_and(|(flags, _)| flags.split(',').any(|f| f == "UP"))
 }
 
 /// Turns one command's outcome into `Err("<step>: <stderr>")` so the caller
@@ -1103,7 +1127,16 @@ src 2402:8100::1/128 dst ::/0
     };
     const ADD_KEY: &str = "ip link add veth-sip0 type veth peer name veth-ims0 netns ims0";
 
+    const LINK_UP: &str = "5: veth-sip0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n";
+    const LINK_DOWN: &str = "5: veth-sip0: <BROADCAST,MULTICAST> mtu 1500 state DOWN\n";
+
     fn seed_veth_addresses(runner: &MockCommandRunner) {
+        runner.set_run_output("ip -o link show dev veth-sip0", success_output(LINK_UP));
+        runner.set_netns_output(
+            "ims0",
+            &["ip", "-o", "link", "show", "dev", "veth-ims0"],
+            LINK_UP,
+        );
         runner.set_run_output(
             "ip -o addr show dev veth-sip0",
             success_output("5: veth-sip0    inet 10.99.0.2/30 scope global veth-sip0\n"),
@@ -1193,6 +1226,7 @@ src 2402:8100::1/128 dst ::/0
         assert!(VETH.is_present(&runner));
 
         let host_only = MockCommandRunner::new();
+        host_only.set_run_output("ip -o link show dev veth-sip0", success_output(LINK_UP));
         host_only.set_run_output(
             "ip -o addr show dev veth-sip0",
             success_output("inet 10.99.0.2/30"),
@@ -1203,5 +1237,33 @@ src 2402:8100::1/128 dst ::/0
         let gone = MockCommandRunner::new();
         seed_absent(&gone, "ip -o addr show dev veth-sip0");
         assert!(!VETH.is_present(&gone));
+    }
+
+    #[test]
+    fn addressed_but_down_links_are_not_present() {
+        // Greptile #101: a failed final `ip link set up` leaves both
+        // addresses installed on down links; that must still read as broken.
+        let host_down = MockCommandRunner::new();
+        seed_veth_addresses(&host_down);
+        host_down.set_run_output("ip -o link show dev veth-sip0", success_output(LINK_DOWN));
+        assert!(!VETH.is_present(&host_down));
+
+        let ns_down = MockCommandRunner::new();
+        seed_veth_addresses(&ns_down);
+        ns_down.set_netns_output(
+            "ims0",
+            &["ip", "-o", "link", "show", "dev", "veth-ims0"],
+            LINK_DOWN,
+        );
+        assert!(!VETH.is_present(&ns_down));
+    }
+
+    #[test]
+    fn link_is_up_reads_only_the_flag_list() {
+        assert!(link_is_up("2: x: <BROADCAST,UP,LOWER_UP> mtu 1 state UP"));
+        assert!(!link_is_up("2: x: <NO-CARRIER,BROADCAST> mtu 1 state DOWN"));
+        // `state UP` outside the flags must not count.
+        assert!(!link_is_up("2: x: <BROADCAST> mtu 1 state UP"));
+        assert!(!link_is_up(""));
     }
 }

@@ -306,9 +306,11 @@ is up, so a few of these warnings at startup are normal. If they continue:
   engine) until the cause is fixed.
 - After about five minutes without a bind, Agent B logs an `error`
   ("control channel still not bindable after a long wait") every five minutes.
-- Check both ends by hand: `ip -d link show veth-sip0` on the host, and
-  `ip netns exec ims0 ip -d link show veth-ims0` for the namespace end (use
-  the line's own index). Both need their `/30` address.
+- Check both ends by hand: `ip addr show dev veth-sip0` on the host, and
+  `ip netns exec ims0 ip addr show dev veth-ims0` for the namespace end (use
+  the line's own index). Both need their `/30` address and the `UP` flag.
+  If the address is present but the bind still fails, something else may own
+  the port; the bind error in the log says which.
 - If the tunnel itself keeps cycling, the veth is not the problem; see the
   re-establishes-every-~30-seconds entry below.
 
