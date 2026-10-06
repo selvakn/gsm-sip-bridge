@@ -184,19 +184,10 @@ impl DialogInfo {
         // the wrong target is still better than never hanging up at all.
         let remote_target = invite
             .header("Contact")
-            .and_then(|c| {
-                let start = c.find('<')? + 1;
-                let end = c[start..].find('>')? + start;
-                Some(c[start..end].to_string())
-            })
+            .and_then(contact_uri)
             .unwrap_or_else(|| invite.request_uri.clone());
 
-        let route_headers: Vec<String> = invite
-            .headers_all("Record-Route")
-            .iter()
-            .rev()
-            .map(|v| format!("Route: {v}"))
-            .collect();
+        let route_headers = route_set_in_order(&invite.headers_all("Record-Route"));
 
         let from = match invite.header("To") {
             Some(to) if to.contains(";tag=") => to.to_string(),
@@ -219,13 +210,11 @@ impl DialogInfo {
     /// The UAC-role counterpart to [`from_invite`](Self::from_invite) —
     /// specs/025-outbound-calling, research.md R-010: we *sent* the INVITE
     /// this dialog started from, so unlike `from_invite`, `from`/`to` come
-    /// from what we sent/received rather than the reverse, and `route_headers`
-    /// reuses the same Service-Route set the INVITE itself was routed with
-    /// (the same simplification `ims::call::run_call` already makes for its
-    /// own BYE, rather than recomputing a dialog route set from
-    /// `Record-Route` — `SipResponse` does not even expose repeated headers
-    /// the way `SipRequest::headers_all` does, since nothing needed it before
-    /// this).
+    /// from what we sent/received rather than the reverse.
+    ///
+    /// `route_headers` is the dialog route set — build it with
+    /// [`uac_route_set`] from the same 2xx, so the ACK and every later
+    /// in-dialog request (BYE, UPDATE) agree on it (RFC 3261 §12.1.2).
     pub(super) fn from_uac_response(
         resp: &crate::ims::sip_client::SipResponse,
         route_headers: Vec<String>,
@@ -239,13 +228,7 @@ impl DialogInfo {
         // §12.1.2); no Contact on the 200 OK is malformed but not fatal — the
         // original callee URI is still a request the network already proved
         // it could route once.
-        let remote_target = resp
-            .header("Contact")
-            .and_then(|c| {
-                let start = c.find('<')? + 1;
-                let end = c[start..].find('>')? + start;
-                Some(c[start..end].to_string())
-            })
+        let remote_target = uac_remote_target(resp)
             // `callee_uri` is a bare `user@host`, so the scheme has to go back
             // on: a `Contact`-less response produced `BYE +91...@ims... SIP/2.0`
             // with no `sip:` at all, which Jio refused
@@ -639,9 +622,244 @@ pub(super) fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall)
     tracing::info!(call_id = %call.call_id, "call ended");
 }
 
+/// The URI of a `Contact` header value (RFC 3261 §20.10): the `<...>` form,
+/// or — when the URI carries no params or commas — the bare addr-spec form,
+/// whose trailing `;params` belong to the header, not the URI. `None` when
+/// nothing usable is there.
+fn contact_uri(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(start) = value.find('<') {
+        let end = value[start..].find('>')? + start;
+        return Some(value[start + 1..end].to_string());
+    }
+    let bare = value.split(';').next()?.trim();
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
+/// The remote target of a UAC dialog: the URI inside the 2xx's `Contact`
+/// (RFC 3261 §12.1.2). `None` when the response carries no usable Contact.
+pub(super) fn uac_remote_target(resp: &crate::ims::sip_client::SipResponse) -> Option<String> {
+    let target = contact_uri(resp.header("Contact")?);
+    if target.is_none() {
+        tracing::warn!(
+            "2xx Contact is unparsable; in-dialog requests fall back to the dialled URI"
+        );
+    }
+    target
+}
+
+/// `Record-Route` header values as `Route` headers, in the order received —
+/// whether the entries arrive as separate headers or comma-joined in one.
+/// A UAS keeps this order (RFC 3261 §12.1.1); a UAC reverses it
+/// ([`uac_route_set`], §12.1.2).
+pub(super) fn route_set_in_order(record_routes: &[&str]) -> Vec<String> {
+    record_routes
+        .iter()
+        .flat_map(|v| split_route_list(v))
+        .map(|v| format!("Route: {v}"))
+        .collect()
+}
+
+/// The dialog route set a UAC builds from a 2xx: its `Record-Route` entries
+/// reversed, falling back to `service_route` (the registration's
+/// Service-Route the INVITE was routed with) when the response records no
+/// route at all.
+///
+/// Jio's P-CSCF record-routes with a `b2bdlg=` dialog token and only matches
+/// an ACK that carries it; an ACK sent via the Service-Route is dropped, the
+/// 200 OK is retransmitted at T1 backoff, and the carrier tears the call down
+/// at Timer H (~32 s) — issue #97.
+pub(super) fn uac_route_set(
+    resp: &crate::ims::sip_client::SipResponse,
+    service_route: &[String],
+) -> Vec<String> {
+    let mut set = route_set_in_order(&resp.headers_all("Record-Route"));
+    set.reverse();
+    if set.is_empty() {
+        service_route.to_vec()
+    } else {
+        set
+    }
+}
+
+/// Split one `Record-Route` header value on the commas that separate
+/// entries, ignoring commas inside `<...>` (a URI may contain them) or inside
+/// a quoted display name (`"Bob, Smith" <sip:...>`, with `\"` escapes).
+fn split_route_list(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    let (mut quoted, mut escaped) = (false, false);
+    for (i, ch) in value.char_indices() {
+        if quoted {
+            match (escaped, ch) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(value[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(value[start..].trim());
+    out.retain(|e| !e.is_empty());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resp_with(headers: &[(&str, &str)]) -> crate::ims::sip_client::SipResponse {
+        crate::ims::sip_client::SipResponse {
+            status: 200,
+            reason: "OK".into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: String::new(),
+        }
+    }
+
+    /// Issue #97: the ACK/BYE target is the Contact URI, params outside the
+    /// angle brackets (`;audio;video`) are not part of it.
+    #[test]
+    fn uac_remote_target_is_the_contact_uri() {
+        let r = resp_with(&[(
+            "Contact",
+            "<sip:user@192.0.2.1:6000;b2bdlg=abc>;audio;video",
+        )]);
+        assert_eq!(
+            uac_remote_target(&r).as_deref(),
+            Some("sip:user@192.0.2.1:6000;b2bdlg=abc")
+        );
+        assert_eq!(uac_remote_target(&resp_with(&[])), None);
+    }
+
+    #[test]
+    fn contact_uri_handles_the_bare_addr_spec_form() {
+        assert_eq!(
+            contact_uri("sip:user@192.0.2.1:6000;transport=tcp").as_deref(),
+            Some("sip:user@192.0.2.1:6000")
+        );
+        assert_eq!(
+            contact_uri("\"Bob\" <sip:user@192.0.2.1>;q=1").as_deref(),
+            Some("sip:user@192.0.2.1")
+        );
+        assert_eq!(contact_uri("  "), None);
+    }
+
+    #[test]
+    fn uac_route_set_prefers_record_route_over_service_route() {
+        let r = resp_with(&[("Record-Route", "<sip:192.0.2.1:6000;lr;b2bdlg=abc>")]);
+        let svc = vec!["Route: <sip:scscf.example.test;lr>".to_string()];
+        assert_eq!(
+            uac_route_set(&r, &svc),
+            vec!["Route: <sip:192.0.2.1:6000;lr;b2bdlg=abc>".to_string()]
+        );
+    }
+
+    /// RFC 3261 §12.1.2: a UAC reverses the Record-Route order, whether the
+    /// entries arrive as separate headers or comma-joined in one.
+    #[test]
+    fn uac_route_set_reverses_record_route_order() {
+        let expect = vec![
+            "Route: <sip:c.example.test;lr>".to_string(),
+            "Route: <sip:b.example.test;lr>".to_string(),
+            "Route: <sip:a.example.test;lr>".to_string(),
+        ];
+        let separate = resp_with(&[
+            ("Record-Route", "<sip:a.example.test;lr>"),
+            ("Record-Route", "<sip:b.example.test;lr>"),
+            ("Record-Route", "<sip:c.example.test;lr>"),
+        ]);
+        assert_eq!(uac_route_set(&separate, &[]), expect);
+        let joined = resp_with(&[(
+            "Record-Route",
+            "<sip:a.example.test;lr>, <sip:b.example.test;lr>,<sip:c.example.test;lr>",
+        )]);
+        assert_eq!(uac_route_set(&joined, &[]), expect);
+    }
+
+    #[test]
+    fn uac_route_set_falls_back_to_service_route_without_record_route() {
+        let svc = vec!["Route: <sip:scscf.example.test;lr>".to_string()];
+        assert_eq!(uac_route_set(&resp_with(&[]), &svc), svc);
+    }
+
+    #[test]
+    fn split_route_list_ignores_commas_inside_quoted_display_names() {
+        assert_eq!(
+            split_route_list(r#""Bob, Smith" <sip:a;lr>, "Q \" , x" <sip:b;lr>"#),
+            vec![r#""Bob, Smith" <sip:a;lr>"#, r#""Q \" , x" <sip:b;lr>"#]
+        );
+    }
+
+    /// A UAS keeps the received Record-Route order (RFC 3261 §12.1.1); only
+    /// a UAC reverses it.
+    #[test]
+    fn route_set_in_order_keeps_the_received_order() {
+        assert_eq!(
+            route_set_in_order(&["<sip:a;lr>, <sip:b;lr>", "<sip:c;lr>"]),
+            vec![
+                "Route: <sip:a;lr>".to_string(),
+                "Route: <sip:b;lr>".to_string(),
+                "Route: <sip:c;lr>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_route_list_ignores_commas_inside_uris() {
+        assert_eq!(
+            split_route_list("<sip:a;x=1,2;lr>, <sip:b;lr>"),
+            vec!["<sip:a;x=1,2;lr>", "<sip:b;lr>"]
+        );
+    }
+
+    /// End to end through the builder: the ACK for the issue's 200 OK carries
+    /// the Contact as Request-URI and the Record-Route as its only Route.
+    #[test]
+    fn ack_for_issue_97_200_ok_targets_contact_and_record_route() {
+        let r = resp_with(&[
+            ("Record-Route", "<sip:192.0.2.1:6000;lr;b2bdlg=abc>"),
+            (
+                "Contact",
+                "<sip:405000000000001@192.0.2.1:6000;b2bdlg=abc>;audio",
+            ),
+        ]);
+        let target = uac_remote_target(&r).unwrap();
+        let routes = uac_route_set(&r, &["Route: <sip:scscf.example.test;lr>".to_string()]);
+        let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
+            request_uri: &target,
+            route_headers: &routes,
+            via_transport: "TCP",
+            local_addr: "10.0.0.2:5060".parse().unwrap(),
+            public_uri: "+919000000000@ims.example.test",
+            to_header: "<sip:9000000001@ims.example.test>;tag=t",
+            call_id: "out-0",
+            from_tag: "f",
+            cseq: 5,
+            branch: "z9hG4bKx",
+        });
+        assert!(
+            ack.starts_with("ACK sip:405000000000001@192.0.2.1:6000;b2bdlg=abc SIP/2.0\r\n"),
+            "{ack}"
+        );
+        assert!(ack.contains("Route: <sip:192.0.2.1:6000;lr;b2bdlg=abc>\r\n"));
+        assert!(!ack.contains("scscf.example.test"));
+        assert!(!ack.contains("sip:sip:"));
+    }
 
     #[test]
     fn a_call_with_flowing_audio_never_probes_the_attachment() {

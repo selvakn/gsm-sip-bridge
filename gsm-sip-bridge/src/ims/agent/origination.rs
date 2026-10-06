@@ -538,7 +538,8 @@ impl PendingOrigination {
     }
 
     /// The carrier answered despite our CANCEL — a `200` that raced the `487`.
-    /// ACK it (reusing the INVITE's branch/CSeq, §17.1.1.3) then immediately
+    /// ACK it (a 2xx ACK is its own transaction, §13.2.2.4: fresh branch, the
+    /// INVITE's CSeq number) then immediately
     /// BYE, or the carrier leg would stay up with nothing on our end tracking
     /// it. Best-effort; there is nothing to retry from here.
     fn ack_and_bye_racing_answer(
@@ -551,9 +552,13 @@ impl PendingOrigination {
             "outbound: carrier answered despite CANCEL; sending ACK then BYE to hang up"
         );
         let to_header = resp.header("To").unwrap_or(&self.callee_uri).to_string();
+        let remote_target = super::call::uac_remote_target(resp)
+            .unwrap_or_else(|| format!("sip:{}", self.callee_uri));
+        let request_uri = remote_target.as_str();
+        let route_set = super::call::uac_route_set(resp, &self.route_headers);
         let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
+            request_uri,
+            route_headers: &route_set,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
             public_uri: &session.origination_identity(),
@@ -561,12 +566,12 @@ impl PendingOrigination {
             call_id: &self.call_id,
             from_tag: &self.from_tag,
             cseq: self.invite_cseq,
-            branch: &self.branch,
+            branch: &format!("z9hG4bK{}", random_hex(6)),
         });
         let _ = session.transport_mut().and_then(|t| t.send(&ack));
         let bye = crate::ims::call::build_bye(&crate::ims::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
+            request_uri,
+            route_headers: &route_set,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
             public_uri: &session.origination_identity(),
@@ -891,10 +896,17 @@ impl PendingOrigination {
             return OriginationStatus::Ended;
         }
 
+        // RFC 3261 §13.2.2.4: the ACK to a 2xx is an in-dialog request, so it
+        // goes to the 2xx's Contact via the Record-Route set — not the dialled
+        // URI via the registration Service-Route (issue #97: Jio never matched
+        // that ACK and tore the call down at Timer H, ~32 s).
+        let remote_target = super::call::uac_remote_target(resp)
+            .unwrap_or_else(|| format!("sip:{}", self.callee_uri));
+        let route_set = super::call::uac_route_set(resp, &self.route_headers);
         let ack_branch = format!("z9hG4bK{}", random_hex(6));
         let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
+            request_uri: &remote_target,
+            route_headers: &route_set,
             via_transport: self.via_transport,
             local_addr: session.local_addr,
             public_uri: &session.origination_identity(),
@@ -912,7 +924,7 @@ impl PendingOrigination {
 
         let dialog = DialogInfo::from_uac_response(
             resp,
-            self.route_headers.clone(),
+            route_set,
             &self.callee_uri,
             &session.origination_identity(),
             &self.from_tag,
@@ -1841,6 +1853,133 @@ mod tests {
             matches!(veth_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "expected a fresh, still-pending veth listener, not the stale failed one"
         );
+    }
+
+    /// Issue #97, through the real answer path: the ACK on the wire targets
+    /// the 200 OK's Contact via its Record-Route (not the dialled URI via the
+    /// Service-Route), and the dialog's later BYE uses the same route set.
+    #[test]
+    fn answer_acks_the_contact_via_record_route_and_dialog_matches() {
+        let call_id = "out-97";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        session.transport = Some(
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap(),
+        );
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+        p.route_headers = vec!["Route: <sip:scscf.example.test;lr>".to_string()];
+
+        let resp = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+                (
+                    "Record-Route".to_string(),
+                    "<sip:192.0.2.1:6000;lr;b2bdlg=abc>".to_string(),
+                ),
+                (
+                    "Contact".to_string(),
+                    "<sip:405000000000001@192.0.2.1:6000;b2bdlg=abc>;audio".to_string(),
+                ),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        };
+        let _ = p.on_carrier_response(&resp, &mut session);
+
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).expect("ACK was not sent");
+        let ack = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            ack.starts_with("ACK sip:405000000000001@192.0.2.1:6000;b2bdlg=abc SIP/2.0\r\n"),
+            "{ack}"
+        );
+        assert!(ack.contains("Route: <sip:192.0.2.1:6000;lr;b2bdlg=abc>\r\n"));
+        assert!(!ack.contains("scscf.example.test"), "{ack}");
+
+        let OriginationStep::AwaitingVeth { dialog, .. } = &p.step else {
+            panic!("expected AwaitingVeth");
+        };
+        assert_eq!(
+            dialog.remote_target,
+            "sip:405000000000001@192.0.2.1:6000;b2bdlg=abc"
+        );
+        assert_eq!(
+            dialog.route_headers,
+            vec!["Route: <sip:192.0.2.1:6000;lr;b2bdlg=abc>".to_string()]
+        );
+    }
+
+    /// A `200 OK` that races our CANCEL is ACKed then BYEd: both go to the
+    /// Contact via the recorded routes, the ACK on its own fresh branch and
+    /// the BYE on a higher CSeq.
+    #[test]
+    fn racing_answer_acks_and_byes_via_contact_and_record_route() {
+        let call_id = "out-97-race";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        session.transport = Some(
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap(),
+        );
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+        p.route_headers = vec!["Route: <sip:scscf.example.test;lr>".to_string()];
+        let invite_branch = p.branch.clone();
+
+        let resp = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+                (
+                    "Record-Route".to_string(),
+                    "<sip:192.0.2.1:6000;lr;b2bdlg=abc>".to_string(),
+                ),
+                (
+                    "Contact".to_string(),
+                    "<sip:405000000000001@192.0.2.1:6000;b2bdlg=abc>".to_string(),
+                ),
+            ],
+            body: String::new(),
+        };
+        p.ack_and_bye_racing_answer(&mut session, &resp);
+
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).expect("ACK was not sent");
+        let ack = String::from_utf8_lossy(&buf[..n]).to_string();
+        let n = peer.recv(&mut buf).expect("BYE was not sent");
+        let bye = String::from_utf8_lossy(&buf[..n]).to_string();
+
+        let target = "sip:405000000000001@192.0.2.1:6000;b2bdlg=abc SIP/2.0\r\n";
+        assert!(ack.starts_with(&format!("ACK {target}")), "{ack}");
+        assert!(bye.starts_with(&format!("BYE {target}")), "{bye}");
+        for msg in [&ack, &bye] {
+            assert!(msg.contains("Route: <sip:192.0.2.1:6000;lr;b2bdlg=abc>\r\n"));
+            assert!(!msg.contains("scscf.example.test"), "{msg}");
+        }
+        assert!(
+            !ack.contains(&format!("branch={invite_branch};")),
+            "2xx ACK must not reuse the INVITE branch: {ack}"
+        );
+        assert!(ack.contains("CSeq: 1 ACK"), "{ack}");
+        assert!(bye.contains("CSeq: 2 BYE"), "{bye}");
     }
 
     /// A `200 OK` fixture identical in shape to

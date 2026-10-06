@@ -853,14 +853,29 @@ pub(crate) fn build_prack(p: &AckParts, rack: &str) -> String {
     build_in_dialog_request("PRACK", p, &format!("RAck: {rack}\r\n"))
 }
 
+/// A request-line URI with its scheme: callers pass either a bare
+/// `user@host` (the dialled URI) or a full URI taken from a `Contact`
+/// (`sip:`, `sips:`, `tel:`, any case) — which must not gain a second scheme.
+fn request_line_uri(uri: &str) -> std::borrow::Cow<'_, str> {
+    let lower = uri.to_ascii_lowercase();
+    if ["sip:", "sips:", "tel:"]
+        .iter()
+        .any(|s| lower.starts_with(s))
+    {
+        uri.into()
+    } else {
+        format!("sip:{uri}").into()
+    }
+}
+
 fn build_in_dialog_request(method: &str, p: &AckParts, extra_headers: &str) -> String {
     let via_addr = format_sip_addr(p.local_addr);
     let mut msg = format!(
-        "{method} sip:{request_uri} SIP/2.0\r\n\
+        "{method} {request_uri} SIP/2.0\r\n\
          Via: SIP/2.0/{transport} {via_addr};branch={branch};rport\r\n\
          Max-Forwards: 70\r\n",
         method = method,
-        request_uri = p.request_uri,
+        request_uri = request_line_uri(p.request_uri),
         transport = p.via_transport,
         via_addr = via_addr,
         branch = p.branch,
@@ -1104,6 +1119,31 @@ mod tests {
         let a_pos = msg.find("Route: <sip:a>").unwrap();
         let b_pos = msg.find("Route: <sip:b>").unwrap();
         assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn in_dialog_request_line_never_doubles_the_scheme() {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        for (uri, line) in [
+            ("x@realm", "BYE sip:x@realm SIP/2.0"),
+            ("sip:x@realm", "BYE sip:x@realm SIP/2.0"),
+            ("SIP:x@realm", "BYE SIP:x@realm SIP/2.0"),
+            ("sips:x@realm", "BYE sips:x@realm SIP/2.0"),
+        ] {
+            let msg = build_bye(&AckParts {
+                request_uri: uri,
+                route_headers: &[],
+                via_transport: "TCP",
+                local_addr: addr,
+                public_uri: "u@realm",
+                to_header: "<sip:x@realm>;tag=t",
+                call_id: "c",
+                from_tag: "f",
+                cseq: 2,
+                branch: "b",
+            });
+            assert!(msg.starts_with(&format!("{line}\r\n")), "{msg}");
+        }
     }
 
     #[test]
