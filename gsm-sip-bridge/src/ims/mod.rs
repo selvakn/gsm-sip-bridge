@@ -220,6 +220,12 @@ pub(crate) struct RegisteredSession {
     /// past whatever REGISTER used).
     cseq: u32,
     gm_state: Option<(GmEndpoints, SaProposal, gm_ipsec::SecurityServerParams)>,
+    /// The P-CSCF's `Security-Server` list, echoed verbatim. RFC 3329 §2.3.1
+    /// has the client repeat it as `Security-Verify` on *every* request sent
+    /// over the negotiated SA, not just the REGISTER that set it up; some
+    /// P-CSCFs (MEO) answer `494 Security Agreement Required` otherwise.
+    /// `None` when no Gm SA was negotiated.
+    security_verify: Option<String>,
     xfrm_proto: &'static str,
     status: u16,
     reason: String,
@@ -260,6 +266,11 @@ impl RegisteredSession {
         self.default_impu()
             .map(|impu| impu.trim_start_matches("sip:").to_string())
             .unwrap_or_else(|| self.public_uri.clone())
+    }
+
+    /// `Security-Verify` to attach to requests sent over the Gm SA.
+    pub(crate) fn security_verify(&self) -> Option<&str> {
+        self.security_verify.as_deref()
     }
 
     /// First `sip:` `P-Associated-URI` from the REGISTER `200 OK`, scheme
@@ -902,6 +913,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
     // before this function returns rather than leaking kernel XFRM state
     // across repeated `ims-register` invocations.
     let mut gm_state: Option<(GmEndpoints, SaProposal, gm_ipsec::SecurityServerParams)> = None;
+    let mut security_verify: Option<String> = None;
 
     // First REGISTER — no credentials; expect a 401 challenge.
     let branch = format!("z9hG4bK{}", random_hex(6));
@@ -1045,6 +1057,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                                             // always includes this on the post-IPsec retry).
                                             extra_headers
                                                 .push(format!("Security-Verify: {sec_verify}"));
+                                            security_verify = Some(sec_verify.clone());
                                             gm_state = Some((endpoints, p.clone(), theirs));
                                         }
                                         Err(e) => {
@@ -1134,6 +1147,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         use_tcp: cfg.use_tcp,
         cseq: cseq + 1,
         gm_state,
+        security_verify,
         xfrm_proto,
         status: resp.status,
         reason: resp.reason,

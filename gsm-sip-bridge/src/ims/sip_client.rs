@@ -983,6 +983,9 @@ pub struct MessageRequest<'a> {
     /// Arbitrary bytes, which is why this builder returns `Vec<u8>` rather
     /// than the `String` every other builder here returns.
     pub body: &'a [u8],
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub security_verify: Option<&'a str>,
 }
 
 /// Build an out-of-dialog `MESSAGE` request (RFC 3428) with a binary body.
@@ -1003,6 +1006,15 @@ pub fn build_message(req: &MessageRequest) -> Vec<u8> {
     for route in req.route_headers {
         msg.push_str(route);
         msg.push_str("\r\n");
+    }
+    if let Some(sv) = req.security_verify {
+        // RFC 3329 §2.3.1 / TS 24.229 §5.1.1.5.1: the verify echo travels
+        // with both option tags, so the P-CSCF and the far end must honor it.
+        msg.push_str(&format!(
+            "Require: sec-agree\r\n\
+             Proxy-Require: sec-agree\r\n\
+             Security-Verify: {sv}\r\n"
+        ));
     }
     msg.push_str(&format!(
         "P-Preferred-Identity: <{impu}>\r\n\
@@ -1969,7 +1981,33 @@ mod tests {
             cseq: 9,
             content_type: "application/vnd.3gpp.sms",
             body,
+            security_verify: None,
         })
+    }
+
+    #[test]
+    fn build_message_carries_security_verify_when_negotiated() {
+        let msg = String::from_utf8(build_message(&MessageRequest {
+            target_uri: "sip:A2P@203.0.113.7",
+            impu: "sip:u@ims.example.org",
+            route_headers: &[],
+            local_addr: "10.0.0.2:5060".parse().unwrap(),
+            transport: "TCP",
+            call_id: "c",
+            from_tag: "t",
+            branch: "z9hG4bKx",
+            cseq: 1,
+            content_type: "application/vnd.3gpp.sms",
+            body: b"",
+            security_verify: Some("ipsec-3gpp; alg=hmac-sha-1-96; ealg=null"),
+        }))
+        .unwrap();
+        assert!(
+            msg.contains("Security-Verify: ipsec-3gpp; alg=hmac-sha-1-96; ealg=null\r\n"),
+            "{msg}"
+        );
+        assert!(msg.contains("Require: sec-agree\r\n"), "{msg}");
+        assert!(msg.contains("Proxy-Require: sec-agree\r\n"), "{msg}");
     }
 
     /// TS 24.341 Annex B.6 table B.6-7: the delivery report is addressed to
