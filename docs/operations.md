@@ -293,6 +293,25 @@ Since v6.2.0 the entrypoint reconciles this automatically on boot
 it was wrong. If it fails, check the modem supports `AT+QCFG="ims"` at all —
 `ims_conf=1` with `volte_cap=1` is the state that causes this.
 
+### VoWiFi: "control channel not bindable yet" repeats and never clears
+
+Agent B binds each line's control channel to the host end of that line's veth
+pair (e.g. `10.99.0.2:7050`). The supervisor creates the pair once the tunnel
+is up, so a few of these warnings at startup are normal. If they continue:
+
+- The supervisor log says why. `veth setup failed (<step>: <stderr>)` means a
+  command in the setup failed; `veth missing; rebuilt` means it noticed the
+  pair was gone and repaired it, and the next bind attempt should succeed.
+  `veth missing and rebuild failed` repeats every tick (30s, or 5s for the swu
+  engine) until the cause is fixed.
+- After about five minutes without a bind, Agent B logs an `error`
+  ("control channel still not bindable after a long wait") every five minutes.
+- Check both ends by hand: `ip -d link show veth-sip0` on the host, and
+  `ip netns exec ims0 ip -d link show veth-ims0` for the namespace end (use
+  the line's own index). Both need their `/30` address.
+- If the tunnel itself keeps cycling, the veth is not the problem; see the
+  re-establishes-every-~30-seconds entry below.
+
 ### VoWiFi: a line re-establishes its tunnel every ~30 seconds
 
 Symptom: one line never stays up. Its supervisor logs

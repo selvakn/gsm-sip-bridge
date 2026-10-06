@@ -1648,6 +1648,9 @@ fn start_vowifi_line_strongswan(
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
+                // Under the shutdown guard: a repair racing teardown would
+                // recreate the pair the plan just deleted.
+                repair_line_veth(runner.as_ref(), idx, &netns, line);
                 drop(guard);
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
@@ -1709,6 +1712,32 @@ fn start_vowifi_line_strongswan(
     }
 }
 
+/// Rebuilds a line's veth pair if it has gone missing, and says so.
+///
+/// Runs only on a tick that found the tunnel otherwise healthy, so it never
+/// competes with the tunnel-recovery paths. It cannot be folded into
+/// `TunnelEngine::steady_state_health`: both engines share the veth, and the
+/// pair is not part of either engine's own state. Agent B needs no restart
+/// afterwards — its control-channel bind already retries on its own (#96).
+fn repair_line_veth(runner: &dyn CommandRunner, idx: u32, netns: &str, line: &LineResolutionEntry) {
+    let sip_addr = format!("{}/30", line.veth_peer_addr);
+    let ims_addr = format!("{}/30", line.veth_local_addr);
+    let veth = epdg_iface::LineVeth {
+        netns,
+        veth_sip: &line.config.veth_sip_iface,
+        veth_ims: &line.config.veth_ims_iface,
+        sip_addr: &sip_addr,
+        ims_addr: &ims_addr,
+    };
+    if veth.is_present(runner) {
+        return;
+    }
+    match epdg_iface::ensure_line_veth(runner, &veth) {
+        Ok(()) => println!("[supervise] line {idx}: veth missing; rebuilt"),
+        Err(e) => eprintln!("[supervise] line {idx}: veth missing and rebuild failed: {e}"),
+    }
+}
+
 /// Veth pair + this line's vowifi-ims-agent (with per-incident USIM
 /// auto-recovery) + the idle-tunnel keepalive — 1:1 port of
 /// `start_line_tail` and its keepalive sibling. Both supervision loops run
@@ -1734,34 +1763,18 @@ fn start_line_tail(
     let veth_ims_addr = format!("{}/30", line.veth_local_addr);
 
     println!("[supervise] line {idx}: creating veth pair ({veth_sip} <-> {veth_ims} in netns {netns})...");
-    if !runner
-        .run_in_netns(netns, &["ip", "link", "show", &veth_ims])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        && runner
-            .run(&["ip", "link", "show", &veth_sip])
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    {
-        let _ = runner.run(&["ip", "link", "delete", &veth_sip]);
-    }
-    if !runner
-        .run(&["ip", "link", "show", &veth_sip])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        let _ = runner.run(&[
-            "ip", "link", "add", &veth_sip, "type", "veth", "peer", "name", &veth_ims, "netns",
-            netns,
-        ]);
-    }
-    let _ = runner.run(&["ip", "addr", "replace", &veth_sip_addr, "dev", &veth_sip]);
-    let _ = runner.run(&["ip", "link", "set", &veth_sip, "up"]);
-    let _ = runner.run_in_netns(
+    let veth = epdg_iface::LineVeth {
         netns,
-        &["ip", "addr", "replace", &veth_ims_addr, "dev", &veth_ims],
-    );
-    let _ = runner.run_in_netns(netns, &["ip", "link", "set", &veth_ims, "up"]);
+        veth_sip: &veth_sip,
+        veth_ims: &veth_ims,
+        sip_addr: &veth_sip_addr,
+        ims_addr: &veth_ims_addr,
+    };
+    // Non-fatal here: the steady-state loop re-checks the pair every tick and
+    // rebuilds it (`repair_line_veth`), so a failure is reported, not final.
+    if let Err(e) = epdg_iface::ensure_line_veth(runner.as_ref(), &veth) {
+        eprintln!("[supervise] line {idx}: veth setup failed ({e}); will retry each tick");
+    }
 
     // vowifi-ims-agent, supervised, with per-incident CSIM-failure counting.
     {
@@ -2097,6 +2110,9 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
+                // Under the shutdown guard: a repair racing teardown would
+                // recreate the pair the plan just deleted.
+                repair_line_veth(runner.as_ref(), idx, &netns, line);
                 drop(guard);
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {

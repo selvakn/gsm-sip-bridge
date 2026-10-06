@@ -10,6 +10,18 @@ across releases.
 
 ### Fixed
 
+- **VoWiFi line stuck with "control channel not bindable yet" forever.**
+  The per-line veth pair was built once, right after the tunnel first came
+  up, with every command's result discarded, and nothing ever looked at it
+  again. If that single setup failed, Agent B retried its bind indefinitely
+  and the supervisor never noticed. Setup is now checked (a failing step is
+  logged with its stderr), and the steady-state loop re-verifies the pair
+  every tick and rebuilds it with `veth missing; rebuilt`. A line whose bind
+  is still failing after about five minutes now logs an `error`, not another
+  routine warning. Reported in
+  [#96](https://github.com/selvakn/gsm-sip-bridge/issues/96); the reported
+  trigger (a reboot within the carrier's stale-session window) is unconfirmed.
+
 - **Inbound Jio VoWiFi calls were torn down by the network moments after
   being answered, with `cause=503 "SDP Protocol Error"`, whenever the call
   was routed through one of Jio's Alcatel-Lucent border elements.** The
