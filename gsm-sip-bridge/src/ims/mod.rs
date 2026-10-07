@@ -68,7 +68,7 @@ use crate::modules::usim::{self, AkaResult, ApduTransport};
 use gm_ipsec::GmEndpoints;
 use sip_client::{
     build_options, build_register, extract_challenge, format_sip_addr, parse_digest_challenge,
-    random_hex, OptionsRequest, RegisterRequest, SipTransport,
+    random_hex, sec_agree_headers, OptionsRequest, RegisterRequest, SipTransport,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -219,13 +219,8 @@ pub(crate) struct RegisteredSession {
     /// Next `CSeq` to use for a request on this session (already advanced
     /// past whatever REGISTER used).
     cseq: u32,
-    gm_state: Option<(GmEndpoints, SaProposal, gm_ipsec::SecurityServerParams)>,
-    /// The P-CSCF's `Security-Server` list, echoed verbatim. RFC 3329 §2.3.1
-    /// has the client repeat it as `Security-Verify` on *every* request sent
-    /// over the negotiated SA, not just the REGISTER that set it up; some
-    /// P-CSCFs (MEO) answer `494 Security Agreement Required` otherwise.
-    /// `None` when no Gm SA was negotiated.
-    security_verify: Option<String>,
+    /// `None` when no Gm SA was negotiated (`--sec-agree` off).
+    gm_state: Option<GmSa>,
     xfrm_proto: &'static str,
     status: u16,
     reason: String,
@@ -234,6 +229,19 @@ pub(crate) struct RegisteredSession {
     from_tag: String,
     pcscf_addr: SocketAddr,
     imei: String,
+}
+
+/// The Gm security association a registration negotiated, kept together so
+/// the echo below can neither outlive nor precede the SA it belongs to.
+pub(crate) struct GmSa {
+    pub(crate) endpoints: GmEndpoints,
+    pub(crate) proposal: SaProposal,
+    pub(crate) theirs: gm_ipsec::SecurityServerParams,
+    /// The P-CSCF's `Security-Server` list, echoed verbatim. RFC 3329 §2.3.1
+    /// has the client repeat it as `Security-Verify` on *every* request sent
+    /// over the negotiated SA, not just the REGISTER that set it up; some
+    /// P-CSCFs (MEO) answer `494 Security Agreement Required` otherwise.
+    pub(crate) security_verify: String,
 }
 
 impl RegisteredSession {
@@ -270,7 +278,7 @@ impl RegisteredSession {
 
     /// `Security-Verify` to attach to requests sent over the Gm SA.
     pub(crate) fn security_verify(&self) -> Option<&str> {
-        self.security_verify.as_deref()
+        self.gm_state.as_ref().map(|g| g.security_verify.as_str())
     }
 
     /// First `sip:` `P-Associated-URI` from the REGISTER `200 OK`, scheme
@@ -293,7 +301,7 @@ impl RegisteredSession {
     /// case there is no such port and nothing can be delivered to us.
     /// See `sip_client::spawn_gm_server`.
     fn gm_server_addr(&self) -> Option<SocketAddr> {
-        self.gm_state.as_ref().map(|(e, _, _)| e.local_s)
+        self.gm_state.as_ref().map(|g| g.endpoints.local_s)
     }
 
     /// The live client transport. `Err` only in the brief window inside
@@ -317,8 +325,8 @@ impl RegisteredSession {
     /// isn't a persistent registration, so kernel XFRM state would
     /// otherwise leak across repeated invocations.
     fn cleanup(&mut self) {
-        if let Some((endpoints, p, theirs)) = self.gm_state.take() {
-            gm_ipsec::remove_gm_sas(&endpoints, &p, &theirs, self.xfrm_proto);
+        if let Some(sa) = self.gm_state.take() {
+            gm_ipsec::remove_gm_sas(&sa.endpoints, &sa.proposal, &sa.theirs, self.xfrm_proto);
         }
     }
 
@@ -375,9 +383,9 @@ impl RegisteredSession {
         // failure, and the next scheduled renewal negotiates a fresh SA and
         // replaces this session (and its transport) wholesale.
         let new_transport = match self.gm_state.as_ref() {
-            Some((endpoints, _, _)) => SipTransport::connect_from(
-                endpoints.local_c.port(),
-                endpoints.remote_s,
+            Some(sa) => SipTransport::connect_from(
+                sa.endpoints.local_c.port(),
+                sa.endpoints.remote_s,
                 self.use_tcp,
             )?,
             None => SipTransport::connect(self.pcscf_addr, self.use_tcp)?,
@@ -410,6 +418,10 @@ impl RegisteredSession {
 
         self.cseq = self.cseq.wrapping_add(1);
         let branch = format!("z9hG4bK{}", random_hex(6));
+        let sec_agree: Vec<String> = sec_agree_headers(self.security_verify())
+            .lines()
+            .map(str::to_string)
+            .collect();
         let unreg = build_register(&RegisterRequest {
             registrar_uri: &request_uri,
             public_uri: &self.public_uri,
@@ -422,7 +434,7 @@ impl RegisteredSession {
             expires: 0,
             transport: via_transport,
             authorization: None,
-            extra_headers: &[],
+            extra_headers: &sec_agree,
             imei: &self.imei,
         });
 
@@ -469,6 +481,7 @@ impl RegisteredSession {
             call_id: &self.call_id,
             cseq,
             branch: &branch,
+            security_verify: self.security_verify(),
         });
         self.transport_mut()?.send(&options)?;
         Ok(cseq)
@@ -912,8 +925,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
     // Populated once Gm IPsec SAs are installed, so they can be torn down
     // before this function returns rather than leaking kernel XFRM state
     // across repeated `ims-register` invocations.
-    let mut gm_state: Option<(GmEndpoints, SaProposal, gm_ipsec::SecurityServerParams)> = None;
-    let mut security_verify: Option<String> = None;
+    let mut gm_state: Option<GmSa> = None;
 
     // First REGISTER — no credentials; expect a 401 challenge.
     let branch = format!("z9hG4bK{}", random_hex(6));
@@ -1011,7 +1023,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                         // mechanisms, we echoed the one we picked, and every
                         // protected REGISTER came back `494 Security
                         // Agreement Required`.
-                        Some((params, offers.join(", ")))
+                        Some((params, security_verify_echo(&offers)))
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "no usable Security-Server offer");
@@ -1057,8 +1069,12 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                                             // always includes this on the post-IPsec retry).
                                             extra_headers
                                                 .push(format!("Security-Verify: {sec_verify}"));
-                                            security_verify = Some(sec_verify.clone());
-                                            gm_state = Some((endpoints, p.clone(), theirs));
+                                            gm_state = Some(GmSa {
+                                                endpoints,
+                                                proposal: p.clone(),
+                                                theirs,
+                                                security_verify: sec_verify.clone(),
+                                            });
                                         }
                                         Err(e) => {
                                             tracing::warn!(error = %e, "failed to reconnect over the negotiated Gm port; reopening the original connection");
@@ -1147,7 +1163,6 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         use_tcp: cfg.use_tcp,
         cseq: cseq + 1,
         gm_state,
-        security_verify,
         xfrm_proto,
         status: resp.status,
         reason: resp.reason,
@@ -1176,6 +1191,13 @@ pub struct SaProposal {
     pub spi_s: u32,
     pub port_c: u16,
     pub port_s: u16,
+}
+
+/// The `Security-Verify` value to echo: the P-CSCF's *whole* `Security-Server`
+/// list, verbatim and in the order offered, not only the offer we selected.
+/// See the measurement note at the call site: a partial echo is a `494`.
+fn security_verify_echo(offers: &[&str]) -> String {
+    offers.join(", ")
 }
 
 /// The URI for the REGISTER request line (`REGISTER sip:<this> SIP/2.0`).
@@ -1309,6 +1331,57 @@ fn build_resync_authorization(
         realm = challenge.realm,
         nonce = challenge.nonce,
     )
+}
+
+/// A registered session for tests that need real Gm-negotiated state without a
+/// SIM card: `verify` becomes the stored `Security-Server` echo (`None` = no Gm
+/// SA negotiated), and `transport` a real connection when the test wants to read
+/// what is sent.
+#[cfg(test)]
+pub(crate) fn test_session_with_sa(
+    transport: Option<SipTransport>,
+    pcscf_addr: SocketAddr,
+    verify: Option<&str>,
+) -> RegisteredSession {
+    let ours = SaProposal {
+        spi_c: 1,
+        spi_s: 2,
+        port_c: 5062,
+        port_s: 5063,
+    };
+    let theirs = gm_ipsec::SecurityServerParams {
+        alg: "hmac-sha-1-96".into(),
+        ealg: "null".into(),
+        spi_c: 3,
+        spi_s: 4,
+        port_c: 6000,
+        port_s: 6001,
+        q: 0.5,
+    };
+    let local = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 5062);
+    RegisteredSession {
+        transport,
+        realm: "ims.example.test".to_string(),
+        public_uri: "9000000000@ims.example.test".to_string(),
+        local_addr: local,
+        contact_addr: SocketAddr::new(local.ip(), 5063),
+        use_tcp: true,
+        cseq: 2,
+        gm_state: verify.map(|v| GmSa {
+            endpoints: GmEndpoints::new(local.ip(), pcscf_addr.ip(), &ours, &theirs),
+            proposal: ours.clone(),
+            theirs: theirs.clone(),
+            security_verify: v.to_string(),
+        }),
+        xfrm_proto: "tcp",
+        status: 200,
+        reason: "OK".to_string(),
+        headers: Vec::new(),
+        call_id: "reg-1".to_string(),
+        from_tag: "regtag".to_string(),
+        pcscf_addr,
+        imei: "000000000000000".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1712,5 +1785,112 @@ mod tests {
         );
         assert_eq!(opened, Ok("commander"));
         assert!(slept.is_empty(), "a free port must not delay registration");
+    }
+
+    // ---- Security-Verify wiring (specs/082) --------------------------------
+
+    /// Three offers as a P-CSCF sends them: one header per mechanism.
+    const OFFERS: [&str; 3] = [
+        "ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001",
+        "ipsec-3gpp;q=0.3;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001",
+        "ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=6000;port-s=6001",
+    ];
+
+    #[test]
+    fn the_echo_is_the_whole_offer_list_not_the_selected_offer() {
+        let echo = security_verify_echo(&OFFERS);
+        for offer in OFFERS {
+            assert!(echo.contains(offer), "echo is missing {offer}: {echo}");
+        }
+        // Selecting one offer must not narrow what is echoed.
+        let (_, selected) = gm_ipsec::select_security_server(&OFFERS, None, None).unwrap();
+        assert!(echo.len() > selected.len(), "{echo}");
+    }
+
+    /// Accepts one connection on a loopback listener, answers each request
+    /// with `200 OK`, and returns everything the client sent until it closes
+    /// or `want` requests have been read. Real sockets, no mock transport.
+    fn capture_requests(
+        listener: std::net::TcpListener,
+        want: usize,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut seen = Vec::new();
+            let mut buf = String::new();
+            let mut chunk = [0u8; 4096];
+            while seen.len() < want {
+                let Ok(n) = conn.read(&mut chunk) else { break };
+                if n == 0 {
+                    break;
+                }
+                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                while let Some(end) = buf.find("\r\n\r\n") {
+                    let req: String = buf.drain(..end + 4).collect();
+                    let _ = conn.write_all(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    seen.push(req);
+                }
+            }
+            seen
+        })
+    }
+
+    /// Sends a keepalive then an un-REGISTER from a session over a real loopback
+    /// connection, and returns the two requests as they arrived on the wire.
+    fn sent_by_session(verify: Option<&str>) -> Vec<String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = capture_requests(listener, 2);
+        let transport = SipTransport::connect(addr, true).unwrap();
+        let mut session = test_session_with_sa(Some(transport), addr, verify);
+        session.send_gm_ping().unwrap();
+        session.unregister();
+        drop(session);
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn keepalive_and_unregister_echo_the_full_list_when_an_sa_is_negotiated() {
+        let echo = security_verify_echo(&OFFERS);
+        let sent = sent_by_session(Some(&echo));
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[0].starts_with("OPTIONS "), "{}", sent[0]);
+        assert!(sent[1].starts_with("REGISTER "), "{}", sent[1]);
+        assert!(sent[1].contains("Expires: 0\r\n"), "{}", sent[1]);
+        for req in &sent {
+            assert!(req.contains("Require: sec-agree\r\n"), "{req}");
+            assert!(req.contains("Proxy-Require: sec-agree\r\n"), "{req}");
+            assert!(
+                req.contains(&format!("Security-Verify: {echo}\r\n")),
+                "full list expected in {req}"
+            );
+        }
+    }
+
+    #[test]
+    fn keepalive_and_unregister_carry_no_sec_agree_without_an_sa() {
+        let sent = sent_by_session(None);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        for req in &sent {
+            assert!(
+                !req.contains("sec-agree") && !req.contains("Security-Verify"),
+                "{req}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_echo_exists_exactly_when_the_sa_does() {
+        let addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut s = test_session_with_sa(None, addr, Some("v1"));
+        assert_eq!(s.security_verify(), Some("v1"));
+        // Not `cleanup()`: that would run `ip xfrm` against this fake SA.
+        s.gm_state = None;
+        assert_eq!(s.security_verify(), None, "no echo once the SA is gone");
+        // A new registration that negotiated different offers replaces it.
+        let fresh = test_session_with_sa(None, addr, Some("v2"));
+        assert_eq!(fresh.security_verify(), Some("v2"));
     }
 }

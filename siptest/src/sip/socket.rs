@@ -351,6 +351,7 @@ mod tests {
             call_id: "call1",
             cseq: 1,
             branch: "z9hG4bKtest",
+            security_verify: None,
         });
         b.send(a.local_addr(), &options).unwrap();
         let (req, _src) = a

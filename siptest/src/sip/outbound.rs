@@ -547,6 +547,8 @@ pub fn send_bye(socket: &SipSocket, dialog: &ConfirmedDialog) -> SipTestResult<(
         call_id: &dialog.call_id,
         cseq: dialog.next_cseq,
         branch: &branch,
+        // siptest is a plain SIP endpoint with no Gm security association.
+        security_verify: None,
     });
     socket.send(dialog.remote_target, &msg)
 }

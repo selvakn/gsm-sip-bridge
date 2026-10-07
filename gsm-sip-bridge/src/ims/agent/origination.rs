@@ -526,6 +526,7 @@ impl PendingOrigination {
             from_tag: &self.from_tag,
             cseq: self.invite_cseq,
             branch: &self.branch,
+            security_verify: session.security_verify(),
         });
         let Ok(transport) = session.transport_mut() else {
             return false;
@@ -568,6 +569,7 @@ impl PendingOrigination {
             from_tag: &self.from_tag,
             cseq: self.invite_cseq,
             branch: &format!("z9hG4bK{}", random_hex(6)),
+            security_verify: session.security_verify(),
         });
         let _ = session.transport_mut().and_then(|t| t.send(&ack));
         let bye = crate::ims::call::build_bye(&crate::ims::call::AckParts {
@@ -581,6 +583,7 @@ impl PendingOrigination {
             from_tag: &self.from_tag,
             cseq: self.invite_cseq + self.extra_cseq + 1,
             branch: &format!("z9hG4bK{}", random_hex(6)),
+            security_verify: session.security_verify(),
         });
         let _ = session.transport_mut().and_then(|t| t.send(&bye));
     }
@@ -632,6 +635,7 @@ impl PendingOrigination {
                 from_tag: &self.from_tag,
                 cseq,
                 branch: &format!("z9hG4bK{}", random_hex(6)),
+                security_verify: session.security_verify(),
             },
             &format!("{rseq} {} INVITE", self.invite_cseq),
         );
@@ -851,6 +855,7 @@ impl PendingOrigination {
                 from_tag: &self.from_tag,
                 cseq: self.invite_cseq,
                 branch: &self.branch,
+                security_verify: session.security_verify(),
             });
             let _ = session.transport_mut().and_then(|t| t.send(&ack));
             self.fail(&format!("{} {}", resp.status, resp.reason));
@@ -916,6 +921,7 @@ impl PendingOrigination {
             from_tag: &self.from_tag,
             cseq: self.invite_cseq,
             branch: &ack_branch,
+            security_verify: session.security_verify(),
         });
         if let Err(e) = session.transport_mut().and_then(|t| t.send(&ack)) {
             self.fail(&format!("ACK send failed: {e}"));
@@ -1638,7 +1644,6 @@ mod tests {
             use_tcp: true,
             cseq: 2,
             gm_state: None,
-            security_verify: None,
             xfrm_proto: "esp",
             status: 200,
             reason: "OK".to_string(),

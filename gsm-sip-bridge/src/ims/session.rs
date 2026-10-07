@@ -15,8 +15,8 @@
 //! compile error rather than a silent difference.
 
 use super::sip_client::{
-    build_message, build_uas_response, format_sip_addr, random_hex, spawn_gm_server, GmServer,
-    MessageRequest, SipMessage, SipRequest, SipSink,
+    build_message, build_uas_response, format_sip_addr, random_hex, sec_agree_headers,
+    spawn_gm_server, GmServer, MessageRequest, SipMessage, SipRequest, SipSink,
 };
 use super::ImsRegisterConfig;
 use crate::control::protocol::RegistrationStatus;
@@ -235,6 +235,9 @@ pub(crate) struct SubscribeParts<'a> {
     /// into `P-Access-Network-Info` instead of a hardcoded value
     /// (specs/045 MT-11).
     pub(crate) access_network_info: &'a str,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub(crate) security_verify: Option<&'a str>,
 }
 
 pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
@@ -262,6 +265,7 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
          Event: reg\r\n\
          Expires: {expires}\r\n\
          Accept: application/reginfo+xml\r\n\
+         {sec_agree}\
          P-Access-Network-Info: {access_network_info}\r\n\
          Content-Length: 0\r\n\r\n",
         impu = p.impu,
@@ -273,6 +277,7 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
         transport = p.via_transport,
         expires = p.expires,
         access_network_info = p.access_network_info,
+        sec_agree = sec_agree_headers(p.security_verify),
     ));
     msg
 }
@@ -314,6 +319,7 @@ pub(crate) fn subscribe_reg_event(
         cseq,
         expires: super::DEFAULT_EXPIRES,
         access_network_info,
+        security_verify: session.security_verify(),
     });
     match session.transport_mut().and_then(|t| t.send(&msg)) {
         Ok(()) => tracing::info!(impu = %impu, "sent reg-event SUBSCRIBE"),
