@@ -172,6 +172,11 @@ pub(super) struct DialogInfo {
     /// Our own CSeq counter for this dialog. We answered the INVITE, so the
     /// caller's CSeq space is theirs; ours starts fresh.
     pub(super) cseq: u32,
+    /// `Security-Verify` echo of the registration this call was set up under
+    /// (`None` when it negotiated no Gm SA). Captured here, like `local_addr`
+    /// and `use_tcp`: renewal is deferred while a call is active, so the SA
+    /// cannot change under the dialog.
+    pub(super) security_verify: Option<String>,
 }
 
 impl DialogInfo {
@@ -204,6 +209,7 @@ impl DialogInfo {
             local_addr: session.local_addr,
             use_tcp: session.use_tcp,
             cseq: 1,
+            security_verify: session.security_verify().map(str::to_string),
         }
     }
 
@@ -251,6 +257,7 @@ impl DialogInfo {
             local_addr: session.local_addr,
             use_tcp: session.use_tcp,
             cseq: next_cseq,
+            security_verify: session.security_verify().map(str::to_string),
         }
     }
 
@@ -267,6 +274,7 @@ impl DialogInfo {
             call_id,
             cseq: self.cseq,
             branch: &format!("z9hG4bK{}", random_hex(6)),
+            security_verify: self.security_verify.as_deref(),
         })
     }
 
@@ -288,6 +296,7 @@ impl DialogInfo {
             cseq: self.cseq,
             branch: &format!("z9hG4bK{}", random_hex(6)),
             session_expires,
+            security_verify: self.security_verify.as_deref(),
         })
     }
 }
@@ -595,6 +604,7 @@ pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -
             local_addr: addr,
             use_tcp: true,
             cseq: 1,
+            security_verify: None,
         },
         caller: "+919000000000".to_string(),
         answered_at: Utc::now(),
@@ -851,6 +861,7 @@ mod tests {
             from_tag: "f",
             cseq: 5,
             branch: "z9hG4bKx",
+            security_verify: None,
         });
         assert!(
             ack.starts_with("ACK sip:405000000000001@192.0.2.1:6000;b2bdlg=abc SIP/2.0\r\n"),
@@ -943,5 +954,57 @@ mod tests {
             classify_in_dialog_invite(&req, None),
             InDialogInvite::ReInvite
         ));
+    }
+
+    /// Specs/082 FR-008: a call set up under a registration echoes *that*
+    /// registration's `Security-Server` list in its BYE and UPDATE, and a call
+    /// set up under a newer registration echoes the newer list, never the old.
+    #[test]
+    fn a_dialog_echoes_the_list_of_the_registration_it_was_set_up_under() {
+        let addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let r = resp_with(&[("Contact", "<sip:carrier@192.0.2.1:6000>")]);
+        let dialog_under = |echo: Option<&str>| {
+            let session = crate::ims::test_session_with_sa(None, addr, echo);
+            DialogInfo::from_uac_response(
+                &r,
+                Vec::new(),
+                "9000000001@ims.example.test",
+                "9000000000@ims.example.test",
+                "ftag",
+                2,
+                &session,
+            )
+        };
+
+        let mut old = dialog_under(Some("old-list"));
+        let mut new = dialog_under(Some("new-list-a, new-list-b"));
+        for (dialog, want, stale) in [
+            (&mut old, "Security-Verify: old-list\r\n", "new-list"),
+            (
+                &mut new,
+                "Security-Verify: new-list-a, new-list-b\r\n",
+                "old-list",
+            ),
+        ] {
+            let bye = dialog.build_bye_for("c1");
+            let update = dialog.build_update_for("c1", "300;refresher=uac");
+            for msg in [bye, update] {
+                assert!(msg.contains(want), "{msg}");
+                assert!(msg.contains("Require: sec-agree\r\n"), "{msg}");
+                assert!(msg.contains("Proxy-Require: sec-agree\r\n"), "{msg}");
+                assert!(!msg.contains(stale), "{msg}");
+            }
+        }
+
+        let mut plain = dialog_under(None);
+        for msg in [
+            plain.build_bye_for("c1"),
+            plain.build_update_for("c1", "300;refresher=uac"),
+        ] {
+            assert!(
+                !msg.contains("sec-agree") && !msg.contains("Security-Verify"),
+                "{msg}"
+            );
+        }
     }
 }

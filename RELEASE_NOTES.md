@@ -3,6 +3,10 @@
 <!-- Rename the "## Unreleased" heading to the real "## vX.Y.Z" at release
      time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
      "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **Hang-up, session refresh, keepalive and subscription are no longer sent bare to P-CSCFs that enforce Security Agreement.** Follow-up to the outbound `INVITE`/`MESSAGE` fix: every other request sent over the negotiated Gm security association now also carries `Require: sec-agree`, `Proxy-Require: sec-agree` and the P-CSCF's full `Security-Server` list in `Security-Verify` (RFC 3329 §2.3.1, TS 24.229 §5.1.1.5.1). That covers `BYE`, `UPDATE`, `PRACK`, `ACK`, `CANCEL`, the reg-event `SUBSCRIBE`, the `OPTIONS` keepalive and the un-`REGISTER`. A strict P-CSCF (MEO) was expected to answer these with `494`, which would show up as a call that connects but cannot be hung up or refreshed. The header block is now built in one place instead of two copies, and the echoed list lives with the Gm security state it belongs to. With no Gm security association nothing changes. Not yet confirmed on an enforcing carrier (#100).
+
 ## v8.19.1
 
 - **Outbound VoWiFi calls and SMS delivery acknowledgements are no longer rejected by P-CSCFs that enforce Security Agreement.** Every request sent over the negotiated Gm security association must echo the P-CSCF's `Security-Server` list in `Security-Verify`, alongside `Require` and `Proxy-Require: sec-agree` (RFC 3329 §2.3.1, TS 24.229 §5.1.1.5.1). The bridge only did this on the post-IPsec `REGISTER`, so a strict P-CSCF (reported on MEO, Portugal) answered outbound `INVITE`s and the SMS `RP-ACK` `MESSAGE` with `494 Security Agreement Required`. The registered session now keeps the echoed list, and outbound `INVITE` and `MESSAGE` add the three headers whenever a Gm security association was negotiated; with no association nothing changes. Live-checked on Vodafone and Jio: outbound calls connect with audio both ways. In-dialog requests (`BYE`, `UPDATE`, `PRACK`, ...) do not carry the headers yet. Reported by @mironovlab (#95).

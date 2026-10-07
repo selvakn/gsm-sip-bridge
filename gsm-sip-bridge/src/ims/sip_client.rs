@@ -715,6 +715,9 @@ pub struct ByeRequest<'a> {
     pub call_id: &'a str,
     pub cseq: u32,
     pub branch: &'a str,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub security_verify: Option<&'a str>,
 }
 
 pub fn build_bye(req: &ByeRequest) -> String {
@@ -736,11 +739,13 @@ pub fn build_bye(req: &ByeRequest) -> String {
          To: {to}\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} BYE\r\n\
+         {sec_agree}\
          Content-Length: 0\r\n\r\n",
         from = req.from,
         to = req.to,
         call_id = req.call_id,
         cseq = req.cseq,
+        sec_agree = sec_agree_headers(req.security_verify),
     ));
     msg
 }
@@ -762,6 +767,9 @@ pub struct UpdateRequest<'a> {
     /// The `Session-Expires` value to restate on this refresh (RFC 4028
     /// §7.4: `"<interval>;refresher=uac"` when this bridge is refreshing).
     pub session_expires: &'a str,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub security_verify: Option<&'a str>,
 }
 
 /// A body-less `UPDATE`, per RFC 4028 §7.4: "It is RECOMMENDED that the
@@ -788,12 +796,14 @@ pub fn build_update(req: &UpdateRequest) -> String {
          CSeq: {cseq} UPDATE\r\n\
          Supported: timer\r\n\
          Session-Expires: {session_expires}\r\n\
+         {sec_agree}\
          Content-Length: 0\r\n\r\n",
         from = req.from,
         to = req.to,
         call_id = req.call_id,
         cseq = req.cseq,
         session_expires = req.session_expires,
+        sec_agree = sec_agree_headers(req.security_verify),
     ));
     msg
 }
@@ -930,6 +940,9 @@ pub struct OptionsRequest<'a> {
     /// how the dispatch loop matches an answer to the ping it sent.
     pub cseq: u32,
     pub branch: &'a str,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub security_verify: Option<&'a str>,
 }
 
 /// Build an out-of-dialog `OPTIONS` request used as a Gm-connection keepalive.
@@ -944,6 +957,7 @@ pub fn build_options(req: &OptionsRequest) -> String {
          To: <sip:{public}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} OPTIONS\r\n\
+         {sec_agree}\
          Content-Length: 0\r\n\r\n",
         request_uri = req.request_uri,
         transport = req.transport,
@@ -953,6 +967,7 @@ pub fn build_options(req: &OptionsRequest) -> String {
         from_tag = req.from_tag,
         call_id = req.call_id,
         cseq = req.cseq,
+        sec_agree = sec_agree_headers(req.security_verify),
     )
 }
 
@@ -988,6 +1003,25 @@ pub struct MessageRequest<'a> {
     pub security_verify: Option<&'a str>,
 }
 
+/// The three headers RFC 3329 §2.3.1 / TS 24.229 §5.1.1.5.1 require on every
+/// request sent over a negotiated Gm security association: the verify echo
+/// travels with both option tags, so the P-CSCF and the far end must honor it.
+///
+/// `verify` is the P-CSCF's full `Security-Server` list, verbatim (a partial
+/// echo reads as a tampered negotiation; Jio answers it `494`). `None` means
+/// no Gm SA was negotiated, and the result is empty so the request is
+/// unchanged. Each line ends in CRLF, ready to append to a header block.
+pub(crate) fn sec_agree_headers(verify: Option<&str>) -> String {
+    match verify {
+        Some(sv) => format!(
+            "Require: sec-agree\r\n\
+             Proxy-Require: sec-agree\r\n\
+             Security-Verify: {sv}\r\n"
+        ),
+        None => String::new(),
+    }
+}
+
 /// Build an out-of-dialog `MESSAGE` request (RFC 3428) with a binary body.
 ///
 /// No `Contact`: a `MESSAGE` is a standalone transaction, not a dialog, so
@@ -1007,15 +1041,7 @@ pub fn build_message(req: &MessageRequest) -> Vec<u8> {
         msg.push_str(route);
         msg.push_str("\r\n");
     }
-    if let Some(sv) = req.security_verify {
-        // RFC 3329 §2.3.1 / TS 24.229 §5.1.1.5.1: the verify echo travels
-        // with both option tags, so the P-CSCF and the far end must honor it.
-        msg.push_str(&format!(
-            "Require: sec-agree\r\n\
-             Proxy-Require: sec-agree\r\n\
-             Security-Verify: {sv}\r\n"
-        ));
-    }
+    msg.push_str(&sec_agree_headers(req.security_verify));
     msg.push_str(&format!(
         "P-Preferred-Identity: <{impu}>\r\n\
          From: <{impu}>;tag={from_tag}\r\n\
@@ -1854,6 +1880,24 @@ pub fn extract_challenge(params: &[(String, String)]) -> BridgeResult<DigestChal
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sec_agree_headers_is_empty_without_a_negotiated_sa() {
+        assert_eq!(sec_agree_headers(None), "");
+    }
+
+    #[test]
+    fn sec_agree_headers_emits_the_three_headers_in_order() {
+        let h = sec_agree_headers(Some(
+            "ipsec-3gpp; alg=hmac-sha-1-96, ipsec-3gpp; alg=hmac-md5-96",
+        ));
+        assert_eq!(
+            h,
+            "Require: sec-agree\r\n\
+             Proxy-Require: sec-agree\r\n\
+             Security-Verify: ipsec-3gpp; alg=hmac-sha-1-96, ipsec-3gpp; alg=hmac-md5-96\r\n"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1950,7 +1994,9 @@ mod tests {
             call_id: "call-abc",
             cseq: 5,
             branch: "z9hG4bKdeadbeef",
+            security_verify: None,
         });
+        assert!(!msg.contains("sec-agree") && !msg.contains("Security-Verify"));
         assert!(msg.starts_with("OPTIONS sip:ims.example.org SIP/2.0\r\n"));
         // CSeq carries the OPTIONS method token — the correlation key the
         // dispatch loop matches on.
@@ -2259,6 +2305,7 @@ mod tests {
             call_id: "callid1",
             cseq: 1,
             branch: "z9hG4bKbye1",
+            security_verify: None,
         });
         assert!(msg.starts_with("BYE sip:caller@pcscf.example:5060 SIP/2.0\r\n"));
         assert!(msg.contains("Route: <sip:pcscf.example;lr>\r\n"));
@@ -2495,6 +2542,7 @@ mod tests {
             cseq: 3,
             branch: "z9hG4bKabc123",
             session_expires: "300;refresher=uac",
+            security_verify: None,
         });
         assert!(msg.starts_with("UPDATE sip:carrier@10.1.1.1:5060 SIP/2.0\r\n"));
         assert!(msg.contains("CSeq: 3 UPDATE\r\n"));
@@ -2886,5 +2934,104 @@ mod tests {
             .expect("a To header");
         assert_eq!(to_line.matches("tag=").count(), 1);
         assert!(to_line.contains("tag=mine"));
+    }
+
+    const ECHO: &str =
+        "ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;ealg=null, ipsec-3gpp;q=0.3;alg=hmac-md5-96;ealg=null";
+
+    fn assert_full_block(method: &str, msg: &str) {
+        assert!(msg.contains("Require: sec-agree\r\n"), "{method}: {msg}");
+        assert!(
+            msg.contains("Proxy-Require: sec-agree\r\n"),
+            "{method}: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("Security-Verify: {ECHO}\r\n")),
+            "{method}: {msg}"
+        );
+        assert!(
+            msg.find("Security-Verify").unwrap() < msg.find("\r\n\r\n").unwrap(),
+            "{method}: header must be in the header block"
+        );
+    }
+
+    #[test]
+    fn bye_update_options_and_message_carry_the_full_block_when_negotiated() {
+        let addr: SocketAddr = "10.0.0.9:5060".parse().unwrap();
+        let bye = build_bye(&ByeRequest {
+            request_uri: "sip:c@pcscf.example:5060",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            from: "<sip:a@ims.example>;tag=1",
+            to: "<sip:b@ims.example>;tag=2",
+            call_id: "c",
+            cseq: 1,
+            branch: "z9hG4bKb",
+            security_verify: Some(ECHO),
+        });
+        assert_full_block("BYE", &bye);
+        let update = build_update(&UpdateRequest {
+            request_uri: "sip:c@pcscf.example:5060",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            from: "<sip:a@ims.example>;tag=1",
+            to: "<sip:b@ims.example>;tag=2",
+            call_id: "c",
+            cseq: 2,
+            branch: "z9hG4bKu",
+            session_expires: "300;refresher=uac",
+            security_verify: Some(ECHO),
+        });
+        assert_full_block("UPDATE", &update);
+        let options = build_options(&OptionsRequest {
+            request_uri: "ims.example",
+            local_addr: addr,
+            transport: "TCP",
+            public_uri: "u@ims.example",
+            from_tag: "t",
+            call_id: "c",
+            cseq: 3,
+            branch: "z9hG4bKo",
+            security_verify: Some(ECHO),
+        });
+        assert_full_block("OPTIONS", &options);
+    }
+
+    #[test]
+    fn bye_and_update_are_unchanged_without_an_sa() {
+        let addr: SocketAddr = "10.0.0.9:5060".parse().unwrap();
+        let bye = build_bye(&ByeRequest {
+            request_uri: "sip:c@pcscf.example:5060",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            from: "<sip:a@ims.example>;tag=1",
+            to: "<sip:b@ims.example>;tag=2",
+            call_id: "c",
+            cseq: 1,
+            branch: "z9hG4bKb",
+            security_verify: None,
+        });
+        let update = build_update(&UpdateRequest {
+            request_uri: "sip:c@pcscf.example:5060",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            from: "<sip:a@ims.example>;tag=1",
+            to: "<sip:b@ims.example>;tag=2",
+            call_id: "c",
+            cseq: 2,
+            branch: "z9hG4bKu",
+            session_expires: "300;refresher=uac",
+            security_verify: None,
+        });
+        for msg in [bye, update] {
+            assert!(
+                !msg.contains("sec-agree") && !msg.contains("Security-Verify"),
+                "{msg}"
+            );
+        }
     }
 }

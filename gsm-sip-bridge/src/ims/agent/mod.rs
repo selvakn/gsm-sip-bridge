@@ -2762,6 +2762,33 @@ mod tests {
     }
 
     #[test]
+    fn build_subscribe_carries_the_full_sec_agree_block_when_negotiated() {
+        let echo = "ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;ealg=null, ipsec-3gpp;q=0.3;alg=hmac-md5-96;ealg=null";
+        let msg = build_subscribe(&SubscribeParts {
+            impu: "sip:+919000000010@ims.example.test",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: "1.2.3.4:48584".parse().unwrap(),
+            contact_addr: "1.2.3.4:48586".parse().unwrap(),
+            public_user: "9000000010",
+            call_id: "cid1",
+            from_tag: "tag1",
+            cseq: 7,
+            expires: 3600,
+            access_network_info: "IEEE-802.11",
+            security_verify: Some(echo),
+        });
+        assert!(msg.contains("Require: sec-agree\r\n"), "{msg}");
+        assert!(msg.contains("Proxy-Require: sec-agree\r\n"), "{msg}");
+        assert!(
+            msg.contains(&format!("Security-Verify: {echo}\r\n")),
+            "{msg}"
+        );
+        assert!(msg.find("Security-Verify").unwrap() < msg.find("\r\n\r\n").unwrap());
+        assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
     fn build_subscribe_formats_a_reg_event_subscription() {
         let msg = build_subscribe(&SubscribeParts {
             impu: "sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org",
@@ -2775,7 +2802,9 @@ mod tests {
             cseq: 7,
             expires: 3600,
             access_network_info: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01",
+            security_verify: None,
         });
+        assert!(!msg.contains("sec-agree") && !msg.contains("Security-Verify"));
         assert!(msg
             .starts_with("SUBSCRIBE sip:+919000000010@ims.mnc094.mcc404.3gppnetwork.org SIP/2.0"));
         assert!(msg.contains("Route: <sip:pcscf.example:6000;lr>\r\n"));

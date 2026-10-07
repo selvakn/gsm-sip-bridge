@@ -11,7 +11,7 @@
 //! place a call, exchange audio for a fixed duration, and hang up.
 
 use super::sdp::NegotiatedCodec;
-use super::sip_client::{format_sip_addr, random_hex};
+use super::sip_client::{format_sip_addr, random_hex, sec_agree_headers};
 use super::{sdp, ImsRegisterConfig};
 use crate::error::{BridgeError, BridgeResult};
 use std::io;
@@ -270,6 +270,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
             from_tag: &from_tag,
             cseq: invite_cseq,
             branch: &branch,
+            security_verify: session.security_verify(),
         });
         let _ = session.transport_mut().and_then(|t| t.send(&ack));
         session.cleanup();
@@ -298,6 +299,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         from_tag: &from_tag,
         cseq: invite_cseq,
         branch: &ack_branch,
+        security_verify: session.security_verify(),
     });
     session.transport_mut()?.send(&ack)?;
 
@@ -315,6 +317,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         from_tag: &from_tag,
         cseq: invite_cseq + 1,
         branch: &bye_branch,
+        security_verify: session.security_verify(),
     });
     // Best-effort — the recording already happened; a BYE-send failure
     // shouldn't turn a successful call test into an error.
@@ -756,15 +759,7 @@ pub(crate) fn build_invite(p: &InviteParts) -> String {
     // is unchanged on Vodafone (identical 183/180/200 accept-and-ring
     // shape, same as "3GPP-WLAN"). See `docs/plans/jio-vowifi-outbound-480.md`'s
     // "RESOLVED" section.
-    if let Some(sv) = p.security_verify {
-        // RFC 3329 §2.3.1 / TS 24.229 §5.1.1.5.1: the verify echo travels
-        // with both option tags, so the P-CSCF and the far end must honor it.
-        msg.push_str(&format!(
-            "Require: sec-agree\r\n\
-             Proxy-Require: sec-agree\r\n\
-             Security-Verify: {sv}\r\n"
-        ));
-    }
+    msg.push_str(&sec_agree_headers(p.security_verify));
     msg.push_str(&format!(
         "P-Access-Network-Info: IEEE-802.11\r\n\
          User-Agent: motorola_XT2241-1_Android15_V1SQS35H.58-10-8-9\r\n\
@@ -797,6 +792,9 @@ pub(crate) struct CancelParts<'a> {
     /// The *original* INVITE's own branch — this is what ties the CANCEL
     /// to the transaction it cancels.
     pub(crate) branch: &'a str,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub(crate) security_verify: Option<&'a str>,
 }
 
 pub(crate) fn build_cancel(p: &CancelParts) -> String {
@@ -819,12 +817,14 @@ pub(crate) fn build_cancel(p: &CancelParts) -> String {
          To: <sip:{callee_uri}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} CANCEL\r\n\
+         {sec_agree}\
          Content-Length: 0\r\n\r\n",
         public_uri = p.public_uri,
         from_tag = p.from_tag,
         callee_uri = p.callee_uri,
         call_id = p.call_id,
         cseq = p.cseq,
+        sec_agree = sec_agree_headers(p.security_verify),
     ));
     msg
 }
@@ -840,6 +840,9 @@ pub(crate) struct AckParts<'a> {
     pub(crate) from_tag: &'a str,
     pub(crate) cseq: u32,
     pub(crate) branch: &'a str,
+    /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
+    /// registration negotiated no Gm SA.
+    pub(crate) security_verify: Option<&'a str>,
 }
 
 pub(crate) fn build_ack(p: &AckParts) -> String {
@@ -903,6 +906,7 @@ fn build_in_dialog_request(method: &str, p: &AckParts, extra_headers: &str) -> S
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} {method}\r\n\
          {extra_headers}\
+         {sec_agree}\
          Content-Length: 0\r\n\r\n",
         public_uri = p.public_uri,
         from_tag = p.from_tag,
@@ -911,6 +915,7 @@ fn build_in_dialog_request(method: &str, p: &AckParts, extra_headers: &str) -> S
         cseq = p.cseq,
         method = method,
         extra_headers = extra_headers,
+        sec_agree = sec_agree_headers(p.security_verify),
     ));
     msg
 }
@@ -1178,6 +1183,7 @@ mod tests {
                 from_tag: "f",
                 cseq: 2,
                 branch: "b",
+                security_verify: None,
             });
             assert!(msg.starts_with(&format!("{line}\r\n")), "{msg}");
         }
@@ -1197,6 +1203,7 @@ mod tests {
             from_tag: "f",
             cseq: 2,
             branch: "b",
+            security_verify: None,
         });
         assert!(msg.starts_with("BYE sip:x@realm SIP/2.0\r\n"));
         assert!(msg.contains("To: <sip:x@realm>;tag=abc123\r\n"));
@@ -1239,6 +1246,7 @@ mod tests {
             from_tag: "tag1",
             cseq: 7,
             branch: "z9hG4bKinvitebranch",
+            security_verify: None,
         });
         assert!(cancel.starts_with("CANCEL sip:+919000000000@realm SIP/2.0\r\n"));
         assert!(cancel.contains("branch=z9hG4bKinvitebranch"));
@@ -1261,8 +1269,82 @@ mod tests {
             from_tag: "f",
             cseq: 1,
             branch: "b",
+            security_verify: None,
         });
         assert!(cancel.contains("To: <sip:x@realm>\r\n"));
         assert!(!cancel.contains("To: <sip:x@realm>;tag"));
+    }
+
+    const ECHO: &str =
+        "ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;ealg=null, ipsec-3gpp;q=0.3;alg=hmac-md5-96;ealg=null";
+
+    /// Every in-dialog request this module builds, with and without an SA.
+    fn in_dialog_requests(verify: Option<&str>) -> Vec<(&'static str, String)> {
+        let addr: std::net::SocketAddr = "1.2.3.4:5060".parse().unwrap();
+        let ack_parts = |v| AckParts {
+            request_uri: "x@realm",
+            route_headers: &[],
+            via_transport: "TCP",
+            local_addr: addr,
+            public_uri: "u@realm",
+            to_header: "<sip:x@realm>;tag=abc",
+            call_id: "c",
+            from_tag: "f",
+            cseq: 2,
+            branch: "b",
+            security_verify: v,
+        };
+        vec![
+            ("ACK", build_ack(&ack_parts(verify))),
+            ("BYE", build_bye(&ack_parts(verify))),
+            ("PRACK", build_prack(&ack_parts(verify), "1 2 INVITE")),
+            (
+                "CANCEL",
+                build_cancel(&CancelParts {
+                    request_uri: "x@realm",
+                    route_headers: &[],
+                    via_transport: "TCP",
+                    local_addr: addr,
+                    public_uri: "u@realm",
+                    callee_uri: "x@realm",
+                    call_id: "c",
+                    from_tag: "f",
+                    cseq: 2,
+                    branch: "b",
+                    security_verify: verify,
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn ack_bye_prack_and_cancel_carry_the_full_sec_agree_block_when_negotiated() {
+        for (method, msg) in in_dialog_requests(Some(ECHO)) {
+            assert!(msg.starts_with(method), "{msg}");
+            assert!(msg.contains("Require: sec-agree\r\n"), "{method}: {msg}");
+            assert!(
+                msg.contains("Proxy-Require: sec-agree\r\n"),
+                "{method}: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("Security-Verify: {ECHO}\r\n")),
+                "{method}: {msg}"
+            );
+            assert!(msg.find("Security-Verify").unwrap() < msg.find("\r\n\r\n").unwrap());
+            assert!(
+                msg.ends_with("Content-Length: 0\r\n\r\n"),
+                "{method}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_bye_prack_and_cancel_are_unchanged_without_an_sa() {
+        for (method, msg) in in_dialog_requests(None) {
+            assert!(
+                !msg.contains("sec-agree") && !msg.contains("Security-Verify"),
+                "{method}: {msg}"
+            );
+        }
     }
 }

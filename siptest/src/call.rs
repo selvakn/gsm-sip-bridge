@@ -801,6 +801,8 @@ fn send_our_bye(
         call_id,
         cseq: 1,
         branch: &branch,
+        // siptest is a plain SIP endpoint with no Gm security association.
+        security_verify: None,
     });
     let _ = state.sip_socket.send(peer, &bye);
 }
