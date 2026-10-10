@@ -1189,13 +1189,6 @@ fn handle_message(
         }
         None => None,
     };
-    // The sender came from the SIP headers (no decoded TPDU supplied one) and
-    // they named nobody: record why, once (issue #104, FR-015).
-    if decoded.is_none() {
-        if let Some(raw) = unresolved_caller_diagnostic(req) {
-            tracing::warn!(headers = %raw, "SMS has no readable sender identity");
-        }
-    }
     if let Some(decoded) = &decoded {
         sender = decoded.sender.clone();
         body = match decoded.part {
@@ -1273,6 +1266,16 @@ fn handle_message(
             p.sms_delivery_report && claim_confirmed,
         );
         return;
+    }
+
+    // The sender came from the SIP headers (no decoded TPDU supplied one) and
+    // they named nobody: record why (issue #104, FR-015). Placed after the
+    // duplicate check above, so a retransmission of a message already handled
+    // — same sender and body — returns before it and does not log again.
+    if decoded.is_none() {
+        if let Some(raw) = unresolved_caller_diagnostic(req) {
+            tracing::warn!(headers = %raw, "SMS has no readable sender identity");
+        }
     }
 
     // specs/047-offerless-invite-sms-reassembly (SMS-05): a multi-part
@@ -1660,6 +1663,10 @@ struct LoopState {
     /// itself instead of exiting into `supervise::sim_recovery` — see
     /// [`Self::schedule_renewal_retry`].
     consecutive_renewal_failures: u32,
+    /// Call-ID of the last INVITE whose caller identity was unreadable and
+    /// already logged, so a retransmission of it (our final response lost)
+    /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
+    unreadable_caller_warned: Option<String>,
 }
 
 impl LoopState {
@@ -1676,7 +1683,24 @@ impl LoopState {
             force_renewal: false,
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
+            unreadable_caller_warned: None,
         }
+    }
+
+    /// The FR-015 diagnostic for this INVITE, at most once per Call-ID: a
+    /// retransmission is the same request, and the busy / PBX-down rejection
+    /// paths keep no record of it, so without this a lost `486` would log the
+    /// same raw headers again with every retry. Only the most recent Call-ID is
+    /// remembered — retransmissions arrive back to back, and a handful of
+    /// distinct unreadable callers in between is already a different problem.
+    fn unreadable_caller_to_log(&mut self, req: &SipRequest) -> Option<String> {
+        let raw = unresolved_caller_diagnostic(req)?;
+        let call_id = req.header("Call-ID").unwrap_or_default();
+        if self.unreadable_caller_warned.as_deref() == Some(call_id) {
+            return None;
+        }
+        self.unreadable_caller_warned = Some(call_id.to_string());
+        Some(raw)
     }
 
     /// Is this line occupied — by a bridged call or an attempt still being
@@ -2252,7 +2276,7 @@ impl LoopState {
         // above): say once, with the raw values, when neither identity header
         // names a caller — every later `caller=unknown` then has a cause on
         // record (issue #104, FR-015).
-        if let Some(raw) = unresolved_caller_diagnostic(req) {
+        if let Some(raw) = self.unreadable_caller_to_log(req) {
             tracing::warn!(headers = %raw, "inbound call has no readable caller identity");
         }
         // An in-flight outbound origination occupies the line too (specs/029,
@@ -2986,6 +3010,34 @@ mod tests {
         );
         assert_eq!(extract_caller(&req), "+919000000001");
         assert_eq!(extract_caller_name(&req), Some("Other Name".to_string()));
+    }
+
+    /// FR-015: one warning per INVITE, not per retransmission. A rejection
+    /// whose response was lost is retried with the same Call-ID.
+    #[test]
+    fn unreadable_caller_is_logged_once_per_call_id() {
+        let invite = |call_id: &str| {
+            let raw = format!(
+                "INVITE sip:x SIP/2.0\r\nFrom: <sip:gateway.ims.example>;tag=a\r\n\
+                 Call-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+            );
+            SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+        };
+        let mut state = LoopState::new();
+        assert!(state.unreadable_caller_to_log(&invite("one")).is_some());
+        assert!(state.unreadable_caller_to_log(&invite("one")).is_none());
+        assert!(state.unreadable_caller_to_log(&invite("one")).is_none());
+        assert!(state.unreadable_caller_to_log(&invite("two")).is_some());
+    }
+
+    /// A readable caller never produces the diagnostic, so it must not
+    /// consume the "already warned" slot either.
+    #[test]
+    fn a_readable_caller_does_not_disturb_the_warned_call_id() {
+        let mut state = LoopState::new();
+        let readable = invite_with_headers("From: <tel:+919000000001>;tag=a\r\n");
+        assert!(state.unreadable_caller_to_log(&readable).is_none());
+        assert_eq!(state.unreadable_caller_warned, None);
     }
 
     /// A display name that merely looks like a URI must not mislead parsing.

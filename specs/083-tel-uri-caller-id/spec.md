@@ -260,7 +260,8 @@ delivery report.
 
 - **FR-015**: When neither `P-Asserted-Identity` nor `From` yields a number
   for an inbound call or SMS, the bridge MUST log exactly one warning for
-  that request, naming:
+  that request (a retransmission of it is the same request and MUST NOT
+  log again), naming:
   - the raw `P-Asserted-Identity` values (or that the header is absent);
   - the raw `From` values (or that the header is absent).
 
