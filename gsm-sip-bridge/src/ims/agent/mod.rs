@@ -3220,6 +3220,47 @@ mod tests {
         );
     }
 
+    /// RFC 3325 §9.1: a two-value P-Asserted-Identity pairs a `tel` with a
+    /// `sip` URI. The delivery report is a SIP request to a network node, so
+    /// it goes to the `sip` one — in either order, on one line or two.
+    #[test]
+    fn header_uri_prefers_the_sip_value_of_a_two_value_asserted_identity() {
+        for headers in [
+            "P-Asserted-Identity: <tel:+919000000000>, <sip:ipsmgw.example;transport=udp>\r\n",
+            "P-Asserted-Identity: <sip:ipsmgw.example;transport=udp>, <tel:+919000000000>\r\n",
+            "P-Asserted-Identity: <tel:+919000000000>\r\n\
+             P-Asserted-Identity: <sip:ipsmgw.example;transport=udp>\r\n",
+        ] {
+            let req = message_with_headers(headers);
+            assert_eq!(
+                header_uri(&req, "P-Asserted-Identity").as_deref(),
+                Some("sip:ipsmgw.example;transport=udp"),
+                "{headers}"
+            );
+        }
+    }
+
+    /// A tel-only asserted identity is still addressed as it is today.
+    #[test]
+    fn header_uri_falls_back_to_a_tel_uri_when_that_is_all_there_is() {
+        let req = message_with_headers("P-Asserted-Identity: <tel:+919000000000>\r\n");
+        assert_eq!(
+            header_uri(&req, "P-Asserted-Identity").as_deref(),
+            Some("tel:+919000000000")
+        );
+    }
+
+    /// RFC 3261 §20.10: with no `<>`, a `;param` after a `From` URI is a
+    /// *header* parameter — it must not end up in the request-line.
+    #[test]
+    fn header_uri_drops_header_parameters_of_an_unbracketed_from() {
+        let req = message_with_headers("From: sip:ipsmgw.example;tag=abc\r\n");
+        assert_eq!(
+            header_uri(&req, "From").as_deref(),
+            Some("sip:ipsmgw.example")
+        );
+    }
+
     /// Nothing to address a report to: a missing header, or one carrying only
     /// a display name. `acknowledge` logs and skips rather than sending a
     /// request to a URI it invented.

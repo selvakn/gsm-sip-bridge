@@ -103,9 +103,9 @@ only when PAI yields nothing, and never mixed with it.
 `;tag`. The live Jio form is byte-identical.
 **Independent test**: C4.1–C4.7 pass through `header_uri`.
 
-- [ ] T014 [P] [US3] In `agent/mod.rs` tests (next to `header_uri_keeps_the_whole_uri_from_a_bracketed_header`, ~line 3090), add failing tests for C4.1–C4.4 using `message_with_headers`. Keep C4.5, C4.6 and C4.7, which already exist as `header_uri_keeps_parameters_of_an_unbracketed_uri`, `header_uri_keeps_the_whole_uri_from_a_bracketed_header` and `header_uri_is_none_without_a_uri`, unchanged as the FR-014 guard.
+- [x] T014 [P] [US3] In `agent/mod.rs` tests (next to `header_uri_keeps_the_whole_uri_from_a_bracketed_header`, ~line 3090), add failing tests for C4.1–C4.4 using `message_with_headers`. Keep C4.5, C4.6 and C4.7, which already exist as `header_uri_keeps_parameters_of_an_unbracketed_uri`, `header_uri_keeps_the_whole_uri_from_a_bracketed_header` and `header_uri_is_none_without_a_uri`, unchanged as the FR-014 guard.
 - [x] T015 [US3] In `identity.rs`, add `pub(crate) fn header_uri_values<'a>(req: &'a SipRequest, name: &str, params: HeaderParams) -> Vec<NameAddr<'a>>`, and reuse it inside `header_identity`.
-- [ ] T016 [US3] In `session.rs`, re-implement `header_uri(req, name)`:
+- [x] T016 [US3] In `session.rs`, re-implement `header_uri(req, name)`:
   - Pick `HeaderParams::Allowed` when `name` is `From`/`To`/`Contact` (case-insensitive), otherwise `HeaderParams::None`.
   - Return the first URI whose scheme is `sip`/`sips` (case-insensitive), otherwise the first URI, as an owned `String`.
   - Update its doc comment: drop "parameters after the URI, if any, are the URI's own" as a general rule, and cite RFC 3261 §20.10 for `From` and RFC 3325 §9.1 for PAI.

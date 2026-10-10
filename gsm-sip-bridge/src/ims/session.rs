@@ -687,25 +687,41 @@ pub(crate) fn escape_display_name(name: &str) -> String {
 }
 
 /// The **whole URI** named by a header, where [`extract_caller`] wants only
-/// the user part — for addressing a new request back at whoever sent this
-/// one. RFC 3261 §20 allows either form: a `name-addr`, where the URI is
-/// inside `<...>` and any `;` after it separates *header* parameters, or a
-/// bare `addr-spec`, where a `;` belongs to the URI itself. The brackets are
-/// what tells the two apart, so they decide where the cut goes.
+/// the number — for addressing a new request back at whoever sent this one.
+/// URI parameters stay (`;transport=udp` belongs to the URI).
+///
+/// Every value of every line of the header is considered
+/// (RFC 3261 §7.3.1), and a `sip`/`sips` URI is preferred over any other: a
+/// two-value `P-Asserted-Identity` (RFC 3325 §9.1) pairs a `tel` with a `sip`
+/// one, and a request is addressed to a SIP node, not a phone number. With no
+/// SIP URI the first URI of any scheme is used, as before.
+///
+/// Whether a `;` after a *bare* URI belongs to it depends on the header: on
+/// `From`/`To`/`Contact` it is a header parameter (`;tag=…`, RFC 3261 §20.10)
+/// and is cut; `P-Asserted-Identity` defines no header parameters (RFC 3325
+/// §9.1), so there it is the URI's own.
 ///
 /// `None` for a header that is absent or names no URI at all.
 pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
-    let value = req.header(name)?.trim();
-    let uri = match value.split_once('<') {
-        Some((_, rest)) => rest.split('>').next()?,
-        // No brackets: parameters after the URI, if any, are the URI's own,
-        // so only a `,` (the next header value) can end it.
-        None => value.split(',').next()?,
-    }
-    .trim();
-    // A display name with no URI at all ("Anonymous"), or an empty header,
-    // is not something a request can be addressed to.
-    uri.contains(':').then(|| uri.to_string())
+    use super::identity::{header_uri_values, HeaderParams};
+    let params = if ["From", "To", "Contact"]
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(name))
+    {
+        HeaderParams::Allowed
+    } else {
+        HeaderParams::None
+    };
+    let values = header_uri_values(req, name, params);
+    values
+        .iter()
+        .find(|v| {
+            v.uri.split_once(':').is_some_and(|(scheme, _)| {
+                scheme.eq_ignore_ascii_case("sip") || scheme.eq_ignore_ascii_case("sips")
+            })
+        })
+        .or_else(|| values.first())
+        .map(|v| v.uri.to_string())
 }
 
 #[cfg(test)]
