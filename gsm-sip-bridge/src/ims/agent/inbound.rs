@@ -1221,6 +1221,22 @@ mod tests {
         );
     }
 
+    /// FR-012: a `tel:` P-Asserted-Identity is now the source of the name, and
+    /// `Privacy: id` still withholds it from the onward leg (RFC 3325 §9.1).
+    #[test]
+    fn onward_signaling_withholds_a_tel_asserted_name_under_privacy_id() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <sip:+919000000001@ims.example>;tag=abc\r\n\
+             P-Asserted-Identity: \"Firstname Lastname\" <tel:+919000000000>\r\n\
+             Privacy: id\r\n",
+        );
+        assert_eq!(caller_name_for_onward_signaling(&req, true), None);
+        assert_eq!(
+            caller_name_for_onward_signaling(&req, false),
+            Some("Firstname Lastname".to_string())
+        );
+    }
+
     fn invite_with_content_type(content_type: Option<&str>) -> SipRequest {
         let ct_line = content_type
             .map(|ct| format!("Content-Type: {ct}\r\n"))

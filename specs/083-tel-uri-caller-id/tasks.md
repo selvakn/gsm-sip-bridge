@@ -80,9 +80,9 @@ only when PAI yields nothing, and never mixed with it.
 **Independent test**: C3.2–C3.5 and C3.7 pass through `extract_caller` plus
 `extract_caller_name`.
 
-- [ ] T011 [US2] In `agent/mod.rs` tests, fix the test that passed by accident: in `extract_caller_name_reads_the_quoted_display_name_from_p_asserted_identity` (~line 2871), change the `From` display name to `"Other Name"` and its number to `+919000000001`. Assert the name is still `Firstname Lastname` and `extract_caller` is `+919000000000`. Run it against the current code first and confirm it **fails** for the name. That proves the old pass was accidental.
-- [ ] T012 [US2] In `agent/mod.rs` tests, add failing tests for C3.2, C3.3 (two separate `P-Asserted-Identity:` lines in the raw request), C3.4, C3.5 and C3.7, asserting both `extract_caller` and `extract_caller_name`. Add one test confirming `caller_name_for_onward_signaling` still returns `None` under `Privacy: id` with a `tel:` PAI (FR-012; `agent/inbound.rs` ~line 141, test in that file's test module).
-- [ ] T013 [US2] In `session.rs`, delete `header_user_part` (kept until now because `extract_caller_name` still used it) and re-implement `extract_caller_name`:
+- [x] T011 [US2] In `agent/mod.rs` tests, fix the test that passed by accident: in `extract_caller_name_reads_the_quoted_display_name_from_p_asserted_identity` (~line 2871), change the `From` display name to `"Other Name"` and its number to `+919000000001`. Assert the name is still `Firstname Lastname` and `extract_caller` is `+919000000000`. Run it against the current code first and confirm it **fails** for the name. That proves the old pass was accidental.
+- [x] T012 [US2] In `agent/mod.rs` tests, add failing tests for C3.2, C3.3 (two separate `P-Asserted-Identity:` lines in the raw request), C3.4, C3.5 and C3.7, asserting both `extract_caller` and `extract_caller_name`. Add one test confirming `caller_name_for_onward_signaling` still returns `None` under `Privacy: id` with a `tel:` PAI (FR-012; `agent/inbound.rs` ~line 141, test in that file's test module).
+- [x] T013 [US2] In `session.rs`, delete `header_user_part` (kept until now because `extract_caller_name` still used it) and re-implement `extract_caller_name`:
 
   ```rust
   match identity::header_identity(req, "P-Asserted-Identity", HeaderParams::None) {

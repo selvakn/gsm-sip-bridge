@@ -591,16 +591,6 @@ pub(crate) fn respond(sink: &SipSink, what: &str, message: &str) {
     }
 }
 
-/// The user part of a header's URI, the same shape `extract_caller` has
-/// always used for `From` — extracted here so `P-Asserted-Identity` can be
-/// read with the exact same parsing (specs/045 MT-12).
-fn header_user_part(req: &SipRequest, name: &str) -> Option<String> {
-    req.header(name)
-        .and_then(|f| f.split("sip:").nth(1))
-        .and_then(|rest| rest.split(['@', ';', '>']).next())
-        .map(str::to_string)
-}
-
 /// The caller's identity for this bridge's own internal attribution (logs,
 /// CDRs, SMS sender fields) — never re-presented to any third party, so
 /// RFC 3325 §9.1's `Privacy` withholding obligation (which governs onward
@@ -625,69 +615,22 @@ pub(crate) fn extract_caller(req: &SipRequest) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// A header's RFC 3261 `name-addr` display name — the quoted-string
-/// (unescaped) or unquoted token part before the URI's own `<...>` — or
-/// `None` for a bare `addr-spec` (no display name at all), an empty one
-/// (`""`, or `<...>` with nothing before it), an unterminated quoted-string,
-/// or one containing a bare CR/LF (never legitimate inside a header value;
-/// rejected here rather than passed on to become a header-injection vector
-/// in whatever onward request re-presents it).
-///
-/// Deliberately does **not** locate the URI with a plain `split_once('<')`:
-/// RFC 3261's `qdtext` excludes only `"` and `\`, not `<`, so a quoted
-/// display name may legitimately contain one (`"Doe <Junior>" <sip:...>`) —
-/// splitting on the first `<` anywhere in the value would cut the name in
-/// half. A quoted-string's own closing quote (tracking `\`-escapes, so an
-/// escaped `\"` doesn't end it early) is what actually marks where the
-/// display name ends; only a *bare* token, which the grammar forbids from
-/// containing `<` at all, may use the character itself as the boundary.
-///
-/// Unlike [`extract_caller`], absence is a real, common outcome here
-/// (confirmed live: the Nokia SBC's `X-P-Asserted-Identity` carries no
-/// display name at all) and must not collapse to a placeholder string a
-/// caller could plausibly send as their actual name.
-fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
-    let value = req.header(name)?.trim_start();
-    let display = if let Some(rest) = value.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        let mut closed = false;
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            } else if c == '"' {
-                closed = true;
-                break;
-            } else {
-                out.push(c);
-            }
-        }
-        if !closed {
-            return None;
-        }
-        out
-    } else {
-        let (token, _) = value.split_once('<')?;
-        token.trim().to_string()
-    };
-    (!display.is_empty() && !display.contains(['\r', '\n'])).then_some(display)
-}
-
 /// The caller's display name — CNAP/CLI name delivery (confirmed live
 /// 2026-09-03: Indian carriers send this unprompted, no negotiation
 /// needed), for re-presenting to the PBX/SIP-server side.
 ///
 /// Reads the *same* header [`extract_caller`] actually sourced the number
-/// from — checked via `header_user_part`'s own success, not merely whether
-/// `P-Asserted-Identity` is present — rather than independently preferring
-/// PAI's name and falling back to `From`'s. A carrier's `From` can name a
-/// different party than its `P-Asserted-Identity` (an SMSC gateway, e.g.);
-/// pairing a from-derived name with a PAI-derived number would present a
-/// name that does not belong to that number. When the sourced header has no
-/// display name of its own, this returns `None` rather than reaching into
-/// the *other* header for one.
+/// from — the asserted identity when it yields a number, else `From` —
+/// rather than independently preferring PAI's name and falling back to
+/// `From`'s. A carrier's `From` can name a different party than its
+/// `P-Asserted-Identity` (an SMSC gateway, e.g.); pairing a from-derived name
+/// with a PAI-derived number would present a name that does not belong to
+/// that number. When the sourced header has no display name of its own, this
+/// returns `None` rather than reaching into the *other* header for one.
+///
+/// Within that header, the name is the first one among *all* its values
+/// (RFC 3325 §9.1 allows two, on one line or two), so a name on the `sip`
+/// value is found even when the nameless `tel` value comes first.
 ///
 /// Callers of this function MUST also check
 /// [`caller_identity_is_private`] before re-presenting the result onward —
@@ -696,12 +639,11 @@ fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
 /// caller is headed for a PBX or handset display, which is exactly the
 /// onward signaling `Privacy` governs.
 pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
-    let source = if header_user_part(req, "P-Asserted-Identity").is_some() {
-        "P-Asserted-Identity"
-    } else {
-        "From"
-    };
-    header_display_name(req, source)
+    use super::identity::{header_identity, HeaderParams};
+    match header_identity(req, "P-Asserted-Identity", HeaderParams::None) {
+        Some(asserted) => asserted.display,
+        None => header_identity(req, "From", HeaderParams::Allowed)?.display,
+    }
 }
 
 /// RFC 3323/3325: `Privacy: id` or `Privacy: user` on the inbound request
@@ -738,7 +680,7 @@ pub(crate) fn caller_identity_is_private(req: &SipRequest) -> bool {
 /// containing either character breaks out of the quotes when this bridge
 /// builds its own `P-Asserted-Identity`/`From` around it, producing
 /// malformed syntax a strict endpoint may reject or misparse.
-/// [`header_display_name`] has already rejected embedded CR/LF, so this
+/// [`super::identity::parse_name_addr`] has already rejected embedded CR/LF, so this
 /// only needs to handle the two `quoted-string`-special characters.
 pub(crate) fn escape_display_name(name: &str) -> String {
     name.replace('\\', "\\\\").replace('"', "\\\"")

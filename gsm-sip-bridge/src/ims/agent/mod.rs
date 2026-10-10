@@ -2922,14 +2922,66 @@ mod tests {
     /// carries CNAP as the P-Asserted-Identity display name, unprompted.
     #[test]
     fn extract_caller_name_reads_the_quoted_display_name_from_p_asserted_identity() {
+        // `From` names a *different* party, so this only passes if the name
+        // really comes from the `tel:` P-Asserted-Identity — with the same
+        // name in both it passed even while the `tel:` identity was ignored.
         let raw = "INVITE sip:x SIP/2.0\r\n\
-                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example;user=phone>;tag=abc\r\n\
+                    From: \"Other Name\" <sip:+919000000001@ims.example;user=phone>;tag=abc\r\n\
                     P-Asserted-Identity: \"Firstname Lastname\" <tel:+919000000000;cpc=ordinary>\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000000");
         assert_eq!(
             extract_caller_name(&req),
             Some("Firstname Lastname".to_string())
+        );
+    }
+
+    /// RFC 3325 §9.1: two values on two lines, `tel` first and nameless, the
+    /// `sip` one second with the name. Number and name both come from the
+    /// asserted identity, nothing from `From`.
+    #[test]
+    fn extract_caller_name_reads_the_second_p_asserted_identity_line() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <sip:+919000000001@ims.example>;tag=a\r\n\
+             P-Asserted-Identity: <tel:+919000000000>\r\n\
+             P-Asserted-Identity: \"Asserted Name\" <sip:+919000000000@ims.example>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000000");
+        assert_eq!(extract_caller_name(&req), Some("Asserted Name".to_string()));
+    }
+
+    /// The same two values comma-joined on one line.
+    #[test]
+    fn extract_caller_name_reads_a_comma_joined_p_asserted_identity() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <sip:+919000000001@ims.example>;tag=a\r\n\
+             P-Asserted-Identity: <tel:+919000000000>, \"Asserted Name\" <sip:+919000000000@ims.example>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000000");
+        assert_eq!(extract_caller_name(&req), Some("Asserted Name".to_string()));
+    }
+
+    /// A P-Asserted-Identity naming no user (a host) yields no number, so the
+    /// number *and* the name both come from `From` — never one from each.
+    #[test]
+    fn extract_caller_name_falls_back_to_from_with_its_own_number() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <tel:+919000000001>;tag=a\r\n\
+             P-Asserted-Identity: \"Gateway\" <sip:gateway.ims.example>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000001");
+        assert_eq!(extract_caller_name(&req), Some("Other Name".to_string()));
+    }
+
+    /// A display name that merely looks like a URI must not mislead parsing.
+    #[test]
+    fn a_display_name_containing_a_uri_scheme_does_not_confuse_parsing() {
+        let req = invite_with_headers("From: \"sip:+919000000099\" <tel:+919000000001>;tag=a\r\n");
+        assert_eq!(extract_caller(&req), "+919000000001");
+        assert_eq!(
+            extract_caller_name(&req),
+            Some("sip:+919000000099".to_string())
         );
     }
 
