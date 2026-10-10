@@ -8,9 +8,6 @@
 //! `specs/083-tel-uri-caller-id/contracts/identity-parsing.md` — every row of
 //! that contract is a test below.
 
-// Wired into `session.rs` by the following commits.
-#![allow(dead_code)]
-
 use super::sip_client::SipRequest;
 
 /// Split one header value on the commas that separate entries, ignoring

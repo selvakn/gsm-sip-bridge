@@ -137,9 +137,9 @@ forms are unchanged. Commit.
 
 ## Phase 7: Polish & release
 
-- [ ] T021 [P] Grep for any remaining literal `split("sip:")`-style identity parsing in `gsm-sip-bridge/src/ims/` and `gsm-sip-bridge/src/vowifi/`. Confirm none remains outside `identity.rs`. The out-of-scope `pjsua-safe/src/call.rs` `parse_uri_user` stays as is.
-- [ ] T022 [P] Add a release note to `RELEASE_NOTES.md` under the unreleased section, bolding only the summary. For example: "**Caller ID from `tel:` numbers** — incoming calls and SMS now show the caller's number when the carrier sends it as a `tel:` URI (e.g. T2), and the network-verified caller identity is used consistently on all carriers (#104)." Leave internal refactors out of the note.
-- [ ] T023 Run the full `make format && make lint && make test`. Compare every contract row against a named test, and list any gaps in the PR description.
+- [x] T021 [P] Grep for any remaining literal `split("sip:")`-style identity parsing in `gsm-sip-bridge/src/ims/` and `gsm-sip-bridge/src/vowifi/`. Confirm none remains outside `identity.rs`. The out-of-scope `pjsua-safe/src/call.rs` `parse_uri_user` stays as is.
+- [x] T022 [P] Add a release note to `RELEASE_NOTES.md` under the unreleased section, bolding only the summary. For example: "**Caller ID from `tel:` numbers** — incoming calls and SMS now show the caller's number when the carrier sends it as a `tel:` URI (e.g. T2), and the network-verified caller identity is used consistently on all carriers (#104)." Leave internal refactors out of the note.
+- [x] T023 Run the full `make format && make lint && make test`. Compare every contract row against a named test, and list any gaps in the PR description.
 - [ ] T024 Live check on the Vodafone rig per `quickstart.md` step 1 (SC-005): the caller number and CNAP name on the PBX leg are the same as before.
 - [ ] T025 Live check on the Jio Pi per `quickstart.md` step 2 (SC-006): the delivery-report `ipsmgw=` is unchanged. This needs the user's go-ahead first, because it changes a running remote deployment.
 - [ ] T026 After release, comment on issue #104 asking the reporter to confirm on T2 (SC-001). This is outward-facing, so confirm the wording with the user first.
