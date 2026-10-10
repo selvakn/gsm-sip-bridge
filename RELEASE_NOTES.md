@@ -1,9 +1,6 @@
 # Release Notes
 
-<!-- Rename the "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.19.2
 
 - **Caller ID from `tel:` numbers** -- Incoming calls and SMS now show the caller when the carrier names them with a `tel:` URI (T2), instead of `caller=unknown`. The network-asserted identity (`P-Asserted-Identity`) is now honoured on every carrier, including when it is a `tel:` URI, and SMS delivery reports go to the SMS gateway's `sip:` address. When no caller can be read, one warning logs the raw headers. Reported by @mironovlab (#104).
 - **Hang-up, session refresh, keepalive and subscription are no longer sent bare to P-CSCFs that enforce Security Agreement.** Follow-up to the outbound `INVITE`/`MESSAGE` fix: every other request sent over the negotiated Gm security association now also carries `Require: sec-agree`, `Proxy-Require: sec-agree` and the P-CSCF's full `Security-Server` list in `Security-Verify` (RFC 3329 §2.3.1, TS 24.229 §5.1.1.5.1). That covers `BYE`, `UPDATE`, `PRACK`, `ACK`, `CANCEL`, the reg-event `SUBSCRIBE`, the `OPTIONS` keepalive and the un-`REGISTER`. A strict P-CSCF (MEO) was expected to answer these with `494`, which would show up as a call that connects but cannot be hung up or refreshed. With no Gm security association nothing changes. Not yet confirmed on an enforcing carrier (#100).
