@@ -116,12 +116,12 @@ forms are unchanged. Commit.
 
 ## Phase 6: Diagnosing failures (FR-015, cross-story)
 
-- [ ] T017 In `session.rs` tests, add failing tests for C5.1–C5.3, calling `unresolved_caller_diagnostic(&req)`. For C5.3, assert the returned text contains neither `'\r'` nor `'\n'`.
-- [ ] T018 In `session.rs`, add `pub(crate) fn unresolved_caller_diagnostic(req: &SipRequest) -> Option<String>`.
+- [x] T017 In `session.rs` tests, add failing tests for C5.1–C5.3, calling `unresolved_caller_diagnostic(&req)`. For C5.3, assert the returned text contains neither `'\r'` nor `'\n'`.
+- [x] T018 In `session.rs`, add `pub(crate) fn unresolved_caller_diagnostic(req: &SipRequest) -> Option<String>`.
   - It returns `None` when `extract_caller` resolves.
   - Otherwise it returns `format!("P-Asserted-Identity={:?} From={:?}", req.headers_all("P-Asserted-Identity"), req.headers_all("From"))`. `{:?}` escapes control characters, and an empty `Vec` shows absence.
   - Make T017 pass.
-- [ ] T019 In `agent/mod.rs` INVITE dispatch (the function containing the re-INVITE / retransmission branch, ~line 2190), insert the warning immediately after the `if let Some(call) = self.active_call…` block's early returns and before the `occupant`/busy check (~line 2245):
+- [x] T019 In `agent/mod.rs` INVITE dispatch (the function containing the re-INVITE / retransmission branch, ~line 2190), insert the warning immediately after the `if let Some(call) = self.active_call…` block's early returns and before the `occupant`/busy check (~line 2245):
 
   ```rust
   if let Some(raw) = unresolved_caller_diagnostic(req) {
@@ -130,7 +130,7 @@ forms are unchanged. Commit.
   ```
 
   It must run once per new INVITE. Add `unresolved_caller_diagnostic` to the `use` list (~line 51).
-- [ ] T020 In `handle_message` in `agent/mod.rs`, after the `if let Some(decoded) = &decoded { sender = … }` block (~line 1192) and before the Type-0 check, log the same warning ("SMS has no readable sender identity") only when `decoded.is_none()` and `unresolved_caller_diagnostic(req)` is `Some`.
+- [x] T020 In `handle_message` in `agent/mod.rs`, after the `if let Some(decoded) = &decoded { sender = … }` block (~line 1192) and before the Type-0 check, log the same warning ("SMS has no readable sender identity") only when `decoded.is_none()` and `unresolved_caller_diagnostic(req)` is `Some`.
 
 **Checkpoint**: an unreadable identity leaves exactly one warning per request
 (SC-007). Commit.

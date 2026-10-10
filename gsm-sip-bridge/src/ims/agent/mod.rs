@@ -50,7 +50,7 @@ use crate::ims::sdp;
 use crate::ims::session::{
     attempt_renewal, extract_caller, header_uri, map_registration_error,
     map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
-    subscribe_reg_event, to_unix, Inbound,
+    subscribe_reg_event, to_unix, unresolved_caller_diagnostic, Inbound,
 };
 use crate::ims::sip_client::{
     build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
@@ -1189,6 +1189,13 @@ fn handle_message(
         }
         None => None,
     };
+    // The sender came from the SIP headers (no decoded TPDU supplied one) and
+    // they named nobody: record why, once (issue #104, FR-015).
+    if decoded.is_none() {
+        if let Some(raw) = unresolved_caller_diagnostic(req) {
+            tracing::warn!(headers = %raw, "SMS has no readable sender identity");
+        }
+    }
     if let Some(decoded) = &decoded {
         sender = decoded.sender.clone();
         body = match decoded.part {
@@ -2240,6 +2247,13 @@ impl LoopState {
                 ));
                 return;
             }
+        }
+        // A genuinely new call (the retransmission and re-INVITE cases returned
+        // above): say once, with the raw values, when neither identity header
+        // names a caller — every later `caller=unknown` then has a cause on
+        // record (issue #104, FR-015).
+        if let Some(raw) = unresolved_caller_diagnostic(req) {
+            tracing::warn!(headers = %raw, "inbound call has no readable caller identity");
         }
         // An in-flight outbound origination occupies the line too (specs/029,
         // FR-011): consult whichever lifecycle exists so an inbound INVITE

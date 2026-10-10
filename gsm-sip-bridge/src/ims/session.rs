@@ -608,11 +608,38 @@ pub(crate) fn respond(sink: &SipSink, what: &str, message: &str) {
 /// `sip:gateway.example`) yields no number, and neither header yielding one
 /// gives `"unknown"` (issue #104).
 pub(crate) fn extract_caller(req: &SipRequest) -> String {
+    caller_identity(req)
+        .map(|identity| identity.number)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The identity [`extract_caller`] reports: the asserted one when it yields a
+/// number, else `From`'s. Shared with [`unresolved_caller_diagnostic`] so the
+/// two can never disagree about whether a caller was found.
+fn caller_identity(req: &SipRequest) -> Option<super::identity::Identity> {
     use super::identity::{header_identity, HeaderParams};
     header_identity(req, "P-Asserted-Identity", HeaderParams::None)
         .or_else(|| header_identity(req, "From", HeaderParams::Allowed))
-        .map(|identity| identity.number)
-        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// What to log when neither `P-Asserted-Identity` nor `From` yields a number,
+/// or `None` when one does (FR-015). Issue #104 was hard to diagnose because
+/// the bridge only said `caller=unknown`; this names the raw values so the
+/// next such report can be read off the log instead of a packet capture.
+///
+/// A separate pure function rather than a log line inside [`extract_caller`],
+/// which one INVITE calls up to three times (the busy/decline paths and the
+/// handler): the caller of this logs it once per request. `{:?}` escapes
+/// control characters, so a caller-supplied header cannot forge or split a
+/// log line, and an absent header prints as `[]`.
+pub(crate) fn unresolved_caller_diagnostic(req: &SipRequest) -> Option<String> {
+    caller_identity(req).is_none().then(|| {
+        format!(
+            "P-Asserted-Identity={:?} From={:?}",
+            req.headers_all("P-Asserted-Identity"),
+            req.headers_all("From")
+        )
+    })
 }
 
 /// The caller's display name — CNAP/CLI name delivery (confirmed live
@@ -727,6 +754,52 @@ pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with(headers: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// FR-015: a request whose caller resolves leaves nothing to report —
+    /// including one literally from a user named "unknown", which is a
+    /// resolved number, not the placeholder.
+    #[test]
+    fn no_diagnostic_when_the_caller_resolves() {
+        for headers in [
+            "From: <tel:+919000000000>;tag=a\r\n",
+            "From: <sip:gateway.ims.example>;tag=a\r\nP-Asserted-Identity: <tel:+919000000000>\r\n",
+            "From: <sip:unknown@ims.example>;tag=a\r\n",
+        ] {
+            assert_eq!(
+                unresolved_caller_diagnostic(&request_with(headers)),
+                None,
+                "{headers}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_names_both_raw_headers_when_no_number_resolves() {
+        let req = request_with("From: <sip:gateway.ims.example>;tag=a\r\n");
+        let text = unresolved_caller_diagnostic(&req).expect("an unresolved caller is reported");
+        assert!(text.contains("P-Asserted-Identity=[]"), "{text}");
+        assert!(text.contains("sip:gateway.ims.example"), "{text}");
+    }
+
+    /// A caller-supplied value must not be able to forge or split a log line.
+    #[test]
+    fn diagnostic_escapes_control_characters() {
+        let req =
+            request_with("P-Asserted-Identity: <sip:a%0D%0Ab@x>\r\nFrom: garbage\u{1}\u{7f}\t\r\n");
+        let text = unresolved_caller_diagnostic(&req).expect("unresolved");
+        assert!(text.contains("garbage"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control()),
+            "control character leaked: {text:?}"
+        );
+    }
 
     /// A single-contact reginfo document, no IMEI needed to attribute it —
     /// the common case, and the shape of every network before Jio's paired
