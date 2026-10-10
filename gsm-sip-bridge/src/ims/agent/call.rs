@@ -665,7 +665,7 @@ pub(super) fn uac_remote_target(resp: &crate::ims::sip_client::SipResponse) -> O
 pub(super) fn route_set_in_order(record_routes: &[&str]) -> Vec<String> {
     record_routes
         .iter()
-        .flat_map(|v| split_route_list(v))
+        .flat_map(|v| crate::ims::identity::split_header_values(v))
         .map(|v| format!("Route: {v}"))
         .collect()
 }
@@ -690,39 +690,6 @@ pub(super) fn uac_route_set(
     } else {
         set
     }
-}
-
-/// Split one `Record-Route` header value on the commas that separate
-/// entries, ignoring commas inside `<...>` (a URI may contain them) or inside
-/// a quoted display name (`"Bob, Smith" <sip:...>`, with `\"` escapes).
-fn split_route_list(value: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let (mut depth, mut start) = (0usize, 0usize);
-    let (mut quoted, mut escaped) = (false, false);
-    for (i, ch) in value.char_indices() {
-        if quoted {
-            match (escaped, ch) {
-                (true, _) => escaped = false,
-                (false, '\\') => escaped = true,
-                (false, '"') => quoted = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => quoted = true,
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                out.push(value[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(value[start..].trim());
-    out.retain(|e| !e.is_empty());
-    out
 }
 
 #[cfg(test)]
@@ -807,14 +774,6 @@ mod tests {
         assert_eq!(uac_route_set(&resp_with(&[]), &svc), svc);
     }
 
-    #[test]
-    fn split_route_list_ignores_commas_inside_quoted_display_names() {
-        assert_eq!(
-            split_route_list(r#""Bob, Smith" <sip:a;lr>, "Q \" , x" <sip:b;lr>"#),
-            vec![r#""Bob, Smith" <sip:a;lr>"#, r#""Q \" , x" <sip:b;lr>"#]
-        );
-    }
-
     /// A UAS keeps the received Record-Route order (RFC 3261 §12.1.1); only
     /// a UAC reverses it.
     #[test]
@@ -826,14 +785,6 @@ mod tests {
                 "Route: <sip:b;lr>".to_string(),
                 "Route: <sip:c;lr>".to_string(),
             ]
-        );
-    }
-
-    #[test]
-    fn split_route_list_ignores_commas_inside_uris() {
-        assert_eq!(
-            split_route_list("<sip:a;x=1,2;lr>, <sip:b;lr>"),
-            vec!["<sip:a;x=1,2;lr>", "<sip:b;lr>"]
         );
     }
 

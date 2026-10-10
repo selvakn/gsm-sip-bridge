@@ -14,32 +14,32 @@ commit (constitution II and III). Use only synthetic numbers
 
 ## Phase 1: Setup
 
-- [ ] T001 Create `identity.rs` with a module doc comment citing RFC 3261 §25.1, RFC 3325 §9.1 and RFC 3966 §3. Register it as `pub(crate) mod identity;` next to `pub mod session;` in `mod.rs`.
+- [x] T001 Create `identity.rs` with a module doc comment citing RFC 3261 §25.1, RFC 3325 §9.1 and RFC 3966 §3. Register it as `pub(crate) mod identity;` next to `pub mod session;` in `mod.rs`.
 
 ## Phase 2: Foundational (blocks every story)
 
 The shared grammar. These pieces carry no story label because US1, US2 and US3
 all consume them.
 
-- [ ] T002 Move `split_route_list` and its two tests (`split_route_list_ignores_commas_inside_quoted_display_names`, `split_route_list_ignores_commas_inside_uris`) from `agent/call.rs` (~line 698 and ~811) into `identity.rs`. Rename it `pub(crate) fn split_header_values(value: &str) -> Vec<&str>` and rename the tests to match. In `agent/call.rs`, call `crate::ims::identity::split_header_values` and delete the local copy. This is a pure move: no behaviour changes, and the Record-Route tests in `agent/call.rs` must pass untouched.
-- [ ] T003 In `identity.rs`, write the failing tests for C2.1–C2.11. Each test calls `parse_name_addr(value, HeaderParams::…)` and asserts `display` and `uri` (or `None`).
-- [ ] T004 In `identity.rs`, add `pub(crate) enum HeaderParams { Allowed, None }`, `pub(crate) struct NameAddr<'a> { pub display: Option<String>, pub uri: &'a str }` and `pub(crate) fn parse_name_addr(value: &str, params: HeaderParams) -> Option<NameAddr<'_>>`.
+- [x] T002 Move `split_route_list` and its two tests (`split_route_list_ignores_commas_inside_quoted_display_names`, `split_route_list_ignores_commas_inside_uris`) from `agent/call.rs` (~line 698 and ~811) into `identity.rs`. Rename it `pub(crate) fn split_header_values(value: &str) -> Vec<&str>` and rename the tests to match. In `agent/call.rs`, call `crate::ims::identity::split_header_values` and delete the local copy. This is a pure move: no behaviour changes, and the Record-Route tests in `agent/call.rs` must pass untouched.
+- [x] T003 In `identity.rs`, write the failing tests for C2.1–C2.11. Each test calls `parse_name_addr(value, HeaderParams::…)` and asserts `display` and `uri` (or `None`).
+- [x] T004 In `identity.rs`, add `pub(crate) enum HeaderParams { Allowed, None }`, `pub(crate) struct NameAddr<'a> { pub display: Option<String>, pub uri: &'a str }` and `pub(crate) fn parse_name_addr(value: &str, params: HeaderParams) -> Option<NameAddr<'_>>`.
   - **Quoted display name**: move the escape-aware loop from `header_display_name` (`session.rs` ~line 640) here, keeping its rules: `\`-escapes, an unterminated quote means `None`, CR/LF means no display name, an empty name means `None`.
   - **Token display name**: the trimmed text before `<`.
   - **name-addr**: the URI is the text between `<` and the next `>`.
   - **addr-spec**: the URI is the trimmed value, cut at the first `;` only when `params == Allowed` (research R2).
   - Return `None` unless the URI has a `:`.
   - Make C2 pass.
-- [ ] T005 In `identity.rs`, write the failing tests for C1.1–C1.23. Each test calls `uri_number(uri)`.
-- [ ] T006 In `identity.rs`, add a private `fn percent_decode(s: &str) -> Option<String>`. Hex is case-insensitive. A `%` not followed by two hex digits, or non-UTF-8 output, means `None`.
-- [ ] T007 In `identity.rs`, add `pub(crate) fn uri_number(uri: &str) -> Option<String>`, following data-model.md:
+- [x] T005 In `identity.rs`, write the failing tests for C1.1–C1.23. Each test calls `uri_number(uri)`.
+- [x] T006 In `identity.rs`, add a private `fn percent_decode(s: &str) -> Option<String>`. Hex is case-insensitive. A `%` not followed by two hex digits, or non-UTF-8 output, means `None`.
+- [x] T007 In `identity.rs`, add `pub(crate) fn uri_number(uri: &str) -> Option<String>`, following data-model.md:
   - Split the scheme at the first `:` and compare it ignoring ASCII case.
   - **`tel`**: the raw part is the text before the first `;`. It is always a phone number.
   - **`sip`/`sips`**: the raw part is the text before the first `@`. No `@` means `None`. Drop the `:password` suffix and cut at the first `;`. It is a phone number if a `;user=phone` URI param exists (case-insensitive) or the raw part starts with `+` / `%2B`.
   - **Any other scheme**: `None`.
   - Then percent-decode. For a phone number, remove `-`, `.`, `(` and `)`. Finally require a non-empty result where every char is ASCII alphanumeric or one of `+*#-._~` (FR-008).
   - Doc-comment each rule with its RFC section. Make C1 pass.
-- [ ] T008 In `identity.rs`, add `pub(crate) struct Identity { pub number: String, pub display: Option<String> }` and `pub(crate) fn header_identity(req: &SipRequest, name: &str, params: HeaderParams) -> Option<Identity>`.
+- [x] T008 In `identity.rs`, add `pub(crate) struct Identity { pub number: String, pub display: Option<String> }` and `pub(crate) fn header_identity(req: &SipRequest, name: &str, params: HeaderParams) -> Option<Identity>`.
   - Collect `NameAddr`s from `req.headers_all(name)` → `split_header_values` → `parse_name_addr`.
   - **number**: the first `tel` value whose `uri_number` resolves; otherwise the first `sip`/`sips` value that resolves.
   - **display**: the first non-empty `display` among all values of this header (FR-010, FR-011).
@@ -104,7 +104,7 @@ only when PAI yields nothing, and never mixed with it.
 **Independent test**: C4.1–C4.7 pass through `header_uri`.
 
 - [ ] T014 [P] [US3] In `agent/mod.rs` tests (next to `header_uri_keeps_the_whole_uri_from_a_bracketed_header`, ~line 3090), add failing tests for C4.1–C4.4 using `message_with_headers`. Keep C4.5, C4.6 and C4.7, which already exist as `header_uri_keeps_parameters_of_an_unbracketed_uri`, `header_uri_keeps_the_whole_uri_from_a_bracketed_header` and `header_uri_is_none_without_a_uri`, unchanged as the FR-014 guard.
-- [ ] T015 [US3] In `identity.rs`, add `pub(crate) fn header_uri_values<'a>(req: &'a SipRequest, name: &str, params: HeaderParams) -> Vec<NameAddr<'a>>`, and reuse it inside `header_identity`.
+- [x] T015 [US3] In `identity.rs`, add `pub(crate) fn header_uri_values<'a>(req: &'a SipRequest, name: &str, params: HeaderParams) -> Vec<NameAddr<'a>>`, and reuse it inside `header_identity`.
 - [ ] T016 [US3] In `session.rs`, re-implement `header_uri(req, name)`:
   - Pick `HeaderParams::Allowed` when `name` is `From`/`To`/`Contact` (case-insensitive), otherwise `HeaderParams::None`.
   - Return the first URI whose scheme is `sip`/`sips` (case-insensitive), otherwise the first URI, as an owned `String`.
