@@ -53,14 +53,14 @@ so production behaviour is unchanged. Commit.
 **Goal**: the issue's T2 INVITE yields `+919000000000`.
 **Independent test**: C3.1, C3.6 and C3.8 pass through `extract_caller`.
 
-- [ ] T009 [US1] In `agent/mod.rs` tests (next to `extract_caller_falls_back_to_unknown_when_from_is_unparseable`, ~line 2839), add failing tests built with `SipRequest::try_parse` for:
+- [x] T009 [US1] In `agent/mod.rs` tests (next to `extract_caller_falls_back_to_unknown_when_from_is_unparseable`, ~line 2839), add failing tests built with `SipRequest::try_parse` for:
   - C3.1, the issue's exact headers;
   - C3.6, host-only `From` → `"unknown"`;
   - C3.8, compact `f:`;
   - `sips:`/upper-case scheme variants.
 
   Update the existing `extract_caller_prefers_p_asserted_identity_over_from` (its `From` is host-only, which now yields no number; the assertion still holds) and check that `extract_caller_falls_back_to_unknown_when_from_is_unparseable` still holds.
-- [ ] T010 [US1] In `session.rs`, delete `header_user_part`. Re-implement `extract_caller` as:
+- [x] T010 [US1] In `session.rs`, re-implement `extract_caller` as:
 
   ```rust
   identity::header_identity(req, "P-Asserted-Identity", HeaderParams::None)
@@ -82,7 +82,7 @@ only when PAI yields nothing, and never mixed with it.
 
 - [ ] T011 [US2] In `agent/mod.rs` tests, fix the test that passed by accident: in `extract_caller_name_reads_the_quoted_display_name_from_p_asserted_identity` (~line 2871), change the `From` display name to `"Other Name"` and its number to `+919000000001`. Assert the name is still `Firstname Lastname` and `extract_caller` is `+919000000000`. Run it against the current code first and confirm it **fails** for the name. That proves the old pass was accidental.
 - [ ] T012 [US2] In `agent/mod.rs` tests, add failing tests for C3.2, C3.3 (two separate `P-Asserted-Identity:` lines in the raw request), C3.4, C3.5 and C3.7, asserting both `extract_caller` and `extract_caller_name`. Add one test confirming `caller_name_for_onward_signaling` still returns `None` under `Privacy: id` with a `tel:` PAI (FR-012; `agent/inbound.rs` ~line 141, test in that file's test module).
-- [ ] T013 [US2] In `session.rs`, re-implement `extract_caller_name`:
+- [ ] T013 [US2] In `session.rs`, delete `header_user_part` (kept until now because `extract_caller_name` still used it) and re-implement `extract_caller_name`:
 
   ```rust
   match identity::header_identity(req, "P-Asserted-Identity", HeaderParams::None) {

@@ -2842,6 +2842,59 @@ mod tests {
         assert_eq!(extract_caller(&req), "unknown");
     }
 
+    fn invite_with_headers(headers: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// Issue #104, verbatim from the T2 capture (synthetic number): the
+    /// caller is named only by `tel:` URIs, with vendor parameters.
+    #[test]
+    fn extract_caller_reads_tel_uris_from_both_headers() {
+        let req = invite_with_headers(
+            "From: <tel:+919000000000;noa=international;srvattri=national>;tag=example\r\n\
+             P-Asserted-Identity: <tel:+919000000000>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000000");
+    }
+
+    #[test]
+    fn extract_caller_reads_a_tel_from_without_an_asserted_identity() {
+        let req =
+            invite_with_headers("From: <tel:+91-900-000-0001;noa=international>;tag=example\r\n");
+        assert_eq!(extract_caller(&req), "+919000000001");
+    }
+
+    /// Schemes are case-insensitive (RFC 3986 §3.1) and `sips:` is a SIP URI.
+    #[test]
+    fn extract_caller_accepts_sips_and_any_scheme_case() {
+        for from in [
+            "<sips:+919000000001@ims.example>;tag=a",
+            "<SIP:+919000000001@ims.example>;tag=a",
+            "<Tel:+919000000001>;tag=a",
+        ] {
+            let req = invite_with_headers(&format!("From: {from}\r\n"));
+            assert_eq!(extract_caller(&req), "+919000000001", "{from}");
+        }
+    }
+
+    /// A `sip:` URI with no user part names a host, not a person: no number,
+    /// rather than the hostname presented as the caller.
+    #[test]
+    fn extract_caller_is_unknown_for_a_host_only_uri() {
+        let req = invite_with_headers("From: <sip:gateway.ims.example>;tag=a\r\n");
+        assert_eq!(extract_caller(&req), "unknown");
+    }
+
+    /// The compact form of `From` (RFC 3261 §7.3.3) is canonicalised on parse.
+    #[test]
+    fn extract_caller_reads_the_compact_from_header() {
+        let req = invite_with_headers("f: <tel:+919000000001>;tag=a\r\n");
+        assert_eq!(extract_caller(&req), "+919000000001");
+    }
+
     /// specs/045 MT-12: a trusted network element's `P-Asserted-Identity`
     /// wins over the caller-supplied `From` when both are present — measured
     /// on real carrier traffic where the two legitimately differ (an SMSC

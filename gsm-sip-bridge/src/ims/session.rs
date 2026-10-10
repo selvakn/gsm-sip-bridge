@@ -611,9 +611,17 @@ fn header_user_part(req: &SipRequest, name: &str) -> Option<String> {
 /// both are present — measured on real carrier traffic where the two can
 /// legitimately differ. Falls back to `From` when no asserted identity is
 /// present, exactly as before (specs/045 MT-12).
+///
+/// Each header may name the caller as a `sip:`/`sips:` or a `tel:` URI, and
+/// `P-Asserted-Identity` may carry both (RFC 3325 §9.1); see
+/// [`super::identity`] for the grammar. A URI that names no user (a bare
+/// `sip:gateway.example`) yields no number, and neither header yielding one
+/// gives `"unknown"` (issue #104).
 pub(crate) fn extract_caller(req: &SipRequest) -> String {
-    header_user_part(req, "P-Asserted-Identity")
-        .or_else(|| header_user_part(req, "From"))
+    use super::identity::{header_identity, HeaderParams};
+    header_identity(req, "P-Asserted-Identity", HeaderParams::None)
+        .or_else(|| header_identity(req, "From", HeaderParams::Allowed))
+        .map(|identity| identity.number)
         .unwrap_or_else(|| "unknown".to_string())
 }
 
