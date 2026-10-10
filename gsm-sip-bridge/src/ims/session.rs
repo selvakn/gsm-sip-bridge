@@ -591,16 +591,6 @@ pub(crate) fn respond(sink: &SipSink, what: &str, message: &str) {
     }
 }
 
-/// The user part of a header's URI, the same shape `extract_caller` has
-/// always used for `From` — extracted here so `P-Asserted-Identity` can be
-/// read with the exact same parsing (specs/045 MT-12).
-fn header_user_part(req: &SipRequest, name: &str) -> Option<String> {
-    req.header(name)
-        .and_then(|f| f.split("sip:").nth(1))
-        .and_then(|rest| rest.split(['@', ';', '>']).next())
-        .map(str::to_string)
-}
-
 /// The caller's identity for this bridge's own internal attribution (logs,
 /// CDRs, SMS sender fields) — never re-presented to any third party, so
 /// RFC 3325 §9.1's `Privacy` withholding obligation (which governs onward
@@ -611,60 +601,45 @@ fn header_user_part(req: &SipRequest, name: &str) -> Option<String> {
 /// both are present — measured on real carrier traffic where the two can
 /// legitimately differ. Falls back to `From` when no asserted identity is
 /// present, exactly as before (specs/045 MT-12).
+///
+/// Each header may name the caller as a `sip:`/`sips:` or a `tel:` URI, and
+/// `P-Asserted-Identity` may carry both (RFC 3325 §9.1); see
+/// [`super::identity`] for the grammar. A URI that names no user (a bare
+/// `sip:gateway.example`) yields no number, and neither header yielding one
+/// gives `"unknown"` (issue #104).
 pub(crate) fn extract_caller(req: &SipRequest) -> String {
-    header_user_part(req, "P-Asserted-Identity")
-        .or_else(|| header_user_part(req, "From"))
+    caller_identity(req)
+        .map(|identity| identity.number)
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// A header's RFC 3261 `name-addr` display name — the quoted-string
-/// (unescaped) or unquoted token part before the URI's own `<...>` — or
-/// `None` for a bare `addr-spec` (no display name at all), an empty one
-/// (`""`, or `<...>` with nothing before it), an unterminated quoted-string,
-/// or one containing a bare CR/LF (never legitimate inside a header value;
-/// rejected here rather than passed on to become a header-injection vector
-/// in whatever onward request re-presents it).
+/// The identity [`extract_caller`] reports: the asserted one when it yields a
+/// number, else `From`'s. Shared with [`unresolved_caller_diagnostic`] so the
+/// two can never disagree about whether a caller was found.
+fn caller_identity(req: &SipRequest) -> Option<super::identity::Identity> {
+    use super::identity::{header_identity, HeaderParams};
+    header_identity(req, "P-Asserted-Identity", HeaderParams::None)
+        .or_else(|| header_identity(req, "From", HeaderParams::Allowed))
+}
+
+/// What to log when neither `P-Asserted-Identity` nor `From` yields a number,
+/// or `None` when one does (FR-015). Issue #104 was hard to diagnose because
+/// the bridge only said `caller=unknown`; this names the raw values so the
+/// next such report can be read off the log instead of a packet capture.
 ///
-/// Deliberately does **not** locate the URI with a plain `split_once('<')`:
-/// RFC 3261's `qdtext` excludes only `"` and `\`, not `<`, so a quoted
-/// display name may legitimately contain one (`"Doe <Junior>" <sip:...>`) —
-/// splitting on the first `<` anywhere in the value would cut the name in
-/// half. A quoted-string's own closing quote (tracking `\`-escapes, so an
-/// escaped `\"` doesn't end it early) is what actually marks where the
-/// display name ends; only a *bare* token, which the grammar forbids from
-/// containing `<` at all, may use the character itself as the boundary.
-///
-/// Unlike [`extract_caller`], absence is a real, common outcome here
-/// (confirmed live: the Nokia SBC's `X-P-Asserted-Identity` carries no
-/// display name at all) and must not collapse to a placeholder string a
-/// caller could plausibly send as their actual name.
-fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
-    let value = req.header(name)?.trim_start();
-    let display = if let Some(rest) = value.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        let mut closed = false;
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            } else if c == '"' {
-                closed = true;
-                break;
-            } else {
-                out.push(c);
-            }
-        }
-        if !closed {
-            return None;
-        }
-        out
-    } else {
-        let (token, _) = value.split_once('<')?;
-        token.trim().to_string()
-    };
-    (!display.is_empty() && !display.contains(['\r', '\n'])).then_some(display)
+/// A separate pure function rather than a log line inside [`extract_caller`],
+/// which one INVITE calls up to three times (the busy/decline paths and the
+/// handler): the caller of this logs it once per request. `{:?}` escapes
+/// control characters, so a caller-supplied header cannot forge or split a
+/// log line, and an absent header prints as `[]`.
+pub(crate) fn unresolved_caller_diagnostic(req: &SipRequest) -> Option<String> {
+    caller_identity(req).is_none().then(|| {
+        format!(
+            "P-Asserted-Identity={:?} From={:?}",
+            req.headers_all("P-Asserted-Identity"),
+            req.headers_all("From")
+        )
+    })
 }
 
 /// The caller's display name — CNAP/CLI name delivery (confirmed live
@@ -672,14 +647,17 @@ fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
 /// needed), for re-presenting to the PBX/SIP-server side.
 ///
 /// Reads the *same* header [`extract_caller`] actually sourced the number
-/// from — checked via `header_user_part`'s own success, not merely whether
-/// `P-Asserted-Identity` is present — rather than independently preferring
-/// PAI's name and falling back to `From`'s. A carrier's `From` can name a
-/// different party than its `P-Asserted-Identity` (an SMSC gateway, e.g.);
-/// pairing a from-derived name with a PAI-derived number would present a
-/// name that does not belong to that number. When the sourced header has no
-/// display name of its own, this returns `None` rather than reaching into
-/// the *other* header for one.
+/// from — the asserted identity when it yields a number, else `From` —
+/// rather than independently preferring PAI's name and falling back to
+/// `From`'s. A carrier's `From` can name a different party than its
+/// `P-Asserted-Identity` (an SMSC gateway, e.g.); pairing a from-derived name
+/// with a PAI-derived number would present a name that does not belong to
+/// that number. When the sourced header has no display name of its own, this
+/// returns `None` rather than reaching into the *other* header for one.
+///
+/// Within that header, the name is the first one among *all* its values
+/// (RFC 3325 §9.1 allows two, on one line or two), so a name on the `sip`
+/// value is found even when the nameless `tel` value comes first.
 ///
 /// Callers of this function MUST also check
 /// [`caller_identity_is_private`] before re-presenting the result onward —
@@ -688,12 +666,11 @@ fn header_display_name(req: &SipRequest, name: &str) -> Option<String> {
 /// caller is headed for a PBX or handset display, which is exactly the
 /// onward signaling `Privacy` governs.
 pub(crate) fn extract_caller_name(req: &SipRequest) -> Option<String> {
-    let source = if header_user_part(req, "P-Asserted-Identity").is_some() {
-        "P-Asserted-Identity"
-    } else {
-        "From"
-    };
-    header_display_name(req, source)
+    use super::identity::{header_identity, HeaderParams};
+    match header_identity(req, "P-Asserted-Identity", HeaderParams::None) {
+        Some(asserted) => asserted.display,
+        None => header_identity(req, "From", HeaderParams::Allowed)?.display,
+    }
 }
 
 /// RFC 3323/3325: `Privacy: id` or `Privacy: user` on the inbound request
@@ -730,37 +707,99 @@ pub(crate) fn caller_identity_is_private(req: &SipRequest) -> bool {
 /// containing either character breaks out of the quotes when this bridge
 /// builds its own `P-Asserted-Identity`/`From` around it, producing
 /// malformed syntax a strict endpoint may reject or misparse.
-/// [`header_display_name`] has already rejected embedded CR/LF, so this
+/// [`super::identity::parse_name_addr`] has already rejected embedded CR/LF, so this
 /// only needs to handle the two `quoted-string`-special characters.
 pub(crate) fn escape_display_name(name: &str) -> String {
     name.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The **whole URI** named by a header, where [`extract_caller`] wants only
-/// the user part — for addressing a new request back at whoever sent this
-/// one. RFC 3261 §20 allows either form: a `name-addr`, where the URI is
-/// inside `<...>` and any `;` after it separates *header* parameters, or a
-/// bare `addr-spec`, where a `;` belongs to the URI itself. The brackets are
-/// what tells the two apart, so they decide where the cut goes.
+/// the number — for addressing a new request back at whoever sent this one.
+/// URI parameters stay (`;transport=udp` belongs to the URI).
+///
+/// Every value of every line of the header is considered
+/// (RFC 3261 §7.3.1), and a `sip`/`sips` URI is preferred over any other: a
+/// two-value `P-Asserted-Identity` (RFC 3325 §9.1) pairs a `tel` with a `sip`
+/// one, and a request is addressed to a SIP node, not a phone number. With no
+/// SIP URI the first URI of any scheme is used, as before.
+///
+/// Whether a `;` after a *bare* URI belongs to it depends on the header: on
+/// `From`/`To`/`Contact` it is a header parameter (`;tag=…`, RFC 3261 §20.10)
+/// and is cut; `P-Asserted-Identity` defines no header parameters (RFC 3325
+/// §9.1), so there it is the URI's own.
 ///
 /// `None` for a header that is absent or names no URI at all.
 pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
-    let value = req.header(name)?.trim();
-    let uri = match value.split_once('<') {
-        Some((_, rest)) => rest.split('>').next()?,
-        // No brackets: parameters after the URI, if any, are the URI's own,
-        // so only a `,` (the next header value) can end it.
-        None => value.split(',').next()?,
-    }
-    .trim();
-    // A display name with no URI at all ("Anonymous"), or an empty header,
-    // is not something a request can be addressed to.
-    uri.contains(':').then(|| uri.to_string())
+    use super::identity::{header_uri_values, HeaderParams};
+    let params = if ["From", "To", "Contact"]
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(name))
+    {
+        HeaderParams::Allowed
+    } else {
+        HeaderParams::None
+    };
+    let values = header_uri_values(req, name, params);
+    values
+        .iter()
+        .find(|v| {
+            v.uri.split_once(':').is_some_and(|(scheme, _)| {
+                scheme.eq_ignore_ascii_case("sip") || scheme.eq_ignore_ascii_case("sips")
+            })
+        })
+        .or_else(|| values.first())
+        .map(|v| v.uri.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with(headers: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// FR-015: a request whose caller resolves leaves nothing to report —
+    /// including one literally from a user named "unknown", which is a
+    /// resolved number, not the placeholder.
+    #[test]
+    fn no_diagnostic_when_the_caller_resolves() {
+        for headers in [
+            "From: <tel:+919000000000>;tag=a\r\n",
+            "From: <sip:gateway.ims.example>;tag=a\r\nP-Asserted-Identity: <tel:+919000000000>\r\n",
+            "From: <sip:unknown@ims.example>;tag=a\r\n",
+        ] {
+            assert_eq!(
+                unresolved_caller_diagnostic(&request_with(headers)),
+                None,
+                "{headers}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_names_both_raw_headers_when_no_number_resolves() {
+        let req = request_with("From: <sip:gateway.ims.example>;tag=a\r\n");
+        let text = unresolved_caller_diagnostic(&req).expect("an unresolved caller is reported");
+        assert!(text.contains("P-Asserted-Identity=[]"), "{text}");
+        assert!(text.contains("sip:gateway.ims.example"), "{text}");
+    }
+
+    /// A caller-supplied value must not be able to forge or split a log line.
+    #[test]
+    fn diagnostic_escapes_control_characters() {
+        let req =
+            request_with("P-Asserted-Identity: <sip:a%0D%0Ab@x>\r\nFrom: garbage\u{1}\u{7f}\t\r\n");
+        let text = unresolved_caller_diagnostic(&req).expect("unresolved");
+        assert!(text.contains("garbage"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control()),
+            "control character leaked: {text:?}"
+        );
+    }
 
     /// A single-contact reginfo document, no IMEI needed to attribute it —
     /// the common case, and the shape of every network before Jio's paired

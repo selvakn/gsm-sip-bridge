@@ -50,7 +50,7 @@ use crate::ims::sdp;
 use crate::ims::session::{
     attempt_renewal, extract_caller, header_uri, map_registration_error,
     map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
-    subscribe_reg_event, to_unix, Inbound,
+    subscribe_reg_event, to_unix, unresolved_caller_diagnostic, Inbound,
 };
 use crate::ims::sip_client::{
     build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
@@ -1268,6 +1268,16 @@ fn handle_message(
         return;
     }
 
+    // The sender came from the SIP headers (no decoded TPDU supplied one) and
+    // they named nobody: record why (issue #104, FR-015). Placed after the
+    // duplicate check above, so a retransmission of a message already handled
+    // — same sender and body — returns before it and does not log again.
+    if decoded.is_none() {
+        if let Some(raw) = unresolved_caller_diagnostic(req) {
+            tracing::warn!(headers = %raw, "SMS has no readable sender identity");
+        }
+    }
+
     // specs/047-offerless-invite-sms-reassembly (SMS-05): a multi-part
     // message's individual part is buffered here rather than relayed
     // immediately, and only forwarded — combined, in order — once every
@@ -1653,6 +1663,10 @@ struct LoopState {
     /// itself instead of exiting into `supervise::sim_recovery` — see
     /// [`Self::schedule_renewal_retry`].
     consecutive_renewal_failures: u32,
+    /// Call-ID of the last INVITE whose caller identity was unreadable and
+    /// already logged, so a retransmission of it (our final response lost)
+    /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
+    unreadable_caller_warned: Option<String>,
 }
 
 impl LoopState {
@@ -1669,7 +1683,24 @@ impl LoopState {
             force_renewal: false,
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
+            unreadable_caller_warned: None,
         }
+    }
+
+    /// The FR-015 diagnostic for this INVITE, at most once per Call-ID: a
+    /// retransmission is the same request, and the busy / PBX-down rejection
+    /// paths keep no record of it, so without this a lost `486` would log the
+    /// same raw headers again with every retry. Only the most recent Call-ID is
+    /// remembered — retransmissions arrive back to back, and a handful of
+    /// distinct unreadable callers in between is already a different problem.
+    fn unreadable_caller_to_log(&mut self, req: &SipRequest) -> Option<String> {
+        let raw = unresolved_caller_diagnostic(req)?;
+        let call_id = req.header("Call-ID").unwrap_or_default();
+        if self.unreadable_caller_warned.as_deref() == Some(call_id) {
+            return None;
+        }
+        self.unreadable_caller_warned = Some(call_id.to_string());
+        Some(raw)
     }
 
     /// Is this line occupied — by a bridged call or an attempt still being
@@ -2240,6 +2271,13 @@ impl LoopState {
                 ));
                 return;
             }
+        }
+        // A genuinely new call (the retransmission and re-INVITE cases returned
+        // above): say once, with the raw values, when neither identity header
+        // names a caller — every later `caller=unknown` then has a cause on
+        // record (issue #104, FR-015).
+        if let Some(raw) = self.unreadable_caller_to_log(req) {
+            tracing::warn!(headers = %raw, "inbound call has no readable caller identity");
         }
         // An in-flight outbound origination occupies the line too (specs/029,
         // FR-011): consult whichever lifecycle exists so an inbound INVITE
@@ -2842,6 +2880,59 @@ mod tests {
         assert_eq!(extract_caller(&req), "unknown");
     }
 
+    fn invite_with_headers(headers: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// Issue #104, verbatim from the T2 capture (synthetic number): the
+    /// caller is named only by `tel:` URIs, with vendor parameters.
+    #[test]
+    fn extract_caller_reads_tel_uris_from_both_headers() {
+        let req = invite_with_headers(
+            "From: <tel:+919000000000;noa=international;srvattri=national>;tag=example\r\n\
+             P-Asserted-Identity: <tel:+919000000000>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000000");
+    }
+
+    #[test]
+    fn extract_caller_reads_a_tel_from_without_an_asserted_identity() {
+        let req =
+            invite_with_headers("From: <tel:+91-900-000-0001;noa=international>;tag=example\r\n");
+        assert_eq!(extract_caller(&req), "+919000000001");
+    }
+
+    /// Schemes are case-insensitive (RFC 3986 §3.1) and `sips:` is a SIP URI.
+    #[test]
+    fn extract_caller_accepts_sips_and_any_scheme_case() {
+        for from in [
+            "<sips:+919000000001@ims.example>;tag=a",
+            "<SIP:+919000000001@ims.example>;tag=a",
+            "<Tel:+919000000001>;tag=a",
+        ] {
+            let req = invite_with_headers(&format!("From: {from}\r\n"));
+            assert_eq!(extract_caller(&req), "+919000000001", "{from}");
+        }
+    }
+
+    /// A `sip:` URI with no user part names a host, not a person: no number,
+    /// rather than the hostname presented as the caller.
+    #[test]
+    fn extract_caller_is_unknown_for_a_host_only_uri() {
+        let req = invite_with_headers("From: <sip:gateway.ims.example>;tag=a\r\n");
+        assert_eq!(extract_caller(&req), "unknown");
+    }
+
+    /// The compact form of `From` (RFC 3261 §7.3.3) is canonicalised on parse.
+    #[test]
+    fn extract_caller_reads_the_compact_from_header() {
+        let req = invite_with_headers("f: <tel:+919000000001>;tag=a\r\n");
+        assert_eq!(extract_caller(&req), "+919000000001");
+    }
+
     /// specs/045 MT-12: a trusted network element's `P-Asserted-Identity`
     /// wins over the caller-supplied `From` when both are present — measured
     /// on real carrier traffic where the two legitimately differ (an SMSC
@@ -2869,14 +2960,94 @@ mod tests {
     /// carries CNAP as the P-Asserted-Identity display name, unprompted.
     #[test]
     fn extract_caller_name_reads_the_quoted_display_name_from_p_asserted_identity() {
+        // `From` names a *different* party, so this only passes if the name
+        // really comes from the `tel:` P-Asserted-Identity — with the same
+        // name in both it passed even while the `tel:` identity was ignored.
         let raw = "INVITE sip:x SIP/2.0\r\n\
-                    From: \"Firstname Lastname\" <sip:+919000000000@ims.example;user=phone>;tag=abc\r\n\
+                    From: \"Other Name\" <sip:+919000000001@ims.example;user=phone>;tag=abc\r\n\
                     P-Asserted-Identity: \"Firstname Lastname\" <tel:+919000000000;cpc=ordinary>\r\n\
                     Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(extract_caller(&req), "+919000000000");
         assert_eq!(
             extract_caller_name(&req),
             Some("Firstname Lastname".to_string())
+        );
+    }
+
+    /// RFC 3325 §9.1: two values on two lines, `tel` first and nameless, the
+    /// `sip` one second with the name. Number and name both come from the
+    /// asserted identity, nothing from `From`.
+    #[test]
+    fn extract_caller_name_reads_the_second_p_asserted_identity_line() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <sip:+919000000001@ims.example>;tag=a\r\n\
+             P-Asserted-Identity: <tel:+919000000000>\r\n\
+             P-Asserted-Identity: \"Asserted Name\" <sip:+919000000000@ims.example>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000000");
+        assert_eq!(extract_caller_name(&req), Some("Asserted Name".to_string()));
+    }
+
+    /// The same two values comma-joined on one line.
+    #[test]
+    fn extract_caller_name_reads_a_comma_joined_p_asserted_identity() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <sip:+919000000001@ims.example>;tag=a\r\n\
+             P-Asserted-Identity: <tel:+919000000000>, \"Asserted Name\" <sip:+919000000000@ims.example>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000000");
+        assert_eq!(extract_caller_name(&req), Some("Asserted Name".to_string()));
+    }
+
+    /// A P-Asserted-Identity naming no user (a host) yields no number, so the
+    /// number *and* the name both come from `From` — never one from each.
+    #[test]
+    fn extract_caller_name_falls_back_to_from_with_its_own_number() {
+        let req = invite_with_headers(
+            "From: \"Other Name\" <tel:+919000000001>;tag=a\r\n\
+             P-Asserted-Identity: \"Gateway\" <sip:gateway.ims.example>\r\n",
+        );
+        assert_eq!(extract_caller(&req), "+919000000001");
+        assert_eq!(extract_caller_name(&req), Some("Other Name".to_string()));
+    }
+
+    /// FR-015: one warning per INVITE, not per retransmission. A rejection
+    /// whose response was lost is retried with the same Call-ID.
+    #[test]
+    fn unreadable_caller_is_logged_once_per_call_id() {
+        let invite = |call_id: &str| {
+            let raw = format!(
+                "INVITE sip:x SIP/2.0\r\nFrom: <sip:gateway.ims.example>;tag=a\r\n\
+                 Call-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+            );
+            SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+        };
+        let mut state = LoopState::new();
+        assert!(state.unreadable_caller_to_log(&invite("one")).is_some());
+        assert!(state.unreadable_caller_to_log(&invite("one")).is_none());
+        assert!(state.unreadable_caller_to_log(&invite("one")).is_none());
+        assert!(state.unreadable_caller_to_log(&invite("two")).is_some());
+    }
+
+    /// A readable caller never produces the diagnostic, so it must not
+    /// consume the "already warned" slot either.
+    #[test]
+    fn a_readable_caller_does_not_disturb_the_warned_call_id() {
+        let mut state = LoopState::new();
+        let readable = invite_with_headers("From: <tel:+919000000001>;tag=a\r\n");
+        assert!(state.unreadable_caller_to_log(&readable).is_none());
+        assert_eq!(state.unreadable_caller_warned, None);
+    }
+
+    /// A display name that merely looks like a URI must not mislead parsing.
+    #[test]
+    fn a_display_name_containing_a_uri_scheme_does_not_confuse_parsing() {
+        let req = invite_with_headers("From: \"sip:+919000000099\" <tel:+919000000001>;tag=a\r\n");
+        assert_eq!(extract_caller(&req), "+919000000001");
+        assert_eq!(
+            extract_caller_name(&req),
+            Some("sip:+919000000099".to_string())
         );
     }
 
@@ -3112,6 +3283,47 @@ mod tests {
         assert_eq!(
             header_uri(&req, "P-Asserted-Identity").as_deref(),
             Some("sip:ipsmgw.example;lr")
+        );
+    }
+
+    /// RFC 3325 §9.1: a two-value P-Asserted-Identity pairs a `tel` with a
+    /// `sip` URI. The delivery report is a SIP request to a network node, so
+    /// it goes to the `sip` one — in either order, on one line or two.
+    #[test]
+    fn header_uri_prefers_the_sip_value_of_a_two_value_asserted_identity() {
+        for headers in [
+            "P-Asserted-Identity: <tel:+919000000000>, <sip:ipsmgw.example;transport=udp>\r\n",
+            "P-Asserted-Identity: <sip:ipsmgw.example;transport=udp>, <tel:+919000000000>\r\n",
+            "P-Asserted-Identity: <tel:+919000000000>\r\n\
+             P-Asserted-Identity: <sip:ipsmgw.example;transport=udp>\r\n",
+        ] {
+            let req = message_with_headers(headers);
+            assert_eq!(
+                header_uri(&req, "P-Asserted-Identity").as_deref(),
+                Some("sip:ipsmgw.example;transport=udp"),
+                "{headers}"
+            );
+        }
+    }
+
+    /// A tel-only asserted identity is still addressed as it is today.
+    #[test]
+    fn header_uri_falls_back_to_a_tel_uri_when_that_is_all_there_is() {
+        let req = message_with_headers("P-Asserted-Identity: <tel:+919000000000>\r\n");
+        assert_eq!(
+            header_uri(&req, "P-Asserted-Identity").as_deref(),
+            Some("tel:+919000000000")
+        );
+    }
+
+    /// RFC 3261 §20.10: with no `<>`, a `;param` after a `From` URI is a
+    /// *header* parameter — it must not end up in the request-line.
+    #[test]
+    fn header_uri_drops_header_parameters_of_an_unbracketed_from() {
+        let req = message_with_headers("From: sip:ipsmgw.example;tag=abc\r\n");
+        assert_eq!(
+            header_uri(&req, "From").as_deref(),
+            Some("sip:ipsmgw.example")
         );
     }
 

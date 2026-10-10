@@ -36,6 +36,7 @@ pub mod call;
 pub mod digest;
 pub mod echo;
 mod gm_ipsec;
+pub(crate) mod identity;
 pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
