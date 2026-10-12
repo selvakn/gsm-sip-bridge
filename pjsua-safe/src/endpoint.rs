@@ -5,7 +5,7 @@ use crate::log_bridge;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "pjsip-linked")]
 use std::sync::atomic::{AtomicI32, AtomicU64};
-#[cfg(feature = "pjsip-linked")]
+#[cfg(any(test, feature = "pjsip-linked"))]
 use std::sync::{LazyLock, Mutex};
 
 #[cfg(feature = "pjsip-linked")]
@@ -20,7 +20,7 @@ static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// the existing circuit-switched GSM-to-SIP bridge already relies on — that
 /// is the only path exercised by the daemon today, so this table stays
 /// empty and behavior is byte-for-byte unchanged for it.
-#[cfg(feature = "pjsip-linked")]
+#[cfg(any(test, feature = "pjsip-linked"))]
 static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -741,7 +741,7 @@ unsafe fn negotiated_audio_codec(call_id: pjsua_sys::pjsua_call_id) -> Option<(S
 /// The paired call a DTMF digit received on `call_id` should be re-sent on,
 /// or `None` for an unpaired call (the single-call GSM bridge) or a digit
 /// that isn't a valid keypad character.
-#[cfg(feature = "pjsip-linked")]
+#[cfg(any(test, feature = "pjsip-linked"))]
 fn dtmf_relay_target(call_id: i32, digit: i32) -> Option<(i32, char)> {
     let ch = u8::try_from(digit).ok().map(char::from)?;
     if !matches!(ch, '0'..='9' | '*' | '#' | 'A'..='D' | 'a'..='d') {
@@ -1223,7 +1223,7 @@ mod disconnect_status_tests {
     }
 }
 
-#[cfg(all(test, feature = "pjsip-linked"))]
+#[cfg(test)]
 mod dtmf_relay_tests {
     use super::{dtmf_relay_target, BRIDGE_PAIRS};
 
