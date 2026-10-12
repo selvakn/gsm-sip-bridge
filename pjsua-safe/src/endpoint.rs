@@ -255,6 +255,7 @@ impl Endpoint {
                 cfg.cb.on_call_media_state = Some(on_call_media_state_cb);
                 cfg.cb.on_call_state = Some(on_call_state_cb);
                 cfg.cb.on_incoming_call = Some(on_incoming_call_cb);
+                cfg.cb.on_dtmf_digit = Some(on_dtmf_digit_cb);
                 // RFC 4028 session timers off (neither offered nor accepted).
                 // PJSUA's default is OPTIONAL: a phone whose INVITE offers
                 // `Session-Expires` makes pjsua the timer's other half, and a
@@ -737,6 +738,39 @@ unsafe fn negotiated_audio_codec(call_id: pjsua_sys::pjsua_call_id) -> Option<(S
     ))
 }
 
+/// The paired call a DTMF digit received on `call_id` should be re-sent on,
+/// or `None` for an unpaired call (the single-call GSM bridge) or a digit
+/// that isn't a valid keypad character.
+#[cfg(feature = "pjsip-linked")]
+fn dtmf_relay_target(call_id: i32, digit: i32) -> Option<(i32, char)> {
+    let ch = u8::try_from(digit).ok().map(char::from)?;
+    if !matches!(ch, '0'..='9' | '*' | '#' | 'A'..='D' | 'a'..='d') {
+        return None;
+    }
+    let pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+    pairs.get(&call_id).map(|&peer| (peer, ch))
+}
+
+/// Relays a DTMF digit received on one leg of a paired call to the other leg.
+/// The conference bridge between the legs carries PCM only, so RFC 4733
+/// events never cross it on their own.
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe extern "C" fn on_dtmf_digit_cb(call_id: pjsua_sys::pjsua_call_id, digit: std::os::raw::c_int) { // SAFETY: PJSIP invokes with a valid call_id after init; the digit buffer outlives pjsua_call_dial_dtmf, which copies it
+    let Some((peer, ch)) = dtmf_relay_target(call_id, digit) else {
+        return;
+    };
+    let mut buf = [0 as std::os::raw::c_char; 2];
+    buf[0] = ch as u8 as std::os::raw::c_char;
+    let digits = pjsua_sys::pj_str(buf.as_mut_ptr());
+    let status = pjsua_sys::pjsua_call_dial_dtmf(peer, &digits);
+    if status == PJ_SUCCESS {
+        tracing::debug!(from = call_id, to = peer, digit = %ch, "relayed DTMF digit to paired call");
+    } else {
+        tracing::warn!(from = call_id, to = peer, digit = %ch, status, "failed to relay DTMF digit to paired call");
+    }
+}
+
 #[cfg(feature = "pjsip-linked")]
 #[rustfmt::skip]
 unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) { // SAFETY: PJSIP invokes with valid call_id after init; stack call_info writable for get_info
@@ -1186,5 +1220,34 @@ mod disconnect_status_tests {
         assert_eq!(status_in(&log, token), None);
         record_in(&mut log, token, None);
         assert_eq!(status_in(&log, token), Some(None));
+    }
+}
+
+#[cfg(all(test, feature = "pjsip-linked"))]
+mod dtmf_relay_tests {
+    use super::{dtmf_relay_target, BRIDGE_PAIRS};
+
+    /// Digits received on a paired leg are re-sent on its peer in both
+    /// directions; unpaired calls and non-keypad bytes relay nothing.
+    #[test]
+    fn digits_relay_to_the_paired_call_only() {
+        // Call ids no other test in this process uses (the map is global).
+        let (a, b, lone) = (9_001, 9_002, 9_003);
+        {
+            let mut pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            pairs.insert(a, b);
+            pairs.insert(b, a);
+        }
+        for ch in "123456789*0#".chars() {
+            assert_eq!(dtmf_relay_target(a, ch as i32), Some((b, ch)));
+        }
+        assert_eq!(dtmf_relay_target(b, '5' as i32), Some((a, '5')));
+        assert_eq!(dtmf_relay_target(lone, '5' as i32), None);
+        assert_eq!(dtmf_relay_target(a, 'x' as i32), None);
+        assert_eq!(dtmf_relay_target(a, -1), None);
+        assert_eq!(dtmf_relay_target(a, 0x135), None);
+        let mut pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+        pairs.remove(&a);
+        pairs.remove(&b);
     }
 }
