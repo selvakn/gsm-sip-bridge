@@ -204,14 +204,14 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `203.0.113.x`, `
 
 Build this branch's image for amd64 (Vodafone, local) and arm64 (Jio, via `arm-build-200`), with the P-CSCF probe forced off as in the 098 baseline. Never push the throwaway commit. Recreate the containers; don't restart them.
 
-- [ ] T039 Quickstart §1 on both rigs: `swanctl --dpd --ike ims0` exits 0, and a `parsed INFORMATIONAL response` follows within 2s.
-- [ ] T040 [US3] [US1] Quickstart §2 (no-route) on both rigs: SC-001/002/003, the status line mid-outage, and no `CONNECTING` IKE_SA terminated while active.
-- [ ] T041 [US1] Quickstart §3 (upstream-dead) on both rigs: SC-001/002/003, with a DPD sent and then `no_response` within 120s.
-- [ ] T042 [US2] Quickstart §4 on Vodafone: the single-P-CSCF black-hole recovers within the 097 time + 30s with no hold, and a namespace route deletion is repaired in one tick (SC-004).
-- [ ] T043 [US1] Quickstart §5 (16.5-minute outage) on Vodafone: exactly one `max_hold` recovery, then a new hold, and recovery within 30s of restore (SC-005).
-- [ ] T044 Quickstart §6 (guard off) on Vodafone: the R1 baseline is reproduced, apart from the half-open fix (SC-008).
-- [ ] T045 Quickstart §7 and §8: the idle-hour outer packet count is unchanged (SC-006), and the metrics read as expected after T040/T041.
-- [ ] T046 Write `specs/100-vowifi-underlay-guard/live-verification.md` (SC-001…SC-008 with timestamps; addresses and identities redacted to roles). Commit `docs(100): live verification of the underlay guard (#141)`.
+- [X] T039 Quickstart §1 on both rigs: `swanctl --dpd --ike ims0` exits 0, and a `parsed INFORMATIONAL response` follows within 2s.
+- [X] T040 [US3] [US1] Quickstart §2 (no-route) on both rigs: SC-001/002/003, the status line mid-outage, and no `CONNECTING` IKE_SA terminated while active.
+- [X] T041 [US1] Quickstart §3 (upstream-dead) on both rigs: SC-001/002/003, with a DPD sent and then `no_response` within 120s.
+- [X] T042 [US2] Quickstart §4 on Vodafone: the single-P-CSCF black-hole recovers within the 097 time + 30s with no hold, and a namespace route deletion is repaired in one tick (SC-004).
+- [X] T043 [US1] Quickstart §5 (16.5-minute outage) on Vodafone: exactly one `max_hold` recovery, then a new hold, and recovery within 30s of restore (SC-005).
+- [X] T044 Quickstart §6 (guard off) on Vodafone: the R1 baseline is reproduced, apart from the half-open fix (SC-008).
+- [X] T045 Quickstart §7 and §8: the idle-hour outer packet count is unchanged (SC-006), and the metrics read as expected after T040/T041.
+- [X] T046 Write `specs/100-vowifi-underlay-guard/live-verification.md` (SC-001…SC-008 with timestamps; addresses and identities redacted to roles). Commit `docs(100): live verification of the underlay guard (#141)`.
 
 ## Dependencies
 
