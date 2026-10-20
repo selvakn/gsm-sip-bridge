@@ -37,6 +37,15 @@ tls_verify = "strict"          # strict or skip
 # bandwidth-efficient, a few bytes smaller per packet. A phone that makes the
 # offer (outbound calls) is always followed. VoWiFi/VoLTE only.
 # amr_octet_align = true
+# Optional. Extra final statuses from the PBX or phone (each 400-699) that
+# mean "the person rejected the call", so the mobile carrier is told 486 Busy
+# Here and does not ring the call again. Added to the built-in 486, 600 and
+# 603; it cannot remove them. A response carrying "Reason: Q.850;cause=21"
+# (or cause=17) already counts as a reject whatever its status, so this is
+# only for a PBX that rejects with a bare status, e.g. FreePBX answering 403.
+# 403 is not built in: it can also mean this bridge is not authorised on the
+# PBX. VoWiFi/VoLTE only.
+# reject_statuses = [403]
 
 [bridge]
 sip_destination = ""           # empty = DID passthrough, or fixed extension e.g. "100"
