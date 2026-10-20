@@ -1900,7 +1900,9 @@ fn start_vowifi_line_strongswan(
         );
     }
     loop {
-        runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
+        // Quicker while a hold is on, so the path coming back is noticed within
+        // seconds instead of up to a whole tick later (specs/100 SC-003).
+        runner.sleep(super::underlay::poll_interval(underlay.hold.is_some()));
         // Held across the whole tick_steady_state call, not just a one-off
         // check before it: Greptile P1 (round 2) caught that a plain
         // check-then-call still lets a Recovered outcome's respawn
@@ -2086,20 +2088,14 @@ fn start_vowifi_line_strongswan(
             // recovery it is for waits for the answer.
             line_supervisor::SteadyOutcome::Deferred { .. } => drop(guard),
             line_supervisor::SteadyOutcome::Held {
-                cause,
-                skipped,
-                initiated,
-                ..
+                cause, initiated, ..
             } => {
                 drop(guard);
+                // What a hold held back is summarised once, on the line that
+                // ends it, not logged on every tick.
                 if initiated {
                     println!(
                         "[supervise] line {idx}: uplink down ({}); no IKE_SA, so one initiation was issued and charon's retries carry it",
-                        cause.as_str()
-                    );
-                } else {
-                    println!(
-                        "[supervise] line {idx}: uplink down ({}); holding {skipped:?}",
                         cause.as_str()
                     );
                 }
@@ -2710,6 +2706,9 @@ fn dead_peer_detail(idx: u32, c: &line_supervisor::DeadPeerClassification) -> St
     let verdict = c.verdict.as_str();
     let window = line_supervisor::DPD_GIVE_UP_WINDOW.as_secs();
     match (c.snapshot_age, c.last_in_before_loss, c.packets) {
+        (None, _, _) if c.verdict == line_supervisor::DeadPeerVerdict::Uplink => format!(
+            "[supervise] line {idx}: dead peer verdict: {verdict} (seen while the line was held for an uplink outage; the ePDG's silence is the path's)"
+        ),
         (None, _, _) => {
             format!(
                 "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP snapshot)"

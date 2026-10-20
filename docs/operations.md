@@ -213,6 +213,11 @@ answers, the recovery goes ahead as before, so a real carrier fault, such as a
 single P-CSCF that stopped answering behind a live ePDG, is still repaired,
 about 30s later than it was.
 
+**While held, the supervisor checks every 5s instead of every 30s**, so the
+path coming back is noticed within seconds. Nothing is counted in ticks during a
+hold, and what it held back is summarised on the line that ends it, not logged
+on every tick.
+
 **It cannot hold forever.** A hold ends at the latest 15 minutes after it
 began (`ended after 900s (max_hold)`): the line then gets one ordinary
 recovery pass and may be held again if the evidence is still there. The 10s

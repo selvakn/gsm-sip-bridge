@@ -25,6 +25,21 @@ pub const ROUTE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// turn a wrong verdict into an outage with no end.
 pub const MAX_HOLD: Duration = Duration::from_secs(15 * 60);
 
+/// How often the loop ticks while a hold is on. The ordinary tick is 30s;
+/// during a hold nothing is counted in ticks (a held recovery resets its
+/// strikes), so ticking faster only makes the end of the outage visible sooner.
+pub const HELD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The pause before the next tick: [`HELD_POLL_INTERVAL`] while a hold is on,
+/// the ordinary steady-state interval otherwise.
+pub fn poll_interval(held: bool) -> Duration {
+    if held {
+        HELD_POLL_INTERVAL
+    } else {
+        super::line_supervisor::STEADY_STATE_POLL_INTERVAL
+    }
+}
+
 /// Unanswered retransmits of an outstanding request that establish "no
 /// response" on their own (research R4).
 pub const NO_RESPONSE_RETRANSMITS: u32 = 2;
@@ -404,6 +419,12 @@ mod tests {
             let (now, at) = self.next();
             tracker.begin_tick(obs, now, at)
         }
+    }
+
+    #[test]
+    fn a_held_line_is_polled_faster_than_an_ordinary_one() {
+        assert_eq!(poll_interval(false), Duration::from_secs(30));
+        assert_eq!(poll_interval(true), Duration::from_secs(5));
     }
 
     #[test]
