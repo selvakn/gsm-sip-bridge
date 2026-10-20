@@ -54,6 +54,9 @@ This happens whenever the ePDG is slow or unreachable, not only during an outage
 
 - Q: Should the half-open (`CONNECTING`) misread fix be part of this feature? → A: Yes.
 - Q: Should the line be held by an external control (a pause the network manager could call)? → A: No. The guard decides by itself; no new control surface.
+- Q: charon has no command to send one liveness check on demand. Patch the fork, wait for charon's own DPD, use a rekey, or skip the check? → A: Patch our strongSwan fork (or add a vici command) so the supervisor can send one DPD on demand. SC-004's +30s bound stays.
+- Q: Should operators be able to turn the guard off? → A: Yes. Add `[vowifi].underlay_guard`, default on; off restores today's behaviour exactly, and startup logs which is in effect.
+- Q: What should a held line's alerts say? → A: The existing tunnel-down/unhealthy alert fires as today, but while the line is held its text adds "uplink down (no route / no response), recovery on hold". No new alert type.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -75,7 +78,7 @@ The status command and metrics show the line as held because its uplink is down,
 1. **Given** a healthy registered line, **When** the host's route to that line's ePDG disappears, **Then** within 60s the line is held with cause "no route", and from then until the route returns the supervisor issues no tunnel teardown, no re-initiate and no agent restart for the line.
 2. **Given** a healthy registered line, **When** packets from the ePDG stop arriving while the route stays up, **Then** the line is held with cause "no response" once the ePDG's silence is established (FR-004), and the same no-action guarantee applies from then on.
 3. **Given** a held line, **When** the IMS agent marks every P-CSCF unavailable, **Then** no `PcscfPoolExhausted` rebuild is issued, and once the hold ends those marks don't trigger one.
-4. **Given** a held line, **When** the outage lasts long enough that the existing flapping rule would have fired, **Then** no flapping alert is raised. The line's existing down/unhealthy reporting continues to show it as down.
+4. **Given** a held line, **When** the outage lasts long enough that the existing flapping rule would have fired, **Then** no flapping alert is raised. The line's existing down/unhealthy reporting continues to show it as down, and the existing down alert, when its threshold is reached, says the uplink is down, with the cause and that recovery is on hold.
 5. **Given** a held line, **When** the path to the ePDG returns, **Then** the tunnel is re-established and the line is registered within 30s of the restore, with no manual action. The hold clears and is logged with its duration and cause.
 6. **Given** a host with lines on two carriers, **When** only one carrier's ePDG becomes unreachable, **Then** only that carrier's lines are held.
 
@@ -116,8 +119,8 @@ It intervenes only if that same attempt is still half-open after charon's own re
 
 **Acceptance Scenarios**:
 
-1. **Given** the line's IKE_SA is listed as half-open, **When** a steady-state tick runs within the allowed window, **Then** the supervisor issues no initiate, terminate or agent restart. It logs once per attempt that it is waiting for the negotiation.
-2. **Given** the same half-open attempt is still listed beyond the allowed window, **When** a tick runs and the line is not held, **Then** the supervisor terminates it and re-initiates, logged as a stuck negotiation, distinct from a missing CHILD_SA.
+1. **Given** the line's IKE_SA is listed as half-open and charon has sent or received an IKE message for it within the allowed window, **When** a steady-state tick runs, **Then** the supervisor issues no initiate, terminate or agent restart. It logs once per attempt that it is waiting for the negotiation.
+2. **Given** a half-open attempt that has had no IKE activity for longer than the allowed window, **When** a tick runs and the line is not held, **Then** the supervisor terminates it and re-initiates, logged as a stuck negotiation, distinct from a missing CHILD_SA.
 3. **Given** an IKE_SA that is established but has no usable CHILD_SA, **When** ticks run, **Then** the existing two-strike CHILD_SA recovery (086, #107) is unchanged.
 4. **Given** a half-open attempt completes, **When** the next tick runs, **Then** the line proceeds as an ordinary recovery, re-syncing the P-CSCF and restarting the agent once.
 
@@ -171,7 +174,8 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
   - **ePDG answers:** a protected answer or inbound ESP arrives within 30s. The recovery proceeds.
   - **ePDG silent:** no protected message arrives within 30s. The line is held with cause "no response".
   
-  Establishing this MUST cost at most one protected IKE liveness exchange (RFC 7296 §2.4) on the line's existing IKE_SA per suspicion, and no other new traffic. If no liveness exchange can be triggered on demand, the supervisor MUST instead defer the recovery until the ePDG's own DPD outcome is known.
+  Establishing this MUST cost at most one protected IKE liveness exchange (RFC 7296 §2.4, an empty INFORMATIONAL) on the line's existing IKE_SA per suspicion, and no other new traffic. It MUST NOT be a rekey or any exchange that creates or replaces an SA.
+- **FR-004a**: The strongSwan build MUST let the supervisor trigger that single liveness exchange on demand for a named connection, and read whether it was answered. A small change to the project's strongSwan fork, or a vici command added to it, is in scope. Its retransmission MUST follow charon's normal schedule, and an unanswered exchange MUST NOT by itself delete the IKE_SA any sooner than charon's DPD would.
 - **FR-005**: Local state MUST only ever be used to hold back supervisor actions. It MUST NOT cause any teardown, re-initiate, agent restart or dead-peer verdict.
 - **FR-006**: The verdict MUST return to *up* as soon as local state is healthy again (for "no route") or anything protected arrives from the ePDG (for "no response").
 
@@ -180,12 +184,13 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
 - **FR-007**: While a line is held, the supervisor MUST NOT issue these reachability-inferred recoveries:
   - `PcscfUnreachable`, for as long as the P-CSCF probe exists;
   - `PcscfPoolExhausted`;
-  - the re-initiate for a missing IKE_SA;
+  - the re-initiate for a missing IKE_SA, except as FR-010a allows;
   - the CHILD_SA-missing and stuck-CHILD_SA recoveries;
   - the stuck-rekey rebuild.
 - **FR-008**: While a line is held, the supervisor MUST NOT restart that line's IMS agent for any reason listed in FR-007.
 - **FR-009**: The structural recoveries MUST run regardless of the hold: process death, vici failure, tunnel interface vanished or unavailable, and namespace default route missing.
 - **FR-010**: charon's own retries MUST be left to run during a hold. The supervisor MUST NOT terminate charon's in-flight attempts or reconfigure charon during a hold.
+- **FR-010a**: If a held line has no IKE_SA at all (for example, charon's DPD cleared it), the supervisor MUST start exactly one initiation, with no agent restart, and then leave charon's own retries to carry it. Without this, nothing would be sent to the ePDG, and a "no response" hold could never see the answer that ends it. It MUST NOT initiate while any IKE_SA for the line exists, half-open included.
 - **FR-011**: P-CSCF unavailability marks set by the IMS agent during a hold MUST NOT trigger a `PcscfPoolExhausted` rebuild after the hold ends. Only marks set after the hold ended count.
 - **FR-012**: A line MUST NOT stay held longer than 15 minutes continuously. At that bound it gets one ordinary recovery pass, after which it may be held again on fresh evidence.
 - **FR-013**: When a line's verdict returns to *up*, the supervisor MUST, on that same evaluation, ensure an IKE_SA initiation is under way for the line if none is established or in flight. It MUST NOT tear down an IKE_SA that charon has already re-established.
@@ -193,8 +198,8 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
 **Half-open IKE_SA**
 
 - **FR-014**: The supervisor MUST classify a listed IKE_SA that is still being negotiated (half-open) distinctly from an established IKE_SA without a usable CHILD_SA.
-- **FR-015**: For a half-open IKE_SA, the supervisor MUST take no initiate, terminate or agent-restart action until the same attempt has been half-open for longer than charon's full IKE retransmit schedule plus one tick (~200s at today's settings).
-- **FR-016**: A half-open attempt that outlives FR-015's window MUST, if the line is not held, be terminated and re-initiated. It MUST be logged and reported as a stuck negotiation, a recovery reason distinct from the CHILD_SA ones.
+- **FR-015**: For a half-open IKE_SA, the supervisor MUST take no initiate, terminate or agent-restart action while charon is still working on it, meaning it has sent or received an IKE message for that connection within the last 200s. charon's longest gap between retransmits is ~75s, and with unlimited keying tries it keeps retrying the same half-open IKE_SA indefinitely, so its age alone says nothing.
+- **FR-016**: A half-open IKE_SA with no IKE activity for longer than FR-015's 200s MUST, if the line is not held, be terminated and re-initiated. It MUST be logged and reported as a stuck negotiation, a recovery reason distinct from the CHILD_SA ones.
 - **FR-017**: The established-IKE_SA, missing-CHILD_SA path (086, #107) MUST keep its existing two-strike behaviour.
 
 **Observability**
@@ -207,22 +212,23 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
   
   The counters MUST NOT be rewound by a supervisor restart, like the existing tunnel-recovery counters.
 - **FR-020**: Entering and leaving a hold MUST each produce one log line. Entering names the cause and evidence; leaving names the duration and what ended it (path returned, maximum hold reached).
-- **FR-021**: The flapping alert MUST NOT count recoveries skipped, or charon attempts made, during a hold. The existing down/unhealthy reporting MUST continue to report a held line as down.
+- **FR-021**: The flapping alert MUST NOT count recoveries skipped, or charon attempts made, during a hold. The existing down/unhealthy reporting MUST continue to report a held line as down, and the existing tunnel-down/unhealthy alert MUST still fire on its existing thresholds.
 - **FR-022**: A dead-peer IKE_SA loss while the line is held MUST NOT be counted as a *real* dead peer in the 098 classification. It MUST be attributed to the uplink.
-- **FR-023**: No new Discord alert is added, and no existing alert's text changes.
+- **FR-023**: No new Discord alert type is added. When the existing tunnel-down/unhealthy alert fires for a line that is held, its text MUST add that the uplink is down, the cause (no route / no response) and that recovery is on hold. When the line is not held, the alert's text MUST be unchanged.
 
 **Scope and documentation**
 
 - **FR-024**: Lines on the swu engine and VoLTE lines MUST behave exactly as before.
-- **FR-025**: No new configuration setting is added. The hold bound, debounce and liveness wait are fixed values documented in the operations guide.
+- **FR-025**: One deployment-wide setting, `[vowifi].underlay_guard` (boolean, default on), MUST control the guard. When it is off, every behaviour in FR-001–FR-013 and FR-018–FR-022 MUST be absent, and supervision MUST match the pre-feature behaviour exactly. The half-open fix (FR-014–FR-017) is not affected by this setting. Startup MUST log once whether the guard is on. A non-boolean value MUST fail config loading with an error naming the setting. The hold bound, debounce and liveness wait stay fixed values, documented in the operations guide, not settings.
+- **FR-025a**: The configuration reference and example config MUST document `[vowifi].underlay_guard`. The repository's config-docs test MUST cover it.
 - **FR-026**: The operations guide MUST explain the hold: what it means in the status output, which recoveries it holds back, which it never holds, and how to read the new metrics. The changelog MUST record both the guard and the half-open fix.
-- **FR-027**: The live verification (SC-001 to SC-005) MUST be recorded in the feature's live-verification notes before merge.
+- **FR-027**: The live verification (SC-001 to SC-005, and SC-008) MUST be recorded in the feature's live-verification notes before merge.
 
 ### Key Entities
 
 - **Underlay verdict**: per ePDG address: *up*, *down (no route)* or *down (no response)*, with the evidence and when it was established.
 - **Hold**: per line: start time, cause, and the recoveries skipped during it. It ends when the verdict returns to *up* or the 15-minute bound is reached.
-- **Half-open attempt**: per line: the IKE_SA's identifier and when it was first seen half-open. It is used to tell an attempt still in progress from a stuck one.
+- **Half-open attempt**: per line: the IKE_SA's identifier and the time of the connection's last IKE activity. It is used to tell an attempt still in progress from a stuck one.
 
 ## Success Criteria *(mandatory)*
 
@@ -230,7 +236,8 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
 
 - **SC-001**: In a 330s black-holed-ePDG-route outage and a 330s dropped-inbound-from-ePDG outage, each run on Vodafone and on Jio:
   - from the moment the hold starts until the path returns there are **zero** supervisor-issued tunnel teardowns, re-initiates and agent restarts;
-  - there are zero flapping alerts.
+  - there are zero flapping alerts;
+  - any tunnel-down alert that fires names the uplink as the cause.
   
   Baseline: 4 IKE_SA attempts, 3–4 agent restarts and 1 false flapping alert per run.
 - **SC-002**: In the same runs, the hold starts within 60s of the route loss (no-route case) and within 120s of the inbound drop (no-response case).
@@ -238,7 +245,8 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
 - **SC-004**: The 097 single-P-CSCF black-hole on Vodafone recovers within its existing measured time plus at most 30s, and the 096 namespace-route deletion is repaired within one tick. Neither shows a hold.
 - **SC-005**: In an outage longer than 15 minutes, the line receives exactly one ordinary recovery attempt per 15 minutes held, and recovers within 30s of the path returning.
 - **SC-006**: An idle healthy line generates no additional outer packets because of this feature: an idle hour's packet count to and from the ePDG is unchanged within normal variance.
-- **SC-007**: In unit tests, a half-open IKE_SA persisting for up to the allowed window causes no initiate, terminate or agent restart, and one persisting beyond it causes exactly one stuck-negotiation recovery.
+- **SC-007**: In unit tests, a half-open IKE_SA with recent IKE activity causes no initiate, terminate or agent restart however long it lasts, and one with no activity beyond the allowed window causes exactly one stuck-negotiation recovery.
+- **SC-008**: With `[vowifi].underlay_guard` off, the two outage runs of SC-001 reproduce the pre-feature baseline (a teardown at ~80s, then rebuilds), apart from the half-open fix.
 
 ## Assumptions
 
@@ -247,6 +255,6 @@ These outages are kept separate from carrier-side recoveries and dead-peer verdi
 - charon's retransmit schedule (5 retransmits, ~165s) and `retry_initiate_interval` (10s) stay as they are. Raising the retransmit count so short blips don't cost the IKE_SA (RFC 7296's "a dozen times over several minutes") is a separate decision, because it also slows detection of a really dead ePDG. It is out of scope.
 - MOBIKE stays disabled. It is the standards answer to path changes, but Vodafone's ePDG breaks it (see the swanctl template).
 - Requesting the carrier's liveness timeout (TS 24.302 `TIMEOUT_PERIOD_FOR_LIVENESS_CHECK`) is out of scope. Neither carrier sends it unasked, and requesting it needs a change to the strongSwan fork.
-- How to trigger a single liveness exchange on demand (FR-004) is a planning question. charon has no direct command for it, and the plan's research must pick a mechanism or adopt FR-004's fallback.
+- charon has no command today to send one liveness exchange on demand, so FR-004a adds one to the project's strongSwan fork. The plan's research chooses its shape (a vici command, or an existing hook exposed). The fork is already built from source in the image, so this adds no new dependency.
 - Hold state is in-memory only. After a restart the guard re-derives it from current evidence.
 - Live tests use the existing rigs: Vodafone on the local host, Jio on the remote Pi. Outages are injected on the host (route black hole; inbound drop with a dedicated, auto-removed firewall table), as in the spikes.

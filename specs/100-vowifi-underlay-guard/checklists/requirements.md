@@ -36,9 +36,10 @@
   - 15-minute maximum hold (FR-012);
   - 2 × 10s no-route debounce (FR-002);
   - 30s liveness wait (FR-004);
-  - ~200s half-open window (FR-015).
-- Two items deferred to planning on purpose, each with a stated fallback:
-  - the mechanism for an on-demand liveness exchange (FR-004 / Assumptions);
+  - 200s of IKE inactivity before a half-open IKE_SA counts as stuck (FR-015).
+- One setting added in clarification: `[vowifi].underlay_guard`, default on (FR-025).
+- Two items deferred to planning on purpose:
+  - the shape of the on-demand liveness trigger in the strongSwan fork (FR-004a; clarification settled that it is a fork change);
   - the exact evidence parser for "no response" (FR-003).
 - Explicitly out of scope:
   - charon retransmit tuning;
