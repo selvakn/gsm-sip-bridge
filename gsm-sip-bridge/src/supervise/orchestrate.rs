@@ -1902,7 +1902,7 @@ fn start_vowifi_line_strongswan(
     loop {
         // Quicker while a hold is on, so the path coming back is noticed within
         // seconds instead of up to a whole tick later (specs/100 SC-003).
-        runner.sleep(super::underlay::poll_interval(underlay.hold.is_some()));
+        runner.sleep(underlay.poll_after(std::time::Instant::now()));
         // Held across the whole tick_steady_state call, not just a one-off
         // check before it: Greptile P1 (round 2) caught that a plain
         // check-then-call still lets a Recovered outcome's respawn

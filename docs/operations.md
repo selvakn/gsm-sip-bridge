@@ -213,8 +213,9 @@ answers, the recovery goes ahead as before, so a real carrier fault, such as a
 single P-CSCF that stopped answering behind a live ePDG, is still repaired,
 about 30s later than it was.
 
-**While held, the supervisor checks every 5s instead of every 30s**, so the
-path coming back is noticed within seconds. Nothing is counted in ticks during a
+**While held, and for 30s after, the supervisor checks every 5s instead of
+every 30s**, so the path coming back, and the new P-CSCF that comes with it, are
+noticed within seconds. Nothing is counted in ticks during a
 hold, and what it held back is summarised on the line that ends it, not logged
 on every tick.
 

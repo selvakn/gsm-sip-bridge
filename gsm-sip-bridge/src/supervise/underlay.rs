@@ -30,15 +30,11 @@ pub const MAX_HOLD: Duration = Duration::from_secs(15 * 60);
 /// strikes), so ticking faster only makes the end of the outage visible sooner.
 pub const HELD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The pause before the next tick: [`HELD_POLL_INTERVAL`] while a hold is on,
-/// the ordinary steady-state interval otherwise.
-pub fn poll_interval(held: bool) -> Duration {
-    if held {
-        HELD_POLL_INTERVAL
-    } else {
-        super::line_supervisor::STEADY_STATE_POLL_INTERVAL
-    }
-}
+/// How long the quick polling carries on after a hold ends. The tunnel comes
+/// back with a new P-CSCF, which the very next tick would pick up and hand to
+/// the agent; at the ordinary 30s that is up to 30s of a restored line not yet
+/// registering.
+pub const LINGER_AFTER_HOLD: Duration = Duration::from_secs(30);
 
 /// Unanswered retransmits of an outstanding request that establish "no
 /// response" on their own (research R4).
@@ -114,6 +110,8 @@ pub struct UnderlayTracker {
     tick_mark: LogMark,
     pub hold: Option<Hold>,
     pub pending_check: Option<PendingCheck>,
+    /// Quick polling goes on until this, after a hold has ended.
+    linger_until: Option<Instant>,
 }
 
 impl UnderlayTracker {
@@ -127,6 +125,18 @@ impl UnderlayTracker {
             tick_mark: mark,
             hold: None,
             pending_check: None,
+            linger_until: None,
+        }
+    }
+
+    /// The pause before the next tick: [`HELD_POLL_INTERVAL`] while a hold is
+    /// on and for [`LINGER_AFTER_HOLD`] after one ends, the ordinary
+    /// steady-state interval otherwise.
+    pub fn poll_after(&self, now: Instant) -> Duration {
+        if self.hold.is_some() || self.linger_until.is_some_and(|until| now < until) {
+            HELD_POLL_INTERVAL
+        } else {
+            super::line_supervisor::STEADY_STATE_POLL_INTERVAL
         }
     }
 
@@ -349,6 +359,7 @@ impl UnderlayTracker {
 
     fn end_hold(&mut self, ended_by: HoldEndedBy, now: Instant) -> Option<HoldEnd> {
         let hold = self.hold.take()?;
+        self.linger_until = Some(now + LINGER_AFTER_HOLD);
         Some(HoldEnd {
             cause: hold.cause,
             held: now.saturating_duration_since(hold.started),
@@ -422,9 +433,27 @@ mod tests {
     }
 
     #[test]
-    fn a_held_line_is_polled_faster_than_an_ordinary_one() {
-        assert_eq!(poll_interval(false), Duration::from_secs(30));
-        assert_eq!(poll_interval(true), Duration::from_secs(5));
+    fn a_held_line_is_polled_faster_and_stays_quick_for_a_while_after_it_ends() {
+        let mut t = UnderlayTracker::new(mark());
+        let t0 = Instant::now();
+        let at = SystemTime::UNIX_EPOCH;
+        assert_eq!(t.poll_after(t0), Duration::from_secs(30));
+        t.begin_tick(&no_route(), t0, at);
+        t.begin_tick(&no_route(), t0 + TICK, at);
+        assert_eq!(t.poll_after(t0 + TICK), Duration::from_secs(5));
+        // The route returns: the hold ends, and the quick polling lingers.
+        let end = t0 + TICK * 2;
+        let b = t.begin_tick(&quiet(), end, at);
+        assert!(b.ended.is_some());
+        assert_eq!(t.poll_after(end), Duration::from_secs(5));
+        assert_eq!(
+            t.poll_after(end + LINGER_AFTER_HOLD - Duration::from_secs(1)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            t.poll_after(end + LINGER_AFTER_HOLD),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
