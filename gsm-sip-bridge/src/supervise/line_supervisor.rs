@@ -680,6 +680,10 @@ pub struct UnderlayView {
     pub pending: Option<PendingView>,
     /// The ePDG has sent a protected IKE message since the previous tick.
     pub ike_life_recent: bool,
+    /// This tick follows a no-route hold that has just ended, so the path is
+    /// back and anything charon was still retrying across it is worth
+    /// retrying now rather than after its backoff.
+    pub restored: bool,
 }
 
 impl UnderlayView {
@@ -691,6 +695,7 @@ impl UnderlayView {
             route_ok: true,
             pending: None,
             ike_life_recent: true,
+            restored: false,
         }
     }
 
@@ -1448,6 +1453,25 @@ fn tick_half_open(
             waiting_logged: false,
         },
     };
+    // The no-route hold that kept this IKE_SA's retransmits from reaching the
+    // ePDG has just ended. charon backs off up to ~76s between retransmits, so
+    // waiting for its next one can leave the line down for a minute with the
+    // path already back: send a fresh IKE_SA_INIT now instead (specs/100
+    // SC-003). A hold that ended because the ePDG was heard from does not get
+    // here: an IKE_SA that answered is progressing, not waiting.
+    if underlay.enabled && underlay.restored {
+        println!(
+            "{} IKE_SA #{ike_id} was half-open across a no-route hold that has just ended; re-initiating it now rather than waiting out charon's backoff",
+            engine.log_prefix()
+        );
+        tracking.half_open = None;
+        engine.terminate(runner);
+        engine.reinitiate(runner);
+        return SteadyOutcome::Recovered {
+            reason: DegradeReason::IkeSaNegotiationStuck,
+            ike_sa_loss_cause: None,
+        };
+    }
     let last_activity = engine
         .last_ike_activity(runner)
         .unwrap_or(half_open.first_seen);
@@ -4209,6 +4233,7 @@ mod tests {
             route_ok: true,
             pending: None,
             ike_life_recent: false,
+            restored: false,
         }
     }
 
@@ -4900,5 +4925,46 @@ mod tests {
             POOL_EXHAUSTED
         );
         assert_eq!(*engine.dpd_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn a_half_open_ike_sa_is_retried_at_once_when_a_no_route_hold_ends() {
+        let engine = half_open_engine(7, Some(10));
+        let restored = UnderlayView {
+            restored: true,
+            ..view(UnderlayVerdict::Up)
+        };
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            guarded(&engine, &mut tracking, &restored, None),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaNegotiationStuck,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(*engine.call_order.borrow(), vec!["terminate", "reinitiate"]);
+        assert!(tracking.half_open.is_none());
+        // The same half-open IKE_SA on an ordinary tick is left alone.
+        let engine = half_open_engine(7, Some(10));
+        assert_eq!(
+            guarded(
+                &engine,
+                &mut SteadyTracking::default(),
+                &view(UnderlayVerdict::Up),
+                None
+            ),
+            SteadyOutcome::WaitingForNegotiation
+        );
+        nothing_was_issued(&engine);
+        // And with the guard off the flag means nothing.
+        let off = UnderlayView {
+            restored: true,
+            ..UnderlayView::disabled()
+        };
+        let engine = half_open_engine(7, Some(10));
+        assert_eq!(
+            guarded(&engine, &mut SteadyTracking::default(), &off, None),
+            SteadyOutcome::WaitingForNegotiation
+        );
     }
 }

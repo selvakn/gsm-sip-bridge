@@ -234,6 +234,11 @@ impl UnderlayTracker {
             self.pending_check = None;
         }
 
+        // A no-route hold that ended because the route came back: whatever
+        // charon was retrying across the dead path should be retried now.
+        let restored = ended.as_ref().is_some_and(|e| {
+            e.ended_by == HoldEndedBy::Restored && e.cause == UplinkHoldCause::NoRoute
+        });
         let pending = self.pending_check.map(|p| PendingView {
             reason: p.deferred,
             // The tunnel counter growing since the previous tick covers the
@@ -248,6 +253,7 @@ impl UnderlayTracker {
                 route_ok: obs.route_ok || unheld_pass,
                 pending: pending.filter(|_| !unheld_pass),
                 ike_life_recent: obs.ike_life_recent || unheld_pass,
+                restored,
             },
             ended,
             started,
@@ -479,6 +485,39 @@ mod tests {
         assert_eq!(ended.ended_by, HoldEndedBy::Restored);
         assert_eq!(ended.held, TICK);
         assert!(t.hold.is_none());
+    }
+
+    #[test]
+    fn only_a_restored_no_route_hold_flags_the_tick_that_follows_it() {
+        // Route back: flagged, once.
+        let mut clock = Clock::new();
+        let mut t = UnderlayTracker::new(mark());
+        clock.begin(&mut t, &no_route());
+        clock.begin(&mut t, &no_route());
+        let b = clock.begin(&mut t, &quiet());
+        assert!(b.view.restored);
+        assert!(!clock.begin(&mut t, &quiet()).view.restored);
+        // A no-response hold ending means the ePDG was heard from: not flagged.
+        let mut clock = Clock::new();
+        let mut t = UnderlayTracker::new(mark());
+        clock.begin(&mut t, &silent(2));
+        let heard = Observation {
+            evidence: IkeEvidence {
+                parsed_from_peer: true,
+                unanswered_retransmits: 0,
+            },
+            ..quiet()
+        };
+        let b = clock.begin(&mut t, &heard);
+        assert!(b.ended.is_some() && !b.view.restored);
+        // The 15-minute cut is not a restoration either.
+        let mut t = UnderlayTracker::new(mark());
+        let t0 = Instant::now();
+        let at = SystemTime::UNIX_EPOCH;
+        t.begin_tick(&no_route(), t0, at);
+        t.begin_tick(&no_route(), t0 + TICK, at);
+        let b = t.begin_tick(&no_route(), t0 + TICK + MAX_HOLD, at);
+        assert!(b.ended.is_some() && !b.view.restored);
     }
 
     #[test]

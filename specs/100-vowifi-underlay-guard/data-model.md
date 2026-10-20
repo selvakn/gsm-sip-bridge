@@ -149,7 +149,7 @@ On every transition out of a hold:
 4. one log line with the duration, `ended_by` and the skipped reasons;
 5. set `tracking.negotiated_at = now` (FR-011);
 6. reset `held_initiate_sent`;
-7. if no IKE_SA is established or in flight, issue one `--initiate` (FR-013).
+7. if no IKE_SA is established or in flight, issue one `--initiate` (FR-013). The unheld tick that follows does this itself: a missing IKE_SA is `IkeSaLost` and re-initiated. A half-open IKE_SA left from a *no route* hold is terminated and re-initiated on that tick (`UnderlayView.restored`), reported as `IkeSaNegotiationStuck`; after a *no response* hold it is left alone, since it has just answered.
 
 On shutdown while held: `UplinkHoldEnded { ended_by: shutdown }`, so the held-seconds counter is complete.
 
