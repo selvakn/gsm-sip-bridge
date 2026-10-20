@@ -4,6 +4,7 @@ Delivered as `docker/patches/0002-strongswan-vici-dpd.patch`. It is applied in t
 - `src/libcharon/plugins/vici/vici_control.c`
 - `src/swanctl/commands/dpd.c` (new)
 - `src/swanctl/Makefile.am`
+- `src/swanctl/command.h` (`MAX_COMMANDS` 26 → 27)
 
 ## vici command `dpd`
 
@@ -30,7 +31,7 @@ swanctl --dpd --ike <name> [--raw|--pretty]     # short: -D -i <name>
 
 - Exit 0 on `success = yes`.
 - Exit non-zero, printing `dpd failed: <errmsg>`, otherwise.
-- It uses the 26th and last `MAX_COMMANDS` slot. Short option `D` was unused.
+- It needs one more `MAX_COMMANDS` slot than the fork has: the patch raises it from 26 to 27 (the command table was already full). Short option `D` was unused.
 
 ## How the supervisor uses it
 

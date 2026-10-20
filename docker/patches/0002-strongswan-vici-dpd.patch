@@ -1,0 +1,223 @@
+diff --git a/src/libcharon/plugins/vici/vici_control.c b/src/libcharon/plugins/vici/vici_control.c
+index 4c09b578d..03d21016f 100644
+--- a/src/libcharon/plugins/vici/vici_control.c
++++ b/src/libcharon/plugins/vici/vici_control.c
+@@ -26,6 +26,7 @@
+ #include <processing/jobs/rekey_ike_sa_job.h>
+ #include <processing/jobs/rekey_child_sa_job.h>
+ #include <processing/jobs/redirect_job.h>
++#include <sa/ikev2/tasks/ike_dpd.h>
+ 
+ typedef struct private_vici_control_t private_vici_control_t;
+ 
+@@ -498,6 +499,70 @@ static traffic_selector_t *parse_peer_ip(char *ip)
+ 	return traffic_selector_create_from_cidr(ip, 0, 0, 0xFFFF);
+ }
+ 
++CALLBACK(dpd, vici_message_t*,
++	private_vici_control_t *this, char *name, u_int id, vici_message_t *request)
++{
++	char *ike, errbuf[128];
++	ike_sa_t *ike_sa;
++	ike_sa_state_t state;
++	vici_builder_t *builder;
++	char *errmsg = NULL;
++	u_int ike_id = 0;
++
++	ike = request->get_str(request, NULL, "ike");
++	if (!ike)
++	{
++		return send_reply(this, "missing IKE_SA name");
++	}
++	DBG1(DBG_CFG, "vici dpd IKE_SA '%s'", ike);
++
++	ike_sa = charon->ike_sa_manager->checkout_by_name(
++										charon->ike_sa_manager, ike, FALSE);
++	if (!ike_sa)
++	{
++		snprintf(errbuf, sizeof(errbuf), "no IKE_SA named %s", ike);
++		errmsg = errbuf;
++	}
++	else
++	{
++		state = ike_sa->get_state(ike_sa);
++		if (state != IKE_ESTABLISHED)
++		{
++			snprintf(errbuf, sizeof(errbuf), "IKE_SA %s is %s", ike,
++					 enum_to_name(ike_sa_state_names, state));
++			errmsg = errbuf;
++			charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
++		}
++		else
++		{
++			ike_id = ike_sa->get_unique_id(ike_sa);
++			ike_sa->queue_task(ike_sa, &ike_dpd_create(TRUE)->task);
++			if (ike_sa->initiate(ike_sa, NULL, 0, NULL, NULL) == DESTROY_ME)
++			{
++				charon->ike_sa_manager->checkin_and_destroy(
++										charon->ike_sa_manager, ike_sa);
++				errmsg = "IKE_SA was destroyed while starting the DPD";
++			}
++			else
++			{
++				charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa);
++			}
++		}
++	}
++
++	builder = vici_builder_create();
++	builder->add_kv(builder, "success", errmsg ? "no" : "yes");
++	if (errmsg)
++	{
++		builder->add_kv(builder, "errmsg", "%s", errmsg);
++	}
++	else
++	{
++		builder->add_kv(builder, "ike-id", "%u", ike_id);
++	}
++	return builder->finalize(builder);
++}
++
+ CALLBACK(redirect, vici_message_t*,
+ 	private_vici_control_t *this, char *name, u_int id, vici_message_t *request)
+ {
+@@ -705,6 +770,7 @@ static void manage_commands(private_vici_control_t *this, bool reg)
+ 	manage_command(this, "terminate", terminate, reg);
+ 	manage_command(this, "rekey", rekey, reg);
+ 	manage_command(this, "redirect", redirect, reg);
++	manage_command(this, "dpd", dpd, reg);
+ 	manage_command(this, "install", install, reg);
+ 	manage_command(this, "uninstall", uninstall, reg);
+ 	manage_command(this, "reload-settings", reload_settings, reg);
+diff --git a/src/swanctl/Makefile.am b/src/swanctl/Makefile.am
+index 3a432c454..f335ce1d8 100644
+--- a/src/swanctl/Makefile.am
++++ b/src/swanctl/Makefile.am
+@@ -7,6 +7,7 @@ swanctl_SOURCES = \
+ 	commands/terminate.c \
+ 	commands/rekey.c \
+ 	commands/redirect.c \
++	commands/dpd.c \
+ 	commands/install.c \
+ 	commands/list_sas.c \
+ 	commands/list_pols.c \
+diff --git a/src/swanctl/command.h b/src/swanctl/command.h
+index f2640d90f..30d0d8531 100644
+--- a/src/swanctl/command.h
++++ b/src/swanctl/command.h
+@@ -27,7 +27,7 @@
+ /**
+  * Maximum number of commands (+1).
+  */
+-#define MAX_COMMANDS 26
++#define MAX_COMMANDS 27
+ 
+ /**
+  * Maximum number of options in a command (+3)
+diff --git a/src/swanctl/commands/dpd.c b/src/swanctl/commands/dpd.c
+new file mode 100644
+index 000000000..8c3733c47
+--- /dev/null
++++ b/src/swanctl/commands/dpd.c
+@@ -0,0 +1,101 @@
++/*
++ * Send one liveness check (an empty INFORMATIONAL request) on an
++ * established IKE_SA, on demand.  The exchange is an ordinary IKEv2 DPD and
++ * follows charon's normal retransmit schedule; this command does not wait
++ * for the answer.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include "command.h"
++
++#include <errno.h>
++
++static int dpd(vici_conn_t *conn)
++{
++	vici_req_t *req;
++	vici_res_t *res;
++	command_format_options_t format = COMMAND_FORMAT_NONE;
++	char *arg, *ike = NULL;
++	int ret = 0;
++
++	while (TRUE)
++	{
++		switch (command_getopt(&arg))
++		{
++			case 'h':
++				return command_usage(NULL);
++			case 'P':
++				format |= COMMAND_FORMAT_PRETTY;
++				/* fall through to raw */
++			case 'r':
++				format |= COMMAND_FORMAT_RAW;
++				continue;
++			case 'i':
++				ike = arg;
++				continue;
++			case EOF:
++				break;
++			default:
++				return command_usage("invalid --dpd option");
++		}
++		break;
++	}
++	if (!ike)
++	{
++		return command_usage("--ike is required");
++	}
++	req = vici_begin("dpd");
++	vici_add_key_valuef(req, "ike", "%s", ike);
++	res = vici_submit(req, conn);
++	if (!res)
++	{
++		ret = errno;
++		fprintf(stderr, "dpd request failed: %s\n", strerror(errno));
++		return ret;
++	}
++	if (format & COMMAND_FORMAT_RAW)
++	{
++		vici_dump(res, "dpd reply", format & COMMAND_FORMAT_PRETTY, stdout);
++	}
++	else
++	{
++		if (streq(vici_find_str(res, "no", "success"), "yes"))
++		{
++			printf("dpd sent on IKE_SA '%s'\n", ike);
++		}
++		else
++		{
++			fprintf(stderr, "dpd failed: %s\n",
++					vici_find_str(res, "", "errmsg"));
++			ret = 1;
++		}
++	}
++	vici_free_res(res);
++	return ret;
++}
++
++/**
++ * Register the command.
++ */
++static void __attribute__ ((constructor))reg()
++{
++	command_register((command_t) {
++		dpd, 'D', "dpd", "send a liveness check on an IKE_SA",
++		{"--ike <name> [--raw|--pretty]"},
++		{
++			{"help",		'h', 0, "show usage information"},
++			{"ike",			'i', 1, "IKE_SA (connection) name"},
++			{"raw",			'r', 0, "dump raw response message"},
++			{"pretty",		'P', 0, "dump raw response message in pretty print"},
++		}
++	});
++}

@@ -174,6 +174,15 @@ RUN git clone https://gitea.osmocom.org/ims-volte-vowifi/strongswan-epdg.git \
     && git -C strongswan-epdg checkout 022f3e515b2c7b607def0fbbf1d7b9b1df08fb8c
 WORKDIR /build/strongswan-epdg
 
+# Adds a vici `dpd` command and `swanctl --dpd --ike <name>`: queue one
+# ordinary IKEv2 liveness check on an established IKE_SA, on demand. The
+# underlay guard (specs/100-vowifi-underlay-guard, FR-004a, research R5) sends
+# one before it tears down a tunnel on an inference of "the ePDG is gone", so
+# it can tell a carrier fault from an uplink outage without waiting up to
+# ~285s for charon's own DPD. Stock strongSwan 5.9 has no way to ask for one.
+COPY docker/patches/0002-strongswan-vici-dpd.patch /tmp/
+RUN patch -p1 < /tmp/0002-strongswan-vici-dpd.patch
+
 RUN autoreconf -if
 # --disable-defaults: only the plugins this feature actually uses get
 # built — smaller image, smaller attack surface, and avoids dragging in

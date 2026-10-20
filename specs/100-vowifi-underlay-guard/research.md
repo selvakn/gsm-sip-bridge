@@ -79,7 +79,7 @@ The 098 parser already reads each CHILD_SA's inbound `… Ns ago` from `swanctl 
 - Inside charon, `ike_dpd_create(TRUE)` (`sa/ikev2/tasks/ike_dpd.c`) is the task an ordinary DPD runs: an empty INFORMATIONAL.
 - `ike_sa->queue_task()` followed by `ike_sa->initiate(ike_sa, NULL, 0, NULL, NULL)` is how `processing/jobs/initiate_tasks_job.c` starts queued tasks.
 - `charon->ike_sa_manager->checkout_by_name(…, name, FALSE)` returns the connection's IKE_SA.
-- swanctl registers commands through a constructor in `src/swanctl/commands/*.c`, listed in `src/swanctl/Makefile.am`. `MAX_COMMANDS` is 26 and 25 are used, so exactly one slot is free. Short option `D` is unused.
+- swanctl registers commands through a constructor in `src/swanctl/commands/*.c`, listed in `src/swanctl/Makefile.am`. `MAX_COMMANDS` is 26 and the table is already full (found when the build first registered the command), so the patch raises it to 27. Short option `D` is unused.
 
 **Decision.** One patch, `docker/patches/0002-strongswan-vici-dpd.patch`, applied in the `strongswan-builder` stage before `autoreconf`. It adds:
 1. A vici command `dpd` (`vici_control.c`). It takes `ike` (connection name), checks out that IKE_SA, refuses unless the IKE_SA is `ESTABLISHED`, queues `ike_dpd_create(TRUE)`, starts it, and checks the IKE_SA back in. It replies `success`, plus `ike-id` and an `errmsg` on refusal. It does not wait for the answer.
