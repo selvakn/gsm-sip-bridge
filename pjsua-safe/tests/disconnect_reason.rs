@@ -12,12 +12,15 @@ use pjsua_safe::{Account, Call, CallState, Disconnect, Endpoint, EndpointConfig,
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-const PBX_PORT: u16 = 15082;
+/// The endpoint's own port, distinct from the ones other linked tests in
+/// this crate bind (15060-15092). The fake PBX takes an OS-assigned port, so
+/// parallel test binaries (nextest) cannot collide with it.
+const ENDPOINT_PORT: u16 = 15101;
 
 fn ep_config() -> EndpointConfig {
     EndpointConfig {
         transport: TransportType::Udp,
-        local_port: 15081,
+        local_port: ENDPOINT_PORT,
         tls_verify: false,
         clock_rate: 16000,
         jb_init_ms: 20,
@@ -46,6 +49,8 @@ fn response_for(user: &str) -> (&'static str, &'static str) {
             "503 Service Unavailable",
             "Reason: SIP;cause=503;text=\"Service Unavailable\"\r\nReason: Q.850;cause=21\r\n",
         ),
+        // Both reasons in one header line, SIP first (RFC 3326).
+        "combined" => ("403 Forbidden", "Reason: SIP;cause=403, Q.850;cause=21\r\n"),
         "sip-only" => ("403 Forbidden", "Reason: SIP;cause=403\r\n"),
         "not-failure" => ("486 Busy Here", "Reason: Q.850;cause=16\r\n"),
         other => panic!("unknown scenario {other}"),
@@ -64,8 +69,9 @@ fn header<'a>(request: &'a str, name: &str) -> Vec<&'a str> {
 
 /// Answer every INVITE with its scenario's failure; ACKs and the rest are
 /// ignored. Runs until the process ends.
-fn spawn_fake_pbx() {
-    let socket = UdpSocket::bind(("127.0.0.1", PBX_PORT)).expect("bind fake pbx");
+fn spawn_fake_pbx() -> u16 {
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind fake pbx");
+    let port = socket.local_addr().expect("fake pbx address").port();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok((n, from)) = socket.recv_from(&mut buf) {
@@ -96,12 +102,13 @@ fn spawn_fake_pbx() {
             let _ = socket.send_to(reply.as_bytes(), from);
         }
     });
+    port
 }
 
-fn disconnect_of(account: &Account, user: &str) -> Disconnect {
+fn disconnect_of(account: &Account, pbx_port: u16, user: &str) -> Disconnect {
     let call = Call::make(
         account,
-        &format!("sip:{user}@127.0.0.1:{PBX_PORT}"),
+        &format!("sip:{user}@127.0.0.1:{pbx_port}"),
         None,
         &[],
     )
@@ -120,10 +127,15 @@ fn disconnect_of(account: &Account, user: &str) -> Disconnect {
 
 #[test]
 fn a_failure_response_reason_cause_is_captured_from_a_real_pjsip_call() {
-    spawn_fake_pbx();
+    let pbx = spawn_fake_pbx();
     let ep = Endpoint::create(ep_config()).expect("endpoint create");
     ep.set_null_sound_device().expect("null sound device");
-    let account = Account::local(&ep, "sip:bridge@127.0.0.1:15081", "Bridge").expect("account");
+    let account = Account::local(
+        &ep,
+        &format!("sip:bridge@127.0.0.1:{ENDPOINT_PORT}"),
+        "Bridge",
+    )
+    .expect("account");
 
     let seen = |status, q850| Disconnect {
         status: Some(status),
@@ -131,12 +143,25 @@ fn a_failure_response_reason_cause_is_captured_from_a_real_pjsip_call() {
         response_seen: true,
     };
     // The reported FreePBX case.
-    assert_eq!(disconnect_of(&account, "freepbx"), seen(403, Some(21)));
-    assert_eq!(disconnect_of(&account, "bare403"), seen(403, None));
+    assert_eq!(disconnect_of(&account, pbx, "freepbx"), seen(403, Some(21)));
+    assert_eq!(disconnect_of(&account, pbx, "bare403"), seen(403, None));
     // Parameters after the cause are tolerated.
-    assert_eq!(disconnect_of(&account, "busy-cause"), seen(503, Some(17)));
+    assert_eq!(
+        disconnect_of(&account, pbx, "busy-cause"),
+        seen(503, Some(17))
+    );
     // A SIP-protocol Reason first, the Q.850 one second.
-    assert_eq!(disconnect_of(&account, "two-reasons"), seen(503, Some(21)));
-    assert_eq!(disconnect_of(&account, "sip-only"), seen(403, None));
-    assert_eq!(disconnect_of(&account, "not-failure"), seen(486, Some(16)));
+    assert_eq!(
+        disconnect_of(&account, pbx, "two-reasons"),
+        seen(503, Some(21))
+    );
+    assert_eq!(
+        disconnect_of(&account, pbx, "combined"),
+        seen(403, Some(21))
+    );
+    assert_eq!(disconnect_of(&account, pbx, "sip-only"), seen(403, None));
+    assert_eq!(
+        disconnect_of(&account, pbx, "not-failure"),
+        seen(486, Some(16))
+    );
 }

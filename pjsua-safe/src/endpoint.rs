@@ -119,14 +119,26 @@ fn record_in(log: &mut DisconnectLog, token: usize, disconnect: Disconnect) {
 /// The Q.850 cause in one `Reason` header value, e.g.
 /// `Q.850;cause=21;text="Call Rejected"` gives `21`.
 ///
-/// `None` for anything else — a different protocol (`SIP;cause=486`), a
+/// A header may list several reasons, comma separated (RFC 3326), as in
+/// `SIP;cause=403, Q.850;cause=21`; the first Q.850 one with a cause wins.
+///
+/// `None` for anything else — only other protocols (`SIP;cause=486`), a
 /// missing, non-numeric or out-of-range cause (Q.850 causes are 7 bits), or
 /// a value that does not parse. Never an error: a malformed header must not
-/// cost the call its classification. `;` and `cause=` inside a quoted
-/// `text="..."` are part of the text, not parameters.
+/// cost the call its classification. `;`, `,` and `cause=` inside a quoted
+/// `text="..."` (where `\"` is an escaped quote) are part of the text, not
+/// separators or parameters.
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
 pub(crate) fn parse_q850_cause(value: &str) -> Option<u16> {
-    let mut params = split_unquoted(value, ';').into_iter();
+    split_unquoted(value, ',')
+        .into_iter()
+        .find_map(parse_q850_reason)
+}
+
+/// The cause of one reason value (`protocol;cause=N;text="..."`), if it is
+/// a Q.850 one.
+fn parse_q850_reason(reason: &str) -> Option<u16> {
+    let mut params = split_unquoted(reason, ';').into_iter();
     if !params.next()?.trim().eq_ignore_ascii_case("Q.850") {
         return None;
     }
@@ -139,13 +151,18 @@ pub(crate) fn parse_q850_cause(value: &str) -> Option<u16> {
     })
 }
 
-/// Split on `sep`, ignoring separators inside double quotes.
+/// Split on `sep`, ignoring separators inside double quotes. Inside quotes a
+/// backslash escapes the next character, so `\"` does not end the quoted text.
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
 fn split_unquoted(value: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
-    let (mut start, mut quoted) = (0, false);
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
     for (i, ch) in value.char_indices() {
-        if ch == '"' {
+        if escaped {
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
             quoted = !quoted;
         } else if ch == sep && !quoted {
             parts.push(&value[start..i]);
@@ -1450,6 +1467,23 @@ mod disconnect_status_tests {
             // `;` and `cause=` inside the quoted text are text, not parameters.
             ("Q.850;text=\"a; cause=9\";cause=21", Some(21)),
             ("Q.850;text=\"cause=9\"", None),
+            // Several reasons in one header (RFC 3326): the Q.850 one counts
+            // wherever it sits, and a comma inside quoted text is not a split.
+            ("SIP;cause=403, Q.850;cause=21", Some(21)),
+            (
+                "SIP;cause=403;text=\"Forbidden\",Q.850;cause=17;text=\"User busy\"",
+                Some(17),
+            ),
+            ("Q.850;text=\"a, SIP;cause=1\";cause=21", Some(21)),
+            ("SIP;cause=403, SIP;cause=486", None),
+            ("Q.850;cause=abc, Q.850;cause=21", Some(21)),
+            // An escaped quote does not end the quoted text.
+            ("Q.850;text=\"said \\\"no\";cause=21", Some(21)),
+            ("Q.850;text=\"said \\\"; cause=9\";cause=21", Some(21)),
+            (
+                "Q.850;text=\"ends with a backslash \\\\\";cause=17",
+                Some(17),
+            ),
             ("Q.850;cause=0", Some(0)),
             ("Q.850;cause=127", Some(127)),
             ("Q.850;cause=128", None),
