@@ -25,7 +25,9 @@ pub mod imsi;
 pub mod plmn;
 pub mod usim_bridge;
 
-use crate::config::{AppConfig, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig};
+use crate::config::{
+    AppConfig, RejectStatuses, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig,
+};
 use crate::control::protocol::{
     AgentKind, AgentState, ObservedEvent, OutboundAttemptOutcome, SmsOutcome,
 };
@@ -38,7 +40,7 @@ use crate::sms::discord::DiscordClient;
 use crate::store::{StoreCommand, StoreHandle};
 use control::{read_msg, write_msg, CallRecord, ControlMessage};
 use pjsua_safe::{
-    Account, AccountConfig, Call, CallState, Endpoint, EndpointConfig, TransportType,
+    Account, AccountConfig, Call, CallState, Disconnect, Endpoint, EndpointConfig, TransportType,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
@@ -1695,7 +1697,7 @@ fn handle_connection(
             // ringback to the caller) until we tell it a human actually picked
             // up — answering the carrier the moment the INVITE went out would
             // replace the caller's ringback with dead air.
-            match wait_for_pbx_answer(&pbx_call, &ctrl_rx) {
+            match wait_for_pbx_answer(&pbx_call, &ctrl_rx, &config.sip.reject_statuses) {
                 PbxOutcome::Answered => {
                     tracing::info!(call_id = %call_id, "PBX extension answered");
                     reporter.report(
@@ -1714,13 +1716,7 @@ fn handle_connection(
                 }
                 outcome => {
                     let reason = outcome.reason();
-                    // The telephone side's own status, when it gave one, so
-                    // `vowifi-status` shows *why* — `declined:pbx_failed:404`
-                    // reads very differently from `declined:pbx_rejected:603`.
-                    let summary = match outcome.status() {
-                        Some(status) => format!("declined:{reason}:{status}"),
-                        None => format!("declined:{reason}"),
-                    };
+                    let summary = outcome.record();
                     tracing::info!(call_id = %call_id, reason, "PBX leg never answered; declining");
                     reporter.report(
                         AgentState::default(),
@@ -1903,8 +1899,11 @@ const PBX_RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 enum PbxOutcome {
     /// A human picked up.
     Answered,
-    /// The telephone side declined: it answered `486`, `600` or `603`.
-    Rejected { status: u16 },
+    /// The telephone side declined: a Q.850 reject cause on its failure
+    /// response (spec 099), or a status in the reject set (`486`, `600`,
+    /// `603` and `[sip].reject_statuses`). `q850` is the cause when the
+    /// response carried one, whether or not it decided the outcome.
+    Rejected { status: u16, q850: Option<u16> },
     /// Nobody picked up — our own ring timeout (`status: None`), or the
     /// telephone side giving up on its own no-answer timer (`480`/`408`).
     NoAnswer { status: Option<u16> },
@@ -1928,17 +1927,42 @@ impl PbxOutcome {
         }
     }
 
+    /// The call record's outcome: `declined:<reason>[:<status>[:q850=<n>]]`.
+    /// `vowifi-status` shows *why* — `declined:pbx_failed:404` reads very
+    /// differently from `declined:pbx_rejected:603`, and a reject the PBX
+    /// signalled as `403` says so (`declined:pbx_rejected:403:q850=21`).
+    fn record(&self) -> String {
+        let reason = self.reason();
+        match (self.status(), self.q850()) {
+            (Some(status), Some(cause)) => format!("declined:{reason}:{status}:q850={cause}"),
+            (Some(status), None) => format!("declined:{reason}:{status}"),
+            (None, _) => format!("declined:{reason}"),
+        }
+    }
+
+    /// The Q.850 cause that came with a reject, when there was one.
+    fn q850(&self) -> Option<u16> {
+        match self {
+            PbxOutcome::Rejected { q850, .. } => *q850,
+            _ => None,
+        }
+    }
+
     /// The telephone side's final status, when it gave one.
     fn status(&self) -> Option<u16> {
         match self {
-            PbxOutcome::Rejected { status } => Some(*status),
+            PbxOutcome::Rejected { status, .. } => Some(*status),
             PbxOutcome::NoAnswer { status } | PbxOutcome::Failed { status } => *status,
             PbxOutcome::Answered | PbxOutcome::CallerGone => None,
         }
     }
 }
 
-/// Why the PBX leg ended before answer, from its final SIP status.
+/// Q.850 causes that mean the called party refused the call: 21 "call
+/// rejected" and 17 "user busy".
+const Q850_REJECT_CAUSES: [u16; 2] = [21, 17];
+
+/// Why the PBX leg ended before answer, from how it ended.
 ///
 /// Agent A answers the carrier `486 Busy Here` only for `Rejected` and `480`
 /// otherwise. That split is the whole of issue #108: T2 treats `480` as
@@ -1947,9 +1971,22 @@ impl PbxOutcome {
 /// while `486` is what §13.3.1.3 says a UAS that won't take the call SHOULD
 /// send. The opposite mistake matters as much: a broken PBX reported as
 /// `486` would send callers to busy treatment (often voicemail) for a fault.
-fn classify_pbx_disconnect(status: Option<u16>) -> PbxOutcome {
-    match status {
-        Some(code @ (486 | 600 | 603)) => PbxOutcome::Rejected { status: code },
+///
+/// A PBX may turn the phone's `603` into any status — FreePBX answers `403`
+/// or `503` — but says why in `Reason: Q.850;cause=21`. That cause is the
+/// PBX's own statement of what happened, so it wins over the status code
+/// (spec 099). Only a failure response's cause counts; without one the
+/// status is looked up in the reject set.
+fn classify_pbx_disconnect(disconnect: &Disconnect, rejects: &RejectStatuses) -> PbxOutcome {
+    let q850 = disconnect.q850;
+    match disconnect.status {
+        Some(status)
+            if (400..=699).contains(&status)
+                && q850.is_some_and(|cause| Q850_REJECT_CAUSES.contains(&cause)) =>
+        {
+            PbxOutcome::Rejected { status, q850 }
+        }
+        Some(status) if rejects.contains(status) => PbxOutcome::Rejected { status, q850 },
         Some(code @ (480 | 408)) => PbxOutcome::NoAnswer { status: Some(code) },
         other => PbxOutcome::Failed { status: other },
     }
@@ -1957,12 +1994,35 @@ fn classify_pbx_disconnect(status: Option<u16>) -> PbxOutcome {
 
 /// Ring the PBX extension until someone answers, the PBX gives up on us, the
 /// caller hangs up, or `PBX_RING_TIMEOUT` elapses.
-fn wait_for_pbx_answer(pbx_call: &Call, ctrl_rx: &mpsc::Receiver<ControlMessage>) -> PbxOutcome {
+fn wait_for_pbx_answer(
+    pbx_call: &Call,
+    ctrl_rx: &mpsc::Receiver<ControlMessage>,
+    rejects: &RejectStatuses,
+) -> PbxOutcome {
     let deadline = Instant::now() + PBX_RING_TIMEOUT;
     while Instant::now() < deadline {
         match pbx_call.poll_state() {
             CallState::Confirmed => return PbxOutcome::Answered,
-            CallState::Disconnected => return classify_pbx_disconnect(pbx_call.last_status()),
+            CallState::Disconnected => {
+                let disconnect = pbx_call.last_disconnect().unwrap_or_default();
+                let outcome = classify_pbx_disconnect(&disconnect, rejects);
+                // Why a call became (or did not become) a reject, without a
+                // packet capture: the PBX's status and cause, and whether
+                // there was a response to read a cause from at all.
+                tracing::info!(
+                    status = ?disconnect.status,
+                    q850 = ?disconnect.q850,
+                    response_available = disconnect.response_seen,
+                    outcome = outcome.reason(),
+                    "PBX leg ended before answer{}",
+                    if disconnect.response_seen {
+                        ""
+                    } else {
+                        " (no response available: classified by status alone)"
+                    },
+                );
+                return outcome;
+            }
             // Calling/Early — still ringing.
             _ => {}
         }
@@ -2632,49 +2692,223 @@ mod tests {
     }
     use std::io::Write;
 
+    fn ended(status: Option<u16>, q850: Option<u16>) -> Disconnect {
+        Disconnect {
+            status,
+            q850,
+            response_seen: status.is_some(),
+        }
+    }
+
     /// specs/084 FR-001: the telephone side's final status, not merely the
     /// leg having ended, decides declined / no answer / failed — and only a
     /// genuine decline may ever become `pbx_rejected` (Agent A's `486`).
     #[test]
     fn classify_pbx_disconnect_maps_every_status() {
+        let rejects = RejectStatuses::defaults();
         for code in [486, 600, 603] {
-            let outcome = classify_pbx_disconnect(Some(code));
-            assert_eq!(outcome, PbxOutcome::Rejected { status: code });
+            let outcome = classify_pbx_disconnect(&ended(Some(code), None), &rejects);
+            assert_eq!(
+                outcome,
+                PbxOutcome::Rejected {
+                    status: code,
+                    q850: None
+                }
+            );
             assert_eq!(outcome.reason(), control::reason::PBX_REJECTED);
             assert_eq!(outcome.status(), Some(code));
         }
         for code in [480, 408] {
-            let outcome = classify_pbx_disconnect(Some(code));
+            let outcome = classify_pbx_disconnect(&ended(Some(code), None), &rejects);
             assert_eq!(outcome, PbxOutcome::NoAnswer { status: Some(code) });
             assert_eq!(outcome.reason(), control::reason::PBX_NO_ANSWER);
         }
-        for status in [Some(404), Some(401), Some(488), Some(500), Some(503), None] {
-            let outcome = classify_pbx_disconnect(status);
+        for status in [
+            Some(403),
+            Some(404),
+            Some(401),
+            Some(488),
+            Some(500),
+            Some(503),
+            None,
+        ] {
+            let outcome = classify_pbx_disconnect(&ended(status, None), &rejects);
             assert_eq!(outcome, PbxOutcome::Failed { status });
             assert_eq!(outcome.reason(), control::reason::PBX_FAILED);
             assert_eq!(outcome.status(), status);
         }
     }
 
+    /// Spec 099 FR-001/FR-003: Q.850 cause 21 (call rejected) or 17 (user
+    /// busy) on a failure response is a reject whatever the status, and
+    /// beats a status that would otherwise be a failure or a no-answer.
+    #[test]
+    fn a_q850_reject_cause_beats_the_status_code() {
+        let rejects = RejectStatuses::defaults();
+        for cause in [21, 17] {
+            for status in [403, 408, 480, 487, 500, 503, 603, 486] {
+                assert_eq!(
+                    classify_pbx_disconnect(&ended(Some(status), Some(cause)), &rejects),
+                    PbxOutcome::Rejected {
+                        status,
+                        q850: Some(cause)
+                    },
+                    "status {status} cause {cause}"
+                );
+            }
+        }
+    }
+
+    /// Other causes say nothing about a reject, and a cause is only ever
+    /// read from a failure response: the status classifies as before.
+    #[test]
+    fn other_causes_and_non_failure_statuses_do_not_make_a_reject() {
+        let rejects = RejectStatuses::defaults();
+        // 16 normal clearing, 19 no answer, 34 no circuit.
+        for cause in [16, 19, 34, 0] {
+            assert_eq!(
+                classify_pbx_disconnect(&ended(Some(503), Some(cause)), &rejects),
+                PbxOutcome::Failed { status: Some(503) },
+                "cause {cause}"
+            );
+        }
+        assert_eq!(
+            classify_pbx_disconnect(&ended(Some(480), Some(19)), &rejects),
+            PbxOutcome::NoAnswer { status: Some(480) }
+        );
+        // A reject cause with no status, or on a non-failure status, is ignored.
+        assert_eq!(
+            classify_pbx_disconnect(&ended(None, Some(21)), &rejects),
+            PbxOutcome::Failed { status: None }
+        );
+        assert_eq!(
+            classify_pbx_disconnect(&ended(Some(200), Some(21)), &rejects),
+            PbxOutcome::Failed { status: Some(200) }
+        );
+    }
+
+    /// Spec 099 US2/US3: 403 is a failure unless the operator lists it (it
+    /// can mean the bridge is not authorised on the PBX); a listed status is
+    /// a reject; with a reject cause 403 is a reject either way.
+    #[test]
+    fn a_bare_403_is_a_reject_only_when_the_operator_lists_it() {
+        let defaults = RejectStatuses::defaults();
+        let listed = RejectStatuses::with_extra([403, 410]);
+        let bare_403 = ended(Some(403), None);
+        assert_eq!(
+            classify_pbx_disconnect(&bare_403, &defaults),
+            PbxOutcome::Failed { status: Some(403) }
+        );
+        assert_eq!(
+            classify_pbx_disconnect(&bare_403, &listed),
+            PbxOutcome::Rejected {
+                status: 403,
+                q850: None
+            }
+        );
+        assert_eq!(
+            classify_pbx_disconnect(&ended(Some(410), None), &listed),
+            PbxOutcome::Rejected {
+                status: 410,
+                q850: None
+            }
+        );
+        assert_eq!(
+            classify_pbx_disconnect(&ended(Some(410), None), &defaults),
+            PbxOutcome::Failed { status: Some(410) }
+        );
+        assert_eq!(
+            classify_pbx_disconnect(&ended(Some(403), Some(21)), &defaults),
+            PbxOutcome::Rejected {
+                status: 403,
+                q850: Some(21)
+            }
+        );
+    }
+
+    /// Spec 099 FR-010: the record keeps its form and gains `:q850=<n>`
+    /// whenever a reject carried a cause; a bare decline is unchanged.
+    #[test]
+    fn the_call_record_carries_the_cause_only_on_a_reject_that_had_one() {
+        let rejected = |status, q850| PbxOutcome::Rejected { status, q850 };
+        assert_eq!(
+            rejected(403, Some(21)).record(),
+            "declined:pbx_rejected:403:q850=21"
+        );
+        assert_eq!(
+            rejected(486, Some(17)).record(),
+            "declined:pbx_rejected:486:q850=17"
+        );
+        assert_eq!(rejected(603, None).record(), "declined:pbx_rejected:603");
+        assert_eq!(
+            PbxOutcome::Failed { status: Some(404) }.record(),
+            "declined:pbx_failed:404"
+        );
+        assert_eq!(
+            PbxOutcome::Failed { status: None }.record(),
+            "declined:pbx_failed"
+        );
+        assert_eq!(
+            PbxOutcome::NoAnswer { status: None }.record(),
+            "declined:pbx_no_answer"
+        );
+    }
+
     /// The ring loop classifies from the leg's real final status — a `603`
     /// is a decline, and a leg that ended with no status at all is a failure
     /// rather than the "rejected" every disconnect used to be (issue #108).
+    /// A reject cause on the response decides it whatever the status (spec
+    /// 099).
     #[cfg(not(feature = "pjsip-linked"))]
     #[test]
     fn wait_for_pbx_answer_classifies_a_disconnect_by_its_final_status() {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+        let rejects = RejectStatuses::defaults();
 
         let mut declined = Call::from_id(1, CallState::Disconnected);
         declined.set_last_status(Some(603));
         assert_eq!(
-            wait_for_pbx_answer(&declined, &ctrl_rx),
-            PbxOutcome::Rejected { status: 603 }
+            wait_for_pbx_answer(&declined, &ctrl_rx, &rejects),
+            PbxOutcome::Rejected {
+                status: 603,
+                q850: None
+            }
         );
 
         let vanished = Call::from_id(2, CallState::Disconnected);
         assert_eq!(
-            wait_for_pbx_answer(&vanished, &ctrl_rx),
+            wait_for_pbx_answer(&vanished, &ctrl_rx, &rejects),
             PbxOutcome::Failed { status: None }
+        );
+
+        // The FreePBX case from PR #110: 403 carrying Q.850 cause 21.
+        let mut freepbx = Call::from_id(3, CallState::Disconnected);
+        freepbx.set_last_disconnect(Disconnect {
+            status: Some(403),
+            q850: Some(21),
+            response_seen: true,
+        });
+        assert_eq!(
+            wait_for_pbx_answer(&freepbx, &ctrl_rx, &rejects),
+            PbxOutcome::Rejected {
+                status: 403,
+                q850: Some(21)
+            }
+        );
+
+        // The same 403 with no cause is a failure until the operator lists it.
+        let mut bare = Call::from_id(4, CallState::Disconnected);
+        bare.set_last_status(Some(403));
+        assert_eq!(
+            wait_for_pbx_answer(&bare, &ctrl_rx, &rejects),
+            PbxOutcome::Failed { status: Some(403) }
+        );
+        assert_eq!(
+            wait_for_pbx_answer(&bare, &ctrl_rx, &RejectStatuses::with_extra([403])),
+            PbxOutcome::Rejected {
+                status: 403,
+                q850: None
+            }
         );
     }
 

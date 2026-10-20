@@ -1,5 +1,12 @@
 # Release Notes
 
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **A PBX reject is recognised by its reason, not only its status** -- The v8.20.0 fix answered the carrier `486 Busy Here` only when the phone side ended with `486`, `600` or `603`. FreePBX turns a rejected extension into `403` or `503` instead, so the carrier still got `480`, read it as "try again", and rang the phone a second time. The bridge now reads the `Reason: Q.850;cause=N` header on the PBX's final failure response: cause 21 (call rejected) or 17 (user busy) is a reject whatever the status, and the carrier gets `486`. Without that header nothing changes. New optional `[sip].reject_statuses` lists extra statuses (400-699) to treat as a reject for a PBX that rejects with a bare status, for example `reject_statuses = [403]`; it adds to `486`, `600` and `603` and cannot remove them. `403` is deliberately not a default, because it can also mean the bridge is not authorised on the PBX. Call history appends the cause, e.g. `declined:pbx_rejected:403:q850=21`, and the log line `PBX leg ended before answer` shows the status, the cause and whether a response was available. Reported by @mironovlab (#110).
+
 ## v8.21.0
 
 - **A failing tunnel rekey is repaired before it drops the line** -- When a carrier's ePDG kept refusing a VoWiFi line's hourly CHILD_SA rekey, the bridge did nothing until the old CHILD_SA expired about 11 minutes later, at a moment nobody chose and possibly mid-call, and then needed another minute to notice and rebuild. Now a CHILD_SA still in place with under 5 minutes of its lifetime left is treated as a failed rekey and the tunnel is rebuilt then, while the old one still works: a few seconds without service instead of a minute or more. A call in progress is left alone until it ends or 90 seconds remain. The log shows `rekey overdue` with the carrier's last refusal (for example `N(INVAL_SEL)`) and the recovery `ChildSaRekeyStuck`, which counts toward `[alerts.tunnel_failure]` like other rebuilds. A healthy rekey never triggers it. Strongswan engine only; no configuration change (#127).

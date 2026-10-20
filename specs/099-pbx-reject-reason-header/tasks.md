@@ -24,12 +24,12 @@ Before EVERY commit: `make format && make lint && make test` (CLAUDE.md). One co
 **Goal**: cause 21 or 17 on a failure final response is a reject, 486 to the carrier.
 **Independent test**: stub `Disconnect { status: 403, q850: 21 }` and `{ 503, 21 }` -> `Rejected`; `{ 503, None }` -> `Failed`.
 
-- [ ] T007 [US1] Change `PbxOutcome::Rejected` to `{ status: u16, q850: Option<u16> }` in `gsm-sip-bridge/src/vowifi/mod.rs` and add a `q850()` accessor; update `reason()`/`status()` and every match.
-- [ ] T008 [US1] Change `classify_pbx_disconnect` to take `&Disconnect` and apply contracts/decline-signaling.md rows 1, 3, 4 (cause 21/17 on a 400..=699 status first; 480/408 -> NoAnswer; else Failed). Keep the existing 486/600/603 rule working until T011 introduces the reject set.
-- [ ] T009 [US1] Update `wait_for_pbx_answer` to read `pbx_call.last_disconnect()` and pass it to the classifier (`gsm-sip-bridge/src/vowifi/mod.rs`, `CallState::Disconnected` arm).
-- [ ] T010 [US1] Append `:q850=<cause>` to the record string at the `format!("declined:{reason}:{status}")` site (`gsm-sip-bridge/src/vowifi/mod.rs`, near line 1721) for `pbx_rejected` whenever a cause was present (FR-010). A bare 603 stays `declined:pbx_rejected:603`.
-- [ ] T011 [US1] Tests in `gsm-sip-bridge/src/vowifi/mod.rs`, extending `classify_pbx_disconnect_maps_every_status` into a table over (status, cause): `403+21`, `503+21`, `408+21`, `480+21`, `486+None`, `603+None`, `503+None`, `403+None` (-> Failed until US2/US3), cause 19 on 503 -> Failed, cause 21 with no status -> Failed, cause 17 on 486 -> Rejected carrying `q850 = Some(17)`. Add a `wait_for_pbx_answer` stub test (`#[cfg(not(feature = "pjsip-linked"))]`) for `403+21` -> `Rejected` and a record-string test for the `:q850=21` suffix.
-- [ ] T012 [US1] When the outcome is not `Rejected`, add `q850` and `response_available` fields to the existing "PBX leg ended" log line, and log explicitly when no response was available (FR-011, FR-011a). Find the line via `grep -n "PBX" gsm-sip-bridge/src/vowifi/mod.rs` near the `wait_for_pbx_answer` call (~line 1698).
+- [X] T007 [US1] Change `PbxOutcome::Rejected` to `{ status: u16, q850: Option<u16> }` in `gsm-sip-bridge/src/vowifi/mod.rs` and add a `q850()` accessor; update `reason()`/`status()` and every match.
+- [X] T008 [US1] Change `classify_pbx_disconnect` to take `&Disconnect` and apply contracts/decline-signaling.md rows 1, 3, 4 (cause 21/17 on a 400..=699 status first; 480/408 -> NoAnswer; else Failed). Keep the existing 486/600/603 rule working until T011 introduces the reject set.
+- [X] T009 [US1] Update `wait_for_pbx_answer` to read `pbx_call.last_disconnect()` and pass it to the classifier (`gsm-sip-bridge/src/vowifi/mod.rs`, `CallState::Disconnected` arm).
+- [X] T010 [US1] Append `:q850=<cause>` to the record string at the `format!("declined:{reason}:{status}")` site (`gsm-sip-bridge/src/vowifi/mod.rs`, near line 1721) for `pbx_rejected` whenever a cause was present (FR-010). A bare 603 stays `declined:pbx_rejected:603`.
+- [X] T011 [US1] Tests in `gsm-sip-bridge/src/vowifi/mod.rs`, extending `classify_pbx_disconnect_maps_every_status` into a table over (status, cause): `403+21`, `503+21`, `408+21`, `480+21`, `486+None`, `603+None`, `503+None`, `403+None` (-> Failed until US2/US3), cause 19 on 503 -> Failed, cause 21 with no status -> Failed, cause 17 on 486 -> Rejected carrying `q850 = Some(17)`. Add a `wait_for_pbx_answer` stub test (`#[cfg(not(feature = "pjsip-linked"))]`) for `403+21` -> `Rejected` and a record-string test for the `:q850=21` suffix.
+- [X] T012 [US1] When the outcome is not `Rejected`, add `q850` and `response_available` fields to the existing "PBX leg ended" log line, and log explicitly when no response was available (FR-011, FR-011a). Find the line via `grep -n "PBX" gsm-sip-bridge/src/vowifi/mod.rs` near the `wait_for_pbx_answer` call (~line 1698).
 
 **Checkpoint**: `make format && make lint && make test`. Commit: `feat(vowifi): a Q.850 reject cause makes the PBX leg a reject (#99)`.
 
@@ -38,9 +38,9 @@ Before EVERY commit: `make format && make lint && make test` (CLAUDE.md). One co
 **Goal**: 403 is not a default; the reject set is `{486, 600, 603}` plus configuration, held in one place.
 **Independent test**: `403`, no cause, empty extras -> `Failed`; with extras `{403}` -> `Rejected`.
 
-- [ ] T013 [US2] Add `RejectStatuses` in `gsm-sip-bridge/src/config/mod.rs`: a newtype with `defaults()` (`486, 600, 603` only; a comment explains why 403 is not included), `with_extra(&[u16])`, and `contains(u16)`. Unit tests: defaults exclude 403, extras are added, defaults cannot be removed.
-- [ ] T014 [US2] Make `classify_pbx_disconnect` take `&RejectStatuses` and apply contracts/decline-signaling.md row 2 in place of the hard-coded `486 | 600 | 603`; thread the parameter through `wait_for_pbx_answer` and its callers and tests in `gsm-sip-bridge/src/vowifi/mod.rs`. Use `RejectStatuses::defaults()` at call sites until T016 supplies config.
-- [ ] T015 [US2] Tests in `gsm-sip-bridge/src/vowifi/mod.rs`: `403` with no cause -> `Failed` (record `declined:pbx_failed:403`); same with extras `{403}` -> `Rejected` (record `declined:pbx_rejected:403`); `403+21` -> `Rejected` in both.
+- [X] T013 [US2] Add `RejectStatuses` in `gsm-sip-bridge/src/config/mod.rs`: a newtype with `defaults()` (`486, 600, 603` only; a comment explains why 403 is not included), `with_extra(&[u16])`, and `contains(u16)`. Unit tests: defaults exclude 403, extras are added, defaults cannot be removed.
+- [X] T014 [US2] Make `classify_pbx_disconnect` take `&RejectStatuses` and apply contracts/decline-signaling.md row 2 in place of the hard-coded `486 | 600 | 603`; thread the parameter through `wait_for_pbx_answer` and its callers and tests in `gsm-sip-bridge/src/vowifi/mod.rs`. Use `RejectStatuses::defaults()` at call sites until T016 supplies config.
+- [X] T015 [US2] Tests in `gsm-sip-bridge/src/vowifi/mod.rs`: `403` with no cause -> `Failed` (record `declined:pbx_failed:403`); same with extras `{403}` -> `Rejected` (record `declined:pbx_rejected:403`); `403+21` -> `Rejected` in both.
 
 **Checkpoint**: green. Commit: `feat(vowifi): hold the PBX reject statuses in one set, 403 not included (#99)`.
 
@@ -49,16 +49,16 @@ Before EVERY commit: `make format && make lint && make test` (CLAUDE.md). One co
 **Goal**: `[sip].reject_statuses = [..]` extends the set from the next start.
 **Independent test**: config with `reject_statuses = [410]`; `410` with no cause -> `486` path.
 
-- [ ] T016 [US3] Add `reject_statuses: Option<Vec<u16>>` to `RawSip` and its `Default` in `gsm-sip-bridge/src/config/raw.rs`, and `reject_statuses: RejectStatuses` to `SipConfig` in `gsm-sip-bridge/src/config/mod.rs`.
-- [ ] T017 [US3] In `gsm-sip-bridge/src/config/build.rs` (beside `parse_phone_codecs`), validate every value is in 400..=699 and error as `[sip].reject_statuses: <value> is not a failure status (expected 400-699)`; build the `RejectStatuses`. Unit tests: valid list, `[200]`, `[700]`, empty list, duplicates tolerated, defaults still present with `[]`. Note: strict parsing means a wrong type (a string, not a list) must already fail; add a test.
-- [ ] T018 [US3] Use `config.sip.reject_statuses` where agent B starts (the same `config.sip` used at `gsm-sip-bridge/src/vowifi/mod.rs:308`) and pass it down to `wait_for_pbx_answer` instead of `defaults()`.
-- [ ] T019 [P] [US3] Document in `docs/configuration.md`: a row for `reject_statuses` in the `[sip]` table (type, default, VoWiFi/VoLTE only, global, adds to 486/600/603, Q.850 cause 21/17 already counts) and a commented FreePBX example `# reject_statuses = [403]` in the production example, with a sentence on why 403 is not a default. Also update `docs/migrating-config-to-strict-parsing.md` only if it lists `[sip]` keys.
+- [X] T016 [US3] Add `reject_statuses: Option<Vec<u16>>` to `RawSip` and its `Default` in `gsm-sip-bridge/src/config/raw.rs`, and `reject_statuses: RejectStatuses` to `SipConfig` in `gsm-sip-bridge/src/config/mod.rs`.
+- [X] T017 [US3] In `gsm-sip-bridge/src/config/build.rs` (beside `parse_phone_codecs`), validate every value is in 400..=699 and error as `[sip].reject_statuses: <value> is not a failure status (expected 400-699)`; build the `RejectStatuses`. Unit tests: valid list, `[200]`, `[700]`, empty list, duplicates tolerated, defaults still present with `[]`. Note: strict parsing means a wrong type (a string, not a list) must already fail; add a test.
+- [X] T018 [US3] Use `config.sip.reject_statuses` where agent B starts (the same `config.sip` used at `gsm-sip-bridge/src/vowifi/mod.rs:308`) and pass it down to `wait_for_pbx_answer` instead of `defaults()`.
+- [X] T019 [P] [US3] Document in `docs/configuration.md`: a row for `reject_statuses` in the `[sip]` table (type, default, VoWiFi/VoLTE only, global, adds to 486/600/603, Q.850 cause 21/17 already counts) and a commented FreePBX example `# reject_statuses = [403]` in the production example, with a sentence on why 403 is not a default. Also update `docs/migrating-config-to-strict-parsing.md` only if it lists `[sip]` keys.
 
 **Checkpoint**: green. Commit: `feat(config): [sip].reject_statuses extends the PBX reject set (#99)`.
 
 ## Phase 6: Polish and verification
 
-- [ ] T020 [P] Add an `## Unreleased` bullet to `RELEASE_NOTES.md` (bold only the feature name; plain description after it), per the repo's release-notes rule. Mention `reject_statuses` and that a FreePBX reject is now recognised via Q.850.
+- [X] T020 [P] Add an `## Unreleased` bullet to `RELEASE_NOTES.md` (bold only the feature name; plain description after it), per the repo's release-notes rule. Mention `reject_statuses` and that a FreePBX reject is now recognised via Q.850.
 - [ ] T021 Live verification per `quickstart.md` step 2 using `siptest` in the privileged container: `403+cause21` -> 486; `503+cause21` -> 486; `503` -> 480; `403` -> 480; `403` with `reject_statuses = [403]` -> 486. Confirm the record `declined:pbx_rejected:403:q850=21` in `vowifi-status` and no second INVITE within 60 s. Write the outcome in `specs/099-pbx-reject-reason-header/live-verification.md` (synthetic numbers only; no real MSISDNs).
 - [ ] T022 Run the full pre-commit checklist (`make format && make lint && make test`). For any Greptile bot finding on the PR, fix the code and do not post a reply.
 
