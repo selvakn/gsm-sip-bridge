@@ -152,10 +152,14 @@ pub enum DeadPeerVerdict {
     /// No snapshot, or one that cannot place the last inbound packet on either
     /// side of the window.
     Unknown,
+    /// The loss was seen while the line was held for an uplink outage
+    /// (specs/100 FR-022): the peer's silence is explained by the path, so it
+    /// is never `real`.
+    Uplink,
 }
 
 impl DeadPeerVerdict {
-    pub const ALL: [Self; 3] = [Self::False, Self::Real, Self::Unknown];
+    pub const ALL: [Self; 4] = [Self::False, Self::Real, Self::Unknown, Self::Uplink];
 
     /// The wire and metric label.
     pub fn as_str(self) -> &'static str {
@@ -163,6 +167,79 @@ impl DeadPeerVerdict {
             Self::False => "false",
             Self::Real => "real",
             Self::Unknown => "unknown",
+            Self::Uplink => "uplink",
+        }
+    }
+}
+
+/// What the underlay guard believes about the path to a line's ePDG
+/// (specs/100). Closed: it is a wire value and a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkState {
+    Up,
+    /// The host has no usable route (or source address) to the ePDG.
+    NoRoute,
+    /// The route is fine, but the ePDG has stopped answering.
+    NoResponse,
+}
+
+impl UplinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::NoRoute => "no_route",
+            Self::NoResponse => "no_response",
+        }
+    }
+}
+
+/// Why a line is held (specs/100): the two non-`up` [`UplinkState`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkHoldCause {
+    NoRoute,
+    NoResponse,
+}
+
+impl UplinkHoldCause {
+    pub const ALL: [Self; 2] = [Self::NoRoute, Self::NoResponse];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::NoResponse => "no_response",
+        }
+    }
+}
+
+impl From<UplinkHoldCause> for UplinkState {
+    fn from(cause: UplinkHoldCause) -> Self {
+        match cause {
+            UplinkHoldCause::NoRoute => Self::NoRoute,
+            UplinkHoldCause::NoResponse => Self::NoResponse,
+        }
+    }
+}
+
+/// What ended a hold (specs/100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldEndedBy {
+    /// The path came back.
+    Restored,
+    /// The 15-minute bound was reached.
+    MaxHold,
+    /// The supervisor was shutting down.
+    Shutdown,
+}
+
+impl HoldEndedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restored => "restored",
+            Self::MaxHold => "max_hold",
+            Self::Shutdown => "shutdown",
         }
     }
 }
@@ -688,6 +765,38 @@ mod tests {
                 format!("\"{}\"", v.as_str())
             );
         }
+    }
+
+    #[test]
+    fn uplink_states_causes_and_end_reasons_serialize_under_their_labels() {
+        for state in [
+            UplinkState::Up,
+            UplinkState::NoRoute,
+            UplinkState::NoResponse,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+        }
+        for cause in UplinkHoldCause::ALL {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{}\"", cause.as_str())
+            );
+            assert_eq!(UplinkState::from(cause).as_str(), cause.as_str());
+        }
+        for ended in [
+            HoldEndedBy::Restored,
+            HoldEndedBy::MaxHold,
+            HoldEndedBy::Shutdown,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&ended).unwrap(),
+                format!("\"{}\"", ended.as_str())
+            );
+        }
+        assert_eq!(DeadPeerVerdict::Uplink.as_str(), "uplink");
     }
 
     #[test]

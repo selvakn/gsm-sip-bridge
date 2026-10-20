@@ -19,6 +19,7 @@
 //! | Teardown ordering (the old `cleanup()` trap) | [`shutdown`] |
 //! | strongSwan/vpcd config asset rendering | [`render`] |
 //! | Per-line tunnel state machine and recovery | [`line_supervisor`] |
+//! | Uplink verdict and hold bookkeeping (specs/100) | [`underlay`] |
 //! | SIM power-cycle recovery | [`sim_recovery`] |
 //! | The circuit-switched daemon's respawn loop | [`daemon_supervisor`] |
 //!
@@ -36,4 +37,5 @@ pub mod render;
 pub mod runner;
 pub mod shutdown;
 pub mod sim_recovery;
+pub mod underlay;
 pub mod vpcd;

@@ -1875,6 +1875,10 @@ fn start_vowifi_line_strongswan(
     // The IKE_SA session already warned about for an INVALID_SELECTORS rekey
     // rejection, so the hint appears once per tunnel session (specs/092).
     let mut warned_inval_sel: Option<String> = None;
+    // What the guard believes about the path to the ePDG, and the hold it can
+    // put this line in (specs/100).
+    let underlay_enabled = true;
+    let mut underlay = super::underlay::UnderlayTracker::new(engine.log_mark(runner.as_ref()));
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1892,18 +1896,49 @@ fn start_vowifi_line_strongswan(
         // to snapshot StartedState until this whole section releases it.
         let guard = shutting_down.read().unwrap();
         if *guard {
+            if let Some(end) = underlay.end_for_shutdown(std::time::Instant::now()) {
+                println!("{}", hold_ended_line(idx, &end));
+            }
             return;
         }
         // Taken before the tick: a recovery inside it renegotiates, and only a
         // negotiation logged after this point can carry the new P-CSCF.
         let mark = engine.log_mark(runner.as_ref());
+        let tick_started = std::time::Instant::now();
+        let tick_started_at = SystemTime::now();
+        let underlay_view = if underlay_enabled {
+            let observation = observe_underlay(&engine, runner.as_ref(), &underlay, mark);
+            let begin = underlay.begin_tick(&observation, tick_started, tick_started_at);
+            if let Some(end) = &begin.ended {
+                println!("{}", hold_ended_line(idx, end));
+                // Marks the agent set while the path was down describe the
+                // outage, not the tunnel (FR-011), and the one initiation a
+                // hold allows has done its job (FR-010a).
+                tracking.negotiated_at = Some(tick_started_at);
+                tracking.held_initiate_sent = false;
+            }
+            if let Some(start) = begin.started {
+                println!(
+                    "{}",
+                    hold_started_line(
+                        idx,
+                        start.cause,
+                        engine.epdg_addr(),
+                        observation.evidence.unanswered_retransmits
+                    )
+                );
+            }
+            begin.view
+        } else {
+            line_supervisor::UnderlayView::disabled()
+        };
         // Closed before the tick, not after it: a teardown inside the tick can
         // take many seconds, and an agent that exits meanwhile must not be
         // respawned against the old P-CSCF (specs/087 R5). Released below
         // unless this tick turns out to renegotiate.
         rebuild_gate.close();
         let via_sibling_before = tracking.pcscf_via_sibling;
-        let outcome = line_supervisor::tick_steady_state_with_pool(
+        let outcome = line_supervisor::tick_steady_state_underlay(
             &engine,
             runner.as_ref(),
             &current_pcscf,
@@ -1912,7 +1947,16 @@ fn start_vowifi_line_strongswan(
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
             &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
             &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
+            &underlay_view,
         );
+        if underlay_enabled {
+            if let Some(start) = underlay.end_tick(&outcome, mark, tick_started, tick_started_at) {
+                println!(
+                    "{}",
+                    hold_started_line(idx, start.cause, engine.epdg_addr(), 0)
+                );
+            }
+        }
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         let renegotiated = matches!(
             outcome,
@@ -1966,6 +2010,28 @@ fn start_vowifi_line_strongswan(
             // said so (specs/100). Nothing was issued, so the rebuild gate is
             // already open and the signal reported above.
             line_supervisor::SteadyOutcome::WaitingForNegotiation => drop(guard),
+            // The tick queued a liveness check and said so (specs/100); the
+            // recovery it is for waits for the answer.
+            line_supervisor::SteadyOutcome::Deferred { .. } => drop(guard),
+            line_supervisor::SteadyOutcome::Held {
+                cause,
+                skipped,
+                initiated,
+                ..
+            } => {
+                drop(guard);
+                if initiated {
+                    println!(
+                        "[supervise] line {idx}: uplink down ({}); no IKE_SA, so one initiation was issued and charon's retries carry it",
+                        cause.as_str()
+                    );
+                } else {
+                    println!(
+                        "[supervise] line {idx}: uplink down ({}); holding {skipped:?}",
+                        cause.as_str()
+                    );
+                }
+            }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
@@ -2133,6 +2199,73 @@ fn start_vowifi_line_strongswan(
             }
         }
     }
+}
+
+/// Reads what the underlay tracker needs to judge the path to the ePDG this
+/// tick (specs/100): the route, the ePDG's side of the IKE traffic, and the
+/// tunnel's received-packet counter as the previous tick left it.
+fn observe_underlay(
+    engine: &StrongswanEngine,
+    runner: &dyn CommandRunner,
+    tracker: &super::underlay::UnderlayTracker,
+    mark: super::engines::LogMark,
+) -> super::underlay::Observation {
+    use line_supervisor::TunnelEngine;
+    super::underlay::Observation {
+        route_ok: engine.route_ok(runner),
+        evidence: engine.ike_evidence_since(runner, tracker.evidence_mark()),
+        ike_life_recent: engine
+            .ike_evidence_since(runner, tracker.tick_mark())
+            .parsed_from_peer,
+        rx_packets: engine.tun_rx_packets(),
+        pending_life: tracker
+            .pending_mark()
+            .map(|m| engine.ike_evidence_since(runner, m).parsed_from_peer),
+        mark,
+    }
+}
+
+/// The line logged when a hold begins, naming the cause and its evidence
+/// (specs/100 FR-020).
+fn hold_started_line(
+    idx: u32,
+    cause: crate::control::protocol::UplinkHoldCause,
+    epdg: Option<&str>,
+    unanswered_retransmits: u32,
+) -> String {
+    use crate::control::protocol::UplinkHoldCause;
+    let epdg = epdg.unwrap_or("the ePDG");
+    match cause {
+        UplinkHoldCause::NoRoute => format!(
+            "[supervise] line {idx}: uplink down (no route to {epdg}); holding tunnel recovery until it returns"
+        ),
+        UplinkHoldCause::NoResponse if unanswered_retransmits > 0 => format!(
+            "[supervise] line {idx}: uplink down ({epdg} not responding: {unanswered_retransmits} unanswered retransmit(s), nothing received from it); holding tunnel recovery until it answers"
+        ),
+        UplinkHoldCause::NoResponse => format!(
+            "[supervise] line {idx}: uplink down ({epdg} not responding: its liveness check went unanswered); holding tunnel recovery until it answers"
+        ),
+    }
+}
+
+/// The line logged when a hold ends, with how long it lasted, what ended it
+/// and the recoveries it held back (specs/100 FR-020).
+fn hold_ended_line(idx: u32, end: &super::underlay::HoldEnd) -> String {
+    let skipped = if end.skipped.is_empty() {
+        "none".to_string()
+    } else {
+        end.skipped
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "[supervise] line {idx}: uplink hold ({}) ended after {}s ({}); held back: {skipped}",
+        end.cause.as_str(),
+        end.held.as_secs(),
+        end.ended_by.as_str()
+    )
 }
 
 /// Whether this line's VoWiFi agent reports a call in progress, from the
@@ -3106,7 +3239,9 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 tracking.negotiated_at = Some(SystemTime::now());
             }
             // Only the strongSwan engine has a half-open IKE_SA to wait on.
-            line_supervisor::SteadyOutcome::WaitingForNegotiation => drop(guard),
+            line_supervisor::SteadyOutcome::WaitingForNegotiation
+            | line_supervisor::SteadyOutcome::Deferred { .. }
+            | line_supervisor::SteadyOutcome::Held { .. } => drop(guard),
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
                 println!("[supervise] line {idx}: recovered from {reason:?}");
                 if !tracking.pool_exhausted.is_empty() {
