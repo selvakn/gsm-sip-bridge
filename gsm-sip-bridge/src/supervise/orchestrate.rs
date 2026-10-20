@@ -236,6 +236,12 @@ fn start_vowifi_subsystem(
         "{}",
         dpd_log_line(&config.vowifi)
     );
+    // And whether the underlay guard runs (specs/100 contracts/config.md).
+    tracing::info!(
+        underlay_guard = config.vowifi.underlay_guard,
+        "{}",
+        underlay_guard_log_line(&config.vowifi)
+    );
 
     // Note: the swu-on-slim payload check is NOT here — it is an image
     // property, not a line-table one, so `run` performs it before discovery
@@ -1879,7 +1885,7 @@ fn start_vowifi_line_strongswan(
     let mut warned_inval_sel: Option<String> = None;
     // What the guard believes about the path to the ePDG, and the hold it can
     // put this line in (specs/100).
-    let underlay_enabled = true;
+    let underlay_enabled = ctx.config.vowifi.underlay_guard;
     let mut underlay = super::underlay::UnderlayTracker::new(engine.log_mark(runner.as_ref()));
     // What `vowifi-status` reads (specs/100 contracts/status-file.md), written
     // when the verdict changes, and once now so a healthy line says `up`.
@@ -3144,6 +3150,16 @@ fn dpd_log_line(v: &crate::config::VowifiConfig) -> String {
     }
 }
 
+/// The startup line saying whether the underlay guard runs (specs/100
+/// contracts/config.md), or that the swu engine ignores it.
+fn underlay_guard_log_line(v: &crate::config::VowifiConfig) -> String {
+    match (v.tunnel_engine.as_str(), v.underlay_guard) {
+        ("strongswan", true) => "underlay guard on".to_string(),
+        ("strongswan", false) => "underlay guard off ([vowifi].underlay_guard = false)".to_string(),
+        _ => "underlay guard ignored by the swu engine".to_string(),
+    }
+}
+
 /// One idle-tunnel keepalive cycle (TCP connect, not ICMP — operators filter
 /// ICMP over the tunnel): if the line has a P-CSCF, connect to its SIP port
 /// from inside the line's namespace and discard the result.
@@ -3465,6 +3481,28 @@ mod tests {
         assert_eq!(
             dpd_log_line(&swu),
             "[vowifi].dpd_delay_sec ignored: the swu engine has no DPD setting"
+        );
+    }
+
+    #[test]
+    fn the_startup_underlay_guard_line_says_on_off_or_ignored() {
+        let default = crate::config::VowifiConfig::default();
+        assert_eq!(underlay_guard_log_line(&default), "underlay guard on");
+        let off = crate::config::VowifiConfig {
+            underlay_guard: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            underlay_guard_log_line(&off),
+            "underlay guard off ([vowifi].underlay_guard = false)"
+        );
+        let swu = crate::config::VowifiConfig {
+            tunnel_engine: "swu".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            underlay_guard_log_line(&swu),
+            "underlay guard ignored by the swu engine"
         );
     }
 

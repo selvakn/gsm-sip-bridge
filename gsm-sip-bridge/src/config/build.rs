@@ -876,6 +876,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         src_addr: raw.src_addr.filter(|s| !s.is_empty()),
         idle_keepalive: raw.idle_keepalive,
         dpd_delay_sec: dpd_delay_sec(raw.dpd_delay_sec)?,
+        underlay_guard: raw.underlay_guard,
         keepalive_interval_sec: in_range(
             raw.keepalive_interval_sec,
             "vowifi.keepalive_interval_sec",

@@ -184,9 +184,9 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `203.0.113.x`, `
 
 ## Phase 7: Configuration (FR-025/FR-025a, SC-008)
 
-- [ ] T034 Tests first in `config/mod.rs` `mod tests`: `underlay_guard` defaults to `true`; `false` is accepted; `"yes"`, `1` and `"true"` are rejected with `vowifi.underlay_guard` in the error; it is not a per-line key. Then add `underlay_guard: bool` to `RawVowifi` (`config/raw.rs`, default `true`), `VowifiConfig` (`config/mod.rs`, doc comment per contracts/config.md) and `build_vowifi` (`config/build.rs`).
-- [ ] T035 Wire it in `supervise/orchestrate.rs`: off → `UnderlayView::disabled()`, no `uplink` field, no status file, no `send_dpd`. Log the startup line once per deployment, with swu wording too (contracts/config.md). Add a pure `underlay_guard_log_line(&VowifiConfig) -> String` next to 098's `dpd_log_line`, log it with `tracing::info!` beside the `dpd_log_line` call, and unit-test its three wordings. Add a loop-level test, using whatever seam 098 used for its loop tests (otherwise a pure helper), proving that with the guard off a `PcscfPoolExhausted` tick behaves exactly as before.
-- [ ] T036 `make format lint test`; commit `feat(vowifi): [vowifi].underlay_guard, on by default (#141)`.
+- [X] T034 Tests first in `config/mod.rs` `mod tests`: `underlay_guard` defaults to `true`; `false` is accepted; `"yes"`, `1` and `"true"` are rejected with `vowifi.underlay_guard` in the error; it is not a per-line key. Then add `underlay_guard: bool` to `RawVowifi` (`config/raw.rs`, default `true`), `VowifiConfig` (`config/mod.rs`, doc comment per contracts/config.md) and `build_vowifi` (`config/build.rs`).
+- [X] T035 Wire it in `supervise/orchestrate.rs`: off → `UnderlayView::disabled()`, no `uplink` field, no status file, no `send_dpd`. Log the startup line once per deployment, with swu wording too (contracts/config.md). Add a pure `underlay_guard_log_line(&VowifiConfig) -> String` next to 098's `dpd_log_line`, log it with `tracing::info!` beside the `dpd_log_line` call, and unit-test its three wordings. Add a loop-level test, using whatever seam 098 used for its loop tests (otherwise a pure helper), proving that with the guard off a `PcscfPoolExhausted` tick behaves exactly as before.
+- [X] T036 `make format lint test`; commit `feat(vowifi): [vowifi].underlay_guard, on by default (#141)`.
 
 ## Phase 8: Polish (docs)
 

@@ -377,6 +377,15 @@ apn = "ims"
 # Android IWLAN default (was a fixed 30s; #120). No effect while the line
 # supervisor's P-CSCF probe runs. Applies when the container is recreated.
 # dpd_delay_sec = 120
+# strongswan engine only: while the path from this host to a line's ePDG is
+# down (no route to it, or it has stopped answering), hold back the recoveries
+# that are only inferred from the ePDG being unreachable, so an uplink outage
+# does not churn the tunnel, restart the agent or raise a false "rebuilt
+# repeatedly" alert. A dead charon, a vanished tunnel interface and a missing
+# namespace route are never held, and a hold ends by itself after 15 minutes.
+# false restores the pre-guard behaviour. Default true. Applies when the
+# container is recreated.
+# underlay_guard = true
 # ePDG tunnel engine: "strongswan" (proper IKE rekeying/re-auth/DPD/MOBIKE,
 # netns survives reconnects — the default) or "swu" (the original SWu-IKEv2
 # Python dialer, kept as an explicit fallback until strongswan is proven

@@ -1038,6 +1038,17 @@ pub struct VowifiConfig {
     /// finding 2). No effect while that probe runs, since its traffic keeps
     /// DPD from ever firing. `0` or 10–3600.
     pub dpd_delay_sec: u64,
+    /// Whether the underlay guard runs on every strongSwan line (specs/100).
+    /// On by default: while the path from this host to a line's ePDG is down
+    /// (no route, or the ePDG stopped answering), the supervisor stands back
+    /// from the recoveries that are only inferred from the ePDG being
+    /// unreachable, so an uplink outage no longer churns the tunnel, restarts
+    /// the agent or raises a false flapping alert. Structural recoveries (a
+    /// dead charon, a vanished interface, a missing namespace route) are never
+    /// held, and a hold ends on its own after 15 minutes. `false` restores the
+    /// pre-guard behaviour exactly, apart from the half-open IKE_SA fix, which
+    /// always runs. Ignored by the swu engine. Per deployment, not per line.
+    pub underlay_guard: bool,
     /// Name of the veth interface end in the container's default netns
     /// (Agent B's side). Derived per line, not a `[vowifi]` TOML key.
     pub veth_sip_iface: String,
@@ -1185,6 +1196,7 @@ impl Default for VowifiConfig {
             idle_keepalive: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: DEFAULT_DPD_DELAY_SEC,
+            underlay_guard: true,
             veth_sip_iface: "veth-sip".to_string(),
             veth_ims_iface: "veth-ims".to_string(),
             tunnel_engine: "strongswan".to_string(),
@@ -2401,6 +2413,43 @@ password = "pass"
         .unwrap_err()
         .to_string();
         assert!(err.contains("dpd_delay_sec"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_underlay_guard_defaults_on_and_accepts_false() {
+        // specs/100 FR-025.
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\n"));
+        assert!(cfg.vowifi.underlay_guard);
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nunderlay_guard = false\n"
+        ));
+        assert!(!cfg.vowifi.underlay_guard);
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nunderlay_guard = true\n"
+        ));
+        assert!(cfg.vowifi.underlay_guard);
+    }
+
+    #[test]
+    fn vowifi_underlay_guard_rejects_anything_that_is_not_a_boolean() {
+        for bad in ["\"yes\"", "1", "\"true\"", "0", "\"off\""] {
+            let err = try_parse(&format!(
+                "{MINIMAL_TOML}\n[vowifi]\nunderlay_guard = {bad}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("underlay_guard"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn vowifi_underlay_guard_is_not_a_per_line_key() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nunderlay_guard = false\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("underlay_guard"), "{err}");
     }
 
     #[test]

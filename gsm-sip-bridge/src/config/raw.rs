@@ -435,6 +435,9 @@ section! {
         /// charon's DPD delay for every strongSwan line. See
         /// `VowifiConfig::dpd_delay_sec`.
         pub dpd_delay_sec: u64,
+        /// Whether the VoWiFi underlay guard runs. See
+        /// `VowifiConfig::underlay_guard`.
+        pub underlay_guard: bool,
         /// How long a reg-event `rejected` holds registration off. See
         /// `VowifiConfig::reg_rejected_cooldown_sec`.
         pub reg_rejected_cooldown_sec: u64,
@@ -477,6 +480,7 @@ impl Default for RawVowifi {
             idle_keepalive: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: crate::config::DEFAULT_DPD_DELAY_SEC,
+            underlay_guard: true,
             reg_rejected_cooldown_sec: crate::config::DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             tunnel_engine: "strongswan".to_string(),
             tunnel_address_family: "dual".to_string(),
