@@ -10,6 +10,19 @@ across releases.
 
 ### Added
 
+- **Underlay guard for VoWiFi.** While the path from the host to a line's ePDG
+  is down, because there is no route to it or because it has stopped
+  answering, the supervisor no longer tears the tunnel down and restarts the
+  IMS agent every ~80s for recoveries that are only inferred from the ePDG
+  being unreachable. Before it acts on one, it sends a single on-demand
+  liveness check, so a genuine carrier fault is still repaired. A dead
+  charon, a vanished interface and a missing namespace route are never held,
+  and a hold ends after 15 minutes at the latest. `vowifi-status` shows
+  `uplink:` per line, three `gsm_sip_bridge_vowifi_uplink_*` metrics count it,
+  and `[vowifi].underlay_guard = false` turns it off. The image's strongSwan
+  gains `swanctl --dpd`
+  ([#141](https://github.com/selvakn/gsm-sip-bridge/issues/141)).
+
 - **`[vowifi].dpd_delay_sec`.** How long charon waits with nothing from the
   ePDG before sending a dead-peer-detection request on a strongSwan line;
   `0` turns it off. It was a fixed 30s and now defaults to 120s, the Android
@@ -123,6 +136,13 @@ across releases.
   ([#127](https://github.com/selvakn/gsm-sip-bridge/issues/127)).
 
 ### Fixed
+
+- **A half-open IKE_SA is left to charon.** An IKE_SA still being negotiated
+  was counted as a missing CHILD_SA and terminated on the second tick, which
+  in an outage killed the attempt charon was still retrying. It is now left
+  alone while charon has logged IKE activity for it in the last 200s, and
+  rebuilt as `ike_sa_negotiation_stuck` after that
+  ([#141](https://github.com/selvakn/gsm-sip-bridge/issues/141)).
 
 - **A dead P-CSCF is given up on about 110 s sooner.** When the IMS agent's
   Gm keepalive went unanswered and reconnecting failed, nothing was tried

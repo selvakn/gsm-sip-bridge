@@ -138,9 +138,93 @@ kind it was:
   was down. Look at the uplink or the ePDG, not at DPD.
 - `dead peer verdict: unknown (...)` — the supervisor had no usable snapshot
   (it had just restarted, or the previous tick found a fault).
+- `dead peer verdict: uplink` — the line was on hold for an uplink outage
+  when the IKE_SA was lost, so the ePDG's silence is the path's doing and is
+  never counted as `real` (see
+  [VoWiFi: `uplink down … holding tunnel recovery`](#vowifi-uplink-down--holding-tunnel-recovery)).
 
 `gsm_sip_bridge_vowifi_dead_peer_losses_total{verdict=...}` counts them per
 line.
+
+### VoWiFi: `uplink down … holding tunnel recovery`
+
+The line supervisor noticed that the path from this host to the ePDG is down
+and stopped acting on what it would otherwise infer from that. Before this
+guard, an outage of the host's own internet connection looked to the
+supervisor like a dead P-CSCF, then a missing CHILD_SA, then a stuck one, and
+it tore the tunnel down and restarted the IMS agent every ~80s for as long as
+the outage lasted. That produced a false `rebuilt repeatedly` alert, a
+terminated IKE attempt every cycle, and sometimes a worse recovery afterwards.
+
+```text
+[supervise] line 0: uplink down (no route to 203.0.113.9); holding tunnel recovery until it returns
+[supervise] line 0: uplink down (ePDG 203.0.113.9 not responding: 2 unanswered retransmit(s), nothing received from it); holding tunnel recovery until it answers
+[supervise] line 0: uplink hold (no_route) ended after 312s (restored); held back: PcscfPoolExhausted, ChildSaStuck
+```
+
+**What it means.** The line is *held*, not healthy: `vowifi-status` prints
+`uplink: no_route (held 3m12s, recovery on hold)` (or `no_response`), the
+`gsm_sip_bridge_vowifi_uplink_held{module}` gauge reads 1, and the line still
+counts as down in `gsm_sip_bridge_vowifi_child_sa_up` and the tunnel-failure
+alert, which still fires on its usual thresholds. If it fires during a hold its
+text ends `; uplink down (no route), recovery on hold`. charon keeps retrying
+on its own schedule the whole time. When the path returns, the tunnel comes
+back through charon's own retry, or through one initiation the supervisor
+issues if no IKE_SA exists.
+
+**The two causes.**
+
+- `no_route`: `ip route get <ePDG>` fails, or finds no source address, on two
+  checks at least 10s apart. Check the host's default route, the uplink
+  interface and the router.
+- `no_response`: the route is fine, but charon has retransmitted a request to
+  the ePDG at least twice with nothing received from it, or an on-demand
+  liveness check (below) went unanswered. Check the router's upstream and
+  whether the ePDG's address is reachable from elsewhere. The hold ends the
+  moment anything arrives from the ePDG.
+
+**What is held, and what never is.** While held, the supervisor does not issue:
+
+- a tunnel rebuild for an unreachable P-CSCF (`PcscfUnreachable`) or for every
+  P-CSCF having been marked unavailable (`PcscfPoolExhausted`);
+- the re-initiate for a missing or stuck CHILD_SA (`ChildSaMissing`,
+  `ChildSaStuck`), the stuck-rekey rebuild (`ChildSaRekeyStuck`) or the rebuild
+  of a stuck half-open IKE_SA (`IkeSaNegotiationStuck`);
+- the re-initiate for a lost IKE_SA (`IkeSaLost`) beyond the single initiation
+  described above;
+- the IMS agent restart that goes with any of these.
+
+It never holds a dead charon (`ProcessDied`), a broken vici socket
+(`ViciBroken`), a vanished or unavailable tunnel interface, or a missing
+default route in the line's namespace: those are local faults the path to the
+ePDG cannot explain, and they are repaired on the tick that finds them.
+P-CSCF marks the agent sets during a hold are ignored once it ends, so an
+outage does not trigger a rebuild afterwards.
+
+**It does not trust silence alone.** When the supervisor is about to take one of
+the recoveries above and nothing has arrived from the ePDG for 30s, it first
+sends one ordinary IKEv2 liveness check (`swanctl --dpd --ike imsN`, a command
+this image adds to its strongSwan build) and waits one tick. If the ePDG
+answers, the recovery goes ahead as before, so a real carrier fault, such as a
+single P-CSCF that stopped answering behind a live ePDG, is still repaired,
+about 30s later than it was.
+
+**It cannot hold forever.** A hold ends at the latest 15 minutes after it
+began (`ended after 900s (max_hold)`): the line then gets one ordinary
+recovery pass and may be held again if the evidence is still there. The 10s
+route debounce, the 15-minute bound and the 30s liveness wait are fixed.
+
+**Turning it off.** `[vowifi].underlay_guard = false` restores the previous
+behaviour exactly and takes effect when the container is recreated. Startup
+logs `underlay guard on` or `underlay guard off` once.
+
+**Metrics.** `gsm_sip_bridge_vowifi_uplink_holds_total{module,cause}` counts
+holds, `gsm_sip_bridge_vowifi_uplink_held_seconds_total{module,cause}` adds up
+the time spent held, and the `uplink_held` gauge shows one in progress. A
+half-open IKE_SA that charon has not touched for 200s is rebuilt like any other
+stuck recovery and counted as `reason="ike_sa_negotiation_stuck"` in
+`gsm_sip_bridge_vowifi_tunnel_recoveries_total`; one charon is still retrying
+is left alone, and logged once as `still negotiating; leaving it to charon`.
 
 ### Is this line actually reachable right now?
 

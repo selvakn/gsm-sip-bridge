@@ -190,7 +190,7 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `203.0.113.x`, `
 
 ## Phase 8: Polish (docs)
 
-- [ ] T037 [P] Docs:
+- [X] T037 [P] Docs:
   - `docs/configuration.md`: `[vowifi]` row for `underlay_guard`, in the `dpd_delay_sec` row's style;
   - `config.toml.example`: commented `# underlay_guard = true`;
   - `docs/observability.md`: the three metrics and the two new label values;
@@ -198,7 +198,7 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `203.0.113.x`, `
   - `CHANGELOG.md` under Unreleased: two entries, the guard and the half-open fix, with only the summary bold (release-notes memory).
   
   `tests/test_config_docs.rs` must pass.
-- [ ] T038 `make format lint test`; commit `docs: the VoWiFi underlay guard and the half-open fix (#141)`.
+- [X] T038 `make format lint test`; commit `docs: the VoWiFi underlay guard and the half-open fix (#141)`.
 
 ## Phase 9: Live verification (SC-001…SC-008)
 
