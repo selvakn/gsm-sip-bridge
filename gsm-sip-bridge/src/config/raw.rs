@@ -94,6 +94,11 @@ section! {
         pub codecs: Option<Vec<String>>,
         /// Offer AMR octet-aligned (default) or bandwidth-efficient.
         pub amr_octet_align: bool,
+        /// Extra PBX final statuses that mean "the person rejected the call"
+        /// (spec 099). Added to the built-in 486/600/603. Integers rather
+        /// than `u16` so a value out of range is reported by name, not as a
+        /// bare serde overflow.
+        pub reject_statuses: Option<Vec<i64>>,
     }
 }
 
@@ -111,6 +116,7 @@ impl Default for RawSip {
             public_addr: None,
             codecs: None,
             amr_octet_align: true,
+            reject_statuses: None,
         }
     }
 }

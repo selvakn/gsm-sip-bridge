@@ -237,6 +237,10 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         .transpose()?;
 
     let codecs = raw.codecs.as_deref().map(parse_phone_codecs).transpose()?;
+    let reject_statuses = match raw.reject_statuses.as_deref() {
+        Some(values) => parse_reject_statuses(values)?,
+        None => RejectStatuses::defaults(),
+    };
 
     Ok(SipConfig {
         server: raw.server,
@@ -250,7 +254,25 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         public_addr,
         codecs,
         amr_octet_align: raw.amr_octet_align,
+        reject_statuses,
     })
+}
+
+/// Validate `[sip].reject_statuses` (spec 099, FR-007). Every failure names
+/// the key and the offending value.
+fn parse_reject_statuses(values: &[i64]) -> BridgeResult<RejectStatuses> {
+    let mut statuses = Vec::with_capacity(values.len());
+    for &value in values {
+        match u16::try_from(value) {
+            Ok(status) if (400..=699).contains(&status) => statuses.push(status),
+            _ => {
+                return Err(BridgeError::Config(format!(
+                    "[sip].reject_statuses: {value} is not a failure status (expected 400-699)"
+                )))
+            }
+        }
+    }
+    Ok(RejectStatuses::with_extra(statuses))
 }
 
 /// Validate `[sip].codecs` (spec 085, FR-010). Every failure names the key.

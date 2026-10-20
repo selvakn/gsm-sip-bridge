@@ -143,6 +143,51 @@ pub struct SipConfig {
     /// and refuse the other. A far end that makes the offer is followed
     /// either way. VoWiFi/VoLTE only.
     pub amr_octet_align: bool,
+    /// PBX final statuses that mean the person rejected the call
+    /// (`[sip].reject_statuses`, spec 099). VoWiFi/VoLTE only.
+    pub reject_statuses: RejectStatuses,
+}
+
+/// The PBX final statuses that count as "the person rejected the call", so
+/// the carrier is told `486 Busy Here` rather than the retryable `480`.
+///
+/// The built-in `486`, `600` and `603` are the RFC 3261 decline responses.
+/// `403` is deliberately NOT built in: it can also mean the bridge is not
+/// authorised on the PBX, and reporting that as "busy" would hide a fault. A
+/// PBX that rejects with a bare `403` is accommodated by listing it in
+/// `[sip].reject_statuses`. Configuration only adds; the defaults can never
+/// be removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectStatuses {
+    extra: Vec<u16>,
+}
+
+impl RejectStatuses {
+    /// The statuses that are rejects without any configuration.
+    pub const DEFAULTS: [u16; 3] = [486, 600, 603];
+
+    /// Only the built-in statuses.
+    pub fn defaults() -> Self {
+        Self { extra: Vec::new() }
+    }
+
+    /// The built-in statuses plus `extra`.
+    pub fn with_extra(extra: impl IntoIterator<Item = u16>) -> Self {
+        let mut extra: Vec<u16> = extra.into_iter().collect();
+        extra.sort_unstable();
+        extra.dedup();
+        Self { extra }
+    }
+
+    pub fn contains(&self, status: u16) -> bool {
+        Self::DEFAULTS.contains(&status) || self.extra.contains(&status)
+    }
+}
+
+impl Default for RejectStatuses {
+    fn default() -> Self {
+        Self::defaults()
+    }
 }
 
 /// A codec an operator may name in `[sip].codecs`.

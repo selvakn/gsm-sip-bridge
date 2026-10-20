@@ -812,3 +812,61 @@ fn test_sip_amr_octet_align_can_be_turned_off() {
     let f = sip_with_codecs("amr_octet_align = false");
     assert!(!load_config(f.path()).unwrap().sip.amr_octet_align);
 }
+
+// ------------------------------------------ [sip].reject_statuses (099) ----
+
+#[test]
+fn test_sip_reject_statuses_default_to_the_rfc_declines_without_403() {
+    let f = sip_with_codecs("");
+    let rejects = load_config(f.path()).unwrap().sip.reject_statuses;
+    for status in [486, 600, 603] {
+        assert!(rejects.contains(status), "{status} is a built-in reject");
+    }
+    // 403 can mean the bridge is not authorised on the PBX; it is opt-in.
+    assert!(!rejects.contains(403));
+    assert!(!rejects.contains(503));
+}
+
+#[test]
+fn test_sip_reject_statuses_add_to_the_defaults() {
+    let f = sip_with_codecs("reject_statuses = [403, 410, 403]");
+    let rejects = load_config(f.path()).unwrap().sip.reject_statuses;
+    assert!(rejects.contains(403));
+    assert!(rejects.contains(410));
+    assert!(!rejects.contains(404));
+    for status in [486, 600, 603] {
+        assert!(rejects.contains(status), "{status} cannot be removed");
+    }
+}
+
+#[test]
+fn test_sip_reject_statuses_empty_list_keeps_the_defaults() {
+    let f = sip_with_codecs("reject_statuses = []");
+    let rejects = load_config(f.path()).unwrap().sip.reject_statuses;
+    assert!(rejects.contains(603));
+    assert!(!rejects.contains(403));
+}
+
+#[test]
+fn test_sip_reject_statuses_out_of_range_rejected_naming_key_and_value() {
+    for bad in ["200", "399", "700", "-1", "70000"] {
+        let f = sip_with_codecs(&format!("reject_statuses = [403, {bad}]"));
+        let msg = load_config(f.path()).unwrap_err().to_string();
+        assert!(msg.contains("[sip].reject_statuses"), "{bad}: {msg}");
+        assert!(msg.contains(bad), "{bad}: {msg}");
+    }
+}
+
+#[test]
+fn test_sip_reject_statuses_wrong_type_rejected() {
+    let f = sip_with_codecs(r#"reject_statuses = ["403"]"#);
+    assert!(load_config(f.path()).is_err());
+    let f = sip_with_codecs("reject_statuses = 403");
+    assert!(load_config(f.path()).is_err());
+}
+
+#[test]
+fn test_sip_reject_statuses_typo_key_rejected() {
+    let f = sip_with_codecs("reject_status = [403]");
+    assert!(load_config(f.path()).is_err());
+}
