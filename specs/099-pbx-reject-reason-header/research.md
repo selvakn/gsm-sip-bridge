@@ -17,8 +17,17 @@ when the call reaches `DISCONNECTED`, from the `pjsip_event` it is handed.
   bindings. PJSIP has no typed parser for `Reason`, so it comes back as a
   `pjsip_generic_string_hdr` whose `hvalue` is the raw text.
 
-**Not yet proven**: that a rejected outgoing INVITE always delivers its final
-response in this event. If a disconnect is driven by a timer or transport
+**Verified (2026-10-20)** against a real linked PJSIP:
+`pjsua-safe/tests/disconnect_reason.rs` places real calls to a fake PBX on a
+loopback UDP socket. `403` + `Reason: Q.850;cause=21`, `503` +
+`cause=17;text="User busy"`, a `SIP;cause=503` header followed by a
+`Q.850;cause=21` one, a bare `403`, a `SIP`-only Reason, and a cause on a
+`486` are all captured as specified (`Call::last_disconnect`). Run with
+`LD_LIBRARY_PATH=/usr/local/lib cargo test -p pjsua-safe --features
+pjsip-linked --test disconnect_reason`.
+
+**Still not proven**: that every rejected outgoing INVITE delivers its final
+response in this event on a live PBX. If a disconnect is driven by a timer or transport
 error, `rdata` is null. That case falls back to the status code (spec
 FR-011a), so the worst outcome is today's behaviour.
 

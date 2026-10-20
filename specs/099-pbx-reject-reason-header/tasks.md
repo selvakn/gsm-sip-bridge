@@ -7,7 +7,7 @@ Before EVERY commit: `make format && make lint && make test` (CLAUDE.md). One co
 
 ## Phase 1: Setup
 
-- [ ] T001 Spike R1 on a live path: with the privileged test container (`test/`) and `siptest` as the telephone side, answer the bridge's INVITE with `403` + `Reason: Q.850;cause=21` and confirm via a temporary `tracing` line in `on_call_state_cb` (`pjsua-safe/src/endpoint.rs`) that `disconnect_trigger`'s rdata path yields the response and `pjsip_msg_find_hdr_by_name(msg, "Reason")` finds it. Record the result in `specs/099-pbx-reject-reason-header/research.md` under R1 ("Verified live" or "Not delivered when ..."). Remove the temporary line. If the header is NOT delivered on this path, stop and revisit the design before Phase 2.
+- [X] T001 Spike R1 against a real PJSIP: answer the bridge's INVITE with `403` + `Reason: Q.850;cause=21` and confirm via a temporary `tracing` line in `on_call_state_cb` (`pjsua-safe/src/endpoint.rs`) that `disconnect_trigger`'s rdata path yields the response and `pjsip_msg_find_hdr_by_name(msg, "Reason")` finds it. Record the result in `specs/099-pbx-reject-reason-header/research.md` under R1 ("Verified live" or "Not delivered when ..."). Remove the temporary line. If the header is NOT delivered on this path, stop and revisit the design before Phase 2.
 
 ## Phase 2: Foundational (blocks all stories)
 
@@ -59,7 +59,7 @@ Before EVERY commit: `make format && make lint && make test` (CLAUDE.md). One co
 ## Phase 6: Polish and verification
 
 - [X] T020 [P] Add an `## Unreleased` bullet to `RELEASE_NOTES.md` (bold only the feature name; plain description after it), per the repo's release-notes rule. Mention `reject_statuses` and that a FreePBX reject is now recognised via Q.850.
-- [ ] T021 Live verification per `quickstart.md` step 2 using `siptest` in the privileged container: `403+cause21` -> 486; `503+cause21` -> 486; `503` -> 480; `403` -> 480; `403` with `reject_statuses = [403]` -> 486. Confirm the record `declined:pbx_rejected:403:q850=21` in `vowifi-status` and no second INVITE within 60 s. Write the outcome in `specs/099-pbx-reject-reason-header/live-verification.md` (synthetic numbers only; no real MSISDNs).
+- [ ] T021 (partly done: the capture is verified against real PJSIP in `pjsua-safe/tests/disconnect_reason.rs`; the end-to-end run with a carrier-side leg and `siptest` in the privileged container is still to do) Live verification per `quickstart.md` step 2 using `siptest` in the privileged container: `403+cause21` -> 486; `503+cause21` -> 486; `503` -> 480; `403` -> 480; `403` with `reject_statuses = [403]` -> 486. Confirm the record `declined:pbx_rejected:403:q850=21` in `vowifi-status` and no second INVITE within 60 s. Write the outcome in `specs/099-pbx-reject-reason-header/live-verification.md` (synthetic numbers only; no real MSISDNs).
 - [ ] T022 Run the full pre-commit checklist (`make format && make lint && make test`). For any Greptile bot finding on the PR, fix the code and do not post a reply.
 
 ## Dependencies
