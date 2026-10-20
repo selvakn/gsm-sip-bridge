@@ -46,7 +46,7 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `203.0.113.x`, `
   - lines for `ims1` ignored when asking about `ims0`;
   - no lines → `None`.
   
-  Parse the log's `YYYY-MM-DD HH:MM:SS` prefix to a `SystemTime` in UTC, matching how charon writes it in the container. Add a test that pins the timezone assumption.
+  Superseded after the first Jio run: the log is stamped in local time (IST on the Pi), so `ike_activity` returns a fingerprint (line count + last line) that the tick compares between ticks, with no time parsing.
 - [X] T006 [P] In `supervise/engines.rs`, tests first: `ike_evidence_since(log, conn, mark) -> IkeEvidence { parsed_from_peer: bool, unanswered_retransmits: u32 }` over the log text after a `LogMark`. Cases:
   - a parsed response clears the retransmit count;
   - an ePDG-initiated `parsed INFORMATIONAL request` counts as life;

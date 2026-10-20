@@ -70,9 +70,10 @@ Built by the loop at the top of each tick and passed into `tick_steady_state_wit
 | Field | Type | Notes |
 |---|---|---|
 | `ike_id` | `u32` | `#N` from the `swanctl --list-sas` header. A different `#N` replaces the record. |
+| `activity` / `active_at` | fingerprint / time | The last IKE-traffic fingerprint seen and when it last changed; a different fingerprint on a tick resets `active_at`. |
 | `waiting_logged` | bool | "waiting for negotiation" is logged once per `#N` (US3 scenario 1). |
 
-Last IKE activity is not stored. It is read from the charon log each tick: the newest `<conn|N>` IKE line (R6).
+Charon's IKE activity is a fingerprint (the count of `<conn|N>` IKE lines and the last of them), compared between ticks, never a parsed time: the log is stamped in the container's local time, which the Jio Pi found out is not UTC (R6). `HalfOpen` carries the last fingerprint and `active_at`, the time it last changed (or the `#N` was first listed); idle time is measured from there.
 
 ## New enum variants
 

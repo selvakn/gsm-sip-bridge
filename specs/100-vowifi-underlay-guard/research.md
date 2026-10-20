@@ -102,7 +102,7 @@ The exchange is an ordinary charon DPD, so it retransmits on charon's normal sch
 
 **Decision.**
 - A new `SteadyStateHealth::IkeSaConnecting { ike_id }`, parsed from the header's state column.
-- "Still working" = an `<conn|N>` IKE log line (sent, retransmitted or parsed) within the last 200s.
+- "Still working" = an `<conn|N>` IKE log line (sent, retransmitted or parsed) within the last 200s. Measured by comparing a fingerprint of those lines between ticks (their count and the last one), not by parsing their timestamps: charon stamps its log in the container's local time, which is IST on the Jio Pi, not UTC (found live).
 - "Stuck" = half-open with no such line for over 200s: more than 2.5 × the longest retransmit gap, and longer than one tick plus the gap.
 - Stuck and not held → terminate + re-initiate as a new `DegradeReason::IkeSaNegotiationStuck`. It counts as a renegotiation for the P-CSCF sync and the flap window.
 - Not stuck → no action, logged once per `#N`.

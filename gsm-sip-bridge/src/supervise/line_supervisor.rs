@@ -207,6 +207,20 @@ pub struct IkeEvidence {
     pub unanswered_retransmits: u32,
 }
 
+/// A fingerprint of the IKE traffic charon has logged for one connection:
+/// how many such lines and the last of them (specs/100). Two readings that
+/// differ mean charon sent, retransmitted or parsed something in between.
+///
+/// Compared, never read as a time: charon stamps its log in the container's
+/// local time, which is not UTC on every deployment (the Jio Pi's is IST), and
+/// the supervisor only needs to know *whether* charon has been busy since its
+/// last look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IkeActivity {
+    pub lines: usize,
+    pub last: String,
+}
+
 impl IkeEvidence {
     /// The value for an engine that cannot tell: life seen, nothing unanswered.
     pub const LIFE: Self = Self {
@@ -422,9 +436,9 @@ pub trait TunnelEngine {
     fn ike_header(&self) -> Option<(u32, IkeHeaderState)> {
         None
     }
-    /// When charon last logged IKE traffic for this connection: a message
-    /// generated, parsed or retransmitted (specs/100 R6).
-    fn last_ike_activity(&self, _runner: &dyn CommandRunner) -> Option<SystemTime> {
+    /// A fingerprint of the IKE traffic charon has logged for this connection:
+    /// messages generated, parsed or retransmitted (specs/100 R6).
+    fn ike_activity(&self, _runner: &dyn CommandRunner) -> Option<IkeActivity> {
         None
     }
     /// What the log shows of the ePDG since `mark` (specs/100 R4). The
@@ -623,14 +637,16 @@ pub enum SteadyOutcome {
 pub const HALF_OPEN_STUCK_AFTER: Duration = Duration::from_secs(200);
 
 /// The half-open IKE_SA a line is currently waiting on (specs/100).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HalfOpen {
     /// The `#N` from the `--list-sas` header. A different `#N` replaces the
     /// record.
     pub ike_id: u32,
-    /// When this `#N` was first listed, the reference when charon has logged
-    /// no IKE line for the connection at all.
-    pub first_seen: SystemTime,
+    /// charon's IKE activity as of the last tick that saw it change.
+    pub activity: Option<IkeActivity>,
+    /// When the activity last changed, or when this `#N` was first listed.
+    /// Idle time is measured from here.
+    pub active_at: SystemTime,
     /// Whether the "still negotiating" line was logged for this `#N`.
     pub waiting_logged: bool,
 }
@@ -1445,14 +1461,20 @@ fn tick_half_open(
     underlay: &UnderlayView,
 ) -> SteadyOutcome {
     let now = SystemTime::now();
-    let mut half_open = match tracking.half_open {
+    let activity = engine.ike_activity(runner);
+    let mut half_open = match tracking.half_open.take() {
         Some(h) if h.ike_id == ike_id => h,
         _ => HalfOpen {
             ike_id,
-            first_seen: now,
+            activity: activity.clone(),
+            active_at: now,
             waiting_logged: false,
         },
     };
+    if activity != half_open.activity {
+        half_open.activity = activity;
+        half_open.active_at = now;
+    }
     // The no-route hold that kept this IKE_SA's retransmits from reaching the
     // ePDG has just ended. charon backs off up to ~76s between retransmits, so
     // waiting for its next one can leave the line down for a minute with the
@@ -1472,10 +1494,7 @@ fn tick_half_open(
             ike_sa_loss_cause: None,
         };
     }
-    let last_activity = engine
-        .last_ike_activity(runner)
-        .unwrap_or(half_open.first_seen);
-    let idle = now.duration_since(last_activity).unwrap_or_default();
+    let idle = now.duration_since(half_open.active_at).unwrap_or_default();
     if idle > HALF_OPEN_STUCK_AFTER {
         if let Some(outcome) = underlay_gate(
             engine,
@@ -1851,8 +1870,8 @@ mod tests {
         loss_cause: RefCell<IkeSaLossCause>,
         /// What `ike_header` reports (specs/100).
         ike_header: RefCell<Option<(u32, IkeHeaderState)>>,
-        /// What `last_ike_activity` reports (specs/100).
-        last_activity: RefCell<Option<SystemTime>>,
+        /// What `ike_activity` reports (specs/100).
+        activity: RefCell<Option<IkeActivity>>,
         /// What `route_ok` reports (specs/100).
         route_ok: RefCell<bool>,
         /// What `ike_evidence_since` reports (specs/100).
@@ -1895,7 +1914,7 @@ mod tests {
                 tun_rx: RefCell::new(None),
                 loss_cause: RefCell::new(IkeSaLossCause::Unknown),
                 ike_header: RefCell::new(None),
-                last_activity: RefCell::new(None),
+                activity: RefCell::new(None),
                 route_ok: RefCell::new(true),
                 evidence: RefCell::new(IkeEvidence::LIFE),
                 dpd_calls: RefCell::new(0),
@@ -1949,8 +1968,8 @@ mod tests {
         fn ike_header(&self) -> Option<(u32, IkeHeaderState)> {
             self.ike_header.borrow().clone()
         }
-        fn last_ike_activity(&self, _runner: &dyn CommandRunner) -> Option<SystemTime> {
-            *self.last_activity.borrow()
+        fn ike_activity(&self, _runner: &dyn CommandRunner) -> Option<IkeActivity> {
+            self.activity.borrow().clone()
         }
         fn ike_evidence_since(&self, _runner: &dyn CommandRunner, _mark: LogMark) -> IkeEvidence {
             *self.evidence.borrow()
@@ -4072,12 +4091,32 @@ mod tests {
 
     // ---- specs/100 US3: a half-open IKE_SA is charon's to finish -----------
 
-    fn half_open_engine(ike_id: u32, activity_age: Option<u64>) -> FakeEngine {
+    /// The fingerprint a half-open engine reports, until a test changes it.
+    fn busy() -> Option<IkeActivity> {
+        Some(IkeActivity {
+            lines: 5,
+            last: "retransmit 2 of request with message ID 0".to_string(),
+        })
+    }
+
+    fn half_open_engine(ike_id: u32) -> FakeEngine {
         FakeEngine {
             health: RefCell::new(SteadyStateHealth::IkeSaConnecting { ike_id }),
-            last_activity: RefCell::new(
-                activity_age.map(|secs| SystemTime::now() - Duration::from_secs(secs)),
-            ),
+            activity: RefCell::new(busy()),
+            ..Default::default()
+        }
+    }
+
+    /// A tracking that has been watching `half_open_engine(ike_id)` and seen
+    /// nothing new for `idle_secs`.
+    fn idle_for(ike_id: u32, idle_secs: u64) -> SteadyTracking {
+        SteadyTracking {
+            half_open: Some(HalfOpen {
+                ike_id,
+                activity: busy(),
+                active_at: SystemTime::now() - Duration::from_secs(idle_secs),
+                waiting_logged: true,
+            }),
             ..Default::default()
         }
     }
@@ -4085,7 +4124,7 @@ mod tests {
     #[test]
     fn a_half_open_ike_sa_with_recent_activity_is_left_alone() {
         let runner = MockCommandRunner::new();
-        let engine = half_open_engine(7, Some(10));
+        let engine = half_open_engine(7);
         let mut tracking = SteadyTracking::default();
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
@@ -4102,7 +4141,7 @@ mod tests {
     #[test]
     fn waiting_on_the_same_ike_sa_is_logged_once_and_never_strikes() {
         let runner = MockCommandRunner::new();
-        let engine = half_open_engine(7, Some(60));
+        let engine = half_open_engine(7);
         let mut tracking = SteadyTracking::default();
         for _ in 0..5 {
             assert_eq!(
@@ -4114,16 +4153,20 @@ mod tests {
         assert_eq!(*engine.terminate_calls.borrow(), 0);
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
         assert_eq!(tracking.child_sa_missing, 0);
-        let first_seen = tracking.half_open.unwrap().first_seen;
+        let active_at = tracking.half_open.clone().unwrap().active_at;
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
-        assert_eq!(tracking.half_open.unwrap().first_seen, first_seen);
+        assert_eq!(
+            tracking.half_open.unwrap().active_at,
+            active_at,
+            "nothing new from charon, so the idle clock is not reset"
+        );
     }
 
     #[test]
     fn a_half_open_ike_sa_silent_for_over_200s_is_terminated_and_reinitiated() {
         let runner = MockCommandRunner::new();
-        let engine = half_open_engine(7, Some(201));
-        let mut tracking = SteadyTracking::default();
+        let engine = half_open_engine(7);
+        let mut tracking = idle_for(7, 201);
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
             SteadyOutcome::Recovered {
@@ -4149,9 +4192,9 @@ mod tests {
     fn a_new_ike_sa_number_restarts_the_waiting_record() {
         let runner = MockCommandRunner::new();
         let mut tracking = SteadyTracking::default();
-        let first = half_open_engine(7, Some(10));
+        let first = half_open_engine(7);
         tick_steady_state(&first, &runner, "10.0.0.1", &mut tracking);
-        let second = half_open_engine(8, Some(10));
+        let second = half_open_engine(8);
         assert_eq!(
             tick_steady_state(&second, &runner, "10.0.0.1", &mut tracking),
             SteadyOutcome::WaitingForNegotiation
@@ -4191,7 +4234,8 @@ mod tests {
     #[test]
     fn a_half_open_ike_sa_with_no_activity_line_is_timed_from_when_it_was_first_seen() {
         let runner = MockCommandRunner::new();
-        let engine = half_open_engine(7, None);
+        let engine = half_open_engine(7);
+        *engine.activity.borrow_mut() = None;
         // Seen for the first time just now: not stuck.
         let mut tracking = SteadyTracking::default();
         assert_eq!(
@@ -4201,7 +4245,8 @@ mod tests {
         // Seen 201s ago and silent since: stuck.
         tracking.half_open = Some(HalfOpen {
             ike_id: 7,
-            first_seen: SystemTime::now() - Duration::from_secs(201),
+            activity: None,
+            active_at: SystemTime::now() - Duration::from_secs(201),
             waiting_logged: true,
         });
         assert!(matches!(
@@ -4214,9 +4259,31 @@ mod tests {
     }
 
     #[test]
+    fn new_ike_activity_resets_the_idle_clock_however_old_the_ike_sa() {
+        let runner = MockCommandRunner::new();
+        let engine = half_open_engine(7);
+        // Idle for 250s on the old fingerprint...
+        let mut tracking = idle_for(7, 250);
+        // ...but charon has logged something since the last look.
+        *engine.activity.borrow_mut() = Some(IkeActivity {
+            lines: 6,
+            last: "retransmit 3 of request with message ID 0".to_string(),
+        });
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::WaitingForNegotiation
+        );
+        nothing_was_issued(&engine);
+        let idle = SystemTime::now()
+            .duration_since(tracking.half_open.unwrap().active_at)
+            .unwrap();
+        assert!(idle < Duration::from_secs(5), "{idle:?}");
+    }
+
+    #[test]
     fn leaving_the_half_open_state_forgets_it() {
         let runner = MockCommandRunner::new();
-        let engine = half_open_engine(7, Some(10));
+        let engine = half_open_engine(7);
         let mut tracking = SteadyTracking::default();
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
         *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
@@ -4440,8 +4507,8 @@ mod tests {
 
     #[test]
     fn a_stuck_half_open_ike_sa_is_held_while_the_uplink_is_down() {
-        let engine = half_open_engine(7, Some(201));
-        let mut tracking = SteadyTracking::default();
+        let engine = half_open_engine(7);
+        let mut tracking = idle_for(7, 201);
         assert_eq!(
             guarded(
                 &engine,
@@ -4527,7 +4594,7 @@ mod tests {
     #[test]
     fn a_half_open_ike_sa_counts_as_one_listed_so_no_initiation_is_owed() {
         // FR-010a: never initiate while any IKE_SA exists, half-open included.
-        let engine = half_open_engine(7, Some(10));
+        let engine = half_open_engine(7);
         let mut tracking = SteadyTracking::default();
         guarded(
             &engine,
@@ -4929,7 +4996,7 @@ mod tests {
 
     #[test]
     fn a_half_open_ike_sa_is_retried_at_once_when_a_no_route_hold_ends() {
-        let engine = half_open_engine(7, Some(10));
+        let engine = half_open_engine(7);
         let restored = UnderlayView {
             restored: true,
             ..view(UnderlayVerdict::Up)
@@ -4945,7 +5012,7 @@ mod tests {
         assert_eq!(*engine.call_order.borrow(), vec!["terminate", "reinitiate"]);
         assert!(tracking.half_open.is_none());
         // The same half-open IKE_SA on an ordinary tick is left alone.
-        let engine = half_open_engine(7, Some(10));
+        let engine = half_open_engine(7);
         assert_eq!(
             guarded(
                 &engine,
@@ -4961,7 +5028,7 @@ mod tests {
             restored: true,
             ..UnderlayView::disabled()
         };
-        let engine = half_open_engine(7, Some(10));
+        let engine = half_open_engine(7);
         assert_eq!(
             guarded(&engine, &mut SteadyTracking::default(), &off, None),
             SteadyOutcome::WaitingForNegotiation

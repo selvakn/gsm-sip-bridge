@@ -6,7 +6,8 @@
 //! bash comment used, tested independently of any [`CommandRunner`].
 
 use super::line_supervisor::{
-    ChildSaLifetime, IkeEvidence, IkeHeaderState, InboundEsp, SteadyStateHealth, TunnelEngine,
+    ChildSaLifetime, IkeActivity, IkeEvidence, IkeHeaderState, InboundEsp, SteadyStateHealth,
+    TunnelEngine,
 };
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::config::TunnelAddressFamily;
@@ -15,7 +16,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Keeps only the lines of the **shared** charon log that belong to
 /// `conn_name`.
@@ -406,28 +407,27 @@ fn is_ike_traffic(body: &str) -> bool {
         || (body.starts_with("retransmit ") && body.contains(" of request"))
 }
 
-/// The log's `%Y-%m-%d %H:%M:%S` prefix (`charon-logging.conf`'s
-/// `time_format`) as a time.
+/// A fingerprint of the IKE traffic charon has logged for `conn_name`
+/// (specs/100 R6): how many generated, parsed or retransmitted lines, and the
+/// last of them. `None` when there are none.
 ///
-/// charon writes it in the container's local time, and the image sets no
-/// timezone, so it is UTC. That is an assumption, pinned by a test; a
-/// deployment that set `TZ` would skew [`last_ike_activity`] by the offset,
-/// which only matters if the offset exceeds the 200s half-open bound.
-fn log_line_time(line: &str) -> Option<SystemTime> {
-    let stamp = line.get(..19)?;
-    let t = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S").ok()?;
-    let secs = u64::try_from(t.and_utc().timestamp()).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
-}
-
-/// When charon last logged IKE traffic for `conn_name` (specs/100 R6): the
-/// time of the newest line that generated, parsed or retransmitted a message.
-/// `None` when there is none, or the line carries no timestamp.
-pub fn last_ike_activity(charon_log: &str, conn_name: &str) -> Option<SystemTime> {
-    lines_for_conn(charon_log, conn_name)
-        .rev()
-        .find(|l| ike_line_body(l, conn_name).is_some_and(is_ike_traffic))
-        .and_then(log_line_time)
+/// A fingerprint rather than a time because charon's log is stamped in the
+/// container's local time (the Jio Pi's is IST), so a time parsed from it
+/// would be wrong by the zone's offset. Two fingerprints that differ say that
+/// charon was busy between two looks, which is all the half-open check needs.
+pub fn ike_activity(charon_log: &str, conn_name: &str) -> Option<IkeActivity> {
+    let mut lines = 0usize;
+    let mut last: Option<&str> = None;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if ike_line_body(line, conn_name).is_some_and(is_ike_traffic) {
+            lines += 1;
+            last = Some(line);
+        }
+    }
+    last.map(|last| IkeActivity {
+        lines,
+        last: last.to_string(),
+    })
 }
 
 /// What `log` (the charon log **after** a mark) shows of the ePDG for
@@ -1133,11 +1133,11 @@ impl TunnelEngine for StrongswanEngine {
         self.last_ike_header.borrow().clone()
     }
 
-    fn last_ike_activity(&self, runner: &dyn CommandRunner) -> Option<SystemTime> {
+    fn ike_activity(&self, runner: &dyn CommandRunner) -> Option<IkeActivity> {
         runner
             .read_file(&self.shared.charon_log)
             .ok()
-            .and_then(|c| last_ike_activity(&c, &self.conn_name))
+            .and_then(|c| ike_activity(&c, &self.conn_name))
     }
 
     /// A log truncated since the mark (charon restarted) is read from its
@@ -2960,26 +2960,46 @@ mod underlay_tests {
         assert_eq!(ike_sa_header("", "ims0"), None);
     }
 
-    // ---- T005: last_ike_activity ---------------------------------------
-
-    fn at(h: u64, m: u64, s: u64) -> SystemTime {
-        // 2026-10-20 00:00:00 UTC is 1_792_454_400.
-        UNIX_EPOCH + Duration::from_secs(1_792_454_400 + h * 3600 + m * 60 + s)
-    }
+    // ---- T005: ike_activity ----------------------------------------------
 
     /// An IKE_SA_INIT retry cycle, as charon logs it while the ePDG is
-    /// unreachable.
+    /// unreachable. Timestamps are in the container's local time.
     const INIT_RETRY: &str = "\
-2026-10-20 03:00:00 08[IKE] <ims0|5> initiating IKE_SA ims0[5] to 203.0.113.9
-2026-10-20 03:00:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA KE No N(NATD_S_IP) N(NATD_D_IP) N(FRAG_SUP) N(HASH_ALG) N(REDIR_SUP) ]
-2026-10-20 03:00:04 09[IKE] <ims0|5> retransmit 1 of request with message ID 0
-2026-10-20 03:00:11 10[IKE] <ims0|5> retransmit 2 of request with message ID 0
-2026-10-20 03:00:24 11[IKE] <ims0|5> retransmit 3 of request with message ID 0
+2026-10-20 22:30:00 08[IKE] <ims0|5> initiating IKE_SA ims0[5] to 203.0.113.9
+2026-10-20 22:30:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA KE No N(NATD_S_IP) N(NATD_D_IP) N(FRAG_SUP) N(HASH_ALG) N(REDIR_SUP) ]
+2026-10-20 22:30:04 09[IKE] <ims0|5> retransmit 1 of request with message ID 0
+2026-10-20 22:30:11 10[IKE] <ims0|5> retransmit 2 of request with message ID 0
+2026-10-20 22:30:24 11[IKE] <ims0|5> retransmit 3 of request with message ID 0
 ";
 
+    fn activity(lines: usize, last: &str) -> Option<IkeActivity> {
+        Some(IkeActivity {
+            lines,
+            last: last.to_string(),
+        })
+    }
+
     #[test]
-    fn the_newest_ike_line_of_a_retry_cycle_is_the_activity() {
-        assert_eq!(last_ike_activity(INIT_RETRY, "ims0"), Some(at(3, 0, 24)));
+    fn a_retry_cycle_is_fingerprinted_by_its_ike_lines_and_the_last_of_them() {
+        // The `initiating IKE_SA` line is not traffic; the other four are.
+        assert_eq!(
+            ike_activity(INIT_RETRY, "ims0"),
+            activity(
+                4,
+                "2026-10-20 22:30:24 11[IKE] <ims0|5> retransmit 3 of request with message ID 0"
+            )
+        );
+    }
+
+    #[test]
+    fn every_further_ike_line_changes_the_fingerprint() {
+        let before = ike_activity(INIT_RETRY, "ims0");
+        let more = format!(
+            "{INIT_RETRY}2026-10-20 22:30:47 12[IKE] <ims0|5> retransmit 4 of request with message ID 0\n"
+        );
+        assert_ne!(ike_activity(&more, "ims0"), before);
+        // The same log read twice is the same fingerprint.
+        assert_eq!(ike_activity(INIT_RETRY, "ims0"), before);
     }
 
     #[test]
@@ -2990,7 +3010,9 @@ mod underlay_tests {
 2026-10-20 03:12:30 10[ENC] <ims0|1> parsed INFORMATIONAL request 13 [ ]
 2026-10-20 03:12:30 10[ENC] <ims0|1> generating INFORMATIONAL response 13 [ ]
 ";
-        assert_eq!(last_ike_activity(log, "ims0"), Some(at(3, 12, 30)));
+        let a = ike_activity(log, "ims0").unwrap();
+        assert_eq!(a.lines, 4);
+        assert!(a.last.contains("generating INFORMATIONAL response 13"));
     }
 
     #[test]
@@ -3000,29 +3022,25 @@ mod underlay_tests {
 2026-10-20 03:05:00 08[ENC] <ims1|2> generating IKE_SA_INIT request 0 [ SA KE No ]
 2026-10-20 03:06:00 08[CFG] <ims0|5> peer not responding, trying again (2/0)
 2026-10-20 03:07:00 08[IKE] <ims0|5> received P-CSCF server IP 192.0.2.10
+2026-10-20 03:08:00 08[IKE] <ims0|5> sending keep alive to 203.0.113.9[4500]
 ";
-        assert_eq!(last_ike_activity(log, "ims0"), Some(at(3, 0, 0)));
-        assert_eq!(last_ike_activity(log, "ims1"), Some(at(3, 5, 0)));
-        assert_eq!(last_ike_activity(log, "ims2"), None);
-        assert_eq!(last_ike_activity("", "ims0"), None);
+        assert_eq!(ike_activity(log, "ims0").unwrap().lines, 1);
+        assert!(ike_activity(log, "ims1").unwrap().last.contains("<ims1|2>"));
+        assert_eq!(ike_activity(log, "ims2"), None);
+        assert_eq!(ike_activity("", "ims0"), None);
     }
 
     #[test]
-    fn the_log_timestamp_is_read_as_utc() {
-        // charon writes local time and the image sets no timezone, so UTC.
-        // If the image ever sets TZ this fails to flag it by itself; this pins
-        // what the parser assumes.
-        let log = "2026-10-20 00:00:01 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
-        assert_eq!(
-            last_ike_activity(log, "ims0"),
-            Some(UNIX_EPOCH + Duration::from_secs(1_792_454_401))
-        );
-    }
-
-    #[test]
-    fn a_line_without_a_timestamp_is_not_activity_we_can_date() {
-        let log = "08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
-        assert_eq!(last_ike_activity(log, "ims0"), None);
+    fn the_fingerprint_does_not_depend_on_the_timestamps_zone() {
+        // Same lines, stamped in IST and in UTC: only the text differs, and the
+        // count is what it is. Nothing here parses a time.
+        let utc = "2026-10-20 16:45:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
+        let ist = "2026-10-20 22:15:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
+        assert_eq!(ike_activity(utc, "ims0").unwrap().lines, 1);
+        assert_eq!(ike_activity(ist, "ims0").unwrap().lines, 1);
+        // And a line with no timestamp at all is still activity.
+        let bare = "08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
+        assert_eq!(ike_activity(bare, "ims0").unwrap().lines, 1);
     }
 
     // ---- T006: ike_evidence --------------------------------------------
