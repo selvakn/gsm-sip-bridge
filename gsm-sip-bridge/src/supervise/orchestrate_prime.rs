@@ -610,7 +610,7 @@ fn prime_lines(
                     establish_line_tunnel(&ctx, &line, &mcc, &mnc, Some(MAX_ESTABLISH_ATTEMPTS));
 
                 match result {
-                    Some((pcscf, _usim_holder)) => {
+                    Some((pcscf, _usim_holder, _epdg_ip)) => {
                         let write_result = std::fs::write(&cache_path, &pcscf).map_err(|e| {
                             format!(
                                 "priming: line {card_id}: captured {pcscf} but could not write \

@@ -1447,7 +1447,7 @@ pub(super) type UsimHolder = Arc<Mutex<Option<Arc<ChildHandle>>>>;
 /// for them.
 ///
 /// Returns `None` on any fatal step (already logged at the point of
-/// failure), or `Some((pcscf, usim_holder))` — `usim_holder` is returned
+/// failure), or `Some((pcscf, usim_holder, epdg_ip))` — `usim_holder` is returned
 /// because a persistent line's caller still needs it afterward, for
 /// `start_line_tail`'s per-incident USIM recovery.
 #[allow(clippy::too_many_lines)]
@@ -1457,7 +1457,7 @@ pub(super) fn establish_line_tunnel(
     mcc: &str,
     mnc: &str,
     max_establish_attempts: Option<u32>,
-) -> Option<(String, UsimHolder)> {
+) -> Option<(String, UsimHolder, String)> {
     let runner = ctx.runner;
     let bin = ctx.bin;
     let config_path = ctx.config_path;
@@ -1659,6 +1659,8 @@ pub(super) fn establish_line_tunnel(
         address_family,
         last_inbound: Default::default(),
         last_tun_rx: Default::default(),
+        epdg_addr: Some(epdg_ip.clone()),
+        last_ike_header: Default::default(),
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1750,7 +1752,7 @@ pub(super) fn establish_line_tunnel(
         }
     };
 
-    pcscf.map(|p| (p, usim_holder))
+    pcscf.map(|p| (p, usim_holder, epdg_ip))
 }
 
 fn start_vowifi_line_strongswan(
@@ -1799,7 +1801,8 @@ fn start_vowifi_line_strongswan(
     };
     report_tunnel(signal);
 
-    let Some((pcscf, usim_holder)) = establish_line_tunnel(ctx, line, mcc, mnc, None) else {
+    let Some((pcscf, usim_holder, epdg_ip)) = establish_line_tunnel(ctx, line, mcc, mnc, None)
+    else {
         return;
     };
 
@@ -1821,6 +1824,8 @@ fn start_vowifi_line_strongswan(
         address_family: line.config.tunnel_address_family,
         last_inbound: Default::default(),
         last_tun_rx: Default::default(),
+        epdg_addr: Some(epdg_ip),
+        last_ike_header: Default::default(),
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());

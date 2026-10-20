@@ -6,6 +6,7 @@
 //! control flow, not a redesign: see the per-branch comments below for the
 //! exact bash this replaces.
 
+use super::engines::LogMark;
 use super::runner::CommandRunner;
 pub use crate::control::protocol::DeadPeerVerdict;
 use crate::control::protocol::IkeSaLossCause;
@@ -143,6 +144,11 @@ pub enum SteadyStateHealth {
     /// An IKE_SA is listed (any state, `CONNECTING` included) but has no
     /// usable CHILD_SA.
     ChildSaMissing,
+    /// The IKE_SA `#ike_id` is half-open (`CONNECTING`): charon is still
+    /// negotiating it, which is not a lost CHILD_SA (specs/100 US3).
+    IkeSaConnecting {
+        ike_id: u32,
+    },
 }
 
 /// What one steady-state tick saw of a line's newest usable CHILD_SA
@@ -173,6 +179,34 @@ pub struct InboundEsp {
     /// charon deletes the CHILD_SA, so comparing it with the loss tick's
     /// reading covers the time the snapshot cannot. `None` if unread.
     pub tun_rx_packets: Option<u64>,
+}
+
+/// The state column of a `swanctl --list-sas` IKE_SA header (specs/100).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IkeHeaderState {
+    Established,
+    /// An IKE_SA_INIT / IKE_AUTH still in flight: listed, but not usable.
+    Connecting,
+    Other(String),
+}
+
+/// What the charon log shows of the ePDG's side of one connection since a log
+/// mark (specs/100 research R4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IkeEvidence {
+    /// A `parsed … request|response` line for the connection: the ePDG said
+    /// something, whether it answered us or sent its own request.
+    pub parsed_from_peer: bool,
+    /// Retransmits of an outstanding request since the last parsed message.
+    pub unanswered_retransmits: u32,
+}
+
+impl IkeEvidence {
+    /// The value for an engine that cannot tell: life seen, nothing unanswered.
+    pub const LIFE: Self = Self {
+        parsed_from_peer: true,
+        unanswered_retransmits: 0,
+    };
 }
 
 /// How long charon retransmits an unanswered request before giving up on the
@@ -366,6 +400,42 @@ pub trait TunnelEngine {
     /// the strongswan engine can tell; the default is `None`.
     fn child_sa_rejection(&self, _runner: &dyn CommandRunner) -> Option<String> {
         None
+    }
+    /// The ePDG address this line's tunnel runs to, for the underlay guard's
+    /// route check (specs/100). `None` for an engine that has none (swu).
+    fn epdg_addr(&self) -> Option<&str> {
+        None
+    }
+    /// Does the host have a usable route to the ePDG? `true` when the engine
+    /// cannot tell, so the guard never holds on no evidence (specs/100 R3).
+    fn route_ok(&self, _runner: &dyn CommandRunner) -> bool {
+        true
+    }
+    /// The IKE_SA header as the last [`Self::steady_state_health`] listed it,
+    /// without listing again (specs/100).
+    fn ike_header(&self) -> Option<(u32, IkeHeaderState)> {
+        None
+    }
+    /// When charon last logged IKE traffic for this connection: a message
+    /// generated, parsed or retransmitted (specs/100 R6).
+    fn last_ike_activity(&self, _runner: &dyn CommandRunner) -> Option<SystemTime> {
+        None
+    }
+    /// What the log shows of the ePDG since `mark` (specs/100 R4). The
+    /// default reads as life seen, so an engine without a log never reports
+    /// the path down.
+    fn ike_evidence_since(&self, _runner: &dyn CommandRunner, _mark: LogMark) -> IkeEvidence {
+        IkeEvidence::LIFE
+    }
+    /// A position in the engine's log, for [`Self::ike_evidence_since`].
+    fn log_mark(&self, _runner: &dyn CommandRunner) -> LogMark {
+        LogMark::default()
+    }
+    /// Queues one liveness check on the established IKE_SA (specs/100
+    /// FR-004a), returning whether it was accepted. Does not wait for the
+    /// answer.
+    fn send_dpd(&self, _runner: &dyn CommandRunner) -> bool {
+        false
     }
     /// What the steady-state tick's own log lines start with, naming this
     /// line and connection (`[supervise] line 0: ims0`).
@@ -816,7 +886,10 @@ pub fn tick_steady_state_with_pool(
     // Only a fully healthy structural check counts as a usable CHILD_SA; an
     // unreachable P-CSCF later in the tick does not undo that (specs/086).
     tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok(_));
-    if health != SteadyStateHealth::ChildSaMissing {
+    if !matches!(
+        health,
+        SteadyStateHealth::ChildSaMissing | SteadyStateHealth::IkeSaConnecting { .. }
+    ) {
         tracking.child_sa_missing = 0;
     }
     if !matches!(health, SteadyStateHealth::Ok(Some(_))) {
@@ -890,7 +963,7 @@ pub fn tick_steady_state_with_pool(
                 ike_sa_loss_cause: Some(cause),
             };
         }
-        SteadyStateHealth::ChildSaMissing => {
+        SteadyStateHealth::ChildSaMissing | SteadyStateHealth::IkeSaConnecting { .. } => {
             tracking.child_sa_missing += 1;
             if tracking.child_sa_missing >= CHILD_SA_MISSING_STRIKES {
                 // Re-initiating inside the surviving IKE_SA did not bring the
@@ -1364,6 +1437,18 @@ mod tests {
         tun_rx: RefCell<Option<u64>>,
         /// What `ike_sa_loss_cause` reports.
         loss_cause: RefCell<IkeSaLossCause>,
+        /// What `ike_header` reports (specs/100).
+        ike_header: RefCell<Option<(u32, IkeHeaderState)>>,
+        /// What `last_ike_activity` reports (specs/100).
+        last_activity: RefCell<Option<SystemTime>>,
+        /// What `route_ok` reports (specs/100).
+        route_ok: RefCell<bool>,
+        /// What `ike_evidence_since` reports (specs/100).
+        evidence: RefCell<IkeEvidence>,
+        /// Every `send_dpd` call.
+        dpd_calls: RefCell<u32>,
+        /// Whether `send_dpd` reports the check as queued.
+        dpd_accepted: RefCell<bool>,
     }
 
     impl Default for FakeEngine {
@@ -1397,6 +1482,12 @@ mod tests {
                 inbound: RefCell::new(None),
                 tun_rx: RefCell::new(None),
                 loss_cause: RefCell::new(IkeSaLossCause::Unknown),
+                ike_header: RefCell::new(None),
+                last_activity: RefCell::new(None),
+                route_ok: RefCell::new(true),
+                evidence: RefCell::new(IkeEvidence::LIFE),
+                dpd_calls: RefCell::new(0),
+                dpd_accepted: RefCell::new(true),
             }
         }
     }
@@ -1439,6 +1530,23 @@ mod tests {
         }
         fn tun_rx_packets(&self) -> Option<u64> {
             *self.tun_rx.borrow()
+        }
+        fn route_ok(&self, _runner: &dyn CommandRunner) -> bool {
+            *self.route_ok.borrow()
+        }
+        fn ike_header(&self) -> Option<(u32, IkeHeaderState)> {
+            self.ike_header.borrow().clone()
+        }
+        fn last_ike_activity(&self, _runner: &dyn CommandRunner) -> Option<SystemTime> {
+            *self.last_activity.borrow()
+        }
+        fn ike_evidence_since(&self, _runner: &dyn CommandRunner, _mark: LogMark) -> IkeEvidence {
+            *self.evidence.borrow()
+        }
+        fn send_dpd(&self, _runner: &dyn CommandRunner) -> bool {
+            *self.dpd_calls.borrow_mut() += 1;
+            self.call_order.borrow_mut().push("dpd");
+            *self.dpd_accepted.borrow()
         }
         fn child_sa_rejection(&self, _runner: &dyn CommandRunner) -> Option<String> {
             self.call_order.borrow_mut().push("rejection");
