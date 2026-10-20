@@ -9,5 +9,7 @@ pub mod thread_prio;
 pub use account::{Account, AccountConfig, RegistrationListener};
 pub use audio_media_port::{AudioMediaPort, MediaPortHandle};
 pub use call::{Call, CallState, CallStateListener, SlotId};
-pub use endpoint::{ensure_pjsip_thread, CodecInfo, Endpoint, EndpointConfig, TransportType};
+pub use endpoint::{
+    ensure_pjsip_thread, CodecInfo, Disconnect, Endpoint, EndpointConfig, TransportType,
+};
 pub use error::PjsipError;

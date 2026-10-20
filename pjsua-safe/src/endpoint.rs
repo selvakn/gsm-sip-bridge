@@ -46,8 +46,23 @@ static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
 static DISCONNECT_STATUS: std::sync::LazyLock<std::sync::Mutex<DisconnectLog>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
 
-/// `(token, final status)` per recorded disconnect, oldest first.
-type DisconnectLog = std::collections::VecDeque<(usize, Option<u16>)>;
+/// What the state callback captured when a call ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Disconnect {
+    /// PJSIP's final status; `None` when it recorded none.
+    pub status: Option<u16>,
+    /// The Q.850 cause from `Reason: Q.850;cause=N` on the received failure
+    /// final response (4xx-6xx), when there was one. A `Reason` on any other
+    /// message (BYE, CANCEL, provisional, 2xx) is never read.
+    pub q850: Option<u16>,
+    /// The callback's event carried a received response. `false` means the
+    /// call ended on a timer, a transport error or a request we sent, so
+    /// there was no header to read and only `status` can decide.
+    pub response_seen: bool,
+}
+
+/// `(token, disconnect)` per recorded disconnect, oldest first.
+type DisconnectLog = std::collections::VecDeque<(usize, Disconnect)>;
 
 const DISCONNECT_STATUS_CAPACITY: usize = 64;
 
@@ -65,10 +80,10 @@ pub(crate) fn next_call_token() -> usize {
 }
 
 /// What `on_call_state_cb` recorded when the call holding `token`
-/// disconnected: `None` if it has not (yet) been recorded, `Some(status)`
-/// once it has, where `status` is `None` when PJSIP gave no final status.
+/// disconnected: `None` if it has not (yet) been recorded, `Some` once it
+/// has (its `status` is `None` when PJSIP gave no final status).
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
-pub(crate) fn disconnect_status(token: usize) -> Option<Option<u16>> {
+pub(crate) fn disconnect_status(token: usize) -> Option<Disconnect> {
     status_in(
         &DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner()),
         token,
@@ -76,29 +91,69 @@ pub(crate) fn disconnect_status(token: usize) -> Option<Option<u16>> {
 }
 
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
-fn record_disconnect_status(token: usize, code: Option<u16>) {
+fn record_disconnect_status(token: usize, disconnect: Disconnect) {
     record_in(
         &mut DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner()),
         token,
-        code,
+        disconnect,
     );
 }
 
 /// [`disconnect_status`] over an explicit log, so tests can run on a log of
 /// their own instead of sharing the process-wide one.
-fn status_in(log: &DisconnectLog, token: usize) -> Option<Option<u16>> {
+fn status_in(log: &DisconnectLog, token: usize) -> Option<Disconnect> {
     log.iter()
         .rev()
         .find(|(t, _)| *t == token)
-        .map(|(_, code)| *code)
+        .map(|(_, disconnect)| *disconnect)
 }
 
 /// [`record_disconnect_status`] over an explicit log.
-fn record_in(log: &mut DisconnectLog, token: usize, code: Option<u16>) {
+fn record_in(log: &mut DisconnectLog, token: usize, disconnect: Disconnect) {
     if log.len() >= DISCONNECT_STATUS_CAPACITY {
         log.pop_front();
     }
-    log.push_back((token, code));
+    log.push_back((token, disconnect));
+}
+
+/// The Q.850 cause in one `Reason` header value, e.g.
+/// `Q.850;cause=21;text="Call Rejected"` gives `21`.
+///
+/// `None` for anything else — a different protocol (`SIP;cause=486`), a
+/// missing, non-numeric or out-of-range cause (Q.850 causes are 7 bits), or
+/// a value that does not parse. Never an error: a malformed header must not
+/// cost the call its classification. `;` and `cause=` inside a quoted
+/// `text="..."` are part of the text, not parameters.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+pub(crate) fn parse_q850_cause(value: &str) -> Option<u16> {
+    let mut params = split_unquoted(value, ';').into_iter();
+    if !params.next()?.trim().eq_ignore_ascii_case("Q.850") {
+        return None;
+    }
+    params.find_map(|param| {
+        let (key, val) = param.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("cause") {
+            return None;
+        }
+        val.trim().parse::<u16>().ok().filter(|cause| *cause <= 127)
+    })
+}
+
+/// Split on `sep`, ignoring separators inside double quotes.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+fn split_unquoted(value: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (i, ch) in value.char_indices() {
+        if ch == '"' {
+            quoted = !quoted;
+        } else if ch == sep && !quoted {
+            parts.push(&value[start..i]);
+            start = i + ch.len_utf8();
+        }
+    }
+    parts.push(&value[start..]);
+    parts
 }
 
 /// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
@@ -1021,6 +1076,62 @@ unsafe extern "C" fn on_incoming_call_cb( // SAFETY: PJSIP invokes with valid ac
         .push_back((acc_id, call_id, source_addr));
 }
 
+/// The event kind that carried the message, and the received / sent message
+/// data (either may be null). A transaction-state event wraps the message
+/// that moved the transaction in `src`.
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe fn event_parts(event: *const pjsua_sys::pjsip_event) -> (u32, *mut pjsua_sys::pjsip_rx_data, *mut pjsua_sys::pjsip_tx_data) { // SAFETY: event is non-null and library-owned, valid for the callback
+    let ev = &*event;
+    if ev.type_ == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_TSX_STATE {
+        let t = &ev.body.tsx_state;
+        (t.type_, t.src.rdata, t.src.tdata)
+    } else {
+        (ev.type_, ev.body.rx_msg.rdata, ev.body.tx_msg.tdata)
+    }
+}
+
+/// What the disconnect event carried from the peer: whether it was a
+/// received response at all, and the Q.850 cause of a failure (4xx-6xx)
+/// final response's `Reason` header. See [`Disconnect`].
+#[cfg(feature = "pjsip-linked")]
+#[rustfmt::skip]
+unsafe fn received_response_cause(event: *const pjsua_sys::pjsip_event) -> (bool, Option<u16>) { // SAFETY: event is null or the library-owned event passed to on_call_state; the message is read-only and not kept past the callback
+    if event.is_null() {
+        return (false, None);
+    }
+    let (kind, rdata, _) = event_parts(event);
+    if kind != pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_RX_MSG || rdata.is_null() {
+        return (false, None);
+    }
+    let msg = (*rdata).msg_info.msg;
+    if msg.is_null() || (*msg).type_ != pjsua_sys::pjsip_msg_type_e_PJSIP_RESPONSE_MSG {
+        return (false, None);
+    }
+    if !(400..=699).contains(&(*msg).line.status.code) {
+        return (true, None);
+    }
+    // `Reason` has no typed parser in PJSIP, so it arrives as a generic
+    // string header. A message may carry several (one `SIP`, one `Q.850`):
+    // walk them all and take the first Q.850 cause.
+    let name = pjsua_sys::pj_str_t {
+        ptr: c"Reason".as_ptr() as *mut std::os::raw::c_char,
+        slen: 6,
+    };
+    let mut start: *const std::os::raw::c_void = std::ptr::null();
+    loop {
+        let hdr = pjsua_sys::pjsip_msg_find_hdr_by_name(msg, &name, start)
+            as *const pjsua_sys::pjsip_generic_string_hdr;
+        if hdr.is_null() {
+            return (true, None);
+        }
+        if let Some(cause) = parse_q850_cause(&pj_str_to_string(&(*hdr).hvalue)) {
+            return (true, Some(cause));
+        }
+        start = (*hdr).next as *const std::os::raw::c_void;
+    }
+}
+
 /// Classifies the PJSIP event that delivered a call's DISCONNECTED state, for
 /// the "SIP call disconnected" log line: the event kind plus the SIP message
 /// it carried — a request method (`rx_msg BYE` = the peer hung up; `tx_msg BYE`
@@ -1031,13 +1142,7 @@ unsafe fn disconnect_trigger(event: *const pjsua_sys::pjsip_event) -> String { /
     if event.is_null() {
         return "none".to_string();
     }
-    let ev = &*event;
-    let (kind, rdata, tdata) = if ev.type_ == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_TSX_STATE {
-        let t = &ev.body.tsx_state;
-        (t.type_, t.src.rdata, t.src.tdata)
-    } else {
-        (ev.type_, ev.body.rx_msg.rdata, ev.body.tx_msg.tdata)
-    };
+    let (kind, rdata, tdata) = event_parts(event);
     let msg = if kind == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_RX_MSG && !rdata.is_null() {
         (*rdata).msg_info.msg
     } else if kind == pjsua_sys::pjsip_event_id_e_PJSIP_EVENT_TX_MSG && !tdata.is_null() {
@@ -1086,8 +1191,16 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
     if state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
         let token = pjsua_sys::pjsua_call_get_user_data(call_id) as usize;
         if token != 0 {
-            let code = u16::try_from(info.last_status).ok().filter(|code| *code > 0);
-            record_disconnect_status(token, code);
+            let status = u16::try_from(info.last_status).ok().filter(|code| *code > 0);
+            let (response_seen, q850) = received_response_cause(event);
+            record_disconnect_status(
+                token,
+                Disconnect {
+                    status,
+                    q850,
+                    response_seen,
+                },
+            );
         }
     }
 
@@ -1265,7 +1378,17 @@ mod disconnect_trigger_tests {
 
 #[cfg(test)]
 mod disconnect_status_tests {
-    use super::{next_call_token, record_in, status_in, DisconnectLog, DISCONNECT_STATUS_CAPACITY};
+    use super::{
+        next_call_token, parse_q850_cause, record_in, status_in, Disconnect, DisconnectLog,
+        DISCONNECT_STATUS_CAPACITY,
+    };
+
+    fn with_status(status: Option<u16>) -> Disconnect {
+        Disconnect {
+            status,
+            ..Disconnect::default()
+        }
+    }
 
     /// Two calls that held the same PJSUA call id one after the other keep
     /// separate statuses: the second call's disconnect neither erases nor
@@ -1279,13 +1402,13 @@ mod disconnect_status_tests {
         assert_ne!(rejected, reused);
         assert_eq!(status_in(&log, rejected), None);
 
-        record_in(&mut log, rejected, Some(603));
-        record_in(&mut log, reused, Some(408));
-        assert_eq!(status_in(&log, rejected), Some(Some(603)));
-        assert_eq!(status_in(&log, reused), Some(Some(408)));
+        record_in(&mut log, rejected, with_status(Some(603)));
+        record_in(&mut log, reused, with_status(Some(408)));
+        assert_eq!(status_in(&log, rejected), Some(with_status(Some(603))));
+        assert_eq!(status_in(&log, reused), Some(with_status(Some(408))));
 
         for _ in 0..DISCONNECT_STATUS_CAPACITY {
-            record_in(&mut log, next_call_token(), Some(486));
+            record_in(&mut log, next_call_token(), with_status(Some(486)));
         }
         assert_eq!(status_in(&log, rejected), None);
     }
@@ -1298,8 +1421,48 @@ mod disconnect_status_tests {
         let mut log = DisconnectLog::new();
         let token = next_call_token();
         assert_eq!(status_in(&log, token), None);
-        record_in(&mut log, token, None);
-        assert_eq!(status_in(&log, token), Some(None));
+        record_in(&mut log, token, with_status(None));
+        assert_eq!(status_in(&log, token), Some(with_status(None)));
+    }
+
+    /// The cause travels with the status it arrived with.
+    #[test]
+    fn the_cause_is_stored_beside_the_status() {
+        let mut log = DisconnectLog::new();
+        let token = next_call_token();
+        let seen = Disconnect {
+            status: Some(403),
+            q850: Some(21),
+            response_seen: true,
+        };
+        record_in(&mut log, token, seen);
+        assert_eq!(status_in(&log, token), Some(seen));
+    }
+
+    #[test]
+    fn parses_the_q850_cause_from_a_reason_value() {
+        for (value, expected) in [
+            ("Q.850;cause=21", Some(21)),
+            ("Q.850 ;cause=21;text=\"Call Rejected\"", Some(21)),
+            ("q.850;CAUSE=17", Some(17)),
+            ("Q.850;cause = 21", Some(21)),
+            ("Q.850;text=\"x\";cause=21", Some(21)),
+            // `;` and `cause=` inside the quoted text are text, not parameters.
+            ("Q.850;text=\"a; cause=9\";cause=21", Some(21)),
+            ("Q.850;text=\"cause=9\"", None),
+            ("Q.850;cause=0", Some(0)),
+            ("Q.850;cause=127", Some(127)),
+            ("Q.850;cause=128", None),
+            ("Q.850;cause=999", None),
+            ("Q.850;cause=abc", None),
+            ("Q.850;cause=", None),
+            ("Q.850", None),
+            ("SIP;cause=486;text=\"Busy Here\"", None),
+            ("", None),
+            (";cause=21", None),
+        ] {
+            assert_eq!(parse_q850_cause(value), expected, "value: {value:?}");
+        }
     }
 }
 

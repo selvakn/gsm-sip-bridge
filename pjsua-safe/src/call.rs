@@ -1,6 +1,7 @@
 use crate::account::Account;
 #[cfg(feature = "pjsip-linked")]
 use crate::endpoint::ensure_pjsip_thread;
+use crate::endpoint::Disconnect;
 use crate::error::PjsipError;
 
 pub type SlotId = i32;
@@ -29,10 +30,10 @@ pub struct Call {
     /// `user_data` `Call::make` hands PJSUA. 0 for a call we did not place.
     #[allow(dead_code)]
     token: usize,
-    /// Stub builds only: what [`Call::last_status`] reports, set by tests via
-    /// [`Call::set_last_status`]. A linked build reads PJSIP instead.
+    /// Stub builds only: what [`Call::last_disconnect`] reports, set by tests
+    /// via [`Call::set_last_disconnect`]. A linked build reads PJSIP instead.
     #[allow(dead_code)]
-    last_status: Option<u16>,
+    last_disconnect: Option<Disconnect>,
 }
 
 impl Call {
@@ -121,7 +122,7 @@ impl Call {
                     call_id,
                     state: CallState::Calling,
                     token,
-                    last_status: None,
+                    last_disconnect: None,
                 });
             }
         }
@@ -134,7 +135,7 @@ impl Call {
                 call_id: 0,
                 state: CallState::Calling,
                 token: 0,
-                last_status: None,
+                last_disconnect: None,
             })
         }
     }
@@ -152,7 +153,7 @@ impl Call {
             call_id,
             state,
             token: 0,
-            last_status: None,
+            last_disconnect: None,
         }
     }
 
@@ -371,24 +372,44 @@ impl Call {
     /// token. Only calls placed with [`Call::make`] have one; any other call
     /// reports `None`.
     pub fn last_status(&self) -> Option<u16> {
+        self.last_disconnect().and_then(|d| d.status)
+    }
+
+    /// Everything the disconnect callback captured for this call: the final
+    /// status and, when the peer's failure response carried
+    /// `Reason: Q.850;cause=N`, that cause. `None` until the call has ended
+    /// and the callback has run, and for calls not placed with
+    /// [`Call::make`]. Read from the same per-token capture as
+    /// [`Call::last_status`].
+    pub fn last_disconnect(&self) -> Option<Disconnect> {
         #[cfg(feature = "pjsip-linked")]
         {
             if self.token == 0 {
                 return None;
             }
-            crate::endpoint::disconnect_status(self.token).flatten()
+            crate::endpoint::disconnect_status(self.token)
         }
 
         #[cfg(not(feature = "pjsip-linked"))]
         {
-            self.last_status
+            self.last_disconnect
         }
     }
 
-    /// Stub builds: sets what [`Call::last_status`] reports. A linked build
-    /// ignores it — PJSIP is the only source of truth there.
+    /// Stub builds: sets what [`Call::last_status`] reports, leaving any
+    /// cause unset. A linked build ignores it — PJSIP is the only source of
+    /// truth there.
     pub fn set_last_status(&mut self, status: Option<u16>) {
-        self.last_status = status;
+        self.set_last_disconnect(Disconnect {
+            status,
+            ..Disconnect::default()
+        });
+    }
+
+    /// Stub builds: sets what [`Call::last_disconnect`] reports. A linked
+    /// build ignores it.
+    pub fn set_last_disconnect(&mut self, disconnect: Disconnect) {
+        self.last_disconnect = Some(disconnect);
     }
 
     pub fn call_id(&self) -> i32 {
@@ -427,6 +448,21 @@ mod tests {
         assert_eq!(call.last_status(), None);
         call.set_last_status(Some(603));
         assert_eq!(call.last_status(), Some(603));
+    }
+
+    #[cfg(not(feature = "pjsip-linked"))]
+    #[test]
+    fn a_stub_call_reports_the_disconnect_cause_it_was_given() {
+        let mut call = Call::from_id(3, CallState::Early);
+        assert_eq!(call.last_disconnect(), None);
+        let rejected = Disconnect {
+            status: Some(403),
+            q850: Some(21),
+            response_seen: true,
+        };
+        call.set_last_disconnect(rejected);
+        assert_eq!(call.last_disconnect(), Some(rejected));
+        assert_eq!(call.last_status(), Some(403));
     }
 
     #[test]
