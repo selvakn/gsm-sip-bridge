@@ -508,6 +508,46 @@ pub static VOWIFI_DEAD_PEER_LOSSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Times the underlay guard put a line on hold, by cause (specs/100). A hold
+/// means the path to the ePDG was judged down and the supervisor stood back
+/// from recoveries that are only inferred from the ePDG being unreachable.
+pub static VOWIFI_UPLINK_HOLDS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_uplink_holds_total",
+            "Times a VoWiFi line's recovery was put on hold for an uplink outage, by cause"
+        ),
+        &["module", "cause"]
+    )
+    .unwrap()
+});
+
+/// Seconds lines have spent on hold, by cause, added when each hold ends
+/// (specs/100). A hold still in progress is visible as the gauge below.
+pub static VOWIFI_UPLINK_HELD_SECONDS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_uplink_held_seconds_total",
+            "Seconds a VoWiFi line's recovery has spent on hold for an uplink outage, by cause"
+        ),
+        &["module", "cause"]
+    )
+    .unwrap()
+});
+
+/// 1 while the underlay guard holds this line's recovery, 0 otherwise
+/// (specs/100). Left untouched by a report that does not carry the signal.
+pub static VOWIFI_UPLINK_HELD: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_uplink_held",
+            "1 while the underlay guard is holding this VoWiFi line's tunnel recovery, 0 otherwise"
+        ),
+        &["module"]
+    )
+    .unwrap()
+});
+
 // --- Agent liveness (specs/014-vowifi-metrics-restore) ---------------------
 // Owned by `metrics::ingest`, evaluated at scrape time in `metrics::server`.
 // Labeled by both `agent` (process kind: ims/sip) and `module` (card

@@ -151,36 +151,36 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `203.0.113.x`, `
 
 **Goal**: [contracts/observability.md](contracts/observability.md) and [contracts/status-file.md](contracts/status-file.md), spec FR-018–FR-023. **Independent test**: wire/ingest unit tests plus the control-socket integration test.
 
-- [ ] T026 [P] [US4] In `control/protocol.rs`, tests first:
+- [X] T026 [P] [US4] In `control/protocol.rs`, tests first:
   - `UplinkState { Up, NoRoute, NoResponse }` (snake_case);
   - `AgentState.uplink: Option<UplinkState>` with `skip_serializing_if`/`default`;
   - `ObservedEvent::UplinkHoldStarted { cause }` and `UplinkHoldEnded { cause, held_secs, ended_by }`, with `UplinkHoldCause { NoRoute, NoResponse }` and `HoldEndedBy { Restored, MaxHold, Shutdown }`;
   - `DeadPeerVerdict::Uplink` (`uplink`).
   
   Round-trip each, check an old payload without the fields still parses, and check that existing wire shapes are unchanged.
-- [ ] T027 [US4] In `metrics/mod.rs`, register `gsm_sip_bridge_vowifi_uplink_holds_total{module,cause}`, `…_uplink_held_seconds_total{module,cause}` and gauge `…_uplink_held{module}`. In `metrics/ingest.rs`:
+- [X] T027 [US4] In `metrics/mod.rs`, register `gsm_sip_bridge_vowifi_uplink_holds_total{module,cause}`, `…_uplink_held_seconds_total{module,cause}` and gauge `…_uplink_held{module}`. In `metrics/ingest.rs`:
   - count the two events;
   - set the gauge from `AgentState.uplink` on supervisor reports, leaving it untouched when absent;
   - keep `last_uplink: Option<UplinkState>` on the supervisor record;
   - extend `tunnel_failure_description` with an `uplink` argument that appends `; uplink down (no route|no response), recovery on hold` only when held.
   
   Tests first: every existing description is byte-identical when `uplink` is `Up`/`None`; both suffixes; the counters and gauge per event or state.
-- [ ] T028 [US4] In `supervise/orchestrate.rs`:
+- [X] T028 [US4] In `supervise/orchestrate.rs`:
   - add `uplink` to `TunnelSignal` and `sync_tunnel_signal`, so a verdict change is reported once; with the guard off, never set the field;
   - emit `UplinkHoldStarted`/`UplinkHoldEnded` from the T019 transitions through `send_tunnel`;
   - when a held tick sees `IkeSaLost` with cause `DeadPeer`, report `dead_peer: Uplink` instead of the 098 classification (FR-022).
   
   Unit-test the signal change detection.
-- [ ] T029 [P] [US4] In `ims/pcscf_files.rs`, tests first: `uplink_path(selection_path)` (`<path>.uplink`), `render_uplink(state, since) -> String` and `parse_uplink(&str) -> Option<(UplinkState, Option<u64>)>` per contracts/status-file.md. Reject unknown `v`, malformed JSON and an unknown `state`. Use `write_atomic`.
-- [ ] T030 [US4] Write the uplink file from `supervise/orchestrate.rs` at line start (`up`) and on every verdict change. Do not write it on swu lines or with the guard off.
-- [ ] T031 [US4] In `vowifi/mod.rs` `print_status`, tests first via a pure `format_uplink_line(parsed: Option<…>, now) -> String`: `uplink: up`; `uplink: no_route (held 3m12s, recovery on hold)`; `uplink: unknown` for a missing or unparseable file. Print it under each line after the registration block, and never change the exit code.
-- [ ] T032 [US4] Extend `gsm-sip-bridge/tests/test_vowifi_tunnel_recovery_metrics.rs`: a real reporter sends:
+- [X] T029 [P] [US4] In `ims/pcscf_files.rs`, tests first: `uplink_path(selection_path)` (`<path>.uplink`), `render_uplink(state, since) -> String` and `parse_uplink(&str) -> Option<(UplinkState, Option<u64>)>` per contracts/status-file.md. Reject unknown `v`, malformed JSON and an unknown `state`. Use `write_atomic`.
+- [X] T030 [US4] Write the uplink file from `supervise/orchestrate.rs` at line start (`up`) and on every verdict change. Do not write it on swu lines or with the guard off.
+- [X] T031 [US4] In `vowifi/mod.rs` `print_status`, tests first via a pure `format_uplink_line(parsed: Option<…>, now) -> String`: `uplink: up`; `uplink: no_route (held 3m12s, recovery on hold)`; `uplink: unknown` for a missing or unparseable file. Print it under each line after the registration block, and never change the exit code.
+- [X] T032 [US4] Extend `gsm-sip-bridge/tests/test_vowifi_tunnel_recovery_metrics.rs`: a real reporter sends:
   - a supervisor state `uplink=no_route`, then `uplink_hold_started{no_route}`, then `uplink_hold_ended{no_route, 312, restored}` with `uplink=up`;
   - `TunnelRecovered{IkeSaNegotiationStuck}`;
   - `TunnelRecovered{IkeSaLost, dead_peer: uplink}`.
   
   Assert the registry: holds=1, held_seconds=312, the gauge 1 then 0, a recovery counted with `reason="ike_sa_negotiation_stuck"`, and a dead-peer loss with `verdict="uplink"`.
-- [ ] T033 [US4] `make format lint test`; commit `feat(observability): report uplink holds in metrics, alert text and vowifi-status (#141)`.
+- [X] T033 [US4] `make format lint test`; commit `feat(observability): report uplink holds in metrics, alert text and vowifi-status (#141)`.
 
 ## Phase 7: Configuration (FR-025/FR-025a, SC-008)
 

@@ -6,7 +6,8 @@
 // `supervise::orchestrate`'s strongSwan steady loop uses.
 
 use gsm_sip_bridge::control::protocol::{
-    AgentKind, AgentState, DeadPeerVerdict, ObservedEvent, TunnelRecoveryReason,
+    AgentKind, AgentState, DeadPeerVerdict, HoldEndedBy, ObservedEvent, TunnelRecoveryReason,
+    UplinkHoldCause, UplinkState,
 };
 use gsm_sip_bridge::control::server::start_control_server;
 use gsm_sip_bridge::metrics;
@@ -174,6 +175,107 @@ async fn dead_peer_losses_are_counted_by_verdict() {
     assert_eq!(dead_peer_losses(module, DeadPeerVerdict::Real), 1.0);
     // A loss with no verdict (carrier DELETE, unknown cause) counts nowhere.
     assert_eq!(dead_peer_losses(module, DeadPeerVerdict::Unknown), 0.0);
+
+    let _ = shutdown_tx.send(true);
+    handle.abort();
+}
+
+/// specs/100 US4: an uplink hold is visible in the registry, through the same
+/// reporter -> socket -> registry path the supervisor uses: the gauge follows
+/// the reported state, the start counts a hold, the end adds its seconds, and
+/// the two new label values on the existing counters are counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uplink_hold_is_counted_gauged_and_attributed() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir
+        .path()
+        .join("uplink-hold-test.sock")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = start_control_server(&socket_path, cmd_tx, shutdown_rx).await;
+
+    let module = "test-uplink-hold";
+    let reporter = Reporter::spawn(
+        socket_path.clone(),
+        AgentKind::Supervisor,
+        module.to_string(),
+        Duration::from_millis(50),
+    );
+    let holds = |cause: UplinkHoldCause| {
+        metrics::VOWIFI_UPLINK_HOLDS_TOTAL
+            .with_label_values(&[module, cause.as_str()])
+            .get()
+    };
+    let held_seconds = |cause: UplinkHoldCause| {
+        metrics::VOWIFI_UPLINK_HELD_SECONDS_TOTAL
+            .with_label_values(&[module, cause.as_str()])
+            .get()
+    };
+    let gauge = || {
+        metrics::VOWIFI_UPLINK_HELD
+            .with_label_values(&[module])
+            .get()
+    };
+
+    // The hold starts.
+    reporter.report(
+        AgentState {
+            uplink: Some(UplinkState::NoRoute),
+            ..tunnel_state()
+        },
+        vec![ObservedEvent::UplinkHoldStarted {
+            cause: UplinkHoldCause::NoRoute,
+        }],
+    );
+    wait_for(
+        || holds(UplinkHoldCause::NoRoute) == 1.0 && gauge() == 1.0,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(holds(UplinkHoldCause::NoResponse), 0.0);
+
+    // It ends, 312s later.
+    reporter.report(
+        AgentState {
+            uplink: Some(UplinkState::Up),
+            ..tunnel_state()
+        },
+        vec![ObservedEvent::UplinkHoldEnded {
+            cause: UplinkHoldCause::NoRoute,
+            held_secs: 312,
+            ended_by: HoldEndedBy::Restored,
+        }],
+    );
+    wait_for(
+        || held_seconds(UplinkHoldCause::NoRoute) == 312.0 && gauge() == 0.0,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(held_seconds(UplinkHoldCause::NoResponse), 0.0);
+
+    // A stuck half-open IKE_SA has its own recovery label, and a dead-peer loss
+    // seen on a held line is attributed to the uplink, never to the peer.
+    reporter.report(
+        tunnel_state(),
+        vec![
+            recovered(TunnelRecoveryReason::IkeSaNegotiationStuck),
+            lost(DeadPeerVerdict::Uplink),
+        ],
+    );
+    wait_for(
+        || {
+            recoveries(module, TunnelRecoveryReason::IkeSaNegotiationStuck) == 1.0
+                && recoveries(module, TunnelRecoveryReason::IkeSaLost) == 1.0
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(dead_peer_losses(module, DeadPeerVerdict::Uplink), 1.0);
+    assert_eq!(dead_peer_losses(module, DeadPeerVerdict::Real), 0.0);
 
     let _ = shutdown_tx.send(true);
     handle.abort();

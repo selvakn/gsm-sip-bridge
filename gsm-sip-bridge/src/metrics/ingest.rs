@@ -14,7 +14,7 @@ use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKin
 use crate::config::AlertsConfig;
 use crate::control::protocol::{
     AgentKind, AgentReport, AgentState, CallStatus, IkeSaLossCause, ObservedEvent, QualitySource,
-    SmsOutcome, TunnelRecoveryReason,
+    SmsOutcome, TunnelRecoveryReason, UplinkState,
 };
 use crate::metrics;
 use std::collections::HashMap;
@@ -117,6 +117,8 @@ struct AgentRecord {
     tunnel_flapping: bool,
     /// The most recent IKE_SA loss cause the supervisor reported, for alert text.
     last_ike_sa_loss_cause: Option<IkeSaLossCause>,
+    /// The supervisor's last-reported uplink state (specs/100), for alert text.
+    last_uplink: Option<UplinkState>,
     /// Whether the open tunnel streak was opened by flapping (backdated by the
     /// threshold so it alerts at once) rather than by an outage. Picks the alert
     /// wording.
@@ -277,6 +279,7 @@ fn apply_report_with(
     let mut tunnel_fold = existing.map_or_else(FoldedTunnel::default, |r| r.tunnel_fold);
     let mut tunnel_flapping = existing.is_some_and(|r| r.tunnel_flapping);
     let mut last_ike_sa_loss_cause = existing.and_then(|r| r.last_ike_sa_loss_cause);
+    let mut last_uplink = existing.and_then(|r| r.last_uplink);
     let mut streak_opened_by_flapping = existing.is_some_and(|r| r.streak_opened_by_flapping);
     let mut gm_connection_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.gm_connection_alert_phase);
@@ -324,6 +327,12 @@ fn apply_report_with(
         if report.agent == AgentKind::Supervisor {
             if let Some(cause) = report.state.ike_sa_loss_cause {
                 last_ike_sa_loss_cause = Some(cause);
+            }
+            if let Some(uplink) = report.state.uplink {
+                last_uplink = Some(uplink);
+                metrics::VOWIFI_UPLINK_HELD
+                    .with_label_values(&[module_id])
+                    .set(if uplink == UplinkState::Up { 0.0 } else { 1.0 });
             }
             if let Some(flapping) = report.state.tunnel_flapping {
                 tunnel_flapping = flapping;
@@ -502,6 +511,7 @@ fn apply_report_with(
             tunnel_fold,
             tunnel_flapping,
             last_ike_sa_loss_cause,
+            last_uplink,
             streak_opened_by_flapping,
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
@@ -622,14 +632,17 @@ fn fold_flapping_into_tunnel_streak(
 }
 
 /// The text of a tunnel-failure `Failure` alert (specs/087, contracts/
-/// observability.md). `cause` is omitted when none was ever reported.
+/// observability.md). `cause` is omitted when none was ever reported. While the
+/// underlay guard holds the line (`uplink` down) the text says so (specs/100
+/// FR-023); otherwise it is unchanged.
 fn tunnel_failure_description(
     subject: &str,
     unhealthy_sec: u64,
     flapping: bool,
     cause: Option<IkeSaLossCause>,
+    uplink: Option<UplinkState>,
 ) -> String {
-    match (flapping, cause) {
+    let text = match (flapping, cause) {
         (false, None) => {
             format!("{subject} line's tunnel non-established for over {unhealthy_sec}s")
         }
@@ -642,6 +655,13 @@ fn tunnel_failure_description(
         (true, Some(c)) => format!(
             "{subject} line's tunnel rebuilt repeatedly (3+ times within {unhealthy_sec}s; last IKE_SA loss: {c})"
         ),
+    };
+    match uplink {
+        Some(UplinkState::NoRoute) => format!("{text}; uplink down (no route), recovery on hold"),
+        Some(UplinkState::NoResponse) => {
+            format!("{text}; uplink down (no response), recovery on hold")
+        }
+        Some(UplinkState::Up) | None => text,
     }
 }
 
@@ -812,18 +832,25 @@ fn build_alert(
         // so both read as the VoWiFi line rather than naming whichever kind
         // happened to own the decision.
         (AlertCategory::TunnelFailure, CriticalEventKind::Failure) => {
-            let (flapping, cause) = liveness()
-                .lock()
-                .unwrap()
-                .get(key)
-                .map_or((false, None), |r| {
-                    (r.streak_opened_by_flapping, r.last_ike_sa_loss_cause)
-                });
+            // The IMS agent's record has no uplink, so a failure decided on it
+            // reads the supervisor's, the one that holds the line.
+            let (flapping, cause, uplink) = {
+                let records = liveness().lock().unwrap();
+                let own = records.get(key);
+                let supervisor = records.get(&(AgentKind::Supervisor, key.1.clone()));
+                (
+                    own.is_some_and(|r| r.streak_opened_by_flapping),
+                    own.and_then(|r| r.last_ike_sa_loss_cause),
+                    own.and_then(|r| r.last_uplink)
+                        .or_else(|| supervisor.and_then(|r| r.last_uplink)),
+                )
+            };
             tunnel_failure_description(
                 tunnel_alert_subject(key.0),
                 cfg.tunnel_failure_thresholds.unhealthy_sec,
                 flapping,
                 cause,
+                uplink,
             )
         }
         (AlertCategory::TunnelFailure, CriticalEventKind::Recovered) => {
@@ -1215,6 +1242,18 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
             metrics::RTCP_UNAVAILABLE_TOTAL
                 .with_label_values(&[module_id])
                 .inc();
+        }
+        ObservedEvent::UplinkHoldStarted { cause } => {
+            metrics::VOWIFI_UPLINK_HOLDS_TOTAL
+                .with_label_values(&[module_id, cause.as_str()])
+                .inc();
+        }
+        ObservedEvent::UplinkHoldEnded {
+            cause, held_secs, ..
+        } => {
+            metrics::VOWIFI_UPLINK_HELD_SECONDS_TOTAL
+                .with_label_values(&[module_id, cause.as_str()])
+                .inc_by(*held_secs as f64);
         }
         ObservedEvent::TunnelRecovered {
             reason, dead_peer, ..
@@ -1812,6 +1851,7 @@ mod tests {
                 tunnel_fold: FoldedTunnel::default(),
                 tunnel_flapping: false,
                 last_ike_sa_loss_cause: None,
+                last_uplink: None,
                 streak_opened_by_flapping: false,
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
@@ -2020,6 +2060,7 @@ mod tests {
                     },
                     tunnel_flapping: false,
                     last_ike_sa_loss_cause: None,
+                    last_uplink: None,
                     streak_opened_by_flapping: false,
                     gm_connection_unhealthy_since: None,
                     gm_connection_alert_phase: AlertPhase::Idle,
@@ -2649,19 +2690,154 @@ mod tests {
     fn tunnel_failure_text_per_cause_and_streak_kind() {
         use IkeSaLossCause::*;
         assert_eq!(
-            tunnel_failure_description("VoWiFi", 300, false, None),
+            tunnel_failure_description("VoWiFi", 300, false, None, None),
             "VoWiFi line's tunnel non-established for over 300s"
         );
         assert_eq!(
-            tunnel_failure_description("VoWiFi", 300, false, Some(DeadPeer)),
+            tunnel_failure_description("VoWiFi", 300, false, Some(DeadPeer), None),
             "VoWiFi line's tunnel non-established for over 300s (last IKE_SA loss: dead-peer timeout)"
         );
         assert_eq!(
-            tunnel_failure_description("VoWiFi", 300, true, Some(CarrierDelete)),
+            tunnel_failure_description("VoWiFi", 300, true, Some(CarrierDelete), None),
             "VoWiFi line's tunnel rebuilt repeatedly (3+ times within 300s; last IKE_SA loss: carrier DELETE)"
         );
-        let no_cause = tunnel_failure_description("VoWiFi", 300, true, None);
+        let no_cause = tunnel_failure_description("VoWiFi", 300, true, None, None);
         assert!(no_cause.contains("rebuilt repeatedly") && !no_cause.contains("last IKE_SA loss"));
+    }
+
+    #[test]
+    fn an_alert_for_a_held_line_says_the_uplink_is_down_and_nothing_else_changes() {
+        use IkeSaLossCause::*;
+        for flapping in [false, true] {
+            for cause in [None, Some(DeadPeer), Some(CarrierDelete)] {
+                let plain = tunnel_failure_description("VoWiFi", 300, flapping, cause, None);
+                // Up or absent: byte for byte what it was.
+                assert_eq!(
+                    tunnel_failure_description(
+                        "VoWiFi",
+                        300,
+                        flapping,
+                        cause,
+                        Some(UplinkState::Up)
+                    ),
+                    plain
+                );
+                assert_eq!(
+                    tunnel_failure_description(
+                        "VoWiFi",
+                        300,
+                        flapping,
+                        cause,
+                        Some(UplinkState::NoRoute)
+                    ),
+                    format!("{plain}; uplink down (no route), recovery on hold")
+                );
+                assert_eq!(
+                    tunnel_failure_description(
+                        "VoWiFi",
+                        300,
+                        flapping,
+                        cause,
+                        Some(UplinkState::NoResponse)
+                    ),
+                    format!("{plain}; uplink down (no response), recovery on hold")
+                );
+            }
+        }
+        assert_eq!(
+            tunnel_failure_description(
+                "VoWiFi",
+                300,
+                false,
+                Some(DeadPeer),
+                Some(UplinkState::NoRoute)
+            ),
+            "VoWiFi line's tunnel non-established for over 300s (last IKE_SA loss: dead-peer timeout); uplink down (no route), recovery on hold"
+        );
+    }
+
+    fn uplink_report(m: &str, seq: u64, uplink: Option<UplinkState>, events: Vec<ObservedEvent>) {
+        apply_report(&AgentReport {
+            agent: AgentKind::Supervisor,
+            module_id: m.to_string(),
+            epoch: 1,
+            seq,
+            state: AgentState {
+                uplink,
+                ..AgentState::default()
+            },
+            events,
+            dropped: 0,
+        });
+    }
+
+    #[test]
+    fn the_uplink_held_gauge_follows_the_supervisors_state_and_ignores_silence() {
+        let m = "test-uplink-held-gauge";
+        let gauge = || metrics::VOWIFI_UPLINK_HELD.with_label_values(&[m]).get();
+        uplink_report(m, 1, Some(UplinkState::NoRoute), vec![]);
+        assert_eq!(gauge(), 1.0);
+        // A report that does not carry the signal leaves it as it was.
+        uplink_report(m, 2, None, vec![]);
+        assert_eq!(gauge(), 1.0);
+        uplink_report(m, 3, Some(UplinkState::NoResponse), vec![]);
+        assert_eq!(gauge(), 1.0);
+        uplink_report(m, 4, Some(UplinkState::Up), vec![]);
+        assert_eq!(gauge(), 0.0);
+        let key = (AgentKind::Supervisor, m.to_string());
+        assert_eq!(
+            liveness().lock().unwrap()[&key].last_uplink,
+            Some(UplinkState::Up)
+        );
+    }
+
+    #[test]
+    fn hold_events_count_starts_and_add_up_held_seconds_by_cause() {
+        use crate::control::protocol::{HoldEndedBy, UplinkHoldCause};
+        let m = "test-uplink-hold-events";
+        let holds = |c: &str| {
+            metrics::VOWIFI_UPLINK_HOLDS_TOTAL
+                .with_label_values(&[m, c])
+                .get()
+        };
+        let secs = |c: &str| {
+            metrics::VOWIFI_UPLINK_HELD_SECONDS_TOTAL
+                .with_label_values(&[m, c])
+                .get()
+        };
+        uplink_report(
+            m,
+            1,
+            Some(UplinkState::NoRoute),
+            vec![ObservedEvent::UplinkHoldStarted {
+                cause: UplinkHoldCause::NoRoute,
+            }],
+        );
+        assert_eq!((holds("no_route"), holds("no_response")), (1.0, 0.0));
+        assert_eq!(secs("no_route"), 0.0);
+        uplink_report(
+            m,
+            2,
+            Some(UplinkState::Up),
+            vec![ObservedEvent::UplinkHoldEnded {
+                cause: UplinkHoldCause::NoRoute,
+                held_secs: 312,
+                ended_by: HoldEndedBy::Restored,
+            }],
+        );
+        assert_eq!(secs("no_route"), 312.0);
+        assert_eq!(secs("no_response"), 0.0);
+        uplink_report(
+            m,
+            3,
+            None,
+            vec![ObservedEvent::UplinkHoldEnded {
+                cause: UplinkHoldCause::NoRoute,
+                held_secs: 8,
+                ended_by: HoldEndedBy::Shutdown,
+            }],
+        );
+        assert_eq!(secs("no_route"), 320.0);
     }
 
     #[test]

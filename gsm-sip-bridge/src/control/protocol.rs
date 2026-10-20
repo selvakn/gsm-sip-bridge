@@ -371,6 +371,12 @@ pub struct AgentState {
     /// For alert text; never drives a decision.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ike_sa_loss_cause: Option<IkeSaLossCause>,
+    /// Supervisor only: what the underlay guard believes about the path to
+    /// this line's ePDG (specs/100). Absent when the guard is off, on the swu
+    /// engine, and from an older supervisor; ingest then leaves its state
+    /// untouched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub uplink: Option<UplinkState>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is
@@ -452,6 +458,16 @@ pub enum ObservedEvent {
         /// absent on the wire, for every other recovery.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dead_peer: Option<DeadPeerVerdict>,
+    },
+    /// Supervisor only: the underlay guard put this line on hold (specs/100).
+    UplinkHoldStarted {
+        cause: UplinkHoldCause,
+    },
+    /// Supervisor only: a hold ended, after `held_secs` (specs/100).
+    UplinkHoldEnded {
+        cause: UplinkHoldCause,
+        held_secs: u64,
+        ended_by: HoldEndedBy,
     },
 }
 
@@ -797,6 +813,66 @@ mod tests {
             );
         }
         assert_eq!(DeadPeerVerdict::Uplink.as_str(), "uplink");
+    }
+
+    #[test]
+    fn uplink_state_and_hold_events_round_trip_and_old_payloads_still_parse() {
+        let state = AgentState {
+            uplink: Some(UplinkState::NoRoute),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, r#"{"uplink":"no_route"}"#);
+        assert_eq!(
+            serde_json::from_str::<AgentState>(&json).unwrap().uplink,
+            Some(UplinkState::NoRoute)
+        );
+        // Without the field (an older supervisor, or the guard off) it is absent.
+        assert_eq!(serde_json::to_string(&AgentState::default()).unwrap(), "{}");
+        assert_eq!(
+            serde_json::from_str::<AgentState>(r#"{"child_sa_up":true}"#)
+                .unwrap()
+                .uplink,
+            None
+        );
+
+        let started = ObservedEvent::UplinkHoldStarted {
+            cause: UplinkHoldCause::NoRoute,
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"uplink_hold_started","cause":"no_route"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ObservedEvent>(&json).unwrap(),
+            started
+        );
+
+        let ended = ObservedEvent::UplinkHoldEnded {
+            cause: UplinkHoldCause::NoResponse,
+            held_secs: 312,
+            ended_by: HoldEndedBy::Restored,
+        };
+        let json = serde_json::to_string(&ended).unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"uplink_hold_ended","cause":"no_response","held_secs":312,"ended_by":"restored"}"#
+        );
+        assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), ended);
+    }
+
+    #[test]
+    fn a_dead_peer_loss_attributed_to_the_uplink_round_trips() {
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::IkeSaLost,
+            pcscfs: Vec::new(),
+            rebuilt_at_unix: None,
+            dead_peer: Some(DeadPeerVerdict::Uplink),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""dead_peer":"uplink""#), "{json}");
+        assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), event);
     }
 
     #[test]

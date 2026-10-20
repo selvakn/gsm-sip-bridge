@@ -2312,6 +2312,21 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
             }
         }
 
+        // The supervisor's verdict on the path to the ePDG (specs/100). It
+        // lives in a file beside the P-CSCF files because the supervisor
+        // serves no socket; a missing or unreadable file is `unknown`, never
+        // an error.
+        let uplink = resolution
+            .lines
+            .iter()
+            .find(|l| l.index == line.index)
+            .and_then(|l| {
+                std::fs::read_to_string(crate::ims::pcscf_files::uplink_path(&l.pcscf_source_path))
+                    .ok()
+            })
+            .and_then(|c| crate::ims::pcscf_files::parse_uplink(&c));
+        println!("  {}", format_uplink_line(uplink, unix_now()));
+
         println!("  Recent calls (Agent B):");
         match query_status(&format!("{}:{}", line.veth_peer_addr, line.control_port)) {
             Ok(ControlMessage::CallHistoryReply { calls }) if calls.is_empty() => {
@@ -2362,6 +2377,36 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// The `uplink:` line of `vowifi-status` (specs/100 `contracts/status-file.md`):
+/// the underlay guard's verdict and, while the line is held, for how long.
+/// `None` is a missing or unreadable file (a swu line, the guard off, a
+/// supervisor that has not started) and reads `unknown`.
+pub fn format_uplink_line(
+    uplink: Option<(crate::control::protocol::UplinkState, Option<u64>)>,
+    now: u64,
+) -> String {
+    use crate::control::protocol::UplinkState;
+    match uplink {
+        None => "uplink: unknown".to_string(),
+        Some((UplinkState::Up, _)) => "uplink: up".to_string(),
+        Some((state, Some(since))) => format!(
+            "uplink: {} (held {}, recovery on hold)",
+            state.as_str(),
+            format_held_for(now.saturating_sub(since))
+        ),
+        Some((state, None)) => format!("uplink: {} (recovery on hold)", state.as_str()),
+    }
+}
+
+/// `45s`, `3m12s`, `1h2m3s`.
+fn format_held_for(secs: u64) -> String {
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, m, s) => format!("{h}h{m}m{s}s"),
     }
 }
 
@@ -3102,6 +3147,37 @@ mod tests {
     // binary execution would otherwise race (matches the convention
     // `modules::discovery`'s own `excluded_ports_from_lines_file_behavior`
     // test already establishes for this exact env var).
+    #[test]
+    fn the_uplink_line_reads_up_held_and_unknown() {
+        use crate::control::protocol::UplinkState;
+        assert_eq!(
+            format_uplink_line(Some((UplinkState::Up, None)), 1_000),
+            "uplink: up"
+        );
+        assert_eq!(
+            format_uplink_line(Some((UplinkState::NoRoute, Some(1_000))), 1_192),
+            "uplink: no_route (held 3m12s, recovery on hold)"
+        );
+        assert_eq!(
+            format_uplink_line(Some((UplinkState::NoResponse, Some(1_000))), 1_045),
+            "uplink: no_response (held 45s, recovery on hold)"
+        );
+        assert_eq!(
+            format_uplink_line(Some((UplinkState::NoRoute, Some(1_000))), 1_000 + 3_723),
+            "uplink: no_route (held 1h2m3s, recovery on hold)"
+        );
+        // A clock that went backwards is not a negative duration.
+        assert_eq!(
+            format_uplink_line(Some((UplinkState::NoRoute, Some(2_000))), 1_000),
+            "uplink: no_route (held 0s, recovery on hold)"
+        );
+        assert_eq!(
+            format_uplink_line(Some((UplinkState::NoRoute, None)), 1_000),
+            "uplink: no_route (recovery on hold)"
+        );
+        assert_eq!(format_uplink_line(None, 1_000), "uplink: unknown");
+    }
+
     #[test]
     fn print_status_reports_a_configured_line_failure_even_with_zero_resolved_lines() {
         let dir = tempfile::tempdir().unwrap();

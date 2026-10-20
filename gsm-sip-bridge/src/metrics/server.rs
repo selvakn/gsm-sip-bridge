@@ -23,6 +23,10 @@ fn zero_stale_supervisor_gauges(module_id: &str) {
     super::VOWIFI_CHILD_SA_UP
         .with_label_values(&[module_id])
         .set(0.0);
+    // A supervisor that went quiet is not holding anything.
+    super::VOWIFI_UPLINK_HELD
+        .with_label_values(&[module_id])
+        .set(0.0);
 }
 
 /// Evaluated on every scrape (FR-021a) rather than on a timer, mirroring how

@@ -10,6 +10,7 @@
 //! `healthcheck`, the keepalive loop and `EpdgTransport` all read it as a
 //! single address (FR-004).
 
+use crate::control::protocol::UplinkState;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,44 @@ pub fn write_active_calls(path: &Path, n: u32) -> io::Result<()> {
 /// that is not a plain unsigned number, which the reader treats as "no call".
 pub fn parse_active_calls(contents: &str) -> Option<u32> {
     contents.trim().parse().ok()
+}
+
+/// `/tmp/pcscf-N.uplink` for the selection file `/tmp/pcscf-N` (specs/100).
+pub fn uplink_path(selection_path: &str) -> PathBuf {
+    PathBuf::from(format!("{selection_path}.uplink"))
+}
+
+/// The `.uplink` file's version (specs/100 `contracts/status-file.md`).
+pub const UPLINK_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UplinkFile {
+    v: u32,
+    state: UplinkState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
+}
+
+/// One line of JSON for the `.uplink` file: the supervisor's verdict on the
+/// path to the line's ePDG, and when a hold began (only while held).
+pub fn render_uplink(state: UplinkState, since: Option<u64>) -> String {
+    let file = UplinkFile {
+        v: UPLINK_VERSION,
+        state,
+        since: since.filter(|_| state != UplinkState::Up),
+    };
+    // Serializing three plain fields cannot fail.
+    format!("{}\n", serde_json::to_string(&file).unwrap_or_default())
+}
+
+/// An `.uplink` file's contents; `None` for anything that does not parse, names
+/// an unknown state, or carries another version, which `vowifi-status` prints
+/// as `unknown`.
+pub fn parse_uplink(contents: &str) -> Option<(UplinkState, Option<u64>)> {
+    serde_json::from_str::<UplinkFile>(contents.trim())
+        .ok()
+        .filter(|f| f.v == UPLINK_VERSION)
+        .map(|f| (f.state, f.since))
 }
 
 /// One address per line, trailing newline.
@@ -253,5 +292,55 @@ mod tests {
         assert!(!dir.join("pcscf-0.pool.tmp").exists());
         assert!(read_pool(&dir.join("missing.pool")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_uplink_file_sits_beside_the_selection_file() {
+        assert_eq!(
+            uplink_path("/tmp/pcscf-1"),
+            PathBuf::from("/tmp/pcscf-1.uplink")
+        );
+    }
+
+    #[test]
+    fn the_uplink_file_round_trips_each_state() {
+        let up = render_uplink(UplinkState::Up, Some(1_792_500_000));
+        assert_eq!(up, "{\"v\":1,\"state\":\"up\"}\n", "no `since` while up");
+        assert_eq!(parse_uplink(&up), Some((UplinkState::Up, None)));
+        let held = render_uplink(UplinkState::NoRoute, Some(1_792_500_000));
+        assert_eq!(
+            held,
+            "{\"v\":1,\"state\":\"no_route\",\"since\":1792500000}\n"
+        );
+        assert_eq!(
+            parse_uplink(&held),
+            Some((UplinkState::NoRoute, Some(1_792_500_000)))
+        );
+        assert_eq!(
+            parse_uplink(&render_uplink(UplinkState::NoResponse, Some(5))),
+            Some((UplinkState::NoResponse, Some(5)))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_uplink_file_parses_to_nothing() {
+        for bad in [
+            "",
+            "not json",
+            "{\"v\":2,\"state\":\"up\"}",
+            "{\"v\":1,\"state\":\"sideways\"}",
+            "{\"state\":\"up\"}",
+        ] {
+            assert_eq!(parse_uplink(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_uplink_file_is_written_atomically() {
+        let dir = temp_dir();
+        let path = dir.join("pcscf-9.uplink");
+        write_atomic(&path, &render_uplink(UplinkState::NoRoute, Some(7))).unwrap();
+        let read = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_uplink(&read), Some((UplinkState::NoRoute, Some(7))));
     }
 }
