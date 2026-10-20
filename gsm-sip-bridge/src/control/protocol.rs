@@ -190,10 +190,13 @@ pub enum TunnelRecoveryReason {
     /// The agent marked every P-CSCF in the pool since the last negotiation
     /// (specs/097).
     PcscfPoolExhausted,
+    /// A half-open IKE_SA stopped showing any IKE activity (specs/100): charon
+    /// is no longer working on it, so it was terminated and re-initiated.
+    IkeSaNegotiationStuck,
 }
 
 impl TunnelRecoveryReason {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ProcessDied,
         Self::ViciBroken,
         Self::TunVanished,
@@ -206,6 +209,7 @@ impl TunnelRecoveryReason {
         Self::PcscfUnreachable,
         Self::DefaultRouteMissing,
         Self::PcscfPoolExhausted,
+        Self::IkeSaNegotiationStuck,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -222,6 +226,7 @@ impl TunnelRecoveryReason {
             Self::PcscfUnreachable => "pcscf_unreachable",
             Self::DefaultRouteMissing => "default_route_missing",
             Self::PcscfPoolExhausted => "pcscf_pool_exhausted",
+            Self::IkeSaNegotiationStuck => "ike_sa_negotiation_stuck",
         }
     }
 }
@@ -618,6 +623,19 @@ mod tests {
             assert_eq!(serde_json::from_str::<IkeSaLossCause>(wire).unwrap(), c);
             assert_eq!(c.to_string(), text);
         }
+    }
+
+    #[test]
+    fn a_stuck_half_open_ike_sa_has_its_own_wire_label() {
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::IkeSaNegotiationStuck,
+            pcscfs: Vec::new(),
+            rebuilt_at_unix: None,
+            dead_peer: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"ike_sa_negotiation_stuck\""), "{json}");
+        assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), event);
     }
 
     #[test]

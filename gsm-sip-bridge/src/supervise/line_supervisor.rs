@@ -103,6 +103,11 @@ pub enum DegradeReason {
     /// [`Self::PcscfUnreachable`], decided from the agent's own verdict instead
     /// of a TCP probe of the unprotected port.
     PcscfPoolExhausted,
+    /// A half-open IKE_SA showed no IKE activity for [`HALF_OPEN_STUCK_AFTER`],
+    /// so charon is no longer working on it; terminated and re-initiated
+    /// (specs/100 US3). The new IKE_SA brings a new VIP and P-CSCF pool, so
+    /// the agent restarts, as for [`Self::ChildSaStuck`].
+    IkeSaNegotiationStuck,
 }
 
 /// The wire label for a recovery (specs/096). Exhaustive on purpose, with no
@@ -122,6 +127,7 @@ impl From<DegradeReason> for crate::control::protocol::TunnelRecoveryReason {
             DegradeReason::PcscfUnreachable => Self::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing => Self::DefaultRouteMissing,
             DegradeReason::PcscfPoolExhausted => Self::PcscfPoolExhausted,
+            DegradeReason::IkeSaNegotiationStuck => Self::IkeSaNegotiationStuck,
         }
     }
 }
@@ -576,6 +582,9 @@ pub enum SteadyOutcome {
     PcscfChanged {
         new_pcscf: String,
     },
+    /// An IKE_SA is half-open and charon is still working on it, so nothing
+    /// was done (specs/100 US3).
+    WaitingForNegotiation,
     /// The process/tunnel was unhealthy and a recovery action was already
     /// issued by the time this returns.
     Recovered {
@@ -583,6 +592,28 @@ pub enum SteadyOutcome {
         /// Why the IKE_SA was lost; `Some` only for [`DegradeReason::IkeSaLost`].
         ike_sa_loss_cause: Option<IkeSaLossCause>,
     },
+}
+
+/// How long a half-open IKE_SA may show no IKE activity before it is declared
+/// stuck (specs/100 R6).
+///
+/// charon's retransmit gaps are 4, 7.2, 13, 23.3, 42 and 75.6s, so its longest
+/// silence while it is still retrying is ~76s. 200s is more than 2.5 times that
+/// and more than a 30s tick plus the gap. Age alone says nothing: with
+/// `keyingtries = 0` charon keeps one half-open `#N` alive for a whole outage.
+pub const HALF_OPEN_STUCK_AFTER: Duration = Duration::from_secs(200);
+
+/// The half-open IKE_SA a line is currently waiting on (specs/100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HalfOpen {
+    /// The `#N` from the `--list-sas` header. A different `#N` replaces the
+    /// record.
+    pub ike_id: u32,
+    /// When this `#N` was first listed, the reference when charon has logged
+    /// no IKE line for the connection at all.
+    pub first_seen: SystemTime,
+    /// Whether the "still negotiating" line was logged for this `#N`.
+    pub waiting_logged: bool,
 }
 
 /// Per-line state the steady-state loop carries between ticks. Owned by the
@@ -625,6 +656,8 @@ pub struct SteadyTracking {
     /// The verdict on a dead-peer IKE_SA loss, for the caller's log line and
     /// report. `None` after every other tick.
     pub dead_peer: Option<DeadPeerClassification>,
+    /// The half-open IKE_SA the line is waiting on, if any (specs/100).
+    pub half_open: Option<HalfOpen>,
 }
 
 impl SteadyTracking {
@@ -886,11 +919,11 @@ pub fn tick_steady_state_with_pool(
     // Only a fully healthy structural check counts as a usable CHILD_SA; an
     // unreachable P-CSCF later in the tick does not undo that (specs/086).
     tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok(_));
-    if !matches!(
-        health,
-        SteadyStateHealth::ChildSaMissing | SteadyStateHealth::IkeSaConnecting { .. }
-    ) {
+    if health != SteadyStateHealth::ChildSaMissing {
         tracking.child_sa_missing = 0;
+    }
+    if !matches!(health, SteadyStateHealth::IkeSaConnecting { .. }) {
+        tracking.half_open = None;
     }
     if !matches!(health, SteadyStateHealth::Ok(Some(_))) {
         tracking.clear_rekey_guards();
@@ -963,7 +996,10 @@ pub fn tick_steady_state_with_pool(
                 ike_sa_loss_cause: Some(cause),
             };
         }
-        SteadyStateHealth::ChildSaMissing | SteadyStateHealth::IkeSaConnecting { .. } => {
+        SteadyStateHealth::IkeSaConnecting { ike_id } => {
+            return tick_half_open(engine, runner, ike_id, tracking);
+        }
+        SteadyStateHealth::ChildSaMissing => {
             tracking.child_sa_missing += 1;
             if tracking.child_sa_missing >= CHILD_SA_MISSING_STRIKES {
                 // Re-initiating inside the surviving IKE_SA did not bring the
@@ -1102,6 +1138,58 @@ pub fn tick_steady_state_with_pool(
     }
 
     SteadyOutcome::StillUp
+}
+
+/// The decision for a half-open IKE_SA (specs/100 US3, data-model rows 3-4):
+/// leave it alone while charon has logged IKE activity for the connection
+/// within [`HALF_OPEN_STUCK_AFTER`], terminate and re-initiate it once it has
+/// not.
+///
+/// The old behaviour counted it as a missing CHILD_SA and terminated it on the
+/// second tick, which in an outage killed the very attempt charon was still
+/// retrying (#141: every ~80s).
+fn tick_half_open(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    ike_id: u32,
+    tracking: &mut SteadyTracking,
+) -> SteadyOutcome {
+    let now = SystemTime::now();
+    let mut half_open = match tracking.half_open {
+        Some(h) if h.ike_id == ike_id => h,
+        _ => HalfOpen {
+            ike_id,
+            first_seen: now,
+            waiting_logged: false,
+        },
+    };
+    let last_activity = engine
+        .last_ike_activity(runner)
+        .unwrap_or(half_open.first_seen);
+    let idle = now.duration_since(last_activity).unwrap_or_default();
+    if idle > HALF_OPEN_STUCK_AFTER {
+        println!(
+            "{} IKE_SA #{ike_id} half-open with no IKE activity for {}s; terminating and re-initiating",
+            engine.log_prefix(),
+            idle.as_secs()
+        );
+        tracking.half_open = None;
+        engine.terminate(runner);
+        engine.reinitiate(runner);
+        return SteadyOutcome::Recovered {
+            reason: DegradeReason::IkeSaNegotiationStuck,
+            ike_sa_loss_cause: None,
+        };
+    }
+    if !half_open.waiting_logged {
+        half_open.waiting_logged = true;
+        println!(
+            "{} IKE_SA #{ike_id} still negotiating; leaving it to charon",
+            engine.log_prefix()
+        );
+    }
+    tracking.half_open = Some(half_open);
+    SteadyOutcome::WaitingForNegotiation
 }
 
 /// The stuck-rekey decision for a structurally healthy tick (specs/093,
@@ -2094,6 +2182,7 @@ mod tests {
             DegradeReason::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing,
             DegradeReason::PcscfPoolExhausted,
+            DegradeReason::IkeSaNegotiationStuck,
         ];
         assert_eq!(reasons.len(), TunnelRecoveryReason::ALL.len());
         for reason in reasons {
@@ -3302,6 +3391,7 @@ mod tests {
             DegradeReason::ChildSaRekeyStuck,
             DegradeReason::IkeSaLost,
             DegradeReason::PcscfPoolExhausted,
+            DegradeReason::IkeSaNegotiationStuck,
         ] {
             match reason {
                 DegradeReason::ProcessDied
@@ -3320,6 +3410,8 @@ mod tests {
                 | DegradeReason::PcscfUnreachable
                 // The same rebuild, decided from the agent's own verdict.
                 | DegradeReason::PcscfPoolExhausted
+                // A new IKE_SA, a new VIP and P-CSCF pool (specs/100).
+                | DegradeReason::IkeSaNegotiationStuck
                 // Restarted despite the repair itself being non-disruptive:
                 // with no route there was no data path, so the agent's
                 // registration and any call over it were already dead. Nothing
@@ -3652,5 +3744,159 @@ mod tests {
         }
         assert_eq!(rebuilt_at.len(), 1, "{rebuilt_at:?}");
         assert!(rebuilt_at[0] >= 270, "{rebuilt_at:?}");
+    }
+
+    // ---- specs/100 US3: a half-open IKE_SA is charon's to finish -----------
+
+    fn half_open_engine(ike_id: u32, activity_age: Option<u64>) -> FakeEngine {
+        FakeEngine {
+            health: RefCell::new(SteadyStateHealth::IkeSaConnecting { ike_id }),
+            last_activity: RefCell::new(
+                activity_age.map(|secs| SystemTime::now() - Duration::from_secs(secs)),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_half_open_ike_sa_with_recent_activity_is_left_alone() {
+        let runner = MockCommandRunner::new();
+        let engine = half_open_engine(7, Some(10));
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::WaitingForNegotiation
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+        assert_eq!(*engine.restart_calls.borrow(), 0);
+        let half_open = tracking.half_open.expect("recorded");
+        assert_eq!(half_open.ike_id, 7);
+        assert!(half_open.waiting_logged);
+    }
+
+    #[test]
+    fn waiting_on_the_same_ike_sa_is_logged_once_and_never_strikes() {
+        let runner = MockCommandRunner::new();
+        let engine = half_open_engine(7, Some(60));
+        let mut tracking = SteadyTracking::default();
+        for _ in 0..5 {
+            assert_eq!(
+                tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+                SteadyOutcome::WaitingForNegotiation
+            );
+        }
+        // Five ticks is well past the two strikes a missing CHILD_SA gets.
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+        assert_eq!(tracking.child_sa_missing, 0);
+        let first_seen = tracking.half_open.unwrap().first_seen;
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(tracking.half_open.unwrap().first_seen, first_seen);
+    }
+
+    #[test]
+    fn a_half_open_ike_sa_silent_for_over_200s_is_terminated_and_reinitiated() {
+        let runner = MockCommandRunner::new();
+        let engine = half_open_engine(7, Some(201));
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaNegotiationStuck,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+        assert_eq!(
+            *engine.call_order.borrow(),
+            vec!["terminate", "reinitiate"],
+            "terminate before reinitiate"
+        );
+        assert!(tracking.half_open.is_none());
+        assert!(recovery_restarts_agent(
+            DegradeReason::IkeSaNegotiationStuck
+        ));
+        assert!(recovery_renegotiates(DegradeReason::IkeSaNegotiationStuck));
+    }
+
+    #[test]
+    fn a_new_ike_sa_number_restarts_the_waiting_record() {
+        let runner = MockCommandRunner::new();
+        let mut tracking = SteadyTracking::default();
+        let first = half_open_engine(7, Some(10));
+        tick_steady_state(&first, &runner, "10.0.0.1", &mut tracking);
+        let second = half_open_engine(8, Some(10));
+        assert_eq!(
+            tick_steady_state(&second, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::WaitingForNegotiation
+        );
+        let half_open = tracking.half_open.unwrap();
+        assert_eq!(half_open.ike_id, 8);
+        assert!(half_open.waiting_logged, "logged again for the new #N");
+    }
+
+    #[test]
+    fn a_missing_child_sa_under_an_established_ike_sa_keeps_its_two_strikes() {
+        // 086 / #107: the half-open handling must not weaken the case it was
+        // split from.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ike_header: RefCell::new(Some((3, IkeHeaderState::Established))),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaStuck,
+                ike_sa_loss_cause: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_half_open_ike_sa_with_no_activity_line_is_timed_from_when_it_was_first_seen() {
+        let runner = MockCommandRunner::new();
+        let engine = half_open_engine(7, None);
+        // Seen for the first time just now: not stuck.
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::WaitingForNegotiation
+        );
+        // Seen 201s ago and silent since: stuck.
+        tracking.half_open = Some(HalfOpen {
+            ike_id: 7,
+            first_seen: SystemTime::now() - Duration::from_secs(201),
+            waiting_logged: true,
+        });
+        assert!(matches!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaNegotiationStuck,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn leaving_the_half_open_state_forgets_it() {
+        let runner = MockCommandRunner::new();
+        let engine = half_open_engine(7, Some(10));
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert!(tracking.half_open.is_none());
     }
 }

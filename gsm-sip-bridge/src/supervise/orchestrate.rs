@@ -1962,6 +1962,10 @@ fn start_vowifi_line_strongswan(
                     }
                 }
             }
+            // charon is still working on a half-open IKE_SA and the tick has
+            // said so (specs/100). Nothing was issued, so the rebuild gate is
+            // already open and the signal reported above.
+            line_supervisor::SteadyOutcome::WaitingForNegotiation => drop(guard),
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
@@ -3101,6 +3105,8 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 current_pcscf = new_pcscf;
                 tracking.negotiated_at = Some(SystemTime::now());
             }
+            // Only the strongSwan engine has a half-open IKE_SA to wait on.
+            line_supervisor::SteadyOutcome::WaitingForNegotiation => drop(guard),
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
                 println!("[supervise] line {idx}: recovered from {reason:?}");
                 if !tracking.pool_exhausted.is_empty() {
