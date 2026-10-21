@@ -19,6 +19,19 @@ Also run: the flag-on black-hole repeat (T021). Not run: the one-hour capture (S
 
 The underlay guard's liveness check added about 30s before the rebuild, as designed (specs/100).
 
+## Jio Pi (4-member P-CSCF pool), default config
+
+Image `gsm-sip-bridge:probe119-8e5d11c-arm64` (arm-build-200, `git archive HEAD` of the same tree), container recreated 2026-10-21 about 19:20Z; previous tag `sms101-7d35bfa-arm64` kept loaded, compose backed up as `docker-compose.yaml.bak-pre-probe119`.
+
+| Step | Evidence | Result |
+|---|---|---|
+| Startup line | `supervisor P-CSCF probe off` | pass |
+| No probe connects (SC-001, short) | TCP `ActiveOpens` in the line's netns: 2 at 19:25:25, 2 at 19:30:36 | pass (5 min, not 1 h) |
+| Default route deleted (SC-003) | `ip route del default dev tun23-0` at 19:30:45; `recovered from DefaultRouteMissing` at 19:31:00 (15s) | pass |
+| Current P-CSCF black-holed (SC-005) | `10.56.158.176/32` via the veth peer at 19:31:08. Agent: `P-CSCF marked unavailable ... cause=gm-keepalive` and `selected 56.2.179.162 reason=failover` at 19:33:48, `registered` at 19:33:49 (161s; bound 193s). No supervisor recovery followed the route repair | pass |
+
+The route repair at 19:31:00 restarts the IMS agent (known behaviour), which is why the agent log shows a fresh start at 19:31:06 before the black-hole took effect.
+
 ## Notes
 
 A first flag-on attempt at 18:09 was invalid and is discarded: the black-hole route's next hop was the veth peer's link-local address from the previous container, which changes when the container is recreated (the neighbour showed FAILED and the kernel fell back to the tunnel route, so the probe kept succeeding). Re-read the peer address after every recreate.
@@ -27,4 +40,4 @@ The comparison with the pre-change build (the original T021 wording) was not run
 
 ## Open
 
-T022 (Jio Pi) and T023 (soak) remain.
+T023 (soak) is running; see below once complete.

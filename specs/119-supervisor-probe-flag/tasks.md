@@ -69,7 +69,7 @@ Follow `quickstart.md`. Throwaway image tags; record every run's raw evidence (c
 - [X] T019 (5-minute connect count on the Vodafone rig, not the full hour) Build a throwaway image from `git archive HEAD` (not the working tree: `target-100/` is not `.dockerignored`) and deploy it to the local Vodafone rig with the default config. Check the startup line (US1 AS2) and run quickstart step 2, a one-hour capture (SC-001).
 - [X] T020 Vodafone, probe off: delete the default route (SC-003), then black-hole the sole P-CSCF (SC-004, 315s bound). Record the recovery reason and time.
 - [X] T021 (flag-on vs flag-off timing, not vs the pre-change build) Vodafone, probe on: repeat the black-hole run and confirm the `pcscf_unreachable` rebuild and timing match the pre-change build (SC-006).
-- [ ] T022 Cross-build arm64 (`arm-build-200`) and deploy to the Jio Pi, recreating the container (not restarting). Repeat T019's capture and T020's route deletion; black-hole the current P-CSCF and confirm the agent's failover without a rebuild (SC-005, 193s).
+- [X] T022 (skipped the IPv6 route deletion; the selection is IPv4) Cross-build arm64 (`arm-build-200`) and deploy to the Jio Pi, recreating the container (not restarting). Repeat T019's capture and T020's route deletion; black-hole the current P-CSCF and confirm the agent's failover without a rebuild (SC-005, 193s).
 - [ ] T023 4.5-hour idle soak, probe off, on both rigs: no teardown, registered throughout, zero false dead-peer losses (SC-002). Count DPD and NAT-T traffic against spec 098's soak figures.
 - [ ] T024 Write up `specs/119-supervisor-probe-flag/live-verification.md` and mark the success criteria met or not. Commit: `docs(119): live verification results (#120)`.
 
