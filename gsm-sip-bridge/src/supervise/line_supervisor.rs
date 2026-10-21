@@ -1120,6 +1120,16 @@ pub fn tick_steady_state_underlay(
 ) -> SteadyOutcome {
     tracking.pool_exhausted.clear();
     tracking.dead_peer = None;
+    // A failure seen while the path to the ePDG is down is the path's, not
+    // the tunnel's: a streak is earned only on ticks where the path is up.
+    // Reset here, on every such tick, not only on the tick a recovery is
+    // held: a streak that has not reached its threshold yet, or one still
+    // waiting on its first miss's re-initiate, never gets that far, and would
+    // carry the outage's failures into the first tick after it (specs/100).
+    if underlay.holding().is_some() {
+        tracking.pcscf_unreachable.reset();
+        tracking.child_sa_missing.reset();
+    }
     if !engine.is_process_alive(runner) {
         tracking.inbound = None;
         // A respawned charon starts a fresh connection that gets its own first
@@ -4580,28 +4590,58 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_pcscf_path_is_held_not_rebuilt_while_the_uplink_is_down() {
-        for (verdict, cause) in [
-            (UnderlayVerdict::NoRoute, NO_ROUTE),
-            (UnderlayVerdict::NoResponse, NO_RESPONSE),
-        ] {
+    fn a_dead_pcscf_path_is_never_rebuilt_while_the_uplink_is_down() {
+        for verdict in [UnderlayVerdict::NoRoute, UnderlayVerdict::NoResponse] {
             let engine = FakeEngine {
                 pcscf_reachable: RefCell::new(false),
                 ..Default::default()
             };
             let mut tracking = SteadyTracking::default();
-            let strikes = pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL);
-            let mut last = SteadyOutcome::StillUp;
-            for _ in 0..strikes {
-                last = guarded(&engine, &mut tracking, &view(verdict), None);
+            // Far past the window: the streak never builds while the path is
+            // down, so the rebuild never even comes due.
+            for _ in 0..3 * pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL) {
+                assert_eq!(
+                    guarded(&engine, &mut tracking, &view(verdict), None),
+                    SteadyOutcome::StillUp
+                );
+                assert!(tracking.pcscf_unreachable.count <= 1);
             }
-            assert_eq!(last, held(cause, DegradeReason::PcscfUnreachable));
             nothing_was_issued(&engine);
-            assert_eq!(
-                tracking.pcscf_unreachable.count, 0,
-                "strikes against a dead path are not evidence once it is back"
-            );
         }
+    }
+
+    #[test]
+    fn a_pcscf_rebuild_due_on_an_unanswered_check_is_held() {
+        // The one P-CSCF hold left: the streak was earned with the path up,
+        // and the liveness check it asked for went unanswered (row 6).
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking {
+            pcscf_unreachable: Streak {
+                count: 2,
+                covered: STEADY_STATE_POLL_INTERVAL * 2,
+            },
+            ..Default::default()
+        };
+        let unanswered = UnderlayView {
+            pending: Some(PendingView {
+                reason: DegradeReason::PcscfUnreachable,
+                life_since_mark: false,
+                expired: true,
+            }),
+            ..view(UnderlayVerdict::Up)
+        };
+        assert_eq!(
+            guarded(&engine, &mut tracking, &unanswered, None),
+            held(NO_RESPONSE, DegradeReason::PcscfUnreachable)
+        );
+        nothing_was_issued(&engine);
+        assert_eq!(
+            tracking.pcscf_unreachable.count, 0,
+            "strikes against a dead path are not evidence once it is back"
+        );
     }
 
     #[test]
@@ -4643,6 +4683,8 @@ mod tests {
         );
         // The strike was not earned against a working path.
         assert_eq!(tracking.child_sa_missing.count, 0);
+        // A streak from before the hold is forgotten too: the miss is a first
+        // one again, not a rebuild.
         tracking.child_sa_missing = Streak {
             count: 1,
             covered: STEADY_STATE_POLL_INTERVAL,
@@ -4654,6 +4696,25 @@ mod tests {
                 &view(UnderlayVerdict::NoResponse),
                 None
             ),
+            held(NO_RESPONSE, DegradeReason::ChildSaMissing)
+        );
+        nothing_was_issued(&engine);
+        // A stuck CHILD_SA is held only when the streak was earned with the
+        // path up and its liveness check went unanswered (row 6).
+        tracking.child_sa_missing = Streak {
+            count: 1,
+            covered: STEADY_STATE_POLL_INTERVAL,
+        };
+        let unanswered = UnderlayView {
+            pending: Some(PendingView {
+                reason: DegradeReason::ChildSaStuck,
+                life_since_mark: false,
+                expired: true,
+            }),
+            ..view(UnderlayVerdict::Up)
+        };
+        assert_eq!(
+            guarded(&engine, &mut tracking, &unanswered, None),
             held(NO_RESPONSE, DegradeReason::ChildSaStuck)
         );
         nothing_was_issued(&engine);
@@ -4705,6 +4766,53 @@ mod tests {
         assert_eq!(*engine.repair_calls.borrow(), 1);
         nothing_was_issued(&engine);
         assert_eq!(tracking.rekey_stuck_rebuilt, None);
+    }
+
+    #[test]
+    fn failures_seen_while_the_path_is_down_never_count_after_it_returns() {
+        // A CHILD_SA miss in the quick polling after one hold re-initiates
+        // and starts a streak; a second hold follows. Its ticks must not add
+        // to that streak, or the first tick after it rebuilds on outage time.
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking {
+            child_sa_missing: Streak {
+                count: 1,
+                covered: Duration::from_secs(5),
+            },
+            pcscf_unreachable: Streak {
+                count: 2,
+                covered: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        for _ in 0..20 {
+            assert_eq!(
+                guarded(
+                    &engine,
+                    &mut tracking,
+                    &view(UnderlayVerdict::NoRoute),
+                    None
+                ),
+                held(NO_ROUTE, DegradeReason::ChildSaMissing),
+                "held, not waiting: the path is down"
+            );
+        }
+        nothing_was_issued(&engine);
+        assert_eq!(tracking.child_sa_missing, Streak::default());
+        assert_eq!(tracking.pcscf_unreachable, Streak::default());
+        // The path is back: a first miss again, so a re-initiate, not a
+        // rebuild.
+        assert!(matches!(
+            guarded(&engine, &mut tracking, &view(UnderlayVerdict::Up), None),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing,
+                ..
+            }
+        ));
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
     }
 
     #[test]

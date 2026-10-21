@@ -172,6 +172,6 @@ On shutdown while held: `UplinkHoldEnded { ended_by: shutdown }`, so the held-se
 - A liveness check costs at most one `swanctl --dpd` per pending recovery (FR-004). A second suspicion while `PendingCheck` exists reuses it.
 - A hold lasts at most 15 minutes continuously, whatever its causes (FR-012).
 - A liveness check is given 30s to be answered, measured from when it was sent, however often the loop ticks (FR-004).
-- The tick's strike counters (`pcscf_unreachable`, `child_sa_missing`) are `Streak`s: a count and the time it covers. P-CSCF unreachable needs ≥2 checks covering 90s; a missing CHILD_SA is re-initiated once on the first miss and rebuilt once ≥2 checks cover 60s, with no further re-initiates in between.
+- The tick's strike counters (`pcscf_unreachable`, `child_sa_missing`) are `Streak`s: a count and the time it covers. P-CSCF unreachable needs ≥2 checks covering 90s; a missing CHILD_SA is re-initiated once on the first miss and rebuilt once ≥2 checks cover 60s, with no further re-initiates in between. Both are reset on every tick the path is down (rows 5 and 7), so a failure seen during an outage never counts after it; they are earned only with the path up.
 - At most one held initiation per IKE_SA disappearance (FR-010a).
 - Half-open inactivity bound: 200s (FR-015).
