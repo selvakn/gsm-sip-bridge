@@ -65,10 +65,10 @@ Format: `[ID] [P?] [Story] Description`. `[P]` = different files, no dependency 
 
 Hardware and rig steps; follow quickstart.md. Do not start before Phases 3-5 are green.
 
-- [ ] T018 [US3] Build the Pi image (`arm-build-200` pipeline, next `jio-gmN` tag) and deploy to the remote Jio Pi by recreating the container (not restarting). Send 5 SMS in a row to the line. Record in `specs/101-sms-report-conformance/quickstart.md` (new "Results" section): each report's answer (`202`?), SMS forwarded, no new warnings. Capture one report and check it against contracts/delivery-report-message.md.
-- [ ] T019 [US3] Run the same on the local Vodafone rig (pjsip-linked build on the host): 5 SMS, each report answered `2xx` or no worse than before, delivery unchanged. Record results.
-- [ ] T020 [US3] Rollback check on Jio: set `sms_report_pcscf_route = false`, recreate, send 1 SMS; the report has `In-Reply-To` and no P-CSCF `Route` (User Story 3 scenario 4).
-- [ ] T021 [US3] Decision gate: if T018 or T019 shows any regression or any non-2xx where there was none, implement FR-010 (add the P-CSCF `Route` only when the registration returned no `Service-Route`) in `send_sms_delivery_report`, add tests for it, update T011/T012 expectations and the docs, then repeat T018-T020.
+- [X] T018 [US3] Build the Pi image (`arm-build-200` pipeline, next `jio-gmN` tag) and deploy to the remote Jio Pi by recreating the container (not restarting). Send 5 SMS in a row to the line. Record in `specs/101-sms-report-conformance/quickstart.md` (new "Results" section): each report's answer (`202`?), SMS forwarded, no new warnings. Capture one report and check it against contracts/delivery-report-message.md.
+- [X] T019 [US3] Run the same on the local Vodafone rig (pjsip-linked build on the host): 5 SMS, each report answered `2xx` or no worse than before, delivery unchanged. Record results.
+- [X] T020 [US3] Rollback check on Jio: set `sms_report_pcscf_route = false`, recreate, send 1 SMS; the report has `In-Reply-To` and no P-CSCF `Route` (User Story 3 scenario 4).
+- [X] T021 [US3] Decision gate: if T018 or T019 shows any regression or any non-2xx where there was none, implement FR-010 (add the P-CSCF `Route` only when the registration returned no `Service-Route`) in `send_sms_delivery_report`, add tests for it, update T011/T012 expectations and the docs, then repeat T018-T020.
 - [ ] T022 Final `make format && make lint && make test`. Open the PR referencing #140; leave the issue open. Post to #140 (a human reply, not a bot) a summary and a request that the reporter run the build and post the report and its answer (SC-006). Do not claim a fix.
 
 ## Dependencies and order

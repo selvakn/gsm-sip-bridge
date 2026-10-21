@@ -23,3 +23,20 @@ If any carrier rejects, apply FR-010: only add the P-CSCF `Route` when the regis
 ## Reporter (T2 Russia, MEO)
 
 Ask the #140 reporter to run the built image and post the log lines for the report and its answer. Not a merge gate (SC-006).
+
+## Results (2026-10-21, build `sms101-7d35bfa`)
+
+| Rig | Setting | SMS | Reports | Answers | Warnings |
+|---|---|---|---|---|---|
+| Jio (remote Pi, VoWiFi) | on (default) | 5 | 10 (each SMS preceded by a Jio Type 0 reachability probe, also reported) | 10 x `202 Accepted` | none |
+| Vodafone (local rig, VoWiFi) | on (default) | 5 | 6 | none rejected; answers were not visible at the default log level for this batch | none |
+| Vodafone, trace logging | on | 1 | 1 | `100 Trying`, `202 Accepted` | none |
+| Jio, rollback | `sms_report_pcscf_route = false` | 1 | 2 (probe + SMS) | 2 x `202 Accepted` | none |
+
+Captured reports (addresses and identities omitted):
+
+- Jio, setting on: `Route` 1 = the P-CSCF on its protected server port (`:5067`), `Route` 2 = the `Service-Route` entry; `In-Reply-To` equals the inbound `Call-ID` byte for byte (the inbound request used the compact `i:` form); `Require`/`Proxy-Require`/`Security-Verify` present.
+- Vodafone, setting on: `Route` 1 = the P-CSCF, IPv6 bracketed, on port-s (`[...]:6000`), then both `Service-Route` entries in order; `In-Reply-To` present.
+- Jio, setting off: no P-CSCF `Route`, only the `Service-Route` entry; `In-Reply-To` still present.
+
+No regression on either carrier, so the FR-010 fallback (T021) was not needed.
