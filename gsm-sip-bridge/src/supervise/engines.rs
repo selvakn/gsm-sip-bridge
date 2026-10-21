@@ -298,15 +298,24 @@ impl InitiateClients {
         ClientState::Finished(secs)
     }
 
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    fn insert(&self, line: u32, handle: ChildHandle) {
-        self.clients
-            .lock()
-            .unwrap()
-            .insert(line, (handle, Instant::now()));
+    /// Spawns the line's client and registers it, unless shutdown has closed
+    /// the registry. Check, spawn and insert all happen under the lock
+    /// [`Self::cancel_all`] takes to close and drain, so a start in flight
+    /// either lands before the sweep (and is reaped by it) or sees the closed
+    /// flag and never spawns.
+    fn start(
+        &self,
+        line: u32,
+        runner: &dyn CommandRunner,
+        spec: ChildSpec,
+    ) -> Option<std::io::Result<()>> {
+        let mut map = self.clients.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(runner.spawn(spec).map(|handle| {
+            map.insert(line, (handle, Instant::now()));
+        }))
     }
 
     /// Reaps one line's client, if it has one.
@@ -320,8 +329,11 @@ impl InitiateClients {
     /// Reaps every line's client. What shutdown calls, before it touches the
     /// tunnels, so no client is left to race the IKE_SA terminate.
     pub fn cancel_all(&self, runner: &dyn CommandRunner) {
-        self.closed.store(true, Ordering::SeqCst);
-        let taken: Vec<_> = self.clients.lock().unwrap().drain().collect();
+        let taken: Vec<_> = {
+            let mut map = self.clients.lock().unwrap();
+            self.closed.store(true, Ordering::SeqCst);
+            map.drain().collect()
+        };
         for (_, (handle, _)) in taken {
             Self::reap(handle, runner);
         }
@@ -1158,9 +1170,6 @@ impl StrongswanEngine {
     /// block the supervisor tick for as long as IKE negotiation takes, which
     /// an earlier review caught.
     pub fn initiate(&self, runner: &dyn CommandRunner) {
-        if self.shared.initiate_clients.is_closed() {
-            return; // shutting down
-        }
         if self.collect_initiate(runner) {
             println!(
                 "[supervise] line {}: {} initiate skipped, previous client still running",
@@ -1168,18 +1177,15 @@ impl StrongswanEngine {
             );
             return;
         }
-        match runner.spawn(ChildSpec::new(initiate_argv(
-            &self.shared.strongswan_conf,
-            &self.conn_name,
-        ))) {
-            Ok(handle) => {
-                println!(
-                    "[supervise] line {}: {} initiate started",
-                    self.idx, self.conn_name
-                );
-                self.shared.initiate_clients.insert(self.idx, handle);
-            }
-            Err(e) => eprintln!(
+        let spec = ChildSpec::new(initiate_argv(&self.shared.strongswan_conf, &self.conn_name));
+        match self.shared.initiate_clients.start(self.idx, runner, spec) {
+            // Shutting down: the plan has swept past, start nothing.
+            None => {}
+            Some(Ok(())) => println!(
+                "[supervise] line {}: {} initiate started",
+                self.idx, self.conn_name
+            ),
+            Some(Err(e)) => eprintln!(
                 "[supervise] line {}: {} initiate failed to start: {e}",
                 self.idx, self.conn_name
             ),
