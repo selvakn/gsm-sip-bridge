@@ -1886,7 +1886,10 @@ fn start_vowifi_line_strongswan(
     // What the guard believes about the path to the ePDG, and the hold it can
     // put this line in (specs/100).
     let underlay_enabled = ctx.config.vowifi.underlay_guard;
-    let mut underlay = super::underlay::UnderlayTracker::new(engine.log_mark(runner.as_ref()));
+    let mut underlay = super::underlay::UnderlayTracker::new(
+        engine.log_mark(runner.as_ref()),
+        std::time::Instant::now(),
+    );
     // What `vowifi-status` reads (specs/100 contracts/status-file.md), written
     // when the verdict changes, and once now so a healthy line says `up`.
     let mut written_uplink: Option<crate::control::protocol::UplinkState> = None;
@@ -1942,6 +1945,9 @@ fn start_vowifi_line_strongswan(
         let underlay_view = if underlay_enabled {
             let observation = observe_underlay(&engine, runner.as_ref(), &underlay, mark);
             let begin = underlay.begin_tick(&observation, tick_started, tick_started_at);
+            if let (Some(epdg), Some(heard)) = (engine.epdg_addr(), begin.heard) {
+                engine.shared.epdg_heard.record(epdg, idx, heard);
+            }
             if let Some(end) = &begin.ended {
                 println!("{}", hold_ended_line(idx, end));
                 uplink_events.push(hold_ended_event(end));
@@ -1950,12 +1956,14 @@ fn start_vowifi_line_strongswan(
                 // though: at the 15-minute bound the path is not known to be
                 // back, and the ordinary pass that follows exists in case the
                 // guard was wrong, so it judges every mark (FR-012). The one
-                // initiation a hold allows has done its job either way
-                // (FR-010a).
-                if end.ended_by == crate::control::protocol::HoldEndedBy::Restored {
+                // initiation a hold allows has done its job once the hold is
+                // over (FR-010a); a change of cause is the same hold.
+                if end.path_returned() {
                     tracking.negotiated_at = Some(tick_started_at);
                 }
-                tracking.held_initiate_sent = false;
+                if end.ended_by != crate::control::protocol::HoldEndedBy::CauseChanged {
+                    tracking.held_initiate_sent = false;
+                }
             }
             if let Some(start) = begin.started {
                 println!(
@@ -2294,13 +2302,16 @@ fn observe_underlay(
     super::underlay::Observation {
         route_ok: engine.route_ok(runner),
         evidence: engine.ike_evidence_since(runner, tracker.evidence_mark()),
-        ike_life_recent: engine
+        parsed_since_tick: engine
             .ike_evidence_since(runner, tracker.tick_mark())
             .parsed_from_peer,
         rx_packets: engine.read_tun_rx_packets(runner),
         pending_life: tracker
             .pending_mark()
             .map(|m| engine.ike_evidence_since(runner, m).parsed_from_peer),
+        sibling_heard: engine
+            .epdg_addr()
+            .and_then(|epdg| engine.shared.epdg_heard.others(epdg, engine.idx)),
         mark,
     }
 }

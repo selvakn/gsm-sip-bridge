@@ -232,6 +232,9 @@ pub enum HoldEndedBy {
     MaxHold,
     /// The supervisor was shutting down.
     Shutdown,
+    /// The path is still down, for another reason: the hold carries on under
+    /// the new cause, and its 15-minute bound still runs from its start.
+    CauseChanged,
 }
 
 impl HoldEndedBy {
@@ -240,6 +243,7 @@ impl HoldEndedBy {
             Self::Restored => "restored",
             Self::MaxHold => "max_hold",
             Self::Shutdown => "shutdown",
+            Self::CauseChanged => "cause_changed",
         }
     }
 }
@@ -806,6 +810,7 @@ mod tests {
             HoldEndedBy::Restored,
             HoldEndedBy::MaxHold,
             HoldEndedBy::Shutdown,
+            HoldEndedBy::CauseChanged,
         ] {
             assert_eq!(
                 serde_json::to_string(&ended).unwrap(),

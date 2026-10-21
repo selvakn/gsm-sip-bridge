@@ -1,6 +1,8 @@
 # Data model: VoWiFi underlay guard and the half-open IKE_SA fix
 
-Everything here is in-memory, per line, owned by the strongSwan steady-state loop (`supervise/orchestrate.rs`) or its tick (`supervise/line_supervisor.rs`). The only things that leave the process are:
+Every rule here is a time, never a number of ticks: the loop ticks every 30s normally and every 5s around a hold, so "the next tick" means a different span depending on when it is asked.
+
+Everything here is in-memory and per line, except `EpdgHeard` (below), owned by the strongSwan steady-state loop (`supervise/orchestrate.rs`) or its tick (`supervise/line_supervisor.rs`). The only things that leave the process are:
 - the `AgentState.uplink` field and two events (contracts/observability.md);
 - the per-line `/tmp/pcscf-N.uplink` file (contracts/status-file.md).
 
@@ -40,15 +42,18 @@ Built by the loop at the top of each tick and passed into `tick_steady_state_wit
 | `route_failures` | `u32` + `first_failure_at: Instant` | Debounce for FR-002. |
 | `hold` | `Option<Hold>` | The current hold, if any. |
 | `pending_check` | `Option<PendingCheck>` | An on-demand DPD in flight (FR-004). |
+| `evidence_mark` + `silence_since` | `LogMark` + `Instant` | Where silence is counted from. Moved on whenever the line is up with nothing outstanding, **or the ePDG is heard from by any means** (a parsed message, a grown RX counter, another line on the ePDG), so old retransmits never count against a path that has since answered. |
+| `heard` | `Option<Heard>` | The latest this line heard from the ePDG, as the window `(after, by]` one tick can place it in. `heard_recently` in the view is `by` within 30s (`RECENT_LIFE`). |
 | `held_initiate_sent` | bool | FR-010a: whether this hold already issued its one initiation since the IKE_SA vanished. Reset when an IKE_SA is listed again. |
 
 ### Hold
 
 | Field | Type | Notes |
 |---|---|---|
-| `cause` | `NoRoute` \| `NoResponse` | The variant that started the hold. A hold does not change cause mid-way; if the cause flips, the hold ends and a new one starts. |
-| `started_at` | `Instant` + `SystemTime` | `Instant` for the 15-minute bound, `SystemTime` for the status file and logs. |
-| `skipped` | `Vec<DegradeReason>`, deduplicated | Recoveries held back, for the end-of-hold log line. |
+| `cause` | `NoRoute` \| `NoResponse` | The current cause. It can change while the path stays down: that is the same hold, reported as `ended_by = cause_changed` for the old cause and a start for the new one. |
+| `started` / `started_at` | `Instant` + `SystemTime` | When the hold began, whatever its causes since: `Instant` for the 15-minute bound, `SystemTime` for the status file. |
+| `cause_since` | `Instant` | When the current cause began; `held_secs` is measured from here. |
+| `skipped` | `Vec<DegradeReason>`, deduplicated | Recoveries held back under the current cause, for the line that ends it. |
 | `marks_from` | `SystemTime` | When the hold ends because the path returned, this becomes `tracking.negotiated_at`, so agent P-CSCF marks set during the hold don't count (FR-011; 097's `exhausted_pool` already ignores marks older than `negotiated_at`). A hold ended by `max_hold` keeps them for the ordinary pass. |
 
 ### PendingCheck
@@ -56,8 +61,13 @@ Built by the loop at the top of each tick and passed into `tick_steady_state_wit
 | Field | Type | Notes |
 |---|---|---|
 | `mark` | `LogMark` | Taken immediately before `swanctl --dpd`. |
+| `rx` | `Option<u64>` | The tunnel RX counter read on the same tick, before the DPD went out. Growth past it answers the check; growth before it does not. |
+| `sent` | `Instant` | When the sending tick began. Until `sent + 30s` (`LIVENESS_WAIT`) an unanswered check keeps the recovery `Deferred` without a second DPD; after it, it holds the line. |
 | `deferred` | `DegradeReason` | The recovery waiting on the answer. |
-| `deadline` | `Instant` | `mark + 30s`. In practice the next tick (R8). |
+
+## EpdgHeard (shared, on `SharedCharon`)
+
+FR-001: lines sharing an ePDG share the evidence their verdicts rest on. Each line records the `Heard` window of what it heard on each tick, keyed by ePDG address and line; each line reads the latest of the *other* lines' records (its own it reads more precisely from the log). Another line's word counts as life for the silence count and for a pending check only if its window starts after the silence began or the check was sent, so it never answers for traffic from before. Holds, pending checks and strikes stay per line, because recovery does.
 
 ## Additions to SteadyTracking (tick-owned)
 
@@ -111,7 +121,7 @@ Evaluated in this order; the first matching row wins. "Would take R" means the e
 | 3 | IKE_SA half-open, with IKE activity in the last 200s | `WaitingForNegotiation`: no action; log once per `#N` (FR-015). |
 | 4 | IKE_SA half-open, no IKE activity for >200s, verdict `Up` | Terminate + re-initiate, as `IkeSaNegotiationStuck` (FR-016). |
 | 5 | Verdict `NoRoute` or `NoResponse` and would take R (reachability-inferred) | `Held { cause, skipped: R }`, issue nothing (FR-007/008). Exception, FR-010a: R is the `IkeSaLost` re-initiate and `held_initiate_sent` is false → issue one `--initiate`, no agent restart, and set the flag. |
-| 6 | Verdict `Up`, would take R, `PendingCheck` exists for R | Evidence of life since its mark → take R. None → verdict becomes `NoResponse` and row 5 applies. |
+| 6 | Verdict `Up`, would take R, `PendingCheck` exists | Evidence of life since it was sent → take R. None, and its 30s are not up → `Deferred { reason: R }`, no second DPD. None after 30s → verdict becomes `NoResponse` and row 5 applies. |
 | 7 | Verdict `Up`, would take R, route check failed this tick (not yet debounced) | Verdict becomes `NoRoute` now and row 5 applies (the one-failure-plus-pending-recovery rule). |
 | 8 | Verdict `Up`, would take R, R ≠ `IkeSaLost`, the IKE_SA is `ESTABLISHED`, and nothing proves the ePDG alive in the last 30s (no parsed IKE message, inbound ESP age > 30s) | Trigger `swanctl --dpd`, create `PendingCheck`, `Deferred { reason: R }` (FR-004). |
 | 9 | Otherwise | Existing behaviour, unchanged. |
@@ -150,6 +160,8 @@ On every transition out of a hold:
 4. one log line with the duration, `ended_by` and the skipped reasons;
 5. if it ended because the path returned (`restored`), set `tracking.negotiated_at = now` (FR-011); at `max_hold` the marks stay for the ordinary pass (FR-012);
 6. reset `held_initiate_sent`;
+
+A change of cause while the path stays down (*no response* → *no route*) is not a transition out: it logs and reports the end of the old cause (`ended_by = cause_changed`) and the start of the new one, keeps the hold's start for the 15-minute bound, and does none of steps 5–7.
 7. if no IKE_SA is established or in flight, issue one `--initiate` (FR-013). The unheld tick that follows does this itself: a missing IKE_SA is `IkeSaLost` and re-initiated. A half-open IKE_SA left from a *no route* hold is terminated and re-initiated on that tick (`UnderlayView.restored`), reported as `IkeSaNegotiationStuck`; after a *no response* hold it is left alone, since it has just answered.
 
 On shutdown while held: `UplinkHoldEnded { ended_by: shutdown }`, so the held-seconds counter is complete.
@@ -158,6 +170,8 @@ On shutdown while held: `UplinkHoldEnded { ended_by: shutdown }`, so the held-se
 
 - The debounce is 2 failures, ≥10s apart (FR-002). At the 30s tick that's two consecutive ticks.
 - A liveness check costs at most one `swanctl --dpd` per pending recovery (FR-004). A second suspicion while `PendingCheck` exists reuses it.
-- A hold lasts at most 15 minutes continuously (FR-012).
+- A hold lasts at most 15 minutes continuously, whatever its causes (FR-012).
+- A liveness check is given 30s to be answered, measured from when it was sent, however often the loop ticks (FR-004).
+- The tick's strike counters (`pcscf_unreachable`, `child_sa_missing`) are `Streak`s: a count and the time it covers. P-CSCF unreachable needs ≥2 checks covering 90s; a missing CHILD_SA is re-initiated once on the first miss and rebuilt once ≥2 checks cover 60s, with no further re-initiates in between.
 - At most one held initiation per IKE_SA disappearance (FR-010a).
 - Half-open inactivity bound: 200s (FR-015).

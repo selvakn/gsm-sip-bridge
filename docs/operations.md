@@ -202,26 +202,33 @@ It never holds a dead charon (`ProcessDied`), a broken vici socket
 (`ViciBroken`), a vanished or unavailable tunnel interface, or a missing
 default route in the line's namespace: those are local faults the path to the
 ePDG cannot explain, and they are repaired on the tick that finds them.
-P-CSCF marks the agent sets during a hold are ignored once it ends, so an
-outage does not trigger a rebuild afterwards.
+P-CSCF marks the agent sets during a hold are ignored once the path returns,
+so an outage does not trigger a rebuild afterwards.
+
+**Lines on one ePDG share what they hear from it.** If one line hears from the
+ePDG while another line's requests to it go unanswered, the path is fine and
+the second line's trouble is its own: it is repaired, not held.
 
 **It does not trust silence alone.** When the supervisor is about to take one of
 the recoveries above and nothing has arrived from the ePDG for 30s, it first
 sends one ordinary IKEv2 liveness check (`swanctl --dpd --ike imsN`, a command
-this image adds to its strongSwan build) and waits one tick. If the ePDG
-answers, the recovery goes ahead as before, so a real carrier fault, such as a
+this image adds to its strongSwan build) and gives it 30s to answer. If the
+ePDG answers, the recovery goes ahead as before, so a real carrier fault, such as a
 single P-CSCF that stopped answering behind a live ePDG, is still repaired,
 about 30s later than it was.
 
 **While held, and for 30s after, the supervisor checks every 5s instead of
 every 30s**, so the path coming back, and the new P-CSCF that comes with it, are
-noticed within seconds. Nothing is counted in ticks during a
-hold, and what it held back is summarised on the line that ends it, not logged
-on every tick.
+noticed within seconds. Every threshold is a time, not a number of checks
+(the P-CSCF's 90s, the CHILD_SA's 60s, the 30s liveness wait), so checking
+faster never makes the supervisor act sooner. What a hold held back is
+summarised on the line that ends it, not logged on every check.
 
 **It cannot hold forever.** A hold ends at the latest 15 minutes after it
-began (`ended after 900s (max_hold)`): the line then gets one ordinary
-recovery pass and may be held again if the evidence is still there. The 10s
+began (`(max_hold)`), even if its cause changed along the way (a route lost
+during a *no response* hold logs `(cause_changed)` and carries on as the same
+hold): the line then gets one ordinary recovery pass, P-CSCF marks included,
+and may be held again if the evidence is still there. The 10s
 route debounce, the 15-minute bound and the 30s liveness wait are fixed.
 
 **Turning it off.** `[vowifi].underlay_guard = false` restores the previous

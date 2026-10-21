@@ -8,12 +8,19 @@
 //! tick it hands over the outcome. Everything here is a pure decision over
 //! those inputs and an injected clock, so the whole lifecycle is tested without
 //! charon, a log file or a sleep.
+//!
+//! Every rule here is stated in time, never in ticks: the loop ticks every 30s
+//! normally and every 5s around a hold, so "the next tick" or "since the
+//! previous tick" means a different span depending on when it is asked.
 
 use super::engines::LogMark;
 use super::line_supervisor::{
     DegradeReason, IkeEvidence, PendingView, SteadyOutcome, UnderlayVerdict, UnderlayView,
+    RECENT_LIFE,
 };
 use crate::control::protocol::{HoldEndedBy, UplinkHoldCause, UplinkState};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 /// A failed `ip route get` must be repeated this much later to count
@@ -21,13 +28,19 @@ use std::time::{Duration, Instant, SystemTime};
 /// transient.
 pub const ROUTE_DEBOUNCE: Duration = Duration::from_secs(10);
 
-/// The longest a line stays held (FR-012). A guard that never gave up would
-/// turn a wrong verdict into an outage with no end.
+/// The longest a line stays held continuously (FR-012), whatever the cause
+/// along the way. A guard that never gave up would turn a wrong verdict into an
+/// outage with no end.
 pub const MAX_HOLD: Duration = Duration::from_secs(15 * 60);
 
+/// How long a liveness check is given to be answered (FR-004). Until then the
+/// recovery it is for stays deferred; after it, an unanswered check holds the
+/// line.
+pub const LIVENESS_WAIT: Duration = Duration::from_secs(30);
+
 /// How often the loop ticks while a hold is on. The ordinary tick is 30s;
-/// during a hold nothing is counted in ticks (a held recovery resets its
-/// strikes), so ticking faster only makes the end of the outage visible sooner.
+/// ticking faster makes the end of the outage visible sooner. Nothing in the
+/// tick may count ticks as time because of this (see the module docs).
 pub const HELD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long the quick polling carries on after a hold ends. The tunnel comes
@@ -40,13 +53,18 @@ pub const LINGER_AFTER_HOLD: Duration = Duration::from_secs(30);
 /// response" on their own (research R4).
 pub const NO_RESPONSE_RETRANSMITS: u32 = 2;
 
-/// One line's hold.
+/// One line's hold: one continuous stretch of the path being down, which may
+/// change cause along the way without ending.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hold {
     pub cause: UplinkHoldCause,
+    /// When the stretch began, for the [`MAX_HOLD`] bound.
     pub started: Instant,
     pub started_at: SystemTime,
-    /// The recoveries held back, deduplicated, for the end-of-hold line.
+    /// When the current cause began, for the time reported against it.
+    pub cause_since: Instant,
+    /// The recoveries held back under the current cause, deduplicated, for
+    /// the line that ends it.
     pub skipped: Vec<DegradeReason>,
 }
 
@@ -59,22 +77,91 @@ pub struct PendingCheck {
     /// The tunnel's received-packet counter at the same point: a packet counted
     /// after it answers the check too.
     pub rx: Option<u64>,
+    /// When the tick that sent it began. The answer is waited for
+    /// [`LIVENESS_WAIT`] from here.
+    pub sent: Instant,
     pub deferred: DegradeReason,
 }
 
-/// A hold that began.
+/// A hold that began, or a hold whose cause changed to this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HoldStart {
     pub cause: UplinkHoldCause,
 }
 
-/// A hold that ended.
+/// A hold that ended, or the end of one cause within it
+/// ([`HoldEndedBy::CauseChanged`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldEnd {
     pub cause: UplinkHoldCause,
+    /// The time under `cause`.
     pub held: Duration,
     pub ended_by: HoldEndedBy,
     pub skipped: Vec<DegradeReason>,
+}
+
+impl HoldEnd {
+    /// The path came back. Only then is what was learned during the outage
+    /// (the agent's P-CSCF marks, charon's backed-off retries) stale: at the
+    /// bound, on a change of cause or on shutdown the path is not known to be
+    /// back.
+    pub fn path_returned(&self) -> bool {
+        self.ended_by == HoldEndedBy::Restored
+    }
+}
+
+/// When the ePDG was heard from, as closely as one tick can tell: something
+/// arrived after `after` and by `by`. A tick sees only what accumulated since
+/// the previous one, so the two are that tick and the one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heard {
+    pub after: Instant,
+    pub by: Instant,
+}
+
+impl Heard {
+    fn latest(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(Self {
+                after: a.after.max(b.after),
+                by: a.by.max(b.by),
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// What each line has heard from each ePDG, so lines sharing an ePDG share
+/// the evidence their verdicts rest on (FR-001). One line's IKE_SA failing
+/// while another hears from the same ePDG is that line's fault, not the
+/// path's, and is repaired rather than held.
+///
+/// Only evidence crosses lines. Holds, pending checks and strikes stay per
+/// line, because recovery does.
+#[derive(Debug, Default)]
+pub struct EpdgHeard {
+    by_epdg: Mutex<HashMap<String, HashMap<u32, Heard>>>,
+}
+
+impl EpdgHeard {
+    pub fn record(&self, epdg: &str, line: u32, heard: Heard) {
+        let mut map = self.by_epdg.lock().unwrap_or_else(|e| e.into_inner());
+        let lines = map.entry(epdg.to_owned()).or_default();
+        let merged = Heard::latest(lines.get(&line).copied(), Some(heard));
+        if let Some(merged) = merged {
+            lines.insert(line, merged);
+        }
+    }
+
+    /// The latest any *other* line has heard from `epdg`. A line's own
+    /// evidence it reads more precisely from the log.
+    pub fn others(&self, epdg: &str, line: u32) -> Option<Heard> {
+        let map = self.by_epdg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(epdg)?
+            .iter()
+            .filter(|(l, _)| **l != line)
+            .fold(None, |acc, (_, h)| Heard::latest(acc, Some(*h)))
+    }
 }
 
 /// What the loop saw this tick, before running it.
@@ -85,12 +172,15 @@ pub struct Observation {
     /// The log since [`UnderlayTracker::evidence_mark`].
     pub evidence: IkeEvidence,
     /// A parsed message since the previous tick.
-    pub ike_life_recent: bool,
-    /// The tunnel interface's received-packet counter.
+    pub parsed_since_tick: bool,
+    /// The tunnel interface's received-packet counter, read now.
     pub rx_packets: Option<u64>,
     /// Whether the ePDG said anything since the pending check was sent; `None`
     /// when there is no pending check.
     pub pending_life: Option<bool>,
+    /// What other lines on the same ePDG have heard from it
+    /// ([`EpdgHeard::others`]).
+    pub sibling_heard: Option<Heard>,
     /// The log's current position.
     pub mark: LogMark,
 }
@@ -101,6 +191,9 @@ pub struct Begin {
     pub view: UnderlayView,
     pub ended: Option<HoldEnd>,
     pub started: Option<HoldStart>,
+    /// What this line heard from the ePDG this tick, for the other lines on
+    /// it ([`EpdgHeard::record`]).
+    pub heard: Option<Heard>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +205,15 @@ pub struct UnderlayTracker {
     /// This tick's own counter reading, `None` when it failed: the baseline
     /// for a liveness check the tick sends.
     tick_rx: Option<u64>,
+    /// When the previous tick began: the start of what this tick sees.
+    prev_tick: Option<Instant>,
+    /// The latest this line itself heard from the ePDG.
+    heard: Option<Heard>,
+    /// Silence is counted from here: the log mark retransmits are read from,
+    /// and the time it was taken. Both move whenever the ePDG is heard from by
+    /// any means, so an answer of any kind restarts the count.
     evidence_mark: LogMark,
+    silence_since: Instant,
     tick_mark: LogMark,
     pub hold: Option<Hold>,
     pub pending_check: Option<PendingCheck>,
@@ -121,14 +222,17 @@ pub struct UnderlayTracker {
 }
 
 impl UnderlayTracker {
-    pub fn new(mark: LogMark) -> Self {
+    pub fn new(mark: LogMark, now: Instant) -> Self {
         Self {
             verdict: UnderlayVerdict::Up,
             route_failures: 0,
             first_route_failure: None,
             last_rx: None,
             tick_rx: None,
+            prev_tick: None,
+            heard: None,
             evidence_mark: mark,
+            silence_since: now,
             tick_mark: mark,
             hold: None,
             pending_check: None,
@@ -172,6 +276,7 @@ impl UnderlayTracker {
 
     /// Computes the verdict for this tick and the view the tick is given.
     pub fn begin_tick(&mut self, obs: &Observation, now: Instant, now_at: SystemTime) -> Begin {
+        let window_from = self.prev_tick.replace(now).unwrap_or(now);
         self.tick_mark = obs.mark;
         self.tick_rx = obs.rx_packets;
 
@@ -191,7 +296,8 @@ impl UnderlayTracker {
                 .first_route_failure
                 .is_some_and(|first| now.saturating_duration_since(first) >= ROUTE_DEBOUNCE);
 
-        // The ePDG said something, or the tunnel decrypted something: alive.
+        // What this line heard this tick: a parsed message, or the tunnel
+        // decrypting something.
         let rx_grew = matches!(
             (self.last_rx, obs.rx_packets),
             (Some(before), Some(after)) if after > before
@@ -199,8 +305,19 @@ impl UnderlayTracker {
         if obs.rx_packets.is_some() {
             self.last_rx = obs.rx_packets;
         }
-        let heard =
-            (obs.evidence.parsed_from_peer && obs.evidence.unanswered_retransmits == 0) || rx_grew;
+        let heard_now = (obs.parsed_since_tick || rx_grew).then_some(Heard {
+            after: window_from,
+            by: now,
+        });
+        self.heard = Heard::latest(self.heard, heard_now);
+        let sibling_heard_since = |t: Instant| obs.sibling_heard.is_some_and(|h| h.after >= t);
+
+        // Alive since silence began. The log orders a parsed message against
+        // the retransmits after it; a counter or another line's word cannot be
+        // ordered within the window, so either one restarts the count.
+        let heard = (obs.evidence.parsed_from_peer && obs.evidence.unanswered_retransmits == 0)
+            || rx_grew
+            || sibling_heard_since(self.silence_since);
 
         let previous = self.verdict;
         let mut verdict = if route_down {
@@ -216,23 +333,23 @@ impl UnderlayTracker {
             // The route is back (FR-006). Whatever charon retransmitted while it
             // was gone says nothing about the ePDG, so judge afresh.
             UnderlayVerdict::Up
-        } else if obs.evidence.unanswered_retransmits >= NO_RESPONSE_RETRANSMITS && !rx_grew {
+        } else if obs.evidence.unanswered_retransmits >= NO_RESPONSE_RETRANSMITS && !heard {
             UnderlayVerdict::NoResponse
         } else {
             UnderlayVerdict::Up
         };
 
-        // Evidence is read from a mark that moves on whenever nothing is
-        // outstanding, so the log slice stays short, and stays put while
-        // retransmits are being counted.
-        let advance = match (previous, verdict) {
-            // Heard from, or the route came back and the slate is wiped.
-            (UnderlayVerdict::NoResponse | UnderlayVerdict::NoRoute, UnderlayVerdict::Up) => true,
-            (_, UnderlayVerdict::Up) => obs.evidence.unanswered_retransmits == 0,
-            _ => false,
-        };
-        if advance {
-            self.evidence_mark = obs.mark;
+        // Silence is counted from a mark that moves on whenever the line is up
+        // and nothing is outstanding, or the ePDG has been heard from, so the
+        // log slice stays short and old retransmits are never counted against
+        // a path that has since answered. It stays put while retransmits are
+        // being counted.
+        if verdict == UnderlayVerdict::Up
+            && (previous != UnderlayVerdict::Up
+                || heard
+                || obs.evidence.unanswered_retransmits == 0)
+        {
+            self.restart_silence(obs.mark, now);
         }
 
         // The bound (FR-012): one ordinary pass, whatever the verdict says.
@@ -243,22 +360,25 @@ impl UnderlayTracker {
             if now.saturating_duration_since(hold.started) >= MAX_HOLD {
                 ended = self.end_hold(HoldEndedBy::MaxHold, now);
                 verdict = UnderlayVerdict::Up;
-                self.evidence_mark = obs.mark;
+                self.restart_silence(obs.mark, now);
                 unheld_pass = true;
             }
         }
 
         if !unheld_pass {
-            let cause = verdict.hold_cause();
-            let current = self.hold.as_ref().map(|h| h.cause);
-            if current != cause {
-                if current.is_some() {
-                    ended = self.end_hold(HoldEndedBy::Restored, now);
+            match (self.hold.as_ref().map(|h| h.cause), verdict.hold_cause()) {
+                (Some(current), Some(cause)) if current != cause => {
+                    // Still down, for a different reason: the same hold, so
+                    // the bound still runs from when it began.
+                    ended = self.change_cause(cause, now);
+                    started = Some(HoldStart { cause });
                 }
-                if let Some(cause) = cause {
+                (Some(_), None) => ended = self.end_hold(HoldEndedBy::Restored, now),
+                (None, Some(cause)) => {
                     self.start_hold(cause, now, now_at);
                     started = Some(HoldStart { cause });
                 }
+                _ => {}
             }
         }
         self.verdict = verdict;
@@ -269,32 +389,37 @@ impl UnderlayTracker {
 
         // A no-route hold that ended because the route came back: whatever
         // charon was retrying across the dead path should be retried now.
-        let restored = ended.as_ref().is_some_and(|e| {
-            e.ended_by == HoldEndedBy::Restored && e.cause == UplinkHoldCause::NoRoute
-        });
+        let restored = ended
+            .as_ref()
+            .is_some_and(|e| e.path_returned() && e.cause == UplinkHoldCause::NoRoute);
         let pending = self.pending_check.map(|p| PendingView {
             reason: p.deferred,
-            // The tunnel counter growing since the check went out covers the
-            // packets that answer it, as well as the log lines. Measured from
+            // The log, the tunnel counter growing since the check went out,
+            // or another line on the ePDG hearing from it since. Measured from
             // the check, not from the previous tick: traffic from before the
             // check is no answer to it.
             life_since_mark: obs.pending_life.unwrap_or(false)
                 || matches!(
                     (p.rx, obs.rx_packets),
                     (Some(before), Some(after)) if after > before
-                ),
+                )
+                || sibling_heard_since(p.sent),
+            expired: now.saturating_duration_since(p.sent) >= LIVENESS_WAIT,
         });
+        let heard_recently = Heard::latest(self.heard, obs.sibling_heard)
+            .is_some_and(|h| now.saturating_duration_since(h.by) < RECENT_LIFE);
         Begin {
             view: UnderlayView {
                 enabled: true,
                 verdict,
                 route_ok: obs.route_ok || unheld_pass,
                 pending: pending.filter(|_| !unheld_pass),
-                ike_life_recent: obs.ike_life_recent || unheld_pass,
+                heard_recently: heard_recently || unheld_pass,
                 restored,
             },
             ended,
             started,
+            heard: heard_now,
         }
     }
 
@@ -311,10 +436,14 @@ impl UnderlayTracker {
     ) -> Option<HoldStart> {
         match outcome {
             SteadyOutcome::Deferred { reason } => {
+                // A check already out keeps its mark and its clock: waiting on
+                // it is not a new suspicion (FR-004, one exchange per
+                // suspicion).
                 self.pending_check.get_or_insert(PendingCheck {
                     mark: mark_before_tick,
                     // Read by this tick's `begin_tick`, before the check went out.
                     rx: self.tick_rx,
+                    sent: now,
                     deferred: *reason,
                 });
                 None
@@ -327,6 +456,7 @@ impl UnderlayTracker {
                     if *cause == UplinkHoldCause::NoResponse {
                         if let Some(pending) = self.pending_check {
                             self.evidence_mark = pending.mark;
+                            self.silence_since = pending.sent;
                         }
                     }
                     self.verdict = match cause {
@@ -366,13 +496,33 @@ impl UnderlayTracker {
         self.end_hold(HoldEndedBy::Shutdown, now)
     }
 
+    fn restart_silence(&mut self, mark: LogMark, now: Instant) {
+        self.evidence_mark = mark;
+        self.silence_since = now;
+    }
+
     fn start_hold(&mut self, cause: UplinkHoldCause, now: Instant, now_at: SystemTime) {
         self.hold = Some(Hold {
             cause,
             started: now,
             started_at: now_at,
+            cause_since: now,
             skipped: Vec::new(),
         });
+    }
+
+    /// Reports the time under the old cause and carries on under the new one.
+    fn change_cause(&mut self, cause: UplinkHoldCause, now: Instant) -> Option<HoldEnd> {
+        let hold = self.hold.as_mut()?;
+        let end = HoldEnd {
+            cause: hold.cause,
+            held: now.saturating_duration_since(hold.cause_since),
+            ended_by: HoldEndedBy::CauseChanged,
+            skipped: std::mem::take(&mut hold.skipped),
+        };
+        hold.cause = cause;
+        hold.cause_since = now;
+        Some(end)
     }
 
     fn end_hold(&mut self, ended_by: HoldEndedBy, now: Instant) -> Option<HoldEnd> {
@@ -380,7 +530,7 @@ impl UnderlayTracker {
         self.linger_until = Some(now + LINGER_AFTER_HOLD);
         Some(HoldEnd {
             cause: hold.cause,
-            held: now.saturating_duration_since(hold.started),
+            held: now.saturating_duration_since(hold.cause_since),
             ended_by,
             skipped: hold.skipped,
         })
@@ -397,13 +547,18 @@ mod tests {
         LogMark::default()
     }
 
+    fn tracker() -> UnderlayTracker {
+        UnderlayTracker::new(mark(), Instant::now())
+    }
+
     fn quiet() -> Observation {
         Observation {
             route_ok: true,
             evidence: IkeEvidence::default(),
-            ike_life_recent: true,
+            parsed_since_tick: true,
             rx_packets: Some(100),
             pending_life: None,
+            sibling_heard: None,
             mark: mark(),
         }
     }
@@ -452,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_held_line_is_polled_faster_and_stays_quick_for_a_while_after_it_ends() {
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let t0 = Instant::now();
         let at = SystemTime::UNIX_EPOCH;
         assert_eq!(t.poll_after(t0), Duration::from_secs(30));
@@ -477,7 +632,7 @@ mod tests {
     #[test]
     fn a_quiet_healthy_line_is_up_with_no_hold() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         for _ in 0..5 {
             let b = clock.begin(&mut t, &quiet());
             assert_eq!(b.view.verdict, UnderlayVerdict::Up);
@@ -490,7 +645,7 @@ mod tests {
     #[test]
     fn one_failed_route_check_is_not_a_verdict() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let b = clock.begin(&mut t, &no_route());
         assert_eq!(b.view.verdict, UnderlayVerdict::Up);
         assert!(!b.view.route_ok, "but the tick is told, for row 7");
@@ -500,7 +655,7 @@ mod tests {
     #[test]
     fn two_failed_route_checks_ten_seconds_apart_hold_the_line() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         let b = clock.begin(&mut t, &no_route());
         assert_eq!(b.view.verdict, UnderlayVerdict::NoRoute);
@@ -520,7 +675,7 @@ mod tests {
 
     #[test]
     fn two_failures_closer_than_ten_seconds_do_not_count() {
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let t0 = Instant::now();
         let at = SystemTime::UNIX_EPOCH;
         t.begin_tick(&no_route(), t0, at);
@@ -533,7 +688,7 @@ mod tests {
     #[test]
     fn a_good_route_check_between_failures_restarts_the_debounce() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &quiet());
         let b = clock.begin(&mut t, &no_route());
@@ -543,7 +698,7 @@ mod tests {
     #[test]
     fn the_hold_ends_as_soon_as_the_route_is_back() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &no_route());
         let b = clock.begin(&mut t, &quiet());
@@ -559,7 +714,7 @@ mod tests {
     fn only_a_restored_no_route_hold_flags_the_tick_that_follows_it() {
         // Route back: flagged, once.
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &no_route());
         let b = clock.begin(&mut t, &quiet());
@@ -567,7 +722,7 @@ mod tests {
         assert!(!clock.begin(&mut t, &quiet()).view.restored);
         // A no-response hold ending means the ePDG was heard from: not flagged.
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &silent(2));
         let heard = Observation {
             evidence: IkeEvidence {
@@ -579,7 +734,7 @@ mod tests {
         let b = clock.begin(&mut t, &heard);
         assert!(b.ended.is_some() && !b.view.restored);
         // The 15-minute cut is not a restoration either.
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let t0 = Instant::now();
         let at = SystemTime::UNIX_EPOCH;
         t.begin_tick(&no_route(), t0, at);
@@ -591,7 +746,7 @@ mod tests {
     #[test]
     fn two_unanswered_retransmits_with_nothing_heard_is_no_response() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let b = clock.begin(&mut t, &silent(1));
         assert_eq!(b.view.verdict, UnderlayVerdict::Up, "one is not enough");
         let b = clock.begin(&mut t, &silent(2));
@@ -607,7 +762,7 @@ mod tests {
     #[test]
     fn a_grown_tunnel_counter_is_life_even_with_retransmits_outstanding() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &quiet());
         let mut obs = silent(3);
         obs.rx_packets = Some(101);
@@ -618,7 +773,7 @@ mod tests {
     #[test]
     fn no_response_stays_until_the_epdg_is_heard_from() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &silent(2));
         // charon gave up retransmitting, and the log goes quiet: still held.
         let b = clock.begin(&mut t, &quiet_but_unanswered());
@@ -643,7 +798,7 @@ mod tests {
     #[test]
     fn no_route_takes_precedence_over_no_response() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &silent(2));
         assert_eq!(t.state(), UplinkState::NoResponse);
         let both = Observation {
@@ -653,15 +808,169 @@ mod tests {
         clock.begin(&mut t, &both);
         let b = clock.begin(&mut t, &both);
         assert_eq!(b.view.verdict, UnderlayVerdict::NoRoute);
-        // The cause flipped: the hold ended and a new one started.
-        assert_eq!(b.ended.unwrap().cause, UplinkHoldCause::NoResponse);
+        // The cause changed; the path never came back, so this is the end of
+        // one cause within the same hold, not a restore.
+        let ended = b.ended.unwrap();
+        assert_eq!(ended.cause, UplinkHoldCause::NoResponse);
+        assert_eq!(ended.ended_by, HoldEndedBy::CauseChanged);
+        assert!(!ended.path_returned());
+        assert!(!b.view.restored);
         assert_eq!(b.started.unwrap().cause, UplinkHoldCause::NoRoute);
+    }
+
+    #[test]
+    fn a_change_of_cause_keeps_the_hold_and_its_fifteen_minute_bound() {
+        let mut t = tracker();
+        let t0 = Instant::now();
+        let at = SystemTime::UNIX_EPOCH;
+        t.begin_tick(&silent(2), t0, at);
+        let began = t.hold.as_ref().unwrap().started;
+        // The route goes 14 minutes in.
+        let fourteen = t0 + Duration::from_secs(14 * 60);
+        let both = Observation {
+            route_ok: false,
+            ..silent(4)
+        };
+        t.begin_tick(&both, fourteen, at);
+        let b = t.begin_tick(&both, fourteen + TICK, at);
+        let ended = b.ended.unwrap();
+        assert_eq!(ended.ended_by, HoldEndedBy::CauseChanged);
+        assert_eq!(ended.held, Duration::from_secs(14 * 60) + TICK);
+        let hold = t.hold.as_ref().unwrap();
+        assert_eq!(hold.cause, UplinkHoldCause::NoRoute);
+        assert_eq!(hold.started, began, "the same hold");
+        // So the bound falls at 15 minutes from the start, not 29.
+        let b = t.begin_tick(&both, t0 + MAX_HOLD, at);
+        let ended = b.ended.expect("cut at the bound");
+        assert_eq!(ended.ended_by, HoldEndedBy::MaxHold);
+        assert_eq!(ended.cause, UplinkHoldCause::NoRoute);
+        assert_eq!(ended.held, MAX_HOLD - Duration::from_secs(14 * 60) - TICK);
+    }
+
+    #[test]
+    fn a_grown_counter_restarts_the_silence_count() {
+        // Retransmits outstanding while the tunnel still decrypts traffic:
+        // alive. Silence is then counted afresh from this tick, so those same
+        // retransmits cannot hold the line on a later quiet tick.
+        let mut clock = Clock::new();
+        let mut t = tracker();
+        clock.begin(&mut t, &quiet());
+        let grew = Observation {
+            rx_packets: Some(101),
+            mark: LogMark::at(500),
+            ..silent(2)
+        };
+        let b = clock.begin(&mut t, &grew);
+        assert_eq!(b.view.verdict, UnderlayVerdict::Up);
+        assert_eq!(t.evidence_mark(), LogMark::at(500));
+        // Without growth the mark stays put while retransmits are counted.
+        let mut t = tracker();
+        let stuck = Observation {
+            mark: LogMark::at(500),
+            ..silent(1)
+        };
+        clock.begin(&mut t, &stuck);
+        assert_eq!(t.evidence_mark(), mark());
+    }
+
+    #[test]
+    fn a_sibling_hearing_from_the_epdg_keeps_this_line_up_and_answers_its_check() {
+        let mut clock = Clock::new();
+        let mut t = tracker();
+        clock.begin(&mut t, &quiet());
+        // Another line on the same ePDG heard from it after this line's
+        // silence began: this line's retransmits are its own trouble.
+        let (now, _) = (clock.t0 + TICK, ());
+        let sibling = Some(Heard {
+            after: now,
+            by: now + TICK,
+        });
+        let b = clock.begin(
+            &mut t,
+            &Observation {
+                sibling_heard: sibling,
+                ..silent(3)
+            },
+        );
+        assert_eq!(b.view.verdict, UnderlayVerdict::Up);
+        assert!(b.view.heard_recently);
+        // A check sent now is answered by sibling traffic after it, and
+        // not by sibling traffic from before it.
+        let (sent, at) = clock.next();
+        t.end_tick(
+            &SteadyOutcome::Deferred {
+                reason: DegradeReason::PcscfPoolExhausted,
+            },
+            mark(),
+            sent,
+            at,
+        );
+        let before = Observation {
+            pending_life: Some(false),
+            sibling_heard: Some(Heard {
+                after: sent - Duration::from_secs(1),
+                by: sent + TICK,
+            }),
+            ..quiet()
+        };
+        let b = clock.begin(&mut t, &before);
+        assert!(!b.view.pending.unwrap().life_since_mark);
+        let after = Observation {
+            sibling_heard: Some(Heard {
+                after: sent,
+                by: sent + TICK * 2,
+            }),
+            ..before
+        };
+        let b = clock.begin(&mut t, &after);
+        assert!(b.view.pending.unwrap().life_since_mark);
+    }
+
+    #[test]
+    fn heard_recently_means_thirty_seconds_at_any_cadence() {
+        let mut t = tracker();
+        let t0 = Instant::now();
+        let at = SystemTime::UNIX_EPOCH;
+        let quick = Duration::from_secs(5);
+        t.begin_tick(&quiet(), t0, at);
+        let silent_tick = Observation {
+            parsed_since_tick: false,
+            ..quiet()
+        };
+        // Heard at t0; 25s of quick ticks later it is still recent.
+        let mut now = t0;
+        for _ in 0..5 {
+            now += quick;
+            assert!(t.begin_tick(&silent_tick, now, at).view.heard_recently);
+        }
+        now += quick;
+        assert!(!t.begin_tick(&silent_tick, now, at).view.heard_recently);
+    }
+
+    #[test]
+    fn epdg_heard_shares_between_lines_on_one_epdg_only() {
+        let shared = EpdgHeard::default();
+        let t0 = Instant::now();
+        let h = Heard {
+            after: t0,
+            by: t0 + TICK,
+        };
+        shared.record("192.0.2.1", 0, h);
+        assert_eq!(shared.others("192.0.2.1", 1), Some(h));
+        assert_eq!(shared.others("192.0.2.1", 0), None, "not its own");
+        assert_eq!(shared.others("192.0.2.2", 1), None, "another ePDG");
+        let later = Heard {
+            after: t0 + TICK,
+            by: t0 + TICK * 2,
+        };
+        shared.record("192.0.2.1", 2, later);
+        assert_eq!(shared.others("192.0.2.1", 1), Some(later));
     }
 
     #[test]
     fn retransmits_from_the_outage_do_not_hold_a_line_whose_route_just_returned() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &no_route());
         // Route back, but the log slice still carries the outage's retransmits.
@@ -679,7 +988,7 @@ mod tests {
 
     #[test]
     fn a_hold_is_cut_at_fifteen_minutes_and_that_tick_runs_unheld() {
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let t0 = Instant::now();
         let at = SystemTime::UNIX_EPOCH;
         t.begin_tick(&no_route(), t0, at);
@@ -706,7 +1015,7 @@ mod tests {
     #[test]
     fn shutdown_while_held_counts_the_time() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &no_route());
         assert_eq!(t.state(), UplinkState::NoRoute);
@@ -721,7 +1030,7 @@ mod tests {
     #[test]
     fn held_recoveries_are_recorded_once_each() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &no_route());
         let (now, at) = clock.next();
@@ -752,7 +1061,7 @@ mod tests {
     fn a_hold_decided_inside_the_tick_starts_one() {
         // Row 7: one failed route check and a recovery due.
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         clock.begin(&mut t, &no_route());
         let (now, at) = clock.next();
         let held = SteadyOutcome::Held {
@@ -778,7 +1087,7 @@ mod tests {
     #[test]
     fn a_deferral_creates_a_pending_check_and_a_second_one_reuses_it() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let (now, at) = clock.next();
         let first = SteadyOutcome::Deferred {
             reason: DegradeReason::PcscfPoolExhausted,
@@ -796,7 +1105,7 @@ mod tests {
     #[test]
     fn the_pending_check_is_offered_to_the_next_tick_with_its_answer() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let (now, at) = clock.next();
         t.end_tick(
             &SteadyOutcome::Deferred {
@@ -815,7 +1124,8 @@ mod tests {
             b.view.pending,
             Some(PendingView {
                 reason: DegradeReason::PcscfPoolExhausted,
-                life_since_mark: false
+                life_since_mark: false,
+                expired: true,
             })
         );
         let answered = Observation {
@@ -829,7 +1139,7 @@ mod tests {
     #[test]
     fn only_packets_counted_after_the_check_answer_it() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let quiet_rx = |rx| Observation {
             rx_packets: Some(rx),
             pending_life: Some(false),
@@ -868,7 +1178,7 @@ mod tests {
             },
         ] {
             let mut clock = Clock::new();
-            let mut t = UnderlayTracker::new(mark());
+            let mut t = tracker();
             let (now, at) = clock.next();
             t.end_tick(
                 &SteadyOutcome::Deferred {
@@ -886,7 +1196,7 @@ mod tests {
     #[test]
     fn an_unanswered_check_that_holds_the_line_judges_life_from_the_check_onward() {
         let mut clock = Clock::new();
-        let mut t = UnderlayTracker::new(mark());
+        let mut t = tracker();
         let (now, at) = clock.next();
         t.end_tick(
             &SteadyOutcome::Deferred {

@@ -24,7 +24,9 @@ Supervisor only. Reported on change, through `TunnelSignal` / `sync_tunnel_signa
 |---|---|
 | `cause` | `no_route`, `no_response` |
 | `held_secs` | integer seconds, ≥0 |
-| `ended_by` | `restored`, `max_hold`, `shutdown` |
+| `ended_by` | `restored`, `max_hold`, `shutdown`, `cause_changed` |
+
+`cause_changed` ends the time counted against one cause within a hold whose path never came back, and is followed by `uplink_hold_started` for the new cause. `held_secs` is always the time under `cause`, so `held_seconds_total` adds up per cause; `holds_total{cause}` counts each cause a hold took on.
 
 All are closed enums, so label cardinality is bounded (spec 022 FR-014).
 

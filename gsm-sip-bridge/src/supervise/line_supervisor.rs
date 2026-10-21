@@ -596,8 +596,9 @@ pub enum SteadyOutcome {
     PcscfChanged {
         new_pcscf: String,
     },
-    /// An IKE_SA is half-open and charon is still working on it, so nothing
-    /// was done (specs/100 US3).
+    /// charon is still working on a negotiation, so nothing was done: an
+    /// IKE_SA is half-open (specs/100 US3), or the CHILD_SA re-initiate a
+    /// first miss sent is still within its time.
     WaitingForNegotiation,
     /// A reachability-inferred recovery was due, and the path to the ePDG is
     /// down, so nothing was issued (specs/100 FR-007).
@@ -675,12 +676,15 @@ impl UnderlayVerdict {
 }
 
 /// An on-demand liveness check in flight (specs/100 FR-004), as the tick sees
-/// it: which recovery it is waiting on, and whether the ePDG has said anything
-/// since the check was sent.
+/// it: which recovery it is waiting on, whether the ePDG has said anything
+/// since the check was sent, and whether its time to answer is up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingView {
     pub reason: DegradeReason,
     pub life_since_mark: bool,
+    /// [`super::underlay::LIVENESS_WAIT`] has passed since it was sent. Until
+    /// then silence is no answer either way.
+    pub expired: bool,
 }
 
 /// What the loop tells one steady-state tick about the path to the ePDG
@@ -694,8 +698,9 @@ pub struct UnderlayView {
     /// recovery rule (data-model row 7).
     pub route_ok: bool,
     pub pending: Option<PendingView>,
-    /// The ePDG has sent a protected IKE message since the previous tick.
-    pub ike_life_recent: bool,
+    /// The ePDG was heard from within [`RECENT_LIFE`], by this line or another
+    /// on the same ePDG (FR-001).
+    pub heard_recently: bool,
     /// This tick follows a no-route hold that has just ended, so the path is
     /// back and anything charon was still retrying across it is worth
     /// retrying now rather than after its backoff.
@@ -710,7 +715,7 @@ impl UnderlayView {
             verdict: UnderlayVerdict::Up,
             route_ok: true,
             pending: None,
-            ike_life_recent: true,
+            heard_recently: true,
             restored: false,
         }
     }
@@ -765,14 +770,11 @@ pub struct SteadyTracking {
     /// The pool member that answered while the selection did not, on the last
     /// tick (specs/091 R9); `None` when the selection answered or nothing did.
     pub pcscf_via_sibling: Option<std::net::IpAddr>,
-    /// Consecutive ticks the P-CSCF was unreachable.
-    pub pcscf_unreachable: u32,
-    /// The time those ticks cover, each counted at the pause before it. The
-    /// loop's cadence changes (5s around a hold, specs/100), so the window is
-    /// measured in time, not derived from a tick count at one cadence.
-    pub pcscf_unreachable_for: Duration,
-    /// Consecutive ticks an IKE_SA was listed but had no usable CHILD_SA.
-    pub child_sa_missing: u32,
+    /// Consecutive ticks the P-CSCF was unreachable, and the time they cover.
+    pub pcscf_unreachable: Streak,
+    /// Consecutive ticks an IKE_SA was listed but had no usable CHILD_SA, and
+    /// the time they cover.
+    pub child_sa_missing: Streak,
     /// Whether the last tick saw a usable CHILD_SA.
     pub child_sa_usable: bool,
     /// The CHILD_SA (`#N`) a stuck-rekey rebuild was already issued for, so
@@ -809,12 +811,6 @@ pub struct SteadyTracking {
 }
 
 impl SteadyTracking {
-    /// Forgets the unreachable streak.
-    pub fn reset_pcscf_unreachable(&mut self) {
-        self.pcscf_unreachable = 0;
-        self.pcscf_unreachable_for = Duration::ZERO;
-    }
-
     /// Forgets every per-CHILD_SA stuck-rekey guard.
     fn clear_rekey_guards(&mut self) {
         self.rekey_stuck_rebuilt = None;
@@ -823,10 +819,50 @@ impl SteadyTracking {
     }
 }
 
-/// Consecutive missing-CHILD_SA ticks before the IKE_SA is rebuilt. Tick-based
-/// on purpose: only the strongswan engine, polled every 30s, ever reports
-/// `ChildSaMissing`, so 2 is about 60s. No backoff between repeated rebuilds.
+/// Consecutive missing-CHILD_SA ticks before the IKE_SA is rebuilt: the first
+/// only re-initiates the CHILD_SA. No backoff between repeated rebuilds.
 pub const CHILD_SA_MISSING_STRIKES: u32 = 2;
+
+/// ...and the time those ticks must cover: two of the strongswan loop's 30s
+/// ticks, so the re-initiate the first miss sent has a whole tick to work
+/// however fast the loop is polling (5s around a hold, specs/100).
+pub const CHILD_SA_MISSING_WINDOW: Duration = Duration::from_secs(60);
+
+/// A run of consecutive failed checks, and the time it covers: each check
+/// stands for the pause before it.
+///
+/// Every strike threshold is stated as both a count and a time. A count alone
+/// means a different time at every cadence, and the loops do not share one
+/// cadence (swu polls every 5s, strongswan every 30s and every 5s around a
+/// hold); a time alone would let a slow loop act on one sample.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Streak {
+    pub count: u32,
+    pub covered: Duration,
+}
+
+impl Streak {
+    pub fn hit(&mut self, pause: Duration) {
+        self.count = self.count.saturating_add(1);
+        self.covered += pause;
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// At least `min` checks, covering at least `window`.
+    pub fn reached(&self, min: u32, window: Duration) -> bool {
+        self.count >= min && self.covered >= window
+    }
+
+    /// Whether one more failed check, after `pause`, would reach it.
+    fn would_reach(&self, pause: Duration, min: u32, window: Duration) -> bool {
+        let mut next = *self;
+        next.hit(pause);
+        next.reached(min, window)
+    }
+}
 
 /// Time to hard expiry under which a CHILD_SA that is still the same `#N` has
 /// a stuck rekey (specs/093 R2).
@@ -1088,7 +1124,7 @@ pub fn tick_steady_state_underlay(
         tracking.inbound = None;
         // A respawned charon starts a fresh connection that gets its own first
         // retry, so a miss counted against the old one must not carry over.
-        tracking.child_sa_missing = 0;
+        tracking.child_sa_missing.reset();
         tracking.child_sa_usable = false;
         tracking.clear_rekey_guards();
         engine.restart_process(runner);
@@ -1109,7 +1145,7 @@ pub fn tick_steady_state_underlay(
     // unreachable P-CSCF later in the tick does not undo that (specs/086).
     tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok(_));
     if health != SteadyStateHealth::ChildSaMissing {
-        tracking.child_sa_missing = 0;
+        tracking.child_sa_missing.reset();
     }
     if !matches!(health, SteadyStateHealth::IkeSaConnecting { .. }) {
         tracking.half_open = None;
@@ -1222,7 +1258,19 @@ pub fn tick_steady_state_underlay(
             return tick_half_open(engine, runner, ike_id, tracking, underlay);
         }
         SteadyStateHealth::ChildSaMissing => {
-            let reason = if tracking.child_sa_missing + 1 >= CHILD_SA_MISSING_STRIKES {
+            let stuck = tracking.child_sa_missing.would_reach(
+                poll_interval,
+                CHILD_SA_MISSING_STRIKES,
+                CHILD_SA_MISSING_WINDOW,
+            );
+            if !stuck && tracking.child_sa_missing.count > 0 {
+                // The first miss re-initiated it, and that has not had its
+                // time yet: one CHILD_SA request per miss would be one every
+                // 5s around a hold.
+                tracking.child_sa_missing.hit(poll_interval);
+                return SteadyOutcome::WaitingForNegotiation;
+            }
+            let reason = if stuck {
                 DegradeReason::ChildSaStuck
             } else {
                 DegradeReason::ChildSaMissing
@@ -1231,15 +1279,18 @@ pub fn tick_steady_state_underlay(
                 // A strike earned against a dead path means nothing once it is
                 // back: the next one has to be earned afresh.
                 if matches!(outcome, SteadyOutcome::Held { .. }) {
-                    tracking.child_sa_missing = 0;
+                    tracking.child_sa_missing.reset();
                 }
                 return outcome;
             }
-            tracking.child_sa_missing += 1;
-            if tracking.child_sa_missing >= CHILD_SA_MISSING_STRIKES {
+            tracking.child_sa_missing.hit(poll_interval);
+            if tracking
+                .child_sa_missing
+                .reached(CHILD_SA_MISSING_STRIKES, CHILD_SA_MISSING_WINDOW)
+            {
                 // Re-initiating inside the surviving IKE_SA did not bring the
                 // CHILD_SA back; only a fresh IKE_SA will.
-                tracking.child_sa_missing = 0;
+                tracking.child_sa_missing.reset();
                 engine.terminate(runner);
                 engine.reinitiate(runner);
                 return SteadyOutcome::Recovered {
@@ -1332,7 +1383,7 @@ pub fn tick_steady_state_underlay(
                 return outcome;
             }
             tracking.pool_exhausted_deferral_logged = false;
-            tracking.reset_pcscf_unreachable();
+            tracking.pcscf_unreachable.reset();
             let outcome = rebuild_tunnel(engine, runner, DegradeReason::PcscfPoolExhausted);
             if matches!(
                 outcome,
@@ -1372,17 +1423,17 @@ pub fn tick_steady_state_underlay(
     };
     tracking.pcscf_via_sibling = sibling;
     if selection_reachable || tracking.pcscf_via_sibling.is_some() {
-        tracking.reset_pcscf_unreachable();
+        tracking.pcscf_unreachable.reset();
     } else {
         // The route was checked above, this same tick: unreachable with it in
         // place is some other fault.
-        tracking.pcscf_unreachable = tracking.pcscf_unreachable.saturating_add(1);
-        tracking.pcscf_unreachable_for += poll_interval;
+        tracking.pcscf_unreachable.hit(poll_interval);
         // Measured in real time, so both engines, and one loop whose cadence
         // changes, wait the same ~90s rather than the same number of ticks.
         // At a fixed cadence this is `pcscf_unreachable_strikes` ticks.
-        if tracking.pcscf_unreachable >= PCSCF_UNREACHABLE_MIN_STRIKES
-            && tracking.pcscf_unreachable_for >= PCSCF_UNREACHABLE_WINDOW
+        if tracking
+            .pcscf_unreachable
+            .reached(PCSCF_UNREACHABLE_MIN_STRIKES, PCSCF_UNREACHABLE_WINDOW)
         {
             if let Some(outcome) =
                 underlay_gate(engine, runner, underlay, DegradeReason::PcscfUnreachable)
@@ -1390,11 +1441,11 @@ pub fn tick_steady_state_underlay(
                 // Strikes counted against a dead path are not evidence once it
                 // is back.
                 if matches!(outcome, SteadyOutcome::Held { .. }) {
-                    tracking.reset_pcscf_unreachable();
+                    tracking.pcscf_unreachable.reset();
                 }
                 return outcome;
             }
-            tracking.reset_pcscf_unreachable();
+            tracking.pcscf_unreachable.reset();
             return rebuild_tunnel(engine, runner, DegradeReason::PcscfUnreachable);
         }
     }
@@ -1413,7 +1464,7 @@ fn repair_default_route(
     if current_pcscf.is_empty() || !engine.repair_default_route(runner, current_pcscf) {
         return None;
     }
-    tracking.reset_pcscf_unreachable();
+    tracking.pcscf_unreachable.reset();
     Some(SteadyOutcome::Recovered {
         reason: DegradeReason::DefaultRouteMissing,
         ike_sa_loss_cause: None,
@@ -1447,10 +1498,14 @@ fn underlay_gate(
         });
     }
     // Row 6: a liveness check is already out. An ePDG that has said anything
-    // since it was sent is alive, so the recovery is a genuine one.
+    // since it was sent is alive, so the recovery is a genuine one; one that
+    // has stayed silent for the whole wait is not answering. Before that,
+    // silence settles nothing: keep waiting, without a second check.
     if let Some(pending) = underlay.pending {
         return if pending.life_since_mark {
             None
+        } else if !pending.expired {
+            Some(SteadyOutcome::Deferred { reason })
         } else {
             Some(SteadyOutcome::Held {
                 cause: UplinkHoldCause::NoResponse,
@@ -1466,7 +1521,7 @@ fn underlay_gate(
         .and_then(|esp| esp.last_in_age)
         .is_some_and(|age| age < RECENT_LIFE);
     let established = matches!(engine.ike_header(), Some((_, IkeHeaderState::Established)));
-    if established && !underlay.ike_life_recent && !esp_recent {
+    if established && !underlay.heard_recently && !esp_recent {
         let sent = engine.send_dpd(runner);
         println!(
             "{} the ePDG has been silent for {}s; {} before {reason:?}",
@@ -2413,7 +2468,7 @@ mod tests {
         assert_eq!(*engine.terminate_calls.borrow(), 1);
         assert_eq!(*engine.reinitiate_calls.borrow(), 1);
         assert_eq!(
-            streak.pcscf_unreachable, 0,
+            streak.pcscf_unreachable.count, 0,
             "the streak resets after acting"
         );
     }
@@ -2430,7 +2485,7 @@ mod tests {
             *engine.pcscf_reachable.borrow_mut() = true;
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak);
         }
-        assert_eq!(streak.pcscf_unreachable, 0);
+        assert_eq!(streak.pcscf_unreachable.count, 0);
         assert_eq!(
             *engine.reinitiate_calls.borrow(),
             0,
@@ -2472,7 +2527,7 @@ mod tests {
             }
         );
         assert_eq!(
-            streak.pcscf_unreachable, 0,
+            streak.pcscf_unreachable.count, 0,
             "a refresh must not count as an unreachable tick"
         );
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
@@ -2510,7 +2565,7 @@ mod tests {
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
         assert_eq!(*engine.recreate_interface_calls.borrow(), 0);
         assert_eq!(
-            streak.pcscf_unreachable, 0,
+            streak.pcscf_unreachable.count, 0,
             "a repaired route must not count as a strike"
         );
 
@@ -2596,7 +2651,7 @@ mod tests {
         assert_eq!(*engine.terminate_calls.borrow(), 0);
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
         assert_eq!(*engine.recreate_interface_calls.borrow(), 0);
-        assert_eq!(streak.pcscf_unreachable, 0);
+        assert_eq!(streak.pcscf_unreachable.count, 0);
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::StillUp
@@ -2714,7 +2769,7 @@ mod tests {
             SteadyOutcome::StillUp
         );
         assert_eq!(*engine.repair_calls.borrow(), 1);
-        assert_eq!(streak.pcscf_unreachable, 1);
+        assert_eq!(streak.pcscf_unreachable.count, 1);
     }
 
     #[test]
@@ -2770,7 +2825,53 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(streak.pcscf_unreachable_for, Duration::ZERO);
+        assert_eq!(streak.pcscf_unreachable, Streak::default());
+    }
+
+    #[test]
+    fn a_missing_child_sa_gets_one_reinitiate_and_a_minute_at_any_cadence() {
+        // At 30s: re-initiate, then rebuild on the next tick (as ever). At the
+        // 5s cadence around a hold: one re-initiate, quiet waiting, and the
+        // rebuild once the same minute is covered.
+        let runner = MockCommandRunner::new();
+        for (interval, waits) in [
+            (STEADY_STATE_POLL_INTERVAL, 0),
+            (Duration::from_secs(5), 10),
+        ] {
+            let engine = FakeEngine {
+                health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+                ..Default::default()
+            };
+            let mut tracking = SteadyTracking::default();
+            let mut tick =
+                || super::tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking, interval);
+            assert!(matches!(
+                tick(),
+                SteadyOutcome::Recovered {
+                    reason: DegradeReason::ChildSaMissing,
+                    ..
+                }
+            ));
+            for n in 0..waits {
+                assert_eq!(
+                    tick(),
+                    SteadyOutcome::WaitingForNegotiation,
+                    "{interval:?} wait {n}"
+                );
+            }
+            assert!(
+                matches!(
+                    tick(),
+                    SteadyOutcome::Recovered {
+                        reason: DegradeReason::ChildSaStuck,
+                        ..
+                    }
+                ),
+                "{interval:?}"
+            );
+            assert_eq!(*engine.reinitiate_calls.borrow(), 2, "{interval:?}");
+            assert_eq!(*engine.terminate_calls.borrow(), 1, "{interval:?}");
+        }
     }
 
     #[test]
@@ -2902,7 +3003,10 @@ mod tests {
             ..Default::default()
         };
         let mut tracking = SteadyTracking {
-            child_sa_missing: 1,
+            child_sa_missing: Streak {
+                count: 1,
+                covered: STEADY_STATE_POLL_INTERVAL,
+            },
             child_sa_usable: true,
             ..Default::default()
         };
@@ -2916,7 +3020,7 @@ mod tests {
         );
         assert_eq!(*engine.reinitiate_calls.borrow(), 1);
         assert_eq!(*engine.terminate_calls.borrow(), 0);
-        assert_eq!(tracking.child_sa_missing, 0);
+        assert_eq!(tracking.child_sa_missing.count, 0);
         assert!(!tracking.child_sa_usable);
     }
 
@@ -3210,10 +3314,13 @@ mod tests {
     fn the_exhaustion_rebuild_resets_the_unreachable_strikes() {
         let engine = FakeEngine::default();
         let mut tracking = negotiated();
-        tracking.pcscf_unreachable = 2;
+        tracking.pcscf_unreachable = Streak {
+            count: 2,
+            covered: STEADY_STATE_POLL_INTERVAL * 2,
+        };
         let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
         pool_tick(&engine, &pool(&["10.0.0.11"]), &mut tracking, false, &agent);
-        assert_eq!(tracking.pcscf_unreachable, 0);
+        assert_eq!(tracking.pcscf_unreachable.count, 0);
     }
 
     #[test]
@@ -3588,7 +3695,7 @@ mod tests {
         );
         assert_eq!(*engine.terminate_calls.borrow(), 1);
         assert_eq!(*engine.reinitiate_calls.borrow(), 2);
-        assert_eq!(tracking.child_sa_missing, 0);
+        assert_eq!(tracking.child_sa_missing.count, 0);
     }
 
     #[test]
@@ -3685,10 +3792,10 @@ mod tests {
         };
         let mut tracking = SteadyTracking::default();
         child_sa_tick(&engine, &runner, &mut tracking);
-        assert_eq!(tracking.child_sa_missing, 1);
+        assert_eq!(tracking.child_sa_missing.count, 1);
         *engine.health.borrow_mut() = SteadyStateHealth::TunVanished;
         child_sa_tick(&engine, &runner, &mut tracking);
-        assert_eq!(tracking.child_sa_missing, 0);
+        assert_eq!(tracking.child_sa_missing.count, 0);
     }
 
     #[test]
@@ -4219,7 +4326,7 @@ mod tests {
         // Five ticks is well past the two strikes a missing CHILD_SA gets.
         assert_eq!(*engine.terminate_calls.borrow(), 0);
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
-        assert_eq!(tracking.child_sa_missing, 0);
+        assert_eq!(tracking.child_sa_missing.count, 0);
         let active_at = tracking.half_open.clone().unwrap().active_at;
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
         assert_eq!(
@@ -4366,7 +4473,7 @@ mod tests {
             verdict,
             route_ok: true,
             pending: None,
-            ike_life_recent: false,
+            heard_recently: false,
             restored: false,
         }
     }
@@ -4491,7 +4598,7 @@ mod tests {
             assert_eq!(last, held(cause, DegradeReason::PcscfUnreachable));
             nothing_was_issued(&engine);
             assert_eq!(
-                tracking.pcscf_unreachable, 0,
+                tracking.pcscf_unreachable.count, 0,
                 "strikes against a dead path are not evidence once it is back"
             );
         }
@@ -4535,8 +4642,11 @@ mod tests {
             held(NO_ROUTE, DegradeReason::ChildSaMissing)
         );
         // The strike was not earned against a working path.
-        assert_eq!(tracking.child_sa_missing, 0);
-        tracking.child_sa_missing = 1;
+        assert_eq!(tracking.child_sa_missing.count, 0);
+        tracking.child_sa_missing = Streak {
+            count: 1,
+            covered: STEADY_STATE_POLL_INTERVAL,
+        };
         assert_eq!(
             guarded(
                 &engine,
@@ -4776,7 +4886,7 @@ mod tests {
         let up = view(UnderlayVerdict::Up);
         // Pool exhausted, recent life: no liveness check needed.
         let recent = UnderlayView {
-            ike_life_recent: true,
+            heard_recently: true,
             ..up
         };
         let engine = FakeEngine::default();
@@ -4868,7 +4978,7 @@ mod tests {
         // The ePDG spoke since the last tick.
         let engine = established_engine();
         let spoke = UnderlayView {
-            ike_life_recent: true,
+            heard_recently: true,
             ..view(UnderlayVerdict::Up)
         };
         assert_eq!(
@@ -4944,15 +5054,44 @@ mod tests {
         assert_eq!(*engine.dpd_calls.borrow(), 0);
     }
 
-    // Data-model row 6: the check has had its tick.
+    // Data-model row 6: the check has had its 30s.
     fn with_pending(life: bool) -> UnderlayView {
         UnderlayView {
             pending: Some(PendingView {
                 reason: DegradeReason::PcscfPoolExhausted,
                 life_since_mark: life,
+                expired: true,
             }),
             ..view(UnderlayVerdict::Up)
         }
+    }
+
+    #[test]
+    fn a_check_still_inside_its_wait_keeps_the_recovery_deferred_without_a_second_one() {
+        // The 5s ticks around a hold come back long before the 30s an answer
+        // is given: silence by then is no answer either way.
+        let engine = established_engine();
+        let waiting = UnderlayView {
+            pending: Some(PendingView {
+                reason: DegradeReason::PcscfPoolExhausted,
+                life_since_mark: false,
+                expired: false,
+            }),
+            ..view(UnderlayVerdict::Up)
+        };
+        assert_eq!(
+            guarded(
+                &engine,
+                &mut negotiated(),
+                &waiting,
+                Some(&exhausted_agent())
+            ),
+            SteadyOutcome::Deferred {
+                reason: DegradeReason::PcscfPoolExhausted
+            }
+        );
+        nothing_was_issued(&engine);
+        assert_eq!(*engine.dpd_calls.borrow(), 0, "no second check");
     }
 
     #[test]

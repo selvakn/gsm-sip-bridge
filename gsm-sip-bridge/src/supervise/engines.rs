@@ -627,6 +627,10 @@ pub struct SharedCharon {
     /// to the same file (a length comparison alone cannot: the new log may
     /// have grown past the old mark by the next read).
     log_generation: AtomicU64,
+    /// What each line has heard from each ePDG, so lines on one ePDG share
+    /// the evidence for its verdict (specs/100 FR-001). Here because every
+    /// line that can share an ePDG shares this daemon.
+    pub epdg_heard: super::underlay::EpdgHeard,
 }
 
 /// A position in the shared charon log: its truncation generation and length.
@@ -634,6 +638,15 @@ pub struct SharedCharon {
 pub struct LogMark {
     generation: u64,
     len: usize,
+}
+
+#[cfg(test)]
+impl LogMark {
+    /// A mark `len` bytes into the first log, for tests that need two marks
+    /// to differ.
+    pub fn at(len: usize) -> Self {
+        Self { generation: 0, len }
+    }
 }
 
 impl SharedCharon {
@@ -644,6 +657,7 @@ impl SharedCharon {
             charon_log,
             handle: Mutex::new(None),
             log_generation: AtomicU64::new(0),
+            epdg_heard: Default::default(),
         }
     }
 
