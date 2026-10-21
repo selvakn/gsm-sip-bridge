@@ -158,7 +158,7 @@ IKE_SA to charon.
 
 ```text
 [supervise] line 0: ims0 initiate started
-[supervise] line 0: ims0 initiate client exited 0 after 20s
+[supervise] line 0: ims0 initiate client exited after 20s
 [supervise] line 0: ims0 IKE_SA #1 still negotiating; leaving it to charon
 [supervise] line 0: swanctl --list-sas timed out (2/2)
 [supervise] line 0: charon control interface unresponsive; restarting the shared daemon

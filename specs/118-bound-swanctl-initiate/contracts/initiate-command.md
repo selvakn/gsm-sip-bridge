@@ -20,7 +20,7 @@ Properties a test asserts:
 | --- | --- |
 | started | `[supervise] line <idx>: <conn> initiate started` |
 | skipped | `[supervise] line <idx>: <conn> initiate skipped, previous client still running (<n>s)` |
-| client ended | `[supervise] line <idx>: <conn> initiate client exited <code> after <n>s` |
+| client ended | `[supervise] line <idx>: <conn> initiate client exited after <n>s` |
 | left to charon | `[supervise] line <idx>: <conn> IKE_SA #<id> still negotiating; leaving it to charon` (existing text) |
 | unresponsive | `[supervise] line <idx>: swanctl --list-sas timed out (<k>/2)` |
 | wedge recovery | `[supervise] line <idx>: charon control interface unresponsive; restarting the shared daemon` |

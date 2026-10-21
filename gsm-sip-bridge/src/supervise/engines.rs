@@ -1042,6 +1042,34 @@ impl StrongswanEngine {
             .and_then(|c| child_rekey_invalid_selectors_session(&c, &self.conn_name))
     }
 
+    /// Reaps the outstanding initiate client if it has finished, so a finished
+    /// client never lingers as a zombie with a tracked entry through a long
+    /// outage in which nothing starts another. Returns whether a client is
+    /// still running.
+    ///
+    /// The exit code is not logged: the runner's liveness check consumes the
+    /// status when it notices the exit, so `wait` can only return `None`.
+    /// How long it ran says what it was (about 20s = swanctl detached, about
+    /// 27s = the outer timeout, quick = it failed).
+    fn collect_initiate(&self, runner: &dyn CommandRunner) -> bool {
+        let mut pending = self.pending_initiate.borrow_mut();
+        let Some(p) = pending.take() else {
+            return false;
+        };
+        if runner.is_alive(&p.handle) {
+            *pending = Some(p);
+            return true;
+        }
+        println!(
+            "[supervise] line {}: {} initiate client exited after {}s",
+            self.idx,
+            self.conn_name,
+            p.started.elapsed().as_secs()
+        );
+        let _ = runner.wait(p.handle);
+        false
+    }
+
     /// Starts this line's tunnel initiation, unless the previous client is
     /// still running (#139).
     ///
@@ -1053,25 +1081,19 @@ impl StrongswanEngine {
     /// Not backgrounding the initiate at all would block the supervisor tick
     /// for as long as IKE negotiation takes, which an earlier review caught.
     pub fn initiate(&self, runner: &dyn CommandRunner) {
-        let mut pending = self.pending_initiate.borrow_mut();
-        if let Some(p) = pending.take() {
-            let secs = p.started.elapsed().as_secs();
-            if runner.is_alive(&p.handle) {
-                println!(
-                    "[supervise] line {}: {} initiate skipped, previous client still running ({secs}s)",
-                    self.idx, self.conn_name
-                );
-                *pending = Some(p);
-                return;
-            }
-            let code = runner.wait(p.handle);
+        if self.collect_initiate(runner) {
+            let secs = self
+                .pending_initiate
+                .borrow()
+                .as_ref()
+                .map_or(0, |p| p.started.elapsed().as_secs());
             println!(
-                "[supervise] line {}: {} initiate client exited {} after {secs}s",
-                self.idx,
-                self.conn_name,
-                code.map_or_else(|| "?".to_string(), |c| c.to_string())
+                "[supervise] line {}: {} initiate skipped, previous client still running ({secs}s)",
+                self.idx, self.conn_name
             );
+            return;
         }
+        let mut pending = self.pending_initiate.borrow_mut();
         match runner.spawn(ChildSpec::new(initiate_argv(
             &self.shared.strongswan_conf,
             &self.conn_name,
@@ -1224,6 +1246,7 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn establish_probe(&self, runner: &dyn CommandRunner) -> EstablishProbe {
+        self.collect_initiate(runner);
         self.probe_generation.set(self.shared.generation());
         let Some(out) = self.list_sas(runner) else {
             return EstablishProbe::Unresponsive;
@@ -1247,6 +1270,10 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
+        self.collect_initiate(runner);
+        // The generation this tick's listing is judged under, for a wedge
+        // recovery that follows it (#139).
+        self.probe_generation.set(self.shared.generation());
         self.last_inbound.set(None);
         self.last_tun_rx.set(None);
         *self.last_ike_header.borrow_mut() = None;
@@ -2942,6 +2969,41 @@ mod tests {
             assert!(runner.waited_on(id), "the handle must be consumed");
             assert!(runner.child_ids().is_empty(), "table entry must be gone");
             engine.cancel_initiate(&runner);
+        }
+
+        #[test]
+        fn a_finished_client_is_collected_by_a_probe_without_starting_another() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.initiate(&runner);
+            let id = runner.child_ids()[0];
+            runner.kill_child_by_id(id, 0);
+            engine.establish_probe(&runner);
+            assert!(runner.waited_on(id), "reaped on the probe tick");
+            assert!(runner.child_ids().is_empty());
+            assert_eq!(runner.spawn_specs.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn a_steady_state_wedge_is_recoverable_because_the_health_check_captures_the_generation() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.shared.ensure_started(&runner);
+            engine
+                .shared
+                .restart_if_wedged(&runner, engine.shared.generation()); // generation >= 1
+            let before = engine.shared.current_handle().unwrap().id();
+            seed_list(&runner, 256, "");
+            assert_eq!(
+                engine.steady_state_health(&runner),
+                SteadyStateHealth::ViciBroken
+            );
+            engine.recover_wedged_control(&runner);
+            assert_ne!(
+                engine.shared.current_handle().unwrap().id(),
+                before,
+                "a frozen daemon must be respawned from steady state"
+            );
         }
 
         #[test]
