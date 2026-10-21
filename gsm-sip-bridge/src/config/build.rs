@@ -841,6 +841,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         },
         respond_on_client: raw.respond_on_client,
         sms_delivery_report: raw.sms_delivery_report,
+        sms_report_pcscf_route: raw.sms_report_pcscf_route,
         respect_caller_privacy: raw.respect_caller_privacy,
         reg_rejected_cooldown_sec: in_range(
             raw.reg_rejected_cooldown_sec,
@@ -965,6 +966,9 @@ fn build_volte(raw: RawVolte, vowifi: &VowifiConfig) -> BridgeResult<VolteConfig
         sms_delivery_report: raw
             .sms_delivery_report
             .unwrap_or(vowifi.sms_delivery_report),
+        sms_report_pcscf_route: raw
+            .sms_report_pcscf_route
+            .unwrap_or(vowifi.sms_report_pcscf_route),
         respect_caller_privacy: raw
             .respect_caller_privacy
             .unwrap_or(vowifi.respect_caller_privacy),

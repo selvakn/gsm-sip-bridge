@@ -927,6 +927,13 @@ pub struct VowifiConfig {
     /// a carrier that turns out to dislike the report — and record the
     /// capture if you do, because no such carrier is known.
     pub sms_delivery_report: bool,
+    /// Put the P-CSCF first in the delivery report's `Route` set, ahead of
+    /// the registrar's `Service-Route` entries (TS 24.341 Annex B.6 table
+    /// B.6-7, TS 24.229 §5.1.2A.1.1). On by default. Off restores the
+    /// previous route set (Service-Route entries only), the immediate
+    /// rollback if a carrier dislikes the extra hop. See
+    /// `VolteConfig::sms_report_pcscf_route`.
+    pub sms_report_pcscf_route: bool,
     /// Whether an inbound `Privacy: id`/`user` withholds the caller's CNAP
     /// name (`ims::session::caller_identity_is_private`) from the PBX/
     /// SIP-server leg — RFC 3325 §9.1's withholding obligation for onward
@@ -1179,6 +1186,7 @@ impl Default for VowifiConfig {
             gm_cipher_alg: String::new(),
             respond_on_client: false,
             sms_delivery_report: true,
+            sms_report_pcscf_route: true,
             reg_rejected_cooldown_sec: DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             respect_caller_privacy: true,
             originating_headers: OriginatingHeaders::default(),
@@ -1289,6 +1297,10 @@ pub struct VolteConfig {
     /// the same shared dispatcher), so an upgrade must not silently flip
     /// VoLTE's behaviour back to the default. See `build::build_volte`.
     pub sms_delivery_report: bool,
+    /// The LTE counterpart to `VowifiConfig::sms_report_pcscf_route`.
+    /// Inherits `[vowifi]`'s value when the `[volte]` key is absent, like
+    /// `sms_delivery_report` above.
+    pub sms_report_pcscf_route: bool,
     /// Whether an inbound `Privacy: id`/`user` withholds the caller's CNAP
     /// name from the PBX/SIP-server leg — the LTE counterpart to
     /// `VowifiConfig::respect_caller_privacy`, same RFC 3325 §9.1 obligation.
@@ -1371,6 +1383,7 @@ impl Default for VolteConfig {
             register_request_uri: "home-domain".to_string(),
             respond_on_client: true,
             sms_delivery_report: true,
+            sms_report_pcscf_route: true,
             reg_rejected_cooldown_sec: DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             respect_caller_privacy: true,
             netns: "volte".to_string(),
@@ -1625,6 +1638,36 @@ mod tests {
             "{MINIMAL_TOML}\n[vowifi]\nsms_delivery_report = false\n"
         ));
         assert!(!off.vowifi.sms_delivery_report);
+    }
+
+    /// On by default (TS 24.341 Annex B.6); off restores Service-Route-only.
+    #[test]
+    fn sms_report_pcscf_route_is_on_unless_switched_off() {
+        assert!(parse(MINIMAL_TOML).vowifi.sms_report_pcscf_route);
+        let off = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsms_report_pcscf_route = false\n"
+        ));
+        assert!(!off.vowifi.sms_report_pcscf_route);
+    }
+
+    /// `[volte]` inherits `[vowifi]`'s value unless it sets its own.
+    #[test]
+    fn volte_sms_report_pcscf_route_inherits_and_overrides() {
+        assert!(parse(MINIMAL_TOML).volte.sms_report_pcscf_route);
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsms_report_pcscf_route = false\n"
+        ));
+        assert!(!cfg.volte.sms_report_pcscf_route);
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsms_report_pcscf_route = false\n[volte]\nsms_report_pcscf_route = true\n"
+        ));
+        assert!(!cfg.vowifi.sms_report_pcscf_route);
+        assert!(cfg.volte.sms_report_pcscf_route);
+        let off = parse(&format!(
+            "{MINIMAL_TOML}\n[volte]\nsms_report_pcscf_route = false\n"
+        ));
+        assert!(!off.volte.sms_report_pcscf_route);
+        assert!(off.vowifi.sms_report_pcscf_route);
     }
 
     /// On by default: RFC 3325 §9.1's withholding obligation is the

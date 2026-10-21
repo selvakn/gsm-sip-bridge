@@ -464,6 +464,19 @@ fn service_route_headers(session: &super::RegisteredSession) -> Vec<String> {
         .collect()
 }
 
+/// TS 24.229 §5.1.2A.1.1 / TS 24.341 Annex B.6 table B.6-7: the first entry
+/// of the route set is the P-CSCF itself, `lr`, ahead of the saved
+/// Service-Route. The port is the P-CSCF's protected server port when a Gm
+/// SA exists (traffic to 5060 would bypass the SA), otherwise the address
+/// registered through.
+pub(crate) fn pcscf_route_header(session: &super::RegisteredSession) -> String {
+    let mut addr = session.pcscf_addr;
+    if let Some(sa) = session.gm_state.as_ref() {
+        addr.set_port(sa.theirs.port_s);
+    }
+    format!("Route: <sip:{};lr>", format_sip_addr(addr))
+}
+
 /// TS 24.341 §5.3.2.4: send the SMS delivery report for a short message
 /// delivered to us over IMS — an RP-ACK (`ims::sms_pdu::build_rp_ack`)
 /// carried in a **new `MESSAGE` request** addressed to the IP-SM-GW.
@@ -491,28 +504,37 @@ fn service_route_headers(session: &super::RegisteredSession) -> Vec<String> {
 /// reason `vowifi.respond_on_client` exists. A report sent as a request does
 /// not depend on that defect being solved first.
 ///
+/// `in_reply_to` is the inbound `MESSAGE`'s `Call-ID` (§5.3.2.4 (d)).
+/// `pcscf_route` puts the P-CSCF ahead of the `Service-Route` entries (see
+/// [`pcscf_route_header`]).
+///
 /// Best-effort: the `202 Accepted` comes back
 /// asynchronously on the shared transport and is handled by the dispatch
 /// loop, and a send failure costs a redelivery, which the caller's dedupe
-/// absorbs.
+/// absorbs. Returns the report's own `Call-ID` when it was written, so the
+/// dispatcher can match the network's answer.
 pub(crate) fn send_sms_delivery_report(
     session: &mut super::RegisteredSession,
     ipsmgw_uri: &str,
     rp_ack: &[u8],
-) {
+    in_reply_to: Option<&str>,
+    pcscf_route: bool,
+) -> Option<String> {
     let impu = session
         .default_impu()
         .unwrap_or_else(|| format!("sip:{}", session.public_uri));
-    let route_headers = service_route_headers(session);
+    let route_headers = report_route_headers(session, pcscf_route);
     let cseq = session.cseq;
     session.cseq += 1;
+    let call_id = random_hex(8);
     let msg = build_message(&MessageRequest {
         target_uri: ipsmgw_uri,
         impu: &impu,
         route_headers: &route_headers,
         local_addr: session.local_addr,
         transport: if session.use_tcp { "TCP" } else { "UDP" },
-        call_id: &random_hex(8),
+        call_id: &call_id,
+        in_reply_to,
         from_tag: &random_hex(4),
         branch: &format!("z9hG4bK{}", random_hex(6)),
         cseq,
@@ -521,19 +543,37 @@ pub(crate) fn send_sms_delivery_report(
         security_verify: session.security_verify(),
     });
     match session.transport_mut().and_then(|t| t.send_bytes(&msg)) {
-        Ok(()) => tracing::info!(
-            ipsmgw = %ipsmgw_uri,
-            rp_ack = %rp_ack.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "sent the SMS delivery report"
-        ),
+        Ok(()) => {
+            tracing::info!(
+                ipsmgw = %ipsmgw_uri,
+                report_call_id = %call_id,
+                rp_ack = %rp_ack.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "sent the SMS delivery report"
+            );
+            Some(call_id)
+        }
         // Never silently swallowed: an undelivered report is exactly what
         // makes a message centre redeliver, and it is invisible otherwise.
-        Err(e) => tracing::warn!(
-            error = %e,
-            ipsmgw = %ipsmgw_uri,
-            "failed to send the SMS delivery report; the network may redeliver this message"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                ipsmgw = %ipsmgw_uri,
+                "failed to send the SMS delivery report; the network may redeliver this message"
+            );
+            None
+        }
     }
+}
+
+/// The delivery report's `Route` set: the P-CSCF first when `pcscf_route`,
+/// then the registrar's `Service-Route` entries in order.
+fn report_route_headers(session: &super::RegisteredSession, pcscf_route: bool) -> Vec<String> {
+    let mut routes = Vec::new();
+    if pcscf_route {
+        routes.push(pcscf_route_header(session));
+    }
+    routes.extend(service_route_headers(session));
+    routes
 }
 
 /// One `<contact>` element of a reg-event NOTIFY body (RFC 3680 §4.1 / TS
@@ -2131,5 +2171,172 @@ mod tests {
             .deregistration
             .expect("a deregistration");
         assert_eq!(d.scope, DeregScope::BindingRemoved);
+    }
+
+    // ---- specs/101: the SMS delivery report's routing and correlation ----
+
+    /// Send one delivery report from a session over a loopback UDP socket and
+    /// return what arrived, plus the `Call-ID` the sender reported.
+    fn sent_report(
+        verify: Option<&str>,
+        service_routes: &[&str],
+        in_reply_to: Option<&str>,
+        pcscf_route: bool,
+    ) -> (String, Option<String>) {
+        let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let addr = peer.local_addr().unwrap();
+        let transport = crate::ims::sip_client::SipTransport::connect(addr, false).unwrap();
+        let mut session = crate::ims::test_session_with_sa(Some(transport), addr, verify);
+        for r in service_routes {
+            session
+                .headers
+                .push(("Service-Route".to_string(), (*r).to_string()));
+        }
+        let call_id = send_sms_delivery_report(
+            &mut session,
+            "sip:ip-sm-gw@mmtel.ims.example.org",
+            &[0x02, 0x01, 0x41, 0x02, 0x00, 0x00],
+            in_reply_to,
+            pcscf_route,
+        );
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).unwrap();
+        (String::from_utf8_lossy(&buf[..n]).into_owned(), call_id)
+    }
+
+    fn route_lines(msg: &str) -> Vec<&str> {
+        msg.lines().filter(|l| l.starts_with("Route:")).collect()
+    }
+
+    #[test]
+    fn report_names_the_inbound_message_and_returns_its_own_call_id() {
+        let inbound = "asbc5lyog6o3.coysc@tas.ims.example.org.23";
+        let (msg, call_id) = sent_report(None, &[], Some(inbound), true);
+        assert!(
+            msg.contains(&format!("\r\nIn-Reply-To: {inbound}\r\n")),
+            "{msg}"
+        );
+        let call_id = call_id.expect("a written report returns its Call-ID");
+        assert!(
+            msg.contains(&format!("\r\nCall-ID: {call_id}\r\n")),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn report_without_an_inbound_call_id_has_no_in_reply_to() {
+        let (msg, _) = sent_report(None, &[], None, true);
+        assert!(!msg.contains("In-Reply-To"), "{msg}");
+    }
+
+    #[test]
+    fn pcscf_is_the_only_route_when_there_is_no_service_route() {
+        let (msg, _) = sent_report(None, &[], None, true);
+        assert_eq!(route_lines(&msg).len(), 1, "{msg}");
+        assert!(
+            route_lines(&msg)[0].starts_with("Route: <sip:127.0.0.1:"),
+            "{msg}"
+        );
+        assert!(route_lines(&msg)[0].ends_with(";lr>"), "{msg}");
+    }
+
+    #[test]
+    fn pcscf_route_precedes_the_service_route_entries_in_order() {
+        let (msg, _) = sent_report(
+            None,
+            &[
+                "<sip:orig@scscf1.example.org;lr>",
+                "<sip:orig@scscf2.example.org;lr>",
+            ],
+            None,
+            true,
+        );
+        let routes = route_lines(&msg);
+        assert_eq!(routes.len(), 3, "{msg}");
+        assert!(routes[0].starts_with("Route: <sip:127.0.0.1:"), "{msg}");
+        assert_eq!(routes[1], "Route: <sip:orig@scscf1.example.org;lr>");
+        assert_eq!(routes[2], "Route: <sip:orig@scscf2.example.org;lr>");
+    }
+
+    #[test]
+    fn with_a_gm_sa_the_route_uses_the_protected_server_port() {
+        // `test_session_with_sa` negotiates the P-CSCF's `port-s` as 6001.
+        let (msg, _) = sent_report(Some("v"), &[], None, true);
+        assert_eq!(
+            route_lines(&msg),
+            vec!["Route: <sip:127.0.0.1:6001;lr>"],
+            "{msg}"
+        );
+        // Without an SA it is the address registered through.
+        let (msg, _) = sent_report(None, &[], None, true);
+        assert!(!route_lines(&msg)[0].contains(":6001"), "{msg}");
+    }
+
+    #[test]
+    fn an_ipv6_pcscf_is_bracketed() {
+        let addr: std::net::SocketAddr = "[2001:db8::7]:5060".parse().unwrap();
+        let session = crate::ims::test_session_with_sa(None, addr, Some("v"));
+        assert_eq!(
+            pcscf_route_header(&session),
+            "Route: <sip:[2001:db8::7]:6001;lr>"
+        );
+    }
+
+    #[test]
+    fn with_the_setting_off_only_the_service_route_remains() {
+        let (msg, _) = sent_report(None, &["<sip:orig@scscf.example.org;lr>"], None, false);
+        assert_eq!(
+            route_lines(&msg),
+            vec!["Route: <sip:orig@scscf.example.org;lr>"],
+            "{msg}"
+        );
+        let (msg, _) = sent_report(None, &[], None, false);
+        assert!(route_lines(&msg).is_empty(), "{msg}");
+    }
+
+    #[test]
+    fn security_headers_are_the_same_in_every_variant() {
+        for (verify, pcscf_route, irt) in [
+            (Some("sv-echo"), true, Some("x@y")),
+            (Some("sv-echo"), false, None),
+        ] {
+            let (msg, _) = sent_report(verify, &[], irt, pcscf_route);
+            assert!(msg.contains("Require: sec-agree\r\n"), "{msg}");
+            assert!(msg.contains("Proxy-Require: sec-agree\r\n"), "{msg}");
+            assert!(msg.contains("Security-Verify: sv-echo\r\n"), "{msg}");
+        }
+    }
+
+    /// SC-003: against the pre-change shape, the only differences are the
+    /// added `Route` and `In-Reply-To` lines (Call-ID, tag, branch are random
+    /// per report and so normalised away).
+    #[test]
+    fn the_only_wire_differences_are_the_route_and_in_reply_to() {
+        fn normalised(msg: &str) -> Vec<String> {
+            msg.lines()
+                .map(|l| {
+                    if l.starts_with("Via:") || l.starts_with("From:") || l.starts_with("Call-ID:")
+                    {
+                        l.split([';', ':']).next().unwrap().to_string()
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect()
+        }
+        let svc = ["<sip:orig@scscf.example.org;lr>"];
+        let (before, _) = sent_report(Some("sv"), &svc, None, false);
+        let (after, _) = sent_report(Some("sv"), &svc, Some("inbound@x"), true);
+        let before = normalised(&before);
+        let after = normalised(&after);
+        let added: Vec<_> = after.iter().filter(|l| !before.contains(l)).collect();
+        assert_eq!(added.len(), 2, "{added:?}");
+        assert!(added
+            .iter()
+            .any(|l| l.starts_with("Route: <sip:127.0.0.1:6001;lr>")));
+        assert!(added.iter().any(|l| l.as_str() == "In-Reply-To: inbound@x"));
+        assert!(before.iter().all(|l| after.contains(l)));
     }
 }

@@ -384,6 +384,7 @@ fn run_inner(
         wideband: config.wideband,
         respond_on_client: config.respond_on_client,
         sms_delivery_report: config.sms_delivery_report,
+        sms_report_pcscf_route: config.sms_report_pcscf_route,
         respect_caller_privacy: config.respect_caller_privacy,
         // Already this line's value: discovery applied any `[[vowifi.line]]`
         // override to the per-line config.
@@ -733,6 +734,9 @@ pub(crate) struct InboundParams<'a> {
     /// `config::VolteConfig::sms_delivery_report` — each caller supplies its
     /// own section's copy, same as `respond_on_client` above.
     pub sms_delivery_report: bool,
+    /// See `config::VowifiConfig::sms_report_pcscf_route` /
+    /// `config::VolteConfig::sms_report_pcscf_route`.
+    pub sms_report_pcscf_route: bool,
     /// See `config::VowifiConfig::respect_caller_privacy` /
     /// `config::VolteConfig::respect_caller_privacy` — each caller supplies
     /// its own section's copy, same as `respond_on_client` above.
@@ -808,6 +812,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         wideband,
         respond_on_client,
         sms_delivery_report,
+        sms_report_pcscf_route,
         respect_caller_privacy,
         reg_rejected_cooldown,
         answer_preference,
@@ -984,6 +989,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             dedupe: &dedupe,
             reassembly: &reassembly,
             sms_delivery_report,
+            sms_report_pcscf_route,
             // Still read from `[vowifi]` on both paths deliberately, unlike
             // `sms_delivery_report`/`respect_caller_privacy`: no carrier has
             // ever needed a non-default header set on the VoLTE path, so
@@ -1241,6 +1247,7 @@ fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedRp> {
 fn handle_message(
     session: &mut crate::ims::RegisteredSession,
     p: &DispatchParams,
+    reports: &mut ReportsInFlight,
     req: &SipRequest,
     sink: &SipSink,
 ) {
@@ -1333,11 +1340,13 @@ fn handle_message(
             if let Some(ipsmgw) =
                 header_uri(req, "P-Asserted-Identity").or_else(|| header_uri(req, "From"))
             {
-                send_sms_delivery_report(
+                reports.record(send_sms_delivery_report(
                     session,
                     &ipsmgw,
                     &crate::ims::sms_pdu::build_rp_ack(rp_mr),
-                );
+                    inbound_call_id(req),
+                    p.sms_report_pcscf_route,
+                ));
             } else {
                 tracing::warn!(
                     "no P-Asserted-Identity or From URI on an SMS MESSAGE; cannot address an RP-ACK"
@@ -1362,11 +1371,13 @@ fn handle_message(
             if let Some(ipsmgw) =
                 header_uri(req, "P-Asserted-Identity").or_else(|| header_uri(req, "From"))
             {
-                send_sms_delivery_report(
+                reports.record(send_sms_delivery_report(
                     session,
                     &ipsmgw,
                     &crate::ims::sms_pdu::build_rp_error(rp_mr, None),
-                );
+                    inbound_call_id(req),
+                    p.sms_report_pcscf_route,
+                ));
             } else {
                 tracing::warn!(
                     "no P-Asserted-Identity or From URI on an SMS MESSAGE; cannot address an RP-ERROR"
@@ -1404,7 +1415,15 @@ fn handle_message(
             sender = %sender,
             "silent Type 0 SMS (reachability probe); acknowledging without recording it"
         );
-        acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+        acknowledge(
+            session,
+            sink,
+            reports,
+            req,
+            decoded.as_ref(),
+            p.sms_delivery_report,
+            p.sms_report_pcscf_route,
+        );
         return;
     }
 
@@ -1448,9 +1467,11 @@ fn handle_message(
         acknowledge(
             session,
             sink,
+            reports,
             req,
             decoded.as_ref(),
             p.sms_delivery_report && claim_confirmed,
+            p.sms_report_pcscf_route,
         );
         return;
     }
@@ -1510,7 +1531,15 @@ fn handle_message(
                     total = part.total,
                     "buffered one part of a multi-part message; not yet complete"
                 );
-                acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+                acknowledge(
+                    session,
+                    sink,
+                    reports,
+                    req,
+                    decoded.as_ref(),
+                    p.sms_delivery_report,
+                    p.sms_report_pcscf_route,
+                );
                 return;
             }
             crate::volte::sms::PartOutcome::Complete(joined) => {
@@ -1562,7 +1591,15 @@ fn handle_message(
                 .unwrap_or_else(|e| e.into_inner())
                 .mark_delivered(&sender, &part);
         }
-        acknowledge(session, sink, req, decoded.as_ref(), p.sms_delivery_report);
+        acknowledge(
+            session,
+            sink,
+            reports,
+            req,
+            decoded.as_ref(),
+            p.sms_delivery_report,
+            p.sms_report_pcscf_route,
+        );
     } else {
         // Release the admission above so the retransmission this triggers is
         // treated as fresh, not as a duplicate of a delivery that never
@@ -1714,9 +1751,11 @@ fn flush_expired_reassembly(p: &DispatchParams) {
 fn acknowledge(
     session: &mut crate::ims::RegisteredSession,
     sink: &SipSink,
+    reports: &mut ReportsInFlight,
     req: &SipRequest,
     decoded: Option<&crate::ims::sms_pdu::DecodedSms>,
     send_delivery_report: bool,
+    pcscf_route: bool,
 ) {
     respond(
         sink,
@@ -1739,11 +1778,94 @@ fn acknowledge(
         );
         return;
     };
-    send_sms_delivery_report(
+    reports.record(send_sms_delivery_report(
         session,
         &ipsmgw,
         &crate::ims::sms_pdu::build_rp_ack(decoded.rp_mr),
-    );
+        inbound_call_id(req),
+        pcscf_route,
+    ));
+}
+
+/// The inbound `MESSAGE`'s `Call-ID`, which the delivery report names in
+/// `In-Reply-To` (TS 24.341 §5.3.2.4 (d)). Sending without one is the
+/// defensive fallback for a request that had none.
+fn inbound_call_id(req: &SipRequest) -> Option<&str> {
+    let id = req.header("Call-ID");
+    if id.is_none() {
+        tracing::warn!(
+            "an SMS MESSAGE carried no Call-ID; sending its delivery report without In-Reply-To"
+        );
+    }
+    id
+}
+
+/// How many unanswered delivery reports are remembered; the oldest is
+/// forgotten beyond this.
+const REPORTS_IN_FLIGHT_CAP: usize = 32;
+
+/// What the network's answer to a delivery report amounts to.
+#[derive(Debug, PartialEq, Eq)]
+enum ReportAnswer {
+    /// Not a response to a report we are tracking.
+    NotOurs,
+    /// A provisional response; the final one is still to come.
+    Pending,
+    /// A 2xx: the report was taken.
+    Accepted,
+    /// A final non-2xx: the report was refused.
+    Rejected {
+        call_id: String,
+        status: u16,
+        reason: String,
+        warning: Option<String>,
+    },
+}
+
+/// `Call-ID`s of SMS delivery reports sent and not yet finally answered, so a
+/// refusal is visible rather than falling into the generic unmatched-response
+/// line. Bounded; never drives a resend.
+#[derive(Default)]
+struct ReportsInFlight(std::collections::VecDeque<String>);
+
+impl ReportsInFlight {
+    /// Remember a report's `Call-ID` (`None`: the send failed, nothing to track).
+    fn record(&mut self, call_id: Option<String>) {
+        let Some(call_id) = call_id else { return };
+        if self.0.len() >= REPORTS_IN_FLIGHT_CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back(call_id);
+    }
+
+    /// Classify `resp` against the tracked reports, dropping the entry on a
+    /// final answer.
+    fn on_response(&mut self, resp: &SipResponse) -> ReportAnswer {
+        let is_message = resp
+            .header("CSeq")
+            .and_then(cseq_method)
+            .is_some_and(|m| m.eq_ignore_ascii_case("MESSAGE"));
+        let Some(call_id) = resp.header("Call-ID").filter(|_| is_message) else {
+            return ReportAnswer::NotOurs;
+        };
+        let Some(pos) = self.0.iter().position(|c| c == call_id) else {
+            return ReportAnswer::NotOurs;
+        };
+        if resp.status < 200 {
+            return ReportAnswer::Pending;
+        }
+        let call_id = self.0.remove(pos).expect("position just found");
+        if resp.status < 300 {
+            ReportAnswer::Accepted
+        } else {
+            ReportAnswer::Rejected {
+                call_id,
+                status: resp.status,
+                reason: resp.reason.clone(),
+                warning: resp.header("Warning").map(str::to_string),
+            }
+        }
+    }
 }
 
 /// Everything the dispatch loop needs that does not change across iterations.
@@ -1769,6 +1891,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::sms_delivery_report`; consumed by
     /// [`acknowledge`].
     sms_delivery_report: bool,
+    /// See `config::VowifiConfig::sms_report_pcscf_route`; consumed by the
+    /// delivery-report call sites.
+    sms_report_pcscf_route: bool,
     /// See `config::VowifiConfig::originating_headers`; consumed by
     /// [`origination::begin_origination`].
     originating_headers: crate::config::OriginatingHeaders,
@@ -1901,6 +2026,8 @@ struct LoopState {
     /// A spec 090 qualifying endpoint failure raised by the last subscription
     /// action, waiting for `perform_sub_action` to mark the P-CSCF.
     endpoint_failure_seen: Option<String>,
+    /// Delivery reports awaiting the network's answer.
+    reports: ReportsInFlight,
 }
 
 impl LoopState {
@@ -1930,6 +2057,7 @@ impl LoopState {
             // tests that build a bare `LoopState`.
             pool: PcscfPool::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), Vec::new(), None),
             endpoint_failure_seen: None,
+            reports: ReportsInFlight::default(),
         }
     }
 
@@ -2492,7 +2620,7 @@ fn dispatch_loop(
                 st.handle_reg_notify(session, p, &req, &sink)?;
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "MESSAGE" => {
-                handle_message(session, p, &req, &sink);
+                handle_message(session, p, &mut st.reports, &req, &sink);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "UPDATE" => {
                 st.handle_carrier_update(&req, &sink);
@@ -3436,6 +3564,31 @@ impl LoopState {
     ) {
         if self.take_reg_sub_response(resp, Instant::now()) {
             return;
+        }
+        // The network's answer to an SMS delivery report we sent. Before the
+        // keepalive, which matches by CSeq number alone.
+        match self.reports.on_response(resp) {
+            ReportAnswer::NotOurs => {}
+            ReportAnswer::Pending => return,
+            ReportAnswer::Accepted => {
+                tracing::debug!(status = resp.status, "SMS delivery report accepted");
+                return;
+            }
+            ReportAnswer::Rejected {
+                call_id,
+                status,
+                reason,
+                warning,
+            } => {
+                tracing::warn!(
+                    report_call_id = %call_id,
+                    status,
+                    reason = %reason,
+                    warning = warning.as_deref().unwrap_or(""),
+                    "the network rejected the SMS delivery report"
+                );
+                return;
+            }
         }
         // Is this a response to an outbound INVITE we are placing (specs/029)?
         // These arrive here, on `inbound.rx`, instead of being read from the
@@ -4573,6 +4726,166 @@ mod tests {
         .into_bytes();
         raw.extend_from_slice(&pdu);
         SipRequest::try_parse(&raw).unwrap().unwrap().0
+    }
+
+    fn sms_message_with_call_id(call_id: &str) -> SipRequest {
+        let pdu = a_3gpp_sms_pdu();
+        let mut raw = format!(
+            "MESSAGE sip:x SIP/2.0\r\n\
+             P-Asserted-Identity: <sip:A2P@203.0.113.7;transport=udp>\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: {call_id}\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n\
+             Content-Length: {}\r\n\r\n",
+            pdu.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&pdu);
+        SipRequest::try_parse(&raw).unwrap().unwrap().0
+    }
+
+    /// specs/101 US1: each report names the SMS it acknowledges, and a
+    /// redelivery of the same Call-ID names the same one. Returns the
+    /// `In-Reply-To` of the report each request produced (the `200 OK` goes
+    /// out first, on the same socket).
+    #[test]
+    fn each_delivery_report_names_its_own_inbound_call_id() {
+        let peer = peer();
+        let mut session = session_to(&peer);
+        let sink = session.transport().unwrap().sink().unwrap();
+        let mut reports = ReportsInFlight::default();
+        let mut in_reply_to = Vec::new();
+        for id in [
+            "first@tas.example",
+            "second@tas.example",
+            "first@tas.example",
+        ] {
+            let req = sms_message_with_call_id(id);
+            let decoded = match decode_pdu_body(&req) {
+                Some(crate::ims::sms_pdu::DecodedRp::Message(m)) => m,
+                other => panic!("expected a decoded message, got {other:?}"),
+            };
+            acknowledge(
+                &mut session,
+                &sink,
+                &mut reports,
+                &req,
+                Some(&decoded),
+                true,
+                true,
+            );
+            let mut buf = [0u8; 4096];
+            let n = peer.recv(&mut buf).unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("SIP/2.0 200"));
+            let n = peer.recv(&mut buf).unwrap();
+            let report = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let line = report
+                .lines()
+                .find_map(|l| l.strip_prefix("In-Reply-To: "))
+                .unwrap_or_else(|| panic!("no In-Reply-To in {report}"));
+            in_reply_to.push(line.to_string());
+        }
+        assert_eq!(
+            in_reply_to,
+            [
+                "first@tas.example",
+                "second@tas.example",
+                "first@tas.example"
+            ]
+        );
+        assert_eq!(reports.0.len(), 3, "every written report is tracked");
+    }
+
+    #[test]
+    fn a_message_without_a_call_id_yields_none() {
+        let raw = "MESSAGE sip:x SIP/2.0\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n";
+        let req = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0;
+        assert_eq!(inbound_call_id(&req), None);
+    }
+
+    fn report_answer(status: u16, call_id: &str, warning: Option<&str>) -> SipResponse {
+        let mut headers = vec![
+            ("Call-ID".to_string(), call_id.to_string()),
+            ("CSeq".to_string(), "4 MESSAGE".to_string()),
+        ];
+        if let Some(w) = warning {
+            headers.push(("Warning".to_string(), w.to_string()));
+        }
+        SipResponse {
+            status,
+            reason: "Reason".into(),
+            headers,
+            body: String::new(),
+        }
+    }
+
+    /// specs/101 US4: a final non-2xx is surfaced once with its details; a
+    /// 2xx is not; a provisional waits for the final one.
+    #[test]
+    fn a_rejected_report_is_reported_once_and_an_accepted_one_not_at_all() {
+        let mut r = ReportsInFlight::default();
+        r.record(Some("rep1".into()));
+        let w = "399 tas \"Timer T2 expired\"";
+        assert_eq!(
+            r.on_response(&report_answer(100, "rep1", None)),
+            ReportAnswer::Pending
+        );
+        assert_eq!(
+            r.on_response(&report_answer(500, "rep1", Some(w))),
+            ReportAnswer::Rejected {
+                call_id: "rep1".into(),
+                status: 500,
+                reason: "Reason".into(),
+                warning: Some(w.into()),
+            }
+        );
+        // The duplicate after removal is not announced again.
+        assert_eq!(
+            r.on_response(&report_answer(500, "rep1", Some(w))),
+            ReportAnswer::NotOurs
+        );
+
+        r.record(Some("rep2".into()));
+        assert_eq!(
+            r.on_response(&report_answer(202, "rep2", None)),
+            ReportAnswer::Accepted
+        );
+        assert_eq!(
+            r.on_response(&report_answer(202, "rep2", None)),
+            ReportAnswer::NotOurs
+        );
+    }
+
+    #[test]
+    fn an_answer_to_something_else_is_not_ours() {
+        let mut r = ReportsInFlight::default();
+        r.record(Some("rep1".into()));
+        assert_eq!(
+            r.on_response(&report_answer(500, "other", None)),
+            ReportAnswer::NotOurs
+        );
+        let mut options = report_answer(500, "rep1", None);
+        options.headers[1].1 = "4 OPTIONS".into();
+        assert_eq!(r.on_response(&options), ReportAnswer::NotOurs);
+        r.record(None);
+        assert_eq!(r.0.len(), 1);
+    }
+
+    #[test]
+    fn the_in_flight_set_is_bounded_and_evicts_the_oldest() {
+        let mut r = ReportsInFlight::default();
+        for i in 0..=REPORTS_IN_FLIGHT_CAP {
+            r.record(Some(format!("rep{i}")));
+        }
+        assert_eq!(r.0.len(), REPORTS_IN_FLIGHT_CAP);
+        assert_eq!(
+            r.on_response(&report_answer(500, "rep0", None)),
+            ReportAnswer::NotOurs
+        );
+        assert!(matches!(
+            r.on_response(&report_answer(500, "rep1", None)),
+            ReportAnswer::Rejected { .. }
+        ));
     }
 
     /// specs/088 FR-019: parameters on the media type don't stop a 3GPP SMS

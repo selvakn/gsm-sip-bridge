@@ -230,6 +230,7 @@ pub(crate) fn run(
         // like the ePDG one, so Jio's refusal of `port_us` responses applies.
         respond_on_client: app_config.volte.respond_on_client,
         sms_delivery_report: app_config.volte.sms_delivery_report,
+        sms_report_pcscf_route: app_config.volte.sms_report_pcscf_route,
         respect_caller_privacy: app_config.volte.respect_caller_privacy,
         // `[[volte.line]]`'s override, else `[volte]` (itself inheriting
         // `[vowifi]` when unset).

@@ -410,6 +410,8 @@ section! {
         /// Whether an SMS delivered over IMS is acknowledged at the RP layer.
         /// See `VowifiConfig::sms_delivery_report`.
         pub sms_delivery_report: bool,
+        /// See `VowifiConfig::sms_report_pcscf_route`.
+        pub sms_report_pcscf_route: bool,
         /// Whether an inbound `Privacy: id`/`user` withholds the caller's
         /// CNAP name from the PBX/SIP-server leg. See
         /// `VowifiConfig::respect_caller_privacy`.
@@ -467,6 +469,7 @@ impl Default for RawVowifi {
             gm_cipher_alg: String::new(),
             respond_on_client: false,
             sms_delivery_report: true,
+            sms_report_pcscf_route: true,
             respect_caller_privacy: true,
             originating_headers: Vec::new(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
@@ -536,6 +539,9 @@ section! {
         /// governing VoLTE too, so an absent `[volte]` key inherits it
         /// instead of silently reverting to a hardcoded default.
         pub sms_delivery_report: Option<bool>,
+        /// Same meaning as `RawVowifi::sms_report_pcscf_route`; `None`
+        /// inherits `[vowifi]`'s value.
+        pub sms_report_pcscf_route: Option<bool>,
         /// Same meaning as `RawVowifi::respect_caller_privacy` — the RFC 3325
         /// `Privacy` header is a SIP/IMS-layer signal, not an access one.
         /// `None` inherits `[vowifi]`'s value for the same reason as
@@ -567,6 +573,7 @@ impl Default for RawVolte {
             // need RFC 3261 §18.2.2's normal behaviour instead.
             respond_on_client: true,
             sms_delivery_report: None,
+            sms_report_pcscf_route: None,
             respect_caller_privacy: None,
             reg_rejected_cooldown_sec: None,
             line: Vec::new(),

@@ -991,6 +991,9 @@ pub struct MessageRequest<'a> {
     /// "TCP" or "UDP".
     pub transport: &'a str,
     pub call_id: &'a str,
+    /// `In-Reply-To` (TS 24.341 §5.3.2.4 (d)): the `Call-ID` of the
+    /// `MESSAGE` this one answers. `None` omits the header.
+    pub in_reply_to: Option<&'a str>,
     pub from_tag: &'a str,
     pub branch: &'a str,
     pub cseq: u32,
@@ -1047,6 +1050,7 @@ pub fn build_message(req: &MessageRequest) -> Vec<u8> {
          From: <{impu}>;tag={from_tag}\r\n\
          To: <{target}>\r\n\
          Call-ID: {call_id}\r\n\
+         {in_reply_to}\
          CSeq: {cseq} MESSAGE\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\r\n",
@@ -1054,6 +1058,10 @@ pub fn build_message(req: &MessageRequest) -> Vec<u8> {
         target = req.target_uri,
         from_tag = req.from_tag,
         call_id = req.call_id,
+        in_reply_to = req
+            .in_reply_to
+            .map(|v| format!("In-Reply-To: {v}\r\n"))
+            .unwrap_or_default(),
         cseq = req.cseq,
         content_type = req.content_type,
         len = req.body.len(),
@@ -2022,6 +2030,7 @@ mod tests {
             local_addr: "10.0.0.2:5060".parse().unwrap(),
             transport: "TCP",
             call_id: "call-abc",
+            in_reply_to: None,
             from_tag: "tag123",
             branch: "z9hG4bKdeadbeef",
             cseq: 9,
@@ -2029,6 +2038,46 @@ mod tests {
             body,
             security_verify: None,
         })
+    }
+
+    fn a_report_replying_to(in_reply_to: Option<&str>) -> String {
+        String::from_utf8(build_message(&MessageRequest {
+            target_uri: "sip:A2P@203.0.113.7",
+            impu: "sip:u@ims.example.org",
+            route_headers: &[],
+            local_addr: "10.0.0.2:5060".parse().unwrap(),
+            transport: "TCP",
+            call_id: "call-abc",
+            in_reply_to,
+            from_tag: "tag123",
+            branch: "z9hG4bKdeadbeef",
+            cseq: 9,
+            content_type: "application/vnd.3gpp.sms",
+            body: b"\x02\x01\x41",
+            security_verify: None,
+        }))
+        .unwrap()
+    }
+
+    /// TS 24.341 §5.3.2.4 (d): `In-Reply-To` is the inbound Call-ID, exactly.
+    #[test]
+    fn build_message_carries_in_reply_to_verbatim_after_call_id() {
+        let id = "asbc5lyog6o3coy.scs36@tas.ims.example.org.23";
+        let msg = a_report_replying_to(Some(id));
+        assert!(
+            msg.contains(&format!(
+                "Call-ID: call-abc\r\nIn-Reply-To: {id}\r\nCSeq: 9 MESSAGE\r\n"
+            )),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn build_message_omits_in_reply_to_when_none_and_changes_nothing_else() {
+        let without = a_report_replying_to(None);
+        assert!(!without.contains("In-Reply-To"), "{without}");
+        let with = a_report_replying_to(Some("x@y"));
+        assert_eq!(with.replace("In-Reply-To: x@y\r\n", ""), without);
     }
 
     #[test]
@@ -2040,6 +2089,7 @@ mod tests {
             local_addr: "10.0.0.2:5060".parse().unwrap(),
             transport: "TCP",
             call_id: "c",
+            in_reply_to: None,
             from_tag: "t",
             branch: "z9hG4bKx",
             cseq: 1,

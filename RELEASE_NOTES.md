@@ -1,5 +1,9 @@
 # Release Notes
 
+## Unreleased
+
+- **SMS delivery reports follow TS 24.341 more closely** -- The report the bridge sends after an inbound IMS SMS now carries `In-Reply-To` naming the SMS it acknowledges (TS 24.341 §5.3.2.4), and is routed through the P-CSCF first, ahead of the registrar's `Service-Route` entries (Annex B.6). New `sms_report_pcscf_route` under `[vowifi]` and `[volte]` (default `true`; `[volte]` inherits `[vowifi]`) turns the P-CSCF `Route` off to restore the old routing. A report the network answers with a final error now logs one warning with the status, reason and any `Warning` text. This closes two conformance gaps found while investigating #140; it is not a claimed fix for the T2 report.
+
 ## v8.22.0
 
 - **A PBX reject is recognised by its reason, not only its status** -- The v8.20.0 fix answered the carrier `486 Busy Here` only when the phone side ended with `486`, `600` or `603`. FreePBX turns a rejected extension into `403` or `503` instead, so the carrier still got `480`, read it as "try again", and rang the phone a second time. The bridge now reads the `Reason: Q.850;cause=N` header on the PBX's final failure response: cause 21 (call rejected) or 17 (user busy) is a reject whatever the status, and the carrier gets `486`. Without that header nothing changes. New optional `[sip].reject_statuses` lists extra statuses (400-699) to treat as a reject for a PBX that rejects with a bare status, for example `reject_statuses = [403]`; it adds to `486`, `600` and `603` and cannot remove them. `403` is deliberately not a default, because it can also mean the bridge is not authorised on the PBX. Call history appends the cause, e.g. `declined:pbx_rejected:403:q850=21`, and the log line `PBX leg ended before answer` shows the status, the cause and whether a response was available. Reported by @mironovlab (#110).
