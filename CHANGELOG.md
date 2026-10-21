@@ -8,6 +8,20 @@ across releases.
 
 ## [Unreleased]
 
+### Changed
+
+- **The supervisor's P-CSCF probe is off by default.** The line supervisor's
+  TCP connect to each P-CSCF's unprotected SIP port, which no handset makes,
+  no longer runs. `[vowifi].supervisor_pcscf_probe = true` restores it.
+  Visible consequences: strongSwan's own DPD now runs at `dpd_delay_sec`
+  (the probe's traffic used to keep it from firing), and a dead single
+  P-CSCF is detected through the agent in roughly 115s plus one supervisor
+  poll instead of ~97s. A lost default route and an exhausted P-CSCF pool
+  are repaired exactly as before, and `pcscf_unreachable` recoveries now
+  read zero. The new `SUPERVISOR_PCSCF_PROBE` appears in
+  `gsm-sip-bridge config --shell-env`
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
 ### Added
 
 - **Underlay guard for VoWiFi.** While the path from the host to a line's ePDG

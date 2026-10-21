@@ -195,6 +195,26 @@ fn vowifi_shell_env_reports_the_dpd_delay() {
     assert!(rendered.contains("DPD_DELAY_SEC='0'\n"), "{rendered}");
 }
 
+/// specs/119: whether the supervisor probes the P-CSCF is visible in the
+/// export, right after the DPD delay.
+#[test]
+fn vowifi_shell_env_reports_the_supervisor_pcscf_probe_after_the_dpd_delay() {
+    let rendered = config_cmd::render_vowifi_shell_env(&load_minimal_config());
+    assert!(
+        rendered.contains("DPD_DELAY_SEC='120'\nSUPERVISOR_PCSCF_PROBE='false'\n"),
+        "{rendered}"
+    );
+
+    let on = load_config_from(&format!(
+        "{MINIMAL_CONFIG}\n[vowifi]\nsupervisor_pcscf_probe = true\n"
+    ));
+    let rendered = config_cmd::render_vowifi_shell_env(&on);
+    assert!(
+        rendered.contains("DPD_DELAY_SEC='120'\nSUPERVISOR_PCSCF_PROBE='true'\n"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn vowifi_shell_env_emits_the_globals_a_consumer_reads_by_name() {
     let config = load_minimal_config();

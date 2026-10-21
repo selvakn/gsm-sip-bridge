@@ -1031,6 +1031,12 @@ pub struct VowifiConfig {
     /// own DPD and NAT-T keepalives from running. Turn on only for a carrier
     /// that drops an idle bearer (#106).
     pub idle_keepalive: bool,
+    /// Whether the line supervisor probes each line's P-CSCF every tick (a TCP
+    /// connect to its unprotected SIP port) and rebuilds the tunnel after ~90s
+    /// of failures. Off by default (#120, specs/119-supervisor-probe-flag): no
+    /// handset does this, and the per-tick route repair, the rebuild when the
+    /// agent has marked every P-CSCF, and tuned DPD cover what it caught.
+    pub supervisor_pcscf_probe: bool,
     /// Idle-tunnel keepalive interval (seconds) — a TCP connect to the
     /// P-CSCF's SIP port, since operators commonly filter ICMP over the
     /// tunnel (confirmed on Vodafone India). Only applies when
@@ -1202,6 +1208,7 @@ impl Default for VowifiConfig {
             epdg_ip: None,
             src_addr: None,
             idle_keepalive: false,
+            supervisor_pcscf_probe: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: DEFAULT_DPD_DELAY_SEC,
             underlay_guard: true,
@@ -2402,6 +2409,31 @@ password = "pass"
         .unwrap_err()
         .to_string();
         assert!(err.contains("idle_keepalive"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_supervisor_pcscf_probe_is_off_by_default() {
+        // #120 / specs/119: no handset probes the P-CSCF's unprotected port.
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\n"));
+        assert!(!cfg.vowifi.supervisor_pcscf_probe);
+    }
+
+    #[test]
+    fn vowifi_supervisor_pcscf_probe_can_be_turned_on() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsupervisor_pcscf_probe = true\n"
+        ));
+        assert!(cfg.vowifi.supervisor_pcscf_probe);
+    }
+
+    #[test]
+    fn vowifi_supervisor_pcscf_probe_rejects_a_non_boolean() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nsupervisor_pcscf_probe = \"yes\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("supervisor_pcscf_probe"), "{err}");
     }
 
     #[test]

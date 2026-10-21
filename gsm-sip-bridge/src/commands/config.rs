@@ -90,6 +90,10 @@ pub fn render_vowifi_shell_env(config: &crate::config::AppConfig) -> String {
         ("KEEPALIVE_INTERVAL", v.keepalive_interval_sec.to_string()),
         ("IDLE_KEEPALIVE", v.idle_keepalive.to_string()),
         ("DPD_DELAY_SEC", v.dpd_delay_sec.to_string()),
+        (
+            "SUPERVISOR_PCSCF_PROBE",
+            v.supervisor_pcscf_probe.to_string(),
+        ),
         ("TUNNEL_ENGINE", v.tunnel_engine.clone()),
         ("VPCD_HOST", v.vpcd_host.clone()),
         ("VPCD_PORT", v.vpcd_port.to_string()),

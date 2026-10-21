@@ -433,6 +433,9 @@ section! {
         /// Whether the idle-tunnel keepalive runs. See
         /// `VowifiConfig::idle_keepalive`.
         pub idle_keepalive: bool,
+        /// Whether the line supervisor probes the P-CSCF. See
+        /// `VowifiConfig::supervisor_pcscf_probe`.
+        pub supervisor_pcscf_probe: bool,
         pub keepalive_interval_sec: u64,
         /// charon's DPD delay for every strongSwan line. See
         /// `VowifiConfig::dpd_delay_sec`.
@@ -481,6 +484,7 @@ impl Default for RawVowifi {
             epdg_ip: None,
             src_addr: None,
             idle_keepalive: false,
+            supervisor_pcscf_probe: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: crate::config::DEFAULT_DPD_DELAY_SEC,
             underlay_guard: true,

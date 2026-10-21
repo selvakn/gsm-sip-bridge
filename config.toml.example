@@ -367,15 +367,21 @@ wideband = true
 apn = "ims"
 # Idle-tunnel keepalive: a TCP connect to the P-CSCF's SIP port every
 # keepalive_interval_sec, result discarded. Off by default since #120: the
-# supervisor already probes the P-CSCF every 30s, and the extra traffic keeps
-# strongSwan's DPD and NAT-T keepalives from running. Turn on only if the
-# carrier drops an idle bearer (e.g. #106).
+# extra traffic keeps strongSwan's DPD and NAT-T keepalives from running.
+# Turn on only if the carrier drops an idle bearer (e.g. #106).
 # idle_keepalive = false
+# Whether the line supervisor probes each line's P-CSCF (a TCP connect to its
+# unprotected SIP port every tick) and rebuilds the tunnel after ~90s of
+# failures. Off by default (#120): no handset does this, and route repair, the
+# exhausted-pool rebuild and DPD cover what it caught. Turn on for the faster
+# detection of a dead single P-CSCF, or the previous behaviour. Applies when
+# the container is recreated.
+# supervisor_pcscf_probe = false
 # keepalive_interval_sec = 30
 # strongswan engine only: seconds with nothing received from the ePDG before
 # charon sends a dead-peer-detection request. 0 turns it off. Default 120, the
-# Android IWLAN default (was a fixed 30s; #120). No effect while the line
-# supervisor's P-CSCF probe runs. Applies when the container is recreated.
+# Android IWLAN default (was a fixed 30s; #120). Only takes effect with
+# supervisor_pcscf_probe off (the default). Applies when the container is recreated.
 # dpd_delay_sec = 120
 # strongswan engine only: while the path from this host to a line's ePDG is
 # down (no route to it, or it has stopped answering), hold back the recoveries

@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/118-bound-swanctl-initiate/plan.md`.
+`specs/119-supervisor-probe-flag/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

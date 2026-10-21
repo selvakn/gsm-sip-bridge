@@ -230,6 +230,12 @@ fn start_vowifi_subsystem(
             idle_keepalive_log_line(&config.vowifi)
         ),
     }
+    // And whether the supervisor probes the P-CSCF (specs/119 contracts/logs.md).
+    tracing::info!(
+        supervisor_pcscf_probe = config.vowifi.supervisor_pcscf_probe,
+        "{}",
+        supervisor_probe_log_line(&config.vowifi)
+    );
     // Also once per run (specs/098 contracts/config.md).
     tracing::info!(
         dpd_delay_sec = config.vowifi.dpd_delay_sec,
@@ -1882,6 +1888,7 @@ fn start_vowifi_line_strongswan(
     let mut tracking = line_supervisor::SteadyTracking {
         child_sa_usable: true,
         negotiated_at: Some(negotiated_at),
+        probe_disabled: probe_disabled(&ctx.config.vowifi),
         ..Default::default()
     };
     // IKE_SA rebuilds inside the tunnel-failure window; latching means flapping.
@@ -3167,15 +3174,40 @@ fn idle_keepalive_interval(v: &crate::config::VowifiConfig) -> Option<Duration> 
 /// (specs/094 contracts/logs.md).
 fn idle_keepalive_log_line(v: &crate::config::VowifiConfig) -> String {
     match idle_keepalive_interval(v) {
-        None => "idle-tunnel keepalive off ([vowifi].idle_keepalive = false); \
-                 P-CSCF reachability is probed by the line supervisor only"
-            .to_string(),
+        None => format!(
+            "idle-tunnel keepalive off ([vowifi].idle_keepalive = false); \
+             the supervisor's own P-CSCF probe is [vowifi].supervisor_pcscf_probe = {}",
+            v.supervisor_pcscf_probe
+        ),
         Some(interval) => format!(
             "idle-tunnel keepalive on: TCP connect to each line's P-CSCF :{} every {}s \
              ([vowifi].idle_keepalive = true)",
             line_supervisor::PCSCF_SIP_PORT,
             interval.as_secs()
         ),
+    }
+}
+
+/// Whether the supervisor skips its P-CSCF probe: the inverse of
+/// `[vowifi].supervisor_pcscf_probe`, which `SteadyTracking` carries inverted
+/// so its derived default keeps the probe running (specs/119 research R2).
+fn probe_disabled(v: &crate::config::VowifiConfig) -> bool {
+    !v.supervisor_pcscf_probe
+}
+
+/// The startup line saying whether the supervisor probes the P-CSCF
+/// (specs/119 contracts/logs.md).
+fn supervisor_probe_log_line(v: &crate::config::VowifiConfig) -> String {
+    if v.supervisor_pcscf_probe {
+        format!(
+            "supervisor P-CSCF probe on: TCP connect to each line's P-CSCF :{} every supervisor tick \
+             ([vowifi].supervisor_pcscf_probe = true)",
+            line_supervisor::PCSCF_SIP_PORT
+        )
+    } else {
+        "supervisor P-CSCF probe off ([vowifi].supervisor_pcscf_probe = false); \
+         route loss, an exhausted P-CSCF pool and a dead peer are repaired from their own signals"
+            .to_string()
     }
 }
 
@@ -3349,6 +3381,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     let mut current_pcscf = pcscf;
     let mut tracking = line_supervisor::SteadyTracking {
         negotiated_at: Some(negotiated_at),
+        probe_disabled: probe_disabled(&ctx.config.vowifi),
         ..Default::default()
     };
     loop {
@@ -3492,7 +3525,7 @@ mod tests {
         assert_eq!(
             idle_keepalive_log_line(&off),
             "idle-tunnel keepalive off ([vowifi].idle_keepalive = false); \
-             P-CSCF reachability is probed by the line supervisor only"
+             the supervisor's own P-CSCF probe is [vowifi].supervisor_pcscf_probe = false"
         );
         let on = crate::config::VowifiConfig {
             idle_keepalive: true,
@@ -3504,6 +3537,40 @@ mod tests {
             "idle-tunnel keepalive on: TCP connect to each line's P-CSCF :5060 every 30s \
              ([vowifi].idle_keepalive = true)"
         );
+    }
+
+    #[test]
+    fn the_startup_probe_line_says_whether_the_supervisor_probes() {
+        let off = crate::config::VowifiConfig::default();
+        let line = supervisor_probe_log_line(&off);
+        assert!(line.contains("supervisor_pcscf_probe = false"), "{line}");
+        assert!(line.starts_with("supervisor P-CSCF probe off"), "{line}");
+        let on = crate::config::VowifiConfig {
+            supervisor_pcscf_probe: true,
+            ..Default::default()
+        };
+        let line = supervisor_probe_log_line(&on);
+        assert!(line.contains(":5060"), "{line}");
+        assert!(line.contains("supervisor_pcscf_probe = true"), "{line}");
+    }
+
+    #[test]
+    fn the_idle_keepalive_off_line_never_claims_a_probe_that_is_not_running() {
+        let off = crate::config::VowifiConfig::default();
+        assert!(!idle_keepalive_log_line(&off).contains("is probed by the line supervisor"));
+        let probe_on = crate::config::VowifiConfig {
+            supervisor_pcscf_probe: true,
+            ..Default::default()
+        };
+        assert!(idle_keepalive_log_line(&probe_on).contains("supervisor_pcscf_probe = true"));
+    }
+
+    #[test]
+    fn probe_disabled_is_the_inverse_of_the_config_flag() {
+        let mut v = crate::config::VowifiConfig::default();
+        assert!(probe_disabled(&v));
+        v.supervisor_pcscf_probe = true;
+        assert!(!probe_disabled(&v));
     }
 
     #[test]

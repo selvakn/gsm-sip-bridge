@@ -2581,6 +2581,50 @@ mod tests {
             );
         }
 
+        /// specs/119 SC-007: the real strongSwan engine, through the real tick,
+        /// makes no TCP connect to the P-CSCF with the probe off, and does with
+        /// it on.
+        #[test]
+        fn the_probe_flag_decides_whether_the_real_engine_connects() {
+            use crate::supervise::line_supervisor::{
+                tick_steady_state, SteadyOutcome, SteadyTracking, STEADY_STATE_POLL_INTERVAL,
+            };
+            use std::os::unix::process::ExitStatusExt;
+            let connects = |probe_disabled: bool| {
+                let runner = routes_present(&[V4_ROUTE_SHOW]);
+                runner.set_run_output(
+                    "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+                    std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: format!(
+                            "{}{}",
+                            super::ike_header("ims0"),
+                            super::child_with_in("ims0", 1, "INSTALLED", " 900 bytes, 9 packets, 4s ago")
+                        )
+                        .into_bytes(),
+                        stderr: Vec::new(),
+                    },
+                );
+                let engine = strongswan_engine();
+                assert!(engine.shared.ensure_started(&runner).is_some());
+                let mut tracking = SteadyTracking {
+                    probe_disabled,
+                    ..Default::default()
+                };
+                let outcome = tick_steady_state(
+                    &engine,
+                    &runner,
+                    "192.0.2.11",
+                    &mut tracking,
+                    STEADY_STATE_POLL_INTERVAL,
+                );
+                assert_eq!(outcome, SteadyOutcome::StillUp);
+                runner.tcp_connect_attempts().len()
+            };
+            assert_eq!(connects(true), 0);
+            assert!(connects(false) > 0);
+        }
+
         #[test]
         fn steady_state_health_distinguishes_a_bare_ike_sa_from_one_with_a_child() {
             use std::os::unix::process::ExitStatusExt;
@@ -3176,6 +3220,34 @@ mod tests {
                 log_file: PathBuf::from("/tmp/swu-0.log"),
                 dialer_handle: RefCell::new(None),
             }
+        }
+
+        /// specs/119 SC-007, the SWu half.
+        #[test]
+        fn the_probe_flag_decides_whether_the_swu_engine_connects() {
+            use crate::supervise::line_supervisor::{
+                tick_steady_state, SteadyOutcome, SteadyTracking, SWU_STEADY_STATE_POLL_INTERVAL,
+            };
+            let connects = |probe_disabled: bool| {
+                let runner = MockCommandRunner::new();
+                let engine = swu_engine();
+                engine.restart_process(&runner);
+                let mut tracking = SteadyTracking {
+                    probe_disabled,
+                    ..Default::default()
+                };
+                let outcome = tick_steady_state(
+                    &engine,
+                    &runner,
+                    "192.0.2.11",
+                    &mut tracking,
+                    SWU_STEADY_STATE_POLL_INTERVAL,
+                );
+                assert_eq!(outcome, SteadyOutcome::StillUp);
+                runner.tcp_connect_attempts().len()
+            };
+            assert_eq!(connects(true), 0);
+            assert!(connects(false) > 0);
         }
 
         #[test]

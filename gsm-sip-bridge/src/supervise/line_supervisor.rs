@@ -900,6 +900,11 @@ pub struct SteadyTracking {
     /// The pool member that answered while the selection did not, on the last
     /// tick (specs/091 R9); `None` when the selection answered or nothing did.
     pub pcscf_via_sibling: Option<std::net::IpAddr>,
+    /// Skip the supervisor's P-CSCF probe entirely (specs/119). The inverse of
+    /// `[vowifi].supervisor_pcscf_probe`, stored inverted so the derived
+    /// `Default` (`false`, probe runs) is the behaviour every earlier test
+    /// asserts and the config default (probe off) is set in one line per loop.
+    pub probe_disabled: bool,
     /// Consecutive ticks the P-CSCF was unreachable, and the time they cover.
     pub pcscf_unreachable: Streak,
     /// Consecutive ticks an IKE_SA was listed but had no usable CHILD_SA, and
@@ -1564,6 +1569,16 @@ pub fn tick_steady_state_underlay(
             }
         }
         None => tracking.pool_exhausted_deferral_logged = false,
+    }
+
+    // The probe is optional (specs/119, `[vowifi].supervisor_pcscf_probe`, off
+    // by default): no handset knocks on the P-CSCF's unprotected port. What it
+    // used to catch is covered above (route loss, an exhausted agent pool) and
+    // by charon's own DPD. Skipped means neither a strike nor a success.
+    if tracking.probe_disabled {
+        tracking.pcscf_via_sibling = None;
+        tracking.pcscf_unreachable.reset();
+        return SteadyOutcome::StillUp;
     }
 
     let selection_reachable = engine.pcscf_reachable(runner, current_pcscf);
@@ -4940,6 +4955,129 @@ mod tests {
             };
             assert_eq!(is_reachability_inferred(reason), expected, "{reason:?}");
         }
+    }
+
+    fn probe_off() -> SteadyTracking {
+        SteadyTracking {
+            probe_disabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn with_the_probe_off_the_pcscf_is_never_asked() {
+        // specs/119 FR-003/FR-008: no connect, no strike, no sibling, however
+        // dead the P-CSCF would have been, and a dirty start is cleaned up.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking {
+            probe_disabled: true,
+            pcscf_via_sibling: Some("10.0.0.2".parse().unwrap()),
+            pcscf_unreachable: Streak {
+                count: 2,
+                covered: STEADY_STATE_POLL_INTERVAL * 2,
+            },
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            assert_eq!(
+                tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+                SteadyOutcome::StillUp
+            );
+        }
+        assert!(engine.probed.borrow().is_empty(), "{:?}", engine.probed);
+        assert_eq!(tracking.pcscf_unreachable, Streak::default());
+        assert_eq!(tracking.pcscf_via_sibling, None);
+        nothing_was_issued(&engine);
+    }
+
+    #[test]
+    fn with_the_probe_off_a_dead_single_pcscf_never_reports_unreachable() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut tracking = probe_off();
+        for _ in 0..100 {
+            assert_eq!(
+                tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking),
+                SteadyOutcome::StillUp
+            );
+        }
+        nothing_was_issued(&engine);
+    }
+
+    #[test]
+    fn with_the_probe_off_a_missing_route_is_still_repaired_on_the_first_tick() {
+        // specs/119 FR-005, for an IPv4 and an IPv6 selection.
+        for pcscf in ["10.0.0.1", "2001:db8::11"] {
+            let engine = FakeEngine {
+                route_missing: RefCell::new(true),
+                ..Default::default()
+            };
+            let mut tracking = probe_off();
+            assert_eq!(
+                tick_steady_state(&engine, &MockCommandRunner::new(), pcscf, &mut tracking),
+                SteadyOutcome::Recovered {
+                    reason: DegradeReason::DefaultRouteMissing,
+                    ike_sa_loss_cause: None,
+                },
+                "{pcscf}"
+            );
+            assert_eq!(*engine.route_repairs.borrow(), 1);
+            nothing_was_issued(&engine);
+        }
+    }
+
+    #[test]
+    fn with_the_probe_off_an_exhausted_pool_still_rebuilds_in_one_tick() {
+        // specs/119 FR-006, and the call deferral is unchanged.
+        let agent = state(vec![agent_mark(
+            "10.0.0.11",
+            "gm-keepalive",
+            at(BASELINE + 5),
+        )]);
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking {
+            negotiated_at: Some(at(BASELINE)),
+            ..probe_off()
+        };
+        let p = pool(&["10.0.0.11"]);
+        assert_eq!(
+            pool_tick(&engine, &p, &mut tracking, true, &agent),
+            SteadyOutcome::StillUp,
+            "deferred while a call is active"
+        );
+        nothing_was_issued(&engine);
+        assert_eq!(
+            pool_tick(&engine, &p, &mut tracking, false, &agent),
+            POOL_EXHAUSTED
+        );
+        assert!(engine.probed.borrow().is_empty());
+    }
+
+    #[test]
+    fn with_the_probe_off_an_exhausted_pool_is_still_held_by_the_underlay_guard() {
+        // specs/119 FR-007's neighbour: the guard gate sits ahead of the probe.
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking {
+            negotiated_at: Some(at(BASELINE)),
+            ..probe_off()
+        };
+        assert_eq!(
+            guarded(
+                &engine,
+                &mut tracking,
+                &view(UnderlayVerdict::NoRoute),
+                Some(&exhausted_agent()),
+            ),
+            held(NO_ROUTE, DegradeReason::PcscfPoolExhausted)
+        );
+        nothing_was_issued(&engine);
     }
 
     #[test]

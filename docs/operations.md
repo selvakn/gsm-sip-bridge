@@ -298,8 +298,9 @@ has `failed`. `reconnecting` is not a fault: the agent is still working on it.
 
 The HEALTHCHECK no longer connects to the P-CSCF itself
 ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)). The line
-supervisor still probes the P-CSCF every 30s and repairs the tunnel when it
-stops answering. The two faults to grep the container's health log for:
+supervisor's own P-CSCF probe is off by default too
+(`[vowifi].supervisor_pcscf_probe`); a lost route, an exhausted P-CSCF pool and
+a dead peer are repaired from their own signals. The two faults to grep the container's health log for:
 
 ```text
 line N: IMS agent at <ip>:5071 not responding: <reason>
