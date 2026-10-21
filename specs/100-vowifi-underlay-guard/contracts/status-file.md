@@ -8,6 +8,7 @@ A per-line file beside the existing `/tmp/pcscf-N`, `.pool`, `.state` and `.call
 {"v":1,"state":"up"}
 {"v":1,"state":"no_route","since":1792500000}
 {"v":1,"state":"no_response","since":1792500000}
+{"v":1,"state":"up","last_outage":{"from":1792499700,"to":1792500330}}
 ```
 
 | Field | Type | Notes |
@@ -15,6 +16,9 @@ A per-line file beside the existing `/tmp/pcscf-N`, `.pool`, `.state` and `.call
 | `v` | integer | `1`. A reader that sees another version treats the file as unknown. |
 | `state` | `up` \| `no_route` \| `no_response` | The line's underlay verdict. Anything other than `up` means the line is held. |
 | `since` | unix seconds | When the hold started. Present only while held. |
+| `last_outage` | `{from, to}`, unix seconds | The last outage the path came back from: from when the ePDG was last heard from before the hold (at most 5 minutes before it; 60s if never heard) until the hold ended `restored`. Absent until there has been one; kept through later holds until the next restore replaces it. A hold ended by `max_hold` records none. |
+
+The IMS agent reads `last_outage` too (FR-011): a P-CSCF it marked unavailable inside that window failed because the path did, so it drops the mark, at startup, during a startup wait on marked P-CSCFs (every 5s), and before each renewal. Readers that predate the field ignore it.
 
 ## `vowifi-status` output
 

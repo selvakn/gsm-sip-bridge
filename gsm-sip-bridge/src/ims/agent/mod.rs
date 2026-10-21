@@ -900,6 +900,11 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             reg_cfg,
             |cfg| register_checked(cfg, "IMS registration failed"),
             |addr| crate::ims::route_to(addr, reg_cfg.pcscf_port).is_ok(),
+            || {
+                pcscf_source
+                    .as_deref()
+                    .and_then(crate::ims::pcscf_files::read_last_outage)
+            },
             startup_wait,
         ) {
             Ok(s) => s,
@@ -2298,8 +2303,19 @@ fn log_attempt_failure(addr: IpAddr, f: &RegisterFailure) {
 /// quick respawn would retry a dead pool faster than the renewal ladder ever
 /// does (FR-013, SC-003).
 ///
-/// `register` and `routed` are parameters so the selection logic is testable
-/// without a modem; production passes `register_checked` and `route_to`.
+/// Marks set while the path to the ePDG was down are dropped first, and again
+/// every [`OUTAGE_RECHECK`] of that wait (specs/100 FR-011): an agent restarted
+/// during an outage marks the P-CSCF it could not reach, and the ePDG often
+/// hands the same one back once the path returns. `last_outage` reads the
+/// supervisor's record of the last outage the path came back from.
+///
+/// `register`, `routed` and `last_outage` are parameters so the selection
+/// logic is testable without a modem; production passes `register_checked`,
+/// `route_to` and the `.uplink` file.
+/// How often a startup wait on marked P-CSCFs looks again for an outage they
+/// were set in.
+const OUTAGE_RECHECK: Duration = Duration::from_secs(5);
+
 fn register_via_pool(
     pool: &mut PcscfPool,
     reg_cfg: &ImsRegisterConfig,
@@ -2307,8 +2323,10 @@ fn register_via_pool(
         &ImsRegisterConfig,
     ) -> Result<crate::ims::RegisteredSession, RegisterFailure>,
     routed: impl Fn(IpAddr) -> bool,
+    last_outage: impl Fn() -> Option<crate::ims::pcscf_files::Outage>,
     mut wait: impl FnMut(Duration),
 ) -> Result<crate::ims::RegisteredSession, RegisterFailure> {
+    pool.forget_outage(last_outage());
     if !pool.has_unmarked(SystemTime::now()) {
         let wait_for = pool
             .soonest_expiry(SystemTime::now())
@@ -2318,7 +2336,16 @@ fn register_via_pool(
             wait_secs = wait_for.as_secs(),
             "every P-CSCF is unavailable; waiting before the startup attempt"
         );
-        wait(wait_for);
+        // In steps, so a path that comes back meanwhile ends the wait.
+        let mut left = wait_for;
+        while !left.is_zero() {
+            let step = left.min(OUTAGE_RECHECK);
+            wait(step);
+            left -= step;
+            if pool.forget_outage(last_outage()) > 0 && pool.has_unmarked(SystemTime::now()) {
+                break;
+            }
+        }
     }
     loop {
         let selection = pool.select(SystemTime::now());
@@ -3696,6 +3723,10 @@ impl LoopState {
                     crate::ims::pcscf_files::read_pool(&crate::ims::pcscf_files::pool_path(src));
                 self.pool.replace_pool(pool, selection);
             }
+            // Nor do marks from an outage the path has since come back from
+            // (specs/100 FR-011).
+            self.pool
+                .forget_outage(crate::ims::pcscf_files::read_last_outage(src));
         }
         let target = self.pool.select(SystemTime::now()).addr;
         match attempt_renewal(&p.reg_cfg.with_pcscf(target)) {
@@ -5911,6 +5942,7 @@ mod tests {
             &pcscf_cfg(lo(1), port, true),
             transport_only_register(&tried),
             |_| true,
+            || None,
             |d| waited.borrow_mut().push(d),
         );
         assert!(session.is_ok());
@@ -5945,6 +5977,7 @@ mod tests {
                 }
             },
             |_| true,
+            || None,
             |_| {},
         );
         assert!(result.is_ok());
@@ -5962,6 +5995,7 @@ mod tests {
             &pcscf_cfg(lo(1), port, true),
             transport_only_register(&tried),
             |_| false,
+            || None,
             |_| {},
         );
         assert!(result.is_err());
@@ -5981,6 +6015,7 @@ mod tests {
                 Err(rejected(403, None))
             },
             |_| true,
+            || None,
             |_| {},
         );
         assert_eq!(result.err().and_then(|f| f.status), Some(403));
@@ -6013,19 +6048,131 @@ mod tests {
                     Err(io_failure(REFUSED))
                 },
                 |_| true,
+                || None,
                 |d| waited.borrow_mut().push(d),
             );
             assert!(result.is_err());
             assert_eq!(calls, 1, "one attempt after the wait");
-            let w = waited.borrow();
-            assert_eq!(w.len(), 1);
+            // Waited in steps, rechecking for an outage between them.
+            let w: Duration = waited.borrow().iter().sum();
             assert!(
-                w[0] <= Duration::from_secs(want)
-                    && w[0] + Duration::from_secs(2) >= Duration::from_secs(want),
-                "{retry_after}s mark waited {:?}",
-                w[0]
+                w <= Duration::from_secs(want)
+                    && w + Duration::from_secs(2) >= Duration::from_secs(want),
+                "{retry_after}s mark waited {w:?}"
             );
+            assert!(waited.borrow().iter().all(|d| *d <= OUTAGE_RECHECK));
         }
+    }
+
+    #[test]
+    fn marks_set_during_an_outage_the_path_came_back_from_do_not_hold_startup() {
+        // specs/100 FR-011: the agent restarted while the path was down and
+        // marked the only P-CSCF; the ePDG handed the same one back.
+        let mut pool = Pool::new(lo(1), vec![lo(1)], None);
+        let marked_at = SystemTime::now() - Duration::from_secs(30);
+        pool.select(marked_at);
+        pool.on_failure(
+            lo(1),
+            PoolCause::RetryAfter(Duration::from_secs(120)),
+            marked_at,
+        );
+        let secs = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let outage = crate::ims::pcscf_files::Outage {
+            from: secs(marked_at) - 60,
+            to: secs(SystemTime::now()),
+        };
+        let waited = RefCell::new(Vec::new());
+        let mut tried = Vec::new();
+        let result = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), 5060, true),
+            |cfg| {
+                tried.push(cfg.pcscf_addr);
+                Ok(crate::ims::test_session_with_sa(
+                    None,
+                    SocketAddr::new(cfg.pcscf_addr, 5060),
+                    None,
+                ))
+            },
+            |_| true,
+            || Some(outage),
+            |d| waited.borrow_mut().push(d),
+        );
+        assert!(result.is_ok());
+        assert_eq!(tried, vec![lo(1)]);
+        assert!(waited.borrow().is_empty(), "no wait on an outage's mark");
+    }
+
+    #[test]
+    fn a_startup_wait_ends_once_the_path_it_was_marked_across_comes_back() {
+        // Waiting on a mark when the hold ends: the next recheck drops it.
+        let mut pool = Pool::new(lo(1), vec![lo(1)], None);
+        let marked_at = SystemTime::now();
+        pool.select(marked_at);
+        pool.on_failure(
+            lo(1),
+            PoolCause::RetryAfter(Duration::from_secs(120)),
+            marked_at,
+        );
+        let secs = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let checks = std::cell::Cell::new(0);
+        let waited = RefCell::new(Vec::new());
+        let result = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), 5060, true),
+            |cfg| {
+                Ok(crate::ims::test_session_with_sa(
+                    None,
+                    SocketAddr::new(cfg.pcscf_addr, 5060),
+                    None,
+                ))
+            },
+            |_| true,
+            // No outage on record until the third look.
+            || {
+                checks.set(checks.get() + 1);
+                (checks.get() >= 3).then(|| crate::ims::pcscf_files::Outage {
+                    from: secs(marked_at) - 1,
+                    to: secs(marked_at) + 1,
+                })
+            },
+            |d| waited.borrow_mut().push(d),
+        );
+        assert!(result.is_ok());
+        assert_eq!(*waited.borrow(), vec![OUTAGE_RECHECK; 2]);
+    }
+
+    #[test]
+    fn a_mark_from_before_the_outage_still_waits_its_time() {
+        // A P-CSCF that failed while the path was fine is still avoided.
+        let mut pool = Pool::new(lo(1), vec![lo(1)], None);
+        let marked_at = SystemTime::now();
+        pool.select(marked_at);
+        pool.on_failure(
+            lo(1),
+            PoolCause::RetryAfter(Duration::from_secs(30)),
+            marked_at,
+        );
+        let secs = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let waited = RefCell::new(Vec::new());
+        let _ = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), 5060, true),
+            |_| Err(io_failure(REFUSED)),
+            |_| true,
+            || {
+                Some(crate::ims::pcscf_files::Outage {
+                    from: secs(marked_at) + 10,
+                    to: secs(marked_at) + 60,
+                })
+            },
+            |d| waited.borrow_mut().push(d),
+        );
+        let total: Duration = waited.borrow().iter().sum();
+        assert!(
+            total + Duration::from_secs(2) >= Duration::from_secs(30),
+            "{total:?}"
+        );
     }
 
     fn failing_over_loop() -> LoopState {

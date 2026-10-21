@@ -1892,7 +1892,7 @@ fn start_vowifi_line_strongswan(
     );
     // What `vowifi-status` reads (specs/100 contracts/status-file.md), written
     // when the verdict changes, and once now so a healthy line says `up`.
-    let mut written_uplink: Option<crate::control::protocol::UplinkState> = None;
+    let mut written_uplink: Option<String> = None;
     if underlay_enabled {
         write_uplink_file(
             runner.as_ref(),
@@ -1964,6 +1964,15 @@ fn start_vowifi_line_strongswan(
                 if end.ended_by != crate::control::protocol::HoldEndedBy::CauseChanged {
                     tracking.held_initiate_sent = false;
                 }
+                // Now, before the tick: a recovery it takes restarts the agent,
+                // which must find the outage it is to forget (FR-011).
+                write_uplink_file(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &underlay,
+                    &mut written_uplink,
+                );
             }
             if let Some(start) = begin.started {
                 println!(
@@ -2339,28 +2348,30 @@ fn hold_started_line(
     }
 }
 
-/// Writes `/tmp/pcscf-N.uplink` when the verdict differs from what was last
-/// written (specs/100 contracts/status-file.md). A failed write is logged and
-/// retried on the next change; it never affects supervision.
+/// Writes `/tmp/pcscf-N.uplink` when what it would say differs from what was
+/// last written: the verdict, or the last outage the path came back from
+/// (specs/100 contracts/status-file.md). A failed write is logged and retried
+/// on the next change; it never affects supervision.
 fn write_uplink_file(
     runner: &dyn CommandRunner,
     idx: u32,
     selection_path: &str,
     tracker: &super::underlay::UnderlayTracker,
-    written: &mut Option<crate::control::protocol::UplinkState>,
+    written: &mut Option<String>,
 ) {
-    let state = tracker.state();
-    if *written == Some(state) {
-        return;
-    }
     let since = tracker
         .hold
         .as_ref()
         .and_then(|h| h.started_at.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
+    let contents =
+        crate::ims::pcscf_files::render_uplink(tracker.state(), since, tracker.last_outage());
+    if written.as_deref() == Some(contents.as_str()) {
+        return;
+    }
     let path = crate::ims::pcscf_files::uplink_path(selection_path);
-    match runner.write_file_atomic(&path, &crate::ims::pcscf_files::render_uplink(state, since)) {
-        Ok(()) => *written = Some(state),
+    match runner.write_file_atomic(&path, &contents) {
+        Ok(()) => *written = Some(contents),
         Err(e) => eprintln!(
             "[supervise] line {idx}: could not write {}: {e}",
             path.display()

@@ -53,6 +53,7 @@ Built by the loop at the top of each tick and passed into `tick_steady_state_wit
 | `cause` | `NoRoute` \| `NoResponse` | The current cause. It can change while the path stays down: that is the same hold, reported as `ended_by = cause_changed` for the old cause and a start for the new one. |
 | `started` / `started_at` | `Instant` + `SystemTime` | When the hold began, whatever its causes since: `Instant` for the 15-minute bound, `SystemTime` for the status file. |
 | `cause_since` | `Instant` | When the current cause began; `held_secs` is measured from here. |
+| `last_good_at` | `SystemTime` | When the path was last known to work: the line's last `heard.by` before the hold, at most 5 minutes back (60s when never heard). The start of `last_outage`. |
 | `skipped` | `Vec<DegradeReason>`, deduplicated | Recoveries held back under the current cause, for the line that ends it. |
 | `marks_from` | `SystemTime` | When the hold ends because the path returned, this becomes `tracking.negotiated_at`, so agent P-CSCF marks set during the hold don't count (FR-011; 097's `exhausted_pool` already ignores marks older than `negotiated_at`). A hold ended by `max_hold` keeps them for the ordinary pass. |
 
@@ -158,7 +159,7 @@ On every transition out of a hold:
 2. state report `uplink=up`;
 3. write the status file;
 4. one log line with the duration, `ended_by` and the skipped reasons;
-5. if it ended because the path returned (`restored`), set `tracking.negotiated_at = now` (FR-011); at `max_hold` the marks stay for the ordinary pass (FR-012);
+5. if it ended because the path returned (`restored`), set `tracking.negotiated_at = now` (FR-011), and record `last_outage = {from: hold.last_good_at, to: now}` in the status file before the tick runs, so an agent the tick restarts drops the marks it set during the outage; at `max_hold` the marks stay for the ordinary pass (FR-012);
 6. reset `held_initiate_sent`;
 
 A change of cause while the path stays down (*no response* → *no route*) is not a transition out: it logs and reports the end of the old cause (`ended_by = cause_changed`) and the start of the new one, keeps the hold's start for the 15-minute bound, and does none of steps 5–7.

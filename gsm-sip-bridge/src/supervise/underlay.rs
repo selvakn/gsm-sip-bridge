@@ -19,6 +19,7 @@ use super::line_supervisor::{
     RECENT_LIFE,
 };
 use crate::control::protocol::{HoldEndedBy, UplinkHoldCause, UplinkState};
+use crate::ims::pcscf_files::Outage;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
@@ -53,6 +54,16 @@ pub const LINGER_AFTER_HOLD: Duration = Duration::from_secs(30);
 /// response" on their own (research R4).
 pub const NO_RESPONSE_RETRANSMITS: u32 = 2;
 
+/// How far before a hold its outage is taken to reach, at most, when the ePDG
+/// was last heard from longer ago than that. An idle line can go minutes
+/// without hearing from it; the outage is not that old.
+pub const OUTAGE_LOOKBACK_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// How far before a hold its outage is taken to reach when the ePDG has not
+/// been heard from at all since supervision began: about what a no-route hold
+/// takes to detect (two route checks 10s apart, across a 30s tick).
+pub const OUTAGE_LOOKBACK_UNHEARD: Duration = Duration::from_secs(60);
+
 /// One line's hold: one continuous stretch of the path being down, which may
 /// change cause along the way without ending.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +74,8 @@ pub struct Hold {
     pub started_at: SystemTime,
     /// When the current cause began, for the time reported against it.
     pub cause_since: Instant,
+    /// When the path was last known to work: the outage began after this.
+    pub last_good_at: SystemTime,
     /// The recoveries held back under the current cause, deduplicated, for
     /// the line that ends it.
     pub skipped: Vec<DegradeReason>,
@@ -219,6 +232,8 @@ pub struct UnderlayTracker {
     pub pending_check: Option<PendingCheck>,
     /// Quick polling goes on until this, after a hold has ended.
     linger_until: Option<Instant>,
+    /// The last outage the path came back from (FR-011), for the IMS agent.
+    last_outage: Option<Outage>,
 }
 
 impl UnderlayTracker {
@@ -237,7 +252,14 @@ impl UnderlayTracker {
             hold: None,
             pending_check: None,
             linger_until: None,
+            last_outage: None,
         }
+    }
+
+    /// The last outage the path came back from: from when it was last known
+    /// to work until the hold ended because it returned.
+    pub fn last_outage(&self) -> Option<Outage> {
+        self.last_outage
     }
 
     /// The pause before the next tick: [`HELD_POLL_INTERVAL`] while a hold is
@@ -373,7 +395,14 @@ impl UnderlayTracker {
                     ended = self.change_cause(cause, now);
                     started = Some(HoldStart { cause });
                 }
-                (Some(_), None) => ended = self.end_hold(HoldEndedBy::Restored, now),
+                (Some(_), None) => {
+                    let last_good_at = self.hold.as_ref().map(|h| h.last_good_at);
+                    ended = self.end_hold(HoldEndedBy::Restored, now);
+                    self.last_outage = last_good_at.map(|from| Outage {
+                        from: unix_secs(from),
+                        to: unix_secs(now_at),
+                    });
+                }
                 (None, Some(cause)) => {
                     self.start_hold(cause, now, now_at);
                     started = Some(HoldStart { cause });
@@ -502,11 +531,20 @@ impl UnderlayTracker {
     }
 
     fn start_hold(&mut self, cause: UplinkHoldCause, now: Instant, now_at: SystemTime) {
+        // The last time the ePDG was heard from, within the bounds: before
+        // that it was answering, so the outage cannot reach further back.
+        let ago = self
+            .heard
+            .map_or(OUTAGE_LOOKBACK_UNHEARD, |h| {
+                now.saturating_duration_since(h.by)
+            })
+            .min(OUTAGE_LOOKBACK_MAX);
         self.hold = Some(Hold {
             cause,
             started: now,
             started_at: now_at,
             cause_since: now,
+            last_good_at: now_at.checked_sub(ago).unwrap_or(now_at),
             skipped: Vec::new(),
         });
     }
@@ -535,6 +573,11 @@ impl UnderlayTracker {
             skipped: hold.skipped,
         })
     }
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -945,6 +988,67 @@ mod tests {
         }
         now += quick;
         assert!(!t.begin_tick(&silent_tick, now, at).view.heard_recently);
+    }
+
+    #[test]
+    fn a_restored_hold_records_its_outage_from_when_the_epdg_was_last_heard() {
+        let mut t = tracker();
+        let t0 = Instant::now();
+        let at0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let tick = |n: u32| (t0 + TICK * n, at0 + TICK * n);
+        // Heard on the first tick, then the route goes.
+        let (now, at) = tick(0);
+        t.begin_tick(&quiet(), now, at);
+        let silent_no_route = Observation {
+            parsed_since_tick: false,
+            ..no_route()
+        };
+        for n in 1..=2 {
+            let (now, at) = tick(n);
+            t.begin_tick(&silent_no_route, now, at);
+        }
+        assert!(t.hold.is_some());
+        assert_eq!(t.last_outage(), None, "not while held");
+        let (now, at) = tick(3);
+        let b = t.begin_tick(&quiet(), now, at);
+        assert!(b.ended.unwrap().path_returned());
+        assert_eq!(
+            t.last_outage(),
+            Some(Outage {
+                from: 1_000_000,
+                to: 1_000_000 + 90,
+            })
+        );
+    }
+
+    #[test]
+    fn a_hold_cut_at_its_bound_records_no_outage() {
+        let mut t = tracker();
+        let t0 = Instant::now();
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        t.begin_tick(&no_route(), t0, at);
+        t.begin_tick(&no_route(), t0 + TICK, at);
+        let b = t.begin_tick(&no_route(), t0 + TICK + MAX_HOLD, at);
+        assert_eq!(b.ended.unwrap().ended_by, HoldEndedBy::MaxHold);
+        assert_eq!(t.last_outage(), None);
+    }
+
+    #[test]
+    fn an_outage_reaches_back_at_most_five_minutes() {
+        let mut t = tracker();
+        let t0 = Instant::now();
+        let at0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        t.begin_tick(&quiet(), t0, at0);
+        let silent_no_route = Observation {
+            parsed_since_tick: false,
+            ..no_route()
+        };
+        // Last heard an hour before the route went.
+        let later = Duration::from_secs(3600);
+        t.begin_tick(&silent_no_route, t0 + later, at0 + later);
+        t.begin_tick(&silent_no_route, t0 + later + TICK, at0 + later + TICK);
+        let hold = t.hold.as_ref().unwrap();
+        assert_eq!(hold.last_good_at, at0 + later + TICK - OUTAGE_LOOKBACK_MAX);
     }
 
     #[test]
