@@ -105,12 +105,14 @@ struct AgentRecord {
     /// reported `registered` at all)".
     registered_unhealthy_since: Option<Instant>,
     registered_alert_phase: AlertPhase,
+    /// The `Failure` in flight for `registered_alert_phase` (#138).
+    registered_in_flight: FailureInFlight,
     /// Same pair, for `tunnel_up`.
     tunnel_unhealthy_since: Option<Instant>,
     tunnel_alert_phase: AlertPhase,
     /// specs/086. State of the folded tunnel decision; only ever set on the
-    /// supervisor's record, which owns it. See [`FoldedTunnel`].
-    tunnel_fold: FoldedTunnel,
+    /// supervisor's record, which owns it. See [`FailureInFlight`].
+    tunnel_fold: FailureInFlight,
     /// specs/087. Supervisor records only: the supervisor's last-reported
     /// `tunnel_flapping`. A flapping tunnel counts as unhealthy even while the
     /// CHILD_SA is up, so a line rebuilt every few minutes still alerts.
@@ -126,6 +128,8 @@ struct AgentRecord {
     /// Same pair, for `gm_connection_up` (specs/028-gm-tcp-reconnect).
     gm_connection_unhealthy_since: Option<Instant>,
     gm_connection_alert_phase: AlertPhase,
+    /// The `Failure` in flight for `gm_connection_alert_phase` (#138).
+    gm_connection_in_flight: FailureInFlight,
     /// When this line's registration lapses, as reported by the agent
     /// (specs/039-at-stall-watchdog). Absolute, so the countdown can be
     /// computed fresh at every scrape without the agent reporting per second.
@@ -161,7 +165,7 @@ struct PoolExhaustion {
     /// delivery callback still matches after the episode has ended.
     generation: Option<Instant>,
     /// The episode ended while that `Failure` was still being sent: the
-    /// callback owes the operator an all-clear (as [`FoldedTunnel::ended`]).
+    /// callback owes the operator an all-clear (as [`FailureInFlight::ended`]).
     ended: bool,
 }
 
@@ -275,8 +279,12 @@ fn apply_report_with(
 
     let mut registered_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.registered_alert_phase);
+    let mut registered_in_flight =
+        existing.map_or_else(FailureInFlight::default, |r| r.registered_in_flight);
+    let mut gm_connection_in_flight =
+        existing.map_or_else(FailureInFlight::default, |r| r.gm_connection_in_flight);
     let mut tunnel_alert_phase = existing.map_or(AlertPhase::Idle, |r| r.tunnel_alert_phase);
-    let mut tunnel_fold = existing.map_or_else(FoldedTunnel::default, |r| r.tunnel_fold);
+    let mut tunnel_fold = existing.map_or_else(FailureInFlight::default, |r| r.tunnel_fold);
     let mut tunnel_flapping = existing.is_some_and(|r| r.tunnel_flapping);
     let mut last_ike_sa_loss_cause = existing.and_then(|r| r.last_ike_sa_loss_cause);
     let mut last_uplink = existing.and_then(|r| r.last_uplink);
@@ -362,16 +370,17 @@ fn apply_report_with(
                 Duration::from_secs(cfg.registration_loss_thresholds.unhealthy_sec);
             let tunnel_threshold = Duration::from_secs(cfg.tunnel_failure_thresholds.unhealthy_sec);
 
-            match decide_transition(
+            match decide_tracked(
                 registered_unhealthy_since,
                 &mut registered_alert_phase,
+                &mut registered_in_flight,
                 registration_threshold,
             ) {
                 Transition::Event(kind) => pending_transitions.push((
                     key.clone(),
                     AlertCategory::RegistrationLoss,
                     kind,
-                    registered_unhealthy_since,
+                    registered_in_flight.generation,
                 )),
                 Transition::Suppressed => {
                     crate::alerts::record_suppressed(AlertCategory::RegistrationLoss)
@@ -448,16 +457,17 @@ fn apply_report_with(
             }
             let gm_connection_threshold =
                 Duration::from_secs(cfg.gm_connection_lost_thresholds.unhealthy_sec);
-            match decide_transition(
+            match decide_tracked(
                 gm_connection_unhealthy_since,
                 &mut gm_connection_alert_phase,
+                &mut gm_connection_in_flight,
                 gm_connection_threshold,
             ) {
                 Transition::Event(kind) => pending_transitions.push((
                     key.clone(),
                     AlertCategory::GmConnectionLost,
                     kind,
-                    gm_connection_unhealthy_since,
+                    gm_connection_in_flight.generation,
                 )),
                 Transition::Suppressed => {
                     crate::alerts::record_suppressed(AlertCategory::GmConnectionLost)
@@ -506,6 +516,7 @@ fn apply_report_with(
             last_applied,
             registered_unhealthy_since,
             registered_alert_phase,
+            registered_in_flight,
             tunnel_unhealthy_since,
             tunnel_alert_phase,
             tunnel_fold,
@@ -515,6 +526,7 @@ fn apply_report_with(
             streak_opened_by_flapping,
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
+            gm_connection_in_flight,
             registration_expires_at,
             pool_exhausted,
             epoch_first_seen_unix,
@@ -700,7 +712,7 @@ fn decide_transition(
 /// Bookkeeping for the folded tunnel-failure decision, kept on the supervisor's
 /// record (specs/086).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct FoldedTunnel {
+struct FailureInFlight {
     /// The effective unhealthy-since a `Failure` was decided against. Frozen at
     /// decision time so a change in which signal is oldest cannot orphan the
     /// delivery callback's generation match.
@@ -720,27 +732,37 @@ fn decide_folded_tunnel(
     ims_since: Option<Instant>,
     supervisor_since: Option<Instant>,
     phase: &mut AlertPhase,
-    fold: &mut FoldedTunnel,
+    fold: &mut FailureInFlight,
     threshold: Duration,
 ) -> Transition {
     let effective = match (ims_since, supervisor_since) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    let t = decide_transition(effective, phase, threshold);
+    decide_tracked(effective, phase, fold, threshold)
+}
+
+/// [`decide_transition`] plus the bookkeeping for a `Failure` still being sent:
+/// freezes the decided generation, and marks it `ended` when the streak clears
+/// while `Pending`. The send cannot be cancelled and may yet succeed, so its
+/// callback owes the operator the all-clear (see `record_alert_outcome`).
+fn decide_tracked(
+    since: Option<Instant>,
+    phase: &mut AlertPhase,
+    in_flight: &mut FailureInFlight,
+    threshold: Duration,
+) -> Transition {
+    let t = decide_transition(since, phase, threshold);
     match t {
         Transition::Event(CriticalEventKind::Failure) => {
-            fold.generation = effective;
-            fold.ended = false;
+            in_flight.generation = since;
+            in_flight.ended = false;
         }
-        Transition::Event(CriticalEventKind::Recovered) => *fold = FoldedTunnel::default(),
+        Transition::Event(CriticalEventKind::Recovered) => *in_flight = FailureInFlight::default(),
         _ => {}
     }
-    // Both signals healthy while a Failure send is still in flight: the send
-    // cannot be cancelled and may yet succeed, so keep tracking it and let its
-    // callback send the all-clear (see `record_alert_outcome`).
-    if effective.is_none() && *phase == AlertPhase::Pending {
-        fold.ended = true;
+    if since.is_none() && *phase == AlertPhase::Pending {
+        in_flight.ended = true;
     }
     t
 }
@@ -919,15 +941,25 @@ fn finish_late_all_clear(key: &(AgentKind, String), category: AlertCategory) {
         }
         return;
     }
-    if category != AlertCategory::TunnelFailure {
-        return;
-    }
     let mut guard = liveness().lock().unwrap();
-    if let Some(record) = guard.get_mut(key) {
-        if record.tunnel_alert_phase == AlertPhase::Pending && record.tunnel_fold.ended {
-            record.tunnel_fold = FoldedTunnel::default();
-            record.tunnel_alert_phase = AlertPhase::Idle;
-        }
+    let Some(record) = guard.get_mut(key) else {
+        return;
+    };
+    let (phase, in_flight) = match category {
+        AlertCategory::TunnelFailure => (&mut record.tunnel_alert_phase, &mut record.tunnel_fold),
+        AlertCategory::RegistrationLoss => (
+            &mut record.registered_alert_phase,
+            &mut record.registered_in_flight,
+        ),
+        AlertCategory::GmConnectionLost => (
+            &mut record.gm_connection_alert_phase,
+            &mut record.gm_connection_in_flight,
+        ),
+        _ => return,
+    };
+    if *phase == AlertPhase::Pending && in_flight.ended {
+        *in_flight = FailureInFlight::default();
+        *phase = AlertPhase::Idle;
     }
 }
 
@@ -954,46 +986,43 @@ fn record_alert_outcome(
     if category == AlertCategory::PcscfPoolExhausted {
         return record_pool_exhausted_outcome(&mut record.pool_exhausted, generation, success);
     }
-    let mut ended = None;
-    let (phase, unhealthy_since) = match category {
+    let (phase, in_flight, generation_now) = match category {
         AlertCategory::RegistrationLoss => (
             &mut record.registered_alert_phase,
-            record.registered_unhealthy_since,
+            &mut record.registered_in_flight,
+            None,
         ),
-        AlertCategory::TunnelFailure => {
-            let generation = record
-                .tunnel_fold
-                .generation
-                .or(record.tunnel_unhealthy_since);
-            ended = Some(&mut record.tunnel_fold);
-            // A folded decision carries its own frozen generation; records
-            // that never had one fall back to their own streak start.
-            (&mut record.tunnel_alert_phase, generation)
-        }
+        // Records that never had a folded decision fall back to their own
+        // streak start.
+        AlertCategory::TunnelFailure => (
+            &mut record.tunnel_alert_phase,
+            &mut record.tunnel_fold,
+            record.tunnel_unhealthy_since,
+        ),
         AlertCategory::GmConnectionLost => (
             &mut record.gm_connection_alert_phase,
-            record.gm_connection_unhealthy_since,
+            &mut record.gm_connection_in_flight,
+            None,
         ),
         _ => return false,
     };
-    if *phase != AlertPhase::Pending || unhealthy_since != Some(generation) {
+    if *phase != AlertPhase::Pending || in_flight.generation.or(generation_now) != Some(generation)
+    {
         return false;
     }
     // The incident ended while this send was in flight: do not park in
     // `Alerted` (nothing would ever send the all-clear). Go back to `Idle` so
     // any new outage is decided fresh, and tell the caller to send the
     // all-clear if the failure notice actually landed.
-    if let Some(fold) = ended {
-        if fold.ended {
-            if success {
-                // Stay `Pending` until the all-clear has been sent
-                // (`finish_late_all_clear`), so nothing can be decided in between.
-                return true;
-            }
-            *fold = FoldedTunnel::default();
-            *phase = AlertPhase::Idle;
-            return false;
+    if in_flight.ended {
+        if success {
+            // Stay `Pending` until the all-clear has been sent
+            // (`finish_late_all_clear`), so nothing can be decided in between.
+            return true;
         }
+        *in_flight = FailureInFlight::default();
+        *phase = AlertPhase::Idle;
+        return false;
     }
     *phase = if success {
         AlertPhase::Alerted
@@ -1815,6 +1844,7 @@ mod tests {
             let mut guard = liveness().lock().unwrap();
             let record = guard.get_mut(&key).unwrap();
             record.registered_unhealthy_since = Some(new_generation);
+            record.registered_in_flight.generation = Some(new_generation);
             record.registered_alert_phase = AlertPhase::Pending;
         }
         assert_ne!(old_generation, new_generation);
@@ -1846,15 +1876,20 @@ mod tests {
                 last_applied: (0, 0),
                 registered_unhealthy_since: Some(generation),
                 registered_alert_phase: AlertPhase::Pending,
+                registered_in_flight: FailureInFlight {
+                    generation: Some(generation),
+                    ended: false,
+                },
                 tunnel_unhealthy_since: None,
                 tunnel_alert_phase: AlertPhase::Idle,
-                tunnel_fold: FoldedTunnel::default(),
+                tunnel_fold: FailureInFlight::default(),
                 tunnel_flapping: false,
                 last_ike_sa_loss_cause: None,
                 last_uplink: None,
                 streak_opened_by_flapping: false,
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
+                gm_connection_in_flight: FailureInFlight::default(),
                 registration_expires_at: None,
                 pool_exhausted: PoolExhaustion::default(),
                 epoch_first_seen_unix: None,
@@ -1986,7 +2021,7 @@ mod tests {
         sup: Option<Instant>,
         phase: &mut AlertPhase,
     ) -> (Transition, Option<Instant>) {
-        let mut fold = FoldedTunnel::default();
+        let mut fold = FailureInFlight::default();
         let t = decide_folded_tunnel(ims, sup, phase, &mut fold, FOLD_THRESHOLD);
         (t, fold.generation)
     }
@@ -2051,10 +2086,11 @@ mod tests {
                     last_applied: (0, 0),
                     registered_unhealthy_since: None,
                     registered_alert_phase: AlertPhase::Idle,
+                    registered_in_flight: FailureInFlight::default(),
                     // The streak start has since moved on; the frozen generation must win.
                     tunnel_unhealthy_since: Some(Instant::now()),
                     tunnel_alert_phase: AlertPhase::Pending,
-                    tunnel_fold: FoldedTunnel {
+                    tunnel_fold: FailureInFlight {
                         generation: Some(generation),
                         ended: false,
                     },
@@ -2064,6 +2100,7 @@ mod tests {
                     streak_opened_by_flapping: false,
                     gm_connection_unhealthy_since: None,
                     gm_connection_alert_phase: AlertPhase::Idle,
+                    gm_connection_in_flight: FailureInFlight::default(),
                     registration_expires_at: None,
                     pool_exhausted: PoolExhaustion::default(),
                     epoch_first_seen_unix: None,
@@ -2853,5 +2890,139 @@ mod tests {
         );
         // The CHILD_SA coming back while still flapping keeps the same episode.
         assert!(tunnel_events(&sup_state_report(&cfg, m, 2, flap_state(true, true))).is_empty());
+    }
+
+    // --- #138: recovery while the Failure is still being sent ---------------
+
+    fn zero_cfg() -> AlertsConfig {
+        let mut cfg = AlertsConfig::default();
+        cfg.registration_loss_thresholds.unhealthy_sec = 0;
+        cfg.gm_connection_lost_thresholds.unhealthy_sec = 0;
+        cfg
+    }
+
+    fn generic_report(
+        cfg: &AlertsConfig,
+        category: AlertCategory,
+        m: &str,
+        seq: u64,
+        healthy: bool,
+    ) -> Vec<CriticalEventKind> {
+        let state = match category {
+            AlertCategory::RegistrationLoss => AgentState {
+                registered: Some(healthy),
+                ..AgentState::default()
+            },
+            _ => AgentState {
+                gm_connection_up: Some(healthy),
+                ..AgentState::default()
+            },
+        };
+        apply_report_with(
+            &AgentReport {
+                agent: AgentKind::Ims,
+                module_id: m.to_string(),
+                epoch: 3,
+                seq,
+                state,
+                events: vec![],
+                dropped: 0,
+            },
+            Some(cfg),
+        )
+        .into_iter()
+        .filter(|(_, c, _, _)| *c == category)
+        .map(|(_, _, kind, _)| kind)
+        .collect()
+    }
+
+    fn generic_phase(key: &(AgentKind, String), category: AlertCategory) -> AlertPhase {
+        let guard = liveness().lock().unwrap();
+        match category {
+            AlertCategory::RegistrationLoss => guard[key].registered_alert_phase,
+            _ => guard[key].gm_connection_alert_phase,
+        }
+    }
+
+    /// The generation the `Failure` was decided against, as dispatch would carry it.
+    fn generic_generation(key: &(AgentKind, String), category: AlertCategory) -> Instant {
+        let guard = liveness().lock().unwrap();
+        match category {
+            AlertCategory::RegistrationLoss => guard[key].registered_in_flight.generation,
+            _ => guard[key].gm_connection_in_flight.generation,
+        }
+        .unwrap()
+    }
+
+    fn check_recovery_mid_send(category: AlertCategory, m: &str, delivered: bool) {
+        let cfg = zero_cfg();
+        let key = (AgentKind::Ims, m.to_string());
+        assert_eq!(
+            generic_report(&cfg, category, m, 1, false),
+            vec![CriticalEventKind::Failure]
+        );
+        assert_eq!(generic_phase(&key, category), AlertPhase::Pending);
+        let generation = generic_generation(&key, category);
+
+        // Recovers before the send answers: nothing decided, still in flight.
+        assert!(generic_report(&cfg, category, m, 2, true).is_empty());
+        assert_eq!(generic_phase(&key, category), AlertPhase::Pending);
+
+        // The callback still matches, and owes the all-clear only if delivered.
+        assert_eq!(
+            record_alert_outcome(&key, category, generation, delivered),
+            delivered
+        );
+        if delivered {
+            assert_eq!(generic_phase(&key, category), AlertPhase::Pending);
+            finish_late_all_clear(&key, category);
+        }
+        assert_eq!(generic_phase(&key, category), AlertPhase::Idle);
+
+        // The next outage alerts again.
+        assert_eq!(
+            generic_report(&cfg, category, m, 3, false),
+            vec![CriticalEventKind::Failure]
+        );
+    }
+
+    #[test]
+    fn registration_loss_recovered_mid_send_is_all_cleared() {
+        check_recovery_mid_send(AlertCategory::RegistrationLoss, "t138-reg-ok", true);
+    }
+
+    #[test]
+    fn registration_loss_recovered_mid_send_undelivered_goes_idle() {
+        check_recovery_mid_send(AlertCategory::RegistrationLoss, "t138-reg-fail", false);
+    }
+
+    #[test]
+    fn gm_connection_recovered_mid_send_is_all_cleared() {
+        check_recovery_mid_send(AlertCategory::GmConnectionLost, "t138-gm-ok", true);
+    }
+
+    #[test]
+    fn gm_connection_recovered_mid_send_undelivered_goes_idle() {
+        check_recovery_mid_send(AlertCategory::GmConnectionLost, "t138-gm-fail", false);
+    }
+
+    #[test]
+    fn re_outage_before_callback_does_not_alert_until_old_send_resolves() {
+        let cfg = zero_cfg();
+        let category = AlertCategory::RegistrationLoss;
+        let m = "t138-reoutage";
+        let key = (AgentKind::Ims, m.to_string());
+        generic_report(&cfg, category, m, 1, false);
+        let generation = generic_generation(&key, category);
+        generic_report(&cfg, category, m, 2, true);
+        // A new outage starts while the old send is unresolved: held back.
+        assert!(generic_report(&cfg, category, m, 3, false).is_empty());
+        assert!(record_alert_outcome(&key, category, generation, true));
+        finish_late_all_clear(&key, category);
+        // The new outage is then decided fresh.
+        assert_eq!(
+            generic_report(&cfg, category, m, 4, false),
+            vec![CriticalEventKind::Failure]
+        );
     }
 }
