@@ -1,5 +1,8 @@
 # Release Notes
 
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
 - **SMS delivery reports follow TS 24.341 more closely** -- The report the bridge sends after an inbound IMS SMS now carries `In-Reply-To` naming the SMS it acknowledges (TS 24.341 §5.3.2.4), and is routed through the P-CSCF first, ahead of the registrar's `Service-Route` entries (Annex B.6). New `sms_report_pcscf_route` under `[vowifi]` and `[volte]` (default `true`; `[volte]` inherits `[vowifi]`) turns the P-CSCF `Route` off to restore the old routing. A report the network answers with a final error now logs one warning with the status, reason and any `Warning` text. This closes two conformance gaps found while investigating #140; it is not a claimed fix for the T2 report.
