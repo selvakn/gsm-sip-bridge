@@ -853,6 +853,21 @@ impl StrongswanEngine {
         }
     }
 
+    /// The tunnel interface's received-packet counter, read now (specs/100).
+    ///
+    /// Not [`TunnelEngine::tun_rx_packets`], which is the value the previous
+    /// tick's health check cached: that check runs before a tick's liveness
+    /// check is sent, so packets that predate the check would read as its
+    /// answer. Leaves that cached value alone, which specs/098 compares across
+    /// ticks. `None` when the interface cannot be read.
+    pub fn read_tun_rx_packets(&self, runner: &dyn CommandRunner) -> Option<u64> {
+        let out = runner
+            .run_in_netns(&self.netns, &["ip", "-s", "link", "show", &self.tun_iface])
+            .ok()
+            .filter(|o| o.status.success())?;
+        link_rx_packets(&String::from_utf8_lossy(&out.stdout))
+    }
+
     /// The P-CSCF of a negotiation logged after `mark`, if one has completed.
     /// A log truncated since the mark (charon restarted) is read from its
     /// start: everything in it is newer than the mark.

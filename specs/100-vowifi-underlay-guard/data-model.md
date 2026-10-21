@@ -49,7 +49,7 @@ Built by the loop at the top of each tick and passed into `tick_steady_state_wit
 | `cause` | `NoRoute` \| `NoResponse` | The variant that started the hold. A hold does not change cause mid-way; if the cause flips, the hold ends and a new one starts. |
 | `started_at` | `Instant` + `SystemTime` | `Instant` for the 15-minute bound, `SystemTime` for the status file and logs. |
 | `skipped` | `Vec<DegradeReason>`, deduplicated | Recoveries held back, for the end-of-hold log line. |
-| `marks_from` | `SystemTime` | When the hold ends this becomes `tracking.negotiated_at`, so agent P-CSCF marks set during the hold don't count (FR-011; 097's `exhausted_pool` already ignores marks older than `negotiated_at`). |
+| `marks_from` | `SystemTime` | When the hold ends because the path returned, this becomes `tracking.negotiated_at`, so agent P-CSCF marks set during the hold don't count (FR-011; 097's `exhausted_pool` already ignores marks older than `negotiated_at`). A hold ended by `max_hold` keeps them for the ordinary pass. |
 
 ### PendingCheck
 
@@ -148,7 +148,7 @@ On every transition out of a hold:
 2. state report `uplink=up`;
 3. write the status file;
 4. one log line with the duration, `ended_by` and the skipped reasons;
-5. set `tracking.negotiated_at = now` (FR-011);
+5. if it ended because the path returned (`restored`), set `tracking.negotiated_at = now` (FR-011); at `max_hold` the marks stay for the ordinary pass (FR-012);
 6. reset `held_initiate_sent`;
 7. if no IKE_SA is established or in flight, issue one `--initiate` (FR-013). The unheld tick that follows does this itself: a missing IKE_SA is `IkeSaLost` and re-initiated. A half-open IKE_SA left from a *no route* hold is terminated and re-initiated on that tick (`UnderlayView.restored`), reported as `IkeSaNegotiationStuck`; after a *no response* hold it is left alone, since it has just answered.
 

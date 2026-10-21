@@ -56,6 +56,9 @@ pub struct PendingCheck {
     /// Taken just before the check was sent; anything the ePDG says after it
     /// answers the check.
     pub mark: LogMark,
+    /// The tunnel's received-packet counter at the same point: a packet counted
+    /// after it answers the check too.
+    pub rx: Option<u64>,
     pub deferred: DegradeReason,
 }
 
@@ -106,6 +109,9 @@ pub struct UnderlayTracker {
     route_failures: u32,
     first_route_failure: Option<Instant>,
     last_rx: Option<u64>,
+    /// This tick's own counter reading, `None` when it failed: the baseline
+    /// for a liveness check the tick sends.
+    tick_rx: Option<u64>,
     evidence_mark: LogMark,
     tick_mark: LogMark,
     pub hold: Option<Hold>,
@@ -121,6 +127,7 @@ impl UnderlayTracker {
             route_failures: 0,
             first_route_failure: None,
             last_rx: None,
+            tick_rx: None,
             evidence_mark: mark,
             tick_mark: mark,
             hold: None,
@@ -166,6 +173,7 @@ impl UnderlayTracker {
     /// Computes the verdict for this tick and the view the tick is given.
     pub fn begin_tick(&mut self, obs: &Observation, now: Instant, now_at: SystemTime) -> Begin {
         self.tick_mark = obs.mark;
+        self.tick_rx = obs.rx_packets;
 
         // Debounce the route check (FR-002).
         if obs.route_ok {
@@ -266,10 +274,15 @@ impl UnderlayTracker {
         });
         let pending = self.pending_check.map(|p| PendingView {
             reason: p.deferred,
-            // The tunnel counter growing since the previous tick covers the
-            // packets that arrived after the check went out, as well as the
-            // log lines.
-            life_since_mark: obs.pending_life.unwrap_or(false) || rx_grew,
+            // The tunnel counter growing since the check went out covers the
+            // packets that answer it, as well as the log lines. Measured from
+            // the check, not from the previous tick: traffic from before the
+            // check is no answer to it.
+            life_since_mark: obs.pending_life.unwrap_or(false)
+                || matches!(
+                    (p.rx, obs.rx_packets),
+                    (Some(before), Some(after)) if after > before
+                ),
         });
         Begin {
             view: UnderlayView {
@@ -300,6 +313,8 @@ impl UnderlayTracker {
             SteadyOutcome::Deferred { reason } => {
                 self.pending_check.get_or_insert(PendingCheck {
                     mark: mark_before_tick,
+                    // Read by this tick's `begin_tick`, before the check went out.
+                    rx: self.tick_rx,
                     deferred: *reason,
                 });
                 None
@@ -343,8 +358,11 @@ impl UnderlayTracker {
     }
 
     /// Ends the hold because the supervisor is shutting down, so its time is
-    /// counted.
+    /// counted. The verdict goes back to up with it: the shutdown reports
+    /// `up`, and the status file written from [`Self::state`] must not go on
+    /// showing a hold nobody is supervising.
     pub fn end_for_shutdown(&mut self, now: Instant) -> Option<HoldEnd> {
+        self.verdict = UnderlayVerdict::Up;
         self.end_hold(HoldEndedBy::Shutdown, now)
     }
 
@@ -691,9 +709,12 @@ mod tests {
         let mut t = UnderlayTracker::new(mark());
         clock.begin(&mut t, &no_route());
         clock.begin(&mut t, &no_route());
+        assert_eq!(t.state(), UplinkState::NoRoute);
         let end = t.end_for_shutdown(clock.t0 + TICK * 5).unwrap();
         assert_eq!(end.ended_by, HoldEndedBy::Shutdown);
         assert_eq!(end.held, TICK * 4);
+        // What the status file is written from on the way out.
+        assert_eq!(t.state(), UplinkState::Up);
         assert!(t.end_for_shutdown(clock.t0 + TICK * 6).is_none());
     }
 
@@ -802,6 +823,37 @@ mod tests {
             ..quiet()
         };
         let b = clock.begin(&mut t, &answered);
+        assert!(b.view.pending.unwrap().life_since_mark);
+    }
+
+    #[test]
+    fn only_packets_counted_after_the_check_answer_it() {
+        let mut clock = Clock::new();
+        let mut t = UnderlayTracker::new(mark());
+        let quiet_rx = |rx| Observation {
+            rx_packets: Some(rx),
+            pending_life: Some(false),
+            ..quiet()
+        };
+        clock.begin(&mut t, &quiet_rx(100));
+        // Traffic arrived since the previous tick, and then this tick sent the
+        // check.
+        clock.begin(&mut t, &quiet_rx(150));
+        let (now, at) = clock.next();
+        t.end_tick(
+            &SteadyOutcome::Deferred {
+                reason: DegradeReason::PcscfPoolExhausted,
+            },
+            mark(),
+            now,
+            at,
+        );
+        let b = clock.begin(&mut t, &quiet_rx(150));
+        assert!(
+            !b.view.pending.unwrap().life_since_mark,
+            "the 50 packets predate the check"
+        );
+        let b = clock.begin(&mut t, &quiet_rx(151));
         assert!(b.view.pending.unwrap().life_since_mark);
     }
 

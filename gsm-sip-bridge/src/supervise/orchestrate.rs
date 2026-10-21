@@ -1902,7 +1902,8 @@ fn start_vowifi_line_strongswan(
     loop {
         // Quicker while a hold is on, so the path coming back is noticed within
         // seconds instead of up to a whole tick later (specs/100 SC-003).
-        runner.sleep(underlay.poll_after(std::time::Instant::now()));
+        let pause = underlay.poll_after(std::time::Instant::now());
+        runner.sleep(pause);
         // Held across the whole tick_steady_state call, not just a one-off
         // check before it: Greptile P1 (round 2) caught that a plain
         // check-then-call still lets a Recovered outcome's respawn
@@ -1945,9 +1946,15 @@ fn start_vowifi_line_strongswan(
                 println!("{}", hold_ended_line(idx, end));
                 uplink_events.push(hold_ended_event(end));
                 // Marks the agent set while the path was down describe the
-                // outage, not the tunnel (FR-011), and the one initiation a
-                // hold allows has done its job (FR-010a).
-                tracking.negotiated_at = Some(tick_started_at);
+                // outage, not the tunnel (FR-011). Only when it came back,
+                // though: at the 15-minute bound the path is not known to be
+                // back, and the ordinary pass that follows exists in case the
+                // guard was wrong, so it judges every mark (FR-012). The one
+                // initiation a hold allows has done its job either way
+                // (FR-010a).
+                if end.ended_by == crate::control::protocol::HoldEndedBy::Restored {
+                    tracking.negotiated_at = Some(tick_started_at);
+                }
                 tracking.held_initiate_sent = false;
             }
             if let Some(start) = begin.started {
@@ -1980,7 +1987,9 @@ fn start_vowifi_line_strongswan(
             &current_pcscf,
             &current_pool,
             &mut tracking,
-            line_supervisor::STEADY_STATE_POLL_INTERVAL,
+            // The pause actually taken, which is 5s around a hold: the
+            // unreachable window is counted in time (specs/100).
+            pause,
             &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
             &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
             &underlay_view,
@@ -2273,7 +2282,8 @@ fn start_vowifi_line_strongswan(
 
 /// Reads what the underlay tracker needs to judge the path to the ePDG this
 /// tick (specs/100): the route, the ePDG's side of the IKE traffic, and the
-/// tunnel's received-packet counter as the previous tick left it.
+/// tunnel's received-packet counter, read now rather than as the previous
+/// tick's health check left it.
 fn observe_underlay(
     engine: &StrongswanEngine,
     runner: &dyn CommandRunner,
@@ -2287,7 +2297,7 @@ fn observe_underlay(
         ike_life_recent: engine
             .ike_evidence_since(runner, tracker.tick_mark())
             .parsed_from_peer,
-        rx_packets: engine.tun_rx_packets(),
+        rx_packets: engine.read_tun_rx_packets(runner),
         pending_life: tracker
             .pending_mark()
             .map(|m| engine.ike_evidence_since(runner, m).parsed_from_peer),

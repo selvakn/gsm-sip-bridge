@@ -767,6 +767,10 @@ pub struct SteadyTracking {
     pub pcscf_via_sibling: Option<std::net::IpAddr>,
     /// Consecutive ticks the P-CSCF was unreachable.
     pub pcscf_unreachable: u32,
+    /// The time those ticks cover, each counted at the pause before it. The
+    /// loop's cadence changes (5s around a hold, specs/100), so the window is
+    /// measured in time, not derived from a tick count at one cadence.
+    pub pcscf_unreachable_for: Duration,
     /// Consecutive ticks an IKE_SA was listed but had no usable CHILD_SA.
     pub child_sa_missing: u32,
     /// Whether the last tick saw a usable CHILD_SA.
@@ -805,6 +809,12 @@ pub struct SteadyTracking {
 }
 
 impl SteadyTracking {
+    /// Forgets the unreachable streak.
+    pub fn reset_pcscf_unreachable(&mut self) {
+        self.pcscf_unreachable = 0;
+        self.pcscf_unreachable_for = Duration::ZERO;
+    }
+
     /// Forgets every per-CHILD_SA stuck-rekey guard.
     fn clear_rekey_guards(&mut self) {
         self.rekey_stuck_rebuilt = None;
@@ -1249,6 +1259,16 @@ pub fn tick_steady_state_underlay(
             if let Some(outcome) =
                 check_rekey_stuck(engine, runner, child, tracking, call_active, underlay)
             {
+                // A held rebuild must not hold back the route repair below
+                // too: that one is structural and never held (FR-009), and
+                // the hold can last 15 minutes.
+                if matches!(outcome, SteadyOutcome::Held { .. }) {
+                    if let Some(repaired) =
+                        repair_default_route(engine, runner, current_pcscf, tracking)
+                    {
+                        return repaired;
+                    }
+                }
                 return outcome;
             }
         }
@@ -1282,12 +1302,8 @@ pub fn tick_steady_state_underlay(
     // The current selection's family, because that is the address the line
     // registers through; a sibling only matters once it has been chosen. No
     // selection yet means no family to check, as for the probe below.
-    if !current_pcscf.is_empty() && engine.repair_default_route(runner, current_pcscf) {
-        tracking.pcscf_unreachable = 0;
-        return SteadyOutcome::Recovered {
-            reason: DegradeReason::DefaultRouteMissing,
-            ike_sa_loss_cause: None,
-        };
+    if let Some(repaired) = repair_default_route(engine, runner, current_pcscf, tracking) {
+        return repaired;
     }
 
     // Has the line's IMS agent given up on every P-CSCF it was given? It is
@@ -1316,7 +1332,7 @@ pub fn tick_steady_state_underlay(
                 return outcome;
             }
             tracking.pool_exhausted_deferral_logged = false;
-            tracking.pcscf_unreachable = 0;
+            tracking.reset_pcscf_unreachable();
             let outcome = rebuild_tunnel(engine, runner, DegradeReason::PcscfPoolExhausted);
             if matches!(
                 outcome,
@@ -1356,30 +1372,52 @@ pub fn tick_steady_state_underlay(
     };
     tracking.pcscf_via_sibling = sibling;
     if selection_reachable || tracking.pcscf_via_sibling.is_some() {
-        tracking.pcscf_unreachable = 0;
+        tracking.reset_pcscf_unreachable();
     } else {
         // The route was checked above, this same tick: unreachable with it in
         // place is some other fault.
         tracking.pcscf_unreachable = tracking.pcscf_unreachable.saturating_add(1);
-        // Derived from this loop's own cadence, so both engines wait the same
-        // ~90s of real time rather than the same number of ticks.
-        if tracking.pcscf_unreachable >= pcscf_unreachable_strikes(poll_interval) {
+        tracking.pcscf_unreachable_for += poll_interval;
+        // Measured in real time, so both engines, and one loop whose cadence
+        // changes, wait the same ~90s rather than the same number of ticks.
+        // At a fixed cadence this is `pcscf_unreachable_strikes` ticks.
+        if tracking.pcscf_unreachable >= PCSCF_UNREACHABLE_MIN_STRIKES
+            && tracking.pcscf_unreachable_for >= PCSCF_UNREACHABLE_WINDOW
+        {
             if let Some(outcome) =
                 underlay_gate(engine, runner, underlay, DegradeReason::PcscfUnreachable)
             {
                 // Strikes counted against a dead path are not evidence once it
                 // is back.
                 if matches!(outcome, SteadyOutcome::Held { .. }) {
-                    tracking.pcscf_unreachable = 0;
+                    tracking.reset_pcscf_unreachable();
                 }
                 return outcome;
             }
-            tracking.pcscf_unreachable = 0;
+            tracking.reset_pcscf_unreachable();
             return rebuild_tunnel(engine, runner, DegradeReason::PcscfUnreachable);
         }
     }
 
     SteadyOutcome::StillUp
+}
+
+/// Puts the namespace default route back if it is gone, for the current
+/// selection's family: `Some` when it was repaired.
+fn repair_default_route(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    current_pcscf: &str,
+    tracking: &mut SteadyTracking,
+) -> Option<SteadyOutcome> {
+    if current_pcscf.is_empty() || !engine.repair_default_route(runner, current_pcscf) {
+        return None;
+    }
+    tracking.reset_pcscf_unreachable();
+    Some(SteadyOutcome::Recovered {
+        reason: DegradeReason::DefaultRouteMissing,
+        ike_sa_loss_cause: None,
+    })
 }
 
 /// What the guard says about a reachability-inferred recovery the tick is
@@ -2704,6 +2742,35 @@ mod tests {
                  {PCSCF_UNREACHABLE_WINDOW:?}, but it is torn down after {worst:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_unreachable_window_is_counted_in_time_when_the_cadence_changes() {
+        // The strongswan loop ticks every 5s around a hold (specs/100). Three
+        // failures there are 15s, not the 90s three are at 30s.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut streak = SteadyTracking::default();
+        let mut tick = |interval| {
+            super::tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak, interval)
+        };
+        let quick = Duration::from_secs(5);
+        // 30s of quick ticks, then 30s ticks: rebuilt on the one reaching 90s.
+        for n in 0..6 {
+            assert_eq!(tick(quick), SteadyOutcome::StillUp, "quick tick {n}");
+        }
+        assert_eq!(tick(STEADY_STATE_POLL_INTERVAL), SteadyOutcome::StillUp);
+        assert!(matches!(
+            tick(STEADY_STATE_POLL_INTERVAL),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::PcscfUnreachable,
+                ..
+            }
+        ));
+        assert_eq!(streak.pcscf_unreachable_for, Duration::ZERO);
     }
 
     #[test]
@@ -4503,6 +4570,31 @@ mod tests {
             tracking.rekey_stuck_rebuilt, None,
             "held, so the one rebuild it is owed is still to come"
         );
+    }
+
+    #[test]
+    fn a_held_stuck_rekey_still_lets_a_missing_route_be_repaired() {
+        let engine = FakeEngine {
+            health: RefCell::new(lifetime(4, 100)),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            guarded(
+                &engine,
+                &mut tracking,
+                &view(UnderlayVerdict::NoRoute),
+                None
+            ),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::DefaultRouteMissing,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(*engine.repair_calls.borrow(), 1);
+        nothing_was_issued(&engine);
+        assert_eq!(tracking.rekey_stuck_rebuilt, None);
     }
 
     #[test]
