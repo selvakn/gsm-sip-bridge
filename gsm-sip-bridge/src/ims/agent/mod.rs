@@ -6071,11 +6071,7 @@ mod tests {
         let mut pool = Pool::new(lo(1), vec![lo(1)], None);
         let marked_at = SystemTime::now() - Duration::from_secs(30);
         pool.select(marked_at);
-        pool.on_failure(
-            lo(1),
-            PoolCause::RetryAfter(Duration::from_secs(120)),
-            marked_at,
-        );
+        pool.on_failure(lo(1), PoolCause::GmKeepalive, marked_at);
         let secs = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let outage = crate::ims::pcscf_files::Outage {
             from: secs(marked_at) - 60,
@@ -6109,11 +6105,7 @@ mod tests {
         let mut pool = Pool::new(lo(1), vec![lo(1)], None);
         let marked_at = SystemTime::now();
         pool.select(marked_at);
-        pool.on_failure(
-            lo(1),
-            PoolCause::RetryAfter(Duration::from_secs(120)),
-            marked_at,
-        );
+        pool.on_failure(lo(1), PoolCause::GmKeepalive, marked_at);
         let secs = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let checks = std::cell::Cell::new(0);
         let waited = RefCell::new(Vec::new());
