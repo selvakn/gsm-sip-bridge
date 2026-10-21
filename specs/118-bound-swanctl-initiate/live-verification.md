@@ -27,7 +27,16 @@ The control interface stops answering at the 12th initiate and the log never adv
 
 `RECOVERY-READY`: the daemon answers `--list-sas`, IKE_SA_INIT retransmits went 5 -> 10 over the window (a window shorter than charon's ~76s backoff reads as stalled), and a fresh bounded initiate was accepted. A real ePDG returning is not simulated here: that needs a responder, so the "line registers without a restart" step stays a hardware check.
 
-## Not run here
+## Live bridge, one real VoWiFi line (2026-10-21)
 
-- T034 (two lines, one silent, 30 min) and T039 (shutdown mid-attempt on a live bridge) need the bridge running against real lines. Their logic is unit-tested (`only_one_of_two_lines_restarts_a_wedged_shared_daemon`, `a_silent_epdg_on_one_line_never_touches_a_healthy_line`, `cancel_initiate_reaps_the_outstanding_client_and_is_idempotent`), but there is no live record.
-- No orchestrate-level test drives shutdown through `establish_line_tunnel`'s `cancel_initiate` call (the priming test never reaches the initiate); the call sits after the loop so every exit passes it.
+Image built from main at 4ab6c07. The ePDG's /16 was dropped inbound with an nft rule (priority -300) before the container was recreated, so startup ran against a silent ePDG; the rule was then removed.
+
+- **Silence, ~7 minutes (T017 short):** 14 samples, `swanctl --list-sas` rc 0 on every one, charon's log advancing throughout (28 -> 62 lines), 17 threads constant, charon never restarted, no wedge line. Log: `initiate started`, `initiate client exited after 28s`, `IKE_SA #1 still negotiating; leaving it to charon`. The "after 28s" is when the client was collected (at the next 30s probe), not how long it ran; swanctl detaches at 20s. (`pgrep -fc` reads 1 because it matches its own `sh -c`.)
+- **Recovery (US2):** path restored after ~10 minutes of silence; `tunnel UP` 10-15s later, no container or charon restart. A first attempt to restore failed because the nft table outlives the container that created it and had to be deleted explicitly.
+- **Shutdown mid-attempt (T039):** SIGTERM while the client was running. Teardown killed charon, but the `timeout ... swanctl --initiate` wrapper was still present at t+1s, until the container exited. Nothing reaps it: the persistent line's establish loop is not stopped by shutdown, so `cancel_initiate` is not reached on that path. It is bounded (the wrapper ends by 27s on its own), so it cannot outlive the bridge process by more than that outside a container, but US6's "nothing left behind" is not strictly met.
+- The bridge was returned to its previous image afterwards and re-established its tunnel.
+
+## Not run
+
+- T034 (two lines, one silent): the host has one modem. Unit tests cover the logic.
+- T036: an orchestrate-level shutdown test is not feasible with the mock; the priming path stops at the vpcd readiness check before it reaches the initiate.

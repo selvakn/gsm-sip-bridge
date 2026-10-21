@@ -133,7 +133,7 @@ All source paths are under `gsm-sip-bridge/src/supervise/` unless stated. Use `C
 
 - [X] T037 [US6] In `line_supervisor.rs` add `TunnelEngine::cancel_initiate(&self, runner)` (default no-op) and implement it on `StrongswanEngine` in `engines.rs` (`reap` the pending handle, clear the slot).
 - [X] T038 [US6] In `orchestrate.rs` call it on every exit of the strongSwan line's loops: the establish loop's shutdown and fatal breaks (~1721-1752), and the steady loop's shutdown/removal returns (~1905-1935 onward). Prefer one RAII-free helper called at each return over scattered calls.
-- [ ] T039 [US6] Live check: request shutdown mid-attempt and confirm `pgrep -f 'swanctl.*--initiate'` is empty; record in `live-verification.md`.
+- [X] T039 [US6] Live check: request shutdown mid-attempt and confirm `pgrep -f 'swanctl.*--initiate'` is empty; record in `live-verification.md`.
 
 ---
 
