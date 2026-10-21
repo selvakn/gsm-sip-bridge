@@ -211,8 +211,9 @@ pub trait CommandRunner: Send + Sync {
 
     /// Starts a fire-and-forget child — matches the bash convention of
     /// backgrounding a command with a trailing `&` and never referencing its
-    /// pid again (e.g. every `swanctl --initiate`, which the original script
-    /// redirects to a log file and immediately forgets about). Deliberately
+    /// pid again. Not for `swanctl --initiate`: that client is tracked, so
+    /// there is at most one per line and shutdown can reach it (#139).
+    /// Deliberately
     /// returns no [`ChildHandle`]: there is no legitimate later use for one
     /// (nothing will ever signal or query this specific process again), and
     /// a caller holding a handle here would be tempted to track it — leading
@@ -1243,6 +1244,11 @@ mod mock {
                 c.alive = false;
                 c.exit_code = Some(exit_code);
             }
+        }
+
+        /// [`Self::kill_child`] for a child known only by id.
+        pub fn kill_child_by_id(&self, id: u64, exit_code: i32) {
+            self.kill_child(&ChildHandle(id), exit_code);
         }
 
         /// A future `spawn()` whose argv contains `needle` creates a child

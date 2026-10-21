@@ -6,8 +6,8 @@
 //! bash comment used, tested independently of any [`CommandRunner`].
 
 use super::line_supervisor::{
-    ChildSaLifetime, IkeActivity, IkeEvidence, IkeHeaderState, InboundEsp, SteadyStateHealth,
-    TunnelEngine,
+    ChildSaLifetime, EstablishProbe, IkeActivity, IkeEvidence, IkeHeaderState, InboundEsp,
+    SteadyStateHealth, TunnelEngine,
 };
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::config::TunnelAddressFamily;
@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Keeps only the lines of the **shared** charon log that belong to
 /// `conn_name`.
@@ -196,6 +196,69 @@ const GRACEFUL_TERMINATE_TIMEOUT_SECS: u32 = 8;
 
 /// Outer bound on the steady-state `swanctl --list-sas` query.
 const STEADY_LIST_SAS_TIMEOUT_SECS: u32 = 10;
+
+/// swanctl's own `--timeout` on an initiate: how long the client (and the
+/// charon worker thread serving it) waits for the IKE_SA to establish before
+/// detaching. charon keeps negotiating after it detaches. Without it a silent
+/// ePDG pins one worker per call forever (`keyingtries = 0` never destroys the
+/// IKE_SA, so the listener never completes) and the 16-thread pool freezes the
+/// whole daemon (#139).
+pub const INITIATE_DETACH_SECS: u32 = 20;
+/// The outer `timeout` around the initiate client, for a VICI that never
+/// answers at all, which swanctl's own `--timeout` cannot bound.
+pub const INITIATE_HARD_KILL_SECS: u32 = 25;
+/// `timeout -k`: how long after the outer TERM before it sends KILL.
+pub const INITIATE_KILL_GRACE_SECS: u32 = 2;
+/// Consecutive timed-out control-interface probes before the shared daemon is
+/// declared wedged. One timeout on a busy daemon is not a wedge.
+pub const VICI_UNRESPONSIVE_STRIKES: u8 = 2;
+
+// A client must be gone before the next cadence-driven initiate is due, or the
+// one-client-per-line skip would swallow it.
+const _: () = {
+    let cadence_secs = super::line_supervisor::STRONGSWAN_REINITIATE_EVERY as u64
+        * super::line_supervisor::ESTABLISH_POLL_INTERVAL.as_secs();
+    assert!(cadence_secs > (INITIATE_HARD_KILL_SECS + INITIATE_KILL_GRACE_SECS) as u64);
+};
+const _: () = assert!(INITIATE_DETACH_SECS < INITIATE_HARD_KILL_SECS);
+
+/// The most lines one shared charon is sized for. A silent ePDG holds one
+/// worker for up to `INITIATE_DETACH_SECS` per line (never more: one client
+/// per line), and charon's pool is 16 (`DEFAULT_THREADS`), of which a handful
+/// serve the daemon itself, so N lines leave headroom while N + 4 <= 16.
+pub const SUPPORTED_MAX_LINES: u32 = 4;
+const CHARON_DEFAULT_THREADS: u32 = 16;
+const CHARON_RESERVED_THREADS: u32 = 4;
+const _: () = assert!(SUPPORTED_MAX_LINES <= CHARON_DEFAULT_THREADS - CHARON_RESERVED_THREADS);
+
+/// The one place a `swanctl --initiate` command line is built (contracts/
+/// initiate-command.md). A test fails the build if `--initiate` appears
+/// anywhere else in non-test code under `supervise/`; go through
+/// [`StrongswanEngine::initiate`].
+pub fn initiate_argv(shared_conf: &str, conn: &str) -> Vec<String> {
+    [
+        "timeout",
+        "-k",
+        &INITIATE_KILL_GRACE_SECS.to_string(),
+        &INITIATE_HARD_KILL_SECS.to_string(),
+        "env",
+        &format!("STRONGSWAN_CONF={shared_conf}"),
+        "swanctl",
+        "--initiate",
+        "--child",
+        conn,
+        "--timeout",
+        &INITIATE_DETACH_SECS.to_string(),
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// The initiate client a line currently has outstanding.
+pub struct PendingInitiate {
+    handle: ChildHandle,
+    started: Instant,
+}
 
 /// CHILD_SA states that still carry (or are about to carry) traffic. A rekey
 /// briefly shows the old SA as `REKEYED` beside the new `INSTALLED` one, and
@@ -695,6 +758,30 @@ impl SharedCharon {
         self.spawn_locked(runner, &mut guard).is_some()
     }
 
+    /// The log generation, to capture before probing the daemon so a later
+    /// [`Self::restart_if_wedged`] can tell whether someone else has already
+    /// replaced it.
+    pub fn generation(&self) -> u64 {
+        self.log_generation.load(Ordering::SeqCst)
+    }
+
+    /// Kills and respawns the daemon because its control interface stopped
+    /// answering while the process is alive, reporting whether it did.
+    ///
+    /// `restart_if_dead` never touches a live daemon, so it cannot repair this.
+    /// `observed_generation` is the [`Self::generation`] the caller saw when it
+    /// found the daemon unresponsive: if the log has been truncated since,
+    /// another line already replaced it and this one must not kill the
+    /// replacement. The handle lock is held across check and respawn, which is
+    /// what makes that atomic.
+    pub fn restart_if_wedged(&self, runner: &dyn CommandRunner, observed_generation: u64) -> bool {
+        let mut guard = self.handle.lock().unwrap();
+        if self.generation() != observed_generation {
+            return false;
+        }
+        self.spawn_locked(runner, &mut guard).is_some()
+    }
+
     fn spawn_locked(
         &self,
         runner: &dyn CommandRunner,
@@ -765,7 +852,12 @@ impl SharedCharon {
     /// concurrently-starting lines to each call it.
     pub fn load_all(&self, runner: &dyn CommandRunner) {
         let env = self.env_prefix();
+        // Bounded: against a wedged daemon an unbounded load would block the
+        // calling supervisor thread along with it (#139 R3).
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
         let _ = runner.run(&[
+            "timeout",
+            secs.as_str(),
             "env",
             env.as_str(),
             "swanctl",
@@ -819,6 +911,13 @@ pub struct StrongswanEngine {
     /// for [`TunnelEngine::ike_header`] (specs/100). Cleared whenever a health
     /// check could not read the SAs.
     pub last_ike_header: RefCell<Option<(u32, IkeHeaderState)>>,
+    /// This line's outstanding initiate client, if any (#139). At most one, so
+    /// at most one live client per line, and held (not detached) so shutdown
+    /// can reach it and its exit status can be logged.
+    pub pending_initiate: RefCell<Option<PendingInitiate>>,
+    /// The shared daemon's log generation when the last establish probe ran,
+    /// for [`SharedCharon::restart_if_wedged`].
+    pub probe_generation: std::cell::Cell<u64>,
 }
 
 impl StrongswanEngine {
@@ -943,28 +1042,55 @@ impl StrongswanEngine {
             .and_then(|c| child_rekey_invalid_selectors_session(&c, &self.conn_name))
     }
 
-    /// Backgrounded `swanctl` invocation — matches the bash calls that end
-    /// in `&` (every `--initiate`). Fire-and-forget: like the bash version,
-    /// the spawned process's handle is never tracked or waited on (the
-    /// script only ever redirects its output to a log file, `>>"...
-    /// -initiate-$idx.log" 2>&1 &`, and never references its pid again).
-    /// Not backgrounding this was a real bug caught by review: running
-    /// `--initiate` synchronously via `run()` blocks the calling supervisor
-    /// tick for as long as IKE negotiation takes, exactly the polling stall
-    /// specs/012-strongswan-epdg's own establish/steady-state loops are
-    /// designed to avoid by backgrounding it in the first place.
-    fn swanctl_background(&self, runner: &dyn CommandRunner, args: &[&str]) {
-        let env = self.env_prefix();
-        let mut argv = vec!["env".to_string(), env, "swanctl".to_string()];
-        argv.extend(args.iter().map(|s| s.to_string()));
-        // spawn_detached, not spawn: a real review finding caught that
-        // `spawn` + discarding the returned handle still leaves an
-        // un-reapable entry in RealCommandRunner's table forever (nothing
-        // holds the handle needed to remove it) — every repeated tunnel
-        // recovery over a long-running container's lifetime would leak one.
-        // `spawn_detached` never inserts a tracked entry at all, matching
-        // this call's true fire-and-forget nature.
-        let _ = runner.spawn_detached(ChildSpec::new(argv));
+    /// Starts this line's tunnel initiation, unless the previous client is
+    /// still running (#139).
+    ///
+    /// The client is bounded (`initiate_argv`: swanctl detaches at 20s, an
+    /// outer `timeout` ends it by 27s) and tracked, never detached: a
+    /// `spawn_detached` waiter thread per call could neither answer "is one
+    /// still pending?" nor be reached by shutdown. A finished client is
+    /// `wait`ed here, which reaps it and yields its exit status to log.
+    /// Not backgrounding the initiate at all would block the supervisor tick
+    /// for as long as IKE negotiation takes, which an earlier review caught.
+    pub fn initiate(&self, runner: &dyn CommandRunner) {
+        let mut pending = self.pending_initiate.borrow_mut();
+        if let Some(p) = pending.take() {
+            let secs = p.started.elapsed().as_secs();
+            if runner.is_alive(&p.handle) {
+                println!(
+                    "[supervise] line {}: {} initiate skipped, previous client still running ({secs}s)",
+                    self.idx, self.conn_name
+                );
+                *pending = Some(p);
+                return;
+            }
+            let code = runner.wait(p.handle);
+            println!(
+                "[supervise] line {}: {} initiate client exited {} after {secs}s",
+                self.idx,
+                self.conn_name,
+                code.map_or_else(|| "?".to_string(), |c| c.to_string())
+            );
+        }
+        match runner.spawn(ChildSpec::new(initiate_argv(
+            &self.shared.strongswan_conf,
+            &self.conn_name,
+        ))) {
+            Ok(handle) => {
+                println!(
+                    "[supervise] line {}: {} initiate started",
+                    self.idx, self.conn_name
+                );
+                *pending = Some(PendingInitiate {
+                    handle,
+                    started: Instant::now(),
+                });
+            }
+            Err(e) => eprintln!(
+                "[supervise] line {}: {} initiate failed to start: {e}",
+                self.idx, self.conn_name
+            ),
+        }
     }
 }
 
@@ -1084,7 +1210,40 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn reinitiate(&self, runner: &dyn CommandRunner) {
-        self.swanctl_background(runner, &["--initiate", "--child", &self.conn_name]);
+        self.initiate(runner);
+    }
+
+    /// Reaps the outstanding initiate client so none outlives the line.
+    fn cancel_initiate(&self, runner: &dyn CommandRunner) {
+        if let Some(p) = self.pending_initiate.borrow_mut().take() {
+            runner.reap(&p.handle);
+            // `reap` signals and polls but does not untrack: consuming the
+            // handle is what removes the runner's table entry.
+            let _ = runner.wait(p.handle);
+        }
+    }
+
+    fn establish_probe(&self, runner: &dyn CommandRunner) -> EstablishProbe {
+        self.probe_generation.set(self.shared.generation());
+        let Some(out) = self.list_sas(runner) else {
+            return EstablishProbe::Unresponsive;
+        };
+        if !list_sas_has_ike_sa(&out, &self.conn_name) {
+            return EstablishProbe::NoIkeSa;
+        }
+        match ike_sa_header(&out, &self.conn_name) {
+            Some((ike_id, IkeHeaderState::Connecting)) => EstablishProbe::Connecting { ike_id },
+            _ => EstablishProbe::Other,
+        }
+    }
+
+    /// The shared daemon's control interface stopped answering: respawn it
+    /// once for every line, reload, and start this line's negotiation again.
+    fn recover_wedged_control(&self, runner: &dyn CommandRunner) {
+        self.shared
+            .restart_if_wedged(runner, self.probe_generation.get());
+        self.shared.load_all(runner);
+        self.initiate(runner);
     }
 
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
@@ -2087,6 +2246,8 @@ mod tests {
                 last_tun_rx: Default::default(),
                 epdg_addr: None,
                 last_ike_header: Default::default(),
+                pending_initiate: Default::default(),
+                probe_generation: Default::default(),
             }
         }
 
@@ -2699,15 +2860,131 @@ mod tests {
         }
 
         #[test]
-        fn reinitiate_also_backgrounds_initiate() {
+        fn reinitiate_spawns_one_tracked_bounded_client_without_blocking() {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
             engine.reinitiate(&runner);
             assert!(runner.run_calls.lock().unwrap().is_empty());
             let specs = runner.spawn_specs.lock().unwrap();
-            assert!(specs
-                .iter()
-                .any(|s| s.argv.contains(&"--initiate".to_string())));
+            assert_eq!(specs.len(), 1);
+            assert_eq!(
+                specs[0].argv,
+                initiate_argv("/etc/strongswan-shared.conf", "ims0")
+            );
+            drop(specs);
+            assert_eq!(runner.child_ids().len(), 1, "tracked, not detached");
+        }
+
+        #[test]
+        fn the_wrapper_shape_ends_a_client_that_never_exits() {
+            // Real process, no mock (constitution I): the same `timeout -k`
+            // wrapper `initiate_argv` uses, around a command that never exits.
+            use crate::supervise::runner::RealCommandRunner;
+            let runner = RealCommandRunner::new();
+            let started = Instant::now();
+            let handle = runner
+                .spawn(ChildSpec::new(["timeout", "-k", "1", "2", "sleep", "1000"]))
+                .expect("spawn");
+            while runner.is_alive(&handle) && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(!runner.is_alive(&handle), "the client must be gone");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "gone within timeout + grace, took {:?}",
+                started.elapsed()
+            );
+            // Already reaped by the liveness poll; consuming the handle must
+            // not block and leaves nothing behind.
+            let _ = runner.wait(handle);
+        }
+
+        #[test]
+        fn initiate_argv_satisfies_the_contract() {
+            let argv = initiate_argv("/etc/x.conf", "ims3");
+            let at = |flag: &str| argv.iter().position(|a| a == flag).unwrap();
+            let n: u32 = argv[at("--timeout") + 1].parse().unwrap();
+            assert!(n > 0 && n < 30, "swanctl --timeout {n}");
+            assert_eq!(argv[0], "timeout");
+            let k: u32 = argv[at("-k") + 1].parse().unwrap();
+            let t: u32 = argv[at("-k") + 2].parse().unwrap();
+            assert!(n < t && t + k < 30, "timeout -k {k} {t}");
+            assert_eq!(argv[at("--child") + 1], "ims3");
+            assert_eq!(argv.iter().filter(|a| *a == "--child").count(), 1);
+            assert!(argv.contains(&"STRONGSWAN_CONF=/etc/x.conf".to_string()));
+        }
+
+        #[test]
+        fn a_second_initiate_while_the_first_client_lives_is_skipped() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.initiate(&runner);
+            engine.initiate(&runner);
+            assert_eq!(runner.spawn_specs.lock().unwrap().len(), 1);
+
+            // Once the client exits, the next call reaps it and starts anew.
+            let first = runner.child_ids()[0];
+            runner.kill_child_by_id(first, 0);
+            engine.initiate(&runner);
+            assert_eq!(runner.spawn_specs.lock().unwrap().len(), 2);
+            assert!(runner.waited_on(first), "a finished client must be waited");
+        }
+
+        #[test]
+        fn cancel_initiate_reaps_the_outstanding_client_and_is_idempotent() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.cancel_initiate(&runner); // none pending: no-op
+            assert!(runner.child_ids().is_empty());
+            engine.initiate(&runner);
+            let id = runner.child_ids()[0];
+            engine.cancel_initiate(&runner);
+            assert!(runner.waited_on(id), "the handle must be consumed");
+            assert!(runner.child_ids().is_empty(), "table entry must be gone");
+            engine.cancel_initiate(&runner);
+        }
+
+        #[test]
+        fn load_all_runs_under_a_timeout() {
+            let runner = MockCommandRunner::new();
+            strongswan_engine().shared.load_all(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls[0][0], "timeout");
+            assert!(calls[0].contains(&"--load-all".to_string()));
+        }
+
+        #[test]
+        fn only_one_of_two_lines_restarts_a_wedged_shared_daemon() {
+            let runner = MockCommandRunner::new();
+            let a = strongswan_engine();
+            let mut b = strongswan_engine();
+            b.shared = Arc::clone(&a.shared);
+            a.shared.ensure_started(&runner);
+            let before = a.shared.current_handle().unwrap().id();
+
+            // Both probe the same wedge generation.
+            seed_list(&runner, 256, "");
+            assert_eq!(a.establish_probe(&runner), EstablishProbe::Unresponsive);
+            assert_eq!(b.establish_probe(&runner), EstablishProbe::Unresponsive);
+            a.recover_wedged_control(&runner);
+            let after_a = a.shared.current_handle().unwrap().id();
+            assert_ne!(before, after_a, "the first line respawns the daemon");
+            b.recover_wedged_control(&runner);
+            assert_eq!(
+                b.shared.current_handle().unwrap().id(),
+                after_a,
+                "the second line must not kill the replacement"
+            );
+        }
+
+        #[test]
+        fn a_live_answering_daemon_is_never_restarted_by_a_probe() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            engine.shared.ensure_started(&runner);
+            let id = engine.shared.current_handle().unwrap().id();
+            assert_eq!(engine.establish_probe(&runner), EstablishProbe::NoIkeSa);
+            assert_eq!(engine.shared.current_handle().unwrap().id(), id);
         }
 
         #[test]
@@ -2943,6 +3220,8 @@ mod underlay_tests {
             last_tun_rx: Default::default(),
             epdg_addr: Some("203.0.113.9".to_string()),
             last_ike_header: Default::default(),
+            pending_initiate: Default::default(),
+            probe_generation: Default::default(),
         }
     }
 

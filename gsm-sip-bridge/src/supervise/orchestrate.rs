@@ -1667,6 +1667,8 @@ pub(super) fn establish_line_tunnel(
         last_tun_rx: Default::default(),
         epdg_addr: Some(epdg_ip.clone()),
         last_ike_header: Default::default(),
+        pending_initiate: Default::default(),
+        probe_generation: Default::default(),
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1711,18 +1713,12 @@ pub(super) fn establish_line_tunnel(
     // line loads *after* writing its own file, so its own connection is always
     // present, and a directory-wide load can never evict another line's.
     ctx.shared_charon.load_all(runner.as_ref());
-    let _ = runner.spawn_detached(ChildSpec::new([
-        "env",
-        &format!("STRONGSWAN_CONF={SHARED_STRONGSWAN_CONF}"),
-        "swanctl",
-        "--initiate",
-        "--child",
-        &conn_name,
-    ]));
+    engine.initiate(runner.as_ref());
 
     println!("[supervise] line {idx}: waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ...");
     let mut attempt = 0u32;
     let mut stuck = false;
+    let mut tracking = line_supervisor::EstablishTracking::default();
     // Logged here too, not only once the tunnel is up: a line whose family
     // excludes every advertised P-CSCF never establishes, and this is the only
     // place that says why.
@@ -1734,8 +1730,13 @@ pub(super) fn establish_line_tunnel(
             );
             break None;
         }
-        match line_supervisor::tick_establishing(&engine, runner.as_ref(), &mut attempt, &mut stuck)
-        {
+        match line_supervisor::tick_establishing(
+            &engine,
+            runner.as_ref(),
+            &mut attempt,
+            &mut stuck,
+            &mut tracking,
+        ) {
             line_supervisor::EstablishOutcome::Established { pcscf } => break Some(pcscf),
             line_supervisor::EstablishOutcome::FatalProcessDied => {
                 eprintln!("[supervise] line {idx}: FATAL: charon exited before establishing the tunnel; skipping this line");
@@ -1757,6 +1758,11 @@ pub(super) fn establish_line_tunnel(
             }
         }
     };
+
+    // Whatever ended the loop, no initiate client may outlive it: this engine
+    // is dropped here (steady state builds its own), and a client left running
+    // would also hold a table entry nothing reaps (#139).
+    engine.cancel_initiate(runner.as_ref());
 
     pcscf.map(|p| (p, usim_holder, epdg_ip))
 }
@@ -1834,6 +1840,8 @@ fn start_vowifi_line_strongswan(
         last_tun_rx: Default::default(),
         epdg_addr: Some(epdg_ip),
         last_ike_header: Default::default(),
+        pending_initiate: Default::default(),
+        probe_generation: Default::default(),
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
@@ -1934,6 +1942,7 @@ fn start_vowifi_line_strongswan(
                     &mut written_uplink,
                 );
             }
+            engine.cancel_initiate(runner.as_ref());
             return;
         }
         // Taken before the tick: a recovery inside it renegotiates, and only a
@@ -3271,9 +3280,15 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     );
     let mut attempt = 0u32;
     let mut stuck = false;
+    let mut tracking = line_supervisor::EstablishTracking::default();
     let pcscf = loop {
-        match line_supervisor::tick_establishing(&engine, runner.as_ref(), &mut attempt, &mut stuck)
-        {
+        match line_supervisor::tick_establishing(
+            &engine,
+            runner.as_ref(),
+            &mut attempt,
+            &mut stuck,
+            &mut tracking,
+        ) {
             line_supervisor::EstablishOutcome::Established { pcscf } => break Some(pcscf),
             line_supervisor::EstablishOutcome::FatalProcessDied => {
                 eprintln!("[supervise] line {idx}: FATAL: dialer exited before establishing the tunnel; skipping this line");

@@ -146,6 +146,29 @@ kind it was:
 `gsm_sip_bridge_vowifi_dead_peer_losses_total{verdict=...}` counts them per
 line.
 
+### VoWiFi: charon's log stops advancing and `swanctl --list-sas` times out
+
+Symptom: with the ePDG unreachable or silent, `/tmp/charon.log` stops growing,
+`timeout 5 swanctl --list-sas` hangs or exits 124, and no line can register
+even after the ePDG returns. Cause (#139): every `swanctl --initiate` that
+never completes holds one of charon's 16 worker threads, and a silent ePDG
+never completes it. The supervisor now bounds each initiate (`--timeout 20`,
+outer `timeout` 25s), keeps at most one per line, and leaves an in-flight
+IKE_SA to charon.
+
+```text
+[supervise] line 0: ims0 initiate started
+[supervise] line 0: ims0 initiate client exited 0 after 20s
+[supervise] line 0: ims0 IKE_SA #1 still negotiating; leaving it to charon
+[supervise] line 0: swanctl --list-sas timed out (2/2)
+[supervise] line 0: charon control interface unresponsive; restarting the shared daemon
+```
+
+The last two lines mean the daemon was already wedged and the supervisor
+respawned it (every line re-establishes once). Seeing `initiate skipped,
+previous client still running` is normal while an attempt is in flight.
+`pgrep -fc 'swanctl.*--initiate'` should never exceed the number of lines.
+
 ### VoWiFi: `uplink down … holding tunnel recovery`
 
 The line supervisor noticed that the path from this host to the ePDG is down

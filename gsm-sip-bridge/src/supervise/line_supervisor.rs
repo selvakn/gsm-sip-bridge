@@ -6,7 +6,7 @@
 //! control flow, not a redesign: see the per-branch comments below for the
 //! exact bash this replaces.
 
-use super::engines::LogMark;
+use super::engines::{LogMark, VICI_UNRESPONSIVE_STRIKES};
 use super::runner::CommandRunner;
 pub use crate::control::protocol::DeadPeerVerdict;
 use crate::control::protocol::{IkeSaLossCause, UplinkHoldCause};
@@ -397,6 +397,19 @@ pub trait TunnelEngine {
     /// (strongswan: `swanctl --initiate --child <this line's connection>`;
     /// swu: no-op, matching `terminate`). Scoped for the same reason.
     fn reinitiate(&self, runner: &dyn CommandRunner);
+    /// Reaps any initiate client this engine still has outstanding, so none
+    /// outlives the line (#139). Default: nothing to cancel.
+    fn cancel_initiate(&self, _runner: &dyn CommandRunner) {}
+    /// What one bounded look at the control interface says about this line's
+    /// negotiation, for the establish loop (#139). Default: nothing to learn,
+    /// so the loop behaves as it always did.
+    fn establish_probe(&self, _runner: &dyn CommandRunner) -> EstablishProbe {
+        EstablishProbe::Other
+    }
+    /// The control interface of a live daemon has stopped answering. Recovers
+    /// it (the shared daemon is respawned once for every line) and starts this
+    /// line's negotiation again. Default: nothing to recover.
+    fn recover_wedged_control(&self, _runner: &dyn CommandRunner) {}
     /// Why this line's IKE_SA was lost, from the engine's own log. Only the
     /// strongswan engine can tell; the default is `Unknown` (specs/087).
     fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
@@ -527,6 +540,27 @@ pub trait TunnelEngine {
     fn pcscf_reachable(&self, runner: &dyn CommandRunner, pcscf: &str) -> bool;
 }
 
+/// What an establish-loop probe of the control interface found for one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EstablishProbe {
+    /// The bounded listing timed out or failed: the interface did not answer.
+    Unresponsive,
+    /// The daemon answered and has no IKE_SA for this line.
+    NoIkeSa,
+    /// This line's IKE_SA is half-open: charon's own negotiation in flight.
+    Connecting { ike_id: u32 },
+    /// Anything else (established, or an engine that cannot tell).
+    Other,
+}
+
+/// What the establish loop remembers between ticks (#139): the same half-open
+/// record steady state keeps, and consecutive unanswered probes.
+#[derive(Debug, Default)]
+pub struct EstablishTracking {
+    pub half_open: Option<HalfOpen>,
+    pub vici_strikes: u8,
+}
+
 /// Outcome of one establish-time tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EstablishOutcome {
@@ -549,6 +583,7 @@ pub fn tick_establishing(
     runner: &dyn CommandRunner,
     attempt: &mut u32,
     stuck_without_pcscf: &mut bool,
+    tracking: &mut EstablishTracking,
 ) -> EstablishOutcome {
     if engine.is_tunnel_established(runner) {
         if let Some(pcscf) = engine.latest_pcscf(runner) {
@@ -573,17 +608,108 @@ pub fn tick_establishing(
 
     if let Some(cadence) = engine.reinitiate_cadence() {
         if (*attempt).is_multiple_of(cadence) {
-            // Stuck-with-an-established-SA-but-no-P-CSCF gets a full
-            // terminate before re-initiating fresh; a plain "still waiting"
-            // just re-initiates on top of whatever's there.
-            if *stuck_without_pcscf {
-                engine.terminate(runner);
-            }
-            engine.reinitiate(runner);
+            establish_cadence_tick(engine, runner, *stuck_without_pcscf, tracking);
         }
     }
 
     EstablishOutcome::StillEstablishing
+}
+
+/// One re-initiate tick of the establish loop (#139, data-model.md's decision
+/// table). The same rule steady state applies: a half-open IKE_SA is charon's
+/// own negotiation, so stacking another initiate on it adds nothing.
+fn establish_cadence_tick(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    stuck_without_pcscf: bool,
+    tracking: &mut EstablishTracking,
+) {
+    let probe = engine.establish_probe(runner);
+    if probe == EstablishProbe::Unresponsive {
+        tracking.vici_strikes += 1;
+        println!(
+            "{} swanctl --list-sas timed out ({}/{})",
+            engine.log_prefix(),
+            tracking.vici_strikes,
+            VICI_UNRESPONSIVE_STRIKES
+        );
+        if tracking.vici_strikes >= VICI_UNRESPONSIVE_STRIKES {
+            println!(
+                "{} charon control interface unresponsive; restarting the shared daemon",
+                engine.log_prefix()
+            );
+            tracking.vici_strikes = 0;
+            tracking.half_open = None;
+            engine.recover_wedged_control(runner);
+        }
+        return;
+    }
+    tracking.vici_strikes = 0;
+    match probe {
+        EstablishProbe::Connecting { ike_id } => {
+            let (half_open, idle) =
+                observe_half_open(engine, runner, &mut tracking.half_open, ike_id);
+            if idle > HALF_OPEN_STUCK_AFTER {
+                println!(
+                    "{} IKE_SA #{ike_id} half-open with no IKE activity for {}s; terminating and re-initiating",
+                    engine.log_prefix(),
+                    idle.as_secs()
+                );
+                tracking.half_open = None;
+                engine.terminate(runner);
+                engine.reinitiate(runner);
+            } else {
+                tracking.half_open = Some(half_open);
+                let h = tracking.half_open.as_mut().unwrap();
+                if !h.waiting_logged {
+                    h.waiting_logged = true;
+                    println!(
+                        "{} IKE_SA #{ike_id} still negotiating; leaving it to charon",
+                        engine.log_prefix()
+                    );
+                }
+            }
+        }
+        EstablishProbe::NoIkeSa | EstablishProbe::Other => {
+            tracking.half_open = None;
+            // Stuck-with-an-established-SA-but-no-P-CSCF gets a full
+            // terminate before re-initiating fresh.
+            if stuck_without_pcscf {
+                engine.terminate(runner);
+            }
+            engine.reinitiate(runner);
+        }
+        EstablishProbe::Unresponsive => unreachable!("handled above"),
+    }
+}
+
+/// Updates the half-open record for `ike_id` from charon's current IKE
+/// activity and reports how long that activity has been silent. Shared by
+/// the establish loop and steady state so there is one rule for "still
+/// negotiating" (#139 R4).
+fn observe_half_open(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    slot: &mut Option<HalfOpen>,
+    ike_id: u32,
+) -> (HalfOpen, Duration) {
+    let now = SystemTime::now();
+    let activity = engine.ike_activity(runner);
+    let mut half_open = match slot.take() {
+        Some(h) if h.ike_id == ike_id => h,
+        _ => HalfOpen {
+            ike_id,
+            activity: activity.clone(),
+            active_at: now,
+            waiting_logged: false,
+        },
+    };
+    if activity != half_open.activity {
+        half_open.activity = activity;
+        half_open.active_at = now;
+    }
+    let idle = now.duration_since(half_open.active_at).unwrap_or_default();
+    (half_open, idle)
 }
 
 /// Outcome of one steady-state tick.
@@ -767,6 +893,10 @@ pub const RECENT_LIFE: Duration = Duration::from_secs(30);
 /// its inputs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SteadyTracking {
+    /// Consecutive ticks the control-interface listing failed. A second one
+    /// in a row means the shared daemon is wedged, which needs more than a
+    /// per-line recovery (#139).
+    pub vici_strikes: u8,
     /// The pool member that answered while the selection did not, on the last
     /// tick (specs/091 R9); `None` when the selection answered or nothing did.
     pub pcscf_via_sibling: Option<std::net::IpAddr>,
@@ -1157,6 +1287,9 @@ pub fn tick_steady_state_underlay(
     if health != SteadyStateHealth::ChildSaMissing {
         tracking.child_sa_missing.reset();
     }
+    if health != SteadyStateHealth::ViciBroken {
+        tracking.vici_strikes = 0;
+    }
     if !matches!(health, SteadyStateHealth::IkeSaConnecting { .. }) {
         tracking.half_open = None;
     }
@@ -1168,7 +1301,19 @@ pub fn tick_steady_state_underlay(
     }
     match health {
         SteadyStateHealth::ViciBroken => {
-            engine.restart_process(runner);
+            tracking.vici_strikes += 1;
+            if tracking.vici_strikes >= VICI_UNRESPONSIVE_STRIKES {
+                // Still failing after a recovery: a live but wedged daemon,
+                // which `restart_process` never touches (#139 R3).
+                println!(
+                    "{} charon control interface unresponsive; restarting the shared daemon",
+                    engine.log_prefix()
+                );
+                tracking.vici_strikes = 0;
+                engine.recover_wedged_control(runner);
+            } else {
+                engine.restart_process(runner);
+            }
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::ViciBroken,
                 ike_sa_loss_cause: None,
@@ -1563,21 +1708,7 @@ fn tick_half_open(
     tracking: &mut SteadyTracking,
     underlay: &UnderlayView,
 ) -> SteadyOutcome {
-    let now = SystemTime::now();
-    let activity = engine.ike_activity(runner);
-    let mut half_open = match tracking.half_open.take() {
-        Some(h) if h.ike_id == ike_id => h,
-        _ => HalfOpen {
-            ike_id,
-            activity: activity.clone(),
-            active_at: now,
-            waiting_logged: false,
-        },
-    };
-    if activity != half_open.activity {
-        half_open.activity = activity;
-        half_open.active_at = now;
-    }
+    let (mut half_open, idle) = observe_half_open(engine, runner, &mut tracking.half_open, ike_id);
     // The no-route hold that kept this IKE_SA's retransmits from reaching the
     // ePDG has just ended. charon backs off up to ~76s between retransmits, so
     // waiting for its next one can leave the line down for a minute with the
@@ -1597,7 +1728,6 @@ fn tick_half_open(
             ike_sa_loss_cause: None,
         };
     }
-    let idle = now.duration_since(half_open.active_at).unwrap_or_default();
     if idle > HALF_OPEN_STUCK_AFTER {
         if let Some(outcome) = underlay_gate(
             engine,
@@ -1983,6 +2113,12 @@ mod tests {
         dpd_calls: RefCell<u32>,
         /// Whether `send_dpd` reports the check as queued.
         dpd_accepted: RefCell<bool>,
+        /// What `establish_probe` reports (#139).
+        probe: RefCell<EstablishProbe>,
+        /// Every `recover_wedged_control` call.
+        wedge_recoveries: RefCell<u32>,
+        /// Every `cancel_initiate` call.
+        cancel_calls: RefCell<u32>,
     }
 
     impl Default for FakeEngine {
@@ -2022,11 +2158,26 @@ mod tests {
                 evidence: RefCell::new(IkeEvidence::LIFE),
                 dpd_calls: RefCell::new(0),
                 dpd_accepted: RefCell::new(true),
+                probe: RefCell::new(EstablishProbe::Other),
+                wedge_recoveries: RefCell::new(0),
+                cancel_calls: RefCell::new(0),
             }
         }
     }
 
     impl TunnelEngine for FakeEngine {
+        fn establish_probe(&self, _runner: &dyn CommandRunner) -> EstablishProbe {
+            self.probe.borrow().clone()
+        }
+
+        fn recover_wedged_control(&self, _runner: &dyn CommandRunner) {
+            *self.wedge_recoveries.borrow_mut() += 1;
+        }
+
+        fn cancel_initiate(&self, _runner: &dyn CommandRunner) {
+            *self.cancel_calls.borrow_mut() += 1;
+        }
+
         fn pcscf_reachable(&self, _runner: &dyn CommandRunner, pcscf: &str) -> bool {
             self.probed.borrow_mut().push(pcscf.to_string());
             match &*self.reachable_addrs.borrow() {
@@ -2129,7 +2280,13 @@ mod tests {
         };
         let mut attempt = 0;
         let mut stuck = false;
-        let outcome = tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+        let outcome = tick_establishing(
+            &engine,
+            &runner,
+            &mut attempt,
+            &mut stuck,
+            &mut EstablishTracking::default(),
+        );
         assert_eq!(outcome, EstablishOutcome::StillEstablishing);
         assert!(
             stuck,
@@ -2147,7 +2304,13 @@ mod tests {
         };
         let mut attempt = 0;
         let mut stuck = false;
-        let outcome = tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+        let outcome = tick_establishing(
+            &engine,
+            &runner,
+            &mut attempt,
+            &mut stuck,
+            &mut EstablishTracking::default(),
+        );
         assert_eq!(
             outcome,
             EstablishOutcome::Established {
@@ -2166,7 +2329,13 @@ mod tests {
         let mut attempt = 0;
         let mut stuck = false;
         assert_eq!(
-            tick_establishing(&engine, &runner, &mut attempt, &mut stuck),
+            tick_establishing(
+                &engine,
+                &runner,
+                &mut attempt,
+                &mut stuck,
+                &mut EstablishTracking::default()
+            ),
             EstablishOutcome::FatalProcessDied
         );
     }
@@ -2178,14 +2347,26 @@ mod tests {
         let mut attempt = 0;
         let mut stuck = false;
         for _ in 0..14 {
-            tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+            tick_establishing(
+                &engine,
+                &runner,
+                &mut attempt,
+                &mut stuck,
+                &mut EstablishTracking::default(),
+            );
         }
         assert_eq!(
             *engine.reinitiate_calls.borrow(),
             0,
             "no reinitiate before the 15th attempt"
         );
-        tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+        tick_establishing(
+            &engine,
+            &runner,
+            &mut attempt,
+            &mut stuck,
+            &mut EstablishTracking::default(),
+        );
         assert_eq!(attempt, 15);
         assert_eq!(*engine.reinitiate_calls.borrow(), 1);
         assert_eq!(
@@ -2205,10 +2386,162 @@ mod tests {
         let mut attempt = 0;
         let mut stuck = false;
         for _ in 0..STRONGSWAN_REINITIATE_EVERY {
-            tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+            tick_establishing(
+                &engine,
+                &runner,
+                &mut attempt,
+                &mut stuck,
+                &mut EstablishTracking::default(),
+            );
         }
         assert_eq!(*engine.terminate_calls.borrow(), 1);
         assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+    }
+
+    // ---- #139: the establish loop's cadence rule ----------------------
+
+    fn run_cadences(
+        engine: &FakeEngine,
+        tracking: &mut EstablishTracking,
+        cadences: u32,
+    ) -> Vec<EstablishOutcome> {
+        let runner = MockCommandRunner::new();
+        let mut attempt = 0;
+        let mut stuck = false;
+        (0..cadences * STRONGSWAN_REINITIATE_EVERY)
+            .map(|_| tick_establishing(engine, &runner, &mut attempt, &mut stuck, tracking))
+            .collect()
+    }
+
+    #[test]
+    fn an_unbounded_establish_loop_never_gives_up_against_a_silent_epdg() {
+        let engine = FakeEngine::default(); // max_attempts None, no tunnel
+        let outcomes = run_cadences(&engine, &mut EstablishTracking::default(), 667);
+        assert!(outcomes
+            .iter()
+            .all(|o| *o == EstablishOutcome::StillEstablishing));
+        assert!(outcomes.len() >= 10_000);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 667, "one per cadence");
+    }
+
+    #[test]
+    fn an_in_flight_negotiation_is_left_to_charon_across_many_cadences() {
+        let engine = FakeEngine {
+            probe: RefCell::new(EstablishProbe::Connecting { ike_id: 7 }),
+            ..Default::default()
+        };
+        run_cadences(&engine, &mut EstablishTracking::default(), 100);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn a_half_open_ike_sa_idle_past_the_limit_is_terminated_and_initiated_once() {
+        let engine = FakeEngine {
+            probe: RefCell::new(EstablishProbe::Connecting { ike_id: 7 }),
+            ..Default::default()
+        };
+        let mut tracking = EstablishTracking {
+            half_open: Some(HalfOpen {
+                ike_id: 7,
+                activity: None,
+                active_at: SystemTime::now() - HALF_OPEN_STUCK_AFTER - Duration::from_secs(1),
+                waiting_logged: true,
+            }),
+            ..Default::default()
+        };
+        run_cadences(&engine, &mut tracking, 1);
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+        assert!(tracking.half_open.is_none(), "the record is reset");
+    }
+
+    #[test]
+    fn no_ike_sa_initiates_once_per_cadence_and_established_without_pcscf_terminates_first() {
+        let engine = FakeEngine {
+            probe: RefCell::new(EstablishProbe::NoIkeSa),
+            ..Default::default()
+        };
+        run_cadences(&engine, &mut EstablishTracking::default(), 3);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 3);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+
+        let stuck = FakeEngine {
+            established: RefCell::new(true),
+            probe: RefCell::new(EstablishProbe::Other),
+            ..Default::default()
+        };
+        run_cadences(&stuck, &mut EstablishTracking::default(), 1);
+        assert_eq!(*stuck.terminate_calls.borrow(), 1);
+        assert_eq!(*stuck.reinitiate_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn one_unanswered_probe_is_a_strike_and_two_in_a_row_recover_the_daemon_once() {
+        let engine = FakeEngine {
+            probe: RefCell::new(EstablishProbe::Unresponsive),
+            ..Default::default()
+        };
+        let mut tracking = EstablishTracking::default();
+        run_cadences(&engine, &mut tracking, 1);
+        assert_eq!(tracking.vici_strikes, 1);
+        assert_eq!(*engine.wedge_recoveries.borrow(), 0);
+        assert_eq!(
+            *engine.reinitiate_calls.borrow(),
+            0,
+            "no initiate on a strike"
+        );
+        let runner = MockCommandRunner::new();
+        let (mut attempt, mut stuck) = (STRONGSWAN_REINITIATE_EVERY, false);
+        for _ in 0..STRONGSWAN_REINITIATE_EVERY {
+            tick_establishing(&engine, &runner, &mut attempt, &mut stuck, &mut tracking);
+        }
+        assert_eq!(*engine.wedge_recoveries.borrow(), 1);
+        assert_eq!(tracking.vici_strikes, 0, "reset after recovery");
+    }
+
+    #[test]
+    fn an_answered_probe_resets_the_strikes() {
+        let engine = FakeEngine {
+            probe: RefCell::new(EstablishProbe::Unresponsive),
+            ..Default::default()
+        };
+        let mut tracking = EstablishTracking::default();
+        run_cadences(&engine, &mut tracking, 1);
+        assert_eq!(tracking.vici_strikes, 1);
+        *engine.probe.borrow_mut() = EstablishProbe::NoIkeSa;
+        run_cadences(&engine, &mut tracking, 1);
+        assert_eq!(tracking.vici_strikes, 0);
+        assert_eq!(*engine.wedge_recoveries.borrow(), 0);
+    }
+
+    #[test]
+    fn a_silent_epdg_on_one_line_never_touches_a_healthy_line() {
+        // Two engines, one silent. Each engine's decisions are its own: the
+        // healthy one never sees a terminate or recovery from the silent one.
+        let silent = FakeEngine {
+            probe: RefCell::new(EstablishProbe::Connecting { ike_id: 1 }),
+            ..Default::default()
+        };
+        let healthy = FakeEngine {
+            established: RefCell::new(true),
+            pcscf: RefCell::new(Some("192.0.2.1".to_string())),
+            ..Default::default()
+        };
+        run_cadences(&silent, &mut EstablishTracking::default(), 100);
+        let runner = MockCommandRunner::new();
+        let outcome = tick_establishing(
+            &healthy,
+            &runner,
+            &mut 0,
+            &mut false,
+            &mut EstablishTracking::default(),
+        );
+        assert!(matches!(outcome, EstablishOutcome::Established { .. }));
+        assert_eq!(*silent.terminate_calls.borrow(), 0);
+        assert_eq!(*silent.wedge_recoveries.borrow(), 0);
+        assert_eq!(*healthy.terminate_calls.borrow(), 0);
+        assert_eq!(*healthy.wedge_recoveries.borrow(), 0);
     }
 
     #[test]
@@ -2222,11 +2555,23 @@ mod tests {
         let mut attempt = 0;
         let mut stuck = false;
         for _ in 0..SWU_MAX_ESTABLISH_ATTEMPTS - 1 {
-            let outcome = tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+            let outcome = tick_establishing(
+                &engine,
+                &runner,
+                &mut attempt,
+                &mut stuck,
+                &mut EstablishTracking::default(),
+            );
             assert_eq!(outcome, EstablishOutcome::StillEstablishing);
         }
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
-        let final_outcome = tick_establishing(&engine, &runner, &mut attempt, &mut stuck);
+        let final_outcome = tick_establishing(
+            &engine,
+            &runner,
+            &mut attempt,
+            &mut stuck,
+            &mut EstablishTracking::default(),
+        );
         assert_eq!(final_outcome, EstablishOutcome::FatalTimedOut);
     }
 
@@ -2266,6 +2611,29 @@ mod tests {
             }
         );
         assert_eq!(*engine.restart_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn a_second_consecutive_vici_failure_recovers_the_wedged_daemon() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ViciBroken),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(*engine.wedge_recoveries.borrow(), 0);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(*engine.wedge_recoveries.borrow(), 1);
+        assert_eq!(*engine.restart_calls.borrow(), 1, "only the first strike");
+        assert_eq!(tracking.vici_strikes, 0);
+
+        // An answered tick in between resets the count.
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::ViciBroken;
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(*engine.wedge_recoveries.borrow(), 1);
     }
 
     #[test]
