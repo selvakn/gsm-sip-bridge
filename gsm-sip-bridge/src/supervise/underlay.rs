@@ -533,10 +533,14 @@ impl UnderlayTracker {
     fn start_hold(&mut self, cause: UplinkHoldCause, now: Instant, now_at: SystemTime) {
         // The last time the ePDG was heard from, within the bounds: before
         // that it was answering, so the outage cannot reach further back.
+        // The start of the window it was heard in, not the end: the tick
+        // only says it arrived somewhere in between, and the outage may have
+        // begun right after (found live: the end put a dropped-inbound
+        // outage's start 18s after the drop began).
         let ago = self
             .heard
             .map_or(OUTAGE_LOOKBACK_UNHEARD, |h| {
-                now.saturating_duration_since(h.by)
+                now.saturating_duration_since(h.after)
             })
             .min(OUTAGE_LOOKBACK_MAX);
         self.hold = Some(Hold {
@@ -1019,6 +1023,28 @@ mod tests {
                 to: 1_000_000 + 90,
             })
         );
+    }
+
+    #[test]
+    fn an_outage_starts_where_the_last_life_could_first_have_arrived() {
+        // Heard on a tick whose window opened 30s earlier: the packet may be
+        // that old, and the outage may have begun right after it.
+        let mut t = tracker();
+        let t0 = Instant::now();
+        let at0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let silent = Observation {
+            parsed_since_tick: false,
+            ..quiet()
+        };
+        t.begin_tick(&silent, t0, at0);
+        t.begin_tick(&quiet(), t0 + TICK, at0 + TICK);
+        let silent_no_route = Observation {
+            parsed_since_tick: false,
+            ..no_route()
+        };
+        t.begin_tick(&silent_no_route, t0 + TICK * 2, at0 + TICK * 2);
+        t.begin_tick(&silent_no_route, t0 + TICK * 3, at0 + TICK * 3);
+        assert_eq!(t.hold.as_ref().unwrap().last_good_at, at0);
     }
 
     #[test]
