@@ -1667,7 +1667,6 @@ pub(super) fn establish_line_tunnel(
         last_tun_rx: Default::default(),
         epdg_addr: Some(epdg_ip.clone()),
         last_ike_header: Default::default(),
-        pending_initiate: Default::default(),
         probe_generation: Default::default(),
     };
     {
@@ -1699,6 +1698,9 @@ pub(super) fn establish_line_tunnel(
         if let Some(h) = ctx.shared_charon.ensure_started(runner.as_ref()) {
             started.lock().unwrap().vowifi_child_handles.push(h);
         }
+        // Idempotent like the daemon above; shutdown reaps through it.
+        started.lock().unwrap().initiate_clients =
+            Some(Arc::clone(&ctx.shared_charon.initiate_clients));
     }
 
     if !ctx.shared_charon.is_alive(runner.as_ref()) {
@@ -1840,7 +1842,6 @@ fn start_vowifi_line_strongswan(
         last_tun_rx: Default::default(),
         epdg_addr: Some(epdg_ip),
         last_ike_header: Default::default(),
-        pending_initiate: Default::default(),
         probe_generation: Default::default(),
     };
 

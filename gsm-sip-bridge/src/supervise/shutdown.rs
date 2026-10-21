@@ -46,6 +46,10 @@ const DELETE_RETRY_SETTLE: std::time::Duration = std::time::Duration::from_milli
 /// step observes a child, it does not take ownership of one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TeardownStep<'a> {
+    /// Reap every outstanding `swanctl --initiate` client (#139).
+    ReapInitiates {
+        clients: &'a super::engines::InitiateClients,
+    },
     KillChild {
         handle: &'a ChildHandle,
         signal: Signal,
@@ -178,6 +182,10 @@ pub struct StartedState {
     /// setup returns — the same position `started_netns.push` occupies, so a
     /// line that fails later is still fully described here (data-model.md).
     pub vowifi_lines: Vec<StartedVowifiLine>,
+    /// The shared charon's outstanding `swanctl --initiate` clients, which
+    /// the plan reaps first so none outlives the bridge or races the IKE_SA
+    /// terminate (#139, US6).
+    pub initiate_clients: Option<Arc<super::engines::InitiateClients>>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +255,14 @@ pub fn build_shutdown_plan<'a>(
     config_path: &str,
 ) -> Vec<TeardownStep<'a>> {
     let mut steps = Vec::new();
+
+    // --- Initiate clients first: a client that outlives the bridge, or runs
+    // while the IKE_SA is being terminated, would only start a negotiation the
+    // rest of this plan is tearing down (#139). Not a child handle of the
+    // flat list below: they come and go every 30s, so the registry reaps them.
+    if let Some(clients) = &state.initiate_clients {
+        steps.push(TeardownStep::ReapInitiates { clients });
+    }
 
     // --- Terminate every VoWiFi line's IKE_SA, before charon is touched ----
     // (FR-003, invariant O-1). `vowifi_child_handles` is a flat list — it
@@ -570,6 +586,7 @@ impl TeardownStep<'_> {
     /// `NotReleased` or `Abandoned`.
     fn label(&self) -> String {
         match self {
+            TeardownStep::ReapInitiates { .. } => "swanctl --initiate clients".to_string(),
             TeardownStep::KillChild { handle, .. } => format!("process {}", handle.id()),
             TeardownStep::WaitForExit { handle, .. } => format!("process {} exiting", handle.id()),
             TeardownStep::RunInNetns { netns, argv } => {
@@ -609,6 +626,10 @@ impl TeardownStep<'_> {
     /// that uses it.
     fn execute(&self, runner: &dyn CommandRunner, may_retry: bool) -> StepOutcome {
         match self {
+            TeardownStep::ReapInitiates { clients } => {
+                clients.cancel_all(runner);
+                StepOutcome::Ok
+            }
             TeardownStep::KillChild { handle, signal } => {
                 runner.signal(handle, *signal);
                 StepOutcome::Ok
@@ -782,6 +803,27 @@ mod tests {
             h = runner.spawn(ChildSpec::new(["true"])).unwrap();
         }
         Arc::new(h)
+    }
+
+    #[test]
+    fn initiate_clients_are_reaped_before_anything_else() {
+        let runner = MockCommandRunner::new();
+        let clients = Arc::new(super::super::engines::InitiateClients::default());
+        let state = StartedState {
+            initiate_clients: Some(Arc::clone(&clients)),
+            ..Default::default()
+        };
+        let plan = build_shutdown_plan(&state, "/tmp/cfg.toml");
+        assert!(
+            matches!(plan.first(), Some(TeardownStep::ReapInitiates { .. })),
+            "the first step must reap the initiate clients, got {:?}",
+            plan.first()
+        );
+        assert_eq!(
+            plan[0].execute(&runner, false),
+            StepOutcome::Ok,
+            "reaping with none outstanding is a no-op"
+        );
     }
 
     #[test]
