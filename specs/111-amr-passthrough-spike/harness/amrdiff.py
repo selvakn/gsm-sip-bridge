@@ -2,6 +2,9 @@
 # usage: amrdiff.py pcap <portA> <portB>   (frames sent FROM portA vs frames sent TO portB)
 import struct, sys
 FL_NB = [95,103,118,134,148,159,204,244,39,0,0,0,0,0,0,0]  # bits per FT (8 = SID)
+FL_WB = [132,177,253,285,317,365,397,461,477,40,0,0,0,0,0,0]  # AMR-WB (9 = SID)
+import sys as _s
+FL = FL_WB if "wb" in _s.argv[4:] else FL_NB
 def bits(b):
     for byte in b:
         for i in range(7,-1,-1): yield (byte >> i) & 1
@@ -14,7 +17,7 @@ def parse(payload, octet):
             if not t & 0x80: break
         frames = []
         for ft, q in tocs:
-            n = FL_NB[ft]; nb = (n + 7)//8
+            n = FL[ft]; nb = (n + 7)//8
             fb = tuple(list(bits(payload[i:i+nb]))[:n]); i += nb
             frames.append((ft, q, fb))
         return cmr, frames
@@ -26,7 +29,7 @@ def parse(payload, octet):
         if not f: break
     frames = []
     for ft, q in tocs:
-        n = FL_NB[ft]; frames.append((ft, q, tuple(bs[p:p+n]))); p += n
+        n = FL[ft]; frames.append((ft, q, tuple(bs[p:p+n]))); p += n
     return cmr, frames
 def rtp(pcap, pred):
     d = open(pcap, "rb").read(); off = 24
@@ -46,7 +49,7 @@ def collect(pcap, pred, octet):
     for sp, dp, pt, seq, ts, ssrc, pl in rtp(pcap, pred):
         cmr, fr = parse(pl, octet); cmrs.add(cmr); frames += fr; meta.append((seq, ts, ssrc, len(fr)))
     return frames, cmrs, meta
-pcap, a, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); octet = len(sys.argv) > 4
+pcap, a, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); octet = "oa" in sys.argv[4:]; SPEECH = 9 if "wb" in sys.argv[4:] else 8
 fa, ca, ma = collect(pcap, lambda s, d: s == a, octet)
 fb, cb, mb = collect(pcap, lambda s, d: d == b, octet)
 from collections import Counter
@@ -54,7 +57,7 @@ print(f"leg-in  (from :{a}) pkts={len(ma)} frames={len(fa)} CMRs={sorted(ca)} FT
 print(f"leg-out (to   :{b}) pkts={len(mb)} frames={len(fb)} CMRs={sorted(cb)} FTs={dict(Counter(f[0] for f in fb))} ssrc={sorted({m[2] for m in mb})}")
 print(f"frames/pkt in={Counter(m[3] for m in ma)} out={Counter(m[3] for m in mb)}")
 # align on the longest common run of speech frames
-sa = [f for f in fa if f[0] < 8]; sb = [f for f in fb if f[0] < 8]
+sa = [f for f in fa if f[0] < SPEECH]; sb = [f for f in fb if f[0] < SPEECH]
 idx = {f[2]: i for i, f in enumerate(sa)}
 start = next((j for j, f in enumerate(sb) if f[2] in idx), None)
 if start is None:

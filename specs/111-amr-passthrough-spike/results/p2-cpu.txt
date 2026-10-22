@@ -1,0 +1,67 @@
+######## base
+B| call 1 media_status=1 conf_slot=1
+B| call 0 media_status=1 conf_slot=2
+B| call 0 media_status=3 conf_slot=3
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=91 | forwarder rx=0 tx=0 rtcp rx=0 tx=0
+B| out-leg (Y): PJSIP stream sent rtp=406, received rtp=406 | forwarder rx=0 tx=0 rtcp rx=0 tx=0
+B| CPU during call window: 368.9 ms
+B| call 0 media_status=1 conf_slot=2
+  :4000  -> :4002    564 pkts  {96: 528, 120: 36}
+  :4001  -> :4003     13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :4002  -> :4000    465 pkts  {96: 465}
+  :4003  -> :4001     14 pkts  {'rtcp201': 9, 'rtcp200': 5}
+  :4004  -> :6000    565 pkts  {101: 565}
+  :4005  -> :6001      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :6000  -> :4004    565 pkts  {101: 565}
+  :6001  -> :4005      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+-- exact payload compare
+  :6000->B 565 pkts, B->:4000 465 pkts; identical (seq, ts, ssrc, payload) in order: 0/465
+  :4000->B 564 pkts, B->:6000 565 pkts; identical (seq, ts, ssrc, payload) in order: 0/564
+######## fwd
+B| call 1 media_status=1 conf_slot=1
+B| call 0 media_status=1 conf_slot=2
+B| call 0 media_status=3 conf_slot=3
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=404 tx=404 rtcp rx=8 tx=4
+B| out-leg (Y): PJSIP stream sent rtp=404, received rtp=404 | forwarder rx=404 tx=404 rtcp rx=4 tx=8
+B| CPU during call window: 341.4 ms
+B| call 0 media_status=1 conf_slot=2
+  :4000  -> :49712   563 pkts  {96: 527, 120: 36}
+  :4001  -> :49713    14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+  :6000  -> :52184   563 pkts  {101: 563}
+  :6001  -> :52185     7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :49712 -> :4000    563 pkts  {96: 563}
+  :49713 -> :4001      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :52184 -> :6000    563 pkts  {101: 527, 120: 36}
+  :52185 -> :6001     14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+05:06:51.263            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+05:06:51.502            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+05:06:51.743            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563
+  :4000->B 563 pkts, B->:6000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563
+######## fwdpause
+B| call 1: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 1 media_status=1 conf_slot=1
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0 media_status=1 conf_slot=2
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0 media_status=3 conf_slot=3
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=404 tx=404 rtcp rx=8 tx=4
+B| out-leg (Y): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=404 tx=404 rtcp rx=4 tx=8
+B| CPU during call window: 72.7 ms
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0 media_status=1 conf_slot=2
+  :4000  -> :39784   563 pkts  {96: 527, 120: 36}
+  :4001  -> :39785    14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+  :6000  -> :53764   563 pkts  {101: 563}
+  :6001  -> :53765     7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :39784 -> :4000    563 pkts  {96: 563}
+  :39785 -> :4001      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :53764 -> :6000    563 pkts  {101: 527, 120: 36}
+  :53765 -> :6001     14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+05:07:09.548            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+05:07:09.788            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+05:07:10.027            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563
+  :4000->B 563 pkts, B->:6000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563

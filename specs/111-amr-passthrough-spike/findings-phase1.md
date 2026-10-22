@@ -12,7 +12,7 @@
 - **Risk 2** (ringback) is harmless in Agent B but breaks the GSM path.
 - **Risk 3** (format matching) shows the switchboard runs **one clock rate per process** and can't connect passthrough to PCM. Today's per-call transcode fallback can't live in the same process as a passthrough call.
 
-Recommendation: do not pursue option 2b. Pursue **option 2a** (PJSIP for signalling only, plus a Rust RTP forwarder in Agent B). It sidesteps all three risks:
+Recommendation: do not pursue option 2b. Pursue **option 2a** (its PJSIP hook is proven in [phase 2](findings-phase2.md)) (PJSIP for signalling only, plus a Rust RTP forwarder in Agent B). It sidesteps all three risks:
 - no pjmedia codec table;
 - no process-global conference mode;
 - AMR-WB framing handled by `ims/amr_rtp.rs`, which already exists.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reproduce spike #111 phase 1. Builds pjproject 2.16 twice (stock, and
+# Reproduce spike #111 phases 1 and 2. Builds pjproject 2.16 twice (stock, and
 # switchboard+passthrough), compiles the "Agent B" harness against both, and
 # runs every experiment on loopback inside one throwaway container. Results
 # land in ../results/. No privileges needed; no network beyond the pjproject
@@ -19,4 +19,11 @@ docker run --rm -v "$W":/lab spike111-lab sh -c '
   echo "== R2 Agent B ringback";       /lab/run_call.sh r2a b-passthru --pt-amr --no-opencore --ptime20 --clock 8000 --ringback
   echo "== R2 GSM-style slot 0";       /lab/run_gsm.sh r2d b-passthru --gsm --clock 8000
   echo "== R3 matrix";                 /lab/r3.sh
+  # Phase 2: PJSIP signalling only, Rust-style forwarder (option 2a)
+  gcc -g -o /lab/b2 /lab/b2.c $(PKG_CONFIG_PATH=/opt/stock/lib/pkgconfig pkg-config --cflags --libs --static libpjproject) -lpthread
+  for m in base fwd fwdpause; do
+    case $m in base) a="";; fwd) a="--fwd";; fwdpause) a="--fwd --pause";; esac
+    echo "== P2 $m"; /lab/run2.sh p2$m $a
+  done
+  echo "== P2 forwarder residence"; python3 -I /lab/residence.py /lab/out/p2fwdpause.pcap 6000 4000; python3 -I /lab/residence.py /lab/out/p2fwdpause.pcap 4000 6000
 ' | tee "$R/run-$(date +%Y%m%d-%H%M%S).txt"

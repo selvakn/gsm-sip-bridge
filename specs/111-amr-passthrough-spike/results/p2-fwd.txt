@@ -1,0 +1,70 @@
+######## FWD
+B| mode=signalling-only+forwarder published=172.17.0.4
+B| call 0: forwarder bound 172.17.0.4:56912/56913; loop_create2 -> 0; closing PJSIP's own transport
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 56912
+B| call 0 state EARLY
+B| answer in-call 0 180 -> 0
+B| call 1: forwarder bound 172.17.0.4:35492/35493; loop_create2 -> 0; closing PJSIP's own transport
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 35492
+B| call 1 local SDP (offer): c=172.17.0.4 m=text 4006
+B| call 1 state CALLING
+B| make_call -> 0
+B| call 1 state CONNECTING
+B| call 1 media_status=1 conf_slot=1
+B| call 1: codec AMR-WB/16000, remote RTP 172.17.0.4:6000, pt tx=101 rx=101, tel-event tx=120 rx=120
+B| call 1 state CONFIRMED
+B| call 0 media_status=1 conf_slot=2
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| forwarder started (no conference connection made)
+B| call 0 state CONNECTING
+B| answer in-call 200 -> 0
+B| call 0 state CONFIRMED
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 56912
+B| call 0 media_status=3 conf_slot=3
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 56912
+B| call 0 media_status=1 conf_slot=2
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| in-leg (X): no stream stat
+B| out-leg (Y): no stream stat
+B| CPU user=0.437s sys=0.082s
+-- flows
+  :4000  -> :56912   564 pkts  {96: 528, 120: 36}
+  :4001  -> :56913    14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+  :6000  -> :35492   565 pkts  {101: 565}
+  :6001  -> :35493     7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :35492 -> :6000    564 pkts  {101: 528, 120: 36}
+  :35493 -> :6001     14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+  :56912 -> :4000    565 pkts  {96: 565}
+  :56913 -> :4001      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+-- AMR-WB frames Y->B vs B->X
+leg-in  (from :6000) pkts=565 frames=565 CMRs=[15] FTs={2: 565} ssrc=[2133522531]
+leg-out (to   :4000) pkts=565 frames=565 CMRs=[15] FTs={2: 565} ssrc=[2133522531]
+frames/pkt in=Counter({1: 565}) out=Counter({1: 565})
+RESULT: 565 consecutive speech frames bit-identical (out-leg speech frames=565, offset in=0 out=0)
+-- AMR-WB frames X->B vs B->Y
+leg-in  (from :4000) pkts=564 frames=564 CMRs=[0, 15] FTs={2: 537, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[531785138]
+leg-out (to   :6000) pkts=564 frames=564 CMRs=[0, 15] FTs={2: 537, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[531785138]
+frames/pkt in=Counter({1: 564}) out=Counter({1: 564})
+RESULT: 150 consecutive speech frames bit-identical (out-leg speech frames=564, offset in=414 out=0)
+-- DTMF seen by Y
+|  #  Send RFC 2833 DTMF       | cl  List ports           |  d  Dump status   |
+|  *  Send DTMF with INFO      | cc  Connect port         | dd  Dump detailed |
+05:04:15.286            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+05:04:15.526            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+05:04:15.766            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- X call events
+05:04:11.986           pjsua_core.c  .PJSUA state changed: CREATED --> INIT
+05:04:11.986           pjsua_core.c  PJSUA state changed: INIT --> STARTING
+05:04:11.986           pjsua_core.c  .PJSUA state changed: STARTING --> RUNNING
+05:04:11.986            pjsua_app.c  .......Call 0 state changed to CALLING
+|  H  Hold call                |  u  Unsubscribe presence | ru  Unregister    |
+|  v  re-inVite (release hold) |  t  Toggle online status |  >  Cycle next ac.|
+05:04:11.996            pjsua_app.c  .....Call 0 state changed to EARLY (180 Ringing)
+05:04:11.996            pjsua_app.c  .....Call 0 state changed to CONNECTING
+05:04:11.996            pjsua_app.c  .....Call 0 state changed to CONFIRMED
+05:04:18.282           pjsua_call.c !Putting call 0 on hold
+05:04:18.283            pjsua_app.c  .....Call 0 media 0 [type=audio], status is Local hold
+05:04:24.287           pjsua_core.c  PJSUA state changed: RUNNING --> CLOSING

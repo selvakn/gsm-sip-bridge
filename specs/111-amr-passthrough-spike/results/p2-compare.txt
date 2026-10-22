@@ -1,0 +1,42 @@
+######## fwd
+B| call 1 local SDP (offer): c=172.17.0.4 m=text 4006
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=404 tx=404 rtcp rx=8 tx=4
+B| out-leg (Y): PJSIP stream sent rtp=404, received rtp=404 | forwarder rx=404 tx=404 rtcp rx=4 tx=8
+B| CPU user=0.476s sys=0.056s
+-- flows
+  :4000  -> :56384   563 pkts  {96: 527, 120: 36}
+  :4001  -> :56385    14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+  :6000  -> :38368   564 pkts  {101: 564}
+  :6001  -> :38369     7 pkts  {'rtcp201': 2, 'rtcp200': 5}
+  :38368 -> :6000    563 pkts  {101: 527, 120: 36}
+  :38369 -> :6001     14 pkts  {'rtcp201': 7, 'rtcp200': 7}
+  :56384 -> :4000    564 pkts  {96: 564}
+  :56385 -> :4001      7 pkts  {'rtcp201': 2, 'rtcp200': 5}
+RESULT: 564 consecutive speech frames bit-identical (out-leg speech frames=564, offset in=0 out=0)
+RESULT: 150 consecutive speech frames bit-identical (out-leg speech frames=563, offset in=413 out=0)
+-- exact payload compare
+  :6000->B 564 pkts, B->:4000 564 pkts; identical (seq, ts, ssrc, payload) in order: 564/564
+  :4000->B 563 pkts, B->:6000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563
+######## base
+B| mode=baseline (conference bridge) published=172.17.0.4
+B| call 1 local SDP (offer): c=172.17.0.4 m=text 4006
+B| baseline: conference-connected 2 <-> 1
+B| baseline: conference-connected 3 <-> 1
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=91 | forwarder rx=0 tx=0 rtcp rx=0 tx=0
+B| out-leg (Y): PJSIP stream sent rtp=405, received rtp=405 | forwarder rx=0 tx=0 rtcp rx=0 tx=0
+B| baseline: conference-connected 2 <-> 1
+B| CPU user=0.563s sys=0.062s
+-- flows
+  :4000  -> :4002    564 pkts  {96: 528, 120: 36}
+  :4001  -> :4003     13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :4002  -> :4000    465 pkts  {96: 465}
+  :4003  -> :4001     14 pkts  {'rtcp201': 9, 'rtcp200': 5}
+  :4004  -> :6000    565 pkts  {101: 565}
+  :4005  -> :6001      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+  :6000  -> :4004    564 pkts  {101: 564}
+  :6001  -> :4005      7 pkts  {'rtcp201': 3, 'rtcp200': 4}
+RESULT: no speech frame of the out-leg appears bit-identical on the in-leg -> frames were RE-ENCODED
+RESULT: 1 consecutive speech frames bit-identical (out-leg speech frames=565, offset in=414 out=0)
+-- exact payload compare
+  :6000->B 564 pkts, B->:4000 465 pkts; identical (seq, ts, ssrc, payload) in order: 0/465
+  :4000->B 564 pkts, B->:6000 565 pkts; identical (seq, ts, ssrc, payload) in order: 0/564

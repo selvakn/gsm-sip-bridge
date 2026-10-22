@@ -1,0 +1,7 @@
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=0ef3b7e0-8c14-495d-986f-562a7deb23c9 remote=<sip:172.17.0.4> media[0].type=-1
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=1fd8deba-904e-4827-bae2-e47abc8b9acd remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=-1
+RESULT: 563 consecutive speech frames bit-identical (out-leg speech frames=563, offset in=0 out=0)
+RESULT: 150 consecutive speech frames bit-identical (out-leg speech frames=563, offset in=413 out=0)
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563
+  :4000->B 563 pkts, B->:6000 563 pkts; identical (seq, ts, ssrc, payload) in order: 563/563
