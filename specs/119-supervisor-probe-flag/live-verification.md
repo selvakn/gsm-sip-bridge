@@ -5,7 +5,7 @@ Run 2026-10-21 on the local Vodafone rig (single P-CSCF, IPv6), image `gsm-sip-b
 ## Scope
 
 Run: startup line, a 5-minute connect count, default-route deletion, black-holing the sole P-CSCF.
-Also run: the flag-on black-hole repeat (T021). Not run: the one-hour capture (SC-001 is shown by a 5-minute count only), the Jio Pi runs (T022), the 4.5h soaks (T023). SC-002 and SC-005 are therefore unverified.
+Also run: the flag-on black-hole repeat (T021), the Jio Pi checks (T022) and the 4.5h idle soaks (T023). Not run: the one-hour capture (SC-001 is shown by 5-minute connect counts only) and the comparison against the pre-change build. DPD and NAT-T packet counts against spec 098's soak figures were not measured.
 
 ## Results
 
@@ -32,6 +32,21 @@ Image `gsm-sip-bridge:probe119-8e5d11c-arm64` (arm-build-200, `git archive HEAD`
 
 The route repair at 19:31:00 restarts the IMS agent (known behaviour), which is why the agent log shows a fresh start at 19:31:06 before the black-hole took effect.
 
+## 4.5h idle soak, probe off (SC-002)
+
+Sampled every 5 minutes from outside the container (registered gauge, container ID, TCP `ActiveOpens` in the line's netns, recovery and dead-peer counters). No faults injected during either window.
+
+| Rig | Window (UTC) | Samples | Registered | Container | Recoveries | Dead-peer losses | Uplink hold |
+|---|---|---|---|---|---|---|---|
+| Vodafone (local) | 19:18 to 23:48 | 54 | 54 of 54 | same throughout | none | none | not sampled |
+| Jio Pi | 19:41 to 00:14 | 53 | 53 of 53 | same throughout | only the `default_route_missing` from the deliberate route deletion before the window (count stayed 1) | none | 0 in every sample |
+
+TCP opens in the namespace rose by 2 about every 55 minutes on both rigs (Vodafone 4 to 12, Pi 8 to 19, the Pi also including the failover's reconnect before the window). That is the IMS agent's hourly registration refresh; the probe would have added about 120 an hour. No teardown, no false dead-peer loss.
+
+The Pi's nightly uplink outage (about 21:30Z, see the project notes) did not show in any 5-minute sample: `uplink_held` stayed 0 and the line stayed registered. A shorter outage between samples cannot be ruled out, but no recovery or dead-peer loss was counted.
+
+SC-002: met on both rigs.
+
 ## Notes
 
 A first flag-on attempt at 18:09 was invalid and is discarded: the black-hole route's next hop was the veth peer's link-local address from the previous container, which changes when the container is recreated (the neighbour showed FAILED and the kernel fell back to the tunnel route, so the probe kept succeeding). Re-read the peer address after every recreate.
@@ -40,4 +55,4 @@ The comparison with the pre-change build (the original T021 wording) was not run
 
 ## Open
 
-T023 (soak) is running; see below once complete.
+SC-001 over a full hour, and the pre-change comparison, were not run.

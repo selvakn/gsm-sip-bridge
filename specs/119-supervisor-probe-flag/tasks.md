@@ -70,8 +70,8 @@ Follow `quickstart.md`. Throwaway image tags; record every run's raw evidence (c
 - [X] T020 Vodafone, probe off: delete the default route (SC-003), then black-hole the sole P-CSCF (SC-004, 315s bound). Record the recovery reason and time.
 - [X] T021 (flag-on vs flag-off timing, not vs the pre-change build) Vodafone, probe on: repeat the black-hole run and confirm the `pcscf_unreachable` rebuild and timing match the pre-change build (SC-006).
 - [X] T022 (skipped the IPv6 route deletion; the selection is IPv4) Cross-build arm64 (`arm-build-200`) and deploy to the Jio Pi, recreating the container (not restarting). Repeat T019's capture and T020's route deletion; black-hole the current P-CSCF and confirm the agent's failover without a rebuild (SC-005, 193s).
-- [ ] T023 4.5-hour idle soak, probe off, on both rigs: no teardown, registered throughout, zero false dead-peer losses (SC-002). Count DPD and NAT-T traffic against spec 098's soak figures.
-- [ ] T024 Write up `specs/119-supervisor-probe-flag/live-verification.md` and mark the success criteria met or not. Commit: `docs(119): live verification results (#120)`.
+- [X] T023 (DPD/NAT-T packet counts vs spec 098 not measured) 4.5-hour idle soak, probe off, on both rigs: no teardown, registered throughout, zero false dead-peer losses (SC-002). Count DPD and NAT-T traffic against spec 098's soak figures.
+- [X] T024 Write up `specs/119-supervisor-probe-flag/live-verification.md` and mark the success criteria met or not. Commit: `docs(119): live verification results (#120)`.
 
 ## Phase 8: Polish
 
