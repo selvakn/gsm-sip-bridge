@@ -1,0 +1,67 @@
+##### pt-amr (opencore kept)
+B| pjsua_init -> 0 (switchboard=1 passthrough=1)
+B| codecs after pjsua_init (14):
+B| passthrough_deinit -> 0
+B| passthrough_init2({AMR}) -> 0
+B| codecs after passthrough re-init (15):
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt= clock=16000 bps=256000 listeners=0
+B| call 0 state EARLY
+B| answered in-call 0 with 180 -> 0
+B| call 1 state CALLING
+B| make_call(sip:y@127.0.0.1:5080;transport=udp) -> 0 out_call=1
+B| call 1 state CONNECTING
+B| call 1 media active, conf_slot=1 codec=AMR/8000 fmt= bps=5900
+B|   : slot 1 'sip:y@127.0.0.1:5080;transport=udp' fmt= clock=8000 bps=128000 listeners=0
+B| call 1: peer not active yet
+B| call 1 state CONFIRMED
+B| call 0 media active, conf_slot=2 codec=AMR/8000 fmt= bps=5900
+B|   : slot 2 'sip:172.17.0.4' fmt= clock=8000 bps=128000 listeners=0
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+B|   : slot 1 'sip:y@127.0.0.1:5080;transport=udp' fmt= clock=8000 bps=128000 listeners=1
+B|   slot0: slot 0 'Master/sound' fmt= clock=16000 bps=256000 listeners=0
+B| call 0 state CONNECTING
+B| out leg confirmed: answer in-call 0 200 -> 0
+B| call 0 state CONFIRMED
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| done
+leg-in  (from :6000) pkts=548 frames=548 CMRs=[15] FTs={2: 548} ssrc=[1927310381]
+leg-out (to   :4000) pkts=1095 frames=1095 CMRs=[15] FTs={2: 1095} ssrc=[1024588110]
+frames/pkt in=Counter({1: 548}) out=Counter({1: 1095})
+RESULT: 3 consecutive speech frames bit-identical (out-leg speech frames=1095, offset in=545 out=132)
+##### pt-amr --no-opencore
+B| pjsua_init -> 0 (switchboard=1 passthrough=1)
+B| codecs after pjsua_init (14):
+B| opencore_amr_deinit -> 0
+B| passthrough_deinit -> 0
+B| passthrough_init2({AMR}) -> 0
+B| codecs after passthrough re-init (13):
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt= clock=16000 bps=256000 listeners=0
+B| call 0 state EARLY
+B| answered in-call 0 with 180 -> 0
+B| call 1 state CALLING
+B| make_call(sip:y@127.0.0.1:5080;transport=udp) -> 0 out_call=1
+B| call 1 state CONNECTING
+B| call 1 media active, conf_slot=1 codec=AMR/8000 fmt= AMR bps=7400
+B|   : slot 1 'sip:y@127.0.0.1:5080;transport=udp' fmt= AMR clock=8000 bps=7400 listeners=0
+B| call 1: peer not active yet
+B| call 1 state CONFIRMED
+B| call 0 media active, conf_slot=2 codec=AMR/8000 fmt= AMR bps=7400
+B|   : slot 2 'sip:172.17.0.4' fmt= AMR clock=8000 bps=7400 listeners=0
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+B|   : slot 1 'sip:y@127.0.0.1:5080;transport=udp' fmt= AMR clock=8000 bps=7400 listeners=1
+B|   slot0: slot 0 'Master/sound' fmt= clock=16000 bps=256000 listeners=0
+B| call 0 state CONNECTING
+B| out leg confirmed: answer in-call 0 200 -> 0
+B| call 0 state CONFIRMED
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| done
+leg-in  (from :6000) pkts=548 frames=548 CMRs=[15] FTs={2: 548} ssrc=[1441957686]
+leg-out (to   :4000) pkts=548 frames=1096 CMRs=[15] FTs={15: 549, 2: 547} ssrc=[1661094190]
+frames/pkt in=Counter({1: 548}) out=Counter({2: 548})
+RESULT: 547 consecutive speech frames bit-identical (out-leg speech frames=547, offset in=0 out=0)

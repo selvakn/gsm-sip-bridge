@@ -1,0 +1,18 @@
+B| codec_get_param(AMR/8000) -> 0 frm_per_pkt=2 ptime=20
+B| codec_set_param(AMR/8000, frm_per_pkt=1) -> 0
+B| call 1 media active, conf_slot=1 codec=AMR/8000 fmt= AMR bps=7400
+B| call 0 media active, conf_slot=2 codec=AMR/8000 fmt= AMR bps=7400
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+leg-in  (from :6000) pkts=548 frames=548 CMRs=[15] FTs={2: 548} ssrc=[1222187185]
+leg-out (to   :4000) pkts=1096 frames=1096 CMRs=[15] FTs={15: 549, 2: 547} ssrc=[1706402066]
+frames/pkt in=Counter({1: 548}) out=Counter({1: 1096})
+RESULT: 547 consecutive speech frames bit-identical (out-leg speech frames=547, offset in=0 out=0)
+== 6000 from
+ts deltas [(160, 547)]
+seq deltas [(1, 547)]
+first frames: SSSSSSSSSSSSSSS
+== 4000 to
+ts deltas [(160, 1095)]
+seq deltas [(1, 1095)]
+first frames: DDSDSDSDSDSDSDS

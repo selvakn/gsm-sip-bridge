@@ -1,0 +1,93 @@
+######## R2a passthru, paired AMR passthrough call + ringback
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt= clock=8000 bps=128000 listeners=0
+B| call 0 state EARLY
+B| ringback: tonegen_create(clock=8000) -> 0
+B| ringback: conf_add_port -> 0 slot=1
+B| ringback: conf_connect(1,0) -> 0
+B|    slot 1 -> slot 0
+B| ringback: transmitters into slot 0 = 1
+B| answered in-call 0 with 180 -> 0
+B| call 1 state CALLING
+B| make_call(sip:y@127.0.0.1:5080;transport=udp) -> 0 out_call=1
+B| call 1 state CONNECTING
+B| call 1 media active, conf_slot=2 codec=AMR/8000 fmt= AMR bps=7400
+B|   : slot 2 'sip:y@127.0.0.1:5080;transport=udp' fmt= AMR clock=8000 bps=7400 listeners=0
+B| call 1: peer not active yet
+B| call 1 state CONFIRMED
+B| ringback: conf_disconnect(1,0) -> 0
+B| ringback: conf_remove_port -> 0
+B| ringback stopped: transmitters into slot 0 = 0
+B| call 0 media active, conf_slot=1 codec=AMR/8000 fmt= AMR bps=7400
+B|   : slot 1 'sip:172.17.0.4' fmt= AMR clock=8000 bps=7400 listeners=0
+B| PAIR connect(1->2) -> 0 (ok)
+B| PAIR connect(2->1) -> 0 (ok)
+B|   : slot 2 'sip:y@127.0.0.1:5080;transport=udp' fmt= AMR clock=8000 bps=7400 listeners=1
+B|   slot0: slot 0 'Master/sound' fmt= clock=8000 bps=128000 listeners=0
+B| call 0 state CONNECTING
+B| out leg confirmed: answer in-call 0 200 -> 0
+B| call 0 state CONFIRMED
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| done
+RESULT: 547 consecutive speech frames bit-identical (out-leg speech frames=547, offset in=0 out=0)
+######## R2b passthru, paired PCMU call + ringback (clock 16k as Agent B)
+B| ringback: tonegen_create(clock=16000) -> 0
+B| ringback: conf_add_port -> 0 slot=1
+B| ringback: conf_connect(1,0) -> 0
+B| ringback: transmitters into slot 0 = 1
+B| call 1 media active, conf_slot=2 codec=PCMU/8000 fmt= bps=64000
+B| ringback: conf_disconnect(1,0) -> 0
+B| ringback: conf_remove_port -> 0
+B| ringback stopped: transmitters into slot 0 = 0
+B| call 0 media active, conf_slot=1 codec=PCMU/8000 fmt= bps=64000
+B| PAIR connect(1->2) -> 0 (ok)
+B| PAIR connect(2->1) -> 0 (ok)
+######## R2c stock, GSM-style slot0 + tone
+B exit=0
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt=ÿÿÿ clock=8000 bps=0 listeners=0
+B| call 0 media active, conf_slot=1 codec=PCMU/8000 fmt= bps=64000
+B|   : slot 1 'sip:172.17.0.4' fmt= clock=8000 bps=128000 listeners=0
+B| gsm: connect(call 1 -> 0) -> 0
+B| gsm: connect(0 -> call 1) -> 0
+B| gsm: adjust_tx_level(0,1.5) -> 0
+B| gsm: transmitters into slot 0 = 0
+B| gsm: --- tone starts while the call is connected to slot 0 ---
+B| ringback: tonegen_create(clock=8000) -> 0
+B| ringback: conf_add_port -> 0 slot=2
+B| ringback: conf_connect(2,0) -> 0
+B| ringback: transmitters into slot 0 = 0
+B| ringback: conf_disconnect(2,0) -> 0
+B| ringback: conf_remove_port -> 0
+B| ringback stopped: transmitters into slot 0 = 0
+B| gsm: after tone stop, transmitters into slot 0 = 0 (call->0 LOST)
+B| call 0 state CONNECTING
+B| call 0 state CONFIRMED
+B| call 0 state DISCONNECTED
+B| done
+######## R2d passthru, GSM-style slot0 + tone
+B exit=0
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt= clock=8000 bps=128000 listeners=0
+B| call 0 media active, conf_slot=1 codec=PCMU/8000 fmt= bps=64000
+B|   : slot 1 'sip:172.17.0.4' fmt= clock=8000 bps=128000 listeners=0
+B| gsm: connect(call 1 -> 0) -> 0
+B| gsm: connect(0 -> call 1) -> 0
+B| gsm: adjust_tx_level(0,1.5) -> 0
+B|    slot 1 -> slot 0
+B| gsm: transmitters into slot 0 = 1
+B| gsm: --- tone starts while the call is connected to slot 0 ---
+B| ringback: tonegen_create(clock=8000) -> 0
+B| ringback: conf_add_port -> 0 slot=2
+B| ringback: conf_connect(2,0) -> 0
+B|    slot 2 -> slot 0
+B| ringback: transmitters into slot 0 = 1
+B| ringback: conf_disconnect(2,0) -> 0
+B| ringback: conf_remove_port -> 0
+B| ringback stopped: transmitters into slot 0 = 0
+B| gsm: after tone stop, transmitters into slot 0 = 0 (call->0 LOST)
+B| call 0 state CONNECTING
+B| call 0 state CONFIRMED
+B| call 0 state DISCONNECTED
+B| done

@@ -1,0 +1,62 @@
+######## r3a: X=L16/16000  Y=G722  conf clock=16000  
+B| call 1 media active, conf_slot=1 codec=G722/16000 fmt= bps=64000
+B| call 0 media active, conf_slot=2 codec=L16/16000 fmt= bps=256000
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+  B->X  pt= 96 pkts=  547 over  10.9s =  50.1 pps
+  B->Y  pt=  9 pkts=  548 over  10.9s =  50.1 pps
+  X->B  pt= 96 pkts=  548 over  10.9s =  50.1 pps
+  Y->B  pt=  9 pkts=  548 over  10.9s =  50.1 pps
+######## r3b: X=L16/16000  Y=PCMU  conf clock=16000  
+B| call 1 media active, conf_slot=1 codec=PCMU/8000 fmt= bps=64000
+B| call 0 media active, conf_slot=2 codec=L16/16000 fmt= bps=256000
+B| PAIR connect(2->1) -> 220160 (Media ports are not compatible (PJMEDIA_ENOTCOMPATIBLE))
+B| PAIR connect(1->2) -> 220160 (Media ports are not compatible (PJMEDIA_ENOTCOMPATIBLE))
+  B->X  pt= 96 pkts=  549 over  11.0s =  50.1 pps
+  B->Y  pt=  0 pkts= 1098 over  11.0s = 100.2 pps
+  X->B  pt= 96 pkts=  549 over  11.0s =  50.1 pps
+  Y->B  pt=  0 pkts=  549 over  11.0s =  50.1 pps
+######## r3c: X=PCMU  Y=G722  conf clock=16000  
+B| call 1 media active, conf_slot=1 codec=G722/16000 fmt= bps=64000
+B| call 0 media active, conf_slot=2 codec=PCMU/8000 fmt= bps=64000
+B| PAIR connect(2->1) -> 220160 (Media ports are not compatible (PJMEDIA_ENOTCOMPATIBLE))
+B| PAIR connect(1->2) -> 220160 (Media ports are not compatible (PJMEDIA_ENOTCOMPATIBLE))
+  B->X  pt=  0 pkts= 1096 over  10.9s = 100.2 pps
+  B->Y  pt=  9 pkts=  548 over  10.9s =  50.1 pps
+  X->B  pt=  0 pkts=  548 over  10.9s =  50.1 pps
+  Y->B  pt=  9 pkts=  548 over  10.9s =  50.1 pps
+######## r3d: X=PCMU  Y=PCMU  conf clock=16000  
+B| call 1 media active, conf_slot=1 codec=PCMU/8000 fmt= bps=64000
+B| call 0 media active, conf_slot=2 codec=PCMU/8000 fmt= bps=64000
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+  B->X  pt=  0 pkts= 1097 over  11.0s = 100.1 pps
+  B->Y  pt=  0 pkts= 1099 over  11.0s = 100.3 pps
+  X->B  pt=  0 pkts=  549 over  11.0s =  50.1 pps
+  Y->B  pt=  0 pkts=  549 over  11.0s =  50.1 pps
+######## r3e: X=L16/16000  Y=G722  conf clock=8000  
+B| call 1 media active, conf_slot=1 codec=G722/16000 fmt= bps=64000
+B| call 0 media active, conf_slot=2 codec=L16/16000 fmt= bps=256000
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+  B->X  pt= 96 pkts=  273 over  10.9s =  25.1 pps
+  B->Y  pt=  9 pkts=  274 over  10.9s =  25.1 pps
+  X->B  pt= 96 pkts=  548 over  10.9s =  50.1 pps
+  Y->B  pt=  9 pkts=  548 over  10.9s =  50.1 pps
+######## r3f: X=PCMU  Y=AMR/8000  conf clock=8000  --pt-amr --no-opencore --ptime20
+B| call 1 media active, conf_slot=1 codec=AMR/8000 fmt= AMR bps=7400
+B| call 0 media active, conf_slot=2 codec=PCMU/8000 fmt= bps=64000
+B| PAIR connect(2->1) -> 220160 (Media ports are not compatible (PJMEDIA_ENOTCOMPATIBLE))
+B| PAIR connect(1->2) -> 220160 (Media ports are not compatible (PJMEDIA_ENOTCOMPATIBLE))
+  B->X  pt=  0 pkts=  549 over  11.0s =  50.1 pps
+  X->B  pt=  0 pkts=  549 over  11.0s =  50.1 pps
+  Y->B  pt=101 pkts=  549 over  11.0s =  50.1 pps
+######## r3g: X=L16/16000  Y=AMR-WB  conf clock=16000  
+B| call 1 media active, conf_slot=1 codec=AMR-WB/16000 fmt= bps=12650
+B| call 0 media active, conf_slot=2 codec=L16/16000 fmt= bps=256000
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+  B->X  pt= 96 pkts=  547 over  10.9s =  50.1 pps
+  B->Y  pt=101 pkts=  548 over  10.9s =  50.1 pps
+  X->B  pt= 96 pkts=  548 over  10.9s =  50.1 pps
+  Y->B  pt=101 pkts=  548 over  10.9s =  50.1 pps

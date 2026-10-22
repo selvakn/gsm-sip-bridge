@@ -1,0 +1,16 @@
+B| startup slot0: slot 0 'Master/sound' fmt= clock=8000 bps=128000 listeners=0
+B| PAIR connect(2->1) -> 0 (ok)
+B| PAIR connect(1->2) -> 0 (ok)
+B|   slot0: slot 0 'Master/sound' fmt= clock=8000 bps=128000 listeners=0
+leg-in  (from :6000) pkts=549 frames=549 CMRs=[15] FTs={2: 549} ssrc=[1656214977]
+leg-out (to   :4000) pkts=549 frames=549 CMRs=[15] FTs={15: 1, 2: 548} ssrc=[2145725198]
+frames/pkt in=Counter({1: 549}) out=Counter({1: 549})
+RESULT: 548 consecutive speech frames bit-identical (out-leg speech frames=548, offset in=0 out=0)
+== 6000 from
+ts deltas [(160, 548)]
+seq deltas [(1, 548)]
+first frames: SSSSSSSSSSSSSSS
+== 4000 to
+ts deltas [(160, 548)]
+seq deltas [(1, 548)]
+first frames: DSSSSSSSSSSSSSS

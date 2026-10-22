@@ -1,0 +1,78 @@
+== stock
+B| pjsua_init -> 0 (switchboard=0 passthrough=0)
+B| codecs after pjsua_init (14):
+B|    speex/16000/1            prio=130
+B|    speex/8000/1             prio=129
+B|    speex/32000/1            prio=128
+B|    iLBC/8000/1              prio=128
+B|    GSM/8000/1               prio=128
+B|    PCMU/8000/1              prio=128
+B|    PCMA/8000/1              prio=128
+B|    G722/16000/1             prio=128
+B|    AMR/8000/1               prio=128
+B|    AMR-WB/16000/1           prio=128
+B|    opus/48000/2             prio=128
+B|    L16/44100/1              prio=0
+B|    L16/44100/2              prio=0
+B|    L16/16000/1              prio=0
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt=ÿÿÿ clock=16000 bps=0 listeners=0
+B| done
+== passthru
+B| pjsua_init -> 0 (switchboard=1 passthrough=1)
+B| codecs after pjsua_init (14):
+B|    speex/16000/1            prio=130
+B|    speex/8000/1             prio=129
+B|    speex/32000/1            prio=128
+B|    iLBC/8000/1              prio=128
+B|    GSM/8000/1               prio=128
+B|    PCMU/8000/1              prio=128
+B|    PCMA/8000/1              prio=128
+B|    G722/16000/1             prio=128
+B|    AMR/8000/1               prio=128
+B|    AMR-WB/16000/1           prio=128
+B|    opus/48000/2             prio=128
+B|    L16/44100/1              prio=0
+B|    L16/44100/2              prio=0
+B|    L16/16000/1              prio=0
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt= clock=16000 bps=256000 listeners=0
+B| done
+== passthru --pt-amr
+B| pjsua_init -> 0 (switchboard=1 passthrough=1)
+B| codecs after pjsua_init (14):
+B|    speex/16000/1            prio=130
+B|    speex/8000/1             prio=129
+B|    speex/32000/1            prio=128
+B|    iLBC/8000/1              prio=128
+B|    GSM/8000/1               prio=128
+B|    PCMU/8000/1              prio=128
+B|    PCMA/8000/1              prio=128
+B|    G722/16000/1             prio=128
+B|    AMR/8000/1               prio=128
+B|    AMR-WB/16000/1           prio=128
+B|    opus/48000/2             prio=128
+B|    L16/44100/1              prio=0
+B|    L16/44100/2              prio=0
+B|    L16/16000/1              prio=0
+B| passthrough_deinit -> 0
+B| passthrough_init2({AMR}) -> 0
+B| codecs after passthrough re-init (15):
+B|    speex/16000/1            prio=130
+B|    speex/8000/1             prio=129
+B|    speex/32000/1            prio=128
+B|    iLBC/8000/1              prio=128
+B|    GSM/8000/1               prio=128
+B|    PCMU/8000/1              prio=128
+B|    PCMA/8000/1              prio=128
+B|    G722/16000/1             prio=128
+B|    AMR/8000/1               prio=128
+B|    AMR-WB/16000/1           prio=128
+B|    opus/48000/2             prio=128
+B|    AMR/8000/1               prio=128
+B|    L16/44100/2              prio=0
+B|    L16/16000/1              prio=0
+B|    L16/44100/1              prio=0
+B| set_null_snd_dev -> 0
+B| startup slot0: slot 0 'Master/sound' fmt= clock=16000 bps=256000 listeners=0
+B| done
