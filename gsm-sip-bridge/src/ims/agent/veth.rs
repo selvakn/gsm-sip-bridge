@@ -281,28 +281,7 @@ fn forward(
                             "RTP source SSRC changed mid-call"
                         );
                     }
-                    match &rtcp {
-                        Some(crate::ims::rtcp::RelayRtcpRole::Receiver {
-                            tracker,
-                            ssrc: last_ssrc,
-                        }) => {
-                            if let Ok(mut t) = tracker.lock() {
-                                t.on_packet(
-                                    pkt.seq,
-                                    pkt.timestamp,
-                                    media_start.elapsed(),
-                                    clock_rate,
-                                );
-                            }
-                            if let Ok(mut s) = last_ssrc.lock() {
-                                *s = Some(ssrc);
-                            }
-                        }
-                        Some(crate::ims::rtcp::RelayRtcpRole::Sender(acc)) => {
-                            acc.record_sent(ssrc, pkt.payload.len() as u64, pkt.timestamp);
-                        }
-                        None => {}
-                    }
+                    crate::ims::rtcp::note_rtcp(&rtcp, &pkt, media_start.elapsed(), clock_rate);
                     if Some(payload_type) == src_dtmf_pt {
                         if let Some(dst_pt) = dst_dtmf_pt {
                             if Some(dst_pt) != src_dtmf_pt {

@@ -23,7 +23,8 @@
 /// shared between them — index 7 means 12.2kbps/244 bits in narrowband but
 /// 23.05kbps/461 bits in wideband — so every framing operation has to know
 /// which codec it is working on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AmrKind {
     Nb,
     Wb,
@@ -33,7 +34,7 @@ pub enum AmrKind {
 /// for narrowband, TS 26.201 §4.1 for wideband). `None` for a frame type
 /// that is not a speech frame (SID/comfort noise, NO_DATA, or reserved) —
 /// those carry no audio and are skipped rather than decoded.
-fn speech_bits(kind: AmrKind, frame_type: u8) -> Option<usize> {
+pub(crate) fn speech_bits(kind: AmrKind, frame_type: u8) -> Option<usize> {
     let table: &[usize] = match kind {
         AmrKind::Nb => &[95, 103, 118, 134, 148, 159, 204, 244],
         AmrKind::Wb => &[132, 177, 253, 285, 317, 365, 397, 461, 477],
@@ -44,18 +45,18 @@ fn speech_bits(kind: AmrKind, frame_type: u8) -> Option<usize> {
 /// Reads big-endian bit fields across byte boundaries — RFC 4867's
 /// bandwidth-efficient format packs everything MSB-first with no padding
 /// between fields.
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
     }
 
     /// Reads `n` bits (n <= 8), MSB-first. `None` if the input runs out.
-    fn read(&mut self, n: usize) -> Option<u8> {
+    pub(crate) fn read(&mut self, n: usize) -> Option<u8> {
         let mut out = 0u8;
         for _ in 0..n {
             let byte = self.bytes.get(self.pos / 8)?;
@@ -69,7 +70,7 @@ impl<'a> BitReader<'a> {
     /// Reads `n` bits into left-aligned bytes (the layout the codec libraries
     /// expect for the speech payload: first speech bit in the MSB of byte 0,
     /// trailing bits of the last byte zero-padded).
-    fn read_bits_to_bytes(&mut self, n: usize) -> Option<Vec<u8>> {
+    pub(crate) fn read_bits_to_bytes(&mut self, n: usize) -> Option<Vec<u8>> {
         let mut out = vec![0u8; n.div_ceil(8)];
         for i in 0..n {
             let byte = self.bytes.get(self.pos / 8)?;
@@ -85,13 +86,13 @@ impl<'a> BitReader<'a> {
 /// the final byte (RFC 4867 §4.3 requires the payload be padded to an octet
 /// boundary).
 #[derive(Default)]
-struct BitWriter {
-    bytes: Vec<u8>,
+pub(crate) struct BitWriter {
+    pub(crate) bytes: Vec<u8>,
     bits: usize,
 }
 
 impl BitWriter {
-    fn write(&mut self, value: u8, n: usize) {
+    pub(crate) fn write(&mut self, value: u8, n: usize) {
         for i in (0..n).rev() {
             let bit = (value >> i) & 1;
             if self.bits.is_multiple_of(8) {
@@ -103,7 +104,7 @@ impl BitWriter {
         }
     }
 
-    fn write_bits_from_bytes(&mut self, src: &[u8], n: usize) {
+    pub(crate) fn write_bits_from_bytes(&mut self, src: &[u8], n: usize) {
         for i in 0..n {
             let bit = (src[i / 8] >> (7 - (i % 8))) & 1;
             self.write(bit, 1);

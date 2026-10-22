@@ -1,7 +1,9 @@
 //! Minimal SDP (RFC 4566) build/parse — just enough for a two-codec
 //! (PCMU, AMR-WB) audio offer/answer, not a general-purpose SDP library.
 
+use crate::amr_forward::params::{AmrLegParams, SdpLeg};
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::amr_rtp::AmrKind;
 use std::net::{IpAddr, SocketAddr};
 
 /// The RTCP bandwidth this bridge's answer declares for active senders
@@ -321,6 +323,35 @@ impl OfferedCodec {
             .split(';')
             .map(|p| p.trim().replace(' ', ""))
             .any(|p| p == "octet-align=1")
+    }
+}
+
+impl SdpOffer {
+    /// The negotiated parameters of the AMR leg `chosen` selected from this
+    /// offer, for the passthrough compatibility check (specs/120). `None`
+    /// when `chosen` is not an AMR codec of this offer, or its parameters are
+    /// malformed (the call is then simply not forwarded).
+    pub fn amr_leg_params(&self, chosen: &ChosenCodec) -> Option<AmrLegParams> {
+        let flavour = match chosen.codec {
+            NegotiatedCodec::AmrNb => AmrKind::Nb,
+            NegotiatedCodec::AmrWb => AmrKind::Wb,
+            _ => return None,
+        };
+        let offered = self
+            .offered
+            .iter()
+            .find(|o| o.payload_type == chosen.payload_type)?;
+        AmrLegParams::from_sdp(&SdpLeg {
+            flavour,
+            fmtp: &offered.fmtp,
+            payload_type: chosen.payload_type,
+            dtmf_payload_type: chosen.dtmf_payload_type,
+            // The offer states no `ptime` of its own that we keep: the answer
+            // asks for 20 ms, which is what the carrier then sends.
+            ptime_ms: None,
+            maxptime_ms: self.maxptime,
+        })
+        .ok()
     }
 }
 
@@ -1487,6 +1518,44 @@ mod tests {
          a=sendrecv\r\na=ptime:20\r\na=maxptime:240\r\n\
          a=fmtp:104 mode-set=0,1,2,3;mode-change-capability=2\r\n\
          a=fmtp:110 mode-set=0,1,2,3;octet-align=1; mode-change-capability=2\r\n";
+
+    /// specs/120: the carrier leg's parameters come out of the real Jio offer
+    /// exactly as it states them.
+    #[test]
+    fn amr_leg_params_reads_the_chosen_payload_types_own_fmtp() {
+        let offer = parse_offer(JIO_MT_OFFER).unwrap();
+        let (_, chosen) = build_answer(
+            "192.0.2.1".parse().unwrap(),
+            40000,
+            1,
+            &offer,
+            true,
+            true,
+            AnswerPreference::Cellular,
+            None,
+        )
+        .unwrap();
+        let leg = offer.amr_leg_params(&chosen).expect("AMR-WB was chosen");
+        assert_eq!(leg.flavour, AmrKind::Wb);
+        assert!(leg.octet_aligned, "answered on the octet-aligned type");
+        assert_eq!(leg.payload_type, 110);
+        assert_eq!(leg.mode_set, Some(0b1111), "mode-set=0,1,2,3");
+        assert_eq!(leg.dtmf_payload_type, Some(105));
+        assert_eq!((leg.frames_per_packet, leg.max_frames_per_packet), (1, 12));
+        assert!(!leg.crc && !leg.robust_sorting && !leg.interleaving && !leg.redundancy);
+    }
+
+    #[test]
+    fn amr_leg_params_is_none_for_pcmu() {
+        let offer = offer_of(&[(0, "PCMU/8000")]);
+        let pcmu = ChosenCodec {
+            codec: NegotiatedCodec::Pcmu,
+            payload_type: 0,
+            octet_aligned: false,
+            dtmf_payload_type: None,
+        };
+        assert!(offer.amr_leg_params(&pcmu).is_none());
+    }
 
     /// A carrier that offers one codec under two payload types differing only
     /// in framing is answered on the octet-aligned one — the simpler path

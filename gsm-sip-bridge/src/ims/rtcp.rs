@@ -677,6 +677,36 @@ pub enum RelayRtcpRole {
     },
 }
 
+/// Feeds one relayed packet to its direction's RTCP role (specs/046): a
+/// `Receiver` role measures receive quality and publishes the carrier's SSRC,
+/// a `Sender` role records what leaves toward the carrier. Shared by this PCMU
+/// relay and the AMR forwarder (`amr_forward::relay`); `clock_rate` is the
+/// codec's, so the interarrival-jitter maths is right for 16 kHz wideband.
+pub(crate) fn note_rtcp(
+    role: &Option<RelayRtcpRole>,
+    pkt: &crate::ims::rtp::ParsedPacket<'_>,
+    elapsed: std::time::Duration,
+    clock_rate: u32,
+) {
+    match role {
+        Some(RelayRtcpRole::Receiver {
+            tracker,
+            ssrc: last_ssrc,
+        }) => {
+            if let Ok(mut t) = tracker.lock() {
+                t.on_packet(pkt.seq, pkt.timestamp, elapsed, clock_rate);
+            }
+            if let Ok(mut s) = last_ssrc.lock() {
+                *s = Some(pkt.ssrc);
+            }
+        }
+        Some(RelayRtcpRole::Sender(acc)) => {
+            acc.record_sent(pkt.ssrc, pkt.payload.len() as u64, pkt.timestamp);
+        }
+        None => {}
+    }
+}
+
 /// The shared state behind both directions' [`RelayRtcpRole`]s for one
 /// call's carrier leg, and what the per-call RTCP thread itself reads
 /// from and writes to.

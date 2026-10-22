@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod amr_forward;
 pub mod cli;
 pub mod commands;
 pub mod config;
