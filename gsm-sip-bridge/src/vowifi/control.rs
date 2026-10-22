@@ -82,13 +82,17 @@ pub enum ControlMessage {
         rtp_port: u16,
         client: AmrLegParams,
     },
-    /// Agent A → Agent B. Reply to `ForwardMedia`. `ok: false` carries a
-    /// `Reason` string and leaves the call transcoded.
+    /// Agent A → Agent B. Reply to `ForwardMedia`. `ok: true` carries the
+    /// port Agent A bound on its veth address, so Agent B can aim its half of
+    /// the hop at it; `ok: false` carries a `Reason` string and leaves the call
+    /// transcoded.
     ForwardAck {
         call_id: String,
         ok: bool,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        rtp_port: Option<u16>,
     },
     /// Agent B → Agent A. Abandon an acked forward (the client's re-INVITE
     /// failed, or the re-check failed): discard the pending forwarding socket
@@ -433,11 +437,13 @@ mod tests {
                 call_id: "a1".into(),
                 ok: true,
                 reason: None,
+                rtp_port: Some(40012),
             },
             ControlMessage::ForwardAck {
                 call_id: "a1".into(),
                 ok: false,
                 reason: Some("mode_set".into()),
+                rtp_port: None,
             },
             ControlMessage::ForwardCancel {
                 call_id: "a1".into(),
@@ -462,7 +468,8 @@ mod tests {
             ControlMessage::ForwardAck {
                 call_id: "a1".into(),
                 ok: true,
-                reason: None
+                reason: None,
+                rtp_port: None
             }
         );
     }

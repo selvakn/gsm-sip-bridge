@@ -44,6 +44,27 @@ impl Reason {
     }
 }
 
+impl Reason {
+    /// The inverse of [`Reason::as_str`], for a reason named by the other
+    /// agent on the control channel.
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "disabled" => Reason::Disabled,
+            "outbound" => Reason::Outbound,
+            "carrier_not_amr" => Reason::CarrierNotAmr,
+            "client_not_amr" => Reason::ClientNotAmr,
+            "flavour_differs" => Reason::FlavourDiffers,
+            "mode_set" => Reason::ModeSet,
+            "feature" => Reason::Feature,
+            "ptime" => Reason::Ptime,
+            "dtmf" => Reason::Dtmf,
+            "ack_timeout" => Reason::AckTimeout,
+            "reinvite_failed" => Reason::ReinviteFailed,
+            _ => return None,
+        })
+    }
+}
+
 impl std::fmt::Display for Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -571,6 +592,7 @@ mod tests {
         for (reason, text) in all {
             assert_eq!(reason.as_str(), text);
             assert_eq!(reason.to_string(), text);
+            assert_eq!(Reason::parse(text), Some(reason));
             assert_eq!(
                 MediaPath::Transcoded { reason }.record_string(),
                 format!("transcoded:{text}")

@@ -11,6 +11,8 @@ use super::call::{spawn_control_reader, ActiveCall, CachedInviteAnswer, DialogIn
 use super::observability;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VETH_INVITE_TIMEOUT};
 use super::{unsupported_required_extensions, CONTROL_TIMEOUT};
+use crate::amr_forward::relay::{ForwardParams, ForwardSession, Leg, Remote};
+use crate::amr_forward::{compatible, AmrLegParams};
 use crate::control::protocol::{BridgeFailureReason, CallStatus};
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::body;
@@ -27,7 +29,7 @@ use crate::ims::sip_client::{
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -89,6 +91,8 @@ pub(super) struct InviteContext<'a> {
     pub(super) access_network_info: &'a str,
     /// See `config::VowifiConfig::respect_caller_privacy`.
     pub(super) respect_caller_privacy: bool,
+    /// See `config::VowifiConfig::amr_passthrough`.
+    pub(super) amr_passthrough: bool,
 }
 
 /// The capability headers on a `200 OK` that answers an inbound INVITE.
@@ -375,6 +379,19 @@ pub(super) fn handle_invite(
         return Ok(None);
     };
 
+    // specs/120: what the carrier leg negotiated, for Agent B to judge against
+    // the client's answer. Only computed when the setting is on, so a
+    // deployment that leaves it off sends exactly the message it always did.
+    // `build_answer` is pure: this is the same selection the real answer makes
+    // below, with a placeholder port.
+    let carrier_amr = carrier_amr_for(
+        ctx.amr_passthrough,
+        session.local_addr.ip(),
+        &offer,
+        ctx.wideband,
+        ctx.answer_preference,
+    );
+
     // Only a wideband *carrier* leg has anything for a wideband veth leg to
     // preserve. A narrowband call (PCMU or AMR-NB — the two shapes Airtel
     // sends when the originating leg is narrowband) keeps the veth link on
@@ -435,7 +452,7 @@ pub(super) fn handle_invite(
             call_id: call_id.clone(),
             caller: caller.clone(),
             caller_name: caller_name_for_onward_signaling(req, ctx.respect_caller_privacy),
-            carrier_amr: None,
+            carrier_amr: carrier_amr.clone(),
         },
     )
     .map_err(BridgeError::Ims)?;
@@ -508,7 +525,24 @@ pub(super) fn handle_invite(
             // in silence until someone picks up. Wait for Agent B to report a
             // real answer — while still watching the carrier's own signaling,
             // since the caller may give up (`CANCEL`) while it rings.
-            match await_pbx_answer(&call_id, &ctrl_rx, &inbound.rx, req, to_tag, &contact, sink)? {
+            let mut forward_offer = ForwardOffer {
+                carrier: carrier_amr.as_ref(),
+                veth_local_ip: ctx.veth_local_ip,
+                control: &mut control,
+                pending: None,
+            };
+            let ringing = await_pbx_answer(
+                &call_id,
+                &ctrl_rx,
+                &inbound.rx,
+                req,
+                to_tag,
+                &contact,
+                sink,
+                Some(&mut forward_offer),
+            )?;
+            let forward_hop = forward_offer.pending.take();
+            match ringing {
                 RingOutcome::Answered => {}
                 RingOutcome::PbxDeclined { reason } => {
                     obs.report_call_not_answered(
@@ -581,31 +615,68 @@ pub(super) fn handle_invite(
                 .is_some()
                 .then(crate::ims::rtcp::CarrierRtcpBundle::new);
 
-            let transcoding = chosen.codec != veth.codec.codec;
-            if transcoding {
-                // The two legs speak different codecs (or the same codec at
-                // different rates), so it has to be terminated on each side
-                // and re-encoded.
-                crate::ims::transcode::spawn_transcoding_relay(
-                    ims_rtp_socket,
-                    veth.rtp_socket,
-                    chosen,
-                    veth.codec,
-                    stop.clone(),
-                    &meter,
-                    rtcp_bundle.clone(),
-                )?;
+            // specs/120: Agent B asked to forward this call's AMR frames and
+            // we accepted, so the carrier socket is wired straight to Agent B's
+            // forwarder instead of through the transcoder. Everything else
+            // below (RTCP toward the carrier, the meters, teardown) is the same
+            // either way.
+            let forwarding;
+            let transcoding;
+            if let (Some(hop), Some(carrier)) = (forward_hop, carrier_amr.as_ref()) {
+                let leg = |socket: UdpSocket| Leg {
+                    socket,
+                    remote: Remote::Connected,
+                    // Agent B relabels to the client's payload types; this hop
+                    // carries the carrier's own.
+                    payload_type: chosen.payload_type,
+                    dtmf_payload_type: chosen.dtmf_payload_type,
+                    octet_aligned: carrier.octet_aligned,
+                };
+                let session = ForwardSession::start(ForwardParams {
+                    kind: carrier.flavour,
+                    a: leg(ims_rtp_socket),
+                    b: leg(hop),
+                    a_rtcp: rtcp_bundle.as_ref().map(|b| b.receiver_role()),
+                    b_rtcp: rtcp_bundle.as_ref().map(|b| b.sender_role()),
+                    a_rx: meter.carrier_rx_counter(),
+                    b_rx: meter.pbx_rx_counter(),
+                    stop: stop.clone(),
+                })
+                .map_err(|e| BridgeError::Ims(format!("AMR forwarder start failed: {e}")))?;
+                // Ends with the call's stop flag, like every other relay. The
+                // veth call is a quiet dialog now: its RTP socket carries
+                // nothing and closes with this scope.
+                session.detach();
+                forwarding = true;
+                transcoding = false;
             } else {
-                // Both legs speak PCMU: forward the payloads untouched.
-                spawn_relay(
-                    ims_rtp_socket,
-                    veth.rtp_socket,
-                    stop.clone(),
-                    &meter,
-                    chosen.dtmf_payload_type,
-                    veth.codec.dtmf_payload_type,
-                    rtcp_bundle.clone(),
-                );
+                forwarding = false;
+                transcoding = chosen.codec != veth.codec.codec;
+                if transcoding {
+                    // The two legs speak different codecs (or the same codec
+                    // at different rates), so it has to be terminated on each
+                    // side and re-encoded.
+                    crate::ims::transcode::spawn_transcoding_relay(
+                        ims_rtp_socket,
+                        veth.rtp_socket,
+                        chosen,
+                        veth.codec,
+                        stop.clone(),
+                        &meter,
+                        rtcp_bundle.clone(),
+                    )?;
+                } else {
+                    // Both legs speak PCMU: forward the payloads untouched.
+                    spawn_relay(
+                        ims_rtp_socket,
+                        veth.rtp_socket,
+                        stop.clone(),
+                        &meter,
+                        chosen.dtmf_payload_type,
+                        veth.codec.dtmf_payload_type,
+                        rtcp_bundle.clone(),
+                    );
+                }
             }
 
             // The per-call RTCP thread itself (US1/US2/US5): sends
@@ -668,6 +739,7 @@ pub(super) fn handle_invite(
                 veth_codec = veth.codec.codec.name(),
                 veth_sample_rate = veth.codec.codec.sample_rate(),
                 transcoding,
+                forwarding,
                 "call answered and bridged"
             );
 
@@ -856,7 +928,16 @@ fn handle_offerless_invite(
         sdp::CodecOffer::preferring_wideband(ctx.wideband && amr_safe::is_available()),
     );
 
-    match await_pbx_answer(call_id, &ctrl_rx, &inbound.rx, req, to_tag, &contact, sink)? {
+    match await_pbx_answer(
+        call_id,
+        &ctrl_rx,
+        &inbound.rx,
+        req,
+        to_tag,
+        &contact,
+        sink,
+        None,
+    )? {
         RingOutcome::Answered => {}
         RingOutcome::PbxDeclined { reason } => {
             obs.report_call_not_answered(
@@ -1119,6 +1200,99 @@ fn decline_response(invite: &SipRequest, to_tag: &str, reason: &str) -> String {
     build_uas_response(status, phrase, invite, Some(to_tag), None, None)
 }
 
+/// What the carrier leg negotiated, for `IncomingCall.carrier_amr` — `None`
+/// when passthrough is off, the chosen codec is not AMR, or its parameters are
+/// not ones forwarding understands. `build_answer` is pure: this is the same
+/// selection the real answer makes later, with a placeholder port.
+fn carrier_amr_for(
+    enabled: bool,
+    local_ip: IpAddr,
+    offer: &sdp::SdpOffer,
+    wideband: bool,
+    preference: sdp::AnswerPreference,
+) -> Option<AmrLegParams> {
+    if !enabled {
+        return None;
+    }
+    let (_, chosen) = sdp::build_answer(
+        local_ip,
+        0,
+        0,
+        offer,
+        amr_safe::is_available(),
+        wideband,
+        preference,
+        None,
+    )
+    .ok()?;
+    offer.amr_leg_params(&chosen)
+}
+
+/// Agent B's offer to forward the call's AMR frames instead of transcoding
+/// (specs/120). Lives for the ring wait: `ForwardMedia` and `ForwardCancel`
+/// arrive on the control channel between `BridgeReady` and `CallAnswered`.
+pub(super) struct ForwardOffer<'a> {
+    /// What the carrier leg negotiated; `None` when the setting is off or the
+    /// codec is not AMR, in which case every `ForwardMedia` is declined.
+    pub(super) carrier: Option<&'a AmrLegParams>,
+    pub(super) veth_local_ip: IpAddr,
+    pub(super) control: &'a mut TcpStream,
+    /// The socket for the hop to Agent B, bound and connected once a
+    /// `ForwardMedia` was accepted; used instead of the transcoding relay if
+    /// `CallAnswered` follows.
+    pub(super) pending: Option<UdpSocket>,
+}
+
+impl ForwardOffer<'_> {
+    fn on_forward_media(&mut self, call_id: &str, rtp_port: u16, client: &AmrLegParams) {
+        let verdict = match self.carrier {
+            None => Err("carrier_not_amr".to_string()),
+            Some(carrier) => compatible(carrier, client)
+                .map_err(|r| r.as_str().to_string())
+                .and_then(|()| {
+                    self.bind_hop(rtp_port)
+                        .map_err(|e| format!("bind_failed: {e}"))
+                }),
+        };
+        let reply = match verdict {
+            Ok((socket, port)) => {
+                self.pending = Some(socket);
+                tracing::info!(call_id = %call_id, hop_port = port, "accepted Agent B's forward offer");
+                ControlMessage::ForwardAck {
+                    call_id: call_id.to_string(),
+                    ok: true,
+                    reason: None,
+                    rtp_port: Some(port),
+                }
+            }
+            Err(reason) => {
+                self.pending = None;
+                tracing::info!(call_id = %call_id, reason = %reason, "declined Agent B's forward offer; the call stays transcoded");
+                ControlMessage::ForwardAck {
+                    call_id: call_id.to_string(),
+                    ok: false,
+                    reason: Some(reason),
+                    rtp_port: None,
+                }
+            }
+        };
+        if let Err(e) = write_msg(self.control, &reply) {
+            tracing::warn!(call_id = %call_id, error = %e, "could not send ForwardAck");
+            self.pending = None;
+        }
+    }
+
+    /// Binds Agent A's end of the hop on the veth address and connects it to
+    /// Agent B's.
+    fn bind_hop(&self, rtp_port: u16) -> std::io::Result<(UdpSocket, u16)> {
+        let socket = UdpSocket::bind((self.veth_local_ip, 0))?;
+        let peer = self.control.peer_addr()?.ip();
+        socket.connect((peer, rtp_port))?;
+        let port = socket.local_addr()?.port();
+        Ok((socket, port))
+    }
+}
+
 /// Why we stopped ringing. The carrier has already been sent its final
 /// response in every case; the distinction is whether **Agent B** still needs
 /// telling — if it does and we don't, the PBX extension keeps ringing at
@@ -1145,6 +1319,7 @@ enum RingOutcome {
 /// RFC 3261 §9.2) or the network keeps retransmitting and the caller is left
 /// listening to a phone that has already been hung up. So this polls both the
 /// control channel and the inbound SIP queue rather than blocking on either.
+#[allow(clippy::too_many_arguments)]
 fn await_pbx_answer(
     call_id: &str,
     ctrl_rx: &mpsc::Receiver<ControlMessage>,
@@ -1153,6 +1328,7 @@ fn await_pbx_answer(
     to_tag: &str,
     contact: &str,
     sink: &SipSink,
+    mut forward: Option<&mut ForwardOffer<'_>>,
 ) -> BridgeResult<RingOutcome> {
     let decline = |status: u16, reason: &str| {
         respond(
@@ -1218,6 +1394,20 @@ fn await_pbx_answer(
                 tracing::info!(call_id = %call_id, reason = %reason, "PBX leg did not answer; declining");
                 respond(sink, &reason, &decline_response(invite, to_tag, &reason));
                 return Ok(RingOutcome::PbxDeclined { reason });
+            }
+            Ok(ControlMessage::ForwardMedia {
+                rtp_port, client, ..
+            }) => match forward.as_deref_mut() {
+                Some(offer) => offer.on_forward_media(call_id, rtp_port, &client),
+                None => {
+                    tracing::warn!(call_id = %call_id, "ForwardMedia on a path that cannot forward; ignoring")
+                }
+            },
+            Ok(ControlMessage::ForwardCancel { .. }) => {
+                if let Some(offer) = forward.as_deref_mut() {
+                    tracing::info!(call_id = %call_id, "Agent B cancelled the forward; the call stays transcoded");
+                    offer.pending = None;
+                }
             }
             Ok(other) => {
                 tracing::warn!(call_id = %call_id, message = ?other, "unexpected control message while ringing");
@@ -1327,6 +1517,7 @@ mod tests {
                 "tag180",
                 "<sip:me@10.0.0.9>",
                 &sink,
+                None,
             )
             .unwrap();
 
@@ -1826,5 +2017,228 @@ mod tests {
             c.contains(";+sip.instance=\"<urn:gsma:imei:860000000000000>\""),
             "the required feature tags must survive: {c}"
         );
+    }
+
+    // ----- specs/120: forwarding offers ------------------------------------
+
+    const JIO_OFFER: &str = "v=0\r\n\
+         o=JIO_ISBC 1 1 IN IP4 ims.example\r\n\
+         s=-\r\nc=IN IP4 192.0.2.50\r\nt=0 0\r\n\
+         m=audio 19730 RTP/AVP 104 110 105\r\n\
+         a=rtpmap:104 AMR-WB/16000\r\n\
+         a=rtpmap:110 AMR-WB/16000\r\n\
+         a=rtpmap:105 telephone-event/16000\r\na=fmtp:105 0-15\r\n\
+         a=sendrecv\r\na=ptime:20\r\na=maxptime:240\r\n\
+         a=fmtp:104 mode-set=0,1,2,3;mode-change-capability=2\r\n\
+         a=fmtp:110 mode-set=0,1,2,3;octet-align=1; mode-change-capability=2\r\n";
+
+    fn carrier_for(enabled: bool, body: &str) -> Option<AmrLegParams> {
+        carrier_amr_for(
+            enabled,
+            "192.0.2.1".parse().unwrap(),
+            &sdp::parse_offer(body).unwrap(),
+            true,
+            sdp::AnswerPreference::legacy(),
+        )
+    }
+
+    #[test]
+    fn the_carrier_leg_is_reported_only_when_passthrough_is_on_and_the_codec_is_amr() {
+        // Off: nothing, so IncomingCall is the message it always was.
+        assert_eq!(carrier_for(false, JIO_OFFER), None);
+        // On with an AMR-WB offer (amr_safe may be unavailable in this build,
+        // in which case no AMR codec is chosen and that is also `None`).
+        let on = carrier_for(true, JIO_OFFER);
+        if amr_safe::is_available() {
+            let leg = on.expect("AMR-WB was chosen");
+            assert_eq!((leg.payload_type, leg.octet_aligned), (110, true));
+            assert_eq!(leg.mode_set, Some(0b1111));
+        } else {
+            assert_eq!(on, None);
+        }
+        // A PCMU-only offer is never AMR.
+        let pcmu = "v=0\r\nc=IN IP4 192.0.2.50\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(carrier_for(true, pcmu), None);
+    }
+
+    fn client_wb(fmtp: &str) -> AmrLegParams {
+        use crate::amr_forward::SdpLeg;
+        AmrLegParams::from_sdp(&SdpLeg {
+            flavour: crate::ims::amr_rtp::AmrKind::Wb,
+            fmtp,
+            payload_type: 96,
+            dtmf_payload_type: Some(101),
+            ptime_ms: Some(20),
+            maxptime_ms: None,
+        })
+        .unwrap()
+    }
+
+    /// A control connection pair: Agent A's writer end and the "Agent B" end.
+    fn control_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        (a, b)
+    }
+
+    /// Runs `await_pbx_answer` through a script of control messages ending in
+    /// `CallAnswered`, returning what Agent B read back and the hop socket.
+    fn ring_with(
+        carrier: Option<&AmrLegParams>,
+        script: Vec<ControlMessage>,
+    ) -> (Vec<ControlMessage>, Option<UdpSocket>) {
+        use crate::ims::sip_client::SipTransport;
+        let carrier_side = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink = SipTransport::connect(carrier_side.local_addr().unwrap(), false)
+            .unwrap()
+            .sink()
+            .unwrap();
+        let (_sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+        for m in script {
+            ctrl_tx.send(m).unwrap();
+        }
+        ctrl_tx
+            .send(ControlMessage::CallAnswered {
+                call_id: "c1".into(),
+            })
+            .unwrap();
+        let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+        let (mut a_end, b_end) = control_pair();
+        let mut offer = ForwardOffer {
+            carrier,
+            veth_local_ip: "127.0.0.1".parse().unwrap(),
+            control: &mut a_end,
+            pending: None,
+        };
+        let outcome = await_pbx_answer(
+            "c1",
+            &ctrl_rx,
+            &sip_rx,
+            &req,
+            "tag",
+            "<sip:me@10.0.0.9>",
+            &sink,
+            Some(&mut offer),
+        )
+        .unwrap();
+        assert!(matches!(outcome, RingOutcome::Answered));
+        let pending = offer.pending.take();
+        drop(a_end);
+        let mut reader = std::io::BufReader::new(b_end);
+        let mut got = Vec::new();
+        while let Ok(m) = crate::vowifi::control::read_msg(&mut reader) {
+            got.push(m);
+        }
+        (got, pending)
+    }
+
+    #[test]
+    fn a_compatible_forward_offer_is_acked_with_a_hop_socket_aimed_at_agent_b() {
+        let b_hop = UdpSocket::bind("127.0.0.1:0").unwrap();
+        b_hop
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let carrier = client_wb("octet-align=1");
+        let (replies, pending) = ring_with(
+            Some(&carrier),
+            vec![ControlMessage::ForwardMedia {
+                call_id: "c1".into(),
+                rtp_port: b_hop.local_addr().unwrap().port(),
+                client: client_wb(""),
+            }],
+        );
+        let hop = pending.expect("an accepted offer leaves the hop socket ready");
+        match replies.as_slice() {
+            [ControlMessage::ForwardAck {
+                ok: true,
+                reason: None,
+                rtp_port: Some(port),
+                ..
+            }] => {
+                assert_eq!(*port, hop.local_addr().unwrap().port());
+            }
+            other => panic!("unexpected replies: {other:?}"),
+        }
+        // The hop socket is connected to Agent B's port.
+        hop.send(b"ping").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(b_hop.recv(&mut buf).unwrap(), 4);
+    }
+
+    #[test]
+    fn an_incompatible_forward_offer_is_declined_with_the_reason() {
+        let carrier = client_wb("octet-align=1");
+        let restricted = client_wb("octet-align=1; mode-set=0,1");
+        let (replies, pending) = ring_with(
+            Some(&carrier),
+            vec![ControlMessage::ForwardMedia {
+                call_id: "c1".into(),
+                rtp_port: 40000,
+                client: restricted,
+            }],
+        );
+        assert!(pending.is_none());
+        match replies.as_slice() {
+            [ControlMessage::ForwardAck {
+                ok: false,
+                reason: Some(r),
+                rtp_port: None,
+                ..
+            }] => {
+                assert_eq!(r, "mode_set")
+            }
+            other => panic!("unexpected replies: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forward_offer_on_a_call_whose_carrier_is_not_amr_is_declined() {
+        let (replies, pending) = ring_with(
+            None,
+            vec![ControlMessage::ForwardMedia {
+                call_id: "c1".into(),
+                rtp_port: 40000,
+                client: client_wb(""),
+            }],
+        );
+        assert!(pending.is_none());
+        assert!(matches!(
+            replies.as_slice(),
+            [ControlMessage::ForwardAck { ok: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_forward_leaves_the_call_on_the_transcoding_relay() {
+        let carrier = client_wb("octet-align=1");
+        let (replies, pending) = ring_with(
+            Some(&carrier),
+            vec![
+                ControlMessage::ForwardMedia {
+                    call_id: "c1".into(),
+                    rtp_port: 40000,
+                    client: client_wb(""),
+                },
+                ControlMessage::ForwardCancel {
+                    call_id: "c1".into(),
+                },
+            ],
+        );
+        assert!(pending.is_none(), "cancel discards the pending hop socket");
+        assert!(matches!(
+            replies.as_slice(),
+            [ControlMessage::ForwardAck { ok: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn without_a_forward_offer_nothing_is_pending_and_nothing_is_sent() {
+        let carrier = client_wb("octet-align=1");
+        let (replies, pending) = ring_with(Some(&carrier), vec![]);
+        assert!(pending.is_none());
+        assert!(replies.is_empty(), "today's message sequence is unchanged");
     }
 }

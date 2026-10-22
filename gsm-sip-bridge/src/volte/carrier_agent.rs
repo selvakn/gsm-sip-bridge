@@ -232,6 +232,8 @@ pub(crate) fn run(
         sms_delivery_report: app_config.volte.sms_delivery_report,
         sms_report_pcscf_route: app_config.volte.sms_report_pcscf_route,
         respect_caller_privacy: app_config.volte.respect_caller_privacy,
+        // One deployment-wide setting covers both transports (FR-015).
+        amr_passthrough: app_config.vowifi.amr_passthrough,
         // `[[volte.line]]`'s override, else `[volte]` (itself inheriting
         // `[vowifi]` when unset).
         reg_rejected_cooldown: std::time::Duration::from_secs(

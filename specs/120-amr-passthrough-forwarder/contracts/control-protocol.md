@@ -25,10 +25,10 @@ Sent after the client answered and Agent B judged the call compatible. Agent B h
 ## ForwardAck (A → B)
 
 ```json
-{"event":"forward_ack","call_id":"…","ok":true,"reason":null}
+{"event":"forward_ack","call_id":"…","ok":true,"reason":null,"rtp_port":40012}
 ```
 
-`ok:false` carries a `Reason` string; Agent B then leaves the call transcoded. No reply within 2 s counts as `ack_timeout`.
+`ok:true` carries `rtp_port`, the port Agent A bound on its veth address for the hop; `ok:false` carries a `Reason` string and Agent B then leaves the call transcoded. No reply within 2 s counts as `ack_timeout`.
 
 ## ForwardCancel (B → A)
 

@@ -4,6 +4,7 @@ pub mod call;
 pub mod endpoint;
 pub mod error;
 pub mod log_bridge;
+pub mod passthrough;
 pub mod thread_prio;
 
 pub use account::{Account, AccountConfig, RegistrationListener};
@@ -13,3 +14,4 @@ pub use endpoint::{
     ensure_pjsip_thread, CodecInfo, Disconnect, Endpoint, EndpointConfig, TransportType,
 };
 pub use error::PjsipError;
+pub use passthrough::ClientMedia;

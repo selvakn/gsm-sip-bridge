@@ -90,6 +90,11 @@ pub struct ForwardParams {
     /// one-way-audio monitor reads on a transcoded call (FR-013).
     pub a_rx: Arc<AtomicU64>,
     pub b_rx: Arc<AtomicU64>,
+    /// Ends both pumps when set. A caller that already owns a per-call stop
+    /// flag (Agent A's `ActiveCall`) passes it here and
+    /// [`ForwardSession::detach`]es; others pass a fresh one and keep the
+    /// session, whose `Drop` sets it.
+    pub stop: Arc<AtomicBool>,
 }
 
 /// Whether packets may be sent *towards* each leg. A held or inactive leg is
@@ -109,6 +114,7 @@ pub struct ForwardSession {
     b_rx: Arc<AtomicU64>,
     sent_to_a: Arc<AtomicU64>,
     sent_to_b: Arc<AtomicU64>,
+    detached: bool,
 }
 
 impl ForwardSession {
@@ -131,7 +137,7 @@ impl ForwardSession {
             dtmf_payload_type: p.b.dtmf_payload_type,
             octet_aligned: p.b.octet_aligned,
         });
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = p.stop;
         let gate = Arc::new(Gate {
             towards_a: AtomicBool::new(true),
             towards_b: AtomicBool::new(true),
@@ -179,7 +185,15 @@ impl ForwardSession {
             b_rx: p.b_rx,
             sent_to_a,
             sent_to_b,
+            detached: false,
         })
+    }
+
+    /// Let the pumps run on their own until the `stop` flag passed in
+    /// [`ForwardParams`] is set. They release both sockets when they end.
+    pub fn detach(mut self) {
+        self.detached = true;
+        self.handles.clear();
     }
 
     /// Open or close each direction (FR-010). `towards_a` governs packets sent
@@ -211,6 +225,9 @@ impl ForwardSession {
 
 impl Drop for ForwardSession {
     fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
         self.stop.store(true, Ordering::Relaxed);
         for h in self.handles.drain(..) {
             let _ = h.join();
@@ -375,6 +392,7 @@ mod tests {
             b_rtcp: None,
             a_rx: a_rx.clone(),
             b_rx: b_rx.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
         Rig {
@@ -639,6 +657,61 @@ mod tests {
         // Both ports can be bound again.
         UdpSocket::bind(a).expect("leg a's port must be released");
         UdpSocket::bind(b).expect("leg b's port must be released");
+    }
+
+    #[test]
+    fn a_detached_session_runs_until_the_shared_stop_flag_is_set() {
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (a_addr, b_addr) = (a_sock.local_addr().unwrap(), b_sock.local_addr().unwrap());
+        a_sock.connect(carrier.local_addr().unwrap()).unwrap();
+        b_sock.connect(client.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let session = ForwardSession::start(ForwardParams {
+            kind: AmrKind::Wb,
+            a: Leg {
+                socket: a_sock,
+                remote: Remote::Connected,
+                payload_type: PT_A,
+                dtmf_payload_type: None,
+                octet_aligned: true,
+            },
+            b: Leg {
+                socket: b_sock,
+                remote: Remote::Connected,
+                payload_type: PT_A,
+                dtmf_payload_type: None,
+                octet_aligned: true,
+            },
+            a_rtcp: None,
+            b_rtcp: None,
+            a_rx: Arc::new(AtomicU64::new(0)),
+            b_rx: Arc::new(AtomicU64::new(0)),
+            stop: stop.clone(),
+        })
+        .unwrap();
+        session.detach(); // dropping the handle must not stop it
+        let payload = oa_payload(15, 2, 1);
+        carrier
+            .send_to(&build_packet(1, 0, 7, PT_A, &payload), a_addr)
+            .unwrap();
+        assert_eq!(&recv(&client)[12..], &payload[..]);
+
+        stop.store(true, Ordering::Relaxed);
+        // The pumps notice within a poll interval and release their sockets.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if UdpSocket::bind(a_addr).is_ok() && UdpSocket::bind(b_addr).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sockets were never released");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

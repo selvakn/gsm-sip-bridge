@@ -386,6 +386,7 @@ fn run_inner(
         sms_delivery_report: config.sms_delivery_report,
         sms_report_pcscf_route: config.sms_report_pcscf_route,
         respect_caller_privacy: config.respect_caller_privacy,
+        amr_passthrough: config.amr_passthrough,
         // Already this line's value: discovery applied any `[[vowifi.line]]`
         // override to the per-line config.
         reg_rejected_cooldown: Duration::from_secs(config.reg_rejected_cooldown_sec),
@@ -741,6 +742,9 @@ pub(crate) struct InboundParams<'a> {
     /// `config::VolteConfig::respect_caller_privacy` — each caller supplies
     /// its own section's copy, same as `respond_on_client` above.
     pub respect_caller_privacy: bool,
+    /// See `config::VowifiConfig::amr_passthrough`. Both transports read the
+    /// `[vowifi]` copy: it is one deployment-wide setting (FR-015).
+    pub amr_passthrough: bool,
     /// This line's resolved `reg_rejected_cooldown_sec` (specs/089) — each
     /// caller resolves its own section and per-line override.
     pub reg_rejected_cooldown: Duration,
@@ -814,6 +818,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         sms_delivery_report,
         sms_report_pcscf_route,
         respect_caller_privacy,
+        amr_passthrough,
         reg_rejected_cooldown,
         answer_preference,
         veth_sip_port,
@@ -997,6 +1002,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             // behind it.
             originating_headers: app_config.vowifi.originating_headers,
             respect_caller_privacy,
+            amr_passthrough,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
@@ -1900,6 +1906,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::respect_caller_privacy`; consumed by
     /// [`inbound::caller_name_for_onward_signaling`].
     respect_caller_privacy: bool,
+    /// See `config::VowifiConfig::amr_passthrough`; consumed by
+    /// [`inbound::handle_invite`].
+    amr_passthrough: bool,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
     /// Publishes which phase the loop is in, so the watchdog can tell a line
@@ -1924,6 +1933,7 @@ impl DispatchParams<'_> {
             obs: self.obs,
             access_network_info: &self.reg_cfg.access_network_info,
             respect_caller_privacy: self.respect_caller_privacy,
+            amr_passthrough: self.amr_passthrough,
         }
     }
 

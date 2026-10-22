@@ -647,15 +647,7 @@ fn print_line_live_status(
         }
         Ok(ControlMessage::CallHistoryReply { calls }) => {
             for c in calls {
-                println!(
-                    "    {} caller={} outcome={} started={} ended={} phone_codec={}",
-                    c.call_id,
-                    c.caller,
-                    c.outcome,
-                    format_unix(Some(c.started_at)),
-                    format_unix(c.ended_at),
-                    c.phone_codec.as_deref().unwrap_or("-")
-                );
+                println!("{}", crate::vowifi::format_call_record(&c));
             }
         }
         // The registration half answered, so this line is up; a failure here

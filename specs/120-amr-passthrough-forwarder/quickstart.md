@@ -10,8 +10,9 @@ Reuse `specs/111-amr-passthrough-spike/harness` (`run.sh`, `b2.c`).
 
 ```bash
 make test                                   # unit, loopback relay, control protocol
-# privileged container, real PJSIP hook (see test/ and the local-docker-test notes)
-make -C test amr-passthrough                # added by this feature
+make test-passthrough                       # real PJSIP hook on loopback: upgrade by re-INVITE,
+                                            # hold/resume, 488, downgrade, no leaked port
+                                            # (needs libpjproject for the pjsip-linked build)
 ```
 
 ## 2. Local rig (Vodafone), inbound

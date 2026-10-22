@@ -296,7 +296,7 @@ pub struct CodecInfo {
 /// NUL-terminated — so it must be read by length, not as a C string.
 #[cfg(feature = "pjsip-linked")]
 #[rustfmt::skip]
-unsafe fn pj_str_to_string(s: &pjsua_sys::pj_str_t) -> String { // SAFETY: caller passes a pj_str_t PJSIP filled in; ptr/slen are valid together
+pub(crate) unsafe fn pj_str_to_string(s: &pjsua_sys::pj_str_t) -> String { // SAFETY: caller passes a pj_str_t PJSIP filled in; ptr/slen are valid together
     if s.ptr.is_null() || s.slen <= 0 {
         return String::new();
     }
@@ -328,6 +328,7 @@ impl Endpoint {
                 cfg.cb.on_call_state = Some(on_call_state_cb);
                 cfg.cb.on_incoming_call = Some(on_incoming_call_cb);
                 cfg.cb.on_dtmf_digit = Some(on_dtmf_digit_cb);
+                crate::passthrough::install(&mut cfg.cb);
                 // RFC 4028 session timers off (neither offered nor accepted).
                 // PJSUA's default is OPTIONAL: a phone whose INVITE offers
                 // `Session-Expires` makes pjsua the timer's other half, and a
@@ -710,6 +711,71 @@ impl Endpoint {
         {
             let _ = (call_a, call_b);
         }
+    }
+
+    /// Carry this call's client-leg media on the application's forwarder
+    /// socket at `rtp_port` instead of PJSIP's own transport
+    /// (specs/120-amr-passthrough-forwarder). Takes effect on the next
+    /// [`Endpoint::reinvite_reinit_media`]. `codec` / `clock_rate` name what the
+    /// call is forwarding: a client re-INVITE that drops it is answered 488.
+    pub fn register_forward(&self, call_id: i32, rtp_port: u16, codec: &str, clock_rate: u32) {
+        crate::passthrough::register_forward(call_id, rtp_port, codec, clock_rate);
+    }
+
+    /// Keep this call's PJSIP stream paused, so it carries no media at all
+    /// (the veth leg of a forwarded call). Returns whether a live stream was
+    /// paused immediately.
+    pub fn register_quiet(&self, call_id: i32) -> bool {
+        crate::passthrough::register_quiet(call_id)
+    }
+
+    /// Forget a call's forward/quiet entry; its next media transport is
+    /// PJSIP's own again.
+    pub fn clear_forward(&self, call_id: i32) {
+        crate::passthrough::clear(call_id);
+    }
+
+    /// How many times the call's media stream has been created, to tell when a
+    /// re-INVITE has taken effect.
+    pub fn media_generation(&self, call_id: i32) -> u64 {
+        crate::passthrough::media_generation(call_id)
+    }
+
+    /// What the client leg negotiated, read from its live stream.
+    pub fn client_media(&self, call_id: i32) -> Option<crate::passthrough::ClientMedia> {
+        crate::passthrough::client_media(call_id)
+    }
+
+    /// Re-INVITE the call and have PJSIP create its media transport again.
+    pub fn reinvite_reinit_media(&self, call_id: i32) -> Result<(), PjsipError> {
+        crate::passthrough::reinvite_reinit_media(call_id)
+    }
+
+    /// Packets PJSIP's own stream `(sent, received)`; zero on a forwarded call.
+    pub fn stream_packets(&self, call_id: i32) -> Option<(u32, u32)> {
+        crate::passthrough::stream_packets(call_id)
+    }
+
+    /// Hold, release and re-INVITE a call. Used by the integration tests that
+    /// drive a forwarded call through renegotiation.
+    #[doc(hidden)]
+    pub fn hold_call(&self, call_id: i32) -> Result<(), PjsipError> {
+        crate::passthrough::hold_call(call_id)
+    }
+
+    #[doc(hidden)]
+    pub fn unhold_call(&self, call_id: i32) -> Result<(), PjsipError> {
+        crate::passthrough::unhold_call(call_id)
+    }
+
+    #[doc(hidden)]
+    pub fn reinvite_plain(&self, call_id: i32) -> Result<(), PjsipError> {
+        crate::passthrough::reinvite_plain(call_id)
+    }
+
+    /// Disconnect the call's conference slot from every other port.
+    pub fn disconnect_from_conference(&self, call_id: i32) {
+        crate::passthrough::disconnect_from_conference(call_id);
     }
 
     /// Remove a call's pairing (both directions), e.g. once it hangs up.
@@ -1256,6 +1322,7 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
                     pairs.remove(&peer);
                 }
             }
+            crate::passthrough::on_call_disconnected(call_id);
 
             AUDIO_MONITOR_RUNNING.store(false, Ordering::Release);
             let count = AUDIO_SAMPLE_COUNT.load(Ordering::Relaxed);

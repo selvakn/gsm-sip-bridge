@@ -1,7 +1,7 @@
 CONFIG ?= config.toml
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
 
-.PHONY: build test test-scripts run clean lint format dev dev-gsm dev-sip \
+.PHONY: build test test-scripts test-passthrough run clean lint format dev dev-gsm dev-sip \
         siptest siptest-status \
         docker-build docker-build-swu docker-build-internet docker-up docker-down docker-logs \
         coverage mutants mutants-full help
@@ -32,6 +32,13 @@ test-scripts: ## Run non-cargo shell integration tests
 	@sh docker/cellular-internet/tests/wds_lifecycle_test.sh
 	@sh docker/cellular-internet/tests/ipv6_lifecycle_test.sh
 	@sh docker/cellular-internet/tests/ipv6_hook_test.sh
+
+# AMR passthrough hooks (specs/120) against a real PJSIP and real answered calls
+# on loopback. PJSUA is a process singleton, so the test re-executes its own
+# binary as the two peers. Needs libpjproject >= 2.14 for the pjsip-linked build
+# (see docs/development.md); not part of `make test`, which builds without it.
+test-passthrough: ## Run the real-PJSIP AMR passthrough hook test
+	@cargo test -p pjsua-safe --features pjsip-linked --test passthrough_hooks -- --test-threads=1
 
 run: build ## Build and run the GSM-SIP bridge
 	@cargo run --release --bin gsm-sip-bridge -- --config $(CONFIG)

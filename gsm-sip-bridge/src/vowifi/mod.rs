@@ -20,6 +20,7 @@
 mod codecs;
 pub mod control;
 pub mod discovery;
+pub(crate) mod forward;
 pub mod ims_mode;
 pub mod imsi;
 pub mod plmn;
@@ -1230,6 +1231,7 @@ fn bridge_outbound_leg(
         phone_call_id = call.call_id(),
         veth_call_id = veth_call.call_id(),
         card_id = %line.card_id,
+        media_path = %forward::outbound_media_path().record_string(),
         "outbound: placed and paired both legs"
     );
     Ok(veth_call)
@@ -1253,6 +1255,7 @@ fn finalize_paired_outbound_leg(
     tracing::info!(
         phone_call_id = call.call_id(),
         veth_call_id = veth_call.call_id(),
+        media_path = %forward::outbound_media_path().record_string(),
         "outbound: answered 200 on an already-paired (early media) leg"
     );
     Ok(veth_call)
@@ -1614,7 +1617,7 @@ fn handle_connection(
     let mut writer = stream;
 
     let msg = read_msg(&mut reader).map_err(BridgeError::Ims)?;
-    let (call_id, caller, caller_name, _carrier_amr) = match msg {
+    let (call_id, caller, caller_name, carrier_amr) = match msg {
         ControlMessage::IncomingCall {
             call_id,
             caller,
@@ -1698,6 +1701,17 @@ fn handle_connection(
             // ringback to the caller) until we tell it a human actually picked
             // up — answering the carrier the moment the INVITE went out would
             // replace the caller's ringback with dead air.
+            // specs/120: how the audio crosses the bridge, filled in once the
+            // client has answered. Stays `None`/`None` for every call that is
+            // not forwarded, which is then exactly today's call.
+            let mut forwarded: Option<forward::ForwardedCall>;
+            let media_path: Option<String>;
+            let mut ended_while_deciding: Option<String>;
+            let legs = PjsipLegs {
+                endpoint,
+                pbx: &pbx_call,
+                veth: &veth_call,
+            };
             match wait_for_pbx_answer(&pbx_call, &ctrl_rx, &config.sip.reject_statuses) {
                 PbxOutcome::Answered => {
                     tracing::info!(call_id = %call_id, "PBX extension answered");
@@ -1707,13 +1721,64 @@ fn handle_connection(
                             outcome: SmsOutcome::Sent,
                         }],
                     );
-                    write_msg(
+                    let decision = decide_media_path(
+                        config,
+                        &call_id,
+                        carrier_amr.as_ref(),
                         &mut writer,
-                        &ControlMessage::CallAnswered {
-                            call_id: call_id.clone(),
-                        },
-                    )
-                    .map_err(BridgeError::Ims)?;
+                        &ctrl_rx,
+                        &legs,
+                    );
+                    media_path = decision.path.as_ref().map(|path| {
+                        tracing::info!(
+                            "media path decided call_id={call_id} {}",
+                            path.log_fields()
+                        );
+                        path.record_string()
+                    });
+                    if decision.broken {
+                        // The client could not be moved back onto PJSIP's own
+                        // media: there is no call to continue.
+                        let _ = write_msg(
+                            &mut writer,
+                            &ControlMessage::BridgeFailed {
+                                call_id: call_id.clone(),
+                                reason: control::reason::VETH_LEG_FAILED.to_string(),
+                            },
+                        );
+                        endpoint.unpair_call(pbx_call.call_id());
+                        let _ = pbx_call.hangup();
+                        let _ = veth_call.hangup();
+                        push_recent_call(
+                            recent_calls,
+                            card_id,
+                            CallRecord {
+                                call_id,
+                                caller,
+                                outcome: format!("failed:{}", control::reason::VETH_LEG_FAILED),
+                                started_at,
+                                ended_at: Some(now_unix()),
+                                phone_codec: None,
+                                media_path,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    forwarded = decision.forwarded;
+                    ended_while_deciding = decision.call_ended;
+                    if ended_while_deciding.is_none() {
+                        write_msg(
+                            &mut writer,
+                            &ControlMessage::CallAnswered {
+                                call_id: call_id.clone(),
+                            },
+                        )
+                        .map_err(BridgeError::Ims)?;
+                        // Now the carrier is answered: let audio flow towards it.
+                        if let Some(f) = forwarded.as_mut() {
+                            f.open(&legs);
+                        }
+                    }
                 }
                 outcome => {
                     let reason = outcome.reason();
@@ -1762,8 +1827,15 @@ fn handle_connection(
             // once media stops, since the call's final tick can come after it.
             let mut phone_codec = endpoint.negotiated_codec(pbx_call.call_id());
             let end_reason = loop {
+                if let Some(reason) = ended_while_deciding.take() {
+                    tracing::info!(call_id = %call_id, reason = %reason, "call ended while the media path was being decided, tearing down both legs");
+                    break reason;
+                }
                 if let Some(codec) = endpoint.negotiated_codec(pbx_call.call_id()) {
                     phone_codec = Some(codec);
+                }
+                if let Some(f) = forwarded.as_mut() {
+                    f.follow(&legs);
                 }
                 match ctrl_rx.recv_timeout(PBX_RING_POLL_INTERVAL) {
                     Ok(ControlMessage::CallEnded { reason, .. }) => {
@@ -1794,6 +1866,12 @@ fn handle_connection(
             endpoint.unpair_call(pbx_call.call_id());
             let _ = pbx_call.hangup();
             let _ = veth_call.hangup();
+            // Stops the forwarder and frees its ports (FR-017).
+            if let Some(f) = forwarded.take() {
+                let (from_carrier, from_client) = f.received();
+                tracing::info!(call_id = %call_id, from_carrier, from_client, "forwarded call media counters");
+                drop(f);
+            }
             let _ = write_msg(
                 &mut writer,
                 &ControlMessage::HangupAck {
@@ -1810,7 +1888,7 @@ fn handle_connection(
                     started_at,
                     ended_at: Some(now_unix()),
                     phone_codec,
-                    media_path: None,
+                    media_path,
                 },
             );
             Ok(())
@@ -2066,6 +2144,81 @@ fn spawn_control_reader(
         }
     });
     rx
+}
+
+/// The PJSIP side of the media-path decision (specs/120): the client call, and
+/// the veth call that is silenced if the call is forwarded.
+struct PjsipLegs<'a> {
+    endpoint: &'a Endpoint,
+    pbx: &'a Call,
+    veth: &'a Call,
+}
+
+impl forward::ClientLeg for PjsipLegs<'_> {
+    fn media(&self) -> Option<pjsua_safe::ClientMedia> {
+        self.endpoint.client_media(self.pbx.call_id())
+    }
+
+    fn register_forward(&self, rtp_port: u16, codec: &str, clock_rate: u32) {
+        self.endpoint
+            .register_forward(self.pbx.call_id(), rtp_port, codec, clock_rate);
+    }
+
+    fn clear_forward(&self) {
+        self.endpoint.clear_forward(self.pbx.call_id());
+    }
+
+    fn generation(&self) -> u64 {
+        self.endpoint.media_generation(self.pbx.call_id())
+    }
+
+    fn reinvite(&self) -> Result<(), String> {
+        self.endpoint
+            .reinvite_reinit_media(self.pbx.call_id())
+            .map_err(|e| e.to_string())
+    }
+
+    fn is_up(&self) -> bool {
+        self.pbx.poll_state() != CallState::Disconnected
+    }
+
+    fn silence_veth(&self) {
+        // Unpaired first, so no later media event reconnects the two calls.
+        self.endpoint.unpair_call(self.pbx.call_id());
+        self.endpoint
+            .disconnect_from_conference(self.veth.call_id());
+        self.endpoint.register_quiet(self.veth.call_id());
+    }
+}
+
+/// Decides whether this inbound call's AMR frames cross the bridge unchanged
+/// and upgrades it if so (specs/120). A call that is not eligible is left
+/// exactly as it is; the verdict never fails a call.
+fn decide_media_path(
+    config: &AppConfig,
+    call_id: &str,
+    carrier: Option<&crate::amr_forward::AmrLegParams>,
+    control: &mut TcpStream,
+    ctrl_rx: &mpsc::Receiver<ControlMessage>,
+    legs: &dyn forward::ClientLeg,
+) -> forward::Decision {
+    let (Ok(local), Ok(peer)) = (control.local_addr(), control.peer_addr()) else {
+        return forward::Decision::transcoded(crate::amr_forward::Reason::ReinviteFailed);
+    };
+    forward::decide(
+        forward::Inputs {
+            call_id,
+            enabled: config.vowifi.amr_passthrough,
+            carrier,
+            veth_bind_ip: local.ip(),
+            agent_a_ip: peer.ip(),
+            control,
+            ctrl_rx,
+            ack_timeout: forward::ACK_TIMEOUT,
+            reinvite_timeout: forward::REINVITE_TIMEOUT,
+        },
+        legs,
+    )
 }
 
 /// Places both legs — the PBX-side call (reusing the same destination-URI
@@ -2338,15 +2491,7 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
             }
             Ok(ControlMessage::CallHistoryReply { calls }) => {
                 for c in calls {
-                    println!(
-                        "    {} caller={} outcome={} started={} ended={} phone_codec={}",
-                        c.call_id,
-                        c.caller,
-                        c.outcome,
-                        format_unix(Some(c.started_at)),
-                        format_unix(c.ended_at),
-                        c.phone_codec.as_deref().unwrap_or("-")
-                    );
+                    println!("{}", format_call_record(&c));
                 }
             }
             Ok(other) => {
@@ -2388,6 +2533,24 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
 /// the underlay guard's verdict and, while the line is held, for how long.
 /// `None` is a missing or unreadable file (a swu line, the guard off, a
 /// supervisor that has not started) and reads `unknown`.
+/// One `vowifi-status` recent-calls line. `media_path=` (specs/120) appears
+/// only for calls that recorded one, so every other line reads as it always did.
+pub fn format_call_record(c: &CallRecord) -> String {
+    let mut line = format!(
+        "    {} caller={} outcome={} started={} ended={} phone_codec={}",
+        c.call_id,
+        c.caller,
+        c.outcome,
+        format_unix(Some(c.started_at)),
+        format_unix(c.ended_at),
+        c.phone_codec.as_deref().unwrap_or("-")
+    );
+    if let Some(path) = &c.media_path {
+        line.push_str(&format!(" media_path={path}"));
+    }
+    line
+}
+
 pub fn format_uplink_line(
     uplink: Option<(crate::control::protocol::UplinkState, Option<u64>)>,
     now: u64,
@@ -3271,6 +3434,23 @@ mod tests {
             service_active_outbound_call(&mut ac),
             "the reassembled message must parse as CallEnded"
         );
+    }
+
+    #[test]
+    fn a_recent_call_line_shows_the_media_path_only_when_one_was_recorded() {
+        let mut c = record("c1");
+        c.phone_codec = Some("AMR-WB".into());
+        let plain = format_call_record(&c);
+        assert!(plain.ends_with("phone_codec=AMR-WB"), "{plain}");
+        assert!(!plain.contains("media_path"), "{plain}");
+        c.media_path = Some("forwarded:amr-wb:oa/be".into());
+        let line = format_call_record(&c);
+        assert!(
+            line.ends_with("phone_codec=AMR-WB media_path=forwarded:amr-wb:oa/be"),
+            "{line}"
+        );
+        c.media_path = Some("transcoded:mode_set".into());
+        assert!(format_call_record(&c).ends_with("media_path=transcoded:mode_set"));
     }
 
     fn record(id: &str) -> CallRecord {
