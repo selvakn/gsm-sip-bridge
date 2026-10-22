@@ -99,6 +99,12 @@ pub(crate) struct ForwardedCall {
     remote: Arc<Mutex<Option<SocketAddr>>>,
     last_remote: Option<SocketAddr>,
     last_send: Option<bool>,
+    /// The carrier leg, for re-judging after the client renegotiates.
+    carrier: AmrLegParams,
+    /// The labels last applied to the relay: payload type, event type, packing.
+    applied: (u8, Option<u8>, bool),
+    /// A renegotiation that cannot be carried closed the gates (logged once).
+    stalled: bool,
     /// Holds the RTCP half of the client's port pair so the port stays ours.
     _client_rtcp: UdpSocket,
     pub(crate) client_rtp_port: u16,
@@ -119,6 +125,30 @@ impl ForwardedCall {
 
     fn sync(&mut self, leg: &dyn ClientLeg, towards_carrier: bool) {
         let Some(media) = leg.media() else { return };
+        // A client may renegotiate payload types, packing or allowed modes. If
+        // the call is still forwardable, the relay follows; if not, there is no
+        // way to move a call that is already answered back onto the transcoder,
+        // so nothing more is sent either way rather than something the other
+        // side cannot parse.
+        match client_leg_params(&media).and_then(|p| compatible(&self.carrier, &p).map(|()| p)) {
+            Ok(p) => {
+                let labels = (p.payload_type, p.dtmf_payload_type, p.octet_aligned);
+                if labels != self.applied {
+                    tracing::info!(payload_type = labels.0, dtmf = ?labels.1, octet_aligned = labels.2, "forwarded call: client renegotiated; relay labels updated");
+                    self.session.update_leg_b(labels.0, labels.1, labels.2);
+                    self.applied = labels;
+                }
+                self.stalled = false;
+            }
+            Err(reason) => {
+                if !self.stalled {
+                    tracing::error!(reason = %reason, "forwarded call: the client's renegotiation can no longer be forwarded; media stopped");
+                    self.stalled = true;
+                }
+                self.session.set_direction(false, false);
+                return;
+            }
+        }
         if media.remote_rtp != self.last_remote {
             if let Some(addr) = media.remote_rtp {
                 tracing::info!(client = %addr, "forwarded call: client media address updated");
@@ -325,21 +355,39 @@ pub(crate) fn decide<W: Write>(inputs: Inputs<'_, W>, leg: &dyn ClientLeg) -> De
         remote: remote_cell,
         last_remote: None,
         last_send: None,
+        carrier: carrier.clone(),
+        applied: (
+            client.payload_type,
+            client.dtmf_payload_type,
+            client.octet_aligned,
+        ),
+        stalled: false,
         _client_rtcp: client_rtcp,
         client_rtp_port: client_port,
     };
 
     leg.register_forward(client_port, &codec.0, codec.1);
     let before = leg.generation();
-    let reinvited = leg.reinvite().is_ok() && wait_for_stream(leg, before, reinvite_timeout);
-    if !reinvited {
+    let sent = leg.reinvite().is_ok();
+    if !sent {
         tracing::warn!(
             call_id,
-            "client did not take the upgrade re-INVITE; transcoding"
+            "the upgrade re-INVITE could not be sent; transcoding"
         );
         leg.clear_forward();
         cancel(control, call_id);
         return Decision::transcoded(Reason::ReinviteFailed);
+    }
+    if !wait_for_stream(leg, before, reinvite_timeout) {
+        // The offer is out and may still be answered: the client would then be
+        // pointed at a forwarder that is about to close. Put it back on PJSIP's
+        // own transport (a second re-INVITE) rather than leave a silent call.
+        tracing::warn!(
+            call_id,
+            "client did not take the upgrade re-INVITE in time; moving it back"
+        );
+        cancel(control, call_id);
+        return downgrade(leg, call_id, Reason::ReinviteFailed, reinvite_timeout);
     }
 
     // What the client now says is what the audio will be judged against.
@@ -347,15 +395,26 @@ pub(crate) fn decide<W: Write>(inputs: Inputs<'_, W>, leg: &dyn ClientLeg) -> De
         .media()
         .ok_or(Reason::ReinviteFailed)
         .and_then(|m| client_leg_params(&m).map(|p| (m, p)))
-        .and_then(|(m, p)| compatible(carrier, &p).map(|()| m));
-    let after = match verdict {
-        Ok(m) => m,
+        .and_then(|(m, p)| compatible(carrier, &p).map(|()| (m, p)));
+    let (after, after_params) = match verdict {
+        Ok(v) => v,
         Err(reason) => {
             tracing::warn!(call_id, reason = %reason, "client's answer to the upgrade is not forwardable; moving it back");
             cancel(control, call_id);
             return downgrade(leg, call_id, reason, reinvite_timeout);
         }
     };
+    // The relay speaks what the client finally answered, not what it first said.
+    forwarded.session.update_leg_b(
+        after_params.payload_type,
+        after_params.dtmf_payload_type,
+        after_params.octet_aligned,
+    );
+    forwarded.applied = (
+        after_params.payload_type,
+        after_params.dtmf_payload_type,
+        after_params.octet_aligned,
+    );
     *forwarded.remote.lock().unwrap_or_else(|e| e.into_inner()) = after.remote_rtp;
     forwarded.last_remote = after.remote_rtp;
     leg.silence_veth();
@@ -487,6 +546,10 @@ mod tests {
         /// Whether the re-INVITE re-creates the stream (a client that rejects
         /// it does not).
         stream_recreated: bool,
+        /// Only the nth re-INVITE (1-based) is acted on, as when the first
+        /// answer arrives after the wait gave up.
+        stream_on_nth_reinvite: Option<u32>,
+        reinvites: RefCell<u32>,
         calls: RefCell<Vec<String>>,
         forward_port: RefCell<Option<u16>>,
     }
@@ -499,6 +562,8 @@ mod tests {
                 generation: RefCell::new(1),
                 reinvite_ok: true,
                 stream_recreated: true,
+                stream_on_nth_reinvite: None,
+                reinvites: RefCell::new(0),
                 calls: RefCell::new(Vec::new()),
                 forward_port: RefCell::new(None),
             }
@@ -531,7 +596,12 @@ mod tests {
             if !self.reinvite_ok {
                 return Err("refused".into());
             }
-            if self.stream_recreated {
+            *self.reinvites.borrow_mut() += 1;
+            let acts = match self.stream_on_nth_reinvite {
+                Some(n) => *self.reinvites.borrow() == n,
+                None => self.stream_recreated,
+            };
+            if acts {
                 *self.generation.borrow_mut() += 1;
                 if self.forward_port.borrow().is_some() {
                     // The upgrade: the client now reads as it will after it.
@@ -1068,10 +1138,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reinvite_the_client_never_acts_on_times_out_to_a_transcoded_call() {
+    fn a_reinvite_answered_too_late_is_undone_with_a_second_reinvite() {
         let a = agent_a_socket();
         let mut leg = FakeLeg::new(wb_client("octet-align=1"));
-        leg.stream_recreated = false;
+        // The first re-INVITE is still pending when the wait gives up; the
+        // client only acts on the second.
+        leg.stream_on_nth_reinvite = Some(2);
         let carrier = carrier_wb("octet-align=1");
         let (d, sent) = run(
             true,
@@ -1080,12 +1152,83 @@ mod tests {
             vec![ack(a.local_addr().unwrap().port())],
         );
         assert_eq!(path_of(&d).as_deref(), Some("transcoded:reinvite_failed"));
+        assert!(d.forwarded.is_none() && !d.broken);
         assert!(matches!(
             sent.last(),
             Some(ControlMessage::ForwardCancel { .. })
         ));
-        assert!(leg.calls().contains(&"clear_forward".to_string()));
+        assert_eq!(
+            leg.calls(),
+            [
+                "register_forward AMR-WB/16000",
+                "reinvite",
+                "clear_forward",
+                "reinvite"
+            ],
+            "moved back so a late answer cannot leave the client pointed at a closed forwarder"
+        );
+    }
+
+    #[test]
+    fn a_reinvite_nobody_ever_answers_breaks_the_call_rather_than_leaving_it_silent() {
+        let a = agent_a_socket();
+        let mut leg = FakeLeg::new(wb_client("octet-align=1"));
+        leg.stream_recreated = false;
+        let carrier = carrier_wb("octet-align=1");
+        let (d, _) = run(
+            true,
+            Some(&carrier),
+            &leg,
+            vec![ack(a.local_addr().unwrap().port())],
+        );
+        assert!(d.broken && d.forwarded.is_none());
         assert!(!leg.calls().contains(&"silence_veth".to_string()));
+    }
+
+    #[test]
+    fn a_renegotiation_the_relay_can_carry_is_followed_and_one_it_cannot_stops_the_media() {
+        let a = agent_a_socket();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut media = wb_client("octet-align=1");
+        media.remote_rtp = Some(client.local_addr().unwrap());
+        let leg = FakeLeg::new(media.clone());
+        let carrier = carrier_wb("octet-align=1");
+        let (mut d, sent) = run(
+            true,
+            Some(&carrier),
+            &leg,
+            vec![ack(a.local_addr().unwrap().port())],
+        );
+        let mut fwd = d.forwarded.take().unwrap();
+        let hop_port = match &sent[0] {
+            ControlMessage::ForwardMedia { rtp_port, .. } => *rtp_port,
+            other => panic!("{other:?}"),
+        };
+        fwd.open(&leg);
+        let pkt = |seq| build_packet(seq, 0, 7, 110, &[0xf0, (2 << 3) | 4, 1, 2, 3]);
+        let mut buf = [0u8; 64];
+
+        // The client moves to payload type 97: the relay follows.
+        media.tx_pt = 97;
+        media.rx_pt = 97;
+        *leg.media.borrow_mut() = Some(media.clone());
+        fwd.follow(&leg);
+        a.send_to(&pkt(1), ("127.0.0.1", hop_port)).unwrap();
+        client.recv(&mut buf).unwrap();
+        assert_eq!(buf[1] & 0x7f, 97);
+
+        // It now restricts the modes: no longer forwardable, nothing is sent.
+        media.remote_fmtp = "octet-align=1; mode-set=0".into();
+        *leg.media.borrow_mut() = Some(media);
+        fwd.follow(&leg);
+        a.send_to(&pkt(2), ("127.0.0.1", hop_port)).unwrap();
+        assert!(
+            client.recv(&mut buf).is_err(),
+            "media stops rather than send what the client refused"
+        );
     }
 
     #[test]

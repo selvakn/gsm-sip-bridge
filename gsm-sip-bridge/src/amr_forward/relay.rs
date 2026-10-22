@@ -17,7 +17,7 @@ use crate::ims::rtcp::RelayRtcpRole;
 use crate::ims::rtp::{parse_packet, SsrcTracker, RTP_HEADER_LEN};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -53,15 +53,53 @@ pub struct Leg {
     pub octet_aligned: bool,
 }
 
+/// Marks "no telephone-event type" in [`LegIo::dtmf`].
+const NO_DTMF: u16 = 0x100;
+
 struct LegIo {
     socket: UdpSocket,
     remote: Remote,
-    payload_type: u8,
-    dtmf_payload_type: Option<u8>,
-    octet_aligned: bool,
+    // Atomics, because a client's renegotiation can change what it expects and
+    // the relay follows it (`ForwardSession::update_leg_b`).
+    payload_type: AtomicU8,
+    dtmf: AtomicU16,
+    octet_aligned: AtomicBool,
 }
 
 impl LegIo {
+    fn new(leg: Leg) -> Self {
+        Self {
+            socket: leg.socket,
+            remote: leg.remote,
+            payload_type: AtomicU8::new(leg.payload_type),
+            dtmf: AtomicU16::new(leg.dtmf_payload_type.map_or(NO_DTMF, u16::from)),
+            octet_aligned: AtomicBool::new(leg.octet_aligned),
+        }
+    }
+
+    fn pt(&self) -> u8 {
+        self.payload_type.load(Ordering::Relaxed)
+    }
+
+    fn dtmf_pt(&self) -> Option<u8> {
+        u8::try_from(self.dtmf.load(Ordering::Relaxed)).ok()
+    }
+
+    fn oa(&self) -> bool {
+        self.octet_aligned.load(Ordering::Relaxed)
+    }
+
+    /// Whether a datagram from `from` may enter the call. A connected socket
+    /// only ever hears its peer; the client-facing socket is bound wide, so
+    /// only the client's current address is accepted (anyone else on the
+    /// network could otherwise inject audio or digits into the carrier call).
+    fn accepts_from(&self, from: SocketAddr) -> bool {
+        match &self.remote {
+            Remote::Connected => true,
+            Remote::Dynamic(cell) => *cell.lock().unwrap_or_else(|e| e.into_inner()) == Some(from),
+        }
+    }
+
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
         match &self.remote {
             Remote::Connected => self.socket.send(buf),
@@ -114,6 +152,7 @@ pub struct ForwardSession {
     b_rx: Arc<AtomicU64>,
     sent_to_a: Arc<AtomicU64>,
     sent_to_b: Arc<AtomicU64>,
+    leg_b: Arc<LegIo>,
     detached: bool,
 }
 
@@ -123,20 +162,8 @@ impl ForwardSession {
             leg.socket.set_read_timeout(Some(POLL_INTERVAL))?;
         }
         let kind = p.kind;
-        let a = Arc::new(LegIo {
-            socket: p.a.socket,
-            remote: p.a.remote,
-            payload_type: p.a.payload_type,
-            dtmf_payload_type: p.a.dtmf_payload_type,
-            octet_aligned: p.a.octet_aligned,
-        });
-        let b = Arc::new(LegIo {
-            socket: p.b.socket,
-            remote: p.b.remote,
-            payload_type: p.b.payload_type,
-            dtmf_payload_type: p.b.dtmf_payload_type,
-            octet_aligned: p.b.octet_aligned,
-        });
+        let a = Arc::new(LegIo::new(p.a));
+        let b = Arc::new(LegIo::new(p.b));
         let stop = p.stop;
         let gate = Arc::new(Gate {
             towards_a: AtomicBool::new(true),
@@ -159,7 +186,7 @@ impl ForwardSession {
         };
         let pump_ba = Pump {
             kind,
-            src: b,
+            src: b.clone(),
             dst: a,
             stop: stop.clone(),
             gate: gate.clone(),
@@ -169,14 +196,23 @@ impl ForwardSession {
             rtcp: p.b_rtcp,
             direction: "b->a",
         };
-        let handles = vec![
-            std::thread::Builder::new()
-                .name("amr-fwd-ab".into())
-                .spawn(move || pump_ab.run())?,
-            std::thread::Builder::new()
-                .name("amr-fwd-ba".into())
-                .spawn(move || pump_ba.run())?,
-        ];
+        let first = std::thread::Builder::new()
+            .name("amr-fwd-ab".into())
+            .spawn(move || pump_ab.run())?;
+        let second = match std::thread::Builder::new()
+            .name("amr-fwd-ba".into())
+            .spawn(move || pump_ba.run())
+        {
+            Ok(h) => h,
+            Err(e) => {
+                // No session exists to stop the first pump: do it here, or it
+                // would hold both sockets for good.
+                stop.store(true, Ordering::Relaxed);
+                let _ = first.join();
+                return Err(e);
+            }
+        };
+        let handles = vec![first, second];
         Ok(Self {
             stop,
             gate,
@@ -185,6 +221,7 @@ impl ForwardSession {
             b_rx: p.b_rx,
             sent_to_a,
             sent_to_b,
+            leg_b: b,
             detached: false,
         })
     }
@@ -201,6 +238,25 @@ impl ForwardSession {
     pub fn set_direction(&self, towards_a: bool, towards_b: bool) {
         self.gate.towards_a.store(towards_a, Ordering::Relaxed);
         self.gate.towards_b.store(towards_b, Ordering::Relaxed);
+    }
+
+    /// Follow the client's renegotiated payload types and packing (leg `b`).
+    pub fn update_leg_b(
+        &self,
+        payload_type: u8,
+        dtmf_payload_type: Option<u8>,
+        octet_aligned: bool,
+    ) {
+        self.leg_b
+            .payload_type
+            .store(payload_type, Ordering::Relaxed);
+        self.leg_b.dtmf.store(
+            dtmf_payload_type.map_or(NO_DTMF, u16::from),
+            Ordering::Relaxed,
+        );
+        self.leg_b
+            .octet_aligned
+            .store(octet_aligned, Ordering::Relaxed);
     }
 
     /// Packets received from `a`, from `b`.
@@ -255,8 +311,13 @@ impl Pump {
         let media_start = Instant::now();
         let clock_rate = self.kind.clock_rate();
         while !self.stop.load(Ordering::Relaxed) {
-            let n = match self.src.socket.recv(&mut buf) {
-                Ok(n) => n,
+            let n = match self.src.socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    if !self.src.accepts_from(from) {
+                        continue;
+                    }
+                    n
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -301,33 +362,29 @@ impl Pump {
     fn translate<'b>(&self, buf: &'b mut [u8]) -> Option<std::borrow::Cow<'b, [u8]>> {
         let marker_and_pt = buf[1];
         let pt = marker_and_pt & 0x7f;
-        if Some(pt) == self.src.dtmf_payload_type {
-            let dst_pt = self.dst.dtmf_payload_type?;
+        if Some(pt) == self.src.dtmf_pt() {
+            let dst_pt = self.dst.dtmf_pt()?;
             buf[1] = (marker_and_pt & 0x80) | (dst_pt & 0x7f);
             return Some(std::borrow::Cow::Borrowed(buf));
         }
-        if pt != self.src.payload_type {
+        if pt != self.src.pt() {
             return None;
         }
-        if self.src.octet_aligned == self.dst.octet_aligned {
-            buf[1] = (marker_and_pt & 0x80) | (self.dst.payload_type & 0x7f);
+        let (src_oa, dst_oa) = (self.src.oa(), self.dst.oa());
+        if src_oa == dst_oa {
+            buf[1] = (marker_and_pt & 0x80) | (self.dst.pt() & 0x7f);
             return Some(std::borrow::Cow::Borrowed(buf));
         }
         // Different packing: rebuild the datagram with a plain 12-byte header.
         // Reading the payload first ends the borrow of `buf`.
         let (seq_ts_ssrc, payload) = {
             let pkt = parse_packet(buf)?;
-            let repacked = repack(
-                pkt.payload,
-                self.kind,
-                self.src.octet_aligned,
-                self.dst.octet_aligned,
-            )?;
+            let repacked = repack(pkt.payload, self.kind, src_oa, dst_oa)?;
             (buf[2..RTP_HEADER_LEN].to_vec(), repacked)
         };
         let mut out = Vec::with_capacity(RTP_HEADER_LEN + payload.len());
         out.push(0x80); // V=2, no padding, extension or CSRCs
-        out.push((marker_and_pt & 0x80) | (self.dst.payload_type & 0x7f));
+        out.push((marker_and_pt & 0x80) | (self.dst.pt() & 0x7f));
         out.extend_from_slice(&seq_ts_ssrc);
         out.extend_from_slice(&payload);
         Some(std::borrow::Cow::Owned(out))
@@ -559,6 +616,52 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(400)))
             .unwrap();
         assert!(r.client.recv(&mut buf).is_err());
+    }
+
+    #[test]
+    fn rtp_from_anyone_but_the_client_is_not_forwarded() {
+        let r = rig(true, true);
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let payload = oa_payload(15, 2, 1);
+        stranger
+            .send_to(&build_packet(1, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        r.carrier
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(
+            r.carrier.recv(&mut buf).is_err(),
+            "a third party must not reach the carrier"
+        );
+        assert_eq!(
+            r.b_rx.load(Ordering::Relaxed),
+            0,
+            "and is not counted as the client's audio"
+        );
+        // The real client still gets through afterwards.
+        r.client
+            .send_to(&build_packet(2, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        r.carrier
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(r.carrier.recv(&mut buf).is_ok());
+    }
+
+    #[test]
+    fn the_client_leg_can_be_relabelled_mid_call() {
+        let r = rig(true, true);
+        r.session.update_leg_b(99, Some(98), true);
+        let payload = oa_payload(15, 2, 1);
+        r.carrier
+            .send_to(&build_packet(1, 0, 7, PT_A, &payload), r.a_addr)
+            .unwrap();
+        assert_eq!(recv(&r.client)[1] & 0x7f, 99);
+        r.client
+            .send_to(&build_packet(2, 0, 8, 99, &payload), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &payload[..]);
     }
 
     #[test]
