@@ -209,7 +209,8 @@ mod linked {
     /// `pjmedia_transport_close` / `_get_info` are `static inline` in the
     /// header, so bindgen has no symbol for them: go through the vtable as the
     /// header does.
-    unsafe fn transport_close(tp: *mut pjsua_sys::pjmedia_transport) {
+    #[rustfmt::skip]
+    unsafe fn transport_close(tp: *mut pjsua_sys::pjmedia_transport) { // SAFETY: `tp` is a live transport PJSIP handed to the hook; its `op` table is set for its whole life
         // SAFETY: `tp` is a live transport PJSIP handed to the hook; its `op`
         // table is set for the transport's whole life, and `destroy` is the
         // header's own `pjmedia_transport_close` body.
@@ -218,7 +219,8 @@ mod linked {
         }
     }
 
-    unsafe fn transport_rtp_addr(tp: *mut pjsua_sys::pjmedia_transport) -> Option<(String, c_int)> {
+    #[rustfmt::skip]
+    unsafe fn transport_rtp_addr(tp: *mut pjsua_sys::pjmedia_transport) -> Option<(String, c_int)> { // SAFETY: `tp` is a live transport PJSIP handed to the hook
         // SAFETY: `info` is zeroed like `pjmedia_transport_info_init` does
         // (sockets set to the invalid value); `get_info` only writes it. The
         // printed buffer is NUL-terminated by `pj_sockaddr_print`.
@@ -383,7 +385,8 @@ mod linked {
         ensure_pjsip_thread();
         // SAFETY: pjsua is started; `info` is writable; the id array is sized
         // together with the count passed to `pjsua_enum_conf_ports`.
-        unsafe {
+        unsafe // SAFETY: see the doc comment; PJSIP is started and the arguments come from its own callback or call info
+        {
             let mut info: pjsua_sys::pjsua_call_info = std::mem::zeroed();
             if pjsua_sys::pjsua_call_get_info(call_id, &mut info) != PJ_SUCCESS
                 || info.conf_slot < 0
@@ -436,7 +439,8 @@ mod linked {
     pub fn stream_packets(call_id: i32) -> Option<(u32, u32)> {
         ensure_pjsip_thread();
         // SAFETY: pjsua is started; `ss` is a zeroed stack value PJSIP writes.
-        unsafe {
+        unsafe // SAFETY: see the doc comment; PJSIP is started and the arguments come from its own callback or call info
+        {
             let mut ss: pjsua_sys::pjsua_stream_stat = std::mem::zeroed();
             if pjsua_sys::pjsua_call_get_stream_stat(call_id, 0, &mut ss) != PJ_SUCCESS {
                 return None;
@@ -518,7 +522,8 @@ mod linked {
         // PJSIP writes; the audio union arm is only read when the stream type
         // is audio; the codec param pointer, when non-null, is pool memory
         // valid until the next call into PJSIP on this call.
-        unsafe {
+        unsafe // SAFETY: see the doc comment; PJSIP is started and the arguments come from its own callback or call info
+        {
             let mut ci: pjsua_sys::pjsua_call_info = std::mem::zeroed();
             if pjsua_sys::pjsua_call_get_info(call_id, &mut ci) != PJ_SUCCESS || ci.media_cnt == 0 {
                 return None;
