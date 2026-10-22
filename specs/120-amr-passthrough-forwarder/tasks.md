@@ -96,7 +96,7 @@
 - [X] T031 [P] [US2] Test: with the setting off, Agent A omits `carrier_amr`, Agent B never calls `register_forward`, and the call takes today's exact path (assert the sequence of control messages equals today's)
 - [X] T032 [US2] Fill any gaps those tests expose in the decision code (T026) — no behaviour change for the non-qualifying branch
 - [X] T033 [US2] Confirm the circuit-switched path is untouched: `git diff` shows no change under `gsm-sip-bridge/src/sip/`, `modules/`, `line/` beyond shared helpers; run `gsm-sip-bridge/tests/test_cs_disabled.rs` and `test_bridge_call.rs`
-- [X] T034 [US2] Regression pass on the local rig (quickstart §2 step 6, built-in registrar and an external PBX, inbound and outbound, non-AMR target): per-leg codecs, audio and outcome identical to the previous release. Record in `live-verification.md`
+- [ ] T034 [US2] Regression pass on the local rig (quickstart §2 step 6, built-in registrar and an external PBX, inbound and outbound, non-AMR target): per-leg codecs, audio and outcome identical to the previous release. Record in `live-verification.md`
 
 **Checkpoint**: SC-002 and SC-003 evidenced.
 
@@ -106,7 +106,7 @@
 
 - [X] T035 [P] [US3] Test: an outbound call placed with the setting on never registers a forward entry and its call record reads `transcoded:outbound` (exercise `run_outbound_listener` / `bridge_outbound_leg` paths with the existing outbound test harness)
 - [X] T036 [US3] Set `media_path = transcoded:outbound` where the outbound call record is built; no other change in the outbound code (FR-016)
-- [X] T037 [US3] Live: one outbound call from baresip on the Vodafone rig and one on the Jio line with the setting on; two-way audio, `transcoded:outbound` in `vowifi-status`. Record in `live-verification.md`
+- [ ] T037 [US3] Live: one outbound call from baresip on the Vodafone rig and one on the Jio line with the setting on; two-way audio, `transcoded:outbound` in `vowifi-status`. Record in `live-verification.md`
 
 ---
 
