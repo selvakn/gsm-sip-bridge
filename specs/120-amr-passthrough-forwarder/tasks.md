@@ -30,32 +30,32 @@
 
 ### Config (FR-015)
 
-- [ ] T005 [P] Test first: `amr_passthrough` defaults to `false`, accepts `true`, rejects a non-boolean at load — beside `idle_keepalive`'s tests in `gsm-sip-bridge/src/config/mod.rs`; extend `gsm-sip-bridge/tests/test_config.rs` and `test_config_docs.rs` as that file's pattern requires
-- [ ] T006 Add `amr_passthrough` to `VowifiConfig` (`gsm-sip-bridge/src/config/{mod,raw,build}.rs`), default `false`
-- [ ] T007 [P] Export `AMR_PASSTHROUGH` in `gsm-sip-bridge/src/commands/config.rs`; extend `gsm-sip-bridge/tests/test_shell_env_contracts.rs`
+- [X] T005 [P] Test first: `amr_passthrough` defaults to `false`, accepts `true`, rejects a non-boolean at load — beside `idle_keepalive`'s tests in `gsm-sip-bridge/src/config/mod.rs`; extend `gsm-sip-bridge/tests/test_config.rs` and `test_config_docs.rs` as that file's pattern requires
+- [X] T006 Add `amr_passthrough` to `VowifiConfig` (`gsm-sip-bridge/src/config/{mod,raw,build}.rs`), default `false`
+- [X] T007 [P] Export `AMR_PASSTHROUGH` in `gsm-sip-bridge/src/commands/config.rs`; extend `gsm-sip-bridge/tests/test_shell_env_contracts.rs`
 
 ### Parameters and the compatibility rule (FR-003)
 
-- [ ] T008 [P] Test first, `gsm-sip-bridge/src/amr_forward/params.rs`: parse `AmrLegParams` from fmtp/rtpmap for NB and WB (`octet-align`, `mode-set`, `crc`, `robust-sorting`, `interleaving`, `ptime`/`maxptime`, telephone-event PT); malformed `mode-set` → feature error
-- [ ] T009 [P] Test first, same file: compatibility matrix, one case per FR-003 clause both directions — flavour differs (WB/NB), mode sets (unrestricted vs restricted, subset, superset, disjoint), each feature flag, frames-per-packet, packing differs but compatible, DTMF mismatch → `Reason::Dtmf` (R10). Assert the `Reason::as_str()` strings from data-model.md
-- [ ] T010 Create `gsm-sip-bridge/src/amr_forward/{mod,params}.rs` (`AmrLegParams`, `MediaPath`, `Reason`, `compatible()`), register the module in `lib.rs`
-- [ ] T011 Extend `gsm-sip-bridge/src/ims/sdp.rs` so the chosen AMR codec carries `AmrLegParams` (mode-set and feature flags added to what `ChosenCodec` already holds); existing sdp tests must pass unchanged
+- [X] T008 [P] Test first, `gsm-sip-bridge/src/amr_forward/params.rs`: parse `AmrLegParams` from fmtp/rtpmap for NB and WB (`octet-align`, `mode-set`, `crc`, `robust-sorting`, `interleaving`, `ptime`/`maxptime`, telephone-event PT); malformed `mode-set` → feature error
+- [X] T009 [P] Test first, same file: compatibility matrix, one case per FR-003 clause both directions — flavour differs (WB/NB), mode sets (unrestricted vs restricted, subset, superset, disjoint), each feature flag, frames-per-packet, packing differs but compatible, DTMF mismatch → `Reason::Dtmf` (R10). Assert the `Reason::as_str()` strings from data-model.md
+- [X] T010 Create `gsm-sip-bridge/src/amr_forward/{mod,params}.rs` (`AmrLegParams`, `MediaPath`, `Reason`, `compatible()`), register the module in `lib.rs`
+- [X] T011 Extend `gsm-sip-bridge/src/ims/sdp.rs` so the chosen AMR codec carries `AmrLegParams` (mode-set and feature flags added to what `ChosenCodec` already holds); existing sdp tests must pass unchanged
 
 ### Repacking (FR-003, FR-007)
 
-- [ ] T012 [P] Test first, `gsm-sip-bridge/src/amr_forward/repack.rs`: `repack` round-trip a→b→a identical for every frame type (NB 0–7 + SID + NO_DATA, WB 0–8 + SID + NO_DATA), 1–3 frames per packet, CMR preserved; cross-check speech bits against `ims::amr_rtp::payload_to_frame`; truncated/garbled input → `None`
-- [ ] T013 Expose the needed internals in `gsm-sip-bridge/src/ims/amr_rtp.rs` as `pub(crate)` and implement `repack.rs`
+- [X] T012 [P] Test first, `gsm-sip-bridge/src/amr_forward/repack.rs`: `repack` round-trip a→b→a identical for every frame type (NB 0–7 + SID + NO_DATA, WB 0–8 + SID + NO_DATA), 1–3 frames per packet, CMR preserved; cross-check speech bits against `ims::amr_rtp::payload_to_frame`; truncated/garbled input → `None`
+- [X] T013 Expose the needed internals in `gsm-sip-bridge/src/ims/amr_rtp.rs` as `pub(crate)` and implement `repack.rs`
 
 ### Control protocol (contracts/control-protocol.md)
 
-- [ ] T014 [P] Test first, `gsm-sip-bridge/src/vowifi/control.rs` tests: round-trip of `IncomingCall{carrier_amr}`, `ForwardMedia`, `ForwardAck`, `ForwardCancel`; an old `incoming_call` without `carrier_amr` parses to `None`; a `CallRecord` without `media_path` parses; `call_id()` covers the new variants
-- [ ] T015 Add the fields and variants in `gsm-sip-bridge/src/vowifi/control.rs`; fix every exhaustive match the compiler reports
+- [X] T014 [P] Test first, `gsm-sip-bridge/src/vowifi/control.rs` tests: round-trip of `IncomingCall{carrier_amr}`, `ForwardMedia`, `ForwardAck`, `ForwardCancel`; an old `incoming_call` without `carrier_amr` parses to `None`; a `CallRecord` without `media_path` parses; `call_id()` covers the new variants
+- [X] T015 Add the fields and variants in `gsm-sip-bridge/src/vowifi/control.rs`; fix every exhaustive match the compiler reports
 
 ### Relay (R6, FR-007, FR-008, FR-010, FR-013)
 
-- [ ] T016 [P] Test first, `gsm-sip-bridge/src/amr_forward/relay.rs`, real loopback UDP sockets, no mocks: payload bytes bit-identical both ways; SSRC/seq/ts untouched; audio PT and telephone-event PT relabelled per leg; repack when packing differs; direction gate stops sending towards a held leg and resumes; remote address update takes effect for the next packet; SID/NO_DATA/CMR pass through; counters per direction; `stop` ends the threads and frees the ports (rebind succeeds)
-- [ ] T017 Implement `relay.rs` (`ForwardLeg` pair, `ForwardSession` with `Drop`, `Direction` atomics, counters), generalising `ims/agent/veth.rs::forward`; make the RTCP clock rate a parameter instead of the PCMU constant
-- [ ] T018 Make `veth.rs::forward` and the new relay share the SSRC tracker / RTCP role hooks rather than copying them; existing veth tests unchanged
+- [X] T016 [P] Test first, `gsm-sip-bridge/src/amr_forward/relay.rs`, real loopback UDP sockets, no mocks: payload bytes bit-identical both ways; SSRC/seq/ts untouched; audio PT and telephone-event PT relabelled per leg; repack when packing differs; direction gate stops sending towards a held leg and resumes; remote address update takes effect for the next packet; SID/NO_DATA/CMR pass through; counters per direction; `stop` ends the threads and frees the ports (rebind succeeds)
+- [X] T017 Implement `relay.rs` (`ForwardLeg` pair, `ForwardSession` with `Drop`, `Direction` atomics, counters), generalising `ims/agent/veth.rs::forward`; make the RTCP clock rate a parameter instead of the PCMU constant
+- [X] T018 Make `veth.rs::forward` and the new relay share the SSRC tracker / RTCP role hooks rather than copying them; existing veth tests unchanged
 
 **Checkpoint**: `make format && make lint && make test` green; commit groups: config, params+sdp, repack, control protocol, relay.
 

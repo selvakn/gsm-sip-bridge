@@ -435,6 +435,7 @@ pub(super) fn handle_invite(
             call_id: call_id.clone(),
             caller: caller.clone(),
             caller_name: caller_name_for_onward_signaling(req, ctx.respect_caller_privacy),
+            carrier_amr: None,
         },
     )
     .map_err(BridgeError::Ims)?;
@@ -796,6 +797,7 @@ fn handle_offerless_invite(
             call_id: call_id.to_string(),
             caller: caller.to_string(),
             caller_name: caller_name_for_onward_signaling(req, ctx.respect_caller_privacy),
+            carrier_amr: None,
         },
     )
     .map_err(BridgeError::Ims)?;

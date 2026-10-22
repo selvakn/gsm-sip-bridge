@@ -1614,12 +1614,13 @@ fn handle_connection(
     let mut writer = stream;
 
     let msg = read_msg(&mut reader).map_err(BridgeError::Ims)?;
-    let (call_id, caller, caller_name) = match msg {
+    let (call_id, caller, caller_name, _carrier_amr) = match msg {
         ControlMessage::IncomingCall {
             call_id,
             caller,
             caller_name,
-        } => (call_id, caller, caller_name),
+            carrier_amr,
+        } => (call_id, caller, caller_name, carrier_amr),
         ControlMessage::StatusQuery => {
             let calls = recent_calls
                 .lock()
@@ -1744,6 +1745,7 @@ fn handle_connection(
                             started_at,
                             ended_at: Some(now_unix()),
                             phone_codec: None,
+                            media_path: None,
                         },
                     );
                     return Ok(());
@@ -1808,6 +1810,7 @@ fn handle_connection(
                     started_at,
                     ended_at: Some(now_unix()),
                     phone_codec,
+                    media_path: None,
                 },
             );
             Ok(())
@@ -1838,6 +1841,7 @@ fn handle_connection(
                     started_at,
                     ended_at: Some(now_unix()),
                     phone_codec: None,
+                    media_path: None,
                 },
             );
             Ok(())
@@ -3277,6 +3281,7 @@ mod tests {
             started_at: 1_700_000_000,
             ended_at: Some(1_700_000_300),
             phone_codec: None,
+            media_path: None,
         }
     }
 

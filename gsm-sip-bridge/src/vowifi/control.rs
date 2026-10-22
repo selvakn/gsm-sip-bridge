@@ -12,6 +12,7 @@
 //! read/write-helper shape follow `control::protocol::read_cmd`/`write_resp`
 //! exactly.
 
+use crate::amr_forward::AmrLegParams;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
@@ -49,6 +50,11 @@ pub enum ControlMessage {
         /// older Agent A that omits it still parses.
         #[serde(default)]
         caller_name: Option<String>,
+        /// What the carrier leg negotiated, when it is AMR and Agent A has
+        /// `amr_passthrough` on (specs/120). Absent otherwise, and from an
+        /// older Agent A: Agent B then never attempts an upgrade.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carrier_amr: Option<AmrLegParams>,
     },
     /// Either direction. Whichever agent sees its own leg drop first sends
     /// this; the receiver tears its side down and does not echo it back.
@@ -67,6 +73,27 @@ pub enum ControlMessage {
     /// answering any earlier cuts the caller's ringback off and leaves them
     /// listening to dead air while the extension is still ringing.
     CallAnswered { call_id: String },
+    /// Agent B → Agent A (specs/120). The client answered and Agent B judged
+    /// the call forwardable: forward the carrier's AMR frames to
+    /// `<Agent B's veth address>:rtp_port` instead of transcoding. `client` is
+    /// what the client negotiated, so Agent A can re-check the rule.
+    ForwardMedia {
+        call_id: String,
+        rtp_port: u16,
+        client: AmrLegParams,
+    },
+    /// Agent A → Agent B. Reply to `ForwardMedia`. `ok: false` carries a
+    /// `Reason` string and leaves the call transcoded.
+    ForwardAck {
+        call_id: String,
+        ok: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Agent B → Agent A. Abandon an acked forward (the client's re-INVITE
+    /// failed, or the re-check failed): discard the pending forwarding socket
+    /// and use the transcoding relay.
+    ForwardCancel { call_id: String },
     /// Agent B → Agent A. The PBX-side or veth-side leg could not be
     /// established, or ended before anyone answered; Agent A must decline the
     /// inbound INVITE. `reason` decides how: only `reason::PBX_REJECTED` is
@@ -225,6 +252,9 @@ impl ControlMessage {
             | ControlMessage::CallAttempting { call_id, .. }
             | ControlMessage::CallRinging { call_id, .. }
             | ControlMessage::CallEarlyMedia { call_id, .. }
+            | ControlMessage::ForwardMedia { call_id, .. }
+            | ControlMessage::ForwardAck { call_id, .. }
+            | ControlMessage::ForwardCancel { call_id, .. }
             | ControlMessage::CallPlaced { call_id, .. }
             | ControlMessage::CallFailed { call_id, .. } => Some(call_id),
             ControlMessage::StatusQuery
@@ -254,6 +284,11 @@ pub struct CallRecord {
     /// `serde(default)` keeps an older agent's reply decodable (spec 085).
     #[serde(default)]
     pub phone_codec: Option<String>,
+    /// How the call's audio crossed the bridge: `forwarded:amr-wb:oa/be` or
+    /// `transcoded:<reason>` (specs/120 `contracts/logs.md`). `None` for calls
+    /// that never reached the decision, and from an older agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_path: Option<String>,
 }
 
 /// `bridge_failed` reasons — kept as `&'static str` constants (rather than a
@@ -342,8 +377,107 @@ mod tests {
             call_id: "a1b2c3".to_string(),
             caller: "+919000000000".to_string(),
             caller_name: Some("Firstname Lastname".to_string()),
+            carrier_amr: None,
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    fn wb_params() -> AmrLegParams {
+        use crate::amr_forward::SdpLeg;
+        use crate::ims::amr_rtp::AmrKind;
+        AmrLegParams::from_sdp(&SdpLeg {
+            flavour: AmrKind::Wb,
+            fmtp: "octet-align=1; mode-set=0,1,2,3",
+            payload_type: 104,
+            dtmf_payload_type: Some(105),
+            ptime_ms: Some(20),
+            maxptime_ms: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn incoming_call_carries_the_carrier_amr_params() {
+        let msg = ControlMessage::IncomingCall {
+            call_id: "a1b2c3".to_string(),
+            caller: "+919000000000".to_string(),
+            caller_name: None,
+            carrier_amr: Some(wb_params()),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""flavour":"wb""#) && json.contains(r#""payload_type":104"#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn an_old_incoming_call_without_carrier_amr_parses_to_none() {
+        let older = r#"{"event":"incoming_call","call_id":"a1","caller":"+919000000000","caller_name":null}"#;
+        match serde_json::from_str::<ControlMessage>(older).unwrap() {
+            ControlMessage::IncomingCall { carrier_amr, .. } => assert_eq!(carrier_amr, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_forward_messages_roundtrip_and_name_their_call() {
+        let msgs = [
+            ControlMessage::ForwardMedia {
+                call_id: "a1".into(),
+                rtp_port: 40010,
+                client: wb_params(),
+            },
+            ControlMessage::ForwardAck {
+                call_id: "a1".into(),
+                ok: true,
+                reason: None,
+            },
+            ControlMessage::ForwardAck {
+                call_id: "a1".into(),
+                ok: false,
+                reason: Some("mode_set".into()),
+            },
+            ControlMessage::ForwardCancel {
+                call_id: "a1".into(),
+            },
+        ];
+        for msg in msgs {
+            assert_eq!(roundtrip(&msg), msg);
+            assert_eq!(msg.call_id(), Some("a1"));
+        }
+        let json = serde_json::to_string(&ControlMessage::ForwardCancel {
+            call_id: "a1".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"event":"forward_cancel","call_id":"a1"}"#);
+    }
+
+    #[test]
+    fn a_forward_ack_without_a_reason_parses() {
+        let ack = r#"{"event":"forward_ack","call_id":"a1","ok":true}"#;
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(ack).unwrap(),
+            ControlMessage::ForwardAck {
+                call_id: "a1".into(),
+                ok: true,
+                reason: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_call_record_without_media_path_parses_and_one_with_it_roundtrips() {
+        let older = r#"{"call_id":"a1","caller":"+919000000000","outcome":"answered","started_at":1,"ended_at":null}"#;
+        let rec: CallRecord = serde_json::from_str(older).unwrap();
+        assert_eq!(rec.media_path, None);
+        let rec = CallRecord {
+            media_path: Some("forwarded:amr-wb:oa/be".into()),
+            ..rec
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert_eq!(serde_json::from_str::<CallRecord>(&json).unwrap(), rec);
     }
 
     #[test]
@@ -534,6 +668,7 @@ mod tests {
             call_id: "a1b2c3".to_string(),
             caller: "+919000000000".to_string(),
             caller_name: Some("Firstname Lastname".to_string()),
+            carrier_amr: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
@@ -549,6 +684,7 @@ mod tests {
                 call_id: "x".to_string(),
                 caller: "y".to_string(),
                 caller_name: None,
+                carrier_amr: None,
             }
             .call_id(),
             Some("x")
@@ -587,6 +723,7 @@ mod tests {
                 call_id: "1".to_string(),
                 caller: "c".to_string(),
                 caller_name: None,
+                carrier_amr: None,
             },
         )
         .unwrap();
@@ -718,6 +855,7 @@ mod tests {
                     started_at: 1_700_000_000,
                     ended_at: Some(1_700_000_300),
                     phone_codec: Some("AMR-WB".to_string()),
+                    media_path: None,
                 },
                 CallRecord {
                     call_id: "2".to_string(),
@@ -726,6 +864,7 @@ mod tests {
                     started_at: 1_700_000_500,
                     ended_at: Some(1_700_000_500),
                     phone_codec: None,
+                    media_path: None,
                 },
             ],
         };
