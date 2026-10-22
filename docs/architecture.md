@@ -445,3 +445,8 @@ gsm-sip-bridge -s /dev/ttyUSB3 -a hw:2,0 --config config.toml
 - [vowifi-epdg-research-notes.md](vowifi-epdg-research-notes.md) — historical engineering notes: ePDG tunnel, IMS-AKA, Gm IPsec debugging, per-carrier behavior
 - [gm-ipsec-xfrm-plan.md](gm-ipsec-xfrm-plan.md) — design rationale for the kernel-XFRM Gm IPsec implementation
 - `specs/` — per-feature specs, plans, and task breakdowns; VoLTE spans `015-volte-host-ims` through `020-volte-line-netns`
+
+
+## AMR passthrough (specs/120)
+
+With `[vowifi].amr_passthrough = true`, an inbound call whose carrier and phone legs both negotiated compatible AMR skips the decode/encode: Agent A relays AMR packets between the carrier and a UDP hop to Agent B, and Agent B runs a forwarder between that hop and the phone. PJSIP in Agent B keeps SIP/SDP only (a pjmedia loop transport advertises the forwarder, the stream is paused). The decision is made once, after the phone answers and before the carrier is answered; calls that do not qualify never take an extra step. Details and the upgrade sequence: `docs/vowifi-bridge.md`.

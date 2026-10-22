@@ -1,0 +1,18 @@
+# baresip for the AMR passthrough checks (specs/120). Audio never touches a
+# sound card: a sine goes out, the received audio is written to a file.
+module_path		/usr/lib/baresip/modules
+module			g711.so
+module			amr.so
+module			account.so
+module			ausine.so
+module			aufile.so
+module			menu.so
+module			cons.so
+audio_player		aufile,/root/rx.wav
+audio_source		aufile,/root/in.wav
+audio_alert		aufile,/root/alert.wav
+cons_listen		127.0.0.1:5555
+call_local_timeout	900
+call_max_calls		4
+audio_buffer		20-160
+rtp_tos			184

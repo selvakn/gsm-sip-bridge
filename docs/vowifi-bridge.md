@@ -139,6 +139,20 @@ ask for AMR or Opus, and one that prefers them can now negotiate them.
 
 The negotiated phone-leg codec shows as `phone_codec=` in `vowifi-status` recent calls.
 
+## AMR passthrough — `gsm-sip-bridge/src/amr_forward/`, `vowifi/forward.rs`
+
+Off by default (`[vowifi].amr_passthrough`, inbound calls only). Normally Agent A decodes the carrier's AMR to PCM and Agent B encodes it again for the phone. When the carrier leg and the phone leg both settled on AMR-WB (or both AMR-NB) with compatible parameters, the speech frames are forwarded without being decoded.
+
+**When a call is forwarded.** Same flavour on both legs; each leg's `mode-set` equal (unrestricted counts as every mode); no CRC, robust-sorting, interleaving or redundancy; frames per packet that fit the other leg; telephone-event negotiated on both legs or neither. Packing (octet-aligned vs bandwidth-efficient) may differ: it is converted frame by frame. Anything else is transcoded exactly as before, and the verdict can never fail a call. Carriers often restrict AMR-WB to `mode-set=0,1,2,3`; a phone that does not state the same restriction in its answer is, by the rule, transcoded (`reason=mode_set`).
+
+**The upgrade sequence.** Every call starts on the transcoded path. After the phone answers, and before Agent B sends `CallAnswered` (so the carrier is not yet answered and no carrier audio has flowed), Agent B judges compatibility. Only a qualifying call is upgraded: `ForwardMedia` → `ForwardAck` (Agent A binds its end of a UDP hop to Agent B and keeps it pending) → Agent B starts its forwarder → the phone leg is re-INVITEd (`PJSUA_CALL_REINIT_MEDIA`) onto the forwarder's address, with PJSIP's own stream paused → the answer is re-checked → the veth call is unpaired and paused → `CallAnswered`. Any failure leaves a transcoded call (`ForwardCancel`; the phone is re-INVITEd back if it had already moved).
+
+**Behaviour.** SSRC, sequence number and timestamp pass through untouched; only the audio and telephone-event payload types are relabelled per leg. Nothing is sent to a held phone, and a changed phone address is followed. A phone re-INVITE that drops the codec is answered 488 and the call carries on. RTCP towards the carrier is unchanged; the phone gets none.
+
+**PBX caveat.** The phone side must pass AMR through. The built-in `[sip_server]` does; stock Asterisk does not (it would negotiate its own codec with the bridge, and the call is transcoded).
+
+**Reading the path.** Agent B logs `media path decided call_id=… path=forwarded flavour=amr-wb carrier_packing=… client_packing=…` or `path=transcoded reason=…`, Agent A's `call answered and bridged` line has `forwarding=true|false`, and `vowifi-status` recent calls show `media_path=forwarded:amr-wb:oa/be` or `transcoded:<reason>`. Reasons: `disabled`, `outbound`, `carrier_not_amr`, `client_not_amr`, `flavour_differs`, `mode_set`, `feature`, `ptime`, `dtmf`, `ack_timeout`, `reinvite_failed`.
+
 ## What's verified vs. what needs real hardware
 
 Everything above is unit- and integration-tested without live hardware (175 `gsm-sip-bridge` lib

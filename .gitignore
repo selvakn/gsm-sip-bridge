@@ -46,3 +46,4 @@ samples/
 
 .aide.yaml
 .worktrees
+specs/120-amr-passthrough-forwarder/harness/run/

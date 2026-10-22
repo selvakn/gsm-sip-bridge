@@ -8,6 +8,16 @@ across releases.
 
 ## [Unreleased]
 
+### Added
+
+- **AMR passthrough** (`[vowifi].amr_passthrough`, off by default, #111).
+  Inbound calls whose carrier and phone legs both negotiated compatible
+  AMR-WB (or both AMR-NB) carry the carrier's frames to the phone without
+  decoding them, with DTMF, hold/resume and a packing conversion between
+  octet-aligned and bandwidth-efficient. Every other call is transcoded as
+  before. `vowifi-status` recent calls show `media_path=`. Outbound calls are
+  never forwarded. Needs a phone or `[sip_server]` that passes AMR through.
+
 ### Changed
 
 - **The supervisor's P-CSCF probe is off by default.** The line supervisor's

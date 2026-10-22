@@ -1140,6 +1140,10 @@ Messages are acknowledged **after** being recorded, never before, so an
 ill-timed crash costs a retransmission (which is de-duplicated) rather than a
 silently lost text.
 
+## AMR passthrough kill switch
+
+`[vowifi].amr_passthrough` (default `false`) forwards AMR between the carrier and an AMR-capable phone without transcoding it (inbound calls only; see `docs/vowifi-bridge.md`). To turn it off, set it to `false` (or remove it) and recreate the container: every call is then transcoded as before, and `vowifi-status` shows `media_path=transcoded:disabled` for calls whose phone leg is AMR. The change needs a recreate, not a restart. To see what a call did, read `media_path=` in `vowifi-status` recent calls or the `media path decided` line in the container log. A call that was not forwarded although AMR was on both sides says why (`mode_set`, `dtmf`, ...).
+
 ## SIP server mode
 
 `specs/024-sip-server-mode`. The bridge **is** the SIP server: IP phones

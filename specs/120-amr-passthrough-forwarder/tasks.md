@@ -121,8 +121,8 @@
 
 ## Phase 7: Polish and release verification
 
-- [ ] T042 [P] Docs: `docs/configuration.md` (setting, default, inbound-only, restart needed), `docs/vowifi-bridge.md` and `docs/architecture.md` (when a call is forwarded and when not, the upgrade sequence, the PBX caveat that stock Asterisk does not pass AMR through, how to read the path from logs), `docs/operations.md` (kill switch), `config.toml.example` — FR-019, SC-007
-- [ ] T043 [P] `CHANGELOG.md` and `RELEASE_NOTES.md`: **Feature name** bolded, plain description after (release-notes rule); state off by default, how to turn on, inbound only
+- [X] T042 [P] Docs: `docs/configuration.md` (setting, default, inbound-only, restart needed), `docs/vowifi-bridge.md` and `docs/architecture.md` (when a call is forwarded and when not, the upgrade sequence, the PBX caveat that stock Asterisk does not pass AMR through, how to read the path from logs), `docs/operations.md` (kill switch), `config.toml.example` — FR-019, SC-007
+- [X] T043 [P] `CHANGELOG.md` and `RELEASE_NOTES.md`: **Feature name** bolded, plain description after (release-notes rule); state off by default, how to turn on, inbound only
 - [ ] T044 Jio line live run on the Pi (arm64 via `arm-build-200`): quickstart §3, 5-minute soak with DTMF and hold/resume, plus an outbound call and a non-AMR target. Record in `live-verification.md` (SC-006, FR-020b)
 - [ ] T045 Cost and delay on the Pi (quickstart §4): forwarded vs transcoded CPU (SC-004 ≥70%) and added delay (SC-005 ≥20 ms). Record numbers in `live-verification.md`; if a target is missed, say so in the release notes rather than rounding up
 - [ ] T046 One-way-audio monitor check on a forwarded call (FR-013): kill one direction at the client, confirm the existing one-way-audio report fires; kill the client mid-call, confirm teardown and no leaked ports (FR-017)

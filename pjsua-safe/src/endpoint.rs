@@ -1012,6 +1012,13 @@ unsafe extern "C" fn on_call_media_state_cb(call_id: pjsua_sys::pjsua_call_id) {
             None => tracing::warn!(call_id, "SIP call media active but the negotiated codec could not be read"),
         }
 
+        // A forwarded (or silenced veth) call carries its media outside PJSIP
+        // (specs/120): its stream is paused, so it must not be connected to the
+        // sound device or paired again.
+        if crate::passthrough::is_registered(call_id) {
+            return;
+        }
+
         let peer_call_id = {
             let pairs = BRIDGE_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
             pairs.get(&call_id).copied()
