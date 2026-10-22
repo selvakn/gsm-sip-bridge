@@ -215,6 +215,26 @@ fn vowifi_shell_env_reports_the_supervisor_pcscf_probe_after_the_dpd_delay() {
     );
 }
 
+/// specs/120: whether AMR passthrough is on is visible in the export, right
+/// after the supervisor probe flag.
+#[test]
+fn vowifi_shell_env_reports_amr_passthrough_after_the_supervisor_probe() {
+    let rendered = config_cmd::render_vowifi_shell_env(&load_minimal_config());
+    assert!(
+        rendered.contains("SUPERVISOR_PCSCF_PROBE='false'\nAMR_PASSTHROUGH='false'\n"),
+        "{rendered}"
+    );
+
+    let on = load_config_from(&format!(
+        "{MINIMAL_CONFIG}\n[vowifi]\namr_passthrough = true\n"
+    ));
+    let rendered = config_cmd::render_vowifi_shell_env(&on);
+    assert!(
+        rendered.contains("SUPERVISOR_PCSCF_PROBE='false'\nAMR_PASSTHROUGH='true'\n"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn vowifi_shell_env_emits_the_globals_a_consumer_reads_by_name() {
     let config = load_minimal_config();

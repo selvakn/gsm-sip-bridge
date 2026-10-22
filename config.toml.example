@@ -377,6 +377,13 @@ apn = "ims"
 # detection of a dead single P-CSCF, or the previous behaviour. Applies when
 # the container is recreated.
 # supervisor_pcscf_probe = false
+# Forward AMR audio between the carrier and an AMR-capable client without
+# decoding it (inbound VoWiFi/VoLTE calls only, off by default, #111). Used only
+# when both legs settled on AMR-WB (or both AMR-NB) with compatible parameters;
+# every other call is transcoded as before. The client or SIP server must pass
+# AMR through (the built-in [sip_server] does; stock Asterisk does not). Applies
+# when the container is recreated.
+# amr_passthrough = false
 # keepalive_interval_sec = 30
 # strongswan engine only: seconds with nothing received from the ePDG before
 # charon sends a dead-peer-detection request. 0 turns it off. Default 120, the

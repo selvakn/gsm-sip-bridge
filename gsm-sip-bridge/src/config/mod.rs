@@ -1037,6 +1037,12 @@ pub struct VowifiConfig {
     /// handset does this, and the per-tick route repair, the rebuild when the
     /// agent has marked every P-CSCF, and tuned DPD cover what it caught.
     pub supervisor_pcscf_probe: bool,
+    /// Forward AMR audio between the carrier and an AMR-capable client without
+    /// decoding it (#111 option 2a, specs/120-amr-passthrough-forwarder).
+    /// Inbound VoWiFi/VoLTE calls only, off by default; a call that does not
+    /// qualify is transcoded exactly as before. Per deployment; takes effect
+    /// when the container is recreated.
+    pub amr_passthrough: bool,
     /// Idle-tunnel keepalive interval (seconds) — a TCP connect to the
     /// P-CSCF's SIP port, since operators commonly filter ICMP over the
     /// tunnel (confirmed on Vodafone India). Only applies when
@@ -1209,6 +1215,7 @@ impl Default for VowifiConfig {
             src_addr: None,
             idle_keepalive: false,
             supervisor_pcscf_probe: false,
+            amr_passthrough: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: DEFAULT_DPD_DELAY_SEC,
             underlay_guard: true,
@@ -2434,6 +2441,41 @@ password = "pass"
         .unwrap_err()
         .to_string();
         assert!(err.contains("supervisor_pcscf_probe"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_amr_passthrough_is_off_by_default() {
+        // #111 / specs/120: forwarding is opt-in.
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\n"));
+        assert!(!cfg.vowifi.amr_passthrough);
+    }
+
+    #[test]
+    fn vowifi_amr_passthrough_can_be_turned_on() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\namr_passthrough = true\n"
+        ));
+        assert!(cfg.vowifi.amr_passthrough);
+    }
+
+    #[test]
+    fn vowifi_amr_passthrough_rejects_a_non_boolean() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\namr_passthrough = \"yes\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("amr_passthrough"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_amr_passthrough_is_not_a_per_line_key() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[[vowifi.line]]\nmodem_serial = \"abc123def456\"\namr_passthrough = true\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("amr_passthrough"), "{err}");
     }
 
     #[test]
