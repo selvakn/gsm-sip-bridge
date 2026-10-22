@@ -2275,7 +2275,7 @@ mod tests {
         let addr: SocketAddr = "[2402:8100::1]:5060".parse().unwrap();
         let req = RegisterRequest {
             registrar_uri: "ims.mnc043.mcc404.3gppnetwork.org",
-            public_uri: "404438083996440@ims.mnc043.mcc404.3gppnetwork.org",
+            public_uri: "404430000000000@ims.mnc043.mcc404.3gppnetwork.org",
             local_addr: addr,
             contact_addr: addr,
             call_id: "callid123",
@@ -2433,11 +2433,11 @@ mod tests {
     // --- SipRequest / UAS response builders (specs/011-vowifi-sip-bridge) ---
 
     const SAMPLE_INVITE: &str =
-        "INVITE sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone SIP/2.0\r\n\
+        "INVITE sip:404430000000000@ims.mnc094.mcc404.3gppnetwork.org;user=phone SIP/2.0\r\n\
          Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKabc123;rport\r\n\
          Max-Forwards: 70\r\n\
          From: <sip:+919000000000@ims.mnc094.mcc404.3gppnetwork.org>;tag=fromtag1\r\n\
-         To: <sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n\
+         To: <sip:404430000000000@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n\
          Call-ID: abc123callid\r\n\
          CSeq: 1 INVITE\r\n\
          Contact: <sip:+919000000000@10.0.0.5:5060;transport=TCP>\r\n\
@@ -2454,7 +2454,7 @@ mod tests {
         assert_eq!(req.method, "INVITE");
         assert_eq!(
             req.request_uri,
-            "sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone"
+            "sip:404430000000000@ims.mnc094.mcc404.3gppnetwork.org;user=phone"
         );
         assert_eq!(req.header("Call-ID").unwrap(), "abc123callid");
         assert_eq!(req.header("CSeq").unwrap(), "1 INVITE");
@@ -2488,7 +2488,7 @@ mod tests {
     fn sample_bye() -> SipRequest {
         let raw = "BYE sip:caller@10.0.0.5:5060 SIP/2.0\r\n\
                     Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKbye1\r\n\
-                    From: <sip:404438083996440@realm>;tag=totag1\r\n\
+                    From: <sip:404430000000000@realm>;tag=totag1\r\n\
                     To: <sip:+919000000000@realm>;tag=fromtag1\r\n\
                     Call-ID: abc123callid\r\n\
                     CSeq: 2 BYE\r\n\
@@ -2508,7 +2508,7 @@ mod tests {
         assert!(resp.contains("CSeq: 1 INVITE\r\n"));
         // To header echoed without a tag added.
         assert!(resp.contains(
-            "To: <sip:404438083996440@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n"
+            "To: <sip:404430000000000@ims.mnc094.mcc404.3gppnetwork.org;user=phone>\r\n"
         ));
     }
 
@@ -2789,10 +2789,10 @@ mod tests {
     }
 
     fn sample_message() -> SipRequest {
-        let raw = "MESSAGE sip:404438083996440@realm SIP/2.0\r\n\
+        let raw = "MESSAGE sip:404430000000000@realm SIP/2.0\r\n\
                     Via: SIP/2.0/TCP 10.0.0.5:5060;branch=z9hG4bKmsg1\r\n\
                     From: <sip:+919000000000@realm>;tag=fromtag1\r\n\
-                    To: <sip:404438083996440@realm>\r\n\
+                    To: <sip:404430000000000@realm>\r\n\
                     Call-ID: msgcallid\r\n\
                     CSeq: 1 MESSAGE\r\n\
                     Content-Type: text/plain\r\n\

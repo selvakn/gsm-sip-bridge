@@ -334,13 +334,13 @@ mod tests {
         let mut responses = usim_selection_responses();
         responses.extend([
             "9000".to_string(),                   // SELECT EF_IMSI
-            "0849403408389946049000".to_string(), // READ BINARY EF_IMSI
+            "0849403400000000009000".to_string(), // READ BINARY EF_IMSI
             "9000".to_string(),                   // SELECT EF_AD
             "000000029000".to_string(),           // READ BINARY EF_AD -> 2-digit MNC
         ]);
         let mut card = QueuedCard(VecDeque::from(responses));
         let (imsi, mcc, mnc) = read_card_identity(&mut card).unwrap();
-        assert_eq!(imsi, "404438083996440");
+        assert_eq!(imsi, "404430000000000");
         assert_eq!(mcc, "404");
         assert_eq!(mnc.as_deref(), Some("43"));
     }
@@ -350,12 +350,12 @@ mod tests {
         let mut responses = usim_selection_responses();
         responses.extend([
             "9000".to_string(),
-            "0849403408389946049000".to_string(),
+            "0849403400000000009000".to_string(),
             "6A82".to_string(), // SELECT EF_AD: file not found
         ]);
         let mut card = QueuedCard(VecDeque::from(responses));
         let (imsi, mcc, mnc) = read_card_identity(&mut card).unwrap();
-        assert_eq!(imsi, "404438083996440");
+        assert_eq!(imsi, "404430000000000");
         assert_eq!(mcc, "404");
         assert_eq!(mnc, None);
     }
@@ -379,7 +379,7 @@ mod tests {
             CardRow {
                 reader: "OMNIKEY AG SmartCard Reader 3x21 00 00".to_string(),
                 status: "ok".to_string(),
-                imsi: Some("404438083996440".to_string()),
+                imsi: Some("404430000000000".to_string()),
                 mcc: Some("404".to_string()),
                 mnc: Some("043".to_string()),
                 carrier: Some("Vodafone India (India)".to_string()),

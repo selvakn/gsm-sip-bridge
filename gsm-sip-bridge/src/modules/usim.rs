@@ -506,20 +506,20 @@ mod tests {
 
     #[test]
     fn swap_nibbles_hex_reverses_each_byte_pair() {
-        assert_eq!(swap_nibbles_hex("4940340838994604"), "9404438083996440");
+        assert_eq!(swap_nibbles_hex("4940340000000000"), "9404430000000000");
     }
 
     #[test]
     fn read_imsi_decodes_a_real_ef_imsi_fixture() {
-        // Reverse-derived from the real IMSI 404438083996440 read live off an
+        // Reverse-derived from the real IMSI 404430000000000 read live off an
         // OmniKey AG 3x21 (docs/omnikey-pcsc-vowifi.md): length byte 0x08 (15
         // digits), then 8 bytes of nibble-swapped BCD with a leading
         // parity/oddness nibble that isn't part of the IMSI.
         let mut t = QueuedTransport(std::collections::VecDeque::from([
             "9000".to_string(),                            // SELECT EF_IMSI
-            "084940340838994604".to_string() + SW_SUCCESS, // READ BINARY
+            "084940340000000000".to_string() + SW_SUCCESS, // READ BINARY
         ]));
-        assert_eq!(read_imsi(&mut t).unwrap(), "404438083996440");
+        assert_eq!(read_imsi(&mut t).unwrap(), "404430000000000");
     }
 
     #[test]
@@ -527,9 +527,9 @@ mod tests {
         let mut t = QueuedTransport(std::collections::VecDeque::from([
             "9000".to_string(),
             "6C09".to_string(), // wrong Le -> retry with 9
-            "084940340838994604".to_string() + SW_SUCCESS,
+            "084940340000000000".to_string() + SW_SUCCESS,
         ]));
-        assert_eq!(read_imsi(&mut t).unwrap(), "404438083996440");
+        assert_eq!(read_imsi(&mut t).unwrap(), "404430000000000");
     }
 
     #[test]

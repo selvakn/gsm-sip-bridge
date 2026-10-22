@@ -80,7 +80,7 @@
 - [X] T025 [US1] Agent A (`ims/agent/inbound.rs`, `veth.rs`, `mod.rs`): populate `carrier_amr` in `IncomingCall`; handle `ForwardMedia` inside the existing `await_pbx_answer` control drain; reply `ForwardAck`; on `CallAnswered` spawn the forwarding relay between the carrier socket and the veth forwarding socket (RTCP bundle roles as today) instead of `spawn_transcoding_relay`; log `forwarding=` in `call answered and bridged`
 - [X] T026 [US1] Agent B (`vowifi/mod.rs`): after `wait_for_pbx_answer` returns `Answered` and before `CallAnswered`, read the client's params, run `compatible()`, and run the upgrade sequence from research R3; unpair the veth call from the conference on success; own the `ForwardSession`; keep refreshing remote address/direction in the existing media-state poll
 - [X] T027 [US1] VoLTE parity: pass the setting through `volte/carrier_agent.rs` so the host-side bridge's lines behave the same; add a case to `gsm-sip-bridge/tests/test_volte_bridge.rs` if that file's pattern allows
-- [ ] T028 [US1] Run the T019–T022 tests to green; then quickstart §2 steps 1–4 on the Vodafone rig (pcap bit-compare, DTMF both ways, hold/resume) and record the result in `specs/120-amr-passthrough-forwarder/live-verification.md`
+- [X] T028 [US1] Run the T019–T022 tests to green; then quickstart §2 steps 1–4 on the Vodafone rig (pcap bit-compare, DTMF both ways, hold/resume) and record the result in `specs/120-amr-passthrough-forwarder/live-verification.md`
 
 **Checkpoint**: US1 works on the local rig. `make format && make lint && make test`; commits: pjsua-safe FFI, Agent A, Agent B, VoLTE.
 
@@ -96,7 +96,7 @@
 - [X] T031 [P] [US2] Test: with the setting off, Agent A omits `carrier_amr`, Agent B never calls `register_forward`, and the call takes today's exact path (assert the sequence of control messages equals today's)
 - [X] T032 [US2] Fill any gaps those tests expose in the decision code (T026) — no behaviour change for the non-qualifying branch
 - [X] T033 [US2] Confirm the circuit-switched path is untouched: `git diff` shows no change under `gsm-sip-bridge/src/sip/`, `modules/`, `line/` beyond shared helpers; run `gsm-sip-bridge/tests/test_cs_disabled.rs` and `test_bridge_call.rs`
-- [ ] T034 [US2] Regression pass on the local rig (quickstart §2 step 6, built-in registrar and an external PBX, inbound and outbound, non-AMR target): per-leg codecs, audio and outcome identical to the previous release. Record in `live-verification.md`
+- [X] T034 [US2] Regression pass on the local rig (quickstart §2 step 6, built-in registrar and an external PBX, inbound and outbound, non-AMR target): per-leg codecs, audio and outcome identical to the previous release. Record in `live-verification.md`
 
 **Checkpoint**: SC-002 and SC-003 evidenced.
 
@@ -106,7 +106,7 @@
 
 - [X] T035 [P] [US3] Test: an outbound call placed with the setting on never registers a forward entry and its call record reads `transcoded:outbound` (exercise `run_outbound_listener` / `bridge_outbound_leg` paths with the existing outbound test harness)
 - [X] T036 [US3] Set `media_path = transcoded:outbound` where the outbound call record is built; no other change in the outbound code (FR-016)
-- [ ] T037 [US3] Live: one outbound call from baresip on the Vodafone rig and one on the Jio line with the setting on; two-way audio, `transcoded:outbound` in `vowifi-status`. Record in `live-verification.md`
+- [X] T037 [US3] Live: one outbound call from baresip on the Vodafone rig and one on the Jio line with the setting on; two-way audio, `transcoded:outbound` in `vowifi-status`. Record in `live-verification.md`
 
 ---
 
@@ -115,7 +115,7 @@
 - [X] T038 [P] [US4] Test: the `media path decided` line and `CallRecord.media_path` carry the exact strings in `contracts/logs.md` for forwarded (with each leg's packing) and for every `Reason`; non-AMR calls record nothing new
 - [X] T039 [US4] Emit the Agent B log line and set `media_path` on the record for every inbound call that reaches the decision (`vowifi/mod.rs`, `push_recent_call`); add `forwarding=` to Agent A's existing line if T025 did not
 - [X] T040 [US4] Verify `vowifi-status` prints `media_path` for recent calls (extend its formatter and test beside the existing `phone_codec` handling)
-- [ ] T041 [US4] Live kill-switch run (quickstart §2 step 7): setting off + recreate → `transcoded:disabled` for a qualifying call; setting on + recreate → forwarded
+- [X] T041 [US4] Live kill-switch run (quickstart §2 step 7): setting off + recreate → `transcoded:disabled` for a qualifying call; setting on + recreate → forwarded
 
 ---
 
@@ -123,10 +123,10 @@
 
 - [X] T042 [P] Docs: `docs/configuration.md` (setting, default, inbound-only, restart needed), `docs/vowifi-bridge.md` and `docs/architecture.md` (when a call is forwarded and when not, the upgrade sequence, the PBX caveat that stock Asterisk does not pass AMR through, how to read the path from logs), `docs/operations.md` (kill switch), `config.toml.example` — FR-019, SC-007
 - [X] T043 [P] `CHANGELOG.md` and `RELEASE_NOTES.md`: **Feature name** bolded, plain description after (release-notes rule); state off by default, how to turn on, inbound only
-- [ ] T044 Jio line live run on the Pi (arm64 via `arm-build-200`): quickstart §3, 5-minute soak with DTMF and hold/resume, plus an outbound call and a non-AMR target. Record in `live-verification.md` (SC-006, FR-020b)
-- [ ] T045 Cost and delay on the Pi (quickstart §4): forwarded vs transcoded CPU (SC-004 ≥70%) and added delay (SC-005 ≥20 ms). Record numbers in `live-verification.md`; if a target is missed, say so in the release notes rather than rounding up
-- [ ] T046 One-way-audio monitor check on a forwarded call (FR-013): kill one direction at the client, confirm the existing one-way-audio report fires; kill the client mid-call, confirm teardown and no leaked ports (FR-017)
-- [ ] T047 Final `make format && make lint && make test`; confirm no real numbers anywhere in the diff (CLAUDE.md); update the spec's Status to Implemented
+- [~] T044 Jio line live run on the Pi (arm64 via `arm-build-200`): quickstart §3, 5-minute soak with DTMF and hold/resume, plus an outbound call and a non-AMR target. Record in `live-verification.md` (SC-006, FR-020b)
+- [~] T045 Cost and delay on the Pi (quickstart §4): forwarded vs transcoded CPU (SC-004 ≥70%) and added delay (SC-005 ≥20 ms). Record numbers in `live-verification.md`; if a target is missed, say so in the release notes rather than rounding up
+- [X] T046 One-way-audio monitor check on a forwarded call (FR-013): kill one direction at the client, confirm the existing one-way-audio report fires; kill the client mid-call, confirm teardown and no leaked ports (FR-017)
+- [X] T047 Final `make format && make lint && make test`; confirm no real numbers anywhere in the diff (CLAUDE.md); update the spec's Status to Implemented
 
 ---
 

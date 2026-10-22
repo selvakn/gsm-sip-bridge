@@ -2076,7 +2076,7 @@ mod tests {
         let base = VowifiConfig {
             line_overrides: vec![VowifiLineOverride {
                 pcsc_reader: true,
-                imsi_override: Some("404438083996440".to_string()),
+                imsi_override: Some("404430000000000".to_string()),
                 ..Default::default()
             }],
             ..Default::default()
@@ -2093,7 +2093,7 @@ mod tests {
         assert_eq!(line.mnc, "");
         assert_eq!(line.config.mcc, "");
         assert_eq!(line.config.mnc, "");
-        assert_eq!(line.imsi_override.as_deref(), Some("404438083996440"));
+        assert_eq!(line.imsi_override.as_deref(), Some("404430000000000"));
         // The IMEI is still auto-generated — that one genuinely isn't on the
         // card, so an empty mcc/mnc must not have disturbed it.
         assert_eq!(
@@ -2264,7 +2264,7 @@ mod tests {
 
     #[test]
     fn generate_imei_is_luhn_valid_and_15_digits() {
-        let imei = generate_imei("404438083996440");
+        let imei = generate_imei("404430000000000");
         assert_eq!(imei.len(), 15);
         assert!(imei.chars().all(|c| c.is_ascii_digit()));
         let (body, check) = imei.split_at(14);
@@ -2274,15 +2274,15 @@ mod tests {
     #[test]
     fn generate_imei_is_stable_for_the_same_imsi() {
         assert_eq!(
-            generate_imei("404438083996440"),
-            generate_imei("404438083996440")
+            generate_imei("404430000000000"),
+            generate_imei("404430000000000")
         );
     }
 
     #[test]
     fn generate_imei_differs_across_imsis() {
         assert_ne!(
-            generate_imei("404438083996440"),
+            generate_imei("404430000000000"),
             generate_imei("404940123456789")
         );
     }
@@ -2292,7 +2292,7 @@ mod tests {
         // 2026-07-28 gap: IMS-AKA registration needs a device identity
         // (+sip.instance) that spec 023's original scope never populated for
         // a pcsc_reader line, leaving it permanently None.
-        let over = pcsc_override("404438083996440", "404", "043");
+        let over = pcsc_override("404430000000000", "404", "043");
         let base = VowifiConfig::default();
         let line = resolve_one_pcsc_line(0, "pcsc0".to_string(), &over, &base);
         let imei = line
@@ -2305,7 +2305,7 @@ mod tests {
 
     #[test]
     fn resolve_one_pcsc_line_respects_explicit_imei_override() {
-        let mut over = pcsc_override("404438083996440", "404", "043");
+        let mut over = pcsc_override("404430000000000", "404", "043");
         over.imei_override = Some("123456789012345".to_string());
         let base = VowifiConfig::default();
         let line = resolve_one_pcsc_line(0, "pcsc0".to_string(), &over, &base);

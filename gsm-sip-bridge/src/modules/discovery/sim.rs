@@ -265,7 +265,7 @@ mod tests {
             "OK\r\n",                    // AT+CFUN=1
             "+CPIN: READY\r\nOK\r\n",    // poll attempt 1: AT+CPIN?
             "+CPIN: READY\r\nOK\r\n",    // re-probe: AT+CPIN?
-            "404438083996440\r\nOK\r\n", // re-probe: AT+CIMI
+            "404430000000000\r\nOK\r\n", // re-probe: AT+CIMI
         ]);
         let status = recover_and_reprobe_sim(
             &mut at,
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(
             status,
             SimStatus::Ready {
-                imsi: "404438083996440".to_string()
+                imsi: "404430000000000".to_string()
             }
         );
     }

@@ -275,12 +275,12 @@ mod tests {
     #[test]
     fn derive_plmn_from_card_reads_both_files_off_the_card() {
         // The real Vodafone SIM from docs/omnikey-pcsc-vowifi.md (IMSI
-        // 404438083996440), with EF_AD declaring a 2-digit MNC — so this is
+        // 404430000000000), with EF_AD declaring a 2-digit MNC — so this is
         // 404/043, the pair that used to have to be hand-written in config.
         let mut responses = usim_selection_responses();
         responses.extend([
             "9000".to_string(),                   // SELECT EF_IMSI
-            "0849403408389946049000".to_string(), // READ BINARY EF_IMSI
+            "0849403400000000009000".to_string(), // READ BINARY EF_IMSI
             "9000".to_string(),                   // SELECT EF_AD
             "000000029000".to_string(),           // READ BINARY EF_AD -> 2-digit MNC
         ]);
@@ -315,7 +315,7 @@ mod tests {
         let mut responses = usim_selection_responses();
         responses.extend([
             "9000".to_string(),
-            "0849403408389946049000".to_string(),
+            "0849403400000000009000".to_string(),
             "6A82".to_string(), // SELECT EF_AD: file not found
         ]);
         let mut card = QueuedCard(VecDeque::from(responses));

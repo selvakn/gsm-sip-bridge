@@ -91,7 +91,7 @@ Vodafone ePDG tunnel establishes fully:
 ```
 [IKE] EAP method EAP_AKA succeeded, MSK established
 [IKE] IKE_SA ims[2] established between 192.168.15.10
-      [0404438083996440@nai.epc.mnc043.mcc404.3gppnetwork.org]...203.88.4.88
+      [0404430000000000@nai.epc.mnc043.mcc404.3gppnetwork.org]...203.88.4.88
 [IKE] CHILD_SA ims{2} established ... TS 2402:8100:6972:e043:0:18:291c:4201/128
 [IKE] installing new virtual IP 2402:8100:6972:e043:0:18:291c:4201
 ```

@@ -2,7 +2,7 @@
 
 **Feature Branch**: `120-amr-passthrough-forwarder`
 **Created**: 2026-10-22
-**Status**: Draft
+**Status**: Implemented (Jio forwarding and Pi cost measurements pending, see live-verification.md)
 **Input**: User description: "AMR passthrough for VoWiFi/VoLTE calls (issue #111, option 2a of #109). When a call's carrier leg and its client leg both negotiate AMR or AMR-WB with compatible parameters, Agent B carries the audio with a socket forwarder instead of PJSIP media: PJSIP keeps SIP/SDP only, via on_create_media_transport returning a pjmedia loop transport that reports the forwarder's address/port (rx disabled, PJSIP's own socket closed) and on_stream_created2 pausing the stream; Agent A forwards AMR frames to the veth leg instead of decoding to L16 (repacketising octet-aligned <-> bandwidth-efficient via ims/amr_rtp.rs when the legs differ). Every other call is transcoded exactly as today. The forward/transcode decision is made per call before media starts (Agent B's hook runs when the veth INVITE arrives, before on_incoming_call; Call-ID is available there). AMR only — no other codecs are forwarded. The forwarder must honour SDP direction (hold), remap payload types per leg (codec and telephone-event), and handle RTCP. Evidence and constraints are in specs/111-amr-passthrough-spike/findings-phase1.md and findings-phase2.md. Stock pjproject build, no pjsip patches; the circuit-switched GSM path is untouched."
 
 ## Background

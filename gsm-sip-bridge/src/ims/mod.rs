@@ -2050,7 +2050,7 @@ mod tests {
             algorithm: Some("AKAv1-MD5".to_string()),
         };
         let auth = build_authorization(
-            "404438083996440@ims.mnc043.mcc404.3gppnetwork.org",
+            "404430000000000@ims.mnc043.mcc404.3gppnetwork.org",
             &challenge,
             "sip:ims.mnc043.mcc404.3gppnetwork.org",
             b"\x01\x02\x03\x04\x05\x06\x07\x08",

@@ -1011,8 +1011,8 @@ mod tests {
 
     #[test]
     fn test_query_imsi() {
-        let mut at = make_commander("404438083996440\r\nOK\r\n");
-        assert_eq!(at.query_imsi().unwrap(), "404438083996440");
+        let mut at = make_commander("404430000000000\r\nOK\r\n");
+        assert_eq!(at.query_imsi().unwrap(), "404430000000000");
     }
 
     #[test]
