@@ -1,0 +1,562 @@
+##### s1full none --fwd --pause --up-in --rx488
+B| mode=signalling-only+forwarder published=172.17.0.4
+B| UDP/socket fds open @0.5s: 1
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=96d74c31-d2ea-4d0c-8eb2-1ddc15b30305 remote=<sip:172.17.0.4> media[0].type=-1
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0 state EARLY
+B| answer in-call 0 180 -> 0
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=9279a509-eb95-42eb-b2b4-91f98154204b remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=-1
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 4004
+B| call 1 state CALLING
+B| make_call -> 0
+B| call 1 state CONNECTING
+B| call 1: stream created (want_fwd=0)
+B| call 1: normal transport, conf_slot=1, left pending
+B| call 1 state CONFIRMED
+B| call 0: stream created (want_fwd=0)
+B| call 0: normal transport, conf_slot=2, left pending
+B| baseline: conference-connected 2 <-> 1
+B| call 0 state CONNECTING
+B| answer in-call 200 -> 0
+B| call 0 state CONFIRMED
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=9279a509-eb95-42eb-b2b4-91f98154204b remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=1
+B| call 1: forwarder bound 172.17.0.4:34356/34357; loop_create2 -> 0; closing PJSIP's own transport
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 34356
+B| call 1: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 1: stream created (want_fwd=1)
+B| call 1: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 1: codec AMR-WB/16000, remote RTP 172.17.0.4:6000, pt tx=101 rx=101, tel-event tx=120 rx=120
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=96d74c31-d2ea-4d0c-8eb2-1ddc15b30305 remote=<sip:172.17.0.4> media[0].type=1
+B| call 0: forwarder bound 172.17.0.4:60384/60385; loop_create2 -> 0; closing PJSIP's own transport
+B| call 0 local SDP (offer): c=172.17.0.4 m=audio 60384
+B| call 0: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| forwarder started (no conference connection made)
+B| UDP/socket fds open @4.0s: 5
+B| UDP/socket fds open @6.0s: 5
+B| call 0: rx re-INVITE, AMR-WB in offer=1 -> 200
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 60384
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=376 tx=390 rtcp rx=7 tx=3
+B| out-leg (Y): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=390 tx=376 rtcp rx=3 tx=7
+B| CPU during call window: 63.1 ms
+B| call 0: rx re-INVITE, AMR-WB in offer=1 -> 200
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 60384
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| UDP/socket fds open @14.0s: 1
+B| CPU user=2.355s sys=1.496s
+-- flows
+  :4000  -> :4002     29 pkts  {96: 29}
+  :4000  -> :60384   535 pkts  {96: 499, 120: 36}
+  :4001  -> :4003      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4001  -> :60385    13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :4002  -> :4000     29 pkts  {96: 29}
+  :4003  -> :4001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4004  -> :6000     14 pkts  {101: 14}
+  :4005  -> :6001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6000  -> :4004     14 pkts  {101: 14}
+  :6000  -> :34356   550 pkts  {101: 550}
+  :6001  -> :4005      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6001  -> :34357     6 pkts  {'rtcp201': 2, 'rtcp200': 4}
+  :34356 -> :6000    535 pkts  {101: 499, 120: 36}
+  :34357 -> :6001     13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :60384 -> :4000    550 pkts  {96: 550}
+  :60385 -> :4001      4 pkts  {'rtcp201': 1, 'rtcp200': 3}
+-- AMR-WB frames Y->B vs B->X
+leg-in  (from :6000) pkts=564 frames=564 CMRs=[15] FTs={2: 564} ssrc=[2123009273]
+leg-out (to   :4000) pkts=579 frames=579 CMRs=[15] FTs={2: 579} ssrc=[484446736, 2123009273]
+frames/pkt in=Counter({1: 564}) out=Counter({1: 579})
+RESULT: 550 consecutive speech frames bit-identical (out-leg speech frames=579, offset in=14 out=29)
+-- AMR-WB frames X->B vs B->Y
+leg-in  (from :4000) pkts=564 frames=564 CMRs=[0, 15] FTs={2: 537, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[168438810]
+leg-out (to   :6000) pkts=549 frames=549 CMRs=[0, 15] FTs={2: 522, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[168438810, 1982677197]
+frames/pkt in=Counter({1: 564}) out=Counter({1: 549})
+RESULT: 1 consecutive speech frames bit-identical (out-leg speech frames=549, offset in=414 out=0)
+-- DTMF seen by Y
+07:18:59.570            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+07:18:59.809            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+07:19:00.050            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- exact payload compare
+  :6000->B 564 pkts, B->:4000 579 pkts; identical (seq, ts, ssrc, payload) in order: 0/564
+  :4000->B 564 pkts, B->:6000 549 pkts; identical (seq, ts, ssrc, payload) in order: 0/549
+-- SDP c=/m= lines in re-INVITEs (Y log)
+07:18:56.284           pjsua_core.c  .RX 1391 bytes Request msg INVITE/cseq=9411 (rdata0x7cd431289048) from UDP 127.0.0.1:5070:
+INVITE sip:y@127.0.0.1:5080;transport=udp SIP/2.0
+CSeq: 9411 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 4004 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+07:18:56.284           pjsua_call.c  .Incoming Request msg INVITE/cseq=9411 (rdata0x7cd431289048)
+07:18:56.285           pjsua_core.c  .....TX 313 bytes Response msg 100/INVITE/cseq=9411 (tdta0x7cd431276840) to UDP 127.0.0.1:5070:
+CSeq: 9411 INVITE
+07:18:56.285           pjsua_core.c  ......TX 941 bytes Response msg 200/INVITE/cseq=9411 (tdta0x7cd431248320) to UDP 127.0.0.1:5070:
+CSeq: 9411 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 6000 RTP/AVP 101 120
+c=IN IP4 172.17.0.4
+07:18:56.566           pjsua_core.c  .RX 1433 bytes Request msg INVITE/cseq=9412 (rdata0x7cd431289038) from UDP 172.17.0.4:5070:
+INVITE sip:172.17.0.4:5080 SIP/2.0
+CSeq: 9412 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 34356 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+-- listening UDP sockets after exit
+/lab/run3.sh: line 26: ss: command not found
+0
+##### s1inc incompat --fwd --pause --up-in --rx488
+B| mode=signalling-only+forwarder published=172.17.0.4
+B| UDP/socket fds open @0.5s: 1
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=cd292028-11af-420d-a78b-933281ce8690 remote=<sip:172.17.0.4> media[0].type=-1
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0 state EARLY
+B| answer in-call 0 180 -> 0
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=f8ba82ac-c26c-42f3-b0c0-8fb40cad43ce remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=-1
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 4004
+B| call 1 state CALLING
+B| make_call -> 0
+B| call 1 state CONNECTING
+B| call 1: stream created (want_fwd=0)
+B| call 1: normal transport, conf_slot=1, left pending
+B| call 1 state CONFIRMED
+B| call 0: stream created (want_fwd=0)
+B| call 0: normal transport, conf_slot=2, left pending
+B| baseline: conference-connected 2 <-> 1
+B| call 0 state CONNECTING
+B| answer in-call 200 -> 0
+B| call 0 state CONFIRMED
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=f8ba82ac-c26c-42f3-b0c0-8fb40cad43ce remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=1
+B| call 1: forwarder bound 172.17.0.4:41192/41193; loop_create2 -> 0; closing PJSIP's own transport
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 41192
+B| call 1: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 1: stream created (want_fwd=1)
+B| call 1: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 1: codec AMR-WB/16000, remote RTP 172.17.0.4:6000, pt tx=101 rx=101, tel-event tx=120 rx=120
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=cd292028-11af-420d-a78b-933281ce8690 remote=<sip:172.17.0.4> media[0].type=1
+B| call 0: forwarder bound 172.17.0.4:49820/49821; loop_create2 -> 0; closing PJSIP's own transport
+B| call 0 local SDP (offer): c=172.17.0.4 m=audio 49820
+B| call 0: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| forwarder started (no conference connection made)
+B| UDP/socket fds open @4.0s: 5
+B| UDP/socket fds open @6.0s: 5
+B| call 0: rx re-INVITE, AMR-WB in offer=1 -> 200
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 49820
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 1: rx re-INVITE, AMR-WB in offer=0 -> 488
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=375 tx=390 rtcp rx=7 tx=3
+B| out-leg (Y): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=390 tx=375 rtcp rx=3 tx=7
+B| CPU during call window: 71.7 ms
+B| call 0: rx re-INVITE, AMR-WB in offer=1 -> 200
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 49820
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| UDP/socket fds open @14.0s: 1
+B| CPU user=2.351s sys=1.525s
+-- flows
+  :4000  -> :4002     29 pkts  {96: 29}
+  :4000  -> :49820   534 pkts  {96: 498, 120: 36}
+  :4001  -> :4003      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4001  -> :49821    13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :4002  -> :4000     29 pkts  {96: 29}
+  :4003  -> :4001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4004  -> :6000     14 pkts  {101: 14}
+  :4005  -> :6001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6000  -> :4004     14 pkts  {101: 14}
+  :6000  -> :41192   549 pkts  {101: 549}
+  :6001  -> :4005      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6001  -> :41193     6 pkts  {'rtcp201': 2, 'rtcp200': 4}
+  :41192 -> :6000    534 pkts  {101: 498, 120: 36}
+  :41193 -> :6001     13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :49820 -> :4000    549 pkts  {96: 549}
+  :49821 -> :4001      4 pkts  {'rtcp201': 1, 'rtcp200': 3}
+-- AMR-WB frames Y->B vs B->X
+leg-in  (from :6000) pkts=563 frames=563 CMRs=[15] FTs={2: 563} ssrc=[1057097456]
+leg-out (to   :4000) pkts=578 frames=578 CMRs=[15] FTs={2: 578} ssrc=[428787350, 1057097456]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 578})
+RESULT: 549 consecutive speech frames bit-identical (out-leg speech frames=578, offset in=14 out=29)
+-- AMR-WB frames X->B vs B->Y
+leg-in  (from :4000) pkts=563 frames=563 CMRs=[0, 15] FTs={2: 536, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[1025345753]
+leg-out (to   :6000) pkts=548 frames=548 CMRs=[0, 15] FTs={2: 521, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[224853661, 1025345753]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 548})
+RESULT: 1 consecutive speech frames bit-identical (out-leg speech frames=548, offset in=413 out=0)
+-- DTMF seen by Y
+07:19:18.768            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+07:19:19.007            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+07:19:19.248            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 578 pkts; identical (seq, ts, ssrc, payload) in order: 0/563
+  :4000->B 563 pkts, B->:6000 548 pkts; identical (seq, ts, ssrc, payload) in order: 0/548
+-- SDP c=/m= lines in re-INVITEs (Y log)
+07:19:15.488           pjsua_core.c  .RX 1391 bytes Request msg INVITE/cseq=14765 (rdata0x758a19481048) from UDP 127.0.0.1:5070:
+INVITE sip:y@127.0.0.1:5080;transport=udp SIP/2.0
+CSeq: 14765 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 4004 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+07:19:15.488           pjsua_call.c  .Incoming Request msg INVITE/cseq=14765 (rdata0x758a19481048)
+07:19:15.488          pjsua_media.c  ..Call 0: initializing media..
+07:19:15.488          pjsua_media.c  ...RTP socket reachable at 172.17.0.4:6000
+07:19:15.488          pjsua_media.c  ...RTCP socket reachable at 172.17.0.4:6001
+07:19:15.488     srtp0x758a1947d4f0  ...SRTP transport created
+07:19:15.488          pjsua_media.c  ...Media index 0 selected for audio call 0
+07:19:15.488      udp0x758a19474020  ...UDP media transport created
+07:19:15.488           pjsua_core.c  .....TX 314 bytes Response msg 100/INVITE/cseq=14765 (tdta0x758a1946e840) to UDP 127.0.0.1:5070:
+CSeq: 14765 INVITE
+07:19:15.488            pjsua_aud.c  ..Conf connect: 3 --> 0
+07:19:15.488            pjsua_aud.c  ...Set sound device: capture=-99, playback=-99, mode=0, use_default_settings=0
+07:19:15.488            pjsua_aud.c  ....Null sound device, mode setting is ignored
+07:19:15.488            pjsua_aud.c  ....Setting null sound device..
+07:19:15.488            pjsua_app.c  .....Turning sound device -99 -99 ON
+-- listening UDP sockets after exit
+/lab/run3.sh: line 26: ss: command not found
+0
+##### s1down none --fwd --pause --up-in --downgrade
+B| mode=signalling-only+forwarder published=172.17.0.4
+B| UDP/socket fds open @0.5s: 1
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=2fdeecdf-5d7e-4336-b6d0-1eb611d488a9 remote=<sip:172.17.0.4> media[0].type=-1
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0 state EARLY
+B| answer in-call 0 180 -> 0
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=306cda23-beef-4505-823f-df9cde8e0eaa remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=-1
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 4004
+B| call 1 state CALLING
+B| make_call -> 0
+B| call 1 state CONNECTING
+B| call 1: stream created (want_fwd=0)
+B| call 1 state CONFIRMED
+B| call 0: stream created (want_fwd=0)
+B| baseline: conference-connected 2 <-> 1
+B| call 0 state CONNECTING
+B| answer in-call 200 -> 0
+B| call 0 state CONFIRMED
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=306cda23-beef-4505-823f-df9cde8e0eaa remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=1
+B| call 1: forwarder bound 172.17.0.4:47060/47061; loop_create2 -> 0; closing PJSIP's own transport
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 47060
+B| call 1: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 1: stream created (want_fwd=1)
+B| call 1: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 1: codec AMR-WB/16000, remote RTP 172.17.0.4:6000, pt tx=101 rx=101, tel-event tx=120 rx=120
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=2fdeecdf-5d7e-4336-b6d0-1eb611d488a9 remote=<sip:172.17.0.4> media[0].type=1
+B| call 0: forwarder bound 172.17.0.4:50490/50491; loop_create2 -> 0; closing PJSIP's own transport
+B| call 0 local SDP (offer): c=172.17.0.4 m=audio 50490
+B| call 0: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| forwarder started (no conference connection made)
+B| UDP/socket fds open @4.0s: 5
+B| UDP/socket fds open @6.0s: 5
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 50490
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=375 tx=390 rtcp rx=7 tx=3
+B| out-leg (Y): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=390 tx=375 rtcp rx=3 tx=7
+B| CPU during call window: 68.9 ms
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 50490
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=306cda23-beef-4505-823f-df9cde8e0eaa remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=1
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 4010
+B| call 1: downgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=2fdeecdf-5d7e-4336-b6d0-1eb611d488a9 remote=<sip:172.17.0.4> media[0].type=1
+B| call 0 local SDP (offer): c=172.17.0.4 m=audio 4012
+B| call 0: downgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: stream created (want_fwd=0)
+B| call 1: stream created (want_fwd=0)
+B| baseline: conference-connected 4 <-> 2
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| UDP/socket fds open @14.0s: 1
+B| CPU user=0.161s sys=0.062s
+-- flows
+  :4000  -> :4002     29 pkts  {96: 29}
+  :4000  -> :4012     59 pkts  {96: 59}
+  :4000  -> :50490   475 pkts  {96: 439, 120: 36}
+  :4001  -> :4003      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4001  -> :4013      4 pkts  {'rtcp201': 2, 'rtcp200': 2}
+  :4001  -> :50491    13 pkts  {'rtcp201': 7, 'rtcp200': 6}
+  :4002  -> :4000     29 pkts  {96: 29}
+  :4003  -> :4001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4004  -> :6000     14 pkts  {101: 14}
+  :4005  -> :6001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4010  -> :6000     59 pkts  {101: 59}
+  :4011  -> :6001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4012  -> :4000     59 pkts  {96: 59}
+  :4013  -> :4001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6000  -> :4004     14 pkts  {101: 14}
+  :6000  -> :4010     59 pkts  {101: 59}
+  :6000  -> :47060   490 pkts  {101: 490}
+  :6001  -> :4005      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6001  -> :4011      4 pkts  {'rtcp201': 2, 'rtcp200': 2}
+  :6001  -> :47061     5 pkts  {'rtcp201': 2, 'rtcp200': 3}
+  :47060 -> :6000    475 pkts  {101: 439, 120: 36}
+  :47061 -> :6001     11 pkts  {'rtcp201': 6, 'rtcp200': 5}
+  :50490 -> :4000    490 pkts  {96: 490}
+  :50491 -> :4001      4 pkts  {'rtcp201': 1, 'rtcp200': 3}
+-- AMR-WB frames Y->B vs B->X
+leg-in  (from :6000) pkts=563 frames=563 CMRs=[15] FTs={2: 563} ssrc=[1017711573]
+leg-out (to   :4000) pkts=578 frames=578 CMRs=[15] FTs={2: 578} ssrc=[1017711573, 1818362980]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 578})
+RESULT: 490 consecutive speech frames bit-identical (out-leg speech frames=578, offset in=14 out=29)
+-- AMR-WB frames X->B vs B->Y
+leg-in  (from :4000) pkts=563 frames=563 CMRs=[0, 15] FTs={2: 536, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[161462443]
+leg-out (to   :6000) pkts=548 frames=548 CMRs=[0, 15] FTs={2: 521, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[161462443, 305899166]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 548})
+RESULT: 1 consecutive speech frames bit-identical (out-leg speech frames=548, offset in=504 out=0)
+-- DTMF seen by Y
+07:19:37.980            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+07:19:38.220            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+07:19:38.460            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 578 pkts; identical (seq, ts, ssrc, payload) in order: 0/563
+  :4000->B 563 pkts, B->:6000 548 pkts; identical (seq, ts, ssrc, payload) in order: 0/548
+-- SDP c=/m= lines in re-INVITEs (Y log)
+07:19:34.698           pjsua_core.c  .RX 1391 bytes Request msg INVITE/cseq=12492 (rdata0x7f8713f4e048) from UDP 127.0.0.1:5070:
+INVITE sip:y@127.0.0.1:5080;transport=udp SIP/2.0
+CSeq: 12492 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 4004 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+07:19:34.698           pjsua_call.c  .Incoming Request msg INVITE/cseq=12492 (rdata0x7f8713f4e048)
+07:19:34.699           pjsua_core.c  .....TX 314 bytes Response msg 100/INVITE/cseq=12492 (tdta0x7f8713f3b840) to UDP 127.0.0.1:5070:
+CSeq: 12492 INVITE
+07:19:34.699           pjsua_core.c  ......TX 942 bytes Response msg 200/INVITE/cseq=12492 (tdta0x7f8713f0d320) to UDP 127.0.0.1:5070:
+CSeq: 12492 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 6000 RTP/AVP 101 120
+c=IN IP4 172.17.0.4
+07:19:34.979           pjsua_core.c  .RX 1433 bytes Request msg INVITE/cseq=12493 (rdata0x7f8713f4e038) from UDP 172.17.0.4:5070:
+INVITE sip:172.17.0.4:5080 SIP/2.0
+CSeq: 12493 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 47060 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+-- listening UDP sockets after exit
+/lab/run3.sh: line 26: ss: command not found
+0
+##### s2quiet none --fwd --pause --quiet-in
+B| mode=signalling-only+forwarder published=172.17.0.4
+B| UDP/socket fds open @0.5s: 1
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=f55b4a32-54da-4249-9fb1-4b779b9c638c remote=<sip:172.17.0.4> media[0].type=-1
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0 state EARLY
+B| answer in-call 0 180 -> 0
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=e386a816-0997-42e4-85bf-c840bff530dd remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=-1
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 4004
+B| call 1 state CALLING
+B| make_call -> 0
+B| call 1 state CONNECTING
+B| call 1: stream created (want_fwd=0)
+B| call 1: normal transport, conf_slot=1, left pending
+B| call 1 state CONFIRMED
+B| call 0: stream created (want_fwd=0)
+B| call 0: normal transport, conf_slot=2, left unpaired (S2)
+B| call 0 state CONNECTING
+B| answer in-call 200 -> 0
+B| call 0 state CONFIRMED
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=e386a816-0997-42e4-85bf-c840bff530dd remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=1
+B| call 1: forwarder bound 172.17.0.4:39260/39261; loop_create2 -> 0; closing PJSIP's own transport
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 39260
+B| call 1: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: conf disconnect all (slot 2) -> 0
+B| call 0: pause veth stream -> 0
+B| call 1: stream created (want_fwd=1)
+B| call 1: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 1: codec AMR-WB/16000, remote RTP 172.17.0.4:6000, pt tx=101 rx=101, tel-event tx=120 rx=120
+B| UDP/socket fds open @4.0s: 5
+B| UDP/socket fds open @6.0s: 5
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0: stream created (want_fwd=0)
+B| call 0: quiet stream created; pause -> 0
+B| call 0: normal transport, conf_slot=1, left unpaired (S2)
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=91 | forwarder rx=0 tx=0 rtcp rx=0 tx=0
+B| out-leg (Y): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=0 tx=0 rtcp rx=0 tx=0
+B| CPU during call window: 84.2 ms
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0: stream created (want_fwd=0)
+B| call 0: quiet stream created; pause -> 0
+B| call 0: normal transport, conf_slot=2, left unpaired (S2)
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| UDP/socket fds open @14.0s: 1
+B| CPU user=0.069s sys=0.058s
+-- flows
+  :4000  -> :4002    563 pkts  {96: 527, 120: 36}
+  :4001  -> :4003     12 pkts  {'rtcp201': 7, 'rtcp200': 5}
+  :4002  -> :4000     14 pkts  {96: 14}
+  :4003  -> :4001     14 pkts  {'rtcp201': 12, 'rtcp200': 2}
+  :4004  -> :6000     14 pkts  {101: 14}
+  :4005  -> :6001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6000  -> :4004     14 pkts  {101: 14}
+  :6000  -> :39260   549 pkts  {101: 549}
+  :6001  -> :4005      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6001  -> :39261     5 pkts  {'rtcp201': 2, 'rtcp200': 3}
+-- AMR-WB frames Y->B vs B->X
+leg-in  (from :6000) pkts=563 frames=563 CMRs=[15] FTs={2: 563} ssrc=[1166055838]
+leg-out (to   :4000) pkts=14 frames=14 CMRs=[15] FTs={2: 14} ssrc=[1334908035]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 14})
+RESULT: no speech frame of the out-leg appears bit-identical on the in-leg -> frames were RE-ENCODED
+-- AMR-WB frames X->B vs B->Y
+leg-in  (from :4000) pkts=563 frames=563 CMRs=[0, 15] FTs={2: 536, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[282851949]
+leg-out (to   :6000) pkts=14 frames=14 CMRs=[15] FTs={2: 14} ssrc=[1835018329]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 14})
+RESULT: 14 consecutive speech frames bit-identical (out-leg speech frames=14, offset in=413 out=0)
+-- DTMF seen by Y
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 14 pkts; identical (seq, ts, ssrc, payload) in order: 0/14
+  :4000->B 563 pkts, B->:6000 14 pkts; identical (seq, ts, ssrc, payload) in order: 0/14
+-- SDP c=/m= lines in re-INVITEs (Y log)
+07:19:53.894           pjsua_core.c  .RX 1391 bytes Request msg INVITE/cseq=7754 (rdata0x74ae03068048) from UDP 127.0.0.1:5070:
+INVITE sip:y@127.0.0.1:5080;transport=udp SIP/2.0
+CSeq: 7754 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 4004 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+07:19:53.895           pjsua_call.c  .Incoming Request msg INVITE/cseq=7754 (rdata0x74ae03068048)
+07:19:53.895           pjsua_core.c  .....TX 313 bytes Response msg 100/INVITE/cseq=7754 (tdta0x74ae03055840) to UDP 127.0.0.1:5070:
+CSeq: 7754 INVITE
+07:19:53.896           pjsua_core.c  ......TX 941 bytes Response msg 200/INVITE/cseq=7754 (tdta0x74ae03027320) to UDP 127.0.0.1:5070:
+CSeq: 7754 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 6000 RTP/AVP 101 120
+c=IN IP4 172.17.0.4
+07:19:54.177           pjsua_core.c  .RX 1433 bytes Request msg INVITE/cseq=7755 (rdata0x74ae03068038) from UDP 172.17.0.4:5070:
+INVITE sip:172.17.0.4:5080 SIP/2.0
+CSeq: 7755 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 39260 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+-- listening UDP sockets after exit
+/lab/run3.sh: line 26: ss: command not found
+0
+##### s1leak none --fwd --pause --up-in
+B| mode=signalling-only+forwarder published=172.17.0.4
+B| UDP/socket fds open @0.5s: 1
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=3672ab8a-c91e-45a4-a6c5-eb64585bc621 remote=<sip:172.17.0.4> media[0].type=-1
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 4002
+B| call 0 state EARLY
+B| answer in-call 0 180 -> 0
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=b5e2cd43-a702-41a3-8e20-e6e1b9cfb695 remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=-1
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 4004
+B| call 1 state CALLING
+B| make_call -> 0
+B| call 1 state CONNECTING
+B| call 1: stream created (want_fwd=0)
+B| call 1: normal transport, conf_slot=1, left pending
+B| call 1 state CONFIRMED
+B| call 0: stream created (want_fwd=0)
+B| call 0: normal transport, conf_slot=2, left pending
+B| baseline: conference-connected 2 <-> 1
+B| call 0 state CONNECTING
+B| answer in-call 200 -> 0
+B| call 0 state CONFIRMED
+B| call 1: in on_create_media_transport: get_info -> 0 role=UAC call-id=b5e2cd43-a702-41a3-8e20-e6e1b9cfb695 remote=sip:y@127.0.0.1:5080;transport=udp media[0].type=1
+B| call 1: forwarder bound 172.17.0.4:35382/35383; loop_create2 -> 0; closing PJSIP's own transport
+B| call 1 local SDP (offer): c=172.17.0.4 m=audio 35382
+B| call 1: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 1: stream created (want_fwd=1)
+B| call 1: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 1: codec AMR-WB/16000, remote RTP 172.17.0.4:6000, pt tx=101 rx=101, tel-event tx=120 rx=120
+B| call 0: in on_create_media_transport: get_info -> 0 role=UAS call-id=3672ab8a-c91e-45a4-a6c5-eb64585bc621 remote=<sip:172.17.0.4> media[0].type=1
+B| call 0: forwarder bound 172.17.0.4:50310/50311; loop_create2 -> 0; closing PJSIP's own transport
+B| call 0 local SDP (offer): c=172.17.0.4 m=audio 50310
+B| call 0: upgrade re-INVITE(REINIT_MEDIA) -> 0
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| forwarder started (no conference connection made)
+B| UDP/socket fds open @4.0s: 5
+B| UDP/socket fds open @6.0s: 5
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 50310
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| in-leg (X): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=376 tx=390 rtcp rx=7 tx=3
+B| out-leg (Y): PJSIP stream sent rtp=0, received rtp=0 | forwarder rx=390 tx=376 rtcp rx=3 tx=7
+B| CPU during call window: 70.5 ms
+B| call 0 local SDP (answer): c=172.17.0.4 m=audio 50310
+B| call 0: stream created (want_fwd=1)
+B| call 0: stream created; pjmedia_stream_pause(ENC+DEC) -> 0
+B| call 0: codec AMR-WB/16000, remote RTP 172.17.0.4:4000, pt tx=96 rx=96, tel-event tx=120 rx=120
+B| call 0 state DISCONNECTED
+B| call 1 state DISCONNECTED
+B| UDP/socket fds open @14.0s: 1
+B| CPU user=2.373s sys=1.505s
+-- flows
+  :4000  -> :4002     29 pkts  {96: 29}
+  :4000  -> :50310   535 pkts  {96: 499, 120: 36}
+  :4001  -> :4003      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4001  -> :50311    13 pkts  {'rtcp201': 6, 'rtcp200': 7}
+  :4002  -> :4000     29 pkts  {96: 29}
+  :4003  -> :4001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :4004  -> :6000     14 pkts  {101: 14}
+  :4005  -> :6001      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6000  -> :4004     14 pkts  {101: 14}
+  :6000  -> :35382   549 pkts  {101: 549}
+  :6001  -> :4005      5 pkts  {'rtcp201': 3, 'rtcp200': 2}
+  :6001  -> :35383     6 pkts  {'rtcp201': 2, 'rtcp200': 4}
+  :35382 -> :6000    535 pkts  {101: 499, 120: 36}
+  :35383 -> :6001     13 pkts  {'rtcp201': 6, 'rtcp200': 7}
+  :50310 -> :4000    549 pkts  {96: 549}
+  :50311 -> :4001      4 pkts  {'rtcp201': 1, 'rtcp200': 3}
+-- AMR-WB frames Y->B vs B->X
+leg-in  (from :6000) pkts=563 frames=563 CMRs=[15] FTs={2: 563} ssrc=[496011162]
+leg-out (to   :4000) pkts=578 frames=578 CMRs=[15] FTs={2: 578} ssrc=[496011162, 1746908358]
+frames/pkt in=Counter({1: 563}) out=Counter({1: 578})
+RESULT: 549 consecutive speech frames bit-identical (out-leg speech frames=578, offset in=14 out=29)
+-- AMR-WB frames X->B vs B->Y
+leg-in  (from :4000) pkts=564 frames=564 CMRs=[0, 15] FTs={2: 537, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[203399191]
+leg-out (to   :6000) pkts=549 frames=549 CMRs=[0, 15] FTs={2: 522, 3: 3, 4: 9, 5: 3, 6: 9, 7: 3} ssrc=[203399191, 953591950]
+frames/pkt in=Counter({1: 564}) out=Counter({1: 549})
+RESULT: 1 consecutive speech frames bit-identical (out-leg speech frames=549, offset in=414 out=0)
+-- DTMF seen by Y
+07:20:16.353            pjsua_app.c  .Incoming DTMF on call 0: 1, using RFC2833 method
+07:20:16.593            pjsua_app.c  .Incoming DTMF on call 0: 2, using RFC2833 method
+07:20:16.832            pjsua_app.c  .Incoming DTMF on call 0: 3, using RFC2833 method
+-- exact payload compare
+  :6000->B 563 pkts, B->:4000 578 pkts; identical (seq, ts, ssrc, payload) in order: 0/563
+  :4000->B 564 pkts, B->:6000 549 pkts; identical (seq, ts, ssrc, payload) in order: 0/549
+-- SDP c=/m= lines in re-INVITEs (Y log)
+07:20:13.069           pjsua_core.c  .RX 1389 bytes Request msg INVITE/cseq=414 (rdata0x75e0d7cb2048) from UDP 127.0.0.1:5070:
+INVITE sip:y@127.0.0.1:5080;transport=udp SIP/2.0
+CSeq: 414 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 4004 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+07:20:13.069           pjsua_call.c  .Incoming Request msg INVITE/cseq=414 (rdata0x75e0d7cb2048)
+07:20:13.070           pjsua_core.c  .....TX 312 bytes Response msg 100/INVITE/cseq=414 (tdta0x75e0d7c9f840) to UDP 127.0.0.1:5070:
+CSeq: 414 INVITE
+07:20:13.070           pjsua_core.c  ......TX 939 bytes Response msg 200/INVITE/cseq=414 (tdta0x75e0d7c71320) to UDP 127.0.0.1:5070:
+CSeq: 414 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 6000 RTP/AVP 101 120
+c=IN IP4 172.17.0.4
+07:20:13.351           pjsua_core.c  .RX 1431 bytes Request msg INVITE/cseq=415 (rdata0x75e0d7cb2038) from UDP 172.17.0.4:5070:
+INVITE sip:172.17.0.4:5080 SIP/2.0
+CSeq: 415 INVITE
+Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS
+m=audio 35382 RTP/AVP 96 97 98 99 3 0 8 9 100 101 102 120 121 122 123
+c=IN IP4 172.17.0.4
+-- listening UDP sockets after exit
+/lab/run3.sh: line 26: ss: command not found
+0
+##### forwarder payload identity (post-upgrade packets)
+  :6000->:34356 550 pkts, :60384->:4000 550 pkts; identical (seq,ts,ssrc,payload) in order: 550/550
+  :4000->:60384 535 pkts, :34356->:6000 535 pkts; identical (seq,ts,ssrc,payload) in order: 535/535
