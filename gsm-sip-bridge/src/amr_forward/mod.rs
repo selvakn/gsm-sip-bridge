@@ -14,4 +14,4 @@ pub mod params;
 pub mod relay;
 pub mod repack;
 
-pub use params::{compatible, AmrLegParams, MediaPath, Reason, SdpLeg};
+pub use params::{compatible, AmrLegParams, MediaPath, ModeSetPolicy, Reason, SdpLeg};

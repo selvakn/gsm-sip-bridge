@@ -56,6 +56,8 @@ Agent B keeps its veth PJSIP call exactly as today (real transport, it stays the
 
 `compatible(carrier, client) -> Result<(), Reason>` implements FR-003 literally: (a) same flavour; (b) `carrier.send_modes ⊆ client.accept_modes` and `client.send_modes ⊆ carrier.accept_modes`; (c) neither side requires a feature the other refuses, and none in use; (d) frames per packet each side sends ≤ what the other accepts. SDP `mode-set` constrains what the *receiver of that fmtp* accepts, so each leg contributes one set used as both its accept set and (as the answerer's choice) its send set. `Reason` is an enum with a stable `as_str()` for logs (contracts/logs.md).
 
+**Relaxed mode-set (#111, `[vowifi].amr_mode_set`)**: Jio always offers `mode-set=0,1,2,3` and clients answer unrestricted, so the strict rule never forwards on Jio. `relax`/`relax_drop` (policy carried on the carrier `AmrLegParams`) waive only the `client ⊆ carrier` half. Agent A's relay then rewrites the CMR in carrier→client packets into the carrier's set (a CMR of 15 or outside the set becomes the highest allowed mode) and inspects the client's speech frame types towards the carrier. Propagating the mode-set into the client re-INVITE was not built: it needs endpoint-global `dec_fmtp` juggling and a client that echoes it.
+
 This is a pure function and the heart of the test suite (FR-020a).
 
 ## R5. Packing conversion without decoding

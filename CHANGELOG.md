@@ -10,6 +10,12 @@ across releases.
 
 ### Added
 
+- **`[vowifi].amr_mode_set`** (`strict` default, `relax`, `relax_drop`, #111).
+  Relaxes the AMR passthrough rule that the phone's `mode-set` must equal the
+  carrier's, which kept every Jio call transcoded. The relay clamps the codec
+  mode request towards the phone into the carrier's set and counts (or drops)
+  phone frames outside it. Verified live on Jio.
+
 - **AMR passthrough** (`[vowifi].amr_passthrough`, off by default, #111).
   Inbound calls whose carrier and phone legs both negotiated compatible
   AMR-WB (or both AMR-NB) carry the carrier's frames to the phone without

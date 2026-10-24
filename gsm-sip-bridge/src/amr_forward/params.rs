@@ -71,6 +71,42 @@ impl std::fmt::Display for Reason {
     }
 }
 
+/// What to do about a carrier `mode-set` the client did not echo
+/// (`[vowifi].amr_mode_set`, #111). Carried on the carrier leg's params, which
+/// both agents already hold, so every `compatible` call and Agent A's relay
+/// see the same policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeSetPolicy {
+    /// FR-003 (b) as specified: the client's modes must equal the carrier's.
+    #[default]
+    Strict,
+    /// Forward when the carrier's modes are within the client's, and count the
+    /// client frames that fall outside the carrier's set (still sent).
+    Relax,
+    /// As `Relax`, and drop those frames instead of sending them.
+    RelaxDrop,
+}
+
+impl ModeSetPolicy {
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "strict" => Self::Strict,
+            "relax" => Self::Relax,
+            "relax_drop" => Self::RelaxDrop,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Relax => "relax",
+            Self::RelaxDrop => "relax_drop",
+        }
+    }
+}
+
 /// What one leg negotiated. Built once from the carrier's SDP (Agent A) and
 /// once from the client's answered call (Agent B), serialised in the control
 /// protocol.
@@ -100,6 +136,10 @@ pub struct AmrLegParams {
     pub payload_type: u8,
     #[serde(default)]
     pub dtmf_payload_type: Option<u8>,
+    /// Only meaningful on the carrier leg; set by Agent A from config after
+    /// parsing the offer. Absent in an older peer's message = `Strict`.
+    #[serde(default)]
+    pub mode_set_policy: ModeSetPolicy,
 }
 
 /// The pieces of a leg's SDP that [`AmrLegParams::from_sdp`] reads.
@@ -191,7 +231,25 @@ impl AmrLegParams {
             redundancy,
             payload_type: leg.payload_type,
             dtmf_payload_type: leg.dtmf_payload_type,
+            mode_set_policy: ModeSetPolicy::Strict,
         })
+    }
+
+    /// This leg with the policy for its `mode-set` applied.
+    pub fn with_mode_set_policy(mut self, policy: ModeSetPolicy) -> Self {
+        self.mode_set_policy = policy;
+        self
+    }
+
+    /// The speech modes the relay lets through towards this (carrier) leg, or
+    /// `None` when the leg is unrestricted or the policy is `Strict` (the
+    /// compatibility rule already guarantees the sets match).
+    pub fn mode_guard(&self) -> Option<(u16, bool)> {
+        match (self.mode_set_policy, self.mode_set) {
+            (ModeSetPolicy::Relax, Some(m)) => Some((m, false)),
+            (ModeSetPolicy::RelaxDrop, Some(m)) => Some((m, true)),
+            _ => None,
+        }
     }
 
     pub fn clock_rate(&self) -> u32 {
@@ -241,8 +299,11 @@ pub fn compatible(carrier: &AmrLegParams, client: &AmrLegParams) -> Result<(), R
         return Err(Reason::Feature);
     }
     // (b) each sender's modes within the receiver's, both directions
+    // Relaxed: only what the carrier sends must be acceptable to the client;
+    // the client's own frames are policed by the relay (`mode_guard`).
     let (c, k) = (carrier.modes(), client.modes());
-    if c & !k != 0 || k & !c != 0 {
+    let relaxed = carrier.mode_set_policy != ModeSetPolicy::Strict;
+    if c & !k != 0 || (!relaxed && k & !c != 0) {
         return Err(Reason::ModeSet);
     }
     // (d) frames per packet each side sends fit the other's maximum
@@ -507,6 +568,37 @@ mod tests {
             both(&low, &other),
             (Err(Reason::ModeSet), Err(Reason::ModeSet))
         );
+    }
+
+    #[test]
+    fn a_relaxed_policy_only_requires_the_carriers_modes_within_the_clients() {
+        let carrier = |policy| wb("octet-align=1; mode-set=0,1,2,3").with_mode_set_policy(policy);
+        let any = wb("octet-align=1");
+        let wide = wb("octet-align=1; mode-set=0,1,2,3,4");
+        let narrow = wb("octet-align=1; mode-set=0,1");
+        let strict = carrier(ModeSetPolicy::Strict);
+        assert_eq!(compatible(&strict, &any), Err(Reason::ModeSet));
+        for policy in [ModeSetPolicy::Relax, ModeSetPolicy::RelaxDrop] {
+            let c = carrier(policy);
+            assert_eq!(compatible(&c, &any), Ok(()));
+            assert_eq!(compatible(&c, &wide), Ok(()));
+            // The carrier may send modes the client refuses: still transcoded.
+            assert_eq!(compatible(&c, &narrow), Err(Reason::ModeSet));
+        }
+    }
+
+    #[test]
+    fn the_mode_guard_exists_only_for_a_restricted_relaxed_carrier() {
+        let restricted = wb("octet-align=1; mode-set=0,1,2,3");
+        assert_eq!(restricted.mode_guard(), None);
+        let relax = restricted
+            .clone()
+            .with_mode_set_policy(ModeSetPolicy::Relax);
+        assert_eq!(relax.mode_guard(), Some((0b1111, false)));
+        let drop = restricted.with_mode_set_policy(ModeSetPolicy::RelaxDrop);
+        assert_eq!(drop.mode_guard(), Some((0b1111, true)));
+        let open = wb("octet-align=1").with_mode_set_policy(ModeSetPolicy::Relax);
+        assert_eq!(open.mode_guard(), None);
     }
 
     #[test]

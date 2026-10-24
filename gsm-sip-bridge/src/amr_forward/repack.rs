@@ -134,6 +134,30 @@ fn build(packet: &Packet, kind: AmrKind, octet_aligned: bool) -> Option<Vec<u8>>
     }
 }
 
+/// The CMR and speech frame types of one payload, for the mode guard. SID and
+/// no-data frames are not speech modes and are left out.
+pub fn speech_modes(payload: &[u8], kind: AmrKind, octet_aligned: bool) -> Option<(u8, Vec<u8>)> {
+    let packet = parse(payload, kind, octet_aligned)?;
+    let speech_max = match kind {
+        AmrKind::Nb => 7,
+        AmrKind::Wb => 8,
+    };
+    let modes = packet
+        .frames
+        .iter()
+        .map(|f| f.frame_type)
+        .filter(|ft| *ft <= speech_max)
+        .collect();
+    Some((packet.cmr, modes))
+}
+
+/// Overwrite the CMR in place. It is the first four bits in both packings.
+pub fn set_cmr(payload: &mut [u8], cmr: u8) {
+    if let Some(first) = payload.first_mut() {
+        *first = (cmr << 4) | (*first & 0x0f);
+    }
+}
+
 /// Convert one RTP payload between packings, frame for frame. Same packing is
 /// a plain copy (the caller usually skips the call). `None` for a truncated or
 /// garbled payload, or a reserved frame type; the relay drops such a packet
@@ -185,6 +209,19 @@ mod tests {
                 .enumerate()
                 .map(|(i, &ft)| frame(kind, ft, i as u8 * 11))
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn speech_modes_lists_speech_frames_and_cmr_is_rewritable() {
+        for oa in [true, false] {
+            let p = packet(AmrKind::Wb, &[2, 8, 9, 15], 15);
+            let mut bytes = build(&p, AmrKind::Wb, oa).unwrap();
+            let (cmr, modes) = speech_modes(&bytes, AmrKind::Wb, oa).unwrap();
+            assert_eq!((cmr, modes), (15, vec![2, 8]));
+            set_cmr(&mut bytes, 3);
+            let (cmr, modes) = speech_modes(&bytes, AmrKind::Wb, oa).unwrap();
+            assert_eq!((cmr, modes), (3, vec![2, 8]));
         }
     }
 

@@ -341,6 +341,7 @@ pub(crate) fn decide<W: Write>(inputs: Inputs<'_, W>, leg: &dyn ClientLeg) -> De
         a_rx: Arc::new(AtomicU64::new(0)),
         b_rx: Arc::new(AtomicU64::new(0)),
         stop: Arc::new(AtomicBool::new(false)),
+        mode_guard: None,
     }) {
         Ok(s) => s,
         Err(_) => {

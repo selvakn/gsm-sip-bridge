@@ -11,7 +11,7 @@
 //! `ims::agent::veth::relay_rtp` rather than copying it: the RTCP hooks and the
 //! SSRC tracker are the same ones.
 
-use super::repack::repack;
+use super::repack::{repack, set_cmr, speech_modes};
 use crate::ims::amr_rtp::AmrKind;
 use crate::ims::rtcp::RelayRtcpRole;
 use crate::ims::rtp::{parse_packet, SsrcTracker, RTP_HEADER_LEN};
@@ -115,6 +115,35 @@ impl LegIo {
     }
 }
 
+/// Polices the carrier's `mode-set` when the client did not echo it
+/// (`ModeSetPolicy::Relax*`). Used on the carrier-facing relay only: the
+/// codec mode requests towards the client are clamped into the set, and the
+/// client's speech frames outside it are counted and optionally dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct ModeGuard {
+    /// Bit `n` set = mode `n` is allowed on the carrier leg.
+    pub modes: u16,
+    pub drop: bool,
+}
+
+impl ModeGuard {
+    fn highest(self) -> u8 {
+        (15 - self.modes.leading_zeros()) as u8
+    }
+
+    fn allows(self, mode: u8) -> bool {
+        mode < 16 && self.modes & (1 << mode) != 0
+    }
+}
+
+/// Counters for [`ModeGuard`], shared by the two pumps and logged when they end.
+#[derive(Default)]
+struct GuardStats {
+    cmr_clamped: AtomicU64,
+    out_of_set: AtomicU64,
+    frames_seen: AtomicU64,
+}
+
 /// Everything [`ForwardSession::start`] needs.
 pub struct ForwardParams {
     pub kind: AmrKind,
@@ -133,6 +162,8 @@ pub struct ForwardParams {
     /// [`ForwardSession::detach`]es; others pass a fresh one and keep the
     /// session, whose `Drop` sets it.
     pub stop: Arc<AtomicBool>,
+    /// See [`ModeGuard`]; `None` for Agent B's relay and strict calls.
+    pub mode_guard: Option<ModeGuard>,
 }
 
 /// Whether packets may be sent *towards* each leg. A held or inactive leg is
@@ -171,6 +202,7 @@ impl ForwardSession {
         });
         let sent_to_a = Arc::new(AtomicU64::new(0));
         let sent_to_b = Arc::new(AtomicU64::new(0));
+        let guard = p.mode_guard.map(|g| (g, Arc::new(GuardStats::default())));
 
         let pump_ab = Pump {
             kind,
@@ -183,6 +215,7 @@ impl ForwardSession {
             sent: sent_to_b.clone(),
             rtcp: p.a_rtcp,
             direction: "a->b",
+            guard: guard.clone(),
         };
         let pump_ba = Pump {
             kind,
@@ -195,6 +228,7 @@ impl ForwardSession {
             sent: sent_to_a.clone(),
             rtcp: p.b_rtcp,
             direction: "b->a",
+            guard,
         };
         let first = std::thread::Builder::new()
             .name("amr-fwd-ab".into())
@@ -302,10 +336,78 @@ struct Pump {
     sent: Arc<AtomicU64>,
     rtcp: Option<RelayRtcpRole>,
     direction: &'static str,
+    guard: Option<(ModeGuard, Arc<GuardStats>)>,
 }
 
 impl Pump {
+    /// Apply the mode guard to a packet before it is translated. `a->b` is
+    /// the carrier's direction: its codec mode request is clamped into the
+    /// set. `b->a` is the client's: its speech frames outside the set are
+    /// counted and, if so configured, make the packet drop (`false`).
+    fn apply_guard(&self, buf: &mut [u8]) -> bool {
+        let Some((guard, stats)) = &self.guard else {
+            return true;
+        };
+        let Some(pkt) = parse_packet(buf) else {
+            return true;
+        };
+        if pkt.payload_type != self.src.pt() {
+            return true;
+        }
+        let start = pkt.payload.as_ptr() as usize - buf.as_ptr() as usize;
+        let Some((cmr, modes)) = speech_modes(pkt.payload, self.kind, self.src.oa()) else {
+            return true;
+        };
+        if self.direction == "a->b" {
+            if !guard.allows(cmr) {
+                set_cmr(&mut buf[start..], guard.highest());
+                crate::ims::media_stats::bump(&stats.cmr_clamped);
+            }
+            return true;
+        }
+        for mode in modes {
+            crate::ims::media_stats::bump(&stats.frames_seen);
+            if !guard.allows(mode) {
+                if stats.out_of_set.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        mode,
+                        allowed = guard.modes,
+                        drop = guard.drop,
+                        "client sent a speech mode outside the carrier's mode-set"
+                    );
+                }
+                if guard.drop {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn log_guard_summary(&self) {
+        if let Some((guard, stats)) = &self.guard {
+            let out = stats.out_of_set.load(Ordering::Relaxed);
+            let clamped = stats.cmr_clamped.load(Ordering::Relaxed);
+            if self.direction == "b->a" || clamped > 0 {
+                tracing::info!(
+                    direction = self.direction,
+                    allowed = guard.modes,
+                    cmr_clamped = clamped,
+                    frames_seen = stats.frames_seen.load(Ordering::Relaxed),
+                    out_of_set = out,
+                    dropped = if guard.drop { out } else { 0 },
+                    "mode-set guard summary"
+                );
+            }
+        }
+    }
+
     fn run(self) {
+        self.pump();
+        self.log_guard_summary();
+    }
+
+    fn pump(&self) {
         let mut buf = [0u8; 2048];
         let mut ssrc_tracker = SsrcTracker::new();
         let media_start = Instant::now();
@@ -346,6 +448,9 @@ impl Pump {
             }
             crate::ims::rtcp::note_rtcp(&self.rtcp, &pkt, media_start.elapsed(), clock_rate);
             if !(self.open_if)(&self.gate) {
+                continue;
+            }
+            if !self.apply_guard(&mut buf[..n]) {
                 continue;
             }
             let Some(out) = self.translate(&mut buf[..n]) else {
@@ -415,6 +520,10 @@ mod tests {
     }
 
     fn rig(a_oa: bool, b_oa: bool) -> Rig {
+        rig_guarded(a_oa, b_oa, None)
+    }
+
+    fn rig_guarded(a_oa: bool, b_oa: bool, mode_guard: Option<ModeGuard>) -> Rig {
         let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let a_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -450,6 +559,7 @@ mod tests {
             a_rx: a_rx.clone(),
             b_rx: b_rx.clone(),
             stop: Arc::new(AtomicBool::new(false)),
+            mode_guard,
         })
         .unwrap();
         Rig {
@@ -468,6 +578,7 @@ mod tests {
     fn oa_payload(cmr: u8, ft: u8, seed: u8) -> Vec<u8> {
         let bits: usize = match ft {
             2 => 253,
+            8 => 477,
             9 => 40,
             15 => 0,
             _ => panic!("test frame type"),
@@ -525,6 +636,59 @@ mod tests {
             assert_eq!(got[1] & 0x7f, PT_A);
             assert_eq!(header_of(&got).2, header_of(&sent).2);
         }
+    }
+
+    const LOW_MODES: u16 = 0b1111;
+
+    #[test]
+    fn mode_guard_clamps_the_carriers_cmr_and_counts_but_forwards_by_default() {
+        let r = rig_guarded(
+            true,
+            true,
+            Some(ModeGuard {
+                modes: LOW_MODES,
+                drop: false,
+            }),
+        );
+        // CMR 15 (no request) and 8 (outside the set) become 3; 1 is kept.
+        for (cmr, want) in [(15u8, 3u8), (8, 3), (1, 1)] {
+            let sent = build_packet(1, 0, 7, PT_A, &oa_payload(cmr, 2, 1));
+            r.carrier.send_to(&sent, r.a_addr).unwrap();
+            let got = recv(&r.client);
+            assert_eq!(got[12] >> 4, want, "cmr {cmr}");
+            assert_eq!(&got[13..], &oa_payload(cmr, 2, 1)[1..], "frame untouched");
+        }
+        // A mode 8 frame from the client still reaches the carrier.
+        let p = oa_payload(15, 8, 3);
+        r.client
+            .send_to(&build_packet(2, 0, 8, PT_B, &p), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &p[..]);
+    }
+
+    #[test]
+    fn mode_guard_drop_discards_only_out_of_set_speech_towards_the_carrier() {
+        let r = rig_guarded(
+            true,
+            true,
+            Some(ModeGuard {
+                modes: LOW_MODES,
+                drop: true,
+            }),
+        );
+        let (bad, ok, sid) = (
+            oa_payload(15, 8, 1),
+            oa_payload(15, 2, 2),
+            oa_payload(15, 9, 3),
+        );
+        for (seq, p) in [(1u16, &bad), (2, &ok), (3, &sid)] {
+            r.client
+                .send_to(&build_packet(seq, 0, 8, PT_B, p), r.b_addr)
+                .unwrap();
+        }
+        // The first thing to arrive is the in-set frame, then the SID.
+        assert_eq!(&recv(&r.carrier)[12..], &ok[..]);
+        assert_eq!(&recv(&r.carrier)[12..], &sid[..]);
     }
 
     #[test]
@@ -796,6 +960,7 @@ mod tests {
             a_rx: Arc::new(AtomicU64::new(0)),
             b_rx: Arc::new(AtomicU64::new(0)),
             stop: stop.clone(),
+            mode_guard: None,
         })
         .unwrap();
         session.detach(); // dropping the handle must not stop it
