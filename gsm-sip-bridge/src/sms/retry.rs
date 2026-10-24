@@ -38,7 +38,15 @@ pub struct SmsForwarder {
     /// retried embed. Seeded from configuration and extended by every fresh
     /// text that carries its number, so a retry names the right SIM.
     phones: Arc<Mutex<HashMap<String, String>>>,
+    /// Set from a Discord `Retry-After`; no backlog row is posted before it.
+    /// Shared by every clone, so the first-attempt path, the next-alert sweep
+    /// and the timer all honour one pause. Per process: the daemon and each
+    /// agent learn of a throttle from their own 429.
+    cooldown_until: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
+
+/// Upper bound on a honoured pause, so a bogus header cannot park retries.
+const MAX_COOLDOWN: Duration = Duration::from_secs(3600);
 
 impl SmsForwarder {
     pub fn new(client: DiscordClient, cfg: &SmsConfig, phones: HashMap<String, String>) -> Self {
@@ -49,7 +57,26 @@ impl SmsForwarder {
             retry_interval: Duration::from_secs(cfg.retry_interval_sec),
             max_age_secs: cfg.retry_max_age_sec as i64,
             phones: Arc::new(Mutex::new(phones)),
+            cooldown_until: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Records a Discord rate limit so retries wait out its `Retry-After`.
+    pub(super) fn note_rate_limit(&self, retry_after: Duration) {
+        let until = tokio::time::Instant::now() + retry_after.min(MAX_COOLDOWN);
+        if let Ok(mut c) = self.cooldown_until.lock() {
+            if c.is_none_or(|cur| until > cur) {
+                *c = Some(until);
+            }
+        }
+    }
+
+    fn cooling_down(&self) -> bool {
+        self.cooldown_until
+            .lock()
+            .ok()
+            .and_then(|c| *c)
+            .is_some_and(|until| tokio::time::Instant::now() < until)
     }
 
     pub(super) fn remember_phone(&self, module_id: &str, phone: &str) {
@@ -157,6 +184,10 @@ pub async fn sweep_excluding(
     if !fwd.retry_enabled {
         return out;
     }
+    if fwd.cooling_down() {
+        out.stopped_early = true;
+        return out;
+    }
     let db = fwd.db_path.as_str();
     let now = chrono::Utc::now().timestamp();
 
@@ -248,7 +279,8 @@ pub async fn sweep_excluding(
                 out.still_failing += 1;
                 super::report_outcome(&cand.module_id, transport, SmsOutcome::Failed, reporter);
                 tracing::warn!(id, module = %cand.module_id, error = %e, "SMS retry failed");
-                if matches!(e, super::discord::PostError::RateLimited { .. }) {
+                if let super::discord::PostError::RateLimited { retry_after } = e {
+                    fwd.note_rate_limit(retry_after);
                     out.stopped_early = true;
                     break;
                 }

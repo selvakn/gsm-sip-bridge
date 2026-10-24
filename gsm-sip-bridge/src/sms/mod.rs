@@ -148,6 +148,9 @@ pub fn record_and_forward(
                 last_error,
             },
         ));
+        if let Err(discord::PostError::RateLimited { retry_after }) = &result {
+            forwarder.note_rate_limit(*retry_after);
+        }
         let outcome = match result {
             Ok(status) => {
                 tracing::info!(module = %module_id, status = status, "SMS forwarded to Discord");

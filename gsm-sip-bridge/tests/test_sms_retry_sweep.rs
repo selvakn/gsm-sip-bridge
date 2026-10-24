@@ -554,3 +554,42 @@ async fn a_text_that_ages_out_during_a_pass_is_abandoned_not_posted() {
     assert_eq!((out.delivered, out.abandoned), (1, 1));
     assert_eq!(rig.bodies().await.len(), 1);
 }
+
+#[tokio::test]
+async fn a_throttled_webhook_is_left_alone_until_its_pause_has_passed() {
+    let rig = Rig::new().await;
+    rig.seed_failed("older", 500);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .mount(&rig.server)
+        .await;
+    let fwd = rig.forwarder();
+
+    assert!(retry::sweep(&fwd, &None).await.stopped_early);
+    assert_eq!(rig.bodies().await.len(), 1);
+
+    // Later triggers (next alert, timer) inside the pause send nothing.
+    let again = retry::sweep(&fwd, &None).await;
+    assert_eq!(again.attempted, 0);
+    assert!(again.stopped_early);
+    assert_eq!(rig.bodies().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_fresh_text_that_is_throttled_holds_back_the_backlog() {
+    let rig = Rig::new().await;
+    let store = StoreHandle::open(&rig.db).unwrap();
+    let old = rig.seed_failed("older", 500);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .mount(&rig.server)
+        .await;
+
+    receive(&rig, &store, Some(rig.forwarder()), "fresh").await;
+
+    let posts = rig.bodies().await;
+    assert_eq!(posts.len(), 1, "only the fresh text's own attempt");
+    assert_eq!(description(&posts[0]), "fresh");
+    assert_eq!(rig.row(old).1, 1, "the older text was not touched");
+    store.shutdown();
+}
