@@ -184,10 +184,6 @@ pub async fn sweep_excluding(
     if !fwd.retry_enabled {
         return out;
     }
-    if fwd.cooling_down() {
-        out.stopped_early = true;
-        return out;
-    }
     let db = fwd.db_path.as_str();
     let now = chrono::Utc::now().timestamp();
 
@@ -198,6 +194,15 @@ pub async fn sweep_excluding(
             tracing::warn!(error = %e, "SMS retry sweep: could not read the store");
             return out;
         }
+    }
+
+    // After expiry, not before: abandoning needs no Discord request, so a
+    // throttled webhook must not leave texts past the age limit reported as
+    // failed.
+    if fwd.cooling_down() {
+        out.stopped_early = true;
+        log_summary(&out);
+        return out;
     }
 
     let candidates = match with_conn(db, move |c| sms::candidates(c, now, SWEEP_BATCH)).await {
@@ -288,6 +293,11 @@ pub async fn sweep_excluding(
         }
     }
 
+    log_summary(&out);
+    out
+}
+
+fn log_summary(out: &SweepOutcome) {
     if out.attempted > 0 || out.abandoned > 0 {
         tracing::info!(
             attempted = out.attempted,
@@ -298,7 +308,6 @@ pub async fn sweep_excluding(
             "SMS retry sweep finished"
         );
     }
-    out
 }
 
 /// Sweeps every `retry_interval_sec`, first tick one full interval after

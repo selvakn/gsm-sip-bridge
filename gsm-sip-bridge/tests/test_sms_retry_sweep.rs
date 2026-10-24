@@ -593,3 +593,30 @@ async fn a_fresh_text_that_is_throttled_holds_back_the_backlog() {
     assert_eq!(rig.row(old).1, 1, "the older text was not touched");
     store.shutdown();
 }
+
+#[tokio::test]
+async fn expiry_still_runs_while_the_webhook_is_cooling_down() {
+    let rig = Rig::new().await;
+    let stale = rig.seed_failed("stale", 10_000);
+    rig.seed_failed("recent", 10);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .mount(&rig.server)
+        .await;
+    let fwd = rig.forwarder_with(true, 5_000);
+    // Trip the cooldown with the recent text.
+    retry::sweep(&fwd, &None).await;
+    let stale_now = rig.seed_failed("stale2", 10_000);
+    let posts = rig.bodies().await.len();
+
+    let out = retry::sweep(&fwd, &None).await;
+    assert!(out.stopped_early);
+    assert_eq!(out.attempted, 0);
+    assert_eq!(
+        rig.bodies().await.len(),
+        posts,
+        "nothing posted while cooling"
+    );
+    assert_eq!(rig.status_of(stale_now), "abandoned");
+    let _ = stale;
+}
