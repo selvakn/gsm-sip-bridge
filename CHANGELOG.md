@@ -10,6 +10,15 @@ across releases.
 
 ### Added
 
+- **SMS delivery reports follow TS 24.341 more closely** (#140). The report
+  the bridge sends after an inbound IMS SMS carries `In-Reply-To` naming the
+  SMS it acknowledges (§5.3.2.4), and is routed through the P-CSCF ahead of the
+  registrar's `Service-Route` entries (Annex B.6). New
+  `sms_report_pcscf_route` under `[vowifi]` and `[volte]` (default `true`)
+  turns the P-CSCF `Route` off. A final error answer to a report logs one
+  warning with the status, reason and any `Warning` text. This is not a
+  claimed fix for the T2 report.
+
 - **Read-only management web UI** (#122). New `[webui]` table (`enabled`,
   `listen_addr`, `port`, `password`, `grafana_url`), off by default, serving a
   password-protected single-page UI on its own listener: an overview of every
@@ -204,6 +213,23 @@ across releases.
   ([#127](https://github.com/selvakn/gsm-sip-bridge/issues/127)).
 
 ### Fixed
+
+- **A silent ePDG can no longer freeze charon.** Every `swanctl --initiate` is
+  bounded by a deadline (`--timeout 20`, outer timeout 25 + 2 s) and runs as
+  one tracked client per line. A line whose initiate keeps failing triggers a
+  generation-guarded restart of the shared charon, and shutdown reaps any
+  client still running before the IKE teardown. In a live rig the unbounded
+  form froze charon at the 12th initiate; the bounded form answered 72 of 72
+  probes over six minutes of silence
+  ([#139](https://github.com/selvakn/gsm-sip-bridge/issues/139),
+  [#118](https://github.com/selvakn/gsm-sip-bridge/issues/118)).
+
+- **`registration_loss` and `gm_connection_lost` always get their all-clear.**
+  A line that recovered while its alert was still being delivered left the
+  alert pending forever, so no all-clear was sent and later outages on that
+  line were never alerted. Both now track the in-flight state that
+  `tunnel_failure` already had
+  ([#138](https://github.com/selvakn/gsm-sip-bridge/issues/138)).
 
 - **A half-open IKE_SA is left to charon.** An IKE_SA still being negotiated
   was counted as a missing CHILD_SA and terminated on the second tick, which
