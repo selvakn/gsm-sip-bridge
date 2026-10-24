@@ -85,7 +85,7 @@ fn a_v4_database_migrates_with_every_row_history_only() {
 
     init_schema(&conn).unwrap();
 
-    assert_eq!(version(&conn), "5");
+    assert_eq!(version(&conn), "6");
     let (n, eligible): (i64, i64) = conn
         .query_row("SELECT COUNT(*), SUM(retry_eligible) FROM sms", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -107,12 +107,12 @@ fn a_v4_database_migrates_with_every_row_history_only() {
 }
 
 #[test]
-fn a_fresh_database_is_v5_and_init_is_idempotent() {
+fn a_fresh_database_is_current_and_init_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh(&dir);
-    assert_eq!(version(&conn), "5");
+    assert_eq!(version(&conn), "6");
     init_schema(&conn).unwrap();
-    assert_eq!(version(&conn), "5");
+    assert_eq!(version(&conn), "6");
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn a_failed_migration_rolls_back_and_can_be_retried() {
 
     conn.execute_batch("DROP TABLE sms_v5").unwrap();
     init_schema(&conn).unwrap();
-    assert_eq!(version(&conn), "5");
+    assert_eq!(version(&conn), "6");
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM sms", [], |r| r.get(0))
         .unwrap();

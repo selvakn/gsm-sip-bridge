@@ -1,7 +1,7 @@
 use crate::error::{BridgeError, BridgeResult};
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
 const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -219,6 +219,41 @@ CREATE VIEW recent_sms AS
     LIMIT 200;
 "#;
 
+/// Management web UI (specs/122-management-webui): outbound calls and
+/// per-call quality on `calls`, plus the `events` timeline. `DEFAULT
+/// 'inbound'` backfills every earlier row accurately, since none was ever
+/// outbound. The view is recreated for the same reason v3/v4 recreated it.
+const SCHEMA_V6_SQL: &str = r#"
+ALTER TABLE calls ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'
+    CHECK (direction IN ('inbound','outbound'));
+ALTER TABLE calls ADD COLUMN loss_percent REAL;
+ALTER TABLE calls ADD COLUMN jitter_ms    REAL;
+ALTER TABLE calls ADD COLUMN rtt_ms       REAL;
+
+CREATE INDEX IF NOT EXISTS idx_calls_direction ON calls(direction);
+
+CREATE TABLE IF NOT EXISTS events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    at               TEXT    NOT NULL,
+    module_id        TEXT,
+    kind             TEXT    NOT NULL,
+    severity         TEXT    NOT NULL CHECK (severity IN ('info','warning','critical')),
+    detail           TEXT    NOT NULL DEFAULT '',
+    raise_id         INTEGER,
+    duration_seconds REAL
+);
+CREATE INDEX IF NOT EXISTS idx_events_at     ON events(at);
+CREATE INDEX IF NOT EXISTS idx_events_module ON events(module_id);
+
+DROP VIEW IF EXISTS recent_calls;
+CREATE VIEW recent_calls AS
+    SELECT id, module_id, caller_id, started_at, duration_seconds, status, sip_destination, transport,
+           direction, loss_percent, jitter_ms, rtt_ms
+    FROM calls
+    ORDER BY id DESC
+    LIMIT 200;
+"#;
+
 /// Every migration, in order: `(from_version, to_version, sql)`.
 ///
 /// To add one: append `SCHEMA_V<N+1>_SQL`, add a row here, and bump
@@ -230,6 +265,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("2", "3", SCHEMA_V3_SQL),
     ("3", "4", SCHEMA_V4_SQL),
     ("4", "5", SCHEMA_V5_SQL),
+    ("5", "6", SCHEMA_V6_SQL),
 ];
 
 fn read_version(conn: &Connection) -> BridgeResult<String> {
@@ -307,7 +343,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fresh_schema_is_v5() {
+    fn test_fresh_schema_is_v6() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let ver: String = conn
@@ -317,7 +353,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
         // Verify new tables exist
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM card_slots", [], |r| r.get(0))
@@ -326,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_to_v5_migration() {
+    fn test_v1_to_v6_migration() {
         let conn = Connection::open_in_memory().unwrap();
         // Bootstrap a v1 schema manually
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -339,7 +375,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
         // Tables should exist after migration
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM card_mode_prefs", [], |r| r.get(0))
@@ -381,7 +417,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
 
         let call_transport: String = conn
             .query_row("SELECT transport FROM calls LIMIT 1", [], |r| r.get(0))
@@ -478,5 +514,58 @@ mod tests {
             [],
         )
         .expect("after the v4 upgrade 'volte' must be accepted");
+    }
+
+    #[test]
+    fn test_v5_to_v6_keeps_rows_and_adds_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V2_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V3_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V4_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V5_SQL).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '5' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calls (module_id, caller_id, started_at, duration_seconds, status, sip_destination, transport)
+             VALUES ('ec20-AAAAAA', '+919000000001', '2026-01-01T00:00:00Z', 12.5, 'answered', '1001', 'vowifi')",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let (direction, loss, jitter, rtt): (String, Option<f64>, Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT direction, loss_percent, jitter_ms, rtt_ms FROM calls",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(direction, "inbound");
+        assert!(loss.is_none() && jitter.is_none() && rtt.is_none());
+
+        let view_direction: String = conn
+            .query_row("SELECT direction FROM recent_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(view_direction, "inbound");
+
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for idx in ["idx_events_at", "idx_events_module", "idx_calls_direction"] {
+            assert!(names.iter().any(|n| n == idx), "missing {idx}");
+        }
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
     }
 }

@@ -3,7 +3,7 @@
 
 use crate::alerts::discord::DiscordClient;
 use crate::cli::Cli;
-use crate::config::load_config;
+use crate::config::load_config_with_snapshot;
 use crate::config::secret::Secret;
 use crate::config::AppConfig;
 use crate::control::server::start_control_server;
@@ -97,19 +97,25 @@ pub fn apply_startup_metrics(plan: &StartupPlan) {
     metrics::CS_ENABLED.set(if plan.circuit_switched { 1.0 } else { 0.0 });
 }
 
+/// How often old timeline events are pruned.
+const EVENT_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 pub fn run(cli: &Cli) -> ExitCode {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting gsm-sip-bridge"
     );
 
-    let config = match load_config(cli.config.as_deref().unwrap_or(std::path::Path::new(""))) {
+    let loaded = match load_config_with_snapshot(
+        cli.config.as_deref().unwrap_or(std::path::Path::new("")),
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "configuration failed");
             return ExitCode::from(1);
         }
     };
+    let config = loaded.config.clone();
 
     modemmanager::check_modemmanager();
     metrics::register_build_info();
@@ -130,6 +136,10 @@ pub fn run(cli: &Cli) -> ExitCode {
             return ExitCode::from(66);
         }
     };
+
+    // specs/122-management-webui: every writer process files its events
+    // through the store it already owns.
+    crate::store::events::install_sink(store.sender());
 
     let (shutdown_tx, shutdown_rx) = runtime::shutdown_channel();
     let (control_tx, control_rx): (ControlCmdSender, _) = mpsc::channel(8);
@@ -196,6 +206,37 @@ pub fn run(cli: &Cli) -> ExitCode {
         log_startup_plan(&plan);
         apply_startup_metrics(&plan);
 
+        // specs/122-management-webui: keep the event timeline to its
+        // retention window. The interval's first tick is immediate, so this
+        // prunes at startup and then every few hours.
+        let prune_handle = {
+            let tx = store.sender();
+            let keep = chrono::Duration::days(i64::from(config.alerts.event_retention_days));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(EVENT_PRUNE_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    let _ = tx.send(crate::store::StoreCommand::PruneEvents {
+                        older_than: chrono::Utc::now() - keep,
+                    });
+                }
+            })
+        };
+
+        // specs/122-management-webui: a UI that cannot bind is logged and
+        // left behind; it must never take the bridge down (FR-004).
+        let webui_handle = config.webui.enabled.then(|| {
+            let state = crate::webui::WebuiState::new(
+                loaded.clone(),
+                plan.circuit_switched.then(|| control_tx.clone()),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = crate::webui::serve(state).await {
+                    tracing::error!(error = %e, "web UI is not running; the bridge continues without it");
+                }
+            })
+        });
+
         let (shutdown_watch_tx, shutdown_watch_rx) = watch::channel(false);
 
         let ctrl_server = start_control_server(&socket_path, control_tx, shutdown_watch_rx).await;
@@ -222,6 +263,10 @@ pub fn run(cli: &Cli) -> ExitCode {
         ctrl_server.abort();
         pool_handle.abort();
         metrics_handle.abort();
+        prune_handle.abort();
+        if let Some(handle) = webui_handle {
+            handle.abort();
+        }
     });
 
     tracing::info!("shutdown complete");

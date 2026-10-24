@@ -13,10 +13,11 @@ use crate::alerts::discord::DiscordClient;
 use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKind};
 use crate::config::AlertsConfig;
 use crate::control::protocol::{
-    AgentKind, AgentReport, AgentState, CallStatus, IkeSaLossCause, ObservedEvent, QualitySource,
-    SmsOutcome, TunnelRecoveryReason, UplinkState,
+    AgentDetails, AgentKind, AgentReport, AgentState, CallStatus, IkeSaLossCause, ObservedEvent,
+    QualitySource, SmsOutcome, TunnelRecoveryReason, UplinkState,
 };
 use crate::metrics;
+use crate::store::events::{self, EventKind};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -533,7 +534,166 @@ fn apply_report_with(
         },
     );
     drop(guard);
+    if !is_replay {
+        store_view(report);
+        export_signal(report);
+    }
     pending_transitions
+}
+
+/// The newest value each field of an agent's `AgentState` carried, plus its
+/// `AgentDetails`, for the management web UI (specs/122-management-webui).
+///
+/// Kept apart from `AgentRecord`, which is `Copy` and read with `.copied()`
+/// all through the alert state machine; this owns strings and a list. A
+/// `Some` in a report overwrites, a `None` leaves what was there (the same
+/// rule the gauges follow).
+#[derive(Debug, Clone, Default)]
+struct StoredView {
+    registered: Option<bool>,
+    tunnel_up: Option<bool>,
+    gm_connection_up: Option<bool>,
+    child_sa_up: Option<bool>,
+    pbx_registered: Option<bool>,
+    active_calls: Option<u32>,
+    details: AgentDetails,
+}
+
+fn details() -> &'static Mutex<HashMap<(AgentKind, String), StoredView>> {
+    static DETAILS: OnceLock<Mutex<HashMap<(AgentKind, String), StoredView>>> = OnceLock::new();
+    DETAILS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_view(report: &AgentReport) {
+    let mut guard = details().lock().unwrap();
+    let view = guard
+        .entry((report.agent, report.module_id.clone()))
+        .or_default();
+    let st = &report.state;
+    view.registered = st.registered.or(view.registered);
+    view.tunnel_up = st.tunnel_up.or(view.tunnel_up);
+    view.gm_connection_up = st.gm_connection_up.or(view.gm_connection_up);
+    view.child_sa_up = st.child_sa_up.or(view.child_sa_up);
+    view.pbx_registered = st.pbx_registered.or(view.pbx_registered);
+    view.active_calls = st.active_calls.or(view.active_calls);
+    if let Some(d) = &report.details {
+        let kept = &mut view.details;
+        if d.registration_state.is_some() {
+            kept.registration_state = d.registration_state;
+        }
+        if d.registered_at.is_some() {
+            kept.registered_at = d.registered_at;
+        }
+        if d.plmn.is_some() {
+            kept.plmn = d.plmn.clone();
+        }
+        if d.signal.is_some() {
+            kept.signal = d.signal.clone();
+        }
+        // Replaces rather than merges: `Some(vec![])` is "no calls".
+        if d.active_call_details.is_some() {
+            kept.active_call_details = d.active_call_details.clone();
+        }
+    }
+}
+
+/// Exports a modem-backed line's reading as the `signal_*` gauges
+/// (specs/122-management-webui). Only the carrier side reads the modem.
+fn export_signal(report: &AgentReport) {
+    if !matches!(report.agent, AgentKind::Ims | AgentKind::Volte) {
+        return;
+    }
+    if let Some(wire) = report.details.as_ref().and_then(|d| d.signal.clone()) {
+        metrics::set_signal(
+            &report.module_id,
+            transport_label(report.agent),
+            &wire.into(),
+        );
+    }
+}
+
+/// Forgets an agent's in-progress call list once it has gone silent, so the
+/// UI never shows a call as live on a line nobody has heard from. The signal
+/// reading is kept; the UI marks the line stale instead.
+pub fn clear_active_call_details(agent: AgentKind, module_id: &str) {
+    if let Some(view) = details()
+        .lock()
+        .unwrap()
+        .get_mut(&(agent, module_id.to_string()))
+    {
+        if view.details.active_call_details.is_some() {
+            view.details.active_call_details = Some(Vec::new());
+        }
+    }
+}
+
+/// One agent's current state as the web UI needs it.
+#[derive(Debug, Clone)]
+pub struct AgentSnapshot {
+    pub agent: AgentKind,
+    pub module_id: String,
+    /// Whether it reported within the staleness threshold.
+    pub up: bool,
+    pub age_seconds: f64,
+    pub registered: Option<bool>,
+    pub tunnel_up: Option<bool>,
+    pub gm_connection_up: Option<bool>,
+    pub child_sa_up: Option<bool>,
+    pub pbx_registered: Option<bool>,
+    pub active_calls: Option<u32>,
+    pub uplink: Option<UplinkState>,
+    pub flapping: bool,
+    pub registration_expires_at: Option<u64>,
+    pub details: AgentDetails,
+}
+
+/// Every agent that has reported since this process started.
+pub fn snapshot_lines() -> Vec<AgentSnapshot> {
+    snapshot_with(crate::metrics::server::staleness_threshold())
+}
+
+fn snapshot_with(staleness_threshold: Duration) -> Vec<AgentSnapshot> {
+    // Copied out first so the two locks are never held together.
+    let records: Vec<_> = liveness()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, r)| (k.clone(), *r))
+        .collect();
+    let views = details().lock().unwrap();
+    records
+        .into_iter()
+        .map(|((agent, module_id), record)| {
+            let view = views
+                .get(&(agent, module_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let age = record.last_report.elapsed();
+            let up = age <= staleness_threshold;
+            let mut view = view;
+            // Cleared here as well as on scrape (`metrics::server`), since the
+            // web UI reads this without anyone scraping /metrics.
+            if !up {
+                view.details.active_call_details = Some(Vec::new());
+            }
+            AgentSnapshot {
+                agent,
+                module_id,
+                up,
+                age_seconds: age.as_secs_f64(),
+                registered: view.registered,
+                tunnel_up: view.tunnel_up,
+                gm_connection_up: view.gm_connection_up,
+                child_sa_up: view.child_sa_up,
+                pbx_registered: view.pbx_registered,
+                active_calls: view.active_calls,
+                uplink: record.last_uplink,
+                flapping: record.tunnel_flapping,
+                registration_expires_at: record.registration_expires_at,
+                details: view.details,
+            }
+        })
+        .collect()
 }
 
 /// Opens or extends a line's pool-exhaustion episode for each
@@ -1284,24 +1444,54 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
             metrics::VOWIFI_UPLINK_HOLDS_TOTAL
                 .with_label_values(&[module_id, cause.as_str()])
                 .inc();
+            events::record(
+                EventKind::UplinkHoldStarted,
+                Some(module_id),
+                &format!("cause: {}", cause.as_str()),
+                None,
+            );
         }
         ObservedEvent::UplinkHoldEnded {
-            cause, held_secs, ..
+            cause,
+            held_secs,
+            ended_by,
         } => {
             metrics::VOWIFI_UPLINK_HELD_SECONDS_TOTAL
                 .with_label_values(&[module_id, cause.as_str()])
                 .inc_by(*held_secs as f64);
+            events::record(
+                EventKind::UplinkHoldEnded,
+                Some(module_id),
+                &format!("cause: {}, ended by: {}", cause.as_str(), ended_by.as_str()),
+                Some(*held_secs as f64),
+            );
         }
         ObservedEvent::TunnelRecovered {
-            reason, dead_peer, ..
+            reason,
+            dead_peer,
+            pcscfs,
+            ..
         } => {
             metrics::VOWIFI_TUNNEL_RECOVERIES_TOTAL
                 .with_label_values(&[module_id, reason.as_str()])
                 .inc();
+            let mut detail = format!("reason: {}", reason.as_str());
+            if !pcscfs.is_empty() {
+                detail.push_str(&format!(", P-CSCFs: {}", pcscfs.join(", ")));
+            }
+            events::record(EventKind::TunnelRecovered, Some(module_id), &detail, None);
             if let Some(verdict) = dead_peer {
                 metrics::VOWIFI_DEAD_PEER_LOSSES_TOTAL
                     .with_label_values(&[module_id, verdict.as_str()])
                     .inc();
+                if *verdict == crate::control::protocol::DeadPeerVerdict::Real {
+                    events::record(
+                        EventKind::DeadPeerLoss,
+                        Some(module_id),
+                        "the ePDG stopped answering IKE while the path was up",
+                        None,
+                    );
+                }
             }
         }
     }
@@ -1368,6 +1558,7 @@ mod tests {
             },
             events: Vec::new(),
             dropped: 0,
+            details: None,
         });
 
         assert_eq!(metrics::SIP_SERVER_BINDINGS.get(), 3.0);
@@ -1387,6 +1578,7 @@ mod tests {
             },
             events: Vec::new(),
             dropped: 0,
+            details: None,
         });
 
         assert_eq!(metrics::SIP_SERVER_BINDINGS.get(), 0.0);
@@ -1412,6 +1604,7 @@ mod tests {
             },
             events: Vec::new(),
             dropped: 0,
+            details: None,
         });
         assert_eq!(metrics::SIP_SERVER_BINDINGS.get(), 7.0);
         assert_eq!(metrics::SIP_SERVER_RING_AOR_REGISTERED.get(), 1.0);
@@ -1437,6 +1630,7 @@ mod tests {
                 duration_seconds: 3.0,
             }],
             dropped: 0,
+            details: None,
         });
 
         let after = metrics::CALLS_TOTAL
@@ -1455,6 +1649,7 @@ mod tests {
             state: AgentState::default(),
             events: vec![],
             dropped: 0,
+            details: None,
         });
 
         let states = evaluate_liveness(std::time::Duration::from_secs(30));
@@ -1479,6 +1674,7 @@ mod tests {
             state: AgentState::default(),
             events: vec![],
             dropped: 7,
+            details: None,
         });
 
         let after = metrics::OBSERVABILITY_EVENTS_DROPPED_TOTAL
@@ -1498,6 +1694,7 @@ mod tests {
             state: AgentState::default(),
             events: vec![ObservedEvent::SmsReceived],
             dropped: 0,
+            details: None,
         };
 
         let before = metrics::SMS_RECEIVED_TOTAL
@@ -1651,6 +1848,7 @@ mod tests {
             },
             events: vec![],
             dropped: 0,
+            details: None,
         });
 
         let guard = liveness().lock().unwrap();
@@ -1674,6 +1872,7 @@ mod tests {
                 },
                 events: vec![],
                 dropped: 0,
+                details: None,
             });
         }
         backdate_unhealthy_since(AgentKind::Ims, module_id, 301);
@@ -1698,6 +1897,7 @@ mod tests {
             },
             events: vec![],
             dropped: 0,
+            details: None,
         });
         let guard = liveness().lock().unwrap();
         let record = guard.get(&(AgentKind::Ims, module_id.to_string())).unwrap();
@@ -1943,6 +2143,7 @@ mod tests {
             },
             events: vec![],
             dropped: 0,
+            details: None,
         });
 
         let guard = liveness().lock().unwrap();
@@ -1969,6 +2170,7 @@ mod tests {
             },
             events: vec![],
             dropped: 0,
+            details: None,
         });
     }
 
@@ -2171,6 +2373,7 @@ mod tests {
                 },
                 events,
                 dropped: 0,
+                details: None,
             },
             Some(cfg),
         )
@@ -2189,6 +2392,7 @@ mod tests {
                 },
                 events: vec![],
                 dropped: 0,
+                details: None,
             },
             Some(cfg),
         );
@@ -2455,6 +2659,7 @@ mod tests {
                 state,
                 events: vec![],
                 dropped: 0,
+                details: None,
             },
             Some(cfg),
         )
@@ -2625,6 +2830,7 @@ mod tests {
                 state,
                 events: vec![],
                 dropped: 0,
+                details: None,
             },
             Some(cfg),
         )
@@ -2813,6 +3019,7 @@ mod tests {
             },
             events,
             dropped: 0,
+            details: None,
         });
     }
 
@@ -2935,6 +3142,7 @@ mod tests {
                 state,
                 events: vec![],
                 dropped: 0,
+                details: None,
             },
             Some(cfg),
         )

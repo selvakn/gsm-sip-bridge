@@ -399,6 +399,30 @@ pub struct MetricsConfig {
     /// threshold (3x this) after which `metrics::server` marks an agent
     /// down and zeros the gauges it owns.
     pub agent_report_interval_seconds: u64,
+    /// How often modem signal quality is read for the web UI and the
+    /// `signal_*` gauges (specs/122-management-webui). `0` disables polling.
+    pub signal_poll_interval_seconds: u64,
+}
+
+/// Default for `[metrics].signal_poll_interval_seconds`.
+pub const DEFAULT_EVENT_RETENTION_DAYS: u32 = 30;
+
+pub const DEFAULT_SIGNAL_POLL_INTERVAL_SECONDS: u64 = 60;
+
+/// Floor for a non-zero `[metrics].signal_poll_interval_seconds`: one modem
+/// SMS sweep interval, the cadence the IMS path piggy-backs on.
+pub const MIN_SIGNAL_POLL_INTERVAL_SECONDS: u64 = 20;
+
+/// The read-only management web UI (specs/122-management-webui). Off unless
+/// `enabled`.
+#[derive(Clone, Debug)]
+pub struct WebuiConfig {
+    pub enabled: bool,
+    pub listen_addr: String,
+    pub port: u16,
+    pub password: Secret<String>,
+    /// Empty when unset.
+    pub grafana_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -624,6 +648,9 @@ pub struct AlertsConfig {
     /// deployment, shown in every alert footer. `None`/empty ⇒ fall back to
     /// the host's system hostname (`alerts::instance_label`).
     pub instance_name: Option<String>,
+    /// specs/122-management-webui: `events` rows older than this many days
+    /// are pruned. At least 1.
+    pub event_retention_days: u32,
     pub sms: CategoryAlertConfig,
     pub module_lifecycle: CategoryAlertConfig,
     pub registration_loss: CategoryAlertConfig,
@@ -742,6 +769,7 @@ impl Default for AlertsConfig {
         Self {
             default_webhook_url: Secret::new(String::new()),
             instance_name: None,
+            event_retention_days: DEFAULT_EVENT_RETENTION_DAYS,
             sms: CategoryAlertConfig {
                 enabled: true,
                 webhook_url_override: None,
@@ -1529,6 +1557,7 @@ pub struct AppConfig {
     pub bridge: BridgeSection,
     pub sms: SmsConfig,
     pub metrics: MetricsConfig,
+    pub webui: WebuiConfig,
     pub modules: ModulesConfig,
     pub resilience: ResilienceConfig,
     pub control: ControlConfig,
@@ -1546,6 +1575,24 @@ pub struct AppConfig {
 }
 
 pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
+    load_config_with_snapshot(path).map(|loaded| loaded.config)
+}
+
+/// The config as loaded, plus what the management web UI needs to show it
+/// (specs/122-management-webui).
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    /// The parsed document taken **before** `env:NAME` resolution, so it still
+    /// holds `env:NAME` literals rather than the secrets they point at
+    /// (research R11). Never serialise `config` for display instead.
+    pub snapshot: Value,
+    pub source_path: std::path::PathBuf,
+    pub loaded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// [`load_config`], keeping the pre-resolution document.
+pub fn load_config_with_snapshot(path: &Path) -> BridgeResult<LoadedConfig> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BridgeError::Config(format!("config file {}: {e}", path.display())))?;
 
@@ -1560,6 +1607,7 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
     // `env:VAR` indirection is resolved over the whole document before serde
     // sees it, so it applies uniformly to every string field rather than
     // needing a wrapper type on each — see `config::env`.
+    let snapshot = root.clone();
     env::resolve_in_place(&mut root, "")?;
 
     // A typo'd key is an error, not a warning nobody reads. This walk runs
@@ -1582,7 +1630,12 @@ pub fn load_config(path: &Path) -> BridgeResult<AppConfig> {
         .try_into()
         .map_err(|e: toml::de::Error| BridgeError::Config(e.to_string()))?;
 
-    build::build(raw)
+    Ok(LoadedConfig {
+        config: build::build(raw)?,
+        snapshot,
+        source_path: path.to_path_buf(),
+        loaded_at: chrono::Utc::now(),
+    })
 }
 
 /// Best-effort read of `[logging].level`, used to pick the tracing filter
@@ -1608,6 +1661,29 @@ pub fn read_log_level(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_keeps_the_literal_env_reference() {
+        std::env::set_var("SNAPSHOT_TEST_PASSWORD", "sentinel-resolved-value");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sip]\nserver = \"127.0.0.1\"\nusername = \"u\"\npassword = \"p\"\n\
+             [webui]\nenabled = true\npassword = \"env:SNAPSHOT_TEST_PASSWORD\"\n",
+        )
+        .unwrap();
+        let loaded = load_config_with_snapshot(&path).unwrap();
+        assert_eq!(
+            loaded.config.webui.password.expose_secret(),
+            "sentinel-resolved-value"
+        );
+        assert_eq!(
+            loaded.snapshot["webui"]["password"].as_str(),
+            Some("env:SNAPSHOT_TEST_PASSWORD")
+        );
+        assert_eq!(loaded.source_path, path);
+    }
 
     /// Parses a config fragment through the real pipeline (env resolution ->
     /// serde -> validation), panicking on failure. The whole-document path,

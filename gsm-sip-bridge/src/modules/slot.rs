@@ -69,6 +69,8 @@ impl SlotState {
                 self.phone_number.clone()
             },
             network: self.network_type.to_string(),
+            module_id: self.module.id.clone(),
+            has_active_call: self.has_active_call,
         }
     }
 }

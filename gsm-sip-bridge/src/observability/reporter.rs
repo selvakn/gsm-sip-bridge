@@ -27,13 +27,15 @@
 //! buffer, and the next heartbeat re-establishes gauge state within one
 //! report interval.
 
-use crate::control::protocol::{AgentKind, AgentReport, AgentState, ControlCmd, ObservedEvent};
+use crate::control::protocol::{
+    AgentDetails, AgentKind, AgentReport, AgentState, ControlCmd, ObservedEvent,
+};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,6 +44,13 @@ use std::time::{Duration, Instant};
 /// and bounded at a few hundred KB.
 const CAPACITY: usize = 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Builds the display-only [`AgentDetails`] attached to each report
+/// (specs/122-management-webui). Called on the reporter's own thread at send
+/// time, so it must be cheap and must not block.
+pub type DetailsProvider = Arc<dyn Fn() -> AgentDetails + Send + Sync>;
+
+type SharedProvider = Arc<Mutex<Option<DetailsProvider>>>;
 
 enum ReporterCmd {
     Report {
@@ -62,6 +71,7 @@ pub struct Reporter {
     /// `worker_loop`), so an ingress-side drop is counted identically to a
     /// ring-buffer-side one.
     ingress_dropped: Arc<AtomicU64>,
+    details: SharedProvider,
 }
 
 impl Reporter {
@@ -91,6 +101,8 @@ impl Reporter {
         let (tx, rx) = mpsc::sync_channel(CAPACITY);
         let ingress_dropped = Arc::new(AtomicU64::new(0));
         let ingress_dropped_worker = ingress_dropped.clone();
+        let details: SharedProvider = Arc::new(Mutex::new(None));
+        let details_worker = details.clone();
         // Random per process lifetime (see `AgentReport::epoch`'s doc
         // comment) — a fresh value each time `Reporter::spawn` runs, which
         // is once per agent process start, is exactly the "never collide
@@ -106,6 +118,7 @@ impl Reporter {
                         module_id,
                         report_interval,
                         ingress_dropped: ingress_dropped_worker,
+                        details: details_worker,
                         epoch,
                         progress,
                     },
@@ -116,6 +129,17 @@ impl Reporter {
         Reporter {
             tx,
             ingress_dropped,
+            details,
+        }
+    }
+
+    /// Installs the provider whose output rides on every subsequent report
+    /// and heartbeat, so the web UI's registration wording, signal and
+    /// in-progress calls stay at most one report interval old without any
+    /// call site having to remember to push them.
+    pub fn set_details_provider(&self, provider: DetailsProvider) {
+        if let Ok(mut slot) = self.details.lock() {
+            *slot = Some(provider);
         }
     }
 
@@ -191,6 +215,7 @@ struct WorkerConfig {
     module_id: String,
     report_interval: Duration,
     ingress_dropped: Arc<AtomicU64>,
+    details: SharedProvider,
     epoch: u64,
     /// `None` for an agent that is not stall-monitored.
     progress: Option<Arc<crate::ims::agent::watchdog::Progress>>,
@@ -203,6 +228,7 @@ fn worker_loop(cfg: WorkerConfig, rx: mpsc::Receiver<ReporterCmd>) {
         module_id,
         report_interval,
         ingress_dropped,
+        details,
         epoch,
         progress,
     } = cfg;
@@ -223,7 +249,7 @@ fn worker_loop(cfg: WorkerConfig, rx: mpsc::Receiver<ReporterCmd>) {
                 state: new_state,
                 events,
             }) => {
-                enqueue(&mut state, agent, &module_id, new_state, events);
+                enqueue(&mut state, agent, &module_id, new_state, events, &details);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Heartbeat: re-report the last known state with no events,
@@ -248,7 +274,14 @@ fn worker_loop(cfg: WorkerConfig, rx: mpsc::Receiver<ReporterCmd>) {
                 last_progress = observed;
                 if heartbeat {
                     let hb_state = state.last_state;
-                    enqueue(&mut state, agent, &module_id, hb_state, Vec::new());
+                    enqueue(
+                        &mut state,
+                        agent,
+                        &module_id,
+                        hb_state,
+                        Vec::new(),
+                        &details,
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -270,8 +303,11 @@ fn enqueue(
     module_id: &str,
     new_state: AgentState,
     events: Vec<ObservedEvent>,
+    details: &SharedProvider,
 ) {
     state.last_state = new_state;
+    // Cloned out so the provider runs without the lock held.
+    let provider = details.lock().ok().and_then(|slot| slot.clone());
     if state.queue.len() >= CAPACITY {
         state.queue.pop_front();
         state.dropped_since_last_send += 1;
@@ -286,6 +322,7 @@ fn enqueue(
         state: new_state,
         events,
         dropped: 0, // set immediately before each send attempt in flush()
+        details: provider.map(|p| p()),
     });
 }
 
@@ -324,7 +361,7 @@ fn send_one(socket_path: &str, report: &AgentReport) -> std::io::Result<bool> {
     let mut reader = BufReader::new(stream);
 
     let cmd = ControlCmd::Observe {
-        report: report.clone(),
+        report: Box::new(report.clone()),
     };
     let mut json = serde_json::to_string(&cmd)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -444,12 +481,42 @@ mod tests {
                 &format!("mod-{i}"),
                 AgentState::default(),
                 Vec::new(),
+                &SharedProvider::default(),
             );
         }
         assert_eq!(state.queue.len(), CAPACITY);
         assert_eq!(state.dropped_since_last_send, 5);
         // Oldest 5 evicted — the front should be mod-5.
         assert_eq!(state.queue.front().unwrap().module_id, "mod-5");
+    }
+
+    #[test]
+    fn a_details_provider_rides_on_every_enqueued_report() {
+        let mut state = WorkerState {
+            queue: VecDeque::new(),
+            dropped_since_last_send: 0,
+            last_state: AgentState::default(),
+            epoch: 1,
+            next_seq: 1,
+        };
+        let provider: DetailsProvider = Arc::new(|| AgentDetails {
+            plmn: Some("405-857".into()),
+            ..Default::default()
+        });
+        let shared: SharedProvider = Arc::new(Mutex::new(Some(provider)));
+        enqueue(
+            &mut state,
+            AgentKind::Ims,
+            "m",
+            AgentState::default(),
+            Vec::new(),
+            &shared,
+        );
+        let sent = state.queue.front().unwrap();
+        assert_eq!(
+            sent.details.as_ref().and_then(|d| d.plmn.as_deref()),
+            Some("405-857")
+        );
     }
 
     #[test]
@@ -467,6 +534,7 @@ mod tests {
             "mod-x",
             AgentState::default(),
             Vec::new(),
+            &SharedProvider::default(),
         );
         flush(&mut state, "/nonexistent/path/to/socket.sock");
         assert_eq!(
@@ -496,6 +564,7 @@ mod tests {
             "mod-a",
             AgentState::default(),
             Vec::new(),
+            &SharedProvider::default(),
         );
         enqueue(
             &mut state,
@@ -503,6 +572,7 @@ mod tests {
             "mod-b",
             AgentState::default(),
             Vec::new(),
+            &SharedProvider::default(),
         );
         assert_eq!(state.queue[0].seq, 1);
         assert_eq!(state.queue[0].epoch, 42);

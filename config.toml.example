@@ -81,6 +81,8 @@ discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
 # is used — set this explicitly under Docker, where the hostname is otherwise a
 # random container id.
 # instance_name = "bridge-01"
+# How many days the web UI's events timeline keeps rows (specs/122). Minimum 1.
+# event_retention_days = 30
 
 [alerts.sms]
 enabled = true                  # default true; matches [sms].enabled above
@@ -226,6 +228,25 @@ port = 9091
 # stopped reporting is marked down (gsm_sip_bridge_agent_up) and the gauges
 # it owns are zeroed. Ignored entirely when [vowifi].enabled is false.
 agent_report_interval_seconds = 10
+# How often modem signal quality (RSSI, and RSRP/RSRQ/SINR on LTE) is read
+# for the web UI and the gsm_sip_bridge_signal_* gauges (specs/122-management-
+# webui). 0 disables polling; 1-19 is raised to 20 (one modem SMS sweep).
+# signal_poll_interval_seconds = 60
+
+# ============================================================================
+# Management web UI (specs/122-management-webui)
+# ============================================================================
+# A read-only, password-protected status page: line health, calls, SMS, events
+# and the loaded config. Plain HTTP on its own port; put a reverse proxy in
+# front of it for TLS. Off unless enabled.
+# [webui]
+# enabled = true
+# listen_addr = "0.0.0.0"
+# port = 8080
+# # Required when enabled. Keep the secret out of this file:
+# password = "env:WEBUI_PASSWORD"
+# # Optional link shown in the UI for history and graphs.
+# # grafana_url = "https://grafana.example/d/abc"
 
 [cs]
 # Master switch for the circuit-switched call path (specs/026-disable-

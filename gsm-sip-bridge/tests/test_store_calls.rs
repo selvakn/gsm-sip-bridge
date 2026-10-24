@@ -20,6 +20,10 @@ fn test_insert_and_query_answered_call() {
         status: "answered".into(),
         sip_destination: "sip:100@pbx:5060".into(),
         transport: Transport::Cs,
+        direction: gsm_sip_bridge::store::calls::CallDirection::Inbound,
+        loss_percent: None,
+        jitter_ms: None,
+        rtt_ms: None,
     };
     insert_call(&conn, &record).unwrap();
 
@@ -44,6 +48,10 @@ fn test_insert_missed_call() {
         status: "missed".into(),
         sip_destination: "".into(),
         transport: Transport::Cs,
+        direction: gsm_sip_bridge::store::calls::CallDirection::Inbound,
+        loss_percent: None,
+        jitter_ms: None,
+        rtt_ms: None,
     };
     insert_call(&conn, &record).unwrap();
 
@@ -68,6 +76,10 @@ fn test_insert_failed_call() {
         status: "failed".into(),
         sip_destination: "sip:unreachable@pbx:5060".into(),
         transport: Transport::Cs,
+        direction: gsm_sip_bridge::store::calls::CallDirection::Inbound,
+        loss_percent: None,
+        jitter_ms: None,
+        rtt_ms: None,
     };
     insert_call(&conn, &record).unwrap();
 
@@ -93,6 +105,10 @@ fn test_recent_calls_view_newest_first() {
             status: "answered".into(),
             sip_destination: "sip:100@pbx:5060".into(),
             transport: Transport::Cs,
+            direction: gsm_sip_bridge::store::calls::CallDirection::Inbound,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
         };
         insert_call(&conn, &record).unwrap();
     }
@@ -103,4 +119,36 @@ fn test_recent_calls_view_newest_first() {
         })
         .unwrap();
     assert_eq!(first_caller, "+15550000004");
+}
+
+#[test]
+fn test_outbound_call_and_quality_round_trip() {
+    use gsm_sip_bridge::store::calls::CallDirection;
+    let conn = mem_db();
+    let record = CallRecord {
+        module_id: "ec20-A1B2C3".into(),
+        caller_id: "+919000000001".into(),
+        started_at: "2026-10-24T10:00:00Z".into(),
+        duration_seconds: 30.0,
+        status: "answered".into(),
+        sip_destination: "".into(),
+        transport: Transport::Vowifi,
+        direction: CallDirection::Outbound,
+        loss_percent: Some(1.5),
+        jitter_ms: Some(12.0),
+        rtt_ms: None,
+    };
+    insert_call(&conn, &record).unwrap();
+
+    let (dir, loss, jitter, rtt): (String, Option<f64>, Option<f64>, Option<f64>) = conn
+        .query_row(
+            "SELECT direction, loss_percent, jitter_ms, rtt_ms FROM calls",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(dir, "outbound");
+    assert_eq!(loss, Some(1.5));
+    assert_eq!(jitter, Some(12.0));
+    assert_eq!(rtt, None);
 }

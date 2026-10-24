@@ -249,6 +249,26 @@ fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryA
     }
 }
 
+/// Files an alert transition on the web UI's event timeline.
+///
+/// `Sms` and `MissedCall` are one-shot notifications, not conditions that
+/// start and stop, so they have no place on a timeline of incidents (FR-050).
+fn record_event(event: &CriticalEvent) {
+    if matches!(
+        event.category,
+        AlertCategory::Sms | AlertCategory::MissedCall
+    ) {
+        return;
+    }
+    crate::store::events::record_alert(
+        event.category.as_str(),
+        event.unit_id.as_deref(),
+        event.kind == CriticalEventKind::Failure,
+        &event.description,
+        event.at,
+    );
+}
+
 /// The single entry point every category's call site uses: resolves
 /// enabled/webhook (FR-007/FR-008/FR-014), sends via `client` if applicable,
 /// and records the outcome in `CRITICAL_ALERTS_TOTAL`/`CRITICAL_EVENT_ACTIVE`
@@ -263,6 +283,10 @@ pub async fn dispatch(
     config: &AlertsConfig,
     event: CriticalEvent,
 ) -> AlertOutcome {
+    // Before the enabled/webhook checks, so an operator who turned a category's
+    // Discord alerts off (or never configured a webhook) still sees the
+    // incident on the web UI's timeline (specs/122-management-webui, FR-051).
+    record_event(&event);
     let cfg = category_config(config, event.category);
     let outcome = match precheck(cfg, &config.default_webhook_url) {
         Some(outcome) => outcome,

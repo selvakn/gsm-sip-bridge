@@ -10,6 +10,20 @@ across releases.
 
 ### Added
 
+- **Read-only management web UI** (#122). New `[webui]` table (`enabled`,
+  `listen_addr`, `port`, `password`, `grafana_url`), off by default, serving a
+  password-protected single-page UI on its own listener: an overview of every
+  line, call history and live calls, SMS with one-time-code copy, an event
+  timeline, and the redacted startup config. Read-only by construction; only
+  login and logout write. Embedded in the binary (three static files, no
+  JavaScript toolchain). Adds `[metrics].signal_poll_interval_seconds`
+  (default 60, `0` disables), `[alerts].event_retention_days` (default 30), the
+  `gsm_sip_bridge_signal_*` gauges, `gsm_sip_bridge_events_recorded_total` and
+  `gsm_sip_bridge_webui_logins_total`. Store schema v5 to v6: `calls.direction`
+  and per-call loss/jitter/RTT columns, and an `events` table. Outbound calls
+  are now recorded in call history. `AgentReport` gains an optional `details`
+  field; older agents and daemons interoperate unchanged.
+
 - **SMS Discord delivery retry and status** (`[sms].retry_enabled`, **on by
   default**, #121). A text whose Discord post fails is kept and re-posted,
   oldest first, after the next text arrives and every `retry_interval_sec`

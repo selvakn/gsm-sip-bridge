@@ -32,6 +32,7 @@ pub mod modem_lock;
 pub mod pcsc_card;
 pub mod pcsc_list;
 pub mod scheduler;
+pub mod signal;
 pub mod usim;
 
 mod pool;

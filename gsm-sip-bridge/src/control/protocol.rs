@@ -33,7 +33,9 @@ pub enum ControlCmd {
     /// `control::server::handle_connection`, never reaching `CardPool`'s
     /// mailbox — see contracts/observability-protocol.md.
     Observe {
-        report: AgentReport,
+        /// Boxed: with `AgentReport::details` it dwarfs every other command,
+        /// and this enum is sent by value through the control channel.
+        report: Box<AgentReport>,
     },
 }
 
@@ -110,6 +112,123 @@ pub struct AgentReport {
     pub events: Vec<ObservedEvent>,
     #[serde(default)]
     pub dropped: u64,
+    /// Display-only extras for the management web UI
+    /// (specs/122-management-webui, contracts/agent-report.md). A sibling of
+    /// `state` rather than part of it because `AgentState` is `Copy` and
+    /// these fields own strings and a list. An older peer omits it; an older
+    /// daemon ignores it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub details: Option<AgentDetails>,
+}
+
+/// Most `active_call_details` entries one report carries, to keep reports
+/// bounded.
+pub const MAX_ACTIVE_CALL_DETAILS: usize = 4;
+
+/// See [`AgentReport::details`]. Every field is optional: a `Some` overwrites
+/// what the daemon holds, a `None` leaves it as it was.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentDetails {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registration_state: Option<RegistrationStateWire>,
+    /// Unix seconds of the current registration.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registered_at: Option<u64>,
+    /// `"MCC-MNC"`, e.g. `"405-857"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub plmn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signal: Option<SignalReadingWire>,
+    /// `Some(vec![])` means "no calls in progress".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active_call_details: Option<Vec<ActiveCallInfoWire>>,
+}
+
+impl AgentDetails {
+    /// Sets the in-progress call list, truncated to
+    /// [`MAX_ACTIVE_CALL_DETAILS`].
+    pub fn with_active_calls(mut self, mut calls: Vec<ActiveCallInfoWire>) -> Self {
+        calls.truncate(MAX_ACTIVE_CALL_DETAILS);
+        self.active_call_details = Some(calls);
+        self
+    }
+}
+
+/// Wire mirror of `ims::RegistrationState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationStateWire {
+    Unregistered,
+    Registering,
+    Registered,
+    Renewing,
+    Failed,
+}
+
+impl From<crate::ims::RegistrationState> for RegistrationStateWire {
+    fn from(state: crate::ims::RegistrationState) -> Self {
+        use crate::ims::RegistrationState as S;
+        match state {
+            S::Unregistered => Self::Unregistered,
+            S::Registering => Self::Registering,
+            S::Registered => Self::Registered,
+            S::Renewing => Self::Renewing,
+            S::Failed => Self::Failed,
+        }
+    }
+}
+
+/// The same wording `vowifi-status` prints (`volte::registration::state_label`).
+impl std::fmt::Display for RegistrationStateWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unregistered => "unregistered",
+            Self::Registering => "registering",
+            Self::Registered => "registered",
+            Self::Renewing => "renewing",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// One modem signal reading (`modules::signal::SignalReading` on the wire).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SignalReadingWire {
+    pub at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rssi_dbm: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rat: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rsrp_dbm: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rsrq_db: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sinr_db: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallDirectionWire {
+    Inbound,
+    Outbound,
+}
+
+/// A call in progress on a line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveCallInfoWire {
+    /// The caller, or the dialled number.
+    pub remote: String,
+    pub direction: CallDirectionWire,
+    pub started_at_unix: u64,
+    /// Ringing (`false`) versus connected (`true`).
+    pub answered: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub loss_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub jitter_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rtt_ms: Option<f64>,
 }
 
 /// Why a line's IKE_SA vanished, as far as the charon log can tell
@@ -523,6 +642,23 @@ impl OutboundAttemptOutcome {
             OutboundAttemptOutcome::CallerAbandoned => "caller_abandoned",
         }
     }
+
+    /// The call-history status an attempt is filed under
+    /// (specs/122-management-webui, data-model.md): a destination that never
+    /// picked up, or a caller who gave up, is `missed`; a refusal is
+    /// `failed`. `Placed` is `None`: that call is recorded as `answered`,
+    /// with its duration, only once it ends.
+    pub fn history_status(&self) -> Option<CallStatus> {
+        match self {
+            OutboundAttemptOutcome::Placed => None,
+            OutboundAttemptOutcome::Unanswered | OutboundAttemptOutcome::CallerAbandoned => {
+                Some(CallStatus::Missed)
+            }
+            OutboundAttemptOutcome::RefusedNoIdleLine
+            | OutboundAttemptOutcome::RefusedInvalidDestination
+            | OutboundAttemptOutcome::RefusedNetworkFailure => Some(CallStatus::Failed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -622,6 +758,13 @@ pub struct SlotInfo {
     pub state: String,
     pub phone: String,
     pub network: String,
+    /// The line id calls and SMS are recorded under (specs/122-management-
+    /// webui). Defaulted so a reply from an older daemon still decodes.
+    #[serde(default)]
+    pub module_id: String,
+    /// Whether a call is in progress on this slot.
+    #[serde(default)]
+    pub has_active_call: bool,
 }
 
 pub fn read_cmd<R: BufRead>(reader: &mut R) -> Result<ControlCmd, String> {
@@ -707,13 +850,126 @@ mod tests {
             },
             events: vec![],
             dropped: 0,
+            details: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"agent\":\"supervisor\""));
+        assert!(
+            !json.contains("details"),
+            "an absent details must not appear on the wire"
+        );
         assert!(json.contains("\"child_sa_up\":false"));
         let back: AgentReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.agent, AgentKind::Supervisor);
         assert_eq!(back.state.child_sa_up, Some(false));
+    }
+
+    #[test]
+    fn outbound_outcomes_map_to_history_statuses() {
+        use OutboundAttemptOutcome as O;
+        assert_eq!(O::Placed.history_status(), None);
+        assert_eq!(O::Unanswered.history_status(), Some(CallStatus::Missed));
+        assert_eq!(
+            O::CallerAbandoned.history_status(),
+            Some(CallStatus::Missed)
+        );
+        for failed in [
+            O::RefusedNoIdleLine,
+            O::RefusedInvalidDestination,
+            O::RefusedNetworkFailure,
+        ] {
+            assert_eq!(failed.history_status(), Some(CallStatus::Failed));
+        }
+    }
+
+    #[test]
+    fn a_report_without_details_still_decodes() {
+        let json = r#"{"agent":"ims","module_id":"m","epoch":1,"seq":2,"state":{}}"#;
+        let report: AgentReport = serde_json::from_str(json).unwrap();
+        assert!(report.details.is_none());
+    }
+
+    #[test]
+    fn details_round_trip() {
+        let details = AgentDetails {
+            registration_state: Some(RegistrationStateWire::Renewing),
+            registered_at: Some(1_700_000_000),
+            plmn: Some("405-857".into()),
+            signal: Some(SignalReadingWire {
+                at_unix: 1_700_000_100,
+                rssi_dbm: Some(-71),
+                rat: Some("LTE".into()),
+                rsrp_dbm: Some(-95),
+                rsrq_db: Some(-10),
+                sinr_db: None,
+            }),
+            active_call_details: None,
+        }
+        .with_active_calls(vec![ActiveCallInfoWire {
+            remote: "+919000000001".into(),
+            direction: CallDirectionWire::Outbound,
+            started_at_unix: 1_700_000_050,
+            answered: true,
+            loss_percent: Some(0.5),
+            jitter_ms: None,
+            rtt_ms: Some(80.0),
+        }]);
+        let report = AgentReport {
+            agent: AgentKind::Ims,
+            module_id: "m".into(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState::default(),
+            events: vec![],
+            dropped: 0,
+            details: Some(details.clone()),
+        };
+        let back: AgentReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(back.details, Some(details));
+        assert_eq!(
+            back.details
+                .unwrap()
+                .registration_state
+                .unwrap()
+                .to_string(),
+            "renewing"
+        );
+    }
+
+    #[test]
+    fn active_calls_are_truncated_to_the_cap() {
+        let call = |n: u64| ActiveCallInfoWire {
+            remote: format!("+9190000000{n:02}"),
+            direction: CallDirectionWire::Inbound,
+            started_at_unix: n,
+            answered: false,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
+        };
+        let details = AgentDetails::default().with_active_calls((0..9).map(call).collect());
+        assert_eq!(
+            details.active_call_details.unwrap().len(),
+            MAX_ACTIVE_CALL_DETAILS
+        );
+    }
+
+    #[test]
+    fn registration_state_wire_matches_the_cli_wording() {
+        use crate::ims::RegistrationState as S;
+        for s in [
+            S::Unregistered,
+            S::Registering,
+            S::Registered,
+            S::Renewing,
+            S::Failed,
+        ] {
+            assert_eq!(
+                RegistrationStateWire::from(s).to_string(),
+                crate::volte::registration::state_label(s)
+            );
+        }
     }
 
     #[test]
@@ -929,6 +1185,7 @@ mod tests {
             },
             events: vec![],
             dropped: 0,
+            details: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"tunnel_flapping\":true"));

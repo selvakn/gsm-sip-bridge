@@ -34,6 +34,7 @@ use crate::sip::SipBridge;
 use crate::sms::discord::DiscordClient;
 use crate::sms::SmsHandler;
 use crate::sms::{self, SmsForwarder};
+use crate::store::events::{self, EventKind};
 use crate::store::{StoreCommand, StoreHandle};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -333,6 +334,12 @@ impl CardPool {
                     metrics::MODULE_INIT_TOTAL
                         .with_label_values(&[&module.id, "success", ""])
                         .inc();
+                    events::record(
+                        EventKind::ModuleInitialized,
+                        Some(&module.id),
+                        &format!("slot {slot}, {net_type}"),
+                        None,
+                    );
 
                     let cmd_tx =
                         self.spawn_worker(tasks, &module, slot, event_tx, usable_phone(&phone));
@@ -358,6 +365,7 @@ impl CardPool {
                     metrics::MODULE_INIT_TOTAL
                         .with_label_values(&[&module.id, "failure", &e])
                         .inc();
+                    events::record(EventKind::ModuleInitFailed, Some(&module.id), &e, None);
                     // Assign a temporary slot for tracking
                     let slot = slots.len() as u32;
                     slots.insert(slot, pending_slot(slot, module, resilience));
@@ -424,6 +432,12 @@ impl CardPool {
                 metrics::MODULE_INIT_TOTAL
                     .with_label_values(&[&module.id, "success", ""])
                     .inc();
+                events::record(
+                    EventKind::ModuleInitialized,
+                    Some(&module.id),
+                    &format!("recovered on retry, slot {new_slot}"),
+                    None,
+                );
 
                 let worker_phone = usable_phone(&phone);
                 let cmd_tx =
@@ -556,6 +570,7 @@ impl CardPool {
                     .at_worker_unresponsive_sec,
             ),
             phone_number,
+            signal_poll_interval_secs: self.config.metrics.signal_poll_interval_seconds,
         }
     }
 

@@ -29,9 +29,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub(crate) struct CallContext {
+    /// The caller for an inbound call, the dialled number for an outbound one.
     caller_id: String,
     sip_destination: String,
     started_at: chrono::DateTime<Utc>,
+    direction: crate::store::calls::CallDirection,
 }
 
 pub(crate) struct ModuleAudioInit {
@@ -53,6 +55,9 @@ pub(crate) struct WorkerSetup {
     /// not issue a second, redundant query on a serial port this repo has a
     /// history of contention on. `None` when the SIM's EF_MSISDN is blank.
     pub(crate) phone_number: Option<String>,
+    /// `[metrics].signal_poll_interval_seconds` (specs/122-management-webui);
+    /// `0` disables signal polling.
+    pub(crate) signal_poll_interval_secs: u64,
 }
 
 /// How often the idle-tick liveness probe (`AT`) is sent while otherwise
@@ -101,6 +106,9 @@ pub(crate) struct ModuleWorker {
     last_at_success: std::time::Instant,
     last_at_probe: std::time::Instant,
     at_worker_alerted: bool,
+    /// See [`WorkerSetup::signal_poll_interval_secs`].
+    signal_poll_interval_secs: u64,
+    last_signal_poll: std::time::Instant,
 }
 
 impl ModuleWorker {
@@ -174,6 +182,8 @@ impl ModuleWorker {
             last_at_success: now,
             last_at_probe: now,
             at_worker_alerted: false,
+            signal_poll_interval_secs: setup.signal_poll_interval_secs,
+            last_signal_poll: now,
         })
     }
 
@@ -217,56 +227,77 @@ impl ModuleWorker {
         }
     }
 
-    /// specs/022-discord-critical-alerts FR-003: send an `AT` no-op every
-    /// `AT_WORKER_PROBE_INTERVAL` and alert once (not every tick) if the modem
-    /// has been silent past the configured threshold.
+    /// Sends the liveness probe, returning whether the modem answered.
+    ///
+    /// Usually a bare `AT`. When a signal poll is due (specs/122-management-
+    /// webui) it is `AT+CSQ` plus `AT+QENG` instead, and a `+CSQ` answer
+    /// counts as liveness exactly as `AT`'s `OK` does -- no extra command is
+    /// added to an idle modem. Never during a call: see
+    /// [`signal::poll_due`](crate::modules::signal::poll_due).
+    fn probe_modem(&mut self) -> bool {
+        use crate::modules::signal;
+        let due = signal::poll_due(
+            self.signal_poll_interval_secs,
+            self.last_signal_poll.elapsed(),
+            self.call_ctx.is_some(),
+        );
+        if !due {
+            return matches!(self.at.send_command("AT"), Ok(AtResponse::Ok(_)));
+        }
+        self.last_signal_poll = std::time::Instant::now();
+        let (reading, answered) = signal::read_signal_checked(&mut self.at);
+        if answered {
+            metrics::set_signal(&self.module.id, "cs", &reading);
+            crate::webui::signal::update(&self.module.id, reading);
+        }
+        answered
+    }
+
+    /// specs/022-discord-critical-alerts FR-003: probe the modem every
+    /// `AT_WORKER_PROBE_INTERVAL` and alert once (not every tick) if it has
+    /// been silent past the configured threshold.
     fn tick_liveness_probe(&mut self) {
         if self.last_at_probe.elapsed() < AT_WORKER_PROBE_INTERVAL {
             return;
         }
         self.last_at_probe = std::time::Instant::now();
-        match self.at.send_command("AT") {
-            Ok(AtResponse::Ok(_)) => {
-                self.last_at_success = std::time::Instant::now();
-                if self.at_worker_alerted {
-                    self.at_worker_alerted = false;
-                    let _ = self
-                        .event_tx
-                        .send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
-                            category: alerts::AlertCategory::ModuleLifecycle,
-                            unit_id: Some(self.module.id.clone()),
-                            description: "AT command worker responsive again".to_string(),
-                            phone_number: self.phone_number.clone(),
-                            at: Utc::now(),
-                            kind: alerts::CriticalEventKind::Recovered,
-                        }));
-                }
+        if self.probe_modem() {
+            self.last_at_success = std::time::Instant::now();
+            if self.at_worker_alerted {
+                self.at_worker_alerted = false;
+                let _ = self
+                    .event_tx
+                    .send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
+                        category: alerts::AlertCategory::ModuleLifecycle,
+                        unit_id: Some(self.module.id.clone()),
+                        description: "AT command worker responsive again".to_string(),
+                        phone_number: self.phone_number.clone(),
+                        at: Utc::now(),
+                        kind: alerts::CriticalEventKind::Recovered,
+                    }));
             }
-            _ => {
-                if !self.at_worker_alerted
-                    && at_worker_unresponsive(
-                        self.last_at_success,
-                        std::time::Instant::now(),
-                        self.at_worker_unresponsive_threshold,
-                    )
-                {
-                    self.at_worker_alerted = true;
-                    tracing::error!(module = %self.module.id, "AT command worker unresponsive");
-                    let _ = self
-                        .event_tx
-                        .send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
-                            category: alerts::AlertCategory::ModuleLifecycle,
-                            unit_id: Some(self.module.id.clone()),
-                            description: format!(
-                                "AT command worker unresponsive for over {}s",
-                                self.at_worker_unresponsive_threshold.as_secs()
-                            ),
-                            phone_number: self.phone_number.clone(),
-                            at: Utc::now(),
-                            kind: alerts::CriticalEventKind::Failure,
-                        }));
-                }
-            }
+        } else if !self.at_worker_alerted
+            && at_worker_unresponsive(
+                self.last_at_success,
+                std::time::Instant::now(),
+                self.at_worker_unresponsive_threshold,
+            )
+        {
+            self.at_worker_alerted = true;
+            tracing::error!(module = %self.module.id, "AT command worker unresponsive");
+            let _ = self
+                .event_tx
+                .send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
+                    category: alerts::AlertCategory::ModuleLifecycle,
+                    unit_id: Some(self.module.id.clone()),
+                    description: format!(
+                        "AT command worker unresponsive for over {}s",
+                        self.at_worker_unresponsive_threshold.as_secs()
+                    ),
+                    phone_number: self.phone_number.clone(),
+                    at: Utc::now(),
+                    kind: alerts::CriticalEventKind::Failure,
+                }));
         }
     }
 
@@ -376,6 +407,7 @@ impl ModuleWorker {
                     caller_id: caller_id.clone(),
                     sip_destination: String::new(),
                     started_at: Utc::now(),
+                    direction: crate::store::calls::CallDirection::Inbound,
                 });
 
                 let _ = self.event_tx.send(BridgeEvent::Ring {
@@ -620,6 +652,7 @@ fn record_call_start_outbound(
         caller_id: destination.to_string(),
         sip_destination: String::new(),
         started_at: Utc::now(),
+        direction: crate::store::calls::CallDirection::Outbound,
     });
     metrics::ACTIVE_CALLS
         .with_label_values(&[module_id, "cs"])
@@ -669,6 +702,10 @@ fn record_call_end(
             status: status.to_string(),
             sip_destination: ctx.sip_destination,
             transport: crate::store::Transport::Cs,
+            direction: ctx.direction,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
         };
         if let Err(e) = store_tx.send(StoreCommand::InsertCall(record)) {
             tracing::error!(error = %e, "failed to send call record to store");
@@ -752,6 +789,136 @@ fn set_eec_mode(at: &mut AtCommander, module_id: &str, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- specs/122-management-webui: signal polling on the liveness tick ----
+
+    /// A worker over a scripted fake modem. `replies` answer the commands the
+    /// worker sends, in order; the returned counter says how many it saw.
+    fn worker_with_modem(
+        module_id: &str,
+        interval_secs: u64,
+        replies: Vec<&'static str>,
+    ) -> (ModuleWorker, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (client, mut modem) = std::os::unix::net::UnixStream::pair().unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen_in_thread = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            for reply in replies {
+                match modem.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                seen_in_thread.fetch_add(1, Ordering::SeqCst);
+                if modem.write_all(reply.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (store_tx, _store_rx) = crossbeam_channel::unbounded();
+        let module = DiscoveredModule {
+            id: module_id.to_string(),
+            serial_port: std::path::PathBuf::from("/dev/null"),
+            audio_device: String::new(),
+            usb_serial: String::new(),
+        };
+        let long_ago = std::time::Instant::now() - Duration::from_secs(3600);
+        let worker = ModuleWorker {
+            card: CardInstance::new(
+                module.id.clone(),
+                module.serial_port.clone(),
+                module.audio_device.clone(),
+                16,
+            ),
+            module,
+            at: AtCommander::from_stream(client, Duration::from_millis(300)),
+            phone_number: None,
+            store_tx,
+            event_tx,
+            cmd_rx,
+            call_ctx: None,
+            at_worker_unresponsive_threshold: Duration::from_secs(60),
+            last_at_success: long_ago,
+            last_at_probe: long_ago,
+            at_worker_alerted: false,
+            signal_poll_interval_secs: interval_secs,
+            last_signal_poll: long_ago,
+        };
+        (worker, seen)
+    }
+
+    const CSQ_OK: &str = "\r\n+CSQ: 21,99\r\n\r\nOK\r\n";
+    const QENG_LTE: &str = "\r\n+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"FDD\",404,43,6BD6814,247,1357,3,3,3,D55E,-95,-13,-66,41,28\r\n\r\nOK\r\n";
+
+    #[test]
+    fn a_due_poll_replaces_the_bare_probe_and_counts_as_liveness() {
+        let (mut w, seen) = worker_with_modem("ec20-SIGPOL", 60, vec![CSQ_OK, QENG_LTE]);
+        w.tick_liveness_probe();
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "AT+CSQ and AT+QENG, with no separate AT"
+        );
+        assert!(
+            w.last_at_success.elapsed() < Duration::from_secs(5),
+            "a +CSQ answer is a liveness success"
+        );
+        let reading = crate::webui::signal::all()["ec20-SIGPOL"].clone();
+        assert_eq!(reading.rssi_dbm, Some(-71));
+        assert_eq!(reading.rsrp_dbm, Some(-95));
+        let out = prometheus::TextEncoder::new()
+            .encode_to_string(&prometheus::gather())
+            .unwrap();
+        assert!(out.contains(
+            "gsm_sip_bridge_signal_rssi_dbm{module=\"ec20-SIGPOL\",transport=\"cs\"} -71"
+        ));
+    }
+
+    #[test]
+    fn no_poll_while_a_call_is_active() {
+        let (mut w, seen) = worker_with_modem("ec20-SIGCALL", 60, vec!["\r\nOK\r\n"]);
+        w.call_ctx = Some(CallContext {
+            caller_id: "+919000000001".into(),
+            sip_destination: String::new(),
+            started_at: Utc::now(),
+            direction: crate::store::calls::CallDirection::Inbound,
+        });
+        w.tick_liveness_probe();
+        // Just the bare `AT`: one command, not the CSQ/QENG pair.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!crate::webui::signal::all().contains_key("ec20-SIGCALL"));
+    }
+
+    #[test]
+    fn polling_disabled_keeps_the_bare_probe() {
+        let (mut w, seen) = worker_with_modem("ec20-SIGOFF", 0, vec!["\r\nOK\r\n"]);
+        w.tick_liveness_probe();
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!crate::webui::signal::all().contains_key("ec20-SIGOFF"));
+    }
+
+    #[test]
+    fn a_csq_99_exports_no_series() {
+        let (mut w, _) = worker_with_modem(
+            "ec20-SIG99",
+            60,
+            vec!["\r\n+CSQ: 99,99\r\n\r\nOK\r\n", "\r\nERROR\r\n"],
+        );
+        w.tick_liveness_probe();
+        let out = prometheus::TextEncoder::new()
+            .encode_to_string(&prometheus::gather())
+            .unwrap();
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with("gsm_sip_bridge_signal_rssi_dbm{module=\"ec20-SIG99\"")),
+            "unknown signal is a gap, not a number"
+        );
+    }
 
     /// Mock stream for `AtCommander`, mirroring `at_commander`'s own private
     /// `MockStream`: reads from a fixed byte buffer, discards writes.
@@ -930,6 +1097,7 @@ mod tests {
             caller_id: "+911234567890".to_string(),
             sip_destination: String::new(),
             started_at: Utc::now(),
+            direction: crate::store::calls::CallDirection::Inbound,
         });
 
         record_call_end("card0", &event_tx, &store_tx, &mut call_ctx, "missed", None);
@@ -956,6 +1124,7 @@ mod tests {
             caller_id: "+911234567890".to_string(),
             sip_destination: String::new(),
             started_at: Utc::now(),
+            direction: crate::store::calls::CallDirection::Inbound,
         });
 
         record_call_end(
@@ -1012,6 +1181,11 @@ mod tests {
         assert_eq!(record.caller_id, "+15551234567");
         assert_eq!(record.status, "answered");
         assert_eq!(record.module_id, "card0");
+        assert_eq!(
+            record.direction,
+            crate::store::calls::CallDirection::Outbound,
+            "the call history must say this call was placed, not received"
+        );
     }
 
     /// specs/025-outbound-calling review: `ModuleCmd::Hangup` (sent when the

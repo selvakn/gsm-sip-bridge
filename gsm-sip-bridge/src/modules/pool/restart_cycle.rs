@@ -105,7 +105,7 @@ impl CardPool {
                     self.apply_send_reboot(slots, tasks, slot, now);
                 }
                 SchedulerAction::RecordOutcome { slot, outcome } => {
-                    self.record_outcome(slot, &outcome);
+                    self.record_outcome(slot, &outcome, slots);
                 }
                 SchedulerAction::Complete => {
                     complete = true;
@@ -236,12 +236,25 @@ impl CardPool {
         state.next_retry_at = Some(now + retry_delay);
     }
 
-    pub(super) fn record_outcome(&self, slot: u32, outcome: &CycleOutcome) {
+    pub(super) fn record_outcome(
+        &self,
+        slot: u32,
+        outcome: &CycleOutcome,
+        slots: &HashMap<u32, SlotState>,
+    ) {
         let cycle_id = self.cycle.as_ref().map(|c| c.id).unwrap_or(0);
         let label = outcome.outcome.metric_label();
         metrics::SCHEDULED_RESTART_TOTAL
             .with_label_values(&[&slot.to_string(), label])
             .inc();
+        // specs/122-management-webui: the timeline names the line, not the
+        // slot number, which changes when a card re-enumerates.
+        crate::store::events::record(
+            crate::store::events::EventKind::ScheduledRestart,
+            slots.get(&slot).map(|s| s.module.id.as_str()),
+            &format!("{} ({})", label, outcome.attempt),
+            Some(outcome.duration.as_secs_f64()),
+        );
 
         match &outcome.outcome {
             Outcome::Success => {

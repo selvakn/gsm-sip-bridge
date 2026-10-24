@@ -171,6 +171,8 @@ section! {
     pub struct RawMetrics {
         pub port: u16,
         pub agent_report_interval_seconds: u64,
+        /// specs/122-management-webui: `0` disables signal polling.
+        pub signal_poll_interval_seconds: u64,
     }
 }
 
@@ -179,6 +181,32 @@ impl Default for RawMetrics {
         Self {
             port: 9091,
             agent_report_interval_seconds: 15,
+            signal_poll_interval_seconds: super::DEFAULT_SIGNAL_POLL_INTERVAL_SECONDS,
+        }
+    }
+}
+
+// -------------------------------------------------------------- [webui] ----
+
+section! {
+    /// specs/122-management-webui: the read-only management UI.
+    pub struct RawWebui {
+        pub enabled: bool,
+        pub listen_addr: String,
+        pub port: u16,
+        pub password: Secret<String>,
+        pub grafana_url: String,
+    }
+}
+
+impl Default for RawWebui {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: "0.0.0.0".to_string(),
+            port: 8080,
+            password: Secret::new(String::new()),
+            grafana_url: String::new(),
         }
     }
 }
@@ -365,6 +393,8 @@ section! {
         pub discord_webhook_url: Option<Secret<String>>,
         /// specs/034-alert-identity: `[alerts].instance_name`.
         pub instance_name: Option<String>,
+        /// specs/122-management-webui: how long `events` rows are kept.
+        pub event_retention_days: Option<u32>,
         pub sms: Option<RawAlertCategory>,
         pub module_lifecycle: Option<RawModuleLifecycle>,
         pub registration_loss: Option<RawUnhealthyCategory>,
@@ -744,6 +774,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("bridge", RawBridge::KEYS),
         ("sms", RawSms::KEYS),
         ("metrics", RawMetrics::KEYS),
+        ("webui", RawWebui::KEYS),
         ("modules", RawModules::KEYS),
         ("resilience", RawResilience::KEYS),
         ("control", RawControl::KEYS),
@@ -867,6 +898,7 @@ section! {
         pub bridge: RawBridge,
         pub sms: RawSms,
         pub metrics: RawMetrics,
+        pub webui: RawWebui,
         pub modules: RawModules,
         pub resilience: RawResilience,
         pub control: RawControl,

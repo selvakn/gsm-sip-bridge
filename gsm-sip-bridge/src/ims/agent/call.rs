@@ -107,6 +107,29 @@ pub(super) struct ActiveCall {
     pub(super) session_refresh: Option<SessionRefreshState>,
 }
 
+impl ActiveCall {
+    /// This call as the web UI shows it in progress (specs/122-management-
+    /// webui). A call this side answered kept the INVITE it answered; one it
+    /// placed did not.
+    pub(super) fn live_call(&self) -> observability::LiveCall {
+        observability::LiveCall {
+            remote: self.caller.clone(),
+            direction: if self.answered_invite.is_some() {
+                crate::control::protocol::CallDirectionWire::Inbound
+            } else {
+                crate::control::protocol::CallDirectionWire::Outbound
+            },
+            started_at_unix: u64::try_from(self.answered_at.timestamp()).unwrap_or(0),
+            answered: true,
+            receive: self
+                .rtcp
+                .as_ref()
+                .map(|r| (Arc::clone(&r.receive), r.clock_rate)),
+            far_end: self.rtcp.as_ref().map(|r| Arc::clone(&r.far_end)),
+        }
+    }
+}
+
 /// See [`ActiveCall::rtcp`]. Holds only what teardown needs to *read* — the
 /// RTCP thread itself owns the socket and the send-side accounting, and
 /// exits on its own once it observes `ActiveCall::stop` (research.md
@@ -440,6 +463,12 @@ pub(super) fn report_answered_call_ended(
         call.answered_at,
         call.answered_instant.elapsed().as_secs_f64(),
         verdict,
+        // A call this side placed has no INVITE of its own to have answered.
+        if call.answered_invite.is_some() {
+            crate::store::calls::CallDirection::Inbound
+        } else {
+            crate::store::calls::CallDirection::Outbound
+        },
     );
     obs.set_active_calls(0);
 }

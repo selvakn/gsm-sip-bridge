@@ -78,6 +78,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
         chrono::Utc::now(),
         42.0,
         gsm_sip_bridge::ims::media_stats::DirectionVerdict::BothWays,
+        gsm_sip_bridge::store::calls::CallDirection::Inbound,
     );
     obs.set_active_calls(0);
     wait_for(|| answered_counter.get() == 1.0, Duration::from_secs(5)).await;
