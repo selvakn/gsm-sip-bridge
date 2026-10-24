@@ -505,7 +505,7 @@
       var codeNode = el("code", { class: "mono", text: code });
       var button = el("button", { class: "btn small", type: "button", text: "Copy code" });
       button.addEventListener("click", function () { copyCode(code, codeNode, button); });
-      parts.push(el("div", { class: "chips" }, "Code ", codeNode, button));
+      parts.push(el("div", { class: "otp" }, el("span", { class: "muted small", text: "Code" }), codeNode, button));
     }
     return el("article", { class: "panel sms" + (m.forwarding_status === "failed" ? " failed" : "") }, parts);
   }

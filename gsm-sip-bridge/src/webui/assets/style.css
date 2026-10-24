@@ -250,3 +250,8 @@ details.cfg .kv { padding: 0 14px 10px; }
   th, td { padding: 6px 8px; }
 }
 .card .banner { margin-bottom: 0; }
+
+/* One-time code row: label, code and button on one baseline-centred line. */
+.otp { display: flex; align-items: center; gap: 10px; }
+.otp code { font-size: 1rem; font-weight: 600; letter-spacing: .04em; }
+.otp .btn { padding: 2px 10px; }
