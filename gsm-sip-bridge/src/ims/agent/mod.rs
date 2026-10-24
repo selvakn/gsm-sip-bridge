@@ -350,7 +350,8 @@ fn run_inner(
     // sweep "runs unconditionally, once per line," which is false for that
     // line type).
     let reassembly = Arc::new(Mutex::new(crate::volte::sms::Reassembly::default()));
-    let signal_slot: crate::volte::sms::SignalSlot = Arc::new(Mutex::new(None));
+    let signal_slot: crate::volte::sms::SignalSlot =
+        Arc::new(crate::volte::sms::SignalShare::default());
     let signal_poll = crate::volte::sms::SignalPoll::for_interval(
         app_config.metrics.signal_poll_interval_seconds,
         Arc::clone(&signal_slot),

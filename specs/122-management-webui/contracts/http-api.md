@@ -97,15 +97,16 @@ Fields that don't apply to a transport are `null`. For example, a CS line has `t
   "today":  {"answered": 3, "missed": 1, "failed": 0, "avg_answered_seconds": 142.5},
   "last_7d": {"answered": 20, "missed": 4, "failed": 2, "avg_answered_seconds": 131.0},
   "by_line": [{"module_id": "card-1a2b", "today": {}, "last_7d": {}}],
-  "by_direction": {"inbound": {"today": {}, "last_7d": {}}, "outbound": {"today": {}, "last_7d": {}}}
+  "by_direction": {"inbound": {"today": {}, "last_7d": {}}, "outbound": {"today": {}, "last_7d": {}}, "unknown": {"today": {}, "last_7d": {}}},
+  "today_start": "2026-10-24T00:00:00+05:30", "host_utc_offset": "+05:30"
 }
 ```
 
-The empty `{}` objects in the example have the same shape as `today`. "Today" is the bridge host's local midnight to now. The client also shows the timezone.
+The empty `{}` objects in the example have the same shape as `today`. "Today" is the bridge host's local midnight to now; `today_start` and `host_utc_offset` say which. `unknown` holds calls recorded before direction was (schema v6 backfill).
 
 ### `GET /api/calls`
 
-Query parameters: `line`, `direction` (`inbound`|`outbound`), `transport`, `status`, `from` and `to` (RFC 3339), plus paging. Results are newest first.
+Query parameters: `line`, `direction` (`inbound`|`outbound`|`unknown`), `transport`, `status`, `from` and `to` (RFC 3339; `to` includes the whole second it names), plus paging. Results are newest first.
 
 Each item: `{id, module_id, direction, remote, started_at, duration_seconds, status, transport, loss_percent, jitter_ms, rtt_ms}`.
 

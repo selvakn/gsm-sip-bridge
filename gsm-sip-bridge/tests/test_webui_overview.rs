@@ -261,6 +261,10 @@ async fn silence_past_the_threshold_turns_a_card_stale() {
     assert_eq!(l["stale"], true);
     assert_eq!(l["health"], "stale");
     assert_eq!(
+        l["active_call_count"], 0,
+        "the count goes with the details, or the Calls page keeps a live row"
+    );
+    assert_eq!(
         l["active_calls"].as_array().unwrap().len(),
         0,
         "a call is not shown live on a line nobody has heard from"

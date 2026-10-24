@@ -198,7 +198,16 @@ pub async fn calls_summary(State(state): State<WebuiState>) -> Response {
         .map_or(now - Duration::hours(24), |t| t.with_timezone(&Utc));
     let store = state.store.clone();
     match blocking(move || store.call_summary(local_midnight, now - Duration::days(7))).await {
-        Ok(summary) => Json(summary).into_response(),
+        Ok(summary) => {
+            // Say which day "today" is: it is the bridge host's, which need not
+            // be the browser's.
+            let mut body = serde_json::to_value(summary).unwrap_or_else(|_| json!({}));
+            body["today_start"] = json!(local_midnight
+                .with_timezone(&Local)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+            body["host_utc_offset"] = json!(Local::now().format("%:z").to_string());
+            Json(body).into_response()
+        }
         Err(response) => response,
     }
 }

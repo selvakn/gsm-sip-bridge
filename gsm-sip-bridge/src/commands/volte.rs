@@ -1190,7 +1190,7 @@ pub(crate) fn handle_volte_carrier_agent_command(
         crate::volte::sms::Reassembly::default(),
     ));
     let signal_slot: crate::volte::sms::SignalSlot =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+        std::sync::Arc::new(crate::volte::sms::SignalShare::default());
     let signal_poll = crate::volte::sms::SignalPoll::for_interval(
         app_config.metrics.signal_poll_interval_seconds,
         signal_slot.clone(),

@@ -281,3 +281,98 @@ async fn a_call_in_progress_appears_on_its_overview_line() {
     assert_eq!(call["loss_percent"], 0.4);
     assert!(call["rtt_ms"].is_null(), "unmeasured stays null, never 0");
 }
+
+#[tokio::test]
+async fn the_upper_date_bound_includes_its_own_second() {
+    let f = Fixture::start("").await;
+    let store = open_store(&f.db_path);
+    let at = chrono::DateTime::parse_from_rfc3339("2026-10-20T23:59:59Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    // Stored the way the bridge writes it: with a zone suffix.
+    store
+        .sender()
+        .send(StoreCommand::InsertCall(CallRecord {
+            started_at: at.to_rfc3339(),
+            ..record(&Seed {
+                line: "line-a",
+                direction: CallDirection::Inbound,
+                transport: Transport::Vowifi,
+                status: "answered",
+                seconds: 5.0,
+                age: Duration::zero(),
+                quality: None,
+            })
+        }))
+        .unwrap();
+    wait_for_rows(&f.db_path, "calls", 1);
+    let cookie = f.login().await;
+
+    let count = |to: &str| {
+        let path = format!("/api/calls?to={}", to.replace('+', "%2B"));
+        let f = &f;
+        let cookie = cookie.clone();
+        async move {
+            f.get_json(&cookie, &path).await.1["total"]
+                .as_u64()
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        count("2026-10-20T23:59:59Z").await,
+        1,
+        "the day's last second is in"
+    );
+    assert_eq!(count("2026-10-20T23:59:59.500Z").await, 1);
+    assert_eq!(
+        count("2026-10-20T23:59:58Z").await,
+        0,
+        "the second before it is not"
+    );
+    assert_eq!(
+        count("2026-10-21T05:29:59+05:30").await,
+        1,
+        "an offset is honoured"
+    );
+}
+
+#[tokio::test]
+async fn calls_from_before_direction_was_recorded_are_unknown_not_inbound() {
+    let f = Fixture::start("").await;
+    let store = open_store(&f.db_path);
+    // A row written without a direction, as every pre-upgrade row was.
+    let conn = rusqlite::Connection::open(&f.db_path).unwrap();
+    conn.execute(
+        "INSERT INTO calls (module_id, caller_id, started_at, duration_seconds, status, sip_destination, transport) \
+         VALUES ('line-a', '+919000000001', ?1, 30.0, 'answered', '', 'vowifi')",
+        [Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    drop(store);
+    let cookie = f.login().await;
+
+    let (_, s) = f.get_json(&cookie, "/api/calls/summary").await;
+    assert_eq!(s["today"]["answered"], 1, "it still counts in the totals");
+    assert_eq!(s["by_direction"]["unknown"]["today"]["answered"], 1);
+    assert_eq!(s["by_direction"]["inbound"]["today"]["answered"], 0);
+    assert_eq!(s["by_direction"]["outbound"]["today"]["answered"], 0);
+
+    let (_, list) = f.get_json(&cookie, "/api/calls?direction=unknown").await;
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["direction"], "unknown");
+    let (_, inbound) = f.get_json(&cookie, "/api/calls?direction=inbound").await;
+    assert_eq!(inbound["total"], 0);
+}
+
+#[tokio::test]
+async fn the_summary_says_whose_midnight_today_starts_at() {
+    let f = Fixture::start("").await;
+    let _store = open_store(&f.db_path);
+    let cookie = f.login().await;
+    let (_, s) = f.get_json(&cookie, "/api/calls/summary").await;
+    let start = s["today_start"].as_str().expect("today_start");
+    let parsed = chrono::DateTime::parse_from_rfc3339(start).expect("an RFC 3339 time");
+    assert_eq!(parsed.format("%H:%M:%S").to_string(), "00:00:00", "{start}");
+    let offset = s["host_utc_offset"].as_str().expect("host_utc_offset");
+    assert_eq!(offset, parsed.format("%:z").to_string());
+}

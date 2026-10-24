@@ -150,6 +150,8 @@ pub struct LineCallSummary {
 pub struct DirectionSummary {
     pub inbound: Windowed,
     pub outbound: Windowed,
+    /// Calls recorded before direction was (schema v6 backfill).
+    pub unknown: Windowed,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -309,13 +311,14 @@ impl StoreReader {
             let mut by_line: BTreeMap<String, Windowed> = BTreeMap::new();
             let mut inbound = Windowed::default();
             let mut outbound = Windowed::default();
+            let mut unknown = Windowed::default();
             for row in rows {
                 let (module, direction, status, is_today, count, seconds) = row?;
                 let count = u64::try_from(count).unwrap_or(0);
-                let by_dir = if direction == "outbound" {
-                    &mut outbound
-                } else {
-                    &mut inbound
+                let by_dir = match direction.as_str() {
+                    "outbound" => &mut outbound,
+                    "inbound" => &mut inbound,
+                    _ => &mut unknown,
                 };
                 let line = by_line.entry(module).or_default();
                 for target in [&mut total, line, by_dir] {
@@ -347,6 +350,7 @@ impl StoreReader {
                 by_direction: DirectionSummary {
                     inbound: done(inbound),
                     outbound: done(outbound),
+                    unknown: done(unknown),
                 },
             })
         })
@@ -494,8 +498,12 @@ fn calls_where(filter: &CallFilter) -> (String, Vec<String>) {
         params.push(ts(from));
     }
     if let Some(to) = filter.to {
-        clauses.push("started_at <= ?".to_string());
-        params.push(ts(to));
+        // `started_at` carries a zone suffix and sometimes a fraction, so it
+        // sorts *after* the bare prefix of its own second. Compare against the
+        // start of the next second, exclusive, which keeps everything up to
+        // and including `to`'s own second.
+        clauses.push("started_at < ?".to_string());
+        params.push(ts(to + chrono::Duration::seconds(1)));
     }
     let sql = if clauses.is_empty() {
         String::new()

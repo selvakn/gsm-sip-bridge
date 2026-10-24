@@ -510,6 +510,15 @@
     return el("article", { class: "panel sms" + (m.forwarding_status === "failed" ? " failed" : "") }, parts);
   }
 
+  // A page can empty out from under the reader (retention, a narrower
+  // filter). Step back to the last page that exists instead of leaving them on
+  // a blank one with no way to go back. True when the caller should reload.
+  function pastTheEnd(state, data) {
+    if (data.items.length || state.page <= 1 || !data.total) return false;
+    state.page = Math.max(1, Math.ceil(data.total / data.per_page));
+    return true;
+  }
+
   function pager(info, goto) {
     var pagesTotal = Math.max(1, Math.ceil(info.total / info.per_page));
     return el("div", { class: "pager" },
@@ -549,8 +558,12 @@
       container.appendChild(el("div", { class: "filters" }, line, search));
       container.appendChild(results);
 
+      var seq = 0;
       function load() {
+        var mine = ++seq;
         api("/api/sms" + query({ line: line.value, q: search.value, page: state.page })).then(function (data) {
+          if (mine !== seq) return;
+          if (pastTheEnd(state, data)) { load(); return; }
           clear(results);
           if (!data.items.length) {
             results.appendChild(el("div", { class: "empty", text: "No messages match." }));
@@ -560,7 +573,7 @@
           data.items.forEach(function (m) { list.appendChild(smsCard(m)); });
           results.appendChild(list);
           results.appendChild(pager(data, function (p) { state.page = p; load(); }));
-        }).catch(function (err) { errorBanner(results, err); });
+        }).catch(function (err) { if (mine === seq) errorBanner(results, err); });
       }
 
       return {
@@ -650,7 +663,7 @@
         node.addEventListener("change", onchange);
         return node;
       }
-      var direction = select("Direction", [["", "Any direction"], ["inbound", "Inbound"], ["outbound", "Outbound"]], function () { state.page = 1; loadLog(); });
+      var direction = select("Direction", [["", "Any direction"], ["inbound", "Inbound"], ["outbound", "Outbound"], ["unknown", "Before direction was recorded"]], function () { state.page = 1; loadLog(); });
       var transport = select("Transport", [["", "Any transport"], ["cs", "GSM"], ["vowifi", "VoWiFi"], ["volte", "VoLTE"]], function () { state.page = 1; loadLog(); });
       var status = select("Status", [["", "Any status"], ["answered", "Answered"], ["missed", "Missed"], ["failed", "Failed"]], function () { state.page = 1; loadLog(); });
       var from = el("input", { type: "date", "aria-label": "From" });
@@ -669,10 +682,16 @@
       function loadSummary() {
         api("/api/calls/summary").then(function (s) {
           clear(summary);
-          var tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || "local time";
-          var today = tile("Today (" + tz + ")", s.today);
+          // "Today" is counted from the bridge host's midnight, which need not
+          // be this browser's, so say whose.
+          var offset = s.host_utc_offset && s.host_utc_offset !== "+00:00" ? "UTC" + s.host_utc_offset : "UTC";
+          var today = tile("Today (bridge host time, " + offset + ")", s.today);
           today.appendChild(directionLine("In", s.by_direction.inbound));
           today.appendChild(directionLine("Out", s.by_direction.outbound));
+          var u = s.by_direction.unknown;
+          if (u && (u.last_7d.answered + u.last_7d.missed + u.last_7d.failed) > 0) {
+            today.appendChild(directionLine("Older", u));
+          }
           summary.appendChild(el("div", { class: "tiles" }, today, tile("Last 7 days", s.last_7d)));
         }).catch(function (err) { errorBanner(summary, err); });
       }
@@ -682,11 +701,15 @@
           .catch(function () { /* the section keeps its last content */ });
       }
 
+      var seq = 0;
       function loadLog() {
+        var mine = ++seq;
         api("/api/calls" + query({
           line: line.value, direction: direction.value, transport: transport.value, status: status.value,
           from: dayBoundary(from.value, false), to: dayBoundary(to.value, true), page: state.page
         })).then(function (data) {
+          if (mine !== seq) return;
+          if (pastTheEnd(state, data)) { loadLog(); return; }
           clear(results);
           if (!data.items.length) {
             results.appendChild(el("div", { class: "empty", text: "No calls match." }));
@@ -697,7 +720,7 @@
             tbody.appendChild(el("tr", null,
               el("td", { text: fmtTime(c.started_at) }),
               el("td", { text: c.module_id || "—" }),
-              el("td", { text: c.direction === "outbound" ? "Out" : "In" }),
+              el("td", { text: c.direction === "outbound" ? "Out" : c.direction === "inbound" ? "In" : "—", title: c.direction === "unknown" ? "Recorded before call direction was tracked" : null }),
               el("td", { class: "mono", text: c.remote || "—" }),
               el("td", { text: c.status === "answered" ? fmtDuration(c.duration_seconds) : "—" }),
               el("td", null, el("span", { class: "badge " + (STATUS_BADGE[c.status] || "stale"), text: c.status })),
@@ -708,7 +731,7 @@
             el("thead", null, el("tr", null, ["Started", "Line", "Dir", "Remote", "Length", "Status", "Via", "Quality"].map(function (h) { return el("th", { text: h }); }))),
             tbody)));
           results.appendChild(pager(data, function (p) { state.page = p; loadLog(); }));
-        }).catch(function (err) { errorBanner(results, err); });
+        }).catch(function (err) { if (mine === seq) errorBanner(results, err); });
       }
 
       return {
@@ -788,8 +811,12 @@
           .catch(function () { /* the panel keeps its last content */ });
       }
 
+      var seq = 0;
       function load() {
+        var mine = ++seq;
         api("/api/events" + query({ line: line.value, kind: kind.value, page: state.page })).then(function (data) {
+          if (mine !== seq) return;
+          if (pastTheEnd(state, data)) { load(); return; }
           clear(results);
           if (!data.items.length) {
             results.appendChild(el("div", { class: "empty", text: "Nothing recorded yet." }));
@@ -799,7 +826,7 @@
           data.items.forEach(function (e) { list.appendChild(eventItem(e)); });
           results.appendChild(list);
           results.appendChild(pager(data, function (p) { state.page = p; load(); }));
-        }).catch(function (err) { errorBanner(results, err); });
+        }).catch(function (err) { if (mine === seq) errorBanner(results, err); });
       }
 
       return {

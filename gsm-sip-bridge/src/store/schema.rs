@@ -219,13 +219,19 @@ CREATE VIEW recent_sms AS
     LIMIT 200;
 "#;
 
-/// Management web UI (specs/122-management-webui): outbound calls and
-/// per-call quality on `calls`, plus the `events` timeline. `DEFAULT
-/// 'inbound'` backfills every earlier row accurately, since none was ever
-/// outbound. The view is recreated for the same reason v3/v4 recreated it.
+/// Management web UI (specs/122-management-webui): call direction and
+/// per-call quality on `calls`, plus the `events` timeline.
+///
+/// Every earlier row backfills as `'unknown'`, not `'inbound'`: the
+/// circuit-switched worker and the VoWiFi/VoLTE IMS agent both recorded calls
+/// this bridge placed, with the dialled number in `caller_id`, and nothing
+/// stored says which rows those were. Claiming them inbound would count old
+/// outbound calls as received ones. Every row written from now on names its
+/// direction explicitly. The view is recreated for the same reason v3/v4
+/// recreated it.
 const SCHEMA_V6_SQL: &str = r#"
-ALTER TABLE calls ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'
-    CHECK (direction IN ('inbound','outbound'));
+ALTER TABLE calls ADD COLUMN direction TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (direction IN ('inbound','outbound','unknown'));
 ALTER TABLE calls ADD COLUMN loss_percent REAL;
 ALTER TABLE calls ADD COLUMN jitter_ms    REAL;
 ALTER TABLE calls ADD COLUMN rtt_ms       REAL;
@@ -545,13 +551,16 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(direction, "inbound");
+        assert_eq!(
+            direction, "unknown",
+            "history from before direction was recorded must not be called inbound"
+        );
         assert!(loss.is_none() && jitter.is_none() && rtt.is_none());
 
         let view_direction: String = conn
             .query_row("SELECT direction FROM recent_calls", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(view_direction, "inbound");
+        assert_eq!(view_direction, "unknown");
 
         let names: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")

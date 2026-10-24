@@ -18,7 +18,7 @@ The migration follows the existing pattern in `store/schema.rs`: a `MIGRATIONS` 
 | `status` | TEXT | — | `answered` / `missed` / `failed` |
 | `sip_destination` | TEXT | — | |
 | `transport` | TEXT | — | `cs` / `vowifi` / `volte` |
-| `direction` | TEXT NOT NULL DEFAULT `'inbound'` | **new** | CHECK in (`inbound`, `outbound`). The default backfills every pre-v5 row accurately, because none was ever outbound |
+| `direction` | TEXT NOT NULL DEFAULT `'unknown'` | **new** | CHECK in (`inbound`, `outbound`, `unknown`). Every earlier row backfills as `unknown`: the CS worker and the IMS agent both recorded calls this bridge placed, and nothing stored says which. Every new row names its direction |
 | `loss_percent` | REAL NULL | **new** | Local receive loss at teardown; NULL when unknown or CS |
 | `jitter_ms` | REAL NULL | **new** | Local receive jitter at teardown |
 | `rtt_ms` | REAL NULL | **new** | Round-trip time from the far end's RTCP |

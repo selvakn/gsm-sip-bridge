@@ -341,7 +341,8 @@ fn run_line(
     // Spawned once (its own reader loop is resilient) and serialised with the
     // carrier half through the shared lock; it relays each message onto the
     // same telephone-side recorder the IMS route uses.
-    let signal_slot: super::sms::SignalSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let signal_slot: super::sms::SignalSlot =
+        std::sync::Arc::new(super::sms::SignalShare::default());
     let signal_poll = super::sms::SignalPoll::for_interval(
         app_config.metrics.signal_poll_interval_seconds,
         signal_slot.clone(),

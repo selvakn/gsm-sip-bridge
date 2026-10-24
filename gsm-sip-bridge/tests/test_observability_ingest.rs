@@ -292,6 +292,45 @@ mod details {
     }
 
     #[test]
+    fn a_lapsed_registration_clears_registered_since_but_a_silent_report_does_not() {
+        let m = "ui-details-regat";
+        let with = |seq, state: Option<RegistrationStateWire>, at: Option<u64>| {
+            report(
+                m,
+                seq,
+                AgentState::default(),
+                Some(AgentDetails {
+                    registration_state: state,
+                    registered_at: at,
+                    ..Default::default()
+                }),
+            )
+        };
+        apply_report(&with(
+            1,
+            Some(RegistrationStateWire::Registered),
+            Some(1_700_000_000),
+        ));
+        assert_eq!(snap(m).details.registered_at, Some(1_700_000_000));
+
+        // An older agent that says nothing about the state changes nothing.
+        apply_report(&with(2, None, None));
+        assert_eq!(snap(m).details.registered_at, Some(1_700_000_000));
+
+        // Renewing is still registered.
+        apply_report(&with(3, Some(RegistrationStateWire::Renewing), None));
+        assert_eq!(snap(m).details.registered_at, Some(1_700_000_000));
+
+        // A failed line has no "registered since".
+        apply_report(&with(4, Some(RegistrationStateWire::Failed), None));
+        assert_eq!(snap(m).details.registered_at, None);
+        assert_eq!(
+            snap(m).details.registration_state,
+            Some(RegistrationStateWire::Failed)
+        );
+    }
+
+    #[test]
     fn active_call_details_replace_the_list() {
         let m = "ui-details-calls";
         let with_calls = |seq, calls: Vec<ActiveCallInfoWire>| {

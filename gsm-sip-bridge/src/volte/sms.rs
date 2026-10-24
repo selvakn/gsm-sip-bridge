@@ -633,7 +633,10 @@ pub fn run_modem_reader(
         // A separate guard from the sweep's: each is judged against its own
         // budget, so a slow listing cannot make a healthy signal read look
         // like part of the same stall.
-        if let Some(poll) = signal.as_ref().filter(|p| p.due_on_pass(pass)) {
+        if let Some(poll) = signal
+            .as_ref()
+            .filter(|p| p.due_on_pass(pass) && !p.slot.is_call_active())
+        {
             let _phase = progress.phase_guard(crate::ims::agent::watchdog::Phase::SmsSweep);
             poll_signal(&modem_port, &modem_lock, &poll.slot);
         }
@@ -645,7 +648,18 @@ pub fn run_modem_reader(
 
 /// Where the modem sweep leaves its latest signal reading, for the agent's
 /// reporter to copy into `AgentReport.details.signal`.
-pub type SignalSlot = Arc<Mutex<Option<crate::modules::signal::SignalReading>>>;
+pub type SignalSlot = Arc<SignalShare>;
+
+/// What the signal poll and the agent share for one line.
+#[derive(Default)]
+pub struct SignalShare {
+    /// The latest reading, `None` until the first successful poll.
+    pub reading: Mutex<Option<crate::modules::signal::SignalReading>>,
+    /// Whether a call is connected or being set up on this line. Set by the
+    /// agent; the poll skips while it is, so an optional read never takes the
+    /// modem port ahead of a call's attachment check.
+    pub call_active: std::sync::atomic::AtomicBool,
+}
 
 /// Asks [`run_modem_reader`] to read signal quality every `every_n_passes`
 /// sweeps (specs/122-management-webui, research R3).
@@ -659,6 +673,12 @@ pub type SignalSlot = Arc<Mutex<Option<crate::modules::signal::SignalReading>>>;
 pub struct SignalPoll {
     pub slot: SignalSlot,
     pub every_n_passes: u32,
+}
+
+impl SignalShare {
+    pub fn is_call_active(&self) -> bool {
+        self.call_active.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl SignalPoll {
@@ -714,7 +734,7 @@ fn poll_signal(
     };
     let (reading, answered) = crate::modules::signal::read_signal_checked(&mut at);
     if answered {
-        if let Ok(mut latest) = slot.lock() {
+        if let Ok(mut latest) = slot.reading.lock() {
             *latest = Some(reading);
         }
     }
@@ -1145,6 +1165,16 @@ fn relay_modem_message(control_addr: SocketAddr, sender: &str, body: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_on_the_line_holds_back_the_signal_poll() {
+        let share = SignalShare::default();
+        assert!(!share.is_call_active());
+        share
+            .call_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(share.is_call_active());
+    }
 
     #[test]
     fn signal_polling_lands_on_whole_sweeps() {

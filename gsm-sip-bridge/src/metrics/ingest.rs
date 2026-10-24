@@ -14,7 +14,7 @@ use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKin
 use crate::config::AlertsConfig;
 use crate::control::protocol::{
     AgentDetails, AgentKind, AgentReport, AgentState, CallStatus, IkeSaLossCause, ObservedEvent,
-    QualitySource, SmsOutcome, TunnelRecoveryReason, UplinkState,
+    QualitySource, RegistrationStateWire, SmsOutcome, TunnelRecoveryReason, UplinkState,
 };
 use crate::metrics;
 use crate::store::events::{self, EventKind};
@@ -371,6 +371,55 @@ fn apply_report_with(
                 Duration::from_secs(cfg.registration_loss_thresholds.unhealthy_sec);
             let tunnel_threshold = Duration::from_secs(cfg.tunnel_failure_thresholds.unhealthy_sec);
 
+            // The web UI's timeline resolves an incident when the condition
+            // clears, whether or not a Discord notice was ever sent for it.
+            // The Discord path only sends `Recovered` after a delivered
+            // `Failure`, so with a category disabled, no webhook, or a failed
+            // delivery its raise would otherwise stay open for ever and fold
+            // every later outage into it. A resolve with nothing open is a
+            // no-op, so this is safe to call on every healthy report.
+            let supervisor_key_tl = (AgentKind::Supervisor, module_id.to_string());
+            let sup_since_tl = guard
+                .get(&supervisor_key_tl)
+                .and_then(|r| r.tunnel_unhealthy_since);
+            let ims_since_tl = guard
+                .get(&(AgentKind::Ims, module_id.to_string()))
+                .and_then(|r| r.tunnel_unhealthy_since);
+            // Only the agent that owns a signal can say it has cleared: the
+            // SIP-side agents never report registration or tunnel state, so
+            // their heartbeats would otherwise read as "healthy".
+            let carrier = matches!(report.agent, AgentKind::Ims | AgentKind::Volte);
+            let tunnel_healthy = match report.agent {
+                AgentKind::Supervisor => ims_since_tl.is_none() && tunnel_unhealthy_since.is_none(),
+                AgentKind::Ims => tunnel_unhealthy_since.is_none() && sup_since_tl.is_none(),
+                _ => false,
+            };
+            for (category, healthy) in [
+                (
+                    AlertCategory::RegistrationLoss,
+                    carrier && registered_unhealthy_since.is_none(),
+                ),
+                (AlertCategory::TunnelFailure, tunnel_healthy),
+                (
+                    AlertCategory::GmConnectionLost,
+                    carrier && gm_connection_unhealthy_since.is_none(),
+                ),
+                (
+                    AlertCategory::PcscfPoolExhausted,
+                    report.agent == AgentKind::Supervisor && pool_exhausted.since.is_none(),
+                ),
+            ] {
+                if healthy {
+                    events::record_alert(
+                        category.as_str(),
+                        Some(module_id),
+                        false,
+                        "condition cleared",
+                        chrono::Utc::now(),
+                    );
+                }
+            }
+
             match decide_tracked(
                 registered_unhealthy_since,
                 &mut registered_alert_phase,
@@ -580,6 +629,15 @@ fn store_view(report: &AgentReport) {
         let kept = &mut view.details;
         if d.registration_state.is_some() {
             kept.registration_state = d.registration_state;
+            // "Registered since" only means something while registered. A
+            // report that names a lapsed state clears it; one that omits the
+            // state (an older agent) leaves it alone.
+            if !matches!(
+                d.registration_state,
+                Some(RegistrationStateWire::Registered | RegistrationStateWire::Renewing)
+            ) {
+                kept.registered_at = None;
+            }
         }
         if d.registered_at.is_some() {
             kept.registered_at = d.registered_at;
@@ -623,6 +681,11 @@ pub fn clear_active_call_details(agent: AgentKind, module_id: &str) {
     {
         if view.details.active_call_details.is_some() {
             view.details.active_call_details = Some(Vec::new());
+        }
+        // The count goes with the details: a count with no details would still
+        // read as a call in progress.
+        if view.active_calls.is_some() {
+            view.active_calls = Some(0);
         }
     }
 }
@@ -675,6 +738,7 @@ fn snapshot_with(staleness_threshold: Duration) -> Vec<AgentSnapshot> {
             // web UI reads this without anyone scraping /metrics.
             if !up {
                 view.details.active_call_details = Some(Vec::new());
+                view.active_calls = view.active_calls.map(|_| 0);
             }
             AgentSnapshot {
                 agent,

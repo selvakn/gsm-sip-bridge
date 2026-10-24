@@ -112,6 +112,7 @@ impl DetailsSource {
             .clone();
         if let Some(slot) = slot {
             details.signal = slot
+                .reading
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
@@ -301,9 +302,6 @@ impl AgentObservability {
     /// Mirrors "how many calls occupy this line" (connected plus being set
     /// up) into the calls file, for the tunnel supervisor (specs/093).
     fn sync_calls_file(&self) {
-        let Some(path) = &self.calls_file else {
-            return;
-        };
         let active = self
             .state
             .lock()
@@ -312,6 +310,21 @@ impl AgentObservability {
             .unwrap_or(0);
         let mut setup = self.setup.lock().unwrap_or_else(|e| e.into_inner());
         let n = active.max(u32::from(setup.inbound || setup.outbound));
+        // The signal poll stands aside while the line is occupied. This runs
+        // on VoLTE too, which has no calls file.
+        if let Some(slot) = self
+            .details
+            .signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            slot.call_active
+                .store(n > 0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some(path) = &self.calls_file else {
+            return;
+        };
         if setup.written == Some(n) {
             return;
         }
@@ -572,7 +585,8 @@ mod tests {
         }));
         obs.attach_registration_status(Arc::clone(&status));
         obs.set_plmn("405", "857");
-        let slot: crate::volte::sms::SignalSlot = Arc::new(Mutex::new(None));
+        let slot: crate::volte::sms::SignalSlot =
+            Arc::new(crate::volte::sms::SignalShare::default());
         obs.attach_signal_slot(Arc::clone(&slot));
 
         let d = obs.details.snapshot();
@@ -582,7 +596,7 @@ mod tests {
         assert!(d.signal.is_none(), "nothing read yet");
         assert_eq!(d.active_call_details, Some(vec![]));
 
-        *slot.lock().unwrap() = Some(crate::modules::signal::SignalReading {
+        *slot.reading.lock().unwrap() = Some(crate::modules::signal::SignalReading {
             at_unix: 5,
             rssi_dbm: Some(-71),
             ..Default::default()
@@ -596,6 +610,16 @@ mod tests {
             jitter_ms: None,
             rtt_ms: None,
         }]);
+        // The signal poll is told when the line is occupied.
+        assert!(!slot.is_call_active());
+        obs.set_inbound_setup(true);
+        assert!(slot.is_call_active(), "a ringing call holds the poll back");
+        obs.set_inbound_setup(false);
+        obs.set_active_calls(1);
+        assert!(slot.is_call_active());
+        obs.set_active_calls(0);
+        assert!(!slot.is_call_active());
+
         // The registration moving on is picked up with no further call.
         status.lock().unwrap().state = crate::ims::RegistrationState::Failed;
 
