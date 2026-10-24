@@ -392,6 +392,9 @@ fn apply_report_with(
             let tunnel_healthy = match report.agent {
                 AgentKind::Supervisor => ims_since_tl.is_none() && tunnel_unhealthy_since.is_none(),
                 AgentKind::Ims => tunnel_unhealthy_since.is_none() && sup_since_tl.is_none(),
+                // VoLTE has no supervisor to fold with: its "tunnel" is the
+                // IMS PDN, decided on the agent's own record.
+                AgentKind::Volte => tunnel_unhealthy_since.is_none(),
                 _ => false,
             };
             for (category, healthy) in [
