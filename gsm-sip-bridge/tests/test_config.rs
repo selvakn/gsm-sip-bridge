@@ -870,3 +870,59 @@ fn test_sip_reject_statuses_typo_key_rejected() {
     let f = sip_with_codecs("reject_status = [403]");
     assert!(load_config(f.path()).is_err());
 }
+
+fn sms_config_with(extra: &str) -> String {
+    format!(
+        r#"
+[sip]
+server = "pbx.example.com"
+username = "bridge"
+password = "secret123"
+
+[sms]
+{extra}
+"#
+    )
+}
+
+/// specs/121-sms-alert-retry: retry is on by default, hourly, with a 7-day age limit.
+#[test]
+fn test_sms_retry_defaults() {
+    let f = write_config(&sms_config_with(""));
+    let cfg = load_config(f.path()).expect("config must load");
+    assert!(cfg.sms.retry_enabled);
+    assert_eq!(cfg.sms.retry_interval_sec, 3600);
+    assert_eq!(cfg.sms.retry_max_age_sec, 604_800);
+}
+
+#[test]
+fn test_sms_retry_overrides() {
+    let f = write_config(&sms_config_with(
+        "retry_enabled = false\nretry_interval_sec = 60\nretry_max_age_sec = 7200",
+    ));
+    let cfg = load_config(f.path()).expect("config must load");
+    assert!(!cfg.sms.retry_enabled);
+    assert_eq!(cfg.sms.retry_interval_sec, 60);
+    assert_eq!(cfg.sms.retry_max_age_sec, 7200);
+}
+
+#[test]
+fn test_sms_retry_out_of_range_is_rejected() {
+    for (line, key) in [
+        ("retry_interval_sec = 59", "sms.retry_interval_sec"),
+        ("retry_interval_sec = 86401", "sms.retry_interval_sec"),
+        ("retry_max_age_sec = 3599", "sms.retry_max_age_sec"),
+        ("retry_max_age_sec = 2592001", "sms.retry_max_age_sec"),
+    ] {
+        let f = write_config(&sms_config_with(line));
+        let err = load_config(f.path()).expect_err(line);
+        assert!(err.to_string().contains(key), "{line}: {err}");
+    }
+}
+
+#[test]
+fn test_sms_unknown_key_still_rejected() {
+    let f = write_config(&sms_config_with("retry_forever = true"));
+    let err = load_config(f.path()).expect_err("unknown key must fail");
+    assert!(err.to_string().contains("retry_forever"), "{err}");
+}

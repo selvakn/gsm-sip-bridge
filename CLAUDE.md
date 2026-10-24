@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/120-amr-passthrough-forwarder/plan.md`.
+`specs/121-sms-alert-retry/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

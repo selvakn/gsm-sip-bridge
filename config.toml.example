@@ -58,6 +58,12 @@ sip_dial_timeout_sec = 30      # range: 5-120
 enabled = true
 discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
 db_path = "/data/store.db"
+# Undelivered Discord notifications are retried (specs/121-sms-alert-retry):
+# after the next text, and every retry_interval_sec. Set retry_enabled = false
+# to restore the old record-only behaviour.
+retry_enabled = true
+retry_interval_sec = 3600       # range: 60-86400
+retry_max_age_sec = 604800      # range: 3600-2592000; older texts are abandoned
 
 # Discord alerts for critical operational events (specs/022-discord-critical-
 # alerts). SMS forwarding above continues to work unchanged even if this

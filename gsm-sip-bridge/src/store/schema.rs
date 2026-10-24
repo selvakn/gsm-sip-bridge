@@ -1,7 +1,7 @@
 use crate::error::{BridgeError, BridgeResult};
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -173,6 +173,52 @@ CREATE VIEW recent_sms AS
     LIMIT 200;
 "#;
 
+/// Delivery tracking for SMS Discord notifications (specs/121-sms-alert-retry).
+/// Adds the retry state (`attempt_count`, `last_attempt_at`, `last_error`,
+/// `first_seen_at`), a cross-process lease (`claimed_until`) and the
+/// `retry_eligible` flag, and widens the `forwarding_status` CHECK with
+/// `'abandoned'`. Rebuilt rather than altered because SQLite cannot change a
+/// CHECK in place (same pattern as v4). Every pre-existing row keeps
+/// `retry_eligible = 0`, so history is never replayed to Discord.
+const SCHEMA_V5_SQL: &str = r#"
+DROP VIEW IF EXISTS recent_sms;
+
+CREATE TABLE sms_v5 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id           TEXT    NOT NULL,
+    sender              TEXT    NOT NULL,
+    body                TEXT    NOT NULL,
+    received_at         TEXT    NOT NULL,
+    forwarding_status   TEXT    NOT NULL CHECK (forwarding_status IN ('pending','sent','failed','skipped','abandoned')),
+    forwarded_at        TEXT,
+    discord_status_code INTEGER,
+    transport           TEXT    NOT NULL DEFAULT 'cs' CHECK (transport IN ('cs','vowifi','volte')),
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     INTEGER,
+    last_error          TEXT,
+    first_seen_at       INTEGER NOT NULL DEFAULT 0,
+    claimed_until       INTEGER,
+    retry_eligible      INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO sms_v5 (id, module_id, sender, body, received_at, forwarding_status, forwarded_at, discord_status_code, transport, first_seen_at, retry_eligible)
+    SELECT id, module_id, sender, body, received_at, forwarding_status, forwarded_at, discord_status_code, transport, CAST(strftime('%s','now') AS INTEGER), 0 FROM sms;
+DROP TABLE sms;
+ALTER TABLE sms_v5 RENAME TO sms;
+
+CREATE INDEX IF NOT EXISTS idx_sms_received_at ON sms(received_at);
+CREATE INDEX IF NOT EXISTS idx_sms_module      ON sms(module_id);
+CREATE INDEX IF NOT EXISTS idx_sms_status      ON sms(forwarding_status);
+CREATE INDEX IF NOT EXISTS idx_sms_transport   ON sms(transport);
+CREATE INDEX IF NOT EXISTS idx_sms_retry       ON sms(retry_eligible, forwarding_status, claimed_until);
+
+CREATE VIEW recent_sms AS
+    SELECT id, module_id, sender, body, received_at, forwarding_status, forwarded_at, discord_status_code, transport,
+           attempt_count, last_attempt_at, last_error, first_seen_at, claimed_until, retry_eligible
+    FROM sms
+    ORDER BY id DESC
+    LIMIT 200;
+"#;
+
 /// Every migration, in order: `(from_version, to_version, sql)`.
 ///
 /// To add one: append `SCHEMA_V<N+1>_SQL`, add a row here, and bump
@@ -183,6 +229,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("1", "2", SCHEMA_V2_SQL),
     ("2", "3", SCHEMA_V3_SQL),
     ("3", "4", SCHEMA_V4_SQL),
+    ("4", "5", SCHEMA_V5_SQL),
 ];
 
 pub fn init_schema(conn: &Connection) -> BridgeResult<()> {
@@ -231,7 +278,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fresh_schema_is_v4() {
+    fn test_fresh_schema_is_v5() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let ver: String = conn
@@ -241,7 +288,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "4");
+        assert_eq!(ver, "5");
         // Verify new tables exist
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM card_slots", [], |r| r.get(0))
@@ -250,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_to_v4_migration() {
+    fn test_v1_to_v5_migration() {
         let conn = Connection::open_in_memory().unwrap();
         // Bootstrap a v1 schema manually
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -263,7 +310,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "4");
+        assert_eq!(ver, "5");
         // Tables should exist after migration
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM card_mode_prefs", [], |r| r.get(0))
@@ -305,7 +352,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "4");
+        assert_eq!(ver, "5");
 
         let call_transport: String = conn
             .query_row("SELECT transport FROM calls LIMIT 1", [], |r| r.get(0))

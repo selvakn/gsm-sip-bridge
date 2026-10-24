@@ -22,6 +22,7 @@ fn test_sms_full_path_persist_then_forward() {
         received_at: "2026-05-04T20:00:00Z".into(),
         forwarding_status: "pending".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
 
@@ -63,6 +64,7 @@ fn test_sms_discord_unreachable_marks_failed() {
         received_at: "2026-05-04T21:00:00Z".into(),
         forwarding_status: "pending".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
     let id: i64 = conn.last_insert_rowid();
@@ -97,6 +99,7 @@ fn test_sms_disabled_skips_forwarding() {
         received_at: "2026-05-04T22:00:00Z".into(),
         forwarding_status: "skipped".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
 

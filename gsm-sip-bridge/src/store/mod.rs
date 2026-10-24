@@ -46,6 +46,18 @@ impl Transport {
     }
 }
 
+impl Transport {
+    /// Inverse of [`Transport::as_str`], for values read back from the store.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cs" => Some(Transport::Cs),
+            "vowifi" => Some(Transport::Vowifi),
+            "volte" => Some(Transport::Volte),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

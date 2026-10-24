@@ -33,6 +33,7 @@ use crate::modules::worker::{self, ModuleAudioInit, WorkerSetup};
 use crate::sip::SipBridge;
 use crate::sms::discord::DiscordClient;
 use crate::sms::SmsHandler;
+use crate::sms::{self, SmsForwarder};
 use crate::store::{StoreCommand, StoreHandle};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -49,7 +50,7 @@ pub struct CardPool {
     config: AppConfig,
     store: StoreHandle,
     sip_bridge: SipBridge,
-    discord_client: Option<DiscordClient>,
+    discord_client: Option<SmsForwarder>,
     /// specs/022-discord-critical-alerts. Separate from `discord_client`
     /// (SMS's own dedicated client): alert categories resolve their own
     /// webhook per event (`alerts::dispatch`), so this client is always
@@ -98,7 +99,11 @@ impl CardPool {
         let discord_client = if sms_handler.has_webhook() {
             let url = config.sms.discord_webhook_url.clone();
             match DiscordClient::new(url, instance.clone()) {
-                Ok(client) => Some(client),
+                Ok(client) => Some(SmsForwarder::new(
+                    client,
+                    &config.sms,
+                    alerts::line_phone_map(&config),
+                )),
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create Discord client");
                     None
@@ -170,6 +175,13 @@ impl CardPool {
 
         if let Err(e) = self.sip_bridge.register() {
             tracing::error!(error = %e, "SIP registration failed — calls will not be bridged");
+        }
+
+        // specs/121-sms-alert-retry: the hourly sweep for texts whose Discord
+        // post failed. Runs for the life of the pool; a failed text is also
+        // retried after the next text arrives (`sms::record_and_forward`).
+        if let Some(forwarder) = &self.discord_client {
+            sms::retry::spawn_timer(&tokio::runtime::Handle::current(), forwarder.clone(), None);
         }
 
         let modules = self.discover_modules(single_card);

@@ -339,6 +339,17 @@ fn build_sms(raw: RawSms) -> BridgeResult<SmsConfig> {
         enabled: raw.enabled,
         discord_webhook_url: raw.discord_webhook_url,
         db_path: raw.db_path,
+        retry_enabled: raw.retry_enabled,
+        retry_interval_sec: in_range(
+            raw.retry_interval_sec,
+            "sms.retry_interval_sec",
+            60..=86_400,
+        )?,
+        retry_max_age_sec: in_range(
+            raw.retry_max_age_sec,
+            "sms.retry_max_age_sec",
+            3_600..=2_592_000,
+        )?,
     })
 }
 

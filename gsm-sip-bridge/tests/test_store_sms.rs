@@ -21,6 +21,7 @@ fn test_insert_sms_pending() {
         received_at: "2026-05-04T20:00:00Z".into(),
         forwarding_status: "pending".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
 
@@ -44,6 +45,7 @@ fn test_update_forwarding_to_sent() {
         received_at: "2026-05-04T20:00:00Z".into(),
         forwarding_status: "pending".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
 
@@ -83,6 +85,7 @@ fn test_update_forwarding_to_failed() {
         received_at: "2026-05-04T20:10:00Z".into(),
         forwarding_status: "pending".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
 
@@ -117,6 +120,7 @@ fn test_skipped_status() {
         received_at: "2026-05-04T21:00:00Z".into(),
         forwarding_status: "skipped".into(),
         transport: Transport::Cs,
+        retry_eligible: false,
     };
     insert_sms(&conn, &record).unwrap();
 

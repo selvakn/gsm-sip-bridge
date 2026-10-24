@@ -383,6 +383,12 @@ pub struct SmsConfig {
     pub enabled: bool,
     pub discord_webhook_url: Secret<String>,
     pub db_path: String,
+    /// Re-post undelivered Discord notifications (specs/121-sms-alert-retry).
+    pub retry_enabled: bool,
+    /// Interval of the background retry sweep, per process owning an SMS client.
+    pub retry_interval_sec: u64,
+    /// A text still undelivered this long after it was received is abandoned.
+    pub retry_max_age_sec: u64,
 }
 
 #[derive(Clone, Debug)]
