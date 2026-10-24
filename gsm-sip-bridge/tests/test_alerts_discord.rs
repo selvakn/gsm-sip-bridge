@@ -158,6 +158,7 @@ async fn forward_sms_embed_includes_instance_footer_and_phone_field() {
             "hi",
             "2026-08-11T00:00:00Z",
             Some("+919000000001"),
+            false,
         )
         .await
         .unwrap();
@@ -450,4 +451,70 @@ async fn dispatch_skips_when_no_webhook_resolves_at_all() {
     let config = enabled_alerts_config("");
 
     dispatch(&client, &config, module_lifecycle_event()).await;
+}
+
+/// specs/121-sms-alert-retry (FR-016, SC-006): a fresh text's payload is
+/// exactly what it was before retry existed, and a retried one differs only by
+/// the `[Late] ` title prefix and the `Originally received` field.
+#[tokio::test]
+async fn forward_sms_late_payload_differs_only_by_prefix_and_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let client = DiscordClient::new(
+        Secret::new(format!("{}/webhook", server.uri())),
+        "bridge-01".to_string(),
+    )
+    .unwrap();
+
+    for late in [false, true] {
+        client
+            .forward_sms(
+                "ec20-A1B2C3",
+                "+919000000000",
+                "hi",
+                "2026-08-11T00:00:00Z",
+                Some("+919000000001"),
+                late,
+            )
+            .await
+            .unwrap();
+    }
+
+    let reqs = server.received_requests().await.unwrap();
+    let fresh: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    let late: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+
+    assert_eq!(
+        fresh,
+        serde_json::json!({
+            "embeds": [{
+                "title": "SMS from +919000000000",
+                "description": "hi",
+                "timestamp": "2026-08-11T00:00:00Z",
+                "color": 3447003,
+                "fields": [
+                    { "name": "Module", "value": "ec20-A1B2C3", "inline": true },
+                    { "name": "Sender", "value": "+919000000000", "inline": true },
+                    { "name": "Phone", "value": "+919000000001", "inline": true }
+                ],
+                "footer": { "text": "gsm-sip-bridge · bridge-01" }
+            }]
+        })
+    );
+
+    let mut expected_late = fresh.clone();
+    expected_late["embeds"][0]["title"] = "[Late] SMS from +919000000000".into();
+    expected_late["embeds"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "Originally received",
+            "value": "2026-08-11T00:00:00Z",
+            "inline": false
+        }));
+    assert_eq!(late, expected_late);
 }

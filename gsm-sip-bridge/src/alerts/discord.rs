@@ -16,6 +16,65 @@ const MAX_RETRIES: u32 = 3;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "gsm-sip-bridge/7.2.0";
 
+/// Why a webhook POST ultimately failed. `Display` reproduces the exact
+/// strings the string-typed error used to carry, so critical alerts (which
+/// still surface `Result<u16, String>`) log identically; [`PostError::category`]
+/// is the stable, secret-free value persisted for SMS retry bookkeeping
+/// (specs/121-sms-alert-retry, R6) — the `Unreachable` detail is a raw
+/// `reqwest` message that can contain the webhook URL and is never stored.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PostError {
+    /// Network-level failure on every attempt.
+    Unreachable(String),
+    /// The 30 s total budget ran out.
+    Timeout,
+    /// A non-retryable 4xx from Discord.
+    Rejected(u16),
+    /// Still 429 after the inline retries.
+    RateLimited { retry_after: Duration },
+    /// Still 5xx (or otherwise not 2xx) after the inline retries.
+    ServerError(u16),
+}
+
+impl PostError {
+    pub fn category(&self) -> String {
+        match self {
+            PostError::Unreachable(_) => "unreachable".into(),
+            PostError::Timeout => "timeout".into(),
+            PostError::Rejected(code) => format!("rejected:{code}"),
+            PostError::RateLimited { .. } => "rate_limited".into(),
+            PostError::ServerError(code) => format!("server_error:{code}"),
+        }
+    }
+
+    /// The HTTP status behind the failure, when there was one.
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            PostError::Rejected(c) | PostError::ServerError(c) => Some(*c),
+            PostError::RateLimited { .. } => Some(429),
+            PostError::Unreachable(_) | PostError::Timeout => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PostError::Unreachable(e) => write!(f, "network error after retries: {e}"),
+            PostError::Timeout => f.write_str("total timeout exceeded"),
+            PostError::Rejected(code) => write!(f, "client error {code}"),
+            PostError::RateLimited { .. } => {
+                write!(f, "failed after {MAX_RETRIES} retries, last status: 429")
+            }
+            PostError::ServerError(code) => {
+                write!(f, "failed after {MAX_RETRIES} retries, last status: {code}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PostError {}
+
 #[derive(Clone)]
 pub struct DiscordClient {
     client: reqwest::Client,
@@ -60,24 +119,39 @@ impl DiscordClient {
         body: &str,
         timestamp: &str,
         phone_number: Option<&str>,
-    ) -> Result<u16, String> {
+        late: bool,
+    ) -> Result<u16, PostError> {
         let description = if body.len() > MAX_DESCRIPTION_LEN {
             format!("{}…", &body[..MAX_DESCRIPTION_LEN])
         } else {
             body.to_string()
         };
 
+        let mut fields = vec![
+            serde_json::json!({ "name": "Module", "value": module_id, "inline": true }),
+            serde_json::json!({ "name": "Sender", "value": sender, "inline": true }),
+            serde_json::json!({ "name": "Phone", "value": phone_field(phone_number), "inline": true }),
+        ];
+        // A retried text differs from a fresh one only by the title prefix and
+        // one extra field (contracts/discord-payload.md).
+        let title = if late {
+            fields.push(serde_json::json!({
+                "name": "Originally received",
+                "value": timestamp,
+                "inline": false
+            }));
+            format!("[Late] SMS from {sender}")
+        } else {
+            format!("SMS from {sender}")
+        };
+
         let payload = serde_json::json!({
             "embeds": [{
-                "title": format!("SMS from {sender}"),
+                "title": title,
                 "description": description,
                 "timestamp": timestamp,
                 "color": 3447003,
-                "fields": [
-                    { "name": "Module", "value": module_id, "inline": true },
-                    { "name": "Sender", "value": sender, "inline": true },
-                    { "name": "Phone", "value": phone_field(phone_number), "inline": true }
-                ],
+                "fields": fields,
                 "footer": self.footer()
             }]
         });
@@ -137,20 +211,31 @@ impl DiscordClient {
             }]
         });
 
-        self.post_with_retry(webhook_url, payload).await
+        self.post_with_retry(webhook_url, payload)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn post_with_retry(
         &self,
         webhook_url: &str,
         payload: serde_json::Value,
-    ) -> Result<u16, String> {
+    ) -> Result<u16, PostError> {
         let start = std::time::Instant::now();
         let mut last_status = 0u16;
+        let mut last_retry_after = Duration::ZERO;
 
         for attempt in 0..=MAX_RETRIES {
             if start.elapsed() >= TOTAL_TIMEOUT {
-                return Err("total timeout exceeded".into());
+                // Budget spent while being throttled is still a rate limit:
+                // callers (the SMS retry sweep) stop on it, not on a timeout.
+                return Err(if last_status == 429 {
+                    PostError::RateLimited {
+                        retry_after: last_retry_after,
+                    }
+                } else {
+                    PostError::Timeout
+                });
             }
 
             let response = self.client.post(webhook_url).json(&payload).send().await;
@@ -167,7 +252,16 @@ impl DiscordClient {
                                 .and_then(|v| v.to_str().ok())
                                 .and_then(|s| s.parse::<f64>().ok())
                                 .unwrap_or(1.0);
-                            tokio::time::sleep(Duration::from_secs_f64(retry_after)).await;
+                            last_retry_after = Duration::from_secs_f64(retry_after);
+                            // A pause longer than the budget left is not worth
+                            // waiting out (and would outlive the SMS retry
+                            // lease): report the throttle now.
+                            if start.elapsed() + last_retry_after >= TOTAL_TIMEOUT {
+                                return Err(PostError::RateLimited {
+                                    retry_after: last_retry_after,
+                                });
+                            }
+                            tokio::time::sleep(last_retry_after).await;
                         }
                         400..=499 => {
                             let body = resp.text().await.unwrap_or_default();
@@ -176,7 +270,7 @@ impl DiscordClient {
                                 body = %body.chars().take(256).collect::<String>(),
                                 "Discord returned client error"
                             );
-                            return Err(format!("client error {last_status}"));
+                            return Err(PostError::Rejected(last_status));
                         }
                         _ => {
                             let backoff = Duration::from_secs(1 << attempt.min(3));
@@ -186,7 +280,7 @@ impl DiscordClient {
                 }
                 Err(e) => {
                     if attempt == MAX_RETRIES {
-                        return Err(format!("network error after retries: {e}"));
+                        return Err(PostError::Unreachable(e.to_string()));
                     }
                     let backoff = Duration::from_secs(1 << attempt.min(3));
                     tokio::time::sleep(backoff).await;
@@ -194,9 +288,13 @@ impl DiscordClient {
             }
         }
 
-        Err(format!(
-            "failed after {MAX_RETRIES} retries, last status: {last_status}"
-        ))
+        Err(if last_status == 429 {
+            PostError::RateLimited {
+                retry_after: last_retry_after,
+            }
+        } else {
+            PostError::ServerError(last_status)
+        })
     }
 }
 

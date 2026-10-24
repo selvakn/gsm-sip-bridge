@@ -3,4 +3,4 @@
 //! Re-exported here so existing `sms::discord::DiscordClient` call sites and
 //! imports are unaffected (`forward_sms`'s behavior is unchanged — FR-001).
 
-pub use crate::alerts::discord::DiscordClient;
+pub use crate::alerts::discord::{DiscordClient, PostError};

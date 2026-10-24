@@ -38,6 +38,7 @@ use crate::modules::discovery::lines_file_path;
 use crate::observability::reporter::Reporter;
 use crate::sms;
 use crate::sms::discord::DiscordClient;
+use crate::sms::SmsForwarder;
 use crate::store::{StoreCommand, StoreHandle};
 use control::{read_msg, write_msg, CallRecord, ControlMessage};
 use pjsua_safe::{
@@ -499,6 +500,25 @@ pub(crate) fn run_telephony_side(
     let discord_client = build_discord_client(config);
     let sms_runtime = Runtime::new()
         .map_err(|e| BridgeError::Ims(format!("failed to build SMS-forwarding runtime: {e}")))?;
+    // specs/121-sms-alert-retry: this process owns its own SMS Discord client,
+    // so it also owns an hourly sweep for texts whose post failed. Outcomes go
+    // through a reporter because this process has no scrape endpoint.
+    if let Some(forwarder) = &discord_client {
+        let retry_reporter = Reporter::spawn(
+            config.control.socket_path.clone(),
+            match record_transport {
+                crate::store::Transport::Volte => AgentKind::VolteSip,
+                _ => AgentKind::Sip,
+            },
+            "sms-retry".to_string(),
+            Duration::from_secs(config.metrics.agent_report_interval_seconds),
+        );
+        sms::retry::spawn_timer(
+            sms_runtime.handle(),
+            forwarder.clone(),
+            Some(retry_reporter),
+        );
+    }
     // Same `[sms].db_path` sqlite file the circuit-switched daemon writes to
     // (WAL mode, see `store::schema`, is exactly what makes two independent
     // processes safely sharing one file work) — so VoWiFi SMS lands in the
@@ -1551,7 +1571,7 @@ fn run_line_listener(
     call_placement_lock: &Mutex<()>,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
-    discord_client: &Option<DiscordClient>,
+    discord_client: &Option<SmsForwarder>,
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     line_msisdn: Option<&str>,
@@ -1631,7 +1651,7 @@ fn run_line_listener(
 /// Builds the Discord client used to forward relayed VoWiFi `MESSAGE`s,
 /// mirroring `modules::mod::CardPool::new`'s gating: only if SMS monitoring
 /// is enabled and a webhook URL is actually configured.
-fn build_discord_client(config: &AppConfig) -> Option<DiscordClient> {
+fn build_discord_client(config: &AppConfig) -> Option<SmsForwarder> {
     if !config.sms.enabled {
         tracing::info!(
             "SMS monitoring disabled via configuration; VoWiFi SMS will not be forwarded"
@@ -1648,7 +1668,11 @@ fn build_discord_client(config: &AppConfig) -> Option<DiscordClient> {
         config.sms.discord_webhook_url.clone(),
         crate::alerts::instance_label(&config.alerts),
     ) {
-        Ok(client) => Some(client),
+        Ok(client) => Some(SmsForwarder::new(
+            client,
+            &config.sms,
+            crate::alerts::line_phone_map(config),
+        )),
         Err(e) => {
             tracing::error!(error = %e, "failed to create Discord client");
             None
@@ -1697,7 +1721,7 @@ fn handle_connection(
     call_placement_lock: &Mutex<()>,
     config: &AppConfig,
     recent_calls: &Arc<Mutex<HashMap<String, RecentCalls>>>,
-    discord_client: &Option<DiscordClient>,
+    discord_client: &Option<SmsForwarder>,
     sms_runtime: &Runtime,
     store_tx: crossbeam_channel::Sender<StoreCommand>,
     reporter: &Reporter,
@@ -2033,7 +2057,7 @@ fn handle_connection(
 #[allow(clippy::too_many_arguments)]
 fn forward_vowifi_sms(
     store_tx: crossbeam_channel::Sender<StoreCommand>,
-    discord_client: &Option<DiscordClient>,
+    discord_client: &Option<SmsForwarder>,
     sms_runtime: &Runtime,
     card_id: String,
     sender: String,

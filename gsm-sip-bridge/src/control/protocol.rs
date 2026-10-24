@@ -522,6 +522,14 @@ pub enum ObservedEvent {
     SmsReceived,
     SmsForwarded {
         outcome: SmsOutcome,
+        /// The text's own line and transport. A retry is reported by whichever
+        /// agent swept, which may not be the line that received the text
+        /// (specs/121-sms-alert-retry); absent from older agents, in which
+        /// case the reporter's identity is used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<String>,
     },
     RegistrationAttempt {
         status: RegistrationStatus,

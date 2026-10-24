@@ -2,7 +2,7 @@
 
 **Feature**: `122-management-webui`
 
-## Persisted (SQLite, schema v4 → v5)
+## Persisted (SQLite, schema v5 → v6)
 
 The migration follows the existing pattern in `store/schema.rs`: a `MIGRATIONS` entry plus a `SCHEMA_VERSION` bump. It is applied by whichever process opens the store first; the other processes see v5 and skip it.
 

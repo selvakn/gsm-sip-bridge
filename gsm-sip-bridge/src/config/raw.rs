@@ -146,6 +146,9 @@ section! {
         pub enabled: bool,
         pub discord_webhook_url: Secret<String>,
         pub db_path: String,
+        pub retry_enabled: bool,
+        pub retry_interval_sec: u64,
+        pub retry_max_age_sec: u64,
     }
 }
 
@@ -155,6 +158,9 @@ impl Default for RawSms {
             enabled: true,
             discord_webhook_url: Secret::new(String::new()),
             db_path: super::DEFAULT_SMS_DB_PATH.to_string(),
+            retry_enabled: true,
+            retry_interval_sec: 3600,
+            retry_max_age_sec: 604_800,
         }
     }
 }

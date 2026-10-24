@@ -43,6 +43,7 @@ fn test_concurrent_writes_via_single_connection() {
                     received_at: format!("2026-05-04T{:02}:{:02}:00Z", i / 60 % 24, i % 60),
                     forwarding_status: "sent".into(),
                     transport: Transport::Cs,
+                    retry_eligible: false,
                 };
                 insert_sms(&guard, &record).unwrap();
             }

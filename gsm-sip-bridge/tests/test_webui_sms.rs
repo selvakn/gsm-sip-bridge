@@ -15,6 +15,7 @@ fn sms(module: &str, sender: &str, body: &str, at: &str, status: &str) -> SmsRec
         received_at: at.to_string(),
         forwarding_status: status.to_string(),
         transport: Transport::Vowifi,
+        retry_eligible: false,
     }
 }
 

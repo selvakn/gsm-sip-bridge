@@ -1386,13 +1386,21 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
                 .with_label_values(&[module_id, transport])
                 .inc();
         }
-        ObservedEvent::SmsForwarded { outcome } => {
+        ObservedEvent::SmsForwarded {
+            outcome,
+            module: row_module,
+            transport: row_transport,
+        } => {
             let outcome_str = match outcome {
                 SmsOutcome::Sent => "sent",
                 SmsOutcome::Failed => "failed",
             };
             metrics::SMS_FORWARDED_TOTAL
-                .with_label_values(&[module_id, outcome_str, transport])
+                .with_label_values(&[
+                    row_module.as_deref().unwrap_or(module_id),
+                    outcome_str,
+                    row_transport.as_deref().unwrap_or(transport),
+                ])
                 .inc();
         }
         ObservedEvent::RegistrationAttempt { status } => {

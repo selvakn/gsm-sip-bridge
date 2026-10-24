@@ -278,6 +278,36 @@ pub static SMS_FORWARDED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// specs/121-sms-alert-retry: refreshed from the SQLite store on every scrape
+/// (`server::refresh_sms_delivery`), not incremented in the hot path, so they
+/// are correct across restarts and across the agent processes that write rows.
+pub static SMS_UNDELIVERED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_sms_undelivered",
+            "SMS Discord notifications not yet delivered"
+        ),
+        &["state"]
+    )
+    .unwrap()
+});
+
+pub static SMS_ABANDONED: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(opts!(
+        "gsm_sip_bridge_sms_abandoned",
+        "SMS Discord notifications given up on (retry age limit)"
+    ))
+    .unwrap()
+});
+
+pub static SMS_OLDEST_UNDELIVERED_AGE_SECONDS: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(opts!(
+        "gsm_sip_bridge_sms_oldest_undelivered_age_seconds",
+        "Age of the oldest undelivered SMS notification; 0 when none"
+    ))
+    .unwrap()
+});
+
 pub static SMS_DB_WRITES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         opts!(

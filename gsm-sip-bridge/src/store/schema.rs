@@ -1,7 +1,7 @@
 use crate::error::{BridgeError, BridgeResult};
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
 const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -173,11 +173,57 @@ CREATE VIEW recent_sms AS
     LIMIT 200;
 "#;
 
+/// Delivery tracking for SMS Discord notifications (specs/121-sms-alert-retry).
+/// Adds the retry state (`attempt_count`, `last_attempt_at`, `last_error`,
+/// `first_seen_at`), a cross-process lease (`claimed_until`) and the
+/// `retry_eligible` flag, and widens the `forwarding_status` CHECK with
+/// `'abandoned'`. Rebuilt rather than altered because SQLite cannot change a
+/// CHECK in place (same pattern as v4). Every pre-existing row keeps
+/// `retry_eligible = 0`, so history is never replayed to Discord.
+const SCHEMA_V5_SQL: &str = r#"
+DROP VIEW IF EXISTS recent_sms;
+
+CREATE TABLE sms_v5 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id           TEXT    NOT NULL,
+    sender              TEXT    NOT NULL,
+    body                TEXT    NOT NULL,
+    received_at         TEXT    NOT NULL,
+    forwarding_status   TEXT    NOT NULL CHECK (forwarding_status IN ('pending','sent','failed','skipped','abandoned')),
+    forwarded_at        TEXT,
+    discord_status_code INTEGER,
+    transport           TEXT    NOT NULL DEFAULT 'cs' CHECK (transport IN ('cs','vowifi','volte')),
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     INTEGER,
+    last_error          TEXT,
+    first_seen_at       INTEGER NOT NULL DEFAULT 0,
+    claimed_until       INTEGER,
+    retry_eligible      INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO sms_v5 (id, module_id, sender, body, received_at, forwarding_status, forwarded_at, discord_status_code, transport, first_seen_at, retry_eligible)
+    SELECT id, module_id, sender, body, received_at, forwarding_status, forwarded_at, discord_status_code, transport, CAST(strftime('%s','now') AS INTEGER), 0 FROM sms;
+DROP TABLE sms;
+ALTER TABLE sms_v5 RENAME TO sms;
+
+CREATE INDEX IF NOT EXISTS idx_sms_received_at ON sms(received_at);
+CREATE INDEX IF NOT EXISTS idx_sms_module      ON sms(module_id);
+CREATE INDEX IF NOT EXISTS idx_sms_status      ON sms(forwarding_status);
+CREATE INDEX IF NOT EXISTS idx_sms_transport   ON sms(transport);
+CREATE INDEX IF NOT EXISTS idx_sms_retry       ON sms(retry_eligible, forwarding_status, claimed_until);
+
+CREATE VIEW recent_sms AS
+    SELECT id, module_id, sender, body, received_at, forwarding_status, forwarded_at, discord_status_code, transport,
+           attempt_count, last_attempt_at, last_error, first_seen_at, claimed_until, retry_eligible
+    FROM sms
+    ORDER BY id DESC
+    LIMIT 200;
+"#;
+
 /// Management web UI (specs/122-management-webui): outbound calls and
 /// per-call quality on `calls`, plus the `events` timeline. `DEFAULT
 /// 'inbound'` backfills every earlier row accurately, since none was ever
 /// outbound. The view is recreated for the same reason v3/v4 recreated it.
-const SCHEMA_V5_SQL: &str = r#"
+const SCHEMA_V6_SQL: &str = r#"
 ALTER TABLE calls ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'
     CHECK (direction IN ('inbound','outbound'));
 ALTER TABLE calls ADD COLUMN loss_percent REAL;
@@ -219,38 +265,68 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("2", "3", SCHEMA_V3_SQL),
     ("3", "4", SCHEMA_V4_SQL),
     ("4", "5", SCHEMA_V5_SQL),
+    ("5", "6", SCHEMA_V6_SQL),
 ];
+
+fn read_version(conn: &Connection) -> BridgeResult<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| BridgeError::Store(format!("failed to read schema_version: {e}")))
+}
 
 pub fn init_schema(conn: &Connection) -> BridgeResult<()> {
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|e| BridgeError::Store(format!("failed to initialize schema: {e}")))?;
 
-    let mut version: String = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| BridgeError::Store(format!("failed to read schema_version: {e}")))?;
+    let mut version = read_version(conn)?;
 
     // Applied in order, each stepping the recorded version by one. A table
     // rather than a chain of near-identical `if version == "N"` blocks: the
     // chain grew by ~10 lines per migration, and every one of those lines was
     // an opportunity to paste the wrong version number into the `UPDATE`.
     // Adding a migration is now one entry.
+    //
+    // Each step is one `BEGIN IMMEDIATE` transaction covering the DDL *and*
+    // the version bump, with the version re-read once the write lock is held:
+    // a process killed mid-rebuild leaves the old schema intact (SQLite DDL is
+    // transactional), and two processes starting together cannot both run it.
     for (from, to, sql) in MIGRATIONS {
         if version != *from {
             continue;
         }
-        conn.execute_batch(sql).map_err(|e| {
-            BridgeError::Store(format!("schema v{from}→v{to} migration failed: {e}"))
-        })?;
-        conn.execute(
-            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-            [to],
-        )
-        .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
-        version = to.to_string();
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| BridgeError::Store(format!("schema v{from}→v{to}: lock failed: {e}")))?;
+        let step = (|| -> BridgeResult<String> {
+            let current = read_version(conn)?;
+            if current != *from {
+                // Another process migrated while we waited for the lock.
+                return Ok(current);
+            }
+            conn.execute_batch(sql).map_err(|e| {
+                BridgeError::Store(format!("schema v{from}→v{to} migration failed: {e}"))
+            })?;
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [to],
+            )
+            .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
+            Ok(to.to_string())
+        })();
+        match step {
+            Ok(v) => {
+                conn.execute_batch("COMMIT").map_err(|e| {
+                    BridgeError::Store(format!("schema v{from}→v{to}: commit failed: {e}"))
+                })?;
+                version = v;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
     }
 
     if version != SCHEMA_VERSION {
@@ -267,7 +343,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fresh_schema_is_v5() {
+    fn test_fresh_schema_is_v6() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let ver: String = conn
@@ -277,7 +353,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
         // Verify new tables exist
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM card_slots", [], |r| r.get(0))
@@ -286,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_to_v5_migration() {
+    fn test_v1_to_v6_migration() {
         let conn = Connection::open_in_memory().unwrap();
         // Bootstrap a v1 schema manually
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -299,7 +375,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
         // Tables should exist after migration
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM card_mode_prefs", [], |r| r.get(0))
@@ -341,7 +417,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
 
         let call_transport: String = conn
             .query_row("SELECT transport FROM calls LIMIT 1", [], |r| r.get(0))
@@ -441,14 +517,15 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_to_v5_keeps_rows_and_adds_columns() {
+    fn test_v5_to_v6_keeps_rows_and_adds_columns() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn.execute_batch(SCHEMA_V2_SQL).unwrap();
         conn.execute_batch(SCHEMA_V3_SQL).unwrap();
         conn.execute_batch(SCHEMA_V4_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V5_SQL).unwrap();
         conn.execute(
-            "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
+            "UPDATE meta SET value = '5' WHERE key = 'schema_version'",
             [],
         )
         .unwrap();

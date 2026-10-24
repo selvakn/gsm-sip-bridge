@@ -19,10 +19,21 @@ across releases.
   JavaScript toolchain). Adds `[metrics].signal_poll_interval_seconds`
   (default 60, `0` disables), `[alerts].event_retention_days` (default 30), the
   `gsm_sip_bridge_signal_*` gauges, `gsm_sip_bridge_events_recorded_total` and
-  `gsm_sip_bridge_webui_logins_total`. Store schema v4 to v5: `calls.direction`
+  `gsm_sip_bridge_webui_logins_total`. Store schema v5 to v6: `calls.direction`
   and per-call loss/jitter/RTT columns, and an `events` table. Outbound calls
   are now recorded in call history. `AgentReport` gains an optional `details`
   field; older agents and daemons interoperate unchanged.
+
+- **SMS Discord delivery retry and status** (`[sms].retry_enabled`, **on by
+  default**, #121). A text whose Discord post fails is kept and re-posted,
+  oldest first, after the next text arrives and every `retry_interval_sec`
+  (1 h), as a `[Late]` message with the original receive time; it is abandoned
+  after `retry_max_age_sec` (7 days). Leases in the store keep the daemon and
+  the VoWiFi agents from double-posting. New `sms-status [--json]` subcommand
+  and `gsm_sip_bridge_sms_undelivered`, `_abandoned` and
+  `_oldest_undelivered_age_seconds` gauges. The store migrates v4 → v5
+  automatically (one-way: an older binary refuses a v5 store). `failed` rows
+  from before the upgrade are never retried.
 
 - **AMR passthrough: client re-INVITEs are judged by the forwarding rule** (#111).
   A phone that renegotiates a forwarded call to parameters it can no longer be

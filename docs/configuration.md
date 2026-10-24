@@ -46,6 +46,17 @@ The bridge reads a single TOML configuration file specified via `--config`.
 | `enabled` | boolean | true | Disable SMS monitoring |
 | `discord_webhook_url` | string | `""` | Supports `env:VAR` syntax |
 | `db_path` | string | `/var/lib/gsm-sip-bridge/store.db` | Store path |
+| `retry_enabled` | boolean | true | Retry Discord notifications that failed to deliver. `false` records the failure and never retries |
+| `retry_interval_sec` | integer | 3600 | Interval of the background retry sweep, per process that owns an SMS Discord client (range 60-86400) |
+| `retry_max_age_sec` | integer | 604800 | A text still undelivered this long after it was received is marked `abandoned` (range 3600-2592000) |
+
+**Retry behaviour.** A text whose Discord post fails stays in the store as
+`failed` with the reason in `last_error`. Undelivered texts are re-posted
+oldest-first after the next text arrives and then every `retry_interval_sec`;
+each retried notification is titled `[Late] SMS from …` and carries an
+`Originally received` field. Delivered texts are never re-sent. Texts that
+failed before this feature existed are not retried. Retry is on by default —
+upgrading changes behaviour for installs that never set these keys.
 
 ### `[alerts]`
 

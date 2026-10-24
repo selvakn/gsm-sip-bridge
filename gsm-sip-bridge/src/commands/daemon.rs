@@ -148,9 +148,11 @@ pub fn run(cli: &Cli) -> ExitCode {
     rt.block_on(async {
         let metrics_port = config.metrics.port;
         let agent_report_interval_seconds = config.metrics.agent_report_interval_seconds;
+        let sms_db_path = Some(config.sms.db_path.clone());
         let metrics_handle = tokio::spawn(async move {
             if let Err(e) =
-                metrics::server::serve(metrics_port, agent_report_interval_seconds).await
+                metrics::server::serve(metrics_port, agent_report_interval_seconds, sms_db_path)
+                    .await
             {
                 tracing::error!(error = %e, "metrics server failed");
             }

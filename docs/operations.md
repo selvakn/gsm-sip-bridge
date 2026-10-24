@@ -745,10 +745,28 @@ be completely silent — no log line, `vowifi-status` didn't mention it,
 
 ### Discord forwarding failing
 
+Texts are stored before they are posted, and a failed post is retried: after
+the next text arrives and every `[sms].retry_interval_sec` (default 1 h), oldest
+first, as a `[Late]` message carrying the original receive time. A text still
+undelivered after `[sms].retry_max_age_sec` (default 7 days) is abandoned and
+never posted.
+
+```bash
+gsm-sip-bridge --config /etc/gsm-sip-bridge/config.toml sms-status         # table
+gsm-sip-bridge --config /etc/gsm-sip-bridge/config.toml sms-status --json  # for scripts
+```
+
+It shows delivered / pending / failed / abandoned counts, the age of the oldest
+undelivered text, and the last undelivered rows with their `last_error`
+(`unreachable`, `timeout`, `rejected:<code>`, `rate_limited`,
+`server_error:<code>`). Message bodies are never printed. `rejected:404` or
+`rejected:401` means the webhook URL is wrong or was deleted; fix
+`[sms].discord_webhook_url` and restart, and the backlog drains by itself.
+
 Check:
 1. Webhook URL valid (test with curl)
 2. Network connectivity from bridge host
-3. Check `sms` table for `forwarding_status = 'failed'` with `discord_status_code`
+3. `sms-status` for the last error per undelivered text
 
 ### Discord alerts/forwarding fail only *inside* the container (host is fine)
 

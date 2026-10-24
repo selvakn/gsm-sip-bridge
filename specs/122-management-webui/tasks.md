@@ -48,7 +48,7 @@ description: "Task list for the read-only management web UI"
   - the `events` table exists with `idx_events_at`/`idx_events_module`;
   - `idx_calls_direction` exists;
   - the `recent_calls` view exposes `direction`;
-  - `schema_version = '5'`.
+  - `schema_version = '6'`.
 - [X] T005 Implement the schema v5 migration in `gsm-sip-bridge/src/store/schema.rs` per data-model.md:
   - bump `SCHEMA_VERSION` to `"5"`;
   - append a migration that does `ALTER TABLE calls ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound' CHECK (direction IN ('inbound','outbound'))`, adds the three nullable REAL columns, creates `events` plus its indexes, and drops and recreates `recent_calls`.
