@@ -148,15 +148,21 @@ pub fn speech_modes(payload: &[u8], kind: AmrKind, octet_aligned: bool) -> Optio
         AmrKind::Wb => 8,
     };
     let mut modes = Vec::new();
-    // At most 16 entries: a ToC longer than any real packet is garbage.
-    for k in 0..16usize {
+    // The payload length bounds the scan: every entry is at least one byte
+    // (octet-aligned) or six bits (bandwidth-efficient), so a packet of any
+    // frame count is covered and a ToC that never ends runs off the buffer.
+    let mut k = 0usize;
+    loop {
         let (follow, frame_type) = if octet_aligned {
             let entry = *payload.get(1 + k)?;
             (entry & 0x80 != 0, (entry >> 3) & 0x0f)
         } else {
             // 4 bits of CMR, then 6 bits per entry: F, FT(4), Q.
             let bit = 4 + 6 * k;
-            let hi = *payload.get(bit / 8)? as u16;
+            if bit + 6 > payload.len() * 8 {
+                return None;
+            }
+            let hi = payload[bit / 8] as u16;
             let lo = payload.get(bit / 8 + 1).copied().unwrap_or(0) as u16;
             let six = (((hi << 8) | lo) >> (10 - bit % 8)) & 0x3f;
             (six & 0x20 != 0, ((six >> 1) & 0x0f) as u8)
@@ -167,8 +173,8 @@ pub fn speech_modes(payload: &[u8], kind: AmrKind, octet_aligned: bool) -> Optio
         if !follow {
             return Some(modes);
         }
+        k += 1;
     }
-    None
 }
 
 /// Overwrite the CMR in place. It is the first four bits in both packings.
@@ -227,9 +233,21 @@ mod tests {
             frames: fts
                 .iter()
                 .enumerate()
-                .map(|(i, &ft)| frame(kind, ft, i as u8 * 11))
+                .map(|(i, &ft)| frame(kind, ft, (i as u8).wrapping_mul(11)))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn speech_modes_covers_packets_with_more_than_sixteen_frames() {
+        for oa in [true, false] {
+            let fts: Vec<u8> = (0..40).map(|i| if i % 3 == 0 { 8 } else { 2 }).collect();
+            let bytes = build(&packet(AmrKind::Wb, &fts, 15), AmrKind::Wb, oa).unwrap();
+            assert_eq!(speech_modes(&bytes, AmrKind::Wb, oa), Some(fts));
+        }
+        // A ToC that never clears its follow bit runs off the buffer: None.
+        assert_eq!(speech_modes(&[0xf0, 0x80, 0x80], AmrKind::Wb, true), None);
+        assert_eq!(speech_modes(&[0xff, 0xff], AmrKind::Wb, false), None);
     }
 
     #[test]
