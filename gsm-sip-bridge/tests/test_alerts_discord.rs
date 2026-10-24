@@ -16,6 +16,7 @@ fn enabled_alerts_config(default_webhook: &str) -> AlertsConfig {
     AlertsConfig {
         default_webhook_url: Secret::new(default_webhook.to_string()),
         instance_name: Some("test-instance".to_string()),
+        event_retention_days: 30,
         sms: CategoryAlertConfig {
             enabled: true,
             webhook_url_override: None,

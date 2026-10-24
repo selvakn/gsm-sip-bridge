@@ -184,3 +184,141 @@ fn test_cs_only_traffic_carries_cs_transport_and_no_vowifi_series() {
         }
     }
 }
+
+// ---- specs/122-management-webui: signal gauges ----
+
+fn scrape() -> String {
+    prometheus::TextEncoder::new()
+        .encode_to_string(&prometheus::gather())
+        .unwrap()
+}
+
+#[test]
+fn test_unknown_signal_values_export_no_series() {
+    use gsm_sip_bridge::modules::signal::SignalReading;
+
+    // Known first, so the removal below has something to remove.
+    metrics::set_signal(
+        "sig-unknown",
+        "cs",
+        &SignalReading {
+            at_unix: 1,
+            rssi_dbm: Some(-71),
+            rat: Some("LTE".into()),
+            rsrp_dbm: Some(-95),
+            rsrq_db: Some(-13),
+            sinr_db: Some(5),
+        },
+    );
+    let out = scrape();
+    assert!(
+        out.contains("gsm_sip_bridge_signal_rssi_dbm{module=\"sig-unknown\",transport=\"cs\"} -71")
+    );
+    assert!(
+        out.contains("gsm_sip_bridge_signal_rsrp_dbm{module=\"sig-unknown\",transport=\"cs\"} -95")
+    );
+
+    // CSQ 99 and a non-LTE cell: every value unknown.
+    metrics::set_signal(
+        "sig-unknown",
+        "cs",
+        &SignalReading {
+            at_unix: 2,
+            ..Default::default()
+        },
+    );
+    let out = scrape();
+    for name in [
+        "signal_rssi_dbm",
+        "signal_rsrp_dbm",
+        "signal_rsrq_db",
+        "signal_sinr_db",
+    ] {
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with(&format!("gsm_sip_bridge_{name}{{module=\"sig-unknown\""))),
+            "{name} must have no series while unknown:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn test_signal_age_is_refreshed_on_demand() {
+    use gsm_sip_bridge::modules::signal::SignalReading;
+
+    metrics::set_signal(
+        "sig-age",
+        "vowifi",
+        &SignalReading {
+            at_unix: 1,
+            rssi_dbm: Some(-80),
+            ..Default::default()
+        },
+    );
+    metrics::refresh_signal_age();
+    let out = scrape();
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("gsm_sip_bridge_signal_last_read_seconds{module=\"sig-age\""))
+        .expect("age series");
+    let age: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(age > 1_000_000.0, "a reading from 1970 is very old: {age}");
+}
+
+/// SC-009 (specs/122-management-webui): with the UI off, `/metrics` gains only
+/// the series contracts/metrics.md lists, and the login counter -- the one
+/// series that exists only because the UI does -- is absent. This binary
+/// never constructs a `WebuiState`, which is what "the UI is off" means here.
+#[test]
+fn test_ui_disabled_adds_only_the_contracted_series() {
+    use gsm_sip_bridge::modules::signal::SignalReading;
+
+    init_all_metrics();
+    metrics::set_signal(
+        "sc009",
+        "cs",
+        &SignalReading {
+            at_unix: 1,
+            rssi_dbm: Some(-80),
+            rsrp_dbm: Some(-100),
+            rsrq_db: Some(-10),
+            sinr_db: Some(3),
+            rat: None,
+        },
+    );
+    metrics::refresh_signal_age();
+    metrics::EVENTS_RECORDED_TOTAL
+        .with_label_values(&["alert_raised"])
+        .inc();
+
+    let names: std::collections::BTreeSet<String> = prometheus::gather()
+        .iter()
+        .map(|f| f.get_name().to_string())
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n.contains("webui")),
+        "no web UI series without the UI: {names:?}"
+    );
+
+    let contracted = [
+        "gsm_sip_bridge_signal_rssi_dbm",
+        "gsm_sip_bridge_signal_rsrp_dbm",
+        "gsm_sip_bridge_signal_rsrq_db",
+        "gsm_sip_bridge_signal_sinr_db",
+        "gsm_sip_bridge_signal_last_read_seconds",
+        "gsm_sip_bridge_events_recorded_total",
+    ];
+    for name in contracted {
+        assert!(names.contains(name), "contracts/metrics.md lists {name}");
+    }
+    let new_looking: Vec<&String> = names
+        .iter()
+        .filter(|n| n.contains("signal_") || n.contains("events_recorded"))
+        .collect();
+    assert_eq!(
+        new_looking.len(),
+        contracted.len(),
+        "series beyond the contract: {new_looking:?}"
+    );
+}

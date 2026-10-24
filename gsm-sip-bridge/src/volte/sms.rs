@@ -604,6 +604,7 @@ pub fn run_modem_reader(
     control_addr: SocketAddr,
     modem_lock: Arc<crate::modules::modem_lock::ModemLock>,
     dedupe: Arc<Mutex<Dedupe>>,
+    signal: Option<SignalPoll>,
 ) {
     // This thread is detached and, before specs/039-at-stall-watchdog, entirely
     // unwatched — yet it is now the *most frequent* user of the AT port (every
@@ -621,6 +622,7 @@ pub fn run_modem_reader(
     // kill the agent every ~36 seconds. Caught on the live line.
     progress.enter(crate::ims::agent::watchdog::Phase::Dormant);
     std::thread::sleep(FIRST_SWEEP_DELAY);
+    let mut pass: u64 = 0;
     loop {
         {
             let _phase = progress.phase_guard(crate::ims::agent::watchdog::Phase::SmsSweep);
@@ -628,8 +630,93 @@ pub fn run_modem_reader(
                 tracing::warn!(error = %e, "modem SMS sweep failed; will retry next interval");
             }
         }
+        // A separate guard from the sweep's: each is judged against its own
+        // budget, so a slow listing cannot make a healthy signal read look
+        // like part of the same stall.
+        if let Some(poll) = signal.as_ref().filter(|p| p.due_on_pass(pass)) {
+            let _phase = progress.phase_guard(crate::ims::agent::watchdog::Phase::SmsSweep);
+            poll_signal(&modem_port, &modem_lock, &poll.slot);
+        }
+        pass = pass.wrapping_add(1);
         progress.enter(crate::ims::agent::watchdog::Phase::Dormant);
         std::thread::sleep(MODEM_SWEEP_INTERVAL);
+    }
+}
+
+/// Where the modem sweep leaves its latest signal reading, for the agent's
+/// reporter to copy into `AgentReport.details.signal`.
+pub type SignalSlot = Arc<Mutex<Option<crate::modules::signal::SignalReading>>>;
+
+/// Asks [`run_modem_reader`] to read signal quality every `every_n_passes`
+/// sweeps (specs/122-management-webui, research R3).
+///
+/// It piggy-backs on this thread instead of adding a poller because this is
+/// the only code that already holds `modem_lock`, opens through
+/// [`open_with_retry`], and is watched by the stall watchdog. A second poller
+/// would be a third user of one AT port -- the contention that
+/// `vowifi-usim-bridge`'s EAP-SIM traffic cannot tolerate.
+#[derive(Clone)]
+pub struct SignalPoll {
+    pub slot: SignalSlot,
+    pub every_n_passes: u32,
+}
+
+impl SignalPoll {
+    /// `None` when `interval_secs` is `0` (polling off).
+    pub fn for_interval(interval_secs: u64, slot: SignalSlot) -> Option<Self> {
+        passes_per_signal_poll(interval_secs).map(|every_n_passes| Self {
+            slot,
+            every_n_passes,
+        })
+    }
+
+    fn due_on_pass(&self, pass: u64) -> bool {
+        signal_due_on_pass(pass, self.every_n_passes)
+    }
+}
+
+/// `ceil(interval / MODEM_SWEEP_INTERVAL)`: the sweep is the clock, so a poll
+/// can only land on a pass boundary. `None` for `0`, which disables polling.
+pub fn passes_per_signal_poll(interval_secs: u64) -> Option<u32> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let sweep = MODEM_SWEEP_INTERVAL.as_secs().max(1);
+    Some(u32::try_from(interval_secs.div_ceil(sweep)).unwrap_or(u32::MAX))
+}
+
+/// Whether pass number `pass` (from 0) is a signal-poll pass. Pass 0 polls, so
+/// a fresh line shows a reading after its first sweep rather than a full
+/// interval later.
+pub fn signal_due_on_pass(pass: u64, every_n_passes: u32) -> bool {
+    pass.is_multiple_of(u64::from(every_n_passes.max(1)))
+}
+
+/// One signal read: the lock, one open, both commands on that one hold, then
+/// release. Any failure leaves the previous reading in place and is retried on
+/// the next poll pass; it is never worth more than a debug line.
+fn poll_signal(
+    modem_port: &Path,
+    modem_lock: &Arc<crate::modules::modem_lock::ModemLock>,
+    slot: &SignalSlot,
+) {
+    let Some(_guard) = modem_lock.lock_timeout(crate::modules::modem_lock::MODEM_LOCK_TIMEOUT)
+    else {
+        tracing::debug!("signal poll skipped: the modem is busy");
+        return;
+    };
+    let mut at = match open_with_retry(modem_port) {
+        Ok(at) => at,
+        Err(e) => {
+            tracing::debug!(error = %e, "signal poll skipped: could not open the modem");
+            return;
+        }
+    };
+    let (reading, answered) = crate::modules::signal::read_signal_checked(&mut at);
+    if answered {
+        if let Ok(mut latest) = slot.lock() {
+            *latest = Some(reading);
+        }
     }
 }
 
@@ -1058,6 +1145,49 @@ fn relay_modem_message(control_addr: SocketAddr, sender: &str, body: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_polling_lands_on_whole_sweeps() {
+        assert_eq!(passes_per_signal_poll(0), None, "0 disables polling");
+        assert_eq!(passes_per_signal_poll(20), Some(1));
+        assert_eq!(passes_per_signal_poll(60), Some(3));
+        assert_eq!(
+            passes_per_signal_poll(61),
+            Some(4),
+            "rounds up, never polls early"
+        );
+        assert_eq!(passes_per_signal_poll(1), Some(1));
+    }
+
+    #[test]
+    fn signal_is_polled_on_pass_zero_and_then_every_nth() {
+        let due: Vec<u64> = (0..10).filter(|p| signal_due_on_pass(*p, 3)).collect();
+        assert_eq!(due, vec![0, 3, 6, 9]);
+        assert!(
+            (0..5).all(|p| signal_due_on_pass(p, 1)),
+            "every pass when the interval is one sweep"
+        );
+        assert!(
+            signal_due_on_pass(7, 0),
+            "a zero count must not divide by zero"
+        );
+    }
+
+    #[test]
+    fn a_signal_poll_fits_the_watchdogs_sweep_budget() {
+        // Lock wait, one open, then two AT round trips -- all on one hold.
+        let open_worst = OPEN_RETRY_BASE_DELAY * (1 + 2 + 3);
+        let worst = crate::modules::modem_lock::MODEM_LOCK_TIMEOUT
+            + open_worst
+            + crate::modules::at_commander::DEFAULT_TIMEOUT * 2;
+        let watchdog = crate::ims::agent::watchdog::Phase::SmsSweep
+            .budget()
+            .expect("the sweep is working, so it carries a budget");
+        assert!(
+            watchdog.as_secs_f64() / worst.as_secs_f64() >= 1.2,
+            "a signal poll's worst case {worst:?} must leave >=20% headroom under {watchdog:?}"
+        );
+    }
 
     #[test]
     fn a_sweep_pass_cannot_outrun_its_watchdog_budget() {

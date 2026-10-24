@@ -11,14 +11,123 @@
 //! — a caller only ever needs to say what changed, not reconstruct the rest.
 
 use crate::control::protocol::{
-    AgentState, BridgeFailureReason, CallStatus, ObservedEvent, RegistrationStatus,
+    ActiveCallInfoWire, AgentDetails, AgentState, BridgeFailureReason, CallStatus, ObservedEvent,
+    RegistrationStatus,
 };
 use crate::observability::reporter::Reporter;
 use crate::store::calls::CallRecord;
 use crate::store::{StoreCommand, StoreHandle, Transport};
 use crate::vowifi::control::reason;
 use chrono::{DateTime, Utc};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// What the web UI shows about this line beyond the gauges
+/// (specs/122-management-webui): registration wording and age, carrier, the
+/// latest signal reading and the calls in progress.
+///
+/// Read by the reporter's thread at send time, through the provider
+/// [`AgentObservability::new`] installs, so every report and heartbeat
+/// carries a current copy and no call site has to remember to push these.
+#[derive(Default)]
+struct DetailsSource {
+    status: Mutex<Option<Arc<Mutex<crate::ims::RegistrationStatus>>>>,
+    plmn: Mutex<Option<String>>,
+    signal: Mutex<Option<crate::volte::sms::SignalSlot>>,
+    /// Calls reported as plain figures.
+    calls: Mutex<Vec<ActiveCallInfoWire>>,
+    /// Calls whose quality is read from the live RTCP state at report time.
+    live: Mutex<Vec<LiveCall>>,
+}
+
+/// A call in progress, holding the shared counters its quality is read from.
+///
+/// The figures are read when a report is built, not pushed: the call loop does
+/// not have to remember to update anything, and the web UI sees loss and
+/// jitter move during the call instead of only at teardown.
+pub struct LiveCall {
+    pub remote: String,
+    pub direction: crate::control::protocol::CallDirectionWire,
+    pub started_at_unix: u64,
+    pub answered: bool,
+    /// The carrier leg's receive tracker and clock rate. `None` on a call
+    /// with no RTCP endpoint, whose quality is then unknown, not zero.
+    pub receive: Option<(Arc<Mutex<crate::ims::media_stats::ReceiveTracker>>, u32)>,
+    pub far_end: Option<Arc<Mutex<crate::ims::rtcp::FarEndQuality>>>,
+}
+
+impl LiveCall {
+    fn to_wire(&self) -> ActiveCallInfoWire {
+        let local = self.receive.as_ref().and_then(|(tracker, clock_rate)| {
+            tracker
+                .lock()
+                .ok()
+                .map(|t| t.stats(*clock_rate))
+                .filter(|s| s.received_packets > 0 || s.lost_packets > 0)
+        });
+        let rtt = self
+            .far_end
+            .as_ref()
+            .and_then(|fe| fe.lock().ok().and_then(|fe| fe.round_trip));
+        ActiveCallInfoWire {
+            remote: self.remote.clone(),
+            direction: self.direction,
+            started_at_unix: self.started_at_unix,
+            answered: self.answered,
+            loss_percent: local.map(|s| s.loss_percent()),
+            jitter_ms: local.map(|s| s.jitter.as_secs_f64() * 1000.0),
+            rtt_ms: rtt.map(|r| r.as_secs_f64() * 1000.0),
+        }
+    }
+}
+
+fn unix(t: std::time::SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+impl DetailsSource {
+    fn snapshot(&self) -> AgentDetails {
+        let mut details = AgentDetails::default();
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(status) = status {
+            let status = status.lock().unwrap_or_else(|e| e.into_inner());
+            details.registration_state = Some(status.state.into());
+            if matches!(
+                status.state,
+                crate::ims::RegistrationState::Registered | crate::ims::RegistrationState::Renewing
+            ) {
+                details.registered_at = status.registered_at.and_then(unix);
+            }
+        }
+        details.plmn = self.plmn.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let slot = self
+            .signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(slot) = slot {
+            details.signal = slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(Into::into);
+        }
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        calls.extend(
+            self.live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(LiveCall::to_wire),
+        );
+        details.with_active_calls(calls)
+    }
+}
 
 pub struct AgentObservability {
     reporter: Reporter,
@@ -46,6 +155,31 @@ pub struct AgentObservability {
     /// or an outbound one being placed would be cut by a rebuild as surely as
     /// a connected one.
     setup: Mutex<CallSetup>,
+    details: Arc<DetailsSource>,
+    /// The last call's quality figures, held until its history row is written
+    /// (specs/122-management-webui). They are reported as events just before
+    /// the row, and the row is the only place they become per-call data.
+    quality: Mutex<CallQuality>,
+}
+
+/// What [`AgentObservability::report_media_quality`] last saw, per source.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct CallQuality {
+    /// Loss and jitter (seconds) this bridge measured on what it received.
+    local: Option<(f64, f64)>,
+    /// Round-trip time (seconds) from the far end's RTCP.
+    remote_rtt: Option<f64>,
+}
+
+impl CallQuality {
+    /// `(loss %, jitter ms, rtt ms)` as stored in the `calls` table.
+    fn columns(self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        (
+            self.local.map(|(loss, _)| loss),
+            self.local.map(|(_, jitter)| jitter * 1000.0),
+            self.remote_rtt.map(|rtt| rtt * 1000.0),
+        )
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +199,9 @@ impl AgentObservability {
         sip_destination: String,
         transport: Transport,
     ) -> Self {
+        let details = Arc::new(DetailsSource::default());
+        let for_reporter = Arc::clone(&details);
+        reporter.set_details_provider(Arc::new(move || for_reporter.snapshot()));
         Self {
             reporter,
             module_id,
@@ -74,7 +211,47 @@ impl AgentObservability {
             state: Mutex::new(AgentState::default()),
             calls_file: None,
             setup: Mutex::new(CallSetup::default()),
+            details,
+            quality: Mutex::new(CallQuality::default()),
         }
+    }
+
+    /// Reports this registration's wording and age from `status`, the
+    /// dispatch loop's own record -- the same one `vowifi-status` answers
+    /// from, so the web UI and the CLI cannot disagree (FR-012).
+    pub fn attach_registration_status(&self, status: Arc<Mutex<crate::ims::RegistrationStatus>>) {
+        *self
+            .details
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(status);
+    }
+
+    /// The home network as `"MCC-MNC"`.
+    pub fn set_plmn(&self, mcc: &str, mnc: &str) {
+        *self.details.plmn.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{mcc}-{mnc}"));
+    }
+
+    /// Reports whatever the modem sweep leaves in `slot`.
+    pub fn attach_signal_slot(&self, slot: crate::volte::sms::SignalSlot) {
+        *self
+            .details
+            .signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(slot);
+    }
+
+    /// A call has been bridged: show it as in progress until
+    /// `set_active_calls(0)`.
+    pub fn begin_live_call(&self, call: LiveCall) {
+        let mut live = self.details.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.clear();
+        live.push(call);
+    }
+
+    /// Replaces the calls-in-progress list reported to the web UI.
+    pub fn set_active_call_details(&self, calls: Vec<ActiveCallInfoWire>) {
+        *self.details.calls.lock().unwrap_or_else(|e| e.into_inner()) = calls;
     }
 
     /// Also mirror every active-call count into `path`.
@@ -89,6 +266,14 @@ impl AgentObservability {
     }
 
     pub fn set_active_calls(&self, n: u32) {
+        if n == 0 {
+            // No call left to describe.
+            self.details
+                .live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -210,7 +395,13 @@ impl AgentObservability {
             },
             ObservedEvent::BridgeFailed { reason },
         ]);
-        self.insert_call_row(caller, started_at, 0.0, status);
+        self.insert_call_row(
+            caller,
+            started_at,
+            0.0,
+            status,
+            crate::store::calls::CallDirection::Inbound,
+        );
     }
 
     /// Reports a call that reached an answer and then ended, judged by its
@@ -223,13 +414,20 @@ impl AgentObservability {
         started_at: DateTime<Utc>,
         duration_seconds: f64,
         media: super::media_stats::DirectionVerdict,
+        direction: crate::store::calls::CallDirection,
     ) {
         if media.is_success() {
             self.push(vec![ObservedEvent::CallCompleted {
                 status: CallStatus::Answered,
                 duration_seconds,
             }]);
-            self.insert_call_row(caller, started_at, duration_seconds, CallStatus::Answered);
+            self.insert_call_row(
+                caller,
+                started_at,
+                duration_seconds,
+                CallStatus::Answered,
+                direction,
+            );
         } else {
             self.push(vec![
                 ObservedEvent::CallCompleted {
@@ -240,7 +438,13 @@ impl AgentObservability {
                     reason: BridgeFailureReason::OneWayAudio,
                 },
             ]);
-            self.insert_call_row(caller, started_at, duration_seconds, CallStatus::Failed);
+            self.insert_call_row(
+                caller,
+                started_at,
+                duration_seconds,
+                CallStatus::Failed,
+                direction,
+            );
         }
     }
 
@@ -258,6 +462,17 @@ impl AgentObservability {
         jitter_seconds: f64,
         round_trip_seconds: Option<f64>,
     ) {
+        {
+            let mut q = self.quality.lock().unwrap_or_else(|e| e.into_inner());
+            match source {
+                crate::control::protocol::QualitySource::Local => {
+                    q.local = Some((loss_percent, jitter_seconds));
+                }
+                crate::control::protocol::QualitySource::Remote => {
+                    q.remote_rtt = round_trip_seconds;
+                }
+            }
+        }
         self.push(vec![ObservedEvent::MediaQuality {
             source,
             loss_percent,
@@ -277,10 +492,14 @@ impl AgentObservability {
         started_at: DateTime<Utc>,
         duration_seconds: f64,
         status: CallStatus,
+        direction: crate::store::calls::CallDirection,
     ) {
         let Some(store) = &self.store else {
             return;
         };
+        // Taken, so one call's figures can never land on the next call's row.
+        let (loss_percent, jitter_ms, rtt_ms) =
+            std::mem::take(&mut *self.quality.lock().unwrap_or_else(|e| e.into_inner())).columns();
         let record = CallRecord {
             module_id: self.module_id.clone(),
             caller_id: caller.to_string(),
@@ -289,6 +508,10 @@ impl AgentObservability {
             status: status.as_str().to_string(),
             sip_destination: self.sip_destination.clone(),
             transport: self.transport,
+            direction,
+            loss_percent,
+            jitter_ms,
+            rtt_ms,
         };
         if let Err(e) = store.sender().send(StoreCommand::InsertCall(record)) {
             tracing::error!(error = %e, "failed to send call record to store");
@@ -320,6 +543,115 @@ pub fn map_bridge_failure_reason(raw: &str) -> BridgeFailureReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obs_for_details() -> AgentObservability {
+        AgentObservability::new(
+            Reporter::spawn(
+                "/nonexistent/no-daemon.sock".to_string(),
+                crate::control::protocol::AgentKind::Ims,
+                "card-details".into(),
+                std::time::Duration::from_secs(3600),
+            ),
+            "card-details".into(),
+            None,
+            "sip:pbx@192.0.2.1".into(),
+            Transport::Vowifi,
+        )
+    }
+
+    #[test]
+    fn details_carry_registration_wording_plmn_signal_and_calls() {
+        use crate::control::protocol::CallDirectionWire;
+        let obs = obs_for_details();
+        let status = Arc::new(Mutex::new(crate::ims::RegistrationStatus {
+            state: crate::ims::RegistrationState::Registered,
+            registered_at: Some(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            ),
+            ..Default::default()
+        }));
+        obs.attach_registration_status(Arc::clone(&status));
+        obs.set_plmn("405", "857");
+        let slot: crate::volte::sms::SignalSlot = Arc::new(Mutex::new(None));
+        obs.attach_signal_slot(Arc::clone(&slot));
+
+        let d = obs.details.snapshot();
+        assert_eq!(d.registration_state.unwrap().to_string(), "registered");
+        assert_eq!(d.registered_at, Some(1_700_000_000));
+        assert_eq!(d.plmn.as_deref(), Some("405-857"));
+        assert!(d.signal.is_none(), "nothing read yet");
+        assert_eq!(d.active_call_details, Some(vec![]));
+
+        *slot.lock().unwrap() = Some(crate::modules::signal::SignalReading {
+            at_unix: 5,
+            rssi_dbm: Some(-71),
+            ..Default::default()
+        });
+        obs.set_active_call_details(vec![ActiveCallInfoWire {
+            remote: "+919000000001".into(),
+            direction: CallDirectionWire::Inbound,
+            started_at_unix: 1,
+            answered: true,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
+        }]);
+        // The registration moving on is picked up with no further call.
+        status.lock().unwrap().state = crate::ims::RegistrationState::Failed;
+
+        let d = obs.details.snapshot();
+        assert_eq!(d.signal.unwrap().rssi_dbm, Some(-71));
+        assert_eq!(d.active_call_details.unwrap().len(), 1);
+        assert_eq!(d.registration_state.unwrap().to_string(), "failed");
+        assert_eq!(
+            d.registered_at, None,
+            "a failed line has no registered-since"
+        );
+    }
+
+    #[test]
+    fn a_live_calls_quality_is_read_fresh_and_cleared_when_it_ends() {
+        use crate::control::protocol::CallDirectionWire;
+        use crate::ims::media_stats::ReceiveTracker;
+        let obs = obs_for_details();
+        let tracker = Arc::new(Mutex::new(ReceiveTracker::new()));
+        let far_end = Arc::new(Mutex::new(crate::ims::rtcp::FarEndQuality::default()));
+        obs.begin_live_call(LiveCall {
+            remote: "+919000000001".into(),
+            direction: CallDirectionWire::Inbound,
+            started_at_unix: 1,
+            answered: true,
+            receive: Some((Arc::clone(&tracker), 8000)),
+            far_end: Some(Arc::clone(&far_end)),
+        });
+
+        // Nothing received yet: unknown, never 0.
+        let call = &obs.details.snapshot().active_call_details.unwrap()[0];
+        assert_eq!(call.loss_percent, None);
+        assert_eq!(call.jitter_ms, None);
+        assert_eq!(call.rtt_ms, None);
+
+        // Packets 1, 2 and 4 arrive: one lost of four expected.
+        {
+            let mut t = tracker.lock().unwrap();
+            for (seq, ts) in [(1u16, 160u32), (2, 320), (4, 640)] {
+                t.on_packet(
+                    seq,
+                    ts,
+                    std::time::Duration::from_millis(u64::from(ts) / 8),
+                    8000,
+                );
+            }
+        }
+        far_end.lock().unwrap().round_trip = Some(std::time::Duration::from_millis(80));
+        let call = &obs.details.snapshot().active_call_details.unwrap()[0];
+        assert_eq!(call.loss_percent, Some(25.0));
+        assert!(call.jitter_ms.is_some());
+        assert!((call.rtt_ms.unwrap() - 80.0).abs() < 1e-6);
+
+        obs.set_active_calls(0);
+        assert_eq!(obs.details.snapshot().active_call_details, Some(vec![]));
+    }
 
     #[test]
     fn calls_in_progress_or_being_set_up_are_mirrored_into_the_calls_file() {

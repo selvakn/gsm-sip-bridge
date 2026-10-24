@@ -719,6 +719,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "socket2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

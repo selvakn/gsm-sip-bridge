@@ -656,3 +656,110 @@ pub fn register_build_info() {
         ])
         .set(1.0);
 }
+
+// ---------------------------------------------------- signal / web UI ------
+//
+// specs/122-management-webui, contracts/metrics.md.
+
+macro_rules! signal_gauge {
+    ($static_name:ident, $metric:literal, $help:literal) => {
+        pub static $static_name: Lazy<GaugeVec> = Lazy::new(|| {
+            register_gauge_vec!(opts!($metric, $help), &["module", "transport"]).unwrap()
+        });
+    };
+}
+
+signal_gauge!(
+    SIGNAL_RSSI_DBM,
+    "gsm_sip_bridge_signal_rssi_dbm",
+    "Modem RSSI in dBm from AT+CSQ; absent while unknown"
+);
+signal_gauge!(
+    SIGNAL_RSRP_DBM,
+    "gsm_sip_bridge_signal_rsrp_dbm",
+    "LTE RSRP in dBm; absent off LTE or while unknown"
+);
+signal_gauge!(
+    SIGNAL_RSRQ_DB,
+    "gsm_sip_bridge_signal_rsrq_db",
+    "LTE RSRQ in dB; absent off LTE or while unknown"
+);
+signal_gauge!(
+    SIGNAL_SINR_DB,
+    "gsm_sip_bridge_signal_sinr_db",
+    "LTE SINR in dB; absent off LTE or while unknown"
+);
+signal_gauge!(
+    SIGNAL_LAST_READ_SECONDS,
+    "gsm_sip_bridge_signal_last_read_seconds",
+    "Age, in seconds, of the last signal reading for this module"
+);
+
+/// Per `(module, transport)`: when the last reading was taken (unix seconds),
+/// so the age can be recomputed at scrape time.
+static SIGNAL_READ_AT: Lazy<std::sync::Mutex<std::collections::HashMap<(String, String), u64>>> =
+    Lazy::new(Default::default);
+
+/// Exports a reading. A value the modem did not report **removes** its series
+/// rather than setting it to 0, so an unknown signal reads as a gap, not as a
+/// perfect or an awful one (FR-023).
+pub fn set_signal(module: &str, transport: &str, reading: &crate::modules::signal::SignalReading) {
+    let labels = [module, transport];
+    for (gauge, value) in [
+        (&*SIGNAL_RSSI_DBM, reading.rssi_dbm),
+        (&*SIGNAL_RSRP_DBM, reading.rsrp_dbm),
+        (&*SIGNAL_RSRQ_DB, reading.rsrq_db),
+        (&*SIGNAL_SINR_DB, reading.sinr_db),
+    ] {
+        match value {
+            Some(v) => gauge.with_label_values(&labels).set(f64::from(v)),
+            None => {
+                let _ = gauge.remove_label_values(&labels);
+            }
+        }
+    }
+    if let Ok(mut map) = SIGNAL_READ_AT.lock() {
+        map.insert((module.to_string(), transport.to_string()), reading.at_unix);
+    }
+}
+
+/// Recomputes `signal_last_read_seconds` for every line that has been read.
+/// Called from the scrape handler, like `agent_last_report_seconds`.
+pub fn refresh_signal_age() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Ok(map) = SIGNAL_READ_AT.lock() {
+        for ((module, transport), at) in map.iter() {
+            SIGNAL_LAST_READ_SECONDS
+                .with_label_values(&[module, transport])
+                .set(now.saturating_sub(*at) as f64);
+        }
+    }
+}
+
+/// Events written to the timeline, by the part of `kind` before the `:`
+/// (`alert_raised`, `tunnel_recovered`, ...), keeping the label closed.
+pub static EVENTS_RECORDED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_events_recorded_total",
+            "Events recorded to the web UI timeline"
+        ),
+        &["kind_group"]
+    )
+    .unwrap()
+});
+
+/// Web UI login attempts. Only dereferenced when `[webui]` is enabled, so a
+/// deployment without the UI exposes no such series.
+pub static WEBUI_LOGINS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_webui_logins_total",
+            "Web UI login attempts by outcome (success, invalid, locked_out)"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});

@@ -21,6 +21,10 @@ fn test_store_survives_restart() {
             status: "answered".into(),
             sip_destination: "sip:200@pbx:5060".into(),
             transport: Transport::Cs,
+            direction: gsm_sip_bridge::store::calls::CallDirection::Inbound,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
         };
         insert_call(&conn, &record).unwrap();
     }
@@ -39,6 +43,6 @@ fn test_store_survives_restart() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "4");
+        assert_eq!(schema_version, "5");
     }
 }

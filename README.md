@@ -89,6 +89,8 @@ re-bridging audio the modem has already decoded.
   and sends a recovery notice when the condition clears.
 - Prometheus metrics endpoint and a Grafana dashboard. See
   [docs/observability.md](docs/observability.md).
+- A read-only [web UI](#web-ui) for line health, calls, SMS, events and the
+  loaded config. Off by default.
 
 ### Operation
 
@@ -223,6 +225,40 @@ including audio tuning (`[audio]`, `[modem_audio]`), card recovery
 
 [`sample_configs/`](sample_configs/README.md) has a ready-to-copy config per
 deployment shape, plus notification snippets to merge into any of them.
+
+## Web UI
+
+A small read-only status page, served by the daemon on its own port. It shows
+one card per line (registration, tunnel, signal, calls in progress), call
+history, received SMS with a copy button for one-time codes, a timeline of
+alerts and recoveries, and the configuration the bridge started with, with
+secrets redacted. It cannot place a call, send a message, restart a card or
+change anything: the only writes are login and logout.
+
+It is off unless you enable it, and it needs a password:
+
+```toml
+[webui]
+enabled = true
+password = "env:WEBUI_PASSWORD"   # put the value in .env, not in this file
+# port = 8080                     # must differ from [metrics].port
+# grafana_url = "https://grafana.example/d/abc"   # adds a link for history graphs
+```
+
+Then open `http://<host>:8080/`. A few things to know:
+
+- It speaks plain HTTP. SMS bodies carry one-time codes, so on anything other
+  than a trusted LAN put a reverse proxy with TLS in front of it.
+- Five wrong passwords lock that address out for five minutes. Sessions last
+  seven days and are forgotten when the bridge restarts.
+- Messages are read from the store, never from the modem, so looking at them
+  does not mark anything read.
+- If the port is taken the bridge logs an error and carries on without the UI.
+- Signal strength is read from each modem every `[metrics].signal_poll_interval_seconds`
+  (default 60; `0` turns it off), never during a call, and is also exported as
+  `gsm_sip_bridge_signal_*` gauges.
+
+See [docs/configuration.md](docs/configuration.md#webui) for every key.
 
 ## Documentation
 

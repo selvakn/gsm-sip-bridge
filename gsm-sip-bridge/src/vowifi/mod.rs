@@ -30,7 +30,7 @@ use crate::config::{
     AppConfig, RejectStatuses, SipTransport as ConfigSipTransport, TlsVerify, VowifiConfig,
 };
 use crate::control::protocol::{
-    AgentKind, AgentState, ObservedEvent, OutboundAttemptOutcome, SmsOutcome,
+    AgentKind, AgentState, CallStatus, ObservedEvent, OutboundAttemptOutcome, SmsOutcome,
 };
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::session::escape_display_name;
@@ -505,6 +505,7 @@ pub(crate) fn run_telephony_side(
     // same `sms` table/history as AT-command SMS, not a separate store.
     let store = StoreHandle::open(Path::new(&config.sms.db_path))
         .map_err(|e| BridgeError::Ims(format!("failed to open SMS store: {e}")))?;
+    crate::store::events::install_sink(store.sender());
 
     // Guards `Account::set_identity` + the `Call::make` that reads it back
     // in `bridge_call`, below. Every line's thread closes over the same
@@ -551,6 +552,10 @@ pub(crate) fn run_telephony_side(
                 "outbound".to_string(),
                 Duration::from_secs(config.metrics.agent_report_interval_seconds),
             );
+            let outbound_history = OutboundHistory {
+                store_tx: store.sender(),
+                transport: record_transport,
+            };
             scope.spawn(move || {
                 run_outbound_listener(
                     endpoint,
@@ -559,6 +564,7 @@ pub(crate) fn run_telephony_side(
                     bindings_ref,
                     trunk_source_ips_ref,
                     &outbound_reporter,
+                    &outbound_history,
                 )
             });
         }
@@ -641,6 +647,59 @@ const PLACE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// same compiled binary.
 const CALL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Writes the outbound requests that never became a call into the shared call
+/// history (specs/122-management-webui): refusals, a destination that did not
+/// pick up, a caller who gave up.
+///
+/// A call that *was* placed is not written here. The line's IMS agent already
+/// records every answered call when it ends -- with the media verdict and
+/// quality figures this process cannot see -- and a second row for it would
+/// count the call twice.
+///
+/// Best-effort like every other history write: a store that has gone away
+/// costs the row, never the call.
+struct OutboundHistory {
+    store_tx: crossbeam_channel::Sender<StoreCommand>,
+    transport: crate::store::Transport,
+}
+
+impl OutboundHistory {
+    fn write(
+        &self,
+        module_id: &str,
+        destination: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        duration_seconds: f64,
+        status: CallStatus,
+    ) {
+        let record = crate::store::calls::CallRecord::outbound(
+            module_id,
+            destination,
+            started_at,
+            duration_seconds,
+            status.as_str(),
+            self.transport,
+        );
+        if let Err(e) = self.store_tx.send(StoreCommand::InsertCall(record)) {
+            tracing::error!(error = %e, "failed to send the outbound call record to the store");
+        }
+    }
+
+    /// A refusal or a call nobody answered. `Placed` writes nothing here: it
+    /// is recorded as answered, with a duration, when the call ends.
+    fn write_outcome(
+        &self,
+        module_id: &str,
+        destination: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        outcome: OutboundAttemptOutcome,
+    ) {
+        if let Some(status) = outcome.history_status() {
+            self.write(module_id, destination, started_at, 0.0, status);
+        }
+    }
+}
+
 /// Polls for an inbound INVITE this process's account (`Account::local` in
 /// SIP server mode, or the classic PBX-trunk registration otherwise)
 /// accepted, and places it on whichever line is idle.
@@ -694,6 +753,7 @@ fn run_outbound_listener(
     bindings: Option<&Arc<crate::sip::server::BindingStore>>,
     trunk_source_ips: &[std::net::IpAddr],
     reporter: &Reporter,
+    history: &OutboundHistory,
 ) {
     let mut active: Option<ActiveOutboundCall> = None;
     'outer: loop {
@@ -737,9 +797,12 @@ fn run_outbound_listener(
         if !trusted {
             tracing::warn!(call_id, %source_addr, "outbound: refusing a dial-out request from an untrusted source");
             let _ = call.answer(403);
+            // Not recorded as a call: a request from an unknown source is
+            // scanner noise, not something this bridge was asked to place.
             report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
             continue;
         }
+        let started_at = chrono::Utc::now();
 
         let Some(destination) = call.request_destination() else {
             tracing::warn!(
@@ -748,6 +811,12 @@ fn run_outbound_listener(
             );
             let _ = call.answer(400);
             report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
+            history.write_outcome(
+                "",
+                "",
+                started_at,
+                OutboundAttemptOutcome::RefusedInvalidDestination,
+            );
             continue;
         };
 
@@ -755,6 +824,12 @@ fn run_outbound_listener(
             tracing::warn!(destination = %destination, "outbound: invalid destination, refusing");
             let _ = call.answer(484);
             report_outbound(reporter, OutboundAttemptOutcome::RefusedInvalidDestination);
+            history.write_outcome(
+                "",
+                &destination,
+                started_at,
+                OutboundAttemptOutcome::RefusedInvalidDestination,
+            );
             continue;
         }
 
@@ -798,6 +873,12 @@ fn run_outbound_listener(
                                 reporter,
                                 OutboundAttemptOutcome::RefusedNetworkFailure,
                             );
+                            history.write_outcome(
+                                &line.card_id,
+                                &destination,
+                                started_at,
+                                OutboundAttemptOutcome::RefusedNetworkFailure,
+                            );
                         }
                     }
                     // Either way this line was tried and the attempt is
@@ -821,6 +902,12 @@ fn run_outbound_listener(
                     // for a caller who is gone (FR-004).
                     tracing::info!(destination = %destination, card_id = %line.card_id, "outbound: caller abandoned the call during the attempt; not trying another line");
                     report_outbound(reporter, OutboundAttemptOutcome::CallerAbandoned);
+                    history.write_outcome(
+                        &line.card_id,
+                        &destination,
+                        started_at,
+                        OutboundAttemptOutcome::CallerAbandoned,
+                    );
                     continue 'outer;
                 }
                 PlaceCallOutcome::Committed(reason) => {
@@ -836,6 +923,7 @@ fn run_outbound_listener(
                     tracing::warn!(destination = %destination, card_id = %line.card_id, reason = %reason, code, "outbound: carrier rejected the call; not trying another line (FR-009a)");
                     let _ = call.answer(code);
                     report_outbound(reporter, outcome);
+                    history.write_outcome(&line.card_id, &destination, started_at, outcome);
                     continue 'outer;
                 }
             }
@@ -856,6 +944,12 @@ fn run_outbound_listener(
         tracing::warn!(destination = %destination, "outbound: no VoWiFi/VoLTE line available, refusing (no cross-process CS audio bridge exists)");
         let _ = call.answer(503);
         report_outbound(reporter, OutboundAttemptOutcome::RefusedNoIdleLine);
+        history.write_outcome(
+            "",
+            &destination,
+            started_at,
+            OutboundAttemptOutcome::RefusedNoIdleLine,
+        );
     }
 }
 
@@ -3543,6 +3637,41 @@ mod tests {
                 OutboundAttemptOutcome::RefusedNetworkFailure,
                 "{reason:?}"
             );
+        }
+    }
+
+    #[test]
+    fn outbound_history_files_each_outcome_under_its_status() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let history = OutboundHistory {
+            store_tx: tx,
+            transport: crate::store::Transport::Vowifi,
+        };
+        let at = chrono::Utc::now();
+        let written = |outcome| {
+            history.write_outcome("card0", "+919000000001", at, outcome);
+            rx.try_recv().ok().map(|cmd| match cmd {
+                StoreCommand::InsertCall(r) => r,
+                _ => panic!("only call rows are written"),
+            })
+        };
+
+        assert!(
+            written(OutboundAttemptOutcome::Placed).is_none(),
+            "a placed call is recorded when it ends, not when it starts"
+        );
+        for (outcome, status) in [
+            (OutboundAttemptOutcome::Unanswered, "missed"),
+            (OutboundAttemptOutcome::CallerAbandoned, "missed"),
+            (OutboundAttemptOutcome::RefusedNetworkFailure, "failed"),
+            (OutboundAttemptOutcome::RefusedNoIdleLine, "failed"),
+            (OutboundAttemptOutcome::RefusedInvalidDestination, "failed"),
+        ] {
+            let r = written(outcome).expect("a row");
+            assert_eq!(r.status, status, "{outcome:?}");
+            assert_eq!(r.caller_id, "+919000000001", "the dialled number");
+            assert_eq!(r.module_id, "card0");
+            assert_eq!(r.direction, crate::store::calls::CallDirection::Outbound);
         }
     }
 

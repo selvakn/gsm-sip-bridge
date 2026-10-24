@@ -1,4 +1,5 @@
 pub mod calls;
+pub mod events;
 pub mod schema;
 pub mod slots;
 pub mod sms;
@@ -57,8 +58,20 @@ pub enum StoreCommand {
     InsertSms(sms::SmsRecord),
     UpdateSmsForwarding(sms::SmsForwardingUpdate),
     UpdateSmsForwardingByTime(sms::SmsForwardingByTimeUpdate),
-    UpsertSlot { imei: String, usb_serial: String },
-    SetModePref { slot: u32, mode: NetworkMode },
+    UpsertSlot {
+        imei: String,
+        usb_serial: String,
+    },
+    SetModePref {
+        slot: u32,
+        mode: NetworkMode,
+    },
+    /// A row for the web UI's event timeline (specs/122-management-webui).
+    InsertEvent(events::EventRecord),
+    /// Deletes timeline rows older than the given time.
+    PruneEvents {
+        older_than: chrono::DateTime<chrono::Utc>,
+    },
     Shutdown,
 }
 
@@ -160,6 +173,18 @@ fn writer_loop(conn: Connection, rx: Receiver<StoreCommand>) {
             StoreCommand::SetModePref { slot, mode } => {
                 if let Err(e) = slots::set_mode_pref(&conn, slot, mode) {
                     tracing::error!(error = %e, slot = slot, "failed to set mode pref");
+                }
+            }
+            StoreCommand::InsertEvent(record) => {
+                if let Err(e) = events::insert_event(&conn, &record) {
+                    tracing::error!(error = %e, "failed to insert event record");
+                }
+            }
+            StoreCommand::PruneEvents { older_than } => {
+                match events::prune_events(&conn, older_than) {
+                    Ok(n) if n > 0 => tracing::info!(deleted = n, "pruned old timeline events"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "failed to prune timeline events"),
                 }
             }
             StoreCommand::Shutdown => {

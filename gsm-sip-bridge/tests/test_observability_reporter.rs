@@ -131,3 +131,78 @@ async fn test_repeated_reports_do_not_reset_the_daemon_side_counter() {
     let _ = shutdown_tx.send(true);
     handle.abort();
 }
+
+// specs/122-management-webui: the reporter carries `AgentDetails` from its
+// provider on every report, through the real socket into the daemon's
+// ingest, so the web UI sees registration wording, carrier and signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_details_from_the_provider_reach_the_daemons_snapshot() {
+    use gsm_sip_bridge::control::protocol::{
+        AgentDetails, RegistrationStateWire, SignalReadingWire,
+    };
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir
+        .path()
+        .join("reporter-details.sock")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = start_control_server(&socket_path, cmd_tx, shutdown_rx).await;
+
+    let module_id = "test-reporter-details".to_string();
+    let reporter = Reporter::spawn(
+        socket_path.clone(),
+        AgentKind::Ims,
+        module_id.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    reporter.set_details_provider(Arc::new(|| AgentDetails {
+        registration_state: Some(RegistrationStateWire::Registered),
+        registered_at: Some(1_700_000_000),
+        plmn: Some("405-857".into()),
+        signal: Some(SignalReadingWire {
+            at_unix: 1_700_000_100,
+            rssi_dbm: Some(-71),
+            ..Default::default()
+        }),
+        active_call_details: None,
+    }));
+    reporter.report(
+        AgentState {
+            registered: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = metrics::ingest::snapshot_lines()
+            .into_iter()
+            .find(|s| s.module_id == module_id && s.agent == AgentKind::Ims);
+        if let Some(snap) = found {
+            if snap.details.plmn.is_some() {
+                assert_eq!(snap.details.plmn.as_deref(), Some("405-857"));
+                assert_eq!(snap.details.registered_at, Some(1_700_000_000));
+                assert_eq!(snap.details.signal.unwrap().rssi_dbm, Some(-71));
+                assert_eq!(
+                    snap.details.registration_state.unwrap().to_string(),
+                    "registered"
+                );
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the details never reached the daemon"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    handle.abort();
+}

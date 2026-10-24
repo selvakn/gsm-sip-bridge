@@ -64,6 +64,7 @@ use super::bridge::BridgeLine;
 /// stall on a finished attempt and exited the whole process mid-backoff.
 /// `pub(crate)` rather than `pub` only because `progress` is a crate-internal
 /// type; the two call sites are both in-crate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     line: &BridgeLine,
     app_config: &AppConfig,
@@ -72,6 +73,7 @@ pub(crate) fn run(
     reassembly: Arc<Mutex<super::sms::Reassembly>>,
     pbx_registered: Option<Arc<AtomicBool>>,
     progress: &Arc<crate::ims::agent::watchdog::Progress>,
+    signal_slot: Option<super::sms::SignalSlot>,
 ) {
     // Arm stall detection before anything touches the modem
     // (specs/039-at-stall-watchdog, FR-032). The LTE bearer shares the AT
@@ -264,6 +266,7 @@ pub(crate) fn run(
         ),
         pcscf_source: None,
         progress: Arc::clone(progress),
+        signal_slot,
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,
     }) {

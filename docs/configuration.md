@@ -59,6 +59,7 @@ clears — never a repeating stream while a condition stays unhealthy.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `discord_webhook_url` | string | `""` | Shared default webhook for any category below with no override of its own. Supports `env:VAR` syntax |
+| `event_retention_days` | integer | 30 | How many days the web UI's events timeline keeps rows. Pruned at startup and every 6 hours. Minimum 1; a lower value falls back to the default |
 | `instance_name` | string | (host hostname) | Name identifying this deployment, shown in every alert footer as `gsm-sip-bridge · <instance_name>`. Falls back to the system hostname when unset — set it explicitly under Docker, where the hostname is a random container id |
 
 | Sub-table | Key | Type | Default | Description |
@@ -88,6 +89,19 @@ category without one falls back to `[alerts].discord_webhook_url`. See
 |---|---|---|---|
 | `port` | integer | 9091 | Metrics HTTP server port |
 | `agent_report_interval_seconds` | integer | 10 | How often each VoWiFi agent re-reports its call/SMS/health state over the control socket. Also sets the staleness threshold (3x this) after which an agent that stopped reporting is marked down. Ignored when `[vowifi].enabled` is false. |
+| `signal_poll_interval_seconds` | integer | 60 | How often modem signal quality is read for the web UI and the `signal_*` gauges. `0` disables polling; values 1–19 are raised to 20 (one modem SMS sweep) with a startup warning. Never polled while a call is active |
+
+### `[webui]`
+
+The read-only management web UI (see the README's "Web UI" section). Off unless `enabled = true`. Served over plain HTTP on its own port; terminate TLS with a reverse proxy.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Serve the UI |
+| `listen_addr` | string | `"0.0.0.0"` | IP address to bind. Must be an IP, not a hostname |
+| `port` | integer | 8080 | Listener port. Must differ from `[metrics].port`, `[sip].port` and (when enabled) `[sip_server].listen_port` |
+| `password` | string | `""` | Login password. Required when `enabled = true`. Supports `env:VAR` syntax, which is the recommended way to set it |
+| `grafana_url` | string | `""` | Optional. When set, the UI links here for history and graphs. Must start with `http://` or `https://` |
 
 ### `[cs]`
 

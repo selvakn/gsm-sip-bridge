@@ -350,7 +350,93 @@ fn build_metrics(raw: RawMetrics) -> BridgeResult<MetricsConfig> {
             "metrics.agent_report_interval_seconds",
             1..=3600,
         )?,
+        signal_poll_interval_seconds: signal_poll_interval(raw.signal_poll_interval_seconds),
     })
+}
+
+/// `0` disables polling; 1–19 is raised to the 20s sweep interval, because a
+/// faster poll could not be honoured by the loops it piggy-backs on.
+fn signal_poll_interval(value: u64) -> u64 {
+    if value != 0 && value < MIN_SIGNAL_POLL_INTERVAL_SECONDS {
+        tracing::warn!(
+            value,
+            raised_to = MIN_SIGNAL_POLL_INTERVAL_SECONDS,
+            "metrics.signal_poll_interval_seconds is below the sweep interval; raising it"
+        );
+        MIN_SIGNAL_POLL_INTERVAL_SECONDS
+    } else {
+        value
+    }
+}
+
+/// `[webui]`. Cross-section port clashes are checked by [`build`], once
+/// `[metrics]`, `[sip]` and `[sip_server]` are all built.
+fn build_webui(raw: RawWebui) -> BridgeResult<WebuiConfig> {
+    if raw.listen_addr.parse::<std::net::IpAddr>().is_err() {
+        return Err(BridgeError::Config(format!(
+            "field webui.listen_addr must be an IP address, got {:?}",
+            raw.listen_addr
+        )));
+    }
+    if raw.port == 0 {
+        return Err(BridgeError::Config(
+            "field webui.port must be non-zero".into(),
+        ));
+    }
+    if raw.enabled && raw.password.expose_secret().is_empty() {
+        return Err(BridgeError::Config(
+            "webui.password must be set when webui.enabled = true \
+             (prefer password = \"env:WEBUI_PASSWORD\")"
+                .into(),
+        ));
+    }
+    let has_scheme =
+        raw.grafana_url.starts_with("http://") || raw.grafana_url.starts_with("https://");
+    if !raw.grafana_url.is_empty() && !has_scheme {
+        return Err(BridgeError::Config(format!(
+            "field webui.grafana_url must start with http:// or https://, got {:?}",
+            raw.grafana_url
+        )));
+    }
+    Ok(WebuiConfig {
+        enabled: raw.enabled,
+        listen_addr: raw.listen_addr,
+        port: raw.port,
+        password: raw.password,
+        grafana_url: raw.grafana_url,
+    })
+}
+
+fn check_webui_port_clash(
+    webui: &WebuiConfig,
+    metrics: &MetricsConfig,
+    sip: &SipConfig,
+    sip_server: &SipServerConfig,
+) -> BridgeResult<()> {
+    if !webui.enabled {
+        return Ok(());
+    }
+    let clashes = [
+        ("metrics.port", metrics.port),
+        ("sip.port", sip.port),
+        (
+            "sip_server.listen_port",
+            if sip_server.enabled {
+                sip_server.listen_port
+            } else {
+                0
+            },
+        ),
+    ];
+    for (key, port) in clashes {
+        if port == webui.port {
+            return Err(BridgeError::Config(format!(
+                "webui.port {} clashes with {key}; pick a different port",
+                webui.port
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_modules(raw: RawModules) -> BridgeResult<ModulesConfig> {
@@ -654,6 +740,10 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
             .discord_webhook_url
             .unwrap_or_else(|| sms.discord_webhook_url.clone()),
         instance_name: raw.instance_name.filter(|s| !s.is_empty()),
+        event_retention_days: raw
+            .event_retention_days
+            .and_then(|v| in_range_or_warn(v, "alerts.event_retention_days", 1..=u32::MAX))
+            .unwrap_or(d.event_retention_days),
         sms: sms_cat,
         module_lifecycle,
         registration_loss,
@@ -1275,11 +1365,16 @@ pub fn build(raw: RawConfig) -> BridgeResult<AppConfig> {
     // Cross-section, so it runs once all three exist rather than inside any one
     // of their builders.
     check_sip_server_port_ownership(&sip_server, &vowifi, &volte)?;
+    let sip = build_sip(raw.sip, &sip_server)?;
+    let metrics = build_metrics(raw.metrics)?;
+    let webui = build_webui(raw.webui)?;
+    check_webui_port_clash(&webui, &metrics, &sip, &sip_server)?;
     Ok(AppConfig {
-        sip: build_sip(raw.sip, &sip_server)?,
+        sip,
         bridge: build_bridge(raw.bridge, &sip_server)?,
         sms,
-        metrics: build_metrics(raw.metrics)?,
+        metrics,
+        webui,
         modules: build_modules(raw.modules)?,
         resilience: build_resilience(raw.resilience)?,
         control: build_control(raw.control)?,

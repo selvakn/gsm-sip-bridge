@@ -52,13 +52,20 @@ async fn report_one_outbound_attempt(
         state: AgentState::default(),
         events: vec![ObservedEvent::OutboundAttempt { outcome }],
         dropped: 0,
+        details: None,
     };
     let sock = socket_path.to_string();
-    let resp =
-        tokio::task::spawn_blocking(move || send_cmd(&sock, &ControlCmd::Observe { report }))
-            .await
-            .unwrap()
-            .unwrap();
+    let resp = tokio::task::spawn_blocking(move || {
+        send_cmd(
+            &sock,
+            &ControlCmd::Observe {
+                report: Box::new(report),
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert!(matches!(
         resp,
         gsm_sip_bridge::control::protocol::ControlResp::Ok

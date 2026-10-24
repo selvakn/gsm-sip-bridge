@@ -341,13 +341,21 @@ fn run_line(
     // Spawned once (its own reader loop is resilient) and serialised with the
     // carrier half through the shared lock; it relays each message onto the
     // same telephone-side recorder the IMS route uses.
+    let signal_slot: super::sms::SignalSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let signal_poll = super::sms::SignalPoll::for_interval(
+        app_config.metrics.signal_poll_interval_seconds,
+        signal_slot.clone(),
+    );
     {
         let modem_port = line.settings.modem_port.clone();
         let lock = modem_lock.clone();
         let dedupe = dedupe.clone();
+        let signal_poll = signal_poll.clone();
         if let Err(e) = std::thread::Builder::new()
             .name(format!("volte-sms-{}", line.card_id))
-            .spawn(move || super::sms::run_modem_reader(modem_port, control_addr, lock, dedupe))
+            .spawn(move || {
+                super::sms::run_modem_reader(modem_port, control_addr, lock, dedupe, signal_poll)
+            })
         {
             tracing::error!(card_id = %line.card_id, error = %e, "failed to start the modem SMS reader for this line");
         }
@@ -370,6 +378,7 @@ fn run_line(
             reassembly.clone(),
             Some(pbx_registered.clone()),
             &progress,
+            signal_poll.is_some().then(|| signal_slot.clone()),
         );
         // The carrier half returned — a failed attach/registration or a lost
         // one. Back off before retrying, so a persistent fault (no SIM, no

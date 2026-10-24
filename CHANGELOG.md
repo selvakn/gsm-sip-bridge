@@ -10,6 +10,20 @@ across releases.
 
 ### Added
 
+- **Read-only management web UI** (#122). New `[webui]` table (`enabled`,
+  `listen_addr`, `port`, `password`, `grafana_url`), off by default, serving a
+  password-protected single-page UI on its own listener: an overview of every
+  line, call history and live calls, SMS with one-time-code copy, an event
+  timeline, and the redacted startup config. Read-only by construction; only
+  login and logout write. Embedded in the binary (three static files, no
+  JavaScript toolchain). Adds `[metrics].signal_poll_interval_seconds`
+  (default 60, `0` disables), `[alerts].event_retention_days` (default 30), the
+  `gsm_sip_bridge_signal_*` gauges, `gsm_sip_bridge_events_recorded_total` and
+  `gsm_sip_bridge_webui_logins_total`. Store schema v4 to v5: `calls.direction`
+  and per-call loss/jitter/RTT columns, and an `events` table. Outbound calls
+  are now recorded in call history. `AgentReport` gains an optional `details`
+  field; older agents and daemons interoperate unchanged.
+
 - **AMR passthrough: client re-INVITEs are judged by the forwarding rule** (#111).
   A phone that renegotiates a forwarded call to parameters it can no longer be
   forwarded under (restricted `mode-set`, CRC, redundancy, a longer packet

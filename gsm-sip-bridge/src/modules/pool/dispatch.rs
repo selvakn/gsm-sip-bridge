@@ -24,6 +24,26 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 impl CardPool {
+    /// Files a refused outbound request in call history as `failed`
+    /// (specs/122-management-webui). `module_id` is `""` when the request was
+    /// turned away before a line was chosen.
+    ///
+    /// A call that was dialled is recorded by the line's own worker when it
+    /// ends, so only refusals the pool itself makes are written here.
+    fn record_outbound_refusal(&self, module_id: &str, destination: &str) {
+        let record = crate::store::calls::CallRecord::outbound(
+            module_id,
+            destination,
+            chrono::Utc::now(),
+            0.0,
+            crate::control::protocol::CallStatus::Failed.as_str(),
+            crate::store::Transport::Cs,
+        );
+        if let Err(e) = self.store.sender().send(StoreCommand::InsertCall(record)) {
+            tracing::error!(error = %e, "failed to send the refused outbound call to the store");
+        }
+    }
+
     /// Handles one `SipBridge::poll_outbound_request` result: validate,
     /// select an idle CS line, dial it, and accept or refuse the SIP call
     /// accordingly (specs/025-outbound-calling, US1).
@@ -46,6 +66,7 @@ impl CardPool {
             metrics::OUTBOUND_ATTEMPTS_TOTAL
                 .with_label_values(&["refused_invalid_destination"])
                 .inc();
+            self.record_outbound_refusal("", &destination);
             return;
         }
 
@@ -55,6 +76,7 @@ impl CardPool {
             metrics::OUTBOUND_ATTEMPTS_TOTAL
                 .with_label_values(&["refused_no_idle_line"])
                 .inc();
+            self.record_outbound_refusal("", &destination);
             return;
         };
 
@@ -68,11 +90,13 @@ impl CardPool {
                 destination = %destination,
                 "outbound: module command channel closed, refusing"
             );
+            let module_id = slot_module_id(slots, slot);
             release_slot(slots, slot);
             self.sip_bridge.refuse_outbound(call, 503);
             metrics::OUTBOUND_ATTEMPTS_TOTAL
                 .with_label_values(&["refused_no_idle_line"])
                 .inc();
+            self.record_outbound_refusal(&module_id, &destination);
             return;
         }
 
@@ -100,11 +124,14 @@ impl CardPool {
             },
             Ok(Ok(Err(e))) => {
                 tracing::warn!(slot, error = %e, "outbound: dial failed");
+                let module_id = slot_module_id(slots, slot);
                 release_slot(slots, slot);
                 self.sip_bridge.refuse_outbound(call, 503);
                 metrics::OUTBOUND_ATTEMPTS_TOTAL
                     .with_label_values(&["refused_network_failure"])
                     .inc();
+                // `ATD` was refused, so the worker has no call to close out.
+                self.record_outbound_refusal(&module_id, &destination);
             }
             Ok(Err(_)) | Err(_) => {
                 tracing::warn!(slot, "outbound: module did not respond in time");
@@ -255,7 +282,7 @@ impl CardPool {
                             outcome: Outcome::AlreadyRestartedByManual,
                             duration: Duration::ZERO,
                         };
-                        self.record_outcome(slot, &outcome);
+                        self.record_outcome(slot, &outcome, slots);
                     }
                     ManualRestartCycleAdvice::Proceed => {}
                 }
@@ -508,6 +535,14 @@ impl CardPool {
     }
 }
 
+/// The line id of `slot`, or `""` if it is gone.
+fn slot_module_id(slots: &HashMap<u32, SlotState>, slot: u32) -> String {
+    slots
+        .get(&slot)
+        .map(|s| s.module.id.clone())
+        .unwrap_or_default()
+}
+
 /// Frees a slot claimed by `claim_idle_cs_slot` when the dial did not end up
 /// bridged. Was five identical inline copies in `handle_outbound_request`.
 fn release_slot(slots: &mut HashMap<u32, SlotState>, slot: u32) {
@@ -583,6 +618,18 @@ mod tests {
             },
             cmd_rx,
         )
+    }
+
+    /// specs/122-management-webui: a refused dial is filed under the line that
+    /// was claimed for it, or under no line when it was refused before one
+    /// was chosen.
+    #[test]
+    fn slot_module_id_names_the_claimed_line_or_nothing() {
+        let mut slots = HashMap::new();
+        let (state, _rx) = slot_state("ec20-ABC123", false);
+        slots.insert(0, state);
+        assert_eq!(slot_module_id(&slots, 0), "ec20-ABC123");
+        assert_eq!(slot_module_id(&slots, 9), "");
     }
 
     /// gh#79: the SIP peer of the currently bridged call disconnecting must

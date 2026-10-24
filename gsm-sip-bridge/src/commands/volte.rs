@@ -1189,10 +1189,17 @@ pub(crate) fn handle_volte_carrier_agent_command(
     let reassembly = std::sync::Arc::new(std::sync::Mutex::new(
         crate::volte::sms::Reassembly::default(),
     ));
+    let signal_slot: crate::volte::sms::SignalSlot =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let signal_poll = crate::volte::sms::SignalPoll::for_interval(
+        app_config.metrics.signal_poll_interval_seconds,
+        signal_slot.clone(),
+    );
     {
         let modem_port = modem_port.clone();
         let lock = modem_lock.clone();
         let dedupe = dedupe.clone();
+        let signal_poll = signal_poll.clone();
         let control_addr = std::net::SocketAddr::new(
             if line.veth_telephony_addr.is_empty() {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -1206,7 +1213,13 @@ pub(crate) fn handle_volte_carrier_agent_command(
         if let Err(e) = std::thread::Builder::new()
             .name(format!("volte-sms-{}", line.card_id))
             .spawn(move || {
-                crate::volte::sms::run_modem_reader(modem_port, control_addr, lock, dedupe)
+                crate::volte::sms::run_modem_reader(
+                    modem_port,
+                    control_addr,
+                    lock,
+                    dedupe,
+                    signal_poll,
+                )
             })
         {
             eprintln!(
@@ -1233,6 +1246,7 @@ pub(crate) fn handle_volte_carrier_agent_command(
         reassembly,
         None,
         &progress,
+        signal_poll.is_some().then_some(signal_slot),
     );
 
     eprintln!(

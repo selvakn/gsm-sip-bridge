@@ -13,7 +13,19 @@ pub fn record_start_time() {
     START_TIME.get_or_init(Instant::now);
 }
 
-fn staleness_threshold() -> Duration {
+/// How long this process has been up, once [`record_start_time`] has run.
+pub fn uptime() -> Option<Duration> {
+    START_TIME.get().map(Instant::elapsed)
+}
+
+/// Sets the staleness threshold ahead of [`serve`]. The first call wins, as
+/// with the value `serve` derives from `[metrics].agent_report_interval_seconds`;
+/// for tests that need a line to go stale without waiting 30 seconds.
+pub fn set_staleness_threshold(threshold: Duration) {
+    let _ = AGENT_STALENESS_THRESHOLD.set(threshold);
+}
+
+pub(crate) fn staleness_threshold() -> Duration {
     *AGENT_STALENESS_THRESHOLD.get_or_init(|| Duration::from_secs(30))
 }
 
@@ -57,6 +69,10 @@ fn refresh_agent_liveness() {
                 .set(remaining);
         }
 
+        if !state.up {
+            ingest::clear_active_call_details(state.agent, &state.module_id);
+        }
+
         if !state.up && state.agent == crate::control::protocol::AgentKind::Supervisor {
             zero_stale_supervisor_gauges(&state.module_id);
         } else if !state.up {
@@ -94,6 +110,7 @@ async fn metrics_handler() -> impl IntoResponse {
         super::UPTIME_SECONDS.set(start.elapsed().as_secs_f64());
     }
     refresh_agent_liveness();
+    super::refresh_signal_age();
 
     let encoder = TextEncoder::new();
     // Both registries, not just the default one.

@@ -870,3 +870,133 @@ fn test_sip_reject_statuses_typo_key_rejected() {
     let f = sip_with_codecs("reject_status = [403]");
     assert!(load_config(f.path()).is_err());
 }
+
+// ------------------------------------------------ specs/122 [webui] etc. ----
+
+const WEBUI_BASE: &str = r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "pw"
+"#;
+
+fn load_with(
+    extra: &str,
+) -> gsm_sip_bridge::error::BridgeResult<gsm_sip_bridge::config::AppConfig> {
+    let f = write_config(&format!("{WEBUI_BASE}{extra}"));
+    load_config(f.path())
+}
+
+fn load_err(extra: &str) -> String {
+    load_with(extra)
+        .expect_err("config must be rejected")
+        .to_string()
+}
+
+#[test]
+fn webui_defaults_when_table_absent() {
+    let cfg = load_with("").unwrap();
+    assert!(!cfg.webui.enabled);
+    assert_eq!(cfg.webui.listen_addr, "0.0.0.0");
+    assert_eq!(cfg.webui.port, 8080);
+    assert_eq!(cfg.webui.password.expose_secret(), "");
+    assert_eq!(cfg.webui.grafana_url, "");
+    assert_eq!(cfg.metrics.signal_poll_interval_seconds, 60);
+    assert_eq!(cfg.alerts.event_retention_days, 30);
+}
+
+#[test]
+fn webui_password_resolves_from_env() {
+    std::env::set_var("TEST_WEBUI_PASSWORD_A", "hunter2-synthetic");
+    let cfg =
+        load_with("[webui]\nenabled = true\npassword = \"env:TEST_WEBUI_PASSWORD_A\"\n").unwrap();
+    assert!(cfg.webui.enabled);
+    assert_eq!(cfg.webui.password.expose_secret(), "hunter2-synthetic");
+}
+
+#[test]
+fn webui_enabled_requires_a_password() {
+    let err = load_err("[webui]\nenabled = true\n");
+    assert!(err.contains("webui.password"), "{err}");
+}
+
+#[test]
+fn webui_disabled_does_not_require_a_password() {
+    load_with("[webui]\nenabled = false\n").unwrap();
+}
+
+#[test]
+fn webui_listen_addr_must_be_an_ip() {
+    let err = load_err("[webui]\nlisten_addr = \"localhost\"\n");
+    assert!(err.contains("webui.listen_addr"), "{err}");
+}
+
+#[test]
+fn webui_port_must_not_clash_with_metrics() {
+    let err = load_err("[webui]\nenabled = true\npassword = \"x\"\nport = 9091\n");
+    assert!(err.contains("metrics.port"), "{err}");
+}
+
+#[test]
+fn webui_port_must_not_clash_with_sip() {
+    let err = load_err("[webui]\nenabled = true\npassword = \"x\"\nport = 5060\n");
+    assert!(err.contains("sip.port"), "{err}");
+}
+
+#[test]
+fn webui_grafana_url_needs_a_scheme() {
+    let err = load_err("[webui]\ngrafana_url = \"grafana.example\"\n");
+    assert!(err.contains("webui.grafana_url"), "{err}");
+    let cfg = load_with("[webui]\ngrafana_url = \"https://grafana.example/d/abc\"\n").unwrap();
+    assert_eq!(cfg.webui.grafana_url, "https://grafana.example/d/abc");
+}
+
+#[test]
+fn webui_unknown_key_is_rejected() {
+    let err = load_err("[webui]\nbogus = 1\n");
+    assert!(err.contains("webui.bogus"), "{err}");
+}
+
+#[test]
+fn signal_poll_interval_is_clamped_and_can_be_disabled() {
+    assert_eq!(
+        load_with("[metrics]\nsignal_poll_interval_seconds = 0\n")
+            .unwrap()
+            .metrics
+            .signal_poll_interval_seconds,
+        0
+    );
+    assert_eq!(
+        load_with("[metrics]\nsignal_poll_interval_seconds = 5\n")
+            .unwrap()
+            .metrics
+            .signal_poll_interval_seconds,
+        20
+    );
+    assert_eq!(
+        load_with("[metrics]\nsignal_poll_interval_seconds = 120\n")
+            .unwrap()
+            .metrics
+            .signal_poll_interval_seconds,
+        120
+    );
+}
+
+#[test]
+fn event_retention_days_is_configurable_and_at_least_one() {
+    assert_eq!(
+        load_with("[alerts]\nevent_retention_days = 7\n")
+            .unwrap()
+            .alerts
+            .event_retention_days,
+        7
+    );
+    assert_eq!(
+        load_with("[alerts]\nevent_retention_days = 0\n")
+            .unwrap()
+            .alerts
+            .event_retention_days,
+        30,
+        "an out-of-range value falls back to the default, like the other [alerts] keys"
+    );
+}

@@ -44,6 +44,7 @@ fn report(module_id: &str, seq: u64, registered: bool) -> AgentReport {
         },
         events: vec![],
         dropped: 0,
+        details: None,
     }
 }
 
@@ -62,6 +63,7 @@ fn gm_report(module_id: &str, seq: u64, gm_connection_up: bool) -> AgentReport {
         },
         events: vec![],
         dropped: 0,
+        details: None,
     }
 }
 
@@ -83,6 +85,7 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
         AlertsConfig {
             default_webhook_url: Secret::new(String::new()),
             instance_name: None,
+            event_retention_days: 30,
             sms: enabled(None),
             module_lifecycle: CategoryAlertConfig {
                 enabled: false,

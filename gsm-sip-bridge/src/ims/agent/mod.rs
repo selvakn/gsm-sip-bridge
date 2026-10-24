@@ -350,11 +350,17 @@ fn run_inner(
     // sweep "runs unconditionally, once per line," which is false for that
     // line type).
     let reassembly = Arc::new(Mutex::new(crate::volte::sms::Reassembly::default()));
+    let signal_slot: crate::volte::sms::SignalSlot = Arc::new(Mutex::new(None));
+    let signal_poll = crate::volte::sms::SignalPoll::for_interval(
+        app_config.metrics.signal_poll_interval_seconds,
+        Arc::clone(&signal_slot),
+    );
     let modem_lock = if wants_modem_sms_reader(config.pcsc_reader) {
         let lock = Arc::new(crate::modules::modem_lock::ModemLock::new());
         let modem_port = PathBuf::from(&config.modem_port);
         let sweep_lock = lock.clone();
         let sweep_dedupe = dedupe.clone();
+        let sweep_signal = signal_poll.clone();
         if let Err(e) = std::thread::Builder::new()
             .name(format!("vowifi-sms-{card_id}"))
             .spawn(move || {
@@ -363,6 +369,7 @@ fn run_inner(
                     control_addr,
                     sweep_lock,
                     sweep_dedupe,
+                    sweep_signal,
                 )
             })
         {
@@ -418,6 +425,10 @@ fn run_inner(
             )),
         ),
         pcscf_source: Some(config.pcscf_source_path.clone()),
+        // A `pcsc_reader` line has no sweep thread, so nothing would ever
+        // fill the slot.
+        signal_slot: (signal_poll.is_some() && wants_modem_sms_reader(config.pcsc_reader))
+            .then_some(signal_slot),
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
     })
@@ -795,6 +806,10 @@ pub(crate) struct InboundParams<'a> {
     /// re-read before every renewal (FR-014). `None` on VoLTE, where nothing
     /// republishes the P-CSCF.
     pub pcscf_source: Option<String>,
+    /// Where this line's modem sweep leaves its latest signal reading, for the
+    /// reporter to carry (specs/122-management-webui). `None` for a line with
+    /// no modem sweep (`pcsc_reader`) or with polling off.
+    pub signal_slot: Option<crate::volte::sms::SignalSlot>,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
     /// Which agent this is, for the `transport` label its reports land under.
@@ -836,6 +851,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         progress,
         pcscf_pool,
         pcscf_source,
+        signal_slot,
         agent_label,
         agent_kind,
     } = p;
@@ -846,7 +862,10 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // unavailable for this run, logged once here rather than on every insert
     // attempt.
     let history_store = match StoreHandle::open(std::path::Path::new(&app_config.sms.db_path)) {
-        Ok(s) => Some(s),
+        Ok(s) => {
+            crate::store::events::install_sink(s.sender());
+            Some(s)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to open call/SMS store; call history will not be recorded this run");
             None
@@ -874,6 +893,10 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         app_config.bridge.sip_destination.clone(),
         transport,
     );
+    obs.set_plmn(&reg_cfg.mcc, &reg_cfg.mnc);
+    if let Some(slot) = signal_slot {
+        obs.attach_signal_slot(slot);
+    }
     // VoWiFi only: its tunnel supervisor holds a stuck-rekey rebuild for a
     // call (specs/093). VoLTE has no `pcscf_source` and no such supervisor.
     let obs = match &pcscf_source {
@@ -967,6 +990,8 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         // has none and leaves this at its default).
         ..Default::default()
     }));
+
+    obs.attach_registration_status(Arc::clone(&status));
 
     let (place_call_tx, place_call_rx) = mpsc::channel();
     {
@@ -2907,6 +2932,7 @@ impl LoopState {
             // active call (fresh media baseline so the last call's counts
             // can't read as a stall on this one).
             p.obs.set_active_calls(1);
+            p.obs.begin_live_call(call.live_call());
             self.watch = AttachmentWatch::default();
             self.active_call = Some(call);
         } else if self.origination.is_none() {
@@ -3142,8 +3168,9 @@ impl LoopState {
                 if call.is_none() {
                     self.recent_declines.record(req, Instant::now());
                 }
-                if call.is_some() {
+                if let Some(answered) = &call {
                     p.obs.set_active_calls(1);
+                    p.obs.begin_live_call(answered.live_call());
                     // Fresh call, fresh media baseline (the meter starts at
                     // zero) — so a previous call's counts cannot read as a
                     // stall on this one.

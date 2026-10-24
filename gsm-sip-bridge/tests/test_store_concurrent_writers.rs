@@ -29,6 +29,10 @@ fn test_concurrent_writes_via_single_connection() {
                     status: "answered".into(),
                     sip_destination: "sip:100@pbx:5060".into(),
                     transport: Transport::Cs,
+                    direction: gsm_sip_bridge::store::calls::CallDirection::Inbound,
+                    loss_percent: None,
+                    jitter_ms: None,
+                    rtt_ms: None,
                 };
                 insert_call(&guard, &record).unwrap();
             } else {

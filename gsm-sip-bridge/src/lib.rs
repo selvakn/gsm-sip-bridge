@@ -17,3 +17,4 @@ pub mod store;
 pub mod supervise;
 pub mod volte;
 pub mod vowifi;
+pub mod webui;
