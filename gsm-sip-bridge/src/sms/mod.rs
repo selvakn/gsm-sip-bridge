@@ -187,7 +187,11 @@ pub(crate) fn report_outcome(
         Some(reporter) => {
             reporter.report(
                 AgentState::default(),
-                vec![ObservedEvent::SmsForwarded { outcome }],
+                vec![ObservedEvent::SmsForwarded {
+                    outcome,
+                    module: Some(module_id.to_string()),
+                    transport: Some(transport.as_str().to_string()),
+                }],
             );
         }
         None => {

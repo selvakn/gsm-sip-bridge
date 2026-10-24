@@ -183,14 +183,22 @@ pub async fn sweep_excluding(
         }
         let id = cand.id;
         let now = chrono::Utc::now().timestamp();
+        // Age is rechecked at claim time: earlier posts in a long pass may
+        // have carried this row past `retry_max_age_sec` since the pass began.
         match with_conn(db, move |c| {
-            sms::claim_for_retry(c, id, now, RETRY_LEASE_SECS)
+            let expired = sms::abandon_expired(c, now, max_age)?;
+            let claimed = sms::claim_for_retry(c, id, now, RETRY_LEASE_SECS)?;
+            Ok((expired, claimed))
         })
         .await
         {
-            Ok(true) => {}
-            // Another process (or a concurrent sweep) owns it now.
-            Ok(false) => continue,
+            Ok((expired, true)) => out.abandoned += expired,
+            // Another process (or a concurrent sweep) owns it now, or it just
+            // aged out.
+            Ok((expired, false)) => {
+                out.abandoned += expired;
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(id, error = %e, "SMS retry sweep: claim failed");
                 continue;

@@ -227,7 +227,15 @@ impl DiscordClient {
 
         for attempt in 0..=MAX_RETRIES {
             if start.elapsed() >= TOTAL_TIMEOUT {
-                return Err(PostError::Timeout);
+                // Budget spent while being throttled is still a rate limit:
+                // callers (the SMS retry sweep) stop on it, not on a timeout.
+                return Err(if last_status == 429 {
+                    PostError::RateLimited {
+                        retry_after: last_retry_after,
+                    }
+                } else {
+                    PostError::Timeout
+                });
             }
 
             let response = self.client.post(webhook_url).json(&payload).send().await;
@@ -245,6 +253,14 @@ impl DiscordClient {
                                 .and_then(|s| s.parse::<f64>().ok())
                                 .unwrap_or(1.0);
                             last_retry_after = Duration::from_secs_f64(retry_after);
+                            // A pause longer than the budget left is not worth
+                            // waiting out (and would outlive the SMS retry
+                            // lease): report the throttle now.
+                            if start.elapsed() + last_retry_after >= TOTAL_TIMEOUT {
+                                return Err(PostError::RateLimited {
+                                    retry_after: last_retry_after,
+                                });
+                            }
                             tokio::time::sleep(last_retry_after).await;
                         }
                         400..=499 => {

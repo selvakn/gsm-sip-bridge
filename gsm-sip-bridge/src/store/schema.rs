@@ -232,36 +232,65 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("4", "5", SCHEMA_V5_SQL),
 ];
 
+fn read_version(conn: &Connection) -> BridgeResult<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| BridgeError::Store(format!("failed to read schema_version: {e}")))
+}
+
 pub fn init_schema(conn: &Connection) -> BridgeResult<()> {
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|e| BridgeError::Store(format!("failed to initialize schema: {e}")))?;
 
-    let mut version: String = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| BridgeError::Store(format!("failed to read schema_version: {e}")))?;
+    let mut version = read_version(conn)?;
 
     // Applied in order, each stepping the recorded version by one. A table
     // rather than a chain of near-identical `if version == "N"` blocks: the
     // chain grew by ~10 lines per migration, and every one of those lines was
     // an opportunity to paste the wrong version number into the `UPDATE`.
     // Adding a migration is now one entry.
+    //
+    // Each step is one `BEGIN IMMEDIATE` transaction covering the DDL *and*
+    // the version bump, with the version re-read once the write lock is held:
+    // a process killed mid-rebuild leaves the old schema intact (SQLite DDL is
+    // transactional), and two processes starting together cannot both run it.
     for (from, to, sql) in MIGRATIONS {
         if version != *from {
             continue;
         }
-        conn.execute_batch(sql).map_err(|e| {
-            BridgeError::Store(format!("schema v{from}→v{to} migration failed: {e}"))
-        })?;
-        conn.execute(
-            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-            [to],
-        )
-        .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
-        version = to.to_string();
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| BridgeError::Store(format!("schema v{from}→v{to}: lock failed: {e}")))?;
+        let step = (|| -> BridgeResult<String> {
+            let current = read_version(conn)?;
+            if current != *from {
+                // Another process migrated while we waited for the lock.
+                return Ok(current);
+            }
+            conn.execute_batch(sql).map_err(|e| {
+                BridgeError::Store(format!("schema v{from}→v{to} migration failed: {e}"))
+            })?;
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [to],
+            )
+            .map_err(|e| BridgeError::Store(format!("failed to update schema_version: {e}")))?;
+            Ok(to.to_string())
+        })();
+        match step {
+            Ok(v) => {
+                conn.execute_batch("COMMIT").map_err(|e| {
+                    BridgeError::Store(format!("schema v{from}→v{to}: commit failed: {e}"))
+                })?;
+                version = v;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
     }
 
     if version != SCHEMA_VERSION {

@@ -298,3 +298,64 @@ fn summary_counts_states_and_reports_the_oldest_age_without_bodies() {
     assert_eq!(sum.rows.len(), 2);
     assert!(!serde_json::to_string(&sum).unwrap().contains("hello"));
 }
+
+#[test]
+fn with_retry_off_the_first_attempt_is_still_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh(&dir);
+    let sent = add(&conn, "pending", false, "t1");
+    let failed = add(&conn, "pending", false, "t2");
+    let pending = add(&conn, "pending", false, "t3");
+    settle(&conn, pending, "pending", 100);
+    settle(&conn, sent, "sent", 50);
+    settle(&conn, failed, "failed", 700);
+
+    let sum = summary(&conn, NOW).unwrap();
+    assert_eq!(sum.counts.sent, 1);
+    assert_eq!(sum.counts.failed, 1);
+    assert_eq!(sum.counts.pending, 1);
+    assert_eq!(
+        sum.counts.legacy_failed, 0,
+        "today's failure is not history"
+    );
+    assert_eq!(sum.oldest_undelivered_age_sec, 700);
+    assert_eq!(sum.rows.len(), 2);
+    // Visible, but still never retried.
+    assert!(candidates(&conn, NOW, 10).unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_migration_rolls_back_and_can_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir);
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version','4');
+         CREATE TABLE sms (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, module_id TEXT NOT NULL, sender TEXT NOT NULL,
+             body TEXT NOT NULL, received_at TEXT NOT NULL,
+             forwarding_status TEXT NOT NULL CHECK (forwarding_status IN ('pending','sent','failed','skipped')),
+             forwarded_at TEXT, discord_status_code INTEGER,
+             transport TEXT NOT NULL DEFAULT 'cs' CHECK (transport IN ('cs','vowifi','volte')));
+         INSERT INTO sms (module_id,sender,body,received_at,forwarding_status)
+             VALUES ('m','+919000000000','a','t1','sent');
+         CREATE TABLE sms_v5 (leftover INTEGER);",
+    )
+    .unwrap();
+
+    // The rebuild collides with the leftover table part-way through.
+    assert!(init_schema(&conn).is_err());
+    assert_eq!(version(&conn), "4");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sms", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "the live table must survive a failed upgrade");
+
+    conn.execute_batch("DROP TABLE sms_v5").unwrap();
+    init_schema(&conn).unwrap();
+    assert_eq!(version(&conn), "5");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sms", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}

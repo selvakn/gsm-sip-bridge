@@ -506,3 +506,51 @@ async fn texts_older_than_the_max_age_are_abandoned_not_posted() {
     assert_eq!(posts.len(), 1);
     assert_eq!(description(&posts[0]), "young");
 }
+
+#[tokio::test]
+async fn a_long_retry_after_stops_the_pass_without_waiting_it_out() {
+    let rig = Rig::new().await;
+    let ids: Vec<i64> = (0..3)
+        .map(|i| rig.seed_failed(&format!("t{i}"), 500 - i))
+        .collect();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .mount(&rig.server)
+        .await;
+
+    let started = std::time::Instant::now();
+    let out = retry::sweep(&rig.forwarder(), &None).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "must not sleep the pause"
+    );
+    assert!(out.stopped_early);
+    assert_eq!(out.attempted, 1);
+    assert_eq!(rig.bodies().await.len(), 1, "no further rows are posted");
+    for id in &ids[1..] {
+        assert_eq!(
+            rig.row(*id).1,
+            1,
+            "untouched rows are not counted as attempts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_text_that_ages_out_during_a_pass_is_abandoned_not_posted() {
+    let rig = Rig::new().await;
+    let first = rig.seed_failed("first", 10);
+    let second = rig.seed_failed("second", 999);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(2500)))
+        .mount(&rig.server)
+        .await;
+
+    // `second` is 999 s old against a 1000 s limit when the pass starts, and
+    // past it by the time the slow first post returns.
+    let out = retry::sweep(&rig.forwarder_with(true, 1_000), &None).await;
+    assert_eq!(rig.status_of(first), "sent");
+    assert_eq!(rig.status_of(second), "abandoned");
+    assert_eq!((out.delivered, out.abandoned), (1, 1));
+    assert_eq!(rig.bodies().await.len(), 1);
+}

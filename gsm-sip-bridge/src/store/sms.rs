@@ -19,7 +19,9 @@ pub struct SmsRecord {
 }
 
 /// How long a freshly inserted row stays leased for its own first attempt.
-/// Longer than the Discord client's 30 s total post budget, with margin.
+/// Longer than the Discord client's whole post (30 s budget, then at most one
+/// 10 s request; a longer `Retry-After` returns instead of sleeping), so a live
+/// sender's lease cannot expire under it.
 pub const FIRST_ATTEMPT_LEASE_SECS: i64 = 120;
 
 /// Lease taken by the retry sweep for each row it re-posts.
@@ -47,11 +49,16 @@ pub struct SmsForwardingByTimeUpdate {
 
 pub fn insert_sms(conn: &Connection, record: &SmsRecord) -> BridgeResult<()> {
     let now = chrono::Utc::now().timestamp();
-    let (eligible, attempts, last_attempt, lease) = if record.retry_eligible {
-        (1, 1, Some(now), Some(now + FIRST_ATTEMPT_LEASE_SECS))
-    } else {
-        (0, 0, None, None)
-    };
+    // `attempt_count > 0` is what marks a row as delivery-tracked (so
+    // `sms-status` and the gauges count it even with retry off); rows that
+    // predate v5 keep 0 and are history. Only retry-eligible rows take a lease.
+    let attempted = record.forwarding_status == "pending";
+    let eligible = i64::from(record.retry_eligible);
+    let attempts = i64::from(attempted);
+    let last_attempt = attempted.then_some(now);
+    let lease = record
+        .retry_eligible
+        .then_some(now + FIRST_ATTEMPT_LEASE_SECS);
     conn.execute(
         "INSERT INTO sms (module_id, sender, body, received_at, forwarding_status, transport, \
                           attempt_count, last_attempt_at, first_seen_at, claimed_until, retry_eligible) \
@@ -244,8 +251,8 @@ pub const SUMMARY_ROW_LIMIT: usize = 20;
 pub fn summary(conn: &Connection, now: i64) -> BridgeResult<SmsDeliverySummary> {
     let mut out = SmsDeliverySummary::default();
 
-    let mut stmt =
-        conn.prepare("SELECT forwarding_status, retry_eligible, COUNT(*) FROM sms GROUP BY 1, 2")?;
+    let mut stmt = conn
+        .prepare("SELECT forwarding_status, attempt_count > 0, COUNT(*) FROM sms GROUP BY 1, 2")?;
     let groups = stmt
         .query_map([], |r| {
             Ok((
@@ -271,7 +278,7 @@ pub fn summary(conn: &Connection, now: i64) -> BridgeResult<SmsDeliverySummary> 
 
     let oldest: Option<i64> = conn.query_row(
         "SELECT MIN(first_seen_at) FROM sms \
-         WHERE retry_eligible = 1 AND forwarding_status IN ('pending','failed')",
+         WHERE attempt_count > 0 AND forwarding_status IN ('pending','failed')",
         [],
         |r| r.get(0),
     )?;
@@ -280,7 +287,7 @@ pub fn summary(conn: &Connection, now: i64) -> BridgeResult<SmsDeliverySummary> 
     let mut stmt = conn.prepare(
         "SELECT id, module_id, transport, sender, received_at, forwarding_status, \
                 attempt_count, last_attempt_at, last_error FROM sms \
-         WHERE retry_eligible = 1 AND forwarding_status IN ('pending','failed','abandoned') \
+         WHERE attempt_count > 0 AND forwarding_status IN ('pending','failed','abandoned') \
          ORDER BY id DESC LIMIT ?1",
     )?;
     out.rows = stmt
