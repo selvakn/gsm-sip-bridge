@@ -134,21 +134,41 @@ fn build(packet: &Packet, kind: AmrKind, octet_aligned: bool) -> Option<Vec<u8>>
     }
 }
 
-/// The CMR and speech frame types of one payload, for the mode guard. SID and
-/// no-data frames are not speech modes and are left out.
-pub fn speech_modes(payload: &[u8], kind: AmrKind, octet_aligned: bool) -> Option<(u8, Vec<u8>)> {
-    let packet = parse(payload, kind, octet_aligned)?;
+/// The codec mode request of a payload: the first four bits in both packings.
+pub fn cmr_of(payload: &[u8]) -> Option<u8> {
+    payload.first().map(|b| b >> 4)
+}
+
+/// The speech frame types named by the table of contents, for the mode guard.
+/// Reads the ToC only (no audio bytes are touched or copied); SID and no-data
+/// frames are not speech modes and are left out.
+pub fn speech_modes(payload: &[u8], kind: AmrKind, octet_aligned: bool) -> Option<Vec<u8>> {
     let speech_max = match kind {
         AmrKind::Nb => 7,
         AmrKind::Wb => 8,
     };
-    let modes = packet
-        .frames
-        .iter()
-        .map(|f| f.frame_type)
-        .filter(|ft| *ft <= speech_max)
-        .collect();
-    Some((packet.cmr, modes))
+    let mut modes = Vec::new();
+    // At most 16 entries: a ToC longer than any real packet is garbage.
+    for k in 0..16usize {
+        let (follow, frame_type) = if octet_aligned {
+            let entry = *payload.get(1 + k)?;
+            (entry & 0x80 != 0, (entry >> 3) & 0x0f)
+        } else {
+            // 4 bits of CMR, then 6 bits per entry: F, FT(4), Q.
+            let bit = 4 + 6 * k;
+            let hi = *payload.get(bit / 8)? as u16;
+            let lo = payload.get(bit / 8 + 1).copied().unwrap_or(0) as u16;
+            let six = (((hi << 8) | lo) >> (10 - bit % 8)) & 0x3f;
+            (six & 0x20 != 0, ((six >> 1) & 0x0f) as u8)
+        };
+        if frame_type <= speech_max {
+            modes.push(frame_type);
+        }
+        if !follow {
+            return Some(modes);
+        }
+    }
+    None
 }
 
 /// Overwrite the CMR in place. It is the first four bits in both packings.
@@ -217,11 +237,11 @@ mod tests {
         for oa in [true, false] {
             let p = packet(AmrKind::Wb, &[2, 8, 9, 15], 15);
             let mut bytes = build(&p, AmrKind::Wb, oa).unwrap();
-            let (cmr, modes) = speech_modes(&bytes, AmrKind::Wb, oa).unwrap();
-            assert_eq!((cmr, modes), (15, vec![2, 8]));
+            assert_eq!(cmr_of(&bytes), Some(15));
+            assert_eq!(speech_modes(&bytes, AmrKind::Wb, oa), Some(vec![2, 8]));
             set_cmr(&mut bytes, 3);
-            let (cmr, modes) = speech_modes(&bytes, AmrKind::Wb, oa).unwrap();
-            assert_eq!((cmr, modes), (3, vec![2, 8]));
+            assert_eq!(cmr_of(&bytes), Some(3));
+            assert_eq!(speech_modes(&bytes, AmrKind::Wb, oa), Some(vec![2, 8]));
         }
     }
 

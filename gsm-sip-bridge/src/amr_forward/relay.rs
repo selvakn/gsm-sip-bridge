@@ -11,7 +11,7 @@
 //! `ims::agent::veth::relay_rtp` rather than copying it: the RTCP hooks and the
 //! SSRC tracker are the same ones.
 
-use super::repack::{repack, set_cmr, speech_modes};
+use super::repack::{cmr_of, repack, set_cmr, speech_modes};
 use crate::ims::amr_rtp::AmrKind;
 use crate::ims::rtcp::RelayRtcpRole;
 use crate::ims::rtp::{parse_packet, SsrcTracker, RTP_HEADER_LEN};
@@ -140,8 +140,13 @@ impl ModeGuard {
 #[derive(Default)]
 struct GuardStats {
     cmr_clamped: AtomicU64,
-    out_of_set: AtomicU64,
+    /// Speech frames seen from the client.
     frames_seen: AtomicU64,
+    /// Of those, frames outside the carrier's set.
+    out_of_set: AtomicU64,
+    /// Speech frames discarded with their packet (`relax_drop`): every speech
+    /// frame of a packet that held an out-of-set one.
+    dropped: AtomicU64,
 }
 
 /// Everything [`ForwardSession::start`] needs.
@@ -184,6 +189,7 @@ pub struct ForwardSession {
     sent_to_a: Arc<AtomicU64>,
     sent_to_b: Arc<AtomicU64>,
     leg_b: Arc<LegIo>,
+    guard_stats: Option<Arc<GuardStats>>,
     detached: bool,
 }
 
@@ -203,6 +209,7 @@ impl ForwardSession {
         let sent_to_a = Arc::new(AtomicU64::new(0));
         let sent_to_b = Arc::new(AtomicU64::new(0));
         let guard = p.mode_guard.map(|g| (g, Arc::new(GuardStats::default())));
+        let guard_stats = guard.as_ref().map(|(_, s)| s.clone());
 
         let pump_ab = Pump {
             kind,
@@ -256,6 +263,7 @@ impl ForwardSession {
             sent_to_a,
             sent_to_b,
             leg_b: b,
+            guard_stats,
             detached: false,
         })
     }
@@ -309,6 +317,18 @@ impl ForwardSession {
         )
     }
 
+    /// `(frames seen from the client, outside the carrier's set, dropped)`;
+    /// `None` without a [`ModeGuard`].
+    pub fn guard_counts(&self) -> Option<(u64, u64, u64)> {
+        self.guard_stats.as_ref().map(|s| {
+            (
+                s.frames_seen.load(Ordering::Relaxed),
+                s.out_of_set.load(Ordering::Relaxed),
+                s.dropped.load(Ordering::Relaxed),
+            )
+        })
+    }
+
     /// Stop the pumps and release both sockets. Same as dropping.
     pub fn stop(self) {}
 }
@@ -355,31 +375,35 @@ impl Pump {
             return true;
         }
         let start = pkt.payload.as_ptr() as usize - buf.as_ptr() as usize;
-        let Some((cmr, modes)) = speech_modes(pkt.payload, self.kind, self.src.oa()) else {
-            return true;
-        };
         if self.direction == "a->b" {
-            if !guard.allows(cmr) {
+            if cmr_of(pkt.payload).is_some_and(|cmr| !guard.allows(cmr)) {
                 set_cmr(&mut buf[start..], guard.highest());
                 crate::ims::media_stats::bump(&stats.cmr_clamped);
             }
             return true;
         }
-        for mode in modes {
-            crate::ims::media_stats::bump(&stats.frames_seen);
-            if !guard.allows(mode) {
-                if stats.out_of_set.fetch_add(1, Ordering::Relaxed) == 0 {
-                    tracing::warn!(
-                        mode,
-                        allowed = guard.modes,
-                        drop = guard.drop,
-                        "client sent a speech mode outside the carrier's mode-set"
-                    );
-                }
-                if guard.drop {
-                    return false;
-                }
-            }
+        let Some(modes) = speech_modes(pkt.payload, self.kind, self.src.oa()) else {
+            return true;
+        };
+        let bad = modes.iter().filter(|m| !guard.allows(**m)).count() as u64;
+        stats
+            .frames_seen
+            .fetch_add(modes.len() as u64, Ordering::Relaxed);
+        if bad == 0 {
+            return true;
+        }
+        if stats.out_of_set.fetch_add(bad, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                allowed = guard.modes,
+                drop = guard.drop,
+                "client sent a speech mode outside the carrier's mode-set"
+            );
+        }
+        if guard.drop {
+            stats
+                .dropped
+                .fetch_add(modes.len() as u64, Ordering::Relaxed);
+            return false;
         }
         true
     }
@@ -395,7 +419,7 @@ impl Pump {
                     cmr_clamped = clamped,
                     frames_seen = stats.frames_seen.load(Ordering::Relaxed),
                     out_of_set = out,
-                    dropped = if guard.drop { out } else { 0 },
+                    dropped = stats.dropped.load(Ordering::Relaxed),
                     "mode-set guard summary"
                 );
             }
@@ -689,6 +713,51 @@ mod tests {
         // The first thing to arrive is the in-set frame, then the SID.
         assert_eq!(&recv(&r.carrier)[12..], &ok[..]);
         assert_eq!(&recv(&r.carrier)[12..], &sid[..]);
+    }
+
+    /// An octet-aligned packet of several 12.65k / 23.85k frames: CMR, ToC, data.
+    fn oa_multi(frame_types: &[u8]) -> Vec<u8> {
+        let last = frame_types.len() - 1;
+        let mut p = vec![15 << 4];
+        for (i, ft) in frame_types.iter().enumerate() {
+            p.push((u8::from(i != last) << 7) | (ft << 3) | (1 << 2));
+        }
+        for ft in frame_types {
+            let bytes = if *ft == 8 { 60 } else { 32 };
+            p.extend(std::iter::repeat_n(0x55, bytes));
+        }
+        p
+    }
+
+    #[test]
+    fn mode_guard_counts_every_speech_frame_of_a_multi_frame_packet() {
+        for (drop, want_dropped) in [(false, 0u64), (true, 3)] {
+            let r = rig_guarded(
+                true,
+                true,
+                Some(ModeGuard {
+                    modes: LOW_MODES,
+                    drop,
+                }),
+            );
+            // Two out-of-set frames and one in-set frame in one packet.
+            let p = oa_multi(&[8, 2, 8]);
+            r.client
+                .send_to(&build_packet(1, 0, 8, PT_B, &p), r.b_addr)
+                .unwrap();
+            if drop {
+                // Dropped as a whole; nothing reaches the carrier. Wait for it.
+                let mut buf = [0u8; 2048];
+                assert!(r.carrier.recv(&mut buf).is_err());
+            } else {
+                assert_eq!(&recv(&r.carrier)[12..], &p[..]);
+            }
+            assert_eq!(
+                r.session.guard_counts(),
+                Some((3, 2, want_dropped)),
+                "drop={drop}"
+            );
+        }
     }
 
     #[test]
