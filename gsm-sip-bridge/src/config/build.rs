@@ -889,6 +889,8 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         idle_keepalive: raw.idle_keepalive,
         supervisor_pcscf_probe: raw.supervisor_pcscf_probe,
         amr_passthrough: raw.amr_passthrough,
+        amr_mode_set: raw.amr_mode_set,
+        amr_client_rtp_latch: raw.amr_client_rtp_latch,
         dpd_delay_sec: dpd_delay_sec(raw.dpd_delay_sec)?,
         underlay_guard: raw.underlay_guard,
         keepalive_interval_sec: in_range(

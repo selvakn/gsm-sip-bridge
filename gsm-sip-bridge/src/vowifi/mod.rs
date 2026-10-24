@@ -2188,6 +2188,11 @@ impl forward::ClientLeg for PjsipLegs<'_> {
             .register_forward(self.pbx.call_id(), rtp_port, codec, clock_rate);
     }
 
+    fn register_offer_check(&self, check: pjsua_safe::OfferCheck) {
+        self.endpoint
+            .register_offer_check(self.pbx.call_id(), check);
+    }
+
     fn clear_forward(&self) {
         self.endpoint.clear_forward(self.pbx.call_id());
     }
@@ -2229,7 +2234,7 @@ fn decide_media_path(
     let (Ok(local), Ok(peer)) = (control.local_addr(), control.peer_addr()) else {
         return forward::Decision::transcoded(crate::amr_forward::Reason::ReinviteFailed);
     };
-    forward::decide(
+    let decision = forward::decide(
         forward::Inputs {
             call_id,
             enabled: config.vowifi.amr_passthrough,
@@ -2242,7 +2247,11 @@ fn decide_media_path(
             reinvite_timeout: forward::REINVITE_TIMEOUT,
         },
         legs,
-    )
+    );
+    if let Some(forwarded) = &decision.forwarded {
+        forwarded.set_source_latch(config.vowifi.amr_client_rtp_latch);
+    }
+    decision
 }
 
 /// Places both legs — the PBX-side call (reusing the same destination-URI

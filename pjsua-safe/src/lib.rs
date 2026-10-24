@@ -14,4 +14,4 @@ pub use endpoint::{
     ensure_pjsip_thread, CodecInfo, Disconnect, Endpoint, EndpointConfig, TransportType,
 };
 pub use error::PjsipError;
-pub use passthrough::ClientMedia;
+pub use passthrough::{ClientMedia, OfferCheck, OfferedAudio, OfferedCodec};

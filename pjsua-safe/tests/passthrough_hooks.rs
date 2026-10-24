@@ -14,7 +14,8 @@
 //!   (sent 0 / received 0);
 //! - the veth leg registered quiet sends nothing;
 //! - hold/resume re-creates the stream and it comes back paused;
-//! - a re-INVITE that drops the forwarded codec is answered 488;
+//! - a re-INVITE that drops the forwarded codec is answered 488, and so is one
+//!   the application's offer check rejects while keeping the codec;
 //! - clearing the entry and re-INVITEing restores PJSIP's own transport;
 //! - nothing is left behind after hangup (registry, sockets).
 //!
@@ -141,6 +142,9 @@ fn peer_entry() {
                     ("restore-pcmu", Some(_)) => {
                         only_codec(&ep, "PCMU");
                         println!("PEER|restored");
+                    }
+                    ("reinvite-same", Some(id)) => {
+                        println!("PEER|reinvite -> {:?}", ep.reinvite_plain(id).is_ok());
                     }
                     ("reinvite-g722", Some(id)) => {
                         only_codec(&ep, "G722");
@@ -387,6 +391,42 @@ fn the_client_leg_can_be_upgraded_onto_a_forwarder_and_back() {
         passthrough::is_registered(yid),
         "hold/resume keeps the entry"
     );
+
+    step!("rejected by the offer check");
+    // --- an offer that keeps the codec but fails the application's check ---
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<passthrough::OfferedAudio>>> =
+        std::sync::Arc::default();
+    let seen_by_check = seen.clone();
+    ep.register_offer_check(
+        yid,
+        std::sync::Arc::new(move |audio| {
+            seen_by_check.lock().unwrap().push(audio.clone());
+            Err("test refuses".into())
+        }),
+    );
+    let generation = ep.media_generation(yid);
+    y.send("reinvite-same");
+    y.expect("reinvite -> true", 10);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        ep.media_generation(yid),
+        generation,
+        "an offer the check rejects must not touch the media"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "the check saw the offer");
+        assert!(
+            seen[0]
+                .codecs
+                .iter()
+                .any(|c| c.encoding_name.eq_ignore_ascii_case("PCMU") && c.clock_rate == 8000),
+            "{:?}",
+            seen[0]
+        );
+    }
+    y.send("state");
+    assert_eq!(y.expect("state", 5), "state Confirmed");
 
     step!("incompatible");
     // --- an incompatible re-INVITE is declined; the call carries on -------

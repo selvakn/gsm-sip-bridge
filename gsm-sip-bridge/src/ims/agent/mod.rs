@@ -387,6 +387,7 @@ fn run_inner(
         sms_report_pcscf_route: config.sms_report_pcscf_route,
         respect_caller_privacy: config.respect_caller_privacy,
         amr_passthrough: config.amr_passthrough,
+        amr_mode_set: config.amr_mode_set,
         // Already this line's value: discovery applied any `[[vowifi.line]]`
         // override to the per-line config.
         reg_rejected_cooldown: Duration::from_secs(config.reg_rejected_cooldown_sec),
@@ -745,6 +746,8 @@ pub(crate) struct InboundParams<'a> {
     /// See `config::VowifiConfig::amr_passthrough`. Both transports read the
     /// `[vowifi]` copy: it is one deployment-wide setting (FR-015).
     pub amr_passthrough: bool,
+    /// See `config::VowifiConfig::amr_mode_set`.
+    pub amr_mode_set: crate::amr_forward::ModeSetPolicy,
     /// This line's resolved `reg_rejected_cooldown_sec` (specs/089) — each
     /// caller resolves its own section and per-line override.
     pub reg_rejected_cooldown: Duration,
@@ -819,6 +822,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         sms_report_pcscf_route,
         respect_caller_privacy,
         amr_passthrough,
+        amr_mode_set,
         reg_rejected_cooldown,
         answer_preference,
         veth_sip_port,
@@ -1003,6 +1007,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             originating_headers: app_config.vowifi.originating_headers,
             respect_caller_privacy,
             amr_passthrough,
+            amr_mode_set,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
@@ -1909,6 +1914,7 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::amr_passthrough`; consumed by
     /// [`inbound::handle_invite`].
     amr_passthrough: bool,
+    amr_mode_set: crate::amr_forward::ModeSetPolicy,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
     /// Publishes which phase the loop is in, so the watchdog can tell a line
@@ -1934,6 +1940,7 @@ impl DispatchParams<'_> {
             access_network_info: &self.reg_cfg.access_network_info,
             respect_caller_privacy: self.respect_caller_privacy,
             amr_passthrough: self.amr_passthrough,
+            amr_mode_set: self.amr_mode_set,
         }
     }
 

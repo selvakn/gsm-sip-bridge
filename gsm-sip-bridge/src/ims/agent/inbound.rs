@@ -93,6 +93,7 @@ pub(super) struct InviteContext<'a> {
     pub(super) respect_caller_privacy: bool,
     /// See `config::VowifiConfig::amr_passthrough`.
     pub(super) amr_passthrough: bool,
+    pub(super) amr_mode_set: crate::amr_forward::ModeSetPolicy,
 }
 
 /// The capability headers on a `200 OK` that answers an inbound INVITE.
@@ -386,6 +387,7 @@ pub(super) fn handle_invite(
     // below, with a placeholder port.
     let carrier_amr = carrier_amr_for(
         ctx.amr_passthrough,
+        ctx.amr_mode_set,
         session.local_addr.ip(),
         &offer,
         ctx.wideband,
@@ -641,6 +643,9 @@ pub(super) fn handle_invite(
                     a_rx: meter.carrier_rx_counter(),
                     b_rx: meter.pbx_rx_counter(),
                     stop: stop.clone(),
+                    mode_guard: carrier
+                        .mode_guard()
+                        .map(|(modes, drop)| crate::amr_forward::relay::ModeGuard { modes, drop }),
                 })
                 .map_err(|e| BridgeError::Ims(format!("AMR forwarder start failed: {e}")))?;
                 // Ends with the call's stop flag, like every other relay. The
@@ -1206,6 +1211,7 @@ fn decline_response(invite: &SipRequest, to_tag: &str, reason: &str) -> String {
 /// selection the real answer makes later, with a placeholder port.
 fn carrier_amr_for(
     enabled: bool,
+    policy: crate::amr_forward::ModeSetPolicy,
     local_ip: IpAddr,
     offer: &sdp::SdpOffer,
     wideband: bool,
@@ -1225,7 +1231,9 @@ fn carrier_amr_for(
         None,
     )
     .ok()?;
-    offer.amr_leg_params(&chosen)
+    offer
+        .amr_leg_params(&chosen)
+        .map(|p| p.with_mode_set_policy(policy))
 }
 
 /// Agent B's offer to forward the call's AMR frames instead of transcoding
@@ -2035,6 +2043,7 @@ mod tests {
     fn carrier_for(enabled: bool, body: &str) -> Option<AmrLegParams> {
         carrier_amr_for(
             enabled,
+            crate::amr_forward::ModeSetPolicy::Strict,
             "192.0.2.1".parse().unwrap(),
             &sdp::parse_offer(body).unwrap(),
             true,

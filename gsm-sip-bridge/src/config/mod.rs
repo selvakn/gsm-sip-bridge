@@ -1049,6 +1049,21 @@ pub struct VowifiConfig {
     /// qualify is transcoded exactly as before. Per deployment; takes effect
     /// when the container is recreated.
     pub amr_passthrough: bool,
+    /// What to do when the carrier's AMR `mode-set` is narrower than what the
+    /// client answered (Jio always offers `0,1,2,3`): `strict` (default)
+    /// transcodes; `relax` forwards and counts client frames outside the set;
+    /// `relax_drop` forwards and drops them. Either relaxed value also clamps
+    /// the codec mode request sent to the client into the set. Only read when
+    /// `amr_passthrough` is on.
+    pub amr_mode_set: crate::amr_forward::ModeSetPolicy,
+    /// Follow a forwarded call's client when its RTP comes from an address
+    /// other than the one in its SDP (a client behind NAT), instead of
+    /// dropping it. The first well-formed packet of the negotiated payload
+    /// type wins, and only until a packet has been heard from the advertised
+    /// address. Off by default: the strict source check is what keeps another
+    /// host on the network from injecting audio or digits into the carrier
+    /// call. Only read when `amr_passthrough` is on.
+    pub amr_client_rtp_latch: bool,
     /// Idle-tunnel keepalive interval (seconds) — a TCP connect to the
     /// P-CSCF's SIP port, since operators commonly filter ICMP over the
     /// tunnel (confirmed on Vodafone India). Only applies when
@@ -1222,6 +1237,8 @@ impl Default for VowifiConfig {
             idle_keepalive: false,
             supervisor_pcscf_probe: false,
             amr_passthrough: false,
+            amr_mode_set: crate::amr_forward::ModeSetPolicy::Strict,
+            amr_client_rtp_latch: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: DEFAULT_DPD_DELAY_SEC,
             underlay_guard: true,
@@ -2462,6 +2479,37 @@ password = "pass"
             "{MINIMAL_TOML}\n[vowifi]\namr_passthrough = true\n"
         ));
         assert!(cfg.vowifi.amr_passthrough);
+    }
+
+    #[test]
+    fn vowifi_amr_mode_set_defaults_to_strict_and_parses_the_relaxed_values() {
+        use crate::amr_forward::ModeSetPolicy;
+        let cfg = parse(MINIMAL_TOML);
+        assert_eq!(cfg.vowifi.amr_mode_set, ModeSetPolicy::Strict);
+        for (text, want) in [
+            ("relax", ModeSetPolicy::Relax),
+            ("relax_drop", ModeSetPolicy::RelaxDrop),
+        ] {
+            let cfg = parse(&format!(
+                "{MINIMAL_TOML}\n[vowifi]\namr_mode_set = \"{text}\"\n"
+            ));
+            assert_eq!(cfg.vowifi.amr_mode_set, want);
+        }
+    }
+
+    #[test]
+    fn vowifi_amr_client_rtp_latch_is_off_by_default_and_a_boolean() {
+        assert!(!parse(MINIMAL_TOML).vowifi.amr_client_rtp_latch);
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\namr_client_rtp_latch = true\n"
+        ));
+        assert!(cfg.vowifi.amr_client_rtp_latch);
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\namr_client_rtp_latch = \"yes\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("amr_client_rtp_latch"), "{err}");
     }
 
     #[test]

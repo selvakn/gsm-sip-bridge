@@ -66,3 +66,30 @@ Pi deployed with the arm64 image `amrpt-7b0dd7f` (built with `arm-build-200`, lo
 A 63.5 % reduction overall (70 % in Agent A, 58 % in Agent B, whose conference-bridge clock
 and SIP work remain). SC-004 asks for at least 70 % **on the Pi**: not measured (no forwarded
 call was possible on Jio). SC-005 (added delay) was not measured either.
+
+## Jio mode-set, `amr_mode_set = "relax"` (Jio line on the Pi, AMR-WB baresip on the Pi, call from a mobile)
+
+| Check | Result |
+|---|---|
+| Inbound from a mobile, `relax` | `path=forwarded flavour=amr-wb carrier_packing=octet-aligned client_packing=octet-aligned`; first forwarded Jio call. Verdict `both-ways` (`carrier_rx=2895`, `pbx_rx=3156`), 63 s, audio heard both ways by the caller |
+| CMR clamp | Jio sends CMR 15 on every packet; all 2812 were rewritten to 3. baresip ignored the request |
+| Client frames outside the set | `frames_seen=3157 out_of_set=3157`: baresip sends mode 8 (23.85 kbps) throughout. Jio accepted them (no drop, audio intact) |
+| DTMF carrier → client | digits pressed on the mobile arrived at baresip as RFC 4733 events with start and end |
+| With the client behind NAT (baresip on a laptop, its RTP arriving from another address) | forwarded, but every client packet dropped by the source check (`frames_seen=0`): the caller heard nothing. Open item: latch the source or leave strict |
+| `relax_drop` | not run live: with a client that always sends mode 8 it would drop all client audio |
+
+Two observations unrelated to forwarding: Jio switches RTP SSRC near the end of a call (also on the transcoded path), which makes `local_lost_packets` jump by one sequence gap; and with the old container in a 39 h restart loop Jio answered busy until the container was recreated.
+
+## Pi measurements on a forwarded Jio call (Raspberry Pi, `amr_mode_set = "relax"` vs `"strict"`)
+
+Same line, same AMR-WB baresip on the Pi, a call from a mobile; one call each. CPU is `harness/cpu.sh` over a 60 s window starting 15 s into the call (Agent A `vowifi-ims-agent` + Agent B `vowifi-sip-agent`; the snapshot shell is left out).
+
+| Check | Forwarded (`relax`) | Transcoded (`strict`, `reason=mode_set`) |
+|---|---|---|
+| CPU, 60 s | 2.51 cpu-s (Agent A 0.98, Agent B 1.53) = 4.2% of one core | 14.24 cpu-s (Agent A 6.11, Agent B 8.13) = 23.7% of one core |
+| **SC-004** (≥70% less) | **82.4% less: met** | |
+| Added delay at Agent B (**SC-005**), pcaps on the hop and the client side, same clock | median 0.11 ms carrier→client, 0.10 ms client→carrier (p95 0.18 ms, max 4.1 ms), matched by SSRC and sequence | **not obtained**: Agent B re-times and re-numbers packets, and a correlation of the decoded client audio against the hop audio did not lock (best corr 0.2, lag at the search edge) |
+
+SC-005 is therefore half-measured: forwarding adds about 0.1 ms; the transcoded figure it is compared against is not known. A tone or click injected into the carrier side would give a clean transcoded measurement.
+
+Soak on a forwarded Jio call (3 min 17 s, shorter than the 5 minutes planned): verdict `both-ways` (`carrier_rx=9405`, `pbx_rx=8806`), 0 packets lost; hold at 2:30 and resume 20 s later both worked; the mobile's digits reached baresip as RFC 4733 events (10 key presses, each with start and end), the first live carrier→client DTMF; guard summary `frames_seen=8807 out_of_set=8807` (baresip sends mode 8 throughout).

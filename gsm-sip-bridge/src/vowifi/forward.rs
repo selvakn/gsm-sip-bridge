@@ -21,7 +21,7 @@ use crate::amr_forward::relay::{ForwardParams, ForwardSession, Leg, Remote};
 use crate::amr_forward::{compatible, AmrLegParams, MediaPath, Reason, SdpLeg};
 use crate::ims::amr_rtp::AmrKind;
 use crate::vowifi::control::{write_msg, ControlMessage};
-use pjsua_safe::ClientMedia;
+use pjsua_safe::{ClientMedia, OfferCheck, OfferedAudio};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -42,6 +42,9 @@ pub(crate) trait ClientLeg {
     fn media(&self) -> Option<ClientMedia>;
     /// Carry the client's media on `rtp_port` from the next re-INVITE.
     fn register_forward(&self, rtp_port: u16, codec: &str, clock_rate: u32);
+    /// Judge the client's later re-INVITEs with `check`; an offer it rejects is
+    /// answered 488 and the call carries on as it was.
+    fn register_offer_check(&self, check: OfferCheck);
     /// Back to PJSIP's own transport from the next re-INVITE.
     fn clear_forward(&self);
     /// Increases each time the client leg's stream is created.
@@ -80,6 +83,55 @@ pub(crate) fn client_leg_params(media: &ClientMedia) -> Result<AmrLegParams, Rea
         dtmf_payload_type: media.tx_event_pt,
         ptime_ms: Some(ms),
         maxptime_ms: Some(ms),
+    })
+}
+
+/// Whether a client's re-INVITE offer can still be forwarded against the
+/// carrier leg: the same rule that admitted the call, applied to what the
+/// client now offers. `Ok` as soon as one offered payload of the call's codec
+/// qualifies; otherwise the reason the last one did not.
+pub(crate) fn offer_is_forwardable(
+    carrier: &AmrLegParams,
+    audio: &OfferedAudio,
+) -> Result<(), Reason> {
+    let rate = carrier.clock_rate();
+    let name = match carrier.flavour {
+        AmrKind::Wb => "AMR-WB",
+        AmrKind::Nb => "AMR",
+    };
+    // The event type PJSIP will pair with the codec is the one at its clock rate.
+    let dtmf_payload_type = audio
+        .codecs
+        .iter()
+        .find(|c| c.encoding_name.eq_ignore_ascii_case("telephone-event") && c.clock_rate == rate)
+        .map(|c| c.payload_type);
+    let mut verdict = Err(Reason::ClientNotAmr);
+    for codec in audio
+        .codecs
+        .iter()
+        .filter(|c| c.encoding_name.eq_ignore_ascii_case(name) && c.clock_rate == rate)
+    {
+        verdict = AmrLegParams::from_sdp(&SdpLeg {
+            flavour: carrier.flavour,
+            fmtp: &codec.fmtp,
+            payload_type: codec.payload_type,
+            dtmf_payload_type,
+            ptime_ms: audio.ptime_ms,
+            maxptime_ms: audio.maxptime_ms,
+        })
+        .and_then(|p| compatible(carrier, &p));
+        if verdict.is_ok() {
+            break;
+        }
+    }
+    verdict
+}
+
+/// The check registered on a forwarded call's client leg.
+pub(crate) fn offer_check_for(carrier: &AmrLegParams) -> OfferCheck {
+    let carrier = carrier.clone();
+    std::sync::Arc::new(move |audio| {
+        offer_is_forwardable(&carrier, audio).map_err(|reason| reason.to_string())
     })
 }
 
@@ -167,6 +219,11 @@ impl ForwardedCall {
         }
         self.session
             .set_direction(towards_carrier, media.send_to_client);
+    }
+
+    /// See `[vowifi].amr_client_rtp_latch`.
+    pub(crate) fn set_source_latch(&self, allow: bool) {
+        self.session.allow_source_latch(allow);
     }
 
     pub(crate) fn received(&self) -> (u64, u64) {
@@ -341,6 +398,7 @@ pub(crate) fn decide<W: Write>(inputs: Inputs<'_, W>, leg: &dyn ClientLeg) -> De
         a_rx: Arc::new(AtomicU64::new(0)),
         b_rx: Arc::new(AtomicU64::new(0)),
         stop: Arc::new(AtomicBool::new(false)),
+        mode_guard: None,
     }) {
         Ok(s) => s,
         Err(_) => {
@@ -367,6 +425,7 @@ pub(crate) fn decide<W: Write>(inputs: Inputs<'_, W>, leg: &dyn ClientLeg) -> De
     };
 
     leg.register_forward(client_port, &codec.0, codec.1);
+    leg.register_offer_check(offer_check_for(carrier));
     let before = leg.generation();
     let sent = leg.reinvite().is_ok();
     if !sent {
@@ -552,6 +611,8 @@ mod tests {
         reinvites: RefCell<u32>,
         calls: RefCell<Vec<String>>,
         forward_port: RefCell<Option<u16>>,
+        /// What `decide` registered to judge later client re-INVITEs.
+        offer_check: RefCell<Option<OfferCheck>>,
     }
 
     impl FakeLeg {
@@ -566,6 +627,7 @@ mod tests {
                 reinvites: RefCell::new(0),
                 calls: RefCell::new(Vec::new()),
                 forward_port: RefCell::new(None),
+                offer_check: RefCell::new(None),
             }
         }
 
@@ -584,6 +646,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("register_forward {codec}/{clock_rate}"));
+        }
+        fn register_offer_check(&self, check: OfferCheck) {
+            *self.offer_check.borrow_mut() = Some(check);
         }
         fn clear_forward(&self) {
             self.calls.borrow_mut().push("clear_forward".into());
@@ -1262,6 +1327,104 @@ mod tests {
         );
     }
 
+    fn offered(attrs: &[(&str, &str)]) -> OfferedAudio {
+        OfferedAudio::from_attributes(attrs.iter().copied())
+    }
+
+    #[test]
+    fn a_reoffer_is_judged_by_the_rule_that_admitted_the_call() {
+        let carrier = carrier_wb("octet-align=1");
+        let base = [
+            ("rtpmap", "96 AMR-WB/16000"),
+            ("rtpmap", "101 telephone-event/16000"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut v = base.to_vec();
+            v.extend_from_slice(extra);
+            offered(&v)
+        };
+        // Same codec, other payload type or packing: still forwardable (the
+        // relay follows those).
+        assert_eq!(offer_is_forwardable(&carrier, &with(&[])), Ok(()));
+        assert_eq!(
+            offer_is_forwardable(
+                &carrier,
+                &with(&[("fmtp", "96 octet-align=0"), ("ptime", "20")])
+            ),
+            Ok(())
+        );
+        // A restricted mode-set, CRC, redundancy and a longer ptime are not.
+        assert_eq!(
+            offer_is_forwardable(&carrier, &with(&[("fmtp", "96 mode-set=0,1")])),
+            Err(Reason::ModeSet)
+        );
+        assert_eq!(
+            offer_is_forwardable(&carrier, &with(&[("fmtp", "96 crc=1")])),
+            Err(Reason::Feature)
+        );
+        assert_eq!(
+            offer_is_forwardable(&carrier, &with(&[("fmtp", "96 max-red=220")])),
+            Err(Reason::Feature)
+        );
+        assert_eq!(
+            offer_is_forwardable(&carrier, &with(&[("ptime", "400")])),
+            Err(Reason::Ptime)
+        );
+        // Dropping telephone-event leaves the legs unmatched.
+        assert_eq!(
+            offer_is_forwardable(&carrier, &offered(&[("rtpmap", "96 AMR-WB/16000")])),
+            Err(Reason::Dtmf)
+        );
+        // Another flavour, or none.
+        assert_eq!(
+            offer_is_forwardable(&carrier, &offered(&[("rtpmap", "96 AMR/8000")])),
+            Err(Reason::ClientNotAmr)
+        );
+    }
+
+    #[test]
+    fn any_compatible_payload_in_the_offer_is_enough() {
+        let carrier = carrier_wb("octet-align=1");
+        let audio = offered(&[
+            ("rtpmap", "96 AMR-WB/16000"),
+            ("fmtp", "96 mode-set=0"),
+            ("rtpmap", "97 AMR-WB/16000"),
+            ("fmtp", "97 octet-align=1"),
+            ("rtpmap", "101 telephone-event/16000"),
+        ]);
+        assert_eq!(offer_is_forwardable(&carrier, &audio), Ok(()));
+    }
+
+    #[test]
+    fn an_upgraded_call_gets_an_offer_check_that_says_why() {
+        let a = agent_a_socket();
+        let leg = FakeLeg::new(wb_client("octet-align=1"));
+        let carrier = carrier_wb("octet-align=1");
+        let (d, _) = run(
+            true,
+            Some(&carrier),
+            &leg,
+            vec![ack(a.local_addr().unwrap().port())],
+        );
+        assert!(d.forwarded.is_some());
+        let check = leg
+            .offer_check
+            .borrow()
+            .clone()
+            .expect("a check was registered");
+        let ok = offered(&[
+            ("rtpmap", "96 AMR-WB/16000"),
+            ("rtpmap", "101 telephone-event/16000"),
+        ]);
+        assert!(check(&ok).is_ok());
+        let bad = offered(&[
+            ("rtpmap", "96 AMR-WB/16000"),
+            ("fmtp", "96 mode-set=0"),
+            ("rtpmap", "101 telephone-event/16000"),
+        ]);
+        assert_eq!(check(&bad), Err(Reason::ModeSet.to_string()));
+    }
+
     #[test]
     fn a_client_that_cannot_be_moved_back_breaks_the_call() {
         let a = agent_a_socket();
@@ -1273,6 +1436,9 @@ mod tests {
             }
             fn register_forward(&self, p: u16, c: &str, r: u32) {
                 self.0.register_forward(p, c, r)
+            }
+            fn register_offer_check(&self, check: OfferCheck) {
+                self.0.register_offer_check(check)
             }
             fn clear_forward(&self) {
                 self.0.clear_forward()

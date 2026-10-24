@@ -120,7 +120,7 @@ An operator turns forwarding on with one setting; it is off by default. They can
 - **FR-002**: Every call that does not meet FR-001 MUST take today's transcoding path, unchanged. No codec other than AMR-WB and AMR-NB is ever forwarded.
 - **FR-003**: Two AMR legs are **compatible** when all of these hold:
   - (a) both are the same flavour (both AMR-WB or both AMR-NB);
-  - (b) every bitrate mode each side may send is one the other side accepts, i.e. each sender's allowed mode set is within the receiver's (an unrestricted mode set accepts all modes);
+  - (b) every bitrate mode each side may send is one the other side accepts, i.e. each sender's allowed mode set is within the receiver's (an unrestricted mode set accepts all modes). With `[vowifi].amr_mode_set` set to `relax` or `relax_drop` the client-to-carrier half is waived: only the carrier's modes must be within the client's, the codec mode request towards the client is clamped into the carrier's set, and client frames outside it are counted (`relax`) or dropped (`relax_drop`);
   - (c) neither side requires an AMR feature the other refused (redundancy, CRC, robust sorting, interleaving), and none of these are in use;
   - (d) the number of frames per packet each side sends is acceptable to the receiving side.
 

@@ -11,7 +11,7 @@
 //! `ims::agent::veth::relay_rtp` rather than copying it: the RTCP hooks and the
 //! SSRC tracker are the same ones.
 
-use super::repack::repack;
+use super::repack::{cmr_of, repack, set_cmr, speech_modes};
 use crate::ims::amr_rtp::AmrKind;
 use crate::ims::rtcp::RelayRtcpRole;
 use crate::ims::rtp::{parse_packet, SsrcTracker, RTP_HEADER_LEN};
@@ -64,6 +64,13 @@ struct LegIo {
     payload_type: AtomicU8,
     dtmf: AtomicU16,
     octet_aligned: AtomicBool,
+    /// Whether a client behind NAT may be learned from its first packet
+    /// ([`ForwardSession::allow_source_latch`]). Off by default.
+    latch: AtomicBool,
+    /// The address a packet has been accepted from since `remote` last held
+    /// it; once it equals `remote`, the address is settled and no packet from
+    /// elsewhere can take over.
+    confirmed: Mutex<Option<SocketAddr>>,
 }
 
 impl LegIo {
@@ -74,6 +81,8 @@ impl LegIo {
             payload_type: AtomicU8::new(leg.payload_type),
             dtmf: AtomicU16::new(leg.dtmf_payload_type.map_or(NO_DTMF, u16::from)),
             octet_aligned: AtomicBool::new(leg.octet_aligned),
+            latch: AtomicBool::new(false),
+            confirmed: Mutex::new(None),
         }
     }
 
@@ -93,11 +102,36 @@ impl LegIo {
     /// only ever hears its peer; the client-facing socket is bound wide, so
     /// only the client's current address is accepted (anyone else on the
     /// network could otherwise inject audio or digits into the carrier call).
-    fn accepts_from(&self, from: SocketAddr) -> bool {
-        match &self.remote {
-            Remote::Connected => true,
-            Remote::Dynamic(cell) => *cell.lock().unwrap_or_else(|e| e.into_inner()) == Some(from),
+    ///
+    /// The one exception is opt-in ([`ForwardSession::allow_source_latch`]): a
+    /// client behind NAT sends from an address other than the one in its SDP.
+    /// Until a packet has been accepted from the advertised address, the first
+    /// packet that is well-formed RTP of a payload type this leg negotiated
+    /// re-points the leg at its sender. After that the address is settled
+    /// until the client renegotiates.
+    fn accepts_from(&self, from: SocketAddr, packet: &[u8]) -> bool {
+        let cell = match &self.remote {
+            Remote::Connected => return true,
+            Remote::Dynamic(cell) => cell,
+        };
+        let mut current = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let mut confirmed = self.confirmed.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == Some(from) {
+            *confirmed = Some(from);
+            return true;
         }
+        let may_latch = self.latch.load(Ordering::Relaxed)
+            && current.is_some()
+            && *confirmed != *current
+            && parse_packet(packet).is_some_and(|p| {
+                p.payload_type == self.pt() || Some(p.payload_type) == self.dtmf_pt()
+            });
+        if may_latch {
+            tracing::info!(advertised = ?*current, actual = %from, "client RTP arrives from an address other than its SDP's; following it (NAT)");
+            *current = Some(from);
+            *confirmed = Some(from);
+        }
+        may_latch
     }
 
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -113,6 +147,40 @@ impl LegIo {
             }
         }
     }
+}
+
+/// Polices the carrier's `mode-set` when the client did not echo it
+/// (`ModeSetPolicy::Relax*`). Used on the carrier-facing relay only: the
+/// codec mode requests towards the client are clamped into the set, and the
+/// client's speech frames outside it are counted and optionally dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct ModeGuard {
+    /// Bit `n` set = mode `n` is allowed on the carrier leg.
+    pub modes: u16,
+    pub drop: bool,
+}
+
+impl ModeGuard {
+    fn highest(self) -> u8 {
+        (15 - self.modes.leading_zeros()) as u8
+    }
+
+    fn allows(self, mode: u8) -> bool {
+        mode < 16 && self.modes & (1 << mode) != 0
+    }
+}
+
+/// Counters for [`ModeGuard`], shared by the two pumps and logged when they end.
+#[derive(Default)]
+struct GuardStats {
+    cmr_clamped: AtomicU64,
+    /// Speech frames seen from the client.
+    frames_seen: AtomicU64,
+    /// Of those, frames outside the carrier's set.
+    out_of_set: AtomicU64,
+    /// Speech frames discarded with their packet (`relax_drop`): every speech
+    /// frame of a packet that held an out-of-set one.
+    dropped: AtomicU64,
 }
 
 /// Everything [`ForwardSession::start`] needs.
@@ -133,6 +201,8 @@ pub struct ForwardParams {
     /// [`ForwardSession::detach`]es; others pass a fresh one and keep the
     /// session, whose `Drop` sets it.
     pub stop: Arc<AtomicBool>,
+    /// See [`ModeGuard`]; `None` for Agent B's relay and strict calls.
+    pub mode_guard: Option<ModeGuard>,
 }
 
 /// Whether packets may be sent *towards* each leg. A held or inactive leg is
@@ -153,6 +223,7 @@ pub struct ForwardSession {
     sent_to_a: Arc<AtomicU64>,
     sent_to_b: Arc<AtomicU64>,
     leg_b: Arc<LegIo>,
+    guard_stats: Option<Arc<GuardStats>>,
     detached: bool,
 }
 
@@ -171,6 +242,8 @@ impl ForwardSession {
         });
         let sent_to_a = Arc::new(AtomicU64::new(0));
         let sent_to_b = Arc::new(AtomicU64::new(0));
+        let guard = p.mode_guard.map(|g| (g, Arc::new(GuardStats::default())));
+        let guard_stats = guard.as_ref().map(|(_, s)| s.clone());
 
         let pump_ab = Pump {
             kind,
@@ -183,6 +256,7 @@ impl ForwardSession {
             sent: sent_to_b.clone(),
             rtcp: p.a_rtcp,
             direction: "a->b",
+            guard: guard.clone(),
         };
         let pump_ba = Pump {
             kind,
@@ -195,6 +269,7 @@ impl ForwardSession {
             sent: sent_to_a.clone(),
             rtcp: p.b_rtcp,
             direction: "b->a",
+            guard,
         };
         let first = std::thread::Builder::new()
             .name("amr-fwd-ab".into())
@@ -222,6 +297,7 @@ impl ForwardSession {
             sent_to_a,
             sent_to_b,
             leg_b: b,
+            guard_stats,
             detached: false,
         })
     }
@@ -259,6 +335,14 @@ impl ForwardSession {
             .store(octet_aligned, Ordering::Relaxed);
     }
 
+    /// Let the client leg (`b`) be learned from its first packet when that
+    /// does not come from the address its SDP advertised (a client behind
+    /// NAT). Without it only the advertised address is heard, so such a
+    /// client is dropped. See [`LegIo::accepts_from`].
+    pub fn allow_source_latch(&self, allow: bool) {
+        self.leg_b.latch.store(allow, Ordering::Relaxed);
+    }
+
     /// Packets received from `a`, from `b`.
     pub fn received(&self) -> (u64, u64) {
         (
@@ -273,6 +357,18 @@ impl ForwardSession {
             self.sent_to_a.load(Ordering::Relaxed),
             self.sent_to_b.load(Ordering::Relaxed),
         )
+    }
+
+    /// `(frames seen from the client, outside the carrier's set, dropped)`;
+    /// `None` without a [`ModeGuard`].
+    pub fn guard_counts(&self) -> Option<(u64, u64, u64)> {
+        self.guard_stats.as_ref().map(|s| {
+            (
+                s.frames_seen.load(Ordering::Relaxed),
+                s.out_of_set.load(Ordering::Relaxed),
+                s.dropped.load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// Stop the pumps and release both sockets. Same as dropping.
@@ -302,10 +398,82 @@ struct Pump {
     sent: Arc<AtomicU64>,
     rtcp: Option<RelayRtcpRole>,
     direction: &'static str,
+    guard: Option<(ModeGuard, Arc<GuardStats>)>,
 }
 
 impl Pump {
+    /// Apply the mode guard to a packet before it is translated. `a->b` is
+    /// the carrier's direction: its codec mode request is clamped into the
+    /// set. `b->a` is the client's: its speech frames outside the set are
+    /// counted and, if so configured, make the packet drop (`false`).
+    fn apply_guard(&self, buf: &mut [u8]) -> bool {
+        let Some((guard, stats)) = &self.guard else {
+            return true;
+        };
+        let Some(pkt) = parse_packet(buf) else {
+            return true;
+        };
+        if pkt.payload_type != self.src.pt() {
+            return true;
+        }
+        let start = pkt.payload.as_ptr() as usize - buf.as_ptr() as usize;
+        if self.direction == "a->b" {
+            if cmr_of(pkt.payload).is_some_and(|cmr| !guard.allows(cmr)) {
+                set_cmr(&mut buf[start..], guard.highest());
+                crate::ims::media_stats::bump(&stats.cmr_clamped);
+            }
+            return true;
+        }
+        let Some(modes) = speech_modes(pkt.payload, self.kind, self.src.oa()) else {
+            return true;
+        };
+        let bad = modes.iter().filter(|m| !guard.allows(**m)).count() as u64;
+        stats
+            .frames_seen
+            .fetch_add(modes.len() as u64, Ordering::Relaxed);
+        if bad == 0 {
+            return true;
+        }
+        if stats.out_of_set.fetch_add(bad, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                allowed = guard.modes,
+                drop = guard.drop,
+                "client sent a speech mode outside the carrier's mode-set"
+            );
+        }
+        if guard.drop {
+            stats
+                .dropped
+                .fetch_add(modes.len() as u64, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    fn log_guard_summary(&self) {
+        if let Some((guard, stats)) = &self.guard {
+            let out = stats.out_of_set.load(Ordering::Relaxed);
+            let clamped = stats.cmr_clamped.load(Ordering::Relaxed);
+            if self.direction == "b->a" || clamped > 0 {
+                tracing::info!(
+                    direction = self.direction,
+                    allowed = guard.modes,
+                    cmr_clamped = clamped,
+                    frames_seen = stats.frames_seen.load(Ordering::Relaxed),
+                    out_of_set = out,
+                    dropped = stats.dropped.load(Ordering::Relaxed),
+                    "mode-set guard summary"
+                );
+            }
+        }
+    }
+
     fn run(self) {
+        self.pump();
+        self.log_guard_summary();
+    }
+
+    fn pump(&self) {
         let mut buf = [0u8; 2048];
         let mut ssrc_tracker = SsrcTracker::new();
         let media_start = Instant::now();
@@ -313,7 +481,7 @@ impl Pump {
         while !self.stop.load(Ordering::Relaxed) {
             let n = match self.src.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
-                    if !self.src.accepts_from(from) {
+                    if !self.src.accepts_from(from, &buf[..n]) {
                         continue;
                     }
                     n
@@ -346,6 +514,9 @@ impl Pump {
             }
             crate::ims::rtcp::note_rtcp(&self.rtcp, &pkt, media_start.elapsed(), clock_rate);
             if !(self.open_if)(&self.gate) {
+                continue;
+            }
+            if !self.apply_guard(&mut buf[..n]) {
                 continue;
             }
             let Some(out) = self.translate(&mut buf[..n]) else {
@@ -415,6 +586,10 @@ mod tests {
     }
 
     fn rig(a_oa: bool, b_oa: bool) -> Rig {
+        rig_guarded(a_oa, b_oa, None)
+    }
+
+    fn rig_guarded(a_oa: bool, b_oa: bool, mode_guard: Option<ModeGuard>) -> Rig {
         let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let a_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -450,6 +625,7 @@ mod tests {
             a_rx: a_rx.clone(),
             b_rx: b_rx.clone(),
             stop: Arc::new(AtomicBool::new(false)),
+            mode_guard,
         })
         .unwrap();
         Rig {
@@ -468,6 +644,7 @@ mod tests {
     fn oa_payload(cmr: u8, ft: u8, seed: u8) -> Vec<u8> {
         let bits: usize = match ft {
             2 => 253,
+            8 => 477,
             9 => 40,
             15 => 0,
             _ => panic!("test frame type"),
@@ -524,6 +701,104 @@ mod tests {
             assert_eq!(&got[12..], &payload[..]);
             assert_eq!(got[1] & 0x7f, PT_A);
             assert_eq!(header_of(&got).2, header_of(&sent).2);
+        }
+    }
+
+    const LOW_MODES: u16 = 0b1111;
+
+    #[test]
+    fn mode_guard_clamps_the_carriers_cmr_and_counts_but_forwards_by_default() {
+        let r = rig_guarded(
+            true,
+            true,
+            Some(ModeGuard {
+                modes: LOW_MODES,
+                drop: false,
+            }),
+        );
+        // CMR 15 (no request) and 8 (outside the set) become 3; 1 is kept.
+        for (cmr, want) in [(15u8, 3u8), (8, 3), (1, 1)] {
+            let sent = build_packet(1, 0, 7, PT_A, &oa_payload(cmr, 2, 1));
+            r.carrier.send_to(&sent, r.a_addr).unwrap();
+            let got = recv(&r.client);
+            assert_eq!(got[12] >> 4, want, "cmr {cmr}");
+            assert_eq!(&got[13..], &oa_payload(cmr, 2, 1)[1..], "frame untouched");
+        }
+        // A mode 8 frame from the client still reaches the carrier.
+        let p = oa_payload(15, 8, 3);
+        r.client
+            .send_to(&build_packet(2, 0, 8, PT_B, &p), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &p[..]);
+    }
+
+    #[test]
+    fn mode_guard_drop_discards_only_out_of_set_speech_towards_the_carrier() {
+        let r = rig_guarded(
+            true,
+            true,
+            Some(ModeGuard {
+                modes: LOW_MODES,
+                drop: true,
+            }),
+        );
+        let (bad, ok, sid) = (
+            oa_payload(15, 8, 1),
+            oa_payload(15, 2, 2),
+            oa_payload(15, 9, 3),
+        );
+        for (seq, p) in [(1u16, &bad), (2, &ok), (3, &sid)] {
+            r.client
+                .send_to(&build_packet(seq, 0, 8, PT_B, p), r.b_addr)
+                .unwrap();
+        }
+        // The first thing to arrive is the in-set frame, then the SID.
+        assert_eq!(&recv(&r.carrier)[12..], &ok[..]);
+        assert_eq!(&recv(&r.carrier)[12..], &sid[..]);
+    }
+
+    /// An octet-aligned packet of several 12.65k / 23.85k frames: CMR, ToC, data.
+    fn oa_multi(frame_types: &[u8]) -> Vec<u8> {
+        let last = frame_types.len() - 1;
+        let mut p = vec![15 << 4];
+        for (i, ft) in frame_types.iter().enumerate() {
+            p.push((u8::from(i != last) << 7) | (ft << 3) | (1 << 2));
+        }
+        for ft in frame_types {
+            let bytes = if *ft == 8 { 60 } else { 32 };
+            p.extend(std::iter::repeat_n(0x55, bytes));
+        }
+        p
+    }
+
+    #[test]
+    fn mode_guard_counts_every_speech_frame_of_a_multi_frame_packet() {
+        for (drop, want_dropped) in [(false, 0u64), (true, 3)] {
+            let r = rig_guarded(
+                true,
+                true,
+                Some(ModeGuard {
+                    modes: LOW_MODES,
+                    drop,
+                }),
+            );
+            // Two out-of-set frames and one in-set frame in one packet.
+            let p = oa_multi(&[8, 2, 8]);
+            r.client
+                .send_to(&build_packet(1, 0, 8, PT_B, &p), r.b_addr)
+                .unwrap();
+            if drop {
+                // Dropped as a whole; nothing reaches the carrier. Wait for it.
+                let mut buf = [0u8; 2048];
+                assert!(r.carrier.recv(&mut buf).is_err());
+            } else {
+                assert_eq!(&recv(&r.carrier)[12..], &p[..]);
+            }
+            assert_eq!(
+                r.session.guard_counts(),
+                Some((3, 2, want_dropped)),
+                "drop={drop}"
+            );
         }
     }
 
@@ -647,6 +922,140 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         assert!(r.carrier.recv(&mut buf).is_ok());
+    }
+
+    /// A client whose RTP comes from a NAT's address, not the one in its SDP.
+    fn natted() -> UdpSocket {
+        let nat = UdpSocket::bind("127.0.0.1:0").unwrap();
+        nat.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        nat
+    }
+
+    #[test]
+    fn a_natted_client_is_dropped_unless_latching_is_allowed() {
+        let r = rig(true, true);
+        let nat = natted();
+        let payload = oa_payload(15, 2, 1);
+        nat.send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(r.carrier.recv(&mut buf).is_err());
+        r.carrier
+            .send_to(&build_packet(1, 0, 7, PT_A, &payload), r.a_addr)
+            .unwrap();
+        assert!(nat.recv(&mut buf).is_err(), "and is sent nothing either");
+    }
+
+    #[test]
+    fn with_latching_the_first_good_packet_from_a_natted_client_is_followed() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let nat = natted();
+        let payload = oa_payload(15, 2, 1);
+        nat.send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &payload[..]);
+        // Audio towards the client now goes to where it really is.
+        r.carrier
+            .send_to(&build_packet(1, 0, 7, PT_A, &payload), r.a_addr)
+            .unwrap();
+        assert_eq!(&recv(&nat)[12..], &payload[..]);
+        assert_eq!(
+            *r.client_addr_cell.lock().unwrap(),
+            Some(nat.local_addr().unwrap())
+        );
+        // The address it left is no longer heard.
+        let mut buf = [0u8; 256];
+        r.client
+            .send_to(&build_packet(2, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert!(r.carrier.recv(&mut buf).is_err());
+    }
+
+    #[test]
+    fn latching_only_follows_rtp_the_leg_negotiated() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let nat = natted();
+        let mut buf = [0u8; 256];
+        // Not RTP, a payload type nobody negotiated.
+        nat.send_to(b"hello", r.b_addr).unwrap();
+        nat.send_to(&build_packet(1, 0, 8, 33, &oa_payload(15, 2, 1)), r.b_addr)
+            .unwrap();
+        assert!(r.carrier.recv(&mut buf).is_err());
+        assert_eq!(
+            *r.client_addr_cell.lock().unwrap(),
+            Some(r.client.local_addr().unwrap()),
+            "neither moved the client"
+        );
+    }
+
+    #[test]
+    fn once_the_advertised_address_has_been_heard_nobody_can_take_over() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let payload = oa_payload(15, 2, 1);
+        r.client
+            .send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert!(!recv(&r.carrier).is_empty());
+        let stranger = natted();
+        stranger
+            .send_to(&build_packet(2, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(r.carrier.recv(&mut buf).is_err());
+        assert_eq!(
+            *r.client_addr_cell.lock().unwrap(),
+            Some(r.client.local_addr().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_renegotiated_address_can_be_latched_again() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let payload = oa_payload(15, 2, 1);
+        r.client
+            .send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert!(!recv(&r.carrier).is_empty());
+        // The client re-INVITEs with a new address; it is behind NAT again.
+        let advertised = UdpSocket::bind("127.0.0.1:0").unwrap();
+        *r.client_addr_cell.lock().unwrap() = Some(advertised.local_addr().unwrap());
+        let nat = natted();
+        nat.send_to(&build_packet(2, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &payload[..]);
+    }
+
+    /// The one-way-audio verdict reads these counters. A client whose uplink
+    /// is dead sends nothing, so the carrier-side count runs on alone and the
+    /// call reads `ReceiveOnly`, as on a transcoded call; a partial outage is
+    /// judged by the same call-wide ratio as there (specs/016 FR-016).
+    #[test]
+    fn a_forwarded_call_with_a_dead_client_uplink_reads_receive_only() {
+        use crate::ims::media_stats::{
+            verdict, DirectionVerdict, DEFAULT_ONE_WAY_THRESHOLD_PERCENT,
+        };
+        let r = rig(true, true);
+        let payload = oa_payload(15, 2, 1);
+        for seq in 0..50u16 {
+            r.carrier
+                .send_to(&build_packet(seq, 0, 7, PT_A, &payload), r.a_addr)
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.a_rx.load(Ordering::Relaxed) < 50 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (from_carrier, from_client) = r.session.received();
+        assert_eq!((from_carrier, from_client), (50, 0));
+        assert_eq!(
+            verdict(from_client, from_carrier, DEFAULT_ONE_WAY_THRESHOLD_PERCENT),
+            DirectionVerdict::ReceiveOnly
+        );
     }
 
     #[test]
@@ -796,6 +1205,7 @@ mod tests {
             a_rx: Arc::new(AtomicU64::new(0)),
             b_rx: Arc::new(AtomicU64::new(0)),
             stop: stop.clone(),
+            mode_guard: None,
         })
         .unwrap();
         session.detach(); // dropping the handle must not stop it
