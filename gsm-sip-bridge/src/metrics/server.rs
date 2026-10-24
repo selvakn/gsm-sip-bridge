@@ -4,6 +4,10 @@ use prometheus::TextEncoder;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+/// Where the SMS store lives, for the delivery gauges. Unset in processes
+/// that serve no SMS store (tests), which then skip the refresh.
+static SMS_DB_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// 3x `[metrics].agent_report_interval_seconds` (research.md §R5): one
 /// missed heartbeat of tolerance before an agent is declared down.
@@ -89,11 +93,47 @@ fn refresh_agent_liveness() {
     }
 }
 
+/// Sets the SMS delivery gauges from the store (specs/121-sms-alert-retry).
+/// A read failure leaves the previous values and logs; a scrape never fails
+/// because of it.
+async fn refresh_sms_delivery() {
+    let Some(path) = SMS_DB_PATH.get().cloned() else {
+        return;
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| e.to_string())?;
+        conn.busy_timeout(Duration::from_secs(2))
+            .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().timestamp();
+        crate::store::sms::summary(&conn, now).map_err(|e| e.to_string())
+    })
+    .await;
+    match read {
+        Ok(Ok(sum)) => {
+            super::SMS_UNDELIVERED
+                .with_label_values(&["pending"])
+                .set(sum.counts.pending as f64);
+            super::SMS_UNDELIVERED
+                .with_label_values(&["failed"])
+                .set(sum.counts.failed as f64);
+            super::SMS_ABANDONED.set(sum.counts.abandoned as f64);
+            super::SMS_OLDEST_UNDELIVERED_AGE_SECONDS.set(sum.oldest_undelivered_age_sec as f64);
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "could not read SMS delivery state for /metrics"),
+        Err(e) => tracing::warn!(error = %e, "SMS delivery state task failed"),
+    }
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     if let Some(start) = START_TIME.get() {
         super::UPTIME_SECONDS.set(start.elapsed().as_secs_f64());
     }
     refresh_agent_liveness();
+    refresh_sms_delivery().await;
 
     let encoder = TextEncoder::new();
     // Both registries, not just the default one.
@@ -129,7 +169,11 @@ async fn metrics_handler() -> impl IntoResponse {
 pub async fn serve(
     port: u16,
     agent_report_interval_seconds: u64,
+    sms_db_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = sms_db_path {
+        let _ = SMS_DB_PATH.set(path);
+    }
     AGENT_STALENESS_THRESHOLD
         .get_or_init(|| Duration::from_secs(3 * agent_report_interval_seconds));
 

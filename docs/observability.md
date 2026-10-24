@@ -24,6 +24,9 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_sms_received_total` | Counter | SMS messages received per module and **transport** |
 | `gsm_sip_bridge_sms_forwarded_total` | Counter | Discord forwarding outcomes per module, outcome, and **transport** |
 | `gsm_sip_bridge_sms_db_writes_total` | Counter | SMS database write outcomes |
+| `gsm_sip_bridge_sms_undelivered` | Gauge | SMS Discord notifications not yet delivered, by `state` (`pending`, `failed`); read from the store on each scrape |
+| `gsm_sip_bridge_sms_abandoned` | Gauge | Notifications given up on after `[sms].retry_max_age_sec` |
+| `gsm_sip_bridge_sms_oldest_undelivered_age_seconds` | Gauge | Age of the oldest undelivered notification; `0` when none. Suggested alert: `> 7200` |
 | `gsm_sip_bridge_store_writes_total` | Counter | All store writes by table and outcome |
 | `gsm_sip_bridge_store_queue_depth` | Gauge | Pending items for DB writer thread |
 | `gsm_sip_bridge_uptime_seconds` | Gauge | Process uptime in seconds |

@@ -15,6 +15,7 @@ pub mod daemon;
 pub mod discover;
 pub mod healthcheck;
 pub mod ims;
+pub mod sms_status;
 pub mod volte;
 pub mod vowifi;
 
@@ -72,6 +73,7 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
             crate::supervise::orchestrate::run(path)
         }
         Commands::Healthcheck => healthcheck::run(cli),
+        Commands::SmsStatus { json } => sms_status::run(cli, *json),
         Commands::PcscList => crate::modules::pcsc_list::run(),
         Commands::TcpProbe { host, port } => healthcheck::run_tcp_probe(host, *port),
     }

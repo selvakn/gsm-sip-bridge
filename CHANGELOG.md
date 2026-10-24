@@ -10,6 +10,17 @@ across releases.
 
 ### Added
 
+- **SMS Discord delivery retry and status** (`[sms].retry_enabled`, **on by
+  default**, #121). A text whose Discord post fails is kept and re-posted,
+  oldest first, after the next text arrives and every `retry_interval_sec`
+  (1 h), as a `[Late]` message with the original receive time; it is abandoned
+  after `retry_max_age_sec` (7 days). Leases in the store keep the daemon and
+  the VoWiFi agents from double-posting. New `sms-status [--json]` subcommand
+  and `gsm_sip_bridge_sms_undelivered`, `_abandoned` and
+  `_oldest_undelivered_age_seconds` gauges. The store migrates v4 → v5
+  automatically (one-way: an older binary refuses a v5 store). `failed` rows
+  from before the upgrade are never retried.
+
 - **AMR passthrough** (`[vowifi].amr_passthrough`, off by default, #111).
   Inbound calls whose carrier and phone legs both negotiated compatible
   AMR-WB (or both AMR-NB) carry the carrier's frames to the phone without

@@ -244,6 +244,16 @@ pub enum Commands {
     /// after specs/021 moved the rest into `supervise`.
     Healthcheck,
 
+    /// Reports SMS Discord-notification delivery state from the store at
+    /// `[sms].db_path`: counts per state, the age of the oldest undelivered
+    /// text, and the latest undelivered/abandoned rows (never message
+    /// bodies). Read-only; works with the daemon down (specs/121-sms-alert-retry).
+    SmsStatus {
+        /// Print one JSON object instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Lists every real (non-vpcd) PC/SC reader attached to the host, along
     /// with whatever card's IMSI and home MCC/MNC/carrier it holds
     /// (specs/023-omnikey-pcsc-vowifi) — read directly off the SIM, no

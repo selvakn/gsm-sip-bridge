@@ -59,9 +59,9 @@
 
 **Independent Test**: seed delivered/failed/abandoned rows; CLI and `/metrics` both show matching counts and oldest age.
 
-- [ ] T016 [P] [US2] Add the three gauges from `contracts/metrics.md` in `src/metrics/mod.rs` (register in the same registry as the other SMS metrics) and refresh them from `store::sms::summary` inside `metrics_handler` in `src/metrics/server.rs` using a short-lived read connection in `spawn_blocking`; on a read error log a warning and leave previous values.
-- [ ] T017 [P] [US2] Create `src/commands/sms_status.rs` and register `SmsStatus` (with `--json`) in `src/cli.rs` / `src/commands/mod.rs` per `contracts/cli.md`: read-only open of `[sms].db_path`, table output, never print bodies, exit non-zero only when the store can't be opened.
-- [ ] T018 [US2] Write `tests/test_sms_status_metrics.rs`: seed a store with a known mix, assert `summary` counts and oldest-age, assert the `/metrics` body contains the expected gauge lines (reuse the pattern in `tests/test_metrics_endpoint.rs`), and run the `sms-status` binary against the seeded file for both text and `--json` output (reuse `tests/test_cli.rs` helpers), including a check that no message body appears.
+- [X] T016 [P] [US2] Add the three gauges from `contracts/metrics.md` in `src/metrics/mod.rs` (register in the same registry as the other SMS metrics) and refresh them from `store::sms::summary` inside `metrics_handler` in `src/metrics/server.rs` using a short-lived read connection in `spawn_blocking`; on a read error log a warning and leave previous values.
+- [X] T017 [P] [US2] Create `src/commands/sms_status.rs` and register `SmsStatus` (with `--json`) in `src/cli.rs` / `src/commands/mod.rs` per `contracts/cli.md`: read-only open of `[sms].db_path`, table output, never print bodies, exit non-zero only when the store can't be opened.
+- [X] T018 [US2] Write `tests/test_sms_status_metrics.rs`: seed a store with a known mix, assert `summary` counts and oldest-age, assert the `/metrics` body contains the expected gauge lines (reuse the pattern in `tests/test_metrics_endpoint.rs`), and run the `sms-status` binary against the seeded file for both text and `--json` output (reuse `tests/test_cli.rs` helpers), including a check that no message body appears.
 
 **Checkpoint**: US1 + US2 work together; an external monitor can alert on stuck texts (SC-004).
 
@@ -95,10 +95,10 @@
 
 ## Phase 7: Polish & cross-cutting
 
-- [ ] T023 [P] Update `docs/observability.md` (new gauges, suggested alert rule), `docs/operations.md` ("Discord forwarding failing" section: use `sms-status`, explain retry/abandon, replace the raw `sqlite` hint), and `docs/configuration.md` (already touched in T009 — add the behavioural paragraph on retry and the 7-day default).
-- [ ] T024 [P] Add a `CHANGELOG.md` entry: retry is **on by default**, pre-v5 failed rows are not retried, schema auto-migrates v4→v5 (and note the one-way migration for downgrade). Draft the RELEASE_NOTES line with only the feature name bolded, per the release-notes memory.
+- [X] T023 [P] Update `docs/observability.md` (new gauges, suggested alert rule), `docs/operations.md` ("Discord forwarding failing" section: use `sms-status`, explain retry/abandon, replace the raw `sqlite` hint), and `docs/configuration.md` (already touched in T009 — add the behavioural paragraph on retry and the 7-day default).
+- [X] T024 [P] Add a `CHANGELOG.md` entry: retry is **on by default**, pre-v5 failed rows are not retried, schema auto-migrates v4→v5 (and note the one-way migration for downgrade). Draft the RELEASE_NOTES line with only the feature name bolded, per the release-notes memory.
 - [ ] T025 Run through `quickstart.md` manually in the local docker test dir (`test/`, pinned GHCR tag, own config/volume): dead webhook → `failed`; restore → `[Late]` message arrives; restart mid-failure → no duplicate. Record the result in `specs/121-sms-alert-retry/quickstart.md`.
-- [ ] T026 Final gate: `make format && make lint && make test`; confirm `git grep -n '+91[0-9]\{10\}'` shows only placeholder numbers in new files; confirm SC-006 by running the pre-existing SMS tests unmodified apart from the signature changes in T004/T007.
+- [X] T026 Final gate: `make format && make lint && make test`; confirm `git grep -n '+91[0-9]\{10\}'` shows only placeholder numbers in new files; confirm SC-006 by running the pre-existing SMS tests unmodified apart from the signature changes in T004/T007.
 
 ---
 
