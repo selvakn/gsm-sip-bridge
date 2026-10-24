@@ -64,6 +64,13 @@ struct LegIo {
     payload_type: AtomicU8,
     dtmf: AtomicU16,
     octet_aligned: AtomicBool,
+    /// Whether a client behind NAT may be learned from its first packet
+    /// ([`ForwardSession::allow_source_latch`]). Off by default.
+    latch: AtomicBool,
+    /// The address a packet has been accepted from since `remote` last held
+    /// it; once it equals `remote`, the address is settled and no packet from
+    /// elsewhere can take over.
+    confirmed: Mutex<Option<SocketAddr>>,
 }
 
 impl LegIo {
@@ -74,6 +81,8 @@ impl LegIo {
             payload_type: AtomicU8::new(leg.payload_type),
             dtmf: AtomicU16::new(leg.dtmf_payload_type.map_or(NO_DTMF, u16::from)),
             octet_aligned: AtomicBool::new(leg.octet_aligned),
+            latch: AtomicBool::new(false),
+            confirmed: Mutex::new(None),
         }
     }
 
@@ -93,11 +102,36 @@ impl LegIo {
     /// only ever hears its peer; the client-facing socket is bound wide, so
     /// only the client's current address is accepted (anyone else on the
     /// network could otherwise inject audio or digits into the carrier call).
-    fn accepts_from(&self, from: SocketAddr) -> bool {
-        match &self.remote {
-            Remote::Connected => true,
-            Remote::Dynamic(cell) => *cell.lock().unwrap_or_else(|e| e.into_inner()) == Some(from),
+    ///
+    /// The one exception is opt-in ([`ForwardSession::allow_source_latch`]): a
+    /// client behind NAT sends from an address other than the one in its SDP.
+    /// Until a packet has been accepted from the advertised address, the first
+    /// packet that is well-formed RTP of a payload type this leg negotiated
+    /// re-points the leg at its sender. After that the address is settled
+    /// until the client renegotiates.
+    fn accepts_from(&self, from: SocketAddr, packet: &[u8]) -> bool {
+        let cell = match &self.remote {
+            Remote::Connected => return true,
+            Remote::Dynamic(cell) => cell,
+        };
+        let mut current = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let mut confirmed = self.confirmed.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == Some(from) {
+            *confirmed = Some(from);
+            return true;
         }
+        let may_latch = self.latch.load(Ordering::Relaxed)
+            && current.is_some()
+            && *confirmed != *current
+            && parse_packet(packet).is_some_and(|p| {
+                p.payload_type == self.pt() || Some(p.payload_type) == self.dtmf_pt()
+            });
+        if may_latch {
+            tracing::info!(advertised = ?*current, actual = %from, "client RTP arrives from an address other than its SDP's; following it (NAT)");
+            *current = Some(from);
+            *confirmed = Some(from);
+        }
+        may_latch
     }
 
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -301,6 +335,14 @@ impl ForwardSession {
             .store(octet_aligned, Ordering::Relaxed);
     }
 
+    /// Let the client leg (`b`) be learned from its first packet when that
+    /// does not come from the address its SDP advertised (a client behind
+    /// NAT). Without it only the advertised address is heard, so such a
+    /// client is dropped. See [`LegIo::accepts_from`].
+    pub fn allow_source_latch(&self, allow: bool) {
+        self.leg_b.latch.store(allow, Ordering::Relaxed);
+    }
+
     /// Packets received from `a`, from `b`.
     pub fn received(&self) -> (u64, u64) {
         (
@@ -439,7 +481,7 @@ impl Pump {
         while !self.stop.load(Ordering::Relaxed) {
             let n = match self.src.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
-                    if !self.src.accepts_from(from) {
+                    if !self.src.accepts_from(from, &buf[..n]) {
                         continue;
                     }
                     n
@@ -880,6 +922,140 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         assert!(r.carrier.recv(&mut buf).is_ok());
+    }
+
+    /// A client whose RTP comes from a NAT's address, not the one in its SDP.
+    fn natted() -> UdpSocket {
+        let nat = UdpSocket::bind("127.0.0.1:0").unwrap();
+        nat.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        nat
+    }
+
+    #[test]
+    fn a_natted_client_is_dropped_unless_latching_is_allowed() {
+        let r = rig(true, true);
+        let nat = natted();
+        let payload = oa_payload(15, 2, 1);
+        nat.send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(r.carrier.recv(&mut buf).is_err());
+        r.carrier
+            .send_to(&build_packet(1, 0, 7, PT_A, &payload), r.a_addr)
+            .unwrap();
+        assert!(nat.recv(&mut buf).is_err(), "and is sent nothing either");
+    }
+
+    #[test]
+    fn with_latching_the_first_good_packet_from_a_natted_client_is_followed() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let nat = natted();
+        let payload = oa_payload(15, 2, 1);
+        nat.send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &payload[..]);
+        // Audio towards the client now goes to where it really is.
+        r.carrier
+            .send_to(&build_packet(1, 0, 7, PT_A, &payload), r.a_addr)
+            .unwrap();
+        assert_eq!(&recv(&nat)[12..], &payload[..]);
+        assert_eq!(
+            *r.client_addr_cell.lock().unwrap(),
+            Some(nat.local_addr().unwrap())
+        );
+        // The address it left is no longer heard.
+        let mut buf = [0u8; 256];
+        r.client
+            .send_to(&build_packet(2, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert!(r.carrier.recv(&mut buf).is_err());
+    }
+
+    #[test]
+    fn latching_only_follows_rtp_the_leg_negotiated() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let nat = natted();
+        let mut buf = [0u8; 256];
+        // Not RTP, a payload type nobody negotiated.
+        nat.send_to(b"hello", r.b_addr).unwrap();
+        nat.send_to(&build_packet(1, 0, 8, 33, &oa_payload(15, 2, 1)), r.b_addr)
+            .unwrap();
+        assert!(r.carrier.recv(&mut buf).is_err());
+        assert_eq!(
+            *r.client_addr_cell.lock().unwrap(),
+            Some(r.client.local_addr().unwrap()),
+            "neither moved the client"
+        );
+    }
+
+    #[test]
+    fn once_the_advertised_address_has_been_heard_nobody_can_take_over() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let payload = oa_payload(15, 2, 1);
+        r.client
+            .send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert!(!recv(&r.carrier).is_empty());
+        let stranger = natted();
+        stranger
+            .send_to(&build_packet(2, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(r.carrier.recv(&mut buf).is_err());
+        assert_eq!(
+            *r.client_addr_cell.lock().unwrap(),
+            Some(r.client.local_addr().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_renegotiated_address_can_be_latched_again() {
+        let r = rig(true, true);
+        r.session.allow_source_latch(true);
+        let payload = oa_payload(15, 2, 1);
+        r.client
+            .send_to(&build_packet(1, 0, 8, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert!(!recv(&r.carrier).is_empty());
+        // The client re-INVITEs with a new address; it is behind NAT again.
+        let advertised = UdpSocket::bind("127.0.0.1:0").unwrap();
+        *r.client_addr_cell.lock().unwrap() = Some(advertised.local_addr().unwrap());
+        let nat = natted();
+        nat.send_to(&build_packet(2, 0, 9, PT_B, &payload), r.b_addr)
+            .unwrap();
+        assert_eq!(&recv(&r.carrier)[12..], &payload[..]);
+    }
+
+    /// The one-way-audio verdict reads these counters. A client whose uplink
+    /// is dead sends nothing, so the carrier-side count runs on alone and the
+    /// call reads `ReceiveOnly`, as on a transcoded call; a partial outage is
+    /// judged by the same call-wide ratio as there (specs/016 FR-016).
+    #[test]
+    fn a_forwarded_call_with_a_dead_client_uplink_reads_receive_only() {
+        use crate::ims::media_stats::{
+            verdict, DirectionVerdict, DEFAULT_ONE_WAY_THRESHOLD_PERCENT,
+        };
+        let r = rig(true, true);
+        let payload = oa_payload(15, 2, 1);
+        for seq in 0..50u16 {
+            r.carrier
+                .send_to(&build_packet(seq, 0, 7, PT_A, &payload), r.a_addr)
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.a_rx.load(Ordering::Relaxed) < 50 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (from_carrier, from_client) = r.session.received();
+        assert_eq!((from_carrier, from_client), (50, 0));
+        assert_eq!(
+            verdict(from_client, from_carrier, DEFAULT_ONE_WAY_THRESHOLD_PERCENT),
+            DirectionVerdict::ReceiveOnly
+        );
     }
 
     #[test]

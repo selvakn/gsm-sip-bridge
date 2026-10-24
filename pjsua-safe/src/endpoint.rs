@@ -722,6 +722,13 @@ impl Endpoint {
         crate::passthrough::register_forward(call_id, rtp_port, codec, clock_rate);
     }
 
+    /// Judge this call's later client re-INVITEs with `check` on top of the
+    /// codec test: an offer it rejects is answered 488 and the call is left as
+    /// it is. Forgotten by [`Endpoint::clear_forward`] and when the call ends.
+    pub fn register_offer_check(&self, call_id: i32, check: crate::passthrough::OfferCheck) {
+        crate::passthrough::register_offer_check(call_id, check);
+    }
+
     /// Keep this call's PJSIP stream paused, so it carries no media at all
     /// (the veth leg of a forwarded call). Returns whether a live stream was
     /// paused immediately.

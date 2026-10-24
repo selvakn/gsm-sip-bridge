@@ -58,6 +58,8 @@ Agent B keeps its veth PJSIP call exactly as today (real transport, it stays the
 
 **Relaxed mode-set (#111, `[vowifi].amr_mode_set`)**: Jio always offers `mode-set=0,1,2,3` and clients answer unrestricted, so the strict rule never forwards on Jio. `relax`/`relax_drop` (policy carried on the carrier `AmrLegParams`) waive only the `client ⊆ carrier` half. Agent A's relay then rewrites the CMR in carrier→client packets into the carrier's set (a CMR of 15 or outside the set becomes the highest allowed mode) and inspects the client's speech frame types towards the carrier. Propagating the mode-set into the client re-INVITE was not built: it needs endpoint-global `dec_fmtp` juggling and a client that echoes it.
 
+**Not built: propagating the carrier's mode-set into the client re-INVITE (#111, decided 2026-10-24).** The alternative to `relax` was to make the phone state the carrier's restriction itself, by setting `dec_fmtp` on PJSIP's AMR codec before the upgrade re-INVITE and restoring it afterwards, under a lock because the codec's fmtp is endpoint-global. It only helps a client that echoes the restriction in its answer, and baresip's `amr` module does not appear to; any other client falls back to transcoding. `amr_mode_set = "relax"` already forwards Jio calls, so this was left out. Revisit only if a client that honours the restriction turns up and `relax`'s out-of-set frames cause trouble at a carrier.
+
 This is a pure function and the heart of the test suite (FR-020a).
 
 ## R5. Packing conversion without decoding

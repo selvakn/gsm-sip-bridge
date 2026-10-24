@@ -1050,6 +1050,14 @@ pub struct VowifiConfig {
     /// the codec mode request sent to the client into the set. Only read when
     /// `amr_passthrough` is on.
     pub amr_mode_set: crate::amr_forward::ModeSetPolicy,
+    /// Follow a forwarded call's client when its RTP comes from an address
+    /// other than the one in its SDP (a client behind NAT), instead of
+    /// dropping it. The first well-formed packet of the negotiated payload
+    /// type wins, and only until a packet has been heard from the advertised
+    /// address. Off by default: the strict source check is what keeps another
+    /// host on the network from injecting audio or digits into the carrier
+    /// call. Only read when `amr_passthrough` is on.
+    pub amr_client_rtp_latch: bool,
     /// Idle-tunnel keepalive interval (seconds) — a TCP connect to the
     /// P-CSCF's SIP port, since operators commonly filter ICMP over the
     /// tunnel (confirmed on Vodafone India). Only applies when
@@ -1224,6 +1232,7 @@ impl Default for VowifiConfig {
             supervisor_pcscf_probe: false,
             amr_passthrough: false,
             amr_mode_set: crate::amr_forward::ModeSetPolicy::Strict,
+            amr_client_rtp_latch: false,
             keepalive_interval_sec: 30,
             dpd_delay_sec: DEFAULT_DPD_DELAY_SEC,
             underlay_guard: true,
@@ -2480,6 +2489,21 @@ password = "pass"
             ));
             assert_eq!(cfg.vowifi.amr_mode_set, want);
         }
+    }
+
+    #[test]
+    fn vowifi_amr_client_rtp_latch_is_off_by_default_and_a_boolean() {
+        assert!(!parse(MINIMAL_TOML).vowifi.amr_client_rtp_latch);
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\namr_client_rtp_latch = true\n"
+        ));
+        assert!(cfg.vowifi.amr_client_rtp_latch);
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\namr_client_rtp_latch = \"yes\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("amr_client_rtp_latch"), "{err}");
     }
 
     #[test]

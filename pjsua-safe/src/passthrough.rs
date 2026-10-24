@@ -16,7 +16,7 @@
 use crate::error::PjsipError;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 /// What the registry knows about a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +34,11 @@ enum Entry {
 }
 
 static REGISTRY: LazyLock<Mutex<HashMap<i32, Entry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The application's judgement of a client re-INVITE, per forwarded call. It
+/// sees the audio section of the offer and says whether the forwarder could
+/// still carry it; `Err` carries the reason, and the offer is answered 488.
+static OFFER_CHECKS: LazyLock<Mutex<HashMap<i32, OfferCheck>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// How many times each call's stream has been (re)created. A caller waiting
 /// for a re-INVITE to take effect watches this advance.
@@ -70,9 +75,17 @@ pub fn register_quiet(call_id: i32) -> bool {
     pause_current_stream(call_id)
 }
 
+/// Have every later client re-INVITE on this call judged by `check` as well as
+/// by the codec name: an offer it rejects is answered 488 and the call carries
+/// on as it was. Cleared with the call's entry.
+pub fn register_offer_check(call_id: i32, check: OfferCheck) {
+    lock(&OFFER_CHECKS).insert(call_id, check);
+}
+
 /// Forget a call's entry: its next media transport is PJSIP's own again.
 pub fn clear(call_id: i32) {
     lock(&REGISTRY).remove(&call_id);
+    lock(&OFFER_CHECKS).remove(&call_id);
 }
 
 /// Whether the call has an entry (a forwarded or quiet call).
@@ -90,6 +103,7 @@ pub fn media_generation(call_id: i32) -> u64 {
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
 pub(crate) fn on_call_disconnected(call_id: i32) {
     lock(&REGISTRY).remove(&call_id);
+    lock(&OFFER_CHECKS).remove(&call_id);
     lock(&GENERATION).remove(&call_id);
     lock(&STREAMS).remove(&call_id);
 }
@@ -99,22 +113,101 @@ fn bump_generation(call_id: i32) {
     *lock(&GENERATION).entry(call_id).or_insert(0) += 1;
 }
 
-/// Whether a re-INVITE offer's audio section still offers the call's codec,
-/// judged from its `a=rtpmap` values (`"96 AMR-WB/16000"`).
+/// Whether a re-INVITE offer can still be carried: it must offer the call's
+/// codec, and the application's check (if any) must accept it.
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
-fn offer_keeps_codec<'a>(
-    rtpmaps: impl IntoIterator<Item = &'a str>,
+fn judge_offer(
+    audio: &OfferedAudio,
     name: &str,
     rate: u32,
-) -> bool {
-    rtpmaps.into_iter().any(|value| {
-        let Some((_pt, enc)) = value.trim().split_once(' ') else {
-            return false;
-        };
-        let mut parts = enc.trim().split('/');
-        parts.next().is_some_and(|n| n.eq_ignore_ascii_case(name))
-            && parts.next().and_then(|r| r.parse::<u32>().ok()) == Some(rate)
-    })
+    check: Option<&OfferCheck>,
+) -> Result<(), String> {
+    let keeps = audio
+        .codecs
+        .iter()
+        .any(|c| c.encoding_name.eq_ignore_ascii_case(name) && c.clock_rate == rate);
+    if !keeps {
+        return Err("the offer no longer includes the forwarded codec".into());
+    }
+    match check {
+        Some(check) => check(audio),
+        None => Ok(()),
+    }
+}
+
+/// One payload type offered in a re-INVITE's audio section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedCodec {
+    pub payload_type: u8,
+    /// `AMR-WB`, `telephone-event`, ...
+    pub encoding_name: String,
+    pub clock_rate: u32,
+    /// The payload type's `a=fmtp` parameters, verbatim (may be empty).
+    pub fmtp: String,
+}
+
+/// The audio section of a client's re-INVITE offer, as far as the forwarder
+/// cares.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OfferedAudio {
+    pub codecs: Vec<OfferedCodec>,
+    pub ptime_ms: Option<u32>,
+    pub maxptime_ms: Option<u32>,
+}
+
+/// See [`register_offer_check`].
+pub type OfferCheck = Arc<dyn Fn(&OfferedAudio) -> Result<(), String> + Send + Sync>;
+
+impl OfferedAudio {
+    /// Read the audio section from its attribute lines: `(name, value)` for
+    /// each `a=` (`("rtpmap", "96 AMR-WB/16000")`, `("fmtp", "96 octet-align=1")`,
+    /// `("ptime", "20")`). A line that does not parse is ignored.
+    pub fn from_attributes<'a>(attrs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut out = Self::default();
+        let mut fmtps: Vec<(u8, String)> = Vec::new();
+        for (name, value) in attrs {
+            let value = value.trim();
+            match name {
+                "rtpmap" => {
+                    let Some((pt, enc)) = value.split_once(' ') else {
+                        continue;
+                    };
+                    let Ok(payload_type) = pt.trim().parse::<u8>() else {
+                        continue;
+                    };
+                    let mut parts = enc.trim().split('/');
+                    let (Some(encoding_name), Some(rate)) = (parts.next(), parts.next()) else {
+                        continue;
+                    };
+                    let Ok(clock_rate) = rate.parse::<u32>() else {
+                        continue;
+                    };
+                    out.codecs.push(OfferedCodec {
+                        payload_type,
+                        encoding_name: encoding_name.to_string(),
+                        clock_rate,
+                        fmtp: String::new(),
+                    });
+                }
+                "fmtp" => {
+                    if let Some((pt, params)) = value.split_once(' ') {
+                        if let Ok(pt) = pt.trim().parse::<u8>() {
+                            fmtps.push((pt, params.trim().to_string()));
+                        }
+                    }
+                }
+                "ptime" => out.ptime_ms = value.parse().ok(),
+                "maxptime" => out.maxptime_ms = value.parse().ok(),
+                _ => {}
+            }
+        }
+        for (pt, params) in fmtps {
+            if let Some(c) = out.codecs.iter_mut().find(|c| c.payload_type == pt) {
+                c.fmtp = params;
+            }
+        }
+        out
+    }
 }
 
 /// What PJSIP negotiated on the client leg, read from the live stream.
@@ -339,7 +432,7 @@ mod linked {
         if offer.is_null() || code.is_null() {
             return;
         }
-        let mut rtpmaps = Vec::new();
+        let mut attrs = Vec::new();
         let sdp = &*offer;
         for i in 0..sdp.media_count as usize {
             let media = &*sdp.media[i];
@@ -348,17 +441,22 @@ mod linked {
             }
             for a in 0..media.attr_count as usize {
                 let attr = &*media.attr[a];
-                if pj_str_to_string(&attr.name) == "rtpmap" {
-                    rtpmaps.push(pj_str_to_string(&attr.value));
-                }
+                attrs.push((pj_str_to_string(&attr.name), pj_str_to_string(&attr.value)));
             }
             break;
         }
-        if offer_keeps_codec(rtpmaps.iter().map(String::as_str), &codec, rate) {
-            return;
+        let audio = OfferedAudio::from_attributes(
+            attrs.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+        );
+        // The check is cloned out so no lock is held while it runs.
+        let check = lock(&OFFER_CHECKS).get(&call_id).cloned();
+        match judge_offer(&audio, &codec, rate, check.as_ref()) {
+            Ok(()) => {}
+            Err(why) => {
+                tracing::info!(call_id, codec = %codec, why = %why, "re-INVITE cannot be carried by the forwarder; answering 488 and keeping the call as it is");
+                *code = 488;
+            }
         }
-        tracing::info!(call_id, codec = %codec, "re-INVITE would drop the forwarded codec; answering 488 and keeping the call as it is");
-        *code = 488;
     }
 
     /// Pause the call's current stream, if one is live.
@@ -626,16 +724,73 @@ mod tests {
         on_call_disconnected(9005);
     }
 
+    fn offer(attrs: &[(&str, &str)]) -> OfferedAudio {
+        OfferedAudio::from_attributes(attrs.iter().copied())
+    }
+
     #[test]
     fn the_reoffer_must_still_offer_the_forwarded_codec() {
-        let amr_wb = ["96 AMR-WB/16000", "101 telephone-event/8000"];
-        assert!(offer_keeps_codec(amr_wb, "AMR-WB", 16000));
-        assert!(offer_keeps_codec(["97 amr-wb/16000/1"], "AMR-WB", 16000));
+        let ok = |attrs: &[(&str, &str)]| judge_offer(&offer(attrs), "AMR-WB", 16000, None);
+        assert!(ok(&[
+            ("rtpmap", "96 AMR-WB/16000"),
+            ("rtpmap", "101 telephone-event/8000")
+        ])
+        .is_ok());
+        assert!(ok(&[("rtpmap", "97 amr-wb/16000/1")]).is_ok());
         // A different codec, a different rate, or a same-prefixed name.
-        assert!(!offer_keeps_codec(["9 G722/8000"], "AMR-WB", 16000));
-        assert!(!offer_keeps_codec(["96 AMR/8000"], "AMR-WB", 16000));
-        assert!(!offer_keeps_codec(["96 AMR-WB/8000"], "AMR-WB", 16000));
-        assert!(!offer_keeps_codec(["96 AMR-WB+/16000"], "AMR-WB", 16000));
-        assert!(!offer_keeps_codec(Vec::<&str>::new(), "AMR-WB", 16000));
+        assert!(ok(&[("rtpmap", "9 G722/8000")]).is_err());
+        assert!(ok(&[("rtpmap", "96 AMR/8000")]).is_err());
+        assert!(ok(&[("rtpmap", "96 AMR-WB/8000")]).is_err());
+        assert!(ok(&[("rtpmap", "96 AMR-WB+/16000")]).is_err());
+        assert!(ok(&[]).is_err());
+    }
+
+    #[test]
+    fn the_offer_is_read_with_its_fmtp_and_ptime() {
+        let audio = offer(&[
+            ("rtpmap", "96 AMR-WB/16000"),
+            ("fmtp", "96 octet-align=1; mode-set=0,1,2"),
+            ("rtpmap", "101 telephone-event/16000"),
+            ("fmtp", "101 0-15"),
+            ("ptime", "40"),
+            ("maxptime", "80"),
+            ("sendrecv", ""),
+            ("rtpmap", "garbage"),
+            ("fmtp", "250 ignored"),
+        ]);
+        assert_eq!(audio.codecs.len(), 2);
+        assert_eq!(audio.codecs[0].payload_type, 96);
+        assert_eq!(audio.codecs[0].fmtp, "octet-align=1; mode-set=0,1,2");
+        assert_eq!(audio.codecs[1].encoding_name, "telephone-event");
+        assert_eq!(audio.codecs[1].clock_rate, 16000);
+        assert_eq!((audio.ptime_ms, audio.maxptime_ms), (Some(40), Some(80)));
+    }
+
+    #[test]
+    fn the_applications_check_can_reject_an_offer_that_keeps_the_codec() {
+        let audio = offer(&[("rtpmap", "96 AMR-WB/16000"), ("fmtp", "96 crc=1")]);
+        let refuse: OfferCheck = Arc::new(|a: &OfferedAudio| {
+            if a.codecs[0].fmtp.contains("crc=1") {
+                Err("crc".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            judge_offer(&audio, "AMR-WB", 16000, Some(&refuse)),
+            Err("crc".to_string())
+        );
+        assert!(judge_offer(&audio, "AMR-WB", 16000, None).is_ok());
+    }
+
+    #[test]
+    fn a_registered_check_is_forgotten_with_the_call() {
+        register_offer_check(9006, Arc::new(|_| Err("no".into())));
+        assert!(lock(&OFFER_CHECKS).contains_key(&9006));
+        clear(9006);
+        assert!(!lock(&OFFER_CHECKS).contains_key(&9006));
+        register_offer_check(9006, Arc::new(|_| Err("no".into())));
+        on_call_disconnected(9006);
+        assert!(!lock(&OFFER_CHECKS).contains_key(&9006));
     }
 }

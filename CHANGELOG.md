@@ -10,6 +10,19 @@ across releases.
 
 ### Added
 
+- **AMR passthrough: client re-INVITEs are judged by the forwarding rule** (#111).
+  A phone that renegotiates a forwarded call to parameters it can no longer be
+  forwarded under (restricted `mode-set`, CRC, redundancy, a longer packet
+  time, a telephone-event mismatch) now gets a 488 and the call carries on, as
+  already happened for a codec change. Previously the relay followed it or
+  stopped media.
+
+- **`[vowifi].amr_client_rtp_latch`** (default `false`, #111). Lets a forwarded
+  call follow a phone behind NAT whose RTP arrives from an address other than
+  its SDP's: the first well-formed packet of the negotiated payload type
+  re-points the call at its sender, only until a packet has been heard from the
+  advertised address. Off keeps the strict source check.
+
 - **`[vowifi].amr_mode_set`** (`strict` default, `relax`, `relax_drop`, #111).
   Relaxes the AMR passthrough rule that the phone's `mode-set` must equal the
   carrier's, which kept every Jio call transcoded. The relay clamps the codec
