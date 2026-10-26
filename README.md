@@ -267,7 +267,7 @@ See [docs/configuration.md](docs/configuration.md#webui) for every key.
 | **Getting started** | [Supported hardware & setup](docs/supported-hardware.md) · [Configuration reference](docs/configuration.md) · [Sample configs](sample_configs/README.md) |
 | **Running it** | [Operations runbook & troubleshooting](docs/operations.md#troubleshooting) · [Metrics & dashboards](docs/observability.md) |
 | **Going deeper** | [Architecture & call flows](docs/architecture.md) · [VoWiFi bridge design](docs/vowifi-bridge.md) · [PC/SC card-reader VoWiFi lines](docs/omnikey-pcsc-vowifi.md) · [Host-side VoLTE operations](docs/operations.md#host-side-ims-over-lte-volte) · [EC20 VoLTE setup (modem-internal, legacy)](docs/ec20-volte-setup.md) |
-| **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) · [Config migrations](docs/migrating-config-reorg.md) |
+| **Contributing / upgrading** | [Building from source](docs/development.md) · [Migrating from v4.1.x](docs/migrating-from-v4.1.x.md) |
 
 The runbook's [troubleshooting section](docs/operations.md#troubleshooting)
 covers missing `ttyUSB` devices, a missing audio device, SIP registration
