@@ -1156,6 +1156,23 @@ Messages are acknowledged **after** being recorded, never before, so an
 ill-timed crash costs a retransmission (which is de-duplicated) rather than a
 silently lost text.
 
+#### The LTE interface lives in the line's namespace
+
+Each line's LTE interface is moved into that line's namespace (`volte0`,
+`volte1`, ...) before its carrier agent starts, and the supervisor keeps it
+there. Three log lines say when it could not:
+
+| Log line | Meaning |
+|---|---|
+| `volte line N: FATAL: could not move interface X into netns Y: <reason>; skipping this line` | The kernel refused the move at startup (some drivers do not allow namespace moves). The line stays down until the container is recreated. |
+| `volte line N: interface X is no longer in netns Y (...); restarting the carrier agent` | The interface left the namespace while the line ran. A modem that re-enumerates on USB, or a link re-created by ModemManager/NetworkManager, comes back in the host namespace. The agent is stopped and the new interface is moved in before it restarts, within about 30 s. |
+| `volte line N: interface X is not present in the container or in netns Y; retrying in 15s` | The interface is gone everywhere, typically a modem mid-reset. The line restarts once it reappears. |
+
+Inside the namespace the agent itself reports `interface X is not in this
+line's namespace` when it finds its interface missing, instead of a PDN or
+route error. Check with `ip netns exec volte0 ip link` (the interface should
+be listed) and `ip link show <iface>` on the host (it should not exist there).
+
 ## AMR passthrough kill switch
 
 `[vowifi].amr_passthrough` (default `false`) forwards AMR between the carrier and an AMR-capable phone without transcoding it (inbound calls only; see `docs/vowifi-bridge.md`). To turn it off, set it to `false` (or remove it) and recreate the container: every call is then transcoded as before, and `vowifi-status` shows `media_path=transcoded:disabled` for calls whose phone leg is AMR. The change needs a recreate, not a restart. To see what a call did, read `media_path=` in `vowifi-status` recent calls or the `media path decided` line in the container log. A call that was not forwarded although AMR was on both sides says why (`mode_set`, `dtmf`, ...).

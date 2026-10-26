@@ -92,6 +92,14 @@ pub(crate) fn run(
     // `attach` records the displaced context (via `settings.restore_cid_path`)
     // *before* it rebinds, so the container's cleanup can restore it even if
     // this line is killed mid-attach.
+    if !line.settings.iface.is_empty() && !super::netcfg::iface_present(&line.settings.iface) {
+        tracing::error!(
+            card_id = %line.card_id,
+            "{}",
+            super::netcfg::iface_missing_reason(&line.settings.iface)
+        );
+        return;
+    }
     let plmn = {
         let Some(_guard) = modem_lock.lock() else {
             tracing::error!(

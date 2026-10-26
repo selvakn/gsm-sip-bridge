@@ -35,6 +35,10 @@ pub fn state_label(state: RegistrationState) -> &'static str {
 /// `attach` is idempotent, so this is a cheap no-op when the PDN is fine.
 /// Returns whether the attachment is usable — attached *and* routable.
 pub fn refresh_attachment(settings: &VolteSettings) -> Result<(), String> {
+    if !settings.iface.is_empty() && !super::netcfg::iface_present(&settings.iface) {
+        metrics::VOLTE_PDN_UP.set(0.0);
+        return Err(super::netcfg::iface_missing_reason(&settings.iface));
+    }
     match super::attach(settings) {
         Ok(report) if report.routed || report.iface.is_empty() => {
             metrics::VOLTE_PDN_UP.set(1.0);
@@ -72,6 +76,21 @@ mod tests {
             err.contains("could not re-establish the IMS PDN"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn a_missing_interface_is_blamed_on_the_namespace_before_touching_the_modem() {
+        // The modem path is bogus too: reaching `attach` would report the PDN
+        // instead, so this also pins the check order (#165).
+        let settings = VolteSettings {
+            modem_port: std::path::PathBuf::from("/nonexistent/tty"),
+            iface: "gsb-no-such-if0".to_string(),
+            ..VolteSettings::default()
+        };
+
+        let err = refresh_attachment(&settings).unwrap_err();
+
+        assert!(err.contains("not in this line's namespace"), "got: {err}");
     }
 
     #[test]

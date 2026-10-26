@@ -7,7 +7,7 @@
 //! specific path's live-validation is still outstanding.
 
 use super::epdg_iface;
-use super::runner::{ChildSpec, CommandRunner};
+use super::runner::{ChildSpec, CommandRunner, Signal};
 use super::shutdown::{StartedState, StartedVolteLine};
 use crate::config::AppConfig;
 use std::sync::{Arc, Mutex, RwLock};
@@ -285,20 +285,18 @@ pub fn start(
                 drop(guard);
                 break;
             }
-            if !ensure_volte_line_netns(runner.as_ref(), &netns, &line.iface) {
+            let line_netns = LineNetns {
+                netns: netns.clone(),
+                iface: line.iface.clone(),
+                veth_telephony_iface: veth_telephony_iface.clone(),
+                veth_carrier_iface: veth_carrier_iface.clone(),
+                veth_telephony_addr: veth_telephony_addr.clone(),
+                veth_carrier_addr: veth_carrier_addr.clone(),
+            };
+            if let Err(reason) = line_netns.ensure(runner.as_ref()) {
                 drop(guard);
-                eprintln!("[supervise] volte line {idx}: FATAL: interface {} not present in container; skipping this line", line.iface);
+                eprintln!("[supervise] volte line {idx}: FATAL: {reason}; skipping this line");
                 continue;
-            }
-            if !veth_carrier_addr.is_empty() {
-                ensure_volte_line_veth(
-                    runner.as_ref(),
-                    &veth_telephony_iface,
-                    &veth_carrier_iface,
-                    &netns,
-                    &veth_telephony_addr,
-                    &veth_carrier_addr,
-                );
             }
 
             started.lock().unwrap().started_netns.push(netns.clone());
@@ -356,6 +354,15 @@ pub fn start(
                     runner.sleep(Duration::from_secs(15));
                     continue;
                 }
+                // Re-applied before every (re)spawn, not just at startup: the
+                // interface may have been re-created in the host namespace
+                // (USB re-enumeration, modem reset) since the last agent ran.
+                if let Err(reason) = line_netns.ensure(runner.as_ref()) {
+                    drop(guard);
+                    eprintln!("[supervise] volte line {idx}: {reason}; retrying in 15s");
+                    runner.sleep(Duration::from_secs(15));
+                    continue;
+                }
                 match runner.spawn(ChildSpec::new([
                     "ip",
                     "netns",
@@ -387,8 +394,44 @@ pub fn start(
                         // to this exact handle (stored in
                         // `carrier_agent_handles` for that purpose) for the
                         // process's entire lifetime.
+                        //
+                        // While polling, also check the LTE interface is still
+                        // in the namespace: an agent whose interface vanished
+                        // never exits on its own (renewals just back off), so
+                        // stop it and let the respawn above move the new one in.
+                        let mut polls: u32 = 0;
+                        let mut signalled = false;
                         while runner.is_alive(&handle) {
                             runner.sleep(Duration::from_secs(1));
+                            polls = polls.wrapping_add(1);
+                            if !polls.is_multiple_of(IFACE_CHECK_POLLS) {
+                                continue;
+                            }
+                            let shutting = shutting_down.try_read().map(|g| *g).unwrap_or(true);
+                            if shutting
+                                || iface_in_netns(
+                                    runner.as_ref(),
+                                    &line_netns.netns,
+                                    &line_netns.iface,
+                                )
+                            {
+                                continue;
+                            }
+                            eprintln!(
+                                "[supervise] volte line {idx}: interface {} is no longer in netns {} \
+                                 (re-created in the host? USB re-enumeration or modem reset); \
+                                 restarting the carrier agent",
+                                line_netns.iface, line_netns.netns
+                            );
+                            runner.signal(
+                                &handle,
+                                if signalled {
+                                    Signal::Kill
+                                } else {
+                                    Signal::Term
+                                },
+                            );
+                            signalled = true;
                         }
                         println!("[supervise] volte line {idx}: volte-carrier-agent exited; restarting in 15s");
                     }
@@ -446,9 +489,63 @@ pub fn start(
     });
 }
 
+/// How often (in 1s liveness polls) the supervisor checks that a running
+/// carrier agent's LTE interface is still inside its namespace.
+const IFACE_CHECK_POLLS: u32 = 15;
+
+/// Everything a line's namespace needs before its carrier agent can run: the
+/// namespace, the LTE interface inside it, and (when the line has one) the
+/// veth pair to the telephony half. Owned so the per-line thread can re-apply
+/// it before every respawn: a modem that re-enumerates brings its netdev back
+/// in the host namespace, never in ours (#165).
+#[derive(Clone)]
+struct LineNetns {
+    netns: String,
+    iface: String,
+    veth_telephony_iface: String,
+    veth_carrier_iface: String,
+    veth_telephony_addr: String,
+    veth_carrier_addr: String,
+}
+
+impl LineNetns {
+    /// Idempotently puts the namespace, interface and veth in place. `Err`
+    /// says why the interface could not be put in place.
+    fn ensure(&self, runner: &dyn CommandRunner) -> Result<(), String> {
+        ensure_volte_line_netns(runner, &self.netns, &self.iface)?;
+        if !self.veth_carrier_addr.is_empty() {
+            ensure_volte_line_veth(
+                runner,
+                &self.veth_telephony_iface,
+                &self.veth_carrier_iface,
+                &self.netns,
+                &self.veth_telephony_addr,
+                &self.veth_carrier_addr,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Whether `iface` is inside `netns`. An empty `iface` (no LTE interface to
+/// keep there) is trivially in place.
+fn iface_in_netns(runner: &dyn CommandRunner, netns: &str, iface: &str) -> bool {
+    iface.is_empty()
+        || runner
+            .run_in_netns(netns, &["ip", "link", "show", iface])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
 /// Idempotently ensures line `netns`'s namespace exists and `iface` (if any)
-/// is inside it — 1:1 port of `ensure_volte_line_netns`.
-fn ensure_volte_line_netns(runner: &dyn CommandRunner, netns: &str, iface: &str) -> bool {
+/// is inside it. The move is verified, not assumed: a driver that refuses
+/// namespace moves would otherwise start an agent with no LTE link and no
+/// log saying why (#165).
+fn ensure_volte_line_netns(
+    runner: &dyn CommandRunner,
+    netns: &str,
+    iface: &str,
+) -> Result<(), String> {
     let netns_marker = format!("/var/run/netns/{netns}");
     let exists = runner
         .run(&["test", "-e", &netns_marker])
@@ -459,26 +556,40 @@ fn ensure_volte_line_netns(runner: &dyn CommandRunner, netns: &str, iface: &str)
     }
     let _ = runner.run_in_netns(netns, &["ip", "link", "set", "lo", "up"]);
 
-    if iface.is_empty() {
-        return true;
+    if iface_in_netns(runner, netns, iface) {
+        return Ok(()); // already in place — idempotent restart
     }
-
-    if runner
-        .run_in_netns(netns, &["ip", "link", "show", iface])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return true; // already in place — idempotent restart
-    }
-    if runner
+    if !runner
         .run(&["ip", "link", "show", iface])
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        let _ = runner.run(&["ip", "link", "set", iface, "netns", netns]);
-        return true;
+        return Err(format!(
+            "interface {iface} is not present in the container or in netns {netns}"
+        ));
     }
-    false // not found in either namespace
+    match runner.run(&["ip", "link", "set", iface, "netns", netns]) {
+        Ok(o) if !o.status.success() => {
+            return Err(format!(
+                "could not move interface {iface} into netns {netns}: {} (the driver may not \
+                 allow namespace moves)",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not move interface {iface} into netns {netns}: {e}"
+            ));
+        }
+        Ok(_) => {}
+    }
+    if iface_in_netns(runner, netns, iface) {
+        Ok(())
+    } else {
+        Err(format!(
+            "moved interface {iface} into netns {netns}, but it is not there afterwards"
+        ))
+    }
 }
 
 /// Idempotently creates line's veth pair — 1:1 port of `ensure_volte_line_veth`.
@@ -682,5 +793,137 @@ mod tests {
                 .map(String::from)
                 .collect()
         );
+    }
+
+    // --- the LTE interface inside the line's namespace (#165) ---
+
+    use crate::supervise::runner::MockCommandRunner;
+
+    const NS: &str = "volte0";
+    const IFACE: &str = "wwan0";
+    const SHOW_IN_NS: &str = "netns:volte0:ip link show wwan0";
+    const MOVE: &[&str] = &["ip", "link", "set", "wwan0", "netns", "volte0"];
+
+    fn failed(stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn succeeded() -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn moved(runner: &MockCommandRunner) -> bool {
+        let move_argv: Vec<String> = MOVE.iter().map(|s| s.to_string()).collect();
+        runner.run_calls.lock().unwrap().contains(&move_argv)
+    }
+
+    #[test]
+    fn an_interface_already_in_the_namespace_is_left_alone() {
+        let runner = MockCommandRunner::new();
+
+        assert_eq!(ensure_volte_line_netns(&runner, NS, IFACE), Ok(()));
+        assert!(!moved(&runner));
+    }
+
+    #[test]
+    fn an_interface_in_the_host_is_moved_and_the_move_verified() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(SHOW_IN_NS, failed("Device \"wwan0\" does not exist."));
+        runner.set_output_after_run(MOVE, SHOW_IN_NS, succeeded());
+
+        assert_eq!(ensure_volte_line_netns(&runner, NS, IFACE), Ok(()));
+        assert!(moved(&runner));
+    }
+
+    #[test]
+    fn a_refused_move_is_an_error_naming_the_kernel_reason() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(SHOW_IN_NS, failed(""));
+        runner.set_run_output(
+            &MOVE.join(" "),
+            failed("RTNETLINK answers: Invalid argument"),
+        );
+
+        let err = ensure_volte_line_netns(&runner, NS, IFACE).unwrap_err();
+
+        assert!(err.contains("could not move interface wwan0"), "got: {err}");
+        assert!(
+            err.contains("RTNETLINK answers: Invalid argument"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_move_that_reports_success_but_did_not_happen_is_an_error() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(SHOW_IN_NS, failed(""));
+
+        let err = ensure_volte_line_netns(&runner, NS, IFACE).unwrap_err();
+
+        assert!(err.contains("not there afterwards"), "got: {err}");
+    }
+
+    #[test]
+    fn an_interface_in_neither_namespace_is_reported_missing_without_a_move() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(SHOW_IN_NS, failed(""));
+        runner.set_run_output("ip link show wwan0", failed(""));
+
+        let err = ensure_volte_line_netns(&runner, NS, IFACE).unwrap_err();
+
+        assert!(err.contains("not present"), "got: {err}");
+        assert!(!moved(&runner));
+    }
+
+    #[test]
+    fn a_line_without_an_interface_has_nothing_to_check() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output("netns:volte0:ip link show ", failed(""));
+
+        assert_eq!(ensure_volte_line_netns(&runner, NS, ""), Ok(()));
+        assert!(iface_in_netns(&runner, NS, ""));
+    }
+
+    #[test]
+    fn the_watchdog_check_sees_an_interface_leave_the_namespace() {
+        let runner = MockCommandRunner::new();
+        assert!(iface_in_netns(&runner, NS, IFACE));
+
+        runner.set_run_output(SHOW_IN_NS, failed(""));
+
+        assert!(!iface_in_netns(&runner, NS, IFACE));
+    }
+
+    #[test]
+    fn a_line_whose_interface_cannot_be_placed_gets_no_veth() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(SHOW_IN_NS, failed(""));
+        runner.set_run_output("ip link show wwan0", failed(""));
+        let line = LineNetns {
+            netns: NS.to_string(),
+            iface: IFACE.to_string(),
+            veth_telephony_iface: "veth-volte-sip".to_string(),
+            veth_carrier_iface: "veth-volte-ims".to_string(),
+            veth_telephony_addr: "10.0.0.1".to_string(),
+            veth_carrier_addr: "10.0.0.2".to_string(),
+        };
+
+        assert!(line.ensure(&runner).is_err());
+        assert!(!runner
+            .run_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|argv| argv.iter().any(|a| a == "veth")));
     }
 }

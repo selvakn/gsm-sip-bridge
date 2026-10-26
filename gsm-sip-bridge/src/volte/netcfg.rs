@@ -300,6 +300,22 @@ pub fn wait_for_router(iface: &str, timeout: std::time::Duration) -> BridgeResul
     }
 }
 
+/// True when `iface` exists in this process's network namespace. `ip netns
+/// exec` remounts `/sys` for the namespace, so this sees the line's own view.
+pub fn iface_present(iface: &str) -> bool {
+    std::path::Path::new(&format!("/sys/class/net/{iface}")).exists()
+}
+
+/// Why a line cannot use its interface when [`iface_present`] says it is
+/// gone: named distinctly so the log points at the namespace, not the carrier.
+pub fn iface_missing_reason(iface: &str) -> String {
+    format!(
+        "interface {iface} is not in this line's namespace: it was not moved in, or was \
+         re-created in the host (USB re-enumeration or modem reset); the supervisor moves it \
+         back before the next restart"
+    )
+}
+
 /// True when the interface has physical-layer carrier.
 ///
 /// After `QNETDEVCTL` rebinds the modem's data path, the host interface takes
@@ -500,6 +516,12 @@ pub fn parse_ip_addr_show(out: &str) -> Vec<Ipv6Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iface_present_follows_sysfs() {
+        assert!(iface_present("lo"));
+        assert!(!iface_present("gsb-no-such-if0"));
+    }
 
     fn assigned() -> Ipv6Addr {
         "2402:8100:6ffe:8ae6:0:c:de2b:3801".parse().unwrap()

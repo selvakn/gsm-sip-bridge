@@ -1101,8 +1101,9 @@ mod mock {
         /// spawned sibling (e.g. vowifi-usim-bridge, spawned on its own
         /// thread) for handle-ID order.
         pub born_dead_substrings: Mutex<Vec<String>>,
-        /// See [`Self::set_netns_output_after`]: `(trigger key, seeded key,
-        /// output)`, applied when the trigger command runs.
+        /// See [`Self::set_netns_output_after`] / [`Self::set_output_after_run`]:
+        /// `(trigger key, seeded key, output)`, applied when the trigger
+        /// command runs.
         netns_effects: Mutex<Vec<(String, String, Output)>>,
         next_id: AtomicU64,
     }
@@ -1172,6 +1173,29 @@ mod mock {
                 format!("netns:{netns}:{}", argv.join(" ")),
                 out,
             ));
+        }
+
+        /// Like [`Self::set_netns_output_after`], but triggered by a host
+        /// (`run`) command and seeding an arbitrary output under a raw key —
+        /// e.g. `ip link set wwan0 netns volte0` making the next in-namespace
+        /// `ip link show wwan0` (key `netns:volte0:ip link show wwan0`) succeed.
+        pub fn set_output_after_run(&self, trigger: &[&str], key: &str, output: Output) {
+            self.netns_effects
+                .lock()
+                .unwrap()
+                .push((trigger.join(" "), key.to_string(), output));
+        }
+
+        /// Applies every seeded effect whose trigger key is `key`.
+        fn apply_effects(&self, key: &str) {
+            for (trigger, seeded, out) in self.netns_effects.lock().unwrap().iter() {
+                if trigger == key {
+                    self.run_outputs
+                        .lock()
+                        .unwrap()
+                        .insert(seeded.clone(), out.clone());
+                }
+            }
         }
 
         /// Seeds `tcp_connect_ok(host, port)`'s return value.
@@ -1315,6 +1339,7 @@ mod mock {
             let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
             let key = owned.join(" ");
             self.run_calls.lock().unwrap().push(owned);
+            self.apply_effects(&key);
             Ok(self
                 .run_outputs
                 .lock()
@@ -1331,14 +1356,7 @@ mod mock {
                 .lock()
                 .unwrap()
                 .push((netns.to_string(), owned));
-            for (trigger, seeded, out) in self.netns_effects.lock().unwrap().iter() {
-                if *trigger == key {
-                    self.run_outputs
-                        .lock()
-                        .unwrap()
-                        .insert(seeded.clone(), out.clone());
-                }
-            }
+            self.apply_effects(&key);
             Ok(self
                 .run_outputs
                 .lock()
