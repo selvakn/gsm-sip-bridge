@@ -572,9 +572,6 @@ section! {
     pub struct RawVolte {
         pub enabled: bool,
         pub pcscf_source_path: String,
-        pub status_path: String,
-        pub lock_path: String,
-        pub bridge_inbound: bool,
         pub max_lines: u32,
         /// Same accepted values and same rationale as
         /// `RawVowifi::register_request_uri` — the LTE access is subject to
@@ -610,9 +607,6 @@ impl Default for RawVolte {
         Self {
             enabled: false,
             pcscf_source_path: "/tmp/pcscf-0".to_string(),
-            status_path: "/tmp/volte-registration-status".to_string(),
-            lock_path: "/tmp/volte-registration.lock".to_string(),
-            bridge_inbound: false,
             max_lines: 8,
             // Confirmed on both Jio and Vodafone (2026-09-17): the home-domain
             // form works everywhere it's been tested, same as `[vowifi]`. Set

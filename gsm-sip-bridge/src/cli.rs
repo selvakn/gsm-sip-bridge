@@ -125,27 +125,14 @@ pub enum Commands {
     /// These probes are DIAGNOSTICS. The Gate G1 investigation established
     /// that the tested carrier publishes no P-CSCF by any mechanism reachable
     /// from the host, so an empty result is the expected outcome there, not a
-    /// fault — supply an address with `--pcscf` on `volte-register` instead.
+    /// fault — supply an address with `[[volte.line]].pcscf` (or `--pcscf` on
+    /// the `volte-*` diagnostics) instead.
     /// The value of running them is detecting a carrier, SIM, or firmware that
     /// behaves differently, without needing a code change.
     ///
     /// Exits 0 when an address was determined by any means, non-zero when none
     /// was; the per-method breakdown is printed either way.
     VolteDiscover(VolteDiscoverArgs),
-    /// Register to the operator's IMS core over LTE using IMS-AKA
-    /// (specs/015-volte-host-ims, US3): brings up the IMS PDN, then runs the
-    /// same registration, IMS-AKA and Gm IPsec code the VoWiFi path uses.
-    ///
-    /// A P-CSCF address is required — this carrier publishes none by any
-    /// mechanism the host can reach (see `volte-discover`). One can be
-    /// captured from a VoWiFi/ePDG tunnel, which writes it to
-    /// `[vowifi].pcscf_source_path`.
-    ///
-    /// WARNING: do not run this while the VoWiFi agent is registered. Both
-    /// present the same IMPU with the same IMEI-derived `+sip.instance`, so
-    /// the network treats one as a re-registration of the other and tears the
-    /// first binding down.
-    VolteRegister(VolteRegisterArgs),
     /// Place a diagnostic voice call over the host-side LTE IMS registration
     /// (specs/016-volte-calls) and report what happened to the audio.
     ///
@@ -371,11 +358,9 @@ pub struct VoltePdnArgs {
     #[arg(long, value_enum)]
     pub action: VoltePdnAction,
     /// Modem AT port. Omit to resolve it — along with `cid`/`apn` — from
-    /// `--config`'s `[[volte.line]]` the same way `volte-register` does;
-    /// falls back to `/dev/ttyUSB0`/the built-in cid/apn defaults when no
-    /// config is given or no line is configured. Needed on `--action down`
-    /// so a `volte-register --config ...` teardown targets the exact same
-    /// line it registered, rather than guessing the CLI default.
+    /// `--config`'s `[[volte.line]]` (the first line a SIM-ready-modem scan
+    /// resolves, honouring a pinned entry). Passing `--modem` explicitly opts
+    /// out of config entirely.
     #[arg(long)]
     pub modem: Option<PathBuf>,
     /// Host network interface carrying the modem's data path. Leave unset to
@@ -435,71 +420,6 @@ pub struct VolteDiscoverArgs {
     /// File the VoWiFi/ePDG path writes its captured P-CSCF to.
     #[arg(long, default_value = "/tmp/pcscf")]
     pub pcscf_source_path: String,
-}
-
-#[derive(Parser, Debug)]
-pub struct VolteRegisterArgs {
-    /// Modem AT port. Omit to resolve it — along with `cid`/`apn` — from
-    /// `--config`'s `[[volte.line]]` (the first line a SIM-ready-modem scan
-    /// resolves); falls back to `/dev/ttyUSB0`/the built-in cid/apn defaults
-    /// when no config is given or no line is configured. Passing `--modem`
-    /// explicitly opts out of config entirely — a pure CLI-args invocation,
-    /// unchanged from before.
-    #[arg(long)]
-    pub modem: Option<PathBuf>,
-    /// Host network interface carrying the IMS PDN.
-    #[arg(long)]
-    pub iface: Option<String>,
-    #[arg(long, default_value_t = crate::volte::DEFAULT_IMS_CID)]
-    pub cid: u8,
-    #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
-    pub apn: String,
-    /// P-CSCF address. When omitted, the address captured by the VoWiFi/ePDG
-    /// path (see --pcscf-source-path) is used — automatic discovery does not
-    /// work on the tested carrier.
-    #[arg(long)]
-    pub pcscf: Option<std::net::IpAddr>,
-    /// File the VoWiFi/ePDG path writes its captured P-CSCF to.
-    #[arg(long, default_value = "/tmp/pcscf")]
-    pub pcscf_source_path: String,
-    #[arg(long, default_value_t = crate::volte::DEFAULT_PCSCF_PORT)]
-    pub pcscf_port: u16,
-    /// Use TCP rather than UDP for SIP.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub tcp: bool,
-    /// Negotiate Gm IPsec (RFC 3329 sec-agree). Vodafone India rejects a
-    /// plain digest REGISTER without it.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub sec_agree: bool,
-    /// Use this MSISDN as the Public User Identity instead of the
-    /// IMSI-derived temporary IMPU.
-    #[arg(long)]
-    pub msisdn: Option<String>,
-    /// Leave the IMS PDN attached after the registration attempt, for
-    /// inspection. By default it is released.
-    #[arg(long)]
-    pub keep_pdn: bool,
-    /// Register once and exit instead of staying up and renewing before
-    /// expiry.
-    #[arg(long)]
-    pub once: bool,
-    /// Where to publish registration state for `volte-status`.
-    #[arg(long, default_value = crate::volte::registration::DEFAULT_STATUS_PATH)]
-    pub status_path: PathBuf,
-    /// Register even when a VoWiFi agent is running. The two present the same
-    /// IMPU and instance-id, so they will displace each other — only useful
-    /// when deliberately testing that interference.
-    #[arg(long)]
-    pub force: bool,
-    /// Lock file preventing two concurrent VoLTE registrations on one SIM.
-    #[arg(long, default_value = crate::volte::guard::DEFAULT_LOCK_PATH)]
-    pub lock_path: PathBuf,
-    /// File to record the context id the IMS PDN displaced. Relevant with
-    /// `--keep-pdn`, where this process leaves the PDN attached for an external
-    /// teardown to release: that teardown reads this to `--restore-cid` the
-    /// previous binding instead of leaving the modem data path unbound.
-    #[arg(long)]
-    pub restore_cid_path: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -681,9 +601,6 @@ pub struct VolteStatusArgs {
     pub cid: u8,
     #[arg(long, default_value = crate::volte::DEFAULT_IMS_APN)]
     pub apn: String,
-    /// Where `volte-register` publishes its registration state.
-    #[arg(long, default_value = crate::volte::registration::DEFAULT_STATUS_PATH)]
-    pub status_path: PathBuf,
 }
 
 #[derive(Parser, Debug)]

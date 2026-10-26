@@ -301,7 +301,7 @@ the same "carrier-facing half in its own namespace, PBX-facing half shared"
 split — generalized to *N* lines instead of two fixed agents. See
 [operations.md](operations.md#host-side-ims-over-lte-volte) for config, CLI
 verbs, and the standalone diagnostic subcommands (`volte-discover`,
-`volte-register`, `volte-call`, `volte-status`) that predate call bridging.
+`volte-listen`, `volte-call`, `volte-status`) that predate call bridging.
 
 **Per-line carrier agent** (`volte-carrier-agent --line N`,
 `specs/020-volte-line-netns`) runs inside that line's own network namespace

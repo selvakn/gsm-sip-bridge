@@ -6,7 +6,7 @@
 >
 > Since `specs/015-volte-host-ims`, there is a second, independent path: the
 > bridge runs **its own** IMS registration over an LTE IMS PDN
-> (`volte-register`), keeping SIP and media under software control. The two are
+> (`[volte].enabled`), keeping SIP and media under software control. The two are
 > mutually exclusive on one SIM — see [Operations →
 > Host-side IMS over LTE](operations.md#host-side-ims-over-lte-volte).
 >

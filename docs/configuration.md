@@ -361,25 +361,28 @@ Host-side IMS over LTE (specs/015-volte-host-ims) — the bridge runs its OWN IM
 registration over an LTE IMS PDN, instead of delegating to the modem's internal
 IMS stack. **Do not enable this alongside `[vowifi]` on the same SIM** — both
 register the same IMPU with the same IMEI-derived `+sip.instance`, so the network
-tears one binding down (`volte-register` refuses to start while a VoWiFi agent is
-running unless `--force` is given).
+tears one binding down (the supervisor refuses to start with both enabled).
+
+Enabling it always bridges: incoming calls are answered over LTE and handed to
+the PBX (`[sip]`) or the SIP server (`[sip_server]`), specs/017-volte-inbound-bridge.
+There is no registration-only mode, the same as `[vowifi]`. Every bridged card
+becomes **exclusive** to this service, and the circuit-switched daemon's SIP
+side stands down for the whole container while VoLTE runs.
 
 Like `[vowifi]`, auto-discovers every SIM-ready modem as its own line by default
 (specs/018-volte-multi-modem), each with sane defaults — `cid` 3, `apn` `"ims"`,
 P-CSCF auto-discovered. Line-specific settings live only in `[[volte.line]]`.
-With `bridge_inbound`, each line also runs in its own network namespace/veth
-pair (specs/020-volte-line-netns) — the same isolation `[vowifi]` lines get,
-and just as with `[vowifi]`'s equivalent fields, this is pure internal
+Each line runs in its own network namespace/veth pair (specs/020-volte-line-netns)
+— the same isolation `[vowifi]` lines get — so its IMS traffic can only leave
+through its own LTE interface, never through another uplink on the host (#165).
+Just as with `[vowifi]`'s equivalent fields, this is pure internal
 infrastructure with no config knob at all.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Master switch. Off by default; the `volte-*` subcommands work without it as diagnostics |
-| `bridge_inbound` | boolean | `false` | Answer incoming calls over this registration and bridge them to the PBX (specs/017-volte-inbound-bridge), instead of only holding the registration open. Turning this on makes every bridged card EXCLUSIVE to this service — the circuit-switched daemon will not drive it |
-| `max_lines` | integer | 8 | Upper bound on auto-discovered LTE lines (specs/018-volte-multi-modem). Only meaningful with `bridge_inbound` — a single PBX registration then serves every line, exactly as the VoWiFi path does |
+| `max_lines` | integer | 8 | Upper bound on auto-discovered LTE lines (specs/018-volte-multi-modem). A single PBX registration serves every line, exactly as the VoWiFi path does |
 | `pcscf_source_path` | string | `/tmp/pcscf-0` | Which VoWiFi line's captured P-CSCF to borrow over LTE. Names **one specific line** — `[vowifi].pcscf_source_path` is a base with the line index appended, and each line's address comes from its own carrier, so there is no single "the" address to pick up. Change the suffix to use a different line |
-| `status_path` | string | `/tmp/volte-registration-status` | Where `volte-register` publishes registration state for `volte-status` |
-| `lock_path` | string | `/tmp/volte-registration.lock` | Lock file preventing two concurrent VoLTE registrations on one SIM |
 | `register_request_uri` | enum | `home-domain` | Same meaning and accepted values as `[vowifi]`'s field above — the LTE access reaches the same P-CSCF as VoWiFi, over a different bearer, so the same Jio loop-detection rejection applies here too. Confirmed working on Jio (required) and Vodafone (verified harmless). Set `pcscf` for a deployment that needs the old literal-address form |
 | `respond_on_client` | boolean | `true` | Same meaning as `[vowifi]`'s field above — this path installs its own Gm IPsec SAs just like the ePDG one, so Jio's refusal of responses sent from `port_us` applies here too. Unlike `[vowifi]`, defaults on: confirmed required on Jio and harmless on Vodafone. Set `false` for a carrier proven to need RFC 3261 §18.2.2's normal behaviour instead |
 | `sms_delivery_report` | boolean | inherits `[vowifi].sms_delivery_report` | Same meaning as `[vowifi]`'s field above — SMS-over-IP's RP-layer acknowledgement is the same TS 24.341 procedure regardless of access. Settable independently, but **when this key is absent it inherits `[vowifi]`'s value** rather than defaulting to `true` on its own — a config that set `[vowifi].sms_delivery_report` before `[volte]` had this key already relied on it governing VoLTE too (both paths share one dispatcher), so an upgrade must not silently flip VoLTE's behaviour back. A VoLTE-only deployment with no `[vowifi]` section gets `true`, `[vowifi]`'s own default |
@@ -428,7 +431,7 @@ share one UDP port. Both default to 5060, so enabling this mode without moving
 
 `listen_port` also cannot be one the VoWiFi or VoLTE telephony side already
 holds — 5072 with `[vowifi].enabled`, or 5073 and the per-line loopback span
-`5074..5074+4×[volte].max_lines` with `[volte].enabled` + `bridge_inbound`.
+`5074..5074+4×[volte].max_lines` with `[volte].enabled`.
 Those are fixed internal constants an operator cannot move, so the error says to
 move `listen_port` instead. They are only reserved when the subsystem that owns
 them is actually running, so a deployment with neither may use them freely.

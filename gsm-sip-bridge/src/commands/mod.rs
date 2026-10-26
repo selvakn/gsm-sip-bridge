@@ -53,9 +53,6 @@ pub fn run(cli: &Cli, command: &Commands) -> ExitCode {
         Commands::VoltePdn(args) => volte::handle_volte_pdn_command(args, cli.config.as_deref()),
         Commands::VolteStatus(args) => volte::handle_volte_status_command(args),
         Commands::VolteDiscover(args) => volte::handle_volte_discover_command(args),
-        Commands::VolteRegister(args) => {
-            volte::handle_volte_register_command(args, cli.config.as_deref())
-        }
         Commands::VolteCall(args) => volte::handle_volte_call_command(args),
         Commands::VolteListen(args) => volte::handle_volte_listen_command(args),
         Commands::VolteBridge(args) => volte::handle_volte_bridge_command(args, cli),

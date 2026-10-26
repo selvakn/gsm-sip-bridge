@@ -17,12 +17,11 @@ username = "gsm-bridge"
 password = "env:SIP_PASSWORD"
 
 [volte]
+# Answers incoming calls over LTE and bridges them to [sip] above, each line
+# in its own network namespace. This makes the modem EXCLUSIVE to this path:
+# the circuit-switched daemon will not drive it, so it has no CS fallback
+# whenever this path is down.
 enabled = true
-# Without this, the registration is held open but nothing answers on it —
-# the modem-internal VoLTE path stays in control of incoming calls. Setting
-# it makes this modem EXCLUSIVE to this path: the circuit-switched daemon
-# will not drive it, so it has no CS fallback whenever this path is down.
-bridge_inbound = true
 # Defaults to "home-domain" — TS 24.229 §5.1.1.2's mandated form, confirmed
 # working on Jio (required) and Vodafone (verified harmless). Set "pcscf" for
 # a deployment that needs the old literal-address form instead (see

@@ -1049,9 +1049,6 @@ fn build_volte(raw: RawVolte, vowifi: &VowifiConfig) -> BridgeResult<VolteConfig
     Ok(VolteConfig {
         enabled: raw.enabled,
         pcscf_source_path: raw.pcscf_source_path,
-        status_path: raw.status_path,
-        lock_path: raw.lock_path,
-        bridge_inbound: raw.bridge_inbound,
         max_lines: in_range(raw.max_lines, "volte.max_lines", 1..=64)?,
         line_overrides,
         register_request_uri: {
@@ -1229,19 +1226,14 @@ fn check_sip_server_port_ownership(
         return Ok(());
     }
 
-    // The VoLTE telephony side claims its ports only when it actually runs, and
-    // `supervise::orchestrate` starts it on `[volte].enabled` — `bridge_inbound`
-    // alone spawns nothing, so on its own it reserves nothing either.
-    let volte_telephony_runs = volte.enabled && volte.bridge_inbound;
-
     // Only two agents would ever host the registrar, and only one may.
     // `supervise::orchestrate` already refuses this pairing for a different
     // reason (both would register the same IMPU), so this is defence in depth
     // plus an earlier, more specific message — and it also covers running the
     // agents by hand, which bypasses the supervisor entirely.
-    if vowifi.enabled && volte_telephony_runs {
+    if vowifi.enabled && volte.enabled {
         return Err(BridgeError::Config(
-            "[vowifi].enabled and [volte].bridge_inbound are both active with \
+            "[vowifi].enabled and [volte].enabled are both active with \
              [sip_server].enabled. Both telephony sides would host a registrar on \
              sip_server.listen_port, and only one can bind it — the other's calls \
              would go nowhere. Enable exactly one inbound path."
@@ -1261,11 +1253,11 @@ fn check_sip_server_port_ownership(
             "[vowifi].enabled",
         ));
     }
-    if volte_telephony_runs {
+    if volte.enabled {
         reserved.push((
             crate::volte::bridge::SIP_LOCAL_PORT,
             "the VoLTE telephony side's SIP port",
-            "[volte].enabled with [volte].bridge_inbound",
+            "[volte].enabled",
         ));
         // The loopback trio is strided per line, and the line count is
         // discovered at runtime — so the whole span up to `max_lines` is

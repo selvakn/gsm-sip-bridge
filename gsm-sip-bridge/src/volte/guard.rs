@@ -7,7 +7,7 @@
 //! stack, and the reason that module disables it before VoWiFi starts.
 //!
 //! Until now this was only a warning in the documentation. It is a real
-//! correctness risk: nothing prevented a `volte-register` from silently
+//! correctness risk: nothing prevented a VoLTE registration from silently
 //! killing a live VoWiFi registration, and the failure is invisible from the
 //! VoLTE side — the network accepts *our* REGISTER perfectly happily.
 //!
@@ -18,8 +18,8 @@
 //!    the same signal `supervise::orchestrate` uses (`pkill -f
 //!    vowifi-ims-agent`), and unlike Agent A's status port it does not depend
 //!    on veth/netns reachability.
-//! 2. **Same-path**: a lock file so two `volte-register` invocations cannot
-//!    fight over one SIM.
+//! 2. **Same-path**: a lock file so two VoLTE registrations (`volte-listen`,
+//!    `volte-call`, `volte-bridge`) cannot fight over one SIM.
 //!
 //! Both are advisory and both can be overridden, because an operator
 //! deliberately testing interference is a legitimate thing to do.
@@ -152,7 +152,7 @@ impl RegistrationGuard {
             match parse_lock(&existing) {
                 Some(pid) if pid_alive(pid) => {
                     return Err(format!(
-                        "another volte-register is already running (pid {pid}); \
+                        "another VoLTE registration is already running (pid {pid}); \
                          two registrations for one SIM would displace each other"
                     ));
                 }
@@ -219,11 +219,7 @@ mod tests {
         // harness's own shell and refused a legitimate registration. It would
         // equally match entrypoint.sh's `pkill -f vowifi-ims-agent`.
         for other in [
-            argv(&[
-                "bash",
-                "-c",
-                "gsb volte-register; pkill -f vowifi-ims-agent",
-            ]),
+            argv(&["bash", "-c", "gsb volte-listen; pkill -f vowifi-ims-agent"]),
             argv(&["/bin/sh", "/entrypoint.sh"]),
             argv(&["grep", "vowifi-ims-agent", "/var/log/bridge.log"]),
             argv(&["pkill", "-f", "vowifi-ims-agent"]),
@@ -271,7 +267,7 @@ mod tests {
         for other in [
             argv(&[
                 "/usr/local/bin/gsm-sip-bridge",
-                "volte-register",
+                "volte-listen",
                 "--pcscf",
                 "2402::1",
             ]),

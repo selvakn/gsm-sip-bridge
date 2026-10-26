@@ -29,15 +29,13 @@ pub(crate) fn handle_volte_pdn_command(
     use crate::cli::VoltePdnAction;
 
     let line = match &args.modem {
-        Some(modem) => ResolvedVolteRegisterLine {
+        Some(modem) => ResolvedVoltePdnLine {
             modem: modem.clone(),
             cid: args.cid,
             apn: args.apn.clone(),
             iface: args.iface.clone(),
-            pcscf: None,
-            msisdn: None,
         },
-        None => match resolve_volte_register_line(config_path) {
+        None => match resolve_volte_pdn_line(config_path) {
             Ok(l) => l,
             Err(msg) => {
                 eprintln!("volte-pdn: {msg}");
@@ -101,11 +99,6 @@ pub(crate) fn handle_volte_status_command(args: &crate::cli::VolteStatusArgs) ->
     match crate::volte::status(&settings) {
         Ok(Some(report)) => {
             print!("{}", report.summary());
-            let status = crate::volte::registration::read_status(&args.status_path);
-            print!(
-                "{}",
-                crate::volte::registration::status_summary(status.as_ref())
-            );
             ExitCode::SUCCESS
         }
         Ok(None) => {
@@ -266,8 +259,8 @@ pub(crate) fn handle_volte_call_command(args: &crate::cli::VolteCallArgs) -> Exi
         Err(e) => {
             eprintln!(
                 "volte-call: {e}. The call places its own registration, so it cannot run \
-                 alongside volte-register — stop the registration loop, run the call, then \
-                 restart it."
+                 alongside another VoLTE registration (volte-listen, or a running bridge) — \
+                 stop it, run the call, then restart it."
             );
             return ExitCode::FAILURE;
         }
@@ -463,19 +456,14 @@ pub(crate) fn render_call_report(
     out
 }
 
-/// A single line's settings for `volte-register`/`volte-pdn`'s inherently
-/// single-line invocations — either taken verbatim from CLI flags (`--modem`
-/// given), or resolved from `--config`'s `[[volte.line]]` (`--modem`
-/// omitted). `volte-pdn --action down` resolving the exact same line
-/// `volte-register` registered (rather than guessing the CLI default) is
-/// what lets `supervise::shutdown` tear down the right modem/PDN.
-pub(crate) struct ResolvedVolteRegisterLine {
+/// A single line's settings for `volte-pdn`'s inherently single-line
+/// invocation — either taken verbatim from CLI flags (`--modem` given), or
+/// resolved from `--config`'s `[[volte.line]]` (`--modem` omitted).
+pub(crate) struct ResolvedVoltePdnLine {
     modem: std::path::PathBuf,
     cid: u8,
     apn: String,
     iface: Option<String>,
-    pcscf: Option<String>,
-    msisdn: Option<String>,
 }
 
 /// Resolves a single line's settings from `--config`'s `[[volte.line]]`: the
@@ -490,9 +478,9 @@ pub(crate) struct ResolvedVolteRegisterLine {
 /// unlike `volte-bridge` — a second `[[volte.line]]` entry is ignored.
 /// Requires `--config`; a config with no usable line is a clear error rather
 /// than a silent fallback to some default port.
-pub(crate) fn resolve_volte_register_line(
+pub(crate) fn resolve_volte_pdn_line(
     config_path: Option<&std::path::Path>,
-) -> Result<ResolvedVolteRegisterLine, String> {
+) -> Result<ResolvedVoltePdnLine, String> {
     let path = config_path.ok_or_else(|| {
         "no --modem given and no --config to resolve one from \
          (pass --modem explicitly, or --config a file with [volte])"
@@ -553,176 +541,12 @@ pub(crate) fn resolve_volte_register_line(
             .to_string()
     })?;
 
-    Ok(ResolvedVolteRegisterLine {
+    Ok(ResolvedVoltePdnLine {
         modem: line.modem_port,
         cid: line.cid,
         apn: line.apn,
         iface: (!line.iface.is_empty()).then_some(line.iface),
-        pcscf: line.pcscf,
-        msisdn: line.msisdn,
     })
-}
-
-pub(crate) fn handle_volte_register_command(
-    args: &crate::cli::VolteRegisterArgs,
-    config_path: Option<&std::path::Path>,
-) -> ExitCode {
-    use crate::ims::RegisterOutcome;
-
-    // Refuse to displace a live VoWiFi registration. Checked before anything
-    // touches the modem, so a refusal leaves the system exactly as it was.
-    if let Err(e) = crate::volte::guard::check_no_vowifi_conflict(args.force) {
-        eprintln!("volte-register: {e}");
-        return ExitCode::FAILURE;
-    }
-    let _lock = match crate::volte::guard::RegistrationGuard::acquire(&args.lock_path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("volte-register: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let line = match &args.modem {
-        Some(modem) => ResolvedVolteRegisterLine {
-            modem: modem.clone(),
-            cid: args.cid,
-            apn: args.apn.clone(),
-            iface: args.iface.clone(),
-            pcscf: args.pcscf.map(|ip| ip.to_string()),
-            msisdn: args.msisdn.clone(),
-        },
-        None => match resolve_volte_register_line(config_path) {
-            Ok(l) => l,
-            Err(msg) => {
-                eprintln!("volte-register: {msg}");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
-
-    // P-CSCF resolution order: explicit flag/resolved line, then the address
-    // captured by the VoWiFi/ePDG path. Automatic discovery is not consulted
-    // here because it is known not to yield an address on the tested
-    // carrier and would only add latency before a failure the operator can
-    // already act on.
-    let (pcscf_addr, pcscf_source) = match line.pcscf.as_deref().and_then(|s| s.parse().ok()) {
-        Some(addr) => (addr, "--pcscf / [[volte.line]].pcscf".to_string()),
-        None => {
-            let cache = std::path::PathBuf::from(&args.pcscf_source_path);
-            match crate::volte::pcscf::probe_epdg_cache(&cache).found() {
-                Some(addr) => (addr, format!("ePDG capture at {}", cache.display())),
-                None => {
-                    eprintln!(
-                        "volte-register: [discovering-pcscf] no P-CSCF address available. \
-                         Pass --pcscf, or run the VoWiFi path once so it writes one to {}. \
-                         `volte-discover` reports what each mechanism returned.",
-                        cache.display()
-                    );
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    };
-    tracing::info!(pcscf = %pcscf_addr, source = %pcscf_source, "resolved P-CSCF");
-
-    let settings = crate::volte::VolteSettings {
-        modem_port: line.modem.clone(),
-        iface: line.iface.clone().unwrap_or_default(),
-        cid: line.cid,
-        apn: line.apn.clone(),
-        pcscf: Some(std::net::SocketAddr::new(pcscf_addr, args.pcscf_port)),
-        // With --keep-pdn this process does not detach; an external teardown
-        // does, and reads this file to restore the displaced context. Without
-        // --keep-pdn it detaches itself and the path is simply unset.
-        restore_cid_path: args.restore_cid_path.clone(),
-    };
-
-    // Stage 1: the network attachment. Reported separately so a failure here
-    // is never mistaken for a credential problem (FR-015).
-    let attach = match crate::volte::attach(&settings) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("volte-register: [attaching] {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    print!("{}", attach.summary());
-    if !attach.routed && !settings.iface.is_empty() {
-        eprintln!(
-            "volte-register: [attaching] the IMS PDN is attached but has no default route, \
-             so signalling cannot reach the P-CSCF"
-        );
-        return ExitCode::FAILURE;
-    }
-
-    // The IMS realm is built from the home PLMN, so derive it from the SIM
-    // exactly as the VoWiFi agent does rather than making the operator pass
-    // it in.
-    let plmn = match crate::modules::at_commander::AtCommander::open(&line.modem)
-        .and_then(|mut at| crate::vowifi::plmn::derive_plmn(&mut at))
-    {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "volte-register: [attaching] could not derive the home PLMN from the SIM: {e}"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    tracing::info!(mcc = %plmn.mcc, mnc = %plmn.mnc, "derived home PLMN from the SIM");
-
-    // Stage 2: registration, over the same shared code the VoWiFi path uses.
-    let reg_cfg = crate::ims::ImsRegisterConfig {
-        modem_port: line.modem.clone(),
-        pcsc_reader: false,
-        pcscf_addr,
-        pcscf_port: args.pcscf_port,
-        mcc: plmn.mcc.clone(),
-        mnc: plmn.mnc.clone(),
-        imsi: None,
-        imei: None,
-        use_tcp: args.tcp,
-        sec_agree: args.sec_agree,
-        msisdn: line.msisdn.clone(),
-        access_network_info: crate::volte::read_access_network_info(&line.modem),
-        register_uri_home_domain: false,
-        gm_auth_alg: None,
-        gm_cipher_alg: None,
-    };
-
-    // Staying up and renewing is the default; --once is the one-shot
-    // diagnostic. A rejected first attempt never enters the renewal loop.
-    let result = crate::volte::registration::run(
-        &reg_cfg,
-        // Lets the renewal loop re-establish the PDN when it drops; without
-        // it a dropped attachment is unrecoverable.
-        Some(&settings),
-        args.once,
-        &args.status_path,
-        crate::ims::DEFAULT_EXPIRES,
-    );
-
-    if !args.keep_pdn {
-        if let Err(e) = crate::volte::detach(&settings, attach.displaced_cid) {
-            tracing::warn!(error = %e, "failed to release the IMS PDN");
-        }
-    }
-
-    match result {
-        Ok(RegisterOutcome::Success { status, .. }) => {
-            println!("\nIMS registration over LTE ACCEPTED (status {status}).");
-            ExitCode::SUCCESS
-        }
-        Ok(RegisterOutcome::Rejected { status, reason }) => {
-            eprintln!("\nvolte-register: [registering] the network rejected the registration: {status} {reason}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("\nvolte-register: [registering] {e}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 pub(crate) fn handle_volte_discover_command(args: &crate::cli::VolteDiscoverArgs) -> ExitCode {
@@ -1266,8 +1090,8 @@ pub(crate) fn handle_volte_carrier_agent_command(
 /// so this tier alone reproduces exactly today's pre-081 behavior. `None`
 /// when none of the three is available.
 /// `allow_legacy_fallback` gates the third, unkeyed-`source_path` tier —
-/// **only** the genuinely single-line path (`volte_bridge_single_line`,
-/// `[volte].bridge_inbound = false`) may pass `true`. For any multi-line
+/// **only** the hand-run single-modem diagnostic (`volte_bridge_single_line`,
+/// `volte-bridge --modem`) may pass `true`. For any multi-line
 /// caller, that file is not necessarily *this* line's address at all: it
 /// may be another line's address left over from a previous priming pass,
 /// or — on a fleet upgraded from a pre-081 deployment — a single stale
@@ -1305,9 +1129,7 @@ fn resolve_line_pcscf(
 /// restored independently: `<base>-<index>`. `None` when no base was given.
 /// Releases every LTE line the running bridge recorded in its manifest, each
 /// with the displaced context read from that line's own restore-cid file, then
-/// removes the manifest. A no-op (success) when no manifest exists — the
-/// single-line `volte-register` path writes none and is torn down by the
-/// entrypoint's own `volte-pdn down`.
+/// removes the manifest. A no-op (success) when no manifest exists.
 /// Tears down one line (`line = Some(idx)`) or every line (`line = None`).
 ///
 /// With `--line`, this is meant to be run as `ip netns exec <that line's

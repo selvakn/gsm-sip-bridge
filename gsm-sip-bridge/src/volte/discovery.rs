@@ -365,7 +365,6 @@ mod tests {
     fn base() -> VolteConfig {
         VolteConfig {
             enabled: true,
-            bridge_inbound: true,
             ..VolteConfig::default()
         }
     }

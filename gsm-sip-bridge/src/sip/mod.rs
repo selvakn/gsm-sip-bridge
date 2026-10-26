@@ -108,8 +108,8 @@ impl SipBridge {
             display_name: config.sip.display_name.clone(),
             tls_verify: config.sip.tls_verify.clone(),
             public_addr: config.sip.public_addr,
-            // Defer the trunk to the VoLTE inbound bridge or the VoWiFi bridge
-            // when either is active, so the same account is not registered
+            // Defer the trunk to the VoLTE bridge or the VoWiFi bridge when
+            // either is active, so the same account is not registered
             // from two places at once. `config.cs.enabled` (specs/026-
             // disable-circuit-switched, FR-009a) folds into the same
             // condition rather than a second mechanism: with the
@@ -122,10 +122,8 @@ impl SipBridge {
             // this term makes that invariant hold for `SipBridge` itself,
             // regardless of caller, rather than relying on that gate as the
             // only thing enforcing it.
-            owns_sip_side: !config.volte.bridge_inbound
-                && !config.vowifi.enabled
-                && config.cs.enabled,
-            register_trunk: !config.volte.bridge_inbound
+            owns_sip_side: !config.volte.enabled && !config.vowifi.enabled && config.cs.enabled,
+            register_trunk: !config.volte.enabled
                 && !config.vowifi.enabled
                 && !config.sip_server.enabled
                 && config.cs.enabled,

@@ -1289,9 +1289,10 @@ impl Default for VowifiConfig {
 
 /// `[volte]` — host-side IMS over LTE (specs/015-volte-host-ims).
 ///
-/// Deliberately mirrors the CLI flags of `volte-pdn`/`volte-register` so the
-/// two never disagree; the CLI remains the diagnostic entry point and this is
-/// what lets the same settings be supplied unattended.
+/// Enabling it always bridges: every discovered line answers calls and hands
+/// them to the PBX/SIP-server leg, its LTE interface isolated in a namespace
+/// of its own (specs/020-volte-line-netns). There is no registration-only
+/// mode, the same as `[vowifi]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolteConfig {
     pub enabled: bool,
@@ -1305,24 +1306,10 @@ pub struct VolteConfig {
     /// project has already paid for. Point it at another line's file to use
     /// that carrier's address instead.
     pub pcscf_source_path: String,
-    pub status_path: String,
-    pub lock_path: String,
-    /// Answer inbound calls and bridge them to the telephone system
-    /// (specs/017-volte-inbound-bridge), rather than only holding the
-    /// registration open.
-    ///
-    /// **Defaults to false**, which leaves the existing arrangement exactly
-    /// as it was: the modem-internal path stays available and this section
-    /// keeps doing what it did before (FR-021, FR-023, FR-024). Opting in is
-    /// what makes the feature safe to merge — an absent selection changes
-    /// nothing.
-    pub bridge_inbound: bool,
     /// Upper bound on concurrently bridged LTE lines (specs/018-volte-multi-
     /// modem) — the counterpart to `[vowifi].max_lines`. Modems discovered
     /// beyond this count are reported and skipped rather than silently
-    /// dropped. Only meaningful with `bridge_inbound` and an empty
-    /// `modem_port` (auto-discovery); a pinned single `modem_port` is always
-    /// one line.
+    /// dropped.
     pub max_lines: u32,
     /// Explicit per-line overrides (specs/018-volte-multi-modem), the LTE
     /// counterpart to `[[vowifi.line]]`: pins a specific modem to the bridge
@@ -1440,9 +1427,6 @@ impl Default for VolteConfig {
             // Same default the [vowifi] section uses, so a captured address is
             // found without configuring anything.
             pcscf_source_path: "/tmp/pcscf-0".to_string(),
-            status_path: "/tmp/volte-registration-status".to_string(),
-            lock_path: "/tmp/volte-registration.lock".to_string(),
-            bridge_inbound: false,
             max_lines: 8,
             line_overrides: Vec::new(),
             register_request_uri: "home-domain".to_string(),
@@ -3124,36 +3108,33 @@ password = "pass"
         assert_eq!(cfg.vowifi.line_overrides.len(), 2);
     }
 
+    /// `[volte]` always bridges now (#165), so the registration-only mode's
+    /// keys are gone. A leftover one is an error naming it, not a silent no-op:
+    /// `bridge_inbound = false` in particular no longer means what it says.
     #[test]
-    fn an_absent_inbound_selection_leaves_todays_arrangement_untouched() {
-        // specs/017 FR-021/FR-024: the feature is opt-in. A config that
-        // predates it must keep behaving exactly as it did — that default is
-        // what makes the feature safe to merge rather than a flag day.
-        let cfg: VolteConfig = Default::default();
-        assert!(!cfg.bridge_inbound);
-
-        // NB: this fixture used to also set `modem_port` inside `[volte]`,
-        // which has never been a `[volte]` key — the old parser warned and
-        // carried on, so the test passed while silently exercising a config
-        // no deployment could have meant. It is now a hard error, so the
-        // stray key is gone.
-        let parsed = try_parse(&format!("{MINIMAL_TOML}\n[volte]\nenabled = true\n"))
-            .map(|c| c.volte)
-            .expect("a config with no inbound selection must parse");
-        assert!(
-            !parsed.bridge_inbound,
-            "an unset selection must not silently enable inbound bridging"
-        );
+    fn the_retired_registration_only_keys_are_rejected() {
+        for key in [
+            "bridge_inbound = true",
+            "status_path = \"/tmp/s\"",
+            "lock_path = \"/tmp/l\"",
+        ] {
+            let err = try_parse(&format!("{MINIMAL_TOML}\n[volte]\nenabled = true\n{key}\n"))
+                .unwrap_err()
+                .to_string();
+            let name = key.split(' ').next().unwrap();
+            assert!(err.contains(&format!("volte.{name}")), "got: {err}");
+        }
     }
 
+    /// A bridge needs somewhere to bridge to: with neither `[sip].server` nor
+    /// `[sip_server]`, enabling VoLTE is refused rather than taking the card
+    /// exclusively and declining every call.
     #[test]
-    fn the_inbound_selection_is_honoured_when_set() {
-        let parsed = try_parse(&format!(
-            "{MINIMAL_TOML}\n[volte]\nenabled = true\nbridge_inbound = true\n"
-        ))
-        .map(|c| c.volte)
-        .expect("parses");
-        assert!(parsed.bridge_inbound);
+    fn volte_without_a_pbx_or_sip_server_is_refused() {
+        let err = try_parse("[volte]\nenabled = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sip.server"), "got: {err}");
     }
 
     // ------------------------------------------------------- [sip_server] ---
@@ -3447,7 +3428,7 @@ password = "s3cret"
     fn server_mode_rejects_a_listen_port_a_telephony_agent_already_claims() {
         for (port, inbound) in [
             (5072u16, "[vowifi]\nenabled = true\n"),
-            (5073, "[volte]\nenabled = true\nbridge_inbound = true\n"),
+            (5073, "[volte]\nenabled = true\n"),
         ] {
             let err = try_parse(&format!(
                 "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\n\
@@ -3477,7 +3458,7 @@ password = "s3cret"
                 "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\n\
                  listen_port = {port}\nring_aor = \"1001\"\n\n[[sip_server.account]]\n\
                  username = \"1001\"\npassword = \"p\"\n\n\
-                 [volte]\nenabled = true\nbridge_inbound = true\nmax_lines = 4\n"
+                 [volte]\nenabled = true\nmax_lines = 4\n"
             ))
             .unwrap_err()
             .to_string();
@@ -3508,7 +3489,7 @@ password = "s3cret"
         let err = try_parse(
             "[sip]\nlocal_port = 5062\n\n[sip_server]\nenabled = true\nring_aor = \"1001\"\n\n\
              [[sip_server.account]]\nusername = \"1001\"\npassword = \"p\"\n\n\
-             [vowifi]\nenabled = true\n\n[volte]\nenabled = true\nbridge_inbound = true\n",
+             [vowifi]\nenabled = true\n\n[volte]\nenabled = true\n",
         )
         .unwrap_err()
         .to_string();
@@ -3522,7 +3503,7 @@ password = "s3cret"
     fn two_inbound_paths_without_server_mode_are_left_alone() {
         try_parse(&format!(
             "{MINIMAL_TOML}\n[vowifi]\nenabled = true\n\n\
-             [volte]\nenabled = true\nbridge_inbound = true\n"
+             [volte]\nenabled = true\n"
         ))
         .expect("unchanged from before this feature");
     }

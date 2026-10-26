@@ -47,7 +47,7 @@ fn test_sip_bridge_unregister() {
 }
 
 #[test]
-fn test_sip_bridge_skips_trunk_when_volte_bridge_inbound_owns_it() {
+fn test_sip_bridge_skips_trunk_when_volte_owns_it() {
     let mut f = NamedTempFile::new().unwrap();
     writeln!(
         f,
@@ -60,7 +60,6 @@ password = "testpass"
 
 [volte]
 enabled = true
-bridge_inbound = true
 "#
     )
     .unwrap();
@@ -261,10 +260,7 @@ fn server_mode_has_no_destination_until_a_phone_registers() {
 /// both processes race for the same UDP port (spec 024, research.md R-003).
 #[test]
 fn the_circuit_switched_bridge_yields_the_registrar_to_the_telephony_agent() {
-    for inbound in [
-        "[vowifi]\nenabled = true\n",
-        "[volte]\nenabled = true\nbridge_inbound = true\n",
-    ] {
+    for inbound in ["[vowifi]\nenabled = true\n", "[volte]\nenabled = true\n"] {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(
             f,

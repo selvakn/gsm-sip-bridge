@@ -48,12 +48,6 @@ pub(crate) fn handle_config_command(args: &crate::cli::ConfigArgs, cli: &Cli) ->
             let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
             println!("VOLTE_ENABLED={}", if v.enabled { 1 } else { 0 });
             println!("VOLTE_PCSCF_SOURCE_PATH={}", q(&v.pcscf_source_path));
-            println!("VOLTE_STATUS_PATH={}", q(&v.status_path));
-            println!("VOLTE_LOCK_PATH={}", q(&v.lock_path));
-            println!(
-                "VOLTE_BRIDGE_INBOUND={}",
-                if v.bridge_inbound { 1 } else { 0 }
-            );
             println!("VOLTE_MAX_LINES={}", v.max_lines);
             ExitCode::SUCCESS
         }

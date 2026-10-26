@@ -152,47 +152,6 @@ fn missing_card_ids(needed: &BTreeSet<String>, found: &BTreeSet<String>) -> Vec<
         .collect()
 }
 
-/// Resolves the single line the legacy, single-line VoLTE path
-/// (`orchestrate_volte::start_legacy_registration`, `[volte].bridge_inbound
-/// = false`) primes — the exact same modem `discover_priming_line`
-/// (specs/080-volte-pcscf-auto-prime's original, singular version) always
-/// picked: VoLTE's own first-selected line, at pass-local index 0.
-///
-/// This path is unaffected by specs/081-multi-carrier-pcscf's per-`card_id`
-/// caching (that only applies to the `bridge_inbound` manifest path) — it
-/// keeps writing to the literal, unkeyed `[volte].pcscf_source_path`, so a
-/// legacy single-line deployment's behavior is unchanged by this feature.
-fn discover_first_volte_line(config: &AppConfig) -> Result<LineResolutionEntry, String> {
-    let modems = crate::commands::discover::scan_for_line_resolution(config)
-        .map_err(|e| format!("priming: {e}"))?;
-
-    let volte_line = crate::volte::discovery::resolve_volte_lines(&modems, &config.volte)
-        .lines
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            "priming: no usable modem/SIM found for VoLTE (no AT-capable modem with a ready SIM)"
-                .to_string()
-        })?;
-
-    let modem = modems
-        .iter()
-        .find(|m| m.card_id == volte_line.card_id)
-        .ok_or_else(|| {
-            format!(
-                "priming: internal error — VoLTE selected modem {} but it is missing from the \
-                 scan that just produced it",
-                volte_line.card_id
-            )
-        })?;
-
-    Ok(crate::vowifi::discovery::resolve_single_line(
-        modem,
-        &config.vowifi,
-        0,
-    ))
-}
-
 /// Renders the shared charon's assets for this pass's lines:
 /// `PCSCF_PLUGIN_CONF` must list every line's connection name *before*
 /// charon starts (`PCSCF_PLUGIN_CONF`'s own doc comment), and the swanctl
@@ -229,11 +188,8 @@ fn render_shared_charon_assets(runner: &dyn CommandRunner, targets: &[PrimeTarge
 /// be written. Plain data rather than a callback so it stays trivially
 /// `Send` across each line's own establish thread.
 ///
-/// The multi-line pass (`prime_pass`) always pairs a line with its own
-/// `card_id`-keyed path (`volte::pcscf::per_line_cache_path`, research.md
-/// R1). The legacy single-line path (`prime_legacy_line`) pairs its one
-/// line with the literal, unkeyed `[volte].pcscf_source_path` instead —
-/// unaffected by this feature, matching its pre-081 behavior exactly.
+/// `prime_pass` always pairs a line with its own `card_id`-keyed path
+/// (`volte::pcscf::per_line_cache_path`, research.md R1).
 struct PrimeTarget {
     line: LineResolutionEntry,
     cache_path: std::path::PathBuf,
@@ -401,54 +357,6 @@ pub fn prime_pass(
     );
     outcomes.append(&mut missing_outcomes);
     outcomes
-}
-
-/// Runs one priming attempt for the legacy, single-line VoLTE path
-/// (`[volte].bridge_inbound = false`) — the pre-081 behavior, unaffected by
-/// per-`card_id` caching: discovers VoLTE's own first-selected line
-/// (`discover_first_volte_line`) and writes its captured address to the
-/// literal, unkeyed `[volte].pcscf_source_path`, exactly as
-/// specs/080-volte-pcscf-auto-prime's original `prime_pcscf` did.
-pub fn prime_legacy_line(
-    runner: Arc<dyn CommandRunner>,
-    bin: &str,
-    config_path: &str,
-    config: &AppConfig,
-    started: &Arc<Mutex<StartedState>>,
-    real_shutting_down: &Arc<RwLock<bool>>,
-) -> Result<(), String> {
-    if config.vowifi.tunnel_engine != "strongswan" {
-        return Err(format!(
-            "priming requires [vowifi].tunnel_engine = \"strongswan\" (the default) to capture \
-             a P-CSCF; this deployment configures {:?}, which priming does not support — supply \
-             an explicit [[volte.line]].pcscf, or run the manual VoWiFi dance once \
-             (docs/operations.md)",
-            config.vowifi.tunnel_engine
-        ));
-    }
-
-    let line = discover_first_volte_line(config)?;
-    let target = PrimeTarget {
-        line,
-        cache_path: std::path::PathBuf::from(&config.volte.pcscf_source_path),
-    };
-
-    let outcomes = prime_lines(
-        runner,
-        bin,
-        config_path,
-        config,
-        &[target],
-        started,
-        real_shutting_down,
-    );
-    outcomes
-        .into_iter()
-        .next()
-        .map(|(_, outcome)| outcome)
-        .unwrap_or_else(|| {
-            Err("priming: internal error — no outcome for the legacy line".to_string())
-        })
 }
 
 /// Turns a joined per-line thread's result into its `LineOutcome`, keeping

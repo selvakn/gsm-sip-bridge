@@ -533,10 +533,9 @@ pub fn pcscf_is_available(cache_path: &std::path::Path, override_addr: Option<&s
 /// does not shift, so a captured address keyed by it stays bound to the
 /// correct line/carrier across fleet-topology changes (research.md R1).
 ///
-/// Deliberately distinct from the legacy, unkeyed `base` path itself, which
-/// `resolve_line_pcscf` continues to read unchanged as the lowest-priority
-/// fallback tier — this function only ever *adds* a new tier, never removes
-/// the old one (research.md R2).
+/// Deliberately distinct from the unkeyed `base` path itself, which only the
+/// hand-run `volte-bridge --modem` diagnostic still reads, as
+/// `resolve_line_pcscf`'s lowest-priority fallback tier (research.md R2).
 pub fn per_line_cache_path(base: &str, card_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{base}-{card_id}"))
 }
@@ -548,19 +547,16 @@ pub fn per_line_cache_path(base: &str, card_id: &str) -> std::path::PathBuf {
 /// address itself (e.g. deciding which manifest lines belong in the next
 /// priming pass, specs/081-multi-carrier-pcscf FR-002/FR-007).
 ///
-/// Deliberately **not** three-tier: every caller of this function is a
-/// multi-line (`bridge_inbound = true`) one, for which the legacy, unkeyed
-/// `base` file is never safely this line's own address — it could be
+/// Deliberately **not** three-tier: every caller of this function is the
+/// supervised multi-line path, for which the unkeyed `base` file is never
+/// safely this line's own address — it could be
 /// another line's leftover capture, or a single stale file from a fleet
 /// upgraded from a pre-081, single-line-only deployment. Treating it as
 /// available here would make `lines_needing_priming` (its only caller
 /// besides the per-line gate) wrongly believe every line already has an
 /// address and skip priming entirely, silently reintroducing the exact
 /// shared-address-across-carriers bug this feature exists to close
-/// (Greptile PR #89 review, "Shared Cache Defeats Isolation"). The
-/// genuinely single-line path (`[volte].bridge_inbound = false`) uses
-/// `pcscf_is_available` directly instead, where the unkeyed file legitimately
-/// *is* that one line's own address.
+/// (Greptile PR #89 review, "Shared Cache Defeats Isolation").
 pub fn line_pcscf_is_available(base: &str, card_id: &str, override_addr: Option<&str>) -> bool {
     let per_line_cache = per_line_cache_path(base, card_id);
     pcscf_is_available(&per_line_cache, override_addr)

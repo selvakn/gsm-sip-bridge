@@ -36,8 +36,7 @@ const DELETE_LINK_TIMEOUT_SECS: u32 = 5;
 const DELETE_RETRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One step of container teardown. `Run`/`RunInNetns` cover the current
-/// trap's non-signal actions (`volte-cleanup`, `volte-pdn --action down`,
-/// `ip netns del`); `KillChild`/`WaitForExit` cover its `kill`/poll-for-exit
+/// trap's non-signal actions (`volte-cleanup`, `ip netns del`); `KillChild`/`WaitForExit` cover its `kill`/poll-for-exit
 /// pairs.
 /// Borrows its handles from the [`StartedState`] it was built from, rather
 /// than copying them: a `KillChild` and the `WaitForExit` that confirms it
@@ -171,10 +170,6 @@ pub struct StartedState {
     /// namespaces AND VoLTE lines' `volteN` namespaces) — deleted last, after
     /// every process using it is gone.
     pub started_netns: Vec<String>,
-    /// Set when the legacy single-line `volte-register` path ran (not the
-    /// auto-discovered multi-line path) — its PDN teardown runs directly,
-    /// unscoped to any namespace, restoring `restore_cid` if one was recorded.
-    pub legacy_volte_registration: Option<LegacyVolteRegistration>,
     /// Auto-discovered multi-line VoLTE lines that actually started.
     pub volte_lines: Vec<StartedVolteLine>,
     pub volte_bridge_supervisor: Option<Arc<ChildHandle>>,
@@ -186,13 +181,6 @@ pub struct StartedState {
     /// the plan reaps first so none outlives the bridge or races the IKE_SA
     /// terminate (#139, US6).
     pub initiate_clients: Option<Arc<super::engines::InitiateClients>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacyVolteRegistration {
-    pub supervisor_handle: Arc<ChildHandle>,
-    pub bridge_inbound: bool,
-    pub restore_cid: Option<String>,
 }
 
 const GSM_SIP_BRIDGE_BIN: &str = "gsm-sip-bridge";
@@ -330,44 +318,6 @@ pub fn build_shutdown_plan<'a>(
             handle: h,
             max_polls: KILL_CONFIRM_MAX_POLLS,
         });
-    }
-
-    // --- Legacy single-line VoLTE registration -----------------------------
-    // SIGKILL, not SIGTERM: the child may be blocked mid-AT-transaction on
-    // the modem's serial port, and only an unblockable kill guarantees the
-    // kernel closes that fd *now*, before `volte-pdn down` reopens the port.
-    if let Some(legacy) = &state.legacy_volte_registration {
-        steps.push(TeardownStep::KillChild {
-            handle: &legacy.supervisor_handle,
-            signal: Signal::Kill,
-        });
-        steps.push(TeardownStep::WaitForExit {
-            handle: &legacy.supervisor_handle,
-            max_polls: KILL_CONFIRM_MAX_POLLS,
-        });
-        steps.push(TeardownStep::Run {
-            argv: vec![
-                GSM_SIP_BRIDGE_BIN.to_string(),
-                "--config".to_string(),
-                config_path.to_string(),
-                "volte-cleanup".to_string(),
-            ],
-        });
-        if !legacy.bridge_inbound {
-            let mut argv = vec![
-                GSM_SIP_BRIDGE_BIN.to_string(),
-                "--config".to_string(),
-                config_path.to_string(),
-                "volte-pdn".to_string(),
-                "--action".to_string(),
-                "down".to_string(),
-            ];
-            if let Some(cid) = &legacy.restore_cid {
-                argv.push("--restore-cid".to_string());
-                argv.push(cid.clone());
-            }
-            steps.push(TeardownStep::Run { argv });
-        }
     }
 
     // --- Auto-discovered multi-line VoLTE ----------------------------------
@@ -903,20 +853,13 @@ mod tests {
 
     #[test]
     fn a_child_that_may_block_mid_at_transaction_is_killed_not_terminated() {
-        // Covers both the legacy single-line VoLTE path and the
-        // auto-discovered multi-line carrier-agent path — both may be
-        // blocked mid-AT-transaction on the modem's serial port, so both
-        // MUST use SIGKILL: a graceful SIGTERM could leave the child holding
-        // the port past any timeout, racing `volte-pdn down`'s reopen.
+        // A VoLTE carrier agent may be blocked mid-AT-transaction on the
+        // modem's serial port, so it MUST get SIGKILL: a graceful SIGTERM
+        // could leave the child holding the port past any timeout, racing
+        // `volte-cleanup`'s reopen.
         let runner = MockCommandRunner::new();
-        let legacy_handle = handle(&runner, 1);
         let carrier_handle = handle(&runner, 1);
         let state = StartedState {
-            legacy_volte_registration: Some(LegacyVolteRegistration {
-                supervisor_handle: legacy_handle.clone(),
-                bridge_inbound: false,
-                restore_cid: None,
-            }),
             volte_lines: vec![StartedVolteLine {
                 index: 0,
                 netns: "volte0".to_string(),
@@ -928,21 +871,15 @@ mod tests {
         };
         let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
 
-        for h in [legacy_handle, carrier_handle] {
-            let kill_step = steps
-                .iter()
-                .find(|s| matches!(s, TeardownStep::KillChild { handle, .. } if handle.id() == h.id()))
-                .unwrap_or_else(|| panic!("expected a kill step for {h:?}"));
-            match kill_step {
-                TeardownStep::KillChild { signal, .. } => {
-                    assert_eq!(
-                        *signal,
-                        Signal::Kill,
-                        "must be SIGKILL, not SIGTERM, for {h:?}"
-                    )
-                }
-                _ => unreachable!(),
+        let kill_step = steps
+            .iter()
+            .find(|s| matches!(s, TeardownStep::KillChild { handle, .. } if handle.id() == carrier_handle.id()))
+            .expect("expected a kill step for the carrier agent");
+        match kill_step {
+            TeardownStep::KillChild { signal, .. } => {
+                assert_eq!(*signal, Signal::Kill, "must be SIGKILL, not SIGTERM")
             }
+            _ => unreachable!(),
         }
     }
 
@@ -1019,55 +956,6 @@ mod tests {
         let state = StartedState::default();
         let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
         assert!(steps.is_empty());
-    }
-
-    #[test]
-    fn legacy_volte_registration_restores_the_displaced_cid_when_recorded() {
-        let runner = MockCommandRunner::new();
-        let legacy_handle = handle(&runner, 1);
-        let state = StartedState {
-            legacy_volte_registration: Some(LegacyVolteRegistration {
-                supervisor_handle: legacy_handle.clone(),
-                bridge_inbound: false,
-                restore_cid: Some("3".to_string()),
-            }),
-            ..Default::default()
-        };
-        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
-        let pdn_down = steps
-            .iter()
-            .find(|s| matches!(s, TeardownStep::Run { argv } if argv.iter().any(|a| a == "volte-pdn")))
-            .expect("volte-pdn down step must exist for the legacy non-bridge-inbound path");
-        match pdn_down {
-            TeardownStep::Run { argv } => {
-                assert!(argv.contains(&"--restore-cid".to_string()));
-                assert!(argv.contains(&"3".to_string()));
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn legacy_volte_bridge_inbound_skips_the_direct_pdn_down_step() {
-        // bridge_inbound writes a line manifest; `volte-cleanup` (already
-        // emitted unconditionally above) tears every recorded line down from
-        // it — running a second, unscoped `volte-pdn down` on top would be
-        // guessing at the CLI default rather than the exact line that
-        // registered, so it must not appear.
-        let runner = MockCommandRunner::new();
-        let legacy_handle = handle(&runner, 1);
-        let state = StartedState {
-            legacy_volte_registration: Some(LegacyVolteRegistration {
-                supervisor_handle: legacy_handle.clone(),
-                bridge_inbound: true,
-                restore_cid: None,
-            }),
-            ..Default::default()
-        };
-        let steps = build_shutdown_plan(&state, "/etc/gsm-sip-bridge/config.toml");
-        assert!(!steps.iter().any(
-            |s| matches!(s, TeardownStep::Run { argv } if argv.iter().any(|a| a == "volte-pdn"))
-        ));
     }
 
     #[test]

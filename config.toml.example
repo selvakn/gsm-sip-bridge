@@ -547,25 +547,20 @@ max_lines = 8
 # WARNING: do not enable this alongside [vowifi] on the same SIM. Both
 # register the same IMPU with the same IMEI-derived +sip.instance, so the
 # network treats one as a re-registration of the other and tears the first
-# binding down. `volte-register` refuses to start while a VoWiFi agent is
-# running unless --force is given.
+# binding down. The supervisor refuses to start with both enabled.
 [volte]
 # Off by default; the volte-* subcommands work without it as diagnostics.
-enabled = false
-# Answer incoming calls over this registration and bridge them to the PBX,
-# instead of only holding the registration open.
 #
-# Off by default, which leaves everything exactly as it was: the
-# modem-internal VoLTE path stays available and this section keeps doing what
-# it did before. Turning it on makes every bridged card EXCLUSIVE to this
-# service — the circuit-switched daemon will not drive it, so that card has
+# Turning it on answers incoming calls over LTE and bridges them to the PBX
+# ([sip]) or the SIP server ([sip_server]); every line runs in its own network
+# namespace. Every bridged card becomes EXCLUSIVE to this service: the
+# circuit-switched daemon stands down for the whole container, so a card has
 # no fallback and takes no calls at all whenever this path is down. Watch
 # gsm_sip_bridge_active_calls{transport="volte"} and the volte_* registration
 # gauges accordingly.
-bridge_inbound = false
-# Upper bound on auto-discovered LTE lines (1-64). Only meaningful with
-# bridge_inbound — a single PBX registration then serves every line, exactly
-# as the VoWiFi path does.
+enabled = false
+# Upper bound on auto-discovered LTE lines (1-64). A single PBX registration
+# serves every line, exactly as the VoWiFi path does.
 max_lines = 8
 # Which VoWiFi line's captured P-CSCF to borrow over LTE (this carrier
 # publishes none over LTE itself). Names ONE specific line: the VoWiFi side
@@ -573,8 +568,6 @@ max_lines = 8
 # so there is no single "the" address to pick up. Change the suffix to borrow
 # a different line's.
 pcscf_source_path = "/tmp/pcscf-0"
-status_path = "/tmp/volte-registration-status"
-lock_path = "/tmp/volte-registration.lock"
 # Same meaning as [vowifi]'s field of the same name above. Settable
 # independently, but when commented out/absent this INHERITS [vowifi]'s
 # value instead of defaulting to true on its own -- so a config that already

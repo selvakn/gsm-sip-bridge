@@ -830,28 +830,35 @@ Check:
 
 `specs/015-volte-host-ims`. The bridge runs **its own** IMS registration over
 an LTE IMS PDN, instead of delegating to the modem's internal IMS stack and
-re-bridging its decoded audio. Opt in with `[volte].enabled`; the `volte-*`
-subcommands work as standalone diagnostics without it.
+re-bridging its decoded audio. Opt in with `[volte].enabled`, which always
+bridges incoming calls to the PBX or SIP server (see "Bridging incoming calls"
+below); the `volte-*` subcommands work as standalone diagnostics without it.
 
 All of them need `CAP_NET_ADMIN` — run them inside the container.
 
 ```bash
 gsm-sip-bridge volte-pdn --action up --iface <ifname>   # attach the IMS PDN
 gsm-sip-bridge volte-discover --iface <ifname>          # what does the carrier publish?
-gsm-sip-bridge volte-register                           # register, then keep it alive
-gsm-sip-bridge volte-status --iface <ifname>            # attachment + registration state
+gsm-sip-bridge volte-listen --pcscf <addr>              # register for a window, decline everything
+gsm-sip-bridge volte-status --iface <ifname>            # attachment state (or the live bridge's)
 gsm-sip-bridge volte-pdn --action down --iface <ifname> # release, restoring the previous binding
 ```
+
+The diagnostics run in whatever namespace you start them in. Inside the
+container that is the host's (`network_mode: host`), so on a host with a second
+uplink (Wi-Fi, Ethernet) their IMS traffic follows the host's routing table and
+can leave through the wrong interface (#165). The supervised bridge does not
+have this problem: every line runs in its own namespace.
 
 ### Never enable VoWiFi and VoLTE on the same SIM
 
 Both register the same IMPU with the same IMEI-derived `+sip.instance`, so per
 RFC 5626 the network treats one registration as a re-registration of the other
 and deactivates the older binding — the same failure documented above for the
-modem's internal IMS stack. `volte-register` refuses to start while a
-`vowifi-ims-agent` is running (override with `--force` only when deliberately
-testing this), and `supervise` refuses to start at all if both sections are
-enabled.
+modem's internal IMS stack. The registering diagnostics (`volte-listen`,
+`volte-call`) refuse to start while a `vowifi-ims-agent` is running (override
+with `--force` only when deliberately testing this), and `supervise` refuses to
+start at all if both sections are enabled.
 
 ### The VoWiFi priming dance: capturing a P-CSCF for VoLTE
 
@@ -865,11 +872,10 @@ opaquely — an empty result across the board is the expected outcome on these
 carriers, not a fault in the probe. See the "Why nothing else works" section
 below before re-investigating this; it's been checked thoroughly.
 
-**Crucially, this isn't just "the discovery command finds nothing" — the live
-registration path (`volte-register` / `bridge_inbound`) never runs that
-discovery chain at all.** It only ever tries two things, in order: an explicit
-override (`[[volte.line]].pcscf` or `--pcscf`), then the file named by
-`[volte].pcscf_source_path`. `volte-discover` is a diagnostic for
+**Crucially, this isn't just "the discovery command finds nothing" — the
+supervised VoLTE path never runs that discovery chain at all.** It only ever
+tries two things, in order: an explicit override (`[[volte.line]].pcscf`), then
+that line's own cache under `[volte].pcscf_source_path` (see below). `volte-discover` is a diagnostic for
 characterizing what a *new* carrier offers — it is not wired into anything
 that actually runs.
 
@@ -916,8 +922,8 @@ wiping the capture) is no longer an operator problem: the next boot just
 notices which lines' caches are gone and re-primes exactly those.
 
 This only ever runs as part of `supervise`'s own startup sequence, never for
-a standalone `volte-register`/`volte-listen`/`volte-call` invocation — those
-keep the manual behavior below. It also never runs when `[vowifi].enabled` is
+a standalone `volte-listen`/`volte-call` invocation — those keep the manual
+behavior below. It also never runs when `[vowifi].enabled` is
 persistently `true`: the mutual-exclusion check further down this document
 still applies unchanged, and priming only ever acts as a transient, internal
 substitute for that persistent registration, never alongside it.
@@ -945,33 +951,26 @@ address, then switch to VoLTE.
    docker exec <bridge-ctr> cat /tmp/pcscf-0
    ```
 
-2. **Switch.** Set `[vowifi].enabled = false` and `[volte].enabled = true`
-   (plus `bridge_inbound = true` for inbound calls). **Restart the container
-   in place — do not recreate it.** `docker compose restart` (or a bare
-   `docker restart <ctr>`) reuses the same container filesystem, so
-   `/tmp/pcscf-0` survives; `docker compose up -d --force-recreate`, `down` +
-   `up`, or any path that replaces the container wipes `/tmp` and destroys the
-   capture, forcing you to redo step 1. (This is exactly the failure mode the
-   automatic version above no longer needs an operator for.)
+2. **Switch.** Pin the captured address with `[[volte.line]].pcscf =
+   "<address>"` for that modem, then set `[vowifi].enabled = false` and
+   `[volte].enabled = true` and restart. The supervised VoLTE path does not
+   read the unkeyed `/tmp/pcscf-0` (see below), so a pin is what carries the
+   capture across — and unlike the file, it also survives a container
+   recreate.
 
-3. **Verify.** `[volte].pcscf_source_path` defaults to `/tmp/pcscf-0` (VoWiFi
-   line 0), so no further config is needed for the single-line case. Confirm
-   over the logs (`connected to P-CSCF`, then a `200 OK` REGISTER response) or
-   the metrics endpoint:
+3. **Verify.** Confirm over the logs (`connected to P-CSCF`, then a `200 OK`
+   REGISTER response) or the metrics endpoint:
 
    ```bash
    curl -s localhost:9091/metrics | grep -E 'volte_(pdn_up|registered)'
    ```
 
-With several VoWiFi lines and `[volte].bridge_inbound = true` (the
-auto-discovered, multi-line VoLTE path), each VoLTE line resolves its own
-address in two tiers (specs/081-multi-carrier-pcscf): an explicit
+Each VoLTE line resolves its own address in two tiers (specs/081-multi-carrier-pcscf): an explicit
 `[[volte.line]].pcscf` override, then that line's own `card_id`-keyed cache
 (`<[volte].pcscf_source_path>-<card_id>`, written automatically by the
-multi-carrier priming pass above). The legacy, unkeyed
-`[volte].pcscf_source_path` file is **not** consulted here, deliberately: in
-a multi-line deployment that file is never safely any one line's own
-address — it could be another line's leftover capture, or (on a fleet
+multi-carrier priming pass above). The unkeyed `[volte].pcscf_source_path`
+file is **not** consulted, deliberately: that file is never safely any one
+line's own address — it could be another line's leftover capture, or (on a fleet
 upgraded from a pre-081, single-line-only deployment) a single stale
 capture from back when only the first discovered line was ever primed.
 Falling back to it would silently reintroduce the shared-address-across-
@@ -979,11 +978,7 @@ carriers bug specs/081 exists to close. A line whose per-`card_id` cache
 isn't populated yet just waits for the next priming pass, same as any other
 unconfigured line.
 
-For the single-line, non-`bridge_inbound` path, nothing has changed: it
-still resolves the one line's address from `[volte].pcscf_source_path`
-directly (a genuine three-tier resolution there: override, then that one
-file, with no `card_id` involved at all, since there's only one line to
-ever mean). `--pcscf` (CLI) / `[[volte.line]].pcscf` (config) overrides
+`[[volte.line]].pcscf` (config) / `--pcscf` (CLI diagnostics) overrides
 everything above and skips the file lookup (and automatic priming)
 entirely, for whichever line it's set on.
 
@@ -1082,35 +1077,33 @@ previous binding, and the container does the same on shutdown.
 |---|---|
 | `gsm_sip_bridge_volte_registered` | 1 when the host-side LTE registration is accepted |
 | `gsm_sip_bridge_volte_pdn_up` | 1 when the IMS PDN is attached **and routable** |
-| `gsm_sip_bridge_volte_registrations_total{outcome}` | `accepted` / `renewed` / `rejected` / `renewal_failed` |
 
 Deliberately separate from `gsm_bridge_sip_registered` (the PBX side) and from
 the VoWiFi agent's gauges — when something is down you need to know *which*
 registration, not that one of them is.
 
-### Bridging incoming calls (`[volte].bridge_inbound`)
+### Bridging incoming calls
 
-`specs/017-volte-inbound-bridge`. With `enabled` alone, the LTE registration is
-held open and nothing more. Adding `bridge_inbound = true` makes the bridge
-**answer incoming calls on it** and connect them through to the PBX:
+`specs/017-volte-inbound-bridge`. `[volte].enabled` makes the bridge **answer
+incoming calls over LTE** and connect them through to the PBX (`[sip]`) or the
+SIP server (`[sip_server]`) — one of the two must be configured, as for every
+other call path:
 
 ```toml
 [volte]
 enabled = true
-bridge_inbound = true
 ```
 
-`supervise::orchestrate_volte` then supervises `volte-bridge` in place of
-`volte-register`.
-Run it by hand the same way:
+`supervise::orchestrate_volte` then runs one `volte-carrier-agent` per
+discovered line, each inside its own network namespace, plus one shared
+`volte-bridge`. For a hand-run, single-modem session (no namespace — see the
+caveat at the top of this section):
 
 ```bash
-gsm-sip-bridge volte-bridge --iface <ifname>
+gsm-sip-bridge volte-bridge --modem <port> --iface <ifname>
 ```
 
-**This is opt-in, and unset means unchanged.** A config written before this
-feature keeps behaving exactly as it did, with the modem-internal path still
-available.
+There is no registration-only mode: `[volte].enabled` always bridges.
 
 #### What it costs: the card becomes exclusive
 
