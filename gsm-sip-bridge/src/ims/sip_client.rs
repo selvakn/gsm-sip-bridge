@@ -4,10 +4,11 @@
 
 use crate::error::{BridgeError, BridgeResult};
 use rand::RngCore;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1088,9 +1089,80 @@ enum Socket {
 pub struct SipTransport {
     socket: Socket,
     buf: Vec<u8>,
+    validity: Arc<PeerValidity>,
 }
 
 impl SipTransport {
+    /// Finish connecting a socket whose source port was reserved before the
+    /// REGISTER security proposal was sent. Keeping ownership avoids another
+    /// connection taking that port while AKA is computed.
+    pub(crate) fn from_reserved(
+        socket: socket2::Socket,
+        dst: SocketAddr,
+        use_tcp: bool,
+    ) -> BridgeResult<Self> {
+        socket
+            .set_read_timeout(Some(RECV_TIMEOUT))
+            .map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))?;
+        let socket = if use_tcp {
+            socket
+                .connect_timeout(&dst.into(), RECV_TIMEOUT)
+                .map_err(|e| BridgeError::Ims(format!("TCP connect to {dst} failed: {e}")))?;
+            Socket::Tcp(socket.into())
+        } else {
+            socket
+                .connect(&dst.into())
+                .map_err(|e| BridgeError::Ims(format!("UDP connect to {dst} failed: {e}")))?;
+            Socket::Udp(socket.into())
+        };
+        Ok(Self {
+            socket,
+            buf: Vec::new(),
+            validity: Arc::new(PeerValidity::new()),
+        })
+    }
+
+    /// Clone only the write handle. The original retains every buffered byte
+    /// and remains the sole reader throughout an in-place registration handoff.
+    pub(crate) fn clone_for_writing(&self) -> BridgeResult<Self> {
+        let socket = match &self.socket {
+            Socket::Tcp(s) => Socket::Tcp(
+                s.try_clone()
+                    .map_err(|e| BridgeError::Ims(format!("TCP try_clone failed: {e}")))?,
+            ),
+            Socket::Udp(s) => Socket::Udp(
+                s.try_clone()
+                    .map_err(|e| BridgeError::Ims(format!("UDP try_clone failed: {e}")))?,
+            ),
+        };
+        Ok(Self {
+            socket,
+            buf: Vec::new(),
+            validity: self.validity.clone(),
+        })
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Duration) -> BridgeResult<()> {
+        let result = match &self.socket {
+            Socket::Tcp(s) => s.set_read_timeout(Some(timeout)),
+            Socket::Udp(s) => s.set_read_timeout(Some(timeout)),
+        };
+        result.map_err(|e| BridgeError::Ims(format!("set_read_timeout failed: {e}")))
+    }
+
+    /// Stop all cloned readers sharing this connection.
+    pub(crate) fn shutdown(&self) {
+        self.validity.retire();
+        match &self.socket {
+            Socket::Tcp(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            Socket::Udp(s) => {
+                let _ = socket2::SockRef::from(s).shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
     pub fn connect(pcscf: SocketAddr, use_tcp: bool) -> BridgeResult<Self> {
         let socket = if use_tcp {
             let stream = TcpStream::connect_timeout(&pcscf, RECV_TIMEOUT)
@@ -1117,6 +1189,7 @@ impl SipTransport {
         Ok(Self {
             socket,
             buf: Vec::new(),
+            validity: Arc::new(PeerValidity::new()),
         })
     }
 
@@ -1174,6 +1247,7 @@ impl SipTransport {
         Ok(Self {
             socket,
             buf: Vec::new(),
+            validity: Arc::new(PeerValidity::new()),
         })
     }
 
@@ -1219,6 +1293,14 @@ impl SipTransport {
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> BridgeResult<()> {
+        let _writing = self
+            .validity
+            .writing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.validity.active.load(Ordering::Acquire) {
+            return Err(BridgeError::Ims("SIP transport has been retired".into()));
+        }
         match &mut self.socket {
             Socket::Udp(socket) => {
                 socket
@@ -1240,6 +1322,9 @@ impl SipTransport {
     /// problem, e.g. while waiting for a phone to ring for longer than
     /// that — or `Err` on a real I/O failure.
     fn read_more(&mut self) -> BridgeResult<bool> {
+        if !self.validity.active.load(Ordering::Acquire) {
+            return Err(BridgeError::Ims("SIP transport has been retired".into()));
+        }
         let mut tmp = [0u8; MAX_MSG_LEN];
         let result = match &mut self.socket {
             Socket::Udp(socket) => socket.recv(&mut tmp),
@@ -1346,6 +1431,9 @@ impl SipTransport {
     /// request's start-line always *ends* with `SIP/2.0` but begins with
     /// its method name instead.
     pub fn recv_message_deadline(&mut self, timeout: Duration) -> BridgeResult<Option<SipMessage>> {
+        if !self.validity.active.load(Ordering::Acquire) {
+            return Err(BridgeError::Ims("SIP transport has been retired".into()));
+        }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some((msg, consumed)) = try_parse_one(&self.buf)? {
@@ -1428,9 +1516,48 @@ enum SinkInner {
     /// address to answer is captured per-message — see
     /// [`response_destination`], which is *not* simply the sender's address.
     Udp(UdpSocket, SocketAddr),
+    Guarded(Box<SipSink>, Arc<PeerValidity>),
+}
+
+/// Retirement waits for writes already in progress before XFRM selectors can
+/// be removed. A queued response can never fall back to cleartext afterward.
+struct PeerValidity {
+    active: AtomicBool,
+    writing: Mutex<()>,
+}
+
+impl PeerValidity {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+            writing: Mutex::new(()),
+        }
+    }
+
+    fn retire(&self) {
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 impl SipSink {
+    fn guarded(self, validity: Arc<PeerValidity>) -> Self {
+        Self {
+            inner: Arc::new(SinkInner::Guarded(Box::new(self), validity)),
+        }
+    }
+
+    /// Also checked by dispatch before handling messages already queued when
+    /// their old Gm peer is retired.
+    pub(crate) fn is_valid(&self) -> bool {
+        match &*self.inner {
+            SinkInner::Guarded(inner, validity) => {
+                validity.active.load(Ordering::Acquire) && inner.is_valid()
+            }
+            _ => true,
+        }
+    }
+
     /// The real address this sink's messages actually go to — for UDP, the
     /// peer captured when the sink was created (the datagram's own source,
     /// per `spawn_gm_udp_server`'s docs); for TCP, the connection's own
@@ -1446,10 +1573,20 @@ impl SipSink {
                 .peer_addr()
                 .ok(),
             SinkInner::Udp(_, peer) => Some(*peer),
+            SinkInner::Guarded(inner, _) => inner.peer_addr(),
         }
     }
 
     pub fn send(&self, message: &str) -> BridgeResult<()> {
+        if let SinkInner::Guarded(inner, validity) = &*self.inner {
+            let _writing = validity.writing.lock().unwrap_or_else(|e| e.into_inner());
+            if !validity.active.load(Ordering::Acquire) {
+                return Err(BridgeError::Ims(
+                    "Gm peer security association has been retired".into(),
+                ));
+            }
+            return inner.send(message);
+        }
         let message = match self.peer_addr() {
             Some(peer) => annotate_via_received_rport(message, peer),
             None => message.to_string(),
@@ -1466,6 +1603,7 @@ impl SipSink {
                 .send_to(message.as_bytes(), peer)
                 .map(|_| ())
                 .map_err(|e| BridgeError::Ims(format!("UDP send failed: {e}"))),
+            SinkInner::Guarded(_, _) => unreachable!("guarded sinks are checked before writing"),
         }
     }
 }
@@ -1479,6 +1617,7 @@ impl SipTransport {
         Ok(Self {
             socket: Socket::Tcp(stream),
             buf: Vec::new(),
+            validity: Arc::new(PeerValidity::new()),
         })
     }
 
@@ -1502,7 +1641,8 @@ impl SipTransport {
         };
         Ok(SipSink {
             inner: Arc::new(inner),
-        })
+        }
+        .guarded(self.validity.clone()))
     }
 
     /// A second handle onto the same connection, for a dedicated reader
@@ -1531,6 +1671,7 @@ impl SipTransport {
         Ok(Self {
             socket,
             buf: Vec::new(),
+            validity: self.validity.clone(),
         })
     }
 }
@@ -1546,15 +1687,68 @@ pub struct GmServer {
     /// sets `stop`) indistinguishable from a crash, so a clean re-registration
     /// would look like a listener death. See specs/028-gm-tcp-reconnect R4.
     alive: Arc<AtomicBool>,
+    peers: PeerRegistry,
+}
+
+type PeerRegistry = Arc<Mutex<HashMap<SocketAddr, GmPeer>>>;
+
+struct GmPeer {
+    validity: Arc<PeerValidity>,
+    streams: Vec<Weak<TcpStream>>,
+}
+
+impl GmPeer {
+    fn new() -> Self {
+        Self {
+            validity: Arc::new(PeerValidity::new()),
+            streams: Vec::new(),
+        }
+    }
+
+    fn retire(&mut self) {
+        self.validity.retire();
+        for stream in self.streams.drain(..).filter_map(|stream| stream.upgrade()) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 impl Drop for GmServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        for peer in self
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            peer.retire();
+        }
     }
 }
 
 impl GmServer {
+    /// Invalidate queued replies and stop every accepted TCP connection from
+    /// the previous P-CSCF client port before removing its old XFRM policies.
+    pub(crate) fn retire_peer(&self, address: SocketAddr) {
+        self.peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(address)
+            .or_insert_with(GmPeer::new)
+            .retire();
+    }
+
+    /// A later SA generation may legitimately reuse a previously retired
+    /// client port. Its new validity token never reactivates old queued sinks.
+    pub(crate) fn activate_peer(&self, address: SocketAddr) {
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let peer = peers.entry(address).or_insert_with(GmPeer::new);
+        if !peer.validity.active.load(Ordering::Acquire) {
+            *peer = GmPeer::new();
+        }
+    }
+
     /// Whether the accept loop is still running. `false` once it has taken its
     /// fatal-error exit — the symptom of the Gm server port dying underneath a
     /// registration, which is otherwise invisible to the rest of the process.
@@ -1582,6 +1776,7 @@ pub fn spawn_gm_server(
 ) -> BridgeResult<GmServer> {
     let stop = Arc::new(AtomicBool::new(false));
     let alive = Arc::new(AtomicBool::new(true));
+    let peers: PeerRegistry = Arc::new(Mutex::new(HashMap::new()));
     // Listen on BOTH transports, not just the one we chose for our own client
     // connection. The network picks the transport for anything it originates,
     // and it does not have to match ours: Jio advertises our `transport=TCP`
@@ -1594,18 +1789,30 @@ pub fn spawn_gm_server(
     // transport we actively use must bind, the other is best-effort so a
     // UDP-only or TCP-only environment still starts.
     if use_tcp {
-        spawn_gm_tcp_server(local, tx.clone(), stop.clone(), alive.clone())?;
-        if let Err(e) = spawn_gm_udp_server(local, tx, stop.clone(), alive.clone()) {
+        spawn_gm_tcp_server(
+            local,
+            tx.clone(),
+            stop.clone(),
+            alive.clone(),
+            peers.clone(),
+        )?;
+        if let Err(e) = spawn_gm_udp_server(local, tx, stop.clone(), alive.clone(), peers.clone()) {
             tracing::warn!(error = %e, "could not also listen on UDP for network-initiated requests; inbound calls may not arrive");
         }
     } else {
-        spawn_gm_udp_server(local, tx.clone(), stop.clone(), alive.clone())?;
-        if let Err(e) = spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone()) {
+        spawn_gm_udp_server(
+            local,
+            tx.clone(),
+            stop.clone(),
+            alive.clone(),
+            peers.clone(),
+        )?;
+        if let Err(e) = spawn_gm_tcp_server(local, tx, stop.clone(), alive.clone(), peers.clone()) {
             tracing::warn!(error = %e, "could not also listen on TCP for network-initiated requests; inbound calls may not arrive");
         }
     }
     tracing::info!(local = %local, transport = "TCP+UDP", "listening on the Gm protected server port for network-initiated requests");
-    Ok(GmServer { stop, alive })
+    Ok(GmServer { stop, alive, peers })
 }
 
 /// Whether an `accept()`/`recv()` error on the Gm server socket is a routine
@@ -1649,6 +1856,7 @@ fn spawn_gm_tcp_server(
     tx: mpsc::Sender<(SipMessage, SipSink)>,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    peers: PeerRegistry,
 ) -> BridgeResult<()> {
     let socket = bind_gm_socket(local, socket2::Type::STREAM, ACCEPT_POLL_INTERVAL)?;
     socket
@@ -1660,10 +1868,35 @@ fn spawn_gm_tcp_server(
         while !stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, peer)) => {
+                    if stop.load(Ordering::Relaxed) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    let retirement_stream = match stream.try_clone() {
+                        Ok(clone) => Arc::new(clone),
+                        Err(error) => {
+                            tracing::warn!(%peer, %error, "could not track the Gm connection for SA retirement");
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        }
+                    };
+                    let validity = {
+                        let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
+                        let entry = peers.entry(peer).or_insert_with(GmPeer::new);
+                        if !entry.validity.active.load(Ordering::Acquire) {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        }
+                        entry.streams.retain(|stream| stream.strong_count() > 0);
+                        entry.streams.push(Arc::downgrade(&retirement_stream));
+                        entry.validity.clone()
+                    };
                     tracing::info!(peer = %peer, "network opened a connection to the Gm server port");
                     let tx = tx.clone();
                     let stop = stop.clone();
-                    std::thread::spawn(move || serve_gm_connection(stream, peer, tx, stop));
+                    std::thread::spawn(move || {
+                        serve_gm_connection(stream, peer, tx, stop, validity, retirement_stream)
+                    });
                 }
                 Err(e) if is_transient_accept_error(e.kind()) => {}
                 Err(e) => {
@@ -1682,6 +1915,8 @@ fn serve_gm_connection(
     peer: SocketAddr,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
     stop: Arc<AtomicBool>,
+    validity: Arc<PeerValidity>,
+    _retirement_stream: Arc<TcpStream>,
 ) {
     let mut transport = match SipTransport::from_tcp(stream) {
         Ok(t) => t,
@@ -1691,15 +1926,18 @@ fn serve_gm_connection(
         }
     };
     let sink = match transport.sink() {
-        Ok(s) => s,
+        Ok(s) => s.guarded(validity.clone()),
         Err(e) => {
             tracing::warn!(peer = %peer, error = %e, "failed to derive a sink for the Gm server connection");
             return;
         }
     };
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && validity.active.load(Ordering::Acquire) {
         match transport.recv_message_deadline(RECV_TIMEOUT) {
             Ok(Some(msg)) => {
+                if !validity.active.load(Ordering::Acquire) {
+                    return;
+                }
                 if tx.send((msg, sink.clone())).is_err() {
                     return;
                 }
@@ -1718,6 +1956,7 @@ fn spawn_gm_udp_server(
     tx: mpsc::Sender<(SipMessage, SipSink)>,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    peers: PeerRegistry,
 ) -> BridgeResult<()> {
     let socket = bind_gm_socket(local, socket2::Type::DGRAM, ACCEPT_POLL_INTERVAL)?;
     let socket: UdpSocket = socket.into();
@@ -1734,6 +1973,20 @@ fn spawn_gm_udp_server(
                     return;
                 }
             };
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let validity = {
+                let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
+                peers
+                    .entry(peer)
+                    .or_insert_with(GmPeer::new)
+                    .validity
+                    .clone()
+            };
+            if !validity.active.load(Ordering::Acquire) {
+                continue;
+            }
             // Every SIP datagram is a complete message, so unlike the TCP
             // path there is no cross-read buffering to do here.
             let datagram = &buf[..n];
@@ -1792,12 +2045,16 @@ fn spawn_gm_udp_server(
             let sink = match socket.try_clone() {
                 Ok(s) => SipSink {
                     inner: Arc::new(SinkInner::Udp(s, peer)),
-                },
+                }
+                .guarded(validity.clone()),
                 Err(e) => {
                     tracing::warn!(error = %e, "Gm server UDP try_clone failed");
                     continue;
                 }
             };
+            if stop.load(Ordering::Relaxed) || !validity.active.load(Ordering::Acquire) {
+                continue;
+            }
             if tx.send((msg, sink)).is_err() {
                 return;
             }
@@ -1975,6 +2232,134 @@ mod tests {
         assert!(
             alive_flag.load(Ordering::Relaxed),
             "a clean shutdown must not report the loop as crashed"
+        );
+    }
+
+    #[test]
+    fn retired_udp_peer_cannot_send_queued_replies_and_a_new_peer_still_works() {
+        let probe = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let (tx, rx) = mpsc::channel();
+        let server = spawn_gm_server(address, false, tx).unwrap();
+        let old = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        old.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let request = b"OPTIONS sip:x SIP/2.0\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+        old.send_to(request, address).unwrap();
+        let (_, queued_old_reply) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(queued_old_reply.is_valid());
+        server.retire_peer(old.local_addr().unwrap());
+        assert!(!queued_old_reply.is_valid());
+        assert!(queued_old_reply
+            .send("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .is_err());
+        let mut bytes = [0; 4096];
+        assert!(
+            old.recv(&mut bytes).is_err(),
+            "a delayed reply must not leave after SA retirement"
+        );
+        old.send_to(request, address).unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "retired source packets must be discarded"
+        );
+
+        let new = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        new.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        new.send_to(request, address).unwrap();
+        let (_, new_reply) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(new_reply.is_valid());
+        new_reply
+            .send("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        assert!(new.recv(&mut bytes).unwrap() > 0);
+
+        // Reuse of a client port creates a new token; old queued replies
+        // remain invalid even after a later generation activates that port.
+        server.activate_peer(old.local_addr().unwrap());
+        old.send_to(request, address).unwrap();
+        let (_, reused_port_reply) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reused_port_reply.is_valid());
+        assert!(!queued_old_reply.is_valid());
+        drop(server);
+        assert!(!new_reply.is_valid());
+        assert!(!reused_port_reply.is_valid());
+    }
+
+    #[test]
+    fn retired_tcp_peer_is_closed_without_disrupting_the_server_or_new_connections() {
+        let probe = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let (tx, rx) = mpsc::channel();
+        let server = spawn_gm_server(address, true, tx).unwrap();
+        let request = b"OPTIONS sip:x SIP/2.0\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+        let mut old = TcpStream::connect(address).unwrap();
+        old.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        old.write_all(request).unwrap();
+        let (_, queued_old_reply) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.retire_peer(old.local_addr().unwrap());
+        assert!(!queued_old_reply.is_valid());
+        assert!(queued_old_reply
+            .send("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .is_err());
+        let mut bytes = [0; 4096];
+        match old.read(&mut bytes) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            result => panic!("retiring the peer must close its TCP connection: {result:?}"),
+        }
+
+        let mut new = TcpStream::connect(address).unwrap();
+        new.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        new.write_all(request).unwrap();
+        let (_, reply) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reply.is_valid());
+        reply
+            .send("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        assert!(new.read(&mut bytes).unwrap() > 0);
+        assert!(server.is_alive());
+    }
+
+    #[test]
+    fn shutting_down_a_udp_transport_invalidates_cloned_writers_readers_and_queued_sinks() {
+        let peer = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut transport = SipTransport::connect(peer.local_addr().unwrap(), false).unwrap();
+        let mut writer = transport.clone_for_writing().unwrap();
+        let queued_sink = transport.sink().unwrap();
+        let mut reader = transport.try_clone_reader().unwrap();
+        transport
+            .send("OPTIONS sip:x SIP/2.0\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        let mut bytes = [0; 4096];
+        assert!(peer.recv(&mut bytes).unwrap() > 0);
+
+        let (completed, result) = mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let outcome = reader.recv_message_deadline(Duration::from_secs(5));
+            completed.send(outcome.is_err()).unwrap();
+        });
+        transport.shutdown();
+        assert!(
+            result.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "the cloned reader must stop after shutdown"
+        );
+        reading.join().unwrap();
+        assert!(!queued_sink.is_valid());
+        assert!(writer.send("OPTIONS sip:x SIP/2.0\r\n\r\n").is_err());
+        assert!(transport.send("OPTIONS sip:x SIP/2.0\r\n\r\n").is_err());
+        assert!(queued_sink.send("SIP/2.0 200 OK\r\n\r\n").is_err());
+        peer.set_nonblocking(true).unwrap();
+        assert!(
+            peer.recv(&mut bytes).is_err(),
+            "retired UDP handles must not emit unprotected packets"
         );
     }
 

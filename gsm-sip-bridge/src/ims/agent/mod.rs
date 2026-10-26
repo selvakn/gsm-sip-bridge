@@ -36,6 +36,9 @@ pub(crate) mod pcscf_pool;
 mod ping;
 mod probe;
 mod reg_subscription;
+mod registration_refresh;
+#[cfg(test)]
+mod registration_tests;
 mod session_refresh;
 mod veth;
 pub(crate) mod watchdog;
@@ -74,7 +77,7 @@ use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -90,6 +93,7 @@ use origination::{
 use pcscf_pool::{cause_of, FailureCause, PcscfPool, SelectReason};
 use ping::{cseq_method, parse_cseq_number, probe_gm_connection, PingState};
 use reg_subscription::{EndpointFailureCause, NotifyMatch, RegSubscription, SubAction, SubKind};
+use registration_refresh::{granted_lifetime, PendingRegister};
 use session_refresh::{RefreshVerdict, Refresher};
 
 pub(crate) use call::AttachmentHook;
@@ -152,10 +156,9 @@ const ACTIVE_CALL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// than this, the same cross-check `CALL_ATTEMPT_TIMEOUT` does against
 /// `OUTBOUND_INVITE_TIMEOUT`.
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// How far ahead of the registration's actual expiry Agent A starts trying
-/// to renew it — SC-003's 90s recovery budget plus margin for the
-/// renewal's own AKA-challenge round trip.
-const RENEWAL_HEADROOM: Duration = Duration::from_secs(300);
+/// Fallback margin if registration timestamps are unavailable. Normal grants
+/// use TS 24.229's 600 seconds / half-lifetime schedule.
+const RENEWAL_HEADROOM: Duration = Duration::from_secs(600);
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// How many consecutive renewal failures this agent absorbs in-process before
@@ -183,7 +186,7 @@ const REGISTRATION_SETTLE: Duration = Duration::from_secs(60);
 const QUALIFYING_FAILURE_REASON: &str =
     "reg-event SUBSCRIBE unanswered and the Gm keepalive probe failed; re-registering";
 
-/// Work that must succeed before a renewal is worth attempting.
+/// Attachment work performed before a disruptive registration recovery.
 ///
 /// Exists for the LTE path, where the carrier tears the network attachment
 /// down roughly every two hours (specs/015 research R15) and renewing over a
@@ -192,7 +195,7 @@ const QUALIFYING_FAILURE_REASON: &str =
 ///
 /// **This is also what defers re-attachment during a call**, and deliberately
 /// so: the hook runs inside the block the dispatch loop already skips while
-/// `active_call.is_some()`, so re-attachment inherits renewal's deferral
+/// `active_call.is_some()`, so re-attachment inherits recovery's deferral
 /// rather than carrying a second policy that could drift from it. An
 /// unguarded re-attach would drop a live call every two hours
 /// (specs/017 T039).
@@ -2025,12 +2028,8 @@ struct LoopState {
     /// drop an otherwise-valid call within that window — found in review,
     /// not live-testing).
     next_renewal_attempt: Option<Instant>,
-    /// Formalises the "maintenance must yield to a call" rule
-    /// (`ims::lifecycle`): it decides whether a due renewal may run or must be
-    /// held for the call in progress, and remembers that it was held so status
-    /// can report the deferral as deliberate rather than as a stall (the
-    /// re-attachment the renewal hook performs inherits the same deferral —
-    /// see `PreRenewalHook`).
+    /// Disruptive recovery yields to a call; ordinary protected REGISTER
+    /// refreshes run independently of this gate.
     maintenance: MaintenancePolicy,
     /// FR-011 mid-call attachment watch, reset per call.
     watch: AttachmentWatch,
@@ -2090,6 +2089,49 @@ struct LoopState {
     endpoint_failure_seen: Option<String>,
     /// Delivery reports awaiting the network's answer.
     reports: ReportsInFlight,
+    /// Ordinary registration refreshes run alongside call signaling.
+    registration_refresh: Option<PendingRegister>,
+    registration_reauth: Option<RegistrationReauth>,
+    retired_registration_sessions: Vec<RetiredRegistrationSession>,
+}
+
+struct RegistrationReauth {
+    result: mpsc::Receiver<Result<crate::ims::registration_auth::Reauthenticated, RegisterFailure>>,
+    responses: mpsc::Sender<SipResponse>,
+    call_id: String,
+    deadline: Instant,
+    cancel: Arc<AtomicBool>,
+    next_cseq: Arc<AtomicU32>,
+    cancelled: bool,
+}
+
+impl Drop for RegistrationReauth {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Old transaction-bound sockets (e.g. an outstanding INVITE's CANCEL) remain
+/// usable during the SA transition. The server listener itself is unchanged.
+struct RetiredRegistrationSession {
+    transport: crate::ims::sip_client::SipTransport,
+    gm: crate::ims::GmSa,
+    keep: crate::ims::gm_ipsec::GmEndpoints,
+    proto: &'static str,
+    retire_after: Instant,
+}
+
+impl Drop for RetiredRegistrationSession {
+    fn drop(&mut self) {
+        self.transport.shutdown();
+        crate::ims::gm_ipsec::remove_gm_sas_preserving(
+            &self.gm.endpoints,
+            &self.gm.proposal,
+            &self.gm.theirs,
+            self.proto,
+            &self.keep,
+        );
+    }
 }
 
 impl LoopState {
@@ -2120,6 +2162,9 @@ impl LoopState {
             pool: PcscfPool::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), Vec::new(), None),
             endpoint_failure_seen: None,
             reports: ReportsInFlight::default(),
+            registration_refresh: None,
+            registration_reauth: None,
+            retired_registration_sessions: Vec::new(),
         }
     }
 
@@ -2173,9 +2218,8 @@ impl LoopState {
     /// `RETRY_MAX_BACKOFF`, until the container was restarted by hand. The
     /// remedy was three minutes away the whole time.
     ///
-    /// Exiting is safe here by construction: `on_idle_tick` has already
-    /// deferred this renewal through [`MaintenancePolicy`] if a call is in
-    /// progress, so no live call is ever cut short by it.
+    /// Disruptive recovery reaches this only while idle. Protected refresh
+    /// failures use `count_loss`, which postpones a budget exit during a call.
     /// A renewal succeeded: the registration is live again, so the backoff
     /// ladder and the retry budget both start over. The counterpart to
     /// [`Self::schedule_renewal_retry`] — kept next to it so the two can't
@@ -2596,6 +2640,9 @@ fn dispatch_loop(
     let first = st.reg_sub.on_new_registration(Instant::now());
     st.perform_sub_action(session, p, first);
     loop {
+        // Advance timers even under continuous incoming traffic. Waiting for
+        // recv_timeout would let NOTIFY/OPTIONS traffic starve registration.
+        st.on_idle_tick(session, inbound, p)?;
         st.sync_shared_status(p);
         // An outbound call being placed occupies the line for the tunnel
         // supervisor before it is bridged (specs/093). Reconciled here, once
@@ -2649,6 +2696,9 @@ fn dispatch_loop(
         // config asks for it — Airtel and Vi answer correctly on the arrival
         // socket today.
         let received = match inbound.rx.recv_timeout(poll) {
+            // A packet can already be queued when an old SA generation is
+            // retired. Do not redirect its invalidated sink onto a live one.
+            Ok((_, sink)) if !sink.is_valid() => continue,
             Ok((msg, sink)) if respond_on_client && matches!(msg, SipMessage::Request(_)) => {
                 match session.transport().and_then(|t| t.sink()) {
                     Ok(client_sink) => {
@@ -2708,7 +2758,9 @@ fn dispatch_loop(
                 );
             }
             Ok((SipMessage::Response(resp), _)) => {
-                st.handle_carrier_response(session, p, &resp);
+                if !st.handle_registration_response(session, inbound, p, &resp)? {
+                    st.handle_carrier_response(session, p, &resp);
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(BridgeError::Ims(
@@ -2717,7 +2769,7 @@ fn dispatch_loop(
                 ));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                st.on_idle_tick(session, inbound, p)?;
+                // Timers are polled at the top of every pass.
             }
         }
     }
@@ -3366,6 +3418,9 @@ impl LoopState {
         p: &DispatchParams,
         deregistration: Option<Deregistration>,
     ) -> BridgeResult<()> {
+        if deregistration.is_some() {
+            self.cancel_registration_refresh();
+        }
         if deregistration.is_some_and(|d| d.event == DeregEvent::Rejected) {
             self.end_calls_on_rejection(session, &|call| report_answered_call_ended(p.obs, call));
         }
@@ -3549,6 +3604,7 @@ impl LoopState {
             );
             return false;
         }
+        self.cancel_registration_refresh();
         self.force_renewal = true;
         self.ping.reset();
         self.reconnect_attempts = 0;
@@ -3619,6 +3675,390 @@ impl LoopState {
                 self.maintenance.release();
             }
         }
+    }
+
+    fn cancel_registration_refresh(&mut self) {
+        self.registration_refresh = None;
+        if let Some(work) = &mut self.registration_reauth {
+            work.cancelled = true;
+            work.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn validate_registration_grant(
+        &mut self,
+        p: &DispatchParams,
+        response: &SipResponse,
+        contact: SocketAddr,
+        requested: u32,
+    ) -> BridgeResult<u32> {
+        let granted = granted_lifetime(response, contact, requested)?;
+        if granted == 0 {
+            let mut status = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.expires_at = Some(SystemTime::now());
+            status.state = crate::ims::RegistrationState::Failed;
+            self.force_renewal = true;
+            return Err(BridgeError::Ims(
+                "registrar removed our binding (expires=0)".into(),
+            ));
+        }
+        Ok(granted)
+    }
+
+    fn confirm_registration_refresh(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        p: &DispatchParams,
+        response: SipResponse,
+        requested: u32,
+    ) -> BridgeResult<()> {
+        let granted =
+            self.validate_registration_grant(p, &response, session.contact_addr, requested)?;
+        // Refresh metadata is for new dialogs. Existing dialogs retain their
+        // own route sets; the reg-event subscription also keeps its dialog.
+        for name in [
+            "Contact",
+            "Expires",
+            "Service-Route",
+            "P-Associated-URI",
+            "Authentication-Info",
+        ] {
+            let values: Vec<_> = response
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .cloned()
+                .collect();
+            if !values.is_empty() {
+                session
+                    .headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+                session.headers.extend(values);
+            }
+        }
+        session.status = 200;
+        session.reason = response.reason;
+        let now = SystemTime::now();
+        let expires_at = now + Duration::from_secs(granted as u64);
+        {
+            let mut status = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.state = crate::ims::RegistrationState::Registered;
+            status.registered_at = Some(now);
+            status.expires_at = Some(expires_at);
+            status.last_failure = None;
+        }
+        self.on_renewal_success();
+        self.budget_exit_owed = None;
+        p.obs
+            .report_registration_attempt(RegistrationStatus::Success);
+        p.obs.set_registered(true);
+        p.obs.set_registration_expiry(expires_at);
+        tracing::info!(
+            granted_expires_secs = granted,
+            in_call = self.busy(),
+            "IMS registration refreshed without replacing the dialog"
+        );
+        Ok(())
+    }
+
+    fn fail_registration_refresh(
+        &mut self,
+        p: &DispatchParams,
+        failure: RegisterFailure,
+    ) -> BridgeResult<()> {
+        tracing::warn!(error = %failure.error, in_call = self.busy(), "IMS registration refresh failed; retaining the existing session");
+        p.obs.report_registration_attempt(
+            failure
+                .status
+                .map(map_registration_status_code)
+                .unwrap_or_else(|| map_registration_error(&failure.error)),
+        );
+        let valid = {
+            let mut status = p.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.last_failure = Some((SystemTime::now(), failure.error.to_string()));
+            let valid = status
+                .expires_at
+                .is_some_and(|expiry| SystemTime::now() < expiry)
+                && status.state == crate::ims::RegistrationState::Registered;
+            if !valid {
+                status.state = crate::ims::RegistrationState::Failed;
+            }
+            valid
+        };
+        p.obs.set_registered(valid);
+        // Receiving a refusal does not mean the tunnel or current SA failed.
+        // Keep serving calls while retries use the existing bounded ladder.
+        self.count_loss(self.busy())?;
+        if let Some(delay) = failure.retry_after {
+            let floor = Instant::now() + delay.min(Duration::from_secs(86_400));
+            self.next_renewal_attempt = self.next_renewal_attempt.max(Some(floor));
+        }
+        if matches!(failure.status, Some(403 | 408 | 500 | 504)) {
+            // TS 24.229 abnormal refresh cases require initial registration.
+            // Its disruptive attachment recovery remains separate from refresh.
+            self.force_renewal = true;
+        }
+        Ok(())
+    }
+
+    fn handle_registration_response(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        inbound: &Inbound,
+        p: &DispatchParams,
+        response: &SipResponse,
+    ) -> BridgeResult<bool> {
+        if let Some(work) = &self.registration_reauth {
+            if response.header("Call-ID") == Some(work.call_id.as_str())
+                && response
+                    .header("CSeq")
+                    .and_then(cseq_method)
+                    .is_some_and(|m| m.eq_ignore_ascii_case("REGISTER"))
+            {
+                let _ = work.responses.send(response.clone());
+                return Ok(true);
+            }
+        }
+        if !self
+            .registration_refresh
+            .as_ref()
+            .is_some_and(|pending| pending.matches(response))
+        {
+            return Ok(false);
+        }
+        let mut pending = self
+            .registration_refresh
+            .take()
+            .expect("matched pending REGISTER");
+        if response.status < 200 {
+            pending.provisional();
+            self.registration_refresh = Some(pending);
+            return Ok(true);
+        }
+        if response.status == 200 {
+            if let Err(error) = self.confirm_registration_refresh(
+                session,
+                p,
+                response.clone(),
+                pending.requested_expires,
+            ) {
+                self.fail_registration_refresh(p, error.into())?;
+            }
+        } else if response.status == 423 {
+            match pending.retry_min_expires(response, session, p.reg_cfg, Instant::now()) {
+                Ok(true) => self.registration_refresh = Some(pending),
+                Ok(false) => self.fail_registration_refresh(
+                    p,
+                    RegisterFailure {
+                        error: BridgeError::Ims("REGISTER 423 without a usable Min-Expires".into()),
+                        status: Some(423),
+                        retry_after: None,
+                    },
+                )?,
+                Err(e) => self.fail_registration_refresh(p, e.into())?,
+            }
+        } else if response.status == 401 {
+            let components = (
+                session.gm_state.clone(),
+                pending.proposal.take(),
+                pending.reserved_port.take(),
+                session.registration_auth.as_ref(),
+            );
+            if let (Some(previous), Some(proposal), Some(reserved_port), Some(auth)) = components {
+                let (responses, old_responses) = mpsc::channel();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let next_cseq = Arc::new(AtomicU32::new(session.registration_cseq));
+                let result = crate::ims::registration_auth::spawn(
+                    crate::ims::registration_auth::ReauthRequest {
+                        cfg: p.reg_cfg.with_pcscf(session.pcscf_addr.ip()),
+                        modem_lock: p.modem_lock.cloned(),
+                        impi: auth.impi.clone(),
+                        public_uri: session.public_uri.clone(),
+                        call_id: session.call_id.clone(),
+                        from_tag: session.from_tag.clone(),
+                        cseq: session.registration_cseq,
+                        next_cseq: Arc::clone(&next_cseq),
+                        contact_addr: session.contact_addr,
+                        local_addr: session.local_addr,
+                        proposal,
+                        previous,
+                        response: response.clone(),
+                        reserved_port,
+                        imei: session.imei.clone(),
+                        old_transport: session.transport()?.sink()?,
+                        old_responses,
+                        requested_expires: pending.requested_expires,
+                        cancel: Arc::clone(&cancel),
+                    },
+                    inbound.tx.clone(),
+                );
+                self.registration_reauth = Some(RegistrationReauth {
+                    result,
+                    responses,
+                    call_id: session.call_id.clone(),
+                    deadline: Instant::now()
+                        + crate::ims::registration_auth::WORK_TIMEOUT
+                        + Duration::from_secs(5),
+                    cancel,
+                    next_cseq,
+                    cancelled: false,
+                });
+                tracing::info!(
+                    in_call = self.busy(),
+                    "IMS registration requires AKA; authenticating in background"
+                );
+            } else {
+                self.force_renewal = true;
+                self.fail_registration_refresh(
+                    p,
+                    RegisterFailure {
+                        error: BridgeError::Ims(
+                            "IMS reauthentication has no protected registration context".into(),
+                        ),
+                        status: Some(401),
+                        retry_after: None,
+                    },
+                )?;
+            }
+        } else {
+            self.fail_registration_refresh(
+                p,
+                RegisterFailure {
+                    error: BridgeError::Ims(format!(
+                        "renewal REGISTER rejected: {} {}",
+                        response.status, response.reason
+                    )),
+                    status: Some(response.status),
+                    retry_after: crate::ims::retry_after(&response.headers),
+                },
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn poll_registration_refresh(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        inbound: &Inbound,
+        p: &DispatchParams,
+    ) -> BridgeResult<bool> {
+        let now = Instant::now();
+        // INVITE's non-2xx ACK/CANCEL must use the transport the transaction
+        // started on. A full timer-F grace also covers other outstanding SIP
+        // transactions and network retransmissions before retiring old SAs.
+        if self.origination.is_some() {
+            for old in &mut self.retired_registration_sessions {
+                old.retire_after = now + registration_refresh::TRANSACTION_TIMEOUT;
+            }
+        } else {
+            self.retired_registration_sessions.retain(|old| {
+                if now < old.retire_after {
+                    return true;
+                }
+                if let Some(server) = &inbound._server {
+                    server.retire_peer(old.gm.endpoints.remote_c);
+                }
+                false
+            });
+        }
+        if let Some(work) = self.registration_reauth.take() {
+            session.registration_cseq = session
+                .registration_cseq
+                .max(work.next_cseq.load(Ordering::Acquire));
+            let outcome = match work.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) if now < work.deadline => {
+                    self.registration_reauth = Some(work);
+                    return Ok(true);
+                }
+                Err(_) => Some(Err(BridgeError::Ims(
+                    "background IMS reauthentication timed out or stopped".into(),
+                )
+                .into())),
+            };
+            match outcome.expect("a completed result") {
+                result if work.cancelled => {
+                    drop(result);
+                }
+                Ok(replacement) => {
+                    // Validate before changing any active policy or transport.
+                    if let Err(e) = self.validate_registration_grant(
+                        p,
+                        &replacement.response,
+                        session.contact_addr,
+                        replacement.requested_expires,
+                    ) {
+                        drop(replacement);
+                        self.fail_registration_refresh(p, e.into())?;
+                    } else {
+                        match replacement.commit() {
+                            Ok(next) => {
+                                if let Some(server) = &inbound._server {
+                                    server.activate_peer(next.gm.endpoints.remote_c);
+                                }
+                                let old_transport = session
+                                    .transport
+                                    .replace(next.transport)
+                                    .expect("registered transport");
+                                session.local_addr = session.transport()?.local_addr()?;
+                                let old_gm = session
+                                    .gm_state
+                                    .replace(next.gm)
+                                    .expect("protected reauthentication");
+                                self.retired_registration_sessions.push(
+                                    RetiredRegistrationSession {
+                                        transport: old_transport,
+                                        gm: old_gm,
+                                        keep: session
+                                            .gm_state
+                                            .as_ref()
+                                            .expect("new GM")
+                                            .endpoints
+                                            .clone(),
+                                        proto: session.xfrm_proto,
+                                        retire_after: now
+                                            + registration_refresh::TRANSACTION_TIMEOUT,
+                                    },
+                                );
+                                session.registration_auth = Some(next.auth);
+                                session.registration_cseq =
+                                    session.registration_cseq.max(next.next_cseq);
+                                inbound.adopt_client_reader(next.reader);
+                                // A pending OPTIONS belongs to the retired
+                                // connection and cannot judge its replacement.
+                                self.ping.reset();
+                                if let Some(call) = &mut self.active_call {
+                                    call.dialog.refresh_signaling(session);
+                                }
+                                if let Some(origination) = &mut self.origination {
+                                    origination.refresh_signaling(session);
+                                }
+                                self.confirm_registration_refresh(
+                                    session,
+                                    p,
+                                    next.response,
+                                    next.requested_expires,
+                                )?;
+                            }
+                            Err(e) => self.fail_registration_refresh(p, e.into())?,
+                        }
+                    }
+                }
+                Err(failure) => self.fail_registration_refresh(p, failure)?,
+            }
+            return Ok(false);
+        }
+        if let Some(mut pending) = self.registration_refresh.take() {
+            match pending.poll(session, now) {
+                Ok(true) => self.registration_refresh = Some(pending),
+                Ok(false) => self.fail_registration_refresh(
+                    p,
+                    BridgeError::Ims("IMS registration refresh timed out (timer F)".into()).into(),
+                )?,
+                Err(e) => self.fail_registration_refresh(p, e.into())?,
+            }
+        }
+        Ok(self.registration_refresh.is_some())
     }
 
     fn handle_carrier_response(
@@ -3703,10 +4143,17 @@ impl LoopState {
         // question is liveness, not whether the carrier liked the request
         // (specs/028 R1). A matching answer is also what confirms a *reconnect*
         // actually worked, before we report the line healthy (R7).
-        let matched = resp
-            .header("CSeq")
-            .and_then(parse_cseq_number)
-            .is_some_and(|n| self.ping.on_response(n));
+        // REGISTER has an independent CSeq counter. A late registration
+        // response can share this number without answering the OPTIONS probe.
+        let matched = resp.status >= 200
+            && resp
+                .header("CSeq")
+                .and_then(cseq_method)
+                .is_some_and(|method| method.eq_ignore_ascii_case("OPTIONS"))
+            && resp
+                .header("CSeq")
+                .and_then(parse_cseq_number)
+                .is_some_and(|n| self.ping.on_response(n));
         if matched {
             if !self.gm_conn.is_up() {
                 tracing::info!("Gm connection liveness confirmed; connection is up");
@@ -3774,6 +4221,9 @@ impl LoopState {
         if let Some(action) = self.reg_sub.poll(Instant::now(), self.force_renewal) {
             self.perform_sub_action(session, p, action);
         }
+        if self.poll_registration_refresh(session, inbound, p)? {
+            return Ok(());
+        }
 
         // Gm connection liveness (specs/028) runs here, on the idle path, only
         // when no call is in progress — a live call proves the connection by
@@ -3801,9 +4251,8 @@ impl LoopState {
             }
         }
 
-        // Never renew mid-call — that would tear down the transport a call's
-        // own signaling (e.g. the eventual BYE) still needs; renewal is
-        // deferred until the call ends.
+        // TS 24.229 5.1.1.4.1: refresh the existing binding before expiry,
+        // including while a call is active. Disruptive recovery is separate.
         let (expires_at, registered_at) = {
             let guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
             (guard.expires_at, guard.registered_at)
@@ -3817,7 +4266,6 @@ impl LoopState {
         let headroom = match (expires_at, registered_at) {
             (Some(exp), Some(reg)) => crate::ims::renewal_headroom_for(
                 exp.duration_since(reg).unwrap_or(RENEWAL_HEADROOM),
-                RENEWAL_HEADROOM,
             ),
             _ => RENEWAL_HEADROOM,
         };
@@ -3830,16 +4278,6 @@ impl LoopState {
         if !due && !self.force_renewal {
             return Ok(());
         }
-        // Renewal is genuinely due. Hold it if a call is in progress, or an
-        // outbound origination is still being placed (specs/029) —
-        // re-registering mid-attempt would replace the transport and the
-        // session the pending INVITE's dialog lives on. Recorded by the policy
-        // so the deferral is visible in status, and so the model, not an inline
-        // `is_some()`, owns the rule.
-        if self.maintenance.decide(Maintenance::Renewal, self.busy()) == MaintenanceDecision::Defer
-        {
-            return Ok(());
-        }
         // A previous attempt failed and its backoff hasn't elapsed yet —
         // `renewal_due` alone would otherwise fire again on every idle wake-up
         // regardless of backoff, hammering a still-failing renewal every poll
@@ -3848,6 +4286,22 @@ impl LoopState {
             if Instant::now() < next_attempt {
                 return Ok(());
             }
+        }
+        if !self.force_renewal {
+            match PendingRegister::start(session, p.reg_cfg, Instant::now()) {
+                Ok(pending) => self.registration_refresh = Some(pending),
+                Err(e) => self.fail_registration_refresh(p, e.into())?,
+            }
+            return Ok(());
+        }
+        // Only recovery after a lost/rejected binding replaces the session or
+        // reattaches LTE. Ordinary periodic refresh never reaches this gate.
+        if self
+            .maintenance
+            .decide(Maintenance::RegistrationRecovery, self.busy())
+            == MaintenanceDecision::Defer
+        {
+            return Ok(());
         }
         // The rejection cooldown's one attempt (FR-011): from here on a
         // failure lands on the ordinary ladder, which the rejection reset.
@@ -3951,6 +4405,13 @@ impl LoopState {
             Ok(new_session) => {
                 self.pool.on_registered(target);
                 tracing::info!(pcscf = %target, outcome = "registered", "registration through P-CSCF");
+                // Stop every old server stream and invalidate queued sinks
+                // before deleting the policies that required ESP on them.
+                inbound._server = None;
+                if let Ok(transport) = session.transport() {
+                    transport.shutdown();
+                }
+                self.retired_registration_sessions.clear();
                 session.cleanup();
                 *session = new_session;
                 // A renewal negotiates a fresh Gm SA on fresh ports, so the old
@@ -6856,7 +7317,8 @@ mod tests {
             crate::ims::RegistrationState::Failed
         );
         assert_eq!(
-            st.maintenance.decide(Maintenance::Renewal, st.busy()),
+            st.maintenance
+                .decide(Maintenance::RegistrationRecovery, st.busy()),
             MaintenanceDecision::Defer
         );
     }

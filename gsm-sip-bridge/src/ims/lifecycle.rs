@@ -301,11 +301,13 @@ impl CallSlot {
     }
 }
 
-/// Maintenance work that must yield to a call in progress.
+/// Registration and attachment work with different effects on a live call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maintenance {
-    /// Renew the registration before it expires.
+    /// Refresh registration over its existing transport, preserving dialogs.
     Renewal,
+    /// Rebuild registration and its transport after in-place recovery fails.
+    RegistrationRecovery,
     /// Re-establish the network attachment the carrier tore down.
     Reattachment,
 }
@@ -314,6 +316,7 @@ impl Maintenance {
     pub fn as_str(self) -> &'static str {
         match self {
             Maintenance::Renewal => "renewal",
+            Maintenance::RegistrationRecovery => "registration-recovery",
             Maintenance::Reattachment => "reattachment",
         }
     }
@@ -330,21 +333,13 @@ pub enum MaintenanceDecision {
 
 /// Decides whether due maintenance may run.
 ///
-/// # Why re-attachment is the dangerous one
-///
-/// Renewal deferral is inherited from the Wi-Fi agent, with the reasoning
-/// recorded at that site: renewing mid-call tears down the transport the
-/// call's own `BYE` still needs.
-///
-/// **Re-attachment is worse and is new to this path.** Renewal rebuilds the
-/// signalling; re-attachment rebuilds the *network attachment underneath it*,
-/// taking the media with it. The carrier tears that attachment down roughly
-/// every two hours, so an unguarded re-attach is not a rare edge case — it is
-/// a call dropped every two hours, indefinitely.
-///
-/// A call is deliberately allowed to **outlive its registration** rather than
-/// be cut short (spec Assumptions): dropping a live conversation to satisfy a
-/// timer is worse than a registration lapsing slightly late.
+/// Ordinary registration refresh is SIP signalling on the existing transport
+/// and must run at its scheduled time, including during a call (3GPP TS 24.229,
+/// section 5.1.1.4.1). It must not tear down the transport or current dialogs.
+/// Registration recovery that replaces the transport and reattachment that
+/// rebuilds the network underneath it are disruptive, so they wait for a call
+/// to end. A failed refresh must not force a local teardown merely to rebuild
+/// registration; the network can still expire the binding independently.
 #[derive(Debug, Default)]
 pub struct MaintenancePolicy {
     deferred: Option<Maintenance>,
@@ -361,18 +356,20 @@ impl MaintenancePolicy {
     /// Takes `call_in_progress` rather than reading a slot so the policy is
     /// testable without a carrier, a modem or a telephone system.
     pub fn decide(&mut self, what: Maintenance, call_in_progress: bool) -> MaintenanceDecision {
+        if what == Maintenance::Renewal {
+            return MaintenanceDecision::Proceed;
+        }
         if call_in_progress {
             if self.deferred.is_none() {
                 self.deferred_since = Some(SystemTime::now());
             }
-            // Re-attachment subsumes renewal: the attachment is underneath the
-            // registration, so if both fell due we must rebuild the lower
-            // layer first or the renewal would only fail again.
+            // Reattachment subsumes registration recovery: rebuild the lower
+            // layer first or replacing registration would only fail again.
             self.deferred = Some(match (self.deferred, what) {
                 (Some(Maintenance::Reattachment), _) | (_, Maintenance::Reattachment) => {
                     Maintenance::Reattachment
                 }
-                _ => Maintenance::Renewal,
+                _ => Maintenance::RegistrationRecovery,
             });
             MaintenanceDecision::Defer
         } else {
@@ -381,7 +378,7 @@ impl MaintenancePolicy {
     }
 
     /// Whether maintenance is currently being held back — reported in status
-    /// so a deferred renewal reads as deliberate rather than as a stall.
+    /// so a deferred recovery reads as deliberate rather than as a stall.
     pub fn deferred(&self) -> Option<Maintenance> {
         self.deferred
     }
@@ -717,14 +714,25 @@ mod tests {
     }
 
     #[test]
-    fn renewal_due_during_a_call_is_deferred_until_it_ends() {
+    fn renewal_due_during_a_call_proceeds_without_deferral() {
         let mut p = MaintenancePolicy::new();
         assert_eq!(
             p.decide(Maintenance::Renewal, true),
-            MaintenanceDecision::Defer,
-            "renewing mid-call tears down the transport the call's own BYE needs"
+            MaintenanceDecision::Proceed
         );
-        assert_eq!(p.release(), Some(Maintenance::Renewal));
+        assert_eq!(p.deferred(), None);
+        assert_eq!(p.deferred_for(SystemTime::now()), None);
+        assert_eq!(p.release(), None);
+    }
+
+    #[test]
+    fn registration_recovery_during_a_call_is_deferred_until_it_ends() {
+        let mut p = MaintenancePolicy::new();
+        assert_eq!(
+            p.decide(Maintenance::RegistrationRecovery, true),
+            MaintenanceDecision::Defer
+        );
+        assert_eq!(p.release(), Some(Maintenance::RegistrationRecovery));
         assert_eq!(p.deferred(), None, "released work is not deferred twice");
     }
 
@@ -742,17 +750,17 @@ mod tests {
     }
 
     #[test]
-    fn reattachment_outranks_renewal_when_both_were_deferred() {
+    fn reattachment_outranks_registration_recovery_when_both_were_deferred() {
         // The attachment is underneath the registration: renewing first would
         // only fail again.
         let mut p = MaintenancePolicy::new();
-        p.decide(Maintenance::Renewal, true);
+        p.decide(Maintenance::RegistrationRecovery, true);
         p.decide(Maintenance::Reattachment, true);
         assert_eq!(p.release(), Some(Maintenance::Reattachment));
 
         let mut p = MaintenancePolicy::new();
         p.decide(Maintenance::Reattachment, true);
-        p.decide(Maintenance::Renewal, true);
+        p.decide(Maintenance::RegistrationRecovery, true);
         assert_eq!(
             p.release(),
             Some(Maintenance::Reattachment),
@@ -761,13 +769,22 @@ mod tests {
     }
 
     #[test]
-    fn a_call_may_outlive_its_registration() {
-        // Deliberate: dropping a live conversation to satisfy a timer is worse
-        // than a registration lapsing slightly late.
+    fn renewal_does_not_cancel_a_deferred_registration_recovery() {
+        let mut p = MaintenancePolicy::new();
+        p.decide(Maintenance::RegistrationRecovery, true);
+        assert_eq!(
+            p.decide(Maintenance::Renewal, true),
+            MaintenanceDecision::Proceed
+        );
+        assert_eq!(p.release(), Some(Maintenance::RegistrationRecovery));
+    }
+
+    #[test]
+    fn failed_registration_does_not_force_disruptive_recovery_during_a_call() {
         let mut p = MaintenancePolicy::new();
         for _ in 0..100 {
             assert_eq!(
-                p.decide(Maintenance::Renewal, true),
+                p.decide(Maintenance::RegistrationRecovery, true),
                 MaintenanceDecision::Defer
             );
         }
@@ -778,18 +795,18 @@ mod tests {
     fn deferral_is_visible_so_it_reads_as_deliberate_not_as_a_stall() {
         let mut p = MaintenancePolicy::new();
         let before = SystemTime::now();
-        p.decide(Maintenance::Renewal, true);
-        assert_eq!(p.deferred(), Some(Maintenance::Renewal));
+        p.decide(Maintenance::RegistrationRecovery, true);
+        assert_eq!(p.deferred(), Some(Maintenance::RegistrationRecovery));
         assert!(p.deferred_for(before + Duration::from_secs(30)).is_some());
     }
 
     #[test]
     fn maintenance_resumes_after_the_call_ends() {
         let mut p = MaintenancePolicy::new();
-        p.decide(Maintenance::Renewal, true);
+        p.decide(Maintenance::RegistrationRecovery, true);
         p.release();
         assert_eq!(
-            p.decide(Maintenance::Renewal, false),
+            p.decide(Maintenance::RegistrationRecovery, false),
             MaintenanceDecision::Proceed
         );
     }

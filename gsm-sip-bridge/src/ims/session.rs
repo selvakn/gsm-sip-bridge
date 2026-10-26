@@ -22,7 +22,8 @@ use super::ImsRegisterConfig;
 use crate::control::protocol::RegistrationStatus;
 use crate::error::{BridgeError, BridgeResult};
 use std::net::SocketAddr;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 /// How long the Gm client reader blocks before checking whether it should
@@ -64,11 +65,30 @@ pub(crate) struct Inbound {
     /// without this, restarting just the client half would need a new
     /// channel, which would orphan `_server`'s already-spawned accept-loop
     /// threads (they hold their own clone of the original sender).
-    tx: mpsc::Sender<(SipMessage, SipSink)>,
-    /// Held only for its `Drop`, which shuts the listener down. Replaced
-    /// wholesale on re-registration, since a renewal negotiates a fresh SA
-    /// on a fresh pair of ports.
+    pub(crate) tx: mpsc::Sender<(SipMessage, SipSink)>,
+    /// Held for its `Drop`, which shuts the listener down. Protected refresh
+    /// and AKA rollover preserve this listener and its stable server port;
+    /// only disruptive registration recovery replaces it wholesale.
     pub(crate) _server: Option<GmServer>,
+    client_reader: Mutex<JoinHandle<()>>,
+}
+
+impl Inbound {
+    /// Adopt a reader for a reauthenticated client connection. The server
+    /// listener and its queue survive because the protected server port is stable.
+    pub(crate) fn adopt_client_reader(&self, reader: JoinHandle<()>) {
+        *self.client_reader.lock().unwrap_or_else(|e| e.into_inner()) = reader;
+    }
+
+    /// Test whether a refresh retained its single live client reader.
+    #[cfg(test)]
+    pub(super) fn client_reader_is_alive(&self) -> bool {
+        !self
+            .client_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_finished()
+    }
 }
 
 /// Spawns the thread that reads the **client** connection we registered
@@ -88,10 +108,10 @@ pub(crate) struct Inbound {
 fn spawn_client_reader(
     session: &super::RegisteredSession,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
-) -> BridgeResult<()> {
+) -> BridgeResult<JoinHandle<()>> {
     let mut client_reader = session.transport()?.try_clone_reader()?;
     let client_sink = session.transport()?.sink()?;
-    std::thread::spawn(move || loop {
+    Ok(std::thread::spawn(move || loop {
         match client_reader.recv_message_deadline(CLIENT_READ_POLL_INTERVAL) {
             Ok(Some(msg)) => {
                 if tx.send((msg, client_sink.clone())).is_err() {
@@ -104,8 +124,7 @@ fn spawn_client_reader(
                 return;
             }
         }
-    });
-    Ok(())
+    }))
 }
 
 /// Start reading both halves of the Gm association for `session`:
@@ -119,7 +138,7 @@ fn spawn_client_reader(
 pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<Inbound> {
     let (tx, rx) = mpsc::channel();
 
-    spawn_client_reader(session, tx.clone())?;
+    let client_reader = spawn_client_reader(session, tx.clone())?;
 
     let server = match session.gm_server_addr() {
         Some(addr) => Some(spawn_gm_server(addr, session.use_tcp, tx.clone())?),
@@ -135,6 +154,7 @@ pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<
         rx,
         tx,
         _server: server,
+        client_reader: Mutex::new(client_reader),
     })
 }
 
@@ -150,7 +170,8 @@ pub(crate) fn restart_client_reader(
     session: &super::RegisteredSession,
     inbound: &Inbound,
 ) -> BridgeResult<()> {
-    spawn_client_reader(session, inbound.tx.clone())
+    inbound.adopt_client_reader(spawn_client_reader(session, inbound.tx.clone())?);
+    Ok(())
 }
 
 /// Restarts just the Gm protected-server-port listener after its accept loop
@@ -190,9 +211,9 @@ pub(crate) fn next_backoff(current: Duration, max: Duration) -> Duration {
     current.checked_mul(2).unwrap_or(max).min(max)
 }
 
-/// Re-runs the full IMS-AKA REGISTER flow (a fresh AT+CSIM challenge, same
-/// as the initial registration — there is no cheaper incremental refresh in
-/// this protocol) to get a new, live `RegisteredSession`. Does not touch
+/// Re-runs initial IMS-AKA registration to recover a lost signaling context.
+/// Ordinary periodic refresh uses the existing connection in
+/// `agent::registration_refresh` instead. Does not touch
 /// `session`/`status` itself; the caller swaps them in only on success, so a
 /// failed attempt leaves the still-valid old session in place until it
 /// actually expires or a later retry succeeds.

@@ -50,10 +50,6 @@ fn after(now: Instant, delay: Duration) -> Instant {
     now + delay.min(Duration::from_secs(MAX_NETWORK_DELAY_SECS))
 }
 
-/// The preferred refresh lead time, scaled down for a short grant by
-/// [`crate::ims::renewal_headroom_for`] exactly as registration renewal is.
-const REFRESH_HEADROOM: Duration = Duration::from_secs(300);
-
 /// Whether a SUBSCRIBE starts a subscription or refreshes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubKind {
@@ -197,7 +193,7 @@ impl Subscription {
         }
         match (self.expires_at, self.granted) {
             (Some(expires_at), Some(granted)) => {
-                now + crate::ims::renewal_headroom_for(granted, REFRESH_HEADROOM) >= expires_at
+                now + crate::ims::renewal_headroom_for(granted) >= expires_at
             }
             _ => false,
         }
@@ -1659,16 +1655,15 @@ mod tests {
         assert_eq!(failure(&sub), Some("expired without a successful refresh"));
     }
 
-    /// A 3600 s grant refreshes at 55 min, the same moment registration
-    /// renewal runs, so the renewal's fresh subscription normally gets there
-    /// first.
+    /// A 3600 s grant refreshes at 50 min, following the same IMS timing
+    /// rule as registration renewal.
     #[test]
-    fn a_full_hour_grant_refreshes_no_earlier_than_55_minutes() {
+    fn a_full_hour_grant_refreshes_no_earlier_than_50_minutes() {
         let t0 = Instant::now();
         let mut sub = confirmed(t0, 3600);
-        assert_eq!(sub.poll(t0 + secs(3299), false), None);
+        assert_eq!(sub.poll(t0 + secs(2999), false), None);
         assert!(matches!(
-            sub.poll(t0 + secs(3300), false),
+            sub.poll(t0 + secs(3000), false),
             Some(SubAction::SendRefresh { .. })
         ));
     }

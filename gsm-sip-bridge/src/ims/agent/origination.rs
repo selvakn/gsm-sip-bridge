@@ -16,10 +16,10 @@ use crate::error::BridgeResult;
 use crate::ims::body;
 use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
-use crate::ims::sip_client::{random_hex, SipResponse};
+use crate::ims::sip_client::{random_hex, SipResponse, SipSink};
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
-use std::net::{IpAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -111,6 +111,10 @@ pub(super) struct PendingOrigination {
     from_tag: String,
     branch: String,
     invite_cseq: u32,
+    /// CANCEL and a non-2xx ACK belong to the original INVITE transaction:
+    /// its Via and connection survive a registration security rollover.
+    /// `None` only for test fixtures that did not send a real INVITE.
+    invite_signaling: Option<InviteSignaling>,
     /// In-dialog requests sent after the INVITE (each `PRACK`), so a later
     /// `BYE` picks a `CSeq` above them rather than reusing one — RFC 3261
     /// §12.2.1.1 requires the sequence to increase within a dialog.
@@ -215,6 +219,26 @@ pub(super) struct PendingOrigination {
     /// afterward too if that header was absent (no obligation). Carried
     /// through to `finish_origination`'s `ActiveCall`.
     session_refresh: Option<session_refresh::SessionRefreshState>,
+}
+
+struct InviteSignaling {
+    local_addr: SocketAddr,
+    via_transport: &'static str,
+    public_uri: String,
+    security_verify: Option<String>,
+    sink: SipSink,
+}
+
+impl InviteSignaling {
+    fn capture(session: &crate::ims::RegisteredSession) -> BridgeResult<Self> {
+        Ok(Self {
+            local_addr: session.local_addr,
+            via_transport: if session.use_tcp { "TCP" } else { "UDP" },
+            public_uri: session.origination_identity(),
+            security_verify: session.security_verify().map(str::to_string),
+            sink: session.transport()?.sink()?,
+        })
+    }
 }
 
 /// The waits the old `originate_and_bridge` blocked on, now explicit states.
@@ -373,6 +397,17 @@ pub(super) fn begin_origination(
         security_verify: session.security_verify(),
     });
 
+    let invite_signaling = match InviteSignaling::capture(session) {
+        Ok(signaling) => Some(signaling),
+        Err(e) => {
+            origination_failed(
+                &mut control,
+                &call_id,
+                &format!("no carrier transport: {e}"),
+            );
+            return None;
+        }
+    };
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
     let transport = match session.transport_mut() {
         Ok(t) => t,
@@ -418,6 +453,7 @@ pub(super) fn begin_origination(
         from_tag,
         branch,
         invite_cseq,
+        invite_signaling,
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
@@ -446,6 +482,16 @@ pub(super) fn begin_origination(
 }
 
 impl PendingOrigination {
+    /// Keep an answered leg waiting for its veth peer on the current
+    /// signaling association. Other pending stages build requests from the
+    /// live session, with the transport name kept here.
+    pub(super) fn refresh_signaling(&mut self, session: &crate::ims::RegisteredSession) {
+        self.via_transport = if session.use_tcp { "TCP" } else { "UDP" };
+        if let OriginationStep::AwaitingVeth { dialog, .. } = &mut self.step {
+            dialog.refresh_signaling(session);
+        }
+    }
+
     /// Does this carrier response belong to this attempt? Matched by `Call-ID`,
     /// so it never collides with the Gm keepalive's `OPTIONS` (a different
     /// `Call-ID`, correlated by `CSeq` at the response arm instead).
@@ -522,27 +568,66 @@ impl PendingOrigination {
     /// transport was momentarily unavailable and the caller should keep the
     /// origination alive and retry, rather than assume the INVITE was cancelled.
     fn send_cancel_now(&mut self, session: &mut crate::ims::RegisteredSession) -> bool {
+        let signaling = self.invite_signaling.as_ref();
+        let public_uri = signaling
+            .map(|s| s.public_uri.clone())
+            .unwrap_or_else(|| session.origination_identity());
         let cancel = crate::ims::call::build_cancel(&crate::ims::call::CancelParts {
             request_uri: &self.callee_uri,
             route_headers: &self.route_headers,
-            via_transport: self.via_transport,
-            local_addr: session.local_addr,
-            public_uri: &session.origination_identity(),
+            via_transport: signaling.map_or(self.via_transport, |s| s.via_transport),
+            local_addr: signaling.map_or(session.local_addr, |s| s.local_addr),
+            public_uri: &public_uri,
             callee_uri: &self.callee_uri,
             call_id: &self.call_id,
             from_tag: &self.from_tag,
             cseq: self.invite_cseq,
             branch: &self.branch,
-            security_verify: session.security_verify(),
+            security_verify: signaling.map_or_else(
+                || session.security_verify(),
+                |s| s.security_verify.as_deref(),
+            ),
         });
-        let Ok(transport) = session.transport_mut() else {
-            return false;
+        let sent = match signaling {
+            Some(signaling) => signaling.sink.send(&cancel),
+            None => session.transport_mut().and_then(|t| t.send(&cancel)),
         };
-        if transport.send(&cancel).is_ok() {
+        if sent.is_ok() {
             tracing::info!(call_id = %self.call_id, "outbound: sent CANCEL for an abandoned INVITE");
             true
         } else {
             false
+        }
+    }
+
+    fn ack_non_success(&self, session: &mut crate::ims::RegisteredSession, resp: &SipResponse) {
+        let signaling = self.invite_signaling.as_ref();
+        let public_uri = signaling
+            .map(|s| s.public_uri.clone())
+            .unwrap_or_else(|| session.origination_identity());
+        let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
+            request_uri: &self.callee_uri,
+            route_headers: &self.route_headers,
+            via_transport: signaling.map_or(self.via_transport, |s| s.via_transport),
+            local_addr: signaling.map_or(session.local_addr, |s| s.local_addr),
+            public_uri: &public_uri,
+            to_header: resp.header("To").unwrap_or(&self.callee_uri),
+            call_id: &self.call_id,
+            from_tag: &self.from_tag,
+            cseq: self.invite_cseq,
+            branch: &self.branch,
+            security_verify: signaling.map_or_else(
+                || session.security_verify(),
+                |s| s.security_verify.as_deref(),
+            ),
+        });
+        match signaling {
+            Some(signaling) => {
+                let _ = signaling.sink.send(&ack);
+            }
+            None => {
+                let _ = session.transport_mut().and_then(|t| t.send(&ack));
+            }
         }
     }
 
@@ -687,6 +772,8 @@ impl PendingOrigination {
         }
         if resp.status == 200 {
             self.ack_and_bye_racing_answer(session, resp);
+        } else {
+            self.ack_non_success(session, resp);
         }
         OriginationStatus::Ended
     }
@@ -866,20 +953,7 @@ impl PendingOrigination {
         if resp.status != 200 {
             // Non-2xx final: ACK reuses the INVITE's own branch/CSeq
             // (RFC 3261 §17.1.1.3), best-effort.
-            let ack = crate::ims::call::build_ack(&crate::ims::call::AckParts {
-                request_uri: &self.callee_uri,
-                route_headers: &self.route_headers,
-                via_transport: self.via_transport,
-                local_addr: session.local_addr,
-                public_uri: &session.origination_identity(),
-                to_header: resp.header("To").unwrap_or(&self.callee_uri),
-                call_id: &self.call_id,
-                from_tag: &self.from_tag,
-                cseq: self.invite_cseq,
-                branch: &self.branch,
-                security_verify: session.security_verify(),
-            });
-            let _ = session.transport_mut().and_then(|t| t.send(&ack));
+            self.ack_non_success(session, resp);
             self.fail(&format!("{} {}", resp.status, resp.reason));
             return OriginationStatus::Ended;
         }
@@ -954,7 +1028,10 @@ impl PendingOrigination {
             self.fail(&format!("ACK send failed: {e}"));
             return OriginationStatus::Ended;
         }
-        session.cseq = self.invite_cseq + self.extra_cseq + 1;
+        // A registration refresh can advance the shared request counter
+        // while this INVITE is pending. Finishing the call setup must not
+        // roll it back and reuse a REGISTER CSeq later.
+        session.cseq = session.cseq.max(self.invite_cseq + self.extra_cseq + 1);
 
         let dialog = DialogInfo::from_uac_response(
             resp,
@@ -1688,7 +1765,9 @@ mod tests {
             contact_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
             use_tcp: true,
             cseq: 2,
+            registration_cseq: 2,
             gm_state: None,
+            registration_auth: None,
             xfrm_proto: "esp",
             status: 200,
             reason: "OK".to_string(),
@@ -1720,6 +1799,7 @@ mod tests {
             from_tag: "ftag".to_string(),
             branch: "z9hG4bKtest".to_string(),
             invite_cseq: 1,
+            invite_signaling: None,
             extra_cseq: 0,
             pracked_rseq: None,
             provisional_answer: None,
@@ -2100,6 +2180,179 @@ mod tests {
                 .unwrap();
         session.transport = Some(transport);
         session
+    }
+
+    #[test]
+    fn a_renewal_during_origination_keeps_new_signaling_and_the_advanced_cseq() {
+        let call_id = "out-renewal";
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap();
+        let local_addr = transport.local_addr().unwrap();
+        let mut session = crate::ims::test_session_with_sa(
+            Some(transport),
+            peer.local_addr().unwrap(),
+            Some("renewed-list"),
+        );
+        session.local_addr = local_addr;
+        session.use_tcp = false;
+        // REGISTER progressed while the INVITE (CSeq 1) and its PRACKs
+        // were outstanding.
+        session.cseq = 42;
+        let (control, _server) = control_pair();
+        let (mut pending, _ctrl_tx) = test_pending(call_id, control);
+        pending.extra_cseq = 2;
+        let (_veth_tx, veth_rx) = mpsc::channel();
+        pending.early_veth_rx = Some(veth_rx);
+        pending.refresh_signaling(&session);
+
+        let mut response = ok_response_with_session_expires(call_id, None);
+        response.headers.extend([
+            (
+                "Contact".to_string(),
+                "<sip:callee@192.0.2.1:6000>".to_string(),
+            ),
+            (
+                "Record-Route".to_string(),
+                "<sip:scscf.example.test;lr>".to_string(),
+            ),
+        ]);
+        assert!(matches!(
+            pending.on_carrier_response(&response, &mut session),
+            OriginationStatus::Pending
+        ));
+
+        let mut buf = [0u8; 4096];
+        let n = peer
+            .recv(&mut buf)
+            .expect("the final response must be ACKed");
+        let ack = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            ack.contains(&format!("Via: SIP/2.0/UDP {local_addr};")),
+            "{ack}"
+        );
+        assert!(ack.contains("Security-Verify: renewed-list\r\n"), "{ack}");
+        assert!(ack.contains("CSeq: 1 ACK\r\n"), "{ack}");
+        assert_eq!(
+            session.cseq, 42,
+            "finishing INVITE must preserve REGISTER progress"
+        );
+
+        // A second rollover after the carrier answer, before veth pairing,
+        // must also update the saved dialog used for a later BYE.
+        let mut newer =
+            crate::ims::test_session_with_sa(None, peer.local_addr().unwrap(), Some("next-list"));
+        newer.local_addr = "127.0.0.1:5084".parse().unwrap();
+        pending.refresh_signaling(&newer);
+        let OriginationStep::AwaitingVeth { dialog, .. } = &pending.step else {
+            panic!("the answered carrier leg should await veth pairing");
+        };
+        assert_eq!(dialog.cseq, 42);
+        assert_eq!(dialog.remote_target, "sip:callee@192.0.2.1:6000");
+        assert_eq!(
+            dialog.route_headers,
+            vec!["Route: <sip:scscf.example.test;lr>".to_string()]
+        );
+        let bye = dialog.build_bye_for(call_id);
+        assert!(bye.contains("Via: SIP/2.0/TCP 127.0.0.1:5084;"), "{bye}");
+        assert!(bye.contains("Security-Verify: next-list\r\n"), "{bye}");
+        assert!(bye.contains("CSeq: 42 BYE\r\n"), "{bye}");
+    }
+
+    #[test]
+    fn cancellation_and_failure_ack_keep_the_original_invite_connection_after_renewal() {
+        for cancelled in [false, true] {
+            let old_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            old_peer
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let old_transport = crate::ims::sip_client::SipTransport::connect(
+                old_peer.local_addr().unwrap(),
+                false,
+            )
+            .unwrap();
+            let old_addr = old_transport.local_addr().unwrap();
+            let mut old_session = crate::ims::test_session_with_sa(
+                Some(old_transport),
+                old_peer.local_addr().unwrap(),
+                Some("original-list"),
+            );
+            old_session.local_addr = old_addr;
+            old_session.use_tcp = false;
+            let (control, _server) = control_pair();
+            let (mut pending, _ctrl_tx) = test_pending("out-rollover", control);
+            pending.invite_signaling = Some(InviteSignaling::capture(&old_session).unwrap());
+
+            let new_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            new_peer.set_nonblocking(true).unwrap();
+            let new_transport = crate::ims::sip_client::SipTransport::connect(
+                new_peer.local_addr().unwrap(),
+                false,
+            )
+            .unwrap();
+            let new_addr = new_transport.local_addr().unwrap();
+            let mut renewed = crate::ims::test_session_with_sa(
+                Some(new_transport),
+                new_peer.local_addr().unwrap(),
+                Some("renewed-list"),
+            );
+            renewed.local_addr = new_addr;
+            pending.refresh_signaling(&renewed);
+            // The snapshot itself keeps the INVITE connection writable.
+            drop(old_session);
+
+            let mut buf = [0u8; 4096];
+            if cancelled {
+                pending.begin_cancel(&mut renewed);
+                let n = old_peer
+                    .recv(&mut buf)
+                    .expect("CANCEL must use the INVITE connection");
+                let cancel = String::from_utf8_lossy(&buf[..n]);
+                assert!(cancel.starts_with("CANCEL "), "{cancel}");
+                assert!(
+                    cancel.contains(&format!("Via: SIP/2.0/UDP {old_addr};branch=z9hG4bKtest")),
+                    "{cancel}"
+                );
+                assert!(
+                    cancel.contains("Security-Verify: original-list\r\n"),
+                    "{cancel}"
+                );
+            }
+            let rejection = SipResponse {
+                status: if cancelled { 487 } else { 486 },
+                reason: "Terminated".to_string(),
+                headers: vec![
+                    ("Call-ID".to_string(), "out-rollover".to_string()),
+                    ("CSeq".to_string(), "1 INVITE".to_string()),
+                    (
+                        "To".to_string(),
+                        "<sip:callee@example.test>;tag=remote".to_string(),
+                    ),
+                ],
+                body: String::new(),
+            };
+            assert!(matches!(
+                pending.on_carrier_response(&rejection, &mut renewed),
+                OriginationStatus::Ended
+            ));
+            let n = old_peer
+                .recv(&mut buf)
+                .expect("non-2xx ACK must use the INVITE connection");
+            let ack = String::from_utf8_lossy(&buf[..n]);
+            assert!(ack.starts_with("ACK "), "{ack}");
+            assert!(
+                ack.contains(&format!("Via: SIP/2.0/UDP {old_addr};branch=z9hG4bKtest")),
+                "{ack}"
+            );
+            assert!(ack.contains("Security-Verify: original-list\r\n"), "{ack}");
+            assert!(ack.contains("CSeq: 1 ACK\r\n"), "{ack}");
+            assert!(
+                new_peer.recv(&mut buf).is_err(),
+                "transaction requests must not reach the new connection"
+            );
+        }
     }
 
     #[test]

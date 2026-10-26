@@ -44,6 +44,7 @@ pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
 pub mod pcscf_files;
+mod registration_auth;
 pub(crate) mod rtcp;
 /// `pub` rather than private: `siptest` (specs/037-siptest-softphone,
 /// research.md R1) reuses RTP framing, the μ-law codec and the WAV writer
@@ -161,10 +162,9 @@ pub struct ImsRegisterConfig {
     /// proposal (RFC 3329 / TS 24.229 Annex H) on every REGISTER. Some
     /// networks (confirmed: Vodafone India's P-CSCF, which rejects a plain
     /// digest REGISTER with `421 Extension Required` / `Require: sec-agree`)
-    /// require this before accepting REGISTER at all. This does **not**
-    /// implement the actual Gm IPsec SA (no kernel XFRM/ESP setup) — it only
-    /// tests whether the network will proceed on the strength of the header
-    /// proposal alone, in case it's lenient about actually enforcing it.
+    /// require this before accepting REGISTER at all. Negotiated Gm SAs are
+    /// installed in kernel XFRM; protected refreshes reuse them and handle
+    /// authenticated SA replacement without replacing the call dialog.
     pub sec_agree: bool,
     /// Use this MSISDN (E.164) as the Public User Identity in
     /// To/From/Contact instead of the IMSI-derived temporary IMPU. The
@@ -325,6 +325,8 @@ pub(crate) struct RegisteredSession {
     /// Next `CSeq` to use for a request on this session (already advanced
     /// past whatever REGISTER used).
     cseq: u32,
+    /// REGISTER has its own Call-ID and advances exactly once per new request.
+    registration_cseq: u32,
     /// `None` when no Gm SA was negotiated (`--sec-agree` off).
     gm_state: Option<GmSa>,
     xfrm_proto: &'static str,
@@ -335,10 +337,13 @@ pub(crate) struct RegisteredSession {
     from_tag: String,
     pcscf_addr: SocketAddr,
     imei: String,
+    /// Last successful IMS-AKA credentials for a protected registration refresh.
+    registration_auth: Option<registration_auth::RegistrationAuth>,
 }
 
 /// The Gm security association a registration negotiated, kept together so
 /// the echo below can neither outlive nor precede the SA it belongs to.
+#[derive(Clone)]
 pub(crate) struct GmSa {
     pub(crate) endpoints: GmEndpoints,
     pub(crate) proposal: SaProposal,
@@ -522,7 +527,8 @@ impl RegisteredSession {
         let via_transport = if self.use_tcp { "TCP" } else { "UDP" };
         let request_uri = format_sip_addr(self.pcscf_addr);
 
-        self.cseq = self.cseq.wrapping_add(1);
+        let cseq = self.registration_cseq;
+        self.registration_cseq = self.registration_cseq.saturating_add(1);
         let branch = format!("z9hG4bK{}", random_hex(6));
         let sec_agree: Vec<String> = sec_agree_headers(self.security_verify())
             .lines()
@@ -536,7 +542,7 @@ impl RegisteredSession {
             call_id: &self.call_id,
             from_tag: &self.from_tag,
             branch: &branch,
-            cseq: self.cseq,
+            cseq,
             expires: 0,
             transport: via_transport,
             authorization: None,
@@ -856,19 +862,14 @@ pub fn granted_expires(headers: &[(String, String)], requested: u32) -> u32 {
 
 /// How far before expiry to renew, for a registration of `granted` seconds.
 ///
-/// Honouring a short granted lifetime is only safe together with this. The
-/// headroom used to be a flat 300s against an assumed 3600s lifetime; the
-/// moment a registrar grants less than twice the headroom, `renewal_due`
-/// becomes permanently true and the agent re-registers on *every idle poll* —
-/// once per second — for as long as the line is up. Scaling the margin to the
-/// lifetime keeps a comfortable early renewal without that runaway.
+/// 3GPP TS 24.229, section 5.1.1.4.1 requires reregistration 600 seconds before
+/// expiry for lifetimes above 1200 seconds, or halfway through shorter grants.
+/// Scale against the lifetime actually granted by the registrar, not the
+/// requested lifetime, so a short grant still leaves time between refreshes.
 ///
 /// Pure and clock-free, like `renewal_due`, so the schedule is testable.
-pub fn renewal_headroom_for(
-    granted: std::time::Duration,
-    preferred: std::time::Duration,
-) -> std::time::Duration {
-    preferred.min(granted / 2)
+pub fn renewal_headroom_for(granted: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(600).min(granted / 2)
 }
 
 pub fn renewal_due(
@@ -1142,6 +1143,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
     }
 
     let mut resync_attempts = 0;
+    let mut registration_auth = None;
     loop {
         if resp.status != 401 {
             break;
@@ -1278,10 +1280,12 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
                         }
                     }
                 }
-                (
-                    build_authorization(&impi_uri, &challenge, &uri, &res),
-                    false,
-                )
+                let authorization = build_authorization(&impi_uri, &challenge, &uri, &res);
+                registration_auth = Some(registration_auth::RegistrationAuth {
+                    impi: impi_uri.clone(),
+                    authorization: authorization.clone(),
+                });
+                (authorization, false)
             }
             AkaResult::SyncFailure { auts } => {
                 resync_attempts += 1;
@@ -1348,6 +1352,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         contact_addr,
         use_tcp: cfg.use_tcp,
         cseq: cseq + 1,
+        registration_cseq: cseq + 1,
         gm_state,
         xfrm_proto,
         status: resp.status,
@@ -1357,6 +1362,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         from_tag,
         pcscf_addr: pcscf,
         imei,
+        registration_auth,
     })
 }
 
@@ -1553,6 +1559,7 @@ pub(crate) fn test_session_with_sa(
         contact_addr: SocketAddr::new(local.ip(), 5063),
         use_tcp: true,
         cseq: 2,
+        registration_cseq: 2,
         gm_state: verify.map(|v| GmSa {
             endpoints: GmEndpoints::new(local.ip(), pcscf_addr.ip(), &ours, &theirs),
             proposal: ours.clone(),
@@ -1567,6 +1574,7 @@ pub(crate) fn test_session_with_sa(
         from_tag: "regtag".to_string(),
         pcscf_addr,
         imei: "000000000000000".to_string(),
+        registration_auth: None,
     }
 }
 
@@ -1882,9 +1890,8 @@ mod tests {
         // fixed 300s headroom, anything granted under 600s is *always* "due",
         // so the agent re-registers on every idle poll — once a second —
         // forever. Scaling the margin is what makes honouring the grant safe.
-        let preferred = Duration::from_secs(300);
         let granted = Duration::from_secs(120);
-        let headroom = renewal_headroom_for(granted, preferred);
+        let headroom = renewal_headroom_for(granted);
         assert_eq!(headroom, Duration::from_secs(60));
 
         let now = SystemTime::now();
@@ -1900,24 +1907,35 @@ mod tests {
     }
 
     #[test]
-    fn a_generous_granted_lifetime_keeps_the_preferred_headroom() {
-        let preferred = Duration::from_secs(300);
-        assert_eq!(
-            renewal_headroom_for(Duration::from_secs(3600), preferred),
-            preferred
-        );
-        // Exactly twice the headroom is the boundary where scaling starts.
-        assert_eq!(
-            renewal_headroom_for(Duration::from_secs(600), preferred),
-            preferred
-        );
+    fn registration_timing_follows_the_ims_1200_second_boundary() {
+        for (granted, expected_headroom) in [
+            (1, Duration::from_millis(500)),
+            (120, Duration::from_secs(60)),
+            (600, Duration::from_secs(300)),
+            (1199, Duration::from_millis(599_500)),
+            (1200, Duration::from_secs(600)),
+            (1201, Duration::from_secs(600)),
+            (3600, Duration::from_secs(600)),
+        ] {
+            let granted = Duration::from_secs(granted);
+            let headroom = renewal_headroom_for(granted);
+            assert_eq!(headroom, expected_headroom, "grant: {granted:?}");
+            let registered_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+            let expires_at = registered_at + granted;
+            let renew_at = expires_at - headroom;
+            assert!(
+                !renewal_due(renew_at - Duration::from_nanos(1), expires_at, headroom),
+                "grant: {granted:?} must not renew before its scheduled time"
+            );
+            assert!(renewal_due(renew_at, expires_at, headroom));
+        }
     }
 
     #[test]
     fn a_600s_grant_renews_at_300s_not_at_the_default_lifetime() {
         let now = SystemTime::now();
         let granted = Duration::from_secs(600);
-        let headroom = renewal_headroom_for(granted, Duration::from_secs(300));
+        let headroom = renewal_headroom_for(granted);
         let expires_at = now + granted;
         assert!(!renewal_due(now, expires_at, headroom));
         assert!(
@@ -1928,16 +1946,11 @@ mod tests {
 
     #[test]
     fn a_response_without_an_expires_header_falls_back_to_what_was_requested() {
-        // The current carriers all grant the hour asked for, so this is the
-        // path in production today: behaviour must be unchanged.
         let headers = vec![("Via".to_string(), "SIP/2.0/TCP 10.0.0.1".to_string())];
         assert_eq!(granted_expires(&headers, DEFAULT_EXPIRES), DEFAULT_EXPIRES);
         assert_eq!(
-            renewal_headroom_for(
-                Duration::from_secs(DEFAULT_EXPIRES as u64),
-                Duration::from_secs(300)
-            ),
-            Duration::from_secs(300)
+            renewal_headroom_for(Duration::from_secs(DEFAULT_EXPIRES as u64)),
+            Duration::from_secs(600)
         );
     }
 

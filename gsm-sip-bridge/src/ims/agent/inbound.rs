@@ -537,6 +537,7 @@ pub(super) fn handle_invite(
                 &call_id,
                 &ctrl_rx,
                 &inbound.rx,
+                Some(&inbound.tx),
                 req,
                 to_tag,
                 &contact,
@@ -937,6 +938,7 @@ fn handle_offerless_invite(
         call_id,
         &ctrl_rx,
         &inbound.rx,
+        Some(&inbound.tx),
         req,
         to_tag,
         &contact,
@@ -1332,12 +1334,32 @@ fn await_pbx_answer(
     call_id: &str,
     ctrl_rx: &mpsc::Receiver<ControlMessage>,
     sip_rx: &mpsc::Receiver<(SipMessage, SipSink)>,
+    replay_tx: Option<&mpsc::Sender<(SipMessage, SipSink)>>,
     invite: &SipRequest,
     to_tag: &str,
     contact: &str,
     sink: &SipSink,
     mut forward: Option<&mut ForwardOffer<'_>>,
 ) -> BridgeResult<RingOutcome> {
+    // This wait owns the queue temporarily. Preserve unrelated transactions
+    // (especially a simultaneous REGISTER) for the dispatcher after ringing.
+    struct Replay<'a> {
+        tx: Option<&'a mpsc::Sender<(SipMessage, SipSink)>>,
+        messages: Vec<(SipMessage, SipSink)>,
+    }
+    impl Drop for Replay<'_> {
+        fn drop(&mut self) {
+            if let Some(tx) = self.tx {
+                for message in self.messages.drain(..) {
+                    let _ = tx.send(message);
+                }
+            }
+        }
+    }
+    let mut replay = Replay {
+        tx: replay_tx,
+        messages: Vec::new(),
+    };
     let decline = |status: u16, reason: &str| {
         respond(
             sink,
@@ -1351,8 +1373,12 @@ fn await_pbx_answer(
         // 1. Did the caller give up while it rang? A CANCEL must be answered
         //    promptly or the network keeps retransmitting it.
         while let Ok((msg, req_sink)) = sip_rx.try_recv() {
-            let SipMessage::Request(req) = msg else {
-                continue;
+            let req = match msg {
+                SipMessage::Request(req) => req,
+                other => {
+                    replay.messages.push((other, req_sink));
+                    continue;
+                }
             };
             if req.method == "CANCEL" && req.header("Call-ID") == Some(call_id) {
                 tracing::info!(call_id = %call_id, "caller hung up while the PBX was still ringing");
@@ -1392,7 +1418,7 @@ fn await_pbx_answer(
                 );
                 continue;
             }
-            tracing::debug!(method = %req.method, "ignoring inbound request received while ringing");
+            replay.messages.push((SipMessage::Request(req), req_sink));
         }
 
         // 2. Did Agent B report an answer, or give up on the PBX?
@@ -1440,6 +1466,54 @@ fn await_pbx_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ringing_preserves_a_concurrent_register_response_for_the_dispatcher() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap();
+        let sink = transport.sink().unwrap();
+        let (sip_tx, sip_rx) = mpsc::channel();
+        sip_tx
+            .send((
+                SipMessage::Response(crate::ims::sip_client::SipResponse {
+                    status: 200,
+                    reason: "OK".into(),
+                    body: String::new(),
+                    headers: vec![
+                        ("Call-ID".into(), "registration".into()),
+                        ("CSeq".into(), "10 REGISTER".into()),
+                    ],
+                }),
+                sink.clone(),
+            ))
+            .unwrap();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel();
+        ctrl_tx
+            .send(ControlMessage::CallAnswered {
+                call_id: "c1".into(),
+            })
+            .unwrap();
+        let invite = invite_with_headers("From: <sip:caller@example.net>;tag=caller\r\n");
+        let result = await_pbx_answer(
+            "c1",
+            &ctrl_rx,
+            &sip_rx,
+            Some(&sip_tx),
+            &invite,
+            "tag",
+            "<sip:me@127.0.0.1>",
+            &sink,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(result, RingOutcome::Answered));
+        assert!(
+            matches!(sip_rx.try_recv().unwrap().0,SipMessage::Response(response) if response.header("Call-ID")==Some("registration"))
+        );
+        transport.shutdown();
+    }
 
     fn invite_with_headers(headers: &str) -> SipRequest {
         let raw = format!(
@@ -1521,6 +1595,7 @@ mod tests {
                 "c1",
                 &ctrl_rx,
                 &sip_rx,
+                None,
                 &req,
                 "tag180",
                 "<sip:me@10.0.0.9>",
@@ -2126,6 +2201,7 @@ mod tests {
             "c1",
             &ctrl_rx,
             &sip_rx,
+            None,
             &req,
             "tag",
             "<sip:me@10.0.0.9>",

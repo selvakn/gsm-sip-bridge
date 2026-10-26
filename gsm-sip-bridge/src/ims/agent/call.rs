@@ -195,14 +195,22 @@ pub(super) struct DialogInfo {
     /// Our own CSeq counter for this dialog. We answered the INVITE, so the
     /// caller's CSeq space is theirs; ours starts fresh.
     pub(super) cseq: u32,
-    /// `Security-Verify` echo of the registration this call was set up under
-    /// (`None` when it negotiated no Gm SA). Captured here, like `local_addr`
-    /// and `use_tcp`: renewal is deferred while a call is active, so the SA
-    /// cannot change under the dialog.
+    /// `Security-Verify` echo of the current signaling association (`None`
+    /// when it negotiated no Gm SA). Refreshed together with `local_addr`
+    /// and `use_tcp` when registration reauthentication replaces that
+    /// association during the call.
     pub(super) security_verify: Option<String>,
 }
 
 impl DialogInfo {
+    /// Follow a successfully renewed signaling association without changing
+    /// the SIP dialog's target, route set, identities or CSeq space.
+    pub(super) fn refresh_signaling(&mut self, session: &crate::ims::RegisteredSession) {
+        self.local_addr = session.local_addr;
+        self.use_tcp = session.use_tcp;
+        self.security_verify = session.security_verify().map(str::to_string);
+    }
+
     pub(super) fn from_invite(
         invite: &SipRequest,
         to_tag: &str,
@@ -986,5 +994,59 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    #[test]
+    fn signaling_renewal_preserves_the_dialog_and_updates_later_requests() {
+        let peer: SocketAddr = "192.0.2.1:6000".parse().unwrap();
+        let old = crate::ims::test_session_with_sa(None, peer, Some("old-list"));
+        let response = resp_with(&[
+            ("Contact", "<sip:carrier@192.0.2.1:6000;dialog=1>"),
+            ("To", "<sip:callee@example.test>;tag=remote-tag"),
+        ]);
+        let route = "Route: <sip:scscf.example.test;lr>".to_string();
+        let mut dialog = DialogInfo::from_uac_response(
+            &response,
+            vec![route.clone()],
+            "callee@example.test",
+            "caller@example.test",
+            "local-tag",
+            73,
+            &old,
+        );
+
+        let mut renewed = crate::ims::test_session_with_sa(None, peer, Some("new-list"));
+        renewed.local_addr = "127.0.0.1:5074".parse().unwrap();
+        renewed.use_tcp = false;
+        dialog.refresh_signaling(&renewed);
+
+        assert_eq!(dialog.cseq, 73);
+        assert_eq!(dialog.remote_target, "sip:carrier@192.0.2.1:6000;dialog=1");
+        assert_eq!(dialog.route_headers, vec![route.clone()]);
+        assert_eq!(dialog.from, "<sip:caller@example.test>;tag=local-tag");
+        assert_eq!(dialog.to, "<sip:callee@example.test>;tag=remote-tag");
+        let bye = dialog.build_bye_for("existing-call");
+        let update = dialog.build_update_for("existing-call", "300;refresher=uac");
+        for request in [bye, update] {
+            assert!(
+                request.contains("Via: SIP/2.0/UDP 127.0.0.1:5074;"),
+                "{request}"
+            );
+            assert!(
+                request.contains("Security-Verify: new-list\r\n"),
+                "{request}"
+            );
+            assert!(request.contains(&route), "{request}");
+            assert!(request.contains("Call-ID: existing-call\r\n"), "{request}");
+            assert!(!request.contains("old-list"), "{request}");
+        }
+        assert_eq!(dialog.cseq, 74);
+
+        let plain = crate::ims::test_session_with_sa(None, peer, None);
+        dialog.refresh_signaling(&plain);
+        assert!(!dialog
+            .build_bye_for("existing-call")
+            .contains("Security-Verify"));
+        assert_eq!(dialog.cseq, 74);
     }
 }

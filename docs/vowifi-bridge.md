@@ -39,10 +39,31 @@ when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate
 
 ## Agent A — `gsm-sip-bridge/src/ims/agent.rs`
 
-- Keeps a persistent IMS-AKA registration alive via `super::register_session` (kept alive rather
-  than immediately cleaned up, unlike the one-shot `ims-register`/`ims-call` CLI tools), renewing
-  it before `Expires` lapses (`renewal_due` in `ims/mod.rs`) with exponential backoff on failure
-  (`next_backoff`).
+- Keeps a persistent IMS-AKA registration alive, unlike the one-shot
+  `ims-register`/`ims-call` CLI tools. The registration schedule uses the lifetime granted by
+  the registrar: 600 seconds before expiry for grants above 1200 seconds, and halfway through
+  grants of 1200 seconds or less (`renewal_headroom_for` in `ims/mod.rs`). A one-hour grant
+  therefore renews after 50 minutes; a ten-minute grant renews after five minutes. This follows
+  [3GPP TS 24.229, section 5.1.1.4.1](https://www.etsi.org/deliver/etsi_ts/124200_124299/124229/18.10.00_60/ts_124229v181000p.pdf).
+  Refreshing registration during a call must preserve the call's SIP dialog and transport;
+  an active call is not a reason to defer the scheduled refresh.
+- Sends periodic `REGISTER` on the live protected connection using the cached IMS-AKA
+  authorization, the existing registration Call-ID and an incremented CSeq. A successful
+  refresh updates the granted lifetime and routes for future dialogs while preserving the
+  active call and the registration-event subscription. Timers run on every dispatch pass,
+  including when incoming SIP traffic is continuous. UDP uses the IMS transaction timers
+  T1=2s, T2=16s and Timer F=128s.
+- Handles a new AKA challenge in a background worker, so SIM access and the new protected
+  connection do not block call signaling. The protected server ports remain stable; new
+  client ports and SPIs are negotiated. Old and new Gm SAs overlap until the new registration
+  succeeds, then old transaction connections are retained for a transaction-drain period
+  (at least 128 seconds, longer while origination is pending). Failed staging rolls back
+  the tentative SAs. These are the Gm associations to the P-CSCF, independent of strongSwan's
+  ePDG tunnel rekeying.
+- Keeps LTE attachment rebuilding and full registration recovery separate from periodic
+  refresh. Those disruptive operations still yield to a call. A failed periodic refresh
+  records its failure and retries with backoff while the previously granted binding is
+  valid; registration expiry remains visible in health reporting.
 - Acts as a SIP UAS on **two** fronts for a single call: the carrier's Gm-protected IMS transport
   (answering inbound `INVITE`s), and a second, unauthenticated plain-SIP link on
   `crate::vowifi::VETH_SIP_PORT` that Agent B's PJSIP dials into once it decides to bridge a call.
