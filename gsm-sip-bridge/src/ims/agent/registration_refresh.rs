@@ -11,15 +11,22 @@
 use super::{map_registration_error, LoopState};
 use crate::control::protocol::RegistrationStatus;
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::gm_ipsec::{
+    self, GmEndpoints, IpXfrm, RetiredSas, SaKeys, SaSet, StagedSas, XfrmBackend,
+};
 use crate::ims::observability::AgentObservability;
+use crate::ims::registration_auth::{Answer, ChallengeJob, Reauthentication};
+use crate::ims::session::ClientReader;
 use crate::ims::session::Inbound;
 use crate::ims::session::RegisterFailure;
+use crate::ims::sip_client::SipTransport;
 use crate::ims::sip_client::{
     build_register, random_hex, RegisterRequest, SipMessage, SipResponse, SipSink,
 };
+use crate::ims::GmSa;
 use crate::ims::{
     build_security_client_headers, register_request_uri, ImsRegisterConfig, RegisteredSession,
-    SaProposal, DEFAULT_EXPIRES,
+    RegistrationAuth, SaProposal, DEFAULT_EXPIRES,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
@@ -52,6 +59,75 @@ pub(super) struct PendingRegister {
     /// Holds the proposed client port while the transaction is outstanding, so
     /// nothing else binds it. Never read; dropped with the transaction.
     _reserved_port: Option<Socket>,
+    /// Which step of the procedure this REGISTER is.
+    kind: Kind,
+    /// The `Authorization` to send instead of the cached one: the answer to a
+    /// challenge, or the resynchronisation request.
+    authorization: Option<String>,
+    /// How many times the network has been asked to resynchronise.
+    resyncs: u32,
+    /// The replacement connection and security associations this REGISTER is
+    /// sent over, once a challenge has produced new keys.
+    swap: Option<Swap>,
+}
+
+/// The steps of a refresh the network turns into a re-authentication
+/// (TS 24.229 §5.1.1.4.2, §5.1.1.5.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Kind {
+    /// The ordinary refresh, with the cached authorization.
+    Refresh,
+    /// Sent with AUTS because the SIM's sequence number is behind the
+    /// network's; the network answers with a fresh challenge.
+    Resync,
+    /// Carries the SIM's answer to a challenge.
+    Answer,
+}
+
+/// A replacement for the client connection and the security associations under
+/// it, built from a challenge and not yet carrying anything. Dropped before the
+/// network confirms it, everything is undone and the working connection was
+/// never touched.
+pub(super) struct Swap {
+    staged: Option<StagedSas>,
+    transport: Option<SipTransport>,
+    reader: Option<ClientReader>,
+    sa: Option<GmSa>,
+}
+
+impl Swap {
+    /// The parts, once the network has confirmed the replacement.
+    fn into_parts(mut self) -> (StagedSas, SipTransport, ClientReader, GmSa) {
+        (
+            self.staged.take().expect("parts are taken once"),
+            self.transport.take().expect("parts are taken once"),
+            self.reader.take().expect("parts are taken once"),
+            self.sa.take().expect("parts are taken once"),
+        )
+    }
+}
+
+impl Drop for Swap {
+    fn drop(&mut self) {
+        // An abandoned replacement: the connection is closed for every handle
+        // (the reader holds one), the reader told to go, and `staged`, dropped
+        // after this, removes the associations it installed.
+        if let Some(transport) = self.transport.take() {
+            transport.abort();
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.stop();
+            reader.reap();
+        }
+    }
+}
+
+/// What a REGISTER in the procedure carries over from the one before it.
+struct Carry {
+    proposal: Option<SaProposal>,
+    reserved: Option<Socket>,
+    resyncs: u32,
+    requested_expires: u32,
 }
 
 /// Binds a socket on an unused port beside `local` and keeps it, so the port
@@ -94,33 +170,69 @@ impl PendingRegister {
                 "no cached authorization to refresh the registration with".into(),
             ));
         }
+        let mut carry = Carry {
+            proposal: None,
+            reserved: None,
+            resyncs: 0,
+            requested_expires: DEFAULT_EXPIRES,
+        };
+        if let Some(gm) = &session.gm_state {
+            let (socket, port_c) = reserve_client_port(session.local_addr, session.use_tcp)?;
+            carry.proposal = Some(SaProposal {
+                spi_c: rand::random::<u32>() | 1,
+                spi_s: rand::random::<u32>() | 1,
+                port_c,
+                port_s: gm.proposal.port_s,
+            });
+            carry.reserved = Some(socket);
+        }
+        Self::launch(session, cfg, now, carry, Kind::Refresh, None, None)
+    }
+
+    /// Sends the next REGISTER of the procedure: the refresh itself, the
+    /// resynchronisation request, or the answer to a challenge.
+    fn launch(
+        session: &mut RegisteredSession,
+        cfg: &ImsRegisterConfig,
+        now: Instant,
+        carry: Carry,
+        kind: Kind,
+        authorization: Option<String>,
+        swap: Option<Swap>,
+    ) -> BridgeResult<Self> {
         let mut pending = Self {
             call_id: session.call_id.clone(),
             cseq: 0,
             branch: String::new(),
             request: String::new(),
-            requested_expires: DEFAULT_EXPIRES,
+            requested_expires: carry.requested_expires,
             deadline: now + TRANSACTION_TIMEOUT,
             retransmit_at: now + T1,
             retransmit_interval: T1,
             use_tcp: session.use_tcp,
             provisional: false,
             interval_retry: false,
-            proposal: None,
-            _reserved_port: None,
+            proposal: carry.proposal,
+            _reserved_port: carry.reserved,
+            kind,
+            authorization,
+            resyncs: carry.resyncs,
+            swap,
         };
-        if let Some(gm) = &session.gm_state {
-            let (socket, port_c) = reserve_client_port(session.local_addr, session.use_tcp)?;
-            pending.proposal = Some(SaProposal {
-                spi_c: rand::random::<u32>() | 1,
-                spi_s: rand::random::<u32>() | 1,
-                port_c,
-                port_s: gm.proposal.port_s,
-            });
-            pending._reserved_port = Some(socket);
-        }
         pending.send_new(session, cfg, now)?;
         Ok(pending)
+    }
+
+    /// The connection this REGISTER goes out on: the replacement, once there is
+    /// one, otherwise the session's.
+    fn out<'a>(
+        &'a mut self,
+        session: &'a mut RegisteredSession,
+    ) -> BridgeResult<&'a mut SipTransport> {
+        match self.swap.as_mut().and_then(|swap| swap.transport.as_mut()) {
+            Some(transport) => Ok(transport),
+            None => session.transport_mut(),
+        }
     }
 
     /// Builds and sends a new transaction (new branch, next REGISTER CSeq).
@@ -130,11 +242,27 @@ impl PendingRegister {
         cfg: &ImsRegisterConfig,
         now: Instant,
     ) -> BridgeResult<()> {
-        let authorization = session
-            .registration_auth
-            .as_ref()
-            .map(|auth| auth.authorization.clone())
-            .ok_or_else(|| BridgeError::Ims("cached authorization is gone".into()))?;
+        let authorization = match &self.authorization {
+            Some(authorization) => authorization.clone(),
+            None => session
+                .registration_auth
+                .as_ref()
+                .map(|auth| auth.authorization.clone())
+                .ok_or_else(|| BridgeError::Ims("cached authorization is gone".into()))?,
+        };
+        // Where the answer to a challenge is sent from: the replacement
+        // connection's own address, not the working one's.
+        let local_addr = match self.swap.as_ref().and_then(|swap| swap.transport.as_ref()) {
+            Some(transport) => transport.local_addr()?,
+            None => session.local_addr,
+        };
+        let security_verify = match self.swap.as_ref().and_then(|swap| swap.sa.as_ref()) {
+            Some(sa) => Some(sa.security_verify.clone()),
+            None => session
+                .gm_state
+                .as_ref()
+                .map(|gm| gm.security_verify.clone()),
+        };
         self.cseq = session.registration_cseq;
         session.registration_cseq = session
             .registration_cseq
@@ -145,18 +273,17 @@ impl PendingRegister {
             "P-Access-Network-Info: {}",
             cfg.access_network_info
         )];
-        if let (Some(gm), Some(proposal)) = (&session.gm_state, &self.proposal) {
+        if let (Some(verify), Some(proposal)) = (&security_verify, &self.proposal) {
             // The security-agreement headers a UE sends on any re-registration
             // (RFC 3329, TS 24.229 §5.1.1.4.2): the protected server port stays,
             // the client port and SPIs are new. The network only acts on them if
-            // it challenges; until background re-authentication exists that is
-            // answered with a full re-registration.
+            // it challenges, which is answered in the background.
             extra.extend([
                 "Require: sec-agree".to_string(),
                 "Proxy-Require: sec-agree".to_string(),
             ]);
             extra.extend(build_security_client_headers(proposal));
-            extra.push(format!("Security-Verify: {}", gm.security_verify));
+            extra.push(format!("Security-Verify: {verify}"));
         }
         self.request = build_register(&RegisterRequest {
             registrar_uri: &register_request_uri(
@@ -165,7 +292,7 @@ impl PendingRegister {
                 cfg.register_uri_home_domain,
             ),
             public_uri: &session.public_uri,
-            local_addr: session.local_addr,
+            local_addr,
             contact_addr: session.contact_addr,
             call_id: &self.call_id,
             from_tag: &session.from_tag,
@@ -177,7 +304,8 @@ impl PendingRegister {
             extra_headers: &extra,
             imei: &session.imei,
         });
-        session.transport_mut()?.send(&self.request)?;
+        let request = self.request.clone();
+        self.out(session)?.send(&request)?;
         self.deadline = now + TRANSACTION_TIMEOUT;
         self.retransmit_at = now + T1;
         self.retransmit_interval = T1;
@@ -240,7 +368,8 @@ impl PendingRegister {
             return Ok(false);
         }
         if !self.use_tcp && now >= self.retransmit_at {
-            session.transport_mut()?.send(&self.request)?;
+            let request = self.request.clone();
+            self.out(session)?.send(&request)?;
             self.retransmit_interval = if self.provisional {
                 T2
             } else {
@@ -413,6 +542,10 @@ pub(super) trait GmLink {
     fn client_alive(&self) -> bool;
     /// Rebuilds the client transport on the still-live security association.
     fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()>;
+    /// Starts a reader on a client connection that is not yet the session's.
+    fn read_connection(&self, transport: &SipTransport) -> BridgeResult<ClientReader>;
+    /// Makes `reader` the live client reader, returning the one it replaces.
+    fn adopt_reader(&self, reader: ClientReader) -> ClientReader;
 }
 
 impl GmLink for Inbound {
@@ -427,6 +560,12 @@ impl GmLink for Inbound {
     fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()> {
         super::ping::reconnect_gm_client(session, self)
     }
+    fn read_connection(&self, transport: &SipTransport) -> BridgeResult<ClientReader> {
+        crate::ims::session::read_client_connection(transport, self)
+    }
+    fn adopt_reader(&self, reader: ClientReader) -> ClientReader {
+        crate::ims::session::adopt_client_reader(self, reader)
+    }
 }
 
 impl GmLink for &Inbound {
@@ -440,6 +579,14 @@ impl GmLink for &Inbound {
 
     fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()> {
         super::ping::reconnect_gm_client(session, self)
+    }
+
+    fn read_connection(&self, transport: &SipTransport) -> BridgeResult<ClientReader> {
+        (**self).read_connection(transport)
+    }
+
+    fn adopt_reader(&self, reader: ClientReader) -> ClientReader {
+        (**self).adopt_reader(reader)
     }
 }
 
@@ -476,9 +623,10 @@ impl Drop for RingRefresh<'_> {
 
 impl super::inbound::RingService for RingRefresh<'_> {
     fn answer(&mut self, session: &mut RegisteredSession, response: &SipResponse) -> bool {
+        let mut link = self.link;
         match self
             .state
-            .handle_registration_answer(session, &self.ctx, response)
+            .handle_registration_answer(session, &self.ctx, &mut link, response)
         {
             Ok(consumed) => consumed,
             Err(e) => {
@@ -515,8 +663,8 @@ pub(super) const REJECTIONS_BEFORE_FALLBACK: u32 = 2;
 
 /// Statuses that mean an in-place refresh cannot work and the UE must perform
 /// the initial registration procedure (TS 24.229 §5.1.1.4.1 for 403, 408, 500
-/// and 504; 401 is a fresh authentication challenge, handled as a full
-/// re-registration until background re-authentication exists).
+/// and 504). A 401 to the refresh is a fresh authentication challenge and is
+/// answered in the background; a 401 to the answer itself ends up here.
 fn needs_full_registration(status: Option<u16>) -> bool {
     matches!(status, Some(401 | 403 | 408 | 500 | 504))
 }
@@ -575,6 +723,10 @@ impl LoopState {
         link: &mut dyn GmLink,
     ) -> BridgeResult<()> {
         let now = Instant::now();
+        self.drive_retired(now, self.origination.is_some());
+        if self.challenged.is_some() {
+            return self.drive_challenge(session, p, link, now);
+        }
         if let Some(mut pending) = self.registration_refresh.take() {
             return match pending.poll(session, now) {
                 Ok(true) => {
@@ -590,8 +742,9 @@ impl LoopState {
                             .into(),
                     )
                     .into(),
+                    pending.kind,
                 ),
-                Err(e) => self.refresh_not_carried(session, p, link, e.into()),
+                Err(e) => self.refresh_not_carried(session, p, link, e.into(), pending.kind),
             };
         }
         let (expires_at, registered_at) = {
@@ -614,6 +767,7 @@ impl LoopState {
                 link,
                 BridgeError::Ims("the Gm client connection was closed by the network".into())
                     .into(),
+                Kind::Refresh,
             );
         }
         match PendingRegister::start(session, p.reg_cfg, now) {
@@ -626,7 +780,7 @@ impl LoopState {
                 self.registration_refresh = Some(pending);
                 Ok(())
             }
-            Err(e) => self.refresh_not_carried(session, p, link, e.into()),
+            Err(e) => self.refresh_not_carried(session, p, link, e.into(), Kind::Refresh),
         }
     }
 
@@ -642,8 +796,16 @@ impl LoopState {
         p: &RefreshCtx,
         link: &mut dyn GmLink,
         failure: RegisterFailure,
+        step: Kind,
     ) -> BridgeResult<()> {
         self.registration_refresh = None;
+        // Only the ordinary refresh can be mended by rebuilding the connection
+        // and sending it again. A step of the re-authentication that was not
+        // carried is a procedure the network is not following: start over with
+        // a full registration.
+        if matches!(step, Kind::Resync | Kind::Answer) {
+            return self.fall_back_to_full(failure.error.to_string());
+        }
         // A silent but open connection may be carrying a call's own signalling
         // (an outgoing call's INVITE, say), and rebuilding it would cut that.
         // So while the line is busy, only a connection that is dead or failed
@@ -682,6 +844,7 @@ impl LoopState {
         &mut self,
         session: &mut RegisteredSession,
         p: &RefreshCtx,
+        link: &mut dyn GmLink,
         response: &SipResponse,
     ) -> BridgeResult<bool> {
         let Some(pending) = self.registration_refresh.as_mut() else {
@@ -699,7 +862,12 @@ impl LoopState {
             .take()
             .expect("matched a pending refresh");
         let failure = match response.status {
-            200..=299 => return self.confirm_registration_refresh(session, p, &pending, response),
+            200..=299 => {
+                return self.confirm_registration_refresh(session, p, link, pending, response)
+            }
+            401 if pending.kind != Kind::Answer => {
+                return self.begin_challenge(session, p, pending, response);
+            }
             423 => match pending.retry_min_expires(response, session, p.reg_cfg, Instant::now()) {
                 Ok(true) => {
                     self.registration_refresh = Some(pending);
@@ -718,7 +886,8 @@ impl LoopState {
         &mut self,
         session: &mut RegisteredSession,
         p: &RefreshCtx,
-        pending: &PendingRegister,
+        link: &mut dyn GmLink,
+        mut pending: PendingRegister,
         response: &SipResponse,
     ) -> BridgeResult<bool> {
         let granted =
@@ -775,6 +944,21 @@ impl LoopState {
             guard.registered_at = Some(now);
             guard.expires_at = Some(expiry);
             guard.attached = true;
+        }
+        if pending.kind == Kind::Answer {
+            if let Some(authorization) = pending.authorization.take() {
+                session.registration_auth = Some(RegistrationAuth { authorization });
+            }
+            if let Some(swap) = pending.swap.take() {
+                if let Err(e) = self.activate_swap(session, link, swap) {
+                    // The network has accepted the replacement but this side
+                    // could not switch to it, so the two disagree about which
+                    // associations are live. A full registration settles it.
+                    tracing::warn!(error = %e, "could not switch to the new Gm association; registering in full");
+                    self.force_renewal = true;
+                }
+            }
+            tracing::info!("registration re-authenticated in place");
         }
         self.on_renewal_success();
         self.last_refresh = Some((now, "ok".to_string()));
@@ -868,6 +1052,358 @@ impl LoopState {
         }
     }
 }
+
+/// The two things a re-authentication needs from outside the process: the SIM
+/// and the kernel's XFRM tables. Production uses the real ones; the tests
+/// substitute a SIM that answers from a script and a table that follows the
+/// kernel's rules, because CI has neither a modem nor `CAP_NET_ADMIN`. Nothing
+/// else about the procedure is replaced.
+#[derive(Clone)]
+pub(super) struct ReauthEnv {
+    pub(super) open_card: OpenCard,
+    pub(super) xfrm: XfrmFactory,
+}
+
+pub(super) type OpenCard =
+    Arc<dyn Fn(&ImsRegisterConfig) -> BridgeResult<crate::ims::OpenedCard> + Send + Sync>;
+pub(super) type XfrmFactory = Arc<dyn Fn() -> Box<dyn XfrmBackend> + Send + Sync>;
+
+impl Default for ReauthEnv {
+    fn default() -> Self {
+        Self {
+            open_card: Arc::new(crate::ims::open_card),
+            xfrm: Arc::new(|| Box::new(IpXfrm)),
+        }
+    }
+}
+
+/// How long a retired connection and its associations are kept after the
+/// replacement took over: a transaction started on them (an outgoing call's
+/// INVITE, say) can still be answered there (TS 33.203 §7.4.1a). The length of
+/// a transaction, so nothing that was in flight at the switch outlives it.
+const DRAIN: Duration = TRANSACTION_TIMEOUT;
+
+/// No pending call can hold a retired leg longer than this.
+const DRAIN_LIMIT: Duration = Duration::from_secs(600);
+
+/// The SIM is answering a challenge. The registration is untouched meanwhile.
+pub(super) struct Challenged {
+    work: Reauthentication,
+    carry: Carry,
+    /// The `Security-Server` offers of the challenge, if it made any.
+    offers: Vec<String>,
+}
+
+/// The client connection and associations a re-authentication replaced, kept
+/// for the drain.
+pub(super) struct RetiredLeg {
+    transport: Option<SipTransport>,
+    reader: Option<ClientReader>,
+    sas: RetiredSas,
+    /// When it may go, as long as nothing is waiting on it.
+    due: Instant,
+    /// When it goes regardless.
+    limit: Instant,
+}
+
+impl RetiredLeg {
+    fn close(&mut self) {
+        if let Some(transport) = self.transport.take() {
+            transport.abort();
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.stop();
+            reader.reap();
+        }
+        self.sas.remove();
+    }
+}
+
+impl Drop for RetiredLeg {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl LoopState {
+    /// The network answered a refresh with a challenge (TS 24.229 §5.1.1.5.1):
+    /// hand it to the SIM on its own thread and carry on. Calls, notifications
+    /// and the registration stay as they are until the answer is in.
+    fn begin_challenge(
+        &mut self,
+        session: &mut RegisteredSession,
+        p: &RefreshCtx,
+        mut pending: PendingRegister,
+        response: &SipResponse,
+    ) -> BridgeResult<bool> {
+        let Some(www_authenticate) = response.header("WWW-Authenticate") else {
+            self.fall_back_to_full("the challenge carried no WWW-Authenticate".into())?;
+            return Ok(true);
+        };
+        if pending.kind == Kind::Resync && pending.resyncs >= MAX_RESYNCS {
+            self.fall_back_to_full("the network kept asking for a resynchronisation".into())?;
+            return Ok(true);
+        }
+        let job = ChallengeJob {
+            cfg: p.reg_cfg.clone(),
+            realm: session.realm.clone(),
+            uri: format!(
+                "sip:{}",
+                register_request_uri(
+                    session.pcscf_addr,
+                    &session.realm,
+                    p.reg_cfg.register_uri_home_domain
+                )
+            ),
+            www_authenticate: www_authenticate.to_string(),
+        };
+        tracing::info!(
+            in_call = self.busy(),
+            "the network challenged the refresh; answering in the background"
+        );
+        self.challenged = Some(Challenged {
+            work: {
+                let open = Arc::clone(&self.reauth_env.open_card);
+                Reauthentication::spawn(job, move |cfg| open(cfg))
+            },
+            offers: response
+                .headers_all("Security-Server")
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            carry: Carry {
+                proposal: pending.proposal.take(),
+                reserved: pending._reserved_port.take(),
+                resyncs: pending.resyncs,
+                requested_expires: pending.requested_expires,
+            },
+        });
+        Ok(true)
+    }
+
+    /// Runs once per pass while the SIM works: takes the answer when it is in,
+    /// and gives up on one that takes too long.
+    fn drive_challenge(
+        &mut self,
+        session: &mut RegisteredSession,
+        p: &RefreshCtx,
+        link: &mut dyn GmLink,
+        now: Instant,
+    ) -> BridgeResult<()> {
+        let Some(challenged) = self.challenged.take() else {
+            return Ok(());
+        };
+        let Some(result) = challenged.work.poll() else {
+            if challenged.work.overdue(now) {
+                return self
+                    .fall_back_to_full("the SIM did not answer the challenge in time".into());
+            }
+            self.challenged = Some(challenged);
+            return Ok(());
+        };
+        let Challenged {
+            mut carry,
+            offers,
+            work: _,
+        } = challenged;
+        match result {
+            Err(e) => {
+                self.fall_back_to_full(format!("the SIM could not answer the challenge: {e}"))
+            }
+            Ok(Answer::Resynchronise { authorization }) => {
+                let mut carry = carry;
+                carry.resyncs += 1;
+                match PendingRegister::launch(
+                    session,
+                    p.reg_cfg,
+                    now,
+                    carry,
+                    Kind::Resync,
+                    Some(authorization),
+                    None,
+                ) {
+                    Ok(pending) => {
+                        tracing::info!("asked the network to resynchronise");
+                        self.registration_refresh = Some(pending);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.fall_back_to_full(format!("could not send the resynchronisation: {e}"))
+                    }
+                }
+            }
+            Ok(Answer::Authenticated {
+                authorization,
+                ik,
+                ck,
+            }) => {
+                let swap =
+                    match self.stage_replacement(session, p, link, &mut carry, &offers, &ik, &ck) {
+                        Ok(swap) => swap,
+                        Err(e) => {
+                            return self.fall_back_to_full(format!(
+                                "could not set up the new Gm association: {e}"
+                            ))
+                        }
+                    };
+                // The port held back for the proposal is the replacement
+                // connection's now (or no longer needed).
+                let carry = Carry {
+                    reserved: None,
+                    ..carry
+                };
+                match PendingRegister::launch(
+                    session,
+                    p.reg_cfg,
+                    now,
+                    carry,
+                    Kind::Answer,
+                    Some(authorization),
+                    swap,
+                ) {
+                    Ok(pending) => {
+                        tracing::info!(
+                            new_association = pending.swap.is_some(),
+                            "answered the challenge"
+                        );
+                        self.registration_refresh = Some(pending);
+                        Ok(())
+                    }
+                    Err(e) => self.fall_back_to_full(format!("could not send the answer: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Installs the associations the challenge proposed beside the working
+    /// ones and opens the connection that will carry the answer (TS 33.203
+    /// §7.4). `None` when there is nothing to replace: no association on this
+    /// registration, or none offered, in which case the answer goes out on the
+    /// working connection.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_replacement(
+        &mut self,
+        session: &RegisteredSession,
+        p: &RefreshCtx,
+        link: &mut dyn GmLink,
+        carry: &mut Carry,
+        offers: &[String],
+        ik: &[u8],
+        ck: &[u8],
+    ) -> BridgeResult<Option<Swap>> {
+        let (Some(gm), Some(ours)) = (&session.gm_state, carry.proposal.clone()) else {
+            return Ok(None);
+        };
+        let ours = &ours;
+        if offers.is_empty() {
+            return Ok(None);
+        }
+        let refs: Vec<&str> = offers.iter().map(String::as_str).collect();
+        let (theirs, _) = gm_ipsec::select_security_server(
+            &refs,
+            p.reg_cfg.gm_auth_alg.as_deref(),
+            p.reg_cfg.gm_cipher_alg.as_deref(),
+        )?;
+        let endpoints = GmEndpoints::new(
+            gm.endpoints.local_c.ip(),
+            gm.endpoints.remote_s.ip(),
+            ours,
+            &theirs,
+        );
+        let keys = SaKeys::derive(&theirs, ik, ck)?;
+        let old = SaSet {
+            endpoints: gm.endpoints.clone(),
+            ours: gm.proposal.clone(),
+            theirs: gm.theirs.clone(),
+        };
+        let new = SaSet {
+            endpoints: endpoints.clone(),
+            ours: ours.clone(),
+            theirs: theirs.clone(),
+        };
+        let staged = StagedSas::stage((self.reauth_env.xfrm)(), &old, new, &keys)?;
+        // The proposal held the client port; the replacement connection
+        // binds it, so it has to be free first.
+        let destination = SocketAddr::new(endpoints.remote_s.ip(), theirs.port_s);
+        drop(carry.reserved.take());
+        let transport = SipTransport::connect_from(ours.port_c, destination, session.use_tcp)?;
+        let reader = link.read_connection(&transport)?;
+        Ok(Some(Swap {
+            staged: Some(staged),
+            transport: Some(transport),
+            reader: Some(reader),
+            sa: Some(GmSa {
+                endpoints,
+                proposal: ours.clone(),
+                theirs,
+                security_verify: crate::ims::security_verify_echo(&refs),
+            }),
+        }))
+    }
+
+    /// The network confirmed the replacement: it becomes the registration's
+    /// connection and associations, and what it replaced is kept for the drain.
+    fn activate_swap(
+        &mut self,
+        session: &mut RegisteredSession,
+        link: &mut dyn GmLink,
+        swap: Swap,
+    ) -> BridgeResult<()> {
+        let (staged, transport, reader, sa) = swap.into_parts();
+        let retired = staged.activate()?;
+        let local = transport.local_addr()?;
+        let old_transport = session.transport.replace(transport);
+        session.local_addr = local;
+        session.gm_state = Some(sa);
+        let old_reader = link.adopt_reader(reader);
+        let now = Instant::now();
+        self.retired_gm.push(RetiredLeg {
+            transport: old_transport,
+            reader: Some(old_reader),
+            sas: retired,
+            due: now + DRAIN,
+            limit: now + DRAIN_LIMIT,
+        });
+        // A probe in flight went out on the connection that was just retired.
+        self.ping.reset();
+        tracing::info!(
+            local = %local,
+            drain_secs = DRAIN.as_secs(),
+            "switched to the new Gm association; the old one drains"
+        );
+        Ok(())
+    }
+
+    /// Closes retired connections whose drain is over. One is kept while an
+    /// outgoing call is still being placed, which may be waiting on it, but not
+    /// beyond [`DRAIN_LIMIT`].
+    pub(super) fn drive_retired(&mut self, now: Instant, waiting: bool) {
+        self.retired_gm.retain_mut(|leg| {
+            let done = now >= leg.limit || (now >= leg.due && !waiting);
+            if done {
+                leg.close();
+                tracing::info!("retired Gm association removed");
+            }
+            !done
+        });
+    }
+
+    /// The procedure cannot continue: whatever was staged is undone and the
+    /// registration is renewed in full, as soon as the line is idle. The
+    /// binding the network already granted keeps serving calls until then.
+    fn fall_back_to_full(&mut self, reason: String) -> BridgeResult<()> {
+        self.registration_refresh = None;
+        self.challenged = None;
+        tracing::warn!(reason = %reason, "re-authentication failed; registering in full");
+        self.last_refresh = Some((SystemTime::now(), "error".to_string()));
+        self.force_renewal = true;
+        Ok(())
+    }
+}
+
+/// How many times a challenge may be answered with a resynchronisation
+/// request, as at registration (TS 24.229 §5.1.1.5.1, RFC 3310 §3.3).
+const MAX_RESYNCS: u32 = 2;
 
 /// The failure for a final error answer to the refresh.
 fn rejected(response: &SipResponse) -> RegisterFailure {

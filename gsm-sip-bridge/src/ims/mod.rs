@@ -44,6 +44,7 @@ pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
 pub mod pcscf_files;
+pub(crate) mod registration_auth;
 pub(crate) mod rtcp;
 /// `pub` rather than private: `siptest` (specs/037-siptest-softphone,
 /// research.md R1) reuses RTP framing, the μ-law codec and the WAV writer
@@ -1055,7 +1056,17 @@ fn open_modem_waiting<T, E: std::fmt::Display>(
     }
 }
 
-pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
+/// The SIM, opened and with its USIM application selected, plus the identities
+/// read alongside it.
+pub(crate) struct OpenedCard {
+    pub(crate) card: Box<dyn ApduTransport>,
+    pub(crate) imsi: String,
+    pub(crate) imei: String,
+}
+
+/// Opens the line's SIM, whichever way it is reached, and selects the USIM.
+/// The initial registration and a background re-authentication both start here.
+pub(crate) fn open_card(cfg: &ImsRegisterConfig) -> BridgeResult<OpenedCard> {
     // A pcsc_reader line's SIM sits in a real PC/SC reader, not the modem at
     // `modem_port` (specs/023-omnikey-pcsc-vowifi). Only one `AtCommander` is
     // ever opened on `modem_port` per call — it must serve both the
@@ -1104,6 +1115,38 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
     let aid = usim::discover_usim_aid(card.as_mut())?;
     usim::select_usim(card.as_mut(), &aid)?;
     tracing::info!(aid = %aid.iter().map(|b| format!("{b:02X}")).collect::<String>(), "selected USIM application");
+
+    Ok(OpenedCard { card, imsi, imei })
+}
+
+/// Runs the SIM's AKA on a challenge: the nonce is RAND followed by AUTN,
+/// base64-encoded (RFC 3310 §3.2).
+pub(crate) fn run_aka(
+    card: &mut dyn ApduTransport,
+    challenge: &sip_client::DigestChallenge,
+) -> BridgeResult<AkaResult> {
+    let nonce_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &challenge.nonce)
+            .map_err(|e| BridgeError::Ims(format!("nonce is not valid base64: {e}")))?;
+    if nonce_bytes.len() < 32 {
+        return Err(BridgeError::Ims(format!(
+            "nonce too short for RAND+AUTN: {} bytes",
+            nonce_bytes.len()
+        )));
+    }
+    let mut rand_arr = [0u8; 16];
+    let mut autn_arr = [0u8; 16];
+    rand_arr.copy_from_slice(&nonce_bytes[0..16]);
+    autn_arr.copy_from_slice(&nonce_bytes[16..32]);
+    usim::authenticate(card, &rand_arr, &autn_arr)
+}
+
+pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<RegisteredSession> {
+    let OpenedCard {
+        mut card,
+        imsi,
+        imei,
+    } = open_card(cfg)?;
 
     let realm = format!("ims.mnc{}.mcc{}.3gppnetwork.org", cfg.mnc, cfg.mcc);
     // The IMPI (private identity) — always IMSI-based per TS 33.203,
@@ -1232,21 +1275,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
             );
         }
 
-        let nonce_bytes =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &challenge.nonce)
-                .map_err(|e| BridgeError::Ims(format!("nonce is not valid base64: {e}")))?;
-        if nonce_bytes.len() < 32 {
-            return Err(BridgeError::Ims(format!(
-                "nonce too short for RAND+AUTN: {} bytes",
-                nonce_bytes.len()
-            )));
-        }
-        let mut rand_arr = [0u8; 16];
-        let mut autn_arr = [0u8; 16];
-        rand_arr.copy_from_slice(&nonce_bytes[0..16]);
-        autn_arr.copy_from_slice(&nonce_bytes[16..32]);
-
-        let aka = usim::authenticate(card.as_mut(), &rand_arr, &autn_arr)?;
+        let aka = run_aka(card.as_mut(), &challenge)?;
 
         cseq += 1;
         // RFC 2617 requires this to match the Request-URI of the message it's
@@ -1461,7 +1490,7 @@ pub struct SaProposal {
 /// The `Security-Verify` value to echo: the P-CSCF's *whole* `Security-Server`
 /// list, verbatim and in the order offered, not only the offer we selected.
 /// See the measurement note at the call site: a partial echo is a `494`.
-fn security_verify_echo(offers: &[&str]) -> String {
+pub(crate) fn security_verify_echo(offers: &[&str]) -> String {
     offers.join(", ")
 }
 
@@ -1542,7 +1571,7 @@ pub(crate) fn build_security_client_headers(proposal: &SaProposal) -> Vec<String
     ]
 }
 
-fn build_authorization(
+pub(crate) fn build_authorization(
     impi_uri: &str,
     challenge: &sip_client::DigestChallenge,
     uri: &str,
@@ -1577,7 +1606,7 @@ fn build_authorization(
     )
 }
 
-fn build_resync_authorization(
+pub(crate) fn build_resync_authorization(
     impi_uri: &str,
     challenge: &sip_client::DigestChallenge,
     uri: &str,
@@ -1596,6 +1625,28 @@ fn build_resync_authorization(
         realm = challenge.realm,
         nonce = challenge.nonce,
     )
+}
+
+/// A registration configuration for tests that never reach a modem or a network.
+#[cfg(test)]
+pub(crate) fn test_register_config() -> ImsRegisterConfig {
+    ImsRegisterConfig {
+        modem_port: "/must-not-open-modem".into(),
+        pcsc_reader: false,
+        pcscf_addr: IpAddr::from([127, 0, 0, 1]),
+        pcscf_port: 5060,
+        mcc: "001".into(),
+        mnc: "01".into(),
+        imsi: None,
+        imei: None,
+        use_tcp: false,
+        sec_agree: false,
+        msisdn: None,
+        access_network_info: "3GPP-WLAN".into(),
+        register_uri_home_domain: true,
+        gm_auth_alg: None,
+        gm_cipher_alg: None,
+    }
 }
 
 /// A registered session for tests that need real Gm-negotiated state without a

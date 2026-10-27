@@ -2099,6 +2099,13 @@ struct LoopState {
     /// ([`registration_refresh`]). Its answer arrives through the dispatch
     /// loop's single reader, so calls keep being served meanwhile.
     registration_refresh: Option<registration_refresh::PendingRegister>,
+    /// A challenge to the refresh that the SIM is answering on its own thread.
+    challenged: Option<registration_refresh::Challenged>,
+    /// Client connections and security associations a re-authentication
+    /// replaced, kept while transactions started on them finish.
+    retired_gm: Vec<registration_refresh::RetiredLeg>,
+    /// The SIM and kernel a re-authentication uses; see [`registration_refresh::ReauthEnv`].
+    reauth_env: registration_refresh::ReauthEnv,
     /// Final error answers to in-place refreshes since the last accepted one.
     refresh_rejections: u32,
     /// Set after [`registration_refresh::REJECTIONS_BEFORE_FALLBACK`] rejections
@@ -2156,6 +2163,9 @@ impl LoopState {
             reconnect_attempts: 0,
             force_renewal: false,
             registration_refresh: None,
+            challenged: None,
+            retired_gm: Vec::new(),
+            reauth_env: registration_refresh::ReauthEnv::default(),
             refresh_rejections: 0,
             refresh_fallback: false,
             refresh_repaired: false,
@@ -2780,7 +2790,12 @@ fn dispatch_loop(
                 );
             }
             Ok((SipMessage::Response(resp), _)) => {
-                if !st.handle_registration_answer(session, &p.refresh_ctx(), &resp)? {
+                if !st.handle_registration_answer(
+                    session,
+                    &p.refresh_ctx(),
+                    &mut &*inbound,
+                    &resp,
+                )? {
                     st.handle_carrier_response(session, p, &resp);
                 }
             }
@@ -3939,6 +3954,8 @@ impl LoopState {
         // A full re-registration replaces the session; an answer to a refresh
         // sent on the old one can never be matched again.
         self.registration_refresh = None;
+        self.challenged = None;
+        self.retired_gm.clear();
         // A previous attempt failed and its backoff hasn't elapsed yet —
         // `renewal_due` alone would otherwise fire again on every idle wake-up
         // regardless of backoff, hammering a still-failing renewal every poll

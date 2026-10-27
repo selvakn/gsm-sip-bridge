@@ -274,19 +274,22 @@ fn ip_proto_number(proto: &str) -> BridgeResult<&'static str> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn xfrm_policy_add(
+/// `add` fails when the selector is already in the table; `update` replaces
+/// the template of one that is. `tmpl_spi` of `None` leaves the SPI out, so the
+/// template matches whichever association the packet arrived on.
+fn xfrm_policy_write(
+    verb: &str,
     src: SocketAddr,
     dst: SocketAddr,
-    tmpl_spi: u32,
+    tmpl_spi: Option<u32>,
     dir_in: bool,
     proto: &str,
 ) -> BridgeResult<()> {
     let dir = if dir_in { "in" } else { "out" };
     let proto_num = ip_proto_number(proto)?;
-    run_ip_xfrm(&[
+    let mut args = vec![
         "policy".to_string(),
-        "add".to_string(),
+        verb.to_string(),
         "src".to_string(),
         src.ip().to_string(),
         "dst".to_string(),
@@ -306,11 +309,14 @@ fn xfrm_policy_add(
         dst.ip().to_string(),
         "proto".to_string(),
         "esp".to_string(),
-        "spi".to_string(),
-        format!("0x{tmpl_spi:08x}"),
-        "mode".to_string(),
-        "transport".to_string(),
-    ])
+    ];
+    if let Some(spi) = tmpl_spi {
+        args.push("spi".to_string());
+        args.push(format!("0x{spi:08x}"));
+    }
+    args.push("mode".to_string());
+    args.push("transport".to_string());
+    run_ip_xfrm(&args)
 }
 
 fn xfrm_policy_del(
@@ -341,6 +347,7 @@ fn xfrm_policy_del(
 
 /// The four endpoints of the two logical Gm tunnels (TS 33.203 Annex H):
 /// "c" = our/their client-role port, "s" = our/their server-role port.
+#[derive(Clone)]
 pub struct GmEndpoints {
     pub local_c: SocketAddr,
     pub local_s: SocketAddr,
@@ -385,54 +392,12 @@ pub fn install_gm_sas(
     ik: &[u8],
     ck: &[u8],
 ) -> BridgeResult<()> {
-    let auth_name = kernel_auth_name(&theirs.alg)?;
-    let enc_name = kernel_cipher_name(&theirs.ealg)?;
-    let auth_key = hex_encode(&derive_auth_key(&theirs.alg, ik)?);
-    let enc_key = hex_encode(&derive_cipher_key(&theirs.ealg, ck)?);
-
-    // TS 33.203 keys all four SAs identically from one `IK`.
-    let in_auth_name = auth_name;
-    let in_auth_key = auth_key.clone();
-
-    // Outbound: we send, tagged with the SPI *they* told us to use.
-    xfrm_state_add(
-        endpoints.local_c.ip(),
-        endpoints.remote_s.ip(),
-        theirs.spi_s,
-        auth_name,
-        &auth_key,
-        enc_name,
-        &enc_key,
-    )?;
-    xfrm_state_add(
-        endpoints.local_s.ip(),
-        endpoints.remote_c.ip(),
-        theirs.spi_c,
-        auth_name,
-        &auth_key,
-        enc_name,
-        &enc_key,
-    )?;
-    // Inbound: they send, tagged with the SPI *we* told them to use.
-    xfrm_state_add(
-        endpoints.remote_c.ip(),
-        endpoints.local_s.ip(),
-        ours.spi_s,
-        in_auth_name,
-        &in_auth_key,
-        enc_name,
-        &enc_key,
-    )?;
-    xfrm_state_add(
-        endpoints.remote_s.ip(),
-        endpoints.local_c.ip(),
-        ours.spi_c,
-        in_auth_name,
-        &in_auth_key,
-        enc_name,
-        &enc_key,
-    )?;
-
+    let keys = SaKeys::derive(theirs, ik, ck)?;
+    let set = SaSet {
+        endpoints: endpoints.clone(),
+        ours: ours.clone(),
+        theirs: theirs.clone(),
+    };
     // TS 33.203: one set of Gm SAs protects **both** transports between the
     // negotiated port pairs. Which one the network uses for a request it
     // originates is its choice, not ours, so `proto` (the transport we picked
@@ -445,82 +410,14 @@ pub fn install_gm_sas(
     // and the caller heard "out of coverage area". Nothing in
     // /proc/net/xfrm_stat records that, and the SAs themselves are
     // wildcard-selector so they were never the limiting factor; only these
-    // four selectors were.
+    // selectors were.
     let _ = proto;
-    for policy_proto in ["tcp", "udp"] {
-        xfrm_policy_add(
-            endpoints.local_c,
-            endpoints.remote_s,
-            theirs.spi_s,
-            false,
-            policy_proto,
-        )?;
-        xfrm_policy_add(
-            endpoints.local_s,
-            endpoints.remote_c,
-            theirs.spi_c,
-            false,
-            policy_proto,
-        )?;
-        xfrm_policy_add(
-            endpoints.remote_c,
-            endpoints.local_s,
-            ours.spi_s,
-            true,
-            policy_proto,
-        )?;
-        xfrm_policy_add(
-            endpoints.remote_s,
-            endpoints.local_c,
-            ours.spi_c,
-            true,
-            policy_proto,
-        )?;
-
-        // The two canonical pairs above are what TS 33.203 draws, but they
-        // only cover a client port talking to the *opposite* server port.
-        // RFC 3261 §18.2.2 routes a response to the `Via` sent-by, and Jio's
-        // P-CSCF sends network-initiated requests from its client port while
-        // naming its *server* port in that `Via` — so the reply belongs on a
-        // pairing the four canonical policies do not describe, and would
-        // otherwise leave unprotected (silently: an unmatched policy is not an
-        // error, the packet just goes out in the clear and the carrier drops
-        // it).
-        //
-        // Completing the cross product costs four more selectors per protocol
-        // and makes every combination of our two protected ports with their
-        // two protected ports carry ESP, so response routing is free to follow
-        // the SIP rules without a transport-layer trap underneath it.
-        xfrm_policy_add(
-            endpoints.local_c,
-            endpoints.remote_c,
-            theirs.spi_c,
-            false,
-            policy_proto,
-        )?;
-        xfrm_policy_add(
-            endpoints.local_s,
-            endpoints.remote_s,
-            theirs.spi_s,
-            false,
-            policy_proto,
-        )?;
-        xfrm_policy_add(
-            endpoints.remote_c,
-            endpoints.local_c,
-            ours.spi_c,
-            true,
-            policy_proto,
-        )?;
-        xfrm_policy_add(
-            endpoints.remote_s,
-            endpoints.local_s,
-            ours.spi_s,
-            true,
-            policy_proto,
-        )?;
+    for state in set.states() {
+        IpXfrm.state_add(&state, &keys)?;
     }
-
+    for policy in set.policies() {
+        IpXfrm.policy_add(&policy)?;
+    }
     Ok(())
 }
 
@@ -533,37 +430,6 @@ pub fn remove_gm_sas(
     theirs: &SecurityServerParams,
     proto: &str,
 ) {
-    fn warn_on_err(label: &str, result: BridgeResult<()>) {
-        if let Err(e) = result {
-            tracing::warn!(what = label, error = %e, "failed to clean up Gm IPsec state");
-        }
-    }
-
-    warn_on_err(
-        "state local_c->remote_s",
-        xfrm_state_del(
-            endpoints.local_c.ip(),
-            endpoints.remote_s.ip(),
-            theirs.spi_s,
-        ),
-    );
-    warn_on_err(
-        "state local_s->remote_c",
-        xfrm_state_del(
-            endpoints.local_s.ip(),
-            endpoints.remote_c.ip(),
-            theirs.spi_c,
-        ),
-    );
-    warn_on_err(
-        "state remote_c->local_s",
-        xfrm_state_del(endpoints.remote_c.ip(), endpoints.local_s.ip(), ours.spi_s),
-    );
-    warn_on_err(
-        "state remote_s->local_c",
-        xfrm_state_del(endpoints.remote_s.ip(), endpoints.local_c.ip(), ours.spi_c),
-    );
-
     // `install_gm_sas` installs 8 policies (4 canonical + 4 cross-product) per
     // protocol, for both "tcp" and "udp" — 16 in total, regardless of which
     // transport `proto` names. This must delete exactly that set, or every
@@ -574,39 +440,467 @@ pub fn remove_gm_sas(
     // silently dropping packets in a way indistinguishable from the Jio
     // inbound-routing bug the cross-product policies exist to fix.
     let _ = proto;
-    for policy_proto in ["tcp", "udp"] {
-        warn_on_err(
-            "policy local_c->remote_s",
-            xfrm_policy_del(endpoints.local_c, endpoints.remote_s, policy_proto, false),
-        );
-        warn_on_err(
-            "policy local_s->remote_c",
-            xfrm_policy_del(endpoints.local_s, endpoints.remote_c, policy_proto, false),
-        );
-        warn_on_err(
-            "policy remote_c->local_s",
-            xfrm_policy_del(endpoints.remote_c, endpoints.local_s, policy_proto, true),
-        );
-        warn_on_err(
-            "policy remote_s->local_c",
-            xfrm_policy_del(endpoints.remote_s, endpoints.local_c, policy_proto, true),
-        );
-        warn_on_err(
-            "policy local_c->remote_c",
-            xfrm_policy_del(endpoints.local_c, endpoints.remote_c, policy_proto, false),
-        );
-        warn_on_err(
-            "policy local_s->remote_s",
-            xfrm_policy_del(endpoints.local_s, endpoints.remote_s, policy_proto, false),
-        );
-        warn_on_err(
-            "policy remote_c->local_c",
-            xfrm_policy_del(endpoints.remote_c, endpoints.local_c, policy_proto, true),
-        );
-        warn_on_err(
-            "policy remote_s->local_s",
-            xfrm_policy_del(endpoints.remote_s, endpoints.local_s, policy_proto, true),
-        );
+    let set = SaSet {
+        endpoints: endpoints.clone(),
+        ours: ours.clone(),
+        theirs: theirs.clone(),
+    };
+    set.remove(&IpXfrm);
+}
+
+// --- the sets, and replacing one with another -------------------------------
+
+/// The key material of one Gm association, in the names the kernel wants.
+pub(crate) struct SaKeys {
+    auth_name: &'static str,
+    auth_key: String,
+    enc_name: &'static str,
+    enc_key: String,
+}
+
+impl SaKeys {
+    /// TS 33.203 keys all four SAs identically from one `IK` (and `CK`).
+    pub(crate) fn derive(
+        theirs: &SecurityServerParams,
+        ik: &[u8],
+        ck: &[u8],
+    ) -> BridgeResult<Self> {
+        Ok(Self {
+            auth_name: kernel_auth_name(&theirs.alg)?,
+            auth_key: hex_encode(&derive_auth_key(&theirs.alg, ik)?),
+            enc_name: kernel_cipher_name(&theirs.ealg)?,
+            enc_key: hex_encode(&derive_cipher_key(&theirs.ealg, ck)?),
+        })
+    }
+}
+
+/// One ESP state: `src` to `dst`, identified by `spi`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StateSpec {
+    pub(crate) src: IpAddr,
+    pub(crate) dst: IpAddr,
+    pub(crate) spi: u32,
+}
+
+/// One policy. Its selector (everything but the template) is what the kernel
+/// keys it on; `spi` is the template's SPI, `None` for any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PolicySpec {
+    pub(crate) src: SocketAddr,
+    pub(crate) dst: SocketAddr,
+    pub(crate) proto: &'static str,
+    pub(crate) dir_in: bool,
+    pub(crate) spi: Option<u32>,
+}
+
+impl PolicySpec {
+    fn same_selector(&self, other: &PolicySpec) -> bool {
+        (self.src, self.dst, self.proto, self.dir_in)
+            == (other.src, other.dst, other.proto, other.dir_in)
+    }
+}
+
+/// What the kernel is asked to do. The real one shells out to `ip xfrm`; a
+/// test substitutes a table that behaves like the kernel's (a duplicate `add`
+/// fails, `update` of a missing selector fails), because the staging logic is
+/// all about those rules and CI cannot create XFRM state without privileges.
+pub(crate) trait XfrmBackend: Send {
+    fn state_add(&self, state: &StateSpec, keys: &SaKeys) -> BridgeResult<()>;
+    fn state_del(&self, state: &StateSpec) -> BridgeResult<()>;
+    fn policy_add(&self, policy: &PolicySpec) -> BridgeResult<()>;
+    fn policy_update(&self, policy: &PolicySpec) -> BridgeResult<()>;
+    fn policy_del(&self, policy: &PolicySpec) -> BridgeResult<()>;
+}
+
+/// The kernel, through `ip xfrm`.
+pub(crate) struct IpXfrm;
+
+impl XfrmBackend for IpXfrm {
+    fn state_add(&self, s: &StateSpec, keys: &SaKeys) -> BridgeResult<()> {
+        xfrm_state_add(
+            s.src,
+            s.dst,
+            s.spi,
+            keys.auth_name,
+            &keys.auth_key,
+            keys.enc_name,
+            &keys.enc_key,
+        )
+    }
+    fn state_del(&self, s: &StateSpec) -> BridgeResult<()> {
+        xfrm_state_del(s.src, s.dst, s.spi)
+    }
+    fn policy_add(&self, p: &PolicySpec) -> BridgeResult<()> {
+        xfrm_policy_write("add", p.src, p.dst, p.spi, p.dir_in, p.proto)
+    }
+    fn policy_update(&self, p: &PolicySpec) -> BridgeResult<()> {
+        xfrm_policy_write("update", p.src, p.dst, p.spi, p.dir_in, p.proto)
+    }
+    fn policy_del(&self, p: &PolicySpec) -> BridgeResult<()> {
+        xfrm_policy_del(p.src, p.dst, p.proto, p.dir_in)
+    }
+}
+
+/// The endpoints and identifiers of one generation of Gm associations.
+#[derive(Clone)]
+pub(crate) struct SaSet {
+    pub(crate) endpoints: GmEndpoints,
+    pub(crate) ours: SaProposal,
+    pub(crate) theirs: SecurityServerParams,
+}
+
+impl SaSet {
+    /// The four ESP states, in the order they are installed.
+    pub(crate) fn states(&self) -> Vec<StateSpec> {
+        let (e, o, t) = (&self.endpoints, &self.ours, &self.theirs);
+        vec![
+            // Outbound: we send, tagged with the SPI *they* told us to use.
+            StateSpec {
+                src: e.local_c.ip(),
+                dst: e.remote_s.ip(),
+                spi: t.spi_s,
+            },
+            StateSpec {
+                src: e.local_s.ip(),
+                dst: e.remote_c.ip(),
+                spi: t.spi_c,
+            },
+            // Inbound: they send, tagged with the SPI *we* told them to use.
+            StateSpec {
+                src: e.remote_c.ip(),
+                dst: e.local_s.ip(),
+                spi: o.spi_s,
+            },
+            StateSpec {
+                src: e.remote_s.ip(),
+                dst: e.local_c.ip(),
+                spi: o.spi_c,
+            },
+        ]
+    }
+
+    /// The sixteen policies (eight per protocol), in the order they are
+    /// installed.
+    ///
+    /// The four canonical pairs are what TS 33.203 draws, but they only cover a
+    /// client port talking to the *opposite* server port. RFC 3261 §18.2.2
+    /// routes a response to the `Via` sent-by, and Jio's P-CSCF sends
+    /// network-initiated requests from its client port while naming its
+    /// *server* port in that `Via` — so the reply belongs on a pairing the four
+    /// canonical policies do not describe, and would otherwise leave
+    /// unprotected (silently: an unmatched policy is not an error, the packet
+    /// just goes out in the clear and the carrier drops it).
+    ///
+    /// Completing the cross product costs four more selectors per protocol and
+    /// makes every combination of our two protected ports with their two
+    /// protected ports carry ESP, so response routing is free to follow the SIP
+    /// rules without a transport-layer trap underneath it.
+    pub(crate) fn policies(&self) -> Vec<PolicySpec> {
+        let (e, o, t) = (&self.endpoints, &self.ours, &self.theirs);
+        let mut out = Vec::with_capacity(16);
+        for proto in ["tcp", "udp"] {
+            let policy = |src, dst, spi, dir_in| PolicySpec {
+                src,
+                dst,
+                proto,
+                dir_in,
+                spi: Some(spi),
+            };
+            out.extend([
+                policy(e.local_c, e.remote_s, t.spi_s, false),
+                policy(e.local_s, e.remote_c, t.spi_c, false),
+                policy(e.remote_c, e.local_s, o.spi_s, true),
+                policy(e.remote_s, e.local_c, o.spi_c, true),
+                policy(e.local_c, e.remote_c, t.spi_c, false),
+                policy(e.local_s, e.remote_s, t.spi_s, false),
+                policy(e.remote_c, e.local_c, o.spi_c, true),
+                policy(e.remote_s, e.local_s, o.spi_s, true),
+            ]);
+        }
+        out
+    }
+
+    /// Best-effort removal of everything this set installed. Failures are
+    /// logged, not returned: this runs on paths that are already failing, or
+    /// are cleaning up after a drain, and must not mask what came before.
+    pub(crate) fn remove(&self, backend: &dyn XfrmBackend) {
+        for state in self.states() {
+            if let Err(e) = backend.state_del(&state) {
+                tracing::warn!(what = "state", error = %e, "failed to clean up Gm IPsec state");
+            }
+        }
+        for policy in self.policies() {
+            if let Err(e) = backend.policy_del(&policy) {
+                tracing::warn!(what = "policy", error = %e, "failed to clean up Gm IPsec state");
+            }
+        }
+    }
+}
+
+/// A replacement generation of SAs installed beside the working one (TS 33.203
+/// §7.4), not yet carrying anything.
+///
+/// - States are new and distinct (new SPIs), so they sit beside the old ones.
+/// - A policy whose selector the old generation does not have is simply added.
+/// - A selector both generations use (our protected server port is unchanged,
+///   and the network may keep its own ports) cannot hold two policies. Its
+///   *inbound* template is widened to any SPI at once, so a packet from either
+///   generation is accepted; its *outbound* template keeps the old SPI, so
+///   nothing we send changes until [`StagedSas::activate`].
+///
+/// Dropping it without activating removes everything it added and restores
+/// what it widened, leaving the working generation exactly as it was.
+pub(crate) struct StagedSas {
+    backend: Option<Box<dyn XfrmBackend>>,
+    old: SaSet,
+    new: SaSet,
+    states: Vec<StateSpec>,
+    added: Vec<PolicySpec>,
+    /// Inbound policies widened to any SPI, as they were before.
+    widened: Vec<PolicySpec>,
+    /// Outbound policies to repoint at activation, with the template they had.
+    repoint: Vec<(PolicySpec, PolicySpec)>,
+}
+
+impl StagedSas {
+    /// Installs `new` beside `old`. On any failure what was done is undone and
+    /// the working generation is untouched.
+    pub(crate) fn stage(
+        backend: Box<dyn XfrmBackend>,
+        old: &SaSet,
+        new: SaSet,
+        keys: &SaKeys,
+    ) -> BridgeResult<Self> {
+        let old_states = old.states();
+        if let Some(clash) = new.states().into_iter().find(|s| old_states.contains(s)) {
+            return Err(BridgeError::Ims(format!(
+                "the replacement Gm SA reuses the working one's SPI {:#010x}",
+                clash.spi
+            )));
+        }
+        let mut staged = Self {
+            backend: Some(backend),
+            old: old.clone(),
+            new,
+            states: Vec::new(),
+            added: Vec::new(),
+            widened: Vec::new(),
+            repoint: Vec::new(),
+        };
+        // A failure part-way returns early; `staged` is dropped and rolls back.
+        staged.install(keys)?;
+        Ok(staged)
+    }
+
+    fn backend(&self) -> &dyn XfrmBackend {
+        self.backend
+            .as_deref()
+            .expect("the backend is only taken when the set is finished")
+    }
+
+    fn install(&mut self, keys: &SaKeys) -> BridgeResult<()> {
+        for state in self.new.states() {
+            self.backend().state_add(&state, keys)?;
+            self.states.push(state);
+        }
+        let old_policies = self.old.policies();
+        for policy in self.new.policies() {
+            match old_policies.iter().find(|o| o.same_selector(&policy)) {
+                None => {
+                    self.backend().policy_add(&policy)?;
+                    self.added.push(policy);
+                }
+                Some(current) if policy.dir_in => {
+                    let any = PolicySpec {
+                        spi: None,
+                        ..policy
+                    };
+                    self.backend().policy_update(&any)?;
+                    self.widened.push(current.clone());
+                }
+                Some(current) => self.repoint.push((policy, current.clone())),
+            }
+        }
+        Ok(())
+    }
+
+    /// The replacement is confirmed: outbound traffic on shared selectors moves
+    /// to it, and the working generation is handed back to be removed once the
+    /// drain is over. If a policy cannot be moved, nothing is activated.
+    pub(crate) fn activate(mut self) -> BridgeResult<RetiredSas> {
+        for (moved, (new, _)) in self.repoint.iter().enumerate() {
+            if let Err(e) = self.backend().policy_update(new) {
+                for (_, was) in &self.repoint[..moved] {
+                    let _ = self.backend().policy_update(was);
+                }
+                return Err(e);
+            }
+        }
+        let kept = self.new.policies();
+        let backend = self.backend.take().expect("not yet finished");
+        // What the new generation shares with the old stays; the rest of the
+        // old generation goes at the end of the drain.
+        let stale: Vec<PolicySpec> = self
+            .old
+            .policies()
+            .into_iter()
+            .filter(|o| !kept.iter().any(|k| k.same_selector(o)))
+            .collect();
+        Ok(RetiredSas {
+            backend: Some(backend),
+            states: self.old.states(),
+            policies: stale,
+        })
+    }
+
+    fn roll_back(&mut self) {
+        let Some(backend) = self.backend.take() else {
+            return;
+        };
+        let warn = |what: &str, result: BridgeResult<()>| {
+            if let Err(e) = result {
+                tracing::warn!(what, error = %e, "failed to roll back a staged Gm IPsec SA");
+            }
+        };
+        for policy in self.added.drain(..) {
+            warn("policy", backend.policy_del(&policy));
+        }
+        for was in self.widened.drain(..) {
+            warn("policy", backend.policy_update(&was));
+        }
+        for state in self.states.drain(..) {
+            warn("state", backend.state_del(&state));
+        }
+    }
+}
+
+impl Drop for StagedSas {
+    fn drop(&mut self) {
+        self.roll_back();
+    }
+}
+
+/// The generation of SAs that a replacement took over from. Its states and the
+/// policies only it used stay in place for pending transactions and are removed
+/// by [`RetiredSas::remove`] or, failing that, when it is dropped.
+pub(crate) struct RetiredSas {
+    backend: Option<Box<dyn XfrmBackend>>,
+    states: Vec<StateSpec>,
+    policies: Vec<PolicySpec>,
+}
+
+impl RetiredSas {
+    pub(crate) fn remove(&mut self) {
+        let Some(backend) = self.backend.take() else {
+            return;
+        };
+        for policy in &self.policies {
+            if let Err(e) = backend.policy_del(policy) {
+                tracing::warn!(what = "policy", error = %e, "failed to remove a retired Gm IPsec SA");
+            }
+        }
+        for state in &self.states {
+            if let Err(e) = backend.state_del(state) {
+                tracing::warn!(what = "state", error = %e, "failed to remove a retired Gm IPsec SA");
+            }
+        }
+    }
+}
+
+impl Drop for RetiredSas {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+/// A kernel table for tests: the rules the staging logic lives by (a selector
+/// holds one policy, `delete` of nothing fails). CI cannot create XFRM state
+/// without privileges, so this stands in for `ip xfrm`; the real command was
+/// checked against a kernel in the privileged container.
+#[cfg(test)]
+pub(crate) mod fake_kernel {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A kernel table: the rules the staging logic lives by (a selector holds
+    /// one policy, `update` needs one to exist, `delete` of nothing fails).
+    #[derive(Default)]
+    pub(crate) struct Table {
+        pub(crate) states: Vec<StateSpec>,
+        pub(crate) policies: Vec<PolicySpec>,
+        /// Fail the nth mutating call (counted from 0), to cut a stage short.
+        pub(crate) fail_at: Option<usize>,
+        pub(crate) calls: usize,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Kernel(pub(crate) Arc<Mutex<Table>>);
+
+    impl Kernel {
+        fn touch(&self) -> BridgeResult<()> {
+            let mut t = self.0.lock().unwrap();
+            t.calls += 1;
+            if t.fail_at == Some(t.calls - 1) {
+                return Err(BridgeError::Ims("injected kernel failure".into()));
+            }
+            Ok(())
+        }
+        pub(crate) fn policies(&self) -> Vec<PolicySpec> {
+            self.0.lock().unwrap().policies.clone()
+        }
+        pub(crate) fn states(&self) -> Vec<StateSpec> {
+            self.0.lock().unwrap().states.clone()
+        }
+    }
+
+    impl XfrmBackend for Kernel {
+        fn state_add(&self, s: &StateSpec, _: &SaKeys) -> BridgeResult<()> {
+            self.touch()?;
+            let mut t = self.0.lock().unwrap();
+            if t.states.contains(s) {
+                return Err(BridgeError::Ims("EEXIST".into()));
+            }
+            t.states.push(s.clone());
+            Ok(())
+        }
+        fn state_del(&self, s: &StateSpec) -> BridgeResult<()> {
+            self.touch()?;
+            let mut t = self.0.lock().unwrap();
+            let before = t.states.len();
+            t.states.retain(|x| x != s);
+            (t.states.len() < before)
+                .then_some(())
+                .ok_or_else(|| BridgeError::Ims("ENOENT".into()))
+        }
+        fn policy_add(&self, p: &PolicySpec) -> BridgeResult<()> {
+            self.touch()?;
+            let mut t = self.0.lock().unwrap();
+            if t.policies.iter().any(|x| x.same_selector(p)) {
+                return Err(BridgeError::Ims("EEXIST".into()));
+            }
+            t.policies.push(p.clone());
+            Ok(())
+        }
+        fn policy_update(&self, p: &PolicySpec) -> BridgeResult<()> {
+            self.touch()?;
+            let mut t = self.0.lock().unwrap();
+            let slot = t
+                .policies
+                .iter_mut()
+                .find(|x| x.same_selector(p))
+                .ok_or_else(|| BridgeError::Ims("ENOENT".into()))?;
+            *slot = p.clone();
+            Ok(())
+        }
+        fn policy_del(&self, p: &PolicySpec) -> BridgeResult<()> {
+            self.touch()?;
+            let mut t = self.0.lock().unwrap();
+            let before = t.policies.len();
+            t.policies.retain(|x| !x.same_selector(p));
+            (t.policies.len() < before)
+                .then_some(())
+                .ok_or_else(|| BridgeError::Ims("ENOENT".into()))
+        }
     }
 }
 
@@ -729,5 +1023,224 @@ mod tests {
         assert_eq!(kernel_auth_name("hmac-sha-1-96").unwrap(), "sha1");
         assert_eq!(kernel_cipher_name("null").unwrap(), "cipher_null");
         assert_eq!(kernel_cipher_name("aes-cbc").unwrap(), "cbc(aes)");
+    }
+
+    // --- staging ---------------------------------------------------------
+
+    use super::fake_kernel::Kernel;
+
+    fn keys() -> SaKeys {
+        SaKeys {
+            auth_name: "hmac(md5)",
+            auth_key: String::new(),
+            enc_name: "ecb(cipher_null)",
+            enc_key: String::new(),
+        }
+    }
+
+    /// A generation on one loopback pair. Our server port and the network's
+    /// ports are the same in every generation, as they are on the carriers
+    /// that keep them; only our client port and the SPIs differ.
+    fn generation(port_c: u16, spi_base: u32) -> SaSet {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        SaSet {
+            endpoints: GmEndpoints {
+                local_c: SocketAddr::new(ip("10.0.0.2"), port_c),
+                local_s: SocketAddr::new(ip("10.0.0.2"), 5062),
+                remote_c: SocketAddr::new(ip("10.0.0.1"), 6001),
+                remote_s: SocketAddr::new(ip("10.0.0.1"), 6002),
+            },
+            ours: SaProposal {
+                spi_c: spi_base + 1,
+                spi_s: spi_base + 2,
+                port_c,
+                port_s: 5062,
+            },
+            theirs: SecurityServerParams {
+                alg: "hmac-md5-96".into(),
+                ealg: "null".into(),
+                spi_c: spi_base + 3,
+                spi_s: spi_base + 4,
+                port_c: 6001,
+                port_s: 6002,
+                q: 0.0,
+            },
+        }
+    }
+
+    fn working(kernel: &Kernel, set: &SaSet) {
+        for s in set.states() {
+            kernel.state_add(&s, &keys()).unwrap();
+        }
+        for p in set.policies() {
+            kernel.policy_add(&p).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_generation_is_four_states_and_sixteen_policies() {
+        let set = generation(5060, 0x100);
+        assert_eq!(set.states().len(), 4);
+        let policies = set.policies();
+        assert_eq!(policies.len(), 16);
+        let kernel = Kernel::default();
+        working(&kernel, &set);
+        assert_eq!(kernel.policies().len(), 16, "no two share a selector");
+    }
+
+    #[test]
+    fn staging_adds_beside_the_working_generation_and_changes_nothing_it_carries() {
+        let (old, new) = (generation(5060, 0x100), generation(5070, 0x200));
+        let kernel = Kernel::default();
+        working(&kernel, &old);
+        let before = kernel.policies();
+
+        let staged =
+            StagedSas::stage(Box::new(kernel.clone()), &old, new.clone(), &keys()).unwrap();
+
+        assert_eq!(kernel.states().len(), 8, "both generations' states exist");
+        // Outbound on a selector both generations use still names the old SPI,
+        // so nothing we send changes before activation.
+        for was in before.iter().filter(|p| !p.dir_in) {
+            let now = kernel
+                .policies()
+                .into_iter()
+                .find(|p| p.same_selector(was))
+                .unwrap();
+            assert_eq!(now.spi, was.spi, "{was:?}");
+        }
+        // Inbound on a shared selector accepts either generation.
+        let shared_in = kernel
+            .policies()
+            .into_iter()
+            .find(|p| p.dir_in && p.src == new.endpoints.remote_c && p.dst == new.endpoints.local_s)
+            .unwrap();
+        assert_eq!(shared_in.spi, None);
+        // The new client port's selectors exist.
+        assert!(kernel
+            .policies()
+            .iter()
+            .any(|p| p.src == new.endpoints.local_c
+                && p.dst == new.endpoints.remote_s
+                && !p.dir_in));
+        drop(staged);
+    }
+
+    #[test]
+    fn dropping_a_staged_set_restores_the_working_generation_exactly() {
+        let (old, new) = (generation(5060, 0x100), generation(5070, 0x200));
+        let kernel = Kernel::default();
+        working(&kernel, &old);
+        let (states, policies) = (kernel.states(), kernel.policies());
+
+        drop(StagedSas::stage(Box::new(kernel.clone()), &old, new, &keys()).unwrap());
+
+        assert_eq!(kernel.states(), states);
+        assert_eq!(kernel.policies(), policies);
+    }
+
+    #[test]
+    fn a_failure_part_way_through_staging_leaves_nothing_behind() {
+        let (old, new) = (generation(5060, 0x100), generation(5070, 0x200));
+        // Cut it short at every kernel call it makes, early and late.
+        for fail_at in 0..40 {
+            let kernel = Kernel::default();
+            working(&kernel, &old);
+            let (states, policies) = (kernel.states(), kernel.policies());
+            {
+                let mut t = kernel.0.lock().unwrap();
+                t.calls = 0;
+                t.fail_at = Some(fail_at);
+            }
+            let result = StagedSas::stage(Box::new(kernel.clone()), &old, new.clone(), &keys());
+            kernel.0.lock().unwrap().fail_at = None;
+            drop(result);
+            assert_eq!(kernel.states(), states, "fail_at {fail_at}");
+            assert_eq!(kernel.policies(), policies, "fail_at {fail_at}");
+        }
+    }
+
+    #[test]
+    fn activation_moves_outbound_to_the_new_spis_and_retires_only_the_old_generation() {
+        let (old, new) = (generation(5060, 0x100), generation(5070, 0x200));
+        let kernel = Kernel::default();
+        working(&kernel, &old);
+        let staged =
+            StagedSas::stage(Box::new(kernel.clone()), &old, new.clone(), &keys()).unwrap();
+
+        let mut retired = staged.activate().unwrap();
+
+        for want in new.policies().iter().filter(|p| !p.dir_in) {
+            let now = kernel
+                .policies()
+                .into_iter()
+                .find(|p| p.same_selector(want))
+                .unwrap();
+            assert_eq!(now.spi, want.spi, "{want:?}");
+        }
+        assert_eq!(
+            kernel.states().len(),
+            8,
+            "the old states stay for the drain"
+        );
+
+        retired.remove();
+
+        assert_eq!(kernel.states().len(), 4);
+        // Every selector of the new generation is present; none of the old
+        // client port's remain.
+        for want in new.policies() {
+            assert!(
+                kernel.policies().iter().any(|p| p.same_selector(&want)),
+                "{want:?}"
+            );
+        }
+        assert!(kernel
+            .policies()
+            .iter()
+            .all(|p| p.src.port() != 5060 && p.dst.port() != 5060));
+        assert_eq!(kernel.policies().len(), 16);
+    }
+
+    #[test]
+    fn a_retired_generation_is_removed_when_dropped_too() {
+        let (old, new) = (generation(5060, 0x100), generation(5070, 0x200));
+        let kernel = Kernel::default();
+        working(&kernel, &old);
+        let retired = StagedSas::stage(Box::new(kernel.clone()), &old, new, &keys())
+            .unwrap()
+            .activate()
+            .unwrap();
+        drop(retired);
+        assert_eq!(kernel.states().len(), 4);
+    }
+
+    #[test]
+    fn a_failed_activation_rolls_everything_back() {
+        let (old, new) = (generation(5060, 0x100), generation(5070, 0x200));
+        let kernel = Kernel::default();
+        working(&kernel, &old);
+        let (states, policies) = (kernel.states(), kernel.policies());
+        let staged = StagedSas::stage(Box::new(kernel.clone()), &old, new, &keys()).unwrap();
+        {
+            let mut t = kernel.0.lock().unwrap();
+            t.calls = 0;
+            t.fail_at = Some(1);
+        }
+        assert!(staged.activate().is_err());
+        kernel.0.lock().unwrap().fail_at = None;
+        assert_eq!(kernel.states(), states);
+        assert_eq!(kernel.policies(), policies);
+    }
+
+    #[test]
+    fn a_replacement_that_reuses_a_working_spi_is_refused_before_touching_the_kernel() {
+        let old = generation(5060, 0x100);
+        let new = generation(5070, 0x100);
+        let kernel = Kernel::default();
+        working(&kernel, &old);
+        let calls = kernel.0.lock().unwrap().calls;
+        assert!(StagedSas::stage(Box::new(kernel.clone()), &old, new, &keys()).is_err());
+        assert_eq!(kernel.0.lock().unwrap().calls, calls);
     }
 }

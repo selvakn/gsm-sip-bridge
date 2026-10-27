@@ -22,7 +22,8 @@ use super::ImsRegisterConfig;
 use crate::control::protocol::RegistrationStatus;
 use crate::error::{BridgeError, BridgeResult};
 use std::net::SocketAddr;
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -73,10 +74,59 @@ pub(crate) struct Inbound {
     /// The thread reading the client connection. It ends when the network
     /// closes that connection, which is how a closed one is noticed without a
     /// keepalive; see [`Inbound::client_reader_alive`].
-    client_reader: Mutex<JoinHandle<()>>,
+    client_reader: Mutex<ClientReader>,
+}
+
+/// The thread reading one client connection, and the flag that tells it to
+/// stop. A TCP reader is woken by shutting the connection down; a UDP socket
+/// cannot be woken, so the thread notices the flag at its next poll instead.
+pub(crate) struct ClientReader {
+    handle: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ClientReader {
+    /// A reader that has already finished, to stand in while one is replaced.
+    fn finished() -> Self {
+        Self {
+            handle: std::thread::spawn(|| {}),
+            stop: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Asks the thread to end without waiting for it. Over TCP, shut the
+    /// connection down first and it ends at once; over UDP it ends at its next
+    /// poll.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits for the thread, if it has ended; otherwise lets it end on its own.
+    pub(crate) fn reap(self) {
+        if self.handle.is_finished() {
+            let _ = self.handle.join();
+        }
+    }
 }
 
 impl Inbound {
+    /// A queue with nothing reading it, for tests that feed the dispatch loop
+    /// by hand and attach readers as the code under test asks for them.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            rx,
+            tx,
+            _server: None,
+            client_reader: Mutex::new(ClientReader::finished()),
+        }
+    }
+
     /// Whether the client connection's reader is still running. A P-CSCF that
     /// closes an idle Gm connection (Jio does, within minutes) stops it, and
     /// until a write fails nothing else says the connection is gone.
@@ -104,25 +154,32 @@ impl Inbound {
 /// direct reader, `cancel_pending_invite`'s post-CANCEL courtesy read, is
 /// documented there as an accepted best-effort exception.
 fn spawn_client_reader(
-    session: &super::RegisteredSession,
+    transport: &super::sip_client::SipTransport,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
-) -> BridgeResult<JoinHandle<()>> {
-    let mut client_reader = session.transport()?.try_clone_reader()?;
-    let client_sink = session.transport()?.sink()?;
-    Ok(std::thread::spawn(move || loop {
+) -> BridgeResult<ClientReader> {
+    let mut client_reader = transport.try_clone_reader()?;
+    let client_sink = transport.sink()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || loop {
         match client_reader.recv_message_deadline(CLIENT_READ_POLL_INTERVAL) {
             Ok(Some(msg)) => {
                 if tx.send((msg, client_sink.clone())).is_err() {
                     return;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "Gm client connection reader stopped");
                 return;
             }
         }
-    }))
+    });
+    Ok(ClientReader { handle, stop })
 }
 
 /// Start reading both halves of the Gm association for `session`:
@@ -136,7 +193,7 @@ fn spawn_client_reader(
 pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<Inbound> {
     let (tx, rx) = mpsc::channel();
 
-    let client_reader = spawn_client_reader(session, tx.clone())?;
+    let client_reader = spawn_client_reader(session.transport()?, tx.clone())?;
 
     let server = match session.gm_server_addr() {
         Some(addr) => Some(spawn_gm_server(addr, session.use_tcp, tx.clone())?),
@@ -168,12 +225,35 @@ pub(crate) fn restart_client_reader(
     session: &super::RegisteredSession,
     inbound: &Inbound,
 ) -> BridgeResult<()> {
-    let reader = spawn_client_reader(session, inbound.tx.clone())?;
+    let reader = spawn_client_reader(session.transport()?, inbound.tx.clone())?;
     *inbound
         .client_reader
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = reader;
     Ok(())
+}
+
+/// Starts a reader on a client connection that is not yet the session's, so
+/// the answers to a request sent on it arrive on the same queue as everything
+/// else. Pair with [`adopt_client_reader`] once the connection is taken over.
+pub(crate) fn read_client_connection(
+    transport: &super::sip_client::SipTransport,
+    inbound: &Inbound,
+) -> BridgeResult<ClientReader> {
+    spawn_client_reader(transport, inbound.tx.clone())
+}
+
+/// Makes `reader` the one that [`Inbound::client_reader_alive`] reports on, and
+/// hands back the one it replaces. That one is still reading its connection:
+/// the caller keeps it until the connection's pending transactions are done.
+pub(crate) fn adopt_client_reader(inbound: &Inbound, reader: ClientReader) -> ClientReader {
+    std::mem::replace(
+        &mut *inbound
+            .client_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        reader,
+    )
 }
 
 /// Ends the client connection and its reader, so the connection's local port
@@ -194,9 +274,10 @@ pub(crate) fn stop_client_reader(session: &super::RegisteredSession, inbound: &I
             .client_reader
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
-        std::thread::spawn(|| {}),
+        ClientReader::finished(),
     );
-    let _ = old.join();
+    old.stop();
+    let _ = old.handle.join();
 }
 
 /// Restarts just the Gm protected-server-port listener after its accept loop

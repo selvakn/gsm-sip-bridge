@@ -18,8 +18,7 @@ const CALLER_FROM: &str = "<sip:caller@example.net>;tag=abc";
 /// The Gm connection for the tests: a queue the test can feed, and a repair that
 /// either fails or puts a fresh connection to the same peer on the session.
 struct FakeLink {
-    tx: mpsc::Sender<(SipMessage, SipSink)>,
-    rx: mpsc::Receiver<(SipMessage, SipSink)>,
+    inbound: crate::ims::session::Inbound,
     peer: std::net::SocketAddr,
     repairs: u32,
     repair_fails: bool,
@@ -28,10 +27,8 @@ struct FakeLink {
 
 impl FakeLink {
     fn new(peer: std::net::SocketAddr) -> Self {
-        let (tx, rx) = mpsc::channel();
         Self {
-            tx,
-            rx,
+            inbound: crate::ims::session::Inbound::detached(),
             peer,
             repairs: 0,
             repair_fails: false,
@@ -42,7 +39,7 @@ impl FakeLink {
 
 impl GmLink for FakeLink {
     fn queue(&self) -> &mpsc::Receiver<(SipMessage, SipSink)> {
-        &self.rx
+        &self.inbound.rx
     }
 
     fn client_alive(&self) -> bool {
@@ -60,6 +57,20 @@ impl GmLink for FakeLink {
         session.contact_addr = session.local_addr;
         session.transport = Some(transport);
         Ok(())
+    }
+
+    fn read_connection(
+        &self,
+        transport: &SipTransport,
+    ) -> BridgeResult<crate::ims::session::ClientReader> {
+        crate::ims::session::read_client_connection(transport, &self.inbound)
+    }
+
+    fn adopt_reader(
+        &self,
+        reader: crate::ims::session::ClientReader,
+    ) -> crate::ims::session::ClientReader {
+        crate::ims::session::adopt_client_reader(&self.inbound, reader)
     }
 }
 
@@ -161,7 +172,7 @@ impl Rig {
             reg_cfg: &self.cfg,
         };
         self.st
-            .handle_registration_answer(&mut self.session, &ctx, response)
+            .handle_registration_answer(&mut self.session, &ctx, &mut self.link, response)
             .unwrap()
     }
 
@@ -426,7 +437,7 @@ fn refused(rig: &mut Rig, status: u16, extra: &[(&str, &str)]) {
 
 #[test]
 fn statuses_that_need_the_initial_procedure_ask_for_a_full_registration() {
-    for status in [403, 408, 500, 504, 401] {
+    for status in [403, 408, 500, 504] {
         let mut rig = Rig::new();
         refused(&mut rig, status, &[]);
         assert!(
@@ -642,11 +653,11 @@ fn one_pass(rig: &mut Rig) -> Option<bool> {
         .st
         .held
         .pop_front()
-        .or_else(|| rig.link.rx.try_recv().ok())?;
+        .or_else(|| rig.link.inbound.rx.try_recv().ok())?;
     match message {
         SipMessage::Response(response) => Some(
             rig.st
-                .handle_registration_answer(&mut rig.session, &ctx, &response)
+                .handle_registration_answer(&mut rig.session, &ctx, &mut rig.link, &response)
                 .unwrap(),
         ),
         _ => Some(false),
@@ -656,6 +667,7 @@ fn one_pass(rig: &mut Rig) -> Option<bool> {
 fn queue_response(rig: &Rig, response: SipResponse) {
     let sink = rig.session.transport().unwrap().sink().unwrap();
     rig.link
+        .inbound
         .tx
         .send((SipMessage::Response(response), sink))
         .unwrap();
@@ -1044,4 +1056,445 @@ fn a_dead_connection_is_rebuilt_even_while_a_call_is_up() {
         rig.st.registration_refresh.is_some(),
         "and the refresh is sent again"
     );
+}
+
+// --- network-requested re-authentication (Slice C) ---------------------------
+
+use crate::ims::gm_ipsec::fake_kernel::Kernel;
+use crate::ims::gm_ipsec::{SaSet, XfrmBackend};
+use crate::ims::registration_auth::scripted::{
+    card, challenge_header, success_reply, sync_failure_reply,
+};
+
+impl Rig {
+    /// A registration with a Gm association, on a kernel that has the working
+    /// generation installed. The SIM answers from `replies`.
+    fn with_sa(replies: Vec<String>, sim_delay: Duration) -> (Self, Kernel) {
+        let mut rig = Rig::new();
+        rig.session.gm_state = crate::ims::test_session_with_sa(
+            None,
+            rig.peer.local_addr().unwrap(),
+            Some("old-verify"),
+        )
+        .gm_state;
+        rig.session.use_tcp = false;
+        let gm = rig.session.gm_state.as_ref().unwrap();
+        let working = SaSet {
+            endpoints: gm.endpoints.clone(),
+            ours: gm.proposal.clone(),
+            theirs: gm.theirs.clone(),
+        };
+        let kernel = Kernel::default();
+        let keys =
+            crate::ims::gm_ipsec::SaKeys::derive(&working.theirs, &[1; 16], &[2; 16]).unwrap();
+        for state in working.states() {
+            kernel.state_add(&state, &keys).unwrap();
+        }
+        for policy in working.policies() {
+            kernel.policy_add(&policy).unwrap();
+        }
+        let table = kernel.clone();
+        rig.st.reauth_env = registration_refresh::ReauthEnv {
+            open_card: Arc::new(card(replies, sim_delay)),
+            xfrm: Arc::new(move || Box::new(table.clone())),
+        };
+        (rig, kernel)
+    }
+
+    /// The challenge a registrar sends to a refresh: a nonce for the SIM, and
+    /// replacement associations whose protected server port is the peer's.
+    fn challenge(&self, request: &str) -> SipResponse {
+        let offer = format!(
+            "ipsec-3gpp; q=0.5; alg=hmac-sha-1-96; ealg=null; spi-c=9001; spi-s=9002; port-c=7001; port-s={}",
+            self.peer.local_addr().unwrap().port()
+        );
+        self.reply_to(
+            request,
+            401,
+            &[
+                ("WWW-Authenticate", &challenge_header()),
+                ("Security-Server", &offer),
+            ],
+        )
+    }
+
+    /// Drives the loop until the next REGISTER goes out, then reads it.
+    fn next_register(&mut self) -> (String, std::net::SocketAddr) {
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut bytes = [0; 8192];
+        loop {
+            self.drive().unwrap();
+            if let Ok((size, from)) = self.peer.recv_from(&mut bytes) {
+                return (String::from_utf8(bytes[..size].to_vec()).unwrap(), from);
+            }
+            assert!(Instant::now() < until, "no REGISTER was sent");
+        }
+    }
+
+    fn header(request: &str, name: &str) -> String {
+        request
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+fn client_port(request: &str) -> u16 {
+    Rig::header(request, "Security-Client")
+        .split(';')
+        .find_map(|p| p.trim().strip_prefix("port-c="))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn a_challenge_during_a_call_is_answered_in_the_background_and_activated_on_success() {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::from_millis(250));
+    rig.st.active_call = Some(test_active_call("c1", "our-to-tag", CALLER_FROM));
+    let working_port = rig.session.gm_state.as_ref().unwrap().proposal.port_c;
+    let server_port = rig.session.gm_state.as_ref().unwrap().proposal.port_s;
+    let old_states = kernel.states();
+
+    rig.drive().unwrap();
+    let refresh = rig.received().expect("the refresh was sent");
+    assert!(rig.answer(&rig.challenge(&refresh)));
+
+    // The SIM is still working: the loop is not held up, the registration is
+    // untouched, and no full re-registration was asked for.
+    let started = Instant::now();
+    rig.drive().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "the loop must not wait for the SIM"
+    );
+    assert!(rig.st.challenged.is_some());
+    assert!(!rig.st.force_renewal);
+    assert_eq!(
+        kernel.states(),
+        old_states,
+        "nothing is installed before the SIM answers"
+    );
+    assert!(rig.st.active_call.is_some());
+
+    // The answer goes out from the proposed new client port, on the new
+    // connection, over the associations the challenge offered.
+    let (answer, from) = rig.next_register();
+    assert!(answer.contains("Authorization: Digest username=\"001010000000001@"));
+    assert!(
+        !answer.contains("nonce=\"cached\""),
+        "the cached authorization is not replayed"
+    );
+    assert_eq!(
+        Rig::header(&answer, "Call-ID"),
+        Rig::header(&refresh, "Call-ID")
+    );
+    assert_eq!(
+        from.port(),
+        client_port(&answer),
+        "sent from the proposed client port"
+    );
+    assert_ne!(from.port(), working_port);
+    assert!(Rig::header(&answer, "Security-Verify").contains("spi-c=9001"));
+    assert!(
+        kernel.states().len() > old_states.len(),
+        "the new associations are installed beside the old"
+    );
+    let cseq = |r: &str| {
+        Rig::header(r, "CSeq")
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    assert_eq!(cseq(&answer), cseq(&refresh) + 1);
+
+    // Until the network confirms, the working association is what carries
+    // traffic.
+    assert_eq!(
+        rig.session.gm_state.as_ref().unwrap().proposal.port_c,
+        working_port
+    );
+
+    let ok = rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]);
+    assert!(rig.answer(&ok));
+
+    let gm = rig.session.gm_state.as_ref().unwrap();
+    assert_eq!(
+        gm.proposal.port_s, server_port,
+        "the protected server port does not change"
+    );
+    assert_eq!(gm.proposal.port_c, from.port(), "the client port does");
+    assert_eq!(gm.theirs.spi_c, 9001);
+    assert_eq!(rig.session.local_addr.port(), from.port());
+    assert!(rig
+        .session
+        .registration_auth
+        .as_ref()
+        .unwrap()
+        .authorization
+        .starts_with("Digest username="));
+    assert!(rig.st.active_call.is_some(), "the call was never touched");
+    assert_eq!(rig.st.retired_gm.len(), 1);
+    assert!(!rig.st.force_renewal);
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "ok");
+    assert!(expiry(&rig) > SystemTime::now() + Duration::from_secs(3500));
+}
+
+#[test]
+fn the_retired_association_stays_for_the_drain_and_longer_while_a_call_is_being_placed() {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+    let (answer, _) = rig.next_register();
+    let ok = rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]);
+    assert!(rig.answer(&ok));
+    assert_eq!(kernel.states().len(), 8);
+
+    let now = Instant::now();
+    rig.st.drive_retired(now + Duration::from_secs(100), false);
+    assert_eq!(rig.st.retired_gm.len(), 1, "128 s have not passed");
+
+    // A call being placed may still be waiting on the old connection.
+    rig.st.drive_retired(now + Duration::from_secs(200), true);
+    assert_eq!(rig.st.retired_gm.len(), 1);
+    assert_eq!(kernel.states().len(), 8);
+
+    rig.st.drive_retired(now + Duration::from_secs(200), false);
+    assert!(rig.st.retired_gm.is_empty());
+    assert_eq!(kernel.states().len(), 4, "only the new generation remains");
+
+    let (mut again, _) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    again.drive().unwrap();
+    let refresh = again.received().unwrap();
+    again.answer(&again.challenge(&refresh));
+    let (answer, _) = again.next_register();
+    again.answer(&again.reply_to(&answer, 200, &[("Contact", &again.contact(3600))]));
+    again
+        .st
+        .drive_retired(Instant::now() + Duration::from_secs(700), true);
+    assert!(
+        again.st.retired_gm.is_empty(),
+        "no call holds it past the limit"
+    );
+}
+
+#[test]
+fn an_answer_the_network_does_not_confirm_leaves_the_working_association_exactly_as_it_was() {
+    for how in ["timer-f", "rejected"] {
+        let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+        rig.st.active_call = Some(test_active_call("c1", "our-to-tag", CALLER_FROM));
+        let (states, policies) = (kernel.states(), kernel.policies());
+        let (local, proposal_port) = (
+            rig.session.local_addr,
+            rig.session.gm_state.as_ref().unwrap().proposal.port_c,
+        );
+        rig.drive().unwrap();
+        let refresh = rig.received().unwrap();
+        rig.answer(&rig.challenge(&refresh));
+        let (answer, _) = rig.next_register();
+        assert!(kernel.states().len() > states.len());
+
+        if how == "timer-f" {
+            rig.st
+                .registration_refresh
+                .as_mut()
+                .unwrap()
+                .set_deadline(Instant::now());
+            rig.drive().unwrap();
+        } else {
+            assert!(rig.answer(&rig.reply_to(&answer, 403, &[])));
+        }
+
+        assert!(rig.st.force_renewal, "{how}: a full registration follows");
+        assert!(rig.st.registration_refresh.is_none(), "{how}");
+        assert_eq!(
+            kernel.states(),
+            states,
+            "{how}: the staged associations are gone"
+        );
+        assert_eq!(kernel.policies(), policies, "{how}");
+        assert_eq!(rig.session.local_addr, local, "{how}");
+        assert_eq!(
+            rig.session.gm_state.as_ref().unwrap().proposal.port_c,
+            proposal_port,
+            "{how}"
+        );
+        assert!(rig.st.active_call.is_some(), "{how}: the call survives");
+        assert!(rig.st.retired_gm.is_empty(), "{how}");
+
+        // A late answer from the abandoned attempt changes nothing.
+        let late = rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]);
+        assert!(!rig.answer(&late), "{how}: nobody is waiting for it");
+        assert_eq!(rig.session.local_addr, local, "{how}");
+        assert_eq!(kernel.states(), states, "{how}");
+    }
+}
+
+#[test]
+fn a_sim_that_cannot_answer_falls_back_to_a_full_registration_and_installs_nothing() {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    rig.st.reauth_env.open_card = Arc::new(|_| Err(BridgeError::Ims("no modem".into())));
+    let states = kernel.states();
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+    let until = Instant::now() + Duration::from_secs(5);
+    while !rig.st.force_renewal {
+        rig.drive().unwrap();
+        assert!(Instant::now() < until, "never gave up");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rig.st.challenged.is_none());
+    assert_eq!(kernel.states(), states);
+    assert!(rig.received().is_none(), "no answer was sent");
+}
+
+#[test]
+fn a_challenge_without_new_associations_is_answered_on_the_working_connection() {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    let states = kernel.states();
+    let working = rig.session.local_addr;
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    let bare = rig.reply_to(&refresh, 401, &[("WWW-Authenticate", &challenge_header())]);
+    rig.answer(&bare);
+    let (answer, from) = rig.next_register();
+    assert_eq!(from, working, "sent from where the working connection is");
+    assert_eq!(kernel.states(), states);
+    let ok = rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]);
+    assert!(rig.answer(&ok));
+    assert_eq!(rig.session.local_addr, working);
+    assert!(rig.st.retired_gm.is_empty());
+    assert!(rig
+        .session
+        .registration_auth
+        .as_ref()
+        .unwrap()
+        .authorization
+        .contains("username="));
+}
+
+#[test]
+fn a_sequence_mismatch_is_resynchronised_and_the_fresh_challenge_answered() {
+    let (mut rig, kernel) =
+        Rig::with_sa(vec![sync_failure_reply(), success_reply()], Duration::ZERO);
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+
+    // The first AUTHENTICATE fails its sequence check: AUTS goes to the network,
+    // on the working connection and with nothing installed.
+    let states = kernel.states();
+    let (resync, from) = rig.next_register();
+    assert!(resync.contains("auts=\""));
+    assert_eq!(from, rig.session.local_addr);
+    assert_eq!(kernel.states(), states);
+
+    // The network answers with a fresh challenge; this one succeeds.
+    rig.answer(&rig.challenge(&resync));
+    let (answer, _) = rig.next_register();
+    assert!(!answer.contains("auts="));
+    assert!(answer.contains("response=\""));
+    assert!(kernel.states().len() > states.len());
+    let ok = rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]);
+    assert!(rig.answer(&ok));
+    assert_eq!(rig.session.gm_state.as_ref().unwrap().theirs.spi_c, 9001);
+}
+
+#[test]
+fn a_network_that_keeps_asking_for_a_resynchronisation_is_given_up_on() {
+    let (mut rig, _kernel) = Rig::with_sa(vec![sync_failure_reply()], Duration::ZERO);
+    rig.drive().unwrap();
+    let mut request = rig.received().unwrap();
+    for _ in 0..5 {
+        rig.answer(&rig.challenge(&request));
+        if rig.st.force_renewal {
+            break;
+        }
+        let (next, _) = rig.next_register();
+        request = next;
+    }
+    assert!(rig.st.force_renewal, "it must not resynchronise forever");
+}
+
+#[test]
+fn a_challenge_to_the_answer_itself_is_a_rejection_and_falls_back() {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    let states = kernel.states();
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+    let (answer, _) = rig.next_register();
+    assert!(rig.answer(&rig.challenge(&answer)));
+    assert!(rig.st.force_renewal);
+    assert!(
+        rig.st.challenged.is_none(),
+        "it does not start a second round"
+    );
+    assert_eq!(kernel.states(), states);
+}
+
+#[test]
+fn udp_replies_addressed_to_the_advertised_server_port_are_read() {
+    // The registration's protected server port is a real socket here, as it is
+    // in the agent (`spawn_gm_server`), feeding the same queue as the client
+    // connection's reader. The network is free to answer to either.
+    let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let (mut rig, _kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    {
+        let gm = rig.session.gm_state.as_mut().unwrap();
+        gm.endpoints.local_s.set_port(server_port);
+        gm.proposal.port_s = server_port;
+    }
+    rig.session.contact_addr.set_port(server_port);
+    let _server = crate::ims::sip_client::spawn_gm_server(
+        rig.session.gm_state.as_ref().unwrap().endpoints.local_s,
+        false,
+        rig.link.inbound.tx.clone(),
+    )
+    .unwrap();
+
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+    let (answer, _) = rig.next_register();
+
+    // The 200 comes to the server port, not to the new client port.
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sender
+        .send_to(
+            format!(
+                "SIP/2.0 200 OK\r\nCall-ID: {}\r\nCSeq: {}\r\nVia: {}\r\nContact: {}\r\nContent-Length: 0\r\n\r\n",
+                Rig::header(&answer, "Call-ID"),
+                Rig::header(&answer, "CSeq"),
+                Rig::header(&answer, "Via"),
+                Rig::header(&ok_contact(&rig), "Contact"),
+            )
+            .as_bytes(),
+            ("127.0.0.1", server_port),
+        )
+        .unwrap();
+
+    let (message, _) = rig
+        .link
+        .inbound
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the reply to the server port reached the dispatch queue");
+    let SipMessage::Response(response) = message else {
+        panic!("expected a response");
+    };
+    assert!(rig.answer(&response), "and it confirmed the answer");
+    assert_eq!(rig.session.gm_state.as_ref().unwrap().theirs.spi_c, 9001);
+}
+
+/// The Contact header of a 200 for this registration, as request-shaped text.
+fn ok_contact(rig: &Rig) -> String {
+    format!("Contact: {}\r\n", rig.contact(3600))
 }
