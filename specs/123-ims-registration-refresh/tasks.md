@@ -53,10 +53,10 @@ description: "Task list for IMS registration refresh without call interruption"
 
 **Purpose**: state and test infrastructure the in-place refresh needs. No behaviour change yet.
 
-- [ ] T009 Add `registration_cseq` (u32, starts after the initial registration's last CSeq) and the cached `registration_auth` (no `Debug`, never logged) to `RegisteredSession` in `ims/mod.rs`; populate both where the initial AKA response is built (around `build_authorization`, ~line 1284) and in the test constructor (~line 1562)
-- [ ] T010 [P] Split `Maintenance` in `ims/lifecycle.rs`: add `RegistrationRecovery`, make `MaintenancePolicy::decide` return `Proceed` for `Renewal` regardless of calls, keep `RegistrationRecovery` and `Reattachment` deferred, `Reattachment` subsuming recovery; port/replace the existing lifecycle tests (reuse the PR's tests with credit)
-- [ ] T011 [P] Build the loopback P-CSCF simulator in `gsm-sip-bridge/tests/common/` (UDP and TCP): scriptable answers (200 with Contact expires, 423 + Min-Expires, 503 + Retry-After, 403/408/500/504, 401 challenge), delayed/dropped answers, retransmission capture, and an OPTIONS answer that reuses a pending REGISTER's CSeq number
-- [ ] T012 Add the new status fields to `RegistrationStatus` in `ims/mod.rs` (`refresh_mode`, `consecutive_rejections`, `last_refresh`, `next_refresh_at`) with defaults per data-model.md; no rendering yet
+- [X] T009 Add `registration_cseq` (u32, starts after the initial registration's last CSeq) and the cached `registration_auth` (no `Debug`, never logged) to `RegisteredSession` in `ims/mod.rs`; populate both where the initial AKA response is built (around `build_authorization`, ~line 1284) and in the test constructor (~line 1562)
+- [X] T010 [P] Split `Maintenance` in `ims/lifecycle.rs`: add `RegistrationRecovery`, make `MaintenancePolicy::decide` return `Proceed` for `Renewal` regardless of calls, keep `RegistrationRecovery` and `Reattachment` deferred, `Reattachment` subsuming recovery; port/replace the existing lifecycle tests (reuse the PR's tests with credit)
+- [X] T011 [P] Build the loopback P-CSCF simulator in `gsm-sip-bridge/tests/common/` (UDP and TCP): scriptable answers (200 with Contact expires, 423 + Min-Expires, 503 + Retry-After, 403/408/500/504, 401 challenge), delayed/dropped answers, retransmission capture, and an OPTIONS answer that reuses a pending REGISTER's CSeq number
+- [X] T012 Add the new status fields to `RegistrationStatus` in `ims/mod.rs` (`refresh_mode`, `consecutive_rejections`, `last_refresh`, `next_refresh_at`) with defaults per data-model.md; no rendering yet
 
 **Checkpoint**: builds and passes; behaviour unchanged.
 
@@ -69,21 +69,21 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ### Tests (write first)
 
-- [ ] T013 [P] [US2] `gsm-sip-bridge/tests/test_ims_registration_refresh.rs`: idle refresh keeps Call-ID, increments CSeq by one, replays the cached Authorization verbatim, extends expiry, keeps the same reg-event subscription (acceptance 4, 6)
-- [ ] T014 [P] [US2] Same file: refresh with an active call and with a pending origination proceeds within 2 s of due; call dialog identity, route, CSeq and media are unchanged afterwards (acceptance 1, 2; SC-008)
-- [ ] T015 [P] [US2] Same file: while the refresh answer is delayed, inbound call signalling and reg-event NOTIFYs are still handled (acceptance 3)
-- [ ] T016 [P] [US2] `ims/agent/registration_tests.rs`: matching requires Call-ID, CSeq number, method and exactly one top-Via branch; a REGISTER answer never confirms an OPTIONS probe with the same number and the reverse; stale answers are ignored (acceptance 5)
-- [ ] T017 [P] [US2] Same file: UDP retransmits the identical request on 2 s → 16 s timers, a provisional answer does not extend the 128 s deadline, TCP does not retransmit (acceptance 7)
-- [ ] T018 [P] [US2] Same file: Contact lifetime parsing (own contact only, zero = lost binding, missing or malformed = failure, response `Expires` fallback only when our contact omits it) and the single `423` retry with `Min-Expires` (edge cases; FR-011, FR-012)
+- [X] T013 [P] [US2] `gsm-sip-bridge/tests/test_ims_registration_refresh.rs`: idle refresh keeps Call-ID, increments CSeq by one, replays the cached Authorization verbatim, extends expiry, keeps the same reg-event subscription (acceptance 4, 6)
+- [X] T014 [P] [US2] Same file: refresh with an active call and with a pending origination proceeds within 2 s of due; call dialog identity, route, CSeq and media are unchanged afterwards (acceptance 1, 2; SC-008)
+- [X] T015 [P] [US2] Same file: while the refresh answer is delayed, inbound call signalling and reg-event NOTIFYs are still handled (acceptance 3)
+- [X] T016 [P] [US2] `ims/agent/registration_tests.rs`: matching requires Call-ID, CSeq number, method and exactly one top-Via branch; a REGISTER answer never confirms an OPTIONS probe with the same number and the reverse; stale answers are ignored (acceptance 5)
+- [X] T017 [P] [US2] Same file: UDP retransmits the identical request on 2 s → 16 s timers, a provisional answer does not extend the 128 s deadline, TCP does not retransmit (acceptance 7)
+- [X] T018 [P] [US2] Same file: Contact lifetime parsing (own contact only, zero = lost binding, missing or malformed = failure, response `Expires` fallback only when our contact omits it) and the single `423` retry with `Min-Expires` (edge cases; FR-011, FR-012)
 
 ### Implementation
 
-- [ ] T019 [US2] Create `ims/agent/registration_refresh.rs` with `PendingRegister` (start, send, matches, poll for retransmit/Timer F, retry_min_expires) and the lifetime/Contact parsing; reuse the sound parts of `3e914c3` with credit. Protected-port and SA-negotiation headers are **not** part of Slice B (Slice B sends no `Security-Client`; it uses the existing SA)
-- [ ] T020 [US2] Wire into `ims/agent/mod.rs`: hold `registration_refresh: Option<PendingRegister>`; in `on_idle_tick`, start a refresh when due and not already pending, honouring `next_renewal_attempt`; route REGISTER answers from the dispatch/response handler to `PendingRegister::matches` before the keepalive/report matchers; make the OPTIONS probe matcher reject REGISTER answers
-- [ ] T021 [US2] On a matching 200: validate the grant (T018), update `granted`/`registered_at`/`expires_at`/P-Associated-URI-derived routing, call `on_renewal_success`, report metrics, keep `session`, `inbound`, `active_call` and the subscription untouched; refresh the reg-subscription timer only if the registrar changed the lifetime
-- [ ] T022 [US2] In `on_idle_tick`, stop calling `maintenance.decide(Maintenance::Renewal, busy)` for the refresh path; keep `decide(RegistrationRecovery, busy)` in front of the old full re-registration code, and route `force_renewal`/Gm-liveness escalation to it
-- [ ] T023 [US2] Make the 401 answer to a refresh a full re-registration (deferred while busy) for now, with a log line naming Slice C as the follow-up
-- [ ] T024 [US2] Run `make format && make lint && make test`; commit in logical pieces (T009/T010 earlier; T019-T023 together or split by file), each green
+- [X] T019 [US2] Create `ims/agent/registration_refresh.rs` with `PendingRegister` (start, send, matches, poll for retransmit/Timer F, retry_min_expires) and the lifetime/Contact parsing; reuse the sound parts of `3e914c3` with credit. Protected-port and SA-negotiation headers are **not** part of Slice B (Slice B sends no `Security-Client`; it uses the existing SA)
+- [X] T020 [US2] Wire into `ims/agent/mod.rs`: hold `registration_refresh: Option<PendingRegister>`; in `on_idle_tick`, start a refresh when due and not already pending, honouring `next_renewal_attempt`; route REGISTER answers from the dispatch/response handler to `PendingRegister::matches` before the keepalive/report matchers; make the OPTIONS probe matcher reject REGISTER answers
+- [X] T021 [US2] On a matching 200: validate the grant (T018), update `granted`/`registered_at`/`expires_at`/P-Associated-URI-derived routing, call `on_renewal_success`, report metrics, keep `session`, `inbound`, `active_call` and the subscription untouched; refresh the reg-subscription timer only if the registrar changed the lifetime
+- [X] T022 [US2] In `on_idle_tick`, stop calling `maintenance.decide(Maintenance::Renewal, busy)` for the refresh path; keep `decide(RegistrationRecovery, busy)` in front of the old full re-registration code, and route `force_renewal`/Gm-liveness escalation to it
+- [X] T023 [US2] Make the 401 answer to a refresh a full re-registration (deferred while busy) for now, with a log line naming Slice C as the follow-up
+- [X] T024 [US2] Run `make format && make lint && make test`; commit in logical pieces (T009/T010 earlier; T019-T023 together or split by file), each green
 
 **Checkpoint**: refresh works in tests during idle, call and set-up. Not yet failure-complete.
 
@@ -109,18 +109,18 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ### Tests (write first)
 
-- [ ] T030 [P] [US3] Table test for R3 mapping in `ims/agent/registration_tests.rs`: 408/500/504/403 → force `RegistrationRecovery`; 503 with Retry-After > 128 s → mark P-CSCF + fail over; 503 ≤ 128 s → retry same P-CSCF after Retry-After; other final error → rejection count + 1; Timer F → no rejection count (acceptance 1, 4)
-- [ ] T031 [P] [US3] Agent test: failure while a call is active keeps the call, keeps reporting registered until actual expiry, defers recovery (acceptance 2)
-- [ ] T032 [P] [US3] Agent test: binding expires mid-call → health `Failed`, call untouched, refresh retries continue on backoff, recovery starts when the call ends (acceptance 3; FR-015)
-- [ ] T033 [P] [US3] Agent test: 2 consecutive rejections → next cycle uses full re-registration (deferred while busy); the cycle after a successful fallback tries in-place again; counter resets on an accepted refresh (acceptance 6, 7; FR-018a; SC-011)
-- [ ] T034 [P] [US3] Agent test: the existing failure budget still ends in exit-for-restart, deferred during a call (acceptance 5; FR-018)
+- [X] T030 [P] [US3] Table test for R3 mapping in `ims/agent/registration_tests.rs`: 408/500/504/403 → force `RegistrationRecovery`; 503 with Retry-After > 128 s → mark P-CSCF + fail over; 503 ≤ 128 s → retry same P-CSCF after Retry-After; other final error → rejection count + 1; Timer F → no rejection count (acceptance 1, 4)
+- [X] T031 [P] [US3] Agent test: failure while a call is active keeps the call, keeps reporting registered until actual expiry, defers recovery (acceptance 2)
+- [X] T032 [P] [US3] Agent test: binding expires mid-call → health `Failed`, call untouched, refresh retries continue on backoff, recovery starts when the call ends (acceptance 3; FR-015)
+- [X] T033 [P] [US3] Agent test: 2 consecutive rejections → next cycle uses full re-registration (deferred while busy); the cycle after a successful fallback tries in-place again; counter resets on an accepted refresh (acceptance 6, 7; FR-018a; SC-011)
+- [X] T034 [P] [US3] Agent test: the existing failure budget still ends in exit-for-restart, deferred during a call (acceptance 5; FR-018)
 
 ### Implementation
 
-- [ ] T035 [US3] Replace the PR-style stand-alone failure handler with one function in `ims/agent/mod.rs` that maps a refresh outcome (`RegisterFailure` plus status and Retry-After) onto `on_renewal_failure` / `schedule_renewal_retry` / `force_renewal` per R3; keep `count_loss` and the budget semantics
-- [ ] T036 [US3] Implement the rejection counter and `refresh_mode` switch (FR-018a) in `LoopState`; log the rejecting status when the fallback engages; reset on success
-- [ ] T037 [US3] Implement expiry-mid-call behaviour: status `Failed` on actual expiry, no call teardown, `RegistrationRecovery` released by `maintenance.release()` when the call ends
-- [ ] T038 [US3] `make format && make lint && make test`; commit
+- [X] T035 [US3] Replace the PR-style stand-alone failure handler with one function in `ims/agent/mod.rs` that maps a refresh outcome (`RegisterFailure` plus status and Retry-After) onto `on_renewal_failure` / `schedule_renewal_retry` / `force_renewal` per R3; keep `count_loss` and the budget semantics
+- [X] T036 [US3] Implement the rejection counter and `refresh_mode` switch (FR-018a) in `LoopState`; log the rejecting status when the fallback engages; reset on success
+- [X] T037 [US3] Implement expiry-mid-call behaviour: status `Failed` on actual expiry, no call teardown, `RegistrationRecovery` released by `maintenance.release()` when the call ends
+- [X] T038 [US3] `make format && make lint && make test`; commit
 
 ---
 
