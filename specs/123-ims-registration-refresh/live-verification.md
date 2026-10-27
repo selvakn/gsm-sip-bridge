@@ -16,6 +16,7 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 | 2026-10-27 | Vodafone | `e517250` | In-place refresh | accepted, 0.27 s |
 | 2026-10-27 | Jio | `e517250` | In-place refresh onto a closed connection | `Broken pipe`, then `the connection did not carry the refresh; rebuilding it and sending it again`, accepted 0.33 s later, `refresh_mode: in-place`, 0 rejections, no failover |
 | 2026-10-27 | Jio to Vodafone | `cd53789` | 21 min call spanning both refreshes (SC-002, SC-004) | stayed up both ways, 62800 sent / 49496 received, 5 lost (0.0%), jitter 2.1 ms. Vodafone: `refreshing the registration in place in_call=true`, accepted 0.16 s. Jio: connection already closed by the network, rebuilt and resent, accepted 0.3 s later. No failover, no re-registration. |
+| 2026-10-27 | Jio to Vodafone | `9fad3ea` | 14 min call spanning both refreshes, after a network outage and redeploy (SC-002, SC-004) | stayed up both ways, 42300 sent / 42298 received, 1 lost (0.0%), jitter 1.3 ms. Vodafone: refreshed in place with `in_call=true`, accepted at the first attempt. Jio: the network had closed the Gm connection mid-call (it did so every ~3.5 min); the refresh rebuilt it, resent, and was accepted 0.15 s later; `last_refresh: ok`, 0 rejections. |
 
 ## Findings
 
