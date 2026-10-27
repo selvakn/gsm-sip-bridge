@@ -1243,4 +1243,64 @@ mod tests {
         assert!(StagedSas::stage(Box::new(kernel.clone()), &old, new, &keys()).is_err());
         assert_eq!(kernel.0.lock().unwrap().calls, calls);
     }
+
+    // --- the real kernel ---------------------------------------------------
+
+    /// `ip xfrm <what>` output, one entry per line that starts at column 0.
+    fn kernel_entries(what: &str) -> usize {
+        let out = Command::new("ip").args(["xfrm", what]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("src "))
+            .count()
+    }
+
+    /// The same staging scenarios as above against the kernel's own XFRM tables
+    /// (what the table-backed tests above stand in for). Needs `CAP_NET_ADMIN`
+    /// and changes the namespace it runs in, so it is for a throwaway
+    /// privileged container: `docker run --privileged ... cargo test --lib
+    /// real_kernel -- --ignored`.
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN; run in the privileged container"]
+    fn real_kernel_stage_activate_retire_and_rollback() {
+        let (old, new) = (generation(5060, 0x1000), generation(5070, 0x2000));
+        let keys = SaKeys::derive(&old.theirs, &[1; 16], &[2; 16]).unwrap();
+        for state in old.states() {
+            IpXfrm.state_add(&state, &keys).unwrap();
+        }
+        for policy in old.policies() {
+            IpXfrm.policy_add(&policy).unwrap();
+        }
+        assert_eq!((kernel_entries("state"), kernel_entries("policy")), (4, 16));
+
+        // Staged and dropped: back to exactly the working generation.
+        let staged = StagedSas::stage(Box::new(IpXfrm), &old, new.clone(), &keys).unwrap();
+        assert_eq!(kernel_entries("state"), 8);
+        // 16 new selectors, of which the ones on our unchanged server port and
+        // the network's unchanged ports are shared with the working generation.
+        let staged_policies = kernel_entries("policy");
+        assert!(
+            staged_policies > 16 && staged_policies <= 32,
+            "{staged_policies}"
+        );
+        drop(staged);
+        assert_eq!((kernel_entries("state"), kernel_entries("policy")), (4, 16));
+
+        // Staged, activated, drained: exactly the new generation.
+        let mut retired = StagedSas::stage(Box::new(IpXfrm), &old, new.clone(), &keys)
+            .unwrap()
+            .activate()
+            .unwrap();
+        assert_eq!(
+            kernel_entries("state"),
+            8,
+            "the old states stay for the drain"
+        );
+        retired.remove();
+        assert_eq!((kernel_entries("state"), kernel_entries("policy")), (4, 16));
+
+        // And the remaining generation can be removed the ordinary way.
+        new.remove(&IpXfrm);
+        assert_eq!((kernel_entries("state"), kernel_entries("policy")), (0, 0));
+    }
 }

@@ -147,7 +147,7 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ## Phase 9: User Story 5 - Network-requested re-authentication (Priority: P2) — Slice C
 
-**Gate**: do not start until T045 is recorded. T045 is recorded in `live-verification.md`: in-place refresh was accepted on both carriers and no carrier has been seen to challenge a refresh. Slice C was started on 2026-10-27 at the maintainer's request (#163 reopened) rather than on a seen challenge; its live check forces one (see T058).
+**Gate**: do not start until T045 is recorded. T045 is recorded in `live-verification.md`: in-place refresh was accepted on both carriers and no carrier has been seen to challenge a refresh. Slice C was started on 2026-10-27 at the maintainer's request (#163 reopened) rather than on a seen challenge. Vodafone was found not to challenge a protected refresh at all, so the live path cannot be forced there (see `live-verification.md`).
 **Goal**: answer a fresh AKA challenge without blocking signalling, with staged SAs, stable server port, drain and rollback.
 
 ### Tests (write first)
@@ -166,7 +166,7 @@ description: "Task list for IMS registration refresh without call interruption"
 - [X] T054 [US5] Extend `ims/session.rs` `Inbound` with adoption of a new client reader (single live reader), and `ims/agent/mod.rs` to start the worker on a 401 to a refresh, poll it, commit or roll back, move the old transport to a retired list, update active call and origination signalling to the new transport
 - [X] T055 [US5] Implement UDP reply reading from both the new client socket and the dispatcher channel (do not repeat PR #168's finding 1)
 - [X] T056 [US5] Replace T023's "401 = full re-registration" with the background re-authentication; keep full re-registration as the failure fallback
-- [ ] T057 [US5] `make format && make lint && make test`; commit in logical pieces
+- [X] T057 [US5] `make format && make lint && make test`; commit in logical pieces
 
 ### Live verification (Slice C)
 
@@ -176,9 +176,9 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ## Phase 10: Polish and cross-cutting
 
-- [ ] T059 [P] Update `docs/vowifi-bridge.md` for the re-authentication and drain behaviour; add the Slice C `RELEASE_NOTES.md` entry
-- [ ] T060 [P] Add anything learned to `docs/greptile-review-learnings.md` (ring-wait ordering, shared Call-ID/CSeq collision) so the next review does not rediscover it
-- [ ] T061 [P] Final scan for real identifiers: `grep` the diff and new fixtures for MSISDN/IMSI/ICCID patterns (CLAUDE.md rule)
+- [X] T059 [P] Update `docs/vowifi-bridge.md` for the re-authentication and drain behaviour; add the Slice C `RELEASE_NOTES.md` entry
+- [X] T060 [P] Add anything learned to `docs/greptile-review-learnings.md` (ring-wait ordering, shared Call-ID/CSeq collision) so the next review does not rediscover it
+- [X] T061 [P] Final scan for real identifiers: `grep` the diff and new fixtures for MSISDN/IMSI/ICCID patterns (CLAUDE.md rule)
 - [ ] T062 Run `/greploop` (or the Greptile CLI) on the branch before opening each slice's PR; fix valid findings in code, do not post replies to the bot
 - [ ] T063 Confirm SC-009: `make format && make lint && make test` green on the final tip; comment on issue #163 with the slice PRs and evidence links
 

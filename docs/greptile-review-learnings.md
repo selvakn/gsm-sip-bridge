@@ -375,6 +375,30 @@ time (reply ordering, failure policy, what a repair may close).
 - Before pushing, ask of each action the new place can take: what else is using
   what it touches? (A rebuild of a silent connection can cut a call's INVITE.)
 
+### Work that must not block the loop (#163, background re-authentication)
+
+The reporter's PR #168 put the whole re-authentication on a worker thread:
+SIM, sockets, kernel SA changes and reply reading. That is where its findings
+came from (UDP replies read from the wrong socket, state changed from two
+threads). The design here splits it the other way.
+
+- The thread does **only** the part that blocks (the SIM). It touches no socket,
+  no kernel state and no registration state, and returns an answer the loop
+  collects with a non-blocking poll.
+- Everything else stays on the dispatch loop, which has the one reader of the Gm
+  connection, so there is no "which socket does the reply come to" question: a
+  reader is started on the new connection before anything is sent on it, and
+  every reader feeds the same queue.
+- Install new kernel state **beside** the working state and make it a value that
+  undoes itself when dropped (`StagedSas`). Then every early return, timeout and
+  rejection is a rollback without a line of cleanup code at the call site, and a
+  test can cut the install short at every kernel call and compare the tables.
+- A selector two generations share cannot hold two policies. Widen what the
+  *receiver* accepts first and move what the *sender* uses only on confirmation.
+- A fault injected by tampering with credentials proved useless against Vodafone,
+  which accepts even an empty-credential refresh over the existing association.
+  Check that a way of forcing a failure works before building the test around it.
+
 ---
 
 ## Source material
