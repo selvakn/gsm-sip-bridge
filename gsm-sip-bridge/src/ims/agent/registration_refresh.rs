@@ -143,6 +143,13 @@ impl PendingRegister {
         Ok(())
     }
 
+    /// Moves Timer F to `deadline`, so a test can stand in for the time that
+    /// passed while the loop was busy.
+    #[cfg(test)]
+    pub(super) fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+
     /// Whether `response` answers this very transaction: same Call-ID, same
     /// CSeq number and method, and exactly one `branch` in the top Via. Matching
     /// on the CSeq number alone would let an OPTIONS probe's answer (which
@@ -402,6 +409,29 @@ impl LoopState {
         !lapsed || self.busy()
     }
 
+    /// The start of a dispatch pass: after a handler that parked the loop,
+    /// takes everything that queued up meanwhile so it is handled before any
+    /// timer is judged, then drives the refresh unless messages are waiting.
+    pub(super) fn begin_pass(
+        &mut self,
+        session: &mut RegisteredSession,
+        p: &RefreshCtx,
+        queue: &std::sync::mpsc::Receiver<(
+            crate::ims::sip_client::SipMessage,
+            crate::ims::sip_client::SipSink,
+        )>,
+    ) -> BridgeResult<()> {
+        if std::mem::take(&mut self.after_blocking_handler) {
+            while let Ok(message) = queue.try_recv() {
+                self.held.push_back(message);
+            }
+        }
+        if self.held.is_empty() {
+            self.drive_registration_refresh(session, p)?;
+        }
+        Ok(())
+    }
+
     /// Runs once per dispatch pass: retransmits or times out the refresh in
     /// flight, or starts one that has fallen due.
     pub(super) fn drive_registration_refresh(
@@ -539,6 +569,7 @@ impl LoopState {
             guard.attached = true;
         }
         self.on_renewal_success();
+        self.last_refresh = Some((now, "ok".to_string()));
         crate::ims::warn_if_short_grant(granted);
         tracing::info!(
             granted_expires_secs = granted,
@@ -565,6 +596,14 @@ impl LoopState {
     ) -> BridgeResult<()> {
         self.registration_refresh = None;
         let busy = self.busy();
+        self.last_refresh = Some((
+            SystemTime::now(),
+            match failure.status {
+                Some(status) => format!("rejected {status}"),
+                None if failure.error.to_string().contains("Timer F") => "timeout".to_string(),
+                None => "error".to_string(),
+            },
+        ));
         let binding_valid = {
             let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
             guard.last_failure = Some((SystemTime::now(), failure.error.to_string()));

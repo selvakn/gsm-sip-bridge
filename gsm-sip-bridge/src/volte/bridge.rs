@@ -573,6 +573,7 @@ fn print_line_live_status(
             blocked_reason,
             gm_connection,
             rejection_cooldown_until,
+            refresh,
             reg_subscription,
             reg_subscription_last_failure,
             pcscf,
@@ -585,6 +586,7 @@ fn print_line_live_status(
             blocked_reason,
             gm_connection,
             rejection_cooldown_until,
+            refresh,
             reg_subscription,
             reg_subscription_last_failure,
             pcscf,
@@ -606,6 +608,7 @@ fn print_line_live_status(
         blocked_reason,
         gm_connection,
         rejection_cooldown_until,
+        refresh,
         reg_subscription,
         reg_subscription_last_failure,
         pcscf,
@@ -614,6 +617,9 @@ fn print_line_live_status(
     println!("    state: {state}");
     println!("    registered_at: {}", format_unix(registered_at));
     println!("    expires_at: {}", format_unix(expires_at));
+    for l in crate::vowifi::format_refresh_lines(refresh.as_deref()) {
+        println!("    {l}");
+    }
     println!(
         "    gm_connection: {}",
         if gm_connection.is_empty() {

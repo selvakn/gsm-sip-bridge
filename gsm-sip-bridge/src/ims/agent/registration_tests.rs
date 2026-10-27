@@ -11,6 +11,7 @@ use crate::ims::observability::AgentObservability;
 use crate::ims::sip_client::{SipResponse, SipTransport};
 use crate::ims::{RegistrationAuth, RegistrationState, RegistrationStatus};
 use std::net::UdpSocket;
+use std::sync::mpsc;
 
 const CALLER_FROM: &str = "<sip:caller@example.net>;tag=abc";
 
@@ -573,4 +574,156 @@ fn a_full_registration_request_pre_empts_the_refresh() {
     rig.drive().unwrap();
     assert!(rig.received().is_none());
     assert!(rig.ctx().status.lock().is_ok());
+}
+
+/// A pass of the loop's front half for one queued message: what
+/// `dispatch_loop` does between handlers.
+fn one_pass(
+    rig: &mut Rig,
+    queue: &mpsc::Receiver<(
+        crate::ims::sip_client::SipMessage,
+        crate::ims::sip_client::SipSink,
+    )>,
+) -> Option<bool> {
+    let ctx = RefreshCtx {
+        status: &rig.status,
+        obs: &rig.obs,
+        reg_cfg: &rig.cfg,
+    };
+    rig.st.begin_pass(&mut rig.session, &ctx, queue).unwrap();
+    let (message, _) = rig.st.held.pop_front().or_else(|| queue.try_recv().ok())?;
+    match message {
+        crate::ims::sip_client::SipMessage::Response(response) => Some(
+            rig.st
+                .handle_registration_answer(&mut rig.session, &ctx, &response)
+                .unwrap(),
+        ),
+        _ => Some(false),
+    }
+}
+
+fn queue_with(
+    rig: &Rig,
+    response: SipResponse,
+) -> mpsc::Receiver<(
+    crate::ims::sip_client::SipMessage,
+    crate::ims::sip_client::SipSink,
+)> {
+    let (tx, rx) = mpsc::channel();
+    let sink = rig.session.transport().unwrap().sink().unwrap();
+    tx.send((crate::ims::sip_client::SipMessage::Response(response), sink))
+        .unwrap();
+    rx
+}
+
+#[test]
+fn an_answer_that_arrived_while_a_call_rang_is_honoured_even_after_timer_f() {
+    // 100 s into the 128 s transaction an INVITE arrives and rings for 40 s.
+    // The carrier answered the refresh during the ring; the loop is back at
+    // 140 s. The answer was in time and must not be thrown away.
+    let mut rig = Rig::new();
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let contact = rig.contact(3000);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    let queue = queue_with(&rig, reply);
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(12));
+    rig.st.after_blocking_handler = true;
+
+    assert_eq!(one_pass(&mut rig, &queue), Some(true));
+
+    assert!(rig.st.registration_refresh.is_none());
+    assert_eq!(
+        rig.status.lock().unwrap().state,
+        RegistrationState::Registered
+    );
+    assert_eq!(rig.st.refresh_rejections, 0);
+    assert!(!rig.st.force_renewal && rig.st.next_renewal_attempt.is_none());
+}
+
+#[test]
+fn without_an_answer_the_refresh_still_times_out_after_the_block() {
+    let mut rig = Rig::new();
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    let (_tx, queue) = mpsc::channel();
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(12));
+    rig.st.after_blocking_handler = true;
+
+    assert_eq!(one_pass(&mut rig, &queue), None);
+
+    assert!(rig.st.registration_refresh.is_none(), "Timer F ends it");
+    assert!(
+        rig.st.next_renewal_attempt.is_some(),
+        "and a retry is scheduled"
+    );
+}
+
+#[test]
+fn timers_are_not_judged_while_held_messages_wait() {
+    let mut rig = Rig::new();
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let reply = rig.reply_to(&request, 100, &[]);
+    let queue = queue_with(&rig, reply);
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(1));
+    rig.st.after_blocking_handler = true;
+    let ctx = RefreshCtx {
+        status: &rig.status,
+        obs: &rig.obs,
+        reg_cfg: &rig.cfg,
+    };
+    rig.st.begin_pass(&mut rig.session, &ctx, &queue).unwrap();
+    assert_eq!(rig.st.held.len(), 1);
+    assert!(
+        rig.st.registration_refresh.is_some(),
+        "the pending refresh is not failed before the waiting message is read"
+    );
+}
+
+#[test]
+fn the_latest_refresh_outcome_is_kept_for_the_status() {
+    let mut rig = Rig::new();
+    assert!(rig.st.last_refresh.is_none());
+    refused(&mut rig, 403, &[]);
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "rejected 403");
+    rig.st.force_renewal = false;
+
+    rig.st.registration_refresh = None;
+    rig.st.next_renewal_attempt = None;
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let contact = rig.contact(3600);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    assert!(rig.answer(&reply));
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "ok");
+
+    rig.st.registration_refresh = None;
+    rig.st.next_renewal_attempt = None;
+    {
+        let mut guard = rig.status.lock().unwrap();
+        guard.registered_at = Some(SystemTime::now() - Duration::from_secs(3100));
+        guard.expires_at = Some(SystemTime::now() + Duration::from_secs(500));
+    }
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(1));
+    rig.drive().unwrap();
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "timeout");
 }

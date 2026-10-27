@@ -738,6 +738,7 @@ mod tests {
             blocked_reason: None,
             gm_connection: gm_connection.to_string(),
             rejection_cooldown_until: None,
+            refresh: None,
             reg_subscription: String::new(),
             reg_subscription_last_failure: None,
             pcscf: pcscf.map(|a| {

@@ -1141,6 +1141,22 @@ fn run_status_listener(
                     blocked_reason: health.blocked_reason().map(str::to_string),
                     gm_connection: snapshot.gm_connection.render(),
                     rejection_cooldown_until: snapshot.rejected_until.and_then(to_unix),
+                    refresh: Some(Box::new(crate::vowifi::control::RefreshStatusReply {
+                        fallback: snapshot.refresh.fallback,
+                        rejections: snapshot.refresh.rejections,
+                        last: snapshot
+                            .refresh
+                            .last
+                            .map(|(t, result)| (to_unix(t).unwrap_or(0), result)),
+                        next_at: snapshot
+                            .registered_at
+                            .zip(snapshot.expires_at)
+                            .and_then(|(at, expiry)| {
+                                let granted = expiry.duration_since(at).unwrap_or_default();
+                                at.checked_add(crate::ims::registration_refresh_offset(granted))
+                            })
+                            .and_then(to_unix),
+                    })),
                     reg_subscription: snapshot.reg_subscription.render(),
                     reg_subscription_last_failure: snapshot
                         .reg_subscription_last_failure
@@ -2089,6 +2105,16 @@ struct LoopState {
     /// in a row: the next cycle uses the full re-registration instead, and
     /// the flag clears when that succeeds (FR-018a).
     refresh_fallback: bool,
+    /// The latest refresh outcome, for the status snapshot.
+    last_refresh: Option<(SystemTime, String)>,
+    /// Messages taken off the queue after a handler that blocked the loop (an
+    /// inbound call ringing) and not yet handled. They are handled before any
+    /// timer is judged, so an answer that arrived in time is not discarded by
+    /// a deadline that passed while the loop was parked.
+    held: std::collections::VecDeque<(SipMessage, SipSink)>,
+    /// Set when a handler that parks the loop returns, so the next pass
+    /// drains the queue first. See [`Self::held`].
+    after_blocking_handler: bool,
     /// Call-ID of the last INVITE whose caller identity was unreadable and
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
@@ -2125,6 +2151,9 @@ impl LoopState {
             registration_refresh: None,
             refresh_rejections: 0,
             refresh_fallback: false,
+            last_refresh: None,
+            held: std::collections::VecDeque::new(),
+            after_blocking_handler: false,
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
             last_registered: Instant::now(),
@@ -2640,7 +2669,7 @@ fn dispatch_loop(
         }
         // Every pass, not only idle ones: continuous call traffic must not
         // starve a refresh's retransmission or its Timer F.
-        st.drive_registration_refresh(session, &p.refresh_ctx())?;
+        st.begin_pass(session, &p.refresh_ctx(), &inbound.rx)?;
 
         // Poll fast enough to notice a PBX-side hangup promptly while a call is
         // up — or a caller hangup / veth leg while an origination is in flight
@@ -2674,7 +2703,11 @@ fn dispatch_loop(
         // It contradicts RFC 3261 §18.2.2, so it is off unless a line's
         // config asks for it — Airtel and Vi answer correctly on the arrival
         // socket today.
-        let received = match inbound.rx.recv_timeout(poll) {
+        let queued = match st.held.pop_front() {
+            Some(message) => Ok(message),
+            None => inbound.rx.recv_timeout(poll),
+        };
+        let received = match queued {
             Ok((msg, sink)) if respond_on_client && matches!(msg, SipMessage::Request(_)) => {
                 match session.transport().and_then(|t| t.sink()) {
                     Ok(client_sink) => {
@@ -2695,6 +2728,9 @@ fn dispatch_loop(
             Ok((SipMessage::Request(req), sink)) if req.method == "INVITE" => {
                 let _phase = p.progress.phase_guard(watchdog::Phase::InboundCall);
                 st.handle_inbound_invite(session, inbound, p, &req, &sink);
+                // The call may have rung for up to a minute with the loop
+                // parked; whatever arrived meanwhile is handled before timers.
+                st.after_blocking_handler = true;
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "BYE" => {
                 st.handle_carrier_bye(p, &req, &sink);
@@ -2761,6 +2797,11 @@ impl LoopState {
         let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
         guard.busy = self.busy();
         guard.deferred_maintenance = self.maintenance.deferred();
+        guard.refresh = crate::ims::RefreshSnapshot {
+            fallback: self.refresh_fallback,
+            rejections: self.refresh_rejections,
+            last: self.last_refresh.clone(),
+        };
         // Reflect the telephone-side half's PBX registration. Absent (Wi-Fi
         // path), the PBX leg is not tracked here, so treat it as available
         // rather than falsely reporting the line unable to answer.

@@ -780,6 +780,22 @@ pub struct RegistrationStatus {
     /// The line's P-CSCF choice (specs/091 FR-020). In-memory only, like
     /// `reg_subscription`, and not an input to [`Self::health`].
     pub pcscf: PcscfSnapshot,
+    /// How the registration is being refreshed and how the last refresh went
+    /// (specs/123). In-memory only, like `pcscf`.
+    pub refresh: RefreshSnapshot,
+}
+
+/// What `vowifi-status` and `volte-status` show of the registration refresh.
+#[derive(Debug, Clone, Default)]
+pub struct RefreshSnapshot {
+    /// The next cycle re-registers in full instead of refreshing in place,
+    /// after repeated rejections of the in-place refresh.
+    pub fallback: bool,
+    /// Final error answers to in-place refreshes since the last accepted one.
+    pub rejections: u32,
+    /// The latest refresh outcome and when it happened: `ok`, `rejected 403`,
+    /// `timeout`, `error`.
+    pub last: Option<(std::time::SystemTime, String)>,
 }
 
 impl Default for RegistrationStatus {
@@ -798,6 +814,7 @@ impl Default for RegistrationStatus {
             reg_subscription: SubscriptionHealth::None,
             reg_subscription_last_failure: None,
             pcscf: PcscfSnapshot::default(),
+            refresh: RefreshSnapshot::default(),
         }
     }
 }

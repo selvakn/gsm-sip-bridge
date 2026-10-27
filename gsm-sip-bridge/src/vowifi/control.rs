@@ -31,6 +31,23 @@ pub struct PcscfStatusReply {
     pub unavailable: Vec<(String, u64)>,
 }
 
+/// The registration-refresh part of a [`ControlMessage::RegistrationStatusReply`]
+/// (specs/123 `contracts/status-output.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshStatusReply {
+    /// The next cycle re-registers in full instead of refreshing in place.
+    pub fallback: bool,
+    /// Consecutive rejections of the in-place refresh.
+    pub rejections: u32,
+    /// Latest outcome: unix seconds and `ok`, `rejected <status>`, `timeout`
+    /// or `error`. `None` before the first refresh.
+    #[serde(default)]
+    pub last: Option<(u64, String)>,
+    /// When the next refresh falls due (unix seconds).
+    #[serde(default)]
+    pub next_at: Option<u64>,
+}
+
 /// One lifecycle event exchanged between the two agents. `call_id` always
 /// correlates to the carrier-side SIP `Call-ID` for the call in question, so
 /// log lines on both agents can be joined.
@@ -142,6 +159,10 @@ pub enum ControlMessage {
         /// cooldown is running, and from an older peer that omits it.
         #[serde(default)]
         rejection_cooldown_until: Option<u64>,
+        /// How the registration is refreshed and how the last refresh went
+        /// (specs/123). `None` from an older peer, printed `unknown`.
+        #[serde(default)]
+        refresh: Option<Box<RefreshStatusReply>>,
         /// Rendered reg-event subscription health (specs/090 FR-020), e.g.
         /// `confirmed, expires <ts>`. Empty from an older peer, which the CLI
         /// prints as `unknown`, as for `gm_connection`.
@@ -790,6 +811,7 @@ mod tests {
             blocked_reason: None,
             gm_connection: "up".to_string(),
             rejection_cooldown_until: None,
+            refresh: None,
             reg_subscription: "confirmed, expires 2026-10-14T11:02:11+00:00".to_string(),
             reg_subscription_last_failure: Some((
                 1_699_999_500,
@@ -815,6 +837,7 @@ mod tests {
             blocked_reason: Some("not registered".to_string()),
             gm_connection: "reconnecting since 2026-08-07T10:14:03+00:00 (attempt 2)".to_string(),
             rejection_cooldown_until: Some(1_700_001_800),
+            refresh: None,
             reg_subscription: "none".to_string(),
             reg_subscription_last_failure: None,
             pcscf: None,

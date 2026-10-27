@@ -64,7 +64,7 @@ pub(crate) struct Inbound {
     /// without this, restarting just the client half would need a new
     /// channel, which would orphan `_server`'s already-spawned accept-loop
     /// threads (they hold their own clone of the original sender).
-    tx: mpsc::Sender<(SipMessage, SipSink)>,
+    pub(crate) tx: mpsc::Sender<(SipMessage, SipSink)>,
     /// Held only for its `Drop`, which shuts the listener down. Replaced
     /// wholesale on re-registration, since a renewal negotiates a fresh SA
     /// on a fresh pair of ports.

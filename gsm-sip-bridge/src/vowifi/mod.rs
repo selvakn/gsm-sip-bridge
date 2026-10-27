@@ -2542,6 +2542,7 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                 blocked_reason,
                 gm_connection,
                 rejection_cooldown_until,
+                refresh,
                 reg_subscription,
                 reg_subscription_last_failure,
                 pcscf,
@@ -2559,6 +2560,9 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                             .unwrap_or(0)
                     )
                 );
+                for l in format_refresh_lines(refresh.as_deref()) {
+                    println!("    {l}");
+                }
                 println!(
                     "    gm_connection: {}",
                     if gm_connection.is_empty() {
@@ -2771,6 +2775,39 @@ pub fn format_reg_subscription(health: &str, last_failure: Option<(u64, String)>
 }
 
 /// The two P-CSCF status lines (specs/091 `contracts/control.md`), shared by
+/// `vowifi-status` and `volte-status`: how the registration is refreshed
+/// (specs/123 `contracts/status-output.md`). `None` is an agent that predates
+/// the fields.
+pub fn format_refresh_lines(status: Option<&control::RefreshStatusReply>) -> [String; 4] {
+    let Some(status) = status else {
+        return [
+            "refresh_mode: unknown".to_string(),
+            "last_refresh: none".to_string(),
+            "next_refresh: none".to_string(),
+            "refresh_rejections: 0".to_string(),
+        ];
+    };
+    [
+        format!(
+            "refresh_mode: {}",
+            if status.fallback {
+                "fallback"
+            } else {
+                "in-place"
+            }
+        ),
+        match &status.last {
+            Some((at, result)) => format!("last_refresh: {result} {}", format_unix(Some(*at))),
+            None => "last_refresh: none".to_string(),
+        },
+        match status.next_at {
+            Some(at) => format!("next_refresh: {}", format_unix(Some(at))),
+            None => "next_refresh: none".to_string(),
+        },
+        format!("refresh_rejections: {}", status.rejections),
+    ]
+}
+
 /// `vowifi-status` and `volte-status`: which P-CSCF the line uses among its
 /// candidates, and which it is avoiding until when.
 pub fn format_pcscf_lines(status: Option<&control::PcscfStatusReply>) -> [String; 2] {
@@ -2849,6 +2886,44 @@ pub fn query_status_bounded(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refresh_lines_follow_the_status_contract() {
+        let status = control::RefreshStatusReply {
+            fallback: true,
+            rejections: 2,
+            last: Some((1_700_000_000, "rejected 403".into())),
+            next_at: Some(1_700_003_000),
+        };
+        let lines = format_refresh_lines(Some(&status));
+        assert_eq!(lines[0], "refresh_mode: fallback");
+        assert!(
+            lines[1].starts_with("last_refresh: rejected 403 "),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].starts_with("next_refresh: ") && !lines[2].ends_with("none"));
+        assert_eq!(lines[3], "refresh_rejections: 2");
+
+        let idle = control::RefreshStatusReply::default();
+        let lines = format_refresh_lines(Some(&idle));
+        assert_eq!(lines[0], "refresh_mode: in-place");
+        assert_eq!(lines[1], "last_refresh: none");
+        assert_eq!(lines[2], "next_refresh: none");
+    }
+
+    #[test]
+    fn an_agent_that_predates_the_refresh_fields_reads_as_unknown() {
+        assert_eq!(
+            format_refresh_lines(None),
+            [
+                "refresh_mode: unknown",
+                "last_refresh: none",
+                "next_refresh: none",
+                "refresh_rejections: 0",
+            ]
+        );
+    }
+
     use super::*;
 
     // ---- specs/094: the bounded status query, against real loopback sockets ----
@@ -2889,6 +2964,7 @@ mod tests {
             blocked_reason: None,
             gm_connection: "up".to_string(),
             rejection_cooldown_until: None,
+            refresh: None,
             reg_subscription: String::new(),
             reg_subscription_last_failure: None,
             pcscf: None,
