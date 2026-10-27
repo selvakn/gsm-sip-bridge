@@ -15,6 +15,7 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 | 2026-10-27 | Jio | `425cbba` | Outgoing call at +32 min | **failed**: `carrier_timeout`. The agent log shows `Gm client connection reader stopped: connection closed by peer` 13 minutes after registration. |
 | 2026-10-27 | Vodafone | `e517250` | In-place refresh | accepted, 0.27 s |
 | 2026-10-27 | Jio | `e517250` | In-place refresh onto a closed connection | `Broken pipe`, then `the connection did not carry the refresh; rebuilding it and sending it again`, accepted 0.33 s later, `refresh_mode: in-place`, 0 rejections, no failover |
+| 2026-10-27 | Jio to Vodafone | `cd53789` | 21 min call spanning both refreshes (SC-002, SC-004) | stayed up both ways, 62800 sent / 49496 received, 5 lost (0.0%), jitter 2.1 ms. Vodafone: `refreshing the registration in place in_call=true`, accepted 0.16 s. Jio: connection already closed by the network, rebuilt and resent, accepted 0.3 s later. No failover, no re-registration. |
 
 ## Findings
 
@@ -24,7 +25,6 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 
 ## Still to run
 
-- A call spanning the refresh of each line (SC-002, SC-004): armed for the `cd53789` build.
 - A 12 h idle soak (SC-003).
 - Vodafone check of the fallback after a forced rejection, and the two-P-CSCF failover (SC-006).
 - UDP transport and background re-authentication: Slice C, not started.
