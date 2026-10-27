@@ -18,6 +18,7 @@ use crate::ims::{
     build_security_client_headers, register_request_uri, ImsRegisterConfig, RegisteredSession,
     SaProposal, DEFAULT_EXPIRES,
 };
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -41,6 +42,38 @@ pub(super) struct PendingRegister {
     use_tcp: bool,
     provisional: bool,
     interval_retry: bool,
+    /// The security association proposed with this refresh (RFC 3329): the
+    /// protected server port is the one in use, the client port and both SPIs
+    /// are new (TS 33.203 §7.4). `None` when the registration has no Gm SA.
+    proposal: Option<SaProposal>,
+    /// Holds the proposed client port while the transaction is outstanding, so
+    /// nothing else binds it. Never read; dropped with the transaction.
+    _reserved_port: Option<Socket>,
+}
+
+/// Binds a socket on an unused port beside `local` and keeps it, so the port
+/// can be proposed as the new protected client port.
+fn reserve_client_port(local: SocketAddr, use_tcp: bool) -> BridgeResult<(Socket, u16)> {
+    let socket = Socket::new(
+        Domain::for_address(local),
+        if use_tcp { Type::STREAM } else { Type::DGRAM },
+        Some(if use_tcp {
+            Protocol::TCP
+        } else {
+            Protocol::UDP
+        }),
+    )
+    .map_err(|e| BridgeError::Ims(format!("reserve a client port for the refresh: {e}")))?;
+    socket
+        .bind(&SocketAddr::new(local.ip(), 0).into())
+        .map_err(|e| BridgeError::Ims(format!("bind a client port for the refresh: {e}")))?;
+    let port = socket
+        .local_addr()
+        .ok()
+        .and_then(|address| address.as_socket())
+        .ok_or_else(|| BridgeError::Ims("the reserved client port has no address".into()))?
+        .port();
+    Ok((socket, port))
 }
 
 impl PendingRegister {
@@ -70,7 +103,19 @@ impl PendingRegister {
             use_tcp: session.use_tcp,
             provisional: false,
             interval_retry: false,
+            proposal: None,
+            _reserved_port: None,
         };
+        if let Some(gm) = &session.gm_state {
+            let (socket, port_c) = reserve_client_port(session.local_addr, session.use_tcp)?;
+            pending.proposal = Some(SaProposal {
+                spi_c: rand::random::<u32>() | 1,
+                spi_s: rand::random::<u32>() | 1,
+                port_c,
+                port_s: gm.proposal.port_s,
+            });
+            pending._reserved_port = Some(socket);
+        }
         pending.send_new(session, cfg, now)?;
         Ok(pending)
     }
@@ -97,23 +142,17 @@ impl PendingRegister {
             "P-Access-Network-Info: {}",
             cfg.access_network_info
         )];
-        if let Some(gm) = &session.gm_state {
-            // The same security-agreement headers a UE sends on any
-            // re-registration (RFC 3329, TS 24.229 §5.1.1.4.2). The proposal
-            // keeps today's ports and takes fresh SPIs; if the network wants a
-            // new association it challenges, and that is handled as a full
-            // re-registration for now.
-            let proposal = SaProposal {
-                spi_c: rand::random::<u32>() | 1,
-                spi_s: rand::random::<u32>() | 1,
-                port_c: gm.proposal.port_c,
-                port_s: gm.proposal.port_s,
-            };
+        if let (Some(gm), Some(proposal)) = (&session.gm_state, &self.proposal) {
+            // The security-agreement headers a UE sends on any re-registration
+            // (RFC 3329, TS 24.229 §5.1.1.4.2): the protected server port stays,
+            // the client port and SPIs are new. The network only acts on them if
+            // it challenges; until background re-authentication exists that is
+            // answered with a full re-registration.
             extra.extend([
                 "Require: sec-agree".to_string(),
                 "Proxy-Require: sec-agree".to_string(),
             ]);
-            extra.extend(build_security_client_headers(&proposal));
+            extra.extend(build_security_client_headers(proposal));
             extra.push(format!("Security-Verify: {}", gm.security_verify));
         }
         self.request = build_register(&RegisterRequest {
@@ -780,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn a_protected_refresh_proposes_the_current_ports_and_echoes_security_verify() {
+    fn a_protected_refresh_keeps_the_server_port_and_proposes_a_new_client_port() {
         let (mut session, mut cfg, peer) = fixture();
         let protected = crate::ims::test_session_with_sa(
             None,
@@ -789,12 +828,48 @@ mod tests {
         );
         session.gm_state = protected.gm_state;
         cfg.sec_agree = true;
-        PendingRegister::start(&mut session, &cfg, Instant::now()).unwrap();
+        let pending = PendingRegister::start(&mut session, &cfg, Instant::now()).unwrap();
         let wire = receive(&peer);
         assert!(wire.contains("Require: sec-agree\r\n"));
         assert!(wire.contains("Security-Verify: network-offer\r\n"));
         assert!(wire.contains("Security-Client: ipsec-3gpp"));
-        assert!(wire.contains("port-c=5062") && wire.contains("port-s=5063"));
+
+        let proposal = pending.proposal.as_ref().expect("a proposal was made");
+        assert_eq!(
+            proposal.port_s, 5063,
+            "the protected server port is unchanged"
+        );
+        assert_ne!(
+            proposal.port_c, 5062,
+            "the client port is new (TS 33.203 7.4)"
+        );
+        assert_ne!(proposal.port_c, session.local_addr.port());
+        assert!(wire.contains(&format!("port-c={}", proposal.port_c)));
+        assert!(wire.contains("port-s=5063"));
+        assert!(
+            !wire.contains("spi-c=1;") && !wire.contains("spi-s=2;"),
+            "fresh SPIs, not the live association's"
+        );
+    }
+
+    #[test]
+    fn the_proposed_client_port_stays_reserved_until_the_transaction_ends() {
+        let (mut session, cfg, peer) = fixture();
+        let protected = crate::ims::test_session_with_sa(
+            None,
+            peer.local_addr().unwrap(),
+            Some("network-offer"),
+        );
+        session.gm_state = protected.gm_state;
+        let pending = PendingRegister::start(&mut session, &cfg, Instant::now()).unwrap();
+        let port = pending.proposal.as_ref().unwrap().port_c;
+        let taken = UdpSocket::bind(("127.0.0.1", port));
+        assert!(taken.is_err(), "nothing else may bind the proposed port");
+        drop(pending);
+        assert!(
+            UdpSocket::bind(("127.0.0.1", port)).is_ok(),
+            "released afterwards"
+        );
     }
 
     #[test]
