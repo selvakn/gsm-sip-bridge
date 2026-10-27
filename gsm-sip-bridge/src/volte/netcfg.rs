@@ -50,7 +50,21 @@ pub enum NetStep {
     /// the flushed local address — so it has to go separately, or a stale
     /// route from a torn-down PDN reads as proof the next one is routed.
     FlushV4Route { iface: String },
+    /// `ip -6 route replace default dev <iface> metric <FALLBACK_ROUTE_METRIC>`
+    /// — a default route with no next hop, only valid on a point-to-point link
+    /// (see [`is_point_to_point`]).
+    DefaultRouteDev { iface: String },
 }
+
+/// Metric of the fallback default route. Above the kernel's RA default (1024)
+/// so a router advertisement that does arrive later still wins.
+pub const FALLBACK_ROUTE_METRIC: u32 = 2048;
+const _: () = assert!(FALLBACK_ROUTE_METRIC > 1024, "an RA default route must win");
+
+// Kernel interface flags, as exposed in `/sys/class/net/<iface>/flags`.
+const IFF_BROADCAST: u32 = 0x2;
+const IFF_POINTOPOINT: u32 = 0x10;
+const IFF_NOARP: u32 = 0x80;
 
 /// The exact sequence that took the reference hardware from "bound but dead"
 /// to "routed on the carrier's IMS PDN".
@@ -212,6 +226,17 @@ impl NetStep {
                 s("flush"),
                 s("dev"),
                 iface.clone(),
+            ],
+            NetStep::DefaultRouteDev { iface } => vec![
+                s("ip"),
+                s("-6"),
+                s("route"),
+                s("replace"),
+                s("default"),
+                s("dev"),
+                iface.clone(),
+                s("metric"),
+                FALLBACK_ROUTE_METRIC.to_string(),
             ],
         }
     }
@@ -391,6 +416,43 @@ pub fn has_default_route(iface: &str) -> BridgeResult<bool> {
     Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
+/// Whether `flags` (the `/sys/class/net/<iface>/flags` value) describe a
+/// point-to-point link: one with no link-layer neighbours, where a default
+/// route needs no next hop. Raw-IP modem links (rmnet, qmimux: `<UP,LOWER_UP>`
+/// with neither BROADCAST nor MULTICAST) are; Ethernet-style ECM/RNDIS
+/// adapters (`enx*`, BROADCAST) are not.
+pub fn is_point_to_point_flags(flags: u32) -> bool {
+    flags & (IFF_POINTOPOINT | IFF_NOARP) != 0 || flags & IFF_BROADCAST == 0
+}
+
+/// Parses a `/sys/class/net/<iface>/flags` value such as `0x1091`.
+pub fn parse_iface_flags(s: &str) -> Option<u32> {
+    u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// [`is_point_to_point_flags`] for a live interface. Unreadable flags read as
+/// "not point-to-point", so the fallback route is never installed blind.
+pub fn is_point_to_point(iface: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/flags"))
+        .ok()
+        .and_then(|s| parse_iface_flags(&s))
+        .is_some_and(is_point_to_point_flags)
+}
+
+/// Installs a default route straight through a point-to-point interface, for
+/// when no router advertisement was accepted on it (#165: a raw-IP link moved
+/// into the line's namespace attached but never got an RA route). Only call
+/// it when [`is_point_to_point`] holds: on a broadcast link a route without a
+/// next hop would send to neighbours that do not exist.
+pub fn add_default_route_dev(iface: &str) -> BridgeResult<()> {
+    run_step(
+        &NetStep::DefaultRouteDev {
+            iface: iface.to_string(),
+        },
+        false,
+    )
+}
+
 /// Sends a Router Solicitation. The kernel emits one when the link comes up,
 /// but only after DAD completes on the link-local, and it gives up after a few
 /// tries — an explicit solicitation makes the bring-up deterministic rather
@@ -521,6 +583,37 @@ mod tests {
     fn iface_present_follows_sysfs() {
         assert!(iface_present("lo"));
         assert!(!iface_present("gsb-no-such-if0"));
+    }
+
+    #[test]
+    fn raw_ip_links_are_point_to_point_and_ethernet_ones_are_not() {
+        // `<UP,LOWER_UP>`, the #165 reporter's qmimux/rmnet `volte0`.
+        assert!(is_point_to_point_flags(parse_iface_flags("0x1").unwrap()));
+        // `<POINTOPOINT,NOARP,UP>`, a tun-style link.
+        assert!(is_point_to_point_flags(parse_iface_flags("0x91").unwrap()));
+        // `<BROADCAST,MULTICAST,UP>`, a Quectel ECM `enx*` adapter.
+        assert!(!is_point_to_point_flags(
+            parse_iface_flags("0x1003").unwrap()
+        ));
+    }
+
+    #[test]
+    fn unreadable_flags_never_count_as_point_to_point() {
+        assert_eq!(parse_iface_flags("garbage"), None);
+        assert!(!is_point_to_point("gsb-no-such-if0"));
+    }
+
+    #[test]
+    fn the_fallback_route_needs_no_next_hop_and_loses_to_an_ra_route() {
+        let step = NetStep::DefaultRouteDev {
+            iface: "volte0".to_string(),
+        };
+
+        assert_eq!(
+            step.argv(),
+            ["ip", "-6", "route", "replace", "default", "dev", "volte0", "metric", "2048"]
+                .map(String::from)
+        );
     }
 
     fn assigned() -> Ipv6Addr {

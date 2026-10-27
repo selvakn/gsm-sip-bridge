@@ -263,6 +263,29 @@ pub fn attach(settings: &VolteSettings) -> BridgeResult<AttachReport> {
             routed_v6 =
                 netcfg::wait_for_router(&settings.iface, std::time::Duration::from_secs(15))?;
             global_addresses = netcfg::global_addresses(&settings.iface)?;
+            // A point-to-point link needs no router to reach: everything goes
+            // to the modem. Seen live (#165) on a raw-IP link in the line's
+            // namespace that attached but never accepted an RA; without this
+            // every connect failed with "Network unreachable".
+            if !routed_v6 && netcfg::is_point_to_point(&settings.iface) {
+                match netcfg::add_default_route_dev(&settings.iface) {
+                    Ok(()) => {
+                        routed_v6 = netcfg::has_default_route(&settings.iface)?;
+                        if routed_v6 {
+                            tracing::info!(
+                                iface = %settings.iface,
+                                "no router advertisement was accepted; the interface is \
+                                 point-to-point, so a default route was installed through it"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        iface = %settings.iface,
+                        error = %e,
+                        "could not install a default route through the point-to-point interface"
+                    ),
+                }
+            }
             if !routed_v6 {
                 tracing::warn!(
                     iface = %settings.iface,

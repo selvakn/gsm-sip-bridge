@@ -521,6 +521,30 @@ pub fn pcscf_is_available(cache_path: &std::path::Path, override_addr: Option<&s
     probe_epdg_cache(cache_path).found().is_some()
 }
 
+/// Why `pcscf` can never be reached over an IMS PDN carrying only the
+/// families in `pdn`, or `None` when it can. A PDN with no address at all
+/// says nothing about family, so it is not judged here.
+///
+/// Seen live on Jio (#165): priming captured an IPv4 P-CSCF over VoWiFi while
+/// the LTE IMS PDN was IPv6-only, and every registration failed with "Network
+/// unreachable" — true, but silent about the cause.
+pub fn pcscf_family_mismatch(pcscf: IpAddr, pdn: &super::pdn::ImsPdn) -> Option<String> {
+    let reachable = match pcscf {
+        IpAddr::V4(_) => pdn.ipv4.is_some(),
+        IpAddr::V6(_) => pdn.ipv6.is_some(),
+    };
+    if reachable || (pdn.ipv4.is_none() && pdn.ipv6.is_none()) {
+        return None;
+    }
+    let family = if pcscf.is_ipv4() { "IPv4" } else { "IPv6" };
+    Some(format!(
+        "P-CSCF {pcscf} is {family}, but this line's IMS PDN is {}, so it can never be reached \
+         over LTE. An address captured over VoWiFi (priming) can belong to the carrier's VoWiFi \
+         core rather than its VoLTE one; set [[volte.line]].pcscf to the carrier's VoLTE P-CSCF",
+        pdn.family()
+    ))
+}
+
 /// The per-line P-CSCF cache path (specs/081-multi-carrier-pcscf FR-003):
 /// `<base>-<card_id>`, e.g. `/tmp/pcscf-0-ec20-ABCDEF`.
 ///
@@ -714,6 +738,60 @@ pub fn discover(inputs: &DiscoveryInputs) -> BridgeResult<DiscoveryReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pdn(ipv4: Option<&str>, ipv6: Option<&str>) -> super::super::pdn::ImsPdn {
+        super::super::pdn::ImsPdn {
+            cid: 3,
+            apn_requested: "ims".to_string(),
+            apn_assigned: "ims".to_string(),
+            bearer_id: 5,
+            ipv4: ipv4.map(|a| a.parse().unwrap()),
+            ipv6: ipv6.map(|a| a.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn an_ipv4_pcscf_on_an_ipv6_only_pdn_is_named_as_unreachable() {
+        // #165: Jio VoWiFi priming gave an IPv4 P-CSCF; the LTE PDN was IPv6-only.
+        let why = pcscf_family_mismatch(
+            "192.0.2.10".parse().unwrap(),
+            &pdn(None, Some("2001:db8::1")),
+        )
+        .expect("an IPv4 P-CSCF cannot be reached over an IPv6-only PDN");
+
+        assert!(why.contains("is IPv4"), "got: {why}");
+        assert!(why.contains("IPv6-only"), "got: {why}");
+        assert!(why.contains("[[volte.line]].pcscf"), "got: {why}");
+    }
+
+    #[test]
+    fn an_ipv6_pcscf_on_an_ipv4_only_pdn_is_named_as_unreachable() {
+        assert!(pcscf_family_mismatch(
+            "2001:db8::5".parse().unwrap(),
+            &pdn(Some("10.0.0.2"), None)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_matching_or_dual_stack_or_unaddressed_pdn_is_not_judged() {
+        let v4: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: IpAddr = "2001:db8::5".parse().unwrap();
+
+        assert_eq!(
+            pcscf_family_mismatch(v6, &pdn(None, Some("2001:db8::1"))),
+            None
+        );
+        assert_eq!(
+            pcscf_family_mismatch(v4, &pdn(Some("10.0.0.2"), None)),
+            None
+        );
+        assert_eq!(
+            pcscf_family_mismatch(v4, &pdn(Some("10.0.0.2"), Some("2001:db8::1"))),
+            None
+        );
+        assert_eq!(pcscf_family_mismatch(v4, &pdn(None, None)), None);
+    }
 
     #[test]
     fn information_request_asks_for_the_sip_server_options() {

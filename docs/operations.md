@@ -887,6 +887,14 @@ that actually runs.
 The one thing that reliably works is letting the VoWiFi/ePDG path capture the
 address once, from the IKEv2 config payload, and handing that to VoLTE.
 
+**Check the address family.** A carrier's VoWiFi core can hand out a P-CSCF the
+LTE IMS PDN cannot reach at all: on Jio, priming captured an IPv4 P-CSCF while
+the LTE IMS PDN was IPv6-only (#165). The carrier agent now refuses such a
+pairing after attaching and logs `P-CSCF <addr> is IPv4, but this line's IMS
+PDN is IPv6-only, so it can never be reached over LTE`, instead of failing
+every registration with `Network unreachable`. Set `[[volte.line]].pcscf` to
+the carrier's VoLTE P-CSCF (one the modem's own VoLTE stack uses) in that case.
+
 #### It's automatic now (specs/080-volte-pcscf-auto-prime, specs/081-multi-carrier-pcscf)
 
 As of specs/080, `supervise` does this for you. When `[volte].enabled = true`
@@ -1059,6 +1067,14 @@ means something upstream failed — check that the interface has carrier and tha
 Note that "attached" and "usable" are different states: the assigned address is
 installed by the bridge regardless, so **the default route — not the presence
 of an address — is what proves the RA was accepted**.
+
+On a **point-to-point** interface (a raw-IP modem link such as rmnet or
+qmimux, listed as `<UP,LOWER_UP>` with no `BROADCAST`), a missing RA no longer
+leaves the line dead: everything on such a link goes to the modem anyway, so
+the bridge installs `default dev <iface>` itself (metric 2048, so a later RA
+route still wins) and logs `no router advertisement was accepted; the
+interface is point-to-point, so a default route was installed through it`.
+Ethernet-style ECM/RNDIS adapters (`enx*`) still need the RA (#165).
 
 This whole RA dance is IPv6-specific. An **IPv4-only PDN** (confirmed on Jio,
 2026-09-16 — the same modem gave Vodafone an IPv6-only bearer) is a different
