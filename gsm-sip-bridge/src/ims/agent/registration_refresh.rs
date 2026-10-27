@@ -444,13 +444,34 @@ impl GmLink for &Inbound {
 }
 
 /// Keeps the refresh running while an inbound call rings and the dispatch
-/// loop is parked: answers and timers are serviced from inside the ring wait.
-/// A failure that ends the refresh for good is kept for the loop to return on
-/// its next pass, since the wait must not end the call over it.
+/// loop is parked: answers and timers are serviced from inside the ring wait,
+/// by the same code the loop runs. The line counts as busy for as long as this
+/// exists, so a failure that would end the agent is deferred until the line is
+/// idle, as it is during a connected call.
 pub(super) struct RingRefresh<'a> {
-    pub(super) state: &'a mut LoopState,
-    pub(super) ctx: RefreshCtx<'a>,
-    pub(super) link: &'a Inbound,
+    state: &'a mut LoopState,
+    ctx: RefreshCtx<'a>,
+    link: &'a Inbound,
+}
+
+impl<'a> RingRefresh<'a> {
+    pub(super) fn new(state: &'a mut LoopState, ctx: RefreshCtx<'a>, link: &'a Inbound) -> Self {
+        state.ringing = true;
+        Self { state, ctx, link }
+    }
+
+    /// An error the refresh cannot recover from. Never ends the call: the exit
+    /// is owed until the line is idle.
+    fn defer(&mut self, e: BridgeError) {
+        tracing::warn!(error = %e, "registration refresh failed while a call rang; exiting once the line is idle");
+        self.state.budget_exit_owed.get_or_insert(e);
+    }
+}
+
+impl Drop for RingRefresh<'_> {
+    fn drop(&mut self) {
+        self.state.ringing = false;
+    }
 }
 
 impl super::inbound::RingService for RingRefresh<'_> {
@@ -461,22 +482,19 @@ impl super::inbound::RingService for RingRefresh<'_> {
         {
             Ok(consumed) => consumed,
             Err(e) => {
-                self.state.ring_failure.get_or_insert(e);
+                self.defer(e);
                 true
             }
         }
     }
 
     fn tick(&mut self, session: &mut RegisteredSession) {
-        if self.state.ring_failure.is_some() {
-            return;
-        }
         let mut link = self.link;
         if let Err(e) = self
             .state
             .drive_registration_refresh(session, &self.ctx, &mut link)
         {
-            self.state.ring_failure = Some(e);
+            self.defer(e);
         }
     }
 }
@@ -537,9 +555,6 @@ impl LoopState {
         p: &RefreshCtx,
         link: &mut dyn GmLink,
     ) -> BridgeResult<()> {
-        if let Some(failure) = self.ring_failure.take() {
-            return Err(failure);
-        }
         if std::mem::take(&mut self.after_blocking_handler) {
             while let Ok(message) = link.queue().try_recv() {
                 self.held.push_back(message);
@@ -629,7 +644,13 @@ impl LoopState {
         failure: RegisterFailure,
     ) -> BridgeResult<()> {
         self.registration_refresh = None;
-        if failure.status.is_none() && !self.refresh_repaired {
+        // A silent but open connection may be carrying a call's own signalling
+        // (an outgoing call's INVITE, say), and rebuilding it would cut that.
+        // So while the line is busy, only a connection that is dead or failed
+        // a write is rebuilt; a silent one is left to the pool logic.
+        let silent_but_open =
+            failure.error.to_string().contains("Timer F") && self.busy() && link.client_alive();
+        if failure.status.is_none() && !self.refresh_repaired && !silent_but_open {
             self.refresh_repaired = true;
             tracing::warn!(
                 error = %failure.error,

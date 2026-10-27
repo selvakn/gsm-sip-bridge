@@ -1441,9 +1441,6 @@ fn await_pbx_answer(
 
     let deadline = Instant::now() + RING_TIMEOUT;
     while Instant::now() < deadline {
-        if let Some(w) = work.as_mut() {
-            w.service.tick(w.session);
-        }
         // 1. Did the caller give up while it rang? A CANCEL must be answered
         //    promptly or the network keeps retransmitting it.
         while let Ok((msg, req_sink)) = sip_rx.try_recv() {
@@ -1494,6 +1491,12 @@ fn await_pbx_answer(
                 continue;
             }
             tracing::debug!(method = %req.method, "ignoring inbound request received while ringing");
+        }
+
+        // Replies were read above; only now are the service's timers judged,
+        // so an answer that arrived in time is not timed out ahead of itself.
+        if let Some(w) = work.as_mut() {
+            w.service.tick(w.session);
         }
 
         // 2. Did Agent B report an answer, or give up on the PBX?
@@ -1652,6 +1655,7 @@ mod tests {
         struct Service {
             ticks: u32,
             answered: Vec<u16>,
+            answers_before_first_tick: Option<usize>,
         }
         impl RingService for Service {
             fn answer(
@@ -1666,6 +1670,8 @@ mod tests {
             }
             fn tick(&mut self, _session: &mut crate::ims::RegisteredSession) {
                 self.ticks += 1;
+                self.answers_before_first_tick
+                    .get_or_insert(self.answered.len());
             }
         }
 
@@ -1702,6 +1708,7 @@ mod tests {
         let mut service = Service {
             ticks: 0,
             answered: Vec::new(),
+            answers_before_first_tick: None,
         };
 
         let mut held = HeldMessages::new(&sip_tx);
@@ -1725,6 +1732,11 @@ mod tests {
 
         assert!(matches!(outcome, RingOutcome::Answered));
         assert!(service.ticks >= 1, "the wait drives the service");
+        assert_eq!(
+            service.answers_before_first_tick,
+            Some(2),
+            "queued replies are read before timers are judged"
+        );
         assert_eq!(
             service.answered,
             vec![200, 200],

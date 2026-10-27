@@ -2118,9 +2118,10 @@ struct LoopState {
     /// Set when a handler that parks the loop returns, so the next pass
     /// drains the queue first. See [`Self::held`].
     after_blocking_handler: bool,
-    /// A failure of the registration refresh met while a call rang, returned
-    /// by the next pass. See [`registration_refresh::RingRefresh`].
-    ring_failure: Option<BridgeError>,
+    /// An incoming call is ringing and the loop is parked in its wait. The
+    /// line is occupied from then on, so failures met meanwhile are deferred
+    /// like those of a connected call. Set by [`registration_refresh::RingRefresh`].
+    ringing: bool,
     /// Call-ID of the last INVITE whose caller identity was unreadable and
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
@@ -2161,7 +2162,7 @@ impl LoopState {
             last_refresh: None,
             held: std::collections::VecDeque::new(),
             after_blocking_handler: false,
-            ring_failure: None,
+            ringing: false,
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
             last_registered: Instant::now(),
@@ -2201,7 +2202,7 @@ impl LoopState {
     /// placed? An in-flight origination counts: its INVITE transaction is live
     /// on this transport (specs/029).
     fn busy(&self) -> bool {
-        self.active_call.is_some() || self.origination.is_some()
+        self.active_call.is_some() || self.origination.is_some() || self.ringing
     }
 
     /// Records one failed renewal attempt: puts the next one on the backoff
@@ -3263,11 +3264,7 @@ impl LoopState {
         // only once the call connects (specs/093).
         p.obs.set_inbound_setup(true);
         let handled = {
-            let mut ring = registration_refresh::RingRefresh {
-                state: self,
-                ctx: p.refresh_ctx(),
-                link: inbound,
-            };
+            let mut ring = registration_refresh::RingRefresh::new(self, p.refresh_ctx(), inbound);
             inbound::handle_invite(
                 session,
                 req,

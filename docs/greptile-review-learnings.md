@@ -357,6 +357,24 @@ site, not just its type signature.**
    deliberately not forced against a SIM with a documented drop history). That
    distinction is what makes the log worth reading — preserve it.
 
+### Code that runs in a second place (PR #170, registration refresh)
+
+Five review rounds on one PR found a new P1 each time, all one defect class:
+the refresh logic ran in the dispatch loop, and was then **copied** into a
+second place (the ring wait), which re-implemented its rules one finding at a
+time (reply ordering, failure policy, what a repair may close).
+
+- When a state machine must also run inside a blocking wait, call the **same**
+  entry points and share the rules. Do not write a second driver. The ring wait
+  now calls `drive_registration_refresh` and `handle_registration_answer`, the
+  loop's own functions.
+- Anything the loop decides by a predicate (`busy()`) must see the new place:
+  the ringing call was invisible to `busy()`, so a failure that is deferred
+  during a call was raised during the ring. Extend the predicate, not the caller.
+- Read queued replies **before** judging timers, in every place that does both.
+- Before pushing, ask of each action the new place can take: what else is using
+  what it touches? (A rebuild of a silent connection can cut a call's INVITE.)
+
 ---
 
 ## Source material

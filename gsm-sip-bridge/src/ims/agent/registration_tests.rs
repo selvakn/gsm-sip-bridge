@@ -990,17 +990,58 @@ fn a_connection_the_network_closed_is_rebuilt_before_the_refresh_is_sent() {
 }
 
 #[test]
-fn a_failure_met_while_a_call_rang_comes_back_on_the_next_pass() {
+fn a_spent_budget_while_a_call_rings_is_owed_not_raised() {
     let mut rig = Rig::new();
-    rig.st.ring_failure = Some(BridgeError::Ims("refresh gave up while ringing".into()));
-    let ctx = RefreshCtx {
-        status: &rig.status,
-        obs: &rig.obs,
-        reg_cfg: &rig.cfg,
-    };
+    rig.st.consecutive_renewal_failures = MAX_CONSECUTIVE_RENEWAL_FAILURES - 1;
+    rig.st.ringing = true;
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(1));
+    rig.st.refresh_repaired = true;
 
-    let first = rig.st.begin_pass(&mut rig.session, &ctx, &mut rig.link);
+    assert!(rig.drive().is_ok(), "the ring is not cut short");
+    assert!(
+        rig.st.budget_exit_owed.is_some(),
+        "the exit waits for the line"
+    );
+    rig.st.ringing = false;
+    assert!(rig.st.take_owed_budget_exit().is_err());
+}
 
-    assert!(first.is_err(), "the loop is told");
-    assert!(rig.st.ring_failure.is_none(), "and only once");
+#[test]
+fn a_silent_open_connection_is_not_rebuilt_while_a_call_may_be_using_it() {
+    let mut rig = Rig::new();
+    rig.st.ringing = true;
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(1));
+
+    rig.drive().unwrap();
+
+    assert_eq!(rig.link.repairs, 0, "the connection is left alone");
+    assert!(rig.st.registration_refresh.is_none());
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "timeout");
+}
+
+#[test]
+fn a_dead_connection_is_rebuilt_even_while_a_call_is_up() {
+    let mut rig = Rig::new();
+    rig.st.ringing = true;
+    rig.link.alive = false;
+
+    rig.drive().unwrap();
+
+    assert_eq!(rig.link.repairs, 1);
+    assert!(
+        rig.st.registration_refresh.is_some(),
+        "and the refresh is sent again"
+    );
 }
