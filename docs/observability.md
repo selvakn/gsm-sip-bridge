@@ -162,6 +162,26 @@ During a rejection cooldown, `vowifi-status`/`volte-status` read `state: Failed`
 `can_answer: false`, and `rejection_cooldown: until <time> (next attempt in <N>s)`;
 otherwise `rejection_cooldown: none`.
 
+## Registration refresh status and logs
+
+A scheduled renewal is a protected `REGISTER` on the connection already in use, sent while a call is up
+if that is when it falls due (specs/123). `vowifi-status` and `volte-status` show, under `registration:`:
+
+- `refresh_mode: in-place` or `fallback`. `fallback` means the carrier rejected two in-place refreshes
+  in a row, so the next cycle re-registers in full; it reads `in-place` again once that succeeds.
+- `last_refresh: ok <time>`, `rejected <status> <time>`, `timeout <time>` or `none`.
+- `next_refresh: <time>`, 600 s before expiry for a grant over 1200 s and half the grant otherwise.
+- `refresh_rejections: <N>`, the consecutive rejections counted toward the fallback.
+
+An agent older than these fields reads `refresh_mode: unknown`.
+
+The agent logs `refreshing the registration in place` (`cseq`, `in_call`) and `registration refreshed in
+place` (`granted_expires_secs`). A refresh that does not succeed logs `registration refresh failed; keeping
+the existing session` (`status`, `in_call`, `binding_valid`): the earlier grant still holds until it expires.
+`in-place refresh keeps being rejected; the next cycle re-registers in full` marks the fallback. A very short
+grant logs `registrar granted a very short lifetime`. A registration that expires during a call is reported as
+`state: Failed`; the call is left running and the full re-registration starts when it ends.
+
 ## Reg-event subscription logs
 
 The reg-event `SUBSCRIBE` is tracked as a transaction and a dialog (specs/090),

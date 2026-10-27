@@ -94,11 +94,11 @@ description: "Task list for IMS registration refresh without call interruption"
 **Goal**: a timely refresh answer is honoured while a PBX reply is held.
 **Independent Test**: incoming call rings 40 s with 100 s of the 128 s transaction elapsed; the answer at 110 s confirms the refresh.
 
-- [ ] T025 [US4] Audit `ims/agent/inbound.rs` (and `call.rs`, `origination.rs`) on current `main` to find where non-call traffic is held during the PBX wait and replayed; write the finding as a comment block in `specs/123-ims-registration-refresh/research.md` §R6 (file, function, hold and replay points)
-- [ ] T026 [P] [US4] Test in `tests/test_ims_registration_refresh.rs`: the 100 s / 40 s ring scenario above, and a variant where the answer arrives before the hold begins (acceptance 1; SC-007)
-- [ ] T027 [P] [US4] Test: registration timers (retransmit and Timer F) fire on time during a held PBX reply (acceptance 2)
-- [ ] T028 [US4] Fix the ordering found in T025: deliver registration answers and evaluate refresh timers before/independently of the held replay, or timestamp held answers and treat an answer received before the deadline as timely; do not add a second reader thread
-- [ ] T029 [US4] `make format && make lint && make test`; commit
+- [X] T025 [US4] Audit `ims/agent/inbound.rs` (and `call.rs`, `origination.rs`) on current `main` to find where non-call traffic is held during the PBX wait and replayed; write the finding as a comment block in `specs/123-ims-registration-refresh/research.md` §R6 (file, function, hold and replay points)
+- [X] T026 [P] [US4] Test in `tests/test_ims_registration_refresh.rs`: the 100 s / 40 s ring scenario above, and a variant where the answer arrives before the hold begins (acceptance 1; SC-007)
+- [X] T027 [P] [US4] Test: registration timers (retransmit and Timer F) fire on time during a held PBX reply (acceptance 2)
+- [X] T028 [US4] Fix the ordering found in T025: deliver registration answers and evaluate refresh timers before/independently of the held replay, or timestamp held answers and treat an answer received before the deadline as timely; do not add a second reader thread
+- [X] T029 [US4] `make format && make lint && make test`; commit
 
 ---
 
@@ -128,10 +128,10 @@ description: "Task list for IMS registration refresh without call interruption"
 
 **Goal**: operators can see the refresh mode and last result (FR-027).
 
-- [ ] T039 [P] Test: `vowifi-status` and `volte-status` render the contract in `contracts/status-output.md`, including the "older agent" defaults (`gsm-sip-bridge/src/vowifi/control.rs` tests and `tests/test_vowifi_*.rs`)
-- [ ] T040 Publish the new fields from the agent into the status reply (`ims/agent/mod.rs`, `vowifi/control.rs`) and render them in `vowifi/mod.rs` and `volte/bridge.rs`; add `registration-recovery` to `Maintenance::as_str` rendering
-- [ ] T041 [P] Update `docs/vowifi-bridge.md` (refresh, fallback, deferral rules), `docs/operations.md` (how to read the new status lines), and add the Slice B `RELEASE_NOTES.md` entry
-- [ ] T042 `make format && make lint && make test`; commit
+- [X] T039 [P] Test: `vowifi-status` and `volte-status` render the contract in `contracts/status-output.md`, including the "older agent" defaults (`gsm-sip-bridge/src/vowifi/control.rs` tests and `tests/test_vowifi_*.rs`)
+- [X] T040 Publish the new fields from the agent into the status reply (`ims/agent/mod.rs`, `vowifi/control.rs`) and render them in `vowifi/mod.rs` and `volte/bridge.rs`; add `registration-recovery` to `Maintenance::as_str` rendering
+- [X] T041 [P] Update `docs/vowifi-bridge.md` (refresh, fallback, deferral rules), `docs/operations.md` (how to read the new status lines), and add the Slice B `RELEASE_NOTES.md` entry
+- [X] T042 `make format && make lint && make test`; commit
 
 ---
 
