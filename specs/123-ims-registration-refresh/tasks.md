@@ -24,7 +24,7 @@ description: "Task list for IMS registration refresh without call interruption"
 ## Phase 1: Setup
 
 - [X] T001 Confirm a clean baseline on branch `123-ims-registration-refresh`: run `make format && make lint && make test` and note the pass count in `specs/123-ims-registration-refresh/live-verification.md` (create it with a header and an empty run table)
-- [ ] T002 [P] Read PR #168 commit `3e914c3` (`gh api` / `git fetch origin 3e914c3`) and list in `specs/123-ims-registration-refresh/research.md` §R8 the exact hunks to reuse per file, so credit (`Co-authored-by: Kirill Mironov`) is applied commit by commit
+- [X] T002 [P] Read PR #168 commit `3e914c3` (`gh api` / `git fetch origin 3e914c3`) and list in `specs/123-ims-registration-refresh/research.md` §R8 the exact hunks to reuse per file, so credit (`Co-authored-by: Kirill Mironov`) is applied commit by commit
 
 ---
 
@@ -170,7 +170,7 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ### Live verification (Slice C)
 
-- [ ] T058 Quickstart steps 6-7 on Jio VoWiFi (mid-call AKA; UDP) and record in `live-verification.md` (SC-004, SC-005); repeat on Vodafone VoWiFi if the carrier issues a challenge
+- [ ] T058 (blocked: no carrier challenges a refresh; see `live-verification.md`) Quickstart steps 6-7 on Jio VoWiFi (mid-call AKA; UDP) and record in `live-verification.md` (SC-004, SC-005); repeat on Vodafone VoWiFi if the carrier issues a challenge
 
 ---
 

@@ -20,6 +20,7 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 
 | 2026-10-27 | Vodafone (IPv6, TCP) | `7e62c83` + test hook | Refresh sent with a nonce the registrar never issued | accepted at the first attempt (200, 0.26 s); **no challenge** |
 | 2026-10-27 | Vodafone (IPv6, TCP) | `7e62c83` + test hook | Refresh sent with empty `nonce` and `response`, as a first REGISTER's placeholder is | accepted at the first attempt (200, 0.30 s); **no challenge** |
+| 2026-10-27 | Vodafone (IPv6, TCP) | `1c96223` | 15 min inbound call (siptest answering), spanning the scheduled refresh (SC-002, SC-005a) | call up the whole time, audio good (listener's report); refresh at +50 min with `in_call=true`, accepted 0.13 s, `last_refresh: ok`, 0 rejections, no failover or re-registration |
 | 2026-10-27 | privileged container (iproute2 6.11, Linux 7.0) | `714a0b8` + `real_kernel_stage_activate_retire_and_rollback` | Stage, drop, stage, activate, drain, remove on the kernel's own XFRM tables (T051) | passed: tables return to exactly 4 states / 16 policies after a dropped stage and after the drain; 8 states while staged |
 
 ## Findings
