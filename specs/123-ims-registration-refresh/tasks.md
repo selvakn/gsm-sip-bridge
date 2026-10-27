@@ -139,7 +139,7 @@ description: "Task list for IMS registration refresh without call interruption"
 
 - [ ] T043 Build the arm64 image (arm-build-200 pipeline) and deploy to the Jio Pi; run the quickstart steps 1-3, recording each run in `live-verification.md` (SC-001, SC-002, SC-003)
 - [ ] T044 Run the quickstart steps 4-5 on the local Vodafone VoWiFi rig (SC-005a) including a forced rejection to see `refresh_mode: fallback`; run the P-CSCF failover check (SC-006)
-- [ ] T045 Record the outcome and any carrier-specific findings in `live-verification.md`; if in-place refresh is rejected on a carrier, open an issue before starting Slice C
+- [X] T045 Record the outcome and any carrier-specific findings in `live-verification.md`; if in-place refresh is rejected on a carrier, open an issue before starting Slice C
 
 **Checkpoint (Slice B)**: stories US2, US3, US4 are done, documented and live-verified. Open the PR; credit the reporter in the PR body and commits. Respond to the reporter on #163/#168 (human reply, not to the Greptile bot).
 
@@ -147,25 +147,25 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ## Phase 9: User Story 5 - Network-requested re-authentication (Priority: P2) — Slice C
 
-**Gate**: do not start until T045 is recorded.
+**Gate**: do not start until T045 is recorded. T045 is recorded in `live-verification.md`: in-place refresh was accepted on both carriers and no carrier has been seen to challenge a refresh. Slice C was started on 2026-10-27 at the maintainer's request (#163 reopened) rather than on a seen challenge; its live check forces one (see T058).
 **Goal**: answer a fresh AKA challenge without blocking signalling, with staged SAs, stable server port, drain and rollback.
 
 ### Tests (write first)
 
-- [ ] T046 [P] [US5] `tests/test_ims_registration_refresh.rs` (TCP and UDP): a 401 challenge during an active call → background worker answers, call signalling and NOTIFYs keep being handled, registration extended, server port unchanged, client port changed (acceptance 1, 2)
-- [ ] T047 [P] [US5] Failure and cancel: staged SAs removed, working SAs untouched, a late answer from the abandoned attempt changes nothing (acceptance 3, 6; FR-026)
-- [ ] T048 [P] [US5] Drain: a transaction started on the old connection (including a pending origination) still completes after the switch; old connection retired after ≥ 128 s, extended while an origination is pending (acceptance 4; FR-023)
-- [ ] T049 [P] [US5] UDP: authentication reply addressed to the advertised server port instead of the new client port is still received (acceptance 5; FR-025)
-- [ ] T050 [P] [US5] AUTS resynchronisation still works through the background path (acceptance 7)
-- [ ] T051 [P] [US5] XFRM stage/activate/rollback in the privileged container (`gm_ipsec.rs` backend trait): activation only after success, rollback on drop, SA lifetime no shorter than registration + 30 s (R4)
+- [X] T046 [P] [US5] `tests/test_ims_registration_refresh.rs` (TCP and UDP): a 401 challenge during an active call → background worker answers, call signalling and NOTIFYs keep being handled, registration extended, server port unchanged, client port changed (acceptance 1, 2)
+- [X] T047 [P] [US5] Failure and cancel: staged SAs removed, working SAs untouched, a late answer from the abandoned attempt changes nothing (acceptance 3, 6; FR-026)
+- [X] T048 [P] [US5] Drain: a transaction started on the old connection (including a pending origination) still completes after the switch; old connection retired after ≥ 128 s, extended while an origination is pending (acceptance 4; FR-023)
+- [X] T049 [P] [US5] UDP: authentication reply addressed to the advertised server port instead of the new client port is still received (acceptance 5; FR-025)
+- [X] T050 [P] [US5] AUTS resynchronisation still works through the background path (acceptance 7)
+- [X] T051 [P] [US5] XFRM stage/activate/rollback in the privileged container (`gm_ipsec.rs` backend trait): activation only after success, rollback on drop, SA lifetime no shorter than registration + 30 s (R4)
 
 ### Implementation
 
-- [ ] T052 [US5] Add `ims/registration_auth.rs`: `ReauthRequest`/`Reauthenticated`/staged association with rollback-on-drop, SIM/AKA work off the dispatch thread, result channel, cancel flag, 600 s work timeout; reuse sound parts of `3e914c3` with credit
-- [ ] T053 [US5] Extend `ims/gm_ipsec.rs` with stage / activate / rollback of replacement SAs keeping the protected server port; keep the SA backend trait mockable only where hardware is unavailable, with the justification comment required by the constitution
-- [ ] T054 [US5] Extend `ims/session.rs` `Inbound` with adoption of a new client reader (single live reader), and `ims/agent/mod.rs` to start the worker on a 401 to a refresh, poll it, commit or roll back, move the old transport to a retired list, update active call and origination signalling to the new transport
-- [ ] T055 [US5] Implement UDP reply reading from both the new client socket and the dispatcher channel (do not repeat PR #168's finding 1)
-- [ ] T056 [US5] Replace T023's "401 = full re-registration" with the background re-authentication; keep full re-registration as the failure fallback
+- [X] T052 [US5] Add `ims/registration_auth.rs`: `ReauthRequest`/`Reauthenticated`/staged association with rollback-on-drop, SIM/AKA work off the dispatch thread, result channel, cancel flag, 600 s work timeout; reuse sound parts of `3e914c3` with credit
+- [X] T053 [US5] Extend `ims/gm_ipsec.rs` with stage / activate / rollback of replacement SAs keeping the protected server port; keep the SA backend trait mockable only where hardware is unavailable, with the justification comment required by the constitution
+- [X] T054 [US5] Extend `ims/session.rs` `Inbound` with adoption of a new client reader (single live reader), and `ims/agent/mod.rs` to start the worker on a 401 to a refresh, poll it, commit or roll back, move the old transport to a retired list, update active call and origination signalling to the new transport
+- [X] T055 [US5] Implement UDP reply reading from both the new client socket and the dispatcher channel (do not repeat PR #168's finding 1)
+- [X] T056 [US5] Replace T023's "401 = full re-registration" with the background re-authentication; keep full re-registration as the failure fallback
 - [ ] T057 [US5] `make format && make lint && make test`; commit in logical pieces
 
 ### Live verification (Slice C)

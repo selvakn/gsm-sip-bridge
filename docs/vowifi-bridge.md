@@ -62,8 +62,22 @@ when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate
   security association and is sent once more. The network closes an idle Gm connection (seen on Jio within
   an hour), and the full renewal that used to run here hid that by opening a new one; the rebuild is not a
   P-CSCF fault and marks nothing. Only a second failure reaches the pool logic below.
-- Failures of a refresh keep the existing session. A `403`, `408`, `500` or `504` (and a fresh
-  authentication challenge, `401`, until background re-authentication exists) asks for a full
+- A `401` to the refresh is the network asking for a **fresh AKA authentication** (TS 33.203 §7.4,
+  TS 24.229 §5.1.1.5.1). The SIM is asked on a thread of its own (`ims/registration_auth.rs`), so the
+  dispatch loop keeps serving calls and notifications meanwhile; the thread touches no socket, no XFRM
+  state and no registration state. When the answer is in, the loop installs the replacement Gm
+  associations beside the working ones (`StagedSas` in `ims/gm_ipsec.rs`: new SPIs, the protected
+  server port unchanged, a new client port), opens the client connection from that port and sends the
+  answer on it. A selector both generations use keeps the old SPI on its outbound policy and accepts
+  any SPI on its inbound one until the network confirms, so nothing we send changes before then. On the
+  `200` the new connection and associations become the registration's; the old connection, its reader
+  and the policies only it used drain for 128 s (longer while an outgoing call is being placed, never
+  beyond 10 minutes) so a transaction started on them can still be answered, then are removed. A
+  sequence mismatch is resynchronised with AUTS (at most twice). If anything fails — the SIM, the
+  staging, no confirmation within Timer F, a rejection, a second challenge — what was staged is undone
+  and a full re-registration follows, as before. Replies are read from the same single queue whichever
+  socket they arrive on, including UDP replies addressed to the advertised server port.
+- Failures of a refresh keep the existing session. A `403`, `408`, `500` or `504` asks for a full
   re-registration, which waits for a call to end like any disruptive recovery
   (`Maintenance::RegistrationRecovery`). A `503` with `Retry-After` longer than Timer F marks the
   P-CSCF unavailable and fails over; a shorter one retries the same P-CSCF after the wait. A `423`

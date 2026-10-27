@@ -24,6 +24,10 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 - Build `cd53789` keeps the reader's thread handle, so the connection closing is noticed when the reader ends, and rebuilds the connection before a refresh or an idle probe uses it.
 - **Test limitation:** the Pi's registrar has one binding per account. `baresip-amr` on the Pi registers as `1002`, so a test-only account `1003` was added to the Pi's config for siptest (backups: `config.toml.bak-pre-1003`, `.env.bak-pre-1003`). It is removed when testing ends.
 
+## Gate for Slice C (T045)
+
+In-place refresh with the cached authorization was accepted on both carriers (Jio first time after the connection was rebuilt, Vodafone at the first attempt), 0 rejections. **No carrier has been seen to challenge a refresh**, so the situation Slice C answers has not occurred naturally. Slice C was started at the maintainer's request (#163 reopened) and is verified live by forcing a challenge: a refresh sent with a nonce the registrar never issued is answered with a fresh `401`, which exercises the same path.
+
 ## Still to run
 
 - A 12 h idle soak (SC-003).
