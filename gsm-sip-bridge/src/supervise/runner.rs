@@ -171,6 +171,10 @@ impl HttpProbe {
 /// nothing usable in time. A refused or timed-out connect, a read timeout, an
 /// early close and an unparsable reply all collapse into `NoAnswer`, with the
 /// error text kept for the fault message.
+// One probe result exists at a time and is consumed at once, so the size of the
+// largest control message (the status reply grows with each field the CLIs
+// show) costs nothing worth an indirection at every construction site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatusProbe {
     /// One message, read before the timeouts. Any variant; the caller decides.
