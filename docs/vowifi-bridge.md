@@ -41,8 +41,12 @@ when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate
 
 - Keeps a persistent IMS-AKA registration alive via `super::register_session` (kept alive rather
   than immediately cleaned up, unlike the one-shot `ims-register`/`ims-call` CLI tools), renewing
-  it before `Expires` lapses (`renewal_due` in `ims/mod.rs`) with exponential backoff on failure
-  (`next_backoff`).
+  it before `Expires` lapses with exponential backoff on failure (`next_backoff`). The renewal
+  falls due on the schedule of [3GPP TS 24.229 §5.1.1.4.1](https://www.etsi.org/deliver/etsi_ts/124200_124299/124229/18.10.00_60/ts_124229v181000p.pdf)
+  (`registration_refresh_offset` in `ims/mod.rs`): 600 seconds before expiry when the registrar
+  granted more than 1200 seconds, halfway through the grant otherwise, and never sooner than 60
+  seconds after the registration. A one-hour grant therefore renews after 50 minutes. A grant
+  under 120 seconds logs a warning, because the binding can lapse before its refresh.
 - Acts as a SIP UAS on **two** fronts for a single call: the carrier's Gm-protected IMS transport
   (answering inbound `INVITE`s), and a second, unauthenticated plain-SIP link on
   `crate::vowifi::VETH_SIP_PORT` that Agent B's PJSIP dials into once it decides to bridge a call.

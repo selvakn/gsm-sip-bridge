@@ -146,16 +146,12 @@ const ACTIVE_CALL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Found live (T072): at 30s, a `PlaceCall` could sit long enough for
 /// `vowifi::mod`'s `PLACE_CALL_TIMEOUT` (a much shorter 3s) to give up on
 /// this line before Agent A even sent `CallAttempting`. 1s keeps renewal
-/// checks plenty timely (`RENEWAL_HEADROOM` is 300s) while bounding that
+/// checks plenty timely (a refresh is due at least 60s apart) while bounding that
 /// worst case to something `PLACE_CALL_TIMEOUT` safely covers. `pub(crate)`
 /// so `vowifi::mod`'s tests can assert `PLACE_CALL_TIMEOUT` stays larger
 /// than this, the same cross-check `CALL_ATTEMPT_TIMEOUT` does against
 /// `OUTBOUND_INVITE_TIMEOUT`.
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// How far ahead of the registration's actual expiry Agent A starts trying
-/// to renew it — SC-003's 90s recovery budget plus margin for the
-/// renewal's own AKA-challenge round trip.
-const RENEWAL_HEADROOM: Duration = Duration::from_secs(300);
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// How many consecutive renewal failures this agent absorbs in-process before
@@ -995,6 +991,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // the requested value would leave a window where the binding has lapsed
     // while we still believe it is live (FR-023).
     let granted_expires = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
+    crate::ims::warn_if_short_grant(granted_expires);
     let status = Arc::new(Mutex::new(crate::ims::RegistrationStatus {
         pcscf: pcscf_pool.snapshot(SystemTime::now()),
         state: crate::ims::RegistrationState::Registered,
@@ -3808,21 +3805,13 @@ impl LoopState {
             let guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
             (guard.expires_at, guard.registered_at)
         };
-        // The headroom scales to the lifetime the registrar actually granted
-        // (FR-024). The granted value needs no separate field: it is exactly
-        // the span the status already records. Without the scaling, a grant
-        // shorter than twice the fixed headroom would make `renewal_due`
-        // permanently true and re-register on every idle poll, once a second,
-        // forever.
-        let headroom = match (expires_at, registered_at) {
-            (Some(exp), Some(reg)) => crate::ims::renewal_headroom_for(
-                exp.duration_since(reg).unwrap_or(RENEWAL_HEADROOM),
-                RENEWAL_HEADROOM,
-            ),
-            _ => RENEWAL_HEADROOM,
-        };
-        let due =
-            expires_at.is_some_and(|e| crate::ims::renewal_due(SystemTime::now(), e, headroom));
+        // TS 24.229 5.1.1.4.1: 600s before expiry for a grant over 1200s,
+        // half the grant otherwise, never closer than the 60s refresh floor.
+        // The granted value needs no separate field: it is exactly the span
+        // the status already records (FR-024).
+        let due = expires_at.is_some_and(|e| {
+            crate::ims::registration_refresh_due(SystemTime::now(), registered_at, e)
+        });
         // `force_renewal` is the Gm-liveness escalation: re-register now even
         // though expiry is far off, because only a re-registration can
         // renegotiate a Gm SA that has gone dead underneath the connection
@@ -3960,6 +3949,7 @@ impl LoopState {
                 // grant a different one each time, and carrying the first
                 // response's value forever would eventually mis-time renewal.
                 let granted = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
+                crate::ims::warn_if_short_grant(granted);
                 let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
                 guard.state = crate::ims::RegistrationState::Registered;
                 guard.registered_at = Some(SystemTime::now());

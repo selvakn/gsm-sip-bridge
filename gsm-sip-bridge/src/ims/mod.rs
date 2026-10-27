@@ -817,13 +817,6 @@ impl RegistrationStatus {
     }
 }
 
-/// Whether a registration expiring at `expires_at` should be renewed *now*,
-/// given the current time and how much headroom to leave before the actual
-/// expiry — renewing early leaves margin for the renewal's own network
-/// round-trip and AKA challenge to finish before the old registration would
-/// actually lapse (FR-001/FR-007: no gap in which an inbound call would go
-/// unanswered). Pure and clock-injectable so it's testable without waiting
-/// on a real timer.
 /// The registration lifetime the network actually granted.
 ///
 /// A registrar may grant less than was requested, and renewing on the requested
@@ -854,16 +847,12 @@ pub fn granted_expires(headers: &[(String, String)], requested: u32) -> u32 {
     requested
 }
 
-/// How far before expiry to renew, for a registration of `granted` seconds.
+/// How far before expiry to refresh the registration-event subscription, for
+/// a subscription of `granted` seconds: the preferred margin, scaled down to
+/// half the lifetime so a short grant is not "due" on every idle poll.
 ///
-/// Honouring a short granted lifetime is only safe together with this. The
-/// headroom used to be a flat 300s against an assumed 3600s lifetime; the
-/// moment a registrar grants less than twice the headroom, `renewal_due`
-/// becomes permanently true and the agent re-registers on *every idle poll* —
-/// once per second — for as long as the line is up. Scaling the margin to the
-/// lifetime keeps a comfortable early renewal without that runaway.
-///
-/// Pure and clock-free, like `renewal_due`, so the schedule is testable.
+/// The registration itself follows [`registration_refresh_offset`] instead.
+/// Pure and clock-free so the schedule is testable.
 pub fn renewal_headroom_for(
     granted: std::time::Duration,
     preferred: std::time::Duration,
@@ -871,15 +860,63 @@ pub fn renewal_headroom_for(
     preferred.min(granted / 2)
 }
 
-pub fn renewal_due(
+/// Refresh starts are never closer together than this, whatever the grant.
+pub const REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long after a registration was granted its refresh falls due
+/// (TS 24.229 5.1.1.4.1): 600s before expiry when the grant is longer than
+/// 1200s, half the grant otherwise. Never earlier than [`REFRESH_FLOOR`], so a
+/// registrar granting a few seconds cannot make the agent refresh in a loop;
+/// such a binding may lapse before its refresh (see [`refresh_floor_applies`]).
+///
+/// Pure and clock-free so the schedule is testable.
+pub fn registration_refresh_offset(granted: std::time::Duration) -> std::time::Duration {
+    const LEAD: std::time::Duration = std::time::Duration::from_secs(600);
+    const HALF_LIFE_LIMIT: std::time::Duration = std::time::Duration::from_secs(1200);
+    let standard = if granted > HALF_LIFE_LIMIT {
+        granted - LEAD
+    } else {
+        granted / 2
+    };
+    standard.max(REFRESH_FLOOR)
+}
+
+/// Whether [`REFRESH_FLOOR`] overrides the standard schedule for this grant,
+/// i.e. half the grant would be under the floor. Callers log a warning.
+pub fn refresh_floor_applies(granted: std::time::Duration) -> bool {
+    granted < REFRESH_FLOOR * 2
+}
+
+/// Logs a warning when [`REFRESH_FLOOR`] overrides the standard schedule for
+/// a freshly granted lifetime: the binding may lapse before its refresh.
+pub fn warn_if_short_grant(granted_secs: u32) {
+    let granted = std::time::Duration::from_secs(granted_secs as u64);
+    if refresh_floor_applies(granted) {
+        tracing::warn!(
+            granted_secs,
+            refresh_floor_secs = REFRESH_FLOOR.as_secs(),
+            "registrar granted a very short lifetime; refreshing at the floor, the binding may lapse first"
+        );
+    }
+}
+
+/// Whether a registration granted at `registered_at` and expiring at
+/// `expires_at` should be refreshed *now*. When `registered_at` is unknown the
+/// grant is assumed to have been [`DEFAULT_EXPIRES`].
+pub fn registration_refresh_due(
     now: std::time::SystemTime,
+    registered_at: Option<std::time::SystemTime>,
     expires_at: std::time::SystemTime,
-    headroom: std::time::Duration,
 ) -> bool {
-    match expires_at.checked_sub(headroom) {
-        Some(renew_at) => now >= renew_at,
-        // headroom >= time-to-expiry (or expires_at is implausibly close to
-        // the epoch): nothing left to wait for, renew immediately.
+    let assumed = std::time::Duration::from_secs(DEFAULT_EXPIRES as u64);
+    let registered_at = registered_at
+        .or_else(|| expires_at.checked_sub(assumed))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let granted = expires_at
+        .duration_since(registered_at)
+        .unwrap_or(std::time::Duration::ZERO);
+    match registered_at.checked_add(registration_refresh_offset(granted)) {
+        Some(refresh_at) => now >= refresh_at,
         None => true,
     }
 }
@@ -1684,13 +1721,6 @@ mod tests {
         assert_eq!((other.pcscf_port, other.mcc.as_str()), (5060, "001"));
     }
 
-    #[test]
-    fn renewal_not_due_when_well_before_expiry() {
-        let expires_at = SystemTime::now() + Duration::from_secs(3600);
-        let now = SystemTime::now();
-        assert!(!renewal_due(now, expires_at, Duration::from_secs(300)));
-    }
-
     /// specs/090 contracts/control.md: every rendering.
     #[test]
     fn subscription_health_renders_every_variant() {
@@ -1876,27 +1906,110 @@ mod tests {
         assert!(status.health_at(now).can_answer());
     }
 
-    #[test]
-    fn a_short_granted_lifetime_scales_the_headroom_instead_of_renewing_constantly() {
-        // The trap that opens the moment a granted lifetime is honoured: with a
-        // fixed 300s headroom, anything granted under 600s is *always* "due",
-        // so the agent re-registers on every idle poll — once a second —
-        // forever. Scaling the margin is what makes honouring the grant safe.
-        let preferred = Duration::from_secs(300);
-        let granted = Duration::from_secs(120);
-        let headroom = renewal_headroom_for(granted, preferred);
-        assert_eq!(headroom, Duration::from_secs(60));
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
 
-        let now = SystemTime::now();
-        let expires_at = now + granted;
-        assert!(
-            !renewal_due(now, expires_at, headroom),
-            "a freshly granted 120s registration must not already be due"
-        );
-        assert!(
-            renewal_due(now + Duration::from_secs(61), expires_at, headroom),
-            "it must still renew comfortably before it lapses"
-        );
+    #[test]
+    fn refresh_is_due_600s_before_expiry_for_a_grant_over_1200s() {
+        // TS 24.229 5.1.1.4.1: a one-hour grant refreshes at 50 minutes.
+        assert_eq!(registration_refresh_offset(secs(3600)), secs(3000));
+        assert_eq!(registration_refresh_offset(secs(1201)), secs(601));
+    }
+
+    #[test]
+    fn refresh_is_due_at_half_the_grant_for_1200s_or_less() {
+        assert_eq!(registration_refresh_offset(secs(600)), secs(300));
+        assert_eq!(registration_refresh_offset(secs(1200)), secs(600));
+    }
+
+    #[test]
+    fn the_1200s_boundary_has_no_gap_or_double_fire() {
+        // 1200 -> half (600); 1201 -> 600s before expiry (601). Monotonic.
+        assert!(registration_refresh_offset(secs(1200)) < registration_refresh_offset(secs(1201)));
+    }
+
+    #[test]
+    fn refresh_is_never_scheduled_closer_than_the_floor() {
+        for granted in [1, 10, 100, 119] {
+            assert_eq!(registration_refresh_offset(secs(granted)), REFRESH_FLOOR);
+            assert!(refresh_floor_applies(secs(granted)), "{granted}s grant");
+        }
+        // 120s is exactly where half the grant equals the floor.
+        assert_eq!(registration_refresh_offset(secs(120)), REFRESH_FLOOR);
+        assert!(!refresh_floor_applies(secs(120)));
+        assert!(!refresh_floor_applies(secs(3600)));
+    }
+
+    #[test]
+    fn due_follows_the_grant_that_was_actually_made() {
+        let registered_at = SystemTime::UNIX_EPOCH + secs(1_000_000);
+        let expires_at = registered_at + secs(3600);
+        assert!(!registration_refresh_due(
+            registered_at + secs(2999),
+            Some(registered_at),
+            expires_at
+        ));
+        assert!(registration_refresh_due(
+            registered_at + secs(3000),
+            Some(registered_at),
+            expires_at
+        ));
+        // A later renewal granted 600s: that grant, not the first, sets the pace.
+        let expires_at = registered_at + secs(600);
+        assert!(!registration_refresh_due(
+            registered_at + secs(299),
+            Some(registered_at),
+            expires_at
+        ));
+        assert!(registration_refresh_due(
+            registered_at + secs(300),
+            Some(registered_at),
+            expires_at
+        ));
+    }
+
+    #[test]
+    fn a_very_short_grant_does_not_refresh_on_every_poll() {
+        let registered_at = SystemTime::UNIX_EPOCH + secs(1_000_000);
+        let expires_at = registered_at + secs(10);
+        assert!(!registration_refresh_due(
+            registered_at + secs(59),
+            Some(registered_at),
+            expires_at
+        ));
+        assert!(registration_refresh_due(
+            registered_at + secs(60),
+            Some(registered_at),
+            expires_at
+        ));
+    }
+
+    #[test]
+    fn an_unknown_registration_time_assumes_the_default_grant() {
+        let expires_at = SystemTime::UNIX_EPOCH + secs(1_000_000);
+        let start = expires_at - secs(DEFAULT_EXPIRES as u64);
+        assert!(!registration_refresh_due(
+            start + secs(2999),
+            None,
+            expires_at
+        ));
+        assert!(registration_refresh_due(
+            start + secs(3000),
+            None,
+            expires_at
+        ));
+    }
+
+    #[test]
+    fn a_registration_already_past_expiry_is_due() {
+        let now = SystemTime::UNIX_EPOCH + secs(2_000_000);
+        let registered_at = now - secs(7200);
+        assert!(registration_refresh_due(
+            now,
+            Some(registered_at),
+            registered_at + secs(3600)
+        ));
     }
 
     #[test]
@@ -1914,19 +2027,6 @@ mod tests {
     }
 
     #[test]
-    fn a_600s_grant_renews_at_300s_not_at_the_default_lifetime() {
-        let now = SystemTime::now();
-        let granted = Duration::from_secs(600);
-        let headroom = renewal_headroom_for(granted, Duration::from_secs(300));
-        let expires_at = now + granted;
-        assert!(!renewal_due(now, expires_at, headroom));
-        assert!(
-            renewal_due(now + Duration::from_secs(301), expires_at, headroom),
-            "must renew 300s in, not wait as if the lifetime were an hour"
-        );
-    }
-
-    #[test]
     fn a_response_without_an_expires_header_falls_back_to_what_was_requested() {
         // The current carriers all grant the hour asked for, so this is the
         // path in production today: behaviour must be unchanged.
@@ -1939,37 +2039,6 @@ mod tests {
             ),
             Duration::from_secs(300)
         );
-    }
-
-    #[test]
-    fn renewal_due_once_inside_the_headroom_window() {
-        let now = SystemTime::now();
-        let expires_at = now + Duration::from_secs(200);
-        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn renewal_due_exactly_at_the_headroom_boundary() {
-        let now = SystemTime::now();
-        let expires_at = now + Duration::from_secs(300);
-        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn renewal_due_when_already_past_expiry() {
-        let now = SystemTime::now();
-        let expires_at = now - Duration::from_secs(10);
-        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn renewal_due_when_headroom_exceeds_time_to_expiry() {
-        // expires_at is so close that subtracting headroom would underflow
-        // (or would if SystemTime allowed negative time) — must still
-        // report "due", not panic or silently say "not due".
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
-        assert!(renewal_due(now, expires_at, Duration::from_secs(300)));
     }
 
     #[test]

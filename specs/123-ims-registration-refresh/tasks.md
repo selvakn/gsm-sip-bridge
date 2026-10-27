@@ -23,7 +23,7 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ## Phase 1: Setup
 
-- [ ] T001 Confirm a clean baseline on branch `123-ims-registration-refresh`: run `make format && make lint && make test` and note the pass count in `specs/123-ims-registration-refresh/live-verification.md` (create it with a header and an empty run table)
+- [X] T001 Confirm a clean baseline on branch `123-ims-registration-refresh`: run `make format && make lint && make test` and note the pass count in `specs/123-ims-registration-refresh/live-verification.md` (create it with a header and an empty run table)
 - [ ] T002 [P] Read PR #168 commit `3e914c3` (`gh api` / `git fetch origin 3e914c3`) and list in `specs/123-ims-registration-refresh/research.md` §R8 the exact hunks to reuse per file, so credit (`Co-authored-by: Kirill Mironov`) is applied commit by commit
 
 ---
@@ -35,15 +35,15 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ### Tests (write first)
 
-- [ ] T003 [P] [US1] Table-driven tests in `ims/mod.rs` tests: 3600 s → due at 3000 s; 600 s → 300 s; 1200 s → 600 s; 1201 s → 601 s; a later different grant uses its own value (acceptance 1-4)
-- [ ] T004 [P] [US1] Test for the 60 s floor: grants of 10 s, 100 s and 119 s refresh at 60 s and report a warning flag; 120 s refreshes at 60 s with no warning (FR-003, edge case)
+- [X] T003 [P] [US1] Table-driven tests in `ims/mod.rs` tests: 3600 s → due at 3000 s; 600 s → 300 s; 1200 s → 600 s; 1201 s → 601 s; a later different grant uses its own value (acceptance 1-4)
+- [X] T004 [P] [US1] Test for the 60 s floor: grants of 10 s, 100 s and 119 s refresh at 60 s and report a warning flag; 120 s refreshes at 60 s with no warning (FR-003, edge case)
 
 ### Implementation
 
-- [ ] T005 [US1] Change `renewal_headroom_for` in `ims/mod.rs` to the TS 24.229 §5.1.1.4.1 rule (drop the `preferred` argument); add the 60 s minimum spacing and a warn-once log for grants under 120 s
-- [ ] T006 [US1] Remove `RENEWAL_HEADROOM` (`ims/agent/mod.rs:158`) and update its three uses (initial headroom around lines 994 and 3817, and the `granted`-derived value) to call the new helper with the granted lifetime
-- [ ] T007 [P] [US1] Update `docs/vowifi-bridge.md` (Agent A bullet) and add a `RELEASE_NOTES.md` Unreleased entry for the timing change (bold only the feature name, plain description after, per project convention)
-- [ ] T008 [US1] Run `make format && make lint && make test`; commit as its own atomic commit (credit the reporter if the helper is taken from `3e914c3`)
+- [X] T005 [US1] Change `renewal_headroom_for` in `ims/mod.rs` to the TS 24.229 §5.1.1.4.1 rule (implemented as the new `registration_refresh_offset`; `renewal_headroom_for` stays, because the reg-event subscription still uses it); add the 60 s minimum spacing and a warn-once log for grants under 120 s
+- [X] T006 [US1] Remove `RENEWAL_HEADROOM` (`ims/agent/mod.rs:158`) and update its three uses (initial headroom around lines 994 and 3817, and the `granted`-derived value) to call the new helper with the granted lifetime
+- [X] T007 [P] [US1] Update `docs/vowifi-bridge.md` (Agent A bullet) and add a `RELEASE_NOTES.md` Unreleased entry for the timing change (bold only the feature name, plain description after, per project convention)
+- [X] T008 [US1] Run `make format && make lint && make test`; commit as its own atomic commit (credit the reporter if the helper is taken from `3e914c3`)
 
 **Checkpoint (Slice A)**: a one-hour grant renews at 50 minutes. Shippable alone.
 
