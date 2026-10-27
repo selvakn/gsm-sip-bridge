@@ -265,6 +265,15 @@ pub(super) fn probe_gm_connection(
         }
     }
 
+    // The reader of the client connection ends when the network closes it. With
+    // no periodic keepalive that is the only early sign, and Jio closes an
+    // idle Gm connection within minutes.
+    if !client_down && !inbound.client_reader_alive() {
+        tracing::warn!("Gm client connection was closed by the network; rebuilding it");
+        ping.pending = None;
+        client_down = true;
+    }
+
     if !client_down && !listener_restart_failed {
         return false;
     }

@@ -408,6 +408,9 @@ pub(super) fn granted_lifetime(
 /// and the way to rebuild the client connection when the network has closed it.
 pub(super) trait GmLink {
     fn queue(&self) -> &std::sync::mpsc::Receiver<(SipMessage, SipSink)>;
+    /// Whether the client connection is still open from our side: its reader
+    /// ends when the network closes it.
+    fn client_alive(&self) -> bool;
     /// Rebuilds the client transport on the still-live security association.
     fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()>;
 }
@@ -415,6 +418,10 @@ pub(super) trait GmLink {
 impl GmLink for Inbound {
     fn queue(&self) -> &std::sync::mpsc::Receiver<(SipMessage, SipSink)> {
         &self.rx
+    }
+
+    fn client_alive(&self) -> bool {
+        self.client_reader_alive()
     }
 
     fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()> {
@@ -508,7 +515,11 @@ impl LoopState {
                     session,
                     p,
                     link,
-                    BridgeError::Ims("IMS registration refresh timed out (Timer F)".into()).into(),
+                    BridgeError::Ims(
+                        "IMS registration refresh timed out waiting for a SIP response (Timer F)"
+                            .into(),
+                    )
+                    .into(),
                 ),
                 Err(e) => self.refresh_not_carried(session, p, link, e.into()),
             };
@@ -525,6 +536,15 @@ impl LoopState {
             || self.next_renewal_attempt.is_some_and(|at| now < at)
         {
             return Ok(());
+        }
+        if !link.client_alive() {
+            return self.refresh_not_carried(
+                session,
+                p,
+                link,
+                BridgeError::Ims("the Gm client connection was closed by the network".into())
+                    .into(),
+            );
         }
         match PendingRegister::start(session, p.reg_cfg, now) {
             Ok(pending) => {
@@ -628,7 +648,14 @@ impl LoopState {
         let granted =
             match granted_lifetime(response, session.contact_addr, pending.requested_expires) {
                 Ok(0) => {
-                    // Our binding is gone even though the request was answered.
+                    // Our binding is gone even though the request was
+                    // answered: the earlier grant no longer holds, so say so
+                    // before the failure is recorded.
+                    {
+                        let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.state = crate::ims::RegistrationState::Failed;
+                        guard.expires_at = Some(SystemTime::now());
+                    }
                     self.fail_registration_refresh(
                         session,
                         p,
@@ -648,11 +675,17 @@ impl LoopState {
         // Routing for future dialogs follows the latest answer; keep what an
         // answer leaves out rather than losing it.
         let mut headers = response.headers.clone();
+        let answered = |name: &str| {
+            response
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(name))
+        };
         for (name, value) in &session.headers {
             let carried = ["Service-Route", "P-Associated-URI", "Path"]
                 .iter()
                 .any(|kept| name.eq_ignore_ascii_case(kept));
-            if carried && !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            if carried && !answered(name) {
                 headers.push((name.clone(), value.clone()));
             }
         }
@@ -740,7 +773,15 @@ impl LoopState {
         }
         let target = session.pcscf_addr.ip();
         let routed = crate::ims::route_to(target, p.reg_cfg.pcscf_port).is_ok();
-        match self.on_renewal_failure(target, &failure, routed, SystemTime::now()) {
+        let result = self.on_renewal_failure(target, &failure, routed, SystemTime::now());
+        // The carrier's own pause is a floor under whatever the ladder chose
+        // (RFC 3261 §20.33), unless the answer already sent us to another
+        // P-CSCF at once.
+        if let (Some(pause), false) = (failure.retry_after, self.force_renewal) {
+            let floor = Instant::now() + pause.min(Duration::from_secs(86_400));
+            self.next_renewal_attempt = self.next_renewal_attempt.max(Some(floor));
+        }
+        match result {
             // The exit would cut the call; it is owed until the line is idle.
             Err(e) if busy => {
                 tracing::warn!(error = %e, "renewal budget spent mid-call; exiting once the call ends");

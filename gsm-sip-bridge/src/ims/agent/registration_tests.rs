@@ -23,6 +23,7 @@ struct FakeLink {
     peer: std::net::SocketAddr,
     repairs: u32,
     repair_fails: bool,
+    alive: bool,
 }
 
 impl FakeLink {
@@ -34,6 +35,7 @@ impl FakeLink {
             peer,
             repairs: 0,
             repair_fails: false,
+            alive: true,
         }
     }
 }
@@ -43,8 +45,13 @@ impl GmLink for FakeLink {
         &self.rx
     }
 
+    fn client_alive(&self) -> bool {
+        self.alive
+    }
+
     fn repair(&mut self, session: &mut crate::ims::RegisteredSession) -> BridgeResult<()> {
         self.repairs += 1;
+        self.alive = true;
         if self.repair_fails {
             return Err(BridgeError::Ims("reconnect refused".into()));
         }
@@ -841,8 +848,8 @@ fn a_second_loss_is_not_repaired_again_and_goes_to_the_normal_failure_path() {
     assert_eq!(rig.link.repairs, 1, "one rebuild per refresh, not a loop");
     assert!(rig.st.registration_refresh.is_none());
     assert!(
-        rig.st.next_renewal_attempt.is_some(),
-        "now it is a backed-off failure"
+        rig.st.force_renewal,
+        "now it is the proxy's fault: marked, and the next registration goes to the other one"
     );
     assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "timeout");
 }
@@ -878,4 +885,106 @@ fn a_rejected_refresh_is_not_a_connection_problem_and_is_not_repaired() {
     let mut rig = Rig::new();
     refused(&mut rig, 403, &[]);
     assert_eq!(rig.link.repairs, 0);
+}
+
+#[test]
+fn every_saved_route_survives_an_answer_that_omits_them() {
+    let mut rig = Rig::new();
+    rig.session.headers = vec![
+        (
+            "Service-Route".into(),
+            "<sip:first@ims.example.test;lr>".into(),
+        ),
+        (
+            "Service-Route".into(),
+            "<sip:second@ims.example.test;lr>".into(),
+        ),
+    ];
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let contact = rig.contact(3600);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    assert!(rig.answer(&reply));
+    let routes: Vec<_> = rig
+        .session
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("Service-Route"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        routes,
+        [
+            "<sip:first@ims.example.test;lr>",
+            "<sip:second@ims.example.test;lr>"
+        ],
+        "both entries, in order"
+    );
+}
+
+#[test]
+fn a_silent_proxy_is_marked_once_the_connection_rebuild_did_not_help() {
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    for _ in 0..2 {
+        rig.st
+            .registration_refresh
+            .as_mut()
+            .unwrap()
+            .set_deadline(Instant::now() - Duration::from_secs(1));
+        rig.drive().unwrap();
+        let _ = rig.received();
+    }
+    assert!(
+        rig.st
+            .pool
+            .is_marked(rig.session.pcscf_addr.ip(), SystemTime::now()),
+        "two unanswered refreshes in a row are the proxy's fault"
+    );
+}
+
+#[test]
+fn the_carriers_pause_is_a_floor_under_the_retry() {
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    refused(&mut rig, 503, &[("Retry-After", "30")]);
+    let at = rig.st.next_renewal_attempt.expect("a retry is scheduled");
+    assert!(
+        at >= Instant::now() + Duration::from_secs(28),
+        "not the 5 s initial backoff"
+    );
+}
+
+#[test]
+fn a_zero_lifetime_removes_the_binding_from_the_status() {
+    let mut rig = Rig::new();
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let contact = rig.contact(0);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    assert!(rig.answer(&reply));
+    let guard = rig.status.lock().unwrap();
+    assert_eq!(guard.state, RegistrationState::Failed);
+    assert!(guard.expires_at.unwrap() <= SystemTime::now());
+    assert!(rig.st.force_renewal);
+}
+
+#[test]
+fn a_connection_the_network_closed_is_rebuilt_before_the_refresh_is_sent() {
+    // The reader ended: the peer closed the idle connection. No send is needed
+    // to find that out, and the refresh must not be written into it.
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    rig.link.alive = false;
+
+    rig.drive().unwrap();
+
+    assert_eq!(rig.link.repairs, 1);
+    assert!(rig.received().is_some(), "sent on the rebuilt connection");
+    assert!(!rig
+        .st
+        .pool
+        .is_marked(rig.session.pcscf_addr.ip(), SystemTime::now()));
 }

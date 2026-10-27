@@ -70,6 +70,9 @@ when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate
   retries once with `Min-Expires`. After two final error answers in a row the next cycle uses the
   full re-registration, and in-place refresh is tried again after that succeeds. A registration
   that expires during a call is reported unregistered and the call is left running.
+- While an incoming call rings (up to 50 s) the dispatch loop is parked in the ring wait. Registrar answers that
+  arrive then are kept and handled first afterwards, but a refresh that falls due, or a UDP retransmission that is
+  owed, waits for the ring to end. That is well inside the 600 s lead before expiry.
 - Acts as a SIP UAS on **two** fronts for a single call: the carrier's Gm-protected IMS transport
   (answering inbound `INVITE`s), and a second, unauthenticated plain-SIP link on
   `crate::vowifi::VETH_SIP_PORT` that Agent B's PJSIP dials into once it decides to bridge a call.
