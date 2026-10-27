@@ -31,7 +31,7 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 
 ## Gate for Slice C (T045)
 
-In-place refresh with the cached authorization was accepted on both carriers (Jio first time after the connection was rebuilt, Vodafone at the first attempt), 0 rejections. **No carrier has been seen to challenge a refresh**, so the situation Slice C answers has not occurred naturally. Slice C was started at the maintainer's request (#163 reopened) and is verified live by forcing a challenge: a refresh sent with a nonce the registrar never issued is answered with a fresh `401`, which exercises the same path.
+In-place refresh with the cached authorization was accepted on both carriers (Jio first time after the connection was rebuilt, Vodafone at the first attempt), 0 rejections. **No carrier has been seen to challenge a refresh**, so the situation Slice C answers has not occurred naturally. Slice C was started at the maintainer's request (#163 reopened). Vodafone accepted the forced-challenge attempts with `200`, so verification against a real carrier challenge remains outstanding.
 
 ## Still to run
 

@@ -1140,10 +1140,6 @@ impl LoopState {
             self.fall_back_to_full("the challenge carried no WWW-Authenticate".into())?;
             return Ok(true);
         };
-        if pending.kind == Kind::Resync && pending.resyncs >= MAX_RESYNCS {
-            self.fall_back_to_full("the network kept asking for a resynchronisation".into())?;
-            return Ok(true);
-        }
         let job = ChallengeJob {
             cfg: p.reg_cfg.clone(),
             realm: session.realm.clone(),
@@ -1211,6 +1207,11 @@ impl LoopState {
                 self.fall_back_to_full(format!("the SIM could not answer the challenge: {e}"))
             }
             Ok(Answer::Resynchronise { authorization }) => {
+                if carry.resyncs >= MAX_RESYNCS {
+                    return self.fall_back_to_full(
+                        "the SIM kept reporting a sequence mismatch after resynchronising".into(),
+                    );
+                }
                 let mut carry = carry;
                 carry.resyncs += 1;
                 match PendingRegister::launch(
@@ -1350,7 +1351,17 @@ impl LoopState {
         swap: Swap,
     ) -> BridgeResult<()> {
         let (staged, transport, reader, sa) = swap.into_parts();
-        let retired = staged.activate()?;
+        let retired = match staged.activate() {
+            Ok(retired) => retired,
+            Err(e) => {
+                // The associations rolled back; the connection and its reader
+                // were never adopted and must not outlive the attempt.
+                transport.abort();
+                reader.stop();
+                reader.reap();
+                return Err(e);
+            }
+        };
         let local = transport.local_addr()?;
         let old_transport = session.transport.replace(transport);
         session.local_addr = local;
@@ -1364,6 +1375,15 @@ impl LoopState {
             due: now + DRAIN,
             limit: now + DRAIN_LIMIT,
         });
+        // An answered call's later requests (BYE, session-timer UPDATE) are
+        // built from its dialog, which captured the address and security echo
+        // of the association it was set up under. They go out on the new
+        // connection now, so they must say so; the dialog's identity and routes
+        // do not change.
+        if let Some(call) = self.active_call.as_mut() {
+            call.dialog.local_addr = local;
+            call.dialog.security_verify = session.security_verify().map(str::to_string);
+        }
         // A probe in flight went out on the connection that was just retired.
         self.ping.reset();
         tracing::info!(

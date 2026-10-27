@@ -111,6 +111,10 @@ pub(super) struct PendingOrigination {
     from_tag: String,
     branch: String,
     invite_cseq: u32,
+    /// The Via sent-by the INVITE went out with. A CANCEL must repeat it to match
+    /// the transaction, even if a re-authentication has since moved the session
+    /// to another client port.
+    invite_local_addr: std::net::SocketAddr,
     /// In-dialog requests sent after the INVITE (each `PRACK`), so a later
     /// `BYE` picks a `CSeq` above them rather than reusing one — RFC 3261
     /// §12.2.1.1 requires the sequence to increase within a dialog.
@@ -373,6 +377,7 @@ pub(super) fn begin_origination(
         security_verify: session.security_verify(),
     });
 
+    let invite_local_addr = session.local_addr;
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
     let transport = match session.transport_mut() {
         Ok(t) => t,
@@ -418,6 +423,7 @@ pub(super) fn begin_origination(
         from_tag,
         branch,
         invite_cseq,
+        invite_local_addr,
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
@@ -526,7 +532,7 @@ impl PendingOrigination {
             request_uri: &self.callee_uri,
             route_headers: &self.route_headers,
             via_transport: self.via_transport,
-            local_addr: session.local_addr,
+            local_addr: self.invite_local_addr,
             public_uri: &session.origination_identity(),
             callee_uri: &self.callee_uri,
             call_id: &self.call_id,
@@ -1722,6 +1728,7 @@ mod tests {
             from_tag: "ftag".to_string(),
             branch: "z9hG4bKtest".to_string(),
             invite_cseq: 1,
+            invite_local_addr: "10.0.0.2:5060".parse().unwrap(),
             extra_cseq: 0,
             pracked_rseq: None,
             provisional_answer: None,
@@ -2426,6 +2433,25 @@ mod tests {
         let n = peer.recv(&mut buf).expect("CANCEL was not sent");
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("CANCEL "));
         assert!(p.awaiting_cancel());
+    }
+
+    /// A re-authentication can move the session to another client port while an
+    /// INVITE is still ringing. The CANCEL must still name the INVITE's own
+    /// sent-by, or the far end cannot match it to the transaction.
+    #[test]
+    fn a_cancel_repeats_the_via_the_invite_went_out_with() {
+        let (control, _server) = control_pair();
+        let (mut session, peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending("out-cancel-via", control);
+        session.local_addr = "10.0.0.2:5999".parse().unwrap();
+
+        assert!(p.send_cancel_now(&mut session));
+
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).unwrap();
+        let cancel = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(cancel.contains("10.0.0.2:5060"), "{cancel}");
+        assert!(!cancel.contains("5999"), "{cancel}");
     }
 
     /// An attempt the carrier already answered is told why, and its leg BYEd.

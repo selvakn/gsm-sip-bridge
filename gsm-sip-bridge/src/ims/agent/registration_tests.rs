@@ -1070,6 +1070,16 @@ impl Rig {
     /// A registration with a Gm association, on a kernel that has the working
     /// generation installed. The SIM answers from `replies`.
     fn with_sa(replies: Vec<String>, sim_delay: Duration) -> (Self, Kernel) {
+        Self::with_sa_on(replies, sim_delay, None)
+    }
+
+    /// As [`Self::with_sa`], with our protected server port set before the
+    /// working generation is installed.
+    fn with_sa_on(
+        replies: Vec<String>,
+        sim_delay: Duration,
+        server_port: Option<u16>,
+    ) -> (Self, Kernel) {
         let mut rig = Rig::new();
         rig.session.gm_state = crate::ims::test_session_with_sa(
             None,
@@ -1078,6 +1088,23 @@ impl Rig {
         )
         .gm_state;
         rig.session.use_tcp = false;
+        // The network keeps its protected ports across a re-authentication, as
+        // the carriers do, so the two generations share some selectors.
+        {
+            let peer_port = rig.peer.local_addr().unwrap().port();
+            let gm = rig.session.gm_state.as_mut().unwrap();
+            gm.theirs.port_s = peer_port;
+            gm.theirs.port_c = 7001;
+            gm.endpoints.remote_s.set_port(peer_port);
+            gm.endpoints.remote_c.set_port(7001);
+            if let Some(port) = server_port {
+                gm.endpoints.local_s.set_port(port);
+                gm.proposal.port_s = port;
+            }
+        }
+        if let Some(port) = server_port {
+            rig.session.contact_addr.set_port(port);
+        }
         let gm = rig.session.gm_state.as_ref().unwrap();
         let working = SaSet {
             endpoints: gm.endpoints.clone(),
@@ -1410,15 +1437,26 @@ fn a_network_that_keeps_asking_for_a_resynchronisation_is_given_up_on() {
     let (mut rig, _kernel) = Rig::with_sa(vec![sync_failure_reply()], Duration::ZERO);
     rig.drive().unwrap();
     let mut request = rig.received().unwrap();
-    for _ in 0..5 {
+    let mut sent = 0;
+    'rounds: for _ in 0..6 {
         rig.answer(&rig.challenge(&request));
-        if rig.st.force_renewal {
-            break;
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut bytes = [0; 8192];
+        loop {
+            rig.drive().unwrap();
+            if rig.st.force_renewal {
+                break 'rounds;
+            }
+            if let Ok(size) = rig.peer.recv(&mut bytes) {
+                request = String::from_utf8(bytes[..size].to_vec()).unwrap();
+                sent += 1;
+                break;
+            }
+            assert!(Instant::now() < until, "nothing happened");
         }
-        let (next, _) = rig.next_register();
-        request = next;
     }
     assert!(rig.st.force_renewal, "it must not resynchronise forever");
+    assert_eq!(sent, 2, "two AUTS, then it gives up");
 }
 
 #[test]
@@ -1446,13 +1484,8 @@ fn udp_replies_addressed_to_the_advertised_server_port_are_read() {
     let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_port = probe.local_addr().unwrap().port();
     drop(probe);
-    let (mut rig, _kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
-    {
-        let gm = rig.session.gm_state.as_mut().unwrap();
-        gm.endpoints.local_s.set_port(server_port);
-        gm.proposal.port_s = server_port;
-    }
-    rig.session.contact_addr.set_port(server_port);
+    let (mut rig, _kernel) =
+        Rig::with_sa_on(vec![success_reply()], Duration::ZERO, Some(server_port));
     let _server = crate::ims::sip_client::spawn_gm_server(
         rig.session.gm_state.as_ref().unwrap().endpoints.local_s,
         false,
@@ -1497,4 +1530,81 @@ fn udp_replies_addressed_to_the_advertised_server_port_are_read() {
 /// The Contact header of a 200 for this registration, as request-shaped text.
 fn ok_contact(rig: &Rig) -> String {
     format!("Contact: {}\r\n", rig.contact(3600))
+}
+
+#[test]
+fn an_answered_call_follows_the_switch_to_the_new_association() {
+    let (mut rig, _kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    rig.st.active_call = Some(test_active_call("c1", "our-to-tag", CALLER_FROM));
+    let (remote_target, to) = {
+        let d = &rig.st.active_call.as_ref().unwrap().dialog;
+        (d.remote_target.clone(), d.to.clone())
+    };
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+    let (answer, from) = rig.next_register();
+    rig.answer(&rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]));
+
+    // A BYE built now names the connection it is sent on and the association
+    // in use, and is still the same dialog.
+    let call = rig.st.active_call.as_ref().unwrap();
+    assert_eq!(call.dialog.local_addr.port(), from.port());
+    assert_eq!(
+        call.dialog.security_verify.as_deref(),
+        rig.session.security_verify()
+    );
+    assert!(call
+        .dialog
+        .build_bye_for("c1")
+        .contains(&format!(":{}", from.port())));
+    assert_eq!(
+        (call.dialog.remote_target.clone(), call.dialog.to.clone()),
+        (remote_target, to)
+    );
+}
+
+#[test]
+fn the_second_permitted_resynchronisation_can_finish() {
+    let (mut rig, _kernel) = Rig::with_sa(
+        vec![sync_failure_reply(), sync_failure_reply(), success_reply()],
+        Duration::ZERO,
+    );
+    rig.drive().unwrap();
+    let mut request = rig.received().unwrap();
+    for _ in 0..2 {
+        rig.answer(&rig.challenge(&request));
+        let (next, _) = rig.next_register();
+        assert!(next.contains("auts=\""));
+        request = next;
+    }
+    rig.answer(&rig.challenge(&request));
+    let (answer, _) = rig.next_register();
+    assert!(!answer.contains("auts="));
+    assert!(!rig.st.force_renewal);
+}
+
+#[test]
+fn a_connection_that_cannot_be_switched_to_is_closed_not_left_reading() {
+    let (mut rig, kernel) = Rig::with_sa(vec![success_reply()], Duration::ZERO);
+    rig.drive().unwrap();
+    let refresh = rig.received().unwrap();
+    rig.answer(&rig.challenge(&refresh));
+    let (answer, _) = rig.next_register();
+    let states = kernel.states().len();
+    // The kernel refuses the very next change: activation fails.
+    {
+        let mut t = kernel.0.lock().unwrap();
+        t.calls = 0;
+        t.fail_at = Some(0);
+    }
+    let ok = rig.reply_to(&answer, 200, &[("Contact", &rig.contact(3600))]);
+    assert!(rig.answer(&ok));
+    kernel.0.lock().unwrap().fail_at = None;
+    assert!(rig.st.force_renewal, "a full registration settles it");
+    assert!(rig.st.retired_gm.is_empty());
+    assert!(
+        kernel.states().len() < states,
+        "the staged associations are gone"
+    );
 }
