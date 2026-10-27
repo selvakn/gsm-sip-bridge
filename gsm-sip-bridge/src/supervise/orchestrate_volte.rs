@@ -293,13 +293,15 @@ pub fn start(
                 veth_telephony_addr: veth_telephony_addr.clone(),
                 veth_carrier_addr: veth_carrier_addr.clone(),
             };
+            // Recorded before the setup can fail: `ensure` may already have
+            // created the namespace, and shutdown deletes only recorded ones.
+            started.lock().unwrap().started_netns.push(netns.clone());
             if let Err(reason) = line_netns.ensure(runner.as_ref()) {
                 drop(guard);
                 eprintln!("[supervise] volte line {idx}: FATAL: {reason}; skipping this line");
                 continue;
             }
 
-            started.lock().unwrap().started_netns.push(netns.clone());
             let mut state = started.lock().unwrap();
             let entry = state.volte_lines.iter_mut().find(|l| l.index == idx);
             if entry.is_none() {
@@ -363,6 +365,7 @@ pub fn start(
                     runner.sleep(Duration::from_secs(15));
                     continue;
                 }
+                line_netns.flush_gm_state(runner.as_ref());
                 match runner.spawn(ChildSpec::new([
                     "ip",
                     "netns",
@@ -524,6 +527,16 @@ impl LineNetns {
             );
         }
         Ok(())
+    }
+
+    /// Drops every XFRM state and policy in the line's namespace. Only this
+    /// line's Gm IPsec SAs live there, and only its carrier agent installs
+    /// them; an agent that was stopped (the watchdog's SIGTERM) or crashed
+    /// never ran its own cleanup, so without this each restart would leave
+    /// the old SAs behind. Called only while no agent runs.
+    fn flush_gm_state(&self, runner: &dyn CommandRunner) {
+        let _ = runner.run_in_netns(&self.netns, &["ip", "xfrm", "state", "flush"]);
+        let _ = runner.run_in_netns(&self.netns, &["ip", "xfrm", "policy", "flush"]);
     }
 }
 
@@ -925,5 +938,33 @@ mod tests {
             .unwrap()
             .iter()
             .any(|argv| argv.iter().any(|a| a == "veth")));
+    }
+
+    #[test]
+    fn a_respawn_flushes_the_previous_agents_gm_ipsec_state_in_its_namespace() {
+        let runner = MockCommandRunner::new();
+        let line = LineNetns {
+            netns: NS.to_string(),
+            iface: IFACE.to_string(),
+            veth_telephony_iface: String::new(),
+            veth_carrier_iface: String::new(),
+            veth_telephony_addr: String::new(),
+            veth_carrier_addr: String::new(),
+        };
+
+        line.flush_gm_state(&runner);
+
+        let calls = runner.run_in_netns_calls.lock().unwrap().clone();
+        let flushed = |what: &str| {
+            calls.iter().any(|(ns, argv)| {
+                ns == NS && *argv == ["ip", "xfrm", what, "flush"].map(String::from)
+            })
+        };
+        assert!(flushed("state"), "calls: {calls:?}");
+        assert!(flushed("policy"), "calls: {calls:?}");
+        assert!(
+            runner.run_calls.lock().unwrap().is_empty(),
+            "never in the host namespace"
+        );
     }
 }
