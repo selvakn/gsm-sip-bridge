@@ -115,6 +115,10 @@ pub(super) struct PendingOrigination {
     /// the transaction, even if a re-authentication has since moved the session
     /// to another client port.
     invite_local_addr: std::net::SocketAddr,
+    /// The connection the INVITE went out on. A CANCEL goes to the same place
+    /// (RFC 3261 §9.1), even after a re-authentication has moved the session
+    /// to a new connection; the old one is kept open while this call is pending.
+    invite_sink: Option<crate::ims::sip_client::SipSink>,
     /// In-dialog requests sent after the INVITE (each `PRACK`), so a later
     /// `BYE` picks a `CSeq` above them rather than reusing one — RFC 3261
     /// §12.2.1.1 requires the sequence to increase within a dialog.
@@ -378,6 +382,7 @@ pub(super) fn begin_origination(
     });
 
     let invite_local_addr = session.local_addr;
+    let invite_sink = session.transport().and_then(|t| t.sink()).ok();
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
     let transport = match session.transport_mut() {
         Ok(t) => t,
@@ -424,6 +429,7 @@ pub(super) fn begin_origination(
         branch,
         invite_cseq,
         invite_local_addr,
+        invite_sink,
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
@@ -541,10 +547,16 @@ impl PendingOrigination {
             branch: &self.branch,
             security_verify: session.security_verify(),
         });
-        let Ok(transport) = session.transport_mut() else {
-            return false;
+        // On the connection the INVITE used while it is still open; otherwise on
+        // the session's current one.
+        let sent = match self.invite_sink.as_ref().map(|sink| sink.send(&cancel)) {
+            Some(Ok(())) => true,
+            _ => match session.transport_mut() {
+                Ok(transport) => transport.send(&cancel).is_ok(),
+                Err(_) => false,
+            },
         };
-        if transport.send(&cancel).is_ok() {
+        if sent {
             tracing::info!(call_id = %self.call_id, "outbound: sent CANCEL for an abandoned INVITE");
             true
         } else {
@@ -1729,6 +1741,7 @@ mod tests {
             branch: "z9hG4bKtest".to_string(),
             invite_cseq: 1,
             invite_local_addr: "10.0.0.2:5060".parse().unwrap(),
+            invite_sink: None,
             extra_cseq: 0,
             pracked_rseq: None,
             provisional_answer: None,
@@ -2452,6 +2465,36 @@ mod tests {
         let cancel = String::from_utf8_lossy(&buf[..n]).to_string();
         assert!(cancel.contains("10.0.0.2:5060"), "{cancel}");
         assert!(!cancel.contains("5999"), "{cancel}");
+    }
+
+    /// After a re-authentication the session sends on a new connection, but the
+    /// CANCEL for an INVITE still ringing goes where the INVITE went.
+    #[test]
+    fn a_cancel_goes_out_on_the_connection_the_invite_used() {
+        let (control, _server) = control_pair();
+        let (mut session, old_peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending("out-cancel-route", control);
+        p.invite_sink = Some(session.transport().unwrap().sink().unwrap());
+        let new_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        new_peer
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        session.transport = Some(
+            crate::ims::sip_client::SipTransport::connect(new_peer.local_addr().unwrap(), false)
+                .unwrap(),
+        );
+
+        assert!(p.send_cancel_now(&mut session));
+
+        let mut buf = [0u8; 4096];
+        let n = old_peer
+            .recv(&mut buf)
+            .expect("CANCEL on the INVITE's connection");
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("CANCEL "));
+        assert!(
+            new_peer.recv(&mut buf).is_err(),
+            "not on the new connection"
+        );
     }
 
     /// An attempt the carrier already answered is told why, and its leg BYEd.
