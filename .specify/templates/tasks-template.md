@@ -10,6 +10,14 @@ description: "Task list template for feature implementation"
 
 **Tests**: The examples below include test tasks. Tests are OPTIONAL - only include them if explicitly requested in the feature specification.
 
+**Rules for every task list** (from the #163 review retrospective):
+- **Audit before change.** Each implementation phase that alters existing state starts with an audit task whose result is written into research.md or plan.md (the Blast Radius section) and committed. The task is not `[X]` until it is.
+- **Every requirement has a test that asserts its effect**, named in the task (not only parsing or classification): the next request after a transition, the published status, the next send time. Add a traceability note "FR-xxx -> test name".
+- **Do not tick a task that was only partly done.** A requirement narrowed during implementation is recorded as a deviation in the task, not ticked, and not closed by documenting a "known limitation" without the maintainer's agreement.
+- **Fix the class, not the instance.** After any review finding, grep for every site of the same shape and fix or justify each one, and re-read every sentence of the finding before closing it.
+- **Re-plan between slices.** Before coding the next slice, fold the previous PR's review findings into its tasks.
+- **Pre-PR self-review task** (see `CLAUDE.md`, "Before a PR"). Local reviewers such as `greploop` and `/code-review` run only when the maintainer asks for them.
+
 **Organization**: Tasks are grouped by user story to enable independent implementation and testing of each story.
 
 ## Format: `[ID] [P?] [Story] Description`
@@ -156,6 +164,7 @@ Examples of foundational tasks (adjust based on your project):
 - [ ] TXXX [P] Additional unit tests (if requested) in tests/unit/
 - [ ] TXXX Security hardening
 - [ ] TXXX Run quickstart.md validation
+- [ ] TXXX Pre-PR self-review: the checklist in `CLAUDE.md` ("Before a PR") over the whole diff, and `docs/greptile-review-learnings.md` Part 1; record anything new there
 
 ---
 

@@ -390,14 +390,40 @@ threads). The design here splits it the other way.
   reader is started on the new connection before anything is sent on it, and
   every reader feeds the same queue.
 - Install new kernel state **beside** the working state and make it a value that
-  undoes itself when dropped (`StagedSas`). Then every early return, timeout and
-  rejection is a rollback without a line of cleanup code at the call site, and a
-  test can cut the install short at every kernel call and compare the tables.
+  undoes itself when dropped (`StagedSas`). Then most early returns, timeouts and
+  rejections are a rollback without cleanup code at the call site, and a test can
+  cut the install short at every kernel call and compare the tables. It is not
+  all of them: a guard disarmed early (`Swap::into_parts` before `activate()`)
+  left the new connection and its reader open when `activate()` failed, so fault
+  injection has to cover the whole set (kernel state, connection, reader), not
+  just the kernel part.
 - A selector two generations share cannot hold two policies. Widen what the
   *receiver* accepts first and move what the *sender* uses only on confirmation.
 - A fault injected by tampering with credentials proved useless against Vodafone,
   which accepts even an empty-credential refresh over the existing association.
   Check that a way of forcing a failure works before building the test around it.
+
+### State captured before a change and used after it (#163, review of #170 and #171)
+
+Three P1s in two PRs: a dialog, a pending INVITE and a status snapshot each held
+a copy of something (`local_addr`, `Security-Verify`, the registration state)
+that the new feature changed underneath them. In one case a comment in the code
+said it could not change (`DialogInfo`: "renewal is deferred while a call is
+active"); the feature made the comment false and nobody re-read it.
+
+- Before changing a field, `grep` every reader **and every struct that copies it**,
+  and every comment that claims it is fixed. Decide for each: update at the
+  transition, or must not change.
+- A request keeps the tuple of the connection it belongs to: a CANCEL repeats the
+  INVITE's Via sent-by, goes out on the INVITE's connection and repeats that
+  association's `Security-Verify`. Fix the whole tuple, not the first element the
+  finding names; re-read every sentence of the finding.
+- Test the **next request of every in-flight kind** after the transition, not
+  that the call "was never touched".
+- A limit, retry count or error wording that the existing path defines is part of
+  the contract: reuse it or match it exactly (the resync limit was re-implemented
+  and checked one step too early; a new error text missed a string-matching
+  classifier).
 
 ---
 

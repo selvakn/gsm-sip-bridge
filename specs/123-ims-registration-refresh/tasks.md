@@ -179,7 +179,7 @@ description: "Task list for IMS registration refresh without call interruption"
 - [X] T059 [P] Update `docs/vowifi-bridge.md` for the re-authentication and drain behaviour; add the Slice C `RELEASE_NOTES.md` entry
 - [X] T060 [P] Add anything learned to `docs/greptile-review-learnings.md` (ring-wait ordering, shared Call-ID/CSeq collision) so the next review does not rediscover it
 - [X] T061 [P] Final scan for real identifiers: `grep` the diff and new fixtures for MSISDN/IMSI/ICCID patterns (CLAUDE.md rule)
-- [ ] T062 Run `/greploop` (or the Greptile CLI) on the branch before opening each slice's PR; fix valid findings in code, do not post replies to the bot
+- [ ] T062 Fix valid Greptile findings in code and reply "Addressed in <sha>" on each thread. Local reviewers (`/greploop`, `/code-review`) run only when the maintainer asks.
 - [ ] T063 Confirm SC-009: `make format && make lint && make test` green on the final tip; comment on issue #163 with the slice PRs and evidence links
 
 ---

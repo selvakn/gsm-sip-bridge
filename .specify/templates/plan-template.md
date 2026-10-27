@@ -33,6 +33,31 @@
 
 [Gates determined based on constitution file]
 
+## Blast Radius (required when the feature changes existing runtime state)
+
+*GATE: fill in before Phase 0 research ends; re-check after Phase 1 design. Skip with "N/A: new code only" when nothing existing is changed. Born from #163, where 10 of 15 review findings were things an existing part of the system still assumed.*
+
+### State and invariants inventory
+
+For every field, connection, SA, timer, flag or predicate this feature **changes**, list each row. Use `grep -rn '<name>' <src>`; do not rely on memory.
+
+| Changed item | Readers | Copies made at construction (dialogs, pending transactions, status snapshots, retired lists) | Invariant comments about it (`grep -n -i 'cannot change\|deferred while\|never changes\|always'`) | Decision: update at the transition / must not change / reuse existing function |
+|---|---|---|---|---|
+
+Also list **implicit contracts** with existing code: error text matched by a classifier, limits and retry counts in the existing path (reuse the constant and its check point, or match the semantics exactly), ordering rules, lock order.
+
+### Concurrency and ownership map
+
+Every thread, socket (including clones held by readers), kernel object and guard this feature creates or touches: who owns it, who holds a clone, and how it is released on success, error, cancel, rollback and shutdown. A guard that is disarmed early (`take`, `into_parts`) needs the error path after it spelled out.
+
+### Where else does this logic run?
+
+Blocking waits (ring wait, origination wait), shutdown, other transports (UDP and TCP), other lines. If the feature's logic must also run there, the plan says it **calls the same entry points** and extends the shared predicates (for example `busy()`); it never copies the logic.
+
+### Situations checklist
+
+Answer each for every new or changed behaviour: idle / in a call / ringing / origination pending / UDP and TCP / error and rollback / cancel / shutdown / limits and off-by-one against the existing path / blocks the dispatch loop (how long, and does the existing code already do the same) / docs, release notes and repo rules.
+
 ## Project Structure
 
 ### Documentation (this feature)
