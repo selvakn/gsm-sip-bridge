@@ -12,8 +12,11 @@ use super::{map_registration_error, LoopState};
 use crate::control::protocol::RegistrationStatus;
 use crate::error::{BridgeError, BridgeResult};
 use crate::ims::observability::AgentObservability;
+use crate::ims::session::Inbound;
 use crate::ims::session::RegisterFailure;
-use crate::ims::sip_client::{build_register, random_hex, RegisterRequest, SipResponse};
+use crate::ims::sip_client::{
+    build_register, random_hex, RegisterRequest, SipMessage, SipResponse, SipSink,
+};
 use crate::ims::{
     build_security_client_headers, register_request_uri, ImsRegisterConfig, RegisteredSession,
     SaProposal, DEFAULT_EXPIRES,
@@ -401,6 +404,24 @@ pub(super) fn granted_lifetime(
 
 // --- the dispatch loop's side of a refresh -----------------------------------
 
+/// The Gm connection as the refresh sees it: the queue its answers arrive on,
+/// and the way to rebuild the client connection when the network has closed it.
+pub(super) trait GmLink {
+    fn queue(&self) -> &std::sync::mpsc::Receiver<(SipMessage, SipSink)>;
+    /// Rebuilds the client transport on the still-live security association.
+    fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()>;
+}
+
+impl GmLink for Inbound {
+    fn queue(&self) -> &std::sync::mpsc::Receiver<(SipMessage, SipSink)> {
+        &self.rx
+    }
+
+    fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()> {
+        super::ping::reconnect_gm_client(session, self)
+    }
+}
+
 /// What the refresh glue needs of the dispatch loop's parameters: the shared
 /// registration status, the reporter, and the registration config. A narrow
 /// view, so the logic can be driven without building a whole agent.
@@ -455,18 +476,15 @@ impl LoopState {
         &mut self,
         session: &mut RegisteredSession,
         p: &RefreshCtx,
-        queue: &std::sync::mpsc::Receiver<(
-            crate::ims::sip_client::SipMessage,
-            crate::ims::sip_client::SipSink,
-        )>,
+        link: &mut dyn GmLink,
     ) -> BridgeResult<()> {
         if std::mem::take(&mut self.after_blocking_handler) {
-            while let Ok(message) = queue.try_recv() {
+            while let Ok(message) = link.queue().try_recv() {
                 self.held.push_back(message);
             }
         }
         if self.held.is_empty() {
-            self.drive_registration_refresh(session, p)?;
+            self.drive_registration_refresh(session, p, link)?;
         }
         Ok(())
     }
@@ -477,6 +495,7 @@ impl LoopState {
         &mut self,
         session: &mut RegisteredSession,
         p: &RefreshCtx,
+        link: &mut dyn GmLink,
     ) -> BridgeResult<()> {
         let now = Instant::now();
         if let Some(mut pending) = self.registration_refresh.take() {
@@ -485,12 +504,13 @@ impl LoopState {
                     self.registration_refresh = Some(pending);
                     Ok(())
                 }
-                Ok(false) => self.fail_registration_refresh(
+                Ok(false) => self.refresh_not_carried(
                     session,
                     p,
+                    link,
                     BridgeError::Ims("IMS registration refresh timed out (Timer F)".into()).into(),
                 ),
-                Err(e) => self.fail_registration_refresh(session, p, e.into()),
+                Err(e) => self.refresh_not_carried(session, p, link, e.into()),
             };
         }
         let (expires_at, registered_at) = {
@@ -516,8 +536,48 @@ impl LoopState {
                 self.registration_refresh = Some(pending);
                 Ok(())
             }
-            Err(e) => self.fail_registration_refresh(session, p, e.into()),
+            Err(e) => self.refresh_not_carried(session, p, link, e.into()),
         }
+    }
+
+    /// The refresh could not be sent, or went unanswered. Without traffic to
+    /// keep it open, the network closes an idle Gm connection (seen on Jio
+    /// within an hour), and the full renewal that used to run here hid that by
+    /// opening a new one. So the first time, rebuild the client connection on
+    /// the live security association and send the refresh again, rather than
+    /// blaming the P-CSCF. A second failure is handled as any other.
+    fn refresh_not_carried(
+        &mut self,
+        session: &mut RegisteredSession,
+        p: &RefreshCtx,
+        link: &mut dyn GmLink,
+        failure: RegisterFailure,
+    ) -> BridgeResult<()> {
+        self.registration_refresh = None;
+        if failure.status.is_none() && !self.refresh_repaired {
+            self.refresh_repaired = true;
+            tracing::warn!(
+                error = %failure.error,
+                "the connection did not carry the refresh; rebuilding it and sending it again"
+            );
+            match link.repair(session) {
+                Ok(()) => {
+                    // Anything pending on the old connection is gone with it.
+                    self.ping.reset();
+                    return match PendingRegister::start(session, p.reg_cfg, Instant::now()) {
+                        Ok(pending) => {
+                            self.registration_refresh = Some(pending);
+                            Ok(())
+                        }
+                        Err(e) => self.fail_registration_refresh(session, p, e.into()),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rebuilding the Gm connection failed");
+                }
+            }
+        }
+        self.fail_registration_refresh(session, p, failure)
     }
 
     /// Consumes the answer to the refresh in flight. `Ok(false)` when

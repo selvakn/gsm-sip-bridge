@@ -58,6 +58,10 @@ when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate
   is accepted only if it matches the request's Call-ID, CSeq number, method and Via branch, and the
   lifetime comes from this line's own `Contact`. The P-CSCF, not the UE, adds the
   `integrity-protected` parameter (TS 24.229 §5.2.2.2).
+- A refresh that cannot be sent, or goes unanswered, first rebuilds the Gm client connection on the live
+  security association and is sent once more. The network closes an idle Gm connection (seen on Jio within
+  an hour), and the full renewal that used to run here hid that by opening a new one; the rebuild is not a
+  P-CSCF fault and marks nothing. Only a second failure reaches the pool logic below.
 - Failures of a refresh keep the existing session. A `403`, `408`, `500` or `504` (and a fresh
   authentication challenge, `401`, until background re-authentication exists) asks for a full
   re-registration, which waits for a call to end like any disruptive recovery

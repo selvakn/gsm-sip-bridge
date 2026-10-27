@@ -180,7 +180,7 @@ pub(super) fn gm_episode_since(gm_conn: crate::ims::GmConnectionState) -> System
 /// still-live Gm SA and restart the reader thread that had died with the old
 /// socket. Mirrors what `hangup_carrier` does reactively — reused here
 /// proactively (specs/028 R6).
-fn reconnect_gm_client(
+pub(super) fn reconnect_gm_client(
     session: &mut crate::ims::RegisteredSession,
     inbound: &Inbound,
 ) -> BridgeResult<()> {

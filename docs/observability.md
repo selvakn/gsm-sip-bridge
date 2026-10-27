@@ -178,7 +178,7 @@ An agent older than these fields reads `refresh_mode: unknown`.
 The agent logs `refreshing the registration in place` (`cseq`, `in_call`) and `registration refreshed in
 place` (`granted_expires_secs`). A refresh that does not succeed logs `registration refresh failed; keeping
 the existing session` (`status`, `in_call`, `binding_valid`): the earlier grant still holds until it expires.
-`in-place refresh keeps being rejected; the next cycle re-registers in full` marks the fallback. A very short
+`the connection did not carry the refresh; rebuilding it and sending it again` (`error`) is the one-time connection rebuild before a refresh is counted as failed; `in-place refresh keeps being rejected; the next cycle re-registers in full` marks the fallback. A very short
 grant logs `registrar granted a very short lifetime`. A registration that expires during a call is reported as
 `state: Failed`; the call is left running and the full re-registration starts when it ends.
 

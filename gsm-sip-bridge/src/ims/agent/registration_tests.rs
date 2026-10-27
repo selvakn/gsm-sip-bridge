@@ -5,15 +5,56 @@
 
 use super::call::test_active_call;
 use super::pcscf_pool::PcscfPool;
-use super::registration_refresh::{RefreshCtx, REJECTIONS_BEFORE_FALLBACK};
+use super::registration_refresh::{GmLink, RefreshCtx, REJECTIONS_BEFORE_FALLBACK};
 use super::*;
 use crate::ims::observability::AgentObservability;
-use crate::ims::sip_client::{SipResponse, SipTransport};
+use crate::ims::sip_client::{SipMessage, SipResponse, SipSink, SipTransport};
 use crate::ims::{RegistrationAuth, RegistrationState, RegistrationStatus};
 use std::net::UdpSocket;
 use std::sync::mpsc;
 
 const CALLER_FROM: &str = "<sip:caller@example.net>;tag=abc";
+
+/// The Gm connection for the tests: a queue the test can feed, and a repair that
+/// either fails or puts a fresh connection to the same peer on the session.
+struct FakeLink {
+    tx: mpsc::Sender<(SipMessage, SipSink)>,
+    rx: mpsc::Receiver<(SipMessage, SipSink)>,
+    peer: std::net::SocketAddr,
+    repairs: u32,
+    repair_fails: bool,
+}
+
+impl FakeLink {
+    fn new(peer: std::net::SocketAddr) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            tx,
+            rx,
+            peer,
+            repairs: 0,
+            repair_fails: false,
+        }
+    }
+}
+
+impl GmLink for FakeLink {
+    fn queue(&self) -> &mpsc::Receiver<(SipMessage, SipSink)> {
+        &self.rx
+    }
+
+    fn repair(&mut self, session: &mut crate::ims::RegisteredSession) -> BridgeResult<()> {
+        self.repairs += 1;
+        if self.repair_fails {
+            return Err(BridgeError::Ims("reconnect refused".into()));
+        }
+        let transport = SipTransport::connect(self.peer, false)?;
+        session.local_addr = transport.local_addr()?;
+        session.contact_addr = session.local_addr;
+        session.transport = Some(transport);
+        Ok(())
+    }
+}
 
 struct Rig {
     st: LoopState,
@@ -22,6 +63,7 @@ struct Rig {
     obs: AgentObservability,
     cfg: ImsRegisterConfig,
     peer: UdpSocket,
+    link: FakeLink,
 }
 
 impl Rig {
@@ -82,6 +124,7 @@ impl Rig {
             status,
             obs,
             cfg,
+            link: FakeLink::new(peer.local_addr().unwrap()),
             peer,
         }
     }
@@ -100,7 +143,8 @@ impl Rig {
             obs: &self.obs,
             reg_cfg: &self.cfg,
         };
-        self.st.drive_registration_refresh(&mut self.session, &ctx)
+        self.st
+            .drive_registration_refresh(&mut self.session, &ctx, &mut self.link)
     }
 
     fn answer(&mut self, response: &SipResponse) -> bool {
@@ -578,22 +622,22 @@ fn a_full_registration_request_pre_empts_the_refresh() {
 
 /// A pass of the loop's front half for one queued message: what
 /// `dispatch_loop` does between handlers.
-fn one_pass(
-    rig: &mut Rig,
-    queue: &mpsc::Receiver<(
-        crate::ims::sip_client::SipMessage,
-        crate::ims::sip_client::SipSink,
-    )>,
-) -> Option<bool> {
+fn one_pass(rig: &mut Rig) -> Option<bool> {
     let ctx = RefreshCtx {
         status: &rig.status,
         obs: &rig.obs,
         reg_cfg: &rig.cfg,
     };
-    rig.st.begin_pass(&mut rig.session, &ctx, queue).unwrap();
-    let (message, _) = rig.st.held.pop_front().or_else(|| queue.try_recv().ok())?;
+    rig.st
+        .begin_pass(&mut rig.session, &ctx, &mut rig.link)
+        .unwrap();
+    let (message, _) = rig
+        .st
+        .held
+        .pop_front()
+        .or_else(|| rig.link.rx.try_recv().ok())?;
     match message {
-        crate::ims::sip_client::SipMessage::Response(response) => Some(
+        SipMessage::Response(response) => Some(
             rig.st
                 .handle_registration_answer(&mut rig.session, &ctx, &response)
                 .unwrap(),
@@ -602,18 +646,12 @@ fn one_pass(
     }
 }
 
-fn queue_with(
-    rig: &Rig,
-    response: SipResponse,
-) -> mpsc::Receiver<(
-    crate::ims::sip_client::SipMessage,
-    crate::ims::sip_client::SipSink,
-)> {
-    let (tx, rx) = mpsc::channel();
+fn queue_response(rig: &Rig, response: SipResponse) {
     let sink = rig.session.transport().unwrap().sink().unwrap();
-    tx.send((crate::ims::sip_client::SipMessage::Response(response), sink))
+    rig.link
+        .tx
+        .send((SipMessage::Response(response), sink))
         .unwrap();
-    rx
 }
 
 #[test]
@@ -626,7 +664,7 @@ fn an_answer_that_arrived_while_a_call_rang_is_honoured_even_after_timer_f() {
     let request = rig.received().unwrap();
     let contact = rig.contact(3000);
     let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
-    let queue = queue_with(&rig, reply);
+    queue_response(&rig, reply);
     rig.st
         .registration_refresh
         .as_mut()
@@ -634,7 +672,7 @@ fn an_answer_that_arrived_while_a_call_rang_is_honoured_even_after_timer_f() {
         .set_deadline(Instant::now() - Duration::from_secs(12));
     rig.st.after_blocking_handler = true;
 
-    assert_eq!(one_pass(&mut rig, &queue), Some(true));
+    assert_eq!(one_pass(&mut rig), Some(true));
 
     assert!(rig.st.registration_refresh.is_none());
     assert_eq!(
@@ -648,9 +686,10 @@ fn an_answer_that_arrived_while_a_call_rang_is_honoured_even_after_timer_f() {
 #[test]
 fn without_an_answer_the_refresh_still_times_out_after_the_block() {
     let mut rig = Rig::new();
+    // The connection was already rebuilt for this refresh once.
+    rig.st.refresh_repaired = true;
     rig.drive().unwrap();
     rig.received().unwrap();
-    let (_tx, queue) = mpsc::channel();
     rig.st
         .registration_refresh
         .as_mut()
@@ -658,7 +697,7 @@ fn without_an_answer_the_refresh_still_times_out_after_the_block() {
         .set_deadline(Instant::now() - Duration::from_secs(12));
     rig.st.after_blocking_handler = true;
 
-    assert_eq!(one_pass(&mut rig, &queue), None);
+    assert_eq!(one_pass(&mut rig), None);
 
     assert!(rig.st.registration_refresh.is_none(), "Timer F ends it");
     assert!(
@@ -673,7 +712,7 @@ fn timers_are_not_judged_while_held_messages_wait() {
     rig.drive().unwrap();
     let request = rig.received().unwrap();
     let reply = rig.reply_to(&request, 100, &[]);
-    let queue = queue_with(&rig, reply);
+    queue_response(&rig, reply);
     rig.st
         .registration_refresh
         .as_mut()
@@ -685,7 +724,9 @@ fn timers_are_not_judged_while_held_messages_wait() {
         obs: &rig.obs,
         reg_cfg: &rig.cfg,
     };
-    rig.st.begin_pass(&mut rig.session, &ctx, &queue).unwrap();
+    rig.st
+        .begin_pass(&mut rig.session, &ctx, &mut rig.link)
+        .unwrap();
     assert_eq!(rig.st.held.len(), 1);
     assert!(
         rig.st.registration_refresh.is_some(),
@@ -719,6 +760,7 @@ fn the_latest_refresh_outcome_is_kept_for_the_status() {
     }
     rig.drive().unwrap();
     rig.received().unwrap();
+    rig.st.refresh_repaired = true;
     rig.st
         .registration_refresh
         .as_mut()
@@ -726,4 +768,114 @@ fn the_latest_refresh_outcome_is_kept_for_the_status() {
         .set_deadline(Instant::now() - Duration::from_secs(1));
     rig.drive().unwrap();
     assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "timeout");
+}
+
+#[test]
+fn a_dead_connection_is_rebuilt_and_the_refresh_sent_again_without_blaming_the_proxy() {
+    // The network closed the idle Gm connection: the send fails. The refresh
+    // must not be reported as a P-CSCF fault; it rebuilds the connection and
+    // goes out on the new one.
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    rig.session.transport = None;
+
+    rig.drive().unwrap();
+
+    assert_eq!(rig.link.repairs, 1);
+    assert!(
+        rig.received().is_some(),
+        "the refresh went out on the rebuilt connection"
+    );
+    assert!(rig.st.registration_refresh.is_some());
+    assert!(!rig
+        .st
+        .pool
+        .is_marked(rig.session.pcscf_addr.ip(), SystemTime::now()));
+    assert!(!rig.st.force_renewal);
+    assert_eq!(rig.st.refresh_rejections, 0);
+}
+
+#[test]
+fn an_unanswered_refresh_rebuilds_the_connection_once_and_tries_again() {
+    // The first write into a connection the peer has closed succeeds and is
+    // never answered. Timer F ends it; the connection is rebuilt and the
+    // refresh sent again.
+    let mut rig = Rig::new();
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    rig.st
+        .registration_refresh
+        .as_mut()
+        .unwrap()
+        .set_deadline(Instant::now() - Duration::from_secs(1));
+
+    rig.drive().unwrap();
+
+    assert_eq!(rig.link.repairs, 1);
+    assert!(
+        rig.received().is_some(),
+        "sent again on the rebuilt connection"
+    );
+    assert!(rig.st.registration_refresh.is_some());
+    assert!(
+        rig.st.next_renewal_attempt.is_none(),
+        "no backoff for the first loss"
+    );
+}
+
+#[test]
+fn a_second_loss_is_not_repaired_again_and_goes_to_the_normal_failure_path() {
+    let mut rig = Rig::new();
+    rig.pool("127.0.0.2");
+    rig.drive().unwrap();
+    rig.received().unwrap();
+    for _ in 0..2 {
+        rig.st
+            .registration_refresh
+            .as_mut()
+            .unwrap()
+            .set_deadline(Instant::now() - Duration::from_secs(1));
+        rig.drive().unwrap();
+        let _ = rig.received();
+    }
+    assert_eq!(rig.link.repairs, 1, "one rebuild per refresh, not a loop");
+    assert!(rig.st.registration_refresh.is_none());
+    assert!(
+        rig.st.next_renewal_attempt.is_some(),
+        "now it is a backed-off failure"
+    );
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "timeout");
+}
+
+#[test]
+fn a_rebuild_that_fails_falls_back_to_the_failure_path() {
+    let mut rig = Rig::new();
+    rig.link.repair_fails = true;
+    rig.session.transport = None;
+
+    rig.drive().unwrap();
+
+    assert_eq!(rig.link.repairs, 1);
+    assert!(rig.st.registration_refresh.is_none());
+    assert!(rig.st.next_renewal_attempt.is_some() || rig.st.force_renewal);
+    assert_eq!(rig.st.last_refresh.as_ref().unwrap().1, "error");
+}
+
+#[test]
+fn an_accepted_refresh_allows_the_next_cycle_its_own_rebuild() {
+    let mut rig = Rig::new();
+    rig.st.refresh_repaired = true;
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let contact = rig.contact(3600);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    assert!(rig.answer(&reply));
+    assert!(!rig.st.refresh_repaired);
+}
+
+#[test]
+fn a_rejected_refresh_is_not_a_connection_problem_and_is_not_repaired() {
+    let mut rig = Rig::new();
+    refused(&mut rig, 403, &[]);
+    assert_eq!(rig.link.repairs, 0);
 }

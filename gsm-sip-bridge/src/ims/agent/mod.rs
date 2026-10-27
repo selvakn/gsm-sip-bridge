@@ -2105,6 +2105,9 @@ struct LoopState {
     /// in a row: the next cycle uses the full re-registration instead, and
     /// the flag clears when that succeeds (FR-018a).
     refresh_fallback: bool,
+    /// The connection was rebuilt once for the current refresh; a second
+    /// transport failure or timeout goes to the pool logic instead.
+    refresh_repaired: bool,
     /// The latest refresh outcome, for the status snapshot.
     last_refresh: Option<(SystemTime, String)>,
     /// Messages taken off the queue after a handler that blocked the loop (an
@@ -2151,6 +2154,7 @@ impl LoopState {
             registration_refresh: None,
             refresh_rejections: 0,
             refresh_fallback: false,
+            refresh_repaired: false,
             last_refresh: None,
             held: std::collections::VecDeque::new(),
             after_blocking_handler: false,
@@ -2241,6 +2245,7 @@ impl LoopState {
         self.next_renewal_attempt = None;
         self.refresh_rejections = 0;
         self.refresh_fallback = false;
+        self.refresh_repaired = false;
     }
 
     /// A reg-event NOTIFY reported our current binding deregistered: apply
@@ -2669,7 +2674,7 @@ fn dispatch_loop(
         }
         // Every pass, not only idle ones: continuous call traffic must not
         // starve a refresh's retransmission or its Timer F.
-        st.begin_pass(session, &p.refresh_ctx(), &inbound.rx)?;
+        st.begin_pass(session, &p.refresh_ctx(), &mut *inbound)?;
 
         // Poll fast enough to notice a PBX-side hangup promptly while a call is
         // up — or a caller hangup / veth leg while an origination is in flight
