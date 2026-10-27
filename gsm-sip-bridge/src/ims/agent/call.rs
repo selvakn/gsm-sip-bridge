@@ -195,10 +195,12 @@ pub(super) struct DialogInfo {
     /// Our own CSeq counter for this dialog. We answered the INVITE, so the
     /// caller's CSeq space is theirs; ours starts fresh.
     pub(super) cseq: u32,
-    /// `Security-Verify` echo of the registration this call was set up under
-    /// (`None` when it negotiated no Gm SA). Captured here, like `local_addr`
-    /// and `use_tcp`: renewal is deferred while a call is active, so the SA
-    /// cannot change under the dialog.
+    /// `Security-Verify` echo of the association this call's requests go out
+    /// under (`None` when it negotiated no Gm SA). Captured here, like
+    /// `local_addr` and `use_tcp`. A re-authentication replaces the association
+    /// during a call (the registration refresh is never held for one), so
+    /// `activate_swap` in `registration_refresh.rs` rewrites `local_addr` and
+    /// this at the switch; nothing else may assume they stay fixed.
     pub(super) security_verify: Option<String>,
 }
 
