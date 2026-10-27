@@ -184,6 +184,7 @@ pub(super) fn reconnect_gm_client(
     session: &mut crate::ims::RegisteredSession,
     inbound: &Inbound,
 ) -> BridgeResult<()> {
+    crate::ims::session::stop_client_reader(session, inbound);
     session.reconnect_transport()?;
     restart_client_reader(session, inbound)
 }

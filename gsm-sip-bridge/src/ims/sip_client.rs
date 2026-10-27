@@ -1198,6 +1198,18 @@ impl SipTransport {
         }
     }
 
+    /// For TCP, end the connection for every handle onto it, including a
+    /// reader thread's `try_clone_reader` clone. `force_close` alone only
+    /// sets the linger option, which has no effect while another handle keeps
+    /// the connection open; `shutdown` wakes that reader with an end of
+    /// stream. No-op for UDP.
+    pub fn abort(&self) {
+        self.force_close();
+        if let Socket::Tcp(stream) = &self.socket {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     pub fn send(&mut self, message: &str) -> BridgeResult<()> {
         tracing::debug!(message = %message, "sending SIP request");
         self.write_all(message.as_bytes())

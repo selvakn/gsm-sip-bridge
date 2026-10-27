@@ -176,6 +176,29 @@ pub(crate) fn restart_client_reader(
     Ok(())
 }
 
+/// Ends the client connection and its reader, so the connection's local port
+/// can be bound again. The reader holds its own handle onto the connection,
+/// which keeps it open (and the port taken) for as long as the peer does, so
+/// closing the session's handle is not enough. A no-op over UDP, where the
+/// reader's read cannot be woken and the socket is rebound with
+/// `SO_REUSEADDR`.
+pub(crate) fn stop_client_reader(session: &super::RegisteredSession, inbound: &Inbound) {
+    if !session.use_tcp {
+        return;
+    }
+    if let Ok(transport) = session.transport() {
+        transport.abort();
+    }
+    let old = std::mem::replace(
+        &mut *inbound
+            .client_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        std::thread::spawn(|| {}),
+    );
+    let _ = old.join();
+}
+
 /// Restarts just the Gm protected-server-port listener after its accept loop
 /// dies (`GmServer::is_alive` went false), mirroring `restart_client_reader`
 /// for the other half of the association. Replaces `inbound._server`
@@ -1349,6 +1372,28 @@ pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stopping_the_client_reader_frees_its_port_while_the_peer_stays_connected() {
+        // A refresh that gets no answer leaves the connection open at the
+        // peer. Rebuilding it must still be able to bind the same local port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dst = listener.local_addr().unwrap();
+        let transport = crate::ims::sip_client::SipTransport::connect(dst, true).unwrap();
+        let port = transport.local_addr().unwrap().port();
+        let (_peer, _) = listener.accept().unwrap();
+        let session = crate::ims::test_session_with_sa(Some(transport), dst, None);
+        let inbound = start_inbound(&session).unwrap();
+
+        stop_client_reader(&session, &inbound);
+        // `reconnect_transport` drops the session's own handle next.
+        drop(session);
+
+        assert!(
+            crate::ims::sip_client::SipTransport::connect_from(port, dst, true).is_ok(),
+            "the local port is free again"
+        );
+    }
 
     #[test]
     fn the_client_reader_ends_when_the_network_closes_the_connection() {
