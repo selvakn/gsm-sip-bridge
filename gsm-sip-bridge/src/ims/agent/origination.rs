@@ -1697,6 +1697,8 @@ mod tests {
             from_tag: "regtag".to_string(),
             pcscf_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5060),
             imei: "000000000000000".to_string(),
+            registration_cseq: 2,
+            registration_auth: None,
         }
     }
 

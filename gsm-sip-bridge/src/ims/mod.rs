@@ -335,6 +335,22 @@ pub(crate) struct RegisteredSession {
     from_tag: String,
     pcscf_addr: SocketAddr,
     imei: String,
+    /// Next `CSeq` for a REGISTER on this registration. Separate from `cseq`
+    /// (OPTIONS probes, SUBSCRIBE and call requests share the registration
+    /// Call-ID and advance that one) so REGISTERs stay strictly consecutive,
+    /// as RFC 3261 §10.2 asks of a reused Call-ID.
+    registration_cseq: u32,
+    /// The `Authorization` of the REGISTER the registrar accepted, replayed
+    /// verbatim by a protected refresh (TS 24.229 §5.1.1.4.2 a): the last
+    /// received nonce and the last calculated response. `None` for a
+    /// registration that carried no credentials.
+    registration_auth: Option<RegistrationAuth>,
+}
+
+/// The cached `Authorization` header value of an accepted REGISTER. Holds
+/// credential material, so it deliberately has no `Debug` and is never logged.
+pub(crate) struct RegistrationAuth {
+    pub(crate) authorization: String,
 }
 
 /// The Gm security association a registration negotiated, kept together so
@@ -1179,6 +1195,9 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
     }
 
     let mut resync_attempts = 0;
+    // The `Authorization` of the most recent authenticated REGISTER; when that
+    // request is the one answered 200, it is what a later refresh replays.
+    let mut sent_authorization: Option<String> = None;
     loop {
         if resp.status != 401 {
             break;
@@ -1338,6 +1357,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
             }
         };
 
+        sent_authorization = Some(auth_header.clone());
         let branch = format!("z9hG4bK{}", random_hex(6));
         let retry = build_register(&RegisterRequest {
             registrar_uri: &request_uri,
@@ -1377,6 +1397,7 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         .take()
         .ok_or_else(|| BridgeError::Ims("transport unexpectedly absent after REGISTER".into()))?;
 
+    let status = resp.status;
     Ok(RegisteredSession {
         transport: Some(transport),
         realm,
@@ -1387,13 +1408,17 @@ pub(crate) fn register_session(cfg: &ImsRegisterConfig) -> BridgeResult<Register
         cseq: cseq + 1,
         gm_state,
         xfrm_proto,
-        status: resp.status,
+        status,
         reason: resp.reason,
         headers: resp.headers,
         call_id,
         from_tag,
         pcscf_addr: pcscf,
         imei,
+        registration_cseq: cseq + 1,
+        registration_auth: sent_authorization
+            .filter(|_| status == 200)
+            .map(|authorization| RegistrationAuth { authorization }),
     })
 }
 
@@ -1448,7 +1473,7 @@ fn security_verify_echo(offers: &[&str]) -> String {
 ///
 /// The digest `uri` parameter follows this value (RFC 2617 requires the two to
 /// match, and the server checks it) — see `register_session`'s `uri`.
-fn register_request_uri(pcscf: SocketAddr, realm: &str, home_domain: bool) -> String {
+pub(crate) fn register_request_uri(pcscf: SocketAddr, realm: &str, home_domain: bool) -> String {
     if home_domain {
         realm.to_string()
     } else {
@@ -1479,7 +1504,7 @@ fn register_request_uri(pcscf: SocketAddr, realm: &str, home_domain: bool) -> St
 /// TS 33.203 Annex I CK-expansion we don't implement, and a network could
 /// legitimately select it if offered. `gm_ipsec` keys `aes-cbc` with the
 /// AKA CK directly (TS 33.203 Annex H), same as it always did for IK.
-fn build_security_client_headers(proposal: &SaProposal) -> Vec<String> {
+pub(crate) fn build_security_client_headers(proposal: &SaProposal) -> Vec<String> {
     const ALGS: [&str; 2] = ["hmac-md5-96", "hmac-sha-1-96"];
     const EALGS: [&str; 2] = ["aes-cbc", "null"];
 
@@ -1604,6 +1629,8 @@ pub(crate) fn test_session_with_sa(
         from_tag: "regtag".to_string(),
         pcscf_addr,
         imei: "000000000000000".to_string(),
+        registration_cseq: 2,
+        registration_auth: None,
     }
 }
 

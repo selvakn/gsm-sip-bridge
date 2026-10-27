@@ -36,6 +36,9 @@ pub(crate) mod pcscf_pool;
 mod ping;
 mod probe;
 mod reg_subscription;
+mod registration_refresh;
+#[cfg(test)]
+mod registration_tests;
 mod session_refresh;
 mod veth;
 pub(crate) mod watchdog;
@@ -1971,6 +1974,14 @@ struct DispatchParams<'a> {
 }
 
 impl DispatchParams<'_> {
+    fn refresh_ctx(&self) -> registration_refresh::RefreshCtx<'_> {
+        registration_refresh::RefreshCtx {
+            status: self.status,
+            obs: self.obs,
+            reg_cfg: self.reg_cfg,
+        }
+    }
+
     fn invite_ctx(&self) -> inbound::InviteContext<'_> {
         inbound::InviteContext {
             control_addr: self.control_addr,
@@ -2068,6 +2079,16 @@ struct LoopState {
     /// would have torn the call down. Owed to the supervisor as soon as the
     /// line is idle — checked before any renewal can run and clear the count.
     budget_exit_owed: Option<BridgeError>,
+    /// The refresh REGISTER in flight on the live connection, if any
+    /// ([`registration_refresh`]). Its answer arrives through the dispatch
+    /// loop's single reader, so calls keep being served meanwhile.
+    registration_refresh: Option<registration_refresh::PendingRegister>,
+    /// Final error answers to in-place refreshes since the last accepted one.
+    refresh_rejections: u32,
+    /// Set after [`registration_refresh::REJECTIONS_BEFORE_FALLBACK`] rejections
+    /// in a row: the next cycle uses the full re-registration instead, and
+    /// the flag clears when that succeeds (FR-018a).
+    refresh_fallback: bool,
     /// Call-ID of the last INVITE whose caller identity was unreadable and
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
@@ -2101,6 +2122,9 @@ impl LoopState {
             ping: PingState::default(),
             reconnect_attempts: 0,
             force_renewal: false,
+            registration_refresh: None,
+            refresh_rejections: 0,
+            refresh_fallback: false,
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
             last_registered: Instant::now(),
@@ -2186,6 +2210,8 @@ impl LoopState {
         self.backoff = RETRY_INITIAL_BACKOFF;
         self.consecutive_renewal_failures = 0;
         self.next_renewal_attempt = None;
+        self.refresh_rejections = 0;
+        self.refresh_fallback = false;
     }
 
     /// A reg-event NOTIFY reported our current binding deregistered: apply
@@ -2612,6 +2638,9 @@ fn dispatch_loop(
         if st.handle_place_call_request(session, p, &place_call_rx) {
             continue;
         }
+        // Every pass, not only idle ones: continuous call traffic must not
+        // starve a refresh's retransmission or its Timer F.
+        st.drive_registration_refresh(session, &p.refresh_ctx())?;
 
         // Poll fast enough to notice a PBX-side hangup promptly while a call is
         // up — or a caller hangup / veth leg while an origination is in flight
@@ -2705,7 +2734,9 @@ fn dispatch_loop(
                 );
             }
             Ok((SipMessage::Response(resp), _)) => {
-                st.handle_carrier_response(session, p, &resp);
+                if !st.handle_registration_answer(session, &p.refresh_ctx(), &resp)? {
+                    st.handle_carrier_response(session, p, &resp);
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(BridgeError::Ims(
@@ -3700,8 +3731,12 @@ impl LoopState {
         // question is liveness, not whether the carrier liked the request
         // (specs/028 R1). A matching answer is also what confirms a *reconnect*
         // actually worked, before we report the line healthy (R7).
+        // OPTIONS only: the probe shares the registration Call-ID, and a
+        // REGISTER answer with the same CSeq number is not proof of liveness
+        // for the probe (nor may it end it).
         let matched = resp
             .header("CSeq")
+            .filter(|c| cseq_method(c).is_some_and(|m| m.eq_ignore_ascii_case("OPTIONS")))
             .and_then(parse_cseq_number)
             .is_some_and(|n| self.ping.on_response(n));
         if matched {
@@ -3819,16 +3854,28 @@ impl LoopState {
         if !due && !self.force_renewal {
             return Ok(());
         }
+        // An ordinary refresh runs in place on the live connection and is
+        // driven every pass by `drive_registration_refresh`; it is never held
+        // for a call. Only the disruptive full re-registration below is.
+        if self.in_place_refresh_possible(session, expires_at) {
+            return Ok(());
+        }
         // Renewal is genuinely due. Hold it if a call is in progress, or an
         // outbound origination is still being placed (specs/029) —
         // re-registering mid-attempt would replace the transport and the
         // session the pending INVITE's dialog lives on. Recorded by the policy
         // so the deferral is visible in status, and so the model, not an inline
         // `is_some()`, owns the rule.
-        if self.maintenance.decide(Maintenance::Renewal, self.busy()) == MaintenanceDecision::Defer
+        if self
+            .maintenance
+            .decide(Maintenance::RegistrationRecovery, self.busy())
+            == MaintenanceDecision::Defer
         {
             return Ok(());
         }
+        // A full re-registration replaces the session; an answer to a refresh
+        // sent on the old one can never be matched again.
+        self.registration_refresh = None;
         // A previous attempt failed and its backoff hasn't elapsed yet —
         // `renewal_due` alone would otherwise fire again on every idle wake-up
         // regardless of backoff, hammering a still-failing renewal every poll
@@ -6846,7 +6893,8 @@ mod tests {
             crate::ims::RegistrationState::Failed
         );
         assert_eq!(
-            st.maintenance.decide(Maintenance::Renewal, st.busy()),
+            st.maintenance
+                .decide(Maintenance::RegistrationRecovery, st.busy()),
             MaintenanceDecision::Defer
         );
     }

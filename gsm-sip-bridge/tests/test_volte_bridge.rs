@@ -120,14 +120,30 @@ fn losing_the_attachment_mid_call_is_not_recorded_as_a_hangup() {
 // ---- maintenance deferral (US2, FR-009) -----------------------------------
 
 #[test]
-fn renewal_falling_due_during_a_call_waits_for_the_call_to_end() {
-    // Renewing mid-call tears down the transport the call's own BYE needs.
+fn a_refresh_falling_due_during_a_call_is_not_held_back() {
+    // An ordinary refresh is signalling on the connection the call already
+    // uses and leaves its dialog alone (TS 24.229 5.1.1.4.1), so it runs.
     let mut slot = CallSlot::new();
     let mut policy = MaintenancePolicy::new();
     slot.accept(bridged("x@carrier", "+919000000000"));
 
     assert_eq!(
         policy.decide(Maintenance::Renewal, slot.is_busy()),
+        MaintenanceDecision::Proceed
+    );
+    assert_eq!(policy.deferred(), None);
+}
+
+#[test]
+fn registration_recovery_falling_due_during_a_call_waits_for_the_call_to_end() {
+    // Rebuilding the registration replaces the transport the call's own BYE
+    // needs.
+    let mut slot = CallSlot::new();
+    let mut policy = MaintenancePolicy::new();
+    slot.accept(bridged("x@carrier", "+919000000000"));
+
+    assert_eq!(
+        policy.decide(Maintenance::RegistrationRecovery, slot.is_busy()),
         MaintenanceDecision::Defer
     );
 
@@ -136,11 +152,11 @@ fn renewal_falling_due_during_a_call_waits_for_the_call_to_end() {
 
     assert_eq!(
         policy.release(),
-        Some(Maintenance::Renewal),
+        Some(Maintenance::RegistrationRecovery),
         "the held-back work runs as soon as the line is free"
     );
     assert_eq!(
-        policy.decide(Maintenance::Renewal, slot.is_busy()),
+        policy.decide(Maintenance::RegistrationRecovery, slot.is_busy()),
         MaintenanceDecision::Proceed
     );
 }
@@ -170,8 +186,8 @@ fn the_attachment_is_rebuilt_before_the_registration_when_both_are_pending() {
     // The attachment sits underneath the registration; renewing over a dead
     // one only fails again. Arrival order must not change that.
     for order in [
-        [Maintenance::Renewal, Maintenance::Reattachment],
-        [Maintenance::Reattachment, Maintenance::Renewal],
+        [Maintenance::RegistrationRecovery, Maintenance::Reattachment],
+        [Maintenance::Reattachment, Maintenance::RegistrationRecovery],
     ] {
         let mut policy = MaintenancePolicy::new();
         for what in order {
@@ -186,17 +202,22 @@ fn the_attachment_is_rebuilt_before_the_registration_when_both_are_pending() {
 }
 
 #[test]
-fn a_long_call_is_allowed_to_outlive_its_registration() {
-    // Deliberate (spec Assumptions): dropping a live conversation to satisfy
-    // a timer is worse than a registration lapsing slightly late.
+fn a_call_is_never_cut_to_rebuild_a_lost_registration() {
+    // Deliberate (spec FR-015): dropping a live conversation to satisfy a
+    // timer is worse than a registration lapsing slightly late. The refresh
+    // keeps trying meanwhile; only the disruptive rebuild waits.
     let mut policy = MaintenancePolicy::new();
     for _ in 0..500 {
         assert_eq!(
-            policy.decide(Maintenance::Renewal, true),
+            policy.decide(Maintenance::RegistrationRecovery, true),
             MaintenanceDecision::Defer
         );
+        assert_eq!(
+            policy.decide(Maintenance::Renewal, true),
+            MaintenanceDecision::Proceed
+        );
     }
-    assert_eq!(policy.deferred(), Some(Maintenance::Renewal));
+    assert_eq!(policy.deferred(), Some(Maintenance::RegistrationRecovery));
 }
 
 #[test]
