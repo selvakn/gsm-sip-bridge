@@ -988,3 +988,19 @@ fn a_connection_the_network_closed_is_rebuilt_before_the_refresh_is_sent() {
         .pool
         .is_marked(rig.session.pcscf_addr.ip(), SystemTime::now()));
 }
+
+#[test]
+fn a_failure_met_while_a_call_rang_comes_back_on_the_next_pass() {
+    let mut rig = Rig::new();
+    rig.st.ring_failure = Some(BridgeError::Ims("refresh gave up while ringing".into()));
+    let ctx = RefreshCtx {
+        status: &rig.status,
+        obs: &rig.obs,
+        reg_cfg: &rig.cfg,
+    };
+
+    let first = rig.st.begin_pass(&mut rig.session, &ctx, &mut rig.link);
+
+    assert!(first.is_err(), "the loop is told");
+    assert!(rig.st.ring_failure.is_none(), "and only once");
+}

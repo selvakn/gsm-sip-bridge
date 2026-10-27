@@ -2118,6 +2118,9 @@ struct LoopState {
     /// Set when a handler that parks the loop returns, so the next pass
     /// drains the queue first. See [`Self::held`].
     after_blocking_handler: bool,
+    /// A failure of the registration refresh met while a call rang, returned
+    /// by the next pass. See [`registration_refresh::RingRefresh`].
+    ring_failure: Option<BridgeError>,
     /// Call-ID of the last INVITE whose caller identity was unreadable and
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
@@ -2158,6 +2161,7 @@ impl LoopState {
             last_refresh: None,
             held: std::collections::VecDeque::new(),
             after_blocking_handler: false,
+            ring_failure: None,
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
             last_registered: Instant::now(),
@@ -3258,7 +3262,23 @@ impl LoopState {
         // Rings inside `handle_invite`; the line is occupied from here, not
         // only once the call connects (specs/093).
         p.obs.set_inbound_setup(true);
-        match inbound::handle_invite(session, req, sink, inbound, &p.invite_ctx(), &to_tag) {
+        let handled = {
+            let mut ring = registration_refresh::RingRefresh {
+                state: self,
+                ctx: p.refresh_ctx(),
+                link: inbound,
+            };
+            inbound::handle_invite(
+                session,
+                req,
+                sink,
+                inbound,
+                &p.invite_ctx(),
+                &to_tag,
+                Some(&mut ring),
+            )
+        };
+        match handled {
             Ok(call) => {
                 if call.is_none() {
                     self.recent_declines.record(req, Instant::now());

@@ -429,6 +429,58 @@ impl GmLink for Inbound {
     }
 }
 
+impl GmLink for &Inbound {
+    fn queue(&self) -> &std::sync::mpsc::Receiver<(SipMessage, SipSink)> {
+        (**self).queue()
+    }
+
+    fn client_alive(&self) -> bool {
+        (**self).client_alive()
+    }
+
+    fn repair(&mut self, session: &mut RegisteredSession) -> BridgeResult<()> {
+        super::ping::reconnect_gm_client(session, self)
+    }
+}
+
+/// Keeps the refresh running while an inbound call rings and the dispatch
+/// loop is parked: answers and timers are serviced from inside the ring wait.
+/// A failure that ends the refresh for good is kept for the loop to return on
+/// its next pass, since the wait must not end the call over it.
+pub(super) struct RingRefresh<'a> {
+    pub(super) state: &'a mut LoopState,
+    pub(super) ctx: RefreshCtx<'a>,
+    pub(super) link: &'a Inbound,
+}
+
+impl super::inbound::RingService for RingRefresh<'_> {
+    fn answer(&mut self, session: &mut RegisteredSession, response: &SipResponse) -> bool {
+        match self
+            .state
+            .handle_registration_answer(session, &self.ctx, response)
+        {
+            Ok(consumed) => consumed,
+            Err(e) => {
+                self.state.ring_failure.get_or_insert(e);
+                true
+            }
+        }
+    }
+
+    fn tick(&mut self, session: &mut RegisteredSession) {
+        if self.state.ring_failure.is_some() {
+            return;
+        }
+        let mut link = self.link;
+        if let Err(e) = self
+            .state
+            .drive_registration_refresh(session, &self.ctx, &mut link)
+        {
+            self.state.ring_failure = Some(e);
+        }
+    }
+}
+
 /// What the refresh glue needs of the dispatch loop's parameters: the shared
 /// registration status, the reporter, and the registration config. A narrow
 /// view, so the logic can be driven without building a whole agent.
@@ -485,6 +537,9 @@ impl LoopState {
         p: &RefreshCtx,
         link: &mut dyn GmLink,
     ) -> BridgeResult<()> {
+        if let Some(failure) = self.ring_failure.take() {
+            return Err(failure);
+        }
         if std::mem::take(&mut self.after_blocking_handler) {
             while let Ok(message) = link.queue().try_recv() {
                 self.held.push_back(message);
