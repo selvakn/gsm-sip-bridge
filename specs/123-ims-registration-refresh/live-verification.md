@@ -22,13 +22,17 @@ Baseline: `make format && make lint && make test` green on `2ad3241` (2026-10-27
 | 2026-10-27 | Vodafone (IPv6, TCP) | `7e62c83` + test hook | Refresh sent with empty `nonce` and `response`, as a first REGISTER's placeholder is | accepted at the first attempt (200, 0.30 s); **no challenge** |
 | 2026-10-27 | Vodafone (IPv6, TCP) | `1c96223` | 15 min inbound call (siptest answering), spanning the scheduled refresh (SC-002, SC-005a) | call up the whole time, audio good (listener's report); refresh at +50 min with `in_call=true`, accepted 0.13 s, `last_refresh: ok`, 0 rejections, no failover or re-registration |
 | 2026-10-27 | privileged container (iproute2 6.11, Linux 7.0) | `714a0b8` + `real_kernel_stage_activate_retire_and_rollback` | Stage, drop, stage, activate, drain, remove on the kernel's own XFRM tables (T051) | passed: tables return to exactly 4 states / 16 policies after a dropped stage and after the drain; 8 states while staged |
+| 2026-10-27 to 28 | Jio (Pi) | `9fad3ea` | 12 h idle soak, sampled every 10 min, 19:42 to 07:42 IST (SC-001, SC-003) | 13 scheduled refreshes confirmed in place (`last_refresh: ok`, 50 min apart), 0 rejections, `gm_connection: up` in every sample that answered. One cycle (due ~02:59 IST) fell at the start of the Pi's nightly uplink outage: the agent lost the tunnel, the supervisor held recovery 148 s, the P-CSCF changed and the registration was rebuilt in full at 03:04:42 IST (`last_refresh: none`); the next cycle at 03:54 was an in-place refresh again. Whether the 02:59 refresh was sent first is not recoverable (the agent restarted and the log does not show refreshes). Three samples (04:14 to 04:34 IST) got no answer from the status command; the bridge logged nothing in that window and refreshed on schedule at 04:44. Consecutive CSeq was not checked on the wire. The first 1 h of samples were lost with the scratchpad, see the log header. |
+| 2026-10-28 | Vodafone (IPv6, TCP) | `162c5cd` + test hook | Registrar's reply to the first refresh replaced with `403` (SC-005a) | `last_refresh: rejected 403`, full re-registration 4 s later (`registered_at` moved, `Registered` throughout, 0 rejections after). A `403` is on the immediate full-registration list, so `refresh_mode: fallback` (two rejections with other statuses) was **not** exercised live; it is covered by the automated tests. |
+| 2026-10-28 | Jio (Pi, 4 P-CSCFs in the pool) | `162c5cd` + test hook | Registrar's reply to the first refresh replaced with `503` + `Retry-After: 300` (SC-006) | `last_refresh: rejected 503`; the current P-CSCF was marked unavailable for the 300 s hint (`pcscf_unavailable`), the next registration used another one (`pcscf` changed) and was `Registered` 2 s later, not after the carrier's hint. |
+| 2026-10-28 | Jio to Vodafone | `162c5cd` (final, both rigs) | 30 s call after redeploy | both ways, 1500 sent / 1498 received, 0 loss, jitter 1.2 ms, tone detected |
 
 ## Findings
 
 - **The Jio P-CSCF closes the idle Gm client connection within minutes.** Observed: closed 13 minutes after registration, with no traffic. The full renewal this change replaces opened a new connection every time and hid it. Since #164 made the periodic OPTIONS keepalive opt-in, nothing noticed the closed connection, so an outgoing call placed after that point got no answer. This affects any outgoing call on Jio, not only the refresh.
 - Build `cd53789` keeps the reader's thread handle, so the connection closing is noticed when the reader ends, and rebuilds the connection before a refresh or an idle probe uses it.
 - **Vodafone does not challenge a refresh that arrives over its protected association.** It accepted a refresh with an unissued nonce and one with no credentials at all. It relies on the association's integrity protection, as TS 33.203 lets it. So a challenge cannot be forced by tampering with the credentials, and the live path of Slice C (a `401` to a refresh, answered in the background, then the switch to new associations) has **not** been seen against a carrier. It is covered by loopback tests of the real dispatch loop with the SIM and the XFRM tables replaced, and by the staging test on the kernel's real tables. Jio was not tried while its 12 h soak runs.
-- **Test limitation:** the Pi's registrar has one binding per account. `baresip-amr` on the Pi registers as `1002`, so a test-only account `1003` was added to the Pi's config for siptest (backups: `config.toml.bak-pre-1003`, `.env.bak-pre-1003`). It is removed when testing ends.
+- **Test limitation:** the Pi's registrar has one binding per account. `baresip-amr` on the Pi registers as `1002`, so a test-only account `1003` was added to the Pi's config for siptest. It was removed on 2026-10-28 (config and `.env` restored from the pre-1003 backups; the diff was only that account). The Pi now runs the final `162c5cd` build.
 
 ## Gate for Slice C (T045)
 
@@ -36,7 +40,6 @@ In-place refresh with the cached authorization was accepted on both carriers (Ji
 
 ## Still to run
 
-- A 12 h idle soak (SC-003).
-- Vodafone check of the fallback after a forced rejection, and the two-P-CSCF failover (SC-006).
+- `refresh_mode: fallback` live (needs two rejections with a status outside the immediate-full list); automated only.
 - Background re-authentication against a real carrier challenge (T058): not seen on Vodafone (see Findings); Jio after the soak.
 - UDP transport live: no carrier line in the lab uses it; covered by the loopback tests (T049).

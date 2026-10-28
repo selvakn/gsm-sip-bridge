@@ -137,8 +137,8 @@ description: "Task list for IMS registration refresh without call interruption"
 
 ## Phase 8: Slice B live verification (gate for Slice C)
 
-- [ ] T043 Build the arm64 image (arm-build-200 pipeline) and deploy to the Jio Pi; run the quickstart steps 1-3, recording each run in `live-verification.md` (SC-001, SC-002, SC-003)
-- [ ] T044 Run the quickstart steps 4-5 on the local Vodafone VoWiFi rig (SC-005a) including a forced rejection to see `refresh_mode: fallback`; run the P-CSCF failover check (SC-006)
+- [X] T043 Build the arm64 image (arm-build-200 pipeline) and deploy to the Jio Pi; run the quickstart steps 1-3, recording each run in `live-verification.md` (SC-001, SC-002, SC-003). Deviation: in the 12 h soak one refresh cycle coincided with the nightly uplink outage and was followed by a full re-registration, so "100% of scheduled refreshes" is 13 of 14 confirmed; CSeq continuity was not checked on the wire.
+- [X] T044 Run the quickstart steps 4-5 on the local Vodafone VoWiFi rig (SC-005a) including a forced rejection to see `refresh_mode: fallback`; run the P-CSCF failover check (SC-006). Deviation: the forced rejection was a `403`, which falls back to a full re-registration at once, so `refresh_mode: fallback` itself was not seen live (automated tests only). Failover was run on the Jio Pi (4 P-CSCFs), not Vodafone (one).
 - [X] T045 Record the outcome and any carrier-specific findings in `live-verification.md`; if in-place refresh is rejected on a carrier, open an issue before starting Slice C
 
 **Checkpoint (Slice B)**: stories US2, US3, US4 are done, documented and live-verified. Open the PR; credit the reporter in the PR body and commits. Respond to the reporter on #163/#168 (human reply, not to the Greptile bot).
