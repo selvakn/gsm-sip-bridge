@@ -295,8 +295,11 @@ impl AtCommander {
     /// `AT+CFUN=1,1`, reporting only an explicit refusal. A reset modem often
     /// answers nothing before it drops off the bus, so `OK`, a timeout or a
     /// port error all mean "the reset is under way". Only `ERROR` or
-    /// `+CME ERROR` proves the module did not reset (gh#160: a caller that
-    /// must not free a line while a call may still be up needs that answer).
+    /// `+CME ERROR` proves the module did not reset. An error that kept the
+    /// command from being sent at all reads as "under way" too; that is safe
+    /// only because initialisation refuses a line whose modem still lists a
+    /// call ([`AtCommander::require_no_voice_call`]), so the line cannot come
+    /// back into service on a reset that never happened.
     pub fn try_reboot(&mut self) -> Result<(), String> {
         match self.send_command("AT+CFUN=1,1") {
             Ok(AtResponse::Error(e)) => Err(format!("AT+CFUN=1,1 refused: {e}")),
@@ -648,6 +651,21 @@ impl AtCommander {
             AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
                 Err(BridgeError::Discovery(format!("CLCC failed: {e}")))
             }
+        }
+    }
+
+    /// Initialisation gate (gh#160, Greptile on PR #175): a line must not be
+    /// handed out while the modem may still carry a call. A worker can exit
+    /// mid-hang-up, after a radio cycle, a reset it could not confirm or a port
+    /// error, and the pool frees the line on any exit. This check before
+    /// `Ready` is what guarantees the replacement starts on an empty line. A
+    /// failed query is not an empty list, so it fails the init too; the pool
+    /// retries on its backoff.
+    pub fn require_no_voice_call(&mut self) -> Result<(), String> {
+        match self.has_voice_call() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("modem still lists a voice call".into()),
+            Err(e) => Err(format!("cannot confirm the line is free: {e}")),
         }
     }
 
@@ -1021,6 +1039,14 @@ mod tests {
         assert!(at.has_voice_call().is_err());
         let mut at = make_commander("+CME ERROR: 3\r\n");
         assert!(at.has_voice_call().is_err());
+    }
+
+    #[test]
+    fn init_gate_passes_only_an_empty_call_list() {
+        assert!(make_commander("OK\r\n").require_no_voice_call().is_ok());
+        let listed = "+CLCC: 1,0,0,0,0,\"+919000000001\",145\r\nOK\r\n";
+        assert!(make_commander(listed).require_no_voice_call().is_err());
+        assert!(make_commander("ERROR\r\n").require_no_voice_call().is_err());
     }
 
     /// Mock stream: reads from a fixed byte buffer, discards writes.

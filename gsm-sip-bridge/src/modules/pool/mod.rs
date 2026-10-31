@@ -650,6 +650,9 @@ impl CardPool {
             }
             Err(e) => return Err(format!("AT probe failed: {e}")),
         }
+        // gh#160: never put a line in service with a call still up; see
+        // `require_no_voice_call`.
+        at.require_no_voice_call()?;
 
         let imei = at.query_imei().unwrap_or_else(|_| "Unknown".into());
 
