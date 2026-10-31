@@ -53,6 +53,22 @@ pub static ACTIVE_CALLS: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// How a circuit-switched line left `Cleanup` after a local `AT+CHUP`
+/// (gh#160). `outcome` is `confirmed_clcc` (the modem's call list came back
+/// empty), `confirmed_no_carrier` (`NO CARRIER` arrived), `stuck_alerted`
+/// (still listed after the alert threshold) or `radio_restart` (still listed
+/// at the restart threshold, so the radio was cycled).
+pub static CS_HANGUP_CLEANUP_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_cs_hangup_cleanup_total",
+            "Circuit-switched hang-up cleanups by module and outcome"
+        ),
+        &["module", "outcome"]
+    )
+    .unwrap()
+});
+
 pub static SIP_REGISTRATIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         opts!(

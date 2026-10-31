@@ -357,6 +357,7 @@ impl CardPool {
                             next_retry_at: None,
                             cmd_tx: Some(cmd_tx),
                             has_active_call: false,
+                            hanging_up: false,
                         },
                     );
                 }
@@ -519,6 +520,12 @@ impl CardPool {
         if let Some(state) = slots.get_mut(&slot) {
             state.lifecycle = LifecycleState::Recovering;
             state.cmd_tx = None;
+            // The replacement worker opens with its card `Idle`, and nothing
+            // will send a `LineIdle` for whatever this one was holding (gh#160:
+            // a `Cleanup` that ended in a radio cycle exits this way).
+            // `retry_slot` updates this entry in place, so a busy flag left
+            // here would keep the line out of service for good.
+            state.release_call();
             let delay = backoff_delay(
                 state.retry_count,
                 resilience.initial_backoff_sec,
@@ -797,6 +804,7 @@ impl CardPool {
                             next_retry_at: None,
                             cmd_tx: Some(cmd_tx),
                             has_active_call: false,
+                            hanging_up: false,
                         },
                     );
                 }
@@ -836,5 +844,6 @@ fn pending_slot(
         ),
         cmd_tx: None,
         has_active_call: false,
+        hanging_up: false,
     }
 }

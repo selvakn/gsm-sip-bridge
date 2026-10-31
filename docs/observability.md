@@ -14,6 +14,7 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_sip_calls_total` | Counter | Outbound SIP calls by module, status, and **transport** |
 | `gsm_sip_bridge_call_duration_seconds` | Histogram | Call duration distribution by module and **transport** (1s to 30min buckets) |
 | `gsm_sip_bridge_active_calls` | Gauge | Currently active bridged calls per module and **transport** |
+| `gsm_sip_bridge_cs_hangup_cleanup_total` | Counter | How a circuit-switched line confirmed a local hang-up, by module and `outcome`: `confirmed_clcc`, `confirmed_no_carrier`, `stuck_alerted` (call still listed after 10 s) or `radio_restart` (still listed at 60 s, radio cycled) |
 | `gsm_sip_bridge_sip_registrations_total` | Counter | SIP registration attempts by status (circuit-switched daemon's own PBX registration) |
 | `gsm_sip_bridge_sip_registered` | Gauge | SIP registration state (1=registered, 0=unregistered) |
 | `gsm_sip_bridge_module_init_total` | Counter | Module initialization attempts by status |

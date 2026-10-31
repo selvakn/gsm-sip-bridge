@@ -54,6 +54,11 @@ impl CardPool {
     /// the existing `BridgeEvent::Hangup` handling (both written for the
     /// inbound-call direction) already watch — reused here unmodified in
     /// the other direction.
+    ///
+    /// Every path below that sends `ModuleCmd::Hangup` leaves the slot busy
+    /// until the worker's `BridgeEvent::LineIdle` (gh#160), through
+    /// [`hang_up_claimed_slot`]. Only a dial the modem refused outright is
+    /// released here, since its worker never left `Idle`.
     pub(super) async fn handle_outbound_request(
         &mut self,
         call: Call,
@@ -111,12 +116,11 @@ impl CardPool {
                 Err(e) => {
                     tracing::error!(slot, error = %e, "outbound: failed to accept SIP leg after dial succeeded");
                     // ATD already succeeded — the modem is on a real,
-                    // live call. Hang it up before freeing the slot, or
-                    // it stays connected indefinitely while `SlotState`
-                    // reports it idle and eligible for a second dial
-                    // (specs/025-outbound-calling review).
-                    let _ = cmd_tx.send(ModuleCmd::Hangup);
-                    release_slot(slots, slot);
+                    // live call. Hang it up, and keep the slot busy until
+                    // the worker confirms the call is gone, or it is
+                    // eligible for a second dial while still connected
+                    // (specs/025-outbound-calling review, gh#160).
+                    hang_up_claimed_slot(slots, slot, &cmd_tx);
                     metrics::OUTBOUND_ATTEMPTS_TOTAL
                         .with_label_values(&["refused_network_failure"])
                         .inc();
@@ -146,9 +150,9 @@ impl CardPool {
                 // dial is still running and hangs it up the moment it
                 // finishes either way; harmless if the worker already
                 // died (`cmd_tx.send` just fails silently) or if the dial
-                // genuinely never reached the modem.
-                let _ = cmd_tx.send(ModuleCmd::Hangup);
-                release_slot(slots, slot);
+                // genuinely never reached the modem. Either way the worker
+                // answers with `LineIdle` once the line is clear (gh#160).
+                hang_up_claimed_slot(slots, slot, &cmd_tx);
                 self.sip_bridge.refuse_outbound(call, 503);
                 metrics::OUTBOUND_ATTEMPTS_TOTAL
                     .with_label_values(&["refused_network_failure"])
@@ -364,8 +368,8 @@ impl CardPool {
                     // the scheduler does not permanently defer this slot.
                     if state.has_active_call {
                         tracing::warn!(module = %module_id, slot = state.slot, "active call terminated by network loss");
-                        state.has_active_call = false;
                     }
+                    state.release_call();
                 }
             }
             BridgeEvent::Ring {
@@ -377,10 +381,13 @@ impl CardPool {
             }
             BridgeEvent::Hangup { module_id } => {
                 if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
-                    state.has_active_call = false;
+                    state.release_call();
                 }
                 tracing::info!(module = %module_id, "GSM call ended, tearing down SIP call");
                 self.sip_bridge.hangup_active_call();
+            }
+            BridgeEvent::LineIdle { module_id } => {
+                release_hung_up_line(slots, &module_id);
             }
             BridgeEvent::SmsReceived {
                 module_id,
@@ -425,11 +432,11 @@ impl CardPool {
     /// connected to dead air indefinitely, while `has_active_call = false`
     /// made the slot look idle and eligible for a *second* dial while the
     /// modem was still genuinely busy with the first.
-    /// [`Self::hang_up_unbridged_call`] sends the same `ModuleCmd::Hangup`
+    /// [`hang_up_unbridged_call`] sends the same `ModuleCmd::Hangup`
     /// the outbound-dial path already uses for the equivalent "answered but
-    /// couldn't bridge" case — it hangs up the real call, sets `card.state =
-    /// Idle`, and closes out `call_ctx` via `record_call_end("failed")` —
-    /// genuinely freeing the slot, not just pretending to.
+    /// couldn't bridge" case — it hangs up the real call and closes out
+    /// `call_ctx` via `record_call_end("failed")`. The slot stays busy until
+    /// the worker confirms the modem dropped the call (gh#160).
     fn handle_ring_event(
         &mut self,
         slots: &mut HashMap<u32, SlotState>,
@@ -543,37 +550,86 @@ fn slot_module_id(slots: &HashMap<u32, SlotState>, slot: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Frees a slot claimed by `claim_idle_cs_slot` when the dial did not end up
-/// bridged. Was five identical inline copies in `handle_outbound_request`.
+/// Frees a slot claimed by `claim_idle_cs_slot` when the dial was refused
+/// outright, so the worker never left `Idle` and has nothing to hang up.
 fn release_slot(slots: &mut HashMap<u32, SlotState>, slot: u32) {
     if let Some(state) = slots.get_mut(&slot) {
-        state.has_active_call = false;
+        state.release_call();
     }
 }
 
-/// Frees a slot whose GSM call was answered but could not be bridged, and
-/// hangs up the real call behind it. See [`CardPool::handle_ring_event`].
-fn hang_up_unbridged_call(slots: &mut HashMap<u32, SlotState>, module_id: &str) {
-    if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
-        state.has_active_call = false;
-        if let Some(cmd_tx) = &state.cmd_tx {
+/// Sends a hang-up to a line's worker over `cmd_tx`, leaving the line busy
+/// until the worker confirms with `BridgeEvent::LineIdle` (gh#160). Frees it at
+/// once only when the command cannot be delivered: a worker that is gone will
+/// never confirm, and its replacement starts with no call.
+fn request_hangup(
+    state: &mut SlotState,
+    cmd_tx: Option<&crossbeam_channel::Sender<ModuleCmd>>,
+    cmd: ModuleCmd,
+) {
+    if cmd_tx.is_some_and(|tx| tx.send(cmd).is_ok()) {
+        state.has_active_call = true;
+        state.hanging_up = true;
+    } else {
+        state.release_call();
+    }
+}
+
+/// Hangs up the call on a slot `claim_idle_cs_slot` claimed for a dial that
+/// the modem accepted, or may still accept, but that will not be bridged.
+/// Uses the claim's own sender, which belongs to the worker that dialled.
+fn hang_up_claimed_slot(
+    slots: &mut HashMap<u32, SlotState>,
+    slot: u32,
+    cmd_tx: &crossbeam_channel::Sender<ModuleCmd>,
+) {
+    match slots.get_mut(&slot) {
+        Some(state) => request_hangup(state, Some(cmd_tx), ModuleCmd::Hangup),
+        None => {
             let _ = cmd_tx.send(ModuleCmd::Hangup);
         }
     }
 }
 
-/// Frees the slot whose call is bridged to `SipBridge::active_call` and
-/// tells its worker to hang up the real GSM call. Unlike
-/// `hang_up_unbridged_call`, the SIP peer ending first is a normal call
-/// end, not a failure — `ModuleCmd::SipPeerHangup` records it as
-/// `"answered"`, matching the outcome `hang_up_unbridged_call`'s `"failed"`
-/// deliberately does not.
+/// Hangs up the real call behind a slot whose GSM call was answered but could
+/// not be bridged. See [`CardPool::handle_ring_event`].
+fn hang_up_unbridged_call(slots: &mut HashMap<u32, SlotState>, module_id: &str) {
+    if let Some(state) = slots.values_mut().find(|s| s.module.id == module_id) {
+        let cmd_tx = state.cmd_tx.clone();
+        request_hangup(state, cmd_tx.as_ref(), ModuleCmd::Hangup);
+    }
+}
+
+/// Tells the worker of the slot bridged to `SipBridge::active_call` to hang
+/// up the real GSM call. Unlike `hang_up_unbridged_call`, the SIP peer ending
+/// first is a normal call end, not a failure — `ModuleCmd::SipPeerHangup`
+/// records it as `"answered"`, matching the outcome `hang_up_unbridged_call`'s
+/// `"failed"` deliberately does not.
+///
+/// A line already `hanging_up` is busy but no longer bridged, so it is
+/// skipped: picking it would send this hang-up to the wrong worker and leave
+/// the bridged call connected (gh#160).
 fn signal_sip_peer_hangup(slots: &mut HashMap<u32, SlotState>) {
-    if let Some(state) = slots.values_mut().find(|s| s.has_active_call) {
-        state.has_active_call = false;
-        if let Some(cmd_tx) = &state.cmd_tx {
-            let _ = cmd_tx.send(ModuleCmd::SipPeerHangup);
-        }
+    if let Some(state) = slots
+        .values_mut()
+        .find(|s| s.has_active_call && !s.hanging_up)
+    {
+        let cmd_tx = state.cmd_tx.clone();
+        request_hangup(state, cmd_tx.as_ref(), ModuleCmd::SipPeerHangup);
+    }
+}
+
+/// Frees a line once its worker confirms a hang-up (`BridgeEvent::LineIdle`,
+/// gh#160). Ignored unless the line is waiting for exactly that: a late
+/// confirmation from a worker that has since been replaced must not free a
+/// line the new worker is using.
+fn release_hung_up_line(slots: &mut HashMap<u32, SlotState>, module_id: &str) {
+    if let Some(state) = slots
+        .values_mut()
+        .find(|s| s.module.id == module_id && s.hanging_up)
+    {
+        tracing::debug!(module = %module_id, slot = state.slot, "hang-up confirmed, line free");
+        state.release_call();
     }
 }
 
@@ -615,6 +671,7 @@ mod tests {
                 next_retry_at: None,
                 cmd_tx: Some(cmd_tx),
                 has_active_call,
+                hanging_up: false,
             },
             cmd_rx,
         )
@@ -647,7 +704,10 @@ mod tests {
 
         signal_sip_peer_hangup(&mut slots);
 
-        assert!(!slots[&1].has_active_call, "the bridged slot must be freed");
+        assert!(
+            slots[&1].has_active_call && slots[&1].hanging_up,
+            "gh#160: the bridged slot stays busy until its worker confirms the hang-up"
+        );
         assert!(
             !slots[&0].has_active_call,
             "an already-idle slot must stay idle"
@@ -673,5 +733,101 @@ mod tests {
 
         assert!(!slots[&0].has_active_call);
         assert!(idle_rx.try_recv().is_err());
+    }
+
+    // ---- gh#160: a hung-up line stays busy until its worker confirms ----
+
+    /// A line already hanging up is busy but no longer bridged. Picking it
+    /// would send the SIP peer's hang-up to the wrong worker and leave the
+    /// call that really is bridged connected.
+    #[test]
+    fn signal_sip_peer_hangup_skips_a_line_still_hanging_up() {
+        let mut slots = HashMap::new();
+        let (mut cleaning, cleaning_rx) = slot_state("card0", true);
+        cleaning.hanging_up = true;
+        let (bridged, bridged_rx) = slot_state("card1", true);
+        slots.insert(0, cleaning);
+        slots.insert(1, bridged);
+
+        signal_sip_peer_hangup(&mut slots);
+
+        assert!(cleaning_rx.try_recv().is_err());
+        assert!(matches!(
+            bridged_rx.try_recv(),
+            Ok(ModuleCmd::SipPeerHangup)
+        ));
+    }
+
+    #[test]
+    fn a_hang_up_to_a_dead_worker_frees_the_line_at_once() {
+        let mut slots = HashMap::new();
+        let (bridged, bridged_rx) = slot_state("card0", true);
+        drop(bridged_rx);
+        slots.insert(0, bridged);
+
+        signal_sip_peer_hangup(&mut slots);
+
+        assert!(
+            !slots[&0].has_active_call && !slots[&0].hanging_up,
+            "nothing will ever confirm, so the line must not latch busy"
+        );
+    }
+
+    #[test]
+    fn hang_up_unbridged_call_keeps_the_line_busy_until_confirmed() {
+        let mut slots = HashMap::new();
+        let (answered, rx) = slot_state("card0", true);
+        slots.insert(0, answered);
+
+        hang_up_unbridged_call(&mut slots, "card0");
+
+        assert!(matches!(rx.try_recv(), Ok(ModuleCmd::Hangup)));
+        assert!(slots[&0].has_active_call && slots[&0].hanging_up);
+        assert!(
+            crate::modules::slot::claim_idle_cs_slot(&mut slots).is_none(),
+            "an outbound dial must not claim a line still hanging up"
+        );
+    }
+
+    #[test]
+    fn hang_up_claimed_slot_keeps_the_line_busy_until_confirmed() {
+        let mut slots = HashMap::new();
+        let (claimed, rx) = slot_state("card0", true);
+        let cmd_tx = claimed.cmd_tx.clone().unwrap();
+        slots.insert(0, claimed);
+
+        hang_up_claimed_slot(&mut slots, 0, &cmd_tx);
+
+        assert!(matches!(rx.try_recv(), Ok(ModuleCmd::Hangup)));
+        assert!(slots[&0].has_active_call && slots[&0].hanging_up);
+    }
+
+    #[test]
+    fn line_idle_frees_only_the_named_line() {
+        let mut slots = HashMap::new();
+        for (slot, id) in [(0, "card0"), (1, "card1")] {
+            let (mut state, _rx) = slot_state(id, true);
+            state.slot = slot;
+            state.hanging_up = true;
+            slots.insert(slot, state);
+        }
+
+        release_hung_up_line(&mut slots, "card1");
+
+        assert!(!slots[&1].has_active_call && !slots[&1].hanging_up);
+        assert!(slots[&0].has_active_call && slots[&0].hanging_up);
+    }
+
+    /// A late `LineIdle` from a worker that has since been replaced must not
+    /// free a line the new worker is using for a call of its own.
+    #[test]
+    fn line_idle_ignores_a_line_not_waiting_for_one() {
+        let mut slots = HashMap::new();
+        let (in_call, _rx) = slot_state("card0", true);
+        slots.insert(0, in_call);
+
+        release_hung_up_line(&mut slots, "card0");
+
+        assert!(slots[&0].has_active_call);
     }
 }

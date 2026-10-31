@@ -24,6 +24,18 @@ pub(crate) enum BridgeEvent {
     Hangup {
         module_id: String,
     },
+    /// The modem confirmed that a call this line hung up itself
+    /// (`ModuleCmd::Hangup` or `ModuleCmd::SipPeerHangup`) is gone, so the
+    /// line can take a new call (gh#160). Until then the pool keeps the slot
+    /// busy.
+    ///
+    /// Deliberately not `Hangup`: that one also tears down
+    /// `SipBridge::active_call`, which is a single field for the whole
+    /// bridge. By the time a slow confirmation arrives, that field may hold a
+    /// different line's live call.
+    LineIdle {
+        module_id: String,
+    },
     SmsReceived {
         module_id: String,
         sender: String,

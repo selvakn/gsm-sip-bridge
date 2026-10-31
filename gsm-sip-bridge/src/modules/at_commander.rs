@@ -621,6 +621,21 @@ impl AtCommander {
         }
     }
 
+    /// Whether the modem still lists a voice call, via `AT+CLCC` (gh#160).
+    ///
+    /// Used after a locally-initiated `AT+CHUP` to confirm the call is really
+    /// gone before the line is reused: a local hang-up often produces no
+    /// `NO CARRIER`. A failed query is an `Err`, never `Ok(false)`: a broken
+    /// AT channel says nothing about whether the call ended.
+    pub fn has_voice_call(&mut self) -> BridgeResult<bool> {
+        match self.send_command("AT+CLCC")? {
+            AtResponse::Ok(lines) => Ok(clcc_lists_a_voice_call(&lines)),
+            AtResponse::Error(e) | AtResponse::CmeError(_, e) => {
+                Err(BridgeError::Discovery(format!("CLCC failed: {e}")))
+            }
+        }
+    }
+
     pub fn query_imei(&mut self) -> BridgeResult<String> {
         match self.send_command("AT+CGSN")? {
             // Digit-only, like `query_imsi` below — not just "first non-empty
@@ -928,10 +943,70 @@ impl AtCommander {
     }
 }
 
+/// Whether an `AT+CLCC` response lists at least one voice call.
+///
+/// Each entry is `+CLCC: <id>,<dir>,<stat>,<mode>,<mpty>[,...]` (3GPP TS
+/// 27.007 §7.18), where `<mode>` 0 is voice. Pure data and fax entries do
+/// not count, so they cannot hold a voice line in cleanup. An entry whose
+/// `<mode>` is unknown or unreadable counts as a call: a line kept busy a
+/// little longer is better than one reused while a call is still up. Echo and
+/// any other lines are ignored.
+fn clcc_lists_a_voice_call(lines: &[String]) -> bool {
+    lines.iter().any(|line| {
+        let Some(fields) = line.trim().strip_prefix("+CLCC:") else {
+            return false;
+        };
+        // 1 data, 2 fax (TS 27.007 §7.18). Everything else, including the
+        // alternating voice/data modes, `9` unknown and an unreadable field,
+        // is treated as a call.
+        !matches!(fields.split(',').nth(3).map(str::trim), Some("1" | "2"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // ---- gh#160: AT+CLCC after a local hang-up ----
+
+    #[test]
+    fn clcc_empty_list_is_no_call() {
+        let mut at = make_commander("OK\r\n");
+        assert!(!at.has_voice_call().unwrap());
+    }
+
+    #[test]
+    fn clcc_active_voice_call_is_a_call() {
+        let mut at = make_commander("+CLCC: 1,1,0,0,0,\"+919000000001\",145\r\nOK\r\n");
+        assert!(at.has_voice_call().unwrap());
+    }
+
+    #[test]
+    fn clcc_dialling_voice_call_is_a_call() {
+        let mut at = make_commander("+CLCC: 1,0,2,0,0,\"+919000000001\",145\r\nOK\r\n");
+        assert!(at.has_voice_call().unwrap());
+    }
+
+    #[test]
+    fn clcc_data_entry_only_is_no_voice_call() {
+        let mut at = make_commander("+CLCC: 1,0,0,1,0,\"\",128\r\nOK\r\n");
+        assert!(!at.has_voice_call().unwrap());
+    }
+
+    #[test]
+    fn clcc_echo_line_is_ignored() {
+        let mut at = make_commander("AT+CLCC\r\nOK\r\n");
+        assert!(!at.has_voice_call().unwrap());
+    }
+
+    #[test]
+    fn clcc_error_is_not_an_empty_list() {
+        let mut at = make_commander("ERROR\r\n");
+        assert!(at.has_voice_call().is_err());
+        let mut at = make_commander("+CME ERROR: 3\r\n");
+        assert!(at.has_voice_call().is_err());
+    }
 
     /// Mock stream: reads from a fixed byte buffer, discards writes.
     struct MockStream {

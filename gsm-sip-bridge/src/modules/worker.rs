@@ -66,6 +66,33 @@ pub(crate) struct WorkerSetup {
 /// window, not two.
 const AT_WORKER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// gh#160: how often a line in `Cleanup` asks the modem (`AT+CLCC`) whether
+/// the call it just hung up is really gone. A floor, not a cadence: the loop
+/// only comes round once per URC read, which blocks for up to the port
+/// timeout when the modem is quiet.
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// gh#160: a line still listing its call this long after `AT+CHUP` raises a
+/// critical alert, once, and keeps waiting.
+const CLEANUP_ALERT_AFTER: Duration = Duration::from_secs(10);
+
+/// gh#160: a line still listing its call this long after `AT+CHUP` has its
+/// radio cycled (`AT+CFUN=0` -> `1`), which drops any call, and the worker
+/// exits so the pool re-initialises the slot. Without this, `Cleanup` would
+/// have no way out and the line would stay out of service indefinitely.
+const CLEANUP_RESTART_AFTER: Duration = Duration::from_secs(60);
+
+/// A line waiting for the modem to confirm a locally hung-up call is gone
+/// (gh#160). Present exactly while `card.state == CardState::Cleanup`.
+struct CleanupWait {
+    started: std::time::Instant,
+    /// `None` until the first `AT+CLCC` after the hang-up.
+    last_poll: Option<std::time::Instant>,
+    /// Whether the `CLEANUP_ALERT_AFTER` alert has fired, so it fires once and
+    /// a later confirmation can send the matching recovery.
+    alerted: bool,
+}
+
 /// Opens the modem and runs its URC loop until the modem is rebooted, the
 /// control channel closes, or the serial port errors.
 pub(crate) fn run_module_loop(
@@ -109,6 +136,8 @@ pub(crate) struct ModuleWorker {
     /// See [`WorkerSetup::signal_poll_interval_secs`].
     signal_poll_interval_secs: u64,
     last_signal_poll: std::time::Instant,
+    /// See [`CleanupWait`].
+    cleanup: Option<CleanupWait>,
 }
 
 impl ModuleWorker {
@@ -184,12 +213,16 @@ impl ModuleWorker {
             at_worker_alerted: false,
             signal_poll_interval_secs: setup.signal_poll_interval_secs,
             last_signal_poll: now,
+            cleanup: None,
         })
     }
 
     fn run(mut self) -> Result<(), String> {
         loop {
             self.tick_liveness_probe();
+            if self.tick_cleanup() {
+                return Ok(());
+            }
 
             // If cmd_tx side was dropped (slot restarted), try_recv will see a disconnect.
             // We check via a separate try_recv for the disconnect error.
@@ -239,7 +272,8 @@ impl ModuleWorker {
         let due = signal::poll_due(
             self.signal_poll_interval_secs,
             self.last_signal_poll.elapsed(),
-            self.call_ctx.is_some(),
+            // A line in `Cleanup` may still hold its call (gh#160).
+            self.call_ctx.is_some() || self.cleanup.is_some(),
         );
         if !due {
             return matches!(self.at.send_command("AT"), Ok(AtResponse::Ok(_)));
@@ -330,43 +364,179 @@ impl ModuleWorker {
                 false
             }
             ModuleCmd::Hangup => {
-                tracing::info!(module = %self.module.id, "outbound: hanging up after SIP-side accept failed post-dial");
-                let _ = self.at.hangup();
-                self.card.state = CardState::Idle;
-                metrics::ACTIVE_CALLS
-                    .with_label_values(&[&self.module.id, "cs"])
-                    .set(0.0);
-                record_call_end(
-                    &self.module.id,
-                    &self.event_tx,
-                    &self.store_tx,
-                    &mut self.call_ctx,
-                    "failed",
-                    self.phone_number.as_deref(),
-                );
+                tracing::info!(module = %self.module.id, "hanging up a call that could not be bridged");
+                self.hang_up_and_clean_up("failed");
                 false
             }
             ModuleCmd::SipPeerHangup => {
-                if self.card.state == CardState::Bridged || self.card.state == CardState::Answering
-                {
-                    tracing::info!(module = %self.module.id, "SIP peer disconnected, hanging up GSM");
-                    let _ = self.at.hangup();
-                    record_call_end(
-                        &self.module.id,
-                        &self.event_tx,
-                        &self.store_tx,
-                        &mut self.call_ctx,
-                        "answered",
-                        self.phone_number.as_deref(),
-                    );
-                    self.card.state = CardState::Idle;
-                    metrics::ACTIVE_CALLS
-                        .with_label_values(&[&self.module.id, "cs"])
-                        .set(0.0);
+                match self.card.state {
+                    CardState::Bridged | CardState::Answering => {
+                        tracing::info!(module = %self.module.id, "SIP peer disconnected, hanging up GSM");
+                        self.hang_up_and_clean_up("answered");
+                    }
+                    // Already waiting for confirmation; that wait ends in a
+                    // `LineIdle` of its own.
+                    CardState::Cleanup => {}
+                    // The GSM side ended first (`NO CARRIER` won the race),
+                    // so there is nothing to hang up. The pool is still
+                    // holding the line busy until it hears back.
+                    CardState::Idle | CardState::Ringing => self.emit_line_idle(),
                 }
                 false
             }
         }
+    }
+
+    /// Hangs up the call on this line (`AT+CHUP`), closes out its call record
+    /// and holds the line in `Cleanup` until the modem confirms the call is
+    /// gone (gh#160). A local `AT+CHUP` often produces no `NO CARRIER`, so
+    /// going straight to `Idle` let a `RING` or a `Dial` reuse a line the
+    /// modem still had a call on.
+    ///
+    /// Checks the call list once straight away: EC20's `AT+CHUP` normally
+    /// completes before its `OK`, so the usual case leaves here `Idle`.
+    fn hang_up_and_clean_up(&mut self, status: &str) {
+        if let Err(e) = self.at.hangup() {
+            tracing::warn!(module = %self.module.id, error = %e, "AT+CHUP failed, waiting for the modem to drop the call");
+        }
+        record_call_end(
+            &self.module.id,
+            &self.event_tx,
+            &self.store_tx,
+            &mut self.call_ctx,
+            status,
+            self.phone_number.as_deref(),
+        );
+        self.card.state = CardState::Cleanup;
+        // A second hang-up while already waiting keeps the original clock, so
+        // repeated commands cannot postpone the alert or the restart.
+        if self.cleanup.is_none() {
+            self.cleanup = Some(CleanupWait {
+                started: std::time::Instant::now(),
+                last_poll: None,
+                alerted: false,
+            });
+        }
+        // Cannot reach the restart threshold on the first check.
+        let _ = self.tick_cleanup();
+    }
+
+    /// Advances a pending `Cleanup` (gh#160). Returns `true` when the worker
+    /// must exit, which is only after the radio was cycled at
+    /// `CLEANUP_RESTART_AFTER`.
+    fn tick_cleanup(&mut self) -> bool {
+        let Some(wait) = self.cleanup.as_mut() else {
+            return false;
+        };
+        if wait
+            .last_poll
+            .is_some_and(|t| t.elapsed() < CLEANUP_POLL_INTERVAL)
+        {
+            return false;
+        }
+        wait.last_poll = Some(std::time::Instant::now());
+
+        match self.at.has_voice_call() {
+            Ok(false) => {
+                self.finish_cleanup("confirmed_clcc");
+                return false;
+            }
+            Ok(true) => {}
+            // A failed query is not an empty list: keep the line busy.
+            Err(e) => {
+                tracing::warn!(module = %self.module.id, error = %e, "AT+CLCC failed during hang-up cleanup");
+            }
+        }
+        self.check_cleanup_deadlines()
+    }
+
+    /// The alert and restart thresholds for a call the modem still lists.
+    fn check_cleanup_deadlines(&mut self) -> bool {
+        let Some(wait) = self.cleanup.as_mut() else {
+            return false;
+        };
+        let elapsed = wait.started.elapsed();
+        if elapsed >= CLEANUP_RESTART_AFTER {
+            tracing::error!(
+                module = %self.module.id,
+                elapsed_s = elapsed.as_secs(),
+                "modem still lists the call after AT+CHUP, cycling the radio"
+            );
+            metrics::CS_HANGUP_CLEANUP_TOTAL
+                .with_label_values(&[&self.module.id, "radio_restart"])
+                .inc();
+            self.send_lifecycle_alert(
+                format!(
+                    "call still up {}s after hang-up, cycling the radio",
+                    elapsed.as_secs()
+                ),
+                alerts::CriticalEventKind::Failure,
+            );
+            self.at.radio_restart();
+            metrics::ACTIVE_CALLS
+                .with_label_values(&[&self.module.id, "cs"])
+                .set(0.0);
+            return true;
+        }
+        if elapsed >= CLEANUP_ALERT_AFTER && !wait.alerted {
+            wait.alerted = true;
+            tracing::error!(
+                module = %self.module.id,
+                elapsed_s = elapsed.as_secs(),
+                "modem still lists the call after AT+CHUP, keeping the line busy"
+            );
+            metrics::CS_HANGUP_CLEANUP_TOTAL
+                .with_label_values(&[&self.module.id, "stuck_alerted"])
+                .inc();
+            self.send_lifecycle_alert(
+                format!(
+                    "call still up {}s after hang-up, line held busy",
+                    elapsed.as_secs()
+                ),
+                alerts::CriticalEventKind::Failure,
+            );
+        }
+        false
+    }
+
+    /// The modem confirmed the hung-up call is gone: free the line.
+    fn finish_cleanup(&mut self, outcome: &str) {
+        let wait = self.cleanup.take();
+        self.card.state = CardState::Idle;
+        metrics::ACTIVE_CALLS
+            .with_label_values(&[&self.module.id, "cs"])
+            .set(0.0);
+        metrics::CS_HANGUP_CLEANUP_TOTAL
+            .with_label_values(&[&self.module.id, outcome])
+            .inc();
+        let elapsed_ms = wait.as_ref().map_or(0, |w| w.started.elapsed().as_millis());
+        tracing::info!(module = %self.module.id, outcome, elapsed_ms, "hang-up confirmed, line idle");
+        if wait.is_some_and(|w| w.alerted) {
+            self.send_lifecycle_alert(
+                "call finally cleared after hang-up, line idle again".to_string(),
+                alerts::CriticalEventKind::Recovered,
+            );
+        }
+        self.emit_line_idle();
+    }
+
+    fn emit_line_idle(&self) {
+        let _ = self.event_tx.send(BridgeEvent::LineIdle {
+            module_id: self.module.id.clone(),
+        });
+    }
+
+    fn send_lifecycle_alert(&self, description: String, kind: alerts::CriticalEventKind) {
+        let _ = self
+            .event_tx
+            .send(BridgeEvent::CriticalAlert(alerts::CriticalEvent {
+                category: alerts::AlertCategory::ModuleLifecycle,
+                unit_id: Some(self.module.id.clone()),
+                description,
+                phone_number: self.phone_number.clone(),
+                at: Utc::now(),
+                kind,
+            }));
     }
 
     fn dispatch_urc(&mut self, trimmed: &str) {
@@ -435,6 +605,13 @@ impl ModuleWorker {
     }
 
     fn handle_hangup(&mut self) {
+        // gh#160: the confirmation a `Cleanup` was waiting for. The call was
+        // already recorded and the SIP side already torn down when it was
+        // hung up, so neither happens again here.
+        if self.card.state == CardState::Cleanup {
+            self.finish_cleanup("confirmed_no_carrier");
+            return;
+        }
         if self.card.state == CardState::Bridged || self.card.state == CardState::Answering {
             tracing::info!(module = %self.module.id, "call ended (NO CARRIER)");
             metrics::ACTIVE_CALLS
@@ -799,6 +976,26 @@ mod tests {
         interval_secs: u64,
         replies: Vec<&'static str>,
     ) -> (ModuleWorker, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let (worker, seen, _events, _store) =
+            worker_with_modem_and_channels(module_id, interval_secs, replies);
+        (worker, seen)
+    }
+
+    type Events = mpsc::UnboundedReceiver<BridgeEvent>;
+    type Store = crossbeam_channel::Receiver<StoreCommand>;
+
+    /// [`worker_with_modem`], also handing back what the worker sends to the
+    /// pool and to the store.
+    fn worker_with_modem_and_channels(
+        module_id: &str,
+        interval_secs: u64,
+        replies: Vec<&'static str>,
+    ) -> (
+        ModuleWorker,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Events,
+        Store,
+    ) {
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (client, mut modem) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -818,9 +1015,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_secs(2));
         });
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-        let (store_tx, _store_rx) = crossbeam_channel::unbounded();
+        let (store_tx, store_rx) = crossbeam_channel::unbounded();
         let module = DiscoveredModule {
             id: module_id.to_string(),
             serial_port: std::path::PathBuf::from("/dev/null"),
@@ -848,8 +1045,9 @@ mod tests {
             at_worker_alerted: false,
             signal_poll_interval_secs: interval_secs,
             last_signal_poll: long_ago,
+            cleanup: None,
         };
-        (worker, seen)
+        (worker, seen, event_rx, store_rx)
     }
 
     const CSQ_OK: &str = "\r\n+CSQ: 21,99\r\n\r\nOK\r\n";
@@ -1222,5 +1420,237 @@ mod tests {
         assert_eq!(record.caller_id, "+15551234567");
         assert_eq!(record.status, "failed");
         assert_eq!(record.module_id, "card0");
+    }
+
+    // ---- gh#160: a hung-up line stays in Cleanup until the modem confirms ----
+
+    const OK: &str = "\r\nOK\r\n";
+    const ERROR: &str = "\r\nERROR\r\n";
+    const CLCC_LISTED: &str = "\r\n+CLCC: 1,1,0,0,0,\"+919000000001\",145\r\n\r\nOK\r\n";
+
+    fn bridged(w: &mut ModuleWorker) {
+        w.card.state = CardState::Bridged;
+        w.call_ctx = Some(CallContext {
+            caller_id: "+919000000001".into(),
+            sip_destination: String::new(),
+            started_at: Utc::now(),
+            direction: crate::store::calls::CallDirection::Inbound,
+        });
+    }
+
+    fn drain(events: &mut Events) -> Vec<BridgeEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    fn line_idles(events: &[BridgeEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, BridgeEvent::LineIdle { .. }))
+            .count()
+    }
+
+    fn failure_alerts(events: &[BridgeEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, BridgeEvent::CriticalAlert(a)
+                    if a.kind == alerts::CriticalEventKind::Failure)
+            })
+            .count()
+    }
+
+    fn cleanup_count(module: &str, outcome: &str) -> f64 {
+        metrics::CS_HANGUP_CLEANUP_TOTAL
+            .with_label_values(&[module, outcome])
+            .get()
+    }
+
+    /// Forces the next `tick_cleanup` to poll, as if `ago` had passed since
+    /// the hang-up.
+    fn backdate_cleanup(w: &mut ModuleWorker, ago: Duration) {
+        let wait = w.cleanup.as_mut().expect("in cleanup");
+        wait.started = std::time::Instant::now() - ago;
+        wait.last_poll = None;
+    }
+
+    #[test]
+    fn a_sip_peer_hangup_confirmed_by_an_empty_call_list_frees_the_line() {
+        let (mut w, seen, mut events, store) =
+            worker_with_modem_and_channels("ec20-CLN1", 0, vec![OK, OK]);
+        bridged(&mut w);
+
+        w.apply_cmd(ModuleCmd::SipPeerHangup);
+
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "CHUP, CLCC"
+        );
+        assert_eq!(w.card.state, CardState::Idle);
+        assert!(w.cleanup.is_none());
+        let events = drain(&mut events);
+        assert_eq!(line_idles(&events), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, BridgeEvent::Hangup { .. })),
+            "the SIP side is already gone; a Hangup event would tear down another line's call"
+        );
+        let Ok(StoreCommand::InsertCall(record)) = store.try_recv() else {
+            panic!("expected the call to be recorded");
+        };
+        assert_eq!(record.status, "answered");
+        assert_eq!(cleanup_count("ec20-CLN1", "confirmed_clcc"), 1.0);
+    }
+
+    #[test]
+    fn a_call_still_listed_holds_the_line_until_no_carrier() {
+        let (mut w, _, mut events, store) =
+            worker_with_modem_and_channels("ec20-CLN2", 0, vec![OK, CLCC_LISTED]);
+        bridged(&mut w);
+
+        w.apply_cmd(ModuleCmd::SipPeerHangup);
+        assert_eq!(w.card.state, CardState::Cleanup);
+        assert_eq!(line_idles(&drain(&mut events)), 0);
+
+        w.dispatch_urc("NO CARRIER");
+
+        assert_eq!(w.card.state, CardState::Idle);
+        let events = drain(&mut events);
+        assert_eq!(line_idles(&events), 1);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, BridgeEvent::Hangup { .. })));
+        assert_eq!(store.try_iter().count(), 1, "the call is recorded once");
+        assert_eq!(cleanup_count("ec20-CLN2", "confirmed_no_carrier"), 1.0);
+    }
+
+    #[test]
+    fn a_call_that_clears_on_a_later_poll_frees_the_line() {
+        let (mut w, _, mut events, _) =
+            worker_with_modem_and_channels("ec20-CLN3", 0, vec![OK, CLCC_LISTED, OK]);
+        bridged(&mut w);
+        w.apply_cmd(ModuleCmd::SipPeerHangup);
+        assert_eq!(w.card.state, CardState::Cleanup);
+
+        assert!(!w.tick_cleanup(), "not due yet: no poll, no exit");
+        assert_eq!(w.card.state, CardState::Cleanup);
+        backdate_cleanup(&mut w, Duration::from_secs(1));
+        assert!(!w.tick_cleanup());
+
+        assert_eq!(w.card.state, CardState::Idle);
+        assert_eq!(line_idles(&drain(&mut events)), 1);
+    }
+
+    #[test]
+    fn a_failed_call_list_query_is_not_an_empty_list() {
+        let (mut w, _, mut events, _) =
+            worker_with_modem_and_channels("ec20-CLN4", 0, vec![OK, ERROR]);
+        bridged(&mut w);
+
+        w.apply_cmd(ModuleCmd::SipPeerHangup);
+
+        assert_eq!(w.card.state, CardState::Cleanup);
+        assert_eq!(line_idles(&drain(&mut events)), 0);
+    }
+
+    #[test]
+    fn a_stuck_call_alerts_once_and_keeps_the_line_busy() {
+        let (mut w, _, mut events, _) = worker_with_modem_and_channels(
+            "ec20-CLN5",
+            0,
+            vec![OK, CLCC_LISTED, CLCC_LISTED, CLCC_LISTED, OK],
+        );
+        bridged(&mut w);
+        w.apply_cmd(ModuleCmd::SipPeerHangup);
+
+        backdate_cleanup(&mut w, CLEANUP_ALERT_AFTER + Duration::from_secs(1));
+        assert!(!w.tick_cleanup());
+        backdate_cleanup(&mut w, CLEANUP_ALERT_AFTER + Duration::from_secs(2));
+        assert!(!w.tick_cleanup());
+
+        assert_eq!(w.card.state, CardState::Cleanup);
+        let stuck = drain(&mut events);
+        assert_eq!(failure_alerts(&stuck), 1, "alerted once, not every poll");
+        assert_eq!(line_idles(&stuck), 0);
+        assert_eq!(cleanup_count("ec20-CLN5", "stuck_alerted"), 1.0);
+
+        // The call finally clears: the line frees and the alert recovers.
+        backdate_cleanup(&mut w, CLEANUP_ALERT_AFTER + Duration::from_secs(3));
+        assert!(!w.tick_cleanup());
+        assert_eq!(w.card.state, CardState::Idle);
+        let cleared = drain(&mut events);
+        assert_eq!(line_idles(&cleared), 1);
+        assert!(cleared
+            .iter()
+            .any(|e| matches!(e, BridgeEvent::CriticalAlert(a)
+            if a.kind == alerts::CriticalEventKind::Recovered)));
+    }
+
+    #[test]
+    fn a_call_stuck_past_the_restart_threshold_cycles_the_radio_and_exits() {
+        // CLCC, then AT+CFUN=0 and AT+CFUN=1.
+        let (mut w, seen, mut events, _) =
+            worker_with_modem_and_channels("ec20-CLN6", 0, vec![CLCC_LISTED, OK, OK]);
+        w.card.state = CardState::Cleanup;
+        w.cleanup = Some(CleanupWait {
+            started: std::time::Instant::now() - CLEANUP_RESTART_AFTER,
+            last_poll: None,
+            alerted: true,
+        });
+
+        assert!(
+            w.tick_cleanup(),
+            "the worker must exit so the slot is re-initialised"
+        );
+
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(failure_alerts(&drain(&mut events)), 1);
+        assert_eq!(cleanup_count("ec20-CLN6", "radio_restart"), 1.0);
+    }
+
+    #[test]
+    fn a_line_in_cleanup_takes_no_new_call() {
+        let (mut w, seen, _, _) = worker_with_modem_and_channels("ec20-CLN7", 0, vec![]);
+        w.card.state = CardState::Cleanup;
+
+        w.dispatch_urc("RING");
+
+        assert_eq!(w.card.state, CardState::Cleanup);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut at = mock_at("OK\r\n");
+        let mut card = mock_card(CardState::Cleanup);
+        assert!(apply_dial_cmd(&mut at, &mut card, "+919000000001").is_err());
+        assert_eq!(card.state, CardState::Cleanup);
+    }
+
+    /// `NO CARRIER` won the race: the line is already idle, but the pool is
+    /// still holding it busy and must be told.
+    #[test]
+    fn a_sip_peer_hangup_on_an_idle_line_confirms_at_once() {
+        let (mut w, seen, mut events, _) = worker_with_modem_and_channels("ec20-CLN8", 0, vec![]);
+
+        w.apply_cmd(ModuleCmd::SipPeerHangup);
+
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(line_idles(&drain(&mut events)), 1);
+    }
+
+    /// A second hang-up while already waiting must not restart the clock, or
+    /// repeated commands could postpone the alert and restart for ever.
+    #[test]
+    fn a_repeated_hang_up_keeps_the_original_cleanup_clock() {
+        let (mut w, _, _, _) =
+            worker_with_modem_and_channels("ec20-CLN9", 0, vec![OK, CLCC_LISTED, OK, CLCC_LISTED]);
+        bridged(&mut w);
+        w.apply_cmd(ModuleCmd::Hangup);
+        backdate_cleanup(&mut w, Duration::from_secs(5));
+        let started = w.cleanup.as_ref().unwrap().started;
+
+        w.apply_cmd(ModuleCmd::Hangup);
+
+        assert_eq!(w.cleanup.as_ref().unwrap().started, started);
+        assert_eq!(w.card.state, CardState::Cleanup);
     }
 }

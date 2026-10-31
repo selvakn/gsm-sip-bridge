@@ -48,6 +48,12 @@ pub(crate) struct SlotState {
     pub(crate) next_retry_at: Option<tokio::time::Instant>,
     pub(crate) cmd_tx: Option<crossbeam_channel::Sender<ModuleCmd>>,
     pub(crate) has_active_call: bool,
+    /// gh#160: this line's call was hung up from our side and the worker has
+    /// not yet confirmed the modem dropped it (`BridgeEvent::LineIdle`). The
+    /// line stays busy (`has_active_call`) meanwhile, but it is no longer the
+    /// line bridged to `SipBridge::active_call`, so the SIP-peer-hangup lookup
+    /// must skip it.
+    pub(crate) hanging_up: bool,
 }
 
 impl SlotState {
@@ -57,6 +63,13 @@ impl SlotState {
     /// `unknown` in its place.
     pub(crate) fn alert_phone(&self) -> Option<String> {
         usable_phone(&self.phone_number)
+    }
+
+    /// Marks the line free: the worker confirmed the call is gone, or the
+    /// worker itself is gone and its replacement starts with no call.
+    pub(crate) fn release_call(&mut self) {
+        self.has_active_call = false;
+        self.hanging_up = false;
     }
 
     pub(crate) fn info(&self) -> SlotInfo {
@@ -219,6 +232,7 @@ mod tests {
             next_retry_at: None,
             cmd_tx: None,
             has_active_call: false,
+            hanging_up: false,
         }
     }
 
