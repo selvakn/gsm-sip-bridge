@@ -9,6 +9,7 @@
 //! blocks live in sibling modules and mutate them directly, exactly as they
 //! did when everything shared one file.
 
+use crate::alerts;
 use crate::control::protocol::SlotInfo;
 use crate::modules::at_commander::{NetworkMode, NetworkType};
 use crate::modules::discovery::DiscoveredModule;
@@ -54,6 +55,12 @@ pub(crate) struct SlotState {
     /// line bridged to `SipBridge::active_call`, so the SIP-peer-hangup lookup
     /// must skip it.
     pub(crate) hanging_up: bool,
+    /// This line's worker raised a `ModuleLifecycle` failure that it has not
+    /// closed. A worker that exits (a radio cycle or reset after a stuck
+    /// hang-up, gh#160) takes its own alert state with it and its replacement
+    /// starts clean, so the pool remembers the open alert and sends the
+    /// matching recovery when the line is `Ready` again.
+    pub(crate) lifecycle_alert_open: bool,
 }
 
 impl SlotState {
@@ -115,6 +122,38 @@ pub(crate) fn find_given_up_slot(slots: &HashMap<u32, SlotState>, module_id: &st
         .iter()
         .find(|(_, s)| s.lifecycle == LifecycleState::GivenUp && s.module.id == module_id)
         .map(|(k, _)| *k)
+}
+
+/// Records a worker's `ModuleLifecycle` alert against its line, so a recovery
+/// the worker can no longer send (it exited) is sent by the pool instead; see
+/// `SlotState::lifecycle_alert_open`.
+pub(crate) fn track_lifecycle_alert(
+    slots: &mut HashMap<u32, SlotState>,
+    event: &alerts::CriticalEvent,
+) {
+    if event.category != alerts::AlertCategory::ModuleLifecycle {
+        return;
+    }
+    let Some(module_id) = event.unit_id.as_deref() else {
+        return;
+    };
+    let open = event.kind == alerts::CriticalEventKind::Failure;
+    for state in slots.values_mut().filter(|s| s.module.id == module_id) {
+        state.lifecycle_alert_open = open;
+    }
+}
+
+/// Clears every slot's open-alert flag for `module_id`, returning whether any
+/// was set (one recovery covers them all).
+pub(crate) fn take_open_lifecycle_alert(
+    slots: &mut HashMap<u32, SlotState>,
+    module_id: &str,
+) -> bool {
+    let mut was_open = false;
+    for state in slots.values_mut().filter(|s| s.module.id == module_id) {
+        was_open |= std::mem::take(&mut state.lifecycle_alert_open);
+    }
+    was_open
 }
 
 /// Selects the first `Ready`, non-busy CS slot and claims it
@@ -233,6 +272,7 @@ mod tests {
             cmd_tx: None,
             has_active_call: false,
             hanging_up: false,
+            lifecycle_alert_open: false,
         }
     }
 
@@ -254,6 +294,64 @@ mod tests {
             None,
             "a Ready slot is not a stale incident to clear"
         );
+    }
+
+    fn lifecycle_event(module_id: &str, kind: alerts::CriticalEventKind) -> alerts::CriticalEvent {
+        alerts::CriticalEvent {
+            category: alerts::AlertCategory::ModuleLifecycle,
+            unit_id: Some(module_id.to_string()),
+            description: String::new(),
+            phone_number: None,
+            at: chrono::Utc::now(),
+            kind,
+        }
+    }
+
+    /// gh#160 (Greptile on PR #175): a worker that alerted and then exited for
+    /// a restart cannot send the recovery; the pool must remember it.
+    #[test]
+    fn a_worker_failure_alert_stays_open_until_the_line_recovers() {
+        let mut slots = HashMap::from([
+            (0, slot_state("ec20-A", LifecycleState::Ready)),
+            (1, slot_state("ec20-B", LifecycleState::Ready)),
+        ]);
+
+        track_lifecycle_alert(
+            &mut slots,
+            &lifecycle_event("ec20-A", alerts::CriticalEventKind::Failure),
+        );
+        assert!(slots[&0].lifecycle_alert_open);
+        assert!(!slots[&1].lifecycle_alert_open);
+
+        assert!(take_open_lifecycle_alert(&mut slots, "ec20-A"));
+        assert!(!slots[&0].lifecycle_alert_open);
+        assert!(
+            !take_open_lifecycle_alert(&mut slots, "ec20-A"),
+            "one recovery per failure"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_recovers_on_its_own_closes_the_alert() {
+        let mut slots = HashMap::from([(0, slot_state("ec20-A", LifecycleState::Ready))]);
+        track_lifecycle_alert(
+            &mut slots,
+            &lifecycle_event("ec20-A", alerts::CriticalEventKind::Failure),
+        );
+        track_lifecycle_alert(
+            &mut slots,
+            &lifecycle_event("ec20-A", alerts::CriticalEventKind::Recovered),
+        );
+        assert!(!take_open_lifecycle_alert(&mut slots, "ec20-A"));
+    }
+
+    #[test]
+    fn other_alert_categories_do_not_open_a_lifecycle_alert() {
+        let mut slots = HashMap::from([(0, slot_state("ec20-A", LifecycleState::Ready))]);
+        let mut event = lifecycle_event("ec20-A", alerts::CriticalEventKind::Failure);
+        event.category = alerts::AlertCategory::RegistrationLoss;
+        track_lifecycle_alert(&mut slots, &event);
+        assert!(!slots[&0].lifecycle_alert_open);
     }
 
     fn slot_state_with_cmd_tx(module_id: &str) -> SlotState {

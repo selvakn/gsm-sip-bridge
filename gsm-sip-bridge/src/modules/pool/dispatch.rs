@@ -14,7 +14,9 @@ use crate::modules::at_commander::{NetworkMode, NetworkType};
 use crate::modules::protocol::{BridgeEvent, ModuleCmd};
 use crate::modules::restart_policy::{retry_delay_for, RestartMode};
 use crate::modules::scheduler::{AttemptType, CycleOutcome, Outcome};
-use crate::modules::slot::{backoff_delay, claim_idle_cs_slot, LifecycleState, SlotState};
+use crate::modules::slot::{
+    backoff_delay, claim_idle_cs_slot, track_lifecycle_alert, LifecycleState, SlotState,
+};
 use crate::sms;
 use crate::store::StoreCommand;
 use pjsua_safe::Call;
@@ -415,6 +417,7 @@ impl CardPool {
                 );
             }
             BridgeEvent::CriticalAlert(event) => {
+                track_lifecycle_alert(slots, &event);
                 if let Some(client) = self.alerts_client.clone() {
                     let config = self.config.alerts.clone();
                     tokio::runtime::Handle::current()
@@ -672,6 +675,7 @@ mod tests {
                 cmd_tx: Some(cmd_tx),
                 has_active_call,
                 hanging_up: false,
+                lifecycle_alert_open: false,
             },
             cmd_rx,
         )

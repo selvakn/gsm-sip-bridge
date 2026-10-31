@@ -77,9 +77,13 @@ const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CLEANUP_ALERT_AFTER: Duration = Duration::from_secs(10);
 
 /// gh#160: a line still listing its call this long after `AT+CHUP` has its
-/// radio cycled (`AT+CFUN=0` -> `1`), which drops any call, and the worker
-/// exits so the pool re-initialises the slot. Without this, `Cleanup` would
-/// have no way out and the line would stay out of service indefinitely.
+/// radio cycled (`AT+CFUN=0` -> `1`). If the modem then lists no call, the
+/// worker exits so the pool re-initialises the slot; if it still lists one
+/// (or cannot say), the module is reset (`AT+CFUN=1,1`). Without this,
+/// `Cleanup` would have no way out and the line would stay out of service
+/// indefinitely. A modem that refuses the reset keeps the line busy and is
+/// tried again after another interval: freeing a line that may still carry a
+/// call is the failure this state exists to prevent.
 const CLEANUP_RESTART_AFTER: Duration = Duration::from_secs(60);
 
 /// A line waiting for the modem to confirm a locally hung-up call is gone
@@ -91,6 +95,10 @@ struct CleanupWait {
     /// Whether the `CLEANUP_ALERT_AFTER` alert has fired, so it fires once and
     /// a later confirmation can send the matching recovery.
     alerted: bool,
+    /// Restart attempts the modem refused (it kept the call and rejected
+    /// `AT+CFUN=1,1`). The next attempt is due at
+    /// `CLEANUP_RESTART_AFTER * (refused_restarts + 1)`.
+    refused_restarts: u32,
 }
 
 /// Opens the modem and runs its URC loop until the modem is rebooted, the
@@ -415,6 +423,7 @@ impl ModuleWorker {
                 started: std::time::Instant::now(),
                 last_poll: None,
                 alerted: false,
+                refused_restarts: 0,
             });
         }
         // Cannot reach the restart threshold on the first check.
@@ -422,8 +431,8 @@ impl ModuleWorker {
     }
 
     /// Advances a pending `Cleanup` (gh#160). Returns `true` when the worker
-    /// must exit, which is only after the radio was cycled at
-    /// `CLEANUP_RESTART_AFTER`.
+    /// must exit, which is only after a restart at `CLEANUP_RESTART_AFTER`
+    /// that left no call listed, or a module reset the modem did not refuse.
     fn tick_cleanup(&mut self) -> bool {
         let Some(wait) = self.cleanup.as_mut() else {
             return false;
@@ -456,27 +465,8 @@ impl ModuleWorker {
             return false;
         };
         let elapsed = wait.started.elapsed();
-        if elapsed >= CLEANUP_RESTART_AFTER {
-            tracing::error!(
-                module = %self.module.id,
-                elapsed_s = elapsed.as_secs(),
-                "modem still lists the call after AT+CHUP, cycling the radio"
-            );
-            metrics::CS_HANGUP_CLEANUP_TOTAL
-                .with_label_values(&[&self.module.id, "radio_restart"])
-                .inc();
-            self.send_lifecycle_alert(
-                format!(
-                    "call still up {}s after hang-up, cycling the radio",
-                    elapsed.as_secs()
-                ),
-                alerts::CriticalEventKind::Failure,
-            );
-            self.at.radio_restart();
-            metrics::ACTIVE_CALLS
-                .with_label_values(&[&self.module.id, "cs"])
-                .set(0.0);
-            return true;
+        if elapsed >= CLEANUP_RESTART_AFTER * (wait.refused_restarts + 1) {
+            return self.restart_stuck_line(elapsed);
         }
         if elapsed >= CLEANUP_ALERT_AFTER && !wait.alerted {
             wait.alerted = true;
@@ -497,6 +487,82 @@ impl ModuleWorker {
             );
         }
         false
+    }
+
+    /// Cycles the radio on a line whose call outlived `AT+CHUP`, escalating to
+    /// a module reset if the call survives that too. Returns `true` (exit, so
+    /// the pool re-initialises the slot) only once no call can remain: the
+    /// modem lists none after the radio cycle, or it did not refuse the reset.
+    /// `AT+CFUN=0` itself is fire-and-forget, so the call list afterwards is
+    /// what decides, not that command's reply.
+    fn restart_stuck_line(&mut self, elapsed: Duration) -> bool {
+        // The Failure below needs its matching Recovered if the call later
+        // clears on this worker (`finish_cleanup`), even when this tick is the
+        // first to see the line past the alert threshold.
+        if let Some(wait) = self.cleanup.as_mut() {
+            wait.alerted = true;
+        }
+        tracing::error!(
+            module = %self.module.id,
+            elapsed_s = elapsed.as_secs(),
+            "modem still lists the call after AT+CHUP, cycling the radio"
+        );
+        metrics::CS_HANGUP_CLEANUP_TOTAL
+            .with_label_values(&[&self.module.id, "radio_restart"])
+            .inc();
+        self.send_lifecycle_alert(
+            format!(
+                "call still up {}s after hang-up, cycling the radio",
+                elapsed.as_secs()
+            ),
+            alerts::CriticalEventKind::Failure,
+        );
+        self.at.radio_restart();
+        match self.at.has_voice_call() {
+            Ok(false) => return self.leave_for_reinit(),
+            Ok(true) => tracing::error!(
+                module = %self.module.id,
+                "modem still lists the call after a radio cycle, resetting the module"
+            ),
+            Err(e) => tracing::error!(
+                module = %self.module.id,
+                error = %e,
+                "cannot confirm the call ended after a radio cycle, resetting the module"
+            ),
+        }
+        metrics::CS_HANGUP_CLEANUP_TOTAL
+            .with_label_values(&[&self.module.id, "module_reset"])
+            .inc();
+        match self.at.try_reboot() {
+            Ok(()) => self.leave_for_reinit(),
+            Err(e) => {
+                if let Some(wait) = self.cleanup.as_mut() {
+                    wait.refused_restarts += 1;
+                }
+                tracing::error!(
+                    module = %self.module.id,
+                    error = %e,
+                    "modem refused the reset, keeping the line busy"
+                );
+                metrics::CS_HANGUP_CLEANUP_TOTAL
+                    .with_label_values(&[&self.module.id, "reset_refused"])
+                    .inc();
+                self.send_lifecycle_alert(
+                    format!("modem refused a reset with a call still up, line held busy: {e}"),
+                    alerts::CriticalEventKind::Failure,
+                );
+                false
+            }
+        }
+    }
+
+    /// The worker is about to exit after a restart; the replacement starts
+    /// with no call.
+    fn leave_for_reinit(&mut self) -> bool {
+        metrics::ACTIVE_CALLS
+            .with_label_values(&[&self.module.id, "cs"])
+            .set(0.0);
+        true
     }
 
     /// The modem confirmed the hung-up call is gone: free the line.
@@ -1587,26 +1653,90 @@ mod tests {
             if a.kind == alerts::CriticalEventKind::Recovered)));
     }
 
-    #[test]
-    fn a_call_stuck_past_the_restart_threshold_cycles_the_radio_and_exits() {
-        // CLCC, then AT+CFUN=0 and AT+CFUN=1.
-        let (mut w, seen, mut events, _) =
-            worker_with_modem_and_channels("ec20-CLN6", 0, vec![CLCC_LISTED, OK, OK]);
+    fn stuck_past_restart(w: &mut ModuleWorker) {
         w.card.state = CardState::Cleanup;
         w.cleanup = Some(CleanupWait {
             started: std::time::Instant::now() - CLEANUP_RESTART_AFTER,
             last_poll: None,
             alerted: true,
+            refused_restarts: 0,
         });
+    }
+
+    #[test]
+    fn a_call_stuck_past_the_restart_threshold_cycles_the_radio_and_exits() {
+        // CLCC, AT+CFUN=0, AT+CFUN=1, then CLCC lists nothing.
+        let (mut w, seen, mut events, _) =
+            worker_with_modem_and_channels("ec20-CLN6", 0, vec![CLCC_LISTED, OK, OK, OK]);
+        stuck_past_restart(&mut w);
 
         assert!(
             w.tick_cleanup(),
             "the worker must exit so the slot is re-initialised"
         );
 
-        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 4);
         assert_eq!(failure_alerts(&drain(&mut events)), 1);
         assert_eq!(cleanup_count("ec20-CLN6", "radio_restart"), 1.0);
+        assert_eq!(cleanup_count("ec20-CLN6", "module_reset"), 0.0);
+    }
+
+    /// Greptile on PR #175: `AT+CFUN=0` can be refused with the call still
+    /// up. Exiting then would let the pool hand an occupied line to the next
+    /// call, so the worker resets the module instead.
+    #[test]
+    fn a_call_that_survives_the_radio_cycle_resets_the_module_and_exits() {
+        // CLCC, AT+CFUN=0 (refused), AT+CFUN=1, CLCC still listed, then
+        // AT+CFUN=1,1 goes unanswered as a resetting modem's does.
+        let (mut w, seen, _, _) = worker_with_modem_and_channels(
+            "ec20-CLN10",
+            0,
+            vec![CLCC_LISTED, ERROR, OK, CLCC_LISTED],
+        );
+        stuck_past_restart(&mut w);
+
+        assert!(w.tick_cleanup(), "a reset under way drops any call");
+
+        // The mock modem stops answering after four replies, so the reset
+        // command times out like a real reset: counted, not refused.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(cleanup_count("ec20-CLN10", "module_reset"), 1.0);
+    }
+
+    /// A failed call-list query after the radio cycle is not an empty list.
+    #[test]
+    fn an_unanswerable_call_list_after_the_radio_cycle_resets_the_module() {
+        let (mut w, _, _, _) =
+            worker_with_modem_and_channels("ec20-CLN11", 0, vec![CLCC_LISTED, OK, OK, ERROR, OK]);
+        stuck_past_restart(&mut w);
+
+        assert!(w.tick_cleanup());
+        assert_eq!(cleanup_count("ec20-CLN11", "module_reset"), 1.0);
+    }
+
+    #[test]
+    fn a_refused_reset_keeps_the_line_busy_and_retries_later() {
+        let (mut w, seen, mut events, _) = worker_with_modem_and_channels(
+            "ec20-CLN12",
+            0,
+            vec![CLCC_LISTED, OK, OK, CLCC_LISTED, ERROR],
+        );
+        stuck_past_restart(&mut w);
+
+        assert!(!w.tick_cleanup(), "the call may still be up: stay");
+
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(w.card.state, CardState::Cleanup);
+        assert_eq!(w.cleanup.as_ref().unwrap().refused_restarts, 1);
+        assert_eq!(cleanup_count("ec20-CLN12", "reset_refused"), 1.0);
+        let events = drain(&mut events);
+        assert_eq!(failure_alerts(&events), 2);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, BridgeEvent::LineIdle { .. })));
+        // The next attempt waits another full interval, not the next tick.
+        assert!(!w.check_cleanup_deadlines());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     #[test]

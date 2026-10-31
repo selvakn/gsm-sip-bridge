@@ -27,7 +27,8 @@ use crate::modules::discovery::{self, DiscoveredModule};
 use crate::modules::protocol::{BridgeEvent, ControlCmdReceiver, ModuleCmd};
 use crate::modules::scheduler::{self, CycleState};
 use crate::modules::slot::{
-    backoff_delay, find_given_up_slot, usable_phone, LifecycleState, SlotState,
+    backoff_delay, find_given_up_slot, take_open_lifecycle_alert, usable_phone, LifecycleState,
+    SlotState,
 };
 use crate::modules::worker::{self, ModuleAudioInit, WorkerSetup};
 use crate::sip::SipBridge;
@@ -358,6 +359,7 @@ impl CardPool {
                             cmd_tx: Some(cmd_tx),
                             has_active_call: false,
                             hanging_up: false,
+                            lifecycle_alert_open: false,
                         },
                     );
                 }
@@ -465,7 +467,8 @@ impl CardPool {
                 // created a fresh `Initializing` slot for a module that
                 // already had a `GivenUp` slot from an earlier incident, and
                 // it's that fresh slot recovering here.
-                self.clear_stale_given_up(slots, &module.id, worker_phone);
+                self.clear_stale_given_up(slots, &module.id, worker_phone.clone());
+                self.close_open_lifecycle_alert(slots, &module.id, worker_phone);
             }
             Err(e) => {
                 tracing::debug!(module = %module.id, error = %e, "retry failed");
@@ -738,6 +741,27 @@ impl CardPool {
         );
     }
 
+    /// gh#160 (Greptile on PR #175): the module is `Ready` again, so a
+    /// `ModuleLifecycle` failure its previous worker raised and never closed
+    /// (it exited to be restarted) gets its recovery now. Any slot of this
+    /// module counts: a module reset can move its port, so it returns under a
+    /// new slot key while the old entry still holds the flag.
+    fn close_open_lifecycle_alert(
+        &self,
+        slots: &mut HashMap<u32, SlotState>,
+        module_id: &str,
+        phone_number: Option<String>,
+    ) {
+        if take_open_lifecycle_alert(slots, module_id) {
+            self.dispatch_alert(
+                module_id,
+                "module back in service after a restart".to_string(),
+                alerts::CriticalEventKind::Recovered,
+                phone_number,
+            );
+        }
+    }
+
     fn rescan_new_modules(
         &self,
         slots: &mut HashMap<u32, SlotState>,
@@ -788,6 +812,7 @@ impl CardPool {
                     // new, healthy one forever.
                     let worker_phone = usable_phone(&phone);
                     self.clear_stale_given_up(slots, &module.id, worker_phone.clone());
+                    self.close_open_lifecycle_alert(slots, &module.id, worker_phone.clone());
 
                     let cmd_tx = self.spawn_worker(tasks, &module, slot, event_tx, worker_phone);
                     slots.insert(
@@ -805,6 +830,7 @@ impl CardPool {
                             cmd_tx: Some(cmd_tx),
                             has_active_call: false,
                             hanging_up: false,
+                            lifecycle_alert_open: false,
                         },
                     );
                 }
@@ -845,5 +871,6 @@ fn pending_slot(
         cmd_tx: None,
         has_active_call: false,
         hanging_up: false,
+        lifecycle_alert_open: false,
     }
 }

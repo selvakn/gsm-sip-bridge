@@ -292,6 +292,21 @@ impl AtCommander {
         self.send_command("AT+CFUN=1,1").ok();
     }
 
+    /// `AT+CFUN=1,1`, reporting only an explicit refusal. A reset modem often
+    /// answers nothing before it drops off the bus, so `OK`, a timeout or a
+    /// port error all mean "the reset is under way". Only `ERROR` or
+    /// `+CME ERROR` proves the module did not reset (gh#160: a caller that
+    /// must not free a line while a call may still be up needs that answer).
+    pub fn try_reboot(&mut self) -> Result<(), String> {
+        match self.send_command("AT+CFUN=1,1") {
+            Ok(AtResponse::Error(e)) => Err(format!("AT+CFUN=1,1 refused: {e}")),
+            Ok(AtResponse::CmeError(code, e)) => {
+                Err(format!("AT+CFUN=1,1 refused: +CME ERROR {code}: {e}"))
+            }
+            Ok(AtResponse::Ok(_)) | Err(_) => Ok(()),
+        }
+    }
+
     /// Soft radio-cycle (`AT+CFUN=0` -> `AT+CFUN=1`): drops and re-acquires
     /// network registration without power-cycling the module or
     /// re-enumerating USB, unlike `reboot`'s `AT+CFUN=1,1` (which resets the
