@@ -15,7 +15,7 @@ use crate::modules::protocol::{BridgeEvent, ModuleCmd};
 use crate::modules::restart_policy::{retry_delay_for, RestartMode};
 use crate::modules::scheduler::{AttemptType, CycleOutcome, Outcome};
 use crate::modules::slot::{
-    backoff_delay, claim_idle_cs_slot, track_lifecycle_alert, LifecycleState, SlotState,
+    backoff_delay, claim_idle_cs_slot, track_lifecycle_alert, LifecycleState, SlotState, TaskExit,
 };
 use crate::sms;
 use crate::store::StoreCommand;
@@ -168,7 +168,7 @@ impl CardPool {
         cmd: ControlCmd,
         reply: oneshot::Sender<ControlResp>,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
     ) {
         match cmd {
             ControlCmd::ListSlots => {
@@ -321,6 +321,7 @@ impl CardPool {
                         state.module.serial_port.clone(),
                         state.module.id.clone(),
                         slot,
+                        state.instance,
                         mode,
                         "card restart",
                     );
@@ -659,6 +660,7 @@ mod tests {
         (
             SlotState {
                 slot: 0,
+                instance: crate::modules::slot::next_instance(),
                 module: DiscoveredModule {
                     id: module_id.to_string(),
                     serial_port: PathBuf::from(format!("/dev/tty{module_id}")),

@@ -16,7 +16,7 @@ use crate::modules::restart_policy::{retry_delay_for, scheduled_restart_mode, Re
 use crate::modules::scheduler::{
     self, AttemptType, CycleOutcome, CyclePhase, CycleState, Outcome, SchedulerAction, SkipReason,
 };
-use crate::modules::slot::{LifecycleState, PoolSlotView, SlotState};
+use crate::modules::slot::{LifecycleState, PoolSlotView, SlotState, TaskExit};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -64,7 +64,7 @@ impl CardPool {
     pub(super) fn advance_scheduler(
         &mut self,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         now: tokio::time::Instant,
     ) {
         // 1) If no cycle is active and the scheduled instant has arrived, start one.
@@ -165,7 +165,7 @@ impl CardPool {
     fn apply_send_reboot(
         &self,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         slot: u32,
         now: tokio::time::Instant,
     ) {
@@ -227,6 +227,7 @@ impl CardPool {
                 state.module.serial_port.clone(),
                 state.module.id.clone(),
                 slot,
+                state.instance,
                 mode,
                 "scheduled_restart",
             );
@@ -383,10 +384,11 @@ impl CardPool {
 /// `apply_send_reboot`'s comment for why it is tracked in `tasks` rather than
 /// detached. `context` only labels the warning if the port will not open.
 pub(super) fn spawn_fallback_restart(
-    tasks: &mut JoinSet<(u32, String)>,
+    tasks: &mut JoinSet<TaskExit>,
     serial_port: std::path::PathBuf,
     module_id: String,
     slot: u32,
+    instance: u64,
     mode: RestartMode,
     context: &'static str,
 ) {
@@ -404,6 +406,10 @@ pub(super) fn spawn_fallback_restart(
                 );
             }
         }
-        (slot, module_id)
+        TaskExit {
+            slot,
+            module_id,
+            instance,
+        }
     });
 }

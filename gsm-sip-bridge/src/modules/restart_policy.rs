@@ -85,7 +85,7 @@ pub(crate) const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// `join_next` branch recomputes `next_retry_at` from the real exit event —
 /// that's what actually closes the race in the common case, this constant
 /// only bounds how bad the window is if it doesn't land in time. (A `JoinSet`
-/// task that panics loses its `(slot, module_id)` payload — `join_next`'s
+/// task that panics loses its `TaskExit` payload — `join_next`'s
 /// `Err` arm can't identify which slot to correct — so an unbounded wait
 /// instead of a numeric backstop isn't a safe alternative: a panicking
 /// restart would leave that slot stuck in `Recovering` forever instead of

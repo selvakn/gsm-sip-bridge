@@ -17,6 +17,7 @@ use crate::modules::protocol::ModuleCmd;
 use crate::modules::scheduler::{RestartProgress, SlotView};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,11 @@ impl std::fmt::Display for LifecycleState {
 
 pub(crate) struct SlotState {
     pub(crate) slot: u32,
+    /// This entry's identity for the process lifetime ([`next_instance`]),
+    /// kept when the entry is updated in place or re-keyed. Every task in the
+    /// pool's `JoinSet` reports it ([`TaskExit`]), because a slot key can be
+    /// reused by another module while a task is in flight (gh#159).
+    pub(crate) instance: u64,
     pub(crate) module: DiscoveredModule,
     pub(crate) imei: String,
     pub(crate) phone_number: String,
@@ -110,6 +116,40 @@ pub(crate) fn backoff_delay(attempt: u32, initial_sec: u64, max_sec: u64) -> Dur
     let shift = attempt.min(30);
     let secs = initial_sec.saturating_mul(1u64 << shift);
     Duration::from_secs(secs.min(max_sec))
+}
+
+/// A fresh [`SlotState::instance`]; never repeats within a process.
+pub(crate) fn next_instance() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What every task in the pool's `JoinSet` (module workers and the fallback
+/// restarts) returns when it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskExit {
+    /// The key the entry had when the task was spawned; may be stale.
+    pub(crate) slot: u32,
+    pub(crate) module_id: String,
+    pub(crate) instance: u64,
+}
+
+/// The key of the entry a finished task belongs to. gh#159, Greptile on
+/// PR #178: a parked entry can be moved off its key (`place_slot`) while a
+/// restart task for it is in flight, and a healthy modem then initialises
+/// into that key; the task's exit must not reach the healthy modem. Matched
+/// by instance, not key: `None` when the entry is gone.
+pub(crate) fn exit_target(slots: &HashMap<u32, SlotState>, exit: &TaskExit) -> Option<u32> {
+    if slots
+        .get(&exit.slot)
+        .is_some_and(|s| s.instance == exit.instance)
+    {
+        return Some(exit.slot);
+    }
+    slots
+        .iter()
+        .find(|(_, s)| s.instance == exit.instance)
+        .map(|(k, _)| *k)
 }
 
 /// The modems the circuit-switched pool already holds, as a USB rescan must
@@ -369,6 +409,7 @@ mod tests {
     fn slot_state(module_id: &str, lifecycle: LifecycleState) -> SlotState {
         SlotState {
             slot: 0,
+            instance: next_instance(),
             module: DiscoveredModule {
                 id: module_id.to_string(),
                 serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
@@ -538,6 +579,40 @@ mod tests {
             "the parked module moved, not lost"
         );
         assert!(!slots.contains_key(&2));
+    }
+
+    #[test]
+    fn a_task_exit_follows_its_entry_and_never_reaches_a_new_holder_of_the_key() {
+        // Greptile on PR #178: a restart is in flight for parked `a` at key 0;
+        // `a` is moved to key 1 and healthy `b` takes key 0.
+        let mut slots = HashMap::new();
+        slots.insert(0, parked("a", 0));
+        let exit = TaskExit {
+            slot: 0,
+            module_id: "a".into(),
+            instance: slots[&0].instance,
+        };
+        place_slot(&mut slots, 0, initialised("b", 0, LifecycleState::Ready));
+
+        assert_eq!(exit_target(&slots, &exit), Some(1));
+        slots.remove(&1);
+        assert_eq!(
+            exit_target(&slots, &exit),
+            None,
+            "entry gone: nothing to update"
+        );
+    }
+
+    #[test]
+    fn a_task_exit_for_an_entry_still_on_its_key_lands_there() {
+        let mut slots = HashMap::new();
+        slots.insert(3, initialised("a", 3, LifecycleState::Ready));
+        let exit = TaskExit {
+            slot: 3,
+            module_id: "a".into(),
+            instance: slots[&3].instance,
+        };
+        assert_eq!(exit_target(&slots, &exit), Some(3));
     }
 
     #[test]

@@ -27,8 +27,9 @@ use crate::modules::discovery::{self, DiscoveredModule};
 use crate::modules::protocol::{BridgeEvent, ControlCmdReceiver, ModuleCmd};
 use crate::modules::scheduler::{self, CycleState};
 use crate::modules::slot::{
-    backoff_delay, find_given_up_slot, free_slot_key, live_slot_at, move_slot, place_slot,
-    take_open_lifecycle_alert, usable_phone, LifecycleState, OccupiedModems, SlotState,
+    backoff_delay, exit_target, find_given_up_slot, free_slot_key, live_slot_at, move_slot,
+    next_instance, place_slot, take_open_lifecycle_alert, usable_phone, LifecycleState,
+    OccupiedModems, SlotState, TaskExit,
 };
 use crate::modules::worker::{self, ModuleAudioInit, WorkerSetup};
 use crate::sip::SipBridge;
@@ -192,7 +193,7 @@ impl CardPool {
         }
 
         let mut slots: HashMap<u32, SlotState> = HashMap::new();
-        let mut tasks: JoinSet<(u32, String)> = JoinSet::new();
+        let mut tasks: JoinSet<TaskExit> = JoinSet::new();
         let resilience = self.config.resilience.clone();
 
         self.bootstrap_slots(modules, &mut slots, &mut tasks, &event_tx, &resilience);
@@ -322,7 +323,7 @@ impl CardPool {
         &self,
         modules: Vec<DiscoveredModule>,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
         resilience: &crate::config::ResilienceConfig,
     ) {
@@ -362,13 +363,21 @@ impl CardPool {
                         continue;
                     }
 
-                    let cmd_tx =
-                        self.spawn_worker(tasks, &module, slot, event_tx, usable_phone(&phone));
+                    let instance = next_instance();
+                    let cmd_tx = self.spawn_worker(
+                        tasks,
+                        &module,
+                        slot,
+                        instance,
+                        event_tx,
+                        usable_phone(&phone),
+                    );
                     place_slot(
                         slots,
                         slot,
                         SlotState {
                             slot,
+                            instance,
                             module,
                             imei,
                             phone_number: phone,
@@ -403,7 +412,7 @@ impl CardPool {
     fn on_timer_tick(
         &mut self,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
         resilience: &crate::config::ResilienceConfig,
         rescan_deadline: &mut tokio::time::Instant,
@@ -446,7 +455,7 @@ impl CardPool {
         &self,
         slot: u32,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
         resilience: &crate::config::ResilienceConfig,
     ) {
@@ -484,8 +493,15 @@ impl CardPool {
                 );
 
                 let worker_phone = usable_phone(&phone);
-                let cmd_tx =
-                    self.spawn_worker(tasks, &module, new_slot, event_tx, worker_phone.clone());
+                let instance = slots[&slot].instance;
+                let cmd_tx = self.spawn_worker(
+                    tasks,
+                    &module,
+                    new_slot,
+                    instance,
+                    event_tx,
+                    worker_phone.clone(),
+                );
 
                 if let Some(state) = slots.get_mut(&slot) {
                     state.imei = imei;
@@ -553,18 +569,27 @@ impl CardPool {
     /// A module worker thread ended: park its slot on the retry backoff so
     /// the timer tick picks it up.
     fn on_worker_exit(
-        result: Result<(u32, String), tokio::task::JoinError>,
+        result: Result<TaskExit, tokio::task::JoinError>,
         slots: &mut HashMap<u32, SlotState>,
         resilience: &crate::config::ResilienceConfig,
     ) {
-        let (slot, module_id) = match result {
+        let exit = match result {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "module worker panicked");
                 return;
             }
         };
-        tracing::warn!(module = %module_id, slot = slot, "module worker exited, scheduling retry");
+        // gh#159: by instance, not key; the key may now hold another module.
+        let Some(slot) = exit_target(slots, &exit) else {
+            tracing::debug!(
+                module = %exit.module_id,
+                slot = exit.slot,
+                "module task exited after its slot was removed; nothing to update"
+            );
+            return;
+        };
+        tracing::warn!(module = %exit.module_id, slot = slot, "module worker exited, scheduling retry");
         if let Some(state) = slots.get_mut(&slot) {
             state.lifecycle = LifecycleState::Recovering;
             state.cmd_tx = None;
@@ -636,9 +661,10 @@ impl CardPool {
     /// card (specs/034-alert-identity), passed to the worker for its alerts.
     fn spawn_worker(
         &self,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         module: &DiscoveredModule,
         slot: u32,
+        instance: u64,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
         phone_number: Option<String>,
     ) -> crossbeam_channel::Sender<ModuleCmd> {
@@ -651,7 +677,11 @@ impl CardPool {
             if let Err(e) = worker::run_module_loop(module, setup, event_tx, cmd_rx) {
                 tracing::error!(module = %module_id, error = %e, "module loop exited with error");
             }
-            (slot, module_id)
+            TaskExit {
+                slot,
+                module_id,
+                instance,
+            }
         });
         cmd_tx
     }
@@ -813,7 +843,7 @@ impl CardPool {
     fn rescan_new_modules(
         &self,
         slots: &mut HashMap<u32, SlotState>,
-        tasks: &mut JoinSet<(u32, String)>,
+        tasks: &mut JoinSet<TaskExit>,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
     ) {
         // gh#159: the modems this pool's workers hold are skipped by exact
@@ -883,12 +913,15 @@ impl CardPool {
                     self.clear_stale_given_up(slots, &module.id, worker_phone.clone());
                     self.close_open_lifecycle_alert(slots, &module.id, worker_phone.clone());
 
-                    let cmd_tx = self.spawn_worker(tasks, &module, slot, event_tx, worker_phone);
+                    let instance = next_instance();
+                    let cmd_tx =
+                        self.spawn_worker(tasks, &module, slot, instance, event_tx, worker_phone);
                     place_slot(
                         slots,
                         slot,
                         SlotState {
                             slot,
+                            instance,
                             module,
                             imei,
                             phone_number: phone,
@@ -923,6 +956,7 @@ fn pending_slot(
 ) -> SlotState {
     SlotState {
         slot,
+        instance: next_instance(),
         module,
         imei: String::new(),
         phone_number: String::new(),
