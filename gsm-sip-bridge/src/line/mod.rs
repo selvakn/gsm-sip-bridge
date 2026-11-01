@@ -231,6 +231,7 @@ mod tests {
             card_id: card_id.to_string(),
             model: "EC20",
             usb_serial: card_id.to_string(),
+            usb_path: String::new(),
             has_audio_capability: true,
             audio_device: None,
             net_device: None,

@@ -872,6 +872,7 @@ mod tests {
             card_id: card_id.to_string(),
             model: "EC200",
             usb_serial: card_id.to_string(),
+            usb_path: String::new(),
             has_audio_capability: audio,
             audio_device: if audio {
                 Some("hw:0,0".to_string())
@@ -1111,6 +1112,7 @@ mod tests {
             card_id: card_id.to_string(),
             model: "EC200",
             usb_serial: card_id.to_string(),
+            usb_path: String::new(),
             has_audio_capability: false,
             audio_device: None,
             net_device: None,

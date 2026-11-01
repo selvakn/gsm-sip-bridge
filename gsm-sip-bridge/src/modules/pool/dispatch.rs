@@ -664,6 +664,7 @@ mod tests {
                     serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
                     audio_device: String::new(),
                     usb_serial: String::new(),
+                    usb_path: String::new(),
                 },
                 imei: String::new(),
                 phone_number: String::new(),

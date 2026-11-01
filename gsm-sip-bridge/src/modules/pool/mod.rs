@@ -27,8 +27,8 @@ use crate::modules::discovery::{self, DiscoveredModule};
 use crate::modules::protocol::{BridgeEvent, ControlCmdReceiver, ModuleCmd};
 use crate::modules::scheduler::{self, CycleState};
 use crate::modules::slot::{
-    backoff_delay, find_given_up_slot, take_open_lifecycle_alert, usable_phone, LifecycleState,
-    SlotState,
+    backoff_delay, find_given_up_slot, free_slot_key, live_slot_at, take_open_lifecycle_alert,
+    usable_phone, LifecycleState, OccupiedModems, SlotState,
 };
 use crate::modules::worker::{self, ModuleAudioInit, WorkerSetup};
 use crate::sip::SipBridge;
@@ -290,11 +290,16 @@ impl CardPool {
                         .to_string_lossy()
                         .as_ref(),
                 );
+                // gh#159: resolve the pinned port's USB topology so the
+                // periodic rescan recognizes this modem and leaves its other
+                // interfaces alone.
+                let usb_path = discovery::usb_path_for_port(&serial);
                 vec![DiscoveredModule {
                     id,
                     serial_port: serial,
                     audio_device: audio,
                     usb_serial: String::new(),
+                    usb_path,
                 }]
             }
             None => match discovery::scan_modules_excluding_cards(
@@ -342,6 +347,21 @@ impl CardPool {
                         None,
                     );
 
+                    // gh#159: the slot key comes from the IMEI, so two modems
+                    // reporting the same one (e.g. both unreadable, "Unknown")
+                    // land on one key. Never replace a live slot.
+                    if live_slot_at(slots, slot) {
+                        tracing::error!(
+                            module = %module.id,
+                            slot = slot,
+                            imei = %imei,
+                            holder = %slots[&slot].module.id,
+                            "module maps to a slot another module already holds; \
+                             leaving it out of service"
+                        );
+                        continue;
+                    }
+
                     let cmd_tx =
                         self.spawn_worker(tasks, &module, slot, event_tx, usable_phone(&phone));
                     slots.insert(
@@ -370,7 +390,7 @@ impl CardPool {
                         .inc();
                     events::record(EventKind::ModuleInitFailed, Some(&module.id), &e, None);
                     // Assign a temporary slot for tracking
-                    let slot = slots.len() as u32;
+                    let slot = free_slot_key(slots);
                     slots.insert(slot, pending_slot(slot, module, resilience));
                 }
             }
@@ -771,27 +791,34 @@ impl CardPool {
         tasks: &mut JoinSet<(u32, String)>,
         event_tx: &mpsc::UnboundedSender<BridgeEvent>,
     ) {
+        // gh#159: the modems this pool's workers hold are skipped by exact
+        // USB topology *before* discovery opens any of their ports. Filtering
+        // by port path afterward is not enough: the worker holds its AT port
+        // exclusively, so the probe falls through to the same modem's next
+        // AT-answering interface and reports it under a new path.
+        //
         // specs/022-discord-critical-alerts (Greptile P1 fix): a `GivenUp`
-        // slot's serial port must NOT count as "known" — otherwise this scan
-        // treats the module as already-seen forever and never attempts it
-        // again, even if the underlying hardware issue has since cleared.
-        let known_serials: std::collections::HashSet<PathBuf> = slots
-            .values()
-            .filter(|s| s.lifecycle != LifecycleState::GivenUp)
-            .map(|s| s.module.serial_port.clone())
-            .collect();
+        // slot does NOT count as held (see `OccupiedModems`) — otherwise this
+        // scan treats the module as already-seen forever and never attempts
+        // it again, even if the underlying hardware issue has since cleared.
+        let occupied = OccupiedModems::from_slots(slots);
+        let held_usb_paths: Vec<String> = occupied.usb_paths.iter().cloned().collect();
 
         let volte_ports = discovery::volte_claimed_ports(&self.config.volte);
-        let volte_cards = discovery::volte_claimed_card_ids(&self.config.volte);
+        let mut skip_cards = discovery::volte_claimed_card_ids(&self.config.volte);
+        skip_cards.extend(occupied.fallback_card_ids.iter().cloned());
         let mut policy = self.discovery_policy.lock().unwrap();
-        let new_modules = match discovery::scan_modules_excluding_cards(
+        let new_modules = match discovery::scan_modules_excluding_modems(
             &volte_ports,
-            &volte_cards,
+            &skip_cards,
+            &held_usb_paths,
             &mut policy,
         ) {
+            // Discovery already skipped these; this second check keeps a held
+            // modem from ever becoming a second slot regardless.
             Ok(m) => m
                 .into_iter()
-                .filter(|m| !known_serials.contains(&m.serial_port))
+                .filter(|m| !occupied.contains(m))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::debug!(error = %e, "USB rescan failed");
@@ -805,6 +832,20 @@ impl CardPool {
             tracing::info!(module = %module.id, "new module detected, initializing");
             match self.try_init_module(&module) {
                 Ok((slot, imei, phone, net_type, net_mode)) => {
+                    // gh#159: never replace a live slot (see
+                    // `live_slot_at`); this would be a second worker on a
+                    // modem the pool already runs.
+                    if live_slot_at(slots, slot) {
+                        tracing::error!(
+                            module = %module.id,
+                            slot = slot,
+                            imei = %imei,
+                            holder = %slots[&slot].module.id,
+                            "rescanned module maps to a slot another module already holds; \
+                             not starting a second worker"
+                        );
+                        continue;
+                    }
                     // specs/022-discord-critical-alerts (Greptile P1 fix):
                     // this module_id may already have a stale `GivenUp` slot
                     // from an earlier incident (a different slot key — the
@@ -839,7 +880,7 @@ impl CardPool {
                 }
                 Err(e) => {
                     tracing::warn!(module = %module.id, error = %e, "new module init failed");
-                    let slot = slots.len() as u32;
+                    let slot = free_slot_key(slots);
                     slots.insert(slot, pending_slot(slot, module, resilience));
                 }
             }

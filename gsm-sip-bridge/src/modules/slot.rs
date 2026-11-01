@@ -15,7 +15,8 @@ use crate::modules::at_commander::{NetworkMode, NetworkType};
 use crate::modules::discovery::DiscoveredModule;
 use crate::modules::protocol::ModuleCmd;
 use crate::modules::scheduler::{RestartProgress, SlotView};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +110,71 @@ pub(crate) fn backoff_delay(attempt: u32, initial_sec: u64, max_sec: u64) -> Dur
     let shift = attempt.min(30);
     let secs = initial_sec.saturating_mul(1u64 << shift);
     Duration::from_secs(secs.min(max_sec))
+}
+
+/// The modems the circuit-switched pool already holds, as a USB rescan must
+/// recognize them (gh#159). `GivenUp` slots are left out on purpose: the
+/// specs/022 recovery path depends on a later rescan rediscovering that
+/// modem.
+#[derive(Debug, Default)]
+pub(crate) struct OccupiedModems {
+    /// Exact USB topology of every held modem that has one; the rescan
+    /// passes these to discovery so their ports are never opened.
+    pub(crate) usb_paths: HashSet<String>,
+    /// Card ids of held modems with no resolved `usb_path` (an operator-pinned
+    /// port with no sysfs entry): the coarser fallback, since a card id can
+    /// collide between two modems.
+    pub(crate) fallback_card_ids: HashSet<String>,
+    serial_ports: HashSet<PathBuf>,
+}
+
+impl OccupiedModems {
+    pub(crate) fn from_slots(slots: &HashMap<u32, SlotState>) -> Self {
+        let mut occupied = Self::default();
+        for slot in slots
+            .values()
+            .filter(|s| s.lifecycle != LifecycleState::GivenUp)
+        {
+            occupied
+                .serial_ports
+                .insert(slot.module.serial_port.clone());
+            if slot.module.usb_path.is_empty() {
+                occupied.fallback_card_ids.insert(slot.module.id.clone());
+            } else {
+                occupied.usb_paths.insert(slot.module.usb_path.clone());
+            }
+        }
+        occupied
+    }
+
+    /// Whether a scan result is a modem the pool already holds — matched by
+    /// port, by exact USB topology, or by card id for a held modem without a
+    /// topology. A held modem *with* a topology never matches by card id, so
+    /// a different modem whose card id collides with it is still accepted.
+    pub(crate) fn contains(&self, module: &DiscoveredModule) -> bool {
+        self.serial_ports.contains(&module.serial_port)
+            || (!module.usb_path.is_empty() && self.usb_paths.contains(&module.usb_path))
+            || self.fallback_card_ids.contains(&module.id)
+    }
+}
+
+/// Whether `key` holds a slot that must not be overwritten: anything but a
+/// `GivenUp` one (which a rediscovery is allowed to replace). gh#159: the
+/// slot key comes from the card's IMEI, so a second init of a modem the pool
+/// already runs lands on that modem's own live key.
+pub(crate) fn live_slot_at(slots: &HashMap<u32, SlotState>, key: u32) -> bool {
+    slots
+        .get(&key)
+        .is_some_and(|s| s.lifecycle != LifecycleState::GivenUp)
+}
+
+/// The lowest key no slot uses, for parking a module whose init failed (it
+/// has no IMEI-derived key yet). `slots.len()` is not that: with keys `{1}`
+/// it is `1`, which would overwrite the live slot.
+pub(crate) fn free_slot_key(slots: &HashMap<u32, SlotState>) -> u32 {
+    (0..=u32::MAX)
+        .find(|k| !slots.contains_key(k))
+        .expect("fewer than u32::MAX slots")
 }
 
 /// specs/022-discord-critical-alerts (Greptile P1 fix): finds a stale
@@ -261,6 +327,7 @@ mod tests {
                 serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
                 audio_device: String::new(),
                 usb_serial: String::new(),
+                usb_path: String::new(),
             },
             imei: String::new(),
             phone_number: String::new(),
@@ -274,6 +341,119 @@ mod tests {
             hanging_up: false,
             lifecycle_alert_open: false,
         }
+    }
+
+    fn held(module_id: &str, port: &str, usb_path: &str, lifecycle: LifecycleState) -> SlotState {
+        let mut state = slot_state(module_id, lifecycle);
+        state.module.serial_port = PathBuf::from(port);
+        state.module.usb_path = usb_path.to_string();
+        state
+    }
+
+    fn scanned(module_id: &str, port: &str, usb_path: &str) -> DiscoveredModule {
+        held(module_id, port, usb_path, LifecycleState::Ready).module
+    }
+
+    #[test]
+    fn occupied_modems_cover_every_lifecycle_but_given_up() {
+        let mut slots = HashMap::new();
+        slots.insert(0, held("a", "/dev/ttyUSB2", "1-1", LifecycleState::Ready));
+        slots.insert(
+            1,
+            held("b", "/dev/ttyUSB6", "1-2", LifecycleState::Initializing),
+        );
+        slots.insert(
+            2,
+            held("c", "/dev/ttyUSB10", "1-3", LifecycleState::Recovering),
+        );
+        slots.insert(
+            3,
+            held("d", "/dev/ttyUSB14", "1-4", LifecycleState::GivenUp),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert_eq!(
+            occupied.usb_paths,
+            ["1-1", "1-2", "1-3"].map(String::from).into()
+        );
+        assert!(!occupied.contains(&scanned("d", "/dev/ttyUSB14", "1-4")));
+    }
+
+    #[test]
+    fn a_held_modem_found_on_another_interface_is_recognized_by_usb_path() {
+        // gh#159: the worker holds ttyUSB2 exclusively, so the rescan's probe
+        // falls through to ttyUSB3 on the same modem.
+        let mut slots = HashMap::new();
+        slots.insert(
+            0,
+            held(
+                "ec20-ABCDEF",
+                "/dev/ttyUSB2",
+                "5-1.4",
+                LifecycleState::Ready,
+            ),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert!(occupied.contains(&scanned("ec20-ABCDEF", "/dev/ttyUSB3", "5-1.4")));
+    }
+
+    #[test]
+    fn a_different_modem_with_a_colliding_card_id_is_not_recognized() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            0,
+            held(
+                "ec20-ABCDEF",
+                "/dev/ttyUSB2",
+                "5-1.4",
+                LifecycleState::Ready,
+            ),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert!(!occupied.contains(&scanned("ec20-ABCDEF", "/dev/ttyUSB7", "5-1.3")));
+    }
+
+    #[test]
+    fn a_held_modem_without_usb_path_falls_back_to_card_id() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            0,
+            held("ec20-PINNED", "/dev/ttyUSB2", "", LifecycleState::Ready),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert!(occupied.usb_paths.is_empty());
+        assert_eq!(
+            occupied.fallback_card_ids,
+            ["ec20-PINNED".to_string()].into()
+        );
+        assert!(occupied.contains(&scanned("ec20-PINNED", "/dev/ttyUSB3", "5-1.4")));
+    }
+
+    #[test]
+    fn live_slot_at_protects_everything_but_given_up() {
+        let mut slots = HashMap::new();
+        slots.insert(0, slot_state("a", LifecycleState::Ready));
+        slots.insert(1, slot_state("b", LifecycleState::Initializing));
+        slots.insert(2, slot_state("c", LifecycleState::GivenUp));
+
+        assert!(live_slot_at(&slots, 0));
+        assert!(live_slot_at(&slots, 1));
+        assert!(!live_slot_at(&slots, 2));
+        assert!(!live_slot_at(&slots, 3));
+    }
+
+    #[test]
+    fn free_slot_key_never_reuses_an_existing_key() {
+        let mut slots = HashMap::new();
+        assert_eq!(free_slot_key(&slots), 0);
+        slots.insert(1, slot_state("a", LifecycleState::Ready));
+        // `slots.len()` would be 1 here, overwriting the live slot.
+        assert_eq!(free_slot_key(&slots), 0);
+        slots.insert(0, slot_state("b", LifecycleState::Ready));
+        assert_eq!(free_slot_key(&slots), 2);
     }
 
     #[test]

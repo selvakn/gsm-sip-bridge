@@ -113,6 +113,18 @@ pub(super) fn find_net_iface(dev_path: &Path) -> Option<String> {
     find_in_iface_subdir(dev_path, ":", "net", |name| Some(name.to_string()))
 }
 
+/// The USB topology name (e.g. `5-1.4`) of the device a `ttyUSB*` belongs to,
+/// read from `<tty_class_root>/<tty>/device`, which links into the USB
+/// interface directory (`…/5-1.4/5-1.4:1.2/ttyUSB2`). `None` when the tty
+/// has no sysfs entry or does not sit under a USB interface.
+/// `tty_class_root` is `/sys/class/tty` in production and a tempdir in tests.
+pub(super) fn usb_device_name_for_tty(tty_class_root: &Path, tty: &str) -> Option<String> {
+    let device = fs::canonicalize(tty_class_root.join(tty).join("device")).ok()?;
+    let iface = device.parent()?.file_name()?.to_str()?;
+    let (usb_name, _) = iface.split_once(':')?;
+    (!usb_name.is_empty()).then(|| usb_name.to_string())
+}
+
 pub(super) fn read_sysfs_attr(path: &Path, attr: &str) -> Option<String> {
     fs::read_to_string(path.join(attr))
         .ok()
@@ -129,6 +141,35 @@ mod tests {
         fs::write(iface_dir.join("bInterfaceNumber"), iface_num).unwrap();
         let tty_tty_dir = iface_dir.join(tty_name).join("tty").join(tty_name);
         fs::create_dir_all(&tty_tty_dir).unwrap();
+    }
+
+    #[test]
+    fn usb_device_name_for_tty_reads_the_owning_usb_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty_dev = dir.path().join("devices/usb5/5-1/5-1.4/5-1.4:1.2/ttyUSB2");
+        fs::create_dir_all(&tty_dev).unwrap();
+        let class = dir.path().join("class/tty/ttyUSB2");
+        fs::create_dir_all(&class).unwrap();
+        std::os::unix::fs::symlink(&tty_dev, class.join("device")).unwrap();
+
+        assert_eq!(
+            usb_device_name_for_tty(&dir.path().join("class/tty"), "ttyUSB2").as_deref(),
+            Some("5-1.4")
+        );
+    }
+
+    #[test]
+    fn usb_device_name_for_tty_is_none_without_a_usb_interface_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty_dev = dir.path().join("devices/platform/serial8250/ttyS0");
+        fs::create_dir_all(&tty_dev).unwrap();
+        let class = dir.path().join("class/tty/ttyS0");
+        fs::create_dir_all(&class).unwrap();
+        std::os::unix::fs::symlink(&tty_dev, class.join("device")).unwrap();
+
+        let root = dir.path().join("class/tty");
+        assert_eq!(usb_device_name_for_tty(&root, "ttyS0"), None);
+        assert_eq!(usb_device_name_for_tty(&root, "ttyUSB9"), None);
     }
 
     #[test]

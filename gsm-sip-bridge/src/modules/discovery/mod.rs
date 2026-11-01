@@ -37,7 +37,7 @@ use claims::{
     active_volte_card_ids, active_volte_line_ports, active_vowifi_card_ids,
     excluded_ports_from_lines_file,
 };
-use sysfs::{find_alsa_card, find_net_iface, read_sysfs_attr};
+use sysfs::{find_alsa_card, find_net_iface, read_sysfs_attr, usb_device_name_for_tty};
 
 pub use claims::{
     lines_file_path, volte_claimed_card_ids, volte_claimed_ports, DEFAULT_LINES_FILE,
@@ -52,6 +52,13 @@ pub struct DiscoveredModule {
     pub serial_port: PathBuf,
     pub audio_device: String,
     pub usb_serial: String,
+    /// The modem's USB topology name in sysfs (`/sys/bus/usb/devices/<this>`,
+    /// e.g. `5-1.4`): the exact identity of "this physical device right now"
+    /// (gh#159). Unlike `usb_serial` it is never empty for a scanned modem and
+    /// two devices cannot share it; unlike `serial_port` it does not change
+    /// with which `ttyUSB*` interface answered `AT`. Empty only when it could
+    /// not be resolved (an operator-pinned port with no sysfs entry).
+    pub usb_path: String,
 }
 
 pub fn derive_module_id(identifier: &str) -> String {
@@ -62,6 +69,18 @@ pub fn derive_module_id(identifier: &str) -> String {
         &clean
     };
     format!("ec20-{}", suffix.to_ascii_uppercase())
+}
+
+/// The [`DiscoveredModule::usb_path`] of the modem that owns serial `port`
+/// (e.g. `/dev/ttyUSB2` → `5-1.4`), for a module built from an operator-pinned
+/// port rather than a scan. A `/dev/serial/by-id/…` link is followed to its
+/// `ttyUSB*` first. Empty when it cannot be resolved.
+pub fn usb_path_for_port(port: &Path) -> String {
+    let port = fs::canonicalize(port).unwrap_or_else(|_| port.to_path_buf());
+    port.file_name()
+        .and_then(|tty| tty.to_str())
+        .and_then(|tty| usb_device_name_for_tty(Path::new("/sys/class/tty"), tty))
+        .unwrap_or_default()
 }
 
 /// Every USB-recognized modem, probed for its AT-capable interface and SIM
@@ -76,6 +95,8 @@ pub struct ProbedModem {
     pub card_id: String,
     pub model: &'static str,
     pub usb_serial: String,
+    /// See [`DiscoveredModule::usb_path`].
+    pub usb_path: String,
     pub has_audio_capability: bool,
     pub audio_device: Option<String>,
     /// Host network interface this modem exposes for its data path (e.g. a
@@ -128,6 +149,7 @@ pub fn scan_all_preferring(preferred_ports: &[PathBuf]) -> BridgeResult<Vec<Prob
     scan_all_inner(
         preferred_ports,
         &HashSet::new(),
+        &HashSet::new(),
         SimRecovery::Disabled,
         &mut DiscoveryPolicy::unfiltered(),
     )
@@ -141,7 +163,13 @@ pub fn scan_all_preferring_with_sim_recovery(
     sim_recovery: SimRecovery,
     policy: &mut DiscoveryPolicy,
 ) -> BridgeResult<Vec<ProbedModem>> {
-    scan_all_inner(preferred_ports, &HashSet::new(), sim_recovery, policy)
+    scan_all_inner(
+        preferred_ports,
+        &HashSet::new(),
+        &HashSet::new(),
+        sim_recovery,
+        policy,
+    )
 }
 
 /// Like [`scan_all_preferring`], but honoring an operator [`DiscoveryPolicy`]
@@ -156,6 +184,7 @@ pub fn scan_all_preferring_with_policy(
 ) -> BridgeResult<Vec<ProbedModem>> {
     scan_all_inner(
         preferred_ports,
+        &HashSet::new(),
         &HashSet::new(),
         SimRecovery::Disabled,
         policy,
@@ -175,11 +204,22 @@ pub fn scan_all_preferring_with_policy(
 /// "modem claimed by both subsystems" hazard the spec's edge cases warn
 /// about, just manifesting after startup instead of at it.
 ///
+/// `skip_usb_paths` is the same "do not open" set keyed by exact USB topology
+/// (see [`DiscoveredModule::usb_path`]) — how the circuit-switched pool's
+/// rescan names the modems its own workers hold (gh#159). Those cannot be
+/// named by card id: `card_id` keeps only the last six characters of the
+/// identifier, so two distinct modems can share one. And they must be skipped
+/// *before* the probe, not filtered after it: the worker holds its AT port
+/// exclusively, so the probe's open of it fails and the probe falls through
+/// to the modem's next `AT`-answering interface, which no port-path filter
+/// recognizes as the same modem.
+///
 /// `sim_recovery` gates the one effect in here that writes to a modem
 /// rather than reading from it — see [`SimRecovery`].
 fn scan_all_inner(
     preferred_ports: &[PathBuf],
     skip_card_ids: &HashSet<String>,
+    skip_usb_paths: &HashSet<String>,
     sim_recovery: SimRecovery,
     policy: &mut DiscoveryPolicy,
 ) -> BridgeResult<Vec<ProbedModem>> {
@@ -209,17 +249,18 @@ fn scan_all_inner(
         };
         let card_id = derive_module_id(&identifier);
 
-        if skip_card_ids.contains(&card_id) {
+        if should_skip_modem(&card_id, &usb_name, skip_card_ids, skip_usb_paths) {
             tracing::debug!(
                 module_id = %card_id,
                 model = device.model,
                 usb_path = %usb_name,
-                "modem already claimed by an active VoWiFi line; not re-probing its serial ports"
+                "modem already claimed by an active line; not re-probing its serial ports"
             );
             modems.push(ProbedModem {
                 card_id,
                 model: device.model,
                 usb_serial: serial,
+                usb_path: usb_name,
                 has_audio_capability: device.has_audio_capability,
                 audio_device: find_alsa_card(&dev_path),
                 net_device: find_net_iface(&dev_path),
@@ -273,6 +314,7 @@ fn scan_all_inner(
             card_id,
             model: device.model,
             usb_serial: serial,
+            usb_path: usb_name,
             has_audio_capability: device.has_audio_capability,
             audio_device,
             net_device,
@@ -282,6 +324,19 @@ fn scan_all_inner(
     }
 
     Ok(modems)
+}
+
+/// Whether `scan_all_inner` must leave this modem's serial ports unopened:
+/// its card id is claimed by another subsystem, or its exact USB topology is
+/// held by a running circuit-switched worker. An empty `usb_path` never
+/// matches, so an unresolved identity cannot shadow a real device.
+fn should_skip_modem(
+    card_id: &str,
+    usb_path: &str,
+    skip_card_ids: &HashSet<String>,
+    skip_usb_paths: &HashSet<String>,
+) -> bool {
+    skip_card_ids.contains(card_id) || (!usb_path.is_empty() && skip_usb_paths.contains(usb_path))
 }
 
 /// The circuit-switched pool's view of `scan_all`: audio-capable modems
@@ -312,6 +367,19 @@ pub fn scan_modules_excluding_cards(
     also_skip_cards: &[String],
     policy: &mut DiscoveryPolicy,
 ) -> BridgeResult<Vec<DiscoveredModule>> {
+    scan_modules_excluding_modems(also_excluded, also_skip_cards, &[], policy)
+}
+
+/// [`scan_modules_excluding_cards`] for the circuit-switched pool's own
+/// rescan, which additionally names the USB topology of every modem its
+/// running workers hold (`also_skip_usb_paths`, gh#159). Those modems' serial
+/// ports are never opened — see `scan_all_inner`.
+pub(crate) fn scan_modules_excluding_modems(
+    also_excluded: &[PathBuf],
+    also_skip_cards: &[String],
+    also_skip_usb_paths: &[String],
+    policy: &mut DiscoveryPolicy,
+) -> BridgeResult<Vec<DiscoveredModule>> {
     let mut excluded = excluded_ports_from_lines_file();
     excluded.extend(active_volte_line_ports());
     excluded.extend(also_excluded.iter().cloned());
@@ -338,7 +406,8 @@ pub fn scan_modules_excluding_cards(
     skip.extend(also_skip_cards.iter().cloned());
     // `SimRecovery::Disabled`: this is the ongoing-rescan path, which must
     // stay a read-only probe — see `SimRecovery`.
-    let modems = scan_all_inner(&[], &skip, SimRecovery::Disabled, policy)?;
+    let skip_usb_paths: HashSet<String> = also_skip_usb_paths.iter().cloned().collect();
+    let modems = scan_all_inner(&[], &skip, &skip_usb_paths, SimRecovery::Disabled, policy)?;
     Ok(modems
         .into_iter()
         .filter(|m| m.has_audio_capability)
@@ -357,6 +426,7 @@ pub fn scan_modules_excluding_cards(
                 serial_port,
                 audio_device: m.audio_device.unwrap_or_default(),
                 usb_serial: m.usb_serial,
+                usb_path: m.usb_path,
             })
         })
         .collect())
@@ -364,6 +434,59 @@ pub fn scan_modules_excluding_cards(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn should_skip_modem_matches_a_claimed_card_id() {
+        assert!(should_skip_modem(
+            "ec20-ABCDEF",
+            "5-1.4",
+            &set(&["ec20-ABCDEF"]),
+            &set(&[])
+        ));
+    }
+
+    #[test]
+    fn should_skip_modem_matches_a_held_usb_path() {
+        assert!(should_skip_modem(
+            "ec20-ABCDEF",
+            "5-1.4",
+            &set(&[]),
+            &set(&["5-1.4"])
+        ));
+    }
+
+    #[test]
+    fn should_skip_modem_does_not_conflate_two_modems_sharing_a_card_id() {
+        // gh#159: both modems' identifiers end in `ABCDEF`, so they derive the
+        // same card id. The pool holds the one at 5-1.4; the one at 5-1.3 is
+        // a different device and must still be probed.
+        assert_eq!(
+            derive_module_id("first-ABCDEF"),
+            derive_module_id("second-ABCDEF")
+        );
+        assert!(!should_skip_modem(
+            &derive_module_id("second-ABCDEF"),
+            "5-1.3",
+            &set(&[]),
+            &set(&["5-1.4"])
+        ));
+    }
+
+    #[test]
+    fn should_skip_modem_never_matches_an_empty_usb_path() {
+        assert!(!should_skip_modem(
+            "ec20-ABCDEF",
+            "",
+            &set(&[]),
+            &set(&[""])
+        ));
+    }
+
     /// The ongoing-rescan path must never power-cycle a radio: it runs for
     /// the container's whole lifetime next to modems that may be registered
     /// or mid-call, and `skip_card_ids` only shields *VoWiFi* lines, not

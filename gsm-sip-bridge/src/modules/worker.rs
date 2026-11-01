@@ -1089,6 +1089,7 @@ mod tests {
             serial_port: std::path::PathBuf::from("/dev/null"),
             audio_device: String::new(),
             usb_serial: String::new(),
+            usb_path: String::new(),
         };
         let long_ago = std::time::Instant::now() - Duration::from_secs(3600);
         let worker = ModuleWorker {
