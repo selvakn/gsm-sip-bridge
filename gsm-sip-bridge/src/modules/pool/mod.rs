@@ -27,8 +27,8 @@ use crate::modules::discovery::{self, DiscoveredModule};
 use crate::modules::protocol::{BridgeEvent, ControlCmdReceiver, ModuleCmd};
 use crate::modules::scheduler::{self, CycleState};
 use crate::modules::slot::{
-    backoff_delay, find_given_up_slot, free_slot_key, live_slot_at, take_open_lifecycle_alert,
-    usable_phone, LifecycleState, OccupiedModems, SlotState,
+    backoff_delay, find_given_up_slot, free_slot_key, live_slot_at, move_slot, place_slot,
+    take_open_lifecycle_alert, usable_phone, LifecycleState, OccupiedModems, SlotState,
 };
 use crate::modules::worker::{self, ModuleAudioInit, WorkerSetup};
 use crate::sip::SipBridge;
@@ -364,7 +364,8 @@ impl CardPool {
 
                     let cmd_tx =
                         self.spawn_worker(tasks, &module, slot, event_tx, usable_phone(&phone));
-                    slots.insert(
+                    place_slot(
+                        slots,
                         slot,
                         SlotState {
                             slot,
@@ -413,7 +414,12 @@ impl CardPool {
         let slot_ids: Vec<u32> = slots.keys().copied().collect();
         for slot in slot_ids {
             let should_retry = {
-                let s = &slots[&slot];
+                // A retry earlier in this loop can remove or re-key an entry:
+                // `clear_stale_given_up` drops a stale slot, and gh#159's
+                // `move_slot` re-keys a recovered one.
+                let Some(s) = slots.get(&slot) else {
+                    continue;
+                };
                 s.lifecycle != LifecycleState::Ready
                     && s.lifecycle != LifecycleState::GivenUp
                     && s.next_retry_at.is_some_and(|t| t <= now)
@@ -449,7 +455,22 @@ impl CardPool {
             .with_label_values(&[&module.id])
             .inc();
 
-        match self.try_init_module(&module) {
+        // gh#159: a module parked after a failed init sits on a temporary key;
+        // once its IMEI is read it belongs under the store's slot for it. That
+        // slot may already be another initialised module's (two modems
+        // reporting one IMEI): then this is not a recovery.
+        let result = self.try_init_module(&module).and_then(|init| {
+            let new_slot = init.0;
+            if new_slot != slot && live_slot_at(slots, new_slot) {
+                Err(format!(
+                    "maps to slot {new_slot}, which module {} already holds",
+                    slots[&new_slot].module.id
+                ))
+            } else {
+                Ok(init)
+            }
+        });
+        match result {
             Ok((new_slot, imei, phone, net_type, net_mode)) => {
                 tracing::info!(module = %module.id, slot = new_slot, "module recovered on retry");
                 metrics::MODULE_INIT_TOTAL
@@ -489,6 +510,10 @@ impl CardPool {
                 // it's that fresh slot recovering here.
                 self.clear_stale_given_up(slots, &module.id, worker_phone.clone());
                 self.close_open_lifecycle_alert(slots, &module.id, worker_phone);
+                // gh#159: the worker reports under `new_slot`, so key the entry
+                // the same. After the stale-`GivenUp` cleanup above, so that
+                // entry is closed with its recovery rather than overwritten.
+                move_slot(slots, slot, new_slot);
             }
             Err(e) => {
                 tracing::debug!(module = %module.id, error = %e, "retry failed");
@@ -859,7 +884,8 @@ impl CardPool {
                     self.close_open_lifecycle_alert(slots, &module.id, worker_phone.clone());
 
                     let cmd_tx = self.spawn_worker(tasks, &module, slot, event_tx, worker_phone);
-                    slots.insert(
+                    place_slot(
+                        slots,
                         slot,
                         SlotState {
                             slot,
