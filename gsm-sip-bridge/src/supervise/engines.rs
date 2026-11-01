@@ -197,6 +197,73 @@ const GRACEFUL_TERMINATE_TIMEOUT_SECS: u32 = 8;
 /// Outer bound on the steady-state `swanctl --list-sas` query.
 const STEADY_LIST_SAS_TIMEOUT_SECS: u32 = 10;
 
+/// How many times [`SharedCharon::load_all`] tries while a live charon is not
+/// accepting VICI connections yet, and the wait between tries: about 15s. This
+/// is the only wait for a freshly spawned daemon, and it runs inside recovery,
+/// which shutdown waits for, so it stays well under `STOP_ALLOWANCE` (#177). A
+/// daemon slower than this is picked up by the line's next probe, through
+/// [`StrongswanEngine::ensure_conn_loaded`].
+const LOAD_ALL_CONNECT_ATTEMPTS: u32 = 30;
+const LOAD_ALL_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// What one `swanctl --load-all` run achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadOutcome {
+    Loaded,
+    /// swanctl could not reach VICI: the daemon has not bound its socket yet,
+    /// or (`Connection refused`) a previous run's socket file is still there.
+    NotListening,
+    /// Anything retrying will not fix: a wedged daemon or a bad config.
+    Failed,
+}
+
+/// Classifies a `swanctl --load-all` result. The exit status alone cannot say:
+/// swanctl exits 0 on a config it could not parse, having loaded nothing.
+/// Both strings are swanctl's own wording, captured from the bundled 5.9.3.
+fn classify_load(out: &std::process::Output) -> LoadOutcome {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let says = |needle: &str| stdout.contains(needle) || stderr.contains(needle);
+    if says("invalid config file") {
+        LoadOutcome::Failed
+    } else if out.status.success() {
+        LoadOutcome::Loaded
+    } else if says("connecting to") && out.status.code() != Some(TIMEOUT_EXIT_CODE) {
+        LoadOutcome::NotListening
+    } else {
+        LoadOutcome::Failed
+    }
+}
+
+/// `timeout`'s exit status when it had to end the command.
+const TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// The lines of a `swanctl --load-all` result worth logging: without the usage
+/// text it prints on a connection failure and the "opening directory" line it
+/// prints for every credential directory that does not exist.
+fn load_diagnostics(out: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stderr
+        .lines()
+        .take_while(|l| !l.starts_with("strongSwan "))
+        .chain(stdout.lines())
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("opening directory"))
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Whether `swanctl --list-conns` output defines `conn_name`. A connection's
+/// own line starts in column 0 with `<name>:`; its children are indented, and
+/// the colon keeps `ims1` from matching `ims10`.
+fn list_conns_has_conn(output: &str, conn_name: &str) -> bool {
+    output.lines().any(|l| {
+        l.strip_prefix(conn_name)
+            .is_some_and(|r| r.starts_with(':'))
+    })
+}
+
 /// swanctl's own `--timeout` on an initiate: how long the client (and the
 /// charon worker thread serving it) waits for the IKE_SA to establish before
 /// detaching. charon keeps negotiating after it detaches. Without it a silent
@@ -915,16 +982,6 @@ impl SharedCharon {
             )
             .ok()
             .map(Arc::new);
-        if spawned.is_some() {
-            // Let the vici socket come up before any swanctl call. A
-            // `--load-all` issued too early fails silently (its result is
-            // deliberately ignored), and the `--initiate` that follows then
-            // fails with "CHILD_SA config not found" — leaving the line
-            // re-initiating against an empty config forever, since
-            // steady-state's ChildSaMissing branch only re-initiates and
-            // never reloads.
-            runner.sleep(Duration::from_secs(2));
-        }
         guard.clone_from(&spawned);
         spawned
     }
@@ -945,28 +1002,76 @@ impl SharedCharon {
     }
 
     /// `swanctl --load-all` over the shared `conf.d`, loading the union of
-    /// every line's connection file.
+    /// every line's connection file. Returns whether it loaded; failures are
+    /// logged here, since swanctl's output goes nowhere else (#177).
     ///
     /// It must stay a whole-directory load: `--load-all` *unloads* any
     /// connection missing from what it just read, so loading one line's file
     /// alone would evict the other lines' connections. Loading the union is
     /// idempotent and order-independent, which is what makes it safe for
     /// concurrently-starting lines to each call it.
-    pub fn load_all(&self, runner: &dyn CommandRunner) {
+    ///
+    /// Every path that spawns the daemon comes through here next, so this is
+    /// also what waits for a new daemon's VICI socket: the request itself is
+    /// the readiness check. It retries only that one failure, and only while
+    /// the daemon is alive. A wedged daemon has its own recovery, and a bad
+    /// config will not improve in 15s.
+    pub fn load_all(&self, runner: &dyn CommandRunner) -> bool {
         let env = self.env_prefix();
         // Bounded: against a wedged daemon an unbounded load would block the
         // calling supervisor thread along with it (#139 R3).
         let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
-        let _ = runner.run(&[
-            "timeout",
-            secs.as_str(),
-            "env",
-            env.as_str(),
-            "swanctl",
-            "--load-all",
-            "--file",
-            &self.swanctl_top_conf,
-        ]);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let out = match runner.run(&[
+                "timeout",
+                secs.as_str(),
+                "env",
+                env.as_str(),
+                "swanctl",
+                "--load-all",
+                "--file",
+                &self.swanctl_top_conf,
+            ]) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("[supervise] swanctl --load-all could not run: {e}");
+                    return false;
+                }
+            };
+            match classify_load(&out) {
+                LoadOutcome::Loaded => return true,
+                LoadOutcome::Failed => {
+                    eprintln!(
+                        "[supervise] swanctl --load-all failed ({}): {}",
+                        out.status,
+                        load_diagnostics(&out)
+                    );
+                    return false;
+                }
+                LoadOutcome::NotListening => {}
+            }
+            if !self.is_alive(runner) {
+                eprintln!(
+                    "[supervise] swanctl --load-all failed, charon is not running: {}",
+                    load_diagnostics(&out)
+                );
+                return false;
+            }
+            if attempt >= LOAD_ALL_CONNECT_ATTEMPTS {
+                eprintln!(
+                    "[supervise] swanctl --load-all gave up after {attempt} attempts, charon \
+                     is running but not accepting VICI connections: {}",
+                    load_diagnostics(&out)
+                );
+                return false;
+            }
+            if attempt == 1 {
+                println!("[supervise] charon not accepting VICI connections yet; waiting");
+            }
+            runner.sleep(LOAD_ALL_RETRY_DELAY);
+        }
     }
 }
 
@@ -1138,6 +1243,47 @@ impl StrongswanEngine {
             .read_file(&self.shared.charon_log)
             .ok()
             .and_then(|c| child_rekey_invalid_selectors_session(&c, &self.conn_name))
+    }
+
+    /// Whether charon has this line's connection defined, or `None` if it
+    /// could not be asked: a failed query is not an empty result.
+    fn conn_loaded(&self, runner: &dyn CommandRunner) -> Option<bool> {
+        let env = self.env_prefix();
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
+        match runner.run(&["timeout", &secs, "env", &env, "swanctl", "--list-conns"]) {
+            Ok(out) if out.status.success() => Some(list_conns_has_conn(
+                &String::from_utf8_lossy(&out.stdout),
+                &self.conn_name,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Loads the shared `conf.d`, then checks this line's connection really
+    /// arrived. A load can succeed and still not include it (#177): nothing
+    /// else would say so, and every initiate would then fail.
+    pub fn load_and_verify(&self, runner: &dyn CommandRunner) {
+        if self.shared.load_all(runner) && self.conn_loaded(runner) == Some(false) {
+            eprintln!(
+                "[supervise] line {}: {} is not defined in charon after loading {}",
+                self.idx, self.conn_name, self.shared.swanctl_top_conf
+            );
+        }
+    }
+
+    /// Reloads if charon answers but no longer has this line's connection.
+    /// Re-initiating alone can never repair that: it fails with "CHILD_SA
+    /// config not found" for as long as the daemon stays up (#177). Called by
+    /// the probes that lead to a re-initiate, not by `reinitiate` itself, which
+    /// must not block (#139).
+    fn ensure_conn_loaded(&self, runner: &dyn CommandRunner) {
+        if self.conn_loaded(runner) == Some(false) {
+            println!(
+                "[supervise] line {}: {} is not defined in charon; reloading its connections",
+                self.idx, self.conn_name
+            );
+            self.load_and_verify(runner);
+        }
     }
 
     /// Collects this line's initiate client if it has finished (see
@@ -1324,6 +1470,7 @@ impl TunnelEngine for StrongswanEngine {
             return EstablishProbe::Unresponsive;
         };
         if !list_sas_has_ike_sa(&out, &self.conn_name) {
+            self.ensure_conn_loaded(runner);
             return EstablishProbe::NoIkeSa;
         }
         match ike_sa_header(&out, &self.conn_name) {
@@ -1376,6 +1523,7 @@ impl TunnelEngine for StrongswanEngine {
                 "[supervise] line {}: {} IKE_SA missing; re-initiating",
                 self.idx, self.conn_name
             );
+            self.ensure_conn_loaded(runner);
             return SteadyStateHealth::IkeSaMissing;
         }
         let header = ike_sa_header(&sas_output, &self.conn_name);
@@ -2971,34 +3119,277 @@ mod tests {
         }
 
         #[test]
-        fn restart_process_sleeps_before_load_all_to_let_the_vici_socket_come_up() {
+        fn restart_process_waits_for_the_new_daemons_vici_before_giving_up_on_the_load() {
             // Regression test for a real bug found live (T049/FR-009 audit):
-            // the bash original has `sleep 2 # let the vici socket come up
-            // before swanctl talks to it` at every one of its charon-respawn
-            // sites, including this one — but this port's restart_charon
-            // had it only at the *initial* startup call site (orchestrate.rs),
-            // not here. Missing it here meant `--load-all` could run before
-            // the freshly respawned charon's vici socket was listening,
-            // silently failing to load anything, so the follow-up
-            // `--initiate` failed with "CHILD_SA config 'ims' not found" —
-            // and steady-state's ChildSaMissing branch only ever
-            // re-initiates, never reloads, so the tunnel never recovered on
-            // its own. Observed live: killing charon mid-session left the
-            // line permanently stuck, while the healthcheck kept passing on
-            // the stale pre-kill tun23-0 address.
+            // `--load-all` could run before a freshly respawned charon's vici
+            // socket was listening, silently loading nothing, so the follow-up
+            // `--initiate` failed with "CHILD_SA config 'ims' not found" and
+            // the line never recovered. Observed live: killing charon
+            // mid-session left the line permanently stuck. A fixed 2s sleep
+            // only narrowed that window: #177 hit it again at startup.
             let runner = MockCommandRunner::new();
-            runner.set_born_dead_if_argv_contains("charon");
+            runner.set_run_output_sequence(
+                LOAD_ALL_KEY,
+                vec![refused(), refused(), swanctl_out(0, LOADED_STDOUT, "")],
+            );
             let engine = strongswan_engine();
             engine.restart_process(&runner);
-            assert!(
-                runner
-                    .sleeps
-                    .lock()
-                    .unwrap()
-                    .contains(&std::time::Duration::from_secs(2)),
-                "a respawn must sleep 2s before --load-all, matching \
-                 the bash original at every one of its charon-respawn sites"
+            assert_eq!(load_attempts(&runner), 3);
+            assert_eq!(*runner.sleeps.lock().unwrap(), [LOAD_ALL_RETRY_DELAY; 2]);
+        }
+
+        const LOAD_ALL_KEY: &str = "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf \
+             swanctl --load-all --file /etc/swanctl/swanctl.conf";
+        const LIST_CONNS_KEY: &str =
+            "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-conns";
+
+        // Captured from the bundled swanctl 5.9.3 (ghcr.io image, 8.24.0).
+        const REFUSED_STDERR: &str = "connecting to 'unix:///var/run/charon.vici' failed: \
+             Connection refused\nError: connecting to 'default' URI failed: Connection refused\n\
+             strongSwan 5.9.3 swanctl\nusage:\n  swanctl --load-all [--raw|--pretty]\n";
+        const NO_SOCKET_STDERR: &str =
+            "connecting to 'unix:///var/run/charon.vici' failed: No such file or directory\n";
+        const INVALID_CONFIG: &str = "no connections found, 0 unloaded\n\
+             syntax error, unexpected end of file, expecting NAME or NEWLINE or '}'\n\
+             invalid config file '/etc/swanctl/swanctl.conf'\n\
+             opening directory '/etc/swanctl/x509' failed: No such file or directory\n";
+        const LOADED_STDOUT: &str =
+            "loaded connection 'ims0'\nsuccessfully loaded 1 connections, 0 unloaded\n";
+        const LIST_CONNS_IMS1_IMS10: &str = "\
+ims1: IKEv2, no reauthentication, rekeying every 14400s
+  local:  %any
+  remote: %any
+  local pre-shared key authentication:
+  remote pre-shared key authentication:
+  ims1: TUNNEL, rekeying every 3600s
+    local:  dynamic
+    remote: dynamic
+ims10: IKEv2, no reauthentication, rekeying every 14400s
+  local:  %any
+  remote: %any
+  ims10: TUNNEL, rekeying every 3600s
+    local:  dynamic
+    remote: dynamic
+";
+
+        fn swanctl_out(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        fn refused() -> std::process::Output {
+            swanctl_out(111, "", REFUSED_STDERR)
+        }
+
+        fn load_attempts(runner: &MockCommandRunner) -> usize {
+            let calls = runner.run_calls.lock().unwrap();
+            calls
+                .iter()
+                .filter(|c| c.contains(&"--load-all".to_string()))
+                .count()
+        }
+
+        #[test]
+        fn classify_load_table() {
+            for (out, want) in [
+                (swanctl_out(0, LOADED_STDOUT, ""), LoadOutcome::Loaded),
+                (refused(), LoadOutcome::NotListening),
+                (
+                    swanctl_out(111, "", NO_SOCKET_STDERR),
+                    LoadOutcome::NotListening,
+                ),
+                // swanctl really does exit 0 here, having loaded nothing.
+                (swanctl_out(0, "", INVALID_CONFIG), LoadOutcome::Failed),
+                (swanctl_out(0, INVALID_CONFIG, ""), LoadOutcome::Failed),
+                // `timeout` ended it: the daemon is wedged, whatever was printed.
+                (
+                    swanctl_out(TIMEOUT_EXIT_CODE, "", NO_SOCKET_STDERR),
+                    LoadOutcome::Failed,
+                ),
+                (swanctl_out(1, "", "loading failed"), LoadOutcome::Failed),
+            ] {
+                assert_eq!(classify_load(&out), want, "{out:?}");
+            }
+        }
+
+        #[test]
+        fn load_diagnostics_keeps_the_cause_and_drops_the_noise() {
+            assert_eq!(
+                load_diagnostics(&refused()),
+                "connecting to 'unix:///var/run/charon.vici' failed: Connection refused | \
+                 Error: connecting to 'default' URI failed: Connection refused"
             );
+            let bad = load_diagnostics(&swanctl_out(0, "", INVALID_CONFIG));
+            assert!(bad.contains("invalid config file"), "{bad}");
+            assert!(!bad.contains("opening directory"), "{bad}");
+        }
+
+        #[test]
+        fn list_conns_has_conn_table() {
+            for (name, want) in [
+                ("ims1", true),
+                ("ims10", true),
+                ("ims0", false),
+                ("ims", false),
+            ] {
+                assert_eq!(
+                    list_conns_has_conn(LIST_CONNS_IMS1_IMS10, name),
+                    want,
+                    "{name}"
+                );
+            }
+            assert!(!list_conns_has_conn("", "ims1"));
+        }
+
+        #[test]
+        fn load_all_gives_up_at_the_attempt_cap_while_vici_never_answers() {
+            let runner = MockCommandRunner::new();
+            runner.set_run_output(LOAD_ALL_KEY, refused());
+            let engine = strongswan_engine();
+            engine.shared.ensure_started(&runner);
+            assert!(!engine.shared.load_all(&runner));
+            assert_eq!(load_attempts(&runner), LOAD_ALL_CONNECT_ATTEMPTS as usize);
+            assert_eq!(
+                runner.sleeps.lock().unwrap().len(),
+                LOAD_ALL_CONNECT_ATTEMPTS as usize - 1
+            );
+        }
+
+        #[test]
+        fn load_all_does_not_retry_what_retrying_cannot_fix() {
+            for out in [
+                swanctl_out(TIMEOUT_EXIT_CODE, "", ""),
+                swanctl_out(0, "", INVALID_CONFIG),
+                swanctl_out(1, "", "loading connection failed"),
+            ] {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(LOAD_ALL_KEY, out);
+                let engine = strongswan_engine();
+                engine.shared.ensure_started(&runner);
+                assert!(!engine.shared.load_all(&runner));
+                assert_eq!(load_attempts(&runner), 1);
+                assert!(runner.sleeps.lock().unwrap().is_empty());
+            }
+        }
+
+        #[test]
+        fn load_all_stops_waiting_for_a_daemon_that_died() {
+            let runner = MockCommandRunner::new();
+            runner.set_born_dead_if_argv_contains("charon");
+            runner.set_run_output(LOAD_ALL_KEY, refused());
+            let engine = strongswan_engine();
+            engine.shared.ensure_started(&runner);
+            assert!(!engine.shared.load_all(&runner));
+            assert_eq!(load_attempts(&runner), 1);
+        }
+
+        #[test]
+        fn spawning_the_daemon_no_longer_sleeps_under_the_handle_lock() {
+            let runner = MockCommandRunner::new();
+            strongswan_engine().shared.ensure_started(&runner);
+            assert!(runner.sleeps.lock().unwrap().is_empty());
+        }
+
+        /// `(--list-conns output, expected --load-all runs)`. A failed query
+        /// is not an absent connection, and must not trigger a reload.
+        fn ensure_conn_loaded_cases() -> [(std::process::Output, usize); 3] {
+            [
+                (swanctl_out(0, "ims0: IKEv2\n", ""), 0),
+                (swanctl_out(0, "", ""), 1),
+                (swanctl_out(1, "", ""), 0),
+            ]
+        }
+
+        #[test]
+        fn ensure_conn_loaded_reloads_only_a_connection_charon_says_is_absent() {
+            for (listing, loads) in ensure_conn_loaded_cases() {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(LIST_CONNS_KEY, listing);
+                strongswan_engine().ensure_conn_loaded(&runner);
+                assert_eq!(load_attempts(&runner), loads);
+            }
+        }
+
+        #[test]
+        fn establish_probe_reloads_an_absent_connection_without_touching_the_daemon() {
+            for (listing, loads) in ensure_conn_loaded_cases() {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(LIST_CONNS_KEY, listing);
+                let engine = strongswan_engine();
+                engine.shared.ensure_started(&runner);
+                let daemon = engine.shared.current_handle().unwrap().id();
+                seed_list(&runner, 0, "");
+                assert_eq!(engine.establish_probe(&runner), EstablishProbe::NoIkeSa);
+                assert_eq!(load_attempts(&runner), loads);
+                assert_eq!(engine.shared.current_handle().unwrap().id(), daemon);
+            }
+        }
+
+        #[test]
+        fn steady_state_reloads_an_absent_connection_when_the_ike_sa_is_gone() {
+            for (listing, loads) in ensure_conn_loaded_cases() {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(LIST_CONNS_KEY, listing);
+                let engine = strongswan_engine();
+                seed_list(&runner, 0, "");
+                assert_eq!(
+                    engine.steady_state_health(&runner),
+                    SteadyStateHealth::IkeSaMissing
+                );
+                assert_eq!(load_attempts(&runner), loads);
+            }
+        }
+
+        #[test]
+        fn a_line_with_an_ike_sa_never_runs_the_connection_check() {
+            // One swanctl call per tick is what a healthy line costs today; this
+            // fix must not add to it.
+            let established = "ims0: #3, ESTABLISHED, IKEv2, aa_i* bb_r\n";
+            for connecting in [false, true] {
+                let listing = if connecting {
+                    established.replace("ESTABLISHED", "CONNECTING")
+                } else {
+                    established.to_string()
+                };
+                let runner = MockCommandRunner::new();
+                let engine = strongswan_engine();
+                seed_list(&runner, 0, &listing);
+                engine.establish_probe(&runner);
+                engine.steady_state_health(&runner);
+                let calls = runner.run_calls.lock().unwrap();
+                assert!(!calls
+                    .iter()
+                    .any(|c| c.contains(&"--list-conns".to_string())));
+            }
+        }
+
+        #[test]
+        fn a_vici_that_stopped_answering_never_reaches_the_connection_check() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            seed_list(&runner, 256, "");
+            assert_eq!(
+                engine.establish_probe(&runner),
+                EstablishProbe::Unresponsive
+            );
+            let calls = runner.run_calls.lock().unwrap();
+            assert!(!calls
+                .iter()
+                .any(|c| c.contains(&"--list-conns".to_string())));
+        }
+
+        #[test]
+        fn load_and_verify_loads_the_union_and_then_checks_the_connection() {
+            let runner = MockCommandRunner::new();
+            runner.set_run_output(LOAD_ALL_KEY, swanctl_out(0, LOADED_STDOUT, ""));
+            strongswan_engine().load_and_verify(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert!(calls[0].contains(&"--load-all".to_string()));
+            assert!(calls[1].contains(&"--list-conns".to_string()));
         }
 
         #[test]

@@ -817,14 +817,14 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     // A plain `AtomicBool`, checked once before each spawn, closes the
     // common case but not all of it: `tick_steady_state`'s `Recovered`
     // outcome can itself spawn a replacement (`engine.restart_process()`)
-    // and that whole choreography — signal, wait for the old process, a
-    // deliberate 2s sleep for the vici socket, spawn, load-all, initiate —
-    // takes multiple real seconds. A loop that checked the flag (false) right
+    // and that whole choreography — signal, wait for the old process, spawn,
+    // load-all (which waits for the vici socket), initiate — takes multiple
+    // real seconds. A loop that checked the flag (false) right
     // before starting that sequence, then finishes it and registers the new
     // handle *after* shutdown has already set the flag and taken its
     // snapshot, still escapes it — found live by Greptile, and correctly:
     // this window is on the order of seconds, not nanoseconds, precisely
-    // because of the sleep(2) this same feature added earlier.
+    // because of that wait.
     //
     // `RwLock<bool>` makes "check the flag, then maybe spawn and register
     // the handle" one atomic critical section instead of two separate
@@ -1735,8 +1735,9 @@ pub(super) fn establish_line_tunnel(
     // Load the union of every line's connection file, then initiate only this
     // line's child. Ordering between concurrently-starting lines is safe: each
     // line loads *after* writing its own file, so its own connection is always
-    // present, and a directory-wide load can never evict another line's.
-    ctx.shared_charon.load_all(runner.as_ref());
+    // present, and a directory-wide load can never evict another line's. If
+    // this fails the line still starts: its probes retry the load (#177).
+    engine.load_and_verify(runner.as_ref());
     engine.initiate(runner.as_ref());
 
     println!("[supervise] line {idx}: waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ...");

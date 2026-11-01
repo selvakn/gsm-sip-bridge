@@ -1052,6 +1052,8 @@ mod mock {
         pub run_calls: Mutex<Vec<Vec<String>>>,
         pub run_in_netns_calls: Mutex<Vec<(String, Vec<String>)>>,
         pub run_outputs: Mutex<Map<String, Output>>,
+        /// Outputs a `run` returns one per call, before `run_outputs` applies.
+        run_output_sequences: Mutex<Map<String, std::collections::VecDeque<Output>>>,
         pub files: Mutex<Map<std::path::PathBuf, String>>,
         /// Every path written, in call order — `files` alone cannot show that
         /// one file was written before another.
@@ -1146,6 +1148,16 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(argv_key.to_string(), output);
+        }
+
+        /// Seeds what successive `run(argv)` calls return, for a command whose
+        /// answer changes over time. Once these run out, `run` falls back to
+        /// [`Self::set_run_output`]'s seed or the default.
+        pub fn set_run_output_sequence(&self, argv_key: &str, outputs: Vec<Output>) {
+            self.run_output_sequences
+                .lock()
+                .unwrap()
+                .insert(argv_key.to_string(), outputs.into());
         }
 
         /// Seeds the stdout a future `run_in_netns(netns, argv)` returns.
@@ -1344,6 +1356,15 @@ mod mock {
             let key = owned.join(" ");
             self.run_calls.lock().unwrap().push(owned);
             self.apply_effects(&key);
+            if let Some(next) = self
+                .run_output_sequences
+                .lock()
+                .unwrap()
+                .get_mut(&key)
+                .and_then(|outputs| outputs.pop_front())
+            {
+                return Ok(next);
+            }
             Ok(self
                 .run_outputs
                 .lock()
