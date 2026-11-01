@@ -706,7 +706,10 @@ impl CardPool {
             at: Utc::now(),
             kind,
         };
-        tokio::spawn(async move { alerts::dispatch(&client, &config, event).await });
+        // On the timeline now, so a later Recovered cannot be filed ahead of
+        // this Failure by whichever spawned task runs first (#179).
+        alerts::record_event(&event);
+        tokio::spawn(async move { alerts::deliver(&client, &config, event).await });
     }
 
     fn try_init_module(

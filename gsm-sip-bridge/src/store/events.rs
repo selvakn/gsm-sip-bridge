@@ -2,7 +2,7 @@
 //! (specs/122-management-webui, data-model.md `events`).
 //!
 //! Events originate in several processes -- the daemon, both VoWiFi/VoLTE
-//! agents, and the supervisor -- and deep inside code (`alerts::dispatch`)
+//! agents, and the supervisor -- and deep inside code (`alerts::record_event`)
 //! that has no store handle. So each process installs one sink at startup
 //! ([`install_sink`]) and call sites just call [`record_alert`] or
 //! [`record`]; every write goes through the store's ordered writer thread.
@@ -10,6 +10,11 @@
 //! Alert raise/resolve pairs are deduplicated here, in-process: a `Failure`
 //! while one is open (a retried delivery) and a `Recovered` with nothing open
 //! add no row, so the timeline reads once per outage, not once per attempt.
+//!
+//! That dedup only works if raises and resolves arrive in the order they were
+//! decided, so callers record on the deciding thread, never from a spawned
+//! delivery task (#179): a stale raise landing after its resolve would reopen
+//! the incident.
 
 use crate::error::BridgeResult;
 use crate::store::StoreCommand;

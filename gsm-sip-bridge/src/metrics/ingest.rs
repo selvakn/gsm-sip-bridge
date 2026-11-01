@@ -585,6 +585,26 @@ fn apply_report_with(
             epoch_first_seen_unix,
         },
     );
+    // The timeline's raises are filed here, under the same lock as its
+    // resolves above, so the two land in the order the reports were applied.
+    // From the spawned dispatch, a Failure decided before a healthy report
+    // could run after that report's resolve and reopen the incident (#179).
+    // A raise while one is open is dropped, so a retried Failure is harmless;
+    // `Recovered` needs nothing here, the healthy-report resolve covers it.
+    if let Some(cfg) = alerts {
+        for (key, category, kind, _) in &pending_transitions {
+            if *kind == CriticalEventKind::Failure {
+                let detail = alert_description(&guard, cfg, key, *category, *kind);
+                events::record_alert(
+                    category.as_str(),
+                    Some(&key.1),
+                    true,
+                    &detail,
+                    chrono::Utc::now(),
+                );
+            }
+        }
+    }
     drop(guard);
     if !is_replay {
         store_view(report);
@@ -1032,7 +1052,9 @@ fn dispatch_transition(
     };
 
     tokio::spawn(async move {
-        let outcome = crate::alerts::dispatch(&client, &cfg, event).await;
+        // Discord only: the timeline was written under the liveness lock in
+        // `apply_report_with`, in report order (#179).
+        let outcome = crate::alerts::deliver(&client, &cfg, event).await;
         if kind == CriticalEventKind::Failure {
             let success = matches!(outcome, AlertOutcome::Sent(_));
             // `generation` is always `Some` here — only `Failure`
@@ -1048,7 +1070,7 @@ fn dispatch_transition(
                     if let Some((cfg, client, event)) =
                         build_alert(&key, category, CriticalEventKind::Recovered)
                     {
-                        crate::alerts::dispatch(&client, &cfg, event).await;
+                        crate::alerts::deliver(&client, &cfg, event).await;
                     }
                     finish_late_all_clear(&key, category);
                 }
@@ -1066,9 +1088,30 @@ fn build_alert(
     let (Some(cfg), Some(client)) = (ALERTS_CONFIG.get(), ALERTS_CLIENT.get()) else {
         return None;
     };
-    let cfg = cfg.clone();
-    let client = client.clone();
-    let description = match (category, kind) {
+    let description = alert_description(&liveness().lock().unwrap(), cfg, key, category, kind);
+    let phone_number = ALERTS_PHONE_MAP.get().and_then(|m| m.get(&key.1).cloned());
+    let event = CriticalEvent {
+        category,
+        unit_id: Some(key.1.clone()),
+        description,
+        phone_number,
+        at: chrono::Utc::now(),
+        kind,
+    };
+    Some((cfg.clone(), client.clone(), event))
+}
+
+/// The text of one transition's alert, read from `records` (the liveness map,
+/// already locked by the caller). Shared by the Discord notice and the
+/// timeline raise that [`apply_report_with`] files under its own lock.
+fn alert_description(
+    records: &HashMap<(AgentKind, String), AgentRecord>,
+    cfg: &AlertsConfig,
+    key: &(AgentKind, String),
+    category: AlertCategory,
+    kind: CriticalEventKind,
+) -> String {
+    match (category, kind) {
         (AlertCategory::RegistrationLoss, CriticalEventKind::Failure) => format!(
             "{} line unregistered for over {}s",
             key.0.as_str(),
@@ -1084,7 +1127,6 @@ fn build_alert(
             // The IMS agent's record has no uplink, so a failure decided on it
             // reads the supervisor's, the one that holds the line.
             let (flapping, cause, uplink) = {
-                let records = liveness().lock().unwrap();
                 let own = records.get(key);
                 let supervisor = records.get(&(AgentKind::Supervisor, key.1.clone()));
                 (
@@ -1120,9 +1162,7 @@ fn build_alert(
             )
         }
         (AlertCategory::PcscfPoolExhausted, kind) => {
-            let rebuilds = liveness()
-                .lock()
-                .unwrap()
+            let rebuilds = records
                 .get(key)
                 .map_or(0, |r| r.pool_exhausted.rebuilds);
             let pcscfs = pool_exhausted_pcscfs()
@@ -1141,17 +1181,7 @@ fn build_alert(
         _ => unreachable!(
             "only RegistrationLoss/TunnelFailure/GmConnectionLost/PcscfPoolExhausted transitions are produced here"
         ),
-    };
-    let phone_number = ALERTS_PHONE_MAP.get().and_then(|m| m.get(&key.1).cloned());
-    let event = CriticalEvent {
-        category,
-        unit_id: Some(key.1.clone()),
-        description,
-        phone_number,
-        at: chrono::Utc::now(),
-        kind,
-    };
-    Some((cfg, client, event))
+    }
 }
 
 /// Completes a late all-clear started by [`record_alert_outcome`]: frees the
@@ -2463,6 +2493,74 @@ mod tests {
             },
             Some(cfg),
         );
+    }
+
+    /// #179: down, down, up with the category's Discord alert off leaves
+    /// nothing open on the timeline, however late the Failures' deliveries run.
+    #[tokio::test]
+    async fn a_late_failure_delivery_does_not_reopen_a_resolved_incident() {
+        let mut cfg = AlertsConfig::default();
+        cfg.registration_loss_thresholds.unhealthy_sec = 0;
+        assert!(!cfg.registration_loss.enabled, "the default is off");
+        let m = "ingest-179";
+        let key = (AgentKind::Ims, m.to_string());
+        let open_here = || {
+            events::open_raises()
+                .iter()
+                .any(|r| r.category == "registration_loss" && r.module_id.as_deref() == Some(m))
+        };
+        let report = |seq: u64, registered: bool| {
+            apply_report_with(
+                &AgentReport {
+                    agent: AgentKind::Ims,
+                    module_id: m.to_string(),
+                    epoch: 179,
+                    seq,
+                    state: AgentState {
+                        registered: Some(registered),
+                        ..AgentState::default()
+                    },
+                    events: vec![],
+                    dropped: 0,
+                    details: None,
+                },
+                Some(&cfg),
+            )
+        };
+
+        let mut transitions = report(1, false);
+        assert!(
+            open_here(),
+            "the raise is filed when the Failure is decided"
+        );
+        // The first delivery is skipped (the category is off), which frees
+        // the phase, so the next down report decides a second Failure.
+        let (_, category, _, generation) = transitions[0].clone();
+        record_alert_outcome(&key, category, generation.unwrap(), false);
+        let second = report(2, false);
+        assert_eq!(second.len(), 1, "{second:?}");
+        transitions.extend(second);
+        transitions.extend(report(3, true));
+        assert!(!open_here(), "the healthy report resolves it");
+
+        // Only now do the spawned deliveries run, after the resolve.
+        let client = DiscordClient::new(
+            crate::config::secret::Secret::new(String::new()),
+            "t".into(),
+        )
+        .unwrap();
+        for (key, category, kind, _) in transitions {
+            let event = CriticalEvent {
+                category,
+                unit_id: Some(key.1.clone()),
+                description: "late".into(),
+                phone_number: None,
+                at: chrono::Utc::now(),
+                kind,
+            };
+            crate::alerts::deliver(&client, &cfg, event).await;
+        }
+        assert!(!open_here(), "a late delivery reopened the incident");
     }
 
     /// Makes the line's current IMS agent look `secs` older to the daemon.

@@ -253,7 +253,12 @@ fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryA
 ///
 /// `Sms` and `MissedCall` are one-shot notifications, not conditions that
 /// start and stop, so they have no place on a timeline of incidents (FR-050).
-fn record_event(event: &CriticalEvent) {
+///
+/// Call it on the thread that decided the transition, before handing the
+/// event to a spawned [`deliver`]. Spawned tasks run in no particular order,
+/// so a raise recorded from one could land after the resolve that ended its
+/// incident, and reopen it (#179).
+pub fn record_event(event: &CriticalEvent) {
     if matches!(
         event.category,
         AlertCategory::Sms | AlertCategory::MissedCall
@@ -269,15 +274,10 @@ fn record_event(event: &CriticalEvent) {
     );
 }
 
-/// The single entry point every category's call site uses: resolves
-/// enabled/webhook (FR-007/FR-008/FR-014), sends via `client` if applicable,
-/// and records the outcome in `CRITICAL_ALERTS_TOTAL`/`CRITICAL_EVENT_ACTIVE`
-/// plus a structured log line. Intended to be run via
-/// `tokio::runtime::Handle::spawn`/`Runtime::spawn` (fire-and-forget, never
-/// awaited by a call/SMS/AT-command hot path — FR-011). Returns the outcome
-/// so a caller that needs to react to delivery success/failure (e.g.
-/// `metrics::ingest`'s Pending→Alerted/Idle transition, Greptile P1) can —
-/// most callers just discard it.
+/// Files `event` on the timeline ([`record_event`]) and then [`deliver`]s it,
+/// in that order on the awaiting task. For a caller that awaits it; a
+/// fire-and-forget caller records first and spawns only [`deliver`], or see
+/// [`spawn_dispatch`].
 pub async fn dispatch(
     client: &discord::DiscordClient,
     config: &AlertsConfig,
@@ -287,6 +287,36 @@ pub async fn dispatch(
     // Discord alerts off (or never configured a webhook) still sees the
     // incident on the web UI's timeline (specs/122-management-webui, FR-051).
     record_event(&event);
+    deliver(client, config, event).await
+}
+
+/// Records `event` on the timeline now, on the calling thread, then spawns its
+/// Discord delivery on `handle` (fire-and-forget, FR-011). Recording before the
+/// spawn keeps the timeline in the order the transitions were decided (#179).
+pub fn spawn_dispatch(
+    handle: &tokio::runtime::Handle,
+    client: std::sync::Arc<discord::DiscordClient>,
+    config: std::sync::Arc<AlertsConfig>,
+    event: CriticalEvent,
+) {
+    record_event(&event);
+    handle.spawn(async move { deliver(&client, &config, event).await });
+}
+
+/// The Discord side of an alert, and nothing on the timeline: resolves
+/// enabled/webhook (FR-007/FR-008/FR-014), sends via `client` if applicable,
+/// and records the outcome in `CRITICAL_ALERTS_TOTAL`/`CRITICAL_EVENT_ACTIVE`
+/// plus a structured log line. Intended to be spawned (fire-and-forget, never
+/// awaited by a call/SMS/AT-command hot path — FR-011), with the event already
+/// filed by [`record_event`]. Returns the outcome so a caller that needs to
+/// react to delivery success/failure (e.g. `metrics::ingest`'s
+/// Pending→Alerted/Idle transition, Greptile P1) can — most callers just
+/// discard it.
+pub async fn deliver(
+    client: &discord::DiscordClient,
+    config: &AlertsConfig,
+    event: CriticalEvent,
+) -> AlertOutcome {
     let cfg = category_config(config, event.category);
     let outcome = match precheck(cfg, &config.default_webhook_url) {
         Some(outcome) => outcome,
@@ -398,8 +428,7 @@ impl AlertContext {
     pub fn fire(&self, event: CriticalEvent) {
         let client = std::sync::Arc::clone(&self.client);
         let config = std::sync::Arc::clone(&self.config);
-        self.handle
-            .spawn(async move { dispatch(&client, &config, event).await });
+        spawn_dispatch(&self.handle, client, config, event);
     }
 }
 

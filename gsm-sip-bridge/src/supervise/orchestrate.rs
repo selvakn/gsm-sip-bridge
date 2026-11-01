@@ -790,7 +790,7 @@ pub fn run(config_path: &Path) -> std::process::ExitCode {
     };
 
     // specs/122-management-webui: this process raises alerts too (discovery
-    // failures, the P-CSCF pool), and `alerts::dispatch` files each one on the
+    // failures, the P-CSCF pool), and `AlertContext::fire` files each one on the
     // event timeline through this sink. A store that will not open costs the
     // timeline entries, never the alert itself.
     let _events_store =

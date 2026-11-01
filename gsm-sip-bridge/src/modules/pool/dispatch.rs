@@ -421,8 +421,11 @@ impl CardPool {
                 track_lifecycle_alert(slots, &event);
                 if let Some(client) = self.alerts_client.clone() {
                     let config = self.config.alerts.clone();
+                    // On the timeline now, in the order the events arrived;
+                    // only the Discord send is spawned (#179).
+                    alerts::record_event(&event);
                     tokio::runtime::Handle::current()
-                        .spawn(async move { alerts::dispatch(&client, &config, event).await });
+                        .spawn(async move { alerts::deliver(&client, &config, event).await });
                 }
             }
         }

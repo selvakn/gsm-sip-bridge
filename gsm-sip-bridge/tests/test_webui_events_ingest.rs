@@ -89,14 +89,21 @@ async fn a_recovery_is_recorded_even_when_discord_never_heard_of_the_outage() {
 
     // Down long enough to count (threshold 0): the raise is recorded.
     apply_report(&report(AgentKind::Ims, module, 1, state(false)));
-    apply_report(&report(AgentKind::Ims, module, 2, state(false)));
     wait_kinds(1).await;
     assert_eq!(kinds(&f.db_path)[0].0, "alert_raised:registration_loss");
+    // The first dispatch is skipped (the category is off), which frees the
+    // phase, so the next down report spawns a second one (#179).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    apply_report(&report(AgentKind::Ims, module, 2, state(false)));
 
-    // Back up: the incident closes, with no Discord notice involved.
+    // Back up at once, likely ahead of that second dispatch: the incident
+    // closes, with no Discord notice involved.
     apply_report(&report(AgentKind::Ims, module, 3, state(true)));
     wait_kinds(2).await;
+    // Let every spawned dispatch run after the resolve; none may reopen it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let rows = kinds(&f.db_path);
+    assert_eq!(rows.len(), 2, "no stray raise after the resolve: {rows:?}");
     assert_eq!(rows[1].0, "alert_resolved:registration_loss");
     assert!(rows[1].1.is_some(), "the resolve points at its raise");
     assert!(
