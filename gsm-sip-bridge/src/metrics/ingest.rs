@@ -3317,6 +3317,69 @@ mod tests {
         .collect()
     }
 
+    /// #181: an agent restart while the daemon stays up. The daemon keeps the
+    /// old agent's Gm reading and its unhealthy timer until the new agent says
+    /// otherwise, which is why the new agent must say so once it registers.
+    #[test]
+    fn a_new_agent_reporting_gm_up_replaces_the_previous_agents_down() {
+        let cfg = zero_cfg();
+        let m = "test-181-gm-across-epochs";
+        let key = (AgentKind::Ims, m.to_string());
+        let report = |epoch, seq, gm_connection_up| AgentReport {
+            agent: AgentKind::Ims,
+            module_id: m.to_string(),
+            epoch,
+            seq,
+            state: AgentState {
+                registered: Some(true),
+                gm_connection_up,
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+            details: None,
+        };
+        let gm_alerts = |report: &AgentReport| -> Vec<CriticalEventKind> {
+            apply_report_with(report, Some(&cfg))
+                .into_iter()
+                .filter(|(_, c, _, _)| *c == AlertCategory::GmConnectionLost)
+                .map(|(_, _, kind, _)| kind)
+                .collect()
+        };
+        let reading = || {
+            snapshot_with(Duration::from_secs(3600))
+                .into_iter()
+                .find(|s| s.module_id == m)
+                .unwrap()
+                .gm_connection_up
+        };
+
+        // The old agent's Gm goes down, and the operator is told.
+        assert_eq!(
+            gm_alerts(&report(1, 1, Some(false))),
+            vec![CriticalEventKind::Failure]
+        );
+        let generation = generic_generation(&key, AlertCategory::GmConnectionLost);
+        record_alert_outcome(&key, AlertCategory::GmConnectionLost, generation, true);
+
+        // A new process that says nothing about Gm changes nothing.
+        assert!(gm_alerts(&report(2, 1, None)).is_empty());
+        assert_eq!(reading(), Some(false));
+
+        // Its report of Gm up ends the episode everywhere the old value lived.
+        assert_eq!(
+            gm_alerts(&report(2, 2, Some(true))),
+            vec![CriticalEventKind::Recovered]
+        );
+        assert_eq!(reading(), Some(true));
+        assert_eq!(
+            metrics::VOWIFI_GM_CONNECTION_UP
+                .with_label_values(&[m])
+                .get(),
+            1.0
+        );
+    }
+
     fn generic_phase(key: &(AgentKind, String), category: AlertCategory) -> AlertPhase {
         let guard = liveness().lock().unwrap();
         match category {

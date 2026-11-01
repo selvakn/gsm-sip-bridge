@@ -1608,3 +1608,67 @@ fn a_connection_that_cannot_be_switched_to_is_closed_not_left_reading() {
         "the staged associations are gone"
     );
 }
+
+// --- #181: what observability is told about Gm ---------------------------
+
+#[test]
+fn a_starting_loop_reports_the_gm_state_it_starts_from() {
+    let rig = Rig::new();
+    assert_eq!(rig.obs.gm_connection_up(), None, "nothing said yet");
+
+    rig.st.publish_initial_gm_state(&rig.obs);
+
+    assert!(rig.st.gm_conn.is_up());
+    assert_eq!(rig.obs.gm_connection_up(), Some(true));
+}
+
+/// Runs one refresh to a 200 that keeps our binding.
+fn refresh_answered_ok(rig: &mut Rig) {
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    let contact = rig.contact(3000);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    assert!(rig.answer(&reply));
+}
+
+#[test]
+fn a_refresh_answered_over_gm_ends_a_reconnect_whose_probe_is_gone() {
+    let mut rig = Rig::new();
+    // The state a repair leaves when its confirming probe is then dropped:
+    // reported down, with nothing left to confirm it.
+    rig.st.gm_conn = crate::ims::GmConnectionState::Reconnecting {
+        since: SystemTime::now(),
+        attempts: 1,
+    };
+    rig.st.reconnect_attempts = 1;
+    rig.obs.set_gm_connection_up(false);
+    rig.st.ping.reset();
+
+    refresh_answered_ok(&mut rig);
+
+    assert!(rig.st.gm_conn.is_up());
+    assert_eq!(rig.st.reconnect_attempts, 0);
+    assert_eq!(rig.obs.gm_connection_up(), Some(true));
+}
+
+#[test]
+fn a_refresh_does_not_end_a_failure_a_full_registration_still_owes() {
+    let mut rig = Rig::new();
+    rig.drive().unwrap();
+    let request = rig.received().unwrap();
+    // An endpoint failure while the refresh is on the wire: the escalation owns
+    // the recovery from here, and it re-registers in full.
+    rig.st.force_renewal = true;
+    rig.st.gm_conn = crate::ims::GmConnectionState::Failed {
+        since: SystemTime::now(),
+    };
+    rig.obs.set_gm_connection_up(false);
+
+    let contact = rig.contact(3000);
+    let reply = rig.reply_to(&request, 200, &[("Contact", &contact)]);
+    assert!(rig.answer(&reply));
+
+    assert!(!rig.st.gm_conn.is_up());
+    assert!(rig.st.force_renewal);
+    assert_eq!(rig.obs.gm_connection_up(), Some(false));
+}

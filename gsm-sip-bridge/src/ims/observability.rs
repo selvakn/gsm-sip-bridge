@@ -384,6 +384,15 @@ impl AgentObservability {
         self.push(Vec::new());
     }
 
+    /// What the next report would say about Gm.
+    #[cfg(test)]
+    pub(crate) fn gm_connection_up(&self) -> Option<bool> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gm_connection_up
+    }
+
     pub fn report_registration_attempt(&self, status: RegistrationStatus) {
         self.push(vec![ObservedEvent::RegistrationAttempt { status }]);
     }

@@ -962,6 +962,17 @@ impl LoopState {
         }
         self.on_renewal_success();
         self.last_refresh = Some((now, "ok".to_string()));
+        // The answer is a round trip over Gm, as good as a keepalive's. Without
+        // this a `Reconnecting` whose confirming probe was dropped would stay
+        // that way: a refresh's repair or switch drops the probe, and with the
+        // keepalive off nothing sends another (#181). A pending full
+        // re-registration still owns its own recovery.
+        if !self.force_renewal && !self.gm_conn.is_up() {
+            tracing::info!("Gm connection confirmed by the registration refresh; connection is up");
+            self.gm_conn = crate::ims::GmConnectionState::Up;
+            self.reconnect_attempts = 0;
+            p.obs.set_gm_connection_up(true);
+        }
         crate::ims::warn_if_short_grant(granted);
         tracing::info!(
             granted_expires_secs = granted,
