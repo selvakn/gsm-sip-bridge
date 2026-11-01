@@ -1651,6 +1651,37 @@ fn a_refresh_answered_over_gm_ends_a_reconnect_whose_probe_is_gone() {
     assert_eq!(rig.obs.gm_connection_up(), Some(true));
 }
 
+/// A repair part-way through when the refresh is answered. Left in place, what
+/// it still owes would report Gm down again and rebuild the connection the
+/// answer has just proved.
+fn check_a_refresh_ends_what_a_repair_owes(owe: fn(&mut super::ping::PingState)) {
+    let mut rig = Rig::new();
+    rig.st.gm_conn = crate::ims::GmConnectionState::Reconnecting {
+        since: SystemTime::now(),
+        attempts: 1,
+    };
+    rig.st.reconnect_attempts = 1;
+    rig.obs.set_gm_connection_up(false);
+    owe(&mut rig.st.ping);
+    assert!(rig.st.ping.owes_a_probe());
+
+    refresh_answered_ok(&mut rig);
+
+    assert!(rig.st.gm_conn.is_up());
+    assert_eq!(rig.obs.gm_connection_up(), Some(true));
+    assert!(!rig.st.ping.owes_a_probe());
+}
+
+#[test]
+fn a_refresh_answered_over_gm_clears_a_confirming_probe_still_pending() {
+    check_a_refresh_ends_what_a_repair_owes(|ping| ping.on_sent(999, Instant::now()));
+}
+
+#[test]
+fn a_refresh_answered_over_gm_clears_a_repair_retry_still_scheduled() {
+    check_a_refresh_ends_what_a_repair_owes(|ping| ping.on_repair_failed(Instant::now()));
+}
+
 #[test]
 fn a_refresh_does_not_end_a_failure_a_full_registration_still_owes() {
     let mut rig = Rig::new();

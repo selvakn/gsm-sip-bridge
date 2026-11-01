@@ -114,7 +114,7 @@ impl PingState {
     }
 
     /// Record that a ping with `cseq` just went out at `now`.
-    fn on_sent(&mut self, cseq: u32, now: Instant) {
+    pub(super) fn on_sent(&mut self, cseq: u32, now: Instant) {
         self.last_sent = Some(now);
         self.pending = Some(PendingPing { cseq, sent_at: now });
         self.retry_at = None;
@@ -123,7 +123,7 @@ impl PingState {
     /// A repair at `now` left no probe in flight. The next one is due a
     /// response timeout later, so the reconnect ladder's attempts land 10s
     /// apart rather than an interval apart.
-    fn on_repair_failed(&mut self, now: Instant) {
+    pub(super) fn on_repair_failed(&mut self, now: Instant) {
         self.pending = None;
         self.retry_at = Some(now + PING_RESPONSE_TIMEOUT);
     }
@@ -139,6 +139,12 @@ impl PingState {
             }
             _ => false,
         }
+    }
+
+    /// Whether a repair still owes a probe, or is waiting on one.
+    #[cfg(test)]
+    pub(super) fn owes_a_probe(&self) -> bool {
+        self.pending.is_some() || self.retry_at.is_some()
     }
 
     /// Drop any in-flight ping. Called when the session (and thus the

@@ -2250,15 +2250,6 @@ impl LoopState {
     /// [`Self::schedule_renewal_retry`] — kept next to it so the two can't
     /// drift, since a budget that was spent but never cleared would exit the
     /// agent on the first blip after an hour of healthy renewals.
-    /// Tells the daemon the Gm state this loop starts from (#181), before
-    /// anything in the loop can change it. The daemon keeps the last value it
-    /// was told across an agent restart, so an agent that stayed silent here
-    /// would leave a previous agent's `false` on the web UI, the gauge and the
-    /// alert timer for as long as nothing else happened to report Gm.
-    fn publish_initial_gm_state(&self, obs: &observability::AgentObservability) {
-        obs.set_gm_connection_up(self.gm_conn.is_up());
-    }
-
     fn on_renewal_success(&mut self) {
         self.ladder_before_success = (self.backoff, self.consecutive_renewal_failures);
         self.last_registered = Instant::now();
@@ -2270,6 +2261,15 @@ impl LoopState {
         self.refresh_rejections = 0;
         self.refresh_fallback = false;
         self.refresh_repaired = false;
+    }
+
+    /// Tells the daemon the Gm state this loop starts from (#181), before
+    /// anything in the loop can change it. The daemon keeps the last value it
+    /// was told across an agent restart, so an agent that stayed silent here
+    /// would leave a previous agent's `false` on the web UI, the gauge and the
+    /// alert timer for as long as nothing else happened to report Gm.
+    fn publish_initial_gm_state(&self, obs: &observability::AgentObservability) {
+        obs.set_gm_connection_up(self.gm_conn.is_up());
     }
 
     /// A reg-event NOTIFY reported our current binding deregistered: apply
