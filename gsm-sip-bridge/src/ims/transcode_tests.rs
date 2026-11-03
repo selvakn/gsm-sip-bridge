@@ -502,6 +502,116 @@ fn an_interleaved_dtmf_packet_completes_the_shared_sequence_space() {
 }
 
 #[test]
+fn a_separate_dtmf_ssrc_preserves_active_amr_and_its_pending_gap() {
+    let mut carrier = codec(NegotiatedCodec::AmrNb, 97);
+    carrier.dtmf_payload_type = Some(100);
+    let mut pbx = codec(NegotiatedCodec::Pcmu, 0);
+    pbx.dtmf_payload_type = Some(101);
+    let packets: Vec<_> = speech_payloads(AmrKind::Nb, true, 4)
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            source_packet(100 + index as u16, 1_000 + index as u32 * 160, 97, payload)
+        })
+        .collect();
+
+    let baseline = Relay::start(carrier, pbx, REORDER_WAIT);
+    let expected: Vec<_> = packets
+        .iter()
+        .map(|packet| {
+            baseline.downlink(packet);
+            receive(&baseline.pbx)
+        })
+        .collect();
+
+    let relay = Relay::start(carrier, pbx, Duration::from_millis(500));
+    relay.downlink(&packets[0]);
+    assert_eq!(receive(&relay.pbx), expected[0]);
+    relay.downlink(&packets[2]);
+    assert_no_packet(&relay.pbx, Duration::from_millis(10));
+    relay
+        .pbx
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+
+    // This event has an independent RTP source and sequence space. It must
+    // be forwarded without replacing the active AMR source or its queued 102.
+    let digit = [1, 10, 0, 160];
+    relay.downlink(&rtp::build_packet(7_000, 5_000, 0x8765_4321, 100, &digit));
+    let event = receive(&relay.pbx);
+    assert_eq!(event.payload_type, 101);
+    assert_eq!(event.payload, digit);
+    assert_no_packet(&relay.pbx, Duration::from_millis(30));
+    relay
+        .pbx
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+
+    relay.downlink(&packets[1]);
+    assert_eq!(receive(&relay.pbx), expected[1]);
+    assert_eq!(receive(&relay.pbx), expected[2]);
+    relay.downlink(&packets[3]);
+    assert_eq!(receive(&relay.pbx), expected[3]);
+    assert_no_packet(&relay.pbx, Duration::from_millis(60));
+}
+
+#[test]
+fn separate_dtmf_before_the_first_audio_packet_does_not_establish_an_amr_source() {
+    let mut carrier = codec(NegotiatedCodec::AmrNb, 97);
+    carrier.dtmf_payload_type = Some(100);
+    let mut pbx = codec(NegotiatedCodec::Pcmu, 0);
+    pbx.dtmf_payload_type = Some(101);
+    let packets: Vec<_> = speech_payloads(AmrKind::Nb, true, 2)
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            source_packet(100 + index as u16, 4_000 + index as u32 * 160, 97, payload)
+        })
+        .collect();
+
+    let baseline = Relay::start(carrier, pbx, REORDER_WAIT);
+    let expected: Vec<_> = packets
+        .iter()
+        .map(|packet| {
+            baseline.downlink(packet);
+            receive(&baseline.pbx)
+        })
+        .collect();
+
+    let relay = Relay::start(carrier, pbx, Duration::from_millis(500));
+    relay
+        .pbx
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let digit = [2, 10, 0, 160];
+    relay.downlink(&rtp::build_packet(7_000, 5_000, 0x8765_4321, 100, &digit));
+    let first_event = receive(&relay.pbx);
+    assert_eq!(first_event.payload_type, 101);
+    assert_eq!(first_event.payload, digit);
+    relay.downlink(&packets[0]);
+    assert_eq!(receive(&relay.pbx), expected[0]);
+
+    // Starting AMR must not retire the previously seen independent DTMF
+    // source, and its next event packet must not retire AMR in turn.
+    let digit_repeat = [2, 10, 0, 240];
+    relay.downlink(&rtp::build_packet(
+        7_001,
+        5_000,
+        0x8765_4321,
+        100,
+        &digit_repeat,
+    ));
+    let repeat = receive(&relay.pbx);
+    assert_eq!(repeat.payload_type, 101);
+    assert_eq!(repeat.payload, digit_repeat);
+    assert_eq!(repeat.timestamp, first_event.timestamp);
+    assert_eq!(repeat.seq, first_event.seq.wrapping_add(1));
+    relay.downlink(&packets[1]);
+    assert_eq!(receive(&relay.pbx), expected[1]);
+    assert_no_packet(&relay.pbx, Duration::from_millis(60));
+}
+
+#[test]
 fn no_data_and_timestamp_wrap_preserve_the_original_timeline() {
     let relay = Relay::start(
         codec(NegotiatedCodec::AmrNb, 97),

@@ -580,10 +580,23 @@ fn relay_direction(
                 );
             }
 
-            // Include DTMF and unknown payloads: they share the source's RTP
-            // sequence space and must not look like missing audio packets.
+            // Only audio can establish or replace the reordered source.
+            // DTMF and unknown payloads fill its sequence gaps only when they
+            // share its SSRC. An independent event source must never retire
+            // audio or discard its pending packets or restart probation.
+            let in_audio_sequence = reorder.as_ref().is_none_or(|buffer| {
+                pkt.payload_type == src_codec.payload_type || buffer.source_ssrc() == Some(pkt.ssrc)
+            });
+            let arrived_at = Instant::now();
             ready = match &mut reorder {
-                Some(buffer) => buffer.push(buf[..n].to_vec(), Instant::now()),
+                Some(buffer) if in_audio_sequence => buffer.push(buf[..n].to_vec(), arrived_at),
+                Some(buffer) => {
+                    // Independent events still forward immediately, while an
+                    // audio gap must expire even if only DTMF keeps arriving.
+                    let mut ready = buffer.flush_expired(arrived_at);
+                    ready.push(buf[..n].to_vec());
+                    ready
+                }
                 None => vec![buf[..n].to_vec()],
             };
         }
@@ -1130,6 +1143,111 @@ mod tests {
         );
 
         stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn auxiliary_sources_cannot_take_over_the_source_timed_audio_stream() {
+        // Exercise the same source-timed receive path without requiring AMR
+        // libraries in the default test suite. Real-AMR tests also check PCM
+        // decoder state against an ordered reference stream.
+        let (ims, carrier) = connected_pair();
+        let (veth, agent_b) = connected_pair();
+        ims.set_read_timeout(Some(RELAY_POLL_INTERVAL)).unwrap();
+        agent_b
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let src_codec = codec_with_dtmf(NegotiatedCodec::Pcmu, 0, Some(100));
+        let dst_codec = codec_with_dtmf(NegotiatedCodec::L16, 96, Some(101));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            relay_direction(
+                ims,
+                veth,
+                Decoder::new(src_codec).unwrap(),
+                Encoder::new(dst_codec).unwrap(),
+                Resampler::between(8000, 16000).unwrap(),
+                src_codec,
+                dst_codec,
+                "test source routing",
+                worker_stop,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                None,
+                Some(Duration::from_millis(500)),
+            );
+        });
+        let receive = || {
+            let mut buf = [0u8; RECV_BUF];
+            let n = agent_b.recv(&mut buf).unwrap();
+            let pkt = rtp::parse_packet(&buf[..n]).unwrap();
+            (
+                pkt.seq,
+                pkt.timestamp,
+                pkt.ssrc,
+                pkt.payload_type,
+                pkt.payload.to_vec(),
+            )
+        };
+        let send = |seq, timestamp, ssrc, pt, payload: &[u8]| {
+            carrier
+                .send(&rtp::build_packet(seq, timestamp, ssrc, pt, payload))
+                .unwrap();
+        };
+        let digit = [1u8, 10, 0, 160];
+        let silence = [0xff; 160];
+
+        // An independent event can arrive first, without owning audio's
+        // sequence space. Unknown sources cannot claim that space either.
+        send(7000, 5000, 99, 100, &digit);
+        let first_event = receive();
+        assert_eq!((first_event.3, first_event.4), (101, digit.to_vec()));
+        send(8000, 6000, 77, 13, &[]);
+        send(100, 1000, 42, 0, &silence);
+        let audio = receive();
+        assert_eq!((audio.0, audio.1, audio.2, audio.3), (100, 2000, 42, 96));
+        assert_eq!(audio.4, vec![0; 640]);
+
+        send(102, 1320, 42, 0, &silence);
+        send(7001, 5000, 99, 100, &digit);
+        let event = receive();
+        assert_eq!((event.3, event.4), (101, digit.to_vec()));
+        assert_eq!(event.1, first_event.1);
+        assert_eq!(event.0, first_event.0.wrapping_add(1));
+        agent_b
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let error = agent_b.recv(&mut [0; RECV_BUF]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        agent_b
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Foreign unknown traffic also leaves the gap intact; an event in
+        // audio's own SSRC fills it and releases the queued audio immediately.
+        send(8001, 6160, 77, 13, &[]);
+        send(101, 1000, 42, 100, &digit);
+        assert_eq!(receive().3, 101);
+        let audio = receive();
+        assert_eq!((audio.0, audio.1, audio.2, audio.3), (102, 2640, 42, 96));
+        assert_eq!(audio.4, vec![0; 640]);
+        send(103, 1480, 42, 0, &silence);
+        assert_eq!(receive().0, 103);
+
+        // Seeing unknown payloads on 77 must not retire it as a future audio
+        // source. Unknown payloads sharing its SSRC still fill sequence gaps.
+        send(1, 2000, 77, 0, &silence);
+        let audio = receive();
+        assert_eq!((audio.0, audio.1, audio.2), (1, 4000, 77));
+        send(3, 2320, 77, 0, &silence);
+        send(2, 2160, 77, 13, &[]);
+        let audio = receive();
+        assert_eq!((audio.0, audio.1, audio.2), (3, 4640, 77));
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
     }
 
     /// A leg whose own answer never negotiated `telephone-event` has nowhere

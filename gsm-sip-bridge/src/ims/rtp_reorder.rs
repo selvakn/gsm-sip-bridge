@@ -166,6 +166,11 @@ impl RtpReorderBuffer {
         self.deadline
     }
 
+    /// Auxiliary payloads can fill gaps only in this source's sequence space.
+    pub(super) fn source_ssrc(&self) -> Option<u32> {
+        self.ssrc
+    }
+
     fn media_identity(parsed: &rtp::ParsedPacket<'_>) -> u64 {
         // Fingerprint media rather than the complete wire packet: extensions,
         // padding and the marker bit may change on a retransmission. Include
