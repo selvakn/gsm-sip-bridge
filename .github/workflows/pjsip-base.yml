@@ -6,7 +6,7 @@ on:
       pjsip_version:
         description: "PJSIP version to build"
         required: true
-        default: "2.16"
+        default: "2.17"
 
 env:
   REGISTRY: ghcr.io

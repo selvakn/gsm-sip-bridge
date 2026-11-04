@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim
 
-ARG PJSIP_VERSION=2.16
+ARG PJSIP_VERSION=2.17
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
