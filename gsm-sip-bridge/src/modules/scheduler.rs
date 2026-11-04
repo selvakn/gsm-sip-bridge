@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// One end-to-end execution triggered by a single cron occurrence.
 #[derive(Debug)]

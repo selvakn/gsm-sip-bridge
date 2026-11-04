@@ -5,6 +5,7 @@
      "Unreleased" heading is not picked up for the GitHub release. -->
 ## Unreleased
 
+- **rand updated to 0.10** -- the random-number crate moves from 0.9 to 0.10 in gsm-sip-bridge and siptest, so the workspace no longer carries rand 0.9. The code change is a rename of rand's traits (`RngCore` is now `Rng`, and `random_range` lives on `RngExt`); SIP branches, Call-IDs, RTP SSRCs, IPsec SPIs, web UI session tokens and the scheduler's jitter are generated the same way. The seeded scheduler tests pass unchanged.
 - **toml updated to 1.x** -- the config-file parser moves from toml 0.9 to 1.2 (gsm-sip-bridge and siptest). Config parsing is unchanged: a set of malformed configs (syntax, type, duplicate key, bad date, oversized integer, duplicate table) and every file in `sample_configs/` give byte-identical errors and results before and after, including the strict unknown-key rejection.
 - **bindgen updated to 0.73** -- the build-time generator for the PJSIP FFI bindings moves from 0.71 to 0.73 (with prettyplease 0.3, which 0.73 needs to build alongside syn 3). The exported functions, structs, constants and types are identical; only bindgen's internal bitfield helpers changed. No behaviour change.
 - **Dependencies refreshed within their version ranges** -- `cargo update` moved about 100 locked packages to their latest compatible releases (tokio, clap, hyper, zerocopy, webpki-roots and others), with no `Cargo.toml` changes and no behaviour change. cargo-deny (advisories, licenses, bans, sources) is clean. Major-version bumps follow in separate changes.
