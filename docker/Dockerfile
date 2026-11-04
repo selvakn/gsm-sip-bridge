@@ -25,7 +25,7 @@
 # there's no reason to carry glibc's and Debian's much larger base + apt
 # footprint. See docker/patches/ for the one carrier/modem-specific patch
 # applied to the vendored SWu-IKEv2 dialer.
-ARG PJSIP_VERSION=2.16
+ARG PJSIP_VERSION=2.17
 ARG ALPINE_VERSION=3.24
 # specs/033-slim-optional-swu-image: the SWu/Python tunnel engine is an opt-in
 # build-time payload. Default false → the slim image (strongSwan only). Set

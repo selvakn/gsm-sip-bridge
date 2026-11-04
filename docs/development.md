@@ -79,10 +79,10 @@ where possible:
   and warns at build time, naming the missing defines. To fix it for real,
   rebuild PJSIP from source with the project's `config_site.h` in place —
   version pinned by `docker/Dockerfile`'s `PJSIP_VERSION` build arg
-  (`2.16` as of this writing):
+  (`2.17` as of this writing):
   ```bash
-  wget https://github.com/pjsip/pjproject/archive/refs/tags/2.16.tar.gz
-  tar xzf 2.16.tar.gz && cd pjproject-2.16
+  wget https://github.com/pjsip/pjproject/archive/refs/tags/2.17.tar.gz
+  tar xzf 2.17.tar.gz && cd pjproject-2.17
   cp ../gsm-sip-bridge/docker/pjsip-config-site.h pjlib/include/pj/config_site.h
   ./configure --prefix=/usr/local CFLAGS="-fPIC"   # shared libs, matching
                                                     # the apt package's layout
