@@ -81,7 +81,7 @@ fn refresh_agent_liveness() {
             zero_stale_supervisor_gauges(&state.module_id);
         } else if !state.up {
             super::ACTIVE_CALLS
-                .with_label_values(&[&state.module_id, "vowifi"])
+                .with_label_values(&[state.module_id.as_str(), "vowifi"])
                 .set(0.0);
             if state.agent == crate::control::protocol::AgentKind::Ims {
                 super::VOWIFI_REGISTERED

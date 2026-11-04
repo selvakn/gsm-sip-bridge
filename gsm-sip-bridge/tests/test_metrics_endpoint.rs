@@ -293,7 +293,7 @@ fn test_ui_disabled_adds_only_the_contracted_series() {
 
     let names: std::collections::BTreeSet<String> = prometheus::gather()
         .iter()
-        .map(|f| f.get_name().to_string())
+        .map(|f| f.name().to_string())
         .collect();
 
     assert!(

@@ -489,7 +489,7 @@ impl CardPool {
                 );
                 metrics::SIP_SERVER_RING_TARGET_MISSING_TOTAL.inc();
                 metrics::SIP_CALLS_TOTAL
-                    .with_label_values(&[&module_id, "error", "cs"])
+                    .with_label_values(&[module_id.as_str(), "error", "cs"])
                     .inc();
                 hang_up_unbridged_call(slots, &module_id);
                 return;
@@ -507,7 +507,7 @@ impl CardPool {
         if let Err(e) = self.sip_bridge.set_sound_device(&audio_device) {
             tracing::error!(error = %e, "failed to set sound device");
             metrics::AUDIO_ERRORS_TOTAL
-                .with_label_values(&[&module_id, "sound_device"])
+                .with_label_values(&[module_id.as_str(), "sound_device"])
                 .inc();
             hang_up_unbridged_call(slots, &module_id);
             return;
@@ -523,12 +523,12 @@ impl CardPool {
                 "SIP outbound call failed"
             );
             metrics::SIP_CALLS_TOTAL
-                .with_label_values(&[&module_id, "error", "cs"])
+                .with_label_values(&[module_id.as_str(), "error", "cs"])
                 .inc();
             hang_up_unbridged_call(slots, &module_id);
         } else {
             metrics::SIP_CALLS_TOTAL
-                .with_label_values(&[&module_id, "initiated", "cs"])
+                .with_label_values(&[module_id.as_str(), "initiated", "cs"])
                 .inc();
         }
     }

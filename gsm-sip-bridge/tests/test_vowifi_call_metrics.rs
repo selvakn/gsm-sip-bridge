@@ -61,11 +61,11 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
     // Acceptance Scenario 1: an inbound call is answered, then ends.
     obs.set_active_calls(1);
     let answered_counter =
-        metrics::CALLS_TOTAL.with_label_values(&[&module_id, "answered", "vowifi"]);
+        metrics::CALLS_TOTAL.with_label_values(&[module_id.as_str(), "answered", "vowifi"]);
     wait_for(
         || {
             metrics::ACTIVE_CALLS
-                .with_label_values(&[&module_id, "vowifi"])
+                .with_label_values(&[module_id.as_str(), "vowifi"])
                 .get()
                 == 1.0
         },
@@ -85,7 +85,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
     wait_for(
         || {
             metrics::ACTIVE_CALLS
-                .with_label_values(&[&module_id, "vowifi"])
+                .with_label_values(&[module_id.as_str(), "vowifi"])
                 .get()
                 == 0.0
         },
@@ -94,7 +94,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
     .await;
 
     let duration_sum = metrics::CALL_DURATION_SECONDS
-        .with_label_values(&[&module_id, "vowifi"])
+        .with_label_values(&[module_id.as_str(), "vowifi"])
         .get_sample_sum();
     assert!(
         duration_sum >= 42.0,
@@ -102,9 +102,10 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
     );
 
     // Acceptance Scenario 2: an inbound call arrives but cannot be bridged.
-    let failed_counter = metrics::CALLS_TOTAL.with_label_values(&[&module_id, "failed", "vowifi"]);
-    let bridge_failures =
-        metrics::VOWIFI_BRIDGE_FAILURES_TOTAL.with_label_values(&[&module_id, "pbx_declined"]);
+    let failed_counter =
+        metrics::CALLS_TOTAL.with_label_values(&[module_id.as_str(), "failed", "vowifi"]);
+    let bridge_failures = metrics::VOWIFI_BRIDGE_FAILURES_TOTAL
+        .with_label_values(&[module_id.as_str(), "pbx_declined"]);
     obs.report_call_not_answered(
         CallStatus::Failed,
         BridgeFailureReason::PbxDeclined,
@@ -120,7 +121,7 @@ async fn test_answered_and_declined_calls_produce_correct_call_metrics() {
     // incremented it in the first place.
     assert_eq!(
         metrics::ACTIVE_CALLS
-            .with_label_values(&[&module_id, "vowifi"])
+            .with_label_values(&[module_id.as_str(), "vowifi"])
             .get(),
         0.0
     );

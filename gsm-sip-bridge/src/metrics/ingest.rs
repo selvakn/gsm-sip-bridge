@@ -1795,7 +1795,7 @@ mod tests {
         };
 
         let before = metrics::SMS_RECEIVED_TOTAL
-            .with_label_values(&[&module_id, "vowifi"])
+            .with_label_values(&[module_id.as_str(), "vowifi"])
             .get();
 
         apply_report(&make_report(1));
@@ -1804,7 +1804,7 @@ mod tests {
         apply_report(&make_report(1));
 
         let after = metrics::SMS_RECEIVED_TOTAL
-            .with_label_values(&[&module_id, "vowifi"])
+            .with_label_values(&[module_id.as_str(), "vowifi"])
             .get();
         assert_eq!(
             after,
@@ -1815,7 +1815,7 @@ mod tests {
         // A genuinely new report (seq advances) must still apply normally.
         apply_report(&make_report(2));
         let final_count = metrics::SMS_RECEIVED_TOTAL
-            .with_label_values(&[&module_id, "vowifi"])
+            .with_label_values(&[module_id.as_str(), "vowifi"])
             .get();
         assert_eq!(final_count, before + 2.0);
 
@@ -1825,7 +1825,7 @@ mod tests {
         restarted.epoch = 9005;
         apply_report(&restarted);
         let after_restart = metrics::SMS_RECEIVED_TOTAL
-            .with_label_values(&[&module_id, "vowifi"])
+            .with_label_values(&[module_id.as_str(), "vowifi"])
             .get();
         assert_eq!(after_restart, before + 3.0);
     }

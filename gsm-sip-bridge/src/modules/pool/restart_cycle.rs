@@ -246,7 +246,7 @@ impl CardPool {
         let cycle_id = self.cycle.as_ref().map(|c| c.id).unwrap_or(0);
         let label = outcome.outcome.metric_label();
         metrics::SCHEDULED_RESTART_TOTAL
-            .with_label_values(&[&slot.to_string(), label])
+            .with_label_values(&[slot.to_string().as_str(), label])
             .inc();
         // specs/122-management-webui: the timeline names the line, not the
         // slot number, which changes when a card re-enumerates.

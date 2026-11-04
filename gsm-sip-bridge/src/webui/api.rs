@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 fn counter_total(name: &str) -> f64 {
     prometheus::gather()
         .iter()
-        .filter(|family| family.get_name() == name)
+        .filter(|family| family.name() == name)
         .flat_map(|family| family.get_metric())
         .map(|m| m.get_counter().get_value())
         .sum()
@@ -38,7 +38,7 @@ pub async fn health() -> Json<Value> {
 fn firing_alerts() -> Vec<(String, String)> {
     let mut firing = Vec::new();
     for family in prometheus::gather() {
-        if family.get_name() != "gsm_sip_bridge_critical_event_active" {
+        if family.name() != "gsm_sip_bridge_critical_event_active" {
             continue;
         }
         for metric in family.get_metric() {
@@ -49,8 +49,8 @@ fn firing_alerts() -> Vec<(String, String)> {
                 metric
                     .get_label()
                     .iter()
-                    .find(|l| l.get_name() == name)
-                    .map(|l| l.get_value().to_string())
+                    .find(|l| l.name() == name)
+                    .map(|l| l.value().to_string())
                     .unwrap_or_default()
             };
             firing.push((label("category"), label("module")));

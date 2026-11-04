@@ -202,7 +202,7 @@ impl ModuleWorker {
 
         tracing::info!(module = %module.id, "module worker started, monitoring for events");
         metrics::ACTIVE_CALLS
-            .with_label_values(&[&module.id, "cs"])
+            .with_label_values(&[module.id.as_str(), "cs"])
             .set(0.0);
 
         let now = std::time::Instant::now();
@@ -476,7 +476,7 @@ impl ModuleWorker {
                 "modem still lists the call after AT+CHUP, keeping the line busy"
             );
             metrics::CS_HANGUP_CLEANUP_TOTAL
-                .with_label_values(&[&self.module.id, "stuck_alerted"])
+                .with_label_values(&[self.module.id.as_str(), "stuck_alerted"])
                 .inc();
             self.send_lifecycle_alert(
                 format!(
@@ -508,7 +508,7 @@ impl ModuleWorker {
             "modem still lists the call after AT+CHUP, cycling the radio"
         );
         metrics::CS_HANGUP_CLEANUP_TOTAL
-            .with_label_values(&[&self.module.id, "radio_restart"])
+            .with_label_values(&[self.module.id.as_str(), "radio_restart"])
             .inc();
         self.send_lifecycle_alert(
             format!(
@@ -531,7 +531,7 @@ impl ModuleWorker {
             ),
         }
         metrics::CS_HANGUP_CLEANUP_TOTAL
-            .with_label_values(&[&self.module.id, "module_reset"])
+            .with_label_values(&[self.module.id.as_str(), "module_reset"])
             .inc();
         match self.at.try_reboot() {
             Ok(()) => self.leave_for_reinit(),
@@ -545,7 +545,7 @@ impl ModuleWorker {
                     "modem refused the reset, keeping the line busy"
                 );
                 metrics::CS_HANGUP_CLEANUP_TOTAL
-                    .with_label_values(&[&self.module.id, "reset_refused"])
+                    .with_label_values(&[self.module.id.as_str(), "reset_refused"])
                     .inc();
                 self.send_lifecycle_alert(
                     format!("modem refused a reset with a call still up, line held busy: {e}"),
@@ -560,7 +560,7 @@ impl ModuleWorker {
     /// with no call.
     fn leave_for_reinit(&mut self) -> bool {
         metrics::ACTIVE_CALLS
-            .with_label_values(&[&self.module.id, "cs"])
+            .with_label_values(&[self.module.id.as_str(), "cs"])
             .set(0.0);
         true
     }
@@ -570,10 +570,10 @@ impl ModuleWorker {
         let wait = self.cleanup.take();
         self.card.state = CardState::Idle;
         metrics::ACTIVE_CALLS
-            .with_label_values(&[&self.module.id, "cs"])
+            .with_label_values(&[self.module.id.as_str(), "cs"])
             .set(0.0);
         metrics::CS_HANGUP_CLEANUP_TOTAL
-            .with_label_values(&[&self.module.id, outcome])
+            .with_label_values(&[self.module.id.as_str(), outcome])
             .inc();
         let elapsed_ms = wait.as_ref().map_or(0, |w| w.started.elapsed().as_millis());
         tracing::info!(module = %self.module.id, outcome, elapsed_ms, "hang-up confirmed, line idle");
@@ -625,7 +625,7 @@ impl ModuleWorker {
         tracing::info!(module = %self.module.id, "incoming call (RING)");
         self.card.state = CardState::Ringing;
         metrics::CALLS_TOTAL
-            .with_label_values(&[&self.module.id, "incoming", "cs"])
+            .with_label_values(&[self.module.id.as_str(), "incoming", "cs"])
             .inc();
 
         let caller_id = extract_caller_id(&mut self.at);
@@ -654,17 +654,17 @@ impl ModuleWorker {
 
                 self.card.state = CardState::Bridged;
                 metrics::ACTIVE_CALLS
-                    .with_label_values(&[&self.module.id, "cs"])
+                    .with_label_values(&[self.module.id.as_str(), "cs"])
                     .set(1.0);
                 metrics::CALLS_TOTAL
-                    .with_label_values(&[&self.module.id, "answered", "cs"])
+                    .with_label_values(&[self.module.id.as_str(), "answered", "cs"])
                     .inc();
             }
             Err(e) => {
                 tracing::error!(module = %self.module.id, error = %e, "failed to answer call");
                 self.card.state = CardState::Idle;
                 metrics::CALLS_TOTAL
-                    .with_label_values(&[&self.module.id, "missed", "cs"])
+                    .with_label_values(&[self.module.id.as_str(), "missed", "cs"])
                     .inc();
             }
         }
@@ -681,7 +681,7 @@ impl ModuleWorker {
         if self.card.state == CardState::Bridged || self.card.state == CardState::Answering {
             tracing::info!(module = %self.module.id, "call ended (NO CARRIER)");
             metrics::ACTIVE_CALLS
-                .with_label_values(&[&self.module.id, "cs"])
+                .with_label_values(&[self.module.id.as_str(), "cs"])
                 .set(0.0);
             let _ = self.event_tx.send(BridgeEvent::Hangup {
                 module_id: self.module.id.clone(),
@@ -710,7 +710,7 @@ impl ModuleWorker {
     fn handle_cmti(&mut self, line: &str) {
         tracing::info!(module = %self.module.id, notification = line, "SMS notification received");
         metrics::SMS_RECEIVED_TOTAL
-            .with_label_values(&[&self.module.id, "cs"])
+            .with_label_values(&[self.module.id.as_str(), "cs"])
             .inc();
 
         let Some(idx_str) = line.split(',').next_back() else {
