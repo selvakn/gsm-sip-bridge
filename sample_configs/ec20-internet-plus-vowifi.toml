@@ -30,9 +30,13 @@ enabled = true
 # sidecar-provided uplink, it does not dial a cellular IMS APN itself).
 tunnel_engine = "strongswan"
 
-# Pin the line to the modem's AT port. An EC20 exposes a USB audio interface, so
-# it is not auto-selected by the "audio-less modem" VoWiFi discovery heuristic —
-# pin it explicitly. The sidecar uses this same modem's QMI node (/dev/cdc-wdm0)
-# for data; the two never contend (different device nodes).
+# Pin the line to the modem. An EC20 exposes a USB audio interface, so it is not
+# auto-selected by the "audio-less modem" VoWiFi discovery heuristic — pin it
+# explicitly. The sidecar uses this same modem's QMI node (/dev/cdc-wdm0) for
+# data; the two never contend (different device nodes).
+# Pinned by USB serial number, which survives a replug; a /dev/ttyUSBn number is
+# assigned by enumeration order and can silently change. Find yours with
+#   udevadm info -q property -n /dev/ttyUSB2 | grep ID_SERIAL_SHORT
+# (modem_port = "/dev/ttyUSB2" also works, but only until the next re-enumeration).
 [[vowifi.line]]
-modem_port = "/dev/ttyUSB2"
+modem_serial = "abc123def456"

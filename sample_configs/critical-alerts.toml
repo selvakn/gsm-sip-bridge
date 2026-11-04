@@ -1,11 +1,13 @@
 # ============================================================================
 # Sample: Discord alerts for critical operational events
 # ============================================================================
-# Four categories beyond plain SMS forwarding (specs/022-discord-critical-
-# alerts), each off by default — opt in per-category below. A category
-# alerts only once its own built-in recovery is exhausted, then sends a
-# single "recovered" notice when it clears, never a repeating stream while
-# a condition stays unhealthy. See docs/configuration.md#alerts.
+# Beyond plain SMS forwarding (specs/022-discord-critical-alerts and later),
+# each category below alerts only once its own built-in recovery is exhausted,
+# then sends a single "recovered" notice when it clears, never a repeating
+# stream while a condition stays unhealthy. Most categories are off by
+# default and opted into here; gm_connection_lost and pcscf_pool_exhausted
+# default ON and are shown only so you can tune or silence them.
+# See docs/configuration.md#alerts.
 
 [sip]
 server = "pbx.example.com"
@@ -15,19 +17,43 @@ password = "env:SIP_PASSWORD"
 [alerts]
 # Shared default webhook for any category below with no override of its own.
 discord_webhook_url = "env:DISCORD_WEBHOOK_URL"
+# Shown in every alert footer. Under Docker the hostname is a random container
+# id, so name the deployment when several bridges post to one channel.
+instance_name = "bridge-01"
 
 [alerts.module_lifecycle]
 # SIM absent/unreadable, discovery/init failure, or an AT worker unresponsive.
 enabled = true
+at_worker_unresponsive_sec = 60   # range: 5-600
 
 [alerts.registration_loss]
 # A VoLTE/VoWiFi line's SIP registration lost continuously past unhealthy_sec.
 enabled = true
+unhealthy_sec = 300               # range: 30-3600
 
 [alerts.tunnel_failure]
-# A VoWiFi line's ePDG/IPsec tunnel non-established past unhealthy_sec.
+# A VoWiFi line's ePDG/IPsec tunnel non-established (or its CHILD_SA missing)
+# past unhealthy_sec, or rebuilt 3+ times within it (a flapping tunnel).
 enabled = true
+unhealthy_sec = 300               # range: 30-3600
 
 [alerts.missed_call]
 # An inbound call that rang out unanswered (never bridged).
 enabled = true
+
+[alerts.line_discovery_failed]
+# An explicitly pinned VoWiFi line (modem_port/modem_serial) never resolved,
+# even after retrying discovery for it.
+enabled = true
+
+[alerts.gm_connection_lost]
+# A registered line's Gm signaling connection down and unrecoverable past
+# unhealthy_sec. Defaults ENABLED; set enabled = false to silence it.
+enabled = true
+unhealthy_sec = 300               # range: 30-3600
+
+[alerts.pcscf_pool_exhausted]
+# A line keeps rebuilding its tunnel because its IMS agent gave up on every
+# P-CSCF. Defaults ENABLED; set enabled = false to silence it.
+enabled = true
+unhealthy_sec = 300               # range: 30-3600
