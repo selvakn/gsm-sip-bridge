@@ -3,7 +3,7 @@
 //! deliberately does not use PJSIP — see the design note in `ims/mod.rs`.
 
 use crate::error::{BridgeError, BridgeResult};
-use rand::RngCore;
+use rand::Rng;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
