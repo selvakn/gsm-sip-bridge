@@ -33,13 +33,39 @@ samples are trimmed down from.
 | File | Scenario |
 |---|---|
 | [`sms-notifications.toml`](sms-notifications.toml) | Forward incoming SMS text to a Discord webhook. |
-| [`critical-alerts.toml`](critical-alerts.toml) | Discord alerts for registration loss, tunnel failure, module lifecycle problems, and missed calls. See `specs/022-discord-critical-alerts`. |
+| [`critical-alerts.toml`](critical-alerts.toml) | Discord alerts for module lifecycle problems, registration loss, tunnel failure, missed calls, undiscovered pinned lines, Gm connection loss and P-CSCF pool exhaustion. See `specs/022-discord-critical-alerts`. |
 
 These sections are independent of the call path — merge the relevant
 section(s) into whichever call-path sample you started from.
 
+### Docker Compose — pick one
+
+[`docker-compose/`](docker-compose/) holds compose files that run the
+**published images**, so no repo checkout or build is needed (the monitoring
+one also reads Prometheus/Grafana config from `docker/`). Each expects your
+chosen config as `config.toml` and your secrets as `.env` beside it:
+
+```bash
+cd sample_configs/docker-compose
+cp ../ec20-vowifi.toml config.toml
+cp ../../.env.example .env          # fill in SIP_PASSWORD etc.
+docker compose -f docker-compose.bridge.yml up -d
+```
+
+| File | Scenario |
+|---|---|
+| [`docker-compose.bridge.yml`](docker-compose/docker-compose.bridge.yml) | The bridge alone. Works with every config above. |
+| [`docker-compose.monitoring.yml`](docker-compose/docker-compose.monitoring.yml) | Bridge plus Prometheus, Grafana and a read-only SQLite browser. |
+
+Only one bridge container can run per host (host networking). Pin
+`BRIDGE_IMAGE` to a release; a config with `tunnel_engine = "swu"` needs the
+`-swu` tag.
+
 Common to all:
 
+- Modems are pinned by `modem_serial` (the USB serial number, stable across
+  replugs), not `modem_port`: a `/dev/ttyUSBn` number follows enumeration
+  order and silently stops matching after a replug.
 - Secrets use the `env:VAR_NAME` syntax — set the referenced environment
   variable rather than writing the plaintext value into the file.
 - Everything not shown (`[logging]`, `[bridge]`, `[metrics]`, `[modules]`,

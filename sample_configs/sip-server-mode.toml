@@ -13,8 +13,12 @@
 # to move — leave 5060 free for the phones.
 #
 # Inbound only: a phone can't dial out through the mobile network unless
-# [outbound] is also enabled (see multi-vowifi.toml / ec20-vowifi.toml for
-# the telephony side to pair this with).
+# [outbound] is also enabled (see the commented block below).
+#
+# This file enables no VoWiFi/VoLTE, so calls arrive over the default
+# circuit-switched path (ec20-circuit-switching.toml). To carry them over
+# VoWiFi or VoLTE instead, add the [vowifi]/[volte] section from
+# ec20-vowifi.toml / ec200-volte.toml; neither needs [sip].server here.
 
 [sip]
 local_port = 5062
@@ -31,3 +35,8 @@ password = "env:PHONE_1001_PASSWORD"
 # [[sip_server.account]]
 # username = "1002"
 # password = "env:PHONE_1002_PASSWORD"
+
+# Let a registered phone dial out through the mobile network (refused with 403
+# otherwise). The destination is dialed as given, on whichever line is idle.
+# [outbound]
+# enabled = true

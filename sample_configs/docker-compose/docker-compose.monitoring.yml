@@ -1,0 +1,96 @@
+# ============================================================================
+# Sample: the bridge plus Prometheus, Grafana and a read-only SQLite browser
+# ============================================================================
+# The same stack as the repo's docker/docker-compose.yml, but running the
+# published image. Prometheus and Grafana take their config from the repo's
+# docker/ directory, so run this from a checkout:
+#
+#   cp ../ec20-vowifi.toml config.toml
+#   cp ../../.env.example .env
+#   docker compose -f docker-compose.monitoring.yml up -d
+#
+# Everything uses host networking: Prometheus scrapes the bridge's metrics on
+# localhost:9091 (see ../../docker/prometheus.yml), then
+#   Prometheus  http://<host>:9090
+#   Grafana     http://<host>:3000   (admin / GRAFANA_ADMIN_PASSWORD, default "admin")
+#   SQLite web  http://<host>:8088   (calls + SMS history, read-only)
+# None of these are authenticated beyond Grafana's login. Keep them off an
+# untrusted network, or set GRAFANA_ADMIN_PASSWORD in .env at the very least.
+name: gsm-sip-bridge
+
+services:
+  gsm-sip-bridge:
+    image: ${BRIDGE_IMAGE:-ghcr.io/selvakn/gsm-sip-bridge:8.24.0}
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    init: true
+    stop_grace_period: 90s
+    volumes:
+      - bridge-data:/data
+      - ./config.toml:/etc/gsm-sip-bridge/config.toml:ro
+      - /var/run/netns:/var/run/netns:rshared
+      - /dev:/dev
+      - /sys:/sys:ro
+    env_file:
+      - .env
+    group_add:
+      - audio
+      - dialout
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gsm-sip-bridge", "--config", "/etc/gsm-sip-bridge/config.toml", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      gsm-sip-bridge:
+        condition: service_healthy
+    volumes:
+      - ../../docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.listen-address=:9090'
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../../docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_SERVER_HTTP_PORT=3000
+
+  sqlite-web:
+    image: coleifer/sqlite-web:latest
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      gsm-sip-bridge:
+        condition: service_healthy
+    volumes:
+      - bridge-data:/data:ro
+    command: ["sqlite_web", "--read-only", "--host", "0.0.0.0", "--port", "8088", "/data/store.db"]
+
+volumes:
+  bridge-data:
+  prometheus-data:
+  grafana-data:

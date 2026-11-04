@@ -1,0 +1,57 @@
+# ============================================================================
+# Sample: the bridge alone, from the published image (no repo checkout needed)
+# ============================================================================
+# Works with every config in ../*.toml. Put the one you chose next to this file
+# as ./config.toml and the secrets it references (env:VAR_NAME) in ./.env — see
+# the repo's .env.example for the variables.
+#
+#   cp ../ec20-vowifi.toml config.toml
+#   cp ../../.env.example .env        # then fill in SIP_PASSWORD etc.
+#   docker compose -f docker-compose.bridge.yml up -d
+#
+# Pin BRIDGE_IMAGE to a release rather than :latest for a deployment you care
+# about. A config with [vowifi].tunnel_engine = "swu" needs the full image
+# (tag suffix -swu, e.g. ghcr.io/selvakn/gsm-sip-bridge:8.24.0-swu); the
+# default slim image is strongSwan only.
+#
+# Host networking and privileged mode are required, not a convenience: the
+# bridge hot-plug-discovers USB modems, creates a network namespace and veth
+# pair per VoWiFi/VoLTE line, and manages IPsec/XFRM state. Only one bridge
+# container can run per host (it owns UDP 500/4500 and the SIP ports).
+name: gsm-sip-bridge
+
+services:
+  gsm-sip-bridge:
+    image: ${BRIDGE_IMAGE:-ghcr.io/selvakn/gsm-sip-bridge:8.24.0}
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    # tini as PID 1 reaps orphaned child processes.
+    init: true
+    # Graceful stop tears down every line's IKE_SA, XFRM state and namespaces.
+    # Must stay strictly greater than the bridge's internal 60s stop allowance.
+    stop_grace_period: 90s
+    volumes:
+      - bridge-data:/data
+      - ./config.toml:/etc/gsm-sip-bridge/config.toml:ro
+      # rshared keeps per-line namespaces visible to `ip netns` on the host and
+      # lets the next start reclaim them if this container is force-killed.
+      - /var/run/netns:/var/run/netns:rshared
+      - /dev:/dev
+      - /sys:/sys:ro
+    env_file:
+      - .env
+    group_add:
+      - audio
+      - dialout
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gsm-sip-bridge", "--config", "/etc/gsm-sip-bridge/config.toml", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      # A VoWiFi line is only healthy once its tunnel is up and has a P-CSCF,
+      # which takes 30-120s on a real carrier.
+      start_period: 180s
+      retries: 3
+
+volumes:
+  bridge-data:

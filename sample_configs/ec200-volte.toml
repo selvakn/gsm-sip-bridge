@@ -33,7 +33,8 @@ enabled = true
 # the normal RFC 3261 behaviour instead.
 # respond_on_client = false
 
-# Optional: pin to a known modem. Omit [[volte.line]] entirely for
+# Optional: pin to a known modem, by USB serial number (stable across
+# replugs, unlike a /dev/ttyUSBn number). Omit [[volte.line]] entirely for
 # auto-discovery (cid 3, apn "ims", P-CSCF auto-discovered).
 [[volte.line]]
-modem_port = "/dev/ttyUSB0"
+modem_serial = "abc123def456"

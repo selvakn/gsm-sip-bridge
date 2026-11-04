@@ -13,9 +13,13 @@ password = "env:SIP_PASSWORD"
 [vowifi]
 enabled = true
 
-# Optional: pin to a known modem port for a deterministic line assignment.
-# Omit [[vowifi.line]] entirely for full auto-discovery — every SIM-ready,
-# audio-less modem becomes its own VoWiFi line, with mcc/mnc/IMSI derived
-# from the SIM.
+# Pin the line to a known modem. An EC20 has USB audio, so the circuit-switched
+# path would otherwise reserve it and auto-discovery would skip it for VoWiFi
+# (it only auto-selects audio-less modems while [cs] is enabled) — pin it.
+# mcc/mnc/IMSI are still derived from the SIM.
+# Pinned by USB serial number, which survives a replug; a /dev/ttyUSBn number is
+# assigned by enumeration order and can silently change. Find yours with
+#   udevadm info -q property -n /dev/ttyUSB2 | grep ID_SERIAL_SHORT
+# (modem_port = "/dev/ttyUSB2" also works, but only until the next re-enumeration).
 [[vowifi.line]]
-modem_port = "/dev/ttyUSB2"
+modem_serial = "abc123def456"
