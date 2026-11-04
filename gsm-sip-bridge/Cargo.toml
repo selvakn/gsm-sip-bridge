@@ -41,7 +41,7 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 # stays on 0.14 as well.
 prometheus = { version = "0.14", default-features = false }
 crossbeam-queue = "0.3"
-alsa = "0.9"
+alsa = "0.12"
 libc = "0.2"
 crossbeam-channel = "0.5"
 rusb = { version = "0.9", features = ["vendored"] }
