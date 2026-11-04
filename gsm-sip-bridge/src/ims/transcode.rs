@@ -65,8 +65,7 @@ struct Downsampler {
 impl Downsampler {
     fn process(&mut self, input: &[i16]) -> Vec<i16> {
         let mut out = Vec::with_capacity(input.len() / 2);
-        for pair in input.chunks_exact(2) {
-            let (a, b) = (pair[0], pair[1]);
+        for &[a, b] in input.as_chunks::<2>().0 {
             let filtered = (self.prev as i32 + 2 * a as i32 + b as i32) / 4;
             out.push(filtered.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
             self.prev = b;
@@ -215,8 +214,10 @@ impl Decoder {
             // network (big-endian) byte order, with no payload header.
             Self::L16 => Some(
                 payload
-                    .chunks_exact(2)
-                    .map(|s| i16::from_be_bytes([s[0], s[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&s| i16::from_be_bytes(s))
                     .collect(),
             ),
             Self::Amr {

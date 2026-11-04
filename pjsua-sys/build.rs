@@ -318,6 +318,21 @@ fn run_bindgen(header: &Path, pkg_cflags: &[String], out_path: &Path) -> Result<
         .blocklist_item("FP_ZERO")
         .blocklist_item("FP_SUBNORMAL")
         .blocklist_item("FP_NORMAL")
+        // libc string/allocation functions that pjsip's headers drag in via
+        // <string.h>/<stdlib.h>. Nothing here calls them, and bindgen types
+        // `size_t` as `c_ulong`, which rustc's
+        // `suspicious_runtime_symbol_definitions` lint (deny-by-default since
+        // it landed, so a hard error under -D warnings) rejects as a
+        // redefinition of the std runtime symbol. Not generating them removes
+        // the redefinition instead of silencing the lint.
+        .blocklist_function("memcpy")
+        .blocklist_function("memmove")
+        .blocklist_function("memset")
+        .blocklist_function("memcmp")
+        .blocklist_function("bcmp")
+        .blocklist_function("strlen")
+        .blocklist_function("malloc")
+        .blocklist_function("realloc")
         .generate()
         .map_err(|_| ())?;
 
