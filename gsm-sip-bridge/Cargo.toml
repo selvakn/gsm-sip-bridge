@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "json", "query"], default-features = false }
 rusqlite = { version = "0.41", features = ["bundled"] }
 # `default-features = false` drops the protobuf encoder, and with it the
 # `protobuf 2.x` dependency carrying RUSTSEC-2024-0437 (stack overflow on
