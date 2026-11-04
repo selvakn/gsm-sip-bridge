@@ -64,7 +64,8 @@ async fn test_reports_made_before_the_daemon_exists_are_delivered_once_it_starts
     // just getting lucky with timing.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let counter = metrics::CALLS_TOTAL.with_label_values(&[&module_id, "answered", "vowifi"]);
+    let counter =
+        metrics::CALLS_TOTAL.with_label_values(&[module_id.as_str(), "answered", "vowifi"]);
     assert_eq!(
         counter.get(),
         0.0,
@@ -98,7 +99,8 @@ async fn test_repeated_reports_do_not_reset_the_daemon_side_counter() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handle = start_control_server(&socket_path, cmd_tx, shutdown_rx).await;
 
-    let counter = metrics::CALLS_TOTAL.with_label_values(&[&module_id, "answered", "vowifi"]);
+    let counter =
+        metrics::CALLS_TOTAL.with_label_values(&[module_id.as_str(), "answered", "vowifi"]);
 
     // Simulate an agent restart: a fresh Reporter, same module id, sending
     // its own count of completed calls. The daemon's counter is the only

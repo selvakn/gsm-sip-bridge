@@ -54,7 +54,8 @@ async fn test_vowifi_sms_received_and_forwarded_metrics_and_history() {
     // branch: report SmsReceived, then call record_and_forward.
     reporter.report(AgentState::default(), vec![ObservedEvent::SmsReceived]);
 
-    let received_counter = metrics::SMS_RECEIVED_TOTAL.with_label_values(&[&module_id, "vowifi"]);
+    let received_counter =
+        metrics::SMS_RECEIVED_TOTAL.with_label_values(&[module_id.as_str(), "vowifi"]);
     wait_for(|| received_counter.get() == 1.0, Duration::from_secs(5)).await;
 
     // record_and_forward with no discord_client configured writes the

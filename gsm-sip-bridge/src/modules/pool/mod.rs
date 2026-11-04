@@ -339,7 +339,7 @@ impl CardPool {
                         "module initialized"
                     );
                     metrics::MODULE_INIT_TOTAL
-                        .with_label_values(&[&module.id, "success", ""])
+                        .with_label_values(&[module.id.as_str(), "success", ""])
                         .inc();
                     events::record(
                         EventKind::ModuleInitialized,
@@ -396,7 +396,7 @@ impl CardPool {
                 Err(e) => {
                     tracing::warn!(module = %module.id, error = %e, "module init failed, will retry");
                     metrics::MODULE_INIT_TOTAL
-                        .with_label_values(&[&module.id, "failure", &e])
+                        .with_label_values(&[module.id.as_str(), "failure", &e])
                         .inc();
                     events::record(EventKind::ModuleInitFailed, Some(&module.id), &e, None);
                     // Assign a temporary slot for tracking
@@ -483,7 +483,7 @@ impl CardPool {
             Ok((new_slot, imei, phone, net_type, net_mode)) => {
                 tracing::info!(module = %module.id, slot = new_slot, "module recovered on retry");
                 metrics::MODULE_INIT_TOTAL
-                    .with_label_values(&[&module.id, "success", ""])
+                    .with_label_values(&[module.id.as_str(), "success", ""])
                     .inc();
                 events::record(
                     EventKind::ModuleInitialized,

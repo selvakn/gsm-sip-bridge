@@ -81,7 +81,7 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
     )
     .await;
     let success_count = metrics::VOWIFI_REGISTRATIONS_TOTAL
-        .with_label_values(&[&module_id, "success"])
+        .with_label_values(&[module_id.as_str(), "success"])
         .get();
     assert!(success_count >= 1.0);
 
@@ -110,14 +110,14 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
     )
     .await;
     let auth_failed_count = metrics::VOWIFI_REGISTRATIONS_TOTAL
-        .with_label_values(&[&module_id, "auth_failed"])
+        .with_label_values(&[module_id.as_str(), "auth_failed"])
         .get();
     assert!(auth_failed_count >= 1.0);
 
     // A bridge failure is attributed to a specific, bounded reason — never
     // an unattributed bucket (SC-005).
     let ring_timeout_before = metrics::VOWIFI_BRIDGE_FAILURES_TOTAL
-        .with_label_values(&[&module_id, "ring_timeout"])
+        .with_label_values(&[module_id.as_str(), "ring_timeout"])
         .get();
     obs.report_call_not_answered(
         CallStatus::Missed,
@@ -128,7 +128,7 @@ async fn test_registration_and_tunnel_gauges_and_bridge_failure_reasons() {
     wait_for(
         || {
             metrics::VOWIFI_BRIDGE_FAILURES_TOTAL
-                .with_label_values(&[&module_id, "ring_timeout"])
+                .with_label_values(&[module_id.as_str(), "ring_timeout"])
                 .get()
                 == ring_timeout_before + 1.0
         },

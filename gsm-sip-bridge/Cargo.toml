@@ -36,9 +36,10 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # `protobuf 2.x` dependency carrying RUSTSEC-2024-0437 (stack overflow on
 # untrusted input). We only ever emit the text exposition format —
 # `metrics::server` uses `TextEncoder` and nothing references protobuf — so
-# the encoder was pure attack surface. This also removes the reason to chase
-# prometheus 0.14, whose only draw was a newer protobuf.
-prometheus = { version = "0.13", default-features = false }
+# the encoder was pure attack surface. prometheus 0.14 keeps that feature
+# optional too (verified: `cargo tree -i protobuf` finds nothing), so the pin
+# stays on 0.14 as well.
+prometheus = { version = "0.14", default-features = false }
 crossbeam-queue = "0.3"
 alsa = "0.9"
 libc = "0.2"
