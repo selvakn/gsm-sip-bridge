@@ -26,7 +26,7 @@
 # footprint. See docker/patches/ for the one carrier/modem-specific patch
 # applied to the vendored SWu-IKEv2 dialer.
 ARG PJSIP_VERSION=2.16
-ARG ALPINE_VERSION=3.21
+ARG ALPINE_VERSION=3.24
 # specs/033-slim-optional-swu-image: the SWu/Python tunnel engine is an opt-in
 # build-time payload. Default false → the slim image (strongSwan only). Set
 # --build-arg INCLUDE_SWU=true for the on-demand full image (published under a
@@ -183,11 +183,18 @@ WORKDIR /build/strongswan-epdg
 COPY docker/patches/0002-strongswan-vici-dpd.patch /tmp/
 RUN patch -p1 < /tmp/0002-strongswan-vici-dpd.patch
 
-RUN autoreconf -if
+# gettext 1.0 (Alpine 3.24) keeps its m4 macros (AC_LIB_PREFIX, ...) in
+# /usr/share/gettext/m4 instead of /usr/share/aclocal, so autoreconf has to be
+# pointed there or configure.ac fails with "undefined or overquoted macro".
+RUN autoreconf -if -I /usr/share/gettext/m4
 # --disable-defaults: only the plugins this feature actually uses get
 # built — smaller image, smaller attack surface, and avoids dragging in
 # build deps (e.g. gmp, curl, ldap) for crypto backends/features we don't
 # need (--enable-openssl covers IKE crypto and DH on its own).
+# -std=gnu17: GCC 15 (Alpine 3.24) defaults to C23, where an empty parameter
+# list means (void), so strongSwan's `bool return_false();` no longer matches
+# its `bool (*)(void *)` callback type and the build stops with
+# -Wincompatible-pointer-types. This code base is C11/gnu17 throughout.
 RUN ./configure --prefix=/usr --sysconfdir=/etc \
         --disable-defaults \
         --enable-charon --enable-ikev2 --enable-swanctl --enable-vici \
@@ -196,7 +203,7 @@ RUN ./configure --prefix=/usr --sysconfdir=/etc \
         --enable-random --enable-nonce --enable-hmac \
         --enable-socket-default --enable-kernel-netlink --enable-resolve \
         --enable-updown --enable-stroke \
-        CFLAGS="-fPIC"
+        CFLAGS="-fPIC -std=gnu17"
 RUN make -j"$(nproc)"
 RUN make install DESTDIR=/staging
 

@@ -7,7 +7,7 @@
 #
 # QMI only: this never opens the modem's AT port, which the bridge needs for
 # AT+CSIM. See docs/ec20-internet-plus-vowifi.md.
-FROM alpine:3.20
+FROM alpine:3.24
 
 # qmi-utils -> qmicli (QMI control over the modem's cdc-wdm node). NOTE: the
 #              `libqmi` package ships only the shared library — the CLI lives in
