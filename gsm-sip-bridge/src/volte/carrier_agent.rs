@@ -248,6 +248,7 @@ pub(crate) fn run(
         respect_caller_privacy: app_config.volte.respect_caller_privacy,
         // One deployment-wide setting covers both transports (FR-015).
         amr_passthrough: app_config.vowifi.amr_passthrough,
+        rtp_reorder_wait: std::time::Duration::from_millis(app_config.audio.rtp_reorder_wait_ms),
         gm_options_keepalive: app_config.vowifi.gm_options_keepalive,
         amr_mode_set: app_config.vowifi.amr_mode_set,
         // `[[volte.line]]`'s override, else `[volte]` (itself inheriting

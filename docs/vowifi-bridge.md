@@ -184,6 +184,10 @@ ask for AMR or Opus, and one that prefers them can now negotiate them.
 
 The negotiated phone-leg codec shows as `phone_codec=` in `vowifi-status` recent calls.
 
+## Carrier AMR packet order
+
+Before decoding, Agent A waits up to `[audio].rtp_reorder_wait_ms` (default `40`, `0` disables waiting) for a missing carrier AMR RTP packet. Later packets accumulate until that packet arrives or the deadline expires, then available packets are decoded in sequence order, skipping an expired gap. This applies only to carrier AMR → SIP/PBX transcoding, including early media, for both VoWiFi and VoLTE. The RTP passed to Agent B's PJMEDIA retains the carrier sequence numbers and media timing: timestamps pass through at equal clock rates, and are scaled when converting AMR-WB at 16 kHz to PCMU at 8 kHz. Timestamp gaps and rollover are retained.
+
 ## AMR passthrough — `gsm-sip-bridge/src/amr_forward/`, `vowifi/forward.rs`
 
 Off by default (`[vowifi].amr_passthrough`, inbound calls only). Normally Agent A decodes the carrier's AMR to PCM and Agent B encodes it again for the phone. When the carrier leg and the phone leg both settled on AMR-WB (or both AMR-NB) with compatible parameters, the speech frames are forwarded without being decoded.

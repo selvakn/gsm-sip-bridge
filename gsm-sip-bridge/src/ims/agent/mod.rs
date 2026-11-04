@@ -394,6 +394,7 @@ fn run_inner(
         sms_report_pcscf_route: config.sms_report_pcscf_route,
         respect_caller_privacy: config.respect_caller_privacy,
         amr_passthrough: config.amr_passthrough,
+        rtp_reorder_wait: Duration::from_millis(app_config.audio.rtp_reorder_wait_ms),
         gm_options_keepalive: config.gm_options_keepalive,
         amr_mode_set: config.amr_mode_set,
         // Already this line's value: discovery applied any `[[vowifi.line]]`
@@ -758,6 +759,8 @@ pub(crate) struct InboundParams<'a> {
     /// See `config::VowifiConfig::amr_passthrough`. Both transports read the
     /// `[vowifi]` copy: it is one deployment-wide setting (FR-015).
     pub amr_passthrough: bool,
+    /// See `config::AudioConfig::rtp_reorder_wait_ms`. Shared by both transports.
+    pub rtp_reorder_wait: Duration,
     /// See `config::VowifiConfig::gm_options_keepalive`. Both transports read
     /// the `[vowifi]` copy: it is one deployment-wide setting.
     pub gm_options_keepalive: bool,
@@ -841,6 +844,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         sms_report_pcscf_route,
         respect_caller_privacy,
         amr_passthrough,
+        rtp_reorder_wait,
         gm_options_keepalive,
         amr_mode_set,
         reg_rejected_cooldown,
@@ -1048,6 +1052,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             originating_headers: app_config.vowifi.originating_headers,
             respect_caller_privacy,
             amr_passthrough,
+            rtp_reorder_wait,
             gm_options_keepalive,
             amr_mode_set,
             pbx_registered: pbx_registered.as_ref(),
@@ -1972,6 +1977,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::amr_passthrough`; consumed by
     /// [`inbound::handle_invite`].
     amr_passthrough: bool,
+    /// See `config::AudioConfig::rtp_reorder_wait_ms`; consumed by both inbound
+    /// and originated transcoding relays, including early media.
+    rtp_reorder_wait: Duration,
     /// See `config::VowifiConfig::gm_options_keepalive`; consumed by
     /// [`ping::probe_gm_connection`].
     gm_options_keepalive: bool,
@@ -2009,6 +2017,7 @@ impl DispatchParams<'_> {
             access_network_info: &self.reg_cfg.access_network_info,
             respect_caller_privacy: self.respect_caller_privacy,
             amr_passthrough: self.amr_passthrough,
+            rtp_reorder_wait: self.rtp_reorder_wait,
             amr_mode_set: self.amr_mode_set,
         }
     }
@@ -2019,6 +2028,7 @@ impl DispatchParams<'_> {
             veth_sip_port: self.veth_sip_port,
             wideband: self.wideband,
             originating_headers: self.originating_headers,
+            rtp_reorder_wait: self.rtp_reorder_wait,
         }
     }
 }

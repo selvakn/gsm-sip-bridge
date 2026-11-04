@@ -51,6 +51,7 @@ pub(crate) mod rtcp;
 /// rather than re-implementing them — the reasoning `digest` and
 /// `sip_client` below already carry, extended one module further.
 pub mod rtp;
+mod rtp_reorder;
 pub mod sdp;
 pub mod session;
 /// `pub` rather than `pub(crate)`: `sip::server`'s registrar reuses this

@@ -164,8 +164,8 @@ restart_mode = "full"
 # Audio tuning
 # ============================================================================
 [audio]
-# Shared by every audio path: circuit-switched calls AND VoWiFi/VoLTE IMS
-# calls (both run through the same jitter-buffer/latency pipeline).
+# Audio tuning for circuit-switched calls and VoWiFi/VoLTE IMS calls.
+# The RTP reorder setting below applies only to carrier AMR transcoding.
 #
 # Latency profile for the PJSIP jitter buffer and audio ring buffer.
 # "lan" — SIP server on the same machine or local network (default, lowest latency).
@@ -183,6 +183,13 @@ vad = true
 # the logs report "alsa_capture_overrun" / "alsa_playback_underrun" events.
 snd_rec_latency_ms = 150
 snd_play_latency_ms = 150
+# Agent A: maximum milliseconds to wait for the next carrier AMR RTP packet
+# before transcoding. Later packets are buffered and released in sequence order
+# when the gap closes or this deadline expires. 0 disables waiting. Applies to
+# carrier -> SIP/PBX only, for VoWiFi and VoLTE, including early media. The
+# carrier RTP sequence and media timing are carried through transcoding;
+# timestamps are scaled when the output codec uses a different clock rate.
+# rtp_reorder_wait_ms = 40
 
 [modem_audio]
 # EC20 USB sound-device tuning. Circuit-switched calls ONLY — has no effect

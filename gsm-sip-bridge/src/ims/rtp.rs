@@ -32,8 +32,8 @@ pub fn build_packet(
 }
 
 /// A parsed RTP packet's header fields plus a view of its payload. Not
-/// every field is consumed by the current single-codec, no-reordering call
-/// flow, but they're part of a correctly-parsed packet's identity.
+/// every caller consumes every field, but they form the packet's identity
+/// through reordering and transcoding as well as passthrough.
 #[allow(dead_code)]
 pub struct ParsedPacket<'a> {
     pub seq: u16,

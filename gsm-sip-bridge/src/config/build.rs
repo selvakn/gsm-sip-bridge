@@ -528,6 +528,7 @@ fn build_audio(raw: RawAudio) -> BridgeResult<AudioConfig> {
         vad: raw.vad,
         snd_rec_latency_ms: latency_ms(raw.snd_rec_latency_ms, "snd_rec_latency_ms")?,
         snd_play_latency_ms: latency_ms(raw.snd_play_latency_ms, "snd_play_latency_ms")?,
+        rtp_reorder_wait_ms: raw.rtp_reorder_wait_ms,
     })
 }
 

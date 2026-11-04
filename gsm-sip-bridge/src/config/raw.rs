@@ -295,6 +295,8 @@ section! {
         pub vad: bool,
         pub snd_rec_latency_ms: u32,
         pub snd_play_latency_ms: u32,
+        /// See `AudioConfig::rtp_reorder_wait_ms`.
+        pub rtp_reorder_wait_ms: u64,
     }
 }
 
@@ -305,6 +307,7 @@ impl Default for RawAudio {
             vad: true,
             snd_rec_latency_ms: super::DEFAULT_SND_REC_LATENCY_MS,
             snd_play_latency_ms: super::DEFAULT_SND_PLAY_LATENCY_MS,
+            rtp_reorder_wait_ms: super::DEFAULT_RTP_REORDER_WAIT_MS,
         }
     }
 }

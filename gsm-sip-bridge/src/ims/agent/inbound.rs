@@ -93,6 +93,8 @@ pub(super) struct InviteContext<'a> {
     pub(super) respect_caller_privacy: bool,
     /// See `config::VowifiConfig::amr_passthrough`.
     pub(super) amr_passthrough: bool,
+    /// See `config::AudioConfig::rtp_reorder_wait_ms`.
+    pub(super) rtp_reorder_wait: Duration,
     pub(super) amr_mode_set: crate::amr_forward::ModeSetPolicy,
 }
 
@@ -689,6 +691,7 @@ pub(super) fn handle_invite(
                         stop.clone(),
                         &meter,
                         rtcp_bundle.clone(),
+                        ctx.rtp_reorder_wait,
                     )?;
                 } else {
                     // Both legs speak PCMU: forward the payloads untouched.
@@ -1158,6 +1161,7 @@ fn handle_offerless_invite(
             stop.clone(),
             &meter,
             None,
+            ctx.rtp_reorder_wait,
         )?;
     } else {
         spawn_relay(

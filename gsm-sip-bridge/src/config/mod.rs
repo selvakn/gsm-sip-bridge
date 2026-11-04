@@ -23,6 +23,8 @@ pub const DEFAULT_REG_REJECTED_COOLDOWN_SEC: u64 = 1800;
 
 /// Default `[vowifi].dpd_delay_sec`: a handset's DPD timer (specs/098 R1).
 pub const DEFAULT_DPD_DELAY_SEC: u64 = 120;
+/// Maximum time to wait for a missing carrier AMR RTP packet before decoding.
+pub const DEFAULT_RTP_REORDER_WAIT_MS: u64 = 40;
 
 fn default_reg_rejected_cooldown_sec() -> u64 {
     DEFAULT_REG_REJECTED_COOLDOWN_SEC
@@ -513,6 +515,11 @@ pub struct AudioConfig {
     /// ALSA playback (SIP→GSM) ring-buffer depth in milliseconds, passed to PJMEDIA as
     /// `snd_play_latency`. Range 20–2000; default 150 (PJSUA default is 140).
     pub snd_play_latency_ms: u32,
+    /// Maximum milliseconds Agent A waits for the next carrier AMR RTP packet
+    /// before skipping it and decoding the buffered packets in sequence order.
+    /// Only the carrier-to-SIP/PBX transcoding direction uses this buffer;
+    /// `0` disables waiting. Shared by VoWiFi and VoLTE, including early media.
+    pub rtp_reorder_wait_ms: u64,
 }
 
 /// EC20 USB sound-device tuning. Circuit-switched calls ONLY — VoWiFi/VoLTE
@@ -560,6 +567,7 @@ impl Default for AudioConfig {
             vad: true,
             snd_rec_latency_ms: DEFAULT_SND_REC_LATENCY_MS,
             snd_play_latency_ms: DEFAULT_SND_PLAY_LATENCY_MS,
+            rtp_reorder_wait_ms: DEFAULT_RTP_REORDER_WAIT_MS,
         }
     }
 }
@@ -2282,6 +2290,48 @@ password = "pass"
             .unwrap_err()
             .to_string()
             .contains("audio.profile must be"));
+    }
+
+    #[test]
+    fn audio_rtp_reorder_wait_defaults_and_accepts_zero_or_a_custom_wait() {
+        assert_eq!(parse(MINIMAL_TOML).audio.rtp_reorder_wait_ms, 40);
+        assert_eq!(AudioConfig::default().rtp_reorder_wait_ms, 40);
+        for wait_ms in [0, 125] {
+            let cfg = parse(&format!(
+                "{MINIMAL_TOML}\n[audio]\nrtp_reorder_wait_ms = {wait_ms}\n"
+            ));
+            assert_eq!(cfg.audio.rtp_reorder_wait_ms, wait_ms);
+        }
+    }
+
+    #[test]
+    fn audio_rtp_reorder_wait_rejects_invalid_values_and_other_sections() {
+        for value in ["-1", "1.5", "\"40\""] {
+            let err = try_parse(&format!(
+                "{MINIMAL_TOML}\n[audio]\nrtp_reorder_wait_ms = {value}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("rtp_reorder_wait_ms"), "{err}");
+        }
+        for section in ["[vowifi]", "[volte]", "[[vowifi.line]]"] {
+            let err = try_parse(&format!(
+                "{MINIMAL_TOML}\n{section}\nrtp_reorder_wait_ms = 40\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("rtp_reorder_wait_ms"), "{err}");
+        }
+    }
+
+    #[test]
+    fn audio_rtp_reorder_wait_does_not_depend_on_latency_profile() {
+        for profile in ["lan", "wan"] {
+            let src = format!("{MINIMAL_TOML}\n[audio]\nprofile = \"{profile}\"\n");
+            assert_eq!(parse(&src).audio.rtp_reorder_wait_ms, 40);
+            let custom = format!("{src}rtp_reorder_wait_ms = 125\n");
+            assert_eq!(parse(&custom).audio.rtp_reorder_wait_ms, 125);
+        }
     }
 
     #[test]

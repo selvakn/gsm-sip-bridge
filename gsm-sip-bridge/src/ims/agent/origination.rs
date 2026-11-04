@@ -203,6 +203,7 @@ pub(super) struct PendingOrigination {
     veth_local_ip: IpAddr,
     veth_sip_port: u16,
     wideband: bool,
+    rtp_reorder_wait: Duration,
     /// While `AwaitingCarrier`: the carrier-response deadline (initially
     /// `OUTBOUND_INVITE_TIMEOUT`, extended to `OUTBOUND_RING_TIMEOUT` once any
     /// response arrives). While `AwaitingVeth`: the veth-leg deadline
@@ -295,6 +296,8 @@ pub(super) struct OriginationSetup {
     pub(super) veth_local_ip: IpAddr,
     pub(super) veth_sip_port: u16,
     pub(super) wideband: bool,
+    /// See `config::AudioConfig::rtp_reorder_wait_ms`.
+    pub(super) rtp_reorder_wait: Duration,
     /// See `config::OriginatingHeaders` — empty everywhere by default.
     pub(super) originating_headers: crate::config::OriginatingHeaders,
 }
@@ -454,6 +457,7 @@ pub(super) fn begin_origination(
         veth_local_ip: setup.veth_local_ip,
         veth_sip_port: setup.veth_sip_port,
         wideband: setup.wideband,
+        rtp_reorder_wait: setup.rtp_reorder_wait,
         deadline: Instant::now() + OUTBOUND_INVITE_TIMEOUT,
         any_response_seen: false,
         ringing_relayed: false,
@@ -1208,6 +1212,7 @@ pub(super) fn tick_pending_origination(
                                             // (specs/046-rtcp-reporting
                                             // FR-023).
                                             None,
+                                            p.rtp_reorder_wait,
                                         )
                                         .is_ok()
                                     } else {
@@ -1416,6 +1421,7 @@ fn finish_origination(
         mut lifecycle,
         early_relay,
         early_veth_socket,
+        rtp_reorder_wait,
         session_refresh,
         ..
     } = p;
@@ -1490,6 +1496,7 @@ fn finish_origination(
                             // Originated calls are out of scope for RTCP
                             // reporting (specs/046-rtcp-reporting FR-023).
                             None,
+                            rtp_reorder_wait,
                         )
                     } else {
                         spawn_relay(
@@ -1618,6 +1625,7 @@ fn finish_origination(
                     // Originated calls are out of scope for RTCP reporting
                     // (specs/046-rtcp-reporting FR-023).
                     None,
+                    rtp_reorder_wait,
                 )
             } else {
                 spawn_relay(
@@ -1777,6 +1785,7 @@ mod tests {
             veth_local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             veth_sip_port: 0,
             wideband: false,
+            rtp_reorder_wait: Duration::from_millis(crate::config::DEFAULT_RTP_REORDER_WAIT_MS),
             deadline: Instant::now() + Duration::from_secs(30),
             any_response_seen: false,
             ringing_relayed: false,

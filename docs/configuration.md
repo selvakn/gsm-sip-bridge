@@ -191,11 +191,11 @@ keys stay valid and simply have no effect while `[cs].enabled = false`.
 
 ### `[audio]`
 
-Latency and audio-quality tuning **shared by every call path** — circuit-switched
-(EC20 USB audio) AND VoWiFi/VoLTE IMS calls all run through the same jitter-buffer
-pipeline. All keys are optional. The section is read at startup; changes require a
-process restart. See `docs/audio-tuning-log.md` for the empirical history behind
-the defaults.
+Latency and audio-quality tuning for circuit-switched calls (EC20 USB audio)
+and VoWiFi/VoLTE IMS calls. The latency profile, VAD and ring-buffer settings
+apply to every call path; RTP reordering applies only to carrier AMR transcoding.
+All keys are optional. The section is read at startup; changes require a process
+restart. See `docs/audio-tuning-log.md` for the empirical history behind the defaults.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -203,6 +203,7 @@ the defaults.
 | `vad` | boolean | `true` | PJMEDIA voice activity detection / noise suppression on the capture path. Set `false` only to diagnose audio issues (raw passthrough). |
 | `snd_rec_latency_ms` | integer | `150` | Capture ring-buffer depth (caller → SIP), 20–2000 ms. Raise if logs report `alsa_capture_overrun`. |
 | `snd_play_latency_ms` | integer | `150` | Playback ring-buffer depth (SIP → caller), 20–2000 ms. Raise if logs report `alsa_playback_underrun`. |
+| `rtp_reorder_wait_ms` | integer | `40` | Maximum milliseconds Agent A waits for the next carrier AMR RTP packet before transcoding. Later packets accumulate until the missing packet arrives or the deadline expires, then the available packets are decoded in sequence order; an expired missing packet is skipped. Applies only to carrier AMR → SIP/PBX transcoding, including early media, on VoWiFi and VoLTE lines. `0` disables waiting. The transcoded RTP sent to Agent B's PJMEDIA preserves the carrier packet sequence and media timing; timestamps are scaled when the output codec uses a different clock rate. Per deployment, not per line; takes effect when the container is recreated |
 
 ### `[modem_audio]`
 
