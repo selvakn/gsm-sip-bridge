@@ -158,10 +158,12 @@ fn store_unavailable() -> Response {
 /// Runs a blocking store query off the async workers.
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, super::queries::StoreUnavailable> + Send + 'static,
-) -> Result<T, Response> {
+) -> Result<T, ()> {
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
-        _ => Err(store_unavailable()),
+        // Callers answer `store_unavailable()`; the failure itself carries
+        // nothing, so it is not a (large) `Response` built here and passed on.
+        _ => Err(()),
     }
 }
 
@@ -183,7 +185,7 @@ pub async fn sms(State(state): State<WebuiState>, Query(params): Query<SmsParams
     let store = state.store.clone();
     match blocking(move || store.list_sms(&filter, page)).await {
         Ok(rows) => Json(rows).into_response(),
-        Err(response) => response,
+        Err(()) => store_unavailable(),
     }
 }
 
@@ -208,7 +210,7 @@ pub async fn calls_summary(State(state): State<WebuiState>) -> Response {
             body["host_utc_offset"] = json!(Local::now().format("%:z").to_string());
             Json(body).into_response()
         }
-        Err(response) => response,
+        Err(()) => store_unavailable(),
     }
 }
 
@@ -261,7 +263,7 @@ pub async fn calls(State(state): State<WebuiState>, Query(p): Query<CallParams>)
     let store = state.store.clone();
     match blocking(move || store.list_calls(&filter, page)).await {
         Ok(rows) => Json(rows).into_response(),
-        Err(response) => response,
+        Err(()) => store_unavailable(),
     }
 }
 
@@ -283,7 +285,7 @@ pub async fn events(State(state): State<WebuiState>, Query(p): Query<EventParams
     let store = state.store.clone();
     match blocking(move || store.list_events(&filter, page)).await {
         Ok(rows) => Json(rows).into_response(),
-        Err(response) => response,
+        Err(()) => store_unavailable(),
     }
 }
 

@@ -245,10 +245,8 @@ pub fn extract_sip_servers(options: &[(u16, Vec<u8>)]) -> Vec<Ipv6Addr> {
         .iter()
         .filter(|(code, _)| *code == OPT_SIP_SERVER_ADDRS)
         .flat_map(|(_, val)| {
-            val.chunks_exact(16).filter_map(|c| {
-                let mut o = [0u8; 16];
-                o.copy_from_slice(c);
-                let a = Ipv6Addr::from(o);
+            val.as_chunks::<16>().0.iter().filter_map(|&c| {
+                let a = Ipv6Addr::from(c);
                 (!a.is_unspecified()).then_some(a)
             })
         })
@@ -261,10 +259,8 @@ pub fn extract_dns_servers(options: &[(u16, Vec<u8>)]) -> Vec<Ipv6Addr> {
         .iter()
         .filter(|(code, _)| *code == OPT_DNS_SERVERS)
         .flat_map(|(_, val)| {
-            val.chunks_exact(16).filter_map(|c| {
-                let mut o = [0u8; 16];
-                o.copy_from_slice(c);
-                let a = Ipv6Addr::from(o);
+            val.as_chunks::<16>().0.iter().filter_map(|&c| {
+                let a = Ipv6Addr::from(c);
                 (!a.is_unspecified()).then_some(a)
             })
         })
@@ -806,8 +802,10 @@ mod tests {
             .expect("no option-request");
         let requested: Vec<u16> = oro
             .1
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_be_bytes(c))
             .collect();
         assert!(requested.contains(&OPT_SIP_SERVER_ADDRS));
         assert!(requested.contains(&OPT_SIP_SERVER_DOMAINS));
