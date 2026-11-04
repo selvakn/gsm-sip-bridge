@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # `default-features = false` drops the protobuf encoder, and with it the
 # `protobuf 2.x` dependency carrying RUSTSEC-2024-0437 (stack overflow on
 # untrusted input). We only ever emit the text exposition format —
