@@ -22,7 +22,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -50,12 +50,12 @@ jobs:
         # caches the later steps persist, so repointing the tag would change
         # what executes here without any change to this repository
         # (Greptile P2). Bump deliberately.
-        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
         with:
           tool: cargo-deny,cargo-nextest
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -66,7 +66,7 @@ jobs:
 
       - name: Cache PJSIP build
         id: pjsip-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/pjsip
           key: pjsip-${{ env.PJSIP_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('docker/pjsip-config-site.h') }}
@@ -129,10 +129,10 @@ jobs:
     if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build the SWu/Python payload stage (no push)
         run: docker build -f docker/Dockerfile --target python-builder .
