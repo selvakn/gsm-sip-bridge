@@ -1,0 +1,59 @@
+# Keeps the dependency stack from drifting again (it took a 12-PR stack to
+# catch up). Minor/patch updates are grouped into one PR per ecosystem; every
+# MAJOR (or 0.x minor) bump gets its own PR, because those are the ones that
+# need the per-PR evidence the dependency stack carried (API changes, on-disk
+# or wire compatibility, TLS/trust changes).
+#
+# NOT covered by Dependabot, bump by hand (grep the old version first):
+#   - PJSIP_VERSION: docker/Dockerfile, docker/pjsip.Dockerfile,
+#     .github/workflows/ci.yml, pjsip-base.yml, docs/development.md
+#   - ALPINE_VERSION in docker/Dockerfile (ARG-interpolated FROM lines are
+#     invisible to Dependabot's docker ecosystem)
+#   - the strongSwan-epdg commit pinned in docker/Dockerfile
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: monthly
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(ci)"
+
+  # Literal FROM lines only: docker/cellular-internet/Dockerfile and
+  # docker/pjsip.Dockerfile. docker/Dockerfile's ARG-built tags are manual.
+  - package-ecosystem: docker
+    directories:
+      - /docker
+      - /docker/cellular-internet
+    schedule:
+      interval: monthly
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(docker)"
