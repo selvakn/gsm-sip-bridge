@@ -50,7 +50,7 @@ jobs:
         # caches the later steps persist, so repointing the tag would change
         # what executes here without any change to this repository
         # (Greptile P2). Bump deliberately.
-        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2
         with:
           tool: cargo-deny,cargo-nextest
 
