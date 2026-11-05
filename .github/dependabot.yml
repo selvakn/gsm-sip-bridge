@@ -40,8 +40,8 @@ updates:
     schedule:
       interval: monthly
     groups:
-      actions:
-        patterns: ["*"]
+      actions-minor-patch:
+        update-types: [minor, patch]
     labels: [dependencies]
     commit-message:
       prefix: "chore(ci)"
