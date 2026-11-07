@@ -943,6 +943,9 @@ impl LoopState {
             guard.state = crate::ims::RegistrationState::Registered;
             guard.registered_at = Some(now);
             guard.expires_at = Some(expiry);
+            // Header merging above preserves the number when this refresh
+            // omits P-Associated-URI, and replaces it when the network sends it.
+            guard.msisdn = session.associated_msisdn();
             guard.attached = true;
         }
         if pending.kind == Kind::Answer {

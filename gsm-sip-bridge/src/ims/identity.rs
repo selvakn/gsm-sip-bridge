@@ -215,6 +215,58 @@ fn is_tel(uri: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("tel"))
 }
 
+/// The subscriber's telephone number advertised by a successful REGISTER.
+///
+/// A numeric SIP user alone is not enough: an IMS public identity may contain
+/// the IMSI rather than the subscriber's telephone number. Only `tel`, a
+/// `+`-leading SIP user, or an explicit SIP `user=phone` identifies a telephone
+/// subscriber. Prefer a usable `tel` identity across all repeated header lines.
+/// Like [`uri_number`], this normalizes escapes and telephone visual separators,
+/// but permits only an optional leading `+` and ASCII digits in the result.
+pub(crate) fn associated_msisdn(headers: &[(String, String)]) -> Option<String> {
+    let values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("P-Associated-URI"))
+        .flat_map(|(_, value)| split_header_values(value))
+        .filter_map(|value| parse_name_addr(value, HeaderParams::None))
+        .collect();
+    values
+        .iter()
+        .filter(|value| is_tel(value.uri))
+        .find_map(|value| associated_uri_msisdn(value.uri))
+        .or_else(|| {
+            values
+                .iter()
+                .filter(|value| !is_tel(value.uri))
+                .find_map(|value| associated_uri_msisdn(value.uri))
+        })
+}
+
+fn associated_uri_msisdn(uri: &str) -> Option<String> {
+    let (scheme, rest) = uri.trim().split_once(':')?;
+    let number = uri_number(uri)?;
+    if !scheme.eq_ignore_ascii_case("tel") {
+        if !scheme.eq_ignore_ascii_case("sip") && !scheme.eq_ignore_ascii_case("sips") {
+            return None;
+        }
+        let (_, hostpart) = rest.split_once('@')?;
+        let address = hostpart.split('?').next()?;
+        let host = address.split(';').next()?;
+        if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c == '@') {
+            return None;
+        }
+        let user_phone = address
+            .split(';')
+            .skip(1)
+            .any(|param| param.trim().eq_ignore_ascii_case("user=phone"));
+        if !number.starts_with('+') && !user_phone {
+            return None;
+        }
+    }
+    let digits = number.strip_prefix('+').unwrap_or(&number);
+    (!digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())).then_some(number)
+}
+
 /// The caller named by one header, or `None` when none of its values yields a
 /// number.
 ///
@@ -423,5 +475,93 @@ mod tests {
             None
         );
         assert_eq!(header_identity(&r, "From", HeaderParams::Allowed), None);
+    }
+
+    fn associated_headers(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn associated_msisdn_prefers_tel_across_repeated_case_insensitive_headers() {
+        let headers = associated_headers(&[
+            (
+                "P-Associated-URI",
+                r#""Subscriber, Test" <sip:+919000000001@ims.example>, <sip:001010123456789@ims.example>"#,
+            ),
+            ("p-associated-uri", "<tel:+91-900-000-0002;ext=12>"),
+        ]);
+        assert_eq!(
+            associated_msisdn(&headers).as_deref(),
+            Some("+919000000002")
+        );
+    }
+
+    #[test]
+    fn associated_msisdn_accepts_explicit_telephone_identities() {
+        let cases = [
+            ("<TEL:+91(900)000.0000;noa=international>", "+919000000000"),
+            ("tel:9000000000;phone-context=+91", "9000000000"),
+            ("<sip:+919000000000@ims.example>", "+919000000000"),
+            ("<SIPS:%2b919000000000@ims.example>", "+919000000000"),
+            ("sip:919000000000@ims.example;UsEr=PhOnE", "919000000000"),
+            (
+                "<sip:91-900-000-0000;npdi;rn=+919000000099@ims.example;user=phone;transport=tcp>",
+                "919000000000",
+            ),
+        ];
+        for (uri, want) in cases {
+            let headers = associated_headers(&[("P-Associated-URI", uri)]);
+            assert_eq!(associated_msisdn(&headers).as_deref(), Some(want), "{uri}");
+        }
+    }
+
+    #[test]
+    fn associated_msisdn_rejects_imsi_nonphone_and_malformed_identities() {
+        let cases = [
+            "<sip:001010123456789@ims.example>",
+            "<sip:919000000000@ims.example>",
+            "<sip:alice@ims.example>",
+            "<sip:alice@ims.example;user=phone>",
+            "<sip:ims.example;user=phone>",
+            "<sip:+919000000000@>",
+            "<sip:+919000000000@ims.example@other.example>",
+            "<sip:+919000000000@ims. example>",
+            "<sip:919000000000@ims.example?user=phone>",
+            "<tel:+>",
+            "<tel:+919000000000#>",
+            "<tel:１２３４５>",
+            "<tel:+919000%zz>",
+            "<tel:+919000000000%0d%0a>",
+            "<mailto:+919000000000@example.com>",
+            "<tel:+919000000000",
+            r#""unterminated <tel:+919000000000>"#,
+        ];
+        for uri in cases {
+            let headers = associated_headers(&[("P-Associated-URI", uri)]);
+            assert_eq!(associated_msisdn(&headers), None, "{uri}");
+        }
+        assert_eq!(associated_msisdn(&[]), None);
+        assert_eq!(
+            associated_msisdn(&associated_headers(&[(
+                "P-Asserted-Identity",
+                "<tel:+919000000000>",
+            )])),
+            None
+        );
+    }
+
+    #[test]
+    fn associated_msisdn_skips_invalid_entries_and_uses_phone_sip_fallback() {
+        let headers = associated_headers(&[
+            ("P-Associated-URI", "<tel:+bad>, <sip:alice@ims.example>"),
+            (
+                "P-Associated-URI",
+                "<tel:+919000%zz>, <sip:919000000000@ims.example;user=phone>",
+            ),
+        ]);
+        assert_eq!(associated_msisdn(&headers).as_deref(), Some("919000000000"));
     }
 }

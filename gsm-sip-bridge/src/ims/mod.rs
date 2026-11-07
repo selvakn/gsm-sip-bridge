@@ -418,6 +418,12 @@ impl RegisteredSession {
             })
     }
 
+    /// The telephone identity the registrar returned for this binding.
+    /// Never falls back to the IMSI-derived registration identity.
+    pub(crate) fn associated_msisdn(&self) -> Option<String> {
+        identity::associated_msisdn(&self.headers)
+    }
+
     /// Our Gm **protected server port** (`port-s`) endpoint — where the
     /// network opens connections to deliver everything it originates
     /// (reg-event `NOTIFY`s, mobile-terminating `INVITE`s). `None` when the
@@ -747,6 +753,9 @@ pub struct RegistrationStatus {
     pub registered_at: Option<std::time::SystemTime>,
     pub expires_at: Option<std::time::SystemTime>,
     pub last_failure: Option<(std::time::SystemTime, String)>,
+    /// Own telephone number from an accepted REGISTER's `P-Associated-URI`.
+    /// In-memory only; exported to the web UI through agent details.
+    pub msisdn: Option<String>,
     // The health inputs the dispatch loop keeps current so the status listener
     // can answer `can_answer`/`blocked_reason` (`ims::lifecycle::ServiceHealth`)
     // without touching the modem itself. In-memory only — `render_status`
@@ -807,6 +816,7 @@ impl Default for RegistrationStatus {
             registered_at: None,
             expires_at: None,
             last_failure: None,
+            msisdn: None,
             attached: true,
             busy: false,
             pbx_registered: true,

@@ -119,6 +119,7 @@ Then open `http://<host>:8080/`. A few things to know:
 - Messages are read from the store, never from the modem, so looking at them does not mark anything read.
 - If the port is taken the bridge logs an error and carries on without the UI.
 - Signal strength is read from each modem every `[metrics].signal_poll_interval_seconds` (default 60; `0` turns it off), never during a call, and is also exported as `gsm_sip_bridge_signal_*` gauges.
+- For VoWiFi/VoLTE, **Number** uses the telephone identity supplied by the carrier in `P-Associated-URI` after a successful IMS registration or renewal. A configured per-line `msisdn` takes priority for modem lines matched by `modem_serial` and for PC/SC lines; a `modem_port`-only entry cannot supply this UI override and uses the learned IMS number. No additional request is sent. A `tel:` identity is preferred; SIP identities must start with `+` or carry `user=phone`, so an IMSI is not mistaken for a phone number. A renewal without this header keeps the previous identity; a replacement header without a telephone identity clears it. If neither source provides a number, the field shows `—`. The UI masks numbers to their last four digits.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -357,7 +358,7 @@ network identity. Every field is optional except the matcher.
 | `mnc` | string | unset (auto-derive) | This line's home network MNC, zero-padded to 3 digits |
 | `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch: use this IMSI instead of reading it from the SIM |
 | `imei_override` | string | unset (read via AT+CGSN, or auto-generated for a `pcsc_reader` line) | Diagnostic escape hatch: use this IMEI instead of reading it from the modem |
-| `msisdn` | string | none | This line's phone number, shown in its alert notifications (specs/034-alert-identity) |
+| `msisdn` | string | none | This line's phone number, shown in its alert notifications (specs/034-alert-identity). For `modem_serial` or PC/SC entries, it also takes priority over the IMS-learned number in the web UI; `modem_port`-only entries use the learned number there |
 | `reg_rejected_cooldown_sec` | integer | inherits `[vowifi].reg_rejected_cooldown_sec` | This line's reg-event `rejected` cooldown, `60..=86400` |
 | `tunnel_address_family` | enum | inherits `[vowifi].tunnel_address_family` | This line's tunnel address family: `dual`, `ipv4` or `ipv6`. Each line renders only its own value, so one line can run `ipv4` while the others stay `dual` |
 | `pcsc_reader` | bool | `false` | This line's SIM comes from a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem (specs/023-omnikey-pcsc-vowifi) — see [docs/omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md). `imsi_override` becomes mandatory — not because the IMSI is unreadable (it is read from `EF_IMSI` over PC/SC) but because it names which reader's card this line owns, which must be known before any card session exists; run `gsm-sip-bridge pcsc-list` to see every attached reader's card (IMSI, MCC/MNC, carrier) before writing this in. `mcc`/`mnc` stay optional and auto-derive from the card's own `EF_IMSI`/`EF_AD` via `vowifi-plmn --pcsc-imsi`; pin them only for a card whose `EF_AD` omits the MNC-length byte, which fails at startup saying so. `imei_override` stays optional — left unset, a stable, Luhn-valid IMEI is auto-generated from the line's IMSI (an IMEI is a device identity, genuinely not on the card). Requires `[vowifi].tunnel_engine = "strongswan"` (the default); the `swu` engine has no PC/SC support and refuses to start with this set |
@@ -420,7 +421,7 @@ Every field is optional except the matcher.
 | `apn` | string | `ims` | This line's APN |
 | `pcscf` | string | unset (auto-discover) | This line's explicit P-CSCF address. Unset falls back to `pcscf_source_path`, then on-modem discovery — which does not work on every carrier |
 | `iface` | string | unset (auto-detect) | Host data interface bound to this line's IMS PDN. Unset auto-detects from the modem's own USB device |
-| `msisdn` | string | none | This line's own MSISDN, advertised in the P-Preferred-Identity |
+| `msisdn` | string | none | This line's own MSISDN, advertised in the P-Preferred-Identity. With `modem_serial`, it also takes priority over the IMS-learned number in the web UI; `modem_port`-only entries use the learned number there |
 | `reg_rejected_cooldown_sec` | integer | inherits `[volte].reg_rejected_cooldown_sec` | This line's reg-event `rejected` cooldown, `60..=86400` |
 
 ### `[sip_server]`

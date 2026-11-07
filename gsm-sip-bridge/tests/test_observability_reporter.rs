@@ -136,7 +136,7 @@ async fn test_repeated_reports_do_not_reset_the_daemon_side_counter() {
 
 // specs/122-management-webui: the reporter carries `AgentDetails` from its
 // provider on every report, through the real socket into the daemon's
-// ingest, so the web UI sees registration wording, carrier and signal.
+// ingest, so the web UI sees registration wording, carrier, own number and signal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_details_from_the_provider_reach_the_daemons_snapshot() {
     use gsm_sip_bridge::control::protocol::{
@@ -166,6 +166,7 @@ async fn test_details_from_the_provider_reach_the_daemons_snapshot() {
         registration_state: Some(RegistrationStateWire::Registered),
         registered_at: Some(1_700_000_000),
         plmn: Some("405-857".into()),
+        msisdn: Some("+919000000000".into()),
         signal: Some(SignalReadingWire {
             at_unix: 1_700_000_100,
             rssi_dbm: Some(-71),
@@ -189,6 +190,7 @@ async fn test_details_from_the_provider_reach_the_daemons_snapshot() {
         if let Some(snap) = found {
             if snap.details.plmn.is_some() {
                 assert_eq!(snap.details.plmn.as_deref(), Some("405-857"));
+                assert_eq!(snap.details.msisdn.as_deref(), Some("+919000000000"));
                 assert_eq!(snap.details.registered_at, Some(1_700_000_000));
                 assert_eq!(snap.details.signal.unwrap().rssi_dbm, Some(-71));
                 assert_eq!(

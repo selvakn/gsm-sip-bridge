@@ -117,6 +117,12 @@ Arrives in `AgentReport.details.active_call_details`, or is built from `CardPool
 
 At most 4 entries per report, to keep reports bounded.
 
+### IMS phone number
+
+`RegistrationStatus.msisdn` holds the telephone identity learned from an accepted REGISTER's `P-Associated-URI`, including successful full re-registration and in-place renewal. No separate number lookup is sent. A `tel:` identity is preferred; a SIP identity is accepted only when its user starts with `+` or it has `user=phone`. An unmarked numeric SIP user is not treated as a phone number.
+
+An in-place renewal without `P-Associated-URI` preserves the previous session identity. A replacement header with no usable telephone identity clears it. The carrier-facing agent reports this through `AgentDetails.msisdn`: `None` leaves the daemon's stored value unchanged for compatibility with older agents, while `Some("")` clears it. This value is in-memory observability data, not a new metric label or an update to alert identities.
+
 ### `LineView`
 
 Assembled per request, not stored.
@@ -126,7 +132,7 @@ Assembled per request, not stored.
 | `id`, `index` | Ingest key `module_id` / CS slot number |
 | `transport` | `cs` / `vowifi` / `volte`, from the agent kind (`ingest::transport_label`) |
 | `carrier` | PLMN → operator name from `details.plmn` (new; MCC/MNC is shown when the name is unknown). CS: `SlotInfo.network` |
-| `msisdn` | `alerts::line_phone_map` or the CS slot `phone`; the client masks it to the last 4 digits |
+| `msisdn` | VoWiFi/VoLTE: nonempty configured number from `webui::lines::phone_map` (`modem_serial` or PC/SC entries), falling back to the carrier-facing agent's nonempty `details.msisdn`. `modem_port`-only entries use the learned IMS number. CS: slot `phone`. The client masks it to the last 4 digits; absent values render as `—` |
 | `registration_state` | `details.registration_state` (`ims::RegistrationState` Display) |
 | `registered_at`, `expires_at` | Ingest record |
 | `tunnel_up`, `child_sa_up`, `gm_connection_up`, `uplink` | Ingest records (IMS + Supervisor) |

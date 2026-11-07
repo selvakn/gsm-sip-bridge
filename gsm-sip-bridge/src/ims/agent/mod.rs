@@ -980,14 +980,6 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         agent = agent_label,
         "registered, listening for inbound calls"
     );
-    obs.report_registration_attempt(RegistrationStatus::Success);
-    obs.set_registered(true);
-    obs.set_tunnel_up(true);
-    obs.set_active_calls(0);
-    obs.set_registration_expiry(
-        SystemTime::now()
-            + Duration::from_secs(session.granted_expires(crate::ims::DEFAULT_EXPIRES) as u64),
-    );
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
     // the NOTIFY the network sends straight back on a new connection. The
     // SUBSCRIBE itself is the dispatch loop's first act, so it is tracked like
@@ -1005,6 +997,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         registered_at: Some(SystemTime::now()),
         expires_at: Some(SystemTime::now() + Duration::from_secs(granted_expires as u64)),
         last_failure: None,
+        msisdn: session.associated_msisdn(),
         // Health starts able-to-answer: we reach here only after a successful
         // registration, and the attachment underneath it is up (the Wi-Fi path
         // has none and leaves this at its default).
@@ -1012,6 +1005,13 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     }));
 
     obs.attach_registration_status(Arc::clone(&status));
+    // Attach the registrar's identity before the first success report, so
+    // Number is available without waiting for the next heartbeat.
+    obs.report_registration_attempt(RegistrationStatus::Success);
+    obs.set_registered(true);
+    obs.set_tunnel_up(true);
+    obs.set_active_calls(0);
+    obs.set_registration_expiry(SystemTime::now() + Duration::from_secs(granted_expires as u64));
 
     let (place_call_tx, place_call_rx) = mpsc::channel();
     {
@@ -4101,6 +4101,9 @@ impl LoopState {
                 guard.state = crate::ims::RegistrationState::Registered;
                 guard.registered_at = Some(SystemTime::now());
                 guard.expires_at = Some(SystemTime::now() + Duration::from_secs(granted as u64));
+                // A full registration replaces the old binding, including
+                // its number when the new response has no telephone identity.
+                guard.msisdn = session.associated_msisdn();
                 // A renewal only reaches here through a successful re-attach
                 // (the hook above), so the attachment is up.
                 guard.attached = true;

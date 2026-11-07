@@ -79,6 +79,8 @@ async fn a_vowifi_line_matches_what_its_agents_reported() {
             registration_state: Some(RegistrationStateWire::Registered),
             registered_at: Some(1_999_990_000),
             plmn: Some("405-857".into()),
+            // An operator's configured number takes priority over IMS.
+            msisdn: Some("+919000000002".into()),
             signal: Some(SignalReadingWire {
                 at_unix: 1_999_999_000,
                 rssi_dbm: Some(-71),
@@ -146,6 +148,122 @@ async fn a_vowifi_line_matches_what_its_agents_reported() {
     assert_eq!(l["stale"], false);
     assert_eq!(l["health"], "ok");
     assert_eq!(l["health_reasons"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn ims_numbers_reach_overview_without_config_and_follow_refreshes() {
+    init();
+    let f = Fixture::start("").await;
+    let cookie = f.login().await;
+
+    for (carrier, sip, module, transport) in [
+        (AgentKind::Ims, AgentKind::Sip, "ov-number-vowifi", "vowifi"),
+        (
+            AgentKind::Volte,
+            AgentKind::VolteSip,
+            "ov-number-volte",
+            "volte",
+        ),
+    ] {
+        let number_details = |number: &str| AgentDetails {
+            registration_state: Some(RegistrationStateWire::Registered),
+            msisdn: Some(number.into()),
+            ..Default::default()
+        };
+        let send = |seq, details| {
+            // Exercise the actual agent wire representation before ingesting.
+            let wire = serde_json::to_vec(&report(
+                carrier,
+                module,
+                seq,
+                AgentState {
+                    registered: Some(true),
+                    ..Default::default()
+                },
+                details,
+            ))
+            .unwrap();
+            apply_report(&serde_json::from_slice::<AgentReport>(&wire).unwrap());
+        };
+        send(1, Some(number_details("+919000000000")));
+        apply_report(&report(
+            sip,
+            module,
+            1,
+            AgentState::default(),
+            Some(number_details("+919000000009")),
+        ));
+        let (_, overview) = f.get_json(&cookie, "/api/overview").await;
+        let l = line(&overview, module);
+        assert_eq!(l["transport"], transport);
+        assert_eq!(l["msisdn"], "+919000000000");
+
+        // A new registration/refresh can replace the previously learned number.
+        send(2, Some(number_details("+919000000001")));
+        let (_, overview) = f.get_json(&cookie, "/api/overview").await;
+        assert_eq!(line(&overview, module)["msisdn"], "+919000000001");
+
+        // Both generations of older reports must leave the number intact:
+        // before details existed, and with details but no number field.
+        for (seq, details) in [(3, None), (4, Some(AgentDetails::default()))] {
+            send(seq, details);
+            let (_, overview) = f.get_json(&cookie, "/api/overview").await;
+            assert_eq!(line(&overview, module)["msisdn"], "+919000000001");
+        }
+
+        // A current registration without a number explicitly clears the value.
+        // A SIP-side number is never a fallback for the carrier's own number.
+        send(5, Some(number_details("")));
+        let (_, overview) = f.get_json(&cookie, "/api/overview").await;
+        assert!(line(&overview, module)["msisdn"].is_null());
+        send(6, None);
+        let (_, overview) = f.get_json(&cookie, "/api/overview").await;
+        assert!(line(&overview, module)["msisdn"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn a_configured_number_survives_ims_number_changes_on_renewal() {
+    init();
+    for (carrier, section, serial) in [
+        (AgentKind::Ims, "vowifi", "SYNTH-NUMBER-CFG111"),
+        (AgentKind::Volte, "volte", "SYNTH-NUMBER-CFG222"),
+    ] {
+        let module = derive_module_id(serial);
+        let f = Fixture::start(&format!(
+            "[[{section}.line]]\nmodem_serial = \"{serial}\"\nmsisdn = \"+919000000002\"\n"
+        ))
+        .await;
+        let cookie = f.login().await;
+
+        for (seq, learned) in [(1, "+919000000000"), (2, "+919000000001"), (3, "")] {
+            apply_report(&report(
+                carrier,
+                &module,
+                seq,
+                AgentState {
+                    registered: Some(true),
+                    ..Default::default()
+                },
+                Some(AgentDetails {
+                    registration_state: Some(RegistrationStateWire::Registered),
+                    msisdn: Some(learned.into()),
+                    ..Default::default()
+                }),
+            ));
+
+            // The carrier's learned identity still follows each accepted
+            // renewal; the configured number overrides only the UI value.
+            let snapshot = metrics::ingest::snapshot_lines()
+                .into_iter()
+                .find(|s| s.agent == carrier && s.module_id == module)
+                .unwrap();
+            assert_eq!(snapshot.details.msisdn.as_deref(), Some(learned));
+            let (status, overview) = f.get_json(&cookie, "/api/overview").await;
+            assert_eq!(status, 200);
+            assert_eq!(line(&overview, &module)["msisdn"], "+919000000002");
+        }
+    }
 }
 
 #[tokio::test]

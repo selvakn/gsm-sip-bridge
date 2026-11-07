@@ -668,6 +668,11 @@ fn store_view(report: &AgentReport) {
         if d.plmn.is_some() {
             kept.plmn = d.plmn.clone();
         }
+        // An empty string explicitly forgets an earlier registration's number.
+        // Omission from an older agent leaves the last reported value intact.
+        if d.msisdn.is_some() {
+            kept.msisdn = d.msisdn.clone();
+        }
         if d.signal.is_some() {
             kept.signal = d.signal.clone();
         }
