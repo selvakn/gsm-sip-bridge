@@ -137,6 +137,10 @@ pub struct AgentDetails {
     /// `"MCC-MNC"`, e.g. `"405-857"`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub plmn: Option<String>,
+    /// Own number learned from IMS registration. `Some("")` clears an old
+    /// number; `None` is an omitted field, including from an older agent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub msisdn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub signal: Option<SignalReadingWire>,
     /// `Some(vec![])` means "no calls in progress".
@@ -890,11 +894,39 @@ mod tests {
     }
 
     #[test]
+    fn details_without_an_own_number_keep_the_older_wire_format() {
+        let json = r#"{"agent":"ims","module_id":"m","epoch":1,"seq":2,"state":{},"details":{"registration_state":"registered","plmn":"405-857"}}"#;
+        let report: AgentReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.details.as_ref().unwrap().msisdn, None);
+        assert!(
+            serde_json::to_value(&report).unwrap()["details"]
+                .get("msisdn")
+                .is_none(),
+            "an omitted own number must stay absent on the wire"
+        );
+    }
+
+    #[test]
+    fn an_empty_own_number_is_an_explicit_wire_update() {
+        let details = AgentDetails {
+            msisdn: Some(String::new()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&details).unwrap();
+        assert_eq!(json["msisdn"], "");
+        assert_eq!(
+            serde_json::from_value::<AgentDetails>(json).unwrap(),
+            details
+        );
+    }
+
+    #[test]
     fn details_round_trip() {
         let details = AgentDetails {
             registration_state: Some(RegistrationStateWire::Renewing),
             registered_at: Some(1_700_000_000),
             plmn: Some("405-857".into()),
+            msisdn: Some("+919000000000".into()),
             signal: Some(SignalReadingWire {
                 at_unix: 1_700_000_100,
                 rssi_dbm: Some(-71),

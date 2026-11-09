@@ -296,7 +296,18 @@ pub fn assemble(inputs: Inputs<'_>) -> Vec<LineView> {
             transport: if is_volte { "volte" } else { "vowifi" },
             carrier: carrier_side.details.plmn.as_deref().map(carrier_name),
             network: None,
-            msisdn: inputs.phones.get(id).cloned(),
+            msisdn: inputs
+                .phones
+                .get(id)
+                .filter(|number| !number.is_empty())
+                .or_else(|| {
+                    carrier_side
+                        .details
+                        .msisdn
+                        .as_ref()
+                        .filter(|number| !number.is_empty())
+                })
+                .cloned(),
             registration_state: carrier_side
                 .details
                 .registration_state
@@ -547,6 +558,21 @@ mod tests {
         assert_eq!(lines[0].pdn_up, Some(false));
         assert_eq!(lines[0].health, "down");
         assert_eq!(lines[0].health_reasons, vec!["pdn_down"]);
+    }
+
+    #[test]
+    fn only_a_nonempty_configured_number_overrides_the_carriers_number() {
+        for carrier in [AgentKind::Ims, AgentKind::Volte] {
+            let mut agent = snap(carrier, "number-line");
+            agent.details.msisdn = Some("+919000000000".into());
+            for (configured, expected) in
+                [("+919000000001", "+919000000001"), ("", "+919000000000")]
+            {
+                let phones = HashMap::from([("number-line".into(), configured.into())]);
+                let lines = assemble(inputs(vec![agent.clone()], &phones));
+                assert_eq!(lines[0].msisdn.as_deref(), Some(expected));
+            }
+        }
     }
 
     #[test]

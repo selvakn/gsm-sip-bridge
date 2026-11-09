@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 /// What the web UI shows about this line beyond the gauges
 /// (specs/122-management-webui): registration wording and age, carrier, the
-/// latest signal reading and the calls in progress.
+/// own IMS telephone number, latest signal reading and the calls in progress.
 ///
 /// Read by the reporter's thread at send time, through the provider
 /// [`AgentObservability::new`] installs, so every report and heartbeat
@@ -97,6 +97,9 @@ impl DetailsSource {
         if let Some(status) = status {
             let status = status.lock().unwrap_or_else(|e| e.into_inner());
             details.registration_state = Some(status.state.into());
+            // An explicit empty value clears a previous binding's number in
+            // the daemon. Omitting the field is reserved for older agents.
+            details.msisdn = Some(status.msisdn.clone().unwrap_or_default());
             if matches!(
                 status.state,
                 crate::ims::RegistrationState::Registered | crate::ims::RegistrationState::Renewing
@@ -640,6 +643,32 @@ mod tests {
             d.registered_at, None,
             "a failed line has no registered-since"
         );
+    }
+
+    #[test]
+    fn details_follow_the_current_registrations_number_and_explicitly_clear_it() {
+        let obs = obs_for_details();
+        let status = Arc::new(Mutex::new(crate::ims::RegistrationStatus {
+            state: crate::ims::RegistrationState::Registered,
+            msisdn: Some("+919000000000".into()),
+            ..Default::default()
+        }));
+        obs.attach_registration_status(Arc::clone(&status));
+        assert_eq!(
+            obs.details.snapshot().msisdn.as_deref(),
+            Some("+919000000000")
+        );
+
+        status.lock().unwrap().msisdn = Some("+919000000001".into());
+        assert_eq!(
+            obs.details.snapshot().msisdn.as_deref(),
+            Some("+919000000001")
+        );
+
+        status.lock().unwrap().msisdn = None;
+        let details = obs.details.snapshot();
+        assert_eq!(details.msisdn.as_deref(), Some(""));
+        assert_eq!(serde_json::to_value(details).unwrap()["msisdn"], "");
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # Release Notes
 
+## Unreleased
+
+- **Web UI learns the line's number from IMS** -- VoWiFi and VoLTE lines now show the telephone identity from `P-Associated-URI` after an accepted registration or renewal, using the existing REGISTER response with no additional network or modem query. A configured `msisdn` mapped to the line takes priority. A renewal that omits the identity keeps the previous number; a replacement identity or full registration updates or clears it. Loopback registration and Web UI tests cover the data path; live carrier verification is pending (#203).
+
 ## v8.25.0
 
 - **Dependency updates** -- PJSIP 2.17 (fixes 14 published security issues; upstream also changes SIP timing: INVITE transactions linger briefly to absorb retransmissions and 200 OK retransmissions are off), Alpine 3.24 for the bridge and cellular-internet sidecar images, Rust 1.99.1, reqwest 0.13, rusqlite 0.41 (SQLite 3.54.1), prometheus 0.14, rand 0.10, toml 1.x, alsa 0.12, bindgen 0.73, and about 100 locked packages refreshed within their version ranges. reqwest now validates HTTPS certificates against the operating system's trust store, so a host running the binary directly needs its system CA bundle present (the Docker image already has it). `store.db` files, `/metrics` output and config parsing are unchanged. The images build and the bridge starts in them, but a live call and tunnel check on a real SIM is still pending for PJSIP and Alpine.

@@ -369,6 +369,78 @@ fn an_accepted_refresh_keeps_routing_the_answer_leaves_out() {
 }
 
 #[test]
+fn an_accepted_refresh_updates_or_preserves_its_telephone_identity() {
+    for (initial, header, expected) in [
+        (None, Some("<tel:+919000000001>"), Some("+919000000001")),
+        (
+            Some("<tel:+919000000000>"),
+            Some("<tel:+919000000001>"),
+            Some("+919000000001"),
+        ),
+        (Some("<tel:+919000000000>"), None, Some("+919000000000")),
+        (
+            Some("<tel:+919000000000>"),
+            Some("<sip:001010123456789@ims.example.test>"),
+            None,
+        ),
+    ] {
+        let mut rig = Rig::new();
+        if let Some(initial) = initial {
+            rig.session
+                .headers
+                .push(("P-Associated-URI".into(), initial.into()));
+        }
+        rig.status.lock().unwrap().msisdn = rig.session.associated_msisdn();
+        rig.drive().unwrap();
+        let request = rig.received().unwrap();
+        let contact = rig.contact(3600);
+        let mut extra = vec![("Contact", contact.as_str())];
+        if let Some(header) = header {
+            extra.push(("p-associated-uri", header));
+        }
+        let reply = rig.reply_to(&request, 200, &extra);
+        assert!(rig.answer(&reply));
+        assert_eq!(rig.status.lock().unwrap().msisdn.as_deref(), expected);
+        assert_eq!(rig.session.associated_msisdn().as_deref(), expected);
+    }
+}
+
+#[test]
+fn unconfirmed_registration_answers_never_replace_the_telephone_identity() {
+    for status in [180, 403, 200] {
+        let mut rig = Rig::new();
+        rig.session
+            .headers
+            .push(("P-Associated-URI".into(), "<tel:+919000000000>".into()));
+        rig.status.lock().unwrap().msisdn = rig.session.associated_msisdn();
+        rig.drive().unwrap();
+        let request = rig.received().unwrap();
+        let contact = rig.contact(3600);
+        let mut reply = rig.reply_to(
+            &request,
+            status,
+            &[
+                ("Contact", &contact),
+                ("P-Associated-URI", "<tel:+919000000001>"),
+            ],
+        );
+        if status == 200 {
+            // A success for a different transaction cannot teach us a number.
+            reply.headers[0].1 = "unrelated-call-id".into();
+        }
+        assert_eq!(rig.answer(&reply), status != 200);
+        assert_eq!(
+            rig.status.lock().unwrap().msisdn.as_deref(),
+            Some("+919000000000")
+        );
+        assert_eq!(
+            rig.session.associated_msisdn().as_deref(),
+            Some("+919000000000")
+        );
+    }
+}
+
+#[test]
 fn an_answer_that_is_not_ours_does_not_confirm_the_refresh() {
     let mut rig = Rig::new();
     rig.drive().unwrap();
