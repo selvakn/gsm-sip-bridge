@@ -17,6 +17,7 @@ fn over_registration(sender: &str, body: &str) -> InboundMessage {
         route: MessageRoute::OverRegistration,
         sender: sender.to_string(),
         body: body.to_string(),
+        scts: None,
         modem_index: None,
     }
 }
@@ -26,6 +27,7 @@ fn through_modem(sender: &str, body: &str, index: u32) -> InboundMessage {
         route: MessageRoute::ThroughModem,
         sender: sender.to_string(),
         body: body.to_string(),
+        scts: None,
         modem_index: Some(index),
     }
 }
@@ -59,6 +61,41 @@ fn the_same_message_arriving_on_both_routes_is_recorded_once() {
         Disposition::AcknowledgeOnly,
         "the delivery route must not be part of the message's identity"
     );
+}
+
+#[test]
+fn service_centre_timestamp_distinguishes_new_sends_but_not_delivery_routes() {
+    let mut dedupe = Dedupe::default();
+    let original = InboundMessage {
+        scts: Some([0x62, 0x11, 0x51, 0x51, 0x50, 0x00, 0x00]),
+        ..over_registration("+91123", "same message")
+    };
+    let modem_copy = InboundMessage {
+        scts: original.scts,
+        ..through_modem("+91123", "same message", 7)
+    };
+    let new_send = InboundMessage {
+        scts: Some([0x62, 0x11, 0x51, 0x51, 0x50, 0x10, 0x00]),
+        ..original.clone()
+    };
+
+    assert_eq!(decide(&mut dedupe, &original), Disposition::Handle);
+    assert_eq!(
+        decide(&mut dedupe, &modem_copy),
+        Disposition::AcknowledgeOnly
+    );
+    assert_eq!(decide(&mut dedupe, &new_send), Disposition::Handle);
+    assert_eq!(decide(&mut dedupe, &new_send), Disposition::AcknowledgeOnly);
+}
+
+#[test]
+fn a_missing_timestamp_is_distinct_from_a_zero_timestamp() {
+    let text_only = over_registration("+91123", "same message");
+    let timestamped = InboundMessage {
+        scts: Some([0; 7]),
+        ..text_only.clone()
+    };
+    assert_ne!(text_only.dedupe_key(), timestamped.dedupe_key());
 }
 
 #[test]

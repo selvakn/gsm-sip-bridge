@@ -78,11 +78,19 @@ pub struct InboundMessage {
     pub route: MessageRoute,
     pub sender: String,
     pub body: String,
+    /// Original TP-SCTS octets, shared by IMS and modem SMS-DELIVER PDUs.
+    /// `None` is reserved for plain-text SIP MESSAGEs without an SMS TPDU.
+    pub scts: Option<[u8; 7]>,
     /// Present only for modem-delivered messages — where to clear it from.
     pub modem_index: Option<u32>,
 }
 
 impl InboundMessage {
+    /// The same per-part body on the IMS, modem-storage, and expiry paths.
+    pub fn part_body(sequence: u8, total: u8, text: &str) -> String {
+        format!("[{sequence}/{total}] {text}")
+    }
+
     /// Identity for duplicate suppression.
     ///
     /// Deliberately **excludes the route**: the same message arriving over both
@@ -90,18 +98,21 @@ impl InboundMessage {
     /// the modem storage index, since that is an artefact of where the modem
     /// happened to file it rather than anything about the message.
     pub fn dedupe_key(&self) -> String {
-        format!("{}\u{1}{}", self.sender, self.body)
+        let timestamp = self.scts.map_or_else(
+            || "none".to_string(),
+            |scts| scts.iter().map(|octet| format!("{octet:02x}")).collect(),
+        );
+        format!("{timestamp}\u{1}{}\u{1}{}", self.sender, self.body)
     }
 }
 
 /// Remembers recently-handled messages so a retransmission is not recorded or
 /// forwarded twice.
 ///
-/// Bounded, and deliberately not persisted: its job is to absorb a network
-/// retransmission, which happens within seconds. Surviving a restart would
-/// mean carrying the risk of *suppressing* a genuine repeat message — someone
-/// sending "ok" twice in a day is normal, and dropping the second would be a
-/// worse failure than recording a rare duplicate after a crash.
+/// Bounded and deliberately in memory: a restart starts a fresh window.
+/// SMS-DELIVER identities include their original TP-SCTS, so a new send of
+/// identical text does not reuse an old claim. Plain-text SIP messages have
+/// no SMS timestamp and retain content-based deduplication within this cache.
 #[derive(Debug)]
 pub struct Dedupe {
     seen: VecDeque<String>,
@@ -229,8 +240,15 @@ struct PartialMessage {
     /// Sparse — only the positions actually received. `BTreeMap` so
     /// `PartOutcome::Complete`'s join can walk `1..=total` in order without
     /// a separate sort.
-    parts: std::collections::BTreeMap<u8, String>,
+    parts: std::collections::BTreeMap<u8, BufferedPart>,
     last_updated: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct BufferedPart {
+    text: String,
+    /// Preserve this part's own timestamp-bearing identity through relay retries.
+    dedupe_key: String,
 }
 
 /// What happened when a part was handed to [`Reassembly::admit_part`].
@@ -270,12 +288,13 @@ pub enum PartOutcome {
 /// exact moment lost it permanently, with the network's own retransmission
 /// unable to help, since it had already been acknowledged).
 #[derive(Debug, Clone)]
-struct QueuedFlush {
-    id: u64,
-    sender: String,
-    sequence: u8,
-    total: u8,
-    text: String,
+pub struct QueuedFlush {
+    pub id: u64,
+    pub sender: String,
+    pub sequence: u8,
+    pub total: u8,
+    pub text: String,
+    pub dedupe_key: String,
 }
 
 /// Buffers the parts of one or more multi-part text messages until each
@@ -360,7 +379,7 @@ impl Reassembly {
     /// 2026-08-28: the original version evicted silently, losing
     /// already-acknowledged content no retransmission could recover).
     ///
-    /// Re-admitting an already-held `sequence` with the *same* text is a
+    /// Re-admitting an already-held `sequence` with the same text and key is a
     /// harmless no-op that still correctly reports `Complete` if the set is
     /// otherwise full — the retry-after-failed-delivery path
     /// `mark_delivered`'s own docs describe.
@@ -369,18 +388,24 @@ impl Reassembly {
     /// reference is unique beyond one sender's own bookkeeping — an 8-bit
     /// reference wraps at 256, and two unrelated messages can legitimately
     /// share `(sender, reference, total)` within one buffer's lifetime. A
-    /// part landing on an already-filled position with *different* text
-    /// than what's there cannot be a retransmission (Decision 9's
-    /// idempotent-retry case requires identical text), so it is treated as
+    /// part landing on an already-filled position with different text or a
+    /// different TP-SCTS identity cannot be the same segment, so it is treated as
     /// exactly that: the old buffer is queued for delivery and a fresh one
     /// started for the new part. This catches the corrupting case — a
     /// hybrid message silently combining text from two senders' messages —
     /// but is not a complete detector: two messages sharing an identity
     /// whose parts happen to land on disjoint positions (no position ever
-    /// gets conflicting text) cannot be told apart from the PDU alone;
-    /// TS 23.040 gives a receiver no stronger signal to work with.
+    /// gets a conflicting segment identity) cannot be unambiguously separated
+    /// by this assembler: each segment can have a different TP-SCTS, so its
+    /// timestamp is not a key for the whole concatenated message.
     /// Recorded as a residue, not silently assumed impossible.
-    pub fn admit_part(&mut self, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
+    pub fn admit_part(
+        &mut self,
+        sender: &str,
+        part: &ConcatPart,
+        text: &str,
+        dedupe_key: &str,
+    ) -> PartOutcome {
         if part.total == 0 || part.sequence == 0 || part.sequence > part.total {
             return PartOutcome::Malformed;
         }
@@ -394,7 +419,7 @@ impl Reassembly {
             if existing
                 .parts
                 .get(&part.sequence)
-                .is_some_and(|t| t != text)
+                .is_some_and(|held| held.text != text || held.dedupe_key != dedupe_key)
             {
                 if let Some(old) = self.buffers.remove(&key) {
                     self.enqueue_pending(sender, old);
@@ -427,14 +452,43 @@ impl Reassembly {
             .buffers
             .get_mut(&key)
             .expect("just inserted or already present above");
-        buffer.parts.insert(part.sequence, text.to_string());
+        buffer.parts.insert(
+            part.sequence,
+            BufferedPart {
+                text: text.to_string(),
+                dedupe_key: dedupe_key.to_string(),
+            },
+        );
         buffer.last_updated = Instant::now();
 
         if buffer.parts.len() == buffer.total as usize {
-            PartOutcome::Complete(buffer.parts.values().cloned().collect::<Vec<_>>().join(""))
+            PartOutcome::Complete(
+                buffer
+                    .parts
+                    .values()
+                    .map(|part| part.text.as_str())
+                    .collect(),
+            )
         } else {
             PartOutcome::Pending
         }
+    }
+
+    /// Snapshots the original per-part identities of a completed assembly.
+    /// Confirm these only after the joined message's relay succeeds, before
+    /// `mark_delivered` removes the parts and their individual timestamp keys.
+    pub fn completed_dedupe_keys(&self, sender: &str, part: &ConcatPart) -> Vec<String> {
+        let key: ReassemblyKey = (sender.to_string(), part.reference);
+        let Some(buffer) = self.buffers.get(&key).filter(|buffer| {
+            buffer.total == part.total && buffer.parts.len() == usize::from(buffer.total)
+        }) else {
+            return Vec::new();
+        };
+        buffer
+            .parts
+            .values()
+            .map(|part| part.dedupe_key.clone())
+            .collect()
     }
 
     /// Clears a completed message's buffer entry — call this, and only
@@ -445,6 +499,8 @@ impl Reassembly {
     /// (the only one `Dedupe::forget` un-suppresses) still finds every
     /// other part already held, and `admit_part` correctly reports
     /// `Complete` again without needing the whole message re-sent.
+    /// Confirm the keys from [`Self::completed_dedupe_keys`] before clearing
+    /// this entry so earlier parts' cross-route claims are settled too.
     pub fn mark_delivered(&mut self, sender: &str, part: &ConcatPart) {
         let key: ReassemblyKey = (sender.to_string(), part.reference);
         self.buffers.remove(&key);
@@ -484,11 +540,8 @@ impl Reassembly {
     /// self-healing a transient control-channel failure within one
     /// `on_idle_tick` cycle (~1s) instead of losing the content outright
     /// (code review finding, 2026-08-28).
-    pub fn ready_for_delivery(&self) -> Vec<(u64, String, u8, u8, String)> {
-        self.pending
-            .iter()
-            .map(|p| (p.id, p.sender.clone(), p.sequence, p.total, p.text.clone()))
-            .collect()
+    pub fn ready_for_delivery(&self) -> Vec<QueuedFlush> {
+        self.pending.clone()
     }
 
     /// Removes one entry from the retry queue — call this, and only this,
@@ -500,14 +553,15 @@ impl Reassembly {
     /// Moves one buffered message's held parts into the retry queue.
     fn enqueue_pending(&mut self, sender: &str, msg: PartialMessage) {
         let total = msg.total;
-        for (seq, text) in msg.parts {
+        for (seq, part) in msg.parts {
             self.next_pending_id += 1;
             self.pending.push(QueuedFlush {
                 id: self.next_pending_id,
                 sender: sender.to_string(),
                 sequence: seq,
                 total,
-                text,
+                text: part.text,
+                dedupe_key: part.dedupe_key,
             });
         }
     }
@@ -1005,6 +1059,7 @@ fn sweep_modem_storage(
             route: MessageRoute::ThroughModem,
             sender: sms.sender.clone(),
             body: sms.body.clone(),
+            scts: Some(sms.scts),
             modem_index: Some(sms.index),
         };
         let key = inbound.dedupe_key();
@@ -1336,6 +1391,7 @@ mod tests {
             route,
             sender: sender.to_string(),
             body: body.to_string(),
+            scts: None,
             modem_index: None,
         }
     }
@@ -1599,8 +1655,18 @@ mod tests {
     /// `admit_part`'s own docs), and returns just the outcome — what every
     /// test below except the ones specifically targeting eviction/reuse
     /// cares about.
+    fn admit_raw(r: &mut Reassembly, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
+        let key = msg(
+            MessageRoute::OverRegistration,
+            sender,
+            &InboundMessage::part_body(part.sequence, part.total, text),
+        )
+        .dedupe_key();
+        r.admit_part(sender, part, text, &key)
+    }
+
     fn admit(r: &mut Reassembly, sender: &str, part: &ConcatPart, text: &str) -> PartOutcome {
-        let outcome = r.admit_part(sender, part, text);
+        let outcome = admit_raw(r, sender, part, text);
         assert!(
             r.ready_for_delivery().is_empty(),
             "unexpected queued flush: {:?}",
@@ -1743,10 +1809,10 @@ mod tests {
         let past_deadline = Instant::now() + REASSEMBLY_TIMEOUT + Duration::from_secs(1);
         r.expire_due(past_deadline);
         let mut ready = r.ready_for_delivery();
-        ready.sort_by_key(|(_, _, seq, _, _)| *seq);
+        ready.sort_by_key(|part| part.sequence);
         let without_ids: Vec<_> = ready
             .into_iter()
-            .map(|(_, sender, seq, total, text)| (sender, seq, total, text))
+            .map(|part| (part.sender, part.sequence, part.total, part.text))
             .collect();
         assert_eq!(
             without_ids,
@@ -1788,7 +1854,7 @@ mod tests {
             1,
             "+91123/ref1 was cleared by mark_delivered above; only +91002/ref1 remained to expire"
         );
-        let (id, ..) = ready[0].clone();
+        let id = ready[0].id;
         r.mark_flush_delivered(id);
         assert!(r.ready_for_delivery().is_empty());
         // A retry attempt for an already-delivered id is a harmless no-op.
@@ -1821,12 +1887,10 @@ mod tests {
         // keyed on each part's own labelled body (so a retransmission of
         // *one* part is still individually suppressed), `Reassembly` keyed
         // on the message's real identity (so the two *distinct* parts
-        // still combine into one delivery). This is the property
-        // `handle_message` itself has no cheap unit-test seam for (it
-        // needs a live socket/control-channel harness — the same
-        // constraint this project's prior batches recorded for their own
-        // full-request-handler paths), so it is pinned here at the two
-        // pure layers instead.
+        // still combine into one delivery). This pure composition is pinned
+        // here; `ims::agent::sms_tests`
+        // additionally covers the handler's relay and confirmation through
+        // a loopback socket/control-channel harness.
         let mut d = Dedupe::default();
         let mut r = Reassembly::default();
         let sender = "+91123";
@@ -1868,10 +1932,10 @@ mod tests {
     /// what these tests actually care about asserting on.
     fn queued_without_ids(r: &Reassembly) -> Vec<(String, u8, u8, String)> {
         let mut ready = r.ready_for_delivery();
-        ready.sort_by_key(|(_, _, seq, _, _)| *seq);
+        ready.sort_by_key(|part| part.sequence);
         ready
             .into_iter()
-            .map(|(_, sender, seq, total, text)| (sender, seq, total, text))
+            .map(|part| (part.sender, part.sequence, part.total, part.text))
             .collect()
     }
 
@@ -1886,7 +1950,7 @@ mod tests {
         admit(&mut r, "+91002", &concat(1, 1, 2), "b");
         // Third distinct identity evicts the first (+91001/ref 1) — its one
         // held part must be queued, not vanish.
-        r.admit_part("+91003", &concat(1, 1, 2), "c");
+        admit_raw(&mut r, "+91003", &concat(1, 1, 2), "c");
         assert_eq!(
             queued_without_ids(&r),
             vec![("+91001".to_string(), 1, 2, "a".to_string())]
@@ -1896,7 +1960,7 @@ mod tests {
         // necessarily queues +91002 in turn; that's expected, not this
         // test's own concern (`admit`'s no-queue assertion would wrongly
         // fail here, so this uses `admit_part` directly).
-        let outcome = r.admit_part("+91001", &concat(1, 2, 2), "a2");
+        let outcome = admit_raw(&mut r, "+91001", &concat(1, 2, 2), "a2");
         assert_eq!(
             outcome,
             PartOutcome::Pending,
@@ -1921,7 +1985,7 @@ mod tests {
         // A new, unrelated message reuses reference 1 (same total, by
         // coincidence) — its own first part lands on position 1, where the
         // old message's genuinely different text already sits.
-        let outcome = r.admit_part("+91123", &concat(1, 1, 3), "new-message");
+        let outcome = admit_raw(&mut r, "+91123", &concat(1, 1, 3), "new-message");
         assert_eq!(
             queued_without_ids(&r),
             vec![
@@ -1946,9 +2010,45 @@ mod tests {
         // mismatch.
         let mut r = Reassembly::default();
         admit(&mut r, "+91123", &concat(1, 1, 2), "A");
-        let outcome = r.admit_part("+91123", &concat(1, 1, 2), "A");
+        let outcome = admit_raw(&mut r, "+91123", &concat(1, 1, 2), "A");
         assert!(r.ready_for_delivery().is_empty());
         assert_eq!(outcome, PartOutcome::Pending);
+    }
+
+    #[test]
+    fn reference_reuse_with_identical_text_preserves_each_timestamp_key() {
+        let mut r = Reassembly::default();
+        let part = concat(1, 1, 2);
+        let mut message = msg(MessageRoute::OverRegistration, "+91123", "[1/2] same");
+        message.scts = Some([1; 7]);
+        let old_key = message.dedupe_key();
+        message.scts = Some([2; 7]);
+        let new_key = message.dedupe_key();
+
+        assert_eq!(
+            r.admit_part("+91123", &part, "same", &old_key),
+            PartOutcome::Pending
+        );
+        assert_eq!(
+            r.admit_part("+91123", &part, "same", &new_key),
+            PartOutcome::Pending
+        );
+        let queued = r.ready_for_delivery();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].text, "same");
+        assert_eq!(queued[0].dedupe_key, old_key);
+
+        message.body = "[2/2] ending".to_string();
+        message.scts = Some([3; 7]);
+        let ending_key = message.dedupe_key();
+        assert_eq!(
+            r.admit_part("+91123", &concat(1, 2, 2), "ending", &ending_key),
+            PartOutcome::Complete("sameending".to_string())
+        );
+        assert_eq!(
+            r.completed_dedupe_keys("+91123", &part),
+            vec![new_key, ending_key]
+        );
     }
 
     // ---- wait_for_resolution (specs/038 review follow-up) ------------------

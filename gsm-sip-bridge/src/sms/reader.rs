@@ -6,6 +6,8 @@ use std::time::Duration;
 pub struct IncomingSms {
     pub sender: String,
     pub body: String,
+    /// Original TP-SCTS octets from the stored SMS-DELIVER TPDU.
+    pub scts: [u8; 7],
     pub index: u32,
 }
 
@@ -122,12 +124,15 @@ fn decode_pdu_line(hex: &str, index: u32) -> BridgeResult<IncomingSms> {
     let decoded = crate::ims::sms_pdu::decode_sms_deliver_tpdu(tpdu)
         .map_err(|e| BridgeError::Sms(format!("could not decode PDU for index {index}: {e}")))?;
     let body = match decoded.part {
-        Some(part) => format!("[{}/{}] {}", part.sequence, part.total, decoded.text),
+        Some(part) => {
+            crate::volte::sms::InboundMessage::part_body(part.sequence, part.total, &decoded.text)
+        }
         None => decoded.text,
     };
     Ok(IncomingSms {
         sender: decoded.sender,
         body,
+        scts: decoded.scts,
         index,
     })
 }

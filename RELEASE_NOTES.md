@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A newly sent SMS with identical text is no longer mistaken for an old delivery** -- IMS and modem reception now preserve the original seven TP-SCTS timestamp bytes and include them in the shared deduplication key. Multipart completion and expiry retries retain each part's original key, including when parts have different timestamps. This prevents old modem copies from suppressing parts of a later identical SMS. Verified by parser, modem and loopback IMS regression tests and repeated identical three-part SMS on a live line (#206).
+- **Multipart SMS copies no longer get stuck in modem storage after IMS delivery** -- After relaying a complete SMS, the bridge now confirms the deduplication claims for every received part. Earlier parts previously remained unconfirmed, so reading their modem copies repeatedly consumed the sweep budget and left the records in storage. Pending parts and failed relays keep their existing retry behavior. Local regression tests pass, and no modem fragments reappeared after a subsequent live restart. The carrier's rejection of RP-ACK reports remains a separate issue (#206).
 - **Web UI learns the line's number from IMS** -- VoWiFi and VoLTE lines now show the telephone identity from `P-Associated-URI` after an accepted registration or renewal, using the existing REGISTER response with no additional network or modem query. A configured `msisdn` mapped to the line takes priority. A renewal that omits the identity keeps the previous number; a replacement identity or full registration updates or clears it. Loopback registration and Web UI tests cover the data path; live carrier verification is pending (#203).
 
 ## v8.25.0
