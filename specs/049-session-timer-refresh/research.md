@@ -39,6 +39,45 @@ for an unrefreshable session. No separate fallback path is needed; a
 carrier that can't do `UPDATE` gets a clean call end instead of a silent
 drop, which is the whole point of this feature either way.
 
+**Revisited 2026-11-15 (live evidence, branch `fix/session-refresh-reinvite`)**:
+the half of this decision that *accepts* only `UPDATE` did not hold. On T2, an
+outbound call's `200 OK` set `Session-Expires: 1800;refresher=uas` (the
+carrier refreshes), and the carrier's `Allow` lists no `UPDATE`. At 900 s it
+refreshed with a re-INVITE (`Session-Expires: 1800;refresher=uac`), which the
+pre-existing re-INVITE decline answered `488`; after three such attempts about
+33 s apart the carrier ended the call with `BYE` and
+`Reason: Q.850;cause=113;text="Session Timer Expired"`, about 17 minutes in.
+FR-006 asks for any refresh-only request to be accepted, so this was a gap in
+meeting it, not a scope change. `agent::reinvite` now accepts a carrier
+re-INVITE whose SDP keeps the carrier's setup `o=` line unchanged, the same
+media address, and `sendrecv`. RFC 3264 §8 calls an offer whose version has not
+changed "effectively a no-op" and lets the answer be "the same as the previous
+SDP". The carrier's body did change at the same version, which is non-compliant
+and, per RFC 6337 §5.2.5, implementation-dependent to handle. This bridge
+treats the unchanged version as authoritative and answers `200 OK` with the SDP
+it already sent, at its original version. Strictly, that answer shares no
+format with the offer (RFC 3264 §6). So the "no offer/answer machinery for a
+no-op renegotiation" rationale above still holds: the media path is not
+touched. An offerless
+re-INVITE gets that SDP as the offer. The answer in its `ACK` must keep the
+carrier's media address, direction and payload type. An answer that does not
+is a failed refresh, and the call is ended with `BYE` (`SessionTimerExpired`),
+since an `ACK` cannot be refused. Every other re-INVITE is still declined `488`
+(FR-007 unchanged). This bridge's *own* refreshes stay `UPDATE`-only.
+
+Live result (2026-11-15, T2, VoWiFi, outbound call to the operator's service
+number): the carrier's refresh at 900 s came this time as an **offerless**
+re-INVITE (`Session-Expires: 1800;refresher=uac`, no body). The bridge answered
+`200 OK` with its original offer. The `ACK`'s answer (AMR-WB PT 96,
+octet-aligned, same address, `o=` version incremented) was accepted. The call
+ran 1324 s with media both ways and ended with the carrier's `BYE`,
+`Reason: Q.850;cause=16;text="Normal call clearing"`. The second refresh
+(1800 s) was not reached.
+
+Deviation from FR-011: the same handling applies to inbound-answered calls,
+which then take on the refresh duty the re-INVITE states. Otherwise an
+answered call's refresh would fail in exactly the same way.
+
 ## Decision 2: Refresher-role resolution — RFC 4028 §7.2, with one defensive default for a non-compliant response
 
 **Decision**: On the outbound call's `200 OK`, if `Session-Expires` is

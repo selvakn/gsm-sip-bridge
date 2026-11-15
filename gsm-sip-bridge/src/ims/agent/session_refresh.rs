@@ -10,7 +10,9 @@
 //! This bridge never advertises `Supported: timer` on its own outbound
 //! INVITEs (`[vowifi] originating_headers` stays off by default,
 //! unchanged by this feature — spec.md User Story 3) — everything here
-//! reacts only to what a carrier's own `200 OK` says, per RFC 4028 §7.2.
+//! reacts only to what the carrier says: its own `200 OK`, per RFC 4028
+//! §7.2, and (on any active call) the `Session-Expires` on a session-refresh
+//! re-INVITE it sends, per §9 ([`terms_for_peer_refresh`], `agent::reinvite`).
 
 use std::time::{Duration, Instant};
 
@@ -47,11 +49,16 @@ const MAX_SESSION_REFRESH_ATTEMPTS: u8 = 3;
 
 /// Who performs refreshes for a dialog (RFC 4028 §7.1's `refresher`
 /// parameter).
+///
+/// Named for the outbound INVITE's roles, where the duty is first set: `Uac`
+/// is always **this bridge** and `Uas` always **the carrier**, including on a
+/// call whose refresh duty was later set by a carrier's re-INVITE
+/// ([`terms_for_peer_refresh`]), where the wire roles are the other way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Refresher {
-    /// This bridge (the call's UAC) performs refreshes.
+    /// This bridge performs refreshes.
     Uac,
-    /// The carrier (the call's UAS) performs refreshes.
+    /// The carrier performs refreshes.
     Uas,
 }
 
@@ -174,6 +181,11 @@ impl SessionRefreshState {
         // either way rather than risking a silent drop on the one input
         // RFC 4028 leaves unspecified for this side.
         let refresher = refresher_param.unwrap_or(Refresher::Uac);
+        Some(Self::starting(interval, refresher, now))
+    }
+
+    /// A fresh refresh cycle for `interval`, with `refresher` performing it.
+    fn starting(interval: Duration, refresher: Refresher, now: Instant) -> Self {
         let phase = match refresher {
             Refresher::Uac => RefreshPhase::WaitingToSend {
                 due_at: now + interval / 2,
@@ -182,11 +194,11 @@ impl SessionRefreshState {
                 deadline: now + peer_deadline_margin(interval),
             },
         };
-        Some(Self {
+        Self {
             interval,
             refresher,
             phase,
-        })
+        }
     }
 
     pub(super) fn refresher(&self) -> Refresher {
@@ -333,9 +345,148 @@ impl SessionRefreshState {
     }
 }
 
+/// What this bridge states in the `2xx` to a carrier's session-refresh
+/// re-INVITE, and the refresh state the call carries afterwards (RFC 4028
+/// §9, the UAS side — `agent::reinvite`).
+#[derive(Debug, Clone)]
+pub(super) struct PeerRefreshTerms {
+    /// The `Session-Expires` value for the `2xx`; `None` when the request
+    /// carried none.
+    pub(super) session_expires: Option<String>,
+    /// RFC 4028 §9: "If the refresher parameter in the Session-Expires
+    /// header field in the 2xx response has a value of 'uac', the UAS MUST
+    /// place a Require header field into the response with the value
+    /// 'timer'."
+    pub(super) require_timer: bool,
+    /// Replaces the call's `ActiveCall::session_refresh`. `None` when the
+    /// request carried no usable `Session-Expires`: the carrier asked for no
+    /// session timer, and this bridge does not ask for one in its `2xx`
+    /// either (RFC 4028 §9 lets it, it does not require it), so none is in
+    /// force afterwards.
+    pub(super) state: Option<SessionRefreshState>,
+}
+
+/// The terms for answering a re-INVITE from the carrier that carries
+/// `session_expires` (the raw header value, if any); `carrier_supports_timer`
+/// is whether the request listed `timer` in `Supported`.
+///
+/// The `refresher` parameter on that request is relative to the
+/// **re-INVITE's** roles, where the carrier is the UAC: `uac` names the
+/// carrier and `uas` names this bridge. [`Refresher`] is relative to the
+/// dialog's own refresh duty instead, where `Uac` is always this bridge (it
+/// started as the role of the outbound INVITE's sender) — so the mapping
+/// below flips. Who refreshes follows RFC 4028 §9's Table 2:
+///
+/// | `Supported: timer` | `refresher` in request | in the `2xx` |
+/// |---|---|---|
+/// | no | none (anything else is disallowed) | `uas` (this bridge) |
+/// | yes | none | this bridge's choice: `uac` (the carrier) |
+/// | yes | `uac` / `uas` | the same |
+///
+/// For the free choice this bridge picks the carrier, which is already
+/// refreshing and which may not support the `UPDATE` this bridge would
+/// refresh with (the carrier seen live advertised no `UPDATE` in `Allow`). A
+/// carrier that does not support the extension cannot refresh at all, so the
+/// duty falls to this bridge whatever the request says.
+///
+/// The interval is the one the request asks for, echoed verbatim; internally
+/// it is floored at RFC 4028's 90-second minimum exactly as
+/// [`SessionRefreshState::from_2xx`] does.
+pub(super) fn terms_for_peer_refresh(
+    session_expires: Option<&str>,
+    carrier_supports_timer: bool,
+    now: Instant,
+) -> PeerRefreshTerms {
+    let parsed = session_expires
+        .and_then(parse_session_expires)
+        .filter(|(delta, _)| *delta > 0);
+    let Some((delta, requested)) = parsed else {
+        return PeerRefreshTerms {
+            session_expires: None,
+            require_timer: false,
+            state: None,
+        };
+    };
+    let interval = Duration::from_secs(u64::from(delta)).max(MIN_SESSION_INTERVAL);
+    // `requested` is in the re-INVITE's roles; see the doc comment above.
+    let bridge_refreshes = !carrier_supports_timer || requested == Some(Refresher::Uas);
+    let (wire, duty) = if bridge_refreshes {
+        ("uas", Refresher::Uac)
+    } else {
+        ("uac", Refresher::Uas)
+    };
+    PeerRefreshTerms {
+        session_expires: Some(format!("{delta};refresher={wire}")),
+        require_timer: !bridge_refreshes,
+        state: Some(SessionRefreshState::starting(interval, duty, now)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_carrier_refresh_naming_itself_keeps_the_carrier_refreshing() {
+        // The live T2 re-INVITE: `Session-Expires: 1800;refresher=uac`, sent
+        // by the carrier as the re-INVITE's UAC.
+        let now = Instant::now();
+        let terms = terms_for_peer_refresh(Some("1800;refresher=uac"), true, now);
+        assert_eq!(terms.session_expires.as_deref(), Some("1800;refresher=uac"));
+        assert!(terms.require_timer);
+        let state = terms.state.expect("a session timer is in force");
+        assert_eq!(state.refresher(), Refresher::Uas);
+        // RFC 4028 §10: give up min(32s, interval/3) before expiry.
+        assert_eq!(
+            state.peer_deadline(),
+            Some(now + Duration::from_secs(1800 - 32))
+        );
+        assert_eq!(state.verdict(now), RefreshVerdict::Idle);
+    }
+
+    #[test]
+    fn a_carrier_refresh_without_a_refresher_leaves_the_duty_with_the_carrier() {
+        let terms = terms_for_peer_refresh(Some("600"), true, Instant::now());
+        assert_eq!(terms.session_expires.as_deref(), Some("600;refresher=uac"));
+        assert!(terms.require_timer);
+        assert_eq!(terms.state.unwrap().refresher(), Refresher::Uas);
+    }
+
+    #[test]
+    fn a_carrier_refresh_asking_this_bridge_to_refresh_hands_it_the_duty() {
+        let now = Instant::now();
+        let terms = terms_for_peer_refresh(Some("600;refresher=uas"), true, now);
+        assert_eq!(terms.session_expires.as_deref(), Some("600;refresher=uas"));
+        // Require: timer is only mandated when the refresher is the UAC.
+        assert!(!terms.require_timer);
+        let state = terms.state.unwrap();
+        assert_eq!(state.refresher(), Refresher::Uac);
+        assert_eq!(state.verdict(now), RefreshVerdict::Idle);
+        assert_eq!(
+            state.verdict(now + Duration::from_secs(300)),
+            RefreshVerdict::SendNow
+        );
+    }
+
+    /// RFC 4028 §9 Table 2, first row: a carrier without the extension
+    /// cannot refresh, so this bridge takes the duty.
+    #[test]
+    fn a_carrier_without_timer_support_hands_this_bridge_the_duty() {
+        let terms = terms_for_peer_refresh(Some("600"), false, Instant::now());
+        assert_eq!(terms.session_expires.as_deref(), Some("600;refresher=uas"));
+        assert!(!terms.require_timer);
+        assert_eq!(terms.state.unwrap().refresher(), Refresher::Uac);
+    }
+
+    #[test]
+    fn a_refresh_without_session_expires_ends_the_session_timer() {
+        for value in [None, Some("0"), Some("soon")] {
+            let terms = terms_for_peer_refresh(value, true, Instant::now());
+            assert!(terms.session_expires.is_none(), "{value:?}");
+            assert!(!terms.require_timer, "{value:?}");
+            assert!(terms.state.is_none(), "{value:?}");
+        }
+    }
 
     #[test]
     fn parse_session_expires_reads_the_refresher_parameter() {

@@ -26,6 +26,7 @@
 //! | The reg-event subscription's transaction and dialog | [`reg_subscription`] |
 //! | Which advertised P-CSCF to register through, and which to avoid | [`pcscf_pool`] |
 //! | RFC 4028 session-timer refresh on a placed call | [`session_refresh`] |
+//! | A carrier's session-refresh re-INVITE | [`reinvite`] |
 //! | The veth link to Agent B, and the RTP relay | [`veth`] |
 //! | The `probe-inbound` diagnostic | [`probe`] |
 
@@ -39,6 +40,7 @@ mod reg_subscription;
 mod registration_refresh;
 #[cfg(test)]
 mod registration_tests;
+mod reinvite;
 mod session_refresh;
 mod veth;
 pub(crate) mod watchdog;
@@ -2779,7 +2781,7 @@ fn dispatch_loop(
                 st.handle_carrier_cancel(&req, &sink);
             }
             Ok((SipMessage::Request(req), _)) if req.method == "ACK" => {
-                st.log_ack(&req);
+                st.handle_ack(session, inbound, p, &req);
             }
             Ok((SipMessage::Request(req), sink)) if req.method == "NOTIFY" => {
                 st.handle_reg_notify(session, p, &req, &sink)?;
@@ -3002,9 +3004,9 @@ impl LoopState {
     /// at all today. Anything else (no active call, a different dialog, a
     /// body carrying an SDP offer, or arriving while this bridge itself
     /// holds the refresher role) falls through to the same decline this
-    /// bridge has always sent an `UPDATE` (FR-007: this must never weaken
-    /// the separate, pre-existing re-INVITE decline in
-    /// `handle_inbound_invite`, which this method does not touch).
+    /// bridge has always sent an `UPDATE` (FR-007). A refresh that arrives
+    /// as a re-INVITE instead is `answer_reinvite`'s, under the same rule:
+    /// only a refresh that leaves the media unchanged is accepted.
     fn handle_carrier_update(&mut self, req: &SipRequest, sink: &SipSink) {
         // Call-ID alone does not establish dialog membership (greptile PR
         // #74 review) — `names_active_dialog` additionally requires both
@@ -3043,6 +3045,96 @@ impl LoopState {
         }
         tracing::debug!("declining UPDATE: not a matching in-dialog session refresh");
         let _ = sink.send(&unserved_method_response(req, &random_hex(4)));
+    }
+
+    /// A re-INVITE naming the active call (the caller tag already matched).
+    ///
+    /// A session refresh — the same session description the carrier sent at
+    /// setup, `agent::reinvite` — is answered `200 OK` with the SDP this
+    /// bridge already sent, so the media path is untouched; the RFC 4028
+    /// terms it carries replace the call's refresh duty. Anything else is a
+    /// real modification, which this bridge does not implement: declined
+    /// `488`, but not `486 Busy Here`, since the line is not busy
+    /// (specs/042-dialog-transaction-identity, MT-02).
+    ///
+    /// `contact` is the `Contact` for the `200 OK`, and `agent` this side's
+    /// address for the `488`'s `Warning`.
+    fn answer_reinvite(
+        &mut self,
+        req: &SipRequest,
+        sink: &SipSink,
+        contact: &str,
+        agent: &str,
+        access_network_info: &str,
+    ) {
+        let Some(call) = self.active_call.as_mut() else {
+            return;
+        };
+        // `Ok(true)` for an offerless refresh, whose answer the ACK brings.
+        let refresh = match &call.established_media {
+            _ if !names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to) => {
+                Err("the request does not carry this call's dialog tags")
+            }
+            None => Err("no session description was recorded at setup"),
+            Some(media) => match media.classify(inbound::request_sdp(req).as_deref()) {
+                reinvite::ReinviteVerdict::Refresh => Ok(false),
+                reinvite::ReinviteVerdict::OfferlessRefresh => Ok(true),
+                reinvite::ReinviteVerdict::Decline(why) => Err(why),
+            },
+        };
+        // `refresh` is only `Ok` when `established_media` is `Some`.
+        let (offerless, media) = match (refresh, call.established_media.as_mut()) {
+            (Ok(offerless), Some(media)) => (offerless, media),
+            (Ok(_), None) => return,
+            (Err(why), _) => {
+                tracing::info!(call_id = %call.call_id, why, "declining re-INVITE: in-call session modification is not supported");
+                let _ = sink.send(&build_488_not_acceptable(req, &call.to_tag, agent));
+                return;
+            }
+        };
+        let (terms, timer_headers) = reinvite::refresh_terms(req, Instant::now());
+        let mut headers: Vec<(&str, &str)> =
+            inbound::uas_answer_headers(access_network_info).to_vec();
+        headers.extend(
+            timer_headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_str())),
+        );
+        let response = build_uas_response_with_headers(
+            200,
+            "OK",
+            req,
+            Some(&call.to_tag),
+            Some(contact),
+            Some(media.local_sdp()),
+            &headers,
+        );
+        if let Err(e) = sink.send(&response) {
+            // Nothing changes: the carrier will retry or end the call itself.
+            tracing::warn!(call_id = %call.call_id, error = %e, "could not answer the carrier's session-refresh re-INVITE");
+            return;
+        }
+        // An offerless refresh is completed by its ACK's answer
+        // (`handle_ack`); one with an offer supersedes any still due.
+        if offerless {
+            media.await_answer(reinvite::cseq_number(req));
+        } else {
+            media.clear_awaiting_answer();
+        }
+        tracing::info!(
+            call_id = %call.call_id,
+            session_expires = terms.session_expires.as_deref().unwrap_or("none"),
+            offerless,
+            "accepted the carrier's session-refresh re-INVITE; media unchanged"
+        );
+        call.session_refresh = terms.state;
+        // RFC 3261 §12.2.2: a re-INVITE is a target refresh request — once it
+        // is answered `2xx`, the dialog's remote target is its `Contact`, and
+        // the next BYE or UPDATE goes there. The route set never changes
+        // after the dialog is established (§12.2), so it is left alone.
+        if let Some(target) = req.header("Contact").and_then(call::contact_uri) {
+            call.dialog.remote_target = target;
+        }
     }
 
     /// Advance an outbound origination that is mid-flight (specs/029): watch
@@ -3219,16 +3311,16 @@ impl LoopState {
                     ));
                     return;
                 }
-                // A genuine re-INVITE: we don't support renegotiating a call
-                // already in progress, but the line is not busy — say so
-                // honestly instead of claiming `486 Busy Here`
-                // (specs/042-dialog-transaction-identity, MT-02).
-                tracing::info!(call_id = %call.call_id, "declining re-INVITE: in-call session modification is not supported");
-                let _ = sink.send(&build_488_not_acceptable(
+                // A genuine re-INVITE: answered when it only refreshes the
+                // session, declined otherwise (`agent::reinvite`).
+                let contact = inbound::session_uas_contact(session);
+                self.answer_reinvite(
                     req,
-                    &call.to_tag,
+                    sink,
+                    &contact,
                     &format_sip_addr(session.contact_addr),
-                ));
+                    &p.reg_cfg.access_network_info,
+                );
                 return;
             }
         }
@@ -3367,7 +3459,13 @@ impl LoopState {
             .active_call
             .take()
             .expect("bye_response_if_unmatched returned None above, so it matched");
-        // The carrier's BYE is the caller hanging up.
+        // The carrier's BYE is the caller hanging up — but its own account of
+        // why (RFC 3326 `Reason`) is kept with the call and logged in its
+        // `call media verdict`: a network-side teardown, such as T2's
+        // `Q.850;cause=113;text="Session Timer Expired"` after a refused
+        // refresh, otherwise reads exactly like the far end hanging up, and
+        // was visible only in a TRACE message dump.
+        call.lifecycle.carrier_reason = req.header("Reason").map(str::to_string);
         call.lifecycle.end(EndedBy::Caller);
         // See the matching comment in `handle_pbx_hangup` — stop the media/
         // RTCP threads before reading what they published, not after.
@@ -3389,6 +3487,61 @@ impl LoopState {
             .as_ref()
             .map(|c| (c.call_id.as_str(), c.to_tag.as_str()));
         let _ = sink.send(&cancel_response(req, active, &random_hex(4)));
+    }
+
+    /// An inbound `ACK`: logged, and — when it completes an offerless
+    /// session-refresh re-INVITE this bridge answered with an offer
+    /// (`agent::reinvite`) — its answer checked. An answer the media path
+    /// cannot follow ends the call with `BYE`, as RFC 3261 §13.2.2.4 has a
+    /// UAC do with an unacceptable offer in a `2xx`: there is no response to
+    /// an `ACK` to refuse it with, and leaving the call up
+    /// would leave it on media neither side agreed on. It counts as a failed
+    /// session refresh, the cause specs/049 already names.
+    fn handle_ack(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        inbound: &Inbound,
+        p: &DispatchParams,
+        req: &SipRequest,
+    ) {
+        self.log_ack(req);
+        let Some(Err(why)) = self.take_refresh_answer(req) else {
+            return;
+        };
+        let mut call = self
+            .active_call
+            .take()
+            .expect("take_refresh_answer matched it");
+        tracing::warn!(
+            call_id = %call.call_id,
+            why,
+            "ending call: the carrier's answer to an offerless session refresh \
+             changes media this bridge cannot follow"
+        );
+        call.lifecycle.end(EndedBy::SessionTimerExpired);
+        call.stop.store(true, Ordering::Relaxed);
+        report_answered_call_ended(p.obs, &call);
+        hangup_carrier(session, inbound, call, reason::SESSION_TIMER_EXPIRED);
+        self.maintenance.release();
+    }
+
+    /// The outcome of the offerless session refresh `req` (an `ACK`)
+    /// completes, if it completes one: `None` when it does not (no active
+    /// call, another dialog or transaction, or no refresh due).
+    fn take_refresh_answer(&mut self, req: &SipRequest) -> Option<Result<(), &'static str>> {
+        let call = self.active_call.as_mut()?;
+        if !names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to) {
+            return None;
+        }
+        let media = call.established_media.as_mut()?;
+        if !media.completes_refresh(reinvite::cseq_number(req)) {
+            return None;
+        }
+        let outcome = media.take_answer(inbound::request_sdp(req).as_deref());
+        if outcome.is_ok() {
+            tracing::info!(call_id = %call.call_id, "offerless session refresh completed; media unchanged");
+        }
+        Some(outcome)
     }
 
     /// An `ACK` naming the active call confirms its dialog; one naming
@@ -5548,6 +5701,262 @@ mod tests {
             resp.starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
             "{resp}"
         );
+    }
+
+    // ---- a carrier's re-INVITE on the active call (`agent::reinvite`) -----
+
+    const REINVITE_CONTACT: &str = "<sip:+919000000000@192.0.2.67:50174;transport=TCP>";
+
+    /// A re-INVITE on the test call's dialog, carrying `sdp` and the
+    /// `Session-Expires` the live T2 refresh carried.
+    fn reinvite(our_to_tag: &str, sdp: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKreinv\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>;tag={our_to_tag}\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n\
+             Contact: <sip:10.1.1.1:9900;Dsp=ecaa-200>\r\n\
+             Supported: timer\r\n\
+             Session-Expires: 1800;refresher=uac\r\n\
+             Min-SE: 600\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{sdp}",
+            sdp.len()
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// An outbound call whose `200 OK` set `Session-Expires:
+    /// 1800;refresher=uas`, with the live call's session descriptions.
+    fn call_with_established_media() -> ActiveCall {
+        let mut call = active_call_with_refresh("uas");
+        call.established_media = Some(reinvite::tests::established());
+        call
+    }
+
+    fn answer(st: &mut LoopState, req: &SipRequest) -> String {
+        let (sink, peer) = udp_sink_pair();
+        st.answer_reinvite(
+            req,
+            &sink,
+            REINVITE_CONTACT,
+            "192.0.2.67:50174",
+            "IEEE-802.11",
+        );
+        recv_response(&peer)
+    }
+
+    /// The live failure: a session-refresh re-INVITE was declined `488` and
+    /// the carrier ended the call. Now it is answered with the SDP this bridge
+    /// already sent, and the carrier's refresh duty is re-armed.
+    #[test]
+    fn a_session_refresh_re_invite_is_answered_with_the_sdp_already_sent() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        let before = Instant::now();
+
+        let resp = answer(
+            &mut st,
+            &reinvite("our-to-tag", reinvite::tests::REFRESH_OFFER),
+        );
+
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(resp.contains("CSeq: 1 INVITE\r\n"), "{resp}");
+        assert!(
+            resp.contains(&format!("Contact: {REINVITE_CONTACT}\r\n")),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("Session-Expires: 1800;refresher=uac\r\n"),
+            "{resp}"
+        );
+        assert!(resp.contains("Require: timer\r\n"), "{resp}");
+        assert!(resp.contains("Allow: "), "{resp}");
+        assert!(resp.contains("Content-Type: application/sdp\r\n"), "{resp}");
+        assert!(
+            resp.ends_with(reinvite::tests::OUR_OFFER),
+            "the body must be the SDP already sent, same o= version: {resp}"
+        );
+        let refresh = st
+            .active_call
+            .as_ref()
+            .unwrap()
+            .session_refresh
+            .as_ref()
+            .expect("the refresh re-arms the session timer");
+        assert_eq!(refresh.refresher(), Refresher::Uas);
+        // The re-INVITE's 1800 s, not the 300 s the test call started with.
+        let deadline = refresh.peer_deadline().expect("waiting for the carrier");
+        assert!(
+            deadline >= before + Duration::from_secs(1800 - 32),
+            "{deadline:?}"
+        );
+        // A target refresh: the next BYE goes to the re-INVITE's Contact.
+        assert_eq!(
+            st.active_call.as_ref().unwrap().dialog.remote_target,
+            "sip:10.1.1.1:9900;Dsp=ecaa-200"
+        );
+    }
+
+    #[test]
+    fn a_re_invite_that_changes_the_session_is_still_declined() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        let deadline_before = st
+            .active_call
+            .as_ref()
+            .unwrap()
+            .session_refresh
+            .as_ref()
+            .unwrap()
+            .peer_deadline();
+        let changed =
+            reinvite::tests::REFRESH_OFFER.replace("71848567 71848567", "71848567 71848568");
+
+        let resp = answer(&mut st, &reinvite("our-to-tag", &changed));
+
+        assert!(
+            resp.starts_with("SIP/2.0 488 Not Acceptable Here\r\n"),
+            "{resp}"
+        );
+        // A declined re-INVITE refreshes nothing: not the timer, not the target.
+        let call = st.active_call.as_ref().unwrap();
+        assert_eq!(
+            call.session_refresh.as_ref().unwrap().peer_deadline(),
+            deadline_before
+        );
+        assert_eq!(call.dialog.remote_target, "sip:caller@example.net");
+    }
+
+    #[test]
+    fn a_re_invite_on_another_dialog_is_declined_even_with_an_unchanged_offer() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+
+        let resp = answer(
+            &mut st,
+            &reinvite("some-other-to-tag", reinvite::tests::REFRESH_OFFER),
+        );
+
+        assert!(
+            resp.starts_with("SIP/2.0 488 Not Acceptable Here\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn a_re_invite_on_a_call_with_no_recorded_media_is_declined_as_before() {
+        let mut st = LoopState::new();
+        st.active_call = Some(active_call_with_refresh("uas"));
+
+        let resp = answer(
+            &mut st,
+            &reinvite("our-to-tag", reinvite::tests::REFRESH_OFFER),
+        );
+
+        assert!(
+            resp.starts_with("SIP/2.0 488 Not Acceptable Here\r\n"),
+            "{resp}"
+        );
+    }
+
+    /// An inbound-answered call starts with no refresh duty; a carrier
+    /// refresh re-INVITE gives it one, so a later missed refresh is noticed.
+    #[test]
+    fn a_session_refresh_re_invite_gives_an_answered_call_a_refresh_duty() {
+        let mut st = LoopState::new();
+        let mut call = test_active_call("c1", "our-to-tag", REQUEST_HELPER_CALLER_FROM);
+        call.established_media = Some(reinvite::tests::established());
+        st.active_call = Some(call);
+
+        let resp = answer(
+            &mut st,
+            &reinvite("our-to-tag", reinvite::tests::REFRESH_OFFER),
+        );
+
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        let call = st.active_call.as_ref().unwrap();
+        assert_eq!(
+            call.session_refresh.as_ref().map(|r| r.refresher()),
+            Some(Refresher::Uas)
+        );
+    }
+
+    /// An in-dialog request on the test call carrying `sdp` (or no body).
+    fn in_dialog_with_body(method: &str, cseq: u32, sdp: Option<&str>) -> SipRequest {
+        let body = sdp.unwrap_or("");
+        let content_type = if sdp.is_some() {
+            "Content-Type: application/sdp\r\n"
+        } else {
+            ""
+        };
+        let raw = format!(
+            "{method} sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bK{method}{cseq}\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>;tag=our-to-tag\r\n\
+             Call-ID: c1\r\nCSeq: {cseq} {method}\r\n\
+             Contact: <sip:10.1.1.1:9900>\r\n\
+             Supported: timer\r\n\
+             Session-Expires: 1800;refresher=uac\r\n\
+             {content_type}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// An offerless refresh is answered with the SDP already sent, now as an
+    /// offer, and the ACK's answer is checked against the media in use.
+    #[test]
+    fn an_offerless_refresh_offers_the_sdp_already_sent_and_its_ack_completes_it() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+
+        let resp = answer(&mut st, &in_dialog_with_body("INVITE", 7, None));
+
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(
+            resp.contains("Session-Expires: 1800;refresher=uac\r\n"),
+            "{resp}"
+        );
+        assert!(resp.ends_with(reinvite::tests::OUR_OFFER), "{resp}");
+        // An ACK for another transaction completes nothing.
+        let stray = in_dialog_with_body("ACK", 6, Some(reinvite::tests::SETUP_ANSWER));
+        assert_eq!(st.take_refresh_answer(&stray), None);
+        let ack = in_dialog_with_body("ACK", 7, Some(reinvite::tests::SETUP_ANSWER));
+        assert_eq!(st.take_refresh_answer(&ack), Some(Ok(())));
+        // Settled: a retransmitted ACK is not judged again.
+        assert_eq!(st.take_refresh_answer(&ack), None);
+    }
+
+    #[test]
+    fn an_offerless_refresh_whose_ack_changes_the_media_fails() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        let resp = answer(&mut st, &in_dialog_with_body("INVITE", 7, None));
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+
+        let moved = reinvite::tests::SETUP_ANSWER.replace("m=audio 14592", "m=audio 14600");
+        let ack = in_dialog_with_body("ACK", 7, Some(&moved));
+
+        assert!(matches!(st.take_refresh_answer(&ack), Some(Err(_))));
+    }
+
+    #[test]
+    fn a_refresh_with_an_offer_supersedes_an_offerless_one_still_due() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        answer(&mut st, &in_dialog_with_body("INVITE", 7, None));
+
+        let resp = answer(
+            &mut st,
+            &in_dialog_with_body("INVITE", 8, Some(reinvite::tests::REFRESH_OFFER)),
+        );
+
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        let late = in_dialog_with_body("ACK", 7, None);
+        assert_eq!(st.take_refresh_answer(&late), None);
     }
 
     // `handle_session_refresh`'s own send/overdue branches need a real
