@@ -27,6 +27,7 @@ use std::sync::Arc;
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
+const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'";
 
@@ -103,6 +104,10 @@ async fn style_css() -> Response {
     asset("text/css; charset=utf-8", STYLE_CSS)
 }
 
+async fn favicon_svg() -> Response {
+    asset("image/svg+xml", FAVICON_SVG)
+}
+
 /// Adds the headers every response carries (contracts/http-api.md).
 async fn security_headers(request: Request, next: Next) -> Response {
     let is_api = request.uri().path().starts_with("/api/");
@@ -133,6 +138,7 @@ pub fn router(state: WebuiState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/login", get(index))
+        .route("/favicon.svg", get(favicon_svg))
         .route("/assets/app.js", get(app_js))
         .route("/assets/style.css", get(style_css))
         .route("/api/login", post(auth::login))
