@@ -722,6 +722,15 @@ pub enum SteadyOutcome {
     PcscfChanged {
         new_pcscf: String,
     },
+    /// The IKE_SA that a held initiation started (specs/100 FR-010a) is
+    /// established and the line is no longer held. That initiation restarted
+    /// nothing, so the agent is still bound to the previous IKE_SA's virtual
+    /// IP, which is gone whether or not the P-CSCF moved with it: the caller
+    /// publishes `new_pcscf` (the selection as the new negotiation gives it,
+    /// possibly unchanged) and restarts this line's vowifi-ims-agent, once.
+    HeldInitiationEstablished {
+        new_pcscf: String,
+    },
     /// charon is still working on a negotiation, so nothing was done: an
     /// IKE_SA is half-open (specs/100 US3), or the CHILD_SA re-initiate a
     /// first miss sent is still within its time.
@@ -943,6 +952,18 @@ pub struct SteadyTracking {
     /// Whether this hold already issued its one initiation since the IKE_SA
     /// vanished (specs/100 FR-010a). Reset when an IKE_SA is listed again.
     pub held_initiate_sent: bool,
+    /// Whether an IKE_SA initiated during a hold (FR-010a) has not been
+    /// followed by an agent restart yet. That initiation restarts nothing, and
+    /// the IKE_SA it builds comes with a new virtual IP, so the agent left
+    /// running would stay registered from an address the namespace no longer
+    /// has: every indicator healthy, no call possible (found live 2026-11-16,
+    /// where the selection did not move, so `PcscfChanged` never fired).
+    ///
+    /// Unlike `held_initiate_sent` it outlives the half-open ticks in between.
+    /// Cleared by the tick that reports the IKE_SA established
+    /// ([`SteadyOutcome::HeldInitiationEstablished`]) and by any other outcome
+    /// whose handling restarts the agent ([`outcome_restarts_agent`]).
+    pub agent_restart_owed: bool,
 }
 
 impl SteadyTracking {
@@ -1253,6 +1274,54 @@ pub fn tick_steady_state_underlay(
     agent_pool: &dyn Fn() -> Option<PoolState>,
     underlay: &UnderlayView,
 ) -> SteadyOutcome {
+    let outcome = tick_underlay(
+        engine,
+        runner,
+        current_pcscf,
+        current_pool,
+        tracking,
+        poll_interval,
+        call_active,
+        agent_pool,
+        underlay,
+    );
+    // Here rather than at each return: an agent restarted for any reason
+    // starts on the tunnel as it is now, so the restart a held initiation owed
+    // has been made, whichever branch made it.
+    if outcome_restarts_agent(&outcome) {
+        tracking.agent_restart_owed = false;
+    }
+    outcome
+}
+
+/// Whether the strongSwan loop's handling of `outcome` restarts the line's
+/// vowifi-ims-agent. No wildcard: a new outcome must be classified here too.
+pub fn outcome_restarts_agent(outcome: &SteadyOutcome) -> bool {
+    match outcome {
+        SteadyOutcome::PcscfChanged { .. } | SteadyOutcome::HeldInitiationEstablished { .. } => {
+            true
+        }
+        SteadyOutcome::Recovered { reason, .. } => recovery_restarts_agent(*reason),
+        SteadyOutcome::StillUp
+        | SteadyOutcome::WaitingForNegotiation
+        | SteadyOutcome::Held { .. }
+        | SteadyOutcome::Deferred { .. } => false,
+    }
+}
+
+/// The decision behind [`tick_steady_state_underlay`].
+#[allow(clippy::too_many_arguments)]
+fn tick_underlay(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    current_pcscf: &str,
+    current_pool: &[String],
+    tracking: &mut SteadyTracking,
+    poll_interval: Duration,
+    call_active: &dyn Fn() -> bool,
+    agent_pool: &dyn Fn() -> Option<PoolState>,
+    underlay: &UnderlayView,
+) -> SteadyOutcome {
     tracking.pool_exhausted.clear();
     tracking.dead_peer = None;
     // A failure seen while the path to the ePDG is down is the path's, not
@@ -1381,6 +1450,9 @@ pub fn tick_steady_state_underlay(
                 let initiated = !tracking.held_initiate_sent;
                 if initiated {
                     tracking.held_initiate_sent = true;
+                    // No agent restart now (FR-010a), so one is owed for when
+                    // the IKE_SA this builds is up and the hold is over.
+                    tracking.agent_restart_owed = true;
                     engine.reinitiate(runner);
                 }
                 // The peer's silence is explained by the path, not by the peer
@@ -1483,6 +1555,19 @@ pub fn tick_steady_state_underlay(
                 return outcome;
             }
         }
+    }
+
+    // The IKE_SA a held initiation started is established (every other health
+    // returned above). Ahead of the P-CSCF-changed check, which restarts the
+    // agent only when the selection moved: the new IKE_SA has a new virtual IP
+    // either way. Not while the line is still held (FR-008): an agent
+    // restarted into a dead path only marks the P-CSCF it cannot reach.
+    if tracking.agent_restart_owed && underlay.holding().is_none() {
+        return SteadyOutcome::HeldInitiationEstablished {
+            new_pcscf: engine
+                .latest_pcscf(runner)
+                .unwrap_or_else(|| current_pcscf.to_string()),
+        };
     }
 
     // Reachability is checked last, and deliberately *after* the P-CSCF-changed
@@ -5405,6 +5490,194 @@ mod tests {
         *engine.health.borrow_mut() = SteadyStateHealth::IkeSaMissing;
         guarded(&engine, &mut tracking, &down, None);
         assert_eq!(*engine.reinitiate_calls.borrow(), 2);
+    }
+
+    /// A line selecting 10.0.0.11 whose IKE_SA went missing under a hold, and
+    /// the tracking after the tick that issued FR-010a's one initiation.
+    fn after_a_held_initiation() -> (FakeEngine, SteadyTracking) {
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::IkeSaMissing),
+            pcscf: RefCell::new(Some("10.0.0.11".to_string())),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        let first = guarded(
+            &engine,
+            &mut tracking,
+            &view(UnderlayVerdict::NoResponse),
+            None,
+        );
+        assert!(
+            matches!(
+                first,
+                SteadyOutcome::Held {
+                    initiated: true,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        (engine, tracking)
+    }
+
+    fn established(new_pcscf: &str) -> SteadyOutcome {
+        SteadyOutcome::HeldInitiationEstablished {
+            new_pcscf: new_pcscf.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_ike_sa_a_held_initiation_built_restarts_the_agent_though_the_selection_is_unchanged() {
+        // Found live 2026-11-16: the new IKE_SA brought a new virtual IP and a
+        // pool that still held the selection, so nothing restarted the agent
+        // and it stayed registered from an address that no longer existed.
+        let (engine, mut tracking) = after_a_held_initiation();
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        let up = view(UnderlayVerdict::Up);
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            established("10.0.0.11")
+        );
+        // Once: the next healthy tick owes nothing.
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn the_restart_a_held_initiation_owes_carries_the_new_selection() {
+        let (engine, mut tracking) = after_a_held_initiation();
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        *engine.pcscf.borrow_mut() = Some("10.0.0.12".to_string());
+        let up = view(UnderlayVerdict::Up);
+        // One outcome, not this and then `PcscfChanged`: one agent restart.
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            established("10.0.0.12")
+        );
+    }
+
+    #[test]
+    fn the_restart_a_held_initiation_owes_outlives_the_half_open_ticks() {
+        let (engine, mut tracking) = after_a_held_initiation();
+        // The hold ended on the ePDG's first answer; the IKE_SA is not up yet.
+        *engine.health.borrow_mut() = SteadyStateHealth::IkeSaConnecting { ike_id: 2 };
+        *engine.activity.borrow_mut() = busy();
+        let up = view(UnderlayVerdict::Up);
+        for _ in 0..2 {
+            assert_eq!(
+                guarded(&engine, &mut tracking, &up, None),
+                SteadyOutcome::WaitingForNegotiation
+            );
+        }
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            established("10.0.0.11")
+        );
+    }
+
+    #[test]
+    fn the_restart_a_held_initiation_owes_waits_for_the_hold_to_end() {
+        // FR-008: no agent restart into a path that is still down.
+        let (engine, mut tracking) = after_a_held_initiation();
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        assert_eq!(
+            guarded(
+                &engine,
+                &mut tracking,
+                &view(UnderlayVerdict::NoResponse),
+                None
+            ),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(
+            guarded(&engine, &mut tracking, &view(UnderlayVerdict::Up), None),
+            established("10.0.0.11")
+        );
+    }
+
+    #[test]
+    fn an_agent_restart_for_another_reason_settles_the_one_a_held_initiation_owed() {
+        let (engine, mut tracking) = after_a_held_initiation();
+        // The hold ended with still no IKE_SA: the ordinary recovery, whose
+        // handling restarts the agent.
+        let up = view(UnderlayVerdict::Up);
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaLost,
+                ike_sa_loss_cause: Some(IkeSaLossCause::Unknown),
+            }
+        );
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            SteadyOutcome::StillUp
+        );
+    }
+
+    #[test]
+    fn a_child_sa_reinitiate_does_not_settle_the_restart_a_held_initiation_owed() {
+        // `ChildSaMissing` is the one recovery that leaves the agent alone.
+        let (engine, mut tracking) = after_a_held_initiation();
+        let up = view(UnderlayVerdict::Up);
+        *engine.health.borrow_mut() = SteadyStateHealth::ChildSaMissing;
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
+            }
+        );
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        assert_eq!(
+            guarded(&engine, &mut tracking, &up, None),
+            established("10.0.0.11")
+        );
+    }
+
+    #[test]
+    fn every_outcome_is_classified_as_restarting_the_agent_or_not() {
+        for (outcome, restarts) in [
+            (SteadyOutcome::StillUp, false),
+            (SteadyOutcome::WaitingForNegotiation, false),
+            (held(NO_ROUTE, DegradeReason::IkeSaLost), false),
+            (
+                SteadyOutcome::Deferred {
+                    reason: DegradeReason::PcscfUnreachable,
+                },
+                false,
+            ),
+            (
+                SteadyOutcome::PcscfChanged {
+                    new_pcscf: "10.0.0.12".to_string(),
+                },
+                true,
+            ),
+            (established("10.0.0.11"), true),
+        ] {
+            assert_eq!(outcome_restarts_agent(&outcome), restarts, "{outcome:?}");
+        }
+        // A recovery restarts it exactly when its reason says so.
+        for reason in [
+            DegradeReason::IkeSaLost,
+            DegradeReason::DefaultRouteMissing,
+            DegradeReason::ChildSaMissing,
+            DegradeReason::TunUnavailable,
+        ] {
+            assert_eq!(
+                outcome_restarts_agent(&SteadyOutcome::Recovered {
+                    reason,
+                    ike_sa_loss_cause: None,
+                }),
+                recovery_restarts_agent(reason),
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]

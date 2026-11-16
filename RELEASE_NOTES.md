@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **A VoWiFi line no longer stays deaf after an uplink outage** -- When a tunnel lost during an uplink hold came back, the supervisor restarted the IMS agent only if the carrier had also moved the P-CSCF. With the same P-CSCF the agent kept the registration it had made from the old tunnel's address, which no longer existed: the web UI and metrics showed the line registered, outgoing calls failed with `RTP socket bind failed: Cannot assign requested address`, and incoming calls did not arrive until the next scheduled registration refresh, up to 50 minutes later. The supervisor now restarts the agent once when such a tunnel is up and the hold is over, logged as `IKE_SA re-established after an uplink hold`. Found live on T2, where a line was unreachable for 18 minutes; covered by supervisor unit tests, live verification of the fix is pending (#212).
 - **Web UI learns the line's number from IMS** -- VoWiFi and VoLTE lines now show the telephone identity from `P-Associated-URI` after an accepted registration or renewal, using the existing REGISTER response with no additional network or modem query. A configured `msisdn` mapped to the line takes priority. A renewal that omits the identity keeps the previous number; a replacement identity or full registration updates or clears it. Loopback registration and Web UI tests cover the data path; live carrier verification is pending (#203).
 
 ## v8.25.0

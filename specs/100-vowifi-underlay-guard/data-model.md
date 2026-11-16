@@ -45,6 +45,7 @@ Built by the loop at the top of each tick and passed into `tick_steady_state_wit
 | `evidence_mark` + `silence_since` | `LogMark` + `Instant` | Where silence is counted from. Moved on whenever the line is up with nothing outstanding, **or the ePDG is heard from by any means** (a parsed message, a grown RX counter, another line on the ePDG), so old retransmits never count against a path that has since answered. |
 | `heard` | `Option<Heard>` | The latest this line heard from the ePDG, as the window `(after, by]` one tick can place it in. `heard_recently` in the view is `by` within 30s (`RECENT_LIFE`). |
 | `held_initiate_sent` | bool | FR-010a: whether this hold already issued its one initiation since the IKE_SA vanished. Reset when an IKE_SA is listed again. |
+| `agent_restart_owed` | bool | FR-010a: a held initiation was issued and the agent has not been restarted since. Outlives the half-open ticks. Cleared by the tick that returns `HeldInitiationEstablished` and by any other outcome whose handling restarts the agent. |
 
 ### Hold
 
@@ -121,7 +122,8 @@ Evaluated in this order; the first matching row wins. "Would take R" means the e
 | 2 | Namespace default route missing | Route repair, as today (FR-009). |
 | 3 | IKE_SA half-open, with IKE activity in the last 200s | `WaitingForNegotiation`: no action; log once per `#N` (FR-015). |
 | 4 | IKE_SA half-open, no IKE activity for >200s, verdict `Up` | Terminate + re-initiate, as `IkeSaNegotiationStuck` (FR-016). |
-| 5 | Verdict `NoRoute` or `NoResponse` and would take R (reachability-inferred) | `Held { cause, skipped: R }`, issue nothing (FR-007/008). Exception, FR-010a: R is the `IkeSaLost` re-initiate and `held_initiate_sent` is false → issue one `--initiate`, no agent restart, and set the flag. |
+| 5 | Verdict `NoRoute` or `NoResponse` and would take R (reachability-inferred) | `Held { cause, skipped: R }`, issue nothing (FR-007/008). Exception, FR-010a: R is the `IkeSaLost` re-initiate and `held_initiate_sent` is false → issue one `--initiate`, no agent restart, and set the flag and `agent_restart_owed`. |
+| 5a | IKE_SA established with a usable CHILD_SA, not held, `agent_restart_owed` set | `HeldInitiationEstablished { new_pcscf }`: republish the selection and pool, restart the agent once (FR-010a). Checked ahead of `PcscfChanged`, so a selection that moved costs one restart, not two. |
 | 6 | Verdict `Up`, would take R, `PendingCheck` exists | Evidence of life since it was sent → take R. None, and its 30s are not up → `Deferred { reason: R }`, no second DPD. None after 30s → verdict becomes `NoResponse` and row 5 applies. |
 | 7 | Verdict `Up`, would take R, route check failed this tick (not yet debounced) | Verdict becomes `NoRoute` now and row 5 applies (the one-failure-plus-pending-recovery rule). |
 | 8 | Verdict `Up`, would take R, R ≠ `IkeSaLost`, the IKE_SA is `ESTABLISHED`, and nothing proves the ePDG alive in the last 30s (no parsed IKE message, inbound ESP age > 30s) | Trigger `swanctl --dpd`, create `PendingCheck`, `Deferred { reason: R }` (FR-004). |
@@ -175,4 +177,5 @@ On shutdown while held: `UplinkHoldEnded { ended_by: shutdown }`, so the held-se
 - A liveness check is given 30s to be answered, measured from when it was sent, however often the loop ticks (FR-004).
 - The tick's strike counters (`pcscf_unreachable`, `child_sa_missing`) are `Streak`s: a count and the time it covers. P-CSCF unreachable needs ≥2 checks covering 90s; a missing CHILD_SA is re-initiated once on the first miss and rebuilt once ≥2 checks cover 60s, with no further re-initiates in between. Both are reset on every tick the path is down (rows 5 and 7), so a failure seen during an outage never counts after it; they are earned only with the path up.
 - At most one held initiation per IKE_SA disappearance (FR-010a).
+- Exactly one agent restart per IKE_SA a held initiation built, and none while the line is still held (FR-008, FR-010a).
 - Half-open inactivity bound: 200s (FR-015).
