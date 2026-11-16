@@ -2705,6 +2705,9 @@ fn dispatch_loop(
         if st.handle_session_refresh(session, inbound, p) {
             continue;
         }
+        if st.handle_refresh_ack_timeout(session, inbound, p) {
+            continue;
+        }
         st.advance_origination(session, p);
         if st.handle_place_call_request(session, p, &place_call_rx) {
             continue;
@@ -3055,7 +3058,12 @@ impl LoopState {
     /// terms it carries replace the call's refresh duty. Anything else is a
     /// real modification, which this bridge does not implement: declined
     /// `488`, but not `486 Busy Here`, since the line is not busy
-    /// (specs/042-dialog-transaction-identity, MT-02).
+    /// (specs/042-dialog-transaction-identity, MT-02). A body that cannot be
+    /// read as SDP is refused `415`/`400`, as on a new call
+    /// (`inbound::invite_body_decision`), never taken for an offerless
+    /// refresh. A refresh asking for a session interval below RFC 4028's
+    /// minimum is refused `422` with `Min-SE`. Every refusal leaves the call
+    /// as it was.
     ///
     /// `contact` is the `Contact` for the `200 OK`, and `agent` this side's
     /// address for the `488`'s `Warning`.
@@ -3070,29 +3078,68 @@ impl LoopState {
         let Some(call) = self.active_call.as_mut() else {
             return;
         };
-        // `Ok(true)` for an offerless refresh, whose answer the ACK brings.
-        let refresh = match &call.established_media {
-            _ if !names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to) => {
-                Err("the request does not carry this call's dialog tags")
-            }
-            None => Err("no session description was recorded at setup"),
-            Some(media) => match media.classify(inbound::request_sdp(req).as_deref()) {
-                reinvite::ReinviteVerdict::Refresh => Ok(false),
-                reinvite::ReinviteVerdict::OfferlessRefresh => Ok(true),
-                reinvite::ReinviteVerdict::Decline(why) => Err(why),
-            },
+        let decline = |why: &str| {
+            tracing::info!(call_id = %call.call_id, why, "declining re-INVITE: in-call session modification is not supported");
+            let _ = sink.send(&build_488_not_acceptable(req, &call.to_tag, agent));
         };
-        // `refresh` is only `Ok` when `established_media` is `Some`.
-        let (offerless, media) = match (refresh, call.established_media.as_mut()) {
-            (Ok(offerless), Some(media)) => (offerless, media),
-            (Ok(_), None) => return,
-            (Err(why), _) => {
-                tracing::info!(call_id = %call.call_id, why, "declining re-INVITE: in-call session modification is not supported");
-                let _ = sink.send(&build_488_not_acceptable(req, &call.to_tag, agent));
+        if !names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to) {
+            decline("the request does not carry this call's dialog tags");
+            return;
+        }
+        // A body that cannot be read is not the same as no body. Taken for an
+        // offerless refresh, it would be answered with an offer the carrier
+        // never asked for, and the carrier's `ACK`, rightly without a body,
+        // would then end a working call as a failed refresh. It is refused as
+        // on a new call (`415`/`400`), which leaves the session as it was
+        // (RFC 3261 §14.1).
+        let offer = match inbound::invite_body_decision(req, &call.to_tag) {
+            inbound::InviteBody::Offer(sdp) => Some(sdp),
+            inbound::InviteBody::Offerless => None,
+            inbound::InviteBody::Refuse { response, reason } => {
+                tracing::info!(call_id = %call.call_id, reason = %reason, "declining re-INVITE: its body cannot be read as a session description; the call is unchanged");
+                let _ = sink.send(&response);
                 return;
             }
         };
-        let (terms, timer_headers) = reinvite::refresh_terms(req, Instant::now());
+        let Some(media) = call.established_media.as_mut() else {
+            decline("no session description was recorded at setup");
+            return;
+        };
+        // An offerless refresh's answer is brought by its `ACK`.
+        let offerless = match media.classify(offer.as_deref()) {
+            reinvite::ReinviteVerdict::Refresh => false,
+            reinvite::ReinviteVerdict::OfferlessRefresh => true,
+            reinvite::ReinviteVerdict::Decline(why) => {
+                decline(why);
+                return;
+            }
+        };
+        // RFC 4028 §9: an interval below the minimum is refused `422` with
+        // the minimum in `Min-SE`, for the carrier to retry with. Accepting
+        // it would promise an interval the session timer does not run on.
+        // Like every refusal here, it leaves the call as it was.
+        let (terms, timer_headers) = match reinvite::refresh_terms(req, Instant::now()) {
+            Ok(terms) => terms,
+            Err(too_small) => {
+                let min_se = too_small.min_se();
+                tracing::info!(
+                    call_id = %call.call_id,
+                    requested = too_small.requested,
+                    min_se = %min_se,
+                    "declining re-INVITE: its Session-Expires is below the minimum session interval"
+                );
+                let _ = sink.send(&build_uas_response_with_headers(
+                    422,
+                    "Session Interval Too Small",
+                    req,
+                    Some(&call.to_tag),
+                    None,
+                    None,
+                    &[("Min-SE", &min_se)],
+                ));
+                return;
+            }
+        };
         let mut headers: Vec<(&str, &str)> =
             inbound::uas_answer_headers(access_network_info).to_vec();
         headers.extend(
@@ -3114,13 +3161,11 @@ impl LoopState {
             tracing::warn!(call_id = %call.call_id, error = %e, "could not answer the carrier's session-refresh re-INVITE");
             return;
         }
-        // An offerless refresh is completed by its ACK's answer
-        // (`handle_ack`); one with an offer supersedes any still due.
-        if offerless {
-            media.await_answer(reinvite::cseq_number(req));
-        } else {
-            media.clear_awaiting_answer();
-        }
+        // Either way the `200 OK` is owed an `ACK`, which `handle_ack`
+        // settles and `handle_refresh_ack_timeout` bounds the wait for; an
+        // offerless refresh's also brings the carrier's answer. This one
+        // supersedes any still due.
+        media.await_ack(reinvite::cseq_number(req), offerless, Instant::now());
         tracing::info!(
             call_id = %call.call_id,
             session_expires = terms.session_expires.as_deref().unwrap_or("none"),
@@ -3489,14 +3534,16 @@ impl LoopState {
         let _ = sink.send(&cancel_response(req, active, &random_hex(4)));
     }
 
-    /// An inbound `ACK`: logged, and — when it completes an offerless
-    /// session-refresh re-INVITE this bridge answered with an offer
-    /// (`agent::reinvite`) — its answer checked. An answer the media path
+    /// An inbound `ACK`: logged, and — when it is the one owed for a
+    /// session-refresh re-INVITE this bridge answered `200 OK`
+    /// (`agent::reinvite`) — settled; an offerless refresh's also has its
+    /// answer checked. An answer the media path
     /// cannot follow ends the call with `BYE`, as RFC 3261 §13.2.2.4 has a
     /// UAC do with an unacceptable offer in a `2xx`: there is no response to
     /// an `ACK` to refuse it with, and leaving the call up
     /// would leave it on media neither side agreed on. It counts as a failed
-    /// session refresh, the cause specs/049 already names.
+    /// session refresh, the cause specs/049 already names. An `ACK` with no
+    /// answer this bridge can read ends nothing (`take_refresh_answer`).
     fn handle_ack(
         &mut self,
         session: &mut crate::ims::RegisteredSession,
@@ -3508,16 +3555,30 @@ impl LoopState {
         let Some(Err(why)) = self.take_refresh_answer(req) else {
             return;
         };
-        let mut call = self
-            .active_call
-            .take()
-            .expect("take_refresh_answer matched it");
-        tracing::warn!(
-            call_id = %call.call_id,
-            why,
-            "ending call: the carrier's answer to an offerless session refresh \
-             changes media this bridge cannot follow"
-        );
+        if let Some(call) = &self.active_call {
+            tracing::warn!(
+                call_id = %call.call_id,
+                why,
+                "ending call: the carrier's answer to an offerless session refresh \
+                 changes media this bridge cannot follow"
+            );
+        }
+        self.end_call_on_failed_peer_refresh(session, inbound, p);
+    }
+
+    /// Ends the active call because a session refresh the carrier started
+    /// with a re-INVITE did not complete: `BYE`, reported as
+    /// `EndedBy::SessionTimerExpired`, the cause specs/049 already names for
+    /// a refresh cycle that failed. The caller logs why.
+    fn end_call_on_failed_peer_refresh(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        inbound: &Inbound,
+        p: &DispatchParams,
+    ) {
+        let Some(mut call) = self.active_call.take() else {
+            return;
+        };
         call.lifecycle.end(EndedBy::SessionTimerExpired);
         call.stop.store(true, Ordering::Relaxed);
         report_answered_call_ended(p.obs, &call);
@@ -3525,23 +3586,86 @@ impl LoopState {
         self.maintenance.release();
     }
 
-    /// The outcome of the offerless session refresh `req` (an `ACK`)
-    /// completes, if it completes one: `None` when it does not (no active
-    /// call, another dialog or transaction, or no refresh due).
+    /// Ends the active call when the `ACK` of a refresh re-INVITE this bridge
+    /// answered `200 OK` is still missing after `reinvite::REFRESH_ACK_TIMEOUT`
+    /// (RFC 3261 §14.2: "If a UAS generates a 2xx response and never receives
+    /// an ACK, it SHOULD generate a BYE to terminate the dialog"). Either the
+    /// `200 OK` never reached the carrier or it abandoned the request; and
+    /// the refresh has already replaced the call's session timer, or removed
+    /// it when the re-INVITE carried no `Session-Expires`, so without this
+    /// bound nothing else would free the line and the media relay (code
+    /// review finding, 2026-11-16). Checked once per dispatch-loop pass, like
+    /// `handle_session_refresh`, so nothing blocks on it. Returns whether the
+    /// call was ended.
+    fn handle_refresh_ack_timeout(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        inbound: &Inbound,
+        p: &DispatchParams,
+    ) -> bool {
+        if !self.refresh_ack_overdue(Instant::now()) {
+            return false;
+        }
+        if let Some(call) = &self.active_call {
+            tracing::warn!(
+                call_id = %call.call_id,
+                waited_secs = reinvite::REFRESH_ACK_TIMEOUT.as_secs(),
+                "ending call: the carrier never acknowledged the 200 OK to its \
+                 session-refresh re-INVITE"
+            );
+        }
+        self.end_call_on_failed_peer_refresh(session, inbound, p);
+        true
+    }
+
+    /// Whether the active call is owed an `ACK` for a refresh re-INVITE that
+    /// is past its deadline at `now`.
+    fn refresh_ack_overdue(&self, now: Instant) -> bool {
+        self.active_call
+            .as_ref()
+            .and_then(|call| call.established_media.as_ref())
+            .is_some_and(|media| media.ack_overdue(now))
+    }
+
+    /// The outcome of the session refresh `req` (an `ACK`) completes, if it
+    /// completes one: `None` when it does not (no active call, another dialog
+    /// or transaction, or no refresh re-INVITE awaiting its `ACK`).
+    ///
+    /// `Err` only for an answer that was read and changes media this bridge
+    /// cannot follow. The `ACK` of a refresh that had an offer brings no
+    /// answer and is `Ok`. So is the `ACK` of an offerless refresh with no
+    /// body, or with one that cannot be read
+    /// as SDP: it does not say the media changed, the offer it
+    /// answers was the SDP already in force, and an `ACK` cannot be refused,
+    /// so the call carries on with the media in use rather than being ended
+    /// on a guess. The carrier's `o=` baseline is then left as it was.
     fn take_refresh_answer(&mut self, req: &SipRequest) -> Option<Result<(), &'static str>> {
         let call = self.active_call.as_mut()?;
         if !names_active_dialog(req, &call.call_id, &call.to_tag, &call.dialog.to) {
             return None;
         }
         let media = call.established_media.as_mut()?;
-        if !media.completes_refresh(reinvite::cseq_number(req)) {
-            return None;
+        if !media.take_ack(reinvite::cseq_number(req))? {
+            tracing::debug!(call_id = %call.call_id, "session-refresh re-INVITE acknowledged");
+            return Some(Ok(()));
         }
-        let outcome = media.take_answer(inbound::request_sdp(req).as_deref());
-        if outcome.is_ok() {
-            tracing::info!(call_id = %call.call_id, "offerless session refresh completed; media unchanged");
-        }
-        Some(outcome)
+        let no_answer = match inbound::ack_answer(req) {
+            Ok(Some(answer)) => {
+                let outcome = media.take_answer(&answer);
+                if outcome.is_ok() {
+                    tracing::info!(call_id = %call.call_id, "offerless session refresh completed; media unchanged");
+                }
+                return Some(outcome);
+            }
+            Ok(None) => "the ACK carried no SDP answer",
+            Err(_) => "the ACK's body cannot be read as an SDP answer",
+        };
+        tracing::warn!(
+            call_id = %call.call_id,
+            why = no_answer,
+            "offerless session refresh: no answer to check; carrying on with the media in use"
+        );
+        Some(Ok(()))
     }
 
     /// An `ACK` naming the active call confirms its dialog; one naming
@@ -5885,12 +6009,16 @@ mod tests {
 
     /// An in-dialog request on the test call carrying `sdp` (or no body).
     fn in_dialog_with_body(method: &str, cseq: u32, sdp: Option<&str>) -> SipRequest {
-        let body = sdp.unwrap_or("");
-        let content_type = if sdp.is_some() {
-            "Content-Type: application/sdp\r\n"
-        } else {
-            ""
-        };
+        in_dialog_with(method, cseq, sdp.map(|sdp| ("application/sdp", sdp)))
+    }
+
+    /// An in-dialog request on the test call carrying a body of the given
+    /// `Content-Type` (or no body).
+    fn in_dialog_with(method: &str, cseq: u32, typed_body: Option<(&str, &str)>) -> SipRequest {
+        let body = typed_body.map_or("", |(_, body)| body);
+        let content_type = typed_body
+            .map(|(ct, _)| format!("Content-Type: {ct}\r\n"))
+            .unwrap_or_default();
         let raw = format!(
             "{method} sip:me@10.0.0.9:5060 SIP/2.0\r\n\
              Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bK{method}{cseq}\r\n\
@@ -5941,6 +6069,276 @@ mod tests {
         let ack = in_dialog_with_body("ACK", 7, Some(&moved));
 
         assert!(matches!(st.take_refresh_answer(&ack), Some(Err(_))));
+    }
+
+    /// Bodies `body::extract_sdp` cannot read as SDP, with the status each
+    /// is refused with: the review finding's SDP part in an unsupported
+    /// transfer encoding, a body of another type, and broken multipart.
+    const UNREADABLE_BODIES: [(&str, &str, &str); 3] = [
+        (
+            "multipart/mixed;boundary=b",
+            "--b\r\nContent-Type: application/sdp\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\ndj0w\r\n--b--\r\n",
+            "415 Unsupported Media Type",
+        ),
+        ("text/plain", "hello", "415 Unsupported Media Type"),
+        (
+            "multipart/mixed;boundary=b",
+            "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n",
+            "400 Bad Request",
+        ),
+    ];
+
+    /// Code review finding, 2026-11-16: a re-INVITE whose body could not be
+    /// read was taken for an offerless refresh and answered `200 OK` with an
+    /// offer; the carrier's `ACK`, rightly without a body, then ended the
+    /// working call. It is refused instead, and nothing about the call
+    /// changes.
+    #[test]
+    fn a_re_invite_whose_body_cannot_be_read_is_refused_and_the_call_is_unchanged() {
+        for (content_type, body, status) in UNREADABLE_BODIES {
+            let mut st = LoopState::new();
+            st.active_call = Some(call_with_established_media());
+            let deadline_before = st
+                .active_call
+                .as_ref()
+                .unwrap()
+                .session_refresh
+                .as_ref()
+                .unwrap()
+                .peer_deadline();
+
+            let resp = answer(
+                &mut st,
+                &in_dialog_with("INVITE", 7, Some((content_type, body))),
+            );
+
+            assert!(
+                resp.starts_with(&format!("SIP/2.0 {status}\r\n")),
+                "{content_type}: {resp}"
+            );
+            assert!(resp.contains(";tag=our-to-tag\r\n"), "{resp}");
+            assert!(resp.ends_with("Content-Length: 0\r\n\r\n"), "{resp}");
+            // No offer went out, so the ACK of the refusal has nothing to
+            // complete, and cannot end the call.
+            let ack = in_dialog_with_body("ACK", 7, None);
+            assert_eq!(st.take_refresh_answer(&ack), None, "{content_type}");
+            let call = st.active_call.as_ref().expect("the call is still up");
+            assert_eq!(
+                call.session_refresh.as_ref().unwrap().peer_deadline(),
+                deadline_before
+            );
+            assert_eq!(call.dialog.remote_target, "sip:caller@example.net");
+        }
+    }
+
+    /// An unreadable re-INVITE leaves an offerless refresh still due as it
+    /// was: its own `ACK` still completes it.
+    #[test]
+    fn an_unreadable_re_invite_leaves_a_pending_offerless_refresh_due() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        answer(&mut st, &in_dialog_with_body("INVITE", 7, None));
+
+        let resp = answer(
+            &mut st,
+            &in_dialog_with("INVITE", 8, Some(("text/plain", "hello"))),
+        );
+
+        assert!(resp.starts_with("SIP/2.0 415 "), "{resp}");
+        let ack = in_dialog_with_body("ACK", 7, Some(reinvite::tests::SETUP_ANSWER));
+        assert_eq!(st.take_refresh_answer(&ack), Some(Ok(())));
+    }
+
+    /// An `ACK` cannot be refused, and one with no answer this bridge can read
+    /// (no body, or a body that is not SDP) does not say the media changed:
+    /// the call carries on with the media in use and is not ended on a guess.
+    #[test]
+    fn an_offerless_refresh_whose_ack_brings_no_readable_answer_keeps_the_call() {
+        let unreadable =
+            UNREADABLE_BODIES.map(|(content_type, body, _)| Some((content_type, body)));
+        for typed_body in unreadable.into_iter().chain([None]) {
+            let mut st = LoopState::new();
+            st.active_call = Some(call_with_established_media());
+            answer(&mut st, &in_dialog_with_body("INVITE", 7, None));
+
+            let ack = in_dialog_with("ACK", 7, typed_body);
+
+            assert_eq!(st.take_refresh_answer(&ack), Some(Ok(())), "{typed_body:?}");
+            // Settled: a retransmitted ACK is not judged again.
+            assert_eq!(st.take_refresh_answer(&ack), None);
+            assert!(st.active_call.is_some(), "the call is still up");
+            // The carrier's `o=` baseline is untouched: its next refresh with
+            // the same session description is still a refresh.
+            let resp = answer(
+                &mut st,
+                &in_dialog_with_body("INVITE", 8, Some(reinvite::tests::REFRESH_OFFER)),
+            );
+            assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        }
+    }
+
+    /// Code review finding, 2026-11-16: the `200 OK` to a refresh re-INVITE
+    /// is owed an `ACK`, and the wait for it is bounded. A carrier that never
+    /// sends it must not hold the line and the relay for good, least of all
+    /// after a refresh without `Session-Expires` removed the session timer.
+    #[test]
+    fn a_refresh_whose_ack_never_arrives_is_overdue_after_the_bounded_wait() {
+        for (sdp, session_expires) in [
+            (None, true),
+            (Some(reinvite::tests::REFRESH_OFFER), true),
+            (None, false),
+            (Some(reinvite::tests::REFRESH_OFFER), false),
+        ] {
+            let mut req = in_dialog_with_body("INVITE", 7, sdp);
+            if !session_expires {
+                req.headers
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case("Session-Expires"));
+            }
+            let mut st = LoopState::new();
+            st.active_call = Some(call_with_established_media());
+            let start = Instant::now();
+            assert!(!st.refresh_ack_overdue(start + reinvite::REFRESH_ACK_TIMEOUT * 2));
+
+            let resp = answer(&mut st, &req);
+
+            assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+            let call = st.active_call.as_ref().unwrap();
+            assert_eq!(call.session_refresh.is_some(), session_expires);
+            assert!(!st.refresh_ack_overdue(start));
+            assert!(st.refresh_ack_overdue(Instant::now() + reinvite::REFRESH_ACK_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn a_refresh_that_is_acknowledged_or_declined_is_never_overdue() {
+        let far =
+            |st: &LoopState| st.refresh_ack_overdue(Instant::now() + Duration::from_secs(3600));
+        // Acknowledged, with an offer and without.
+        for sdp in [None, Some(reinvite::tests::REFRESH_OFFER)] {
+            let mut st = LoopState::new();
+            st.active_call = Some(call_with_established_media());
+            answer(&mut st, &in_dialog_with_body("INVITE", 7, sdp));
+            // An ACK for another transaction settles nothing.
+            let stray = in_dialog_with_body("ACK", 6, None);
+            assert_eq!(st.take_refresh_answer(&stray), None);
+            assert!(far(&st));
+
+            let ack = in_dialog_with_body("ACK", 7, sdp.map(|_| reinvite::tests::SETUP_ANSWER));
+            st.take_refresh_answer(&ack);
+            assert!(!far(&st), "{sdp:?}");
+        }
+        // Declined: no `200 OK` went out, so no ACK is awaited.
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        answer(
+            &mut st,
+            &in_dialog_with("INVITE", 7, Some(("text/plain", "hello"))),
+        );
+        assert!(!far(&st));
+        // No call at all.
+        assert!(!far(&LoopState::new()));
+    }
+
+    /// Code review finding, 2026-11-16: a refresh asking for a session
+    /// interval below the minimum was answered `200 OK` echoing it, while the
+    /// timer ran on 90 s. It is refused `422` with the minimum instead, and
+    /// the call, its timer and any refresh still pending are left alone.
+    #[test]
+    fn a_refresh_below_the_minimum_session_interval_is_refused_422_with_min_se() {
+        for sdp in [None, Some(reinvite::tests::REFRESH_OFFER)] {
+            for session_expires in ["30;refresher=uas", "30;refresher=uac", "89"] {
+                let mut st = LoopState::new();
+                st.active_call = Some(call_with_established_media());
+                let deadline_before = st
+                    .active_call
+                    .as_ref()
+                    .unwrap()
+                    .session_refresh
+                    .as_ref()
+                    .unwrap()
+                    .peer_deadline();
+                let mut req = in_dialog_with_body("INVITE", 7, sdp);
+                for (name, value) in &mut req.headers {
+                    if name.eq_ignore_ascii_case("Session-Expires") {
+                        *value = session_expires.to_string();
+                    }
+                }
+
+                let resp = answer(&mut st, &req);
+
+                assert!(
+                    resp.starts_with("SIP/2.0 422 Session Interval Too Small\r\n"),
+                    "{session_expires}: {resp}"
+                );
+                assert!(resp.contains("\r\nMin-SE: 90\r\n"), "{resp}");
+                assert!(!resp.contains("Session-Expires"), "{resp}");
+                assert!(resp.contains(";tag=our-to-tag\r\n"), "{resp}");
+                assert!(resp.ends_with("Content-Length: 0\r\n\r\n"), "{resp}");
+                let call = st.active_call.as_ref().expect("the call is still up");
+                assert_eq!(
+                    call.session_refresh.as_ref().unwrap().peer_deadline(),
+                    deadline_before
+                );
+                assert_eq!(call.dialog.remote_target, "sip:caller@example.net");
+                // No `200 OK` went out, so no ACK is awaited.
+                assert!(!st.refresh_ack_overdue(Instant::now() + Duration::from_secs(3600)));
+            }
+        }
+    }
+
+    /// The minimum itself is accepted, and what the `200 OK` promises is the
+    /// interval the call's timer then runs on.
+    #[test]
+    fn a_refresh_at_the_minimum_session_interval_is_accepted_and_timed_as_promised() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        let mut req = in_dialog_with_body("INVITE", 7, Some(reinvite::tests::REFRESH_OFFER));
+        for (name, value) in &mut req.headers {
+            if name.eq_ignore_ascii_case("Session-Expires") {
+                *value = "90;refresher=uac".to_string();
+            }
+        }
+        let before = Instant::now();
+
+        let resp = answer(&mut st, &req);
+
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
+        assert!(
+            resp.contains("Session-Expires: 90;refresher=uac\r\n"),
+            "{resp}"
+        );
+        let deadline = st
+            .active_call
+            .as_ref()
+            .unwrap()
+            .session_refresh
+            .as_ref()
+            .unwrap()
+            .peer_deadline()
+            .unwrap();
+        // RFC 4028 §10: min(32 s, interval / 3) before the 90 s expiry.
+        assert!(deadline >= before + Duration::from_secs(60));
+        assert!(deadline <= Instant::now() + Duration::from_secs(60));
+    }
+
+    /// Code review finding, 2026-11-16: an `ACK` answer that keeps PT 96 but
+    /// drops `octet-align=1` changes the AMR framing under the relay.
+    #[test]
+    fn an_offerless_refresh_whose_ack_keeps_the_payload_type_but_changes_framing_fails() {
+        let mut st = LoopState::new();
+        st.active_call = Some(call_with_established_media());
+        answer(&mut st, &in_dialog_with_body("INVITE", 7, None));
+
+        let reframed = reinvite::tests::SETUP_ANSWER.replace("a=fmtp:96 octet-align=1\r\n", "");
+        let ack = in_dialog_with_body("ACK", 7, Some(&reframed));
+
+        assert_eq!(
+            st.take_refresh_answer(&ack),
+            Some(Err(
+                "the answer changes the codec or AMR framing of the payload type in use"
+            ))
+        );
     }
 
     #[test]

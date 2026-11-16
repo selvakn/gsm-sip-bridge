@@ -345,6 +345,23 @@ impl SessionRefreshState {
     }
 }
 
+/// A carrier's re-INVITE asked for a session interval below RFC 4028's
+/// 90-second minimum. §9: "the server MUST reject the request with a 422
+/// (Session Interval Too Small) response ... The 422 response MUST contain a
+/// Min-SE header field with the minimum timer for that server."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SessionIntervalTooSmall {
+    /// The delta-seconds the request asked for.
+    pub(super) requested: u32,
+}
+
+impl SessionIntervalTooSmall {
+    /// The `Min-SE` value for the `422`: the minimum this bridge accepts.
+    pub(super) fn min_se(&self) -> String {
+        MIN_SESSION_INTERVAL.as_secs().to_string()
+    }
+}
+
 /// What this bridge states in the `2xx` to a carrier's session-refresh
 /// re-INVITE, and the refresh state the call carries afterwards (RFC 4028
 /// §9, the UAS side — `agent::reinvite`).
@@ -389,25 +406,30 @@ pub(super) struct PeerRefreshTerms {
 /// carrier that does not support the extension cannot refresh at all, so the
 /// duty falls to this bridge whatever the request says.
 ///
-/// The interval is the one the request asks for, echoed verbatim; internally
-/// it is floored at RFC 4028's 90-second minimum exactly as
-/// [`SessionRefreshState::from_2xx`] does.
+/// The interval is the one the request asks for, echoed verbatim and timed
+/// exactly: what the `2xx` promises is what the call's timer runs on. An
+/// interval below RFC 4028's 90-second minimum is therefore not accepted at
+/// all (`Err`, for a `422`), rather than echoed while the timer runs on a
+/// longer one. A carrier told `30;refresher=uas` would expire the session
+/// after 30 s while this bridge, flooring to 90 s, refreshed after 45 (code
+/// review finding, 2026-11-16). [`SessionRefreshState::from_2xx`] does floor,
+/// because a `2xx` cannot be refused; a request can.
 pub(super) fn terms_for_peer_refresh(
     session_expires: Option<&str>,
     carrier_supports_timer: bool,
     now: Instant,
-) -> PeerRefreshTerms {
-    let parsed = session_expires
-        .and_then(parse_session_expires)
-        .filter(|(delta, _)| *delta > 0);
-    let Some((delta, requested)) = parsed else {
-        return PeerRefreshTerms {
+) -> Result<PeerRefreshTerms, SessionIntervalTooSmall> {
+    let Some((delta, requested)) = session_expires.and_then(parse_session_expires) else {
+        return Ok(PeerRefreshTerms {
             session_expires: None,
             require_timer: false,
             state: None,
-        };
+        });
     };
-    let interval = Duration::from_secs(u64::from(delta)).max(MIN_SESSION_INTERVAL);
+    let interval = Duration::from_secs(u64::from(delta));
+    if interval < MIN_SESSION_INTERVAL {
+        return Err(SessionIntervalTooSmall { requested: delta });
+    }
     // `requested` is in the re-INVITE's roles; see the doc comment above.
     let bridge_refreshes = !carrier_supports_timer || requested == Some(Refresher::Uas);
     let (wire, duty) = if bridge_refreshes {
@@ -415,11 +437,11 @@ pub(super) fn terms_for_peer_refresh(
     } else {
         ("uac", Refresher::Uas)
     };
-    PeerRefreshTerms {
+    Ok(PeerRefreshTerms {
         session_expires: Some(format!("{delta};refresher={wire}")),
         require_timer: !bridge_refreshes,
         state: Some(SessionRefreshState::starting(interval, duty, now)),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -431,7 +453,7 @@ mod tests {
         // The live T2 re-INVITE: `Session-Expires: 1800;refresher=uac`, sent
         // by the carrier as the re-INVITE's UAC.
         let now = Instant::now();
-        let terms = terms_for_peer_refresh(Some("1800;refresher=uac"), true, now);
+        let terms = terms_for_peer_refresh(Some("1800;refresher=uac"), true, now).unwrap();
         assert_eq!(terms.session_expires.as_deref(), Some("1800;refresher=uac"));
         assert!(terms.require_timer);
         let state = terms.state.expect("a session timer is in force");
@@ -446,7 +468,7 @@ mod tests {
 
     #[test]
     fn a_carrier_refresh_without_a_refresher_leaves_the_duty_with_the_carrier() {
-        let terms = terms_for_peer_refresh(Some("600"), true, Instant::now());
+        let terms = terms_for_peer_refresh(Some("600"), true, Instant::now()).unwrap();
         assert_eq!(terms.session_expires.as_deref(), Some("600;refresher=uac"));
         assert!(terms.require_timer);
         assert_eq!(terms.state.unwrap().refresher(), Refresher::Uas);
@@ -455,7 +477,7 @@ mod tests {
     #[test]
     fn a_carrier_refresh_asking_this_bridge_to_refresh_hands_it_the_duty() {
         let now = Instant::now();
-        let terms = terms_for_peer_refresh(Some("600;refresher=uas"), true, now);
+        let terms = terms_for_peer_refresh(Some("600;refresher=uas"), true, now).unwrap();
         assert_eq!(terms.session_expires.as_deref(), Some("600;refresher=uas"));
         // Require: timer is only mandated when the refresher is the UAC.
         assert!(!terms.require_timer);
@@ -472,7 +494,7 @@ mod tests {
     /// cannot refresh, so this bridge takes the duty.
     #[test]
     fn a_carrier_without_timer_support_hands_this_bridge_the_duty() {
-        let terms = terms_for_peer_refresh(Some("600"), false, Instant::now());
+        let terms = terms_for_peer_refresh(Some("600"), false, Instant::now()).unwrap();
         assert_eq!(terms.session_expires.as_deref(), Some("600;refresher=uas"));
         assert!(!terms.require_timer);
         assert_eq!(terms.state.unwrap().refresher(), Refresher::Uac);
@@ -480,12 +502,54 @@ mod tests {
 
     #[test]
     fn a_refresh_without_session_expires_ends_the_session_timer() {
-        for value in [None, Some("0"), Some("soon")] {
-            let terms = terms_for_peer_refresh(value, true, Instant::now());
+        for value in [None, Some("soon")] {
+            let terms = terms_for_peer_refresh(value, true, Instant::now()).unwrap();
             assert!(terms.session_expires.is_none(), "{value:?}");
             assert!(!terms.require_timer, "{value:?}");
             assert!(terms.state.is_none(), "{value:?}");
         }
+    }
+
+    /// Code review finding, 2026-11-16: an interval below the minimum was
+    /// echoed in the `2xx` while the timer ran on 90 s, so the bridge promised
+    /// terms it did not keep. It is refused instead, whoever would refresh.
+    #[test]
+    fn a_carrier_refresh_below_the_minimum_interval_is_refused_with_the_minimum() {
+        for value in ["30;refresher=uas", "30;refresher=uac", "89", "0"] {
+            for supports_timer in [true, false] {
+                let refused = terms_for_peer_refresh(Some(value), supports_timer, Instant::now())
+                    .expect_err(value);
+                assert_eq!(refused.min_se(), "90", "{value}");
+            }
+        }
+        let refused = terms_for_peer_refresh(Some("30;refresher=uas"), true, Instant::now());
+        assert_eq!(refused.unwrap_err().requested, 30);
+    }
+
+    /// What the `2xx` promises is what the timer runs on, down to the
+    /// minimum itself.
+    #[test]
+    fn an_accepted_interval_is_timed_exactly_as_promised() {
+        let now = Instant::now();
+        let terms = terms_for_peer_refresh(Some("90;refresher=uas"), true, now).unwrap();
+        assert_eq!(terms.session_expires.as_deref(), Some("90;refresher=uas"));
+        let state = terms.state.unwrap();
+        // This bridge refreshes at half the promised interval.
+        assert_eq!(
+            state.verdict(now + Duration::from_secs(44)),
+            RefreshVerdict::Idle
+        );
+        assert_eq!(
+            state.verdict(now + Duration::from_secs(45)),
+            RefreshVerdict::SendNow
+        );
+
+        let terms = terms_for_peer_refresh(Some("90;refresher=uac"), true, now).unwrap();
+        // RFC 4028 §10: give up min(32s, interval/3) before expiry.
+        assert_eq!(
+            terms.state.unwrap().peer_deadline(),
+            Some(now + Duration::from_secs(60))
+        );
     }
 
     #[test]

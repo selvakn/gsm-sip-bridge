@@ -148,9 +148,10 @@ pub(super) fn uas_answer_headers(access_network_info: &str) -> [(&str, &str); 3]
 pub(crate) const INVITE_BODY_ACCEPT: &str =
     "application/sdp, multipart/mixed, multipart/alternative";
 
-/// What [`handle_invite`] does with an INVITE's body.
+/// What [`handle_invite`] does with an INVITE's body, and
+/// `LoopState::answer_reinvite` with a re-INVITE's.
 #[derive(Debug, PartialEq, Eq)]
-enum InviteBody {
+pub(super) enum InviteBody {
     /// No body: RFC 3264 §3's offerless INVITE (specs/047 SDP-04).
     Offerless,
     /// The SDP offer, extracted from whatever MIME wrapping it came in.
@@ -171,7 +172,7 @@ enum InviteBody {
 /// description is refused `415` with [`INVITE_BODY_ACCEPT`]; a broken or
 /// ambiguous multipart `400`. Neither is ever scanned as if it were SDP
 /// (specs/045 SDP-05).
-fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
+pub(super) fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
     match body::extract_sdp(req.header("Content-Type"), &req.body_bytes) {
         Ok(body::Decoded::Empty) => InviteBody::Offerless,
         Ok(body::Decoded::Sdp { text, .. }) => InviteBody::Offer(text),
@@ -189,16 +190,17 @@ fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
     }
 }
 
-/// The SDP a request carries, decoded the same way as an INVITE's body
-/// (specs/088) — the answer an offerless call's `ACK` carries (RFC 3264 §3),
-/// and a carrier re-INVITE's offer or its `ACK`'s answer (`agent::reinvite`).
-/// `None` when the request has no body or none this bridge can read as SDP.
-/// For an `ACK`, the ACK itself still arrived; the caller tells that apart
-/// from a timeout.
-pub(super) fn request_sdp(req: &SipRequest) -> Option<String> {
-    match body::extract_sdp(req.header("Content-Type"), &req.body_bytes) {
-        Ok(body::Decoded::Sdp { text, .. }) => Some(text),
-        Ok(body::Decoded::Empty) | Err(_) => None,
+/// The SDP answer an `ACK` carries, decoded the same way as an INVITE's body
+/// (specs/088): an offerless call's (RFC 3264 §3), or an offerless session
+/// refresh's (`agent::reinvite`). `Ok(None)` when the `ACK` has no body, and
+/// `Err` when it has one this bridge cannot read as SDP. The two are kept
+/// apart so that a caller never mistakes an unreadable body for an absent
+/// one. Either way the `ACK` itself still arrived; the caller tells that
+/// apart from a timeout.
+pub(super) fn ack_answer(req: &SipRequest) -> Result<Option<String>, body::Rejection> {
+    match body::extract_sdp(req.header("Content-Type"), &req.body_bytes)? {
+        body::Decoded::Sdp { text, .. } => Ok(Some(text)),
+        body::Decoded::Empty => Ok(None),
     }
 }
 
@@ -1041,7 +1043,7 @@ fn handle_offerless_invite(
     let mut held = HeldMessages::new(&inbound.tx);
     let deadline = Instant::now() + OFFERLESS_ACK_TIMEOUT;
     // Outer `Some`: the ACK arrived. Inner: the SDP answer it carried, if
-    // its body had a usable one (`request_sdp`).
+    // its body had a usable one (`ack_answer`).
     let mut ack: Option<Option<String>> = None;
     let mut caller_bye = false;
     'wait_for_ack: while Instant::now() < deadline {
@@ -1056,7 +1058,10 @@ fn handle_offerless_invite(
                 req.header("From").unwrap_or_default(),
             );
             if candidate.method == "ACK" && this_dialog {
-                ack = Some(request_sdp(&candidate));
+                // A body that cannot be read as SDP (`body::extract_sdp`
+                // has logged why) fails this call exactly as a missing
+                // answer does, below: there is no call yet to keep.
+                ack = Some(ack_answer(&candidate).unwrap_or(None));
                 break 'wait_for_ack;
             }
             if candidate.method == "BYE" && this_dialog {
@@ -2052,21 +2057,23 @@ mod tests {
              --b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n--b--\r\n"
         );
         assert_eq!(
-            request_sdp(&ack_with(Some("multipart/mixed;boundary=b"), &multipart)).as_deref(),
-            Some(BARE_SDP)
+            ack_answer(&ack_with(Some("multipart/mixed;boundary=b"), &multipart)),
+            Ok(Some(BARE_SDP.to_string()))
         );
         assert_eq!(
-            request_sdp(&ack_with(Some("application/sdp"), BARE_SDP)).as_deref(),
-            Some(BARE_SDP)
+            ack_answer(&ack_with(Some("application/sdp"), BARE_SDP)),
+            Ok(Some(BARE_SDP.to_string()))
         );
+        // No body is not the same as a body that cannot be read.
+        for ct in [Some("application/sdp"), None] {
+            assert_eq!(ack_answer(&ack_with(ct, "")), Ok(None), "{ct:?}");
+        }
         let unclosed = "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n";
         for (ct, body) in [
             (Some("multipart/mixed;boundary=b"), unclosed),
             (Some("text/plain"), "hello"),
-            (Some("application/sdp"), ""),
-            (None, ""),
         ] {
-            assert_eq!(request_sdp(&ack_with(ct, body)), None, "{ct:?} {body:?}");
+            assert!(ack_answer(&ack_with(ct, body)).is_err(), "{ct:?} {body:?}");
         }
     }
 

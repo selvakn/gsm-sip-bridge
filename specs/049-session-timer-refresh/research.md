@@ -60,9 +60,23 @@ format with the offer (RFC 3264 §6). So the "no offer/answer machinery for a
 no-op renegotiation" rationale above still holds: the media path is not
 touched. An offerless
 re-INVITE gets that SDP as the offer. The answer in its `ACK` must keep the
-carrier's media address, direction and payload type. An answer that does not
+carrier's media address, direction and audio format: the payload type, and
+the codec and AMR framing (`octet-align`) the carrier's SDP declared for it at
+setup. An answer that does not
 is a failed refresh, and the call is ended with `BYE` (`SessionTimerExpired`),
-since an `ACK` cannot be refused. Every other re-INVITE is still declined `488`
+since an `ACK` cannot be refused. An `ACK` with no body, or with one that
+cannot be read as SDP, does not say the media changed, so the call carries on
+with the media in use. An `ACK` that does not arrive within 128 s (64×T1, IMS T1 of 2 s) of the
+`200 OK` (to a refresh with an offer or without) ends the call with `BYE`
+(RFC 3261 §14.2), checked from the dispatch loop: the refresh has by then
+replaced the session timer, or removed it when it carried no
+`Session-Expires`, so nothing else would free the line. A re-INVITE whose body cannot be read as SDP is refused
+`415`/`400` like a new call's, and is never taken for an offerless one. A
+refresh re-INVITE asking for a `Session-Expires` below the 90 s minimum is
+refused `422` with `Min-SE: 90` (RFC 4028 §9): the `2xx` states the interval
+the call's timer then runs on, so an interval this bridge will not time is not
+accepted. Every
+other re-INVITE is still declined `488`
 (FR-007 unchanged). This bridge's *own* refreshes stay `UPDATE`-only.
 
 Live result (2026-11-15, T2, VoWiFi, outbound call to the operator's service
