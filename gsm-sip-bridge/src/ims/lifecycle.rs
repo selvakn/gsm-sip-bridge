@@ -136,6 +136,12 @@ pub struct BridgedCall {
     pub caller_name: Option<String>,
     pub stage: CallStage,
     pub ended_by: Option<EndedBy>,
+    /// The network's own account of why it ended the call, verbatim — the
+    /// RFC 3326 `Reason` on the carrier's `BYE`, when it sent one. Kept beside
+    /// [`Self::ended_by`] because that cause is ours to infer: T2 ending a call
+    /// with `Q.850;cause=113;text="Session Timer Expired"` still reads as
+    /// [`EndedBy::Caller`] there.
+    pub carrier_reason: Option<String>,
     pub started_at: SystemTime,
     /// High-water mark: whether the call ever reached [`CallStage::Bridged`].
     /// Needed because a *successful* call ends at `Ended` like any other, so
@@ -152,6 +158,7 @@ impl BridgedCall {
             caller_name,
             stage: CallStage::Offered,
             ended_by: None,
+            carrier_reason: None,
             started_at: SystemTime::now(),
             reached_bridged: false,
         }

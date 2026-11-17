@@ -8,6 +8,7 @@
 //! report the call the same way.
 
 use super::observability;
+use super::reinvite::EstablishedMedia;
 use super::session_refresh::SessionRefreshState;
 use crate::ims::lifecycle::BridgedCall;
 use crate::ims::session::respond;
@@ -99,12 +100,20 @@ pub(super) struct ActiveCall {
     /// this feature's scope (FR-023: only the carrier leg of *answered*
     /// calls carries one; an outbound-placed call never does).
     pub(super) rtcp: Option<RtcpHandle>,
-    /// RFC 4028 session-timer refresh state (specs/049), set once from the
-    /// outbound call's `200 OK`. `None` for every inbound-answered call
-    /// (this feature is UAC-leg-only) and for an outbound call whose
-    /// `200 OK` carried no `Session-Expires` (no obligation, today's
-    /// behavior unchanged).
+    /// RFC 4028 session-timer refresh state (specs/049), set from the
+    /// outbound call's `200 OK`, and replaced by every carrier
+    /// session-refresh re-INVITE this bridge accepts (on a call in either
+    /// direction — `agent::reinvite`). `None` for an inbound-answered call
+    /// until such a re-INVITE, for an outbound call whose `200 OK` carried
+    /// no `Session-Expires` (no obligation), and after a refresh re-INVITE
+    /// that carried none (RFC 4028 §9: no session timer).
     pub(super) session_refresh: Option<SessionRefreshState>,
+    /// The session description agreed at setup, against which a carrier's
+    /// re-INVITE is judged a session refresh (answered with the same SDP)
+    /// or a real modification (still declined) — `agent::reinvite`. `None`
+    /// when the carrier's SDP had no `o=` line to compare with; every
+    /// re-INVITE on that call is declined, as before.
+    pub(super) established_media: Option<EstablishedMedia>,
 }
 
 impl ActiveCall {
@@ -428,6 +437,7 @@ pub(super) fn report_answered_call_ended(
         // that drives admission and teardown is auditable against the metric
         // reported just below (`ims::lifecycle`).
         ended_by = call.lifecycle.ended_by.map(|e| e.as_str()).unwrap_or("unknown"),
+        carrier_reason = call.lifecycle.carrier_reason.as_deref().unwrap_or("none"),
         outcome = call.lifecycle.call_status(verdict.is_success()).as_str(),
         "call media verdict"
     );
@@ -645,6 +655,7 @@ pub(super) fn test_active_call(call_id: &str, to_tag: &str, caller_from: &str) -
         answered_invite: None,
         rtcp: None,
         session_refresh: None,
+        established_media: None,
     }
 }
 
