@@ -307,7 +307,9 @@ VoLTE lines run the same logic over their single configured P-CSCF, kept in
 | `P-CSCF state unreadable; starting clean` / `could not save P-CSCF state` | WARN | `path`, `error` |
 
 The supervisor adds `P-CSCF pool: …` when it publishes a pool,
-`P-CSCF pool changed (set): …; not restarting`, and
+`P-CSCF pool changed (set): …; not restarting`,
+`IKE_SA re-established after an uplink hold (…); restarting the IMS agent on the new tunnel`
+when a tunnel rebuilt during an uplink hold comes up, and
 `P-CSCF <a> unreachable; pool member <b> answers` when it holds off a tunnel
 rebuild because another pool member still answers.
 

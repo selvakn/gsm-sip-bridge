@@ -222,7 +222,11 @@ alert, which still fires on its usual thresholds. If it fires during a hold its
 text ends `; uplink down (no route), recovery on hold`. charon keeps retrying
 on its own schedule the whole time. When the path returns, the tunnel comes
 back through charon's own retry, or through one initiation the supervisor
-issues if no IKE_SA exists. When a `no_route` hold ends with an IKE_SA still
+issues if no IKE_SA exists. That initiation builds a new IKE_SA with a new
+tunnel address, so once it is up and the hold is over the supervisor restarts
+the IMS agent onto it, logged as `IKE_SA re-established after an uplink hold
+(P-CSCF … unchanged); restarting the IMS agent on the new tunnel`. When a
+`no_route` hold ends with an IKE_SA still
 half-open, the supervisor re-initiates it on that tick rather than waiting out
 charon's backoff (up to ~76s between retransmits). After a `no_response` hold
 the line comes back with charon's next retransmit, so it can take up to that

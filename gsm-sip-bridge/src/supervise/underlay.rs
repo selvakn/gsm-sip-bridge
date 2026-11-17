@@ -508,6 +508,7 @@ impl UnderlayTracker {
             // Whatever made the check necessary is gone or has been acted on.
             SteadyOutcome::StillUp
             | SteadyOutcome::PcscfChanged { .. }
+            | SteadyOutcome::HeldInitiationEstablished { .. }
             | SteadyOutcome::WaitingForNegotiation
             | SteadyOutcome::Recovered { .. } => {
                 self.pending_check = None;

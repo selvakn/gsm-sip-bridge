@@ -2110,6 +2110,10 @@ fn start_vowifi_line_strongswan(
             uplink_now,
             &report_tunnel,
         );
+        let after_held_initiation = matches!(
+            outcome,
+            line_supervisor::SteadyOutcome::HeldInitiationEstablished { .. }
+        );
         match outcome {
             line_supervisor::SteadyOutcome::StillUp => {
                 // Under the shutdown guard: a repair racing teardown would
@@ -2160,9 +2164,21 @@ fn start_vowifi_line_strongswan(
                     );
                 }
             }
-            line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
+            // Both republish the selection and the pool, then restart the
+            // agent once: the first because the selection moved, the second
+            // because the IKE_SA under it is a new one (a new virtual IP)
+            // even when the selection did not.
+            line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf }
+            | line_supervisor::SteadyOutcome::HeldInitiationEstablished { new_pcscf } => {
                 drop(guard);
-                println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
+                if after_held_initiation {
+                    println!(
+                        "{}",
+                        held_initiation_established_line(idx, &current_pcscf, &new_pcscf)
+                    );
+                } else {
+                    println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
+                }
                 current_pool = engine.latest_pcscf_pool(runner.as_ref());
                 log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                 published_pool = if publish_pcscf(
@@ -2357,6 +2373,21 @@ fn observe_underlay(
             .and_then(|epdg| engine.shared.epdg_heard.others(epdg, engine.idx)),
         mark,
     }
+}
+
+/// The line logged when the IKE_SA a held initiation started (specs/100
+/// FR-010a) is up and the agent is restarted onto it. Says whether the
+/// selection moved, because when it did not this restart is the only thing
+/// that puts the agent on the new tunnel.
+fn held_initiation_established_line(idx: u32, previous: &str, selection: &str) -> String {
+    let pcscf = if previous == selection {
+        format!("P-CSCF {selection} unchanged")
+    } else {
+        format!("P-CSCF {previous} -> {selection}")
+    };
+    format!(
+        "[supervise] line {idx}: IKE_SA re-established after an uplink hold ({pcscf}); restarting the IMS agent on the new tunnel"
+    )
 }
 
 /// The line logged when a hold begins, naming the cause and its evidence
@@ -3462,8 +3493,10 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 current_pcscf = new_pcscf;
                 tracking.negotiated_at = Some(SystemTime::now());
             }
-            // Only the strongSwan engine has a half-open IKE_SA to wait on.
+            // Only the strongSwan engine has a half-open IKE_SA to wait on, or
+            // a hold to initiate under.
             line_supervisor::SteadyOutcome::WaitingForNegotiation
+            | line_supervisor::SteadyOutcome::HeldInitiationEstablished { .. }
             | line_supervisor::SteadyOutcome::Deferred { .. }
             | line_supervisor::SteadyOutcome::Held { .. } => drop(guard),
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
@@ -3494,6 +3527,18 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_restart_after_a_held_initiation_says_whether_the_selection_moved() {
+        assert_eq!(
+            held_initiation_established_line(0, "10.0.0.11", "10.0.0.11"),
+            "[supervise] line 0: IKE_SA re-established after an uplink hold (P-CSCF 10.0.0.11 unchanged); restarting the IMS agent on the new tunnel"
+        );
+        assert_eq!(
+            held_initiation_established_line(1, "10.0.0.11", "10.0.0.12"),
+            "[supervise] line 1: IKE_SA re-established after an uplink hold (P-CSCF 10.0.0.11 -> 10.0.0.12); restarting the IMS agent on the new tunnel"
+        );
+    }
 
     // ---- specs/094: the idle-tunnel keepalive is opt-in ----
 

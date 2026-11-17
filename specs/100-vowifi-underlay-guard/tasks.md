@@ -213,6 +213,13 @@ Build this branch's image for amd64 (Vodafone, local) and arm64 (Jio, via `arm-b
 - [X] T045 Quickstart §7 and §8: the idle-hour outer packet count is unchanged (SC-006), and the metrics read as expected after T040/T041.
 - [X] T046 Write `specs/100-vowifi-underlay-guard/live-verification.md` (SC-001…SC-008 with timestamps; addresses and identities redacted to roles). Commit `docs(100): live verification of the underlay guard (#141)`.
 
+## Phase 10: Fixes after release
+
+Found live 2026-11-16: a `no_response` hold ended with FR-010a's initiation, the carrier handed back a pool that still held the selection, and nothing restarted the agent. The Phase 9 runs did not catch it because on those rigs the selection moved with every new IKE_SA, so `PcscfChanged` restarted the agent.
+
+- [X] T047 FR-010a, second half: `agent_restart_owed` in `SteadyTracking`, `SteadyOutcome::HeldInitiationEstablished` (data-model row 5a) and its handling in the strongSwan loop. Tests in `line_supervisor.rs`: the unchanged selection, a moved selection (one restart, not two), the half-open ticks in between, a line still held, and a restart for another reason settling the debt.
+- [ ] T048 Live: black-hole the ePDG's answers on a line whose carrier hands the same P-CSCF back, until charon's DPD clears the IKE_SA; restore. Expect one `IKE_SA re-established after an uplink hold (P-CSCF … unchanged)` line and a registration from the new tunnel address within one tick. Not run yet.
+
 ## Dependencies
 
 - **T001 → Phase 2.** T002 → T003. T004–T007 are parallel. T008 needs T004–T007. T009 closes the phase.
