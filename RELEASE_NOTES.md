@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Long calls survive a carrier's session-refresh re-INVITE** -- A carrier that keeps a call alive by refreshing its session timer with a re-INVITE had every refresh declined, and ended the call when the timer ran out; on T2 that cut an outbound call after about 17 minutes. The bridge now answers such a refresh without touching the audio path, on outbound and inbound calls alike, and still declines a re-INVITE that really changes the media. The reason a carrier gives when it ends a call is now logged as `carrier_reason`. Verified live on T2: a 22-minute outbound VoWiFi call survived the carrier's refresh at 15 minutes, which came without SDP, with audio both ways; a refresh with SDP is covered by tests only (#208).
 - **Web UI learns the line's number from IMS** -- VoWiFi and VoLTE lines now show the telephone identity from `P-Associated-URI` after an accepted registration or renewal, using the existing REGISTER response with no additional network or modem query. A configured `msisdn` mapped to the line takes priority. A renewal that omits the identity keeps the previous number; a replacement identity or full registration updates or clears it. Loopback registration and Web UI tests cover the data path; live carrier verification is pending (#203).
 
 ## v8.25.0

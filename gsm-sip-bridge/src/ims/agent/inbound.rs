@@ -9,6 +9,7 @@
 
 use super::call::{spawn_control_reader, ActiveCall, CachedInviteAnswer, DialogInfo, RtcpHandle};
 use super::observability;
+use super::reinvite::EstablishedMedia;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VETH_INVITE_TIMEOUT};
 use super::{unsupported_required_extensions, CONTROL_TIMEOUT};
 use crate::amr_forward::relay::{ForwardParams, ForwardSession, Leg, Remote};
@@ -73,6 +74,26 @@ fn uas_contact(public_user: &str, addr: &str, transport: &str, imei: &str) -> St
     )
 }
 
+/// The `Contact` this side states in every session response it sends — the
+/// `180`/`200` answering an INVITE, and the `200` answering a carrier's
+/// session-refresh re-INVITE (`agent::reinvite`) — built from the session as
+/// it is *now*, so a refresh answered after a Gm rebuild names the current
+/// protected port. See `handle_invite` for why the feature tags matter.
+pub(super) fn session_uas_contact(session: &crate::ims::RegisteredSession) -> String {
+    let public_user = session
+        .public_uri
+        .split('@')
+        .next()
+        .unwrap_or(&session.public_uri);
+    let via_transport = if session.use_tcp { "TCP" } else { "UDP" };
+    uas_contact(
+        public_user,
+        &format_sip_addr(session.contact_addr),
+        via_transport,
+        &session.imei,
+    )
+}
+
 /// Everything `handle_invite` needs that is fixed for the life of the agent.
 pub(super) struct InviteContext<'a> {
     pub(super) control_addr: SocketAddr,
@@ -127,9 +148,10 @@ pub(super) fn uas_answer_headers(access_network_info: &str) -> [(&str, &str); 3]
 pub(crate) const INVITE_BODY_ACCEPT: &str =
     "application/sdp, multipart/mixed, multipart/alternative";
 
-/// What [`handle_invite`] does with an INVITE's body.
+/// What [`handle_invite`] does with an INVITE's body, and
+/// `LoopState::answer_reinvite` with a re-INVITE's.
 #[derive(Debug, PartialEq, Eq)]
-enum InviteBody {
+pub(super) enum InviteBody {
     /// No body: RFC 3264 §3's offerless INVITE (specs/047 SDP-04).
     Offerless,
     /// The SDP offer, extracted from whatever MIME wrapping it came in.
@@ -150,7 +172,7 @@ enum InviteBody {
 /// description is refused `415` with [`INVITE_BODY_ACCEPT`]; a broken or
 /// ambiguous multipart `400`. Neither is ever scanned as if it were SDP
 /// (specs/045 SDP-05).
-fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
+pub(super) fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
     match body::extract_sdp(req.header("Content-Type"), &req.body_bytes) {
         Ok(body::Decoded::Empty) => InviteBody::Offerless,
         Ok(body::Decoded::Sdp { text, .. }) => InviteBody::Offer(text),
@@ -168,14 +190,17 @@ fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
     }
 }
 
-/// The SDP answer an offerless call's `ACK` carries (RFC 3264 §3), decoded
-/// the same way as an INVITE's body (specs/088) — `None` when the ACK has no
-/// body or none this bridge can read as SDP. The ACK itself still arrived;
-/// the caller tells that apart from a timeout.
-fn ack_answer(ack: &SipRequest) -> Option<String> {
-    match body::extract_sdp(ack.header("Content-Type"), &ack.body_bytes) {
-        Ok(body::Decoded::Sdp { text, .. }) => Some(text),
-        Ok(body::Decoded::Empty) | Err(_) => None,
+/// The SDP answer an `ACK` carries, decoded the same way as an INVITE's body
+/// (specs/088): an offerless call's (RFC 3264 §3), or an offerless session
+/// refresh's (`agent::reinvite`). `Ok(None)` when the `ACK` has no body, and
+/// `Err` when it has one this bridge cannot read as SDP. The two are kept
+/// apart so that a caller never mistakes an unreadable body for an absent
+/// one. Either way the `ACK` itself still arrived; the caller tells that
+/// apart from a timeout.
+pub(super) fn ack_answer(req: &SipRequest) -> Result<Option<String>, body::Rejection> {
+    match body::extract_sdp(req.header("Content-Type"), &req.body_bytes)? {
+        body::Decoded::Sdp { text, .. } => Ok(Some(text)),
+        body::Decoded::Empty => Ok(None),
     }
 }
 
@@ -416,13 +441,6 @@ pub(super) fn handle_invite(
     // Generated once and reused for every response in this dialog (180 and
     // 200 OK alike) — RFC 3261 requires the same To-tag across all
     // responses that establish/confirm one dialog.
-    let public_user = session
-        .public_uri
-        .split('@')
-        .next()
-        .unwrap_or(&session.public_uri)
-        .to_string();
-    let via_transport = if session.use_tcp { "TCP" } else { "UDP" };
     // The protected server port, not the client port we send from — this is
     // the address the carrier's in-dialog requests (the eventual BYE) come
     // back to. See `RegisteredSession::contact_addr`.
@@ -447,12 +465,7 @@ pub(super) fn handle_invite(
     // answer itself was verified byte-perfect on the wire and media negotiated
     // and flowed both ways. The SDP body was never the variable; this omission
     // is invariant across all five.
-    let contact = uas_contact(
-        &public_user,
-        &format_sip_addr(session.contact_addr),
-        via_transport,
-        &session.imei,
-    );
+    let contact = session_uas_contact(session);
     // Ring the caller. The network turns this into audible ringback and keeps
     // playing it until we answer — which we now deliberately don't do until a
     // human picks up the PBX extension (see `await_pbx_answer`).
@@ -781,6 +794,14 @@ pub(super) fn handle_invite(
             lifecycle.advance_to(CallStage::PbxRinging);
             lifecycle.advance_to(CallStage::Bridged);
 
+            // What a carrier's session-refresh re-INVITE is later compared
+            // against (`agent::reinvite`): its own offer, and our answer.
+            let established_media = EstablishedMedia::new(
+                answer_sdp.clone(),
+                &offer_sdp,
+                offer.remote_rtp,
+                chosen.payload_type,
+            );
             Ok(Some(ActiveCall {
                 control,
                 ctrl_rx,
@@ -799,12 +820,12 @@ pub(super) fn handle_invite(
                 meter,
                 lifecycle,
                 rtcp: rtcp_handle,
-                // Inbound-answered calls are out of scope for RFC 4028
-                // session-timer refresh (specs/049, FR-011) — this bridge
-                // never advertises `Supported: timer` on its own `200 OK`
-                // (`agent::mod::SUPPORTED_EXTENSIONS`), so no such call
-                // ever has a refresh obligation.
+                // No refresh duty at answer time (specs/049, FR-011): this
+                // bridge does not read the INVITE's `Session-Expires`. A
+                // carrier session-refresh re-INVITE sets one if it comes
+                // (`agent::reinvite`).
                 session_refresh: None,
+                established_media,
             }))
         }
         ControlMessage::BridgeFailed {
@@ -875,19 +896,7 @@ fn handle_offerless_invite(
     let veth_wideband = ctx.wideband;
     let veth_rx = spawn_veth_uas_listener(ctx.veth_local_ip, ctx.veth_sip_port, veth_wideband)?;
 
-    let public_user = session
-        .public_uri
-        .split('@')
-        .next()
-        .unwrap_or(&session.public_uri)
-        .to_string();
-    let via_transport = if session.use_tcp { "TCP" } else { "UDP" };
-    let contact = uas_contact(
-        &public_user,
-        &format_sip_addr(session.contact_addr),
-        via_transport,
-        &session.imei,
-    );
+    let contact = session_uas_contact(session);
     sink.send(&build_180_ringing(req, to_tag, &contact))?;
 
     let mut control = TcpStream::connect_timeout(&ctx.control_addr, CONTROL_TIMEOUT)
@@ -1049,7 +1058,10 @@ fn handle_offerless_invite(
                 req.header("From").unwrap_or_default(),
             );
             if candidate.method == "ACK" && this_dialog {
-                ack = Some(ack_answer(&candidate));
+                // A body that cannot be read as SDP (`body::extract_sdp`
+                // has logged why) fails this call exactly as a missing
+                // answer does, below: there is no call yet to keep.
+                ack = Some(ack_answer(&candidate).unwrap_or(None));
                 break 'wait_for_ack;
             }
             if candidate.method == "BYE" && this_dialog {
@@ -1117,8 +1129,9 @@ fn handle_offerless_invite(
     };
 
     let answer = ack_sdp
+        .as_deref()
         .ok_or_else(|| BridgeError::Ims("offerless ACK carried no usable SDP answer".into()))
-        .and_then(|text| sdp::parse_answer(&text));
+        .and_then(sdp::parse_answer);
     let chosen = answer
         .as_ref()
         .ok()
@@ -1193,6 +1206,15 @@ fn handle_offerless_invite(
     lifecycle.advance_to(CallStage::PbxRinging);
     lifecycle.advance_to(CallStage::Bridged);
 
+    // Here the carrier's SDP is the ACK's answer, and ours the offer.
+    let established_media = ack_sdp.as_deref().and_then(|text| {
+        EstablishedMedia::new(
+            our_offer.clone(),
+            text,
+            answer.remote_rtp,
+            chosen.payload_type,
+        )
+    });
     Ok(Some(ActiveCall {
         control,
         ctrl_rx,
@@ -1213,9 +1235,9 @@ fn handle_offerless_invite(
         // FR-002a: no RTCP on the offerless path.
         rtcp: None,
         // See the matching comment at this file's other `ActiveCall`
-        // construction site — inbound-answered calls are out of scope for
-        // specs/049 (FR-011).
+        // construction site.
         session_refresh: None,
+        established_media,
     }))
 }
 
@@ -2035,21 +2057,23 @@ mod tests {
              --b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n--b--\r\n"
         );
         assert_eq!(
-            ack_answer(&ack_with(Some("multipart/mixed;boundary=b"), &multipart)).as_deref(),
-            Some(BARE_SDP)
+            ack_answer(&ack_with(Some("multipart/mixed;boundary=b"), &multipart)),
+            Ok(Some(BARE_SDP.to_string()))
         );
         assert_eq!(
-            ack_answer(&ack_with(Some("application/sdp"), BARE_SDP)).as_deref(),
-            Some(BARE_SDP)
+            ack_answer(&ack_with(Some("application/sdp"), BARE_SDP)),
+            Ok(Some(BARE_SDP.to_string()))
         );
+        // No body is not the same as a body that cannot be read.
+        for ct in [Some("application/sdp"), None] {
+            assert_eq!(ack_answer(&ack_with(ct, "")), Ok(None), "{ct:?}");
+        }
         let unclosed = "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n";
         for (ct, body) in [
             (Some("multipart/mixed;boundary=b"), unclosed),
             (Some("text/plain"), "hello"),
-            (Some("application/sdp"), ""),
-            (None, ""),
         ] {
-            assert_eq!(ack_answer(&ack_with(ct, body)), None, "{ct:?} {body:?}");
+            assert!(ack_answer(&ack_with(ct, body)).is_err(), "{ct:?} {body:?}");
         }
     }
 

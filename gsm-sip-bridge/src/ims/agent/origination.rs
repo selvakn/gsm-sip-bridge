@@ -10,6 +10,7 @@
 //! message; everything here is the state they are applied against.
 
 use super::call::{ActiveCall, DialogInfo};
+use super::reinvite::EstablishedMedia;
 use super::session_refresh;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VethUasResult, VETH_INVITE_TIMEOUT};
 use crate::error::BridgeResult;
@@ -228,6 +229,12 @@ pub(super) struct PendingOrigination {
     /// afterward too if that header was absent (no obligation). Carried
     /// through to `finish_origination`'s `ActiveCall`.
     session_refresh: Option<session_refresh::SessionRefreshState>,
+    /// The SDP offer the INVITE carried — what a carrier's session-refresh
+    /// re-INVITE is later answered with (`agent::reinvite`).
+    offer_sdp: String,
+    /// Set from the real `200 OK` (`agent::reinvite`); carried through to
+    /// `finish_origination`'s `ActiveCall`.
+    established_media: Option<EstablishedMedia>,
 }
 
 /// The waits the old `originate_and_bridge` blocked on, now explicit states.
@@ -464,6 +471,8 @@ pub(super) fn begin_origination(
         abandoned: false,
         lifecycle,
         session_refresh: None,
+        offer_sdp: offer,
+        established_media: None,
     })
 }
 
@@ -935,15 +944,17 @@ impl PendingOrigination {
         //
         // specs/088: the 2xx body is decoded as MIME (it may be multipart),
         // exactly like `ims::call::run_call`'s.
-        let answer = match (
+        let answer_text = match (
             resp.body.trim().is_empty(),
             self.provisional_answer.as_deref(),
         ) {
-            (true, Some(cached)) => sdp::parse_answer(cached),
-            _ => crate::ims::call::answer_sdp(resp).and_then(|text| sdp::parse_answer(&text)),
+            (true, Some(cached)) => Ok(cached.to_string()),
+            _ => crate::ims::call::answer_sdp(resp),
         };
-        let answer = match answer {
-            Ok(a) => a,
+        let answer =
+            answer_text.and_then(|text| sdp::parse_answer(&text).map(|answer| (text, answer)));
+        let (answer_text, answer) = match answer {
+            Ok(pair) => pair,
             Err(e) => {
                 self.fail(&format!("bad SDP answer: {e}"));
                 return OriginationStatus::Ended;
@@ -1014,6 +1025,16 @@ impl PendingOrigination {
             resp.header("Session-Expires"),
             Instant::now(),
         );
+        // What a carrier's session-refresh re-INVITE is later compared
+        // against: the answer just parsed, and our own offer.
+        self.established_media = sdp::offered_chosen_codec(answer.codec).and_then(|chosen| {
+            EstablishedMedia::new(
+                self.offer_sdp.clone(),
+                &answer_text,
+                answer.remote_rtp,
+                chosen.payload_type,
+            )
+        });
 
         // specs/037-p-early-media: reuse the listener a provisional already
         // spawned, *if* it's still usable. Its `VETH_INVITE_TIMEOUT` clock
@@ -1423,6 +1444,7 @@ fn finish_origination(
         early_veth_socket,
         rtp_reorder_wait,
         session_refresh,
+        established_media,
         ..
     } = p;
     let mut control = control;
@@ -1696,6 +1718,7 @@ fn finish_origination(
         // answered (terminating) calls carries an RTCP endpoint.
         rtcp: None,
         session_refresh,
+        established_media,
     })
 }
 
@@ -1792,6 +1815,8 @@ mod tests {
             abandoned: false,
             lifecycle,
             session_refresh: None,
+            offer_sdp: String::new(),
+            established_media: None,
         };
         (p, ctrl_tx)
     }
