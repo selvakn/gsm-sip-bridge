@@ -253,6 +253,31 @@ pub fn parse_answer(body: &str) -> BridgeResult<SdpAnswer> {
     })
 }
 
+/// The session description's `o=` origin line (RFC 4566 §5.2), trimmed —
+/// `None` when the body has none.
+///
+/// RFC 3264 §8 ties a session description's identity to this line: a party
+/// that changes anything in its SDP must increment the version on it, and one
+/// that changes nothing must keep it byte-for-byte. Comparing it is how
+/// `agent::reinvite` tells a carrier's session-refresh re-INVITE (same origin
+/// line) from a real media modification (a new version).
+pub fn origin_line(body: &str) -> Option<&str> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("o="))
+}
+
+/// The first payload type on the `m=audio` line — the format an answer
+/// selected (RFC 3264 §6.1: the answerer lists what it will send, preferred
+/// first). `None` when there is no `m=audio` line or it lists none.
+pub fn first_audio_payload_type(body: &str) -> Option<u8> {
+    body.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("m=audio "))
+        .and_then(|rest| rest.split_whitespace().nth(2))
+        .and_then(|pt| pt.parse().ok())
+}
+
 /// The `ChosenCodec` for a codec `build_offer` actually offers (PCMU or
 /// AMR-WB) — `None` for anything else (`AmrNb`, `L16`), which an answer can
 /// only select by carrier/handset misbehavior, not a codec we'd ever have
@@ -1451,6 +1476,32 @@ mod codec_offer_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_line_finds_the_o_line_and_trims_it() {
+        let body = "v=0\r\no=- 71848567 71848567 IN IP4 192.0.2.7  \r\ns=SBC call\r\n";
+        assert_eq!(
+            origin_line(body),
+            Some("o=- 71848567 71848567 IN IP4 192.0.2.7")
+        );
+        assert_eq!(origin_line("v=0\r\ns=-\r\n"), None);
+    }
+
+    #[test]
+    fn first_audio_payload_type_reads_the_m_line() {
+        assert_eq!(
+            first_audio_payload_type("v=0\r\nm=audio 4000 RTP/AVP 102 97\r\n"),
+            Some(102)
+        );
+        assert_eq!(
+            first_audio_payload_type("v=0\r\nm=video 4000 RTP/AVP 96\r\n"),
+            None
+        );
+        assert_eq!(
+            first_audio_payload_type("v=0\r\nm=audio 4000 RTP/AVP\r\n"),
+            None
+        );
+    }
 
     /// specs/088 (#103): the SDP part of T2's multipart INVITE parses as the
     /// offer it is — including the `/1` channel count on every AMR rtpmap.
